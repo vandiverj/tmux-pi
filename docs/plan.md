@@ -75,7 +75,7 @@ results are plain files, so any piece can be inspected or replaced.
 ## Milestones
 
 - **M0 — skeleton.** Repo, `bin/tp` (`agent`), three-slot layout, self-contained pi and Claude config. *(done)*
-- **M1 — one subagent, by hand.** `tp-spawn --worker pi|claude --model X --thinking Y "task"` opens a hidden window running `tp-pi` or `tp-claude`; `tp-view <id>` swaps it into the viewer.
+- **M1 — one subagent, by hand.** `tp-spawn --worker pi|claude --model X --thinking Y "task"` opens a hidden window running `tp-pi` or `tp-claude`; `tp-view <id>` swaps it into the viewer; `tp-list`, `tp-kill`. *(done)*
 - **M2 — status.** Reporter extension plus a real status pane with keyboard selection.
 - **M3 — router.** Local model classifies the task and picks model and thinking level from a roster.
 - **M4 — context packets.** Orchestrator builds per-task packets; subagents get nothing else.
@@ -84,7 +84,7 @@ results are plain files, so any piece can be inspected or replaced.
 ## Models available now
 
 - **Local (Ollama, `:11434`):** gpt-oss 20b/120b, qwen3-coder 30b, qwen3.6 35b, llama3.3 70b, qwen3 1.7b.
-- **Local (slotstream):** Qwen3.8 Flash Next, OpenAI-compatible. Defaults to `:11434` too, so run it on `--port 11435` (what `agent/models.json` expects).
+- **Local (slotstream):** Qwen3.8 Flash Next, OpenAI-compatible, on `--port 11435` (what `agent/models.json` expects). Rejects the `store` field, so `compat.supportsStore` is false.
 - **GPT:** pi's `openai-codex` provider (ChatGPT subscription); needs `/login` inside tmux-pi.
 - **Claude:** Claude Code workers via `bin/tp-claude`, on the Claude subscription.
 
@@ -104,4 +104,6 @@ results are plain files, so any piece can be inspected or replaced.
 ## Risks
 
 - **Claude built-ins can't be removed.** `--disable-slash-commands` would drop them but also drops tmux-pi's skills. Denying specific ones via `claude/settings.json` is untested.
-- **Port clash** between Ollama and slotstream on `11434`.
+- **Port clash** between Ollama and slotstream on `11434`; slotstream now runs on `11435`.
+- **Claude workers stop at the folder-trust prompt** the first time they run in an untrusted directory; answer it in the viewer.
+- **tmux server options.** `tp` turns on `extended-keys` (csi-u) server-wide, which also affects any other tmux sessions.

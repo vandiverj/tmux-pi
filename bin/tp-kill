@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# tp-kill — stop a subagent and close its window. Its task files are kept.
+#
+# Usage: tp-kill <id>
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+[[ $# -eq 1 ]] || die "usage: tp-kill <id>"
+id="$1"
+session="$(tp_session)"
+task_dir="$(tp_task_dir "$session" "$id")"
+[[ -f "$task_dir/meta.json" ]] || die "no subagent '$id'"
+pane="$(tp_meta "$task_dir" pane)"
+
+# Never kill a pane while it sits in the viewer slot; that would break the layout.
+if [[ "$(tp_opt "$session" @tp_viewing)" == "$id" ]]; then
+  "$ROOT/bin/tp-view" -
+fi
+if [[ "$(tp_pane_state "$pane")" != gone ]]; then
+  tmux kill-pane -t "$pane"
+fi

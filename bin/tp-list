@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tp-list — list subagents in the tmux-pi session (newest last).
+#
+# Usage: tp-list
+#
+# ▸ marks the subagent shown in the viewer slot.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+tasks="$(tp_opt "$session" @tp_state_dir)/tasks"
+current="$(tp_opt "$session" @tp_viewing)"
+
+found=0
+for meta in $(ls -tr "$tasks"/*/meta.json 2>/dev/null); do
+  found=1
+  task_dir="$(dirname "$meta")"
+  id="$(tp_meta "$task_dir" id)"
+  mark=" "; [[ "$id" == "$current" ]] && mark="▸"
+  model="$(tp_meta "$task_dir" model)"; thinking="$(tp_meta "$task_dir" thinking)"
+  printf '%s %-22s %-7s %-8s %s%s\n' "$mark" "$id" "$(tp_meta "$task_dir" worker)" \
+    "$(tp_pane_state "$(tp_meta "$task_dir" pane)")" "${model:-default}" "${thinking:+:$thinking}"
+done
+[[ "$found" == 1 ]] || echo "  no subagents"

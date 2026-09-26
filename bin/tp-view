@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# tp-view — show a subagent's live session in the viewer slot.
+#
+# Usage: tp-view <id>   swap the subagent into the viewer slot
+#        tp-view -      put the placeholder back (subagent returns to its window)
+#        tp-view        print the id currently shown
+#
+# Panes are swapped, not copied: what you see is the real session and you can
+# click into it and type.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+placeholder="$(tp_opt "$session" @tp_viewer_pane)"
+current="$(tp_opt "$session" @tp_viewing)"
+
+# Swap the currently shown subagent back to its own window.
+restore() {
+  [[ -n "$current" ]] || return 0
+  local pane
+  pane="$(tp_meta "$(tp_task_dir "$session" "$current")" pane)"
+  if [[ -n "$pane" && "$(tp_pane_state "$pane")" != gone ]]; then
+    tmux swap-pane -d -s "$pane" -t "$placeholder"
+  fi
+  tmux set-option -t "=$session:" @tp_viewing ""
+  current=""
+}
+
+case "${1:-}" in
+  "")
+    [[ -n "$current" ]] && echo "$current"
+    exit 0 ;;
+  -)
+    restore
+    exit 0 ;;
+esac
+
+id="$1"
+task_dir="$(tp_task_dir "$session" "$id")"
+[[ -f "$task_dir/meta.json" ]] || die "no subagent '$id'"
+pane="$(tp_meta "$task_dir" pane)"
+[[ "$(tp_pane_state "$pane")" != gone ]] || die "subagent '$id' has no pane (killed)"
+[[ "$id" == "$current" ]] && exit 0
+
+restore
+tmux swap-pane -d -s "$pane" -t "$placeholder"
+tmux set-option -t "=$session:" @tp_viewing "$id"

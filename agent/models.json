@@ -121,7 +121,8 @@
       "apiKey": "local",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false
+        "supportsReasoningEffort": false,
+        "supportsStore": false
       },
       "models": [
         {

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# tp — launch the tmux-pi workspace.
+#
+#   ┌──────────────┬──────────────┐
+#   │              │ status       │
+#   │ main pi      ├──────────────┤
+#   │              │ viewer slot  │
+#   └──────────────┴──────────────┘
+#
+# Usage: tp [workdir]    (defaults to the current directory)
+# Env:   TP_SESSION      tmux session name (default: tmux-pi)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKDIR="$(cd "${1:-$PWD}" && pwd)"
+SESSION="${TP_SESSION:-tmux-pi}"
+STATE_DIR="$WORKDIR/.tmux-pi"
+
+command -v tmux >/dev/null || { echo "tp: tmux not found (brew install tmux)" >&2; exit 1; }
+command -v pi   >/dev/null || { echo "tp: pi not found" >&2; exit 1; }
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
+  exec tmux attach -t "$SESSION"
+fi
+
+mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
+
+# pi reads settings, models, auth, extensions, skills, prompts and themes only
+# from the repo's agent/ dir — never from ~/.pi/agent.
+AGENT_DIR="$ROOT/agent"
+
+main_cmd="pi"
+
+# Placeholders until M2 replaces them with the real status pane / viewer.
+status_cmd="while true; do clear; echo 'subagents'; echo; ls -1 '$STATE_DIR/state' 2>/dev/null | sed 's/\\.json\$//' || true; sleep 2; done"
+viewer_cmd="clear; echo 'no subagent selected'; exec cat"
+
+cols="$(tput cols 2>/dev/null || echo 200)"
+lines="$(tput lines 2>/dev/null || echo 50)"
+
+main_pane="$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n main -c "$WORKDIR" -x "$cols" -y "$lines" \
+  -e "PI_CODING_AGENT_DIR=$AGENT_DIR")"
+# Session-level env so every later pane/window (subagents) gets it too.
+tmux set-environment -t "$SESSION" PI_CODING_AGENT_DIR "$AGENT_DIR"
+status_pane="$(tmux split-window -h -l 50% -P -F '#{pane_id}' -t "$main_pane" -c "$WORKDIR" "$status_cmd")"
+viewer_pane="$(tmux split-window -v -l 65% -P -F '#{pane_id}' -t "$status_pane" -c "$WORKDIR" "$viewer_cmd")"
+
+# Record pane ids so other tp-* tools and extensions can find the slots.
+tmux set-option -t "$SESSION" @tp_root "$ROOT"
+tmux set-option -t "$SESSION" @tp_agent_dir "$AGENT_DIR"
+tmux set-option -t "$SESSION" @tp_state_dir "$STATE_DIR"
+tmux set-option -t "$SESSION" @tp_main_pane "$main_pane"
+tmux set-option -t "$SESSION" @tp_status_pane "$status_pane"
+tmux set-option -t "$SESSION" @tp_viewer_pane "$viewer_pane"
+
+tmux select-pane -t "$status_pane" -T status
+tmux select-pane -t "$viewer_pane" -T viewer
+tmux select-pane -t "$main_pane" -T main
+tmux set-option -t "$SESSION" pane-border-status top
+tmux set-option -t "$SESSION" mouse on
+
+tmux send-keys -t "$main_pane" "$main_cmd" Enter
+
+if [[ "${TP_NO_ATTACH:-}" == 1 ]]; then exit 0; fi
+if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
+exec tmux attach -t "$SESSION"

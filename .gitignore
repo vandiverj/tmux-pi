@@ -1,0 +1,9 @@
+.tmux-pi/
+node_modules/
+.DS_Store
+# pi runtime state under the repo-owned agent dir — never commit credentials or sessions
+agent/auth.json
+agent/sessions/
+agent/npm/
+agent/bin/
+agent/models-store.json

@@ -1,0 +1,8 @@
+{
+  "defaultProvider": "ollama",
+  "defaultModel": "qwen3-coder:30b",
+  "defaultThinkingLevel": "medium",
+  "packages": [],
+  "theme": "dark",
+  "lastChangelogVersion": "0.87.1"
+}

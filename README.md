@@ -23,6 +23,12 @@ bin/tp            # workspace for the current directory
 bin/tp ~/code/x   # workspace for another directory
 ```
 
+To launch it as `agent` from any directory:
+
+```sh
+ln -s "$PWD/bin/tp" ~/.local/bin/agent
+```
+
 Re-running `tp` reattaches to the existing session. Set `TP_SESSION` to run more than one.
 
 pi runs with this repo's `agent/` directory as its config (`PI_CODING_AGENT_DIR`), so nothing

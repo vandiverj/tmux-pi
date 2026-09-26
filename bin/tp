@@ -11,7 +11,14 @@
 # Env:   TP_SESSION      tmux session name (default: tmux-pi)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve symlinks (e.g. ~/.local/bin/agent -> bin/tp) to find the repo.
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 WORKDIR="$(cd "${1:-$PWD}" && pwd)"
 SESSION="${TP_SESSION:-tmux-pi}"
 STATE_DIR="$WORKDIR/.tmux-pi"

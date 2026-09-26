@@ -11,7 +11,7 @@ for their task.
 
 ```
 ┌──────────────────────────────┬──────────────────────────────┐
-│ main pi + orchestrator ext   │ status: subagents, model,    │
+│ main pi + subagents ext      │ status: subagents, model,    │
 │                              │ state, current tool, cost    │
 │                              ├──────────────────────────────┤
 │                              │ viewer: selected subagent's  │
@@ -29,8 +29,8 @@ into the viewer slot, so what you see is the real session and you can type into 
 | `bin/tp` | Creates the tmux session and three slots, records pane ids as `@tp_*` session options. Linked as `agent`. |
 | `bin/tp-pi` | Runs pi with only tmux-pi's config and skills. Used for main and pi workers. |
 | `bin/tp-claude` | Runs Claude Code with only tmux-pi's settings, plugins and MCP servers. Used for Claude workers. |
-| `agent/extensions/orchestrator.ts` | Loaded into main pi. Tools: `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `kill_subagent`. |
-| Router | Called by the orchestrator before a spawn. Local model returns `{class, model, thinking, tools, context_hints}` as JSON, validated against `config/models.json`. |
+| `agent/extensions/subagents.ts` | Loaded into main pi. Tools: `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `kill_subagent`. |
+| Router | `bin/tp-route` calls local Laya `typed-decisions` by default, applies a deterministic policy, and validates the result against `config/router.json`. The Slotstream OpenAI-compatible classifier remains an explicit fallback. Called by `spawn_subagent` when no model is given. |
 | Context builder | Writes `.tmux-pi/tasks/<id>/packet.md`: the task plus only the selected files, snippets and notes. Subagents start with `--no-context-files @packet.md`. |
 | Reporter | pi workers: `agent/extensions/reporter.ts`; Claude workers: hooks in the tmux-pi plugin (`claude/plugins/tmux-pi/hooks/`). Both write `.tmux-pi/tasks/<id>/state.json` (state, current tool, turns, tokens, cost) and `result.md` (last reply). `run.sh` writes `exit` when the process ends. |
 | Status pane | `bin/tp-status`: live list from the task dirs and panes; keys to view, focus, read result/task, kill and archive. `enter` runs `tp-view <id>` (a tmux `swap-pane` into the viewer slot). |
@@ -77,13 +77,14 @@ results are plain files, so any piece can be inspected or replaced.
 - **M0 — skeleton.** Repo, `bin/tp` (`agent`), three-slot layout, self-contained pi and Claude config. *(done)*
 - **M1 — one subagent, by hand.** `tp-spawn --worker pi|claude --model X --thinking Y "task"` opens a hidden window running `tp-pi` or `tp-claude`; `tp-view <id>` swaps it into the viewer; `tp-list`, `tp-kill`. *(done)*
 - **M2 — status.** Reporter extension plus a real status pane with keyboard selection. *(done)*
-- **M3 — router.** Local model classifies the task and picks model and thinking level from a roster.
-- **M4 — context packets.** Orchestrator builds per-task packets; subagents get nothing else.
+- **M3 — router.** Laya classifies bounded task traits; a deterministic ladder selects Slotstream, Codex, or Claude plus thinking level from a strict roster. Laya difficulty confidence is not used because its score temperatures are uncalibrated. `agent/extensions/subagents.ts` gives main the spawn/list/send/collect/kill tools and routes spawns without an explicit model. *(done)*
+- **M4 — context packets.** Main builds per-task packets; subagents get nothing else.
 - **M5 — review loop.** A second subagent on a different provider reviews the first one's result before it returns to main.
 
 ## Models available now
 
-- **Local (slotstream, default):** Qwen3.8 Flash Next, OpenAI-compatible, on `--port 11435` (what `agent/models.json` expects). Rejects the `store` field, so `compat.supportsStore` is false.
+- **Local (slotstream):** Qwen3.8 Flash Next, OpenAI-compatible, on `--port 11435` (what `agent/models.json` expects). Rejects the `store` field, so `compat.supportsStore` is false.
+- **Local (Laya router):** `typed-decisions` through `POST /v1/systemone` on loopback port `11436`; repo-local runtime artifacts stay under ignored `.laya/`.
 - **GPT:** pi's `openai-codex` provider (ChatGPT subscription); needs `/login` inside tmux-pi.
 - **Claude:** Claude Code workers via `bin/tp-claude`, on the Claude subscription.
 
@@ -98,7 +99,7 @@ results are plain files, so any piece can be inspected or replaced.
 
 ## Open questions
 
-- **OpenJEV:** where it runs and what API it exposes. Blocks M3 only; M3 can fall back to slotstream Qwen.
+- **Router calibration:** Gather representative task labels before treating Laya's probabilities as calibrated for tmux-pi's coding workload. Current thresholds are explicit conservative heuristics.
 - **Main agent model:** local or frontier. Recommended: frontier at low thinking for main, since it writes every packet.
 
 ## Risks

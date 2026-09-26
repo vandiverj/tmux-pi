@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Start, inspect, or stop the repo-managed local Laya router.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime="$ROOT/.laya"
+venv="$runtime/venv"
+pidfile="$runtime/router.pid"
+logfile="$runtime/router.log"
+port=11436
+command -v lsof >/dev/null || { echo "tp-laya: lsof is required to check port $port" >&2; exit 1; }
+
+listener() { lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null; }
+managed_pid() {
+  [[ -f "$pidfile" ]] || return 1
+  local pid
+  pid="$(cat "$pidfile")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o command= | grep -Fq "$venv/bin/laya-serve" || return 1
+  printf '%s\n' "$pid"
+}
+
+case "${1:-start}" in
+  start)
+    if [[ ! -x "$venv/bin/laya-serve" || ! -x "$venv/bin/python" ]]; then
+      echo "tp-laya: missing .laya/venv; bootstrap Laya first (see README)" >&2
+      exit 1
+    fi
+    if pid="$(managed_pid)"; then
+      echo "tp-laya: managed pid $pid is already starting or running" >&2
+      exit 1
+    fi
+    if listener >/dev/null; then
+      echo "tp-laya: port $port already has a listener; leaving it running" >&2
+      exit 1
+    fi
+    if [[ -n "${TP_LAYA_DEVICE:-}" ]]; then
+      device="$TP_LAYA_DEVICE"
+    else
+      device="$("$venv/bin/python" -c 'import torch; print("mps" if torch.backends.mps.is_available() else "cpu")')"
+    fi
+    mkdir -p "$runtime"
+    nohup env LAYA_HOST=127.0.0.1 LAYA_PORT="$port" LAYA_DEVICE="$device" \
+      LAYA_PRELOAD=1 LAYA_MODELS=typed-decisions LAYA_AUTO_TASK=0 \
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+      "$venv/bin/laya-serve" >>"$logfile" 2>&1 </dev/null &
+    echo "$!" >"$pidfile"
+    echo "tp-laya: started pid $! on 127.0.0.1:$port (device=$device); log: $logfile"
+    ;;
+  status)
+    if pid="$(managed_pid)"; then
+      if listener >/dev/null; then
+        echo "tp-laya: managed pid $pid is listening on 127.0.0.1:$port"
+      else
+        echo "tp-laya: managed pid $pid is starting; see $logfile"
+      fi
+    elif listener >/dev/null; then
+      echo "tp-laya: an external process is listening on port $port"
+    else
+      echo "tp-laya: no listener on port $port"
+      exit 1
+    fi
+    ;;
+  stop)
+    if ! pid="$(managed_pid)"; then
+      echo "tp-laya: no managed Laya process to stop; leaving other listeners alone" >&2
+      exit 1
+    fi
+    if listener >/dev/null; then
+      if ! lsof -nP -a -p "$pid" -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$pid"; then
+        echo "tp-laya: managed pid $pid is not the port $port listener; leaving it alone" >&2
+        exit 1
+      fi
+    fi
+    kill "$pid"
+    rm -f "$pidfile"
+    echo "tp-laya: sent TERM to managed pid $pid"
+    ;;
+  *)
+    echo "usage: tp-laya [start|status|stop]" >&2
+    exit 2
+    ;;
+esac

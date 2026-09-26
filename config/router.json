@@ -1,0 +1,83 @@
+{
+  "backend": "laya",
+  "laya": {
+    "base_url": "http://127.0.0.1:11436",
+    "model": "typed-decisions"
+  },
+  "openai": {
+    "base_url": "http://127.0.0.1:11435/v1",
+    "model": "qwen3.8-flash-next:4bit"
+  },
+  "timeout_seconds": 60,
+  "models": [
+    {
+      "worker": "pi",
+      "model": "slotstream/qwen3.8-flash-next:4bit",
+      "thinking": ["off", "low", "medium"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-5.3-codex-spark",
+      "thinking": ["minimal", "low", "medium", "high", "xhigh"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-5.5",
+      "thinking": ["minimal", "low", "medium", "high", "xhigh"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-5.6-luna",
+      "thinking": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-5.6-terra",
+      "thinking": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinking": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-6-luna",
+      "thinking": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-6-sol",
+      "thinking": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "pi",
+      "model": "openai-codex/gpt-6-astra",
+      "thinking": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "worker": "claude",
+      "model": "claude-haiku-4-5-20251001",
+      "thinking": ["low", "medium", "high"]
+    },
+    {
+      "worker": "claude",
+      "model": "claude-sonnet-5",
+      "thinking": ["low", "medium", "high"]
+    },
+    {
+      "worker": "claude",
+      "model": "claude-opus-5-5",
+      "thinking": ["low", "medium", "high"]
+    }
+  ],
+  "routes": {
+    "simple": {"model": "slotstream/qwen3.8-flash-next:4bit", "thinking": "off"},
+    "standard": {"model": "slotstream/qwen3.8-flash-next:4bit", "thinking": "low"},
+    "coding": {"model": "openai-codex/gpt-5.6-terra", "thinking": "medium"},
+    "complex": {"model": "openai-codex/gpt-6-sol", "thinking": "high"},
+    "expert": {"model": "claude-opus-5-5", "thinking": "high"},
+    "escalated": {"model": "claude-opus-5-5", "thinking": "high"},
+    "fallback": {"model": "claude-sonnet-5", "thinking": "medium"}
+  }
+}

@@ -37,6 +37,17 @@ Run `/login` once inside the workspace for pi's subscription providers.
 
 ## Subagents
 
+Ask the main agent to delegate. Its subagents extension
+(`agent/extensions/subagents.ts`) gives it these tools:
+
+| Tool | Does |
+|---|---|
+| `spawn_subagent` | Routes the task with `tp-route` (unless a model is given), then `tp-spawn`s it |
+| `list_subagents` | `tp-list` |
+| `send_to_subagent` | Types a follow-up message into the subagent's session |
+| `collect_result` | State and last reply; `wait_seconds` waits until it finishes. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
+| `kill_subagent` | `tp-kill` |
+
 Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents):
 
 ```sh
@@ -74,3 +85,97 @@ and `result.md` (the last reply). pi workers report through
 only for pi providers that price tokens.
 
 See [docs/plan.md](docs/plan.md) for the design and milestones.
+
+## Local model router
+
+`bin/tp-route` uses Laya's `typed-decisions` checkpoint at
+`127.0.0.1:11436/v1/systemone` by default. It asks five bounded questions:
+difficulty on a four-level scale, plus tool need, private-context need,
+sensitivity, and risk as yes/no probabilities. A deterministic policy in
+[`config/router.json`](config/router.json) maps those answers to an allowed
+`tp-spawn` target. The output is exactly `worker`, `model`, and `thinking`;
+classification alone never spawns a worker.
+
+Bootstrap once when `.laya/src` and `.laya/venv` are absent:
+
+```sh
+mkdir -p .laya
+git clone https://github.com/NandhaKishorM/laya.git .laya/src
+git -C .laya/src checkout 4066d5d5fbf08b66c6757ddeedbd797bd7655bc0 # verified Laya 0.3.20
+python3.11 -m venv .laya/venv # Python 3.10+ required; use your compatible interpreter
+.laya/venv/bin/python -m pip install -e '.laya/src[serve]'
+.laya/venv/bin/python -c 'from laya import Router; Router().preload(["typed-decisions"])'
+```
+
+The final bootstrap command fetches the checkpoint into the local cache.
+`bin/tp-laya` itself runs offline: it never installs packages or downloads
+weights. It binds only `127.0.0.1`, preloads only `typed-decisions`, chooses
+MPS when available (otherwise CPU), and logs under ignored `.laya/`. Set
+`TP_LAYA_DEVICE=cpu` or another supported torch device to override selection.
+It refuses to start if its venv is missing or port 11436 already has a listener.
+
+```sh
+bin/tp-laya start
+bin/tp-laya status
+curl --noproxy '*' http://127.0.0.1:11436/health
+bin/tp-route --check
+bin/tp-route 'Review the authentication flow'
+bin/tp-route --file task.md
+bin/tp-laya stop                 # stops only a process started by tp-laya
+```
+
+An independently started Laya service can be used on the same endpoint.
+`tp-laya stop` leaves such a service alone; stop it with its own process manager.
+
+The policy is a deterministic ladder. Difficulty below 1.25 reaches
+Slotstream/off when no tools or private context are needed, otherwise
+Slotstream/low; 1.25–2.24 uses GPT-5.6 Terra/medium; 2.25–2.74 uses
+GPT-6 Sol/high; and 2.75+ uses Claude Opus/high. Sensitive work, or lower-
+difficulty high-risk work, also uses Opus/high; complex high-risk work is
+expert. Uncertain yes/no answers (0.35–0.65) or an inconsistent but numeric
+probability distribution use Claude Sonnet/medium. Laya's
+`typed-decisions` score-temperature warning leaves difficulty confidence
+uncalibrated, so its confidence is validated but deliberately does not gate a
+route. Risk escalation wins over the uncertainty fallback.
+
+The roster also permits Claude Haiku/Sonnet/Opus, GPT-5.3 Codex Spark,
+GPT-5.5, GPT-5.6 Luna/Terra/Sol, and GPT-6 Luna/Sol/Astra for deliberate
+policy changes. The installed Pi provider data lists 128k context and
+$1.75/$14 input/output per million tokens for Spark; the remaining Codex
+models have 272k context. Within 5.6, Luna ($0.20/$1.20), Terra ($2/$12), and
+Sol ($4/$20) form the cost ladder; within 6, Luna ($0.10/$0.50), Sol ($2/$10),
+and Astra ($10/$50) do likewise. Terra is the current coding tier and Sol the
+current complex tier; the more expensive or less suitable entries are allowed
+but not selected automatically. There is no GPT-6 Terra entry in the installed
+provider data. These thresholds are conservative heuristics, not calibrated
+for tmux-pi's coding task mix; review them before automated spawning.
+
+The `models` array is the allowed spawn roster; `routes` must point into it.
+It lists eligible targets, not a guarantee that those providers are available.
+The adapter accepts only unauthenticated loopback HTTP, disables proxies and
+redirects, validates responses and route targets, and fails clearly on server
+or data errors.
+
+The previous Slotstream OpenAI-compatible chat classifier remains available
+only by explicit selection:
+
+```sh
+bin/tp-route --backend openai --file task.md
+# For another already-running local chat endpoint:
+bin/tp-route --backend openai --base-url http://127.0.0.1:1234/v1 \
+  --router-model your-loaded-model-id --file task.md
+```
+
+`TP_ROUTER_BACKEND`, `TP_ROUTER_BASE_URL`, and `TP_ROUTER_MODEL` are equivalent
+environment overrides. The OpenAI-compatible endpoint must return a complete
+`choices[0].message.content` JSON object with `model` and `thinking` in the
+roster. The Laya backend never asks the checkpoint to emit raw model IDs.
+
+`spawn_subagent` does this handoff. From a shell:
+
+```sh
+decision="$(bin/tp-route --file task.md)" || exit 1
+bin/tp-spawn --worker "$(jq -r .worker <<<"$decision")" \
+  --model "$(jq -r .model <<<"$decision")" \
+  --thinking "$(jq -r .thinking <<<"$decision")" --file task.md
+```

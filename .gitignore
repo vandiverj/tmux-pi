@@ -1,4 +1,5 @@
 .tmux-pi/
+.laya/
 node_modules/
 .DS_Store
 # pi runtime state under the repo-owned agent dir — never commit credentials or sessions

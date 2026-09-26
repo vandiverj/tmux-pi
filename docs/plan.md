@@ -32,8 +32,8 @@ into the viewer slot, so what you see is the real session and you can type into 
 | `agent/extensions/orchestrator.ts` | Loaded into main pi. Tools: `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `kill_subagent`. |
 | Router | Called by the orchestrator before a spawn. Local model returns `{class, model, thinking, tools, context_hints}` as JSON, validated against `config/models.json`. |
 | Context builder | Writes `.tmux-pi/tasks/<id>/packet.md`: the task plus only the selected files, snippets and notes. Subagents start with `--no-context-files @packet.md`. |
-| Reporter | pi workers: `agent/extensions/reporter.ts`; Claude workers: hooks in `claude/settings.json`. Both write `.tmux-pi/state/<id>.json` (state, current tool, tokens, cost) and a final `result.md`. |
-| Status pane | Reads the state dir and lists subagents. Selecting one runs `tp-view <id>` (a tmux `swap-pane` into the viewer slot). |
+| Reporter | pi workers: `agent/extensions/reporter.ts`; Claude workers: hooks in the tmux-pi plugin (`claude/plugins/tmux-pi/hooks/`). Both write `.tmux-pi/tasks/<id>/state.json` (state, current tool, turns, tokens, cost) and `result.md` (last reply). `run.sh` writes `exit` when the process ends. |
+| Status pane | `bin/tp-status`: live list from the task dirs and panes; keys to view, focus, read result/task, kill and archive. `enter` runs `tp-view <id>` (a tmux `swap-pane` into the viewer slot). |
 
 ## Self-contained config
 
@@ -47,7 +47,7 @@ agent/             pi agent dir (PI_CODING_AGENT_DIR)
   auth.json  sessions/                     (git-ignored; created by pi)
 claude/            Claude Code worker config
   settings.json  mcp.json
-  plugins/tmux-pi/ plugin; skills -> ../../../skills
+  plugins/tmux-pi/ plugin; skills -> ../../../skills, hooks/ (reporter)
 ```
 
 **pi (`bin/tp-pi`):** `PI_CODING_AGENT_DIR=agent/` replaces `~/.pi/agent`, and
@@ -76,15 +76,14 @@ results are plain files, so any piece can be inspected or replaced.
 
 - **M0 — skeleton.** Repo, `bin/tp` (`agent`), three-slot layout, self-contained pi and Claude config. *(done)*
 - **M1 — one subagent, by hand.** `tp-spawn --worker pi|claude --model X --thinking Y "task"` opens a hidden window running `tp-pi` or `tp-claude`; `tp-view <id>` swaps it into the viewer; `tp-list`, `tp-kill`. *(done)*
-- **M2 — status.** Reporter extension plus a real status pane with keyboard selection.
+- **M2 — status.** Reporter extension plus a real status pane with keyboard selection. *(done)*
 - **M3 — router.** Local model classifies the task and picks model and thinking level from a roster.
 - **M4 — context packets.** Orchestrator builds per-task packets; subagents get nothing else.
 - **M5 — review loop.** A second subagent on a different provider reviews the first one's result before it returns to main.
 
 ## Models available now
 
-- **Local (Ollama, `:11434`):** gpt-oss 20b/120b, qwen3-coder 30b, qwen3.6 35b, llama3.3 70b, qwen3 1.7b.
-- **Local (slotstream):** Qwen3.8 Flash Next, OpenAI-compatible, on `--port 11435` (what `agent/models.json` expects). Rejects the `store` field, so `compat.supportsStore` is false.
+- **Local (slotstream, default):** Qwen3.8 Flash Next, OpenAI-compatible, on `--port 11435` (what `agent/models.json` expects). Rejects the `store` field, so `compat.supportsStore` is false.
 - **GPT:** pi's `openai-codex` provider (ChatGPT subscription); needs `/login` inside tmux-pi.
 - **Claude:** Claude Code workers via `bin/tp-claude`, on the Claude subscription.
 
@@ -94,6 +93,7 @@ results are plain files, so any piece can be inspected or replaced.
 - pi for the main agent and default workers; Claude Code as a worker type, so Claude runs on the subscription in Anthropic's own client.
 - Self-contained: all config, extensions, plugins and skills live in this repo; nothing from `~/.pi`, `~/.agents` or `~/.claude`.
 - TypeScript for extensions and tools; bash for thin tmux wrappers.
+- Ollama is not used; slotstream is the only local provider.
 - Started clean rather than extending `pi-improvement-workbench`; borrow from it only where it helps.
 
 ## Open questions
@@ -104,6 +104,6 @@ results are plain files, so any piece can be inspected or replaced.
 ## Risks
 
 - **Claude built-ins can't be removed.** `--disable-slash-commands` would drop them but also drops tmux-pi's skills. Denying specific ones via `claude/settings.json` is untested.
-- **Port clash** between Ollama and slotstream on `11434`; slotstream now runs on `11435`.
 - **Claude workers stop at the folder-trust prompt** the first time they run in an untrusted directory; answer it in the viewer.
+- **Claude token totals lag one turn at Stop.** The transcript can lack the final message when the Stop hook runs; totals catch up on the next prompt.
 - **tmux server options.** `tp` turns on `extended-keys` (csi-u) server-wide, which also affects any other tmux sessions.

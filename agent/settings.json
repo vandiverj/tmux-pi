@@ -1,7 +1,7 @@
 {
-  "defaultProvider": "ollama",
-  "defaultModel": "qwen3-coder:30b",
-  "defaultThinkingLevel": "medium",
+  "defaultProvider": "slotstream",
+  "defaultModel": "qwen3.8-flash-next:4bit",
+  "defaultThinkingLevel": "off",
   "packages": [],
   "theme": "dark",
   "lastChangelogVersion": "0.87.1"

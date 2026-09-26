@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# tp-status — interactive subagent list for the status slot.
+#
+# Keys:  j/k or ↑/↓   move
+#        enter        show the selected subagent in the viewer
+#        o            show it and move focus into it (to type to it)
+#        -            clear the viewer
+#        r / t        read its result / task in a popup
+#        x            kill it (asks first)
+#        c            archive killed subagents (tp-clean)
+#
+# Refreshes every second from each task's state.json (written by the reporters)
+# and its pane. Started by tp in the status slot; runs until the session ends.
+set -o pipefail   # no -u: bash 3.2 treats empty arrays as unbound
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)" || exit 1
+tasks="$(tp_opt "$session" @tp_state_dir)/tasks"
+
+esc=$'\e'
+reset="${esc}[0m" bold="${esc}[1m" dim="${esc}[2m" rev="${esc}[7m"
+red="${esc}[31m" green="${esc}[32m" yellow="${esc}[33m" magenta="${esc}[35m" cyan="${esc}[36m"
+
+selected=""   # id of the selected row; kept across refreshes
+message=""    # one-line feedback shown in the footer
+ids=()
+
+printf '%s[?25l' "$esc"
+trap 'printf "%s[?25h%s[0m" "$esc" "$esc"' EXIT
+
+color_for() {
+  case "$1" in
+    waiting|done) echo "$green" ;;
+    working|tool|starting) echo "$yellow" ;;
+    permission) echo "$magenta" ;;
+    failed*|error) echo "$red" ;;
+    killed) echo "$dim" ;;
+    *) echo "" ;;
+  esac
+}
+
+# clip <width> <text> — cut to the pane width so rows never wrap.
+clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-1}…"; fi; printf '%s' "$t"; }
+
+# pad <width> <text> — left-align in characters (printf pads bytes, and ▸ ↑ ↓ are multibyte).
+pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
+
+render() {
+  local cols rows current out i id worker status tool tokens cost model line c sel_index
+  cols="$(tput cols)"
+  rows="$(tp_rows "$session")"
+  current="$(tp_opt "$session" @tp_viewing)"
+
+  ids=()
+  if [[ -n "$rows" ]]; then
+    while IFS=$'\x1f' read -r id _; do ids+=("$id"); done <<<"$rows"
+  fi
+  # Keep the selection on the same id; fall back to the newest subagent.
+  sel_index=-1
+  for i in "${!ids[@]}"; do if [[ "${ids[$i]}" == "$selected" ]]; then sel_index=$i; fi; done
+  if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
+  if (( ${#ids[@]} == 0 )); then selected=""; fi
+
+  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t task · x kill · c clean")${reset}${esc}[K"$'\n'"${esc}[K"$'\n'
+  if [[ -z "$rows" ]]; then
+    out+="${dim}$(clip "$cols" "  no subagents — tp-spawn \"task\" to start one")${reset}${esc}[K"$'\n'
+  else
+    i=0
+    while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
+      if [[ "$id" == "$current" ]]; then line="▸ "; else line="  "; fi
+      line+="$(pad 20 "$id")$(pad 7 "$worker")$(pad 11 "$status")$(pad 15 "$tokens")$(pad 8 "$cost")$model"
+      c="$(color_for "$status")"
+      if (( i == sel_index )); then c+="$rev"; fi
+      out+="${c}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
+      if [[ -n "$tool" ]]; then out+="${dim}    $(clip $((cols - 4)) "$tool")${reset}${esc}[K"$'\n'; fi
+      i=$((i + 1))
+    done <<<"$rows"
+  fi
+
+  if [[ -n "$selected" ]]; then
+    local d="$tasks/$selected" first
+    out+="${esc}[K"$'\n'"${cyan}$(clip "$cols" "── $selected ")${reset}${esc}[K"$'\n'
+    first="$(grep -m1 -v '^[[:space:]]*$' "$d/task.md" 2>/dev/null)"
+    out+="${dim}task  ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
+    if [[ -s "$d/result.md" ]]; then
+      first="$(grep -m1 -v '^[[:space:]]*$' "$d/result.md")"
+      out+="${dim}reply ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
+    fi
+  fi
+  if [[ -n "$message" ]]; then out+="${esc}[K"$'\n'"${yellow}$(clip "$cols" "$message")${reset}${esc}[K"$'\n'; fi
+  out+="${esc}[J"
+  printf '%s' "$out"
+}
+
+move() {
+  local i n=${#ids[@]}
+  (( n > 0 )) || return 0
+  for i in "${!ids[@]}"; do
+    if [[ "${ids[$i]}" == "$selected" ]]; then
+      i=$(( i + $1 )); (( i < 0 )) && i=0; (( i >= n )) && i=$(( n - 1 ))
+      selected="${ids[$i]}"; return 0
+    fi
+  done
+}
+
+# run <cmd...> — run a tp-* command, showing its error (if any) in the footer.
+run() { local err; if ! err="$("$@" 2>&1 >/dev/null)"; then message="${err##*: }"; fi; }
+
+popup() {
+  local file="$tasks/$selected/$1"
+  if [[ ! -s "$file" ]]; then message="no $1 yet for $selected"; return; fi
+  # Target an attached client explicitly; with none, display-popup would block.
+  local client
+  client="$(tmux list-clients -t "=$session:" -F '#{client_name}' 2>/dev/null | head -1)"
+  if [[ -z "$client" ]]; then message="no attached client to show the popup"; return; fi
+  run tmux display-popup -c "$client" -E -w 90% -h 80% -T " $selected: $1 " "less -R $(printf %q "$file")"
+}
+
+while true; do
+  render
+  message=""
+  key=""
+  IFS= read -rsn1 -t 1 key; rc=$?
+  if (( rc > 128 )); then continue; fi          # timeout: just refresh
+  if (( rc != 0 )); then sleep 1; continue; fi  # no tty (e.g. during resize)
+  if [[ "$key" == "$esc" ]]; then
+    IFS= read -rsn2 -t 1 rest
+    case "$rest" in "[A") key=k ;; "[B") key=j ;; *) key="" ;; esac
+  fi
+  case "$key" in
+    j) move 1 ;;
+    k) move -1 ;;
+    "") if [[ -n "$selected" ]]; then run "$ROOT/bin/tp-view" "$selected"; fi ;;
+    o)
+      if [[ -n "$selected" ]]; then
+        run "$ROOT/bin/tp-view" "$selected"
+        if [[ -z "$message" ]]; then tmux select-pane -t "$(tp_meta "$tasks/$selected" pane)"; fi
+      fi ;;
+    -) run "$ROOT/bin/tp-view" - ;;
+    r) if [[ -n "$selected" ]]; then popup result.md; fi ;;
+    t) if [[ -n "$selected" ]]; then popup task.md; fi ;;
+    c) message="$("$ROOT/bin/tp-clean" 2>&1)" ;;
+    x)
+      if [[ -n "$selected" ]]; then
+        message="kill $selected? y/n"; render; message=""
+        IFS= read -rsn1 answer
+        if [[ "$answer" == y ]]; then run "$ROOT/bin/tp-kill" "$selected"; fi
+      fi ;;
+  esac
+done

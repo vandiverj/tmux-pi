@@ -39,9 +39,11 @@ AGENT_DIR="$ROOT/agent"
 
 main_cmd="'$ROOT/bin/tp-pi'"
 
-# Status is a refreshing tp-list until M2 replaces it with the real status pane.
-status_cmd="while true; do clear; echo 'subagents'; echo; '$ROOT/bin/tp-list'; sleep 2; done"
-viewer_cmd="clear; echo 'no subagent selected'; exec cat"
+# The status and viewer slots must never exit: a closed slot pane breaks the
+# layout. Both ignore ctrl-c/ctrl-\\/ctrl-z (ignored signals carry into the
+# commands they run), and the status list is restarted if it ever exits.
+status_cmd="trap '' INT QUIT TSTP; while true; do '$ROOT/bin/tp-status'; sleep 1; done"
+viewer_cmd="trap '' INT QUIT TSTP; stty -echo -icanon; clear; echo 'no subagent selected'; exec tail -f /dev/null"
 
 cols="$(tput cols 2>/dev/null || echo 200)"
 lines="$(tput lines 2>/dev/null || echo 50)"
@@ -55,7 +57,7 @@ tmux set-environment -t "$SESSION" PATH "$ROOT/bin:$PATH"
 # pi needs extended keys for modified Enter (e.g. shift+enter). Server-wide option.
 tmux set-option -s extended-keys on
 tmux set-option -s extended-keys-format csi-u
-# Set before the status pane starts so tp-list can find the session's state.
+# Set before the status pane starts so tp-status can find the session's state.
 tmux set-option -t "$SESSION" @tp_root "$ROOT"
 tmux set-option -t "$SESSION" @tp_agent_dir "$AGENT_DIR"
 tmux set-option -t "$SESSION" @tp_state_dir "$STATE_DIR"

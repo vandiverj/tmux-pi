@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# tp-clean — archive subagents whose pane is gone (killed, or left over from an
+# earlier session). Their task dirs move to .tmux-pi/archive/; nothing is deleted.
+#
+# Usage: tp-clean
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+state_dir="$(tp_opt "$session" @tp_state_dir)"
+mkdir -p "$state_dir/archive"
+n=0
+for meta in "$state_dir"/tasks/*/meta.json; do
+  [[ -f "$meta" ]] || continue
+  d="$(dirname "$meta")"
+  if [[ "$(tp_pane_state "$(tp_meta "$d" pane)")" == gone ]]; then
+    mv "$d" "$state_dir/archive/"
+    n=$((n + 1))
+  fi
+done
+echo "archived $n"

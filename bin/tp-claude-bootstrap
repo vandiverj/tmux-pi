@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# tp-claude-bootstrap — complete Claude Code folder trust for a workdir before
+# tmux-pi launches Claude workers there.
+#
+# Usage: tp-claude-bootstrap [workdir]
+#
+# Starts the same isolated Claude Code configuration used by workers. Approve
+# Claude Code's folder-trust prompt if it is shown, then type /exit. Claude
+# records trust in its normal user-level trust store; this script does not alter
+# project files or bypass permission checks.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+
+workdir="${1:-$PWD}"
+[[ $# -le 1 ]] || { echo "usage: tp-claude-bootstrap [workdir]" >&2; exit 1; }
+[[ -d "$workdir" ]] || { echo "tp-claude-bootstrap: not a directory: $workdir" >&2; exit 1; }
+workdir="$(cd "$workdir" && pwd)"
+
+cat <<EOF
+Preparing Claude Code trust for:
+  $workdir
+
+If Claude asks whether to trust this folder, approve it. Then type /exit.
+This uses tmux-pi's isolated Claude configuration and does not bypass permissions.
+EOF
+cd "$workdir"
+exec "$ROOT/bin/tp-claude"

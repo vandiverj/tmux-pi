@@ -6,6 +6,7 @@
  *   send_to_subagent  type a follow-up message into a subagent's session
  *   collect_result    read (optionally wait for) a subagent's state and last reply
  *   kill_subagent     tp-kill
+ *   review_subagent   tp-review (cross-provider review of completed work)
  *
  * Active only in the main agent: inside tmux and not in a tp-spawn worker
  * (workers have TP_TASK_DIR). Everything goes through the bin/tp-* commands and
@@ -231,6 +232,23 @@ export default function (pi: ExtensionAPI) {
 			const reply = readText(join(dir, "result.md"));
 			const body = reply.length > 20_000 ? `${reply.slice(0, 20_000)}\n…(truncated; full reply in ${join(dir, "result.md")})` : reply;
 			return text(`${lines.join("\n")}\n${body || "(no reply yet)"}`, { id: params.id, status });
+		},
+	});
+
+	pi.registerTool({
+		name: "review_subagent",
+		label: "Review subagent result",
+		description:
+			"Start an independent reviewer on the other provider (Pi versus Claude) for a successfully completed subagent. " +
+			"The reviewer receives the original task, context packet, and result, checks the working tree, and reports APPROVED or REQUEST_CHANGES. " +
+			"It never edits files. Use collect_result on the returned id.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Successfully completed subagent id to review" }),
+		}),
+		async execute(_id, params) {
+			const reviewId = await must(bin("tp-review"), [params.id]);
+			lastInput.set(reviewId, Date.now());
+			return text(`started cross-provider review ${reviewId} for ${params.id}`, { id: reviewId, reviewOf: params.id });
 		},
 	});
 

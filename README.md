@@ -35,6 +35,14 @@ tmux-pi is self-contained: pi (`bin/tp-pi`) and Claude Code workers (`bin/tp-cla
 this repo's `agent/`, `claude/` and `skills/`, never `~/.pi`, `~/.agents` or `~/.claude`.
 Run `/login` once inside the workspace for pi's subscription providers.
 
+Before launching Claude workers in a new target directory, complete Claude Code's
+one-time folder trust with the same isolated configuration used by workers:
+
+```sh
+bin/tp-claude-bootstrap /path/to/target-project
+# approve trust if prompted, then type /exit
+```
+
 ## Subagents
 
 Ask the main agent to delegate. Its subagents extension
@@ -165,6 +173,21 @@ It lists eligible targets, not a guarantee that those providers are available.
 The adapter accepts only unauthenticated loopback HTTP, disables proxies and
 redirects, validates responses and route targets, and fails clearly on server
 or data errors.
+
+## Cross-provider review loop
+
+After a subagent successfully exits, run `bin/tp-review <task-id>` (or use the
+main agent's `review_subagent` tool). It creates a reviewer on the other
+provider: Pi-authored work is reviewed by Claude Sonnet, and Claude-authored
+work by Pi/Codex. The reviewer receives the original task, packet, and result,
+then independently checks the working tree. It is instructed not to edit and
+returns `APPROVED` or actionable `REQUEST_CHANGES`. Review linkage is recorded
+in the author task's `meta.json`; use `collect_result` on the printed review id.
+
+Reviews are currently explicit. The next policy milestone will use Laya task-intent
+classification plus deterministic risk and complexity rules so that consequential
+plans and change-making tasks are reviewed, while routine research and summaries
+are not.
 
 The previous Slotstream OpenAI-compatible chat classifier remains available
 only by explicit selection:

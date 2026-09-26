@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# tp-review — spawn a cross-provider reviewer for a completed tmux-pi task.
+#
+# Usage: tp-review <task-id>
+#
+# The review packet contains the original task, result, and selected context packet.
+# The reviewer must be on the opposite provider (pi <-> claude) from the author.
+# Prints the review task id.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+usage() { echo "usage: tp-review <task-id>" >&2; exit "${1:-1}"; }
+[[ $# -eq 1 ]] || usage
+id="$1"
+[[ "$id" =~ ^[[:alnum:]_.-]+$ ]] || die "bad task id: $id"
+
+session="$(tp_session)"
+state_dir="$(tp_opt "$session" @tp_state_dir)"
+dir="$state_dir/tasks/$id"
+[[ -f "$dir/meta.json" ]] || die "no subagent '$id'"
+[[ -f "$dir/result.md" ]] || die "subagent '$id' has no result yet"
+# Interactive Pi/Claude sessions remain alive after replying and report `waiting`.
+# Accept that settled state as well as a cleanly exited worker.
+completed=0
+[[ -f "$dir/exit" && "$(cat "$dir/exit")" == 0 ]] && completed=1
+if [[ "$completed" != 1 ]]; then
+  state="$(jq -r '.state // empty' "$dir/state.json" 2>/dev/null || true)"
+  [[ "$state" == waiting ]] || die "subagent '$id' has not completed successfully (state: ${state:-starting})"
+fi
+
+worker="$(tp_meta "$dir" worker)"
+case "$worker" in
+  pi) reviewer=claude; model=claude-sonnet-5; thinking=medium ;;
+  claude) reviewer=pi; model=openai-codex/gpt-5.5; thinking=medium ;;
+  *) die "subagent '$id' has unknown worker '$worker'" ;;
+esac
+
+review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. Report either APPROVED with a brief rationale, or REQUEST_CHANGES with prioritized actionable findings including file paths and line references when possible."
+
+review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" \
+  --context "$dir/task.md" --context "$dir/packet.md" --context "$dir/result.md" \
+  --note "Author task id: $id" \
+  --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
+  -- "$review_task")"
+
+jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
+  '. + {review:$review, reviewer:{worker:$reviewer, model:$model, thinking:$thinking}}' \
+  "$dir/meta.json" > "$dir/meta.json.tmp"
+mv "$dir/meta.json.tmp" "$dir/meta.json"
+printf '%s\n' "$id" > "$(tp_task_dir "$session" "$review_id")/review-of"
+printf '%s\n' "$review_id"

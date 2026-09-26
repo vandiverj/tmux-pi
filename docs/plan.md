@@ -79,7 +79,9 @@ results are plain files, so any piece can be inspected or replaced.
 - **M2 — status.** Reporter extension plus a real status pane with keyboard selection. *(done)*
 - **M3 — router.** Laya classifies bounded task traits; a deterministic ladder selects Slotstream, Codex, or Claude plus thinking level from a strict roster. Laya difficulty confidence is not used because its score temperatures are uncalibrated. `agent/extensions/subagents.ts` gives main the spawn/list/send/collect/kill tools and routes spawns without an explicit model. *(done)*
 - **M4 — context packets.** Main builds per-task packets (task, selected files or line ranges, notes); subagents get nothing else. Size limits and a credentials-file denylist. *(done)*
-- **M5 — review loop.** A second subagent on a different provider reviews the first one's result before it returns to main.
+- **M5 — review loop.** `tp-review <task-id>` and `review_subagent` start a non-editing reviewer on the other provider after a settled worker response (`waiting`) or successful exit. It receives the author task, packet, and result, independently checks the tree, and returns `APPROVED` or `REQUEST_CHANGES`. *(done)*
+- **M6 — review-loop validation.** Cross-provider review was exercised end-to-end with a Pi author and Claude reviewer. `tp-review` accepts interactive workers in `waiting`, and `tp-claude-bootstrap [workdir]` provisions Claude folder trust once before workers run. *(done)*
+- **M7 — review-policy gate.** Extend Laya's request schema with a bounded `task_intent` choice (`research`, `planning`, `implementation`, `configuration_or_operations`, `review`, `communication_or_documentation`). Validate its answer and combine it deterministically with difficulty, tools, private-context, sensitivity, risk, and ambiguity into `review: none|optional|required`. Require review for implementation/config/operations and consequential planning; skip ordinary research/summaries; escalate sensitive, high-risk, ambiguous, and user-requested review tasks. Make `review_subagent` consult the policy by default while preserving an explicit force-review path. Add fixture tests and a labeled calibration corpus before enabling automatic review handoff.
 
 ## Models available now
 
@@ -99,7 +101,7 @@ results are plain files, so any piece can be inspected or replaced.
 
 ## Open questions
 
-- **Router calibration:** Gather representative task labels before treating Laya's probabilities as calibrated for tmux-pi's coding workload. Current thresholds are explicit conservative heuristics.
+- **Router and review-policy calibration:** Gather representative labeled tasks across research, planning, implementation, configuration/operations, review, and communication/documentation. Record Laya answers, expected route, and expected review level; tune deterministic thresholds only after measuring mismatches. Current thresholds are explicit conservative heuristics.
 - **Main agent model:** local or frontier. Recommended: frontier at low thinking for main, since it writes every packet.
 
 ## Risks

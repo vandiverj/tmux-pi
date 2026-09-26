@@ -98,8 +98,11 @@ export default function (pi: ExtensionAPI) {
 		label: "Spawn subagent",
 		description:
 			"Start a subagent in its own tmux-pi session to work on a task, and return its id. " +
-			"The task text is the subagent's only context: include the goal, the relevant file paths, " +
-			"constraints, and what to report back. Leave model and thinking unset to let the local router " +
+			"The subagent gets a context packet and nothing else: no AGENTS.md, CLAUDE.md or this conversation. " +
+			"The packet is the task, then the files you list in `files` (whole, or just the lines that matter), " +
+			"then `notes`. Pick only what the task needs: the files it will change, the interfaces it must " +
+			"use, and facts from this conversation it cannot rediscover. Say what to report back. It can " +
+			"still read other files itself. Leave model and thinking unset to let the local router " +
 			"pick them; set them only when the user asked for a specific model. The subagent runs in the " +
 			"background; use collect_result to wait for its reply.",
 		parameters: Type.Object({
@@ -108,6 +111,16 @@ export default function (pi: ExtensionAPI) {
 			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-5.5); claude: alias (sonnet, opus, haiku)" })),
 			thinking: Type.Optional(StringEnum(THINKING, { description: "Thinking level" })),
 			name: Type.Optional(Type.String({ description: "Short id prefix, e.g. 'tests' or 'review'" })),
+			files: Type.Optional(
+				Type.Array(
+					Type.Object({
+						path: Type.String({ description: "File path, relative to the working directory" }),
+						lines: Type.Optional(Type.String({ description: "Line range to include, e.g. '40-120'; omit for the whole file" })),
+					}),
+					{ description: "Files or snippets to include in the packet" },
+				),
+			),
+			notes: Type.Optional(Type.Array(Type.String(), { description: "Short facts, decisions or constraints to include in the packet" })),
 			view: Type.Optional(Type.Boolean({ description: "Show it in the viewer slot right away" })),
 		}),
 		async execute(_id, params) {
@@ -125,10 +138,16 @@ export default function (pi: ExtensionAPI) {
 			if (model) args.push("--model", model);
 			if (thinking) args.push("--thinking", thinking);
 			if (params.name) args.push("--name", params.name.replace(/[^\w.-]+/g, "-"));
+			for (const f of params.files ?? []) {
+				if (f.lines && !/^\d+-\d+$/.test(f.lines)) throw new Error(`bad line range for ${f.path}: ${f.lines} (use start-end)`);
+				args.push("--context", f.lines ? `${f.path}:${f.lines}` : f.path);
+			}
+			for (const n of params.notes ?? []) args.push("--note", n);
 			if (params.view) args.push("--view");
 			const id = (await must(bin("tp-spawn"), args, params.task)).split("\n")[0];
 			lastInput.set(id, Date.now());
-			return text(`started ${id}${routed}`, { id, worker, model, thinking });
+			const packet = readText(join(await stateDir(), "tasks", id, "packet.md"));
+			return text(`started ${id}${routed}; packet ${packet.length} chars`, { id, worker, model, thinking });
 		},
 	});
 

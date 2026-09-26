@@ -42,7 +42,7 @@ Ask the main agent to delegate. Its subagents extension
 
 | Tool | Does |
 |---|---|
-| `spawn_subagent` | Routes the task with `tp-route` (unless a model is given), then `tp-spawn`s it |
+| `spawn_subagent` | Builds the context packet from the task, `files` (whole or line ranges) and `notes`; routes the task with `tp-route` unless a model is given; then `tp-spawn`s it |
 | `list_subagents` | `tp-list` |
 | `send_to_subagent` | Types a follow-up message into the subagent's session |
 | `collect_result` | State and last reply; `wait_seconds` waits until it finishes. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
@@ -53,6 +53,7 @@ Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents
 ```sh
 tp-spawn -w claude -m sonnet -t high "Refactor the auth module"   # prints an id
 tp-spawn -m slotstream/qwen3.8-flash-next:4bit -f task.md -v       # pi worker, view now
+tp-spawn -c src/auth.ts -c src/db.ts:40-90 -N "tokens expire after 1h" "Fix the refresh bug"
 tp-list            # subagents, state, tokens, cost, current tool
 tp-view <id>       # swap its live session into the viewer (click in to type)
 tp-view -          # put the placeholder back
@@ -68,7 +69,7 @@ The status pane (top right) is the same list, live. Click it, then:
 | `enter` | show the selected subagent in the viewer |
 | `o` | show it and move focus into it, to type to it |
 | `-` | clear the viewer |
-| `r` / `t` | read its last reply / its task in a popup |
+| `r` / `t` | read its last reply / its context packet in a popup |
 | `x` | kill it (asks first) |
 | `c` | archive killed subagents |
 
@@ -77,8 +78,17 @@ its argument show below the row), `waiting` (finished its turn, ready for more),
 `permission` (Claude is asking to use a tool), `error`. Once the process ends:
 `done`, `failed:<code>` or `killed`.
 
-Workers skip context files: the task text is their only context. Each task dir holds
-`task.md`, `meta.json`, the generated `run.sh`, and the reporter's `state.json`
+### Context packets
+
+A worker's first message is its `packet.md`: the task, then each file passed with
+`-c path` or `-c path:start-end` (in a code fence, labelled with its path and range),
+then the `-N` notes. Workers load no `AGENTS.md` or `CLAUDE.md` and never see
+main's conversation, so the packet is all the project context they start with;
+they can still read other files with their tools. Limits: 60k characters per file
+and 200k per packet (use line ranges for big files). Credential files (`.env*`,
+keys, `auth.json`, `*secret*` and similar) are refused.
+
+Each task dir holds `task.md`, `packet.md`, `meta.json`, the generated `run.sh`, and the reporter's `state.json`
 and `result.md` (the last reply). pi workers report through
 `agent/extensions/reporter.ts`, Claude workers through the tmux-pi plugin's hooks
 (`claude/plugins/tmux-pi/hooks/`). Token counts include cached input; cost is shown

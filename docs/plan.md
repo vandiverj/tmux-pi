@@ -31,7 +31,7 @@ into the viewer slot, so what you see is the real session and you can type into 
 | `bin/tp-claude` | Runs Claude Code with only tmux-pi's settings, plugins and MCP servers. Used for Claude workers. |
 | `agent/extensions/subagents.ts` | Loaded into main pi. Tools: `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `kill_subagent`. |
 | Router | `bin/tp-route` calls local Laya `typed-decisions` by default, applies a deterministic policy, and validates the result against `config/router.json`. The Slotstream OpenAI-compatible classifier remains an explicit fallback. Called by `spawn_subagent` when no model is given. |
-| Context builder | Writes `.tmux-pi/tasks/<id>/packet.md`: the task plus only the selected files, snippets and notes. Subagents start with `--no-context-files @packet.md`. |
+| Context builder | `tp-spawn -c path[:start-end] -N note` writes `.tmux-pi/tasks/<id>/packet.md`: the task, then only the selected files or line ranges, then notes. It is the worker's first message; workers load no context files. `spawn_subagent` passes `files` and `notes` through. |
 | Reporter | pi workers: `agent/extensions/reporter.ts`; Claude workers: hooks in the tmux-pi plugin (`claude/plugins/tmux-pi/hooks/`). Both write `.tmux-pi/tasks/<id>/state.json` (state, current tool, turns, tokens, cost) and `result.md` (last reply). `run.sh` writes `exit` when the process ends. |
 | Status pane | `bin/tp-status`: live list from the task dirs and panes; keys to view, focus, read result/task, kill and archive. `enter` runs `tp-view <id>` (a tmux `swap-pane` into the viewer slot). |
 
@@ -78,7 +78,7 @@ results are plain files, so any piece can be inspected or replaced.
 - **M1 — one subagent, by hand.** `tp-spawn --worker pi|claude --model X --thinking Y "task"` opens a hidden window running `tp-pi` or `tp-claude`; `tp-view <id>` swaps it into the viewer; `tp-list`, `tp-kill`. *(done)*
 - **M2 — status.** Reporter extension plus a real status pane with keyboard selection. *(done)*
 - **M3 — router.** Laya classifies bounded task traits; a deterministic ladder selects Slotstream, Codex, or Claude plus thinking level from a strict roster. Laya difficulty confidence is not used because its score temperatures are uncalibrated. `agent/extensions/subagents.ts` gives main the spawn/list/send/collect/kill tools and routes spawns without an explicit model. *(done)*
-- **M4 — context packets.** Main builds per-task packets; subagents get nothing else.
+- **M4 — context packets.** Main builds per-task packets (task, selected files or line ranges, notes); subagents get nothing else. Size limits and a credentials-file denylist. *(done)*
 - **M5 — review loop.** A second subagent on a different provider reviews the first one's result before it returns to main.
 
 ## Models available now
@@ -104,6 +104,8 @@ results are plain files, so any piece can be inspected or replaced.
 
 ## Risks
 
+- **`openai-codex/gpt-5.3-codex-spark` fails on a ChatGPT login** ("not supported when using Codex with a ChatGPT account", 2026-09-26). It is in the router roster but no route targets it; `gpt-5.5` works.
+- **Packets are only as good as main's selection.** A local main model may pick too little; workers can still read files themselves, which costs extra turns. Weaker models also re-read files that are already in the packet.
 - **Claude built-ins can't be removed.** `--disable-slash-commands` would drop them but also drops tmux-pi's skills. Denying specific ones via `claude/settings.json` is untested.
 - **Claude workers stop at the folder-trust prompt** the first time they run in an untrusted directory; answer it in the viewer.
 - **Claude token totals lag one turn at Stop.** The transcript can lack the final message when the Stop hook runs; totals catch up on the next prompt.

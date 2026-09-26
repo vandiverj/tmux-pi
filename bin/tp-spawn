@@ -13,7 +13,15 @@
 #                            (claude: mapped to --effort; off/minimal -> low)
 #   -n, --name <name>        id prefix (default: worker name)
 #   -f, --file <path>        read the task from a file
+#   -c, --context <path>     add a file to the context packet; repeatable.
+#                            path[:start-end] adds only those lines.
+#                            Relative paths are from the workdir.
+#   -N, --note <text>        add a note to the context packet; repeatable
 #   -v, --view               show it in the viewer slot right away
+#
+# The worker's first message is packet.md: the task, then the selected files and
+# notes. Workers load no context files (AGENTS.md, CLAUDE.md), so the packet is
+# all the project context they start with.
 #
 # Prints the subagent id. Files live in <workdir>/.tmux-pi/tasks/<id>/.
 set -euo pipefail
@@ -30,7 +38,7 @@ source "$ROOT/lib/tp.sh"
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 worker=pi model="" thinking="" name="" file="" view=0
-words=()
+words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     -t|--thinking) thinking="${2:?}"; shift 2 ;;
     -n|--name)     name="${2:?}"; shift 2 ;;
     -f|--file)     file="${2:?}"; shift 2 ;;
+    -c|--context)  contexts+=("${2:?}"); shift 2 ;;
+    -N|--note)     notes+=("${2:?}"); shift 2 ;;
     -v|--view)     view=1; shift ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
@@ -65,11 +75,65 @@ session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 workdir="$(dirname "$state_dir")"
 
+# Limits keep packets to selected context rather than whole trees.
+max_file=60000 max_packet=200000
+
+# Never hand credentials to a worker (often a remote model).
+secret_file() {
+  case "$(basename "$1")" in
+    .env|.env.*|*.pem|*.key|*.p12|*.pfx|id_rsa*|id_ed25519*|id_ecdsa*|.netrc|.npmrc|.pypirc|auth.json|credentials*|*secret*) return 0 ;;
+  esac
+  return 1
+}
+
+# fence <text> — a backtick fence longer than any run inside the text.
+fence() {
+  local f='```'
+  while grep -q "$f" <<<"$1"; do f+='`'; done
+  printf '%s' "$f"
+}
+
+# Build the packet before creating anything, so a bad path fails cleanly.
+packet="$(printf '# Task\n\n%s\n' "$task")"
+if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 ]]; then
+  packet+=$'\n\n# Context\n\n'
+  packet+="Working directory: $workdir. The files below were chosen for this task; read others only if the task needs them."$'\n'
+fi
+for spec in ${contexts[@]+"${contexts[@]}"}; do
+  path="$spec" range=""
+  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
+    path="${BASH_REMATCH[1]}" range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+  fi
+  [[ "$path" == /* ]] || path="$workdir/$path"
+  [[ -f "$path" ]] || die "context file not found: $spec"
+  if secret_file "$path"; then die "refusing to put a credentials file in a packet: $spec"; fi
+  if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
+  if [[ -n "$range" ]]; then
+    start="${range%-*}" end="${range#*-}"
+    (( start >= 1 && end >= start )) || die "bad line range: $spec"
+    body="$(sed -n "${start},${end}p" "$path")"
+    label="${path#"$workdir"/} (lines $start-$end)"
+  else
+    body="$(cat "$path")"
+    label="${path#"$workdir"/}"
+  fi
+  (( ${#body} <= max_file )) || die "$spec is ${#body} chars (max $max_file); pass a line range with path:start-end"
+  ext="${path##*.}"; [[ "$ext" == "$path" || "$ext" == */* ]] && ext=""
+  f="$(fence "$body")"
+  packet+=$'\n'"## $label"$'\n\n'"$f$ext"$'\n'"$body"$'\n'"$f"$'\n'
+done
+if [[ ${#notes[@]} -gt 0 ]]; then
+  packet+=$'\n## Notes\n\n'
+  for n in "${notes[@]}"; do packet+="- $n"$'\n'; done
+fi
+(( ${#packet} <= max_packet )) || die "packet is ${#packet} chars (max $max_packet); select fewer files or line ranges"
+
 id="${name:-$worker}-$(date +%H%M%S)"
 if [[ -e "$state_dir/tasks/$id" ]]; then id="$id-$RANDOM"; fi
 task_dir="$state_dir/tasks/$id"
 mkdir -p "$task_dir"
 printf '%s\n' "$task" > "$task_dir/task.md"
+printf '%s\n' "$packet" > "$task_dir/packet.md"
 
 # Build the worker command. Workers skip context files; the task is their context.
 if [[ "$worker" == pi ]]; then
@@ -92,9 +156,9 @@ fi
   printf 'cd %q\n' "$workdir"
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
-  # The task text is the first message (not @task.md: pi would present it as a
-  # file in the task dir, and models then resolve relative paths against that).
-  printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/task.md"
+  # The packet text is the first message (not @packet.md: pi would present it as
+  # a file in the task dir, and models then resolve relative paths against that).
+  printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"
   echo 'status=$?'
   printf 'echo "$status" > %q\n' "$task_dir/exit"
   printf 'echo; echo "[%s exited with status $status]"\n' "$id"

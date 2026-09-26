@@ -5,7 +5,7 @@
 #        enter        show the selected subagent in the viewer
 #        o            show it and move focus into it (to type to it)
 #        -            clear the viewer
-#        r / t        read its result / task in a popup
+#        r / t        read its result / context packet in a popup
 #        x            kill it (asks first)
 #        c            archive killed subagents (tp-clean)
 #
@@ -69,7 +69,7 @@ render() {
   if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
   if (( ${#ids[@]} == 0 )); then selected=""; fi
 
-  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t task · x kill · c clean")${reset}${esc}[K"$'\n'"${esc}[K"$'\n'
+  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean")${reset}${esc}[K"$'\n'"${esc}[K"$'\n'
   if [[ -z "$rows" ]]; then
     out+="${dim}$(clip "$cols" "  no subagents — tp-spawn \"task\" to start one")${reset}${esc}[K"$'\n'
   else
@@ -146,7 +146,10 @@ while true; do
       fi ;;
     -) run "$ROOT/bin/tp-view" - ;;
     r) if [[ -n "$selected" ]]; then popup result.md; fi ;;
-    t) if [[ -n "$selected" ]]; then popup task.md; fi ;;
+    t) if [[ -n "$selected" ]]; then
+         # Tasks spawned before M4 have no packet.
+         if [[ -f "$tasks/$selected/packet.md" ]]; then popup packet.md; else popup task.md; fi
+       fi ;;
     c) message="$("$ROOT/bin/tp-clean" 2>&1)" ;;
     x)
       if [[ -n "$selected" ]]; then

@@ -241,12 +241,19 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Start an independent reviewer on the other provider (Pi versus Claude) for a successfully completed subagent. " +
 			"The reviewer receives the original task, context packet, and result, checks the working tree, and reports APPROVED or REQUEST_CHANGES. " +
-			"It never edits files. Use collect_result on the returned id.",
+			"It never edits files. Use collect_result on the returned id. " +
+			"The local review policy decides first: routine research and summaries are not reviewed. " +
+			"Set force only when the user asked for a review.",
 		parameters: Type.Object({
 			id: Type.String({ description: "Successfully completed subagent id to review" }),
+			force: Type.Optional(Type.Boolean({ description: "Review even when the policy says none" })),
 		}),
 		async execute(_id, params) {
-			const reviewId = await must(bin("tp-review"), [params.id]);
+			const r = await run(bin("tp-review"), params.force ? ["--force", params.id] : [params.id]);
+			// Exit 3: the policy said no review is needed; not an error.
+			if (r.code === 3) return text(r.stderr.trim(), { id: params.id, review: "none" });
+			if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `tp-review exited with ${r.code}`);
+			const reviewId = r.stdout.trim();
 			lastInput.set(reviewId, Date.now());
 			return text(`started cross-provider review ${reviewId} for ${params.id}`, { id: reviewId, reviewOf: params.id });
 		},

@@ -10,6 +10,15 @@ from pathlib import Path
 
 THINKING = frozenset(("off", "minimal", "low", "medium", "high", "xhigh", "max"))
 QUESTIONS = {
+    "task_intent": {"type": "choice", "instructions": "What is the primary requested outcome of this task?",
+                    "criteria": {
+                        "research": "investigate, gather facts, compare options, or answer questions without making a plan or change",
+                        "planning": "produce a plan, design, architecture, roadmap, recommendation, or decision for future work",
+                        "implementation": "write, modify, debug, refactor, or test software or other project artifacts",
+                        "configuration_or_operations": "change or operate configuration, infrastructure, deployments, data, services, or command-line systems",
+                        "review": "inspect or evaluate existing work, code, a plan, or a result",
+                        "communication_or_documentation": "write, summarize, explain, report status, or make routine documentation",
+                    }},
     "difficulty": {"type": "score", "instructions": "How difficult is this software task?",
                    "criteria": ["simple", "routine", "complex", "expert"]},
     "needs_tools": {"type": "noul", "instructions": "Does this task require coding, shell, browsing, or other tools?"},
@@ -158,7 +167,8 @@ def _number(value, name, maximum=1):
     return value
 
 
-def laya_decision(reply, config):
+def _laya_values(reply):
+    """Validate a typed-decisions reply; return its values and whether a distribution was inconsistent."""
     if not isinstance(reply, dict) or not isinstance(reply.get("answers"), dict):
         raise RouterError("Laya response needs an answers object")
     if not isinstance(reply.get("routing"), dict) or reply["routing"].get("model") != "typed-decisions":
@@ -170,25 +180,42 @@ def laya_decision(reply, config):
     bad_distribution = False
     for name, question in QUESTIONS.items():
         answer = answers[name]
-        field = "score" if question["type"] == "score" else "noul"
+        field = question["type"]
         if not isinstance(answer, dict) or field not in answer:
             raise RouterError("Laya answer {} needs {}".format(name, field))
         if "type" in answer and answer["type"] != question["type"]:
             raise RouterError("Laya answer {} has the wrong type".format(name))
-        values[name] = _number(answer[field], "{}.{}".format(name, field),
-                               len(question["criteria"]) - 1 if field == "score" else 1)
+        if field == "choice":
+            if not isinstance(answer[field], str) or answer[field] not in question["criteria"]:
+                raise RouterError("Laya answer {} has an invalid choice".format(name))
+            values[name] = answer[field]
+        else:
+            values[name] = _number(answer[field], "{}.{}".format(name, field),
+                                   len(question["criteria"]) - 1 if field == "score" else 1)
         if "confidence" in answer:
             _number(answer["confidence"], "{}.confidence".format(name))
         if "probabilities" in answer:
             probs = answer["probabilities"]
             if not isinstance(probs, dict) or not probs:
                 raise RouterError("{}.probabilities must be a nonempty object".format(name))
-            if field == "score" and set(probs) != {str(index) for index in range(len(question["criteria"]))}:
+            expected = ({str(index) for index in range(len(question["criteria"]))} if field == "score"
+                        else set(question["criteria"]) if field == "choice" else None)
+            if expected is not None and set(probs) != expected:
                 raise RouterError("{}.probabilities is incomplete".format(name))
             for key, probability in probs.items():
                 _number(probability, "{}.probabilities.{}".format(name, key))
             if abs(sum(probs.values()) - 1) > 0.02:
                 bad_distribution = True
+    return values, bad_distribution
+
+
+def _uncertain(values, bad_distribution):
+    return bad_distribution or any(0.35 <= values[name] <= 0.65
+                                   for name in QUESTIONS if QUESTIONS[name]["type"] == "noul")
+
+
+def laya_decision(reply, config):
+    values, bad_distribution = _laya_values(reply)
     # These thresholds are policy heuristics, not calibrated task probabilities.
     # Laya's typed-decisions score-temperature warning makes difficulty.confidence
     # unsuitable for routing; validate it above, but do not use it as a gate.
@@ -198,7 +225,7 @@ def laya_decision(reply, config):
         route = "expert"
     elif values["is_high_risk"] >= 0.35:
         route = "escalated"
-    elif bad_distribution or any(0.35 <= values[name] <= 0.65 for name in QUESTIONS if name != "difficulty"):
+    elif _uncertain(values, bad_distribution):
         route = "fallback"
     elif values["difficulty"] >= 2.75:
         route = "expert"
@@ -213,7 +240,34 @@ def laya_decision(reply, config):
     return _target(config["routes"][route], config)
 
 
-def route_laya(task, config, base_url=None, router_model=None, opener=None):
+def review_policy(reply, force=False):
+    """Return none, optional or required review for a typed-decisions reply.
+
+    Like the route ladder, these are conservative heuristics, not calibrated
+    probabilities. Research changes nothing, so it is never reviewed. Otherwise
+    sensitivity and risk win over intent; change-making work is always
+    reviewed; planning is reviewed when complex or uncertain.
+    """
+    if force:
+        return "required"
+    values, bad_distribution = _laya_values(reply)
+    intent = values["task_intent"]
+    if intent == "research":
+        return "none"
+    uncertain = _uncertain(values, bad_distribution)
+    if values["is_sensitive"] >= 0.35 or values["is_high_risk"] >= 0.35:
+        return "required"
+    if intent in ("implementation", "configuration_or_operations"):
+        return "required"
+    if intent == "planning":
+        return "required" if values["difficulty"] >= 2.25 or uncertain else "optional"
+    if uncertain:
+        return "optional"
+    return "none"
+
+
+def classify_laya(task, config, base_url=None, router_model=None, opener=None):
+    """Ask Laya's typed-decisions model the routing questions; return its raw reply."""
     if not isinstance(task, str) or not task.strip():
         raise RouterError("task must contain text")
     endpoint = local_base_url(base_url or config["laya"]["base_url"], "laya") + "/v1/systemone"
@@ -221,7 +275,18 @@ def route_laya(task, config, base_url=None, router_model=None, opener=None):
     if model != "typed-decisions":
         raise RouterError("laya model must be typed-decisions")
     body = {"model": model, "state": {"request": task}, "questions": QUESTIONS}
-    return laya_decision(_post(endpoint, body, config["timeout_seconds"], opener), config)
+    return _post(endpoint, body, config["timeout_seconds"], opener)
+
+
+def review_task(task, config, base_url=None, router_model=None, opener=None, force=False):
+    """Review level for a task; force skips the classifier."""
+    if force:
+        return "required"
+    return review_policy(classify_laya(task, config, base_url, router_model, opener))
+
+
+def route_laya(task, config, base_url=None, router_model=None, opener=None):
+    return laya_decision(classify_laya(task, config, base_url, router_model, opener), config)
 
 
 def route_openai(task, config, base_url=None, router_model=None, opener=None):

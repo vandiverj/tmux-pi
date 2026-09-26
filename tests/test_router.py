@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from router import (QUESTIONS, RouterError, laya_decision, load_config, route_openai,
+from router import (QUESTIONS, RouterError, laya_decision, load_config, review_policy, review_task, route_openai,
                     route_task, validate_decision)  # noqa: E402
 
 
@@ -102,8 +102,9 @@ class RouterTests(unittest.TestCase):
             with self.assertRaisesRegex(RouterError, "thinking must"):
                 load_config(path)
 
-    def laya_reply(self, difficulty=1, tools=0.1, private=0.1, sensitive=0.1, risk=0.1):
+    def laya_reply(self, difficulty=1, tools=0.1, private=0.1, sensitive=0.1, risk=0.1, intent="implementation"):
         return {"routing": {"model": "typed-decisions"}, "answers": {
+            "task_intent": {"choice": intent},
             "difficulty": {"score": difficulty, "confidence": 0.8,
                            "probabilities": {"0": 0.1, "1": 0.8, "2": 0.05, "3": 0.05}},
             "needs_tools": {"noul": tools},
@@ -170,6 +171,13 @@ class RouterTests(unittest.TestCase):
         del incomplete["answers"]["difficulty"]["probabilities"]["3"]
         with self.assertRaisesRegex(RouterError, "probabilities is incomplete"):
             laya_decision(incomplete, self.config)
+        bad_choice = self.laya_reply(intent="deploy")
+        with self.assertRaisesRegex(RouterError, "invalid choice"):
+            laya_decision(bad_choice, self.config)
+        bad_choice_probs = self.laya_reply()
+        bad_choice_probs["answers"]["task_intent"]["probabilities"] = {"implementation": 0.9, "research": 0.1}
+        with self.assertRaisesRegex(RouterError, "probabilities is incomplete"):
+            laya_decision(bad_choice_probs, self.config)
         wrong_type = self.laya_reply()
         wrong_type["answers"]["needs_tools"]["type"] = "score"
         with self.assertRaisesRegex(RouterError, "wrong type"):
@@ -183,6 +191,52 @@ class RouterTests(unittest.TestCase):
             reply = self.laya_reply(difficulty=value)
             with self.subTest(difficulty=value), self.assertRaises(RouterError):
                 laya_decision(reply, self.config)
+
+    def test_review_policy(self):
+        cases = [
+            ("implementation", self.laya_reply(intent="implementation"), "required"),
+            ("configuration", self.laya_reply(intent="configuration_or_operations"), "required"),
+            ("simple planning", self.laya_reply(intent="planning", difficulty=1), "optional"),
+            ("complex planning", self.laya_reply(intent="planning", difficulty=2.5), "required"),
+            ("uncertain planning", self.laya_reply(intent="planning", tools=0.5), "required"),
+            ("research", self.laya_reply(intent="research"), "none"),
+            ("review", self.laya_reply(intent="review"), "none"),
+            ("documentation", self.laya_reply(intent="communication_or_documentation"), "none"),
+            ("uncertain research", self.laya_reply(intent="research", private=0.5), "none"),
+            ("sensitive research", self.laya_reply(intent="research", sensitive=0.8), "none"),
+            ("high-risk complex research", self.laya_reply(intent="research", risk=0.8, difficulty=2.8), "none"),
+            ("uncertain review", self.laya_reply(intent="review", private=0.5), "optional"),
+            ("high-risk documentation", self.laya_reply(intent="communication_or_documentation", risk=0.8),
+             "required"),
+        ]
+        for name, reply, level in cases:
+            with self.subTest(name=name):
+                self.assertEqual(review_policy(reply), level)
+        self.assertEqual(review_policy(self.laya_reply(intent="research"), force=True), "required")
+        with self.assertRaisesRegex(RouterError, "invalid choice"):
+            review_policy(self.laya_reply(intent="deploy"))
+        inconsistent = self.laya_reply(intent="communication_or_documentation")
+        inconsistent["answers"]["difficulty"]["probabilities"]["1"] = 0.1
+        self.assertEqual(review_policy(inconsistent), "optional")
+
+    def test_review_task(self):
+        captured = {}
+
+        def open_request(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data)
+            return Response(self.laya_reply(intent="research"))
+
+        self.assertEqual(review_task("Explain tp-view", self.config, opener=open_request), "none")
+        self.assertEqual(captured["url"], "http://127.0.0.1:11436/v1/systemone")
+        self.assertEqual(captured["body"]["questions"], QUESTIONS)
+
+        def never(*_args, **_kwargs):
+            raise AssertionError("force must not contact Laya")
+
+        self.assertEqual(review_task("Explain tp-view", self.config, opener=never, force=True), "required")
+        with self.assertRaisesRegex(RouterError, "task must contain text"):
+            review_task(" ", self.config, opener=never)
 
     def test_laya_transport_and_config_failures(self):
         def unavailable(*_args, **_kwargs):

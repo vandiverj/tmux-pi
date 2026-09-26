@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # tp-review — spawn a cross-provider reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review <task-id>
+# Usage: tp-review [--force] <task-id>
 #
+# Consults the review policy (tp-route --review) on the author's task first. When
+# the policy says `none`, no reviewer starts and tp-review exits 3; --force skips
+# the policy. If the policy can't be reached, the review runs anyway.
 # The review packet contains the original task, result, and selected context packet.
 # The reviewer must be on the opposite provider (pi <-> claude) from the author.
 # Prints the review task id.
@@ -17,7 +20,9 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
-usage() { echo "usage: tp-review <task-id>" >&2; exit "${1:-1}"; }
+usage() { echo "usage: tp-review [--force] <task-id>" >&2; exit "${1:-1}"; }
+force=0
+if [[ "${1:-}" == --force ]]; then force=1; shift; fi
 [[ $# -eq 1 ]] || usage
 id="$1"
 [[ "$id" =~ ^[[:alnum:]_.-]+$ ]] || die "bad task id: $id"
@@ -36,6 +41,19 @@ if [[ "$completed" != 1 ]]; then
   [[ "$state" == waiting ]] || die "subagent '$id' has not completed successfully (state: ${state:-starting})"
 fi
 
+if [[ "$force" == 1 ]]; then
+  policy=forced
+elif out="$("$ROOT/bin/tp-route" --review --file "$dir/task.md")"; then
+  policy="$(jq -r '.review' <<<"$out")"
+else
+  echo "tp-review: review policy unavailable; reviewing anyway" >&2
+  policy=unavailable
+fi
+if [[ "$policy" == none ]]; then
+  echo "tp-review: review not needed for '$id' (policy: none); use --force to review anyway" >&2
+  exit 3
+fi
+
 worker="$(tp_meta "$dir" worker)"
 case "$worker" in
   pi) reviewer=claude; model=claude-sonnet-5; thinking=medium ;;
@@ -48,11 +66,13 @@ review_task="Review the completed work from subagent '$id'. You are an independe
 review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" \
   --context "$dir/task.md" --context "$dir/packet.md" --context "$dir/result.md" \
   --note "Author task id: $id" \
+  --note "Review policy: $policy" \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
   -- "$review_task")"
 
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
-  '. + {review:$review, reviewer:{worker:$reviewer, model:$model, thinking:$thinking}}' \
+  --arg policy "$policy" \
+  '. + {review:$review, review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking}}' \
   "$dir/meta.json" > "$dir/meta.json.tmp"
 mv "$dir/meta.json.tmp" "$dir/meta.json"
 printf '%s\n' "$id" > "$(tp_task_dir "$session" "$review_id")/review-of"

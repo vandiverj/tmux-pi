@@ -184,10 +184,23 @@ then independently checks the working tree. It is instructed not to edit and
 returns `APPROVED` or actionable `REQUEST_CHANGES`. Review linkage is recorded
 in the author task's `meta.json`; use `collect_result` on the printed review id.
 
-Reviews are currently explicit. The next policy milestone will use Laya task-intent
-classification plus deterministic risk and complexity rules so that consequential
-plans and change-making tasks are reviewed, while routine research and summaries
-are not.
+Before starting a reviewer, `tp-review` asks the review policy about the author's
+task (`bin/tp-route --review --file task.md`). Laya answers a `task_intent` choice
+(research, planning, implementation, configuration_or_operations, review,
+communication_or_documentation) alongside the routing traits, and a
+deterministic rule turns them into `none`, `optional` or `required`:
+
+- research: none (it changes nothing), whatever the other answers
+- sensitive or high-risk (≥ 0.35): required
+- implementation or configuration/operations: required
+- planning: required when complex (difficulty ≥ 2.25) or uncertain, else optional
+- anything else: optional when uncertain, else none
+
+On `none`, `tp-review` starts nothing and exits 3. `tp-review --force <id>` (or
+`review_subagent` with `force`) reviews regardless; if Laya is unreachable the
+review runs anyway. The level used is recorded as `review_policy` in the author's
+`meta.json`. Reviews still start only when asked; nothing hands off to review
+automatically until the thresholds are calibrated.
 
 The previous Slotstream OpenAI-compatible chat classifier remains available
 only by explicit selection:

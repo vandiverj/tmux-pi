@@ -1,0 +1,5 @@
+{
+  "name": "tmux-pi",
+  "version": "0.1.0",
+  "description": "tmux-pi worker plugin: shared skills, hooks and agents for Claude workers"
+}

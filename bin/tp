@@ -37,7 +37,7 @@ mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 # from the repo's agent/ dir — never from ~/.pi/agent.
 AGENT_DIR="$ROOT/agent"
 
-main_cmd="pi"
+main_cmd="'$ROOT/bin/tp-pi'"
 
 # Placeholders until M2 replaces them with the real status pane / viewer.
 status_cmd="while true; do clear; echo 'subagents'; echo; ls -1 '$STATE_DIR/state' 2>/dev/null | sed 's/\\.json\$//' || true; sleep 2; done"

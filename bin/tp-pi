@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# tp-pi — run pi with only tmux-pi's config, extensions and skills.
+#
+# Ignores ~/.pi/agent (PI_CODING_AGENT_DIR=agent/) and ~/.agents/skills and
+# project skill dirs (--no-skills); loads skills only from the repo's skills/.
+# Extra arguments are passed through to pi.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+
+export PI_CODING_AGENT_DIR="$ROOT/agent"
+exec pi --no-skills --skill "$ROOT/skills" "$@"

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# tp-claude — run Claude Code with only tmux-pi's settings, plugins and MCP servers.
+#
+# Skips user, project and local settings (so no ~/.claude plugins, skills, hooks,
+# or the target project's .claude/ and CLAUDE.md). Uses the normal Claude login,
+# so a subscription works. Claude Code's built-in skills and plugins still load.
+# Extra arguments are passed through to claude.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+CLAUDE_DIR="$ROOT/claude"
+
+exec claude \
+  --setting-sources "" \
+  --settings "$CLAUDE_DIR/settings.json" \
+  --strict-mcp-config --mcp-config "$CLAUDE_DIR/mcp.json" \
+  --plugin-dir "$CLAUDE_DIR/plugins" \
+  "$@"

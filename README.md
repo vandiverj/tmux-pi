@@ -31,7 +31,8 @@ ln -s "$PWD/bin/tp" ~/.local/bin/agent
 
 Re-running `tp` reattaches to the existing session. Set `TP_SESSION` to run more than one.
 
-pi runs with this repo's `agent/` directory as its config (`PI_CODING_AGENT_DIR`), so nothing
-from `~/.pi/agent` is loaded. Run `/login` once inside the workspace for any subscription providers.
+tmux-pi is self-contained: pi (`bin/tp-pi`) and Claude Code workers (`bin/tp-claude`) load only
+this repo's `agent/`, `claude/` and `skills/`, never `~/.pi`, `~/.agents` or `~/.claude`.
+Run `/login` once inside the workspace for pi's subscription providers.
 
 See [docs/plan.md](docs/plan.md) for the design and milestones.

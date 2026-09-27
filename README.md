@@ -35,8 +35,10 @@ tmux-pi is self-contained: pi (`bin/tp-pi`) and Claude Code workers (`bin/tp-cla
 this repo's `agent/`, `claude/` and `skills/`, never `~/.pi`, `~/.agents` or `~/.claude`.
 Run `/login` once inside the workspace for pi's subscription providers.
 
-Before launching Claude workers in a new target directory, complete Claude Code's
-one-time folder trust with the same isolated configuration used by workers:
+A Claude worker stopped at a choice prompt (Claude Code's one-time folder trust
+in a new directory, or a tool permission) is shown in main as a dialog with the
+prompt's own options; your pick is keyed into the worker. The dialog closes if
+you answer in the worker's pane instead. To settle folder trust ahead of time:
 
 ```sh
 bin/tp-claude-bootstrap /path/to/target-project
@@ -187,16 +189,38 @@ returns the route, intent, review level, execution scope and placement:
   route switches the main model and thinking level in place; the footer shows
   `AUTO main · <model> · <route> · review <level>`.
 - **subagent:** implementation, configuration or operations, required review,
-  or sustained work. The main agent returns to its home model (the default in
-  `agent/settings.json`) and is told to delegate with the routed worker, model
-  and thinking, and to run `review_subagent` when review is required.
+  or sustained work. The dispatcher spawns the routed worker itself; the main
+  model takes no turn. The worker's packet is the verbatim request, what was
+  said since the last delegated task, and two standing instructions: ask before
+  acting if a wrong guess about the intent would change files or waste
+  significant work, and finish with a report of what was done and how it was
+  checked.
 
+Progress is posted into the main conversation as `tmux-pi-auto` messages
+(delegated, a worker's question, the result), so main also sees them on its next
+turn. When review is required, a cross-provider reviewer (`tp-review`) starts as
+soon as the author reports. If it requests changes, its findings go back to the
+author once, and the author is reviewed again. A worker that ends its reply
+with a question is not reviewed until you answer.
+
+While delegated tasks are still running, each new message is first checked
+against them (`tp-route --follow-up`). A message for one of them is typed into
+that worker and saved to its `followups.md`, which its reviewer also reads. When
+the judge is unsure, or two tasks could claim the message, you pick. With the
+`followup` key in `config/local.json`, the local MLX model judges; without it,
+Laya does, and asks you more often.
+
+Start a message with `+followup` to send it to a running task without the
+judge: `+followup <id> …` names the task (any live subagent, including one main
+started), otherwise it goes to the only running delegated task or you pick one.
 Start a message with `+here`, `+delegate` or `+review` to override placement or
-review (they can be combined; the route stays a validated roster target).
-`/auto off` turns routing off for the session; if Laya is unavailable nothing
-changes and the footer says so. A routed model whose context window cannot hold
-the conversation is skipped for the home model; Claude routes stay on the home
-model until they run as foreground workers.
+review (they can be combined; the route stays a validated roster target; a
+marked message is never treated as a follow-up). `/auto off` turns routing off
+for the session. If Laya is unavailable, nothing changes and the footer says so.
+If a spawn fails, main is told to delegate by hand. A routed model whose context
+window cannot hold the conversation is skipped for the home model (the default
+in `agent/settings.json`). Claude routes placed in main stay on the home model
+until they run as foreground workers.
 
 ## Per-machine models
 
@@ -215,6 +239,9 @@ credentials. Every key is optional:
   picks a model in `from` and the task text matches `pattern`, it uses `to`.
 - `prompts` add standing system-prompt text to a model's workers (pi or
   Claude), for a mistake it is known to make; `tp-spawn` appends it.
+- `followup` names a fast local chat model (loopback OpenAI-compatible URL,
+  model id, and the `ask_between` probability band where the user is asked)
+  that decides whether a message belongs to a running delegated task.
 
 On a machine without Slotstream or MLX, leave those out and point `routes` at
 models it does have. `bin/tp-route --check` validates the result;

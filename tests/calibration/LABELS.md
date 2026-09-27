@@ -55,3 +55,11 @@ Where the main agent should run the request.
 |---|---|
 | subagent | implementation or configuration/operations; required review; sustained work (an investigation, profiling, an audit, a full review of an artifact, a whole document, a multi-part plan); or anything that writes project files |
 | main | a quick answer, lookup, short explanation, short draft, a quick review of something small, or a simple recommendation |
+
+## follow-ups (`followups.jsonl`)
+
+`follow_up` is true when the message is meant for the worker on the active task:
+it answers the worker's question, corrects it, asks about its work, or extends
+or continues the same task. It is false for a separate question or piece of
+work, even in the same project or about the same files.
+

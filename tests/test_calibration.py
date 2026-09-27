@@ -22,6 +22,16 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(len(results), len(corpus))
         self.assertIn("holdout", report(results, missing))
 
+    def test_followup_corpus_is_valid(self):
+        rows = [json.loads(line) for line in (ROOT / "tests/calibration/followups.jsonl").read_text().splitlines()]
+        for row in rows:
+            self.assertEqual(set(row), {"task", "reply", "message", "follow_up", "split"})
+            self.assertIn(row["split"], ("tune", "holdout"))
+            self.assertIsInstance(row["follow_up"], bool)
+        for split in ("tune", "holdout"):
+            labels = {row["follow_up"] for row in rows if row["split"] == split}
+            self.assertEqual(labels, {True, False})
+
     def test_shipped_model_never_skips_a_required_review(self):
         results, _ = evaluate(load_corpus(CORPUS), load_answers(ANSWERS), load_model(MODEL))
         self.assertEqual(summary(results)["required_skipped"], 0)

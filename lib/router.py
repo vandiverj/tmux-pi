@@ -105,7 +105,7 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup"}
 
 
 def load_local(path, config):
@@ -180,6 +180,16 @@ def load_local(path, config):
             raise RouterError("mlx port must be an integer from 1024 to 65535")
         if not isinstance(mlx["model"], str) or not mlx["model"]:
             raise RouterError("mlx model must be a Hugging Face id or a local path")
+    followup = local.get("followup")
+    if followup is not None:
+        if not isinstance(followup, dict) or set(followup) != {"base_url", "model", "ask_between"}:
+            raise RouterError("followup needs exactly base_url, model and ask_between")
+        local_base_url(followup["base_url"])
+        _model(followup["model"], "followup model")
+        band = followup["ask_between"]
+        if not isinstance(band, list) or len(band) != 2 or \
+                not 0 <= _number(band[0], "ask_between[0]") < _number(band[1], "ask_between[1]") <= 1:
+            raise RouterError("followup ask_between must be [low, high] with 0 <= low < high <= 1")
     return local
 
 
@@ -572,3 +582,81 @@ def route_task(task, config, backend=None, base_url=None, router_model=None, ope
     else:
         raise RouterError("backend must be laya or openai")
     return apply_rules(task, decision, config)
+
+
+# Follow-up routing: does a new message belong to a delegated task that is still running?
+# Laya separates these poorly (AUC 0.89; most messages land in its ask band), so a machine
+# with a fast local chat model uses it instead (55/56 on tests/calibration/followups.jsonl).
+FOLLOW_UP_QUESTION = {"type": "score", "instructions": "How related is the new message to the active task?",
+                      "criteria": ["unrelated", "loosely related", "same work"]}
+# Laya's score (0-2) is halved to a probability; between these it is unsure (from the
+# followups.jsonl tune split: no errors outside).
+LAYA_FOLLOW_UP_BAND = (0.3, 0.73)
+# With several running tasks, the task that claims a message gets it only when every other
+# task is this far below it.
+FOLLOW_UP_MARGIN = 0.15
+FOLLOW_UP_PROMPT = (
+    "A worker is doing a task for the user. The user just sent a new message. Decide whether the message is "
+    "meant for that worker (it answers the worker's question, corrects it, asks about its work, or extends or "
+    "continues the same task) or is a separate request (a different question or piece of work, even in the same "
+    "project). Reply with exactly one word: worker or separate.")
+
+
+def _clip(text, limit=1500, tail=False):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return "…" + text[-limit:] if tail else text[:limit] + "…"
+
+
+def follow_up_judge(message, task, reply, config, opener=None):
+    """Return (probability the message is for this task's worker, (low, high) unsure band)."""
+    judge = config["local"].get("followup")
+    if not judge:
+        body = {"model": "typed-decisions", "questions": {"follow_up": FOLLOW_UP_QUESTION},
+                "state": {"active_task": _clip(task), "worker_last_reply": _clip(reply, tail=True),
+                          "new_message": message}}
+        endpoint = local_base_url(config["laya"]["base_url"], "laya") + "/v1/systemone"
+        reply_json = _post(endpoint, body, config["timeout_seconds"], opener)
+        try:
+            score = _number(reply_json["answers"]["follow_up"]["score"], "follow_up.score", 2)
+        except (KeyError, TypeError) as exc:
+            raise RouterError("Laya follow-up answer is missing its score") from exc
+        return score / 2, LAYA_FOLLOW_UP_BAND
+    user = "Worker's task: {}\nWorker's last reply: {}\nUser's new message: {}".format(
+        _clip(task), _clip(reply, tail=True), message)
+    body = {"model": judge["model"], "temperature": 0, "max_tokens": 3, "logprobs": True, "top_logprobs": 5,
+            "messages": [{"role": "system", "content": FOLLOW_UP_PROMPT}, {"role": "user", "content": user}]}
+    out = _post(local_base_url(judge["base_url"]) + "/chat/completions", body, config["timeout_seconds"], opener)
+    try:
+        top = out["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        mass = {"worker": 0.0, "separate": 0.0}
+        for item in top:
+            token = item["token"].strip().lstrip("\u0120\u2581").lower()
+            for word in mass:
+                if token and word.startswith(token):
+                    mass[word] += math.exp(item["logprob"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RouterError("follow-up judge returned no logprobs: {}".format(exc)) from exc
+    total = mass["worker"] + mass["separate"]
+    return (mass["worker"] / total if total else 0.5), tuple(judge["ask_between"])
+
+
+def follow_up(message, tasks, config, opener=None):
+    """Pick the running task a message belongs to.
+
+    tasks is a list of {"id", "task", "reply"}. Returns {"target": id or None, "ask": [ids]}:
+    a target when one task claims the message and no other comes near it, ask (most likely
+    first) when the user must choose, neither when every task rejects it (a new request).
+    """
+    overrides, text = parse_markers(message)
+    if not text.strip() or overrides.get("placement") or not tasks:
+        return {"target": None, "ask": []}
+    judged = {item["id"]: follow_up_judge(text, item["task"], item.get("reply", ""), config, opener)
+              for item in tasks}
+    ranked = sorted(judged, key=lambda key: -judged[key][0])
+    best, (low, high) = judged[ranked[0]]
+    rival = judged[ranked[1]][0] if len(ranked) > 1 else 0.0
+    if best >= high and rival <= best - FOLLOW_UP_MARGIN:
+        return {"target": ranked[0], "ask": []}
+    return {"target": None, "ask": [key for key in ranked if judged[key][0] > judged[key][1][0]]}

@@ -6,7 +6,8 @@
 # Consults the review policy (tp-route --review) on the author's task first. When
 # the policy says `none`, no reviewer starts and tp-review exits 3; --force skips
 # the policy. If the policy can't be reached, the review runs anyway.
-# The review packet contains the original task, result, and selected context packet.
+# The review packet contains the original task, any follow-up requests, the result, and the
+# selected context packet.
 # The reviewer must be on the opposite provider (pi <-> claude) from the author.
 # Prints the review task id.
 set -euo pipefail
@@ -63,8 +64,11 @@ esac
 
 review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. Report either APPROVED with a brief rationale, or REQUEST_CHANGES with prioritized actionable findings including file paths and line references when possible."
 
+# Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
+followups=()
+if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md"); fi
 review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" \
-  --context "$dir/task.md" --context "$dir/packet.md" --context "$dir/result.md" \
+  --context "$dir/task.md" ${followups[@]+"${followups[@]}"} --context "$dir/packet.md" --context "$dir/result.md" \
   --note "Author task id: $id" \
   --note "Review policy: $policy" \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \

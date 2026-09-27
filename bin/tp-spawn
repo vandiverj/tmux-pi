@@ -17,6 +17,9 @@
 #                            path[:start-end] adds only those lines.
 #                            Relative paths are from the workdir.
 #   -N, --note <text>        add a note to the context packet; repeatable
+#   -C, --conversation <path>  add the user's recent conversation with main
+#                            (the dispatcher passes what was said since the
+#                            last delegated task)
 #   -v, --view               show it in the viewer slot right away
 #
 # The worker's first message is packet.md: the task, then the selected files and
@@ -37,7 +40,7 @@ source "$ROOT/lib/tp.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
-worker=pi model="" thinking="" name="" file="" view=0
+worker=pi model="" thinking="" name="" file="" view=0 conversation=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     -f|--file)     file="${2:?}"; shift 2 ;;
     -c|--context)  contexts+=("${2:?}"); shift 2 ;;
     -N|--note)     notes+=("${2:?}"); shift 2 ;;
+    -C|--conversation) conversation="${2:?}"; shift 2 ;;
     -v|--view)     view=1; shift ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
@@ -95,9 +99,19 @@ fence() {
 
 # Build the packet before creating anything, so a bad path fails cleanly.
 packet="$(printf '# Task\n\n%s\n' "$task")"
+if [[ -n "$conversation" ]]; then
+  [[ -f "$conversation" ]] || die "conversation file not found: $conversation"
+  body="$(cat "$conversation")"
+  (( ${#body} <= max_file )) || die "conversation is ${#body} chars (max $max_file)"
+  f="$(fence "$body")"
+  packet+=$'\n\n# Conversation so far\n\n'
+  packet+="What the user and the main agent said before this task, for intent and constraints. The task above is what to do."$'\n\n'
+  packet+="$f"$'\n'"$body"$'\n'"$f"$'\n'
+fi
 if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 ]]; then
-  packet+=$'\n\n# Context\n\n'
-  packet+="Working directory: $workdir. The files below were chosen for this task; read others only if the task needs them."$'\n'
+  packet+=$'\n\n# Context\n\n'"Working directory: $workdir."
+  if [[ ${#contexts[@]} -gt 0 ]]; then packet+=" The files below were chosen for this task; read others only if the task needs them."; fi
+  packet+=$'\n'
 fi
 for spec in ${contexts[@]+"${contexts[@]}"}; do
   path="$spec" range=""

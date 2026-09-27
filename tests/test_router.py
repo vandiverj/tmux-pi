@@ -8,7 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, laya_decision, laya_route,
+from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, follow_up, laya_decision,
+                    laya_route,
                     parse_markers, placement_policy,
                     load_config, load_local, load_model, model_digest, review_policy, review_task, route_openai,
                     route_task, validate_decision)  # noqa: E402
@@ -390,6 +391,53 @@ class RouterTests(unittest.TestCase):
         self.assertEqual((forced["placement"], forced["review"], forced["task"]), ("main", "required", "Explain tp-view"))
         with self.assertRaisesRegex(RouterError, "task must contain text"):
             dispatch("+here", config, opener=reply())
+
+    def test_follow_up_with_local_judge(self):
+        config = dict(self.config, local={"followup": {"base_url": "http://127.0.0.1:11437/v1", "model": "qwen",
+                                                       "ask_between": [0.25, 0.9]}})
+        worker = {"a": 0.99, "b": 0.02}  # probability the message is for each task's worker
+        sent = []
+
+        def judge(request, timeout):
+            body = json.loads(request.data)
+            sent.append(body)
+            p = worker["a" if "json flag" in body["messages"][1]["content"] else "b"]
+            top = [{"token": "worker", "logprob": math.log(p)}, {"token": "se", "logprob": math.log(1 - p)}]
+            return Response({"choices": [{"logprobs": {"content": [{"top_logprobs": top}]}}]})
+
+        tasks = [{"id": "a", "task": "Add a json flag to tp-list", "reply": "Include killed tasks?"},
+                 {"id": "b", "task": "Write a haiku", "reply": "Done."}]
+        self.assertEqual(follow_up("yes include them", tasks, config, opener=judge), {"target": "a", "ask": []})
+        self.assertTrue(sent[0]["logprobs"])
+        worker.update(a=0.02)
+        self.assertEqual(follow_up("what is 2+2", tasks, config, opener=judge), {"target": None, "ask": []})
+        worker.update(a=0.6)  # unsure: the user picks
+        self.assertEqual(follow_up("undo that", tasks, config, opener=judge), {"target": None, "ask": ["a"]})
+        worker.update(a=0.99, b=0.95)  # two tasks claim it
+        self.assertEqual(follow_up("do it", tasks, config, opener=judge), {"target": None, "ask": ["a", "b"]})
+        calls = len(sent)
+        self.assertEqual(follow_up("+delegate do it", tasks, config, opener=judge), {"target": None, "ask": []})
+        self.assertEqual(follow_up("do it", [], config, opener=judge), {"target": None, "ask": []})
+        self.assertEqual(len(sent), calls)
+
+    def test_follow_up_with_laya(self):
+        def laya(score):
+            return lambda request, timeout: Response({"answers": {"follow_up": {"type": "score", "score": score}}})
+
+        tasks = [{"id": "a", "task": "Add a json flag to tp-list", "reply": "Include killed tasks?"}]
+        self.assertEqual(follow_up("yes", tasks, self.config, opener=laya(1.6)), {"target": "a", "ask": []})
+        self.assertEqual(follow_up("yes", tasks, self.config, opener=laya(1.0)), {"target": None, "ask": ["a"]})
+        self.assertEqual(follow_up("hi", tasks, self.config, opener=laya(0.2)), {"target": None, "ask": []})
+        with self.assertRaisesRegex(RouterError, "missing its score"):
+            follow_up("yes", tasks, self.config, opener=lambda *_a, **_k: Response({"answers": {}}))
+
+    def test_followup_config_validation(self):
+        good = {"base_url": "http://127.0.0.1:11437/v1", "model": "qwen", "ask_between": [0.25, 0.9]}
+        self.assertEqual(load_local(self.write_local({"followup": good}), self.config)["followup"], good)
+        for bad in ({**good, "ask_between": [0.9, 0.25]}, {**good, "base_url": "http://example.com:1/v1"},
+                    {"model": "qwen"}, {**good, "ask_between": [0, 2]}):
+            with self.assertRaises(RouterError):
+                load_local(self.write_local({"followup": bad}), self.config)
 
     def test_explicit_openai_backend(self):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:

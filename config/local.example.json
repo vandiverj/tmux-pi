@@ -45,5 +45,14 @@
   "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.5-4B's counting: 76% correct without, 90% with (tests/calibration/experiments.md).",
   "prompts": {
     "mlx/mlx-community/Qwen3.5-4B-MLX-4bit": "Only answer a count with a number printed by a counting command you have run (grep -c, wc -l, or jq length for JSON); if you have not run one yet, run it before answering."
+  },
+  "_followup": "A fast local chat model judges whether a new message belongs to a running delegated task; between the two ask_between probabilities the user is asked. Without this key Laya judges, and asks more often (tests/calibration/experiments.md).",
+  "followup": {
+    "base_url": "http://127.0.0.1:11437/v1",
+    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "ask_between": [
+      0.25,
+      0.9
+    ]
   }
 }

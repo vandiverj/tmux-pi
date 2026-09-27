@@ -4,6 +4,8 @@
 With --review, print the task's review level (none, optional or required) instead.
 With --dispatch, print the main agent's full decision: route target, intent, review,
 execution scope and placement (main or subagent), honoring +here/+delegate/+review.
+With --follow-up, read {"message", "tasks": [{"id", "task", "reply"}]} as JSON on stdin
+and print {"target": id or null, "ask": [ids]}: the running task the message belongs to.
 """
 
 import argparse
@@ -13,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from router import RouterError, dispatch, load_config, local_base_url, review_task, route_task  # noqa: E402
+from router import RouterError, dispatch, follow_up, load_config, local_base_url, review_task, route_task  # noqa: E402
 
 
 def main():
@@ -28,6 +30,8 @@ def main():
     parser.add_argument("--check", action="store_true", help="validate config without contacting the endpoint")
     parser.add_argument("--dispatch", action="store_true",
                         help="print the main agent's decision: target, intent, review, scope, placement")
+    parser.add_argument("--follow-up", action="store_true",
+                        help="print the running task a message belongs to (JSON on stdin)")
     parser.add_argument("--review", action="store_true",
                         help="print {\"review\": none|optional|required} from Laya instead of a route")
     args = parser.parse_args()
@@ -44,6 +48,18 @@ def main():
             raise RouterError("router model must be a nonempty string")
         if args.check:
             print("router config valid: {} models".format(len(config["models"])))
+            return 0
+        if args.follow_up:
+            try:
+                request = json.loads(sys.stdin.read())
+                message, tasks = request["message"], request["tasks"]
+                if not isinstance(message, str) or not isinstance(tasks, list) or any(
+                        not isinstance(t, dict) or not isinstance(t.get("id"), str) or not isinstance(t.get("task"), str)
+                        or not isinstance(t.get("reply", ""), str) for t in tasks):
+                    raise ValueError("needs a message string and tasks with string id, task and reply")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RouterError("--follow-up input: {}".format(exc)) from exc
+            print(json.dumps(follow_up(message, tasks, config), separators=(",", ":")))
             return 0
         if args.file and args.task:
             parser.error("use either --file or task arguments")

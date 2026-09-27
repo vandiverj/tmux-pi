@@ -159,3 +159,25 @@ what else to keep in main.
 | 18 | rule: delegate unless Laya's scope is brief | 0.761 | 0.792 | 2/1 | baseline (Laya says brief for 20 of 180) |
 | 18a | brief when P(brief) ≥ threshold (0.35 by tune objective) | 0.767 | 0.783 | 2/1 | no (holdout drops) |
 | 18b | learned placement head over the answers + scope probabilities; threshold 0.2 by 3×5-fold CV on tune (objective: accuracy − 2 × rate of delegable work kept in main; 0.2 ties 0.35 with fewer kept in main) | **0.811** | **0.808** | **0/0** | **yes** |
+
+## Follow-up routing (M8 phase 2, 2026-09-26)
+
+Does a new message belong to a running delegated task? `followups.jsonl`: 56
+messages against 12 task/last-reply pairs; 28 follow-ups (answers, corrections,
+extensions, questions about the work) and 28 separate requests, many in the same
+project; 34 tune, 22 holdout.
+
+| judge | separation | auto-decided (T/H) | wrong when auto (T/H) | asked (T/H) | median |
+|---|---|---|---|---|---|
+| Laya noul "is it about the active task" | true 0.45–0.67, false 0.10–0.62 on the first 10 | — | — | — | — |
+| Laya choice same_task/new_task | AUC 0.85 | — | — | — | — |
+| Laya score unrelated/loosely/same (0–2); unsure band from tune | AUC 0.89 | 8/8 | 0/0 at band (0.61, 1.46) | 26/14 | ~0.1 s |
+| **Qwen3.5-4B (MLX), "worker or separate", P(worker) from top logprobs; ask in (0.25, 0.9)** | 55/56 greedy | **28/19** | **0/0** | **6/3** | **0.18 s** |
+
+Kept: Qwen as the judge where `config/local.json` names one (`followup`), Laya's
+score otherwise (the plan named Laya; it separates too poorly to decide most
+messages on its own). With two running tasks (each message paired with an
+unrelated second task), context-free replies such as "yes go ahead" claim both,
+so the leading task must be at least 0.15 ahead of the next: 39 right, 0 wrong,
+17 asked, of 56.
+

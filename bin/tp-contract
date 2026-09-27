@@ -5,15 +5,28 @@ Usage: tp-contract build --workdir W --task-dir D --kind research|task [--artifa
                          [--budget time=20m,turns=60,tokens=400k] [--checkpoints outline=3m,draft=10m]
                          [--stall 6m] [--grace 3m]
          print {"contract", "note"}; research defaults come from config/research.json
-       tp-contract status    one line per task: id, elapsed, turns, checkpoint state
-       tp-contract enforce   take the checkpoint actions due now; print one JSON line per action
+       tp-contract status    one line per task: id, state, then elapsed, turns, checkpoint state and,
+                             for settled work, the artifact and a one-line summary of the reply
+       tp-contract enforce   take the checkpoint actions due now; print one JSON line per action;
+                             record settled contract tasks in the ledger
+       tp-contract extend <id>          main's "continue": one more budget of the original size
+       tp-contract event <id> <action> [--to ID]  record discard, narrow or escalate
+       tp-contract collect <id>         mark a settled task completed (its result was handed off);
+                                        print its state
+       tp-contract slot --model M [--after ID,...]  may a research task start now? {"ok", "reason"}
        tp-contract research  print config/research.json (validated)
 
+States: starting, working, needs_input (a question or a permission prompt), paused,
+settled (a reply or artifact is ready), completed (handed off), failed, killed, escalated.
+
 A contract's worker keeps `Status: outline|draft|final|partial` at the top of its
-artifact. At a missed checkpoint tmux-pi types one reminder into the worker; when the
-budget is used up it asks the worker to save and ask; a worker that misses its first
-checkpoint by the grace period, or keeps working that long after the stop message,
-is paused (Escape). Every action is recorded in the task's checkpoints.json.
+artifact. At a missed checkpoint, a stall (no writes) or a run of failed tool calls,
+tmux-pi types one reminder into the worker; when the budget is used up it asks the
+worker to save and ask. A worker that misses its first checkpoint by the grace
+period, or is still stalled, failing or working that long after the reminder or
+stop message, is paused (Escape). A stopped or paused worker that settles is
+reported as halted for main to decide. Every action is recorded in the task's
+checkpoints.json.
 """
 
 import argparse
@@ -26,8 +39,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from contract import (ContractError, artifact_info, build, evaluate, load_research, message, note,  # noqa: E402
-                      state_dir)
+from contract import (DONE, RUNNING, ContractError, artifact_info, build, evaluate, extension,  # noqa: E402
+                      is_local, ledger_row, lifecycle, load_research, message, note, state_dir, summary_line,
+                      upsert)
 
 RESEARCH = ROOT / "config" / "research.json"
 
@@ -49,9 +63,43 @@ def read(path):
         return {}
 
 
-def live_panes():
+def panes():
+    """{pane id: "alive" | "dead"}; a pane missing here is gone (killed)."""
     out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True).stdout
-    return {line.split()[0] for line in out.splitlines() if line.endswith(" 0")}
+    return {line.split()[0]: "alive" if line.endswith(" 0") else "dead" for line in out.splitlines() if line.strip()}
+
+
+def text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def task_state(d, meta, pane_map):
+    """(lifecycle state, state.json, checkpoint events, reply) for a task dir."""
+    state = read(d / "state.json")
+    events = read(d / "checkpoints.json").get("events", [])
+    reply = text(d / "result.md")
+    completed = text(d / "completed")
+    life = lifecycle(state, pane_map.get(meta.get("pane"), "gone"), events, reply,
+                     float(completed) if completed else None, text(d / "exit") or None, (d / "escalated").exists(),
+                     (d / "result.md").stat().st_mtime if (d / "result.md").exists() else None)
+    return life, state, events, reply
+
+
+def save_events(d, events):
+    tmp = d / "checkpoints.json.tmp"
+    tmp.write_text(json.dumps({"events": events}) + "\n")
+    os.replace(tmp, d / "checkpoints.json")
+
+
+def find(root, task_id):
+    d = Path(root) / "tasks" / task_id
+    meta = read(d / "meta.json")
+    if not meta:
+        raise ContractError("no subagent '{}'".format(task_id))
+    return d, meta
 
 
 def tasks(root):
@@ -84,23 +132,28 @@ def cmd_build(args):
         artifact = args.artifact
     if not os.path.isabs(artifact):
         artifact = os.path.join(args.workdir, artifact)
-    contract = build(args.kind, os.path.normpath(artifact), budget, checkpoints, stall, grace)
+    errors = config["tool_errors"] if args.kind == "research" else 4
+    contract = build(args.kind, os.path.normpath(artifact), budget, checkpoints, stall, grace, errors)
     os.makedirs(os.path.dirname(contract["artifact"]), exist_ok=True)
     print(json.dumps({"contract": contract, "note": note(contract, time.time())}))
 
 
 def cmd_status(_args):
-    root, live, now = state_dir(), live_panes(), time.time()
+    root, pane_map, now = state_dir(), panes(), time.time()
     for d, meta in tasks(root):
-        state = read(d / "state.json")
-        alive = meta.get("pane") in live
+        life, state, events, reply = task_state(d, meta, pane_map)
+        alive = pane_map.get(meta.get("pane")) == "alive"
         contract = meta.get("contract")
         fake = {"artifact": "", "budget": {"seconds": 10 ** 9, "turns": None, "tokens": None}, "checkpoints": {},
                 "stall": 10 ** 9, "grace": 1}
         art = artifact_info(contract["artifact"]) if contract else {"exists": False, "size": 0, "mtime": None,
                                                                      "status": None, "urls": 0}
-        r = evaluate(dict(meta, contract=contract or fake), state, art, now, alive)
+        r = evaluate(dict(meta, contract=contract or fake), state, art, now, alive, events)
         parts = [clock(r["elapsed"])]
+        fate = next((e for e in reversed(events) if e.get("action") in ("discard", "narrow", "escalate")), None)
+        if fate:
+            parts.append("discarded" if fate["action"] == "discard" else
+                         "{} to {}".format("narrowed" if fate["action"] == "narrow" else "escalated", fate.get("to", "?")))
         if r["turns"]:
             parts.append("{} turns".format(r["turns"]))
         if contract:
@@ -110,10 +163,12 @@ def cmd_status(_args):
                                                            r["status"] or "(no status)", clock(now - art["mtime"])))
             else:
                 parts.append("{} not written".format(os.path.basename(contract["artifact"])))
-            events = read(d / "checkpoints.json").get("events", [])
-            if any(e["action"] == "pause" for e in events):
-                parts.append("paused")
-        print("{}\x1f{}".format(meta.get("id", d.name), " · ".join(parts)))
+        if state.get("tools"):
+            parts.append("{} tool calls{}".format(state["tools"], ", {} failing".format(state["toolErrors"])
+                                                  if state.get("toolErrors") else ""))
+        if life in ("settled", "completed", "needs_input", "paused", "failed") and reply:
+            parts.append(summary_line(reply, question=life == "needs_input"))
+        print("{}\x1f{}\x1f{}".format(meta.get("id", d.name), life, " · ".join(parts)))
 
 
 def send(pane, text):
@@ -124,25 +179,32 @@ def send(pane, text):
 
 
 def cmd_enforce(_args):
-    root, live, now = state_dir(), live_panes(), time.time()
+    root, pane_map, now = state_dir(), panes(), time.time()
     for d, meta in tasks(root):
         contract = meta.get("contract")
-        if not contract or meta.get("pane") not in live or (d / "escalated").exists():
+        if not contract:
             continue
-        log = read(d / "checkpoints.json")
-        events = log.get("events", [])
-        r = evaluate(meta, read(d / "state.json"), artifact_info(contract["artifact"]), now, True, events)
+        life, state, events, _reply = task_state(d, meta, pane_map)
+        # Each settled contract task goes into the ledger once per settled state.
+        mark = "{}@{}".format(life, state.get("updated"))
+        if life in DONE + ("needs_input",) and text(d / "ledger") != mark:
+            upsert(Path(root) / "ledger.jsonl", ledger_row(d, now))
+            (d / "ledger").write_text(mark + "\n")
+        if pane_map.get(meta.get("pane")) != "alive" or (d / "escalated").exists():
+            continue
+        r = evaluate(meta, state, artifact_info(contract["artifact"]), now, True, events)
         if not r["action"]:
             continue
         action, reason = r["action"]
-        text = message(action, contract)
+        text_ = message(action, contract)
         # Record first, so a failed send is not retried every few seconds.
-        events.append({"action": action, "reason": reason, "at": now})
-        tmp = d / "checkpoints.json.tmp"
-        tmp.write_text(json.dumps({"events": events}) + "\n")
-        os.replace(tmp, d / "checkpoints.json")
+        events.append(dict({"action": action, "reason": reason, "at": now},
+                           **({"tools": state.get("tools") or 0} if action == "pause" else {})))
+        save_events(d, events)
         try:
-            if action == "pause":
+            if action == "halted":
+                pass  # main decides; nothing is typed
+            elif action == "pause":
                 subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "Escape"], check=True)
                 # An interrupted worker puts queued messages (our reminders) back in its input box;
                 # clear them so the user's next message is not appended to one.
@@ -151,11 +213,79 @@ def cmd_enforce(_args):
                     subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "C-u"], check=True)
                     time.sleep(0.1)
             else:
-                send(meta["pane"], text)
+                send(meta["pane"], text_)
         except subprocess.CalledProcessError:
             continue
         print(json.dumps({"id": meta.get("id", d.name), "action": action.split("@")[0], "reason": reason,
-                          "artifact": contract["artifact"], "status": r["status"]}), flush=True)
+                          "kind": contract["kind"], "artifact": contract["artifact"], "status": r["status"],
+                          "extended": any(e["action"] == "extend" for e in events)}), flush=True)
+
+
+def cmd_extend(args):
+    d, meta = find(state_dir(), args.id)
+    if not meta.get("contract"):
+        raise ContractError("{} has no contract".format(args.id))
+    events = read(d / "checkpoints.json").get("events", [])
+    event = extension(meta, read(d / "state.json"), time.time(), events)
+    save_events(d, events + [event])
+    b, c = event["budget"], meta["contract"]["budget"]
+    more = ["{} minutes".format(round(c["seconds"] / 60))] + \
+        ["{} turns".format(c["turns"])] * bool(c["turns"]) + ["{} tokens".format(c["tokens"])] * bool(c["tokens"])
+    print(json.dumps({"budget": b, "message": (
+        "tmux-pi: you have {} more. Continue from {}: keep its status line current, save as you go, and finish with "
+        "`Status: final` (or `Status: partial` and what is missing if you run out again).").format(
+            " and ".join(more), meta["contract"]["artifact"])}))
+
+
+def cmd_event(args):
+    d, meta = find(state_dir(), args.id)
+    events = read(d / "checkpoints.json").get("events", [])
+    event = {"action": args.action, "at": time.time()}
+    if args.to:
+        event["to"] = args.to
+    save_events(d, events + [event])
+
+
+def cmd_collect(args):
+    root = state_dir()
+    d, meta = find(root, args.id)
+    life = task_state(d, meta, panes())[0]
+    if life == "settled":
+        (d / "completed").write_text("{}\n".format(time.time()))
+        life = "completed"
+    print(life)
+
+
+def cmd_slot(args):
+    """May a research task on args.model start now: its dependencies are done and there is room."""
+    root, pane_map = state_dir(), panes()
+    config = research_config()
+    states = {}
+    local = frontier = active = 0
+    for d, meta in tasks(root):
+        life = task_state(d, meta, pane_map)[0]
+        states[meta.get("id", d.name)] = life
+        if life not in RUNNING:
+            continue
+        active += 1
+        if (meta.get("contract") or {}).get("kind") == "research":
+            if is_local(meta.get("model")):
+                local += 1
+            else:
+                frontier += 1
+    waiting = [i for i in filter(None, (args.after or "").split(",")) if states.get(i, "killed") not in DONE]
+    if waiting:
+        reason = "waits for {}".format(", ".join(waiting))
+    elif is_local(args.model) and local >= config["max_local"]:
+        reason = "{} local research worker{} running (limit {})".format(local, "s" * (local != 1), config["max_local"])
+    elif not is_local(args.model) and frontier >= config["max_frontier"]:
+        reason = "{} research worker{} running (limit {})".format(frontier, "s" * (frontier != 1), config["max_frontier"])
+    elif active >= config["max_active"]:
+        reason = "{} workers running (limit {})".format(active, config["max_active"])
+    else:
+        reason = ""
+    print(json.dumps({"ok": not reason, "reason": reason, "states": {i: states.get(i, "killed") for i in
+                                                                      filter(None, (args.after or "").split(","))}}))
 
 
 def main():
@@ -170,6 +300,17 @@ def main():
     sub.add_parser("status")
     sub.add_parser("enforce")
     sub.add_parser("research")
+    x = sub.add_parser("extend")
+    x.add_argument("id")
+    e = sub.add_parser("event")
+    e.add_argument("id")
+    e.add_argument("action", choices=("discard", "narrow", "escalate"))
+    e.add_argument("--to")
+    c = sub.add_parser("collect")
+    c.add_argument("id")
+    sl = sub.add_parser("slot")
+    sl.add_argument("--model", required=True)
+    sl.add_argument("--after")
     args = parser.parse_args()
     try:
         if args.cmd == "build":
@@ -178,6 +319,8 @@ def main():
             cmd_status(args)
         elif args.cmd == "enforce":
             cmd_enforce(args)
+        elif args.cmd in ("extend", "event", "collect", "slot"):
+            globals()["cmd_" + args.cmd](args)
         else:
             print(json.dumps(research_config()))
     except ContractError as exc:

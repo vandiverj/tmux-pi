@@ -24,11 +24,15 @@
  * questions are posted into main's conversation as tmux-pi-auto messages, so main sees
  * them on its next turn. `/auto on|off` turns routing on or off.
  *
- * `+research [+review] <question>` starts a research worker (config/research.json) under a
- * contract: a report file, checkpoints and a budget, enforced by `tp-contract enforce`
- * (reminders, then a pause) for every contract task in the workspace. Research rows go
- * into the run ledger (`tp-ledger`) when the worker settles. Past the configured number
- * of research or active workers, the user is asked before another starts.
+ * `+research [+review] [+after <id>[,<id>]] <question>` starts a research worker
+ * (config/research.json) under a contract: a report file, checkpoints and a budget,
+ * enforced by `tp-contract enforce` (reminders, then a pause) for every contract task in
+ * the workspace. Independent research runs in parallel up to the frontier and local caps;
+ * research that builds on a running research task (named with +after, or claimed by the
+ * follow-up judge) or that finds no free slot waits in a queue (.tmux-pi/research-queue.json)
+ * and starts with the earlier reports in its notes. A contract task that was stopped or
+ * paused and has settled is "halted": main shows its reply and offers to continue it once
+ * with more budget, narrow or escalate the question (research), or discard it.
  *
  * Independently of routing, a Claude worker stopped at a choice prompt (folder trust, a
  * tool permission) is shown to the user in main as a dialog; the pick is keyed into it.
@@ -76,6 +80,21 @@ const RESEARCH_REPORT =
 const MAX_REVIEW_ROUNDS = 2;
 const MAX_FOLLOW_UP_TASKS = 3;
 const REPLY_LIMIT = 4000;
+
+// A +research request waiting for its dependencies or a free research slot.
+type Queued = {
+	question: string;
+	review: boolean;
+	worker: string;
+	model: string;
+	thinking: string;
+	after: string[]; // research tasks whose reports it builds on
+	notes: string[];
+	conversation: string;
+	replaces?: string; // a halted task this narrows or escalates
+	how?: "narrow" | "escalate";
+	queued: number;
+};
 
 type Run = { code: number; stdout: string; stderr: string };
 
@@ -269,6 +288,14 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const replyOf = async (id: string) => readText(join(await taskDir(id), "result.md"));
+	// A result handed to main is completed (see tp-contract lifecycle).
+	const complete = (dir: string) => writeFileSync(join(dir, "completed"), `${Date.now() / 1000}\n`);
+	// Stopped or paused by its contract since the last "continue": main's halted dialog takes over.
+	const contractHalted = (dir: string) => {
+		const events: any[] = readJson(join(dir, "checkpoints.json")).events ?? [];
+		const last = events.map((e) => e.action).lastIndexOf("extend");
+		return events.slice(last + 1).some((e) => e.action === "stop" || e.action === "pause");
+	};
 	const summary = (reply: string, path: string) =>
 		reply ? `${clip(reply, REPLY_LIMIT)}${reply.length > REPLY_LIMIT ? `\n(full reply: ${path})` : ""}` : "(no reply)";
 
@@ -285,6 +312,7 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			const dir = await taskDir(task.id);
+			if (contractHalted(dir)) break;
 			const raw = await replyOf(task.id);
 			const reply = raw + (task.report && !raw.includes(task.report) ? `\n\nReport: ${task.report}` : "");
 			if (!done.ok) {
@@ -300,6 +328,7 @@ export default function (pi: ExtensionAPI) {
 				const note = task.rounds >= MAX_REVIEW_ROUNDS ? ` (after ${task.rounds} review rounds; last review: ${task.reviewer})` : "";
 				const verb = task.foreground ? "answered" : "finished";
 				post(`${task.id} ${verb}${note}.\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "result", id: task.id });
+				complete(dir);
 				break;
 			}
 			const started = Date.now();
@@ -323,6 +352,7 @@ export default function (pi: ExtensionAPI) {
 			if (approved || !reviewed.ok) {
 				const head = approved ? `${task.id} finished and ${reviewer} approved it.` : `${task.id} finished; review ${reviewer} failed.`;
 				post(`${head}\n\n${summary(reply, join(dir, "result.md"))}\n\nReview:\n${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "result", id: task.id, review: reviewer });
+				complete(dir);
 				break;
 			}
 			if (task.rounds >= MAX_REVIEW_ROUNDS) {
@@ -341,9 +371,8 @@ export default function (pi: ExtensionAPI) {
 		task.watching = true;
 		void watch(task)
 			.catch((error) => post(`Stopped following ${task.id}: ${(error as Error).message}`, { kind: "failed", id: task.id }))
-			.finally(async () => {
+			.finally(() => {
 				task.watching = false;
-				if (task.report) await run(bin("tp-ledger"), ["record", task.id]);
 			});
 	};
 
@@ -409,6 +438,13 @@ export default function (pi: ExtensionAPI) {
 	// Each prompt is asked once; one dialog at a time. The dialog closes itself if the prompt
 	// is answered in the worker's own pane.
 	const asked = new Map<string, string>();
+	// One dialog at a time: prompt relays and halted-task decisions share main's UI.
+	let dialogs: Promise<unknown> = Promise.resolve();
+	const exclusive = <T>(f: () => Promise<T>): Promise<T> => {
+		const p = dialogs.then(f);
+		dialogs = p.catch(() => undefined);
+		return p;
+	};
 	const capture = async (pane: string) => (await run("tmux", ["capture-pane", "-p", "-t", pane])).stdout;
 	const signature = (p: Prompt) => `${p.text}\n${p.options.join("\n")}`;
 
@@ -471,76 +507,192 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (asked.get(id) === signature(prompt)) continue;
 			asked.set(id, signature(prompt));
-			await relay(id, meta.pane, prompt);
+			await exclusive(() => relay(id, meta.pane, prompt));
 			return;
 		}
 	};
 
 	// Contract checkpoints (M9): tp-contract types reminders into the worker and pauses it;
-	// budget stops and pauses are posted into main, where the user decides what happens next.
+	// budget stops are posted into main, and a halted task gets a dialog: continue, narrow,
+	// escalate or discard.
 	const enforceContracts = async () => {
 		const r = await run(bin("tp-contract"), ["enforce"]);
 		for (const line of r.stdout.split("\n").filter(Boolean)) {
 			const a = JSON.parse(line);
-			const where = `Its report: ${a.artifact} (${a.status ? `Status: ${a.status}` : "no status line"}).`;
-			if (a.action === "pause") {
-				post(
-					`Paused ${a.id}: ${a.reason}. ${where} Continue, narrow the question or escalate with +followup ${a.id} <message>, or kill it from the status pane.`,
-					{ kind: "paused", id: a.id, reason: a.reason },
-				);
-				await run(bin("tp-ledger"), ["record", a.id]);
-			} else if (a.action === "stop") {
-				post(`${a.id}: ${a.reason}; it was asked to save its report and ask how to go on. ${where}`, { kind: "budget", id: a.id });
-			} else {
-				lastCtx?.ui.notify(`${a.id}: ${a.reason}; reminded it`, "info");
-			}
+			if (a.action === "halted") void exclusive(() => decide(a)).catch((error) => post(`${a.id}: ${(error as Error).message}`, { kind: "failed", id: a.id }));
+			else if (a.action === "stop") {
+				post(`${a.id}: ${a.reason}; it was asked to save its report (${a.artifact}) and stop.`, { kind: "budget", id: a.id });
+			} else lastCtx?.ui.notify(`${a.id}: ${a.reason}; ${a.action === "pause" ? "paused it" : "reminded it"}`, "info");
 		}
+		await pumpQueue();
 	};
 
-	// +research: one bounded question to a research worker under a contract.
-	const research = async (ctx: any, question: string, review: boolean): Promise<boolean> => {
-		const config = JSON.parse(await must(bin("tp-contract"), ["research"]));
-		const tasks = join(await stateDir(), "tasks");
-		const live = new Set((await run("tmux", ["list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"])).stdout.split("\n"));
-		let researching = 0;
-		let active = 0;
-		for (const id of readdirSync(tasks, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)) {
-			const meta = readJson(join(tasks, id, "meta.json"));
-			if (!live.has(`${meta.pane} 0`)) continue;
-			if (!["waiting", "error"].includes(readJson(join(tasks, id, "state.json")).state)) active += 1;
-			if (meta.contract?.kind === "research") researching += 1;
+	// A halted contract task: show where it got to and let the user choose what happens next.
+	const decide = async (a: any) => {
+		const dir = await taskDir(a.id);
+		const request = readText(join(dir, "task.md"));
+		const reply = await replyOf(a.id);
+		post(`${a.id} ${a.reason}. Report: ${a.artifact}\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "halted", id: a.id, reason: a.reason });
+		const config = a.kind === "research" ? JSON.parse(await must(bin("tp-contract"), ["research"])) : undefined;
+		const CONTINUE = "Continue with one more budget";
+		const NARROW = "Narrow the question (new research task)";
+		const ESCALATE = config ? `Escalate to ${config.escalate.model} (new research task)` : "";
+		const DISCARD = "Discard it";
+		const LATER = "Decide later";
+		const options = [a.extended ? "" : CONTINUE, config ? NARROW : "", ESCALATE, DISCARD, LATER].filter(Boolean);
+		const choice = await lastCtx.ui.select(`${a.id} ${a.reason}. What next?`, options);
+		if (!choice || choice === LATER) {
+			lastCtx.ui.notify(`${a.id} left as is; +followup ${a.id} <message> or the status pane can still reach it`, "info");
+			return;
 		}
-		const over = [
-			researching >= config.max_research ? `${researching} research workers are running (limit ${config.max_research})` : "",
-			active >= config.max_active ? `${active} workers are active (limit ${config.max_active})` : "",
-		].filter(Boolean);
-		if (over.length && !(await ctx.ui.confirm("Start another research worker?", `${over.join("; ")}. Start it anyway?`))) return false;
-		const tmp = mkdtempSync(join(tmpdir(), "tp-research-"));
-		try {
-			const args = ["--worker", config.worker, "--model", config.model, "--thinking", config.thinking, "--name", "research", "--kind", "research"];
-			const conversation = conversationSinceDelegation(ctx);
-			if (conversation) {
-				writeFileSync(join(tmp, "conversation.md"), conversation);
-				args.push("--conversation", join(tmp, "conversation.md"));
-			}
-			args.push("--note", ASK_IF_UNCLEAR, "--note", RESEARCH_REPORT);
-			if (review) args.push("--note", "A reviewer on another provider will check the report's sources when you finish.");
-			const id = (await must(bin("tp-spawn"), args, question, 60_000)).split("\n")[0];
-			const contract = readJson(join(tasks, id, "meta.json")).contract ?? {};
-			const task: Delegated = { id, request: question, review: review ? "required" : "none", rounds: 0, since: Date.now(), report: contract.artifact };
-			delegated.set(id, task);
-			const minutes = Math.round((contract.budget?.seconds ?? 0) / 60);
-			post(
-				`Research started: ${id} (${config.worker} ${config.model}/${config.thinking}, up to ${minutes} min${review ? ", reviewed" : ""}). Report: ${contract.artifact}\n\n${question}`,
-				{ kind: "delegated", id, research: true, report: contract.artifact },
-			);
-			ctx.ui.setStatus("auto", `AUTO research · ${id}`);
+		const task: Delegated = delegated.get(a.id) ?? { id: a.id, request, review: "none", rounds: 0, since: 0, report: config ? a.artifact : undefined };
+		if (choice === CONTINUE) {
+			const extended = JSON.parse(await must(bin("tp-contract"), ["extend", a.id]));
+			task.since = Date.now();
+			task.rounds = 0;
+			delegated.set(a.id, task);
+			await typeInto(a.id, extended.message);
+			post(`Continued ${a.id} with one more budget.`, { kind: "follow-up", id: a.id });
 			showRunning();
 			follow(task);
-			return true;
+			return;
+		}
+		if (choice === DISCARD) {
+			await run(bin("tp-contract"), ["event", a.id, "discard"]);
+			await run(bin("tp-kill"), [a.id]);
+			await run(bin("tp-ledger"), ["record", a.id]);
+			delegated.delete(a.id);
+			showRunning();
+			post(`Discarded ${a.id}. Its report stays at ${a.artifact}.`, { kind: "discarded", id: a.id });
+			return;
+		}
+		let question = request;
+		if (choice === NARROW) {
+			const narrowed = (await lastCtx.ui.input(`A narrower question to replace ${a.id}`, request))?.trim();
+			if (!narrowed) return;
+			question = narrowed;
+		}
+		const route = choice === ESCALATE ? config.escalate : config;
+		await run(bin("tp-kill"), [a.id]);
+		delegated.delete(a.id);
+		showRunning();
+		await enqueue({
+			question,
+			review: task.review === "required",
+			worker: route.worker,
+			model: route.model,
+			thinking: route.thinking,
+			after: [],
+			notes: [`An earlier attempt at this research (${a.id}) stopped before finishing; its partial report is ${a.artifact}. Read it first, build on it, and do not repeat its searches.`],
+			conversation: "",
+			replaces: a.id,
+			how: choice === ESCALATE ? "escalate" : "narrow",
+			queued: Date.now(),
+		});
+	};
+
+	// The research queue: requests wait there for their dependencies and a free slot
+	// (tp-contract slot), and start in order when both are there.
+	const queueFile = async () => join(await stateDir(), "research-queue.json");
+	const loadQueue = async (): Promise<Queued[]> => {
+		const q = readJson(await queueFile());
+		return Array.isArray(q) ? q : [];
+	};
+	const saveQueue = async (q: Queued[]) => writeFileSync(await queueFile(), `${JSON.stringify(q, null, 1)}\n`);
+	let queueLock: Promise<unknown> = Promise.resolve();
+	const serial = <T>(f: () => Promise<T>): Promise<T> => {
+		const p = queueLock.then(f);
+		queueLock = p.catch(() => undefined);
+		return p;
+	};
+	const slot = async (q: Queued) =>
+		JSON.parse(await must(bin("tp-contract"), ["slot", "--model", q.model, ...(q.after.length ? ["--after", q.after.join(",")] : [])]));
+
+	const startResearch = async (q: Queued) => {
+		const tasks = join(await stateDir(), "tasks");
+		const tmp = mkdtempSync(join(tmpdir(), "tp-research-"));
+		try {
+			const args = ["--worker", q.worker, "--model", q.model, "--thinking", q.thinking, "--name", "research", "--kind", "research"];
+			if (q.conversation) {
+				writeFileSync(join(tmp, "conversation.md"), q.conversation);
+				args.push("--conversation", join(tmp, "conversation.md"));
+			}
+			const reports = q.after.map((id) => `${id}: ${readJson(join(tasks, id, "meta.json")).contract?.artifact ?? "(no report)"}`);
+			if (reports.length) args.push("--note", `This question builds on earlier research. Read these reports first and do not repeat their searches: ${reports.join("; ")}.`);
+			for (const n of q.notes) args.push("--note", n);
+			args.push("--note", ASK_IF_UNCLEAR, "--note", RESEARCH_REPORT);
+			if (q.review) args.push("--note", "A reviewer on another provider will check the report's sources when you finish.");
+			const id = (await must(bin("tp-spawn"), args, q.question, 60_000)).split("\n")[0];
+			const contract = readJson(join(tasks, id, "meta.json")).contract ?? {};
+			const task: Delegated = { id, request: q.question, review: q.review ? "required" : "none", rounds: 0, since: Date.now(), report: contract.artifact };
+			delegated.set(id, task);
+			if (q.replaces) {
+				await run(bin("tp-contract"), ["event", q.replaces, q.how ?? "narrow", "--to", id]);
+				await run(bin("tp-ledger"), ["record", q.replaces]);
+			}
+			const minutes = Math.round((contract.budget?.seconds ?? 0) / 60);
+			const why = [q.review ? "reviewed" : "", q.after.length ? `building on ${q.after.join(", ")}` : "", q.replaces ? `${q.how === "escalate" ? "escalating" : "narrowing"} ${q.replaces}` : ""].filter(Boolean);
+			post(
+				`Research started: ${id} (${q.worker} ${q.model}/${q.thinking}, up to ${minutes} min${why.length ? `; ${why.join("; ")}` : ""}). Report: ${contract.artifact}\n\n${q.question}`,
+				{ kind: "delegated", id, research: true, report: contract.artifact },
+			);
+			lastCtx?.ui.setStatus("auto", `AUTO research · ${id}`);
+			showRunning();
+			follow(task);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
+	};
+
+	const enqueue = (q: Queued) =>
+		serial(async () => {
+			const free = await slot(q);
+			if (free.ok) return startResearch(q);
+			await saveQueue([...(await loadQueue()), q]);
+			post(`Research queued (${free.reason}): ${q.question}`, { kind: "queued", research: true });
+		});
+
+	const pumpQueue = () =>
+		serial(async () => {
+			let queue = await loadQueue();
+			for (const q of [...queue]) {
+				const free = await slot(q);
+				if (!free.ok) continue;
+				queue = queue.filter((x) => x !== q);
+				await saveQueue(queue);
+				await startResearch(q).catch((error) => post(`Queued research could not start: ${(error as Error).message}\n\n${q.question}`, { kind: "failed" }));
+			}
+		});
+
+	// Running research tasks this question builds on: the follow-up judge's clear claimant, if any.
+	const dependsOn = async (question: string): Promise<string[]> => {
+		const status = await run(bin("tp-contract"), ["status"]);
+		const tasks = join(await stateDir(), "tasks");
+		const running = status.stdout.split("\n").map((l) => l.split("\x1f")).filter(([id, life]) =>
+			id && ["starting", "working", "needs_input"].includes(life) && readJson(join(tasks, id, "meta.json")).contract?.kind === "research");
+		if (!running.length) return [];
+		const candidates = await Promise.all(running.slice(-MAX_FOLLOW_UP_TASKS).map(async ([id]) => ({ id, task: readText(join(tasks, id, "task.md")), reply: await replyOf(id) })));
+		const r = await run(bin("tp-route"), ["--follow-up"], JSON.stringify({ message: question, tasks: candidates }));
+		if (r.code !== 0) return [];
+		const target = JSON.parse(r.stdout).target;
+		return target ? [target] : [];
+	};
+
+	// +research: one bounded question to a research worker under a contract.
+	const research = async (ctx: any, question: string, review: boolean, after: string[]) => {
+		const config = JSON.parse(await must(bin("tp-contract"), ["research"]));
+		if (!after.length) after = await dependsOn(question);
+		await enqueue({
+			question,
+			review,
+			worker: config.worker,
+			model: config.model,
+			thinking: config.thinking,
+			after,
+			notes: [],
+			conversation: conversationSinceDelegation(ctx),
+			queued: Date.now(),
+		});
 	};
 
 	let scanning = false;
@@ -634,15 +786,19 @@ export default function (pi: ExtensionAPI) {
 		const researchMarker = /^\+research(\s+|$)/i.exec(text);
 		if (researchMarker) {
 			let question = text.slice(researchMarker[0].length).trim();
-			const reviewed = /^\+review(\s+|$)/i.exec(question);
-			if (reviewed) question = question.slice(reviewed[0].length).trim();
+			let reviewed = false;
+			const after: string[] = [];
+			for (let m; (m = /^\+(review|after\s+([\w.,-]+))(\s+|$)/i.exec(question)); question = question.slice(m[0].length).trim()) {
+				if (m[2]) after.push(...m[2].split(",").filter(Boolean));
+				else reviewed = true;
+			}
 			if (!question) {
 				ctx.ui.notify("+research needs a question", "warning");
 				ctx.ui.setEditorText(text);
 				return { action: "handled" };
 			}
 			try {
-				if (!(await research(ctx, question, !!reviewed))) ctx.ui.setEditorText(text);
+				await research(ctx, question, reviewed, after);
 			} catch (error) {
 				ctx.ui.notify(`Could not start research: ${(error as Error).message}`, "warning");
 				ctx.ui.setEditorText(text);

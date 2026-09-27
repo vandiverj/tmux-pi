@@ -221,7 +221,10 @@ export default function (pi: ExtensionAPI) {
 				onUpdate?.(text(`${params.id}: ${state.state ?? "starting"}${state.tool ? ` — ${state.tool}` : ""}`));
 				await sleep(2000, signal);
 			}
-			const status = ps === "running" ? (state.state ?? "starting") : ps;
+			const raw = ps === "running" ? (state.state ?? "starting") : ps;
+			// starting, working, needs_input, paused, settled, completed, …; reading a settled result here
+			// hands it off, so it becomes completed (bin/tp-contract collect).
+			const status = (await run(bin("tp-contract"), ["collect", params.id])).stdout.trim() || raw;
 			const t = state.tokens;
 			const lines = [
 				`id: ${params.id}`,
@@ -233,7 +236,7 @@ export default function (pi: ExtensionAPI) {
 			].filter((l, i, a) => l || i === a.length - 1);
 			// A worker stuck before its reporter runs (e.g. Claude's folder-trust prompt) or
 			// at a permission prompt needs a human; show its screen so the model can say so.
-			if (ps === "running" && ["starting", "permission"].includes(status)) {
+			if (ps === "running" && ["starting", "permission"].includes(raw)) {
 				const pane = readJson(join(dir, "meta.json")).pane;
 				const screen = (await run("tmux", ["capture-pane", "-p", "-t", pane])).stdout
 					.split("\n").filter((l) => l.trim()).slice(-15).join("\n");

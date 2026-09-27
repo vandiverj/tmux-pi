@@ -7,8 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from contract import (ContractError, artifact_info, build, duration, evaluate, ledger_row, load_research,  # noqa: E402
-                      message, note, quantity, rate, read_ledger, upsert)
+from contract import (ContractError, artifact_info, build, duration, evaluate, extension, is_local,  # noqa: E402
+                      ledger_row, lifecycle, load_research, message, note, quantity, rate, read_ledger, summary_line,
+                      upsert)
 from router import load_config  # noqa: E402
 
 T0 = 1_800_000_000  # a fixed clock; meta.created is this instant
@@ -153,12 +154,107 @@ class ContractTests(unittest.TestCase):
         config = load_research(ROOT / "config/research.json", roster)
         self.assertEqual(config["worker"], "claude")
         good = json.loads((ROOT / "config/research.json").read_text())
-        for change in ({"model": "claude-nope"}, {"thinking": "turbo"}, {"max_active": 0}, {"budget": {"turns": 5}},
-                       {"extra": 1}):
+        bad_escalate = {"escalate": {"worker": "claude", "model": "claude-nope", "thinking": "medium"}}
+        for change in ({"model": "claude-nope"}, {"thinking": "turbo"}, {"max_active": 0}, {"max_local": True},
+                       {"budget": {"turns": 5}}, {"extra": 1}, bad_escalate, {"tool_errors": 0}):
             path = self.dir / "research.json"
             path.write_text(json.dumps(dict(good, **change)))
             with self.assertRaises(ContractError):
                 load_research(path, roster)
+
+    def test_breakers_after_a_reminder(self):
+        def act(minutes, art, events=(), errors=0):
+            state = {"state": "working", "turns": 3, "toolErrors": errors}
+            r = evaluate(self.meta, state, art, T0 + minutes * 60, True, events)
+            return r["action"][0] if r["action"] else None
+
+        draft = self.art("draft", now=T0 + 300)  # last written at 5m
+        self.assertEqual(act(8, draft, ["nudge-outline"], errors=4), "nudge-errors")
+        nudged = [{"action": "nudge-errors", "at": T0 + 480}]
+        self.assertIsNone(act(10, draft, nudged, errors=5))  # within the grace period
+        self.assertEqual(act(11, draft, nudged, errors=6), "pause")
+        self.assertNotEqual(act(11, draft, nudged, errors=0), "pause")  # a success in between resets the run
+        stall = "nudge-stall@{}".format(T0 + 300)
+        self.assertEqual(act(11, draft), stall)
+        self.assertIsNone(act(13, draft, [{"action": stall, "at": T0 + 660}]))
+        self.assertEqual(act(14, draft, [{"action": stall, "at": T0 + 660}]), "pause")
+
+    def test_halted_and_one_extension(self):
+        stop = {"action": "stop", "reason": "time budget used up", "at": T0 + 1200}
+        waiting = {"state": "waiting", "turns": 20, "updated": iso(T0 + 1260)}
+        partial = self.art("partial", now=T0 + 1250)
+        r = evaluate(self.meta, waiting, partial, T0 + 1300, True, [stop])
+        self.assertEqual(r["action"], ("halted", "stopped (time budget used up); report saved with Status: partial"))
+        r = evaluate(self.meta, waiting, self.art("draft", now=T0 + 900), T0 + 1300, True, [stop])
+        self.assertIn("no partial report saved (left at Status: draft)", r["action"][1])
+        halted = [stop, {"action": "halted", "at": T0 + 1300}]
+        self.assertIsNone(evaluate(self.meta, waiting, partial, T0 + 1400, True, halted)["action"])
+        # Waiting at a permission prompt is not halted.
+        self.assertIsNone(evaluate(self.meta, dict(waiting, state="permission"), partial, T0 + 1300, True, [stop])["action"])
+
+        # A paused Claude worker still says "working" (no Stop on interrupt): no reminders, and
+        # halted once its tool count has not moved since the pause; typed into again, it is working.
+        pause = {"action": "pause", "reason": "no outline", "at": T0 + 400, "tools": 9}
+        stuck = {"state": "working", "turns": 4, "tools": 9}
+        r = evaluate(self.meta, stuck, self.art(None), T0 + 800, True, [pause])
+        self.assertEqual(r["action"][0], "halted")
+        self.assertIsNone(evaluate(self.meta, dict(stuck, tools=12), self.art(None), T0 + 800, True, [pause])["action"])
+        # After a stop, no more reminders; only the pause.
+        self.assertIsNone(evaluate(self.meta, dict(stuck, tools=12), self.art(None), T0 + 1210, True, [stop])["action"])
+
+        ext = extension(self.meta, waiting, T0 + 1500, halted)
+        self.assertEqual(ext["budget"], {"seconds": 1260 + 1200, "turns": 70, "tokens": None})
+        with self.assertRaises(ContractError):
+            extension(self.meta, waiting, T0 + 1600, halted + [ext])
+        events = halted + [ext]
+        working = {"state": "working", "turns": 21}
+        self.assertIsNone(evaluate(self.meta, working, partial, T0 + 1600, True, events)["action"])
+        # The stall clock restarts at the extension (the last write was at T0 + 1250).
+        self.assertIsNone(evaluate(self.meta, working, partial, T0 + 1500 + 300, True, events)["action"])
+        self.assertEqual(evaluate(self.meta, working, partial, T0 + 2460, True, events)["action"][0], "stop")
+        self.assertEqual(evaluate(self.meta, dict(working, turns=70), partial, T0 + 1600, True, events)["action"][0], "stop")
+
+    def test_lifecycle(self):
+        at = lambda s: {"state": s, "updated": iso(T0 + 100)}
+        self.assertEqual(lifecycle({}, "alive"), "starting")
+        self.assertEqual(lifecycle(at("tool"), "alive"), "working")
+        self.assertEqual(lifecycle(at("permission"), "alive"), "needs_input")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.\nWhich file?"), "needs_input")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done."), "settled")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 120), "completed")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50), "settled")  # new turn since
+        # Claude touches state.json after its idle notification; the reply time decides.
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50, replied_at=T0 + 40), "completed")
+        self.assertEqual(lifecycle(at("waiting"), "alive", [{"action": "pause", "at": T0 + 30}], replied_at=T0 + 35), "paused")
+        pause = [{"action": "pause", "at": T0 + 95}]
+        self.assertEqual(lifecycle(dict(at("working"), tools=9), "alive", [{"action": "pause", "at": T0 + 95, "tools": 9}]), "paused")
+        self.assertEqual(lifecycle(dict(at("working"), tools=10), "alive", [{"action": "pause", "at": T0 + 95, "tools": 9}]), "working")
+        self.assertEqual(lifecycle(at("error"), "alive", pause), "paused")
+        self.assertEqual(lifecycle(at("error"), "alive"), "failed")
+        self.assertEqual(lifecycle(at("waiting"), "alive", pause + [{"action": "extend", "at": T0 + 99}]), "settled")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0"), "settled")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="1"), "failed")
+        self.assertEqual(lifecycle(at("working"), "gone"), "killed")
+        self.assertEqual(lifecycle(at("working"), "alive", escalated=True), "escalated")
+        self.assertEqual(summary_line("Answer: 3.11\n\nShall I go on?", question=True), "Shall I go on?")
+        self.assertEqual(summary_line("Answer: 3.11\n\nmore"), "Answer: 3.11")
+        self.assertTrue(is_local("mlx/mlx-community/Qwen3.5-4B-MLX-4bit"))
+        self.assertFalse(is_local("claude-sonnet-5") or is_local("openai-codex/gpt-5.5"))
+
+    def test_ledger_stop_reason(self):
+        task = self.dir / "tasks" / "research-2"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps(dict(self.meta, id="research-2")))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 3, "updated": iso(T0 + 1300)}))
+        events = [{"action": "stop", "reason": "time budget used up", "at": T0 + 1200}]
+        (task / "checkpoints.json").write_text(json.dumps({"events": events}))
+        (self.dir / "report.md").write_text("Status: draft\n")
+        self.assertEqual(ledger_row(task, T0 + 1400)["stop"], "stop: time budget used up; no partial saved")
+        (self.dir / "report.md").write_text("Status: partial\n")
+        self.assertEqual(ledger_row(task, T0 + 1400)["stop"], "stop: time budget used up; saved partial")
+        events.append({"action": "escalate", "to": "research-3", "at": T0 + 1500})
+        (task / "checkpoints.json").write_text(json.dumps({"events": events}))
+        self.assertEqual(ledger_row(task, T0 + 1600)["stop"], "escalate to research-3")
 
 
 if __name__ == "__main__":

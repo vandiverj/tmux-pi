@@ -337,16 +337,39 @@ is in `meta.json` and its terms are added to the packet's notes. The worker keep
 The dispatcher runs `tp-contract enforce` every 15 seconds while main is up. For
 a working worker whose artifact is not `final`, it:
 
-- types one reminder when the outline or the draft checkpoint is missed, or when
-  the artifact has not been written for the stall limit;
-- when the budget is used up, asks the worker to save a partial report and ask
-  whether to continue, escalate, narrow or discard, and tells main;
-- pauses the worker (Escape) if it has no outline by outline + grace, or keeps
-  working for the grace period after being asked to stop, and tells main.
+- types one reminder when the outline or the draft checkpoint is missed, when
+  the artifact has not been written for the stall limit, or after `tool_errors`
+  failed tool calls in a row (a worker that cannot reach its sources);
+- when the budget is used up, asks the worker to save its report with
+  `Status: partial` and stop, and tells main;
+- pauses the worker (Escape, then clears its input box) if it has no outline by
+  outline + grace, keeps working for the grace period after being asked to stop,
+  or keeps stalling or failing tool calls for the grace period after the reminder.
 
-Each action is recorded in the task's `checkpoints.json`; a worker waiting on you
-or on a permission is left alone. `tp-contract status` prints the detail line
-the status pane shows.
+Nothing is typed into a paused worker. Each action is recorded in the task's
+`checkpoints.json`; a worker waiting on a permission is left alone.
+
+A contract task that was stopped or paused and is no longer working is
+*halted*: main posts why, whether a partial report was saved, the worker's last
+reply and the report path, and asks what next:
+
+- **Continue**: one more budget of the original size, counted from now
+  (`tp-contract extend`); offered once per task.
+- **Narrow** (research): a new research task on a narrower question you type,
+  told to build on the partial report; the old one is closed.
+- **Escalate** (research): the same question on the `escalate` route in
+  `config/research.json` (Opus by default), building on the partial report.
+- **Discard**: close the task; its report stays.
+- **Decide later**: leave it; `+followup` or the status pane still reach it.
+
+Nothing is retried automatically, on local models or otherwise.
+
+`tp-contract status` prints each task's state and the detail line the status
+pane shows. States: `starting`, `working`, `needs_input` (a permission prompt, or
+a reply that ends in a question), `paused`, `settled` (idle, reply not yet
+handed to main), `completed` (its result was posted into main or read with
+`collect_result`), `failed`, `killed` and `escalated`. Only running tasks
+(`starting`, `working`, `needs_input`) count toward the limits below.
 
 `+research <question>` spawns a Claude Code worker (the only worker type with web
 search and fetch) on the model in `config/research.json` (Sonnet at medium
@@ -354,19 +377,28 @@ thinking by default). It is told to use primary sources, to label claims as
 source facts (with URL or path and access date), background knowledge,
 inference or hypothesis, and to write its report to
 `.tmux-pi/research/<id>.md`, which outlives `tp-clean` and `tp-exit`. Main gets
-the worker's short answer plus the report path. With more than `max_research`
-research workers or `max_active` workers running, the dispatcher asks before
-starting another. With `+review`, a reviewer on another provider checks each key
-claim against its source and classifies it as verified, report-derived,
-background knowledge or synthesis.
+the worker's short answer plus the report path. With `+review`, a reviewer on
+another provider checks each key claim against its source and classifies it as
+verified, report-derived, background knowledge or synthesis.
 
-When a research task settles, its row goes into `.tmux-pi/ledger.jsonl`: task,
-model, provider, elapsed time, turns, tokens, cost, the artifact's status and
-distinct source URLs, the checkpoint actions and why it stopped. Add your
-judgment with `tp-ledger rate <id> sources=ok|weak|missing
-cleanup=none|minor|major useful=yes|partly|no note="…"`. The ledger is the data
-for deciding whether research needs a model floor or tighter parallel limits;
-routing does not use it yet.
+Independent research runs in parallel: up to `max_frontier` (3) research
+workers on frontier models, `max_local` (1) on local models, and `max_active`
+(4) workers of any kind. Research that builds on another waits for it:
+`+research +after <id>[,<id>] <question>` says so explicitly, and otherwise, while
+research is running, the follow-up judge decides whether the question belongs to
+one of those tasks. A request that has to wait (for its inputs or for a free
+slot) goes into `.tmux-pi/research-queue.json`, main says why, and it starts on
+its own when it can, with the reports it builds on named in its notes
+(`tp-contract slot` makes the call).
+
+Contract tasks go into `.tmux-pi/ledger.jsonl` when they settle, pause, finish
+or are closed: task, model, provider, elapsed time, turns, tokens, cost, the
+artifact's status and distinct source URLs, the checkpoint actions and why it
+stopped (for example `stop: time budget used up; no partial saved`, `narrow to
+research-…` or `discard`). Add your judgment with `tp-ledger rate <id>
+sources=ok|weak|missing cleanup=none|minor|major useful=yes|partly|no
+note="…"`. The ledger is the data for deciding whether research needs a model
+floor or tighter parallel limits; routing does not use it yet.
 
 ## Calibration
 

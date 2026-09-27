@@ -8,6 +8,8 @@
  *   $TP_TASK_DIR/result.md   last assistant reply, written each time the agent settles
  *
  * States: starting -> working <-> tool -> waiting (settled, ready for input).
+ * tools counts tool calls; toolErrors counts failed tool calls in a row (reset by a
+ * success), which tp-contract reads to spot a worker that cannot reach its sources.
  * tp-spawn's run.sh records the process exit separately.
  */
 
@@ -22,6 +24,8 @@ type State = {
 	tool: string;
 	model: string;
 	turns: number;
+	tools: number;
+	toolErrors: number;
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	cost: number;
 	error: string;
@@ -66,6 +70,8 @@ export default function (pi: ExtensionAPI) {
 		tool: "",
 		model: "",
 		turns: 0,
+		tools: 0,
+		toolErrors: 0,
 		tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		cost: 0,
 		error: "",
@@ -104,11 +110,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", (event) => {
 		s.state = "tool";
 		s.tool = toolLabel(event.toolName, event.args);
+		s.tools += 1;
 		save();
 	});
-	pi.on("tool_execution_end", () => {
+	pi.on("tool_execution_end", (event) => {
 		s.state = "working";
 		s.tool = "";
+		s.toolErrors = event.isError ? s.toolErrors + 1 : 0;
 		save();
 	});
 	pi.on("message_end", (event) => {

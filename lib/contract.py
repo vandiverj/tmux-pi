@@ -4,14 +4,21 @@ A contract lives in a task's meta.json under "contract":
 
     {"kind": "research" | "task", "artifact": "/abs/path.md",
      "budget": {"seconds": 1200, "turns": 60 | null, "tokens": 400000 | null},
-     "checkpoints": {"outline": 180, "draft": 600}, "stall": 360, "grace": 180}
+     "checkpoints": {"outline": 180, "draft": 600}, "stall": 360, "grace": 180,
+     "tool_errors": 4}
 
 The worker keeps a `Status: outline|draft|final|partial` line at the top of its
 artifact. `evaluate` compares that and the artifact's last write with the clock and
-the worker's reported turns and tokens; `enforce` turns a missed checkpoint into one
-message to the worker, and a missed first checkpoint or an exceeded budget into a
-pause (Escape), each at most once. Every threshold is configuration
-(config/research.json for research), not model behavior.
+the worker's reported turns, tokens and failed tool calls; `enforce` turns a missed
+checkpoint, a stall or a run of failed tool calls into one message to the worker, and
+a missed first checkpoint, a stall or failures that go on after the reminder, or an
+exceeded budget into a pause (Escape). A stopped or paused worker that settles is
+"halted": main offers to continue (one budget extension), narrow, escalate or
+discard it. Every threshold is configuration (config/research.json for research),
+not model behavior.
+
+`lifecycle` names a task's state for the status surfaces: starting, working,
+needs_input, paused, settled, completed, failed, killed or escalated.
 """
 
 import datetime
@@ -25,6 +32,10 @@ KINDS = ("research", "task")
 STATUSES = ("outline", "draft", "final", "partial")
 STATUS_LINE = re.compile(r"^\W*status\W*:?\W*(outline|draft|final|partial)\b", re.I)
 URL = re.compile(r"https?://[^\s)>\]]+")
+# Providers served from this machine; everything else is a frontier (cloud) model.
+LOCAL_PROVIDERS = ("mlx", "slotstream")
+RUNNING = ("starting", "working", "needs_input")
+DONE = ("settled", "completed", "paused", "failed", "killed", "escalated")
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),
            "useful": ("yes", "partly", "no")}
 
@@ -62,7 +73,7 @@ def pairs(spec, name):
     return out
 
 
-def build(kind, artifact, budget, checkpoints, stall, grace):
+def build(kind, artifact, budget, checkpoints, stall, grace, tool_errors=4):
     """A validated contract; artifact must already be absolute."""
     if kind not in KINDS:
         raise ContractError("contract kind must be research or task")
@@ -79,12 +90,22 @@ def build(kind, artifact, budget, checkpoints, stall, grace):
                       "turns": quantity(budget["turns"]) if budget.get("turns") else None,
                       "tokens": quantity(budget["tokens"]) if budget.get("tokens") else None},
            "checkpoints": {k: duration(v) for k, v in checkpoints.items()},
-           "stall": duration(stall), "grace": duration(grace)}
+           "stall": duration(stall), "grace": duration(grace), "tool_errors": _count(tool_errors, "tool_errors")}
     times = [out["checkpoints"].get("outline"), out["checkpoints"].get("draft"), out["budget"]["seconds"]]
     times = [t for t in times if t]
     if times != sorted(times) or len(times) != len(set(times)):
         raise ContractError("checkpoints must come in order: outline < draft < time budget")
     return out
+
+
+def _count(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ContractError("{} must be a positive integer".format(name))
+    return value
+
+
+def is_local(model):
+    return str(model or "").split("/")[0] in LOCAL_PROVIDERS
 
 
 def load_research(path, roster=None):
@@ -97,16 +118,22 @@ def load_research(path, roster=None):
     except (OSError, ValueError) as exc:
         raise ContractError("cannot read research config: {}".format(exc)) from exc
     config = {k: v for k, v in config.items() if not k.startswith("_")}
-    keys = {"worker", "model", "thinking", "budget", "checkpoints", "stall", "grace", "max_research", "max_active"}
+    keys = {"worker", "model", "thinking", "escalate", "budget", "checkpoints", "stall", "grace", "tool_errors",
+            "max_frontier", "max_local", "max_active"}
     if set(config) != keys:
         raise ContractError("research config needs exactly {}".format(", ".join(sorted(keys))))
-    build("research", "/x", config["budget"], config["checkpoints"], config["stall"], config["grace"])
-    for key in ("max_research", "max_active"):
-        if isinstance(config[key], bool) or not isinstance(config[key], int) or config[key] < 1:
-            raise ContractError("{} must be a positive integer".format(key))
-    if roster is not None and not any(item["worker"] == config["worker"] and item["model"] == config["model"] and
-                                      config["thinking"] in item["thinking"] for item in roster):
-        raise ContractError("research worker, model and thinking must match the router roster")
+    build("research", "/x", config["budget"], config["checkpoints"], config["stall"], config["grace"],
+          config["tool_errors"])
+    for key in ("max_frontier", "max_local", "max_active"):
+        _count(config[key], key)
+    escalate = config["escalate"]
+    if not isinstance(escalate, dict) or set(escalate) != {"worker", "model", "thinking"}:
+        raise ContractError("escalate needs worker, model and thinking")
+    for route in (config, escalate):
+        if roster is not None and not any(item["worker"] == route["worker"] and item["model"] == route["model"] and
+                                          route["thinking"] in item["thinking"] for item in roster):
+            raise ContractError("research worker, model and thinking ({}) must match the router roster".format(
+                route["model"]))
     return config
 
 
@@ -181,26 +208,40 @@ def _epoch(stamp):
 def evaluate(meta, state, art, now, alive, events=()):
     """Checkpoint state and the one action due now (or None) for a task with a contract.
 
-    Actions: nudge-outline, nudge-draft, nudge-stall, stop (budget reached: ask the
-    worker to save and ask), pause (Escape: first checkpoint missed after grace, or
-    still working after the stop message plus grace). An action is due only while the
-    worker is working and only once (events holds the ones already taken).
+    Actions while the worker is working: nudge-outline, nudge-draft, nudge-stall,
+    nudge-errors (one reminder each), stop (budget reached: ask the worker to save and
+    ask), pause (Escape: first checkpoint missed by the grace period; still working the
+    grace period after the stop message, a stall reminder or a failed-tools reminder).
+    Once stopped or paused and no longer working: halted, for main to offer what next.
+    Nothing is typed into a paused worker, and nothing but the pause after a stop. A
+    Claude worker reports no Stop when interrupted, so a paused worker whose tool count
+    has not moved since the pause counts as not working.
+    Each is taken once (events holds the ones already taken); an `extend` event (main's
+    "continue") replaces the budget and lets stop, pause and halted happen again.
     """
     c = meta["contract"]
+    events = [e if isinstance(e, dict) else {"action": e, "at": 0} for e in events]
+    extends = [e for e in events if e["action"] == "extend"]
+    since_extend = events[events.index(extends[-1]) + 1:] if extends else events
     created = _epoch(meta.get("created")) or now
+    pause = next((e for e in reversed(since_extend) if e["action"] == "pause"), None)
+    # A Claude worker reports no Stop when interrupted: paused and idle if its tool count has not moved.
+    idle = bool(pause) and "tools" in pause and state.get("state") in ("working", "tool") and \
+        (state.get("tools") or 0) <= pause["tools"]
     settled = not alive or state.get("state") in ("waiting", "error")
-    end = (_epoch(state.get("updated")) or now) if settled else now
+    end = pause["at"] if idle else (_epoch(state.get("updated")) or now) if settled else now
     elapsed = max(0, end - created)
     turns = state.get("turns") or 0
     tokens = sum((state.get("tokens") or {}).get(k, 0) for k in ("input", "output", "cacheRead", "cacheWrite"))
-    b, cp = c["budget"], c["checkpoints"]
+    b, cp = (extends[-1]["budget"] if extends else c["budget"]), c["checkpoints"]
     status = art["status"] if art["exists"] else None
     has_outline = art["exists"]
     has_draft = status in ("draft", "final", "partial")
     over = [what for what, hit in (("time", elapsed >= b["seconds"]),
                                    ("turns", bool(b["turns"]) and turns >= b["turns"]),
                                    ("tokens", bool(b["tokens"]) and tokens >= b["tokens"])) if hit]
-    write_age = now - art["mtime"] if art["mtime"] else None
+    # The stall clock restarts at main's "continue".
+    write_age = now - max(art["mtime"], extends[-1]["at"] if extends else 0) if art["mtime"] else None
 
     if status == "final":
         phase = "final"
@@ -220,29 +261,108 @@ def evaluate(meta, state, art, now, alive, events=()):
         phase = "limit in {}".format(_clock(b["seconds"] - elapsed))
 
     action = None
-    working = alive and state.get("state") in ("working", "tool")
-    taken = {e["action"] if isinstance(e, dict) else e for e in events}
-    if working and status != "final":
-        if over and "stop" not in taken:
+    working = alive and state.get("state") in ("working", "tool") and not idle
+    taken = {e["action"] for e in events}
+    recent = {e["action"] for e in since_extend}
+    errors, error_limit = state.get("toolErrors") or 0, c.get("tool_errors", 4)
+    stall_key = "nudge-stall@{}".format(int(art["mtime"])) if art["mtime"] else None
+    if working and status != "final" and "pause" not in recent:
+        if over and "stop" not in recent:
             action = ("stop", "{} budget used up".format(" and ".join(over)))
-        elif over and "pause" not in taken and _since(events, "stop", now) >= c["grace"]:
+        elif over and "pause" not in recent and _since(since_extend, "stop", now) >= c["grace"]:
             action = ("pause", "still working {} after the stop message".format(_clock(c["grace"])))
         elif "outline" in cp and not has_outline and elapsed >= cp["outline"] + c["grace"] and "pause" not in taken:
             action = ("pause", "no outline in {} after its checkpoint".format(_clock(elapsed - cp["outline"])))
+        elif errors >= error_limit and "nudge-errors" in recent and "pause" not in recent and \
+                _since(since_extend, "nudge-errors", now) >= c["grace"]:
+            action = ("pause", "{} failed tool calls in a row after a reminder".format(errors))
+        elif stall_key in recent and "pause" not in recent and write_age >= c["stall"] + c["grace"] and \
+                _since(since_extend, stall_key, now) >= c["grace"]:
+            action = ("pause", "no new writes for {} after a reminder".format(_clock(write_age)))
+        elif "stop" in recent:
+            pass
+        elif errors >= error_limit and "nudge-errors" not in recent:
+            action = ("nudge-errors", "{} failed tool calls in a row".format(errors))
         elif "outline" in cp and not has_outline and elapsed >= cp["outline"] and "nudge-outline" not in taken:
             action = ("nudge-outline", "outline checkpoint reached with nothing written")
         elif "draft" in cp and not has_draft and elapsed >= cp["draft"] and "nudge-draft" not in taken:
             action = ("nudge-draft", "draft checkpoint reached")
-        elif has_outline and write_age is not None and write_age >= c["stall"] and \
-                "nudge-stall@{}".format(int(art["mtime"])) not in taken:
-            action = ("nudge-stall@{}".format(int(art["mtime"])), "no new writes for {}".format(_clock(write_age)))
+        elif has_outline and write_age is not None and write_age >= c["stall"] and stall_key not in taken:
+            action = (stall_key, "no new writes for {}".format(_clock(write_age)))
+    elif alive and not working and state.get("state") != "permission" and "halted" not in recent:
+        why = next((e for e in reversed(since_extend) if e["action"] in ("stop", "pause")), None)
+        if why:
+            saved = status in ("partial", "final")
+            action = ("halted", "{} ({}); {}".format(
+                "paused" if why["action"] == "pause" else "stopped", why.get("reason", ""),
+                "report saved with Status: {}".format(status) if saved else
+                "no partial report saved ({})".format("left at Status: {}".format(status) if status else
+                                                      "file has no status line" if art["exists"] else "nothing written")))
     return {"elapsed": elapsed, "turns": turns, "tokens": tokens, "status": status, "phase": phase,
-            "write_age": write_age, "over": over, "action": action}
+            "write_age": write_age, "over": over, "action": action, "budget": b}
 
 
 def _since(events, action, now):
     times = [e.get("at", 0) for e in events if isinstance(e, dict) and e.get("action") == action]
     return now - max(times) if times else -1
+
+
+def extension(meta, state, now, events):
+    """main's "continue": a new budget of the original size, counted from now. Once per task."""
+    c = meta["contract"]
+    if any(e.get("action") == "extend" for e in events):
+        raise ContractError("{} was already given more budget once; narrow, escalate or discard it".format(meta.get("id")))
+    r = evaluate(meta, state, {"exists": False, "size": 0, "mtime": None, "status": None, "urls": 0}, now, False, events)
+    b = c["budget"]
+    return {"action": "extend", "at": now,
+            "budget": {"seconds": int(max(r["elapsed"], 0) + b["seconds"]),
+                       "turns": r["turns"] + b["turns"] if b["turns"] else None,
+                       "tokens": r["tokens"] + b["tokens"] if b["tokens"] else None}}
+
+
+def lifecycle(state, pane, events=(), reply="", completed_at=None, exit_code=None, escalated=False, replied_at=None):
+    """A task's state for people: starting, working, needs_input, paused, settled, completed,
+    failed, killed or escalated. pane is "alive", "dead" (process exited) or "gone".
+    replied_at is when the last reply was written (result.md): state.json can be touched
+    later (Claude's idle notification), so paused and completed compare against the reply."""
+    if escalated:
+        return "escalated"
+    if pane == "gone":
+        return "killed"
+    updated = _epoch(state.get("updated")) or 0
+    if pane == "dead":
+        return "failed" if str(exit_code) != "0" else "completed" if completed_at else "settled"
+    s = state.get("state")
+    events = [e for e in events if isinstance(e, dict)]
+    pause = next((e for e in reversed(events) if e.get("action") in ("pause", "extend")), None)
+    pause = pause if pause and pause["action"] == "pause" else None
+    # An interrupted Claude worker still says "working"; its tool count has not moved.
+    if pause and s in ("working", "tool") and "tools" in pause and (state.get("tools") or 0) <= pause["tools"]:
+        return "paused"
+    if s in (None, "starting"):
+        return "starting"
+    if s in ("working", "tool"):
+        return "working"
+    if s == "permission":
+        return "needs_input"
+    replied = replied_at or updated
+    if pause and replied <= pause.get("at", 0) + 30:
+        return "paused"
+    if s == "error":
+        return "failed"
+    if reply.rstrip().endswith("?"):
+        return "needs_input"
+    if completed_at and completed_at >= replied - 1:
+        return "completed"
+    return "settled"
+
+
+def summary_line(reply, question=False):
+    """One line of a reply: its question when it asks one, else its first line."""
+    lines = [l.strip() for l in reply.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    return lines[-1] if question else lines[0]
 
 
 def message(action, contract):
@@ -277,9 +397,15 @@ def ledger_row(task_dir, now):
     tokens = state.get("tokens") or {}
     model = state.get("model") or meta.get("model") or ""
     task = (d / "task.md").read_text().strip() if (d / "task.md").exists() else ""
-    stop = "escalated" if (d / "escalated").exists() else next(
-        (e["action"] + ": " + e.get("reason", "") for e in reversed(events) if e["action"] in ("pause", "stop")),
-        "exit {}".format((d / "exit").read_text().strip()) if (d / "exit").exists() else state.get("state", "starting"))
+    decided = next((e for e in reversed(events) if e["action"] in ("discard", "narrow", "escalate")), None)
+    halted = next((e for e in reversed(events) if e["action"] in ("pause", "stop")), None)
+    stop = "escalated" if (d / "escalated").exists() else \
+        "{}{}".format(decided["action"], " to " + decided["to"] if decided.get("to") else "") if decided else \
+        "exit {}".format((d / "exit").read_text().strip()) if (d / "exit").exists() and not halted else \
+        state.get("state", "starting") if not halted else \
+        "{}: {}; {}".format(halted["action"], halted.get("reason", ""),
+                            "saved {}".format(art["status"]) if art and art["status"] in ("partial", "final")
+                            else "no partial saved")
     return {"id": meta.get("id", d.name), "kind": contract["kind"] if contract else "task",
             "task": task.splitlines()[0][:200] if task else "", "worker": meta.get("worker"),
             "model": model, "thinking": meta.get("thinking"),

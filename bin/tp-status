@@ -10,8 +10,12 @@
 #        c            archive killed subagents (tp-clean)
 #
 # Refreshes every second from each task's state.json (written by the reporters)
-# and its pane. Under each row: elapsed time, turns, and for a contract (M9) its
-# checkpoint state and when its artifact was last written (bin/tp-contract status). Started by tp in the status slot; runs until the session ends.
+# and its pane. States (bin/tp-contract status): starting, working, needs_input,
+# paused, settled (a reply is ready), completed (handed off), failed, killed,
+# escalated. Under each row: elapsed time, turns, tool calls, for a contract (M9)
+# its checkpoint state and when its artifact was last written, and for settled work
+# the first line of its reply (or its question). Started by tp in the status slot;
+# runs until the session ends.
 set -o pipefail   # no -u: bash 3.2 treats empty arrays as unbound
 
 src="${BASH_SOURCE[0]}"
@@ -39,11 +43,11 @@ trap 'printf "%s[?25h%s[0m" "$esc" "$esc"' EXIT
 
 color_for() {
   case "$1" in
-    waiting|done) echo "$green" ;;
+    settled|waiting|done) echo "$green" ;;
     working|tool|starting) echo "$yellow" ;;
-    permission) echo "$magenta" ;;
+    needs_input|permission|paused) echo "$magenta" ;;
     failed*|error) echo "$red" ;;
-    killed) echo "$dim" ;;
+    killed|completed|escalated) echo "$dim" ;;
     *) echo "" ;;
   esac
 }
@@ -55,7 +59,7 @@ clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-
 pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
 
 render() {
-  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail
+  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life
   cols="$(tput cols)"
   rows="$(tp_rows "$session")"
   details=""
@@ -78,12 +82,14 @@ render() {
   else
     i=0
     while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
+      life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
+      if [[ -n "$life" ]]; then status="$life"; fi
       if [[ "$id" == "$current" ]]; then line="▸ "; else line="  "; fi
-      line+="$(pad 20 "$id")$(pad 7 "$worker")$(pad 11 "$status")$(pad 15 "$tokens")$(pad 8 "$cost")$model"
+      line+="$(pad 20 "$id")$(pad 7 "$worker")$(pad 12 "$status")$(pad 15 "$tokens")$(pad 8 "$cost")$model"
       c="$(color_for "$status")"
       if (( i == sel_index )); then c+="$rev"; fi
       out+="${c}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-      detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
+      detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
       if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
       if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; fi
       i=$((i + 1))
@@ -167,7 +173,10 @@ while true; do
         if [[ -z "$message" ]]; then tmux select-pane -t "$(tp_meta "$tasks/$selected" pane)"; fi
       fi ;;
     -) run "$ROOT/bin/tp-view" - ;;
-    r) if [[ -n "$selected" ]]; then popup result.md; fi ;;
+    r) if [[ -n "$selected" ]]; then
+         popup result.md
+         "$ROOT/bin/tp-contract" collect "$selected" >/dev/null 2>&1   # read here = handed off
+       fi ;;
     t) if [[ -n "$selected" ]]; then
          # Tasks spawned before M4 have no packet.
          if [[ -f "$tasks/$selected/packet.md" ]]; then popup packet.md; else popup task.md; fi

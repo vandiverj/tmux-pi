@@ -1,8 +1,13 @@
 {
-  "_comment": "The +research route (M9). Research workers run on Claude Code, the only harness here with web search and fetch; the model is a smaller frontier one, per the plan's external-research floor. budget, checkpoints, stall and grace are the contract defaults (tp-contract); max_research and max_active are the concurrency limits above which the dispatcher asks before starting another research worker.",
+  "_comment": "The +research route (M9). Research workers run on Claude Code, the only harness here with web search and fetch; the model is a smaller frontier one, per the plan's external-research floor. escalate is the stronger route main offers when a research worker stops short. budget, checkpoints, stall, grace and tool_errors (failed tool calls in a row before a reminder) are the contract defaults (tp-contract). Research workers run in parallel up to max_frontier on cloud models and max_local on local ones, and while fewer than max_active workers of any kind are running; further research, and research that builds on a running task, waits in main's queue.",
   "worker": "claude",
   "model": "claude-sonnet-5",
   "thinking": "medium",
+  "escalate": {
+    "worker": "claude",
+    "model": "claude-opus-5-5",
+    "thinking": "medium"
+  },
   "budget": {
     "time": "20m",
     "turns": 80
@@ -13,6 +18,8 @@
   },
   "stall": "6m",
   "grace": "3m",
-  "max_research": 3,
+  "tool_errors": 4,
+  "max_frontier": 3,
+  "max_local": 1,
   "max_active": 4
 }

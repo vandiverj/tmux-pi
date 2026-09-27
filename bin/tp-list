@@ -3,8 +3,10 @@
 #
 # Usage: tp-list
 #
-# ▸ marks the subagent shown in the viewer slot. The current tool, if any, is
-# shown on the line below.
+# ▸ marks the subagent shown in the viewer slot. States: starting, working,
+# needs_input, paused, settled, completed, failed, killed, escalated. The line below
+# shows elapsed time, turns and tool calls, contract checkpoints, the current tool,
+# and for settled work the first line of its reply (bin/tp-contract status).
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -21,11 +23,16 @@ current="$(tp_opt "$session" @tp_viewing)"
 
 rows="$(tp_rows "$session")"
 if [[ -z "$rows" ]]; then echo "  no subagents"; exit 0; fi
+details="$("$ROOT/bin/tp-contract" status 2>/dev/null || true)"
 while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
+  life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
+  detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
+  if [[ -n "$life" ]]; then status="$life"; fi
+  if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
   mark=" "; if [[ "$id" == "$current" ]]; then mark="▸"; fi
   # Pad by characters, not bytes (▸ ↑ ↓ are multibyte).
   printf '%s %s%*s%s%*s%s%*s%s%*s%s%*s%s\n' "$mark" \
-    "$id" $((22 - ${#id})) "" "$worker" $((8 - ${#worker})) "" "$status" $((11 - ${#status})) "" \
+    "$id" $((22 - ${#id})) "" "$worker" $((8 - ${#worker})) "" "$status" $((12 - ${#status})) "" \
     "$tokens" $((16 - ${#tokens})) "" "$cost" $((8 - ${#cost})) "" "$model"
-  if [[ -n "$tool" ]]; then printf '    %s\n' "$tool"; fi
+  if [[ -n "$detail" ]]; then printf '    %s\n' "$detail"; fi
 done <<<"$rows"

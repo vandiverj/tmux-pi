@@ -2,7 +2,8 @@
 # report.sh — Claude Code hook that writes a tmux-pi subagent's live state.
 #
 # Same files as the pi reporter extension (agent/extensions/reporter.ts):
-#   $TP_TASK_DIR/state.json  state, current tool, turns, tokens, model
+#   $TP_TASK_DIR/state.json  state, current tool, turns, tool calls, failed tool
+#                            calls in a row (toolErrors), tokens, model
 #   $TP_TASK_DIR/result.md   last assistant reply, written on Stop
 #
 # Does nothing outside a tp-spawn worker (no TP_TASK_DIR). Never fails the hook:
@@ -50,13 +51,16 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   --arg id "${TP_TASK_ID:-}" --arg now "$now" '
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
-  { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0,
+  { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0, tools: 0, toolErrors: 0,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, error: "" }
   + $prev
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then { state: "working", error: "" }
-      elif $in.hook_event_name == "PreToolUse" then { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip) }
-      elif $in.hook_event_name == "PostToolUse" or $in.hook_event_name == "PostToolUseFailure" then { state: "working", tool: "" }
+      elif $in.hook_event_name == "PreToolUse" then
+        { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
+      elif $in.hook_event_name == "PostToolUse" then { state: "working", tool: "", toolErrors: 0 }
+      elif $in.hook_event_name == "PostToolUseFailure" then
+        { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) }
       elif $in.hook_event_name == "Notification" then
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
       elif $in.hook_event_name == "Stop" then { state: "waiting", tool: "" }

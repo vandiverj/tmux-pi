@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Train and measure tmux-pi's learned route and review layer against labeled tasks.
+
+By default this scores the current model (config/laya-model.json) against the
+recorded Laya replies and never contacts Laya. --record asks Laya about tasks
+with no current reply (new, edited, or recorded with different questions);
+--refresh asks about every task. --fit retrains the model on the tune split
+(needs numpy) and writes it before scoring.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from calibration import evaluate, fit, is_current, load_answers, load_corpus, report, save_answers  # noqa: E402
+from router import RouterError, classify_laya, load_config, load_model, questions_digest  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--corpus", default=str(ROOT / "tests/calibration/corpus.jsonl"))
+    parser.add_argument("--answers", default=str(ROOT / "tests/calibration/answers.jsonl"))
+    parser.add_argument("--config", default=str(ROOT / "config/router.json"))
+    parser.add_argument("--base-url", default=os.environ.get("TP_ROUTER_BASE_URL"))
+    parser.add_argument("--record", action="store_true", help="ask Laya about tasks without a current answer")
+    parser.add_argument("--refresh", action="store_true", help="ask Laya about every task again")
+    parser.add_argument("--fit", action="store_true", help="retrain the model on the tune split and save it")
+    parser.add_argument("--mismatches", action="store_true", help="list every task the model gets wrong")
+    args = parser.parse_args()
+    try:
+        corpus = load_corpus(args.corpus)
+        answers = load_answers(args.answers)
+        config_path = Path(args.config)
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        model_path = config_path.parent / config["laya_model"]
+        if args.record or args.refresh:
+            laya = {"laya": config["laya"], "timeout_seconds": config["timeout_seconds"]}
+            todo = [row for row in corpus if args.refresh or not is_current(row, answers)]
+            for number, row in enumerate(todo, 1):
+                print("[{}/{}] {}".format(number, len(todo), row["id"]), file=sys.stderr)
+                answers[row["id"]] = {"task": row["task"], "questions": questions_digest(),
+                                      "reply": classify_laya(row["task"], laya, args.base_url)}
+                save_answers(args.answers, corpus, answers)
+        if args.fit:
+            stale = [row["id"] for row in corpus if not is_current(row, answers)]
+            if stale:
+                raise RouterError("{} tasks have no current Laya answer; run --record first".format(len(stale)))
+            model = fit(corpus, answers)
+            model_path.write_text(json.dumps(model, indent=1) + "\n", encoding="utf-8")
+            print("wrote {} (trained on {} tasks; lambdas: {})".format(
+                model_path.relative_to(ROOT) if model_path.is_relative_to(ROOT) else model_path, model["trained_on"],
+                ", ".join("{} {}".format(h, model[h]["lambda"]) for h in ("route", "intent", "gate", "level"))),
+                file=sys.stderr)
+        load_config(config_path)
+        print(report(*evaluate(corpus, answers, load_model(model_path)), show_mismatches=args.mismatches))
+        return 0
+    except (RouterError, OSError, ValueError, KeyError) as exc:
+        print("tp-calibrate: {}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

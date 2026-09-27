@@ -8,3 +8,4 @@ agent/sessions/
 agent/npm/
 agent/bin/
 agent/models-store.json
+__pycache__/

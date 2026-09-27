@@ -107,11 +107,14 @@ See [docs/plan.md](docs/plan.md) for the design and milestones.
 ## Local model router
 
 `bin/tp-route` uses Laya's `typed-decisions` checkpoint at
-`127.0.0.1:11436/v1/systemone` by default. It asks five bounded questions:
-difficulty on a four-level scale, plus tool need, private-context need,
-sensitivity, and risk as yes/no probabilities. A deterministic policy in
-[`config/router.json`](config/router.json) maps those answers to an allowed
-`tp-spawn` target. The output is exactly `worker`, `model`, and `thinking`;
+`127.0.0.1:11436/v1/systemone` by default. It asks six bounded questions: the
+task's intent (a six-way choice), difficulty on a four-level scale, and as
+yes/no probabilities whether it needs tools, is sensitive, is high-risk, and
+changes files, systems or data. A small learned layer,
+[`config/laya-model.json`](config/laya-model.json), reads all of Laya's
+probabilities and picks a route from
+[`config/router.json`](config/router.json), whose target must be in the allowed
+`tp-spawn` roster. The output is exactly `worker`, `model`, and `thinking`;
 classification alone never spawns a worker.
 
 Bootstrap once when `.laya/src` and `.laya/venv` are absent:
@@ -145,16 +148,15 @@ bin/tp-laya stop                 # stops only a process started by tp-laya
 An independently started Laya service can be used on the same endpoint.
 `tp-laya stop` leaves such a service alone; stop it with its own process manager.
 
-The policy is a deterministic ladder. Difficulty below 1.25 reaches
-Slotstream/off when no tools or private context are needed, otherwise
-Slotstream/low; 1.25–2.24 uses GPT-5.6 Terra/medium; 2.25–2.74 uses
-GPT-6 Sol/high; and 2.75+ uses Claude Opus/high. Sensitive work, or lower-
-difficulty high-risk work, also uses Opus/high; complex high-risk work is
-expert. Uncertain yes/no answers (0.35–0.65) or an inconsistent but numeric
-probability distribution use Claude Sonnet/medium. Laya's
-`typed-decisions` score-temperature warning leaves difficulty confidence
-uncalibrated, so its confidence is validated but deliberately does not gate a
-route. Risk escalation wins over the uncertainty fallback.
+The routes are `simple` (Slotstream/off), `standard` (Slotstream/low),
+`coding` (GPT-5.6 Terra/medium), `complex` (GPT-6 Sol/high) and `expert`
+(Claude Opus/high, also used for sensitive or risky work). The learned layer is
+multinomial logistic regression over Laya's answer probabilities, trained on
+labeled tasks (see [Calibration](#calibration)); inference is plain Python.
+Laya's answers carry limited information about how hard a task is: the route
+matches the labeled tier for about 55% of held-out tasks and the labeled model
+for about 66%, and it sends about 22% of tasks to a cheaper tier than labeled.
+Pass an explicit model to `spawn_subagent` or `tp-spawn` when that matters.
 
 The roster also permits Claude Haiku/Sonnet/Opus, GPT-5.3 Codex Spark,
 GPT-5.5, GPT-5.6 Luna/Terra/Sol, and GPT-6 Luna/Sol/Astra for deliberate
@@ -165,8 +167,7 @@ Sol ($4/$20) form the cost ladder; within 6, Luna ($0.10/$0.50), Sol ($2/$10),
 and Astra ($10/$50) do likewise. Terra is the current coding tier and Sol the
 current complex tier; the more expensive or less suitable entries are allowed
 but not selected automatically. There is no GPT-6 Terra entry in the installed
-provider data. These thresholds are conservative heuristics, not calibrated
-for tmux-pi's coding task mix; review them before automated spawning.
+provider data.
 
 The `models` array is the allowed spawn roster; `routes` must point into it.
 It lists eligible targets, not a guarantee that those providers are available.
@@ -185,22 +186,53 @@ returns `APPROVED` or actionable `REQUEST_CHANGES`. Review linkage is recorded
 in the author task's `meta.json`; use `collect_result` on the printed review id.
 
 Before starting a reviewer, `tp-review` asks the review policy about the author's
-task (`bin/tp-route --review --file task.md`). Laya answers a `task_intent` choice
-(research, planning, implementation, configuration_or_operations, review,
-communication_or_documentation) alongside the routing traits, and a
-deterministic rule turns them into `none`, `optional` or `required`:
+task (`bin/tp-route --review --file task.md`), which returns `none`, `optional`
+or `required` from the same Laya answers:
 
-- research: none (it changes nothing), whatever the other answers
-- sensitive or high-risk (≥ 0.35): required
-- implementation or configuration/operations: required
-- planning: required when complex (difficulty ≥ 2.25) or uncertain, else optional
-- anything else: optional when uncertain, else none
+- research is never reviewed (it changes nothing); the learned layer reads the
+  intent from all of Laya's answers, which is more accurate than Laya's own
+  intent choice (0.78 against 0.74 on held-out tasks)
+- implementation and configuration/operations work, and anything Laya calls
+  sensitive (≥ 0.5), is always reviewed
+- otherwise a learned review/no-review classifier decides
+- a reviewed task is `required` unless a second classifier is confident it is
+  only `optional`
+
+On held-out tasks this never skipped a review labeled required, decided
+review-or-not correctly for 92%, and ran 6 reviews in 120 that were not needed.
 
 On `none`, `tp-review` starts nothing and exits 3. `tp-review --force <id>` (or
 `review_subagent` with `force`) reviews regardless; if Laya is unreachable the
 review runs anyway. The level used is recorded as `review_policy` in the author's
 `meta.json`. Reviews still start only when asked; nothing hands off to review
-automatically until the thresholds are calibrated.
+automatically yet.
+
+## Calibration
+
+`tests/calibration/corpus.jsonl` holds 300 labeled tasks: for each, the
+intent, route and review level it *should* get, following
+[`LABELS.md`](tests/calibration/LABELS.md), and a split. The learned layer is
+trained on the 180 `tune` tasks only; the 120 `holdout` tasks measure it.
+`tests/calibration/answers.jsonl` records Laya's replies (typed-decisions is
+deterministic, so a recording is a stable baseline), tagged with a digest of
+the questions asked. `bin/tp-calibrate` scores the model per split without
+contacting Laya:
+
+```sh
+bin/tp-calibrate               # score the model offline
+bin/tp-calibrate --mismatches  # also list every wrong decision
+bin/tp-calibrate --record      # ask Laya about new or edited tasks
+bin/tp-calibrate --refresh     # ask Laya about every task again (e.g. after upgrading it)
+bin/tp-calibrate --fit         # retrain config/laya-model.json (needs numpy)
+```
+
+Changing `QUESTIONS` in `lib/router.py` invalidates the recording and the model:
+run `--record --fit`. Every change tried so far, with its tune and holdout
+scores and whether it was kept, is in
+[`experiments.md`](tests/calibration/experiments.md); check it before trying
+another. The tests fail if a task has no current recorded answer, if the model
+skips a review labeled required, or if `--fit` would not reproduce the shipped
+model.
 
 The previous Slotstream OpenAI-compatible chat classifier remains available
 only by explicit selection:

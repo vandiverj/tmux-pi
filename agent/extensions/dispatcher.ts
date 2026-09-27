@@ -13,6 +13,8 @@
  *   placement subagent spawn the routed worker directly with the packet core (the
  *                      verbatim request, the conversation since the last delegation,
  *                      ask-if-unclear and report-back instructions); main takes no turn.
+ *                      Models in local packet_files also get up to 3 files a Claude
+ *                      model picked (`tp-route --pick-files`).
  *   review required    when the author settles, a cross-provider reviewer starts; one
  *                      REQUEST_CHANGES round goes back to the author automatically.
  *   Laya unavailable   change nothing; status "AUTO off: Laya unavailable".
@@ -345,6 +347,12 @@ export default function (pi: ExtensionAPI) {
 			args.push("--note", ASK_IF_UNCLEAR);
 			if (!foreground) args.push("--note", REPORT_BACK);
 			if (decision.review === "required") args.push("--note", "A reviewer on another provider will check this work when you report.");
+			// Models that explore poorly (local packet_files) get files a Claude model picked for the task.
+			// If picking fails the worker starts with the core packet and finds files itself.
+			if (!foreground) {
+				const picked = await run(bin("tp-route"), ["--pick-files", dirname(await stateDir()), "--model", decision.model], decision.task, 150_000);
+				if (picked.code === 0) for (const spec of picked.stdout.split("\n").filter(Boolean)) args.push("--context", spec);
+			}
 			return (await must(bin("tp-spawn"), args, decision.task, 60_000)).split("\n")[0];
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });

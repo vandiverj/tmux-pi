@@ -181,3 +181,34 @@ unrelated second task), context-free replies such as "yes go ahead" claim both,
 so the leading task must be at least 0.15 ahead of the next: 39 right, 0 wrong,
 17 asked, of 56.
 
+
+## Packet file selection (M8, 2026-09-27)
+
+Should a worker's packet include files picked for the task, and who should pick?
+30 chores on a snapshot of this repo that do not say where the answer is (24
+questions checked by answer regex, 6 edits checked by a command). Each worker
+got a tp-spawn-style packet (the task, then up to 3 picked files, each cut to
+16,000 characters) and a grep/read/find/bash/edit tool loop in a fresh copy.
+The picker saw the task and the file list with sizes, and answered with paths.
+
+| picker | picked the needed file | time per pick |
+|---|---|---|
+| Qwen3.5-4B, file list only | 18/30 | ~0.5 s |
+| Qwen3.5-4B, list with one-line descriptions | 17/30 | ~0.5 s |
+| Qwen3.5-4B, descriptions + a grep of the task's key terms | 20/30 | ~0.5 s |
+| Haiku 4.5 (`claude -p`, no tools) | 24/30 | 7.4 s median |
+| **Sonnet 5 (`claude -p`, no tools)** | **26/30** | **~1.9 s** |
+
+| worker | packet | passed | read / edit | median | tool calls | prompt tokens |
+|---|---|---|---|---|---|---|
+| Qwen3.5-4B (2 runs) | core only | 44/60 | 36/48, 8/12 | 33.2 s | 5.9 | 31.6k |
+| Qwen3.5-4B (2 runs) | + Qwen-picked files | 50/60 | — | 30.8 s | 4.3 | 69.9k |
+| Qwen3.5-4B (2 runs) | **+ Sonnet-picked files** | **53/60** | **44/48, 9/12** | **27.8 s** | **3.2** | 50.4k |
+| Slotstream (1 run) | core only | 28/30 | — | 101 s | 6.7 | 42.7k |
+| Slotstream (1 run) | + picked files (either) | 28/30 | — | 101–113 s | ~4.2 | 55–57k |
+
+On the chores where Sonnet picked the needed file, Qwen went from 39/52 to 49/52.
+Kept: picked files for Qwen3.5-4B only (`packet_files` in `config/local.json`),
+picked by Sonnet 5; Slotstream and stronger workers get the core only, since
+they find files themselves at no loss. The plan assumed the local model would
+pick well from its locate-chore results; with only a file list it does not.

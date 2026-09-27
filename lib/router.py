@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -105,7 +107,7 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files"}
 
 
 def load_local(path, config):
@@ -190,6 +192,16 @@ def load_local(path, config):
         if not isinstance(band, list) or len(band) != 2 or \
                 not 0 <= _number(band[0], "ask_between[0]") < _number(band[1], "ask_between[1]") <= 1:
             raise RouterError("followup ask_between must be [low, high] with 0 <= low < high <= 1")
+    packet_files = local.get("packet_files")
+    if packet_files is not None:
+        if not isinstance(packet_files, dict) or set(packet_files) != {"models", "selector"}:
+            raise RouterError("packet_files needs exactly models and selector")
+        if not isinstance(packet_files["models"], list) or not packet_files["models"] or \
+                any(model not in roster for model in packet_files["models"]):
+            raise RouterError("packet_files models must be a nonempty list of roster models")
+        selector = packet_files["selector"]
+        if not isinstance(selector, str) or not re.fullmatch(r"claude-[a-z0-9.-]+", selector):
+            raise RouterError("packet_files selector must be a Claude model id")
     return local
 
 
@@ -660,3 +672,81 @@ def follow_up(message, tasks, config, opener=None):
     if best >= high and rival <= best - FOLLOW_UP_MARGIN:
         return {"target": ranked[0], "ask": []}
     return {"target": None, "ask": [key for key in ranked if judged[key][0] > judged[key][1][0]]}
+
+
+# Packet files for workers that explore poorly (M8). A Claude model picks files from the
+# workdir's file list; the worker gets them in its packet (tp-spawn -c). On 30 chores that
+# do not name their files, Qwen3.5-4B went from 44/60 to 53/60 with Sonnet-picked files;
+# Slotstream was unchanged (28/30). Picks by the local model were right less often
+# (18-20/30 against 26/30). See tests/calibration/experiments.md.
+PICK_PROMPT = ("A worker agent will do the task below in this repository. Choose the files it should be given up front: "
+               "at most {n}, the ones most likely to contain what the task needs. Reply with only the paths, one per line."
+               "\n\nTask: {task}\n\nFiles:\n{files}")
+MAX_PICKED_FILES = 3
+MAX_PICKED_CHARS = 16000
+MAX_LISTED_FILES = 1500
+SKIPPED_DIRS = {".git", ".tmux-pi", "node_modules", ".venv", "venv", "__pycache__", "dist", "build"}
+# The same names bin/tp-spawn refuses as credentials.
+SECRET_NAMES = re.compile(r"^(\.env|\.env\..*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_rsa.*|id_ed25519.*|id_ecdsa.*|"
+                          r"\.netrc|\.npmrc|\.pypirc|auth\.json|credentials.*|.*secret.*)$")
+
+
+def workdir_files(workdir, runner=subprocess.run):
+    """Text-candidate files in a workdir: git's tracked and untracked-not-ignored files, else a walk."""
+    r = runner(["git", "-C", workdir, "ls-files", "-co", "--exclude-standard"], capture_output=True, text=True, timeout=20)
+    if r.returncode == 0:
+        paths = r.stdout.splitlines()
+    else:
+        paths = []
+        for root, dirs, names in os.walk(workdir):
+            dirs[:] = sorted(d for d in dirs if d not in SKIPPED_DIRS)
+            paths += [os.path.relpath(os.path.join(root, n), workdir) for n in names]
+            if len(paths) > MAX_LISTED_FILES:
+                break
+    keep = []
+    for p in sorted(paths):
+        full = os.path.join(workdir, p)
+        if set(Path(p).parts) & SKIPPED_DIRS or SECRET_NAMES.match(os.path.basename(p)) or not os.path.isfile(full):
+            continue
+        keep.append(p)
+    return keep[:MAX_LISTED_FILES]
+
+
+def _text_spec(workdir, path):
+    """A tp-spawn -c spec for a text file, cut to its first MAX_PICKED_CHARS; None for binary or empty files."""
+    try:
+        text = Path(workdir, path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.strip():
+        return None
+    if len(text) <= MAX_PICKED_CHARS:
+        return path
+    lines = max(1, text[:MAX_PICKED_CHARS].count("\n"))
+    return "{}:1-{}".format(path, lines)
+
+
+def pick_files(task, workdir, model, config, runner=subprocess.run):
+    """tp-spawn -c specs for a worker on `model`, or [] when that model gets no picked files."""
+    packet_files = config["local"].get("packet_files")
+    if not packet_files or model not in packet_files["models"]:
+        return []
+    files = workdir_files(workdir, runner)
+    if not files:
+        return []
+    listing = "\n".join("{} ({} bytes)".format(p, os.path.getsize(os.path.join(workdir, p))) for p in files)
+    prompt = PICK_PROMPT.format(n=MAX_PICKED_FILES, task=_clip(task, 4000), files=listing)
+    # No tools, settings or MCP servers: the selector only reads the list it is given.
+    r = runner(["claude", "-p", "--setting-sources", "", "--strict-mcp-config", "--tools", "",
+                "--model", packet_files["selector"], prompt],
+               capture_output=True, text=True, timeout=120, cwd=tempfile.gettempdir())
+    if r.returncode != 0:
+        raise RouterError("file selector failed: {}".format((r.stderr or r.stdout).strip()[:300]))
+    known, picked = set(files), []
+    for line in r.stdout.splitlines():
+        p = line.strip().strip("`*-• ").strip()
+        p = p[2:] if p.startswith("./") else p
+        if p in known and p not in picked:
+            picked.append(p)
+    specs = [_text_spec(workdir, p) for p in picked[:MAX_PICKED_FILES]]
+    return [spec for spec in specs if spec]

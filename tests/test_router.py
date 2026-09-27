@@ -11,8 +11,8 @@ sys.path.insert(0, str(ROOT / "lib"))
 from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, follow_up, laya_decision,
                     laya_route,
                     parse_markers, placement_policy,
-                    load_config, load_local, load_model, model_digest, review_policy, review_task, route_openai,
-                    route_task, validate_decision)  # noqa: E402
+                    load_config, load_local, load_model, model_digest, pick_files, review_policy, review_task, route_openai,
+                    route_task, validate_decision, workdir_files)  # noqa: E402
 
 
 class Response:
@@ -438,6 +438,61 @@ class RouterTests(unittest.TestCase):
                     {"model": "qwen"}, {**good, "ask_between": [0, 2]}):
             with self.assertRaises(RouterError):
                 load_local(self.write_local({"followup": bad}), self.config)
+
+    def test_packet_files_config_validation(self):
+        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        good = {"models": [qwen], "selector": "claude-sonnet-5"}
+        self.assertEqual(load_local(self.write_local({"packet_files": good}), self.config)["packet_files"], good)
+        for bad in ({"models": [], "selector": "claude-sonnet-5"}, {"models": ["nope/model"], "selector": "claude-sonnet-5"},
+                    {"models": [qwen], "selector": "gpt-5.5"}, {"models": [qwen]}, {**good, "extra": 1}):
+            with self.assertRaises(RouterError):
+                load_local(self.write_local({"packet_files": bad}), self.config)
+
+    def pick_workdir(self):
+        from tempfile import TemporaryDirectory
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "lib").mkdir()
+        (root / "lib/small.py").write_text("x = 1\n")
+        (root / "lib/big.py").write_text("line of text\n" * 3000)
+        (root / "lib/blob.bin").write_bytes(b"\xff\xfe\x00\x01" * 10)
+        (root / ".env").write_text("TOKEN=1\n")
+        (root / "db_secret.json").write_text("{}\n")
+        (root / "node_modules").mkdir()
+        (root / "node_modules/dep.js").write_text("1\n")
+        return root
+
+    def test_workdir_files_skip_credentials_and_vendored_dirs(self):
+        root = self.pick_workdir()
+        no_git = lambda *a, **k: type("R", (), {"returncode": 128, "stdout": "", "stderr": ""})()
+        self.assertEqual(workdir_files(str(root), no_git), ["lib/big.py", "lib/blob.bin", "lib/small.py"])
+
+    def test_pick_files(self):
+        root = self.pick_workdir()
+        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        config = dict(self.config, local={"packet_files": {"models": [qwen], "selector": "claude-sonnet-5"}})
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "git":
+                return type("R", (), {"returncode": 0, "stdout": "lib/small.py\nlib/big.py\nlib/blob.bin\n.env\n", "stderr": ""})()
+            return type("R", (), {"returncode": 0, "stderr": "",
+                                  "stdout": "- `lib/big.py`\n./lib/small.py\nlib/blob.bin\n.env\nmissing.py\nlib/small.py\n"})()
+
+        specs = pick_files("fix the thing", str(root), qwen, config, runner)
+        self.assertEqual(specs[1], "lib/small.py")
+        self.assertRegex(specs[0], r"^lib/big\.py:1-\d+$")
+        self.assertEqual(len(specs), 2)  # blob.bin is not text; .env was never listed
+        self.assertIn("claude-sonnet-5", calls[1])
+        self.assertNotIn(".env", calls[1][-1])
+        self.assertEqual(pick_files("task", str(root), "slotstream/qwen3.8-flash-next:4bit", config, runner), [])
+        self.assertEqual(pick_files("task", str(root), qwen, self.config, runner), [])
+
+        failing = lambda cmd, **k: runner(cmd) if cmd[0] == "git" else type("R", (), {"returncode": 1, "stdout": "", "stderr": "no auth"})()
+        with self.assertRaises(RouterError):
+            pick_files("task", str(root), qwen, config, failing)
 
     def test_explicit_openai_backend(self):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:

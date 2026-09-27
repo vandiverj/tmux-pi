@@ -54,5 +54,12 @@
       0.25,
       0.9
     ]
+  },
+  "_packet_files": "Workers on these models get up to 3 files, picked by the selector (a Claude model, via claude -p), in their context packet. Qwen3.5-4B: 44/60 chores without, 53/60 with; Slotstream gained nothing (tests/calibration/experiments.md).",
+  "packet_files": {
+    "models": [
+      "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+    ],
+    "selector": "claude-sonnet-5"
   }
 }

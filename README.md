@@ -244,6 +244,11 @@ credentials. Every key is optional:
 - `followup` names a fast local chat model (loopback OpenAI-compatible URL,
   model id, and the `ask_between` probability band where the user is asked)
   that decides whether a message belongs to a running delegated task.
+- `packet_files` lists models whose delegated workers get up to 3 files picked
+  for the task in their packet, and the Claude model that picks them from the
+  workdir's file list (`claude -p`, no tools; file names only, credentials
+  names left out). Qwen3.5-4B passed 53 of 60 chores with picked files and 44
+  without; stronger workers gain nothing, so leave them out.
 
 On a machine without Slotstream or MLX, leave those out and point `routes` at
 models it does have. `bin/tp-route --check` validates the result;

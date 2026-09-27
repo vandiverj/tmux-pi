@@ -6,6 +6,8 @@ With --dispatch, print the main agent's full decision: route target, intent, rev
 execution scope and placement (main or subagent), honoring +here/+delegate/+review.
 With --follow-up, read {"message", "tasks": [{"id", "task", "reply"}]} as JSON on stdin
 and print {"target": id or null, "ask": [ids]}: the running task the message belongs to.
+With --pick-files WORKDIR --model M, print the tp-spawn -c specs to put in the packet of
+a worker on M, one per line (nothing unless M is listed in local packet_files).
 """
 
 import argparse
@@ -15,7 +17,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from router import RouterError, dispatch, follow_up, load_config, local_base_url, review_task, route_task  # noqa: E402
+from router import (RouterError, dispatch, follow_up, load_config, local_base_url, pick_files,  # noqa: E402
+                    review_task, route_task)
 
 
 def main():
@@ -32,6 +35,9 @@ def main():
                         help="print the main agent's decision: target, intent, review, scope, placement")
     parser.add_argument("--follow-up", action="store_true",
                         help="print the running task a message belongs to (JSON on stdin)")
+    parser.add_argument("--pick-files", metavar="WORKDIR",
+                        help="print packet file specs for a worker on --model (task on stdin)")
+    parser.add_argument("--model", help="worker model for --pick-files")
     parser.add_argument("--review", action="store_true",
                         help="print {\"review\": none|optional|required} from Laya instead of a route")
     args = parser.parse_args()
@@ -69,6 +75,12 @@ def main():
             task = " ".join(args.task)
         else:
             task = sys.stdin.read()
+        if args.pick_files:
+            if not args.model:
+                raise RouterError("--pick-files needs --model")
+            for spec in pick_files(task, args.pick_files, args.model, config):
+                print(spec)
+            return 0
         if args.dispatch:
             print(json.dumps(dispatch(task, config, args.base_url, args.router_model), separators=(",", ":")))
             return 0

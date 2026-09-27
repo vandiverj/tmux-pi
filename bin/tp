@@ -27,6 +27,10 @@ command -v tmux >/dev/null || { echo "tp: tmux not found (brew install tmux)" >&
 command -v pi   >/dev/null || { echo "tp: pi not found" >&2; exit 1; }
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
+  # Reattaching must not leave the client in the status/viewer or an old worker.
+  # Pane ids survive client detach, so the recorded main pane is the reliable target.
+  main_pane="$(tmux show-options -qv -t "=$SESSION:" @tp_main_pane)"
+  [[ -z "$main_pane" ]] || tmux select-pane -t "$main_pane"
   if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
   exec tmux attach -t "$SESSION"
 fi
@@ -76,6 +80,10 @@ tmux set-option -t "$SESSION" pane-border-status top
 tmux set-option -t "$SESSION" mouse on
 
 tmux send-keys -t "$main_pane" "$main_cmd" Enter
+
+# Make the main Pi editor—not either read-only side pane—the active pane for
+# the client that is about to attach.
+tmux select-pane -t "$main_pane"
 
 if [[ "${TP_NO_ATTACH:-}" == 1 ]]; then exit 0; fi
 if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi

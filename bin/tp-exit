@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# tp-exit — stop every tmux-pi process and destroy its tmux session.
+#
+# Usage: tp-exit
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+
+# This stops tracked and untracked workers and restores the viewer before the
+# session itself (and therefore its main, status, and viewer panes) is killed.
+# Unlike tp-reset, ending a workspace must not leave its task records to be
+# redisplayed as killed workers when the same workdir is opened again.
+state_dir="$(tp_opt "$session" @tp_state_dir)"
+"$ROOT/bin/tp-reset" >/dev/null 2>&1 || true
+rm -rf -- "$state_dir/tasks"
+
+if tmux has-session -t "=$session" 2>/dev/null; then
+  tmux kill-session -t "=$session"
+fi

@@ -272,6 +272,18 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("end", {
+		description: "Kill all tmux-pi agents and close the tmux workspace",
+		handler: async (_args, ctx) => {
+			const answer = await ctx.ui.confirm(
+				"Exit tmux-pi workspace",
+				"This stops the main agent and every subagent, clears their task records, then closes this tmux workspace.",
+			);
+			if (!answer) return;
+			await must(bin("tp-exit"), []);
+		},
+	});
+
 	pi.registerCommand("reset", {
 		description: "Kill all subagents and start a fresh main-agent session",
 		handler: async (_args, ctx) => {

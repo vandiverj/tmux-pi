@@ -58,6 +58,7 @@ Ask the main agent to delegate. Its subagents extension
 | `collect_result` | State and last reply; `wait_seconds` waits until it finishes. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
 | `kill_subagent` | `tp-kill` |
 | `/reset` | Stops all subagents, clears the viewer, and starts a fresh main Pi session |
+| `/end` | Stops the main agent and all subagents, clears their task records, then destroys the tmux-pi workspace |
 
 Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents):
 
@@ -74,6 +75,7 @@ tp-kill <id>       # stop it; task files stay in .tmux-pi/tasks/<id>/
 tp-clean           # archive killed subagents to .tmux-pi/archive/
 tp-ledger          # research and contract runs: time, turns, tokens, sources, your rating
 tp-reset           # stop every subagent and restore the viewer (used by /reset)
+tp-exit            # stop every agent, clear task records, and destroy the tmux-pi session (used by /end)
 ```
 
 The status pane (top right) is the same list, live. Click it, then:

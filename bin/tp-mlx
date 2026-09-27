@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Start, inspect, or stop the repo-managed local MLX model server (mlx-lm).
+#
+# The model, port and sampling come from the "mlx" section of config/local.json,
+# since each machine has different local models. The server binds only
+# 127.0.0.1, runs offline (a request naming any other model fails instead of
+# downloading it), and logs under ignored .mlx/.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+runtime="$ROOT/.mlx"
+venv="$runtime/venv"
+pidfile="$runtime/server.pid"
+logfile="$runtime/server.log"
+command -v lsof >/dev/null || { echo "tp-mlx: lsof is required" >&2; exit 1; }
+
+# Read and validate the mlx section through the router's own config loader.
+settings="$(python3 - "$ROOT" <<'EOF'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/lib")
+from router import RouterError, load_config
+try:
+    mlx = load_config(sys.argv[1] + "/config/router.json")["local"].get("mlx")
+except RouterError as exc:
+    sys.exit("tp-mlx: {}".format(exc))
+if not mlx:
+    sys.exit("tp-mlx: no mlx section in config/local.json (see config/local.example.json)")
+print(json.dumps(mlx))
+EOF
+)"
+field() { jq -r "$1" <<<"$settings"; }
+port="$(field .port)"
+model="$(field .model)"
+
+listener() { lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null; }
+managed_pid() {
+  [[ -f "$pidfile" ]] || return 1
+  local pid
+  pid="$(cat "$pidfile")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -p "$pid" -o command= | grep -Fq "$venv/bin/" || return 1
+  printf '%s\n' "$pid"
+}
+
+case "${1:-start}" in
+  start)
+    if [[ ! -x "$venv/bin/mlx_lm.server" ]]; then
+      echo "tp-mlx: missing .mlx/venv; bootstrap it first (see README)" >&2
+      exit 1
+    fi
+    if pid="$(managed_pid)"; then
+      echo "tp-mlx: managed pid $pid is already running" >&2
+      exit 1
+    fi
+    if listener >/dev/null; then
+      echo "tp-mlx: port $port already has a listener; leaving it running" >&2
+      exit 1
+    fi
+    args=(--model "$model" --host 127.0.0.1 --port "$port")
+    if [[ "$(field '.chat_template_args // empty')" != "" ]]; then
+      args+=(--chat-template-args "$(jq -c .chat_template_args <<<"$settings")")
+    fi
+    for key in temp top_p top_k; do
+      value="$(field ".$key // empty")"
+      [[ -z "$value" ]] || args+=("--${key//_/-}" "$value")
+    done
+    mkdir -p "$runtime"
+    nohup env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "$venv/bin/mlx_lm.server" "${args[@]}" \
+      >>"$logfile" 2>&1 </dev/null &
+    echo "$!" >"$pidfile"
+    for _ in $(seq 1 60); do
+      if curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$port/v1/models" >/dev/null; then
+        echo "tp-mlx: serving $model on 127.0.0.1:$port (pid $!); log: $logfile"
+        exit 0
+      fi
+      kill -0 "$(cat "$pidfile")" 2>/dev/null || { echo "tp-mlx: server exited; see $logfile" >&2; exit 1; }
+      sleep 1
+    done
+    echo "tp-mlx: started pid $(cat "$pidfile") but port $port is not answering yet; see $logfile" >&2
+    ;;
+  status)
+    if pid="$(managed_pid)"; then
+      if listener >/dev/null; then
+        echo "tp-mlx: managed pid $pid is serving $model on 127.0.0.1:$port"
+      else
+        echo "tp-mlx: managed pid $pid is starting; see $logfile"
+      fi
+    elif listener >/dev/null; then
+      echo "tp-mlx: an external process is listening on port $port"
+    else
+      echo "tp-mlx: no listener on port $port"
+      exit 1
+    fi
+    ;;
+  stop)
+    if ! pid="$(managed_pid)"; then
+      echo "tp-mlx: no managed MLX server to stop; leaving other listeners alone" >&2
+      exit 1
+    fi
+    kill "$pid"
+    rm -f "$pidfile"
+    echo "tp-mlx: sent TERM to managed pid $pid"
+    ;;
+  *)
+    echo "usage: tp-mlx [start|status|stop]" >&2
+    exit 2
+    ;;
+esac

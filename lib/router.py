@@ -4,6 +4,8 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -92,7 +94,90 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-def load_config(path):
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts"}
+
+
+def load_local(path, config):
+    """Validate a machine's local assignments (config/local.json) against the shared roster.
+
+    Each machine has different models available, so tier assignments, the local
+    MLX server and escalation live here instead of in the committed config.
+    Keys starting with "_" are comments.
+    """
+    try:
+        local = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RouterError("cannot read local config {}: {}".format(path, exc)) from exc
+    if not isinstance(local, dict):
+        raise RouterError("local config must be a JSON object")
+    local = {k: v for k, v in local.items() if not k.startswith("_")}
+    if set(local) - LOCAL_KEYS:
+        raise RouterError("local config keys must be among {}".format(", ".join(sorted(LOCAL_KEYS))))
+    routes = local.get("routes", {})
+    if not isinstance(routes, dict) or set(routes) - ROUTES:
+        raise RouterError("local routes must be among {}".format(", ".join(sorted(ROUTES))))
+    for name, target in routes.items():
+        try:
+            _target(target, config)
+        except RouterError as exc:
+            raise RouterError("invalid local {} route: {}".format(name, exc)) from exc
+    escalation = local.get("escalation")
+    if escalation is not None:
+        if not isinstance(escalation, dict) or set(escalation) != {"models", "after_consecutive_errors", "to"}:
+            raise RouterError("escalation needs exactly models, after_consecutive_errors and to")
+        after = escalation["after_consecutive_errors"]
+        if isinstance(after, bool) or not isinstance(after, int) or not 1 <= after <= 20:
+            raise RouterError("escalation after_consecutive_errors must be an integer from 1 to 20")
+        roster = {item["model"] for item in config["models"]}
+        if not isinstance(escalation["models"], list) or not escalation["models"] or \
+                any(model not in roster for model in escalation["models"]):
+            raise RouterError("escalation models must be a nonempty list of roster models")
+        try:
+            _target(escalation["to"], config)
+        except RouterError as exc:
+            raise RouterError("invalid escalation target: {}".format(exc)) from exc
+    rules = local.get("rules", [])
+    if not isinstance(rules, list):
+        raise RouterError("local rules must be a list")
+    roster = {item["model"] for item in config["models"]}
+    for index, rule in enumerate(rules):
+        rule = {k: v for k, v in rule.items() if not k.startswith("_")} if isinstance(rule, dict) else rule
+        if not isinstance(rule, dict) or set(rule) != {"pattern", "from", "to"}:
+            raise RouterError("rule {} needs exactly pattern, from and to".format(index))
+        try:
+            re.compile(rule["pattern"])
+        except (re.error, TypeError) as exc:
+            raise RouterError("rule {} pattern is not a valid regular expression: {}".format(index, exc)) from exc
+        if not isinstance(rule["from"], list) or not rule["from"] or any(m not in roster for m in rule["from"]):
+            raise RouterError("rule {} from must be a nonempty list of roster models".format(index))
+        try:
+            _target(rule["to"], config)
+        except RouterError as exc:
+            raise RouterError("invalid rule {} target: {}".format(index, exc)) from exc
+    prompts = local.get("prompts", {})
+    if not isinstance(prompts, dict) or any(model not in roster for model in prompts):
+        raise RouterError("local prompts must map roster models to text")
+    if any(not isinstance(text, str) or not text.strip() for text in prompts.values()):
+        raise RouterError("each local prompt must be nonempty text")
+    mlx = local.get("mlx")
+    if mlx is not None:
+        if not isinstance(mlx, dict) or not {"model", "port"} <= set(mlx) or \
+                set(mlx) - {"model", "port", "chat_template_args", "temp", "top_p", "top_k"}:
+            raise RouterError("mlx needs model and port, and may set chat_template_args, temp, top_p, top_k")
+        port = mlx["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+            raise RouterError("mlx port must be an integer from 1024 to 65535")
+        if not isinstance(mlx["model"], str) or not mlx["model"]:
+            raise RouterError("mlx model must be a Hugging Face id or a local path")
+    return local
+
+
+def load_config(path, local_path=None):
+    """Load the shared router config, then apply this machine's local assignments if present.
+
+    local_path defaults to local.json next to the config (or $TP_LOCAL_CONFIG); pass
+    False to ignore local assignments.
+    """
     try:
         config = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -146,6 +231,12 @@ def load_config(path):
     config["model_path"] = Path(path).parent / config["laya_model"]
     if config["backend"] == "laya" or config["model_path"].exists():
         config["model"] = load_model(config["model_path"])
+    if local_path is None:
+        local_path = os.environ.get("TP_LOCAL_CONFIG") or Path(path).parent / "local.json"
+    config["local"] = {}
+    if local_path and Path(local_path).exists():
+        config["local"] = load_local(local_path, config)
+        config["routes"] = {**config["routes"], **config["local"].get("routes", {})}
     return config
 
 
@@ -387,10 +478,24 @@ def route_openai(task, config, base_url=None, router_model=None, opener=None):
     return validate_decision(decision, config)
 
 
+def apply_rules(task, decision, config):
+    """Redirect a decision when a local rule names its model and the task text matches.
+
+    Rules cover task types a model is known to get wrong (see tests/calibration/experiments.md);
+    the first matching rule wins.
+    """
+    for rule in config.get("local", {}).get("rules", []):
+        if decision["model"] in rule["from"] and re.search(rule["pattern"], task):
+            return _target(rule["to"], config)
+    return decision
+
+
 def route_task(task, config, backend=None, base_url=None, router_model=None, opener=None):
     selected = backend or config["backend"]
     if selected == "laya":
-        return route_laya(task, config, base_url, router_model, opener)
-    if selected == "openai":
-        return route_openai(task, config, base_url, router_model, opener)
-    raise RouterError("backend must be laya or openai")
+        decision = route_laya(task, config, base_url, router_model, opener)
+    elif selected == "openai":
+        decision = route_openai(task, config, base_url, router_model, opener)
+    else:
+        raise RouterError("backend must be laya or openai")
+    return apply_rules(task, decision, config)

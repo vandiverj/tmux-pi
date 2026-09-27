@@ -9,3 +9,5 @@ agent/npm/
 agent/bin/
 agent/models-store.json
 __pycache__/
+.mlx/
+config/local.json

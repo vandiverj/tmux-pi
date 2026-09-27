@@ -1,0 +1,49 @@
+{
+  "_comment": "Copy to config/local.json (git-ignored) and edit for this machine. Every key is optional. routes overrides the tier assignments in router.json; each target must be in router.json's models roster. Leave out models this machine does not have.",
+  "routes": {
+    "standard": {
+      "model": "mlx/mlx-community/Qwen3.5-4B-MLX-4bit",
+      "thinking": "off"
+    }
+  },
+  "_escalation": "pi workers on these models hand off after more than after_consecutive_errors failed tool calls in a row.",
+  "escalation": {
+    "models": [
+      "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+    ],
+    "after_consecutive_errors": 3,
+    "to": {
+      "model": "claude-haiku-4-5-20251001",
+      "thinking": "low"
+    }
+  },
+  "_mlx": "The local model bin/tp-mlx serves; pi's mlx provider in agent/models.json must list the same model id.",
+  "mlx": {
+    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "port": 11437,
+    "chat_template_args": {
+      "enable_thinking": false
+    },
+    "temp": 0.7,
+    "top_p": 0.8,
+    "top_k": 20
+  },
+  "_rules": "Send a task type a model is known to get wrong elsewhere: when the router picks a model in from and the task text matches pattern, use to.",
+  "rules": [
+    {
+      "_why": "Qwen3.5-4B reports counts without computing them (wrong on 4 of 24 counting chores; Slotstream 10/10). See tests/calibration/experiments.md.",
+      "pattern": "(?i)\\b(how many|count(s|ing)?|number of|total number)\\b",
+      "from": [
+        "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+      ],
+      "to": {
+        "model": "slotstream/qwen3.8-flash-next:4bit",
+        "thinking": "low"
+      }
+    }
+  ],
+  "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.5-4B's counting: 76% correct without, 90% with (tests/calibration/experiments.md).",
+  "prompts": {
+    "mlx/mlx-community/Qwen3.5-4B-MLX-4bit": "Only answer a count with a number printed by a counting command you have run (grep -c, wc -l, or jq length for JSON); if you have not run one yet, run it before answering."
+  }
+}

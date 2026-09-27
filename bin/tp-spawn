@@ -149,6 +149,21 @@ else
     *) cmd+=(--effort "$thinking") ;;
   esac
 fi
+# A machine can give a model a standing instruction for a mistake it is known to
+# make (config/local.json "prompts"); both harnesses append it to their system prompt.
+if [[ -n "$model" ]]; then
+  prompt="$(python3 - "$ROOT" "$model" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1] + "/lib")
+from router import RouterError, load_config
+try:
+    print(load_config(sys.argv[1] + "/config/router.json")["local"].get("prompts", {}).get(sys.argv[2], ""), end="")
+except RouterError as exc:
+    sys.exit("tp-spawn: {}".format(exc))
+EOF
+)" || exit 1
+  if [[ -n "$prompt" ]]; then cmd+=(--append-system-prompt "$prompt"); fi
+fi
 
 {
   echo '#!/usr/bin/env bash'

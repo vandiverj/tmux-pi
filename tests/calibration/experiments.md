@@ -110,3 +110,39 @@ Open levers: route is limited by what Laya's answers carry (learning curve flat,
 probes and embeddings did not help on tune); an embedding service improves
 intent but not review decisions; route cost weight is a quality-versus-spend
 choice; the best next data is real tmux-pi tasks labeled by the user.
+
+## Worker models for tool chores (2026-09-26)
+
+Tool-calling agents on 40 read-only repository chores in 8 categories (answers
+computed from the repository), with a minimal tool loop (grep, read, find,
+bash) on a copy of the repo. Local models on an M5 Max, 4-bit MLX, thinking off.
+
+| model | correct | median per chore | notes |
+|---|---|---|---|
+| Slotstream Qwen3.8 Flash (prefix cache on) | 40/40 | 13.0 s | first 10-chore run without prefix cache: 32.2 s median |
+| Qwen3.5-4B (mlx-lm, 3 runs) | 111/120 | 1.5 s | counting 18/21 + 2/3 line counts; git "first added" 1/3 |
+| MiniCPM5-2B (10-chore set, 3 runs) | 26/30 | 1.6 s | needs its own tool-call parser |
+| Granite 4.2-3B (10-chore set, 3 runs) | 23/30 | 3.8 s | invented tools; confident wrong answers |
+
+Qwen3.5-4B's recurring mistake is exact counting: it reports a number without
+computing it (46 functions for 25, 20 models for 13). A local rule sends tasks
+matching `how many|count|number of|total number` that were routed to Qwen to
+Slotstream (10/10 on counting). Replaying the Qwen runs with the rule leaves
+5 of 120 wrong (95.8%). Almost every failure was a confident wrong answer, not
+a tool-error streak: only 2 of 120 runs would have escalated.
+
+Counting prompt for Qwen3.5-4B (10 counting chores × 5 runs; appended to the
+system prompt):
+
+| prompt | correct |
+|---|---|
+| none | 38/50 |
+| A: "…compute the number with a command… never count by reading output yourself" | 40/50 |
+| B: "For any count, run a command that counts… and report its output exactly" | 44/50 |
+| C: "Only answer a count with a number printed by a counting command you have run (grep -c, wc -l, or jq length for JSON); if you have not run one yet, run it before answering" | 45/50 |
+
+With C, 4 of the 5 failures were loops without an answer (visible; one would
+escalate) and 1 a wrong number, against mostly wrong numbers without it. On all
+40 chores C scored 111/120, the same as without it. 76% → 90% is suggestive,
+not conclusive (Fisher exact p ≈ 0.07). Kept: C as a standing prompt for Qwen
+workers, and the counting rule to Slotstream for tasks that ask for a count.

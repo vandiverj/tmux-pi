@@ -203,6 +203,16 @@ export default function (pi: ExtensionAPI) {
 			let state: any = {};
 			let ps = "running";
 			for (;;) {
+				// A local-model worker that kept failing hands off to a stronger model (extensions/escalate.ts).
+				const escalatedTo = readText(join(dir, "escalated"));
+				if (escalatedTo) {
+					const why = readJson(join(dir, "meta.json")).escalated_to ?? {};
+					return text(
+						`${params.id} escalated to ${escalatedTo} (${why.model ?? "a stronger model"}) after ${why.after_errors ?? "repeated"} ` +
+							`failed tool calls in a row. Use collect_result on ${escalatedTo}; its attempt log is ${join(dir, "escalation.md")}.`,
+						{ id: params.id, status: "escalated", escalatedTo },
+					);
+				}
 				state = readJson(join(dir, "state.json"));
 				ps = await paneState(dir);
 				const fresh = Date.parse(state.updated ?? "") >= since - 1000;

@@ -17,6 +17,11 @@
     },
     {
       "worker": "pi",
+      "model": "mlx/mlx-community/Qwen3.5-4B-MLX-4bit",
+      "thinking": ["off"]
+    },
+    {
+      "worker": "pi",
       "model": "openai-codex/gpt-5.3-codex-spark",
       "thinking": ["minimal", "low", "medium", "high", "xhigh"]
     },

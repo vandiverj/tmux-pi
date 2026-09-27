@@ -55,6 +55,7 @@ Ask the main agent to delegate. Its subagents extension
 | `send_to_subagent` | Types a follow-up message into the subagent's session |
 | `collect_result` | State and last reply; `wait_seconds` waits until it finishes. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
 | `kill_subagent` | `tp-kill` |
+| `/reset` | Stops all subagents, clears the viewer, and starts a fresh main Pi session |
 
 Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents):
 
@@ -67,6 +68,7 @@ tp-view <id>       # swap its live session into the viewer (click in to type)
 tp-view -          # put the placeholder back
 tp-kill <id>       # stop it; task files stay in .tmux-pi/tasks/<id>/
 tp-clean           # archive killed subagents to .tmux-pi/archive/
+tp-reset           # stop every subagent and restore the viewer (used by /reset)
 ```
 
 The status pane (top right) is the same list, live. Click it, then:
@@ -174,6 +176,59 @@ It lists eligible targets, not a guarantee that those providers are available.
 The adapter accepts only unauthenticated loopback HTTP, disables proxies and
 redirects, validates responses and route targets, and fails clearly on server
 or data errors.
+
+## Per-machine models
+
+Different machines have different local models, so what each tier runs on is
+set per machine in `config/local.json` (git-ignored). Start from the committed
+[`config/local.example.json`](config/local.example.json); it holds no
+credentials. Every key is optional:
+
+- `routes` overrides tier assignments from `config/router.json`
+  (`simple`, `standard`, `coding`, `complex`, `expert`); each target must be in
+  the `models` roster there.
+- `mlx` is the local model `bin/tp-mlx` serves: its id, port and sampling.
+- `escalation` names the models whose pi workers hand off after too many failed
+  tool calls in a row, and what they hand off to.
+- `rules` redirect a task type a model is known to get wrong: when the router
+  picks a model in `from` and the task text matches `pattern`, it uses `to`.
+- `prompts` add standing system-prompt text to a model's workers (pi or
+  Claude), for a mistake it is known to make; `tp-spawn` appends it.
+
+On a machine without Slotstream or MLX, leave those out and point `routes` at
+models it does have. `bin/tp-route --check` validates the result;
+`TP_LOCAL_CONFIG` points at a different file.
+
+### Local MLX server
+
+`bin/tp-mlx` serves the `mlx` model with mlx-lm, bound to `127.0.0.1` and
+offline (a request for any other model fails instead of downloading one). pi
+reaches it as the `mlx` provider in [`agent/models.json`](agent/models.json),
+whose model id must match. Bootstrap once:
+
+```sh
+uv venv .mlx/venv --python 3.12
+VIRTUAL_ENV=.mlx/venv uv pip install "mlx-lm==0.31.3" "mlx==0.32.2"
+.mlx/venv/bin/hf download mlx-community/Qwen3.5-4B-MLX-4bit
+bin/tp-mlx start        # also: status, stop
+```
+
+Qwen3.5-4B (4-bit, thinking off) handles `standard`-tier tool chores on this
+machine: on 40 repository chores it answered 92.5% correctly with a median of
+1.5 s, against 13 s for Slotstream. Its recurring mistake is exact
+counting: it reports a number without computing it. Its workers get a prompt to
+answer counts only from a counting command it ran (76% → 90% correct on
+counting chores), and a rule sends tasks that ask for a count to Slotstream
+(10/10).
+
+### Escalation
+
+A pi worker on an `escalation` model counts failed tool calls; a success resets
+the count. Past `after_consecutive_errors` (3), it writes `escalation.md` in
+its task dir with every tool call it made (arguments, errors, results) and its
+last reply, spawns the `to` model (Claude Haiku) with the original packet plus
+that file, records the new id in `escalated` and `meta.json`, and exits.
+`collect_result` on the old id points to the new one.
 
 ## Cross-provider review loop
 

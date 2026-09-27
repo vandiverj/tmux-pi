@@ -8,9 +8,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from router import (QUESTIONS, REVIEWS, RouterError, feature_names, laya_decision, laya_route, load_config,
-                    load_model, questions_digest, review_policy, review_task, route_openai, route_task,
-                    validate_decision)  # noqa: E402
+from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, feature_names, laya_decision, laya_route,
+                    load_config, load_local, load_model, questions_digest, review_policy, review_task, route_openai,
+                    route_task, validate_decision)  # noqa: E402
 
 
 class Response:
@@ -40,7 +40,8 @@ class ResponseError(Response):
 
 class RouterTests(unittest.TestCase):
     def setUp(self):
-        self.config = load_config(ROOT / "config/router.json")
+        # Tests use the committed config only; a machine's config/local.json must not change them.
+        self.config = load_config(ROOT / "config/router.json", local_path=False)
 
     def reply(self, decision, finish_reason="stop"):
         return Response({"choices": [{"message": {"content": json.dumps(decision)},
@@ -142,7 +143,7 @@ class RouterTests(unittest.TestCase):
         raw = json.loads((ROOT / "config/router.json").read_text())
         (Path(directory.name) / "router.json").write_text(json.dumps(raw))
         (Path(directory.name) / "laya-model.json").write_text(json.dumps(model))
-        return load_config(Path(directory.name) / "router.json")
+        return load_config(Path(directory.name) / "router.json", local_path=False)
 
     def test_shipped_model_matches_questions(self):
         self.assertEqual(self.config["model"]["questions"], questions_digest())
@@ -296,6 +297,55 @@ class RouterTests(unittest.TestCase):
             path.write_text(json.dumps(fine))
             with self.assertRaisesRegex(RouterError, "cannot read Laya model"):
                 load_config(path)
+
+    def write_local(self, local):
+        from tempfile import TemporaryDirectory
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "local.json"
+        path.write_text(json.dumps(local))
+        return path
+
+    def test_example_local_config_is_valid(self):
+        local = load_local(ROOT / "config/local.example.json", self.config)
+        self.assertIn("standard", local["routes"])
+        self.assertIn("mlx/mlx-community/Qwen3.5-4B-MLX-4bit", local["prompts"])
+
+    def test_local_routes_override_and_validate(self):
+        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        path = self.write_local({"_comment": "x", "routes": {"standard": {"model": qwen, "thinking": "off"}}})
+        config = load_config(ROOT / "config/router.json", local_path=path)
+        self.assertEqual(config["routes"]["standard"]["model"], qwen)
+        self.assertEqual(config["routes"]["coding"], self.config["routes"]["coding"])
+        cases = [
+            ({"routes": {"fallback": {"model": qwen, "thinking": "off"}}}, "local routes must be among"),
+            ({"routes": {"standard": {"model": "local/unknown", "thinking": "off"}}}, "invalid local standard route"),
+            ({"hosts": {}}, "local config keys"),
+            ({"escalation": {"models": [qwen], "after_consecutive_errors": 0,
+                             "to": {"model": "claude-haiku-4-5-20251001", "thinking": "low"}}}, "after_consecutive_errors"),
+            ({"escalation": {"models": ["local/unknown"], "after_consecutive_errors": 3,
+                             "to": {"model": "claude-haiku-4-5-20251001", "thinking": "low"}}}, "roster models"),
+            ({"mlx": {"model": "x", "port": 80}}, "mlx port"),
+            ({"rules": [{"pattern": "(", "from": [qwen], "to": {"model": qwen, "thinking": "off"}}]}, "valid regular expression"),
+            ({"rules": [{"pattern": "x", "from": [qwen]}]}, "needs exactly pattern, from and to"),
+            ({"prompts": {"local/unknown": "count with a command"}}, "local prompts must map roster models"),
+            ({"prompts": {qwen: "  "}}, "nonempty text"),
+        ]
+        for local, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RouterError, message):
+                load_config(ROOT / "config/router.json", local_path=self.write_local(local))
+
+    def test_rules_redirect_matching_tasks(self):
+        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        slot = "slotstream/qwen3.8-flash-next:4bit"
+        path = self.write_local({"rules": [{"_why": "counting", "pattern": "(?i)\\bhow many\\b",
+                                            "from": [qwen], "to": {"model": slot, "thinking": "low"}}]})
+        config = load_config(ROOT / "config/router.json", local_path=path)
+        picked = {"worker": "pi", "model": qwen, "thinking": "off"}
+        self.assertEqual(apply_rules("How many tests are there?", picked, config)["model"], slot)
+        self.assertEqual(apply_rules("Where is load_model defined?", picked, config), picked)
+        other = {"worker": "claude", "model": "claude-opus-5-5", "thinking": "high"}
+        self.assertEqual(apply_rules("How many tests are there?", other, config), other)
 
     def test_explicit_openai_backend(self):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:

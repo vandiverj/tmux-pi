@@ -53,7 +53,7 @@ def main():
             model_path.write_text(json.dumps(model, indent=1) + "\n", encoding="utf-8")
             print("wrote {} (trained on {} tasks; lambdas: {})".format(
                 model_path.relative_to(ROOT) if model_path.is_relative_to(ROOT) else model_path, model["trained_on"],
-                ", ".join("{} {}".format(h, model[h]["lambda"]) for h in ("route", "intent", "gate", "level"))),
+                ", ".join("{} {}".format(h, model[h]["lambda"]) for h in ("route", "intent", "gate", "level", "placement"))),
                 file=sys.stderr)
         load_config(config_path)
         print(report(*evaluate(corpus, answers, load_model(model_path)), show_mismatches=args.mismatches))

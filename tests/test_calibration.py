@@ -34,18 +34,20 @@ class CalibrationTests(unittest.TestCase):
         from calibration import fit
         shipped = load_model(MODEL)
         model = fit(load_corpus(CORPUS), load_answers(ANSWERS))
-        for head in ("route", "intent", "gate", "level"):
+        for head in ("route", "intent", "gate", "level", "placement"):
             self.assertEqual(model[head]["labels"], shipped[head]["labels"])
             self.assertEqual(model[head]["lambda"], shipped[head]["lambda"])
             for got, want in zip(model[head]["bias"], shipped[head]["bias"]):
                 self.assertAlmostEqual(got, want, places=4)
 
     def test_rejects_bad_rows(self):
-        good = {"id": "a", "task": "t", "intent": "research", "route": "simple", "review": "none", "split": "tune"}
+        good = {"id": "a", "task": "t", "intent": "research", "route": "simple", "review": "none", "split": "tune",
+                "placement": "main"}
         cases = [
             ({**good, "route": "fallback"}, "route must be one of"),
             ({**good, "intent": "deploy"}, "intent must be one of"),
             ({**good, "split": "train"}, "split must be one of"),
+            ({**good, "placement": "pane"}, "placement must be one of"),
             ({**good, "extra": 1}, "needs exactly"),
             ({**good, "id": "Bad Id"}, "id must be"),
             ({**good, "task": " "}, "task must contain text"),

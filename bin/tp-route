@@ -2,6 +2,8 @@
 """Choose a validated tmux-pi worker model and thinking level for a task.
 
 With --review, print the task's review level (none, optional or required) instead.
+With --dispatch, print the main agent's full decision: route target, intent, review,
+execution scope and placement (main or subagent), honoring +here/+delegate/+review.
 """
 
 import argparse
@@ -11,7 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from router import RouterError, load_config, local_base_url, review_task, route_task  # noqa: E402
+from router import RouterError, dispatch, load_config, local_base_url, review_task, route_task  # noqa: E402
 
 
 def main():
@@ -24,6 +26,8 @@ def main():
     parser.add_argument("--base-url", default=os.environ.get("TP_ROUTER_BASE_URL"))
     parser.add_argument("--router-model", default=os.environ.get("TP_ROUTER_MODEL"))
     parser.add_argument("--check", action="store_true", help="validate config without contacting the endpoint")
+    parser.add_argument("--dispatch", action="store_true",
+                        help="print the main agent's decision: target, intent, review, scope, placement")
     parser.add_argument("--review", action="store_true",
                         help="print {\"review\": none|optional|required} from Laya instead of a route")
     args = parser.parse_args()
@@ -34,8 +38,8 @@ def main():
             raise RouterError("backend must be laya or openai")
         if args.base_url is not None:
             local_base_url(args.base_url, backend)
-        if args.review and backend != "laya":
-            raise RouterError("--review needs the laya backend")
+        if (args.review or args.dispatch) and backend != "laya":
+            raise RouterError("--review and --dispatch need the laya backend")
         if args.router_model is not None and not args.router_model.strip():
             raise RouterError("router model must be a nonempty string")
         if args.check:
@@ -49,6 +53,9 @@ def main():
             task = " ".join(args.task)
         else:
             task = sys.stdin.read()
+        if args.dispatch:
+            print(json.dumps(dispatch(task, config, args.base_url, args.router_model), separators=(",", ":")))
+            return 0
         if args.review:
             print(json.dumps({"review": review_task(task, config, args.base_url, args.router_model)},
                              separators=(",", ":")))

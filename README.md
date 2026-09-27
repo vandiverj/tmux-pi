@@ -177,6 +177,27 @@ The adapter accepts only unauthenticated loopback HTTP, disables proxies and
 redirects, validates responses and route targets, and fails clearly on server
 or data errors.
 
+## Automatic routing
+
+The main agent routes every message itself (`agent/extensions/dispatcher.ts`).
+Before the model sees a message, `bin/tp-route --dispatch` asks Laya once and
+returns the route, intent, review level, execution scope and placement:
+
+- **main:** brief work that changes nothing and needs no required review. A pi
+  route switches the main model and thinking level in place; the footer shows
+  `AUTO main · <model> · <route> · review <level>`.
+- **subagent:** implementation, configuration or operations, required review,
+  or sustained work. The main agent returns to its home model (the default in
+  `agent/settings.json`) and is told to delegate with the routed worker, model
+  and thinking, and to run `review_subagent` when review is required.
+
+Start a message with `+here`, `+delegate` or `+review` to override placement or
+review (they can be combined; the route stays a validated roster target).
+`/auto off` turns routing off for the session; if Laya is unavailable nothing
+changes and the footer says so. A routed model whose context window cannot hold
+the conversation is skipped for the home model; Claude routes stay on the home
+model until they run as foreground workers.
+
 ## Per-machine models
 
 Different machines have different local models, so what each tier runs on is

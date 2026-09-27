@@ -30,7 +30,18 @@ QUESTIONS = {
     "changes": {"type": "noul", "instructions": "Will doing this task change files, systems or data, rather than only producing an answer or a document?",
                 "criteria": {"false": "no: it only produces an answer, findings, a plan or a document",
                              "true": "yes: it changes code, configuration, systems or data"}},
+    "execution_scope": {"type": "choice", "instructions": "How much work does this request take?",
+                        "criteria": {
+                            "brief": "a quick answer, lookup, explanation or small edit, done in a few steps",
+                            "sustained": "a focused piece of work that takes many steps, such as a feature, an investigation or a document",
+                            "multi_step": "several distinct pieces of work, or work across several components or systems",
+                        }},
 }
+# The learned layer reads only these questions; a new question joins them only after it
+# passes the tune/holdout gate (tests/calibration/experiments.md).
+FEATURE_QUESTIONS = ("task_intent", "difficulty", "needs_tools", "is_sensitive", "is_high_risk", "changes")
+PLACEMENTS = ("main", "subagent")
+MARKERS = {"+here": ("placement", "main"), "+delegate": ("placement", "subagent"), "+review": ("review", "required")}
 ROUTES = frozenset(("simple", "standard", "coding", "complex", "expert"))
 REVIEWS = ("none", "optional", "required")
 
@@ -307,7 +318,8 @@ def laya_answers(reply):
 def feature_names():
     """Names of the model inputs, in order: choice and score probabilities, the score, noul values."""
     names = []
-    for name, question in QUESTIONS.items():
+    for name in FEATURE_QUESTIONS:
+        question = QUESTIONS[name]
         if question["type"] == "choice":
             names += ["{}:{}".format(name, key) for key in question["criteria"]]
         elif question["type"] == "score":
@@ -319,7 +331,8 @@ def feature_names():
 
 def features(answers):
     values = []
-    for name, question in QUESTIONS.items():
+    for name in FEATURE_QUESTIONS:
+        question = QUESTIONS[name]
         answer = answers[name]
         if question["type"] == "choice":
             values += [answer["probabilities"][key] for key in question["criteria"]]
@@ -333,12 +346,19 @@ def features(answers):
 
 
 def questions_digest():
+    """Digest of every question asked; recorded answers are current only for the same questions."""
     return hashlib.sha256(json.dumps(QUESTIONS, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _head(model, name, labels):
+def model_digest():
+    """Digest of the questions the learned layer reads; the model is valid only for these."""
+    feature_questions = {name: QUESTIONS[name] for name in FEATURE_QUESTIONS}
+    return hashlib.sha256(json.dumps(feature_questions, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _head(model, name, labels, extra=0):
     head = model.get(name)
-    width = len(feature_names())
+    width = len(feature_names()) + extra
     if not isinstance(head, dict) or set(head) - {"threshold", "lambda"} != {"labels", "mean", "scale", "weights", "bias"}:
         raise RouterError("model {} needs labels, mean, scale, weights and bias".format(name))
     if not isinstance(head["labels"], list) or not head["labels"] or not set(head["labels"]) <= set(labels):
@@ -358,7 +378,7 @@ def load_model(path):
         model = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RouterError("cannot read Laya model: {}".format(exc)) from exc
-    if not isinstance(model, dict) or model.get("questions") != questions_digest():
+    if not isinstance(model, dict) or model.get("questions") != model_digest():
         raise RouterError("Laya model was trained on different questions; run bin/tp-calibrate --fit")
     if model.get("features") != feature_names():
         raise RouterError("Laya model features do not match the questions; run bin/tp-calibrate --fit")
@@ -366,8 +386,9 @@ def load_model(path):
     _head(model, "intent", QUESTIONS["task_intent"]["criteria"])
     if model["intent"]["labels"] != list(QUESTIONS["task_intent"]["criteria"]):
         raise RouterError("model intent labels must be the task_intent choices in order")
-    for name, labels in (("gate", ["none", "review"]), ("level", ["optional", "required"])):
-        _head(model, name, labels)
+    for name, labels in (("gate", ["none", "review"]), ("level", ["optional", "required"]),
+                         ("placement", list(PLACEMENTS))):
+        _head(model, name, labels, extra=len(QUESTIONS["execution_scope"]["criteria"]) if name == "placement" else 0)
         head = model[name]
         if head["labels"] != labels:
             raise RouterError("model {} labels must be {}".format(name, ", ".join(labels)))
@@ -488,6 +509,58 @@ def apply_rules(task, decision, config):
         if decision["model"] in rule["from"] and re.search(rule["pattern"], task):
             return _target(rule["to"], config)
     return decision
+
+
+def parse_markers(text):
+    """Split leading +here/+delegate/+review markers from a request; return (overrides, text)."""
+    overrides = {}
+    words = text.lstrip().split(None, 1)
+    while words and words[0].lower() in MARKERS:
+        key, value = MARKERS[words[0].lower()]
+        overrides[key] = value
+        words = words[1].lstrip().split(None, 1) if len(words) > 1 else []
+    return overrides, " ".join(words)
+
+
+def placement_features(answers):
+    """The learned inputs plus Laya's execution-scope probabilities, for the placement head."""
+    scope = answers["execution_scope"]["probabilities"]
+    return features(answers) + [scope[key] for key in QUESTIONS["execution_scope"]["criteria"]]
+
+
+def placement_policy(reply, model, intent, review):
+    """Where a request runs: main or a subagent.
+
+    Change-making work and anything needing a required review always goes to a
+    subagent. Otherwise the learned placement head decides; its threshold is set
+    low because keeping delegable work in main is the costlier mistake.
+    """
+    if intent in CHANGE_INTENTS or review == "required":
+        return "subagent"
+    head = model["placement"]
+    return "subagent" if _probabilities(head, placement_features(laya_answers(reply)))[1] >= head["threshold"] else "main"
+
+
+def dispatch(text, config, base_url=None, router_model=None, opener=None):
+    """Classify one request for the main agent: route, intent, review, scope and placement.
+
+    Markers at the start of the request override placement or review; the route is
+    always a validated roster target.
+    """
+    overrides, task = parse_markers(text)
+    if not task.strip():
+        raise RouterError("task must contain text")
+    reply = classify_laya(task, config, base_url, router_model, opener)
+    answers = laya_answers(reply)
+    model = config["model"]
+    route = laya_route(reply, model)
+    decision = apply_rules(task, _target(config["routes"][route], config), config)
+    intent = laya_intent(reply, model)
+    review = overrides.get("review") or review_policy(reply, model)
+    scope = answers["execution_scope"]["choice"]
+    placement = overrides.get("placement") or placement_policy(reply, model, intent, review)
+    return {**decision, "route": route, "intent": intent, "review": review, "scope": scope,
+            "placement": placement, "overrides": sorted(overrides), "task": task}
 
 
 def route_task(task, config, backend=None, base_url=None, router_model=None, opener=None):

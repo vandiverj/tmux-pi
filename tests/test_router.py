@@ -8,8 +8,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, feature_names, laya_decision, laya_route,
-                    load_config, load_local, load_model, questions_digest, review_policy, review_task, route_openai,
+from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, laya_decision, laya_route,
+                    parse_markers, placement_policy,
+                    load_config, load_local, load_model, model_digest, review_policy, review_task, route_openai,
                     route_task, validate_decision)  # noqa: E402
 
 
@@ -104,7 +105,8 @@ class RouterTests(unittest.TestCase):
             with self.assertRaisesRegex(RouterError, "thinking must"):
                 load_config(path)
 
-    def laya_reply(self, intent="implementation", difficulty=1, tools=0.5, sensitive=0.1, risk=0.1, changes=0.5):
+    def laya_reply(self, intent="implementation", difficulty=1, tools=0.5, sensitive=0.1, risk=0.1, changes=0.5,
+                   scope="brief"):
         intents = {key: (0.95 if key == intent else 0.01) for key in QUESTIONS["task_intent"]["criteria"]}
         return {"routing": {"model": "typed-decisions"}, "answers": {
             "task_intent": {"choice": intent, "probabilities": intents},
@@ -114,6 +116,8 @@ class RouterTests(unittest.TestCase):
             "is_sensitive": {"noul": sensitive},
             "is_high_risk": {"noul": risk},
             "changes": {"noul": changes},
+            "execution_scope": {"choice": scope, "probabilities": {
+                key: (0.9 if key == scope else 0.05) for key in QUESTIONS["execution_scope"]["criteria"]}},
         }}
 
     def toy_model(self, gate=0.5, level=0.5):
@@ -131,10 +135,19 @@ class RouterTests(unittest.TestCase):
         intent = head(intents, "changes", [0.0] * len(intents))
         for index, key in enumerate(intents):  # the learned intent follows Laya's own choice
             intent["weights"][names.index("task_intent:" + key)][index] = 20.0
-        return {"questions": questions_digest(), "features": names, "intent": intent,
+        return {"questions": model_digest(), "features": names, "intent": intent,
                 "route": head(["simple", "expert"], "is_sensitive", [-20.0, 20.0]),
                 "gate": {**head(["none", "review"], "changes", [-20.0, 20.0]), "threshold": gate},
-                "level": {**head(["optional", "required"], "needs_tools", [-20.0, 20.0]), "threshold": level}}
+                "level": {**head(["optional", "required"], "needs_tools", [-20.0, 20.0]), "threshold": level},
+                "placement": {**self.placement_head(), "threshold": 0.5}}
+
+    def placement_head(self):
+        """Placement follows the probability of a brief scope: brief stays in main."""
+        width = len(feature_names()) + 3
+        weights = [[0.0, 0.0] for _ in range(width)]
+        weights[len(feature_names())] = [20.0, -20.0]  # execution_scope:brief
+        return {"labels": ["main", "subagent"], "mean": [0.5] * width, "scale": [1.0] * width,
+                "weights": weights, "bias": [0.0, 0.0]}
 
     def with_model(self, model):
         from tempfile import TemporaryDirectory
@@ -146,7 +159,7 @@ class RouterTests(unittest.TestCase):
         return load_config(Path(directory.name) / "router.json", local_path=False)
 
     def test_shipped_model_matches_questions(self):
-        self.assertEqual(self.config["model"]["questions"], questions_digest())
+        self.assertEqual(self.config["model"]["questions"], model_digest())
         self.assertEqual(self.config["model"]["features"], feature_names())
         self.assertIn(laya_route(self.laya_reply(), self.config["model"]), self.config["routes"])
 
@@ -213,6 +226,7 @@ class RouterTests(unittest.TestCase):
             ({**good, "level": {**good["level"], "threshold": 1}}, "threshold must be between"),
             ({k: v for k, v in good.items() if k != "level"}, "level needs"),
             ({**good, "intent": {**good["intent"], "labels": good["intent"]["labels"][::-1]}}, "intent labels"),
+            ({**good, "placement": {**good["placement"], "weights": good["route"]["weights"]}}, "wrong shape"),
         ]
         from tempfile import TemporaryDirectory
         with TemporaryDirectory() as directory:
@@ -346,6 +360,36 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(apply_rules("Where is load_model defined?", picked, config), picked)
         other = {"worker": "claude", "model": "claude-opus-5-5", "thinking": "high"}
         self.assertEqual(apply_rules("How many tests are there?", other, config), other)
+
+    def test_markers(self):
+        self.assertEqual(parse_markers("+here +review  fix the bug"), ({"placement": "main", "review": "required"}, "fix the bug"))
+        self.assertEqual(parse_markers("+Delegate write docs"), ({"placement": "subagent"}, "write docs"))
+        self.assertEqual(parse_markers("email me +here later"), ({}, "email me +here later"))
+
+    def test_placement_policy(self):
+        model = self.toy_model()
+        brief, long = self.laya_reply(scope="brief"), self.laya_reply(scope="sustained")
+        self.assertEqual(placement_policy(brief, model, "research", "none"), "main")
+        self.assertEqual(placement_policy(long, model, "research", "none"), "subagent")
+        self.assertEqual(placement_policy(brief, model, "communication_or_documentation", "optional"), "main")
+        # Required review and change-making intents always delegate, whatever the head says.
+        self.assertEqual(placement_policy(brief, model, "planning", "required"), "subagent")
+        for intent in ("implementation", "configuration_or_operations"):
+            self.assertEqual(placement_policy(brief, model, intent, "none"), "subagent")
+
+    def test_dispatch(self):
+        config = self.with_model(self.toy_model())
+        docs = "communication_or_documentation"
+        reply = lambda **kw: (lambda *_args, **_kwargs: Response(self.laya_reply(**kw)))
+        brief = dispatch("Explain tp-view", config, opener=reply(intent=docs, changes=0.1))
+        self.assertEqual((brief["placement"], brief["review"], brief["scope"]), ("main", "none", "brief"))
+        self.assertEqual(brief["model"], "slotstream/qwen3.8-flash-next:4bit")
+        long = dispatch("Write the onboarding guide", config, opener=reply(intent=docs, changes=0.1, scope="sustained"))
+        self.assertEqual(long["placement"], "subagent")
+        forced = dispatch("+here +review Explain tp-view", config, opener=reply(intent=docs, changes=0.1))
+        self.assertEqual((forced["placement"], forced["review"], forced["task"]), ("main", "required", "Explain tp-view"))
+        with self.assertRaisesRegex(RouterError, "task must contain text"):
+            dispatch("+here", config, opener=reply())
 
     def test_explicit_openai_backend(self):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:

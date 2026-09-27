@@ -46,3 +46,12 @@ share a target (Opus/high) and are scored as the same route.
 `tune` tasks drive changes. `holdout` tasks are only checked, never used to
 choose a change, so a change that merely fits the tune set shows up as a
 holdout regression.
+
+## placement
+
+Where the main agent should run the request.
+
+| label | when |
+|---|---|
+| subagent | implementation or configuration/operations; required review; sustained work (an investigation, profiling, an audit, a full review of an artifact, a whole document, a multi-part plan); or anything that writes project files |
+| main | a quick answer, lookup, short explanation, short draft, a quick review of something small, or a simple recommendation |

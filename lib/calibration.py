@@ -8,19 +8,22 @@ import re
 from pathlib import Path
 
 from router import (QUESTIONS, REVIEWS, ROUTES, RouterError, feature_names, features, laya_answers,
-                    laya_intent, laya_route, questions_digest, review_policy)
+                    laya_intent, laya_route, model_digest, PLACEMENTS, placement_features, placement_policy, questions_digest, review_policy)
 
 INTENTS = tuple(QUESTIONS["task_intent"]["criteria"])
 # escalated is a labeling category (sensitive or risky work); it shares expert's target.
 LABEL_ROUTES = tuple(sorted(ROUTES | {"escalated"}))
 SPLITS = ("tune", "holdout")
-FIELDS = {"id", "task", "intent", "route", "review", "split"}
+FIELDS = {"id", "task", "intent", "route", "review", "split", "placement"}
 LAMBDAS = (0.001, 0.01, 0.03, 0.1, 0.3, 1.0)
 # Chosen by repeated 5-fold CV on the tune split (tests/calibration/experiments.md, cycle 13):
 # the gate threshold with the best review-or-not accuracy and no required review skipped,
 # and the highest level threshold with no required review downgraded to optional.
 GATE_THRESHOLD = 0.5
 LEVEL_THRESHOLD = 0.1
+# Cycle 18: the placement threshold with the best CV objective on tune (accuracy minus twice the
+# rate of delegable work kept in main); 0.2 ties 0.35 and keeps less delegable work in main.
+PLACEMENT_THRESHOLD = 0.2
 
 
 def route_label(route):
@@ -47,7 +50,7 @@ def load_corpus(path):
         if not isinstance(row["task"], str) or not row["task"].strip():
             raise RouterError("{}: task must contain text".format(where))
         for field, allowed in (("intent", INTENTS), ("route", LABEL_ROUTES), ("review", REVIEWS),
-                               ("split", SPLITS)):
+                               ("split", SPLITS), ("placement", PLACEMENTS)):
             if row[field] not in allowed:
                 raise RouterError("{}: {} must be one of {}".format(where, field, ", ".join(allowed)))
         rows.append(row)
@@ -129,7 +132,8 @@ def fit(corpus, answers):
     import numpy as np
     rows, X = _matrix(corpus, answers, "tune")
     X = np.array(X, dtype=float)
-    model = {"questions": questions_digest(), "features": feature_names(), "trained_on": len(rows)}
+    P = np.array([placement_features(laya_answers(answers[r["id"]]["reply"])) for r in rows], dtype=float)
+    model = {"questions": model_digest(), "features": feature_names(), "trained_on": len(rows)}
     routes = [route for route in sorted(ROUTES) if any(route_label(r["route"]) == route for r in rows)]
     reviewed = np.array([r["review"] != "none" for r in rows])
     heads = (
@@ -138,6 +142,8 @@ def fit(corpus, answers):
         ("gate", ["none", "review"], X, reviewed.astype(int), GATE_THRESHOLD),
         ("level", ["optional", "required"], X[reviewed],
          np.array([r["review"] == "required" for r in rows])[reviewed].astype(int), LEVEL_THRESHOLD),
+        ("placement", list(PLACEMENTS), P, np.array([r["placement"] == "subagent" for r in rows]).astype(int),
+         PLACEMENT_THRESHOLD),
     )
     for name, labels, data, y, threshold in heads:
         lam = _choose_lambda(data, y, len(labels))
@@ -159,7 +165,9 @@ def evaluate(corpus, answers, model):
         reply = answers[row["id"]]["reply"]
         got = {"intent": laya_intent(reply, model), "route": laya_route(reply, model),
                "review": review_policy(reply, model)}
-        expected = {"intent": row["intent"], "route": route_label(row["route"]), "review": row["review"]}
+        got["placement"] = placement_policy(reply, model, got["intent"], got["review"])
+        expected = {"intent": row["intent"], "route": route_label(row["route"]), "review": row["review"],
+                    "placement": row["placement"]}
         results.append({"id": row["id"], "split": row["split"], "expected": expected, "got": got})
     return results, missing
 
@@ -168,7 +176,11 @@ def summary(results):
     n = len(results)
     if not n:
         return {}
-    out = {dim: sum(r["got"][dim] == r["expected"][dim] for r in results) / n for dim in ("intent", "route", "review")}
+    out = {dim: sum(r["got"][dim] == r["expected"][dim] for r in results) / n
+           for dim in ("intent", "route", "review", "placement")}
+    out["kept_in_main"] = sum(r["expected"]["placement"] == "subagent" and r["got"]["placement"] == "main" for r in results)
+    out["delegated_needlessly"] = sum(r["expected"]["placement"] == "main" and r["got"]["placement"] == "subagent"
+                                      for r in results)
     level = lambda r, side: REVIEWS.index(r[side]["review"])
     out["required_skipped"] = sum(r["expected"]["review"] == "required" and r["got"]["review"] == "none" for r in results)
     out["optional_skipped"] = sum(r["expected"]["review"] == "optional" and r["got"]["review"] == "none" for r in results)
@@ -191,11 +203,13 @@ def report(results, missing, show_mismatches=False):
             split, s["n"], s["intent"], s["route"], s["review"], s["gate"]))
         lines.append("  reviews skipped: {} required, {} optional; required→optional {}; unneeded reviews {}".format(
             s["required_skipped"], s["optional_skipped"], s["required_downgraded"], s["unneeded_reviews"]))
+        lines.append("  placement {:.2f}: kept in main but should delegate {}; delegated needlessly {}".format(
+            s["placement"], s["kept_in_main"], s["delegated_needlessly"]))
     if show_mismatches:
         lines.append("")
         for r in results:
             diffs = ["{} {}->{}".format(d, r["expected"][d], r["got"][d])
-                     for d in ("intent", "route", "review") if r["got"][d] != r["expected"][d]]
+                     for d in ("intent", "route", "review", "placement") if r["got"][d] != r["expected"][d]]
             if diffs:
                 lines.append("  {} [{}]: {}".format(r["id"], r["split"], "; ".join(diffs)))
     if missing:

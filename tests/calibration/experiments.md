@@ -146,3 +146,16 @@ escalate) and 1 a wrong number, against mostly wrong numbers without it. On all
 40 chores C scored 111/120, the same as without it. 76% → 90% is suggestive,
 not conclusive (Fisher exact p ≈ 0.07). Kept: C as a standing prompt for Qwen
 workers, and the counting rule to Slotstream for tasks that ask for a count.
+
+## Placement (M8, 2026-09-26)
+
+Placement labels (main or subagent, `LABELS.md`) were added to all 300 tasks, and
+Laya was given an `execution_scope` question (brief, sustained, multi_step).
+Change-making intents and required reviews always delegate; the question is
+what else to keep in main.
+
+| # | change | T placement | H placement | kept in main that should delegate (T/H) | kept |
+|---|---|---|---|---|---|
+| 18 | rule: delegate unless Laya's scope is brief | 0.761 | 0.792 | 2/1 | baseline (Laya says brief for 20 of 180) |
+| 18a | brief when P(brief) ≥ threshold (0.35 by tune objective) | 0.767 | 0.783 | 2/1 | no (holdout drops) |
+| 18b | learned placement head over the answers + scope probabilities; threshold 0.2 by 3×5-fold CV on tune (objective: accuracy − 2 × rate of delegable work kept in main; 0.2 ties 0.35 with fewer kept in main) | **0.811** | **0.808** | **0/0** | **yes** |

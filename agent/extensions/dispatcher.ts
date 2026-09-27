@@ -8,7 +8,8 @@
  *                      decides whether the message belongs to one of them; if so it is
  *                      typed into that worker. When the judge is unsure, the user picks.
  *   placement main     pi route: switch the main model and thinking in place. Claude
- *                      route: stay on the home model (phase 3 adds foreground workers).
+ *                      route: pi cannot switch to Claude, so a foreground Claude worker
+ *                      answers it in the viewer slot and its reply is posted into main.
  *   placement subagent spawn the routed worker directly with the packet core (the
  *                      verbatim request, the conversation since the last delegation,
  *                      ask-if-unclear and report-back instructions); main takes no turn.
@@ -53,6 +54,7 @@ type Delegated = {
 	reviewer?: string;
 	since: number; // when it was last given input; a report must be newer
 	watching?: boolean;
+	foreground?: boolean; // a main-placed Claude route, shown in the viewer
 };
 
 const ASK_IF_UNCLEAR =
@@ -284,7 +286,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (task.review !== "required" || task.rounds >= MAX_REVIEW_ROUNDS) {
 				const note = task.rounds >= MAX_REVIEW_ROUNDS ? ` (after ${task.rounds} review rounds; last review: ${task.reviewer})` : "";
-				post(`${task.id} finished${note}.\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "result", id: task.id });
+				const verb = task.foreground ? "answered" : "finished";
+				post(`${task.id} ${verb}${note}.\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "result", id: task.id });
 				break;
 			}
 			const started = Date.now();
@@ -329,16 +332,18 @@ export default function (pi: ExtensionAPI) {
 			.finally(() => (task.watching = false));
 	};
 
-	const delegate = async (ctx: any, decision: Decision): Promise<string> => {
+	const delegate = async (ctx: any, decision: Decision, foreground = false): Promise<string> => {
 		const tmp = mkdtempSync(join(tmpdir(), "tp-dispatch-"));
 		try {
-			const args = ["--worker", decision.worker, "--model", decision.model, "--thinking", decision.thinking, "--name", "auto"];
+			const args = ["--worker", decision.worker, "--model", decision.model, "--thinking", decision.thinking];
+			args.push(...(foreground ? ["--name", "fg", "--view"] : ["--name", "auto"]));
 			const conversation = conversationSinceDelegation(ctx);
 			if (conversation) {
 				writeFileSync(join(tmp, "conversation.md"), conversation);
 				args.push("--conversation", join(tmp, "conversation.md"));
 			}
-			args.push("--note", ASK_IF_UNCLEAR, "--note", REPORT_BACK);
+			args.push("--note", ASK_IF_UNCLEAR);
+			if (!foreground) args.push("--note", REPORT_BACK);
 			if (decision.review === "required") args.push("--note", "A reviewer on another provider will check this work when you report.");
 			return (await must(bin("tp-spawn"), args, decision.task, 60_000)).split("\n")[0];
 		} finally {
@@ -556,9 +561,21 @@ export default function (pi: ExtensionAPI) {
 			const used = await switchTo(ctx, decision.model, decision.thinking);
 			ctx.ui.setStatus("auto", `AUTO main · ${used} · ${tags}`);
 		} else if (decision.placement === "main") {
-			const fallback = home();
-			if (fallback) await switchTo(ctx, `${fallback.provider}/${fallback.id}`, fallback.thinking);
-			ctx.ui.setStatus("auto", `AUTO main · home model (Claude route ${routed} not yet in place) · ${tags}`);
+			try {
+				const id = await delegate(ctx, decision, true);
+				const task: Delegated = { id, request: decision.task, review: decision.review, rounds: 0, since: Date.now(), foreground: true };
+				delegated.set(id, task);
+				post(`Answering in the viewer: ${id} (claude ${routed}):\n\n${decision.task}`, { kind: "delegated", id, foreground: true, ...decision });
+				ctx.ui.setStatus("auto", `AUTO main · foreground ${id} · ${routed} · ${tags}`);
+				showRunning();
+				follow(task);
+				return { action: "handled" };
+			} catch (error) {
+				// Could not start the worker: answer on the home model instead.
+				const fallback = home();
+				if (fallback) await switchTo(ctx, `${fallback.provider}/${fallback.id}`, fallback.thinking);
+				ctx.ui.setStatus("auto", `AUTO main · home model (foreground ${routed} failed: ${(error as Error).message}) · ${tags}`);
+			}
 		} else {
 			try {
 				const id = await delegate(ctx, decision);

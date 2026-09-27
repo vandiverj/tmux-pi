@@ -219,8 +219,10 @@ marked message is never treated as a follow-up). `/auto off` turns routing off
 for the session. If Laya is unavailable, nothing changes and the footer says so.
 If a spawn fails, main is told to delegate by hand. A routed model whose context
 window cannot hold the conversation is skipped for the home model (the default
-in `agent/settings.json`). Claude routes placed in main stay on the home model
-until they run as foreground workers.
+in `agent/settings.json`). Pi cannot switch to a Claude model, so a Claude route
+placed in main runs as a foreground worker (`fg-…`): it is shown in the viewer
+slot, its answer is posted into main, and follow-ups go to it like any running
+task. If it cannot start, main answers on the home model.
 
 ## Per-machine models
 

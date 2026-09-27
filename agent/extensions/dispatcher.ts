@@ -24,6 +24,12 @@
  * questions are posted into main's conversation as tmux-pi-auto messages, so main sees
  * them on its next turn. `/auto on|off` turns routing on or off.
  *
+ * `+research [+review] <question>` starts a research worker (config/research.json) under a
+ * contract: a report file, checkpoints and a budget, enforced by `tp-contract enforce`
+ * (reminders, then a pause) for every contract task in the workspace. Research rows go
+ * into the run ledger (`tp-ledger`) when the worker settles. Past the configured number
+ * of research or active workers, the user is asked before another starts.
+ *
  * Independently of routing, a Claude worker stopped at a choice prompt (folder trust, a
  * tool permission) is shown to the user in main as a dialog; the pick is keyed into it.
  */
@@ -57,6 +63,7 @@ type Delegated = {
 	since: number; // when it was last given input; a report must be newer
 	watching?: boolean;
 	foreground?: boolean; // a main-placed Claude route, shown in the viewer
+	report?: string; // a research contract's report file
 };
 
 const ASK_IF_UNCLEAR =
@@ -64,6 +71,8 @@ const ASK_IF_UNCLEAR =
 	"ask before acting and wait for the answer; otherwise state your assumption and proceed.";
 const REPORT_BACK =
 	"Finish with a short report: what you did, the files you changed, how you checked it, and anything you assumed or left open.";
+const RESEARCH_REPORT =
+	"Finish with a short reply: the answer in a few sentences and how confident you are; tmux-pi adds the report's path.";
 const MAX_REVIEW_ROUNDS = 2;
 const MAX_FOLLOW_UP_TASKS = 3;
 const REPLY_LIMIT = 4000;
@@ -276,13 +285,14 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			const dir = await taskDir(task.id);
-			const reply = await replyOf(task.id);
+			const raw = await replyOf(task.id);
+			const reply = raw + (task.report && !raw.includes(task.report) ? `\n\nReport: ${task.report}` : "");
 			if (!done.ok) {
 				post(`${task.id} stopped with an error.\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "failed", id: task.id });
 				break;
 			}
 			// A worker that asked a question waits for the user; its answer is routed back as a follow-up.
-			if (reply.trimEnd().endsWith("?")) {
+			if (raw.trimEnd().endsWith("?")) {
 				post(`${task.id} asks:\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "question", id: task.id });
 				break;
 			}
@@ -331,7 +341,10 @@ export default function (pi: ExtensionAPI) {
 		task.watching = true;
 		void watch(task)
 			.catch((error) => post(`Stopped following ${task.id}: ${(error as Error).message}`, { kind: "failed", id: task.id }))
-			.finally(() => (task.watching = false));
+			.finally(async () => {
+				task.watching = false;
+				if (task.report) await run(bin("tp-ledger"), ["record", task.id]);
+			});
 	};
 
 	const delegate = async (ctx: any, decision: Decision, foreground = false): Promise<string> => {
@@ -463,6 +476,73 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// Contract checkpoints (M9): tp-contract types reminders into the worker and pauses it;
+	// budget stops and pauses are posted into main, where the user decides what happens next.
+	const enforceContracts = async () => {
+		const r = await run(bin("tp-contract"), ["enforce"]);
+		for (const line of r.stdout.split("\n").filter(Boolean)) {
+			const a = JSON.parse(line);
+			const where = `Its report: ${a.artifact} (${a.status ? `Status: ${a.status}` : "no status line"}).`;
+			if (a.action === "pause") {
+				post(
+					`Paused ${a.id}: ${a.reason}. ${where} Continue, narrow the question or escalate with +followup ${a.id} <message>, or kill it from the status pane.`,
+					{ kind: "paused", id: a.id, reason: a.reason },
+				);
+				await run(bin("tp-ledger"), ["record", a.id]);
+			} else if (a.action === "stop") {
+				post(`${a.id}: ${a.reason}; it was asked to save its report and ask how to go on. ${where}`, { kind: "budget", id: a.id });
+			} else {
+				lastCtx?.ui.notify(`${a.id}: ${a.reason}; reminded it`, "info");
+			}
+		}
+	};
+
+	// +research: one bounded question to a research worker under a contract.
+	const research = async (ctx: any, question: string, review: boolean): Promise<boolean> => {
+		const config = JSON.parse(await must(bin("tp-contract"), ["research"]));
+		const tasks = join(await stateDir(), "tasks");
+		const live = new Set((await run("tmux", ["list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"])).stdout.split("\n"));
+		let researching = 0;
+		let active = 0;
+		for (const id of readdirSync(tasks, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)) {
+			const meta = readJson(join(tasks, id, "meta.json"));
+			if (!live.has(`${meta.pane} 0`)) continue;
+			if (!["waiting", "error"].includes(readJson(join(tasks, id, "state.json")).state)) active += 1;
+			if (meta.contract?.kind === "research") researching += 1;
+		}
+		const over = [
+			researching >= config.max_research ? `${researching} research workers are running (limit ${config.max_research})` : "",
+			active >= config.max_active ? `${active} workers are active (limit ${config.max_active})` : "",
+		].filter(Boolean);
+		if (over.length && !(await ctx.ui.confirm("Start another research worker?", `${over.join("; ")}. Start it anyway?`))) return false;
+		const tmp = mkdtempSync(join(tmpdir(), "tp-research-"));
+		try {
+			const args = ["--worker", config.worker, "--model", config.model, "--thinking", config.thinking, "--name", "research", "--kind", "research"];
+			const conversation = conversationSinceDelegation(ctx);
+			if (conversation) {
+				writeFileSync(join(tmp, "conversation.md"), conversation);
+				args.push("--conversation", join(tmp, "conversation.md"));
+			}
+			args.push("--note", ASK_IF_UNCLEAR, "--note", RESEARCH_REPORT);
+			if (review) args.push("--note", "A reviewer on another provider will check the report's sources when you finish.");
+			const id = (await must(bin("tp-spawn"), args, question, 60_000)).split("\n")[0];
+			const contract = readJson(join(tasks, id, "meta.json")).contract ?? {};
+			const task: Delegated = { id, request: question, review: review ? "required" : "none", rounds: 0, since: Date.now(), report: contract.artifact };
+			delegated.set(id, task);
+			const minutes = Math.round((contract.budget?.seconds ?? 0) / 60);
+			post(
+				`Research started: ${id} (${config.worker} ${config.model}/${config.thinking}, up to ${minutes} min${review ? ", reviewed" : ""}). Report: ${contract.artifact}\n\n${question}`,
+				{ kind: "delegated", id, research: true, report: contract.artifact },
+			);
+			ctx.ui.setStatus("auto", `AUTO research · ${id}`);
+			showRunning();
+			follow(task);
+			return true;
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	};
+
 	let scanning = false;
 	pi.on("session_start", (_event, ctx) => {
 		lastCtx = ctx;
@@ -472,6 +552,12 @@ export default function (pi: ExtensionAPI) {
 			for (;;) {
 				await scanPrompts().catch(() => undefined);
 				await sleep(3000);
+			}
+		})();
+		void (async () => {
+			for (;;) {
+				await enforceContracts().catch(() => undefined);
+				await sleep(15_000);
 			}
 		})();
 	});
@@ -540,6 +626,25 @@ export default function (pi: ExtensionAPI) {
 				await sendTo(task, message);
 			} catch (error) {
 				ctx.ui.notify(`Could not send to ${task.id}: ${(error as Error).message}`, "warning");
+				ctx.ui.setEditorText(text);
+			}
+			return { action: "handled" };
+		}
+
+		const researchMarker = /^\+research(\s+|$)/i.exec(text);
+		if (researchMarker) {
+			let question = text.slice(researchMarker[0].length).trim();
+			const reviewed = /^\+review(\s+|$)/i.exec(question);
+			if (reviewed) question = question.slice(reviewed[0].length).trim();
+			if (!question) {
+				ctx.ui.notify("+research needs a question", "warning");
+				ctx.ui.setEditorText(text);
+				return { action: "handled" };
+			}
+			try {
+				if (!(await research(ctx, question, !!reviewed))) ctx.ui.setEditorText(text);
+			} catch (error) {
+				ctx.ui.notify(`Could not start research: ${(error as Error).message}`, "warning");
 				ctx.ui.setEditorText(text);
 			}
 			return { action: "handled" };

@@ -21,6 +21,13 @@
 #                            (the dispatcher passes what was said since the
 #                            last delegated task)
 #   -v, --view               show it in the viewer slot right away
+#   -k, --kind research|task give the worker a contract (bin/tp-contract): an
+#                            artifact, a budget and checkpoints it must meet;
+#                            research takes its defaults from config/research.json
+#   -o, --artifact <path>    the contract's output file (research default:
+#                            the task dir's report.md)
+#   -b, --budget <spec>      time=20m[,turns=N][,tokens=N]
+#   -p, --checkpoints <spec> outline=4m[,draft=12m]
 #
 # The worker's first message is packet.md: the task, then the selected files and
 # notes. Workers load no context files (AGENTS.md, CLAUDE.md), so the packet is
@@ -41,6 +48,7 @@ source "$ROOT/lib/tp.sh"
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation=""
+kind="" artifact="" budget="" checkpoints=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -54,6 +62,10 @@ while [[ $# -gt 0 ]]; do
     -N|--note)     notes+=("${2:?}"); shift 2 ;;
     -C|--conversation) conversation="${2:?}"; shift 2 ;;
     -v|--view)     view=1; shift ;;
+    -k|--kind)     kind="${2:?}"; shift 2 ;;
+    -o|--artifact) artifact="${2:?}"; shift 2 ;;
+    -b|--budget)   budget="${2:?}"; shift 2 ;;
+    -p|--checkpoints) checkpoints="${2:?}"; shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
     -*)            die "unknown option: $1" ;;
@@ -96,6 +108,22 @@ fence() {
   while grep -q "$f" <<<"$1"; do f+='`'; done
   printf '%s' "$f"
 }
+
+id="${name:-$worker}-$(date +%H%M%S)"
+if [[ -e "$state_dir/tasks/$id" ]]; then id="$id-$RANDOM"; fi
+task_dir="$state_dir/tasks/$id"
+
+# A contract adds its terms as the first note and is recorded in meta.json.
+contract=null
+if [[ -n "$kind$artifact$budget$checkpoints" ]]; then
+  cargs=(build --workdir "$workdir" --task-dir "$task_dir" --kind "${kind:-task}")
+  if [[ -n "$artifact" ]]; then cargs+=(--artifact "$artifact"); fi
+  if [[ -n "$budget" ]]; then cargs+=(--budget "$budget"); fi
+  if [[ -n "$checkpoints" ]]; then cargs+=(--checkpoints "$checkpoints"); fi
+  built="$("$ROOT/bin/tp-contract" "${cargs[@]}")" || exit 1
+  contract="$(jq -c .contract <<<"$built")"
+  notes=("$(jq -r .note <<<"$built")" ${notes[@]+"${notes[@]}"})
+fi
 
 # Build the packet before creating anything, so a bad path fails cleanly.
 packet="$(printf '# Task\n\n%s\n' "$task")"
@@ -142,9 +170,6 @@ if [[ ${#notes[@]} -gt 0 ]]; then
 fi
 (( ${#packet} <= max_packet )) || die "packet is ${#packet} chars (max $max_packet); select fewer files or line ranges"
 
-id="${name:-$worker}-$(date +%H%M%S)"
-if [[ -e "$state_dir/tasks/$id" ]]; then id="$id-$RANDOM"; fi
-task_dir="$state_dir/tasks/$id"
 mkdir -p "$task_dir"
 printf '%s\n' "$task" > "$task_dir/task.md"
 printf '%s\n' "$packet" > "$task_dir/packet.md"
@@ -201,8 +226,9 @@ tmux set-option -p -t "$pane" remain-on-exit on
 tmux select-pane -t "$pane" -T "$id"
 
 jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking "$thinking" \
-  --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}' \
+  --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson contract "$contract" \
+  '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}
+   + if $contract == null then {} else {contract:$contract} end' \
   > "$task_dir/meta.json"
 
 echo "$id"

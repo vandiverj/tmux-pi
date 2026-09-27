@@ -65,11 +65,14 @@ Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents
 tp-spawn -w claude -m sonnet -t high "Refactor the auth module"   # prints an id
 tp-spawn -m slotstream/qwen3.8-flash-next:4bit -f task.md -v       # pi worker, view now
 tp-spawn -c src/auth.ts -c src/db.ts:40-90 -N "tokens expire after 1h" "Fix the refresh bug"
+tp-spawn -o notes.md -b time=10m,turns=40 -p outline=2m,draft=6m "Survey the logging calls"  # contract
+tp-spawn -k research "Does GitHub Pages honor custom Cache-Control?"  # research contract
 tp-list            # subagents, state, tokens, cost, current tool
 tp-view <id>       # swap its live session into the viewer (click in to type)
 tp-view -          # put the placeholder back
 tp-kill <id>       # stop it; task files stay in .tmux-pi/tasks/<id>/
 tp-clean           # archive killed subagents to .tmux-pi/archive/
+tp-ledger          # research and contract runs: time, turns, tokens, sources, your rating
 tp-reset           # stop every subagent and restore the viewer (used by /reset)
 ```
 
@@ -89,6 +92,8 @@ States come from each worker's reporter: `starting`, `working`, `tool` (the tool
 its argument show below the row), `waiting` (finished its turn, ready for more),
 `permission` (Claude is asking to use a tool), `error`. Once the process ends:
 `done`, `failed:<code>` or `killed`.
+A second line shows elapsed time and turns and, for a task with a contract,
+its checkpoint state and when its artifact was last written.
 
 ### Context packets
 
@@ -213,6 +218,9 @@ Laya does, and asks you more often.
 Start a message with `+followup` to send it to a running task without the
 judge: `+followup <id> …` names the task (any live subagent, including one main
 started), otherwise it goes to the only running delegated task or you pick one.
+Start a message with `+research` to send one question to a research worker
+(see [Research contracts](#research-contracts)); `+research +review` also has
+another provider check the report's sources.
 Start a message with `+here`, `+delegate` or `+review` to override placement or
 review (they can be combined; the route stays a validated roster target; a
 marked message is never treated as a follow-up). `/auto off` turns routing off
@@ -316,6 +324,49 @@ On `none`, `tp-review` starts nothing and exits 3. `tp-review --force <id>` (or
 review runs anyway. The level used is recorded as `review_policy` in the author's
 `meta.json`. Reviews still start only when asked; nothing hands off to review
 automatically yet.
+
+## Research contracts
+
+A task can carry a contract: an artifact file, a budget (`time`, and optionally
+`turns` and `tokens`), checkpoints (`outline`, `draft`), a stall limit and a grace
+period. `tp-spawn -k task -o FILE -b time=…` adds one (`-p` sets checkpoints);
+`tp-spawn -k research` uses the defaults in `config/research.json`. The contract
+is in `meta.json` and its terms are added to the packet's notes. The worker keeps
+`Status: outline|draft|final|partial` as the first line of its artifact.
+
+The dispatcher runs `tp-contract enforce` every 15 seconds while main is up. For
+a working worker whose artifact is not `final`, it:
+
+- types one reminder when the outline or the draft checkpoint is missed, or when
+  the artifact has not been written for the stall limit;
+- when the budget is used up, asks the worker to save a partial report and ask
+  whether to continue, escalate, narrow or discard, and tells main;
+- pauses the worker (Escape) if it has no outline by outline + grace, or keeps
+  working for the grace period after being asked to stop, and tells main.
+
+Each action is recorded in the task's `checkpoints.json`; a worker waiting on you
+or on a permission is left alone. `tp-contract status` prints the detail line
+the status pane shows.
+
+`+research <question>` spawns a Claude Code worker (the only worker type with web
+search and fetch) on the model in `config/research.json` (Sonnet at medium
+thinking by default). It is told to use primary sources, to label claims as
+source facts (with URL or path and access date), background knowledge,
+inference or hypothesis, and to write its report to
+`.tmux-pi/research/<id>.md`, which outlives `tp-clean` and `tp-exit`. Main gets
+the worker's short answer plus the report path. With more than `max_research`
+research workers or `max_active` workers running, the dispatcher asks before
+starting another. With `+review`, a reviewer on another provider checks each key
+claim against its source and classifies it as verified, report-derived,
+background knowledge or synthesis.
+
+When a research task settles, its row goes into `.tmux-pi/ledger.jsonl`: task,
+model, provider, elapsed time, turns, tokens, cost, the artifact's status and
+distinct source URLs, the checkpoint actions and why it stopped. Add your
+judgment with `tp-ledger rate <id> sources=ok|weak|missing
+cleanup=none|minor|major useful=yes|partly|no note="…"`. The ledger is the data
+for deciding whether research needs a model floor or tighter parallel limits;
+routing does not use it yet.
 
 ## Calibration
 

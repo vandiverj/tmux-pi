@@ -10,7 +10,8 @@
 #        c            archive killed subagents (tp-clean)
 #
 # Refreshes every second from each task's state.json (written by the reporters)
-# and its pane. Started by tp in the status slot; runs until the session ends.
+# and its pane. Under each row: elapsed time, turns, and for a contract (M9) its
+# checkpoint state and when its artifact was last written (bin/tp-contract status). Started by tp in the status slot; runs until the session ends.
 set -o pipefail   # no -u: bash 3.2 treats empty arrays as unbound
 
 src="${BASH_SOURCE[0]}"
@@ -54,9 +55,11 @@ clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-
 pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
 
 render() {
-  local cols rows current out i id worker status tool tokens cost model line c sel_index
+  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail
   cols="$(tput cols)"
   rows="$(tp_rows "$session")"
+  details=""
+  if [[ -n "$rows" ]]; then details="$("$ROOT/bin/tp-contract" status 2>/dev/null)"; fi
   current="$(tp_opt "$session" @tp_viewing)"
 
   ids=()
@@ -80,7 +83,9 @@ render() {
       c="$(color_for "$status")"
       if (( i == sel_index )); then c+="$rev"; fi
       out+="${c}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-      if [[ -n "$tool" ]]; then out+="${dim}    $(clip $((cols - 4)) "$tool")${reset}${esc}[K"$'\n'; fi
+      detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
+      if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
+      if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; fi
       i=$((i + 1))
     done <<<"$rows"
   fi

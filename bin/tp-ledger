@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""tp-ledger — the run ledger for measuring research and other contract work (M9).
+
+Usage: tp-ledger                       list the rows
+       tp-ledger --json                print the rows as JSON lines
+       tp-ledger record <id>           add or refresh a task's row (the dispatcher does this
+                                       for research tasks when they settle)
+       tp-ledger rate <id> key=value…  add your judgment: sources=ok|weak|missing
+                                       cleanup=none|minor|major useful=yes|partly|no note=text
+
+The ledger is <workdir>/.tmux-pi/ledger.jsonl; it outlives tp-clean and tp-exit.
+A row holds what ran (task, worker, model, provider), elapsed time, turns, tokens,
+cost, the artifact (its status line, size and distinct source URLs), the checkpoint
+actions taken, why it stopped, and your rating.
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from contract import ContractError, ledger_row, rate, read_ledger, state_dir, upsert  # noqa: E402
+
+
+def table(rows):
+    if not rows:
+        print("no ledger rows yet (tp-ledger record <id>)")
+        return
+    for r in rows:
+        mins = "{:.1f}m".format(r["elapsed_s"] / 60) if r.get("elapsed_s") is not None else "-"
+        tok = sum((r.get("tokens") or {}).values())
+        rating = " ".join("{}={}".format(k, v) for k, v in (r.get("rating") or {}).items() if k != "note") or "unrated"
+        print("{:<22} {:<8} {:<34} {:>6} {:>4}t {:>7}tok  {:<8} {:>3} urls  {:<28} {}".format(
+            r["id"], r["kind"], r.get("model") or "-", mins, r.get("turns") or 0, tok,
+            r.get("artifact_status") or "-", r.get("source_urls") or 0, (r.get("stop") or "")[:28], rating))
+        print("    " + (r.get("task") or "")[:110])
+
+
+def main(argv):
+    try:
+        root = Path(state_dir())
+        ledger = root / "ledger.jsonl"
+        if not argv or argv == ["--json"]:
+            rows = read_ledger(ledger)
+            if argv:
+                for r in rows:
+                    print(json.dumps(r))
+            else:
+                table(rows)
+        elif argv[0] == "record" and len(argv) == 2:
+            task_dir = root / "tasks" / argv[1]
+            if not (task_dir / "meta.json").exists():
+                raise ContractError("no subagent '{}'".format(argv[1]))
+            row = upsert(ledger, ledger_row(task_dir, time.time()))
+            table([row])
+        elif argv[0] == "rate" and len(argv) > 2:
+            values = {}
+            for arg in argv[2:]:
+                key, sep, value = arg.partition("=")
+                if not sep:
+                    raise ContractError("ratings are key=value: {!r}".format(arg))
+                values[key] = value
+            table([rate(ledger, argv[1], values)])
+        else:
+            print(__doc__.split("\n\n")[0], file=sys.stderr)
+            return 2
+    except ContractError as exc:
+        print("tp-ledger: {}".format(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

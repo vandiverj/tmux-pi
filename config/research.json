@@ -1,0 +1,18 @@
+{
+  "_comment": "The +research route (M9). Research workers run on Claude Code, the only harness here with web search and fetch; the model is a smaller frontier one, per the plan's external-research floor. budget, checkpoints, stall and grace are the contract defaults (tp-contract); max_research and max_active are the concurrency limits above which the dispatcher asks before starting another research worker.",
+  "worker": "claude",
+  "model": "claude-sonnet-5",
+  "thinking": "medium",
+  "budget": {
+    "time": "20m",
+    "turns": 80
+  },
+  "checkpoints": {
+    "outline": "4m",
+    "draft": "12m"
+  },
+  "stall": "6m",
+  "grace": "3m",
+  "max_research": 3,
+  "max_active": 4
+}

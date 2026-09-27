@@ -64,12 +64,20 @@ esac
 
 review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. Report either APPROVED with a brief rationale, or REQUEST_CHANGES with prioritized actionable findings including file paths and line references when possible."
 
+# A research report (M9) is checked for source support rather than code changes.
+extra=()
+if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
+  report="$(jq -r '.contract.artifact' "$dir/meta.json")"
+  review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. Report either APPROVED with a brief rationale, or REQUEST_CHANGES with prioritized findings (unsupported or wrong claims first)."
+  extra=(--note "Research report: $report")
+fi
+
 # Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
 followups=()
 if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md"); fi
 review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} --context "$dir/packet.md" --context "$dir/result.md" \
-  --note "Author task id: $id" \
+  --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy" \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
   -- "$review_task")"

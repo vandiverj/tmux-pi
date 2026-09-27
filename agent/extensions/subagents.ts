@@ -269,6 +269,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("reset", {
+		description: "Kill all subagents and start a fresh main-agent session",
+		handler: async (_args, ctx) => {
+			const answer = await ctx.ui.confirm(
+				"Reset tmux-pi workspace",
+				"This stops every subagent and starts a new main-agent session. Task files are kept.",
+			);
+			if (!answer) return;
+			const output = await must(bin("tp-reset"), []);
+			lastInput.clear();
+			const result = await ctx.newSession({
+				withSession: async (freshCtx) => {
+					freshCtx.ui.notify(output || "Workspace reset", "info");
+				},
+			});
+			if (result.cancelled) ctx.ui.notify("Reset cancelled before creating a new session", "warning");
+		},
+	});
+
 	pi.registerTool({
 		name: "kill_subagent",
 		label: "Kill subagent",

@@ -11,7 +11,7 @@
  * tp-spawn's run.sh records the process exit separately.
  */
 
-import { renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -46,11 +46,21 @@ function textOf(message: any): string {
 }
 
 export default function (pi: ExtensionAPI) {
-	const dir = process.env.TP_TASK_DIR;
+	const taskDir = process.env.TP_TASK_DIR;
+	// Main runs have no TP_TASK_DIR; tp creates @tp_state_dir for the session.
+	let dir = taskDir;
+	if (!dir && process.env.TMUX && process.env.PI_CODING_AGENT_DIR) {
+		try {
+			const { execFileSync } = require("node:child_process");
+			const session = execFileSync("tmux", ["display-message", "-p", "#S"], { encoding: "utf8" }).trim();
+			const stateDir = execFileSync("tmux", ["show-options", "-qv", "-t", `=${session}:`, "@tp_state_dir"], { encoding: "utf8" }).trim();
+			if (stateDir) { dir = join(stateDir, "main"); mkdirSync(dir, { recursive: true }); }
+		} catch {}
+	}
 	if (!dir) return;
 
 	const s: State = {
-		id: process.env.TP_TASK_ID ?? "",
+		id: process.env.TP_TASK_ID ?? "main",
 		harness: "pi",
 		state: "starting",
 		tool: "",

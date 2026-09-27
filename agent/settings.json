@@ -1,7 +1,7 @@
 {
-  "defaultProvider": "slotstream",
-  "defaultModel": "qwen3.8-flash-next:4bit",
-  "defaultThinkingLevel": "off",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.6-terra",
+  "defaultThinkingLevel": "medium",
   "packages": [],
   "theme": "dark",
   "lastChangelogVersion": "0.87.1"

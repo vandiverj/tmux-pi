@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# tp-reset — stop every tmux-pi subagent and restore the viewer placeholder.
+# The main Pi session is reset by the /reset extension command after this exits.
+#
+# Usage: tp-reset
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+state_dir="$(tp_opt "$session" @tp_state_dir)"
+viewer="$(tp_opt "$session" @tp_viewer_pane)"
+main="$(tp_opt "$session" @tp_main_pane)"
+killed=0
+
+# Put the permanent viewer slot back before closing panes that might be shown in it.
+"$ROOT/bin/tp-view" - >/dev/null 2>&1 || true
+
+for meta in "$state_dir"/tasks/*/meta.json; do
+  [[ -f "$meta" ]] || continue
+  pane="$(tp_meta "$(dirname "$meta")" pane)"
+  [[ -n "$pane" ]] || continue
+  if [[ "$(tp_pane_state "$pane")" != gone ]]; then
+    tmux kill-pane -t "$pane"
+    killed=$((killed + 1))
+  fi
+done
+
+# Defensive: close any remaining non-layout panes, including untracked workers.
+while IFS= read -r pane; do
+  [[ -z "$pane" || "$pane" == "$main" || "$pane" == "$viewer" ]] && continue
+  tmux kill-pane -t "$pane" 2>/dev/null || true
+done < <(tmux list-panes -t "=$session" -F '#{pane_id}')
+
+tmux set-option -t "$session" -u @tp_viewing 2>/dev/null || true
+echo "stopped $killed subagent(s); main session will start fresh"

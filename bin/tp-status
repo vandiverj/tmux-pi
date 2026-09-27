@@ -85,6 +85,23 @@ render() {
     done <<<"$rows"
   fi
 
+  # Aggregate main + all worker state by exact model. Keep cache separate from
+  # uncached input so the session's context reuse is visible.
+  local totals tm ti tc to
+  totals="$( { find "$tasks" -mindepth 2 -maxdepth 2 -name state.json -print 2>/dev/null; echo "$(dirname "$tasks")/main/state.json"; } | while IFS= read -r f; do
+    [[ -f "$f" ]] && cat "$f"
+  done | jq -rs '
+    map(select(.model != null and .model != "" and .tokens != null))
+    | sort_by(.model) | group_by(.model)[]
+    | {model: .[0].model, input: (map(.tokens.input // 0) | add), cache: (map((.tokens.cacheRead // 0) + (.tokens.cacheWrite // 0)) | add), output: (map(.tokens.output // 0) | add)}
+    | "\(.model)\u001f\(.input)\u001f\(.cache)\u001f\(.output)"' -r 2>/dev/null)"
+  if [[ -n "$totals" ]]; then
+    out+="${esc}[K"$'\n'"${bold}session tokens by model${reset}${esc}[K"$'\n'
+    while IFS=$'\x1f' read -r tm ti tc to; do
+      out+="${dim}$(pad 30 "$tm")${reset}in $(pad 9 "$ti") cache $(pad 9 "$tc") out $to${esc}[K"$'\n'
+    done <<<"$totals"
+  fi
+
   if [[ -n "$selected" ]]; then
     local d="$tasks/$selected" first
     out+="${esc}[K"$'\n'"${cyan}$(clip "$cols" "── $selected ")${reset}${esc}[K"$'\n'

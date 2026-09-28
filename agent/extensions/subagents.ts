@@ -109,7 +109,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete, self-contained instructions for the subagent" }),
 			worker: Type.Optional(StringEnum(["pi", "claude"] as const, { description: "Harness; implied by the router or the model" })),
-			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-5.5); claude: alias (sonnet, opus, haiku)" })),
+			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-6-sol); claude: alias (sonnet, opus, haiku)" })),
 			thinking: Type.Optional(StringEnum(THINKING, { description: "Thinking level" })),
 			name: Type.Optional(Type.String({ description: "Short id prefix, e.g. 'tests' or 'review'" })),
 			files: Type.Optional(
@@ -277,7 +277,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const answer = await ctx.ui.confirm(
 				"Exit tmux-pi workspace",
-				"This stops the main agent and every subagent, clears their task records, then closes this tmux workspace.",
+				"This stops the main agent and every subagent, archives eligible worker task records, retains protected records, then closes this tmux workspace.",
 			);
 			if (!answer) return;
 			await must(bin("tp-exit"), []);

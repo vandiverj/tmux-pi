@@ -53,12 +53,12 @@ Ask the main agent to delegate. Its subagents extension
 | Tool | Does |
 |---|---|
 | `spawn_subagent` | Builds the context packet from the task, `files` (whole or line ranges) and `notes`; routes the task with `tp-route` unless a model is given; then `tp-spawn`s it |
-| `list_subagents` | `tp-list` |
+| `list_subagents` | `tp-list`; available without main edit authority |
 | `send_to_subagent` | Types a follow-up message into the subagent's session |
-| `collect_result` | State and last reply; `wait_seconds` waits until it finishes. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
+| `collect_result` | State and last reply; `wait_seconds` waits until it finishes. Available without main edit authority, but its canonical collect step refuses unresolved required review. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |
 | `kill_subagent` | `tp-kill` |
 | `/reset` | Stops all subagents, clears the viewer, and starts a fresh main Pi session |
-| `/end` | Stops the main agent and all subagents, clears their task records, then destroys the tmux-pi workspace |
+| `/end` | Stops the main agent and all subagents, archives/retains task records with a cleanup log, then destroys the tmux-pi workspace |
 
 Inside a tmux-pi session the `tp-*` commands are on PATH (for you and the agents):
 
@@ -73,10 +73,22 @@ tp-view <id>       # swap its live session into the viewer (click in to type)
 tp-view -          # put the placeholder back
 tp-kill <id>       # stop it; task files stay in .tmux-pi/tasks/<id>/
 tp-clean           # archive killed subagents to .tmux-pi/archive/
+tp-task list       # retained task records by id/title/ticket; tp-task resume <query> prints task.md
+tp-task cleanup --dry-run --write-review cleanup.json  # review-first retention candidates; no deletion
+tp-task cleanup --delete-reviewed cleanup.json --confirm DELETE-ELIGIBLE-UNPINNED  # explicit reviewed deletion only
+tp-task preflight --mode plan --record "Design the API"  # Slice 2 durable stop-mode contract
+tp-task context --json "Fix PROJ-12 in src/auth.py"  # Slice 3/5 context + capability manifest preview
+tp-task capabilities --json "Fix PROJ-12 in src/auth.py"  # Slice 5 selected capability disclosure
+tp-task capability-request --manifest .tmux-pi/tasks/<id>/context-manifest.json "Sequential Thinking | reason=..."
+tp-task capability-resolve <id> --approve|--deny  # human shell only, not a worker/model command; dispatcher follows resolution through result/review
+tp-task review-list    # list unresolved handoff and delegated-task review blockers
+tp-task review-resolve --task-id <id> --outcome reviewed --review-reference <report> --reason "..." --confirm RESOLVE-REVIEW-REQUIRED  # human decision for a delegated blocker
 tp-ledger          # research and contract runs: time, turns, tokens, sources, your rating
 tp-reset           # stop every subagent and restore the viewer (used by /reset)
-tp-exit            # stop every agent, clear task records, and destroy the tmux-pi session (used by /end)
+tp-exit            # stop every agent, archive/retain task records, and destroy the tmux-pi session (used by /end)
 ```
+
+Review approvals bind the exact author `result.md` bytes and review round; a follow-up re-arms even a previously human-resolved task. Legacy approvals without an author hash are blocked: inspect the result and reviewer report, then use the human-only `review-resolve` command if accepting the risk. If a malformed, symlinked, wrong-id/actor, or `required:false` review marker blocks collection, the CLI intentionally cannot waive it. **Manual repair:** stop the worker, back up the task directory and `.tmux-pi/review-resolutions.log`, inspect `meta.json`, `result.md`, reviewer evidence and the marker, then restore a regular `review-required.json` with `required:true`, `task_id` matching `meta.id`, and `status:"needs_human"`. Re-run `review-list`, explicitly resolve with the human CLI (including reason and report reference when applicable), and retain the backup/audit trail. Never simply delete a blocker to permit collection. For duplicated archived ids, use the renamed archive directory name only when it uniquely identifies the unresolved task; two unresolved copies sharing the original id require individual inspection.
 
 The status pane (top right) is the same list, live. Click it, then:
 
@@ -95,7 +107,7 @@ its argument show below the row), `waiting` (finished its turn, ready for more),
 `permission` (Claude is asking to use a tool), `error`. Once the process ends:
 `done`, `failed:<code>` or `killed`.
 A second line shows elapsed time and turns and, for a task with a contract,
-its checkpoint state and when its artifact was last written.
+its checkpoint state and when its artifact was last written. Settled work also shows the `result.md` path.
 
 ### Context packets
 
@@ -107,10 +119,18 @@ they can still read other files with their tools. Limits: 60k characters per fil
 and 200k per packet (use line ranges for big files). Credential files (`.env*`,
 keys, `auth.json`, `*secret*` and similar) are refused.
 
-Each task dir holds `task.md`, `packet.md`, `meta.json`, the generated `run.sh`, and the reporter's `state.json`
-and `result.md` (the last reply). pi workers report through
+Slice 3 adds a provenance-aware context manifest for packets. Slice 5 layers a versioned capability registry over that manifest. After main preflight, deterministic policy selects the minimal initial categories from repository/filesystem search, shell/test/verification, and qualified reasoning/review profiles. Profile-only stubs (YouTrack, Context Engine, read-only DB, official documentation, browser/rendered UI validation) are documented reference categories only: they are not disclosed as available authority and cannot be auto-granted until fixture-qualified. Laya capability category wiring is inactive/pending fixture-safe selection; it may be previewed by CLI but the dispatcher does not pass Laya categories into packets. Only selected categories get detailed instructions in the packet; the full registry is not dumped into model context. Model `CAPABILITY_REQUEST:` lines are recorded in the manifest: already-approved fixture-qualified read-only/local capabilities may be granted within per-task caps, while profile-only, new, unapproved, write-capable, external, destructive, expanded-data, task-irrelevant, or over-cap requests require human approval and put the task in `needs_input`. These are profiles/stubs only; no real MCPs, broad external retrieval, generic RAG, or database row dumps are enabled.
+
+Slice 6 automation is fail-closed while remediation fixtures are pending. Unqualified routed work is a visible recommendation/manual status; it is not auto-started. The low-risk read-only/investigation and small scoped-edit cells exist only as pending cells until real dispatcher-path model/tool-route fixtures qualify and enable them. Structural medium/higher-risk contracts, sensitive/PII/security work, `+review` requests, high-risk/consequential work, and repeated-failure cases require report-only independent review and/or manual handling. `+delegate`/`+here` are explicit placement requests; `+review` only raises review and never bypasses risk/qualification. If an opposite-provider reviewer cannot start, tmux-pi asks the human and does not silently substitute the same provider or mark the review skipped. Cleanup remains review-first: dry-runs may be saved as a reviewed batch, and direct deletion requires the explicit `--delete-reviewed ... --confirm DELETE-ELIGIBLE-UNPINNED` command; pins, ticket-linked tasks, plan/prototype stop-mode records, promoted durable records, paused/resumable state, and durable artifacts are rechecked and protected. `/end`/`tp-exit` no longer removes task records blindly: it archives worker records, retains main-owned durable records, and appends the action batch to `.tmux-pi/cleanup.log`.
+
+Each task dir holds canonical human `task.md`, verbatim `request.md`, `packet.md`, optional `context-manifest.json`, `meta.json`, the generated `run.sh`, and the reporter's `state.json`
+and `result.md` (the last reply). `task.md` shows title/ticket, lifecycle state, request summary, context manifest summary, result/artifact links, and next action while the runtime files stay compatible. pi workers report through
 `agent/extensions/reporter.ts`, Claude workers through the tmux-pi plugin's hooks
-(`claude/plugins/tmux-pi/hooks/`). Token counts include cached input; cost is shown
+(`claude/plugins/tmux-pi/hooks/`). Claude's Stop settles the current submitted prompt;
+late tool hooks cannot reopen it until another UserPromptSubmit. The next prompt
+invalidates the previous `result.md` before work resumes. Hook writes serialize per
+task using a macOS-compatible advisory lock; `tp-review` still requires both a
+result and a settled worker. Token counts include cached input; cost is shown
 only for pi providers that price tokens.
 
 See [docs/plan.md](docs/plan.md) for the design and milestones.
@@ -160,7 +180,7 @@ An independently started Laya service can be used on the same endpoint.
 `tp-laya stop` leaves such a service alone; stop it with its own process manager.
 
 The routes are `simple` (Slotstream/off), `standard` (Slotstream/low),
-`coding` (GPT-5.6 Terra/medium), `complex` (GPT-6 Sol/high) and `expert`
+`coding` (GPT-6 Sol/medium), `complex` (GPT-6 Sol/high) and `expert`
 (Claude Opus/high, also used for sensitive or risky work). The learned layer is
 multinomial logistic regression over Laya's answer probabilities, trained on
 labeled tasks (see [Calibration](#calibration)); inference is plain Python.
@@ -169,16 +189,12 @@ matches the labeled tier for about 55% of held-out tasks and the labeled model
 for about 66%, and it sends about 22% of tasks to a cheaper tier than labeled.
 Pass an explicit model to `spawn_subagent` or `tp-spawn` when that matters.
 
-The roster also permits Claude Haiku/Sonnet/Opus, GPT-5.3 Codex Spark,
-GPT-5.5, GPT-5.6 Luna/Terra/Sol, and GPT-6 Luna/Sol/Astra for deliberate
-policy changes. The installed Pi provider data lists 128k context and
-$1.75/$14 input/output per million tokens for Spark; the remaining Codex
-models have 272k context. Within 5.6, Luna ($0.20/$1.20), Terra ($2/$12), and
-Sol ($4/$20) form the cost ladder; within 6, Luna ($0.10/$0.50), Sol ($2/$10),
-and Astra ($10/$50) do likewise. Terra is the current coding tier and Sol the
-current complex tier; the more expensive or less suitable entries are allowed
-but not selected automatically. There is no GPT-6 Terra entry in the installed
-provider data.
+The configured roster has eight entries: local Qwen, Slotstream, GPT-6
+Luna/Sol/Astra and Claude Haiku/Sonnet/Opus. The coding and complex tiers
+both use GPT-6 Sol at different thinking levels; the other permitted models
+require a deliberate route or model selection. GPT-5.6 and Spark are not in
+the active roster. Local/Slotstream quality, model availability and prices
+must be rechecked before relying on them for unattended work.
 
 The `models` array is the allowed spawn roster; `routes` must point into it.
 It lists eligible targets, not a guarantee that those providers are available.
@@ -186,28 +202,17 @@ The adapter accepts only unauthenticated loopback HTTP, disables proxies and
 redirects, validates responses and route targets, and fails clearly on server
 or data errors.
 
-## Automatic routing
+## Qualified automatic routing
 
-The main agent routes every message itself (`agent/extensions/dispatcher.ts`).
-Before the model sees a message, `bin/tp-route --dispatch` asks Laya once and
-returns the route, intent, review level, execution scope and placement:
+R5 first routes the request with Laya, persists a **non-authorizing** scaffold in `.tmux-pi/handoffs/<handshake-id>/`, and gives main a hidden Orient/Frame instruction. Ordinary low-risk answers need no contract. Delegation, review, stop modes, and edits require main to call `tmux_pi_commit_contract`: it persists the main contract, evaluates deterministic policy, then (only for authorized delegation) terminates the turn and dispatches at `agent_end`. A failed router/policy never authorizes a spawn. The original and effective requests remain in the handoff scaffold for recovery. A main-placed Pi route currently stays on the existing model; R5 does **not** switch models in place. Claude main placement is a foreground worker behind the same gate.
 
-- **main:** brief work that changes nothing and needs no required review. A pi
-  route switches the main model and thinking level in place; the footer shows
-  `AUTO main · <model> · <route> · review <level>`.
-- **subagent:** implementation, configuration or operations, required review,
-  or sustained work. The dispatcher spawns the routed worker itself; the main
-  model takes no turn. The worker's packet is the verbatim request, what was
-  said since the last delegated task, and two standing instructions: ask before
-  acting if a wrong guess about the intent would change files or waste
-  significant work, and finish with a report of what was done and how it was
-  checked.
+No automatic cells are currently enabled: read-only/investigation and small scoped edits remain pending until real dispatcher-path fixtures qualify them. Everything else becomes a recommendation/manual status with the proposed route and review state. Use `+delegate` or `+here` only when you intentionally make an explicit placement request; `+review` raises review but does not authorize dispatch. Human-facing notices must not be treated by the main model as permission to bypass the gate with manual subagent tools.
 
 Progress is posted into the main conversation as `tmux-pi-auto` messages
 (delegated, a worker's question, the result), so main also sees them on its next
-turn. When review is required, a cross-provider reviewer (`tp-review`) starts as
+turn. When review is required, a report-only opposite-provider reviewer (`tp-review`) starts as
 soon as the author reports. If it requests changes, its findings go back to the
-author once, and the author is reviewed again. A worker that ends its reply
+author once, and the author is reviewed again. If the reviewer cannot start or fails before approval, tmux-pi asks the human; it does not silently use a same-provider substitute or skip the review. A worker that ends its reply
 with a question is not reviewed until you answer.
 
 While delegated tasks are still running, each new message is first checked
@@ -220,19 +225,20 @@ Laya does, and asks you more often.
 Start a message with `+followup` to send it to a running task without the
 judge: `+followup <id> …` names the task (any live subagent, including one main
 started), otherwise it goes to the only running delegated task or you pick one.
+Start a message with `+plan`, `+prototype` or `+investigate` for stop-mode work:
+main gets a no-edit instruction instead of an implementation dispatch. This is
+a guarded no-edit instruction, not an OS sandbox. Before a low-risk direct edit contract (including when no handshake exists), edit/write and all bash except exact `pwd`/`true` are blocked. Shell commands with arguments, including `git --output`, `rg --pre` and `git --ext-diff`, are **not** read-only authority. Registered extension commands are consumed before the input event; slash-prefixed prompts that reach input (templates/skills/path-like text), including extension-source prompts, get their own handshake. Other extensions and unrestricted post-contract bash remain outside this cooperative gate's OS security boundary. A durable stop record is created at input (including `+investigate`), captured at `agent_settled` (after retries/continuations), and remains open if no final output exists. A mismatched direct/delegate stop contract is rejected.
 Start a message with `+research` to send one question to a research worker
 (see [Research contracts](#research-contracts)); `+research +review` also has
 another provider check the report's sources.
 Start a message with `+here`, `+delegate` or `+review` to override placement or
 review (they can be combined; the route stays a validated roster target; a
-marked message is never treated as a follow-up). `/auto off` turns routing off
-for the session. If Laya is unavailable, nothing changes and the footer says so.
-If a spawn fails, main is told to delegate by hand. A routed model whose context
-window cannot hold the conversation is skipped for the home model (the default
-in `agent/settings.json`). Pi cannot switch to a Claude model, so a Claude route
-placed in main runs as a foreground worker (`fg-…`): it is shown in the viewer
-slot, its answer is posted into main, and follow-ups go to it like any running
-task. If it cannot start, main answers on the home model.
+marked message is never treated as a follow-up). Before automatic worker dispatch,
+the main extension writes a compact Slice 2 preflight into the task record for
+non-direct work: task mode, assumptions/frame, allowed paths/tools/MCP stance,
+decision boundary, proof path and artifact tier. Direct low-risk main work remains
+compact and may stay Tier 0/no record; Tier 2+ promotions are included in the
+compact dispatch notice. `/auto off` disables routing and blocks main edits and non-read-only bash; it does not grant manual worker-spawn authority. The real router sends implementation/config changes to subagents, so a direct contract alone does **not** enable main edits on those routes. For a low-risk main placement explicitly request `+here`, then persist a direct contract; any required review or confirmation still blocks edits. Most edits require delegated review or manual handling because there are no qualified automatic cells. Model-initiated spawn/send-to-subagent tools and recognizable bash worker commands remain blocked even with AUTO off, but this is best-effort pattern detection, not a shell sandbox. Required direct-main or delegated review is retained in `review-required.json` across subsequent turns and reported at settlement; inherited blockers are references, not new markers. While a required-review worker is actively watched, its pending marker does not itself block main edits on an otherwise authorized main turn (the shared workdir is cooperative); after restart it blocks. An escalated source is likewise exempt while its linked pending-review replacement is actively watched; after restart, both block until valid approval or explicit human resolution. Follow-ups re-arm an approved task's review marker before any new worker input; collect refuses the new round until reviewed. After watcher loss, kill, discard or archive, a human can inspect `tp-task review-list` and explicitly resolve a pending task marker with `tp-task review-resolve --task-id <id> --outcome reviewed --review-reference <report-path> --reason "..." --confirm RESOLVE-REVIEW-REQUIRED`, or choose `--outcome approved --reason "..."` with the same confirmation to accept the risk. Neither outcome is automatic. Expanded templates/skills invalidate the raw-input route and contract hash: without a new verified route they cannot authorize edits or dispatch. Use `tp-task review-list` to find original blocker ids; it is **not automatically scheduled**. The blocker is ORed into later routing/policy even for innocuous-sounding follow-ups, and main edits remain blocked until a human resolves the original handoff via `tp-task review-resolve <handshake-id> --outcome reviewed --review-reference <report-path> --reason "..." --confirm RESOLVE-REVIEW-REQUIRED` after an independent report-only review, or `--outcome approved --reason "..."` with the same confirmation after an explicit human risk decision. This CLI is a cooperative human boundary, not an OS security control: an unrestricted worker shell or post-contract main shell cannot be sandboxed by this extension. Pending capability resolution likewise stays attached to the watcher until the CLI removes the pending gate and records a resolution; the worker's fresh result is then reviewed and collected. Follow-up text typed into a worker is not re-routed or re-policied: a sensitive follow-up (including a worker-side `/name` expansion) does not raise a review-none task's policy unless an existing blocker is inherited. Treat follow-ups as manual/cooperative, not newly authorized automation. Dispatcher restart does not currently reattach to active delegated tasks. Killed workers (`/reset`, `/end`, `tp-kill`) never auto-escalate. A reporter error or explicit nonzero exit may qualify for one policy-checked escalation. Handoff directories are listed as protected in cleanup dry-runs, not automatically pruned. Human narrow/escalate dialog choices are recorded exceptions to fresh R5 contracts; queued research escalation failures leave a halted recovery notice. Worker-side escalation now writes metadata atomically and carries the effective no-edit preflight into the target's contract; cross-provider escalation targets have not been fixture-qualified, and queued research escalation after restart may not carry the entire context manifest. Runtime harness tests exercise dispatcher events with a fake child-process boundary, pinned real-router decisions and the real `tp-task main-contract`, automation and human deny-resolution CLIs (tmux signalling is faked); they are not a live Pi session or model-quality qualification. Run `tests/check_dispatcher_types.sh` for pinned TypeScript 5.9.3 checking against the installed Pi extension/Node types (`PI_CODING_AGENT_PACKAGE` may override its location). No automation cell is enabled by these tests.
 
 ## Per-machine models
 
@@ -293,12 +299,22 @@ provider to `agent/models.json` and roster entry to `config/router.json`.
 
 ### Escalation
 
-A pi worker on an `escalation` model counts failed tool calls; a success resets
-the count. Past `after_consecutive_errors` (3), it writes `escalation.md` in
-its task dir with every tool call it made (arguments, errors, results) and its
-last reply, spawns the `to` model (Claude Haiku) with the original packet plus
-that file, records the new id in `escalated` and `meta.json`, and exits.
-`collect_result` on the old id points to the new one.
+Escalation is one-step and evidence-based. A worker may be escalated once for an
+observable structured trigger: reporter error state, hard budget/checkpoint or
+circuit-breaker event, a validated `TMUX_PI_ESCALATION_SIGNAL` with reason and
+evidence, or capability unavailable after policy evaluation. Ordinary reply prose
+is not scanned for escalation words. The target is chosen from the existing router
+roster: unknown source strength fails closed; thinking is not downgraded to
+off/minimal; local-to-local requires explicit qualification; otherwise tmux-pi
+prefers a stronger qualified model in the same provider/family and then a
+qualified cross-provider fallback. The source task records `escalation.json` with
+the trigger, evidence, source/target route, outcome and next action; the target
+task is marked `escalated_from`. If the escalated worker also halts, tmux-pi
+pauses and asks rather than starting another retry/fan-out.
+
+The older per-machine `escalation` key still names local pi models that should
+handoff after too many failed tool calls in a row; that handoff writes the same
+source task linkage (`escalated`) so main follows the new worker.
 
 ## Cross-provider review loop
 
@@ -337,9 +353,20 @@ automatically yet.
 A task can carry a contract: an artifact file, a budget (`time`, and optionally
 `turns` and `tokens`), checkpoints (`outline`, `draft`), a stall limit and a grace
 period. `tp-spawn -k task -o FILE -b time=…` adds one (`-p` sets checkpoints);
-`tp-spawn -k research` uses the defaults in `config/research.json`. The contract
-is in `meta.json` and its terms are added to the packet's notes. The worker keeps
-`Status: outline|draft|final|partial` as the first line of its artifact.
+when budget/artifact/checkpoints are omitted for `-k task`, Slice 4 derives them
+from the task scope, selected route/model and local/frontier balance, with hard
+caps. Automatically delegated subagents now receive such task contracts;
+`tp-spawn -k research` still uses `config/research.json`. The contract is in
+`meta.json` and its terms are added to the packet's notes. The worker keeps
+`Status: outline|draft|final|partial` as the first line of its artifact. Exception: for
+`kind=task` when either the recorded preflight or main contract sets `no_edits=true`,
+`tp-spawn` passes `--no-edits` to `tp-contract build`. This reply-only contract keeps
+time/turn/token limits, warnings, tool-error reminders, a stop and grace-period
+pause, and the existing one-escalation policy; it has no worker-written artifact,
+outline/draft checkpoints or write-stall actions. The reporter's `result.md` is
+the canonical output; status shows `reply-only`, not a missing artifact. Explicit
+`-o`/`-p` are rejected for reply-only tasks. Research and edit-authorized tasks
+still require their file artifacts.
 
 The dispatcher runs `tp-contract enforce` every 15 seconds while main is up. For
 a working worker whose artifact is not `final`, it:
@@ -357,8 +384,11 @@ Nothing is typed into a paused worker. Each action is recorded in the task's
 `checkpoints.json`; a worker waiting on a permission is left alone.
 
 A contract task that was stopped or paused and is no longer working is
-*halted*: main posts why, whether a partial report was saved, the worker's last
-reply and the report path, and asks what next:
+*halted*: main first attempts the single automatic qualified escalation described
+above, preserving the partial artifact. If no qualified target is available, the
+source was already escalated, or the handoff fails, main posts why, whether a
+partial report was saved, the worker's last reply and the report path, and asks
+what next:
 
 - **Continue**: one more budget of the original size, counted from now
   (`tp-contract extend`); offered once per task.
@@ -369,10 +399,12 @@ reply and the report path, and asks what next:
 - **Discard**: close the task; its report stays.
 - **Decide later**: leave it; `+followup` or the status pane still reach it.
 
-Nothing is retried automatically, on local models or otherwise.
+After the one escalation, nothing is retried automatically, on local models or otherwise.
 
 `tp-contract status` prints each task's state and the detail line the status
-pane shows. States: `starting`, `working`, `needs_input` (a permission prompt, or
+pane shows. Elapsed time is always visible; cost/latency-style budget pressure is
+shown as a warning only when a threshold is reached, rather than as continuous
+noise. States: `starting`, `working`, `needs_input` (a permission prompt, or
 a reply that ends in a question), `paused`, `settled` (idle, reply not yet
 handed to main), `completed` (its result was posted into main or read with
 `collect_result`), `failed`, `killed` and `escalated`. Only running tasks
@@ -402,7 +434,8 @@ Contract tasks go into `.tmux-pi/ledger.jsonl` when they settle, pause, finish
 or are closed: task, model, provider, elapsed time, turns, tokens, cost, the
 artifact's status and distinct source URLs, the checkpoint actions and why it
 stopped (for example `stop: time budget used up; no partial saved`, `narrow to
-research-…` or `discard`). Add your judgment with `tp-ledger rate <id>
+research-…` or `discard`), plus the latest escalation record when there is one.
+Add your judgment with `tp-ledger rate <id>
 sources=ok|weak|missing cleanup=none|minor|major useful=yes|partly|no
 note="…"`. The ledger is the data for deciding whether research needs a model
 floor or tighter parallel limits; routing does not use it yet.

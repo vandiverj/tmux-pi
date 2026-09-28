@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""tp-task — canonical task records, retained-task resume and retention dry-runs.
+
+Usage:
+  tp-task list [query]          list retained task records (active tasks and archive)
+  tp-task resume <query>        print the canonical task.md for one matching id/title/ticket
+  tp-task end-session [--json]  retain/archive task records for /end without deletion
+  tp-task archive-one <task-dir> archive one gone worker via tp-clean
+  tp-task capture-output <query> [--state settled|completed] < output.md
+                                save main-owned stop-mode output and refresh task.md
+  tp-task pin <query> [reason]  pin a task directory against retention cleanup
+  tp-task unpin <query>         remove an explicit manual pin (ticket protection may remain)
+  tp-task cleanup --dry-run [--days 90] [--json] [--write-review PATH]
+                                report retention candidates; optionally write reviewed batch
+  tp-task cleanup --delete-reviewed PATH --confirm DELETE-ELIGIBLE-UNPINNED [--json]
+                                delete only still-eligible reviewed candidates and log actions
+  tp-task preflight [--json] [--record] [--mode direct|plan|prototype|investigate|delegated]
+                    [--decision-json JSON] [--name NAME] <request...>
+                                select/write a Slice 2 task contract preflight
+  tp-task context [--json] [--workdir DIR] [--preflight-json JSON] [--decision-json JSON]
+                  [--laya-capabilities JSON] [--write PATH] <request...>
+                                build a Slice 3/5 context+capability manifest/broker packet
+  tp-task capabilities [--json] [--preflight-json JSON] [--decision-json JSON]
+                       [--laya-capabilities JSON] <request...>
+                                preview Slice 5 deterministic capability disclosure
+  tp-task main-contract --json --handshake-id ID --request-sha256 SHA256
+                        [--decision-json JSON] [--preflight-json JSON]
+                        [--record auto|always|never] < main-contract.json
+                                persist a main-authored R5 Orient/Frame contract
+  tp-task automation [--json] [--preflight-json JSON] [--decision-json JSON]
+                     [--main-contract-json JSON] [--repeated-failure] <request...>
+                                apply Slice 6 automation/review qualification policy
+  tp-task capability-request --manifest PATH [--json] <request...>
+                                record/grant/ask-human for a model capability request
+  tp-task capability-resolve <id> (--approve | --deny) [--json]
+                                human-only resolution of a pending bounded capability request
+  tp-task review-list [--json]   list unresolved task/handoff blockers and references
+  tp-task review-resolve <handshake-id> | --task-id <id> --outcome approved|reviewed --reason TEXT
+                         [--review-reference REF] --confirm RESOLVE-REVIEW-REQUIRED [--json]
+                                human-only audited resolution of a durable review blocker
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import time
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from contract import ContractError, state_dir as tmux_state_dir  # noqa: E402
+from task_record import (archive_task, capture_main_output, end_session_retention, find_task, format_record_for_resume, iter_task_dirs, parse_record, retention_report,  # noqa: E402
+                         approved_delegated_review, author_result_hash, review_inventory, unresolved_review, set_pin, write_record)
+from automation import automation_policy  # noqa: E402
+from preflight import (contract_note, create_preflight_record, merge_main_contract, normalize_main_contract,  # noqa: E402
+                       select_preflight)
+from context_broker import select_context, write_manifest  # noqa: E402
+from capabilities import (disclosure_note, handle_capability_request, registry, resolve_capability_request, select_capabilities,  # noqa: E402
+                          write_capability_manifest)
+
+
+def resolve_state_dir(args):
+    if args.state_dir:
+        return args.state_dir
+    return tmux_state_dir()
+
+
+def one_match(root, query):
+    matches = find_task(root, query, include_archive=True)
+    if not matches:
+        raise ContractError("no retained task matches {!r}".format(query))
+    if len(matches) > 1:
+        lines = ["multiple tasks match {!r}:".format(query)]
+        for d, where, rec in matches[:20]:
+            bits = [rec["id"], "[{}]".format(where), rec["state"], rec["title"]]
+            if rec["ticket"]:
+                bits.insert(2, rec["ticket"])
+            lines.append("  " + "  ".join(bits))
+        raise ContractError("\n".join(lines))
+    return matches[0]
+
+
+def cmd_list(args):
+    root = resolve_state_dir(args)
+    rows = []
+    for d, where in iter_task_dirs(root, include_archive=True):
+        rec = parse_record(d)
+        if args.query:
+            hay = "\n".join([rec["id"], rec["title"], rec["ticket"], rec["request"]]).lower()
+            if args.query.lower() not in hay:
+                continue
+        rows.append((d, where, rec))
+    if not rows:
+        print("no retained tasks")
+        return
+    for _d, where, rec in rows:
+        ticket = (rec["ticket"] + " ") if rec["ticket"] else ""
+        print("{:<22} {:<7} {:<12} {}{}".format(rec["id"], where, rec["state"], ticket, rec["title"]))
+
+
+def cmd_resume(args):
+    root = resolve_state_dir(args)
+    d, _where, rec = one_match(root, args.query)
+    # Ensure legacy tasks are migrated before display; keep unknown state rather than
+    # attempting to reconstruct runtime outside the existing lifecycle implementation.
+    if not rec["canonical"]:
+        write_record(d, lifecycle_state=rec["state"])
+    print(format_record_for_resume(d), end="")
+
+
+def cmd_end_session(args):
+    root = resolve_state_dir(args)
+    out = end_session_retention(root)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print("session-end retention: archived {}, retained {}; log: {}".format(len(out["archived"]), len(out["retained"]), out["log"]))
+
+
+def cmd_archive_one(args):
+    try:
+        archive_task(resolve_state_dir(args), args.task_dir)
+    except ValueError as exc:
+        raise ContractError(str(exc)) from exc
+
+
+def cmd_capture_output(args):
+    root = resolve_state_dir(args)
+    d, _where, _rec = one_match(root, args.query)
+    output = sys.stdin.read()
+    try:
+        rec = capture_main_output(d, output, lifecycle_state=args.state)
+    except ValueError as exc:
+        raise ContractError(str(exc)) from exc
+    print("captured {} output for {} as {}".format(len(output), rec["id"], rec["state"]))
+
+
+def cmd_pin(args):
+    root = resolve_state_dir(args)
+    d, _where, _rec = one_match(root, args.query)
+    set_pin(d, True, args.reason or "manual")
+    # Refresh the visible task record if present.
+    write_record(d, lifecycle_state=parse_record(d)["state"])
+    print("pinned {}".format(d.name))
+
+
+def cmd_unpin(args):
+    root = resolve_state_dir(args)
+    d, _where, _rec = one_match(root, args.query)
+    set_pin(d, False, "manual unpin")
+    write_record(d, lifecycle_state=parse_record(d)["state"])
+    print("unpinned explicit pin for {}".format(d.name))
+
+
+def _cleanup_batch(root, days):
+    rows = retention_report(root, days=days)
+    handoffs = []
+    for d in sorted((Path(root) / "handoffs").glob("*")):
+        if not d.is_dir() or d.is_symlink():
+            continue
+        scaffold = d / "scaffold.json"
+        age = int((time.time() - (scaffold if scaffold.is_file() else d).stat().st_mtime) // 86400)
+        handoffs.append({"id": d.name, "path": str(d), "age_days": age,
+                         "eligible": False, "protected": ["handoff retained for interrupted handshake; no automatic deletion"]})
+    return {"schema": "tmux-pi-cleanup-review:v1", "dry_run": True, "days": days,
+            "delete_enabled": False, "tasks": rows, "handoffs": handoffs,
+            "eligible_review_keys": [r["review_key"] for r in rows if r["eligible"]],
+            "eligible_ids": [r["id"] for r in rows if r["eligible"]],
+            "instructions": "Inspect this dry-run batch. Direct deletion requires tp-task cleanup --delete-reviewed <file> --confirm DELETE-ELIGIBLE-UNPINNED."}
+
+
+def _safe_task_path(root, path):
+    root = Path(root).resolve()
+    p = Path(path).resolve()
+    return (root / "tasks") in p.parents or (root / "archive") in p.parents
+
+
+def _delete_reviewed(root, review_file, confirm):
+    if confirm != "DELETE-ELIGIBLE-UNPINNED":
+        raise ContractError("direct cleanup deletion requires --confirm DELETE-ELIGIBLE-UNPINNED after reviewing a dry-run batch")
+    try:
+        batch = json.loads(Path(review_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ContractError("cannot read reviewed cleanup batch {}: {}".format(review_file, exc)) from exc
+    if batch.get("schema") != "tmux-pi-cleanup-review:v1" or not batch.get("dry_run"):
+        raise ContractError("review file must be a tmux-pi cleanup dry-run batch")
+    reviewed_rows = {r.get("review_key"): r for r in batch.get("tasks", []) if r.get("eligible") and r.get("review_key")}
+    reviewed = set(batch.get("eligible_review_keys") or reviewed_rows.keys())
+    if not reviewed:
+        raise ContractError("review file has no path+id cleanup candidates; rerun --dry-run with this tmux-pi version")
+    current = {r["review_key"]: r for r in retention_report(root, days=int(batch.get("days") or 90))}
+    deleted, skipped = [], []
+    for key in sorted(reviewed):
+        reviewed_row = reviewed_rows.get(key)
+        row = current.get(key)
+        task_id = (reviewed_row or {}).get("id") or (row or {}).get("id") or key
+        if not reviewed_row:
+            skipped.append({"id": task_id, "reason": "review row missing path/id identity", "review_key": key})
+            continue
+        if not row:
+            skipped.append({"id": task_id, "reason": "not found", "review_key": key})
+            continue
+        if reviewed_row.get("id") != row.get("id") or reviewed_row.get("resolved_path") != row.get("resolved_path"):
+            skipped.append({"id": task_id, "reason": "path/id mismatch", "path": row.get("path"), "review_key": key})
+            continue
+        if not row["eligible"]:
+            skipped.append({"id": task_id, "reason": "no longer eligible/protected", "protected": row.get("protected", [])})
+            continue
+        if not _safe_task_path(root, row["path"]):
+            skipped.append({"id": task_id, "reason": "unsafe path", "path": row["path"]})
+            continue
+        shutil.rmtree(row["path"])
+        deleted.append(row)
+    log = Path(root) / "cleanup.log"
+    with log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "cleanup-delete-reviewed", "review_file": str(review_file),
+                            "deleted": [r["id"] for r in deleted], "skipped": skipped}, sort_keys=True) + "\n")
+    return {"deleted": deleted, "skipped": skipped, "log": str(log)}
+
+
+def cmd_cleanup(args):
+    root = resolve_state_dir(args)
+    if args.delete_reviewed:
+        out = _delete_reviewed(root, args.delete_reviewed, args.confirm)
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True))
+        else:
+            print("deleted reviewed cleanup candidates: {}".format(len(out["deleted"])))
+            for r in out["deleted"]:
+                print("  DELETED {id} {path}".format(**r))
+            for r in out["skipped"]:
+                print("  SKIPPED {id}: {reason}".format(**r))
+            print("log: {}".format(out["log"]))
+        return
+    if not args.dry_run:
+        raise ContractError("cleanup is review-first: run --dry-run, inspect it, then use --delete-reviewed with the explicit confirmation token")
+    batch = _cleanup_batch(root, args.days)
+    rows = batch["tasks"]
+    if args.write_review:
+        Path(args.write_review).write_text(json.dumps(batch, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(batch, indent=2, sort_keys=True))
+        return
+    candidates = [r for r in rows if r["eligible"]]
+    protected = [r for r in rows if not r["eligible"]]
+    print("retention dry-run: delete_enabled=false, threshold={} days".format(args.days))
+    if args.write_review:
+        print("review batch: {}".format(args.write_review))
+    print("eligible candidates: {}".format(len(candidates)))
+    for r in candidates:
+        print("  CANDIDATE {id} ({age_days}d, {where}) {title}  path={path}".format(**r))
+    if protected:
+        print("protected/not eligible: {}".format(len(protected)))
+        for r in protected:
+            reason = "; ".join(r["protected"]) if r["protected"] else "younger than threshold"
+            print("  KEEP      {id} ({age_days}d, {where}) {title} — {reason}".format(reason=reason, **r))
+
+
+def _request_arg(words):
+    if words:
+        return " ".join(words)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+def cmd_preflight(args):
+    request = _request_arg(args.request).strip()
+    if not request:
+        raise ContractError("preflight needs a request")
+    try:
+        decision = json.loads(args.decision_json) if args.decision_json else {}
+    except ValueError as exc:
+        raise ContractError("--decision-json is not valid JSON: {}".format(exc)) from exc
+    preflight = select_preflight(request, decision=decision, mode=args.mode)
+    out = {"preflight": preflight, "note": contract_note(preflight)}
+    if args.record:
+        if not preflight.get("durable"):
+            out["record"] = None
+        else:
+            out["record"] = create_preflight_record(resolve_state_dir(args), request, preflight, name=args.name or preflight["mode"])
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    if out.get("record"):
+        print("record: {record}".format(**out["record"]))
+    elif args.record:
+        print("record: none (Tier 0)")
+    print("mode: {mode}; tier: Tier {artifact_tier}; stop: {stop}; durable: {durable}".format(**preflight))
+    if preflight.get("promotion_notice"):
+        print(preflight["promotion_notice"])
+    print(contract_note(preflight))
+
+
+def _json_arg(value, name):
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except ValueError as exc:
+        raise ContractError("{} is not valid JSON: {}".format(name, exc)) from exc
+
+
+def cmd_context(args):
+    request = _request_arg(args.request).strip()
+    if not request:
+        raise ContractError("context needs a request")
+    workdir = Path(args.workdir).resolve() if args.workdir else Path(resolve_state_dir(args)).resolve().parent
+    out = select_context(
+        request,
+        workdir,
+        preflight=_json_arg(args.preflight_json, "--preflight-json"),
+        decision=_json_arg(args.decision_json, "--decision-json"),
+        laya_capabilities=_json_arg(args.laya_capabilities, "--laya-capabilities") if args.laya_capabilities else None,
+    )
+    if args.write:
+        write_manifest(args.write, out["manifest"])
+        out["manifest_path"] = args.write
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    if args.write:
+        print("manifest: {}".format(args.write))
+    print(out["note"])
+    print(out.get("capability_note", ""))
+    for spec in out["contexts"]:
+        print("context: {}".format(spec))
+
+
+def cmd_capabilities(args):
+    request = _request_arg(args.request).strip()
+    if not request:
+        raise ContractError("capabilities needs a request")
+    manifest = select_capabilities(
+        request,
+        preflight=_json_arg(args.preflight_json, "--preflight-json"),
+        decision=_json_arg(args.decision_json, "--decision-json"),
+        laya=_json_arg(args.laya_capabilities, "--laya-capabilities") if args.laya_capabilities else None,
+    )
+    if args.json:
+        print(json.dumps({"registry": registry(), "manifest": manifest, "note": disclosure_note(manifest)}, indent=2, sort_keys=True))
+        return
+    print(disclosure_note(manifest))
+
+
+def _safe_handshake_id(value):
+    text = (value or "").strip()
+    if not text or len(text) > 120:
+        raise ContractError("handshake id is required and must be compact")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-")
+    if any(ch not in allowed for ch in text):
+        raise ContractError("handshake id contains unsupported characters")
+    return text
+
+
+def _write_json(path, data):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cmd_main_contract(args):
+    handshake_id = _safe_handshake_id(args.handshake_id)
+    request_sha = (args.request_sha256 or "").strip()
+    if len(request_sha) != 64 or any(ch not in "0123456789abcdef" for ch in request_sha.lower()):
+        raise ContractError("--request-sha256 must be a hex SHA-256 digest")
+    try:
+        raw_contract = json.loads(sys.stdin.read() or "{}")
+    except ValueError as exc:
+        raise ContractError("main contract stdin is not valid JSON: {}".format(exc)) from exc
+    try:
+        contract = normalize_main_contract(raw_contract, handshake_id, request_sha)
+    except ValueError as exc:
+        raise ContractError(str(exc)) from exc
+    decision = _json_arg(args.decision_json, "--decision-json")
+    preflight = _json_arg(args.preflight_json, "--preflight-json")
+    if not preflight:
+        preflight = select_preflight(decision.get("task") or contract.get("task_summary") or "", decision=decision)
+    enriched = merge_main_contract(preflight, contract)
+    root = Path(resolve_state_dir(args))
+    handoff = root / "handoffs" / handshake_id
+    handoff.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    try:
+        existing = json.loads((handoff / "scaffold.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    scaffold = {**existing,
+        "schema": "tmux-pi-r5-scaffold:v1",
+        "handshake_id": handshake_id,
+        "request_sha256": request_sha,
+        "decision": decision,
+        "preflight": preflight,
+    }
+    _write_json(handoff / "scaffold.json", scaffold)
+    _write_json(handoff / "main-contract.json", contract)
+    request = preflight.get("task") or decision.get("task") or contract.get("task_summary") or ""
+    make_record = args.record == "always"
+    if args.record == "auto":
+        make_record = (
+            contract["action"] in {"stop", "ask_alignment"} or
+            (contract["action"] == "direct" and (decision.get("review") == "required" or bool(preflight.get("durable")) or preflight.get("mode") != "direct"))
+        )
+    record = None
+    if make_record:
+        state = "needs_input" if contract["action"] == "ask_alignment" else "working"
+        record = create_preflight_record(root, request, enriched, name=contract.get("mode") or "main", main_contract=contract, lifecycle_state=state)
+    out = {
+        "schema": "tmux-pi-r5-main-contract-result:v1",
+        "handshake_id": handshake_id,
+        "request_sha256": request_sha,
+        "handoff": str(handoff),
+        "main_contract": contract,
+        "enriched_preflight": enriched,
+        "note": contract_note(enriched),
+        "record": record,
+        "policy_input": {"decision": decision, "preflight": enriched, "main_contract": contract},
+    }
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    print("main contract: {}".format(handoff / "main-contract.json"))
+    if record:
+        print("record: {record}".format(**record))
+
+
+def cmd_automation(args):
+    request = _request_arg(args.request).strip()
+    if not request:
+        raise ContractError("automation needs a request")
+    policy = automation_policy(
+        request,
+        decision=_json_arg(args.decision_json, "--decision-json"),
+        preflight=_json_arg(args.preflight_json, "--preflight-json"),
+        main_contract=_json_arg(args.main_contract_json, "--main-contract-json"),
+        repeated_failure=args.repeated_failure,
+    )
+    if args.json:
+        print(json.dumps(policy, indent=2, sort_keys=True))
+        return
+    print(policy["notice"])
+
+
+def cmd_capability_request(args):
+    request = _request_arg(args.request).strip()
+    if not request:
+        raise ContractError("capability-request needs a request")
+    path = Path(args.manifest)
+    try:
+        outer = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ContractError("cannot read manifest {}: {}".format(path, exc)) from exc
+    if outer.get("capability_manifest"):
+        cap_manifest = outer["capability_manifest"]
+        wrapped = True
+        preflight = dict(outer.get("preflight") or {})
+        decision = dict(outer.get("routing") or {})
+        task_text = outer.get("request_summary") or cap_manifest.get("policy", {}).get("task_relevance_text")
+    else:
+        cap_manifest = outer
+        wrapped = False
+        preflight = dict(cap_manifest.get("preflight") or {})
+        decision = dict(cap_manifest.get("routing") or {})
+        task_text = cap_manifest.get("request_summary") or cap_manifest.get("policy", {}).get("task_relevance_text")
+    if args.human_approved:
+        raise ContractError("use capability-resolve <id> --approve for a pending request; --human-approved cannot bypass the task gate")
+    cap_manifest, event = handle_capability_request(cap_manifest, request, preflight=preflight, decision=decision,
+                                                    task_text=task_text)
+    if wrapped:
+        outer["capability_manifest"] = cap_manifest
+        outer["selected_capabilities"] = cap_manifest.get("selected_categories", outer.get("selected_capabilities", []))
+        write_manifest(path, outer)
+    else:
+        write_capability_manifest(path, cap_manifest)
+    if args.json:
+        print(json.dumps({"event": event, "manifest": cap_manifest, "note": disclosure_note(cap_manifest)}, indent=2, sort_keys=True))
+        return
+    print("{}: {}".format(event.get("decision"), event.get("reason")))
+    if event.get("decision") == "granted":
+        print(disclosure_note(cap_manifest))
+
+
+def _write_json_atomic(path, data):
+    path = Path(path)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix="." + path.name + ".", delete=False) as f:
+        tmp = Path(f.name)
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def cmd_review_list(args):
+    inventory = review_inventory(resolve_state_dir(args), args.watching)
+    if args.json:
+        print(json.dumps(inventory, indent=2, sort_keys=True))
+        return
+    if not inventory["blockers"] and not inventory["references"]:
+        print("no unresolved review blockers or references")
+    for row in inventory["blockers"]:
+        print("{} {}  {}{}  reasons={}  reference={}  path={}".format(
+            row["kind"], row["id"], row["status"], " (watched; no waiver needed while live)" if row["watched"] else "", "; ".join(row["reasons"]),
+            row["review_reference"], row["path"]))
+    for row in inventory["references"]:
+        print("REFERENCE {} {} blocked_by={}  path={}".format(
+            row["kind"], row["id"], ", ".join(row["blocked_by"]), row["path"]))
+
+
+def cmd_review_resolve(args):
+    """Resolve a persisted task or handoff blocker; never grant authority to a model tool.
+
+    This is a best-effort application boundary, not OS-level authentication. The
+    dispatcher must guard model-initiated shell calls to this command separately.
+    """
+    if os.environ.get("TP_TASK_DIR"):
+        raise ContractError("review-resolve is human-only; worker task environments cannot resolve review")
+    if args.confirm != "RESOLVE-REVIEW-REQUIRED":
+        raise ContractError("review-resolve requires --confirm RESOLVE-REVIEW-REQUIRED")
+    if bool(args.handshake_id) == bool(args.task_id):
+        raise ContractError("choose exactly one handshake id or --task-id")
+    blocker_id = _safe_handshake_id(args.task_id or args.handshake_id)
+    kind = "task" if args.task_id else "handoff"
+    id_key = "task_id" if args.task_id else "handshake_id"
+    reason = (args.reason or "").strip()
+    reference = (args.review_reference or "").strip()
+    if not reason or len(reason) > 2000 or any(c in reason for c in "\r\n"):
+        raise ContractError("--reason must be a single nonempty line of at most 2000 characters")
+    if len(reference) > 2000 or any(c in reference for c in "\r\n"):
+        raise ContractError("--review-reference must be a single line of at most 2000 characters")
+    if args.outcome == "reviewed" and not reference:
+        raise ContractError("--outcome reviewed requires --review-reference to identify the independent report")
+    root = Path(resolve_state_dir(args))
+    if kind == "task":
+        # Archive collisions can rename the directory but not the task's identity.
+        # An archived directory name may disambiguate duplicate metadata ids; an
+        # original id with multiple matches must never select one arbitrarily.
+        candidates = [d for base in ("tasks", "archive") for d in (root / base).glob("*")
+                      if d.is_dir() and not d.is_symlink() and (d / "meta.json").is_file() and
+                      not (d / "meta.json").is_symlink()]
+        # A renamed archive directory is an explicit selector, not an identity lookup.
+        explicit = [d for d in candidates if d.name == blocker_id and
+                    _json_file(d / "meta.json").get("id") != blocker_id]
+        matches = explicit or [d for d in candidates if _json_file(d / "meta.json").get("id") == blocker_id]
+        dirs = [d for d in matches if unresolved_review(d / "review-required.json", _json_file(d / "meta.json").get("id"))]
+        # Never pick arbitrarily between two unresolved copies of the same identity.
+        if not dirs and len(matches) == 1:
+            dirs = matches  # Preserve the precise validation error for an already resolved marker.
+        if len(dirs) != 1:
+            raise ContractError("expected exactly one active/archived task {!r}; found {}".format(blocker_id, len(dirs)))
+        target = dirs[0]
+        meta_path = target / "meta.json"
+        if meta_path.is_symlink() or not meta_path.is_file():
+            raise ContractError("task metadata must match {!r}".format(blocker_id))
+        task_identity = _json_file(meta_path).get("id")
+        if not isinstance(task_identity, str) or not task_identity or (target.name != blocker_id and task_identity != blocker_id):
+            raise ContractError("task metadata must match {!r}".format(blocker_id))
+    else:
+        target = root / "handoffs" / blocker_id
+    path = target / "review-required.json"
+    if target.is_symlink() or not target.is_dir() or path.is_symlink() or not path.is_file():
+        raise ContractError("no durable review-required {} for {!r}".format(kind, blocker_id))
+    try:
+        blocker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ContractError("malformed review-required {}: {}".format(kind, exc)) from exc
+    identity = task_identity if kind == "task" else blocker_id
+    status = blocker.get("status") if isinstance(blocker, dict) else None
+    if not isinstance(blocker, dict) or blocker.get(id_key) != identity or blocker.get("required") is not True or not (
+        status == "needs_human" or (kind == "task" and (status == "pending_review" or
+        (status == "approved" and not approved_delegated_review(target, _json_file(meta_path), blocker))))):
+        raise ContractError("review-required {} must be unresolved, required, and match its id".format(kind))
+    resolution = {"outcome": args.outcome, "reason": reason, "review_reference": reference,
+                  "resolved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "actor": "human_cli"}
+    if kind == "task":
+        import uuid
+        try:
+            resolution["author_sha256"] = author_result_hash(target)
+        except OSError as exc:
+            raise ContractError("cannot resolve unreadable or symlinked author result: {}".format(exc)) from exc
+        # Old human gates need a fresh round; bind both fields in the same atomic write.
+        nonce = blocker.get("round_nonce")
+        if not isinstance(nonce, str) or not nonce:
+            nonce = str(uuid.uuid4())
+        resolution["round_nonce"] = nonce
+        blocker = {**blocker, "round_nonce": nonce}
+    updated = {**blocker, "status": "resolved", "resolution": resolution}
+    # Atomic replacement prevents a partial JSON write from clearing the gate.
+    _write_json_atomic(path, updated)
+    # Direct-main records can carry a copy of the authoritative handoff marker.
+    if kind == "handoff":
+        for base in ("tasks", "archive"):
+            for meta_path in (root / base).glob("*/meta.json"):
+                d = meta_path.parent
+                if d.is_symlink() or meta_path.is_symlink() or _json_file(meta_path).get("handshake_id") != blocker_id:
+                    continue
+                copy = d / "review-required.json"
+                if copy.is_file() and not copy.is_symlink():
+                    local = _json_file(copy)
+                    if local.get("handshake_id") == blocker_id and local.get("status") == "needs_human":
+                        _write_json_atomic(copy, {**local, "status": "resolved", "resolution": resolution})
+    audit = {"schema": "tmux-pi-review-resolution:v1", id_key: task_identity if kind == "task" else blocker_id,
+             kind: str(target), "resolution": resolution}
+    with (root / "review-resolutions.log").open("a", encoding="utf-8") as log:
+        log.write(json.dumps(audit, sort_keys=True) + "\n")
+    print(json.dumps(updated, indent=2, sort_keys=True) if args.json else
+          "resolved review-required {} {} as {}".format(kind, blocker_id, args.outcome))
+
+
+def cmd_capability_resolve(args):
+    # This is a cooperative human authority boundary, not OS-level authentication.
+    if os.environ.get("TP_TASK_DIR"):
+        raise ContractError("capability-resolve is human-only; worker task environments cannot resolve approval")
+    root = Path(resolve_state_dir(args))
+    if not args.id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for c in args.id):
+        raise ContractError("invalid task id")
+    d = root / "tasks" / args.id
+    if not d.is_dir() or d.is_symlink() or not (d / "meta.json").exists():
+        raise ContractError("no active task {!r}".format(args.id))
+    pending_path = d / "pending-capability.json"
+    if not pending_path.is_file() or pending_path.is_symlink():
+        raise ContractError("{} has no pending capability request".format(args.id))
+    pending = _json_file(pending_path)
+    request = pending.get("request")
+    if not isinstance(request, str) or not request.strip():
+        raise ContractError("pending request is malformed")
+    meta = _json_file(d / "meta.json")
+    if meta.get("worker") not in ("pi", "claude"):
+        raise ContractError("capability resolution requires a worker task")
+    manifest_path = d / "context-manifest.json"
+    outer = _json_file(manifest_path) if manifest_path.is_file() else {}
+    cap = outer.get("capability_manifest")
+    if args.approve and (not isinstance(cap, dict) or not cap.get("schema")):
+        raise ContractError("cannot approve without a valid Slice 5 manifest; deny or recreate task with bounded context")
+    event = {"time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             "type": "capability_resolution", "request": request, "decision": "denied" if args.deny else "granted"}
+    if args.approve:
+        try:
+            cap, event = resolve_capability_request(cap, pending)
+        except ValueError as exc:
+            raise ContractError(str(exc)) from exc
+    pane = meta.get("pane")
+    if args.approve:
+        if not isinstance(pane, str) or not pane.startswith("%") or not pane[1:].isdigit():
+            raise ContractError("cannot deliver bounded grant: no valid worker pane")
+        # tmux IPC mirrors tp-contract send. No grant is persisted if delivery fails.
+        note = next(x for x in cap["disclosures"] if x["id"] == event["id"])
+        signal = ("Human approved only {}: authority={}; boundary={}; instructions={}. "
+                  "Do not expand this grant; ask again for any other access.").format(
+                      note["category"], note["authority"], note["data_boundary"], note["instructions"])
+    else:
+        signal = "Human denied capability request: {}. Continue only within existing permissions or report the blocker.".format(request)
+    if pane and isinstance(pane, str) and pane.startswith("%") and pane[1:].isdigit():
+        try:
+            subprocess.run(["tmux", "send-keys", "-t", pane, "-l", signal.replace("\n", " ")], check=True, capture_output=True)
+            time.sleep(0.3)
+            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            if args.approve:
+                raise ContractError("worker signal failed; pending request remains: {}".format(exc)) from exc
+            event["signal_error"] = str(exc)
+    elif args.deny:
+        event["signal_error"] = "no worker pane available"
+    if args.approve:
+        outer["capability_manifest"] = cap
+        outer["selected_capabilities"] = cap.get("selected_categories", [])
+        write_manifest(manifest_path, outer)
+    elif isinstance(cap, dict):
+        cap.setdefault("events", []).append(event)
+        write_manifest(manifest_path, outer)
+    checkpoints = _json_file(d / "checkpoints.json")
+    checkpoints.setdefault("events", []).append({"action": "capability-resolve", "at": time.time(),
+                                                    "outcome": event["decision"], "request": request, "id": event.get("id")})
+    _write_json(d / "checkpoints.json", checkpoints)
+    pending_path.unlink()
+    write_record(d, lifecycle_state="working", meta=meta)
+    result = {"id": args.id, "event": event, "pending_cleared": True,
+              "worker_signaled": "signal_error" not in event}
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else
+          "{} capability request for {} (worker signaled: {})".format(event["decision"], args.id, result["worker_signaled"]))
+
+
+def _json_file(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tp-task", description=__doc__.split("\n")[0])
+    parser.add_argument("--state-dir", help="tmux-pi state dir; defaults to current session/.tmux-pi")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("list")
+    p.add_argument("query", nargs="?")
+    p = sub.add_parser("resume")
+    p.add_argument("query")
+    p = sub.add_parser("end-session")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("archive-one")
+    p.add_argument("task_dir")
+    p = sub.add_parser("capture-output")
+    p.add_argument("query")
+    p.add_argument("--state", choices=("settled", "completed"), default="completed")
+    p = sub.add_parser("pin")
+    p.add_argument("query")
+    p.add_argument("reason", nargs="?")
+    p = sub.add_parser("unpin")
+    p.add_argument("query")
+    p = sub.add_parser("cleanup")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--write-review", help="write the dry-run batch for human review before deletion")
+    p.add_argument("--delete-reviewed", help="delete only still-eligible candidates from a reviewed dry-run JSON batch")
+    p.add_argument("--confirm", help="required token for --delete-reviewed: DELETE-ELIGIBLE-UNPINNED")
+    p = sub.add_parser("preflight")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--record", action="store_true", help="write a durable task record when tier requires it")
+    p.add_argument("--mode", choices=("direct", "delegated", "plan", "prototype", "investigate"))
+    p.add_argument("--decision-json", help="router dispatch JSON to use as hints")
+    p.add_argument("--name", help="task id prefix when --record writes a task dir")
+    p.add_argument("request", nargs="*")
+    p = sub.add_parser("context")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--workdir", help="project workdir; defaults to dirname(state-dir)")
+    p.add_argument("--preflight-json", help="Slice 2 preflight JSON")
+    p.add_argument("--decision-json", help="router dispatch JSON")
+    p.add_argument("--laya-capabilities", help="candidate-only Laya capability categories JSON")
+    p.add_argument("--write", help="write just the manifest JSON to this path")
+    p.add_argument("request", nargs="*")
+    p = sub.add_parser("capabilities")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--preflight-json", help="Slice 2 preflight JSON")
+    p.add_argument("--decision-json", help="router dispatch JSON")
+    p.add_argument("--laya-capabilities", help="candidate-only Laya capability categories JSON")
+    p.add_argument("request", nargs="*")
+    p = sub.add_parser("main-contract")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--handshake-id", required=True)
+    p.add_argument("--request-sha256", required=True)
+    p.add_argument("--decision-json", help="router dispatch JSON to persist as scaffold facts")
+    p.add_argument("--preflight-json", help="deterministic scaffold preflight JSON")
+    p.add_argument("--record", choices=("auto", "always", "never"), default="auto")
+    p = sub.add_parser("automation")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--preflight-json", help="Slice 2 preflight JSON")
+    p.add_argument("--decision-json", help="router dispatch JSON")
+    p.add_argument("--main-contract-json", help="R5 main Orient/Frame contract JSON")
+    p.add_argument("--repeated-failure", action="store_true")
+    p.add_argument("request", nargs="*")
+    p = sub.add_parser("capability-request")
+    p.add_argument("--manifest", required=True, help="capability manifest or context-manifest.json to update")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--human-approved", action="store_true", help="deprecated: rejected; use capability-resolve")
+    p.add_argument("request", nargs="*")
+    p = sub.add_parser("review-list", help="show unresolved task and handoff review blockers")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--watching", nargs="*", default=[], help="live watcher task ids (edit gate only; not collect)")
+    p = sub.add_parser("review-resolve", help="human-only: resolve a durable task or handoff blocker")
+    p.add_argument("handshake_id", nargs="?")
+    p.add_argument("--task-id", help="resolve a worker task blocker instead of a handoff blocker")
+    p.add_argument("--outcome", choices=("approved", "reviewed"), required=True)
+    p.add_argument("--reason", required=True, help="human rationale; approval is a waiver, not independent review")
+    p.add_argument("--review-reference", help="independent report path/URL; required for reviewed outcome")
+    p.add_argument("--confirm", required=True, help="required token: RESOLVE-REVIEW-REQUIRED")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("capability-resolve", help="human-only: resolve a pending worker capability request")
+    p.add_argument("id")
+    choice = p.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--approve", action="store_true")
+    choice.add_argument("--deny", action="store_true")
+    p.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        globals()["cmd_" + args.cmd.replace("-", "_")](args)
+    except ContractError as exc:
+        print("tp-task: {}".format(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,9 +8,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from contract import (ContractError, artifact_info, build, duration, evaluate, extension, is_local,  # noqa: E402
-                      ledger_row, lifecycle, load_research, message, note, quantity, rate, read_ledger, summary_line,
-                      upsert)
+from contract import (ContractError, artifact_info, build, duration, dynamic_terms, evaluate, extension,  # noqa: E402
+                      escalation_record, is_local, ledger_row, lifecycle, load_research, message, note, quantity, rate,
+                      read_escalations, read_ledger, select_escalation, summary_line, upsert, write_escalations)
 from router import load_config  # noqa: E402
 
 T0 = 1_800_000_000  # a fixed clock; meta.created is this instant
@@ -43,6 +44,7 @@ class ContractTests(unittest.TestCase):
                 duration(bad)
         self.assertEqual(self.contract["budget"], {"seconds": 1200, "turns": 50, "tokens": None})
         self.assertEqual(self.contract["checkpoints"], {"outline": 240, "draft": 720})
+        self.assertEqual(self.contract["warning_thresholds"]["time"], 0.8)
         for args in (("essay", "/r.md", "time=5m", "", "1m", "1m"),       # kind
                      ("task", "r.md", "time=5m", "", "1m", "1m"),         # relative artifact
                      ("task", "/r.md", "turns=5", "", "1m", "1m"),        # no time
@@ -51,6 +53,42 @@ class ContractTests(unittest.TestCase):
                      ("task", "/r.md", "time=20m", "outline=8m,draft=4m", "1m", "1m")):  # out of order
             with self.assertRaises(ContractError):
                 build(*args)
+
+    def test_reply_only_build_validation_and_enforcement(self):
+        for kind, cp, flag in (("research", {}, True), ("task", "outline=1m", True),
+                               ("task", {}, "true")):
+            with self.assertRaises(ContractError):
+                build(kind, "/x.md", "time=5m", cp, "1m", "1m", no_edits=flag)
+        c = build("task", str(self.dir / "result.md"), "time=10m,turns=10,tokens=100",
+                  {}, "2m", "1m", no_edits=True)
+        meta = dict(self.meta, contract=c)
+        missing = self.art(False)
+        text = note(c, T0)
+        self.assertIn("reply-only", text)
+        for forbidden in ("artifact.md", "write your output", "Status:", "outline", "draft", "checkpoint"):
+            self.assertNotIn(forbidden, text)
+        state = {"state": "working", "turns": 8, "tokens": {"input": 80}}
+        r = evaluate(meta, state, missing, T0 + 300, True)
+        self.assertEqual((r["status"], set(r["warnings"]), r["action"]),
+                         ("reply-only", {"turns", "tokens"}, None))  # beyond old outline
+        self.assertIn("reply-only", r["phase"])
+        self.assertIn("time", evaluate(meta, state, missing, T0 + 480, True)["warnings"])
+        self.assertEqual(evaluate(meta, dict(state, tokens={"input": 100}), missing,
+                                  T0 + 300, True)["action"][0], "stop")
+        self.assertEqual(evaluate(meta, state, missing, T0 + 600, True)["action"][0], "stop")
+        self.assertEqual(evaluate(meta, dict(state, toolErrors=4), missing, T0 + 300, True)["action"][0], "nudge-errors")
+        errors = [{"action": "nudge-errors", "at": T0 + 300}]
+        self.assertEqual(evaluate(meta, dict(state, toolErrors=4), missing, T0 + 361, True, errors)["action"][0], "pause")
+        over = evaluate(meta, dict(state, turns=10), missing, T0 + 400, True)
+        self.assertEqual(over["action"][0], "stop")
+        self.assertNotIn("Status:", message("stop", c))
+        self.assertNotIn("save", message("stop", c))
+        stopped = [{"action": "stop", "reason": "turns budget used up", "at": T0 + 400}]
+        self.assertEqual(evaluate(meta, dict(state, turns=10), missing, T0 + 461, True, stopped)["action"][0], "pause")
+        halted = evaluate(meta, {"state": "waiting", "updated": iso(T0 + 450)}, missing, T0 + 470, True, stopped)
+        self.assertIn("reply-only", halted["action"][1])
+        self.assertNotIn("no partial", halted["action"][1])
+        self.assertEqual(extension(meta, state, T0 + 500, stopped)["budget"]["turns"], 18)
 
     def test_phases_before_each_checkpoint(self):
         m = lambda minutes, art: evaluate(self.meta, {"state": "working", "turns": 1}, art, T0 + minutes * 60, True)
@@ -61,6 +99,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(m(13, self.art("outline", now=T0 + 780))["phase"], "draft missed")
         self.assertEqual(m(21, self.art("draft", now=T0 + 1260))["phase"], "over budget (time)")
         self.assertEqual(m(21, self.art("final", now=T0 + 1260))["phase"], "final")
+        self.assertIn("time", m(17, self.art("draft", now=T0 + 1020))["warnings"])
         stalled = m(13, self.art("draft", age=400, now=T0 + 780))
         self.assertEqual(stalled["phase"], "no new writes for 6m40s")
 
@@ -95,6 +134,86 @@ class ContractTests(unittest.TestCase):
         self.assertIsNone(act(23, self.art("final", now=T0 + 1380), [stop]))
         # The turn budget counts too.
         self.assertEqual(act(5, fresh(5), turns=50), "stop")
+
+    def test_spawn_reply_only_packet_and_cli_status_fixture(self):
+        state = self.dir / ".tmux-pi"
+        state.mkdir()
+        fake = self.dir / "fake-bin"
+        fake.mkdir()
+        tmux = fake / "tmux"
+        tmux.write_text('#!/bin/sh\ncase "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0";;\n esac\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), TP_SESSION="fixture",
+                   PATH=str(fake) + os.pathsep + os.environ["PATH"])
+        env.pop("TMUX", None)
+        def spawn(label, pf, main):
+            preflight, main_file = self.dir / (label + "-pf.json"), self.dir / (label + "-main.json")
+            preflight.write_text(json.dumps(pf))
+            main_file.write_text(json.dumps(main))
+            run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--kind", "task", "--name", label,
+                                  "--preflight", str(preflight), "--main-contract", str(main_file),
+                                  "--note", "Task contract preflight: no_edits=True; no edit/apply/write tools" if
+                                  (main.get("no_edits") or pf.get("no_edits")) else "Edit allowed",
+                                  "+delegate Read fixture.txt and report the color of cedar; do not modify files" if
+                                  (main.get("no_edits") or pf.get("no_edits")) else "Fix fixture typo"],
+                                 env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            d = state / "tasks" / run.stdout.strip()
+            return d, json.loads((d / "meta.json").read_text()), (d / "packet.md").read_text()
+        d, meta, packet = spawn("read-only", {"no_edits": False}, {"no_edits": True})
+        c = meta["contract"]
+        self.assertTrue(c["no_edits"])
+        self.assertEqual(c["checkpoints"], {})
+        self.assertEqual(c["artifact"], str(d / "result.md"))
+        self.assertFalse((d / "artifact.md").exists())
+        self.assertIn("+delegate Read fixture.txt", packet)
+        self.assertIn("no edit/apply/write tools", packet)
+        self.assertIn("reply-only", packet)
+        self.assertNotIn("artifact.md", packet)
+        self.assertNotIn("Status: outline", packet)
+        d2, m2, p2 = spawn("scaffold-only", {"no_edits": True}, {"no_edits": False})
+        self.assertTrue(m2["contract"]["no_edits"])
+        self.assertIn("reply-only", p2)
+        edit, edit_meta, edit_packet = spawn("edit-allowed", {"no_edits": False}, {"no_edits": False})
+        self.assertNotIn("no_edits", edit_meta["contract"])
+        self.assertIn("artifact.md", edit_packet)
+        self.assertIn("Status: outline", edit_packet)
+        # Beyond the outline deadline, CLI enforcement must not send file-based nudges.
+        import time
+        from datetime import datetime, timezone
+        meta["created"] = datetime.fromtimestamp(time.time() - 180, timezone.utc).isoformat()
+        (d / "meta.json").write_text(json.dumps(meta))
+        (d / "state.json").write_text(json.dumps({"state": "working", "turns": 1}))
+        status = subprocess.run([str(ROOT / "bin/tp-contract"), "status"], env=env, text=True, capture_output=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("reply-only", status.stdout)
+        self.assertNotIn("result.md not written", status.stdout)
+        # Disable the other two fixture panes so only the reply-only task is enforced.
+        (edit / "meta.json").unlink()
+        (d2 / "meta.json").unlink()
+        enforce = subprocess.run([str(ROOT / "bin/tp-contract"), "enforce"], env=env, text=True, capture_output=True)
+        self.assertEqual(enforce.returncode, 0, enforce.stderr)
+        self.assertFalse((d / "checkpoints.json").exists(), enforce.stdout)
+        (d / "result.md").write_text("cedar is green\n")  # reporter-owned reply fixture
+        status = subprocess.run([str(ROOT / "bin/tp-contract"), "status"], env=env, text=True, capture_output=True)
+        self.assertIn("reply-only; result.md recorded by reporter", status.stdout)
+        extended = subprocess.run([str(ROOT / "bin/tp-contract"), "extend", d.name], env=env,
+                                  text=True, capture_output=True)
+        self.assertEqual(extended.returncode, 0, extended.stderr)
+        self.assertIn("reply only", json.loads(extended.stdout)["message"])
+        self.assertNotIn("Status:", extended.stdout)
+        for args in (("--kind", "research", "--no-edits"),
+                     ("--kind", "task", "--no-edits", "--checkpoints", "outline=1m"),
+                     ("--kind", "task", "--no-edits", "--artifact", "/tmp/forbidden.md")):
+            result = subprocess.run([str(ROOT / "bin/tp-contract"), "build", "--workdir", str(self.dir),
+                                     "--task-dir", str(d), *args], env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, args)
+        bad = self.dir / "invalid-pf.json"
+        bad.write_text('{"no_edits":"true"}')
+        result = subprocess.run([str(ROOT / "bin/tp-spawn"), "-k", "task", "--preflight", str(bad),
+                                 "Read fixture.txt"], env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be boolean", result.stderr)
 
     def test_elapsed_stops_when_settled(self):
         r = evaluate(self.meta, {"state": "waiting", "turns": 9, "updated": iso(T0 + 600)}, self.art("final", now=T0 + 600),
@@ -148,6 +267,253 @@ class ContractTests(unittest.TestCase):
                 rate(ledger, "research-1", bad)
         with self.assertRaises(ContractError):
             rate(ledger, "nope", {"useful": "yes"})
+
+    def test_dynamic_terms_and_escalation_target(self):
+        brief = dynamic_terms("task", {"route": "standard", "scope": "brief", "model": "mlx/qwen"})
+        strong = dynamic_terms("task", {"route": "complex", "scope": "multi_step", "model": "openai-codex/gpt-6-sol"})
+        self.assertLess(duration(brief["budget"]["time"]), duration(strong["budget"]["time"]))
+        self.assertEqual(brief["profile"]["source"], "dynamic")
+        roster = load_config(ROOT / "config/router.json", local_path=False)["models"]
+        preferred = {"worker": "claude", "model": "claude-opus-5-5", "thinking": "medium"}
+        self.assertEqual(select_escalation({"worker": "claude", "model": "claude-sonnet-5", "thinking": "medium"}, roster,
+                                           preferred=preferred), preferred)
+        target = select_escalation({"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "medium"}, roster)
+        self.assertEqual(target["model"], "openai-codex/gpt-6-sol")
+        self.assertNotIn(target["thinking"], ("off", "minimal"))
+        local_preferred = {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"}
+        for local_model in ("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b"):
+            escalated = select_escalation({"worker": "pi", "model": local_model, "thinking": "off"}, roster,
+                                          preferred=local_preferred)
+            self.assertIsNotNone(escalated)
+            self.assertEqual(escalated, local_preferred)
+            self.assertIn(escalated["thinking"], next(r["thinking"] for r in roster if r["model"] == escalated["model"]))
+        self.assertNotIn("openai-codex/gpt-5.3-codex-spark", [r["model"] for r in roster])
+        self.assertNotIn("off", next(r["thinking"] for r in roster if r["model"] == "openai-codex/gpt-6-astra"))
+        self.assertIsNone(select_escalation({"worker": "pi", "model": "unknown/model", "thinking": "medium"}, roster))
+        local_roster = [
+            {"worker": "pi", "model": "slotstream/qwen3.8-flash-next:4bit", "thinking": ["low"]},
+            {"worker": "pi", "model": "lmstudio/qwen/qwen3.6-35b-a3b", "thinking": ["low"], "qualified_local_escalation": True},
+        ]
+        self.assertEqual(select_escalation({"worker": "pi", "model": "slotstream/qwen3.8-flash-next:4bit", "thinking": "off"}, local_roster)["model"],
+                         "lmstudio/qwen/qwen3.6-35b-a3b")
+
+    def test_collect_refuses_unresolved_delegated_review_even_if_worker_settled(self):
+        state = self.dir / "collect-state"
+        task = state / "tasks" / "worker-1"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps({"id": "worker-1", "worker": "pi", "pane": "%1"}))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
+        (task / "result.md").write_text("Done.\n")
+        (task / "exit").write_text("0\n")
+        marker = task / "review-required.json"
+        marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True,
+                                      "reasons": ["reviewer unavailable"]}))
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        cmd = [str(ROOT / "bin/tp-contract"), "collect", "worker-1"]
+        for content in (marker.read_text(), "{bad json", json.dumps({"task_id": "wrong", "status": "resolved"})):
+            marker.write_text(content)
+            result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("review", result.stderr)
+            self.assertFalse((task / "completed").exists())
+        human_env = dict(env)
+        for key in ("TP_TASK_DIR", "TP_TASK_ID", "TMUX", "TMUX_PANE"):
+            human_env.pop(key, None)
+        marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True}))
+        resolved = subprocess.run([str(ROOT / "bin/tp-task"), "--state-dir", str(state), "review-resolve",
+                                   "--task-id", "worker-1", "--outcome", "approved", "--reason", "Human waiver",
+                                   "--confirm", "RESOLVE-REVIEW-REQUIRED"], env=human_env,
+                                  text=True, capture_output=True)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        collected = subprocess.run(cmd, env=env, text=True, capture_output=True)
+        self.assertEqual(collected.returncode, 0, collected.stderr)
+        self.assertEqual(collected.stdout.strip(), "completed")
+        self.assertTrue((task / "completed").exists())
+
+    def test_required_review_without_marker_and_independent_approval(self):
+        import hashlib
+        state = self.dir / "review-state"
+        task = state / "tasks" / "author"
+        task.mkdir(parents=True)
+        meta = {"id": "author", "worker": "pi", "pane": "%1", "decision": {"review": "required"}}
+        (task / "meta.json").write_text(json.dumps(meta))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
+        (task / "exit").write_text("0\n")
+        (task / "result.md").write_text("Done.\n")
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        cmd = [str(ROOT / "bin/tp-contract"), "collect", "author"]
+        def collect_ok():
+            return subprocess.run(cmd, env=env, text=True, capture_output=True).returncode == 0
+        self.assertFalse(collect_ok())  # Legacy task / lost watcher.
+        marker = task / "review-required.json"
+        self.assertEqual(json.loads(marker.read_text())["status"], "needs_human")
+        human_env = dict(env)
+        for key in ("TP_TASK_DIR", "TP_TASK_ID", "TMUX", "TMUX_PANE"):
+            human_env.pop(key, None)
+        resolved = subprocess.run([str(ROOT / "bin/tp-task"), "--state-dir", str(state), "review-resolve",
+                                  "--task-id", "author", "--outcome", "approved", "--reason", "Legacy review waived",
+                                  "--confirm", "RESOLVE-REVIEW-REQUIRED"], env=human_env, text=True, capture_output=True)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertTrue(collect_ok())
+        self.assertTrue((state / "review-resolutions.log").exists())
+        (task / "completed").unlink()
+        marker.write_text(json.dumps({"required": True, "status": "pending_review", "task_id": "author"}))
+        self.assertFalse(collect_ok())
+        reviewer = state / "tasks" / "reviewer"
+        reviewer.mkdir()
+        (reviewer / "meta.json").write_text(json.dumps({"id": "reviewer", "worker": "pi"}))
+        (reviewer / "review-of").write_text("author\n")
+        report = "APPROVED: independently inspected."
+        (reviewer / "result.md").write_text(report)
+        approved = {"required": True, "status": "approved", "task_id": "author", "round_nonce": "test-author-round",
+                    "approval": {"reviewer_id": "reviewer", "round_nonce": "test-author-round", "evidence_sha256": hashlib.sha256(report.encode()).hexdigest(),
+                                 "author_sha256": hashlib.sha256((task / "result.md").read_bytes()).hexdigest()}}
+        meta["review"] = "reviewer"
+        (task / "meta.json").write_text(json.dumps(meta))
+        marker.write_text(json.dumps(approved))
+        self.assertFalse(collect_ok())  # Same provider.
+        (reviewer / "meta.json").write_text(json.dumps({"id": "reviewer", "worker": "claude"}))
+        (reviewer / "result.md").write_text("REQUEST_CHANGES: not approved")
+        self.assertFalse(collect_ok())  # Stale evidence / rejected report.
+        (reviewer / "result.md").write_text("NOT APPROVED: fail.")
+        approved["approval"]["evidence_sha256"] = hashlib.sha256(b"NOT APPROVED: fail.").hexdigest()
+        marker.write_text(json.dumps(approved))
+        self.assertFalse(collect_ok())  # A negated keyword is not an approval.
+        (reviewer / "result.md").write_text(report)
+        approved["approval"]["evidence_sha256"] = hashlib.sha256(report.encode()).hexdigest()
+        marker.write_text(json.dumps(approved))
+        self.assertTrue(collect_ok())
+        (task / "completed").unlink()
+        del approved["approval"]["author_sha256"]
+        (task / "result.md").write_text("Changed after legacy approval")
+        marker.write_text(json.dumps(approved))
+        self.assertFalse(collect_ok())  # No hashless legacy approval can authorize a new result.
+
+    def test_escalated_review_lineage_blocks_until_target_approved(self):
+        import hashlib
+        from task_record import unresolved_review
+        state = self.dir / "lineage" / "tasks"
+        source, target, reviewer = (state / name for name in ("source", "target", "reviewer"))
+        for d in (source, target, reviewer):
+            d.mkdir(parents=True)
+        (source / "meta.json").write_text(json.dumps({"id": "source", "worker": "pi"}))
+        (source / "review-required.json").write_text(json.dumps({"required": True, "task_id": "source",
+            "status": "pending_review", "review_target": "target"}))
+        (target / "meta.json").write_text(json.dumps({"id": "target", "worker": "pi", "review": "reviewer", "escalated_from": {"id": "source"}}))
+        (reviewer / "meta.json").write_text(json.dumps({"id": "reviewer", "worker": "claude"}))
+        (reviewer / "review-of").write_text("target")
+        report = "APPROVED: checked source and target."
+        (reviewer / "result.md").write_text(report)
+        marker = {"required": True, "task_id": "target", "status": "pending_review"}
+        (target / "review-required.json").write_text(json.dumps(marker))
+        self.assertTrue(unresolved_review(source / "review-required.json", "source"))
+        (target / "result.md").write_text("Target result")
+        marker.update(status="approved", round_nonce="test-target-round", approval={"reviewer_id": "reviewer", "round_nonce": "test-target-round", "evidence_sha256": hashlib.sha256(report.encode()).hexdigest(),
+                                                   "author_sha256": hashlib.sha256(b"Target result").hexdigest()})
+        (target / "review-required.json").write_text(json.dumps(marker))
+        self.assertFalse(unresolved_review(source / "review-required.json", "source"))
+        (source / "review-required.json").write_text(json.dumps({"required": True, "task_id": "source", "status": "needs_human", "review_target": "target"}))
+        self.assertTrue(unresolved_review(source / "review-required.json", "source"))
+
+    def test_local_escalation_cli_prefers_available_gpt6(self):
+        state = self.dir / "state"
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        for idx, model in enumerate(("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b")):
+            task_id = "local-{}".format(idx)
+            d = state / "tasks" / task_id
+            d.mkdir(parents=True)
+            (d / "meta.json").write_text(json.dumps({"id": task_id, "pane": "%1", "worker": "pi",
+                                                     "model": model, "thinking": "off", "created": iso(T0)}))
+            (d / "state.json").write_text(json.dumps({"state": "working"}))
+            (d / "exit").write_text("1\n")
+            outcome = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", task_id,
+                                      "--trigger", "model_error", "--reason", "failed"],
+                                     text=True, capture_output=True, env=env)
+            self.assertEqual(outcome.returncode, 0, outcome.stderr)
+            self.assertEqual(json.loads(outcome.stdout)["target"],
+                             {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"})
+
+    def test_escalation_cli_plans_without_marking_and_failed_spawn_is_recoverable(self):
+        state = self.dir / "state"
+        task = state / "tasks" / "task-1"
+        task.mkdir(parents=True)
+        meta = {"id": "task-1", "created": iso(T0), "pane": "%1", "worker": "pi",
+                "model": "openai-codex/gpt-6-luna", "thinking": "medium"}
+        (task / "meta.json").write_text(json.dumps(meta))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0 + 60)}))
+        (task / "checkpoints.json").write_text(json.dumps({"events": []}))
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.chmod(0o755)
+        (task / "exit").write_text("1\n")
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        plan = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", "task-1", "--trigger", "model_error",
+                               "--reason", "structured reporter error", "--evidence", "state.json:error"],
+                              env=env, text=True, capture_output=True, check=True)
+        out = json.loads(plan.stdout)
+        self.assertEqual(out["target"]["model"], "openai-codex/gpt-6-sol")
+        self.assertFalse((task / "escalation.json").exists())
+        failed = subprocess.run([str(ROOT / "bin/tp-contract"), "escalated", "task-1", "--outcome", "failed",
+                                 "--record-json", json.dumps(out["record"]), "--message", "spawn failed"],
+                                env=env, text=True, capture_output=True, check=True)
+        self.assertEqual(failed.returncode, 0)
+        self.assertFalse((task / "escalated").exists())
+        records = read_escalations(task)
+        self.assertEqual(records[-1]["outcome"], "failed")
+        self.assertEqual(records[-1]["message"], "spawn failed")
+
+    def test_escalation_cli_refuses_killed_cancelled_and_completed(self):
+        state = self.dir / "states"
+        task = state / "tasks" / "stopped"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps({"id": "stopped", "pane": "%1", "worker": "pi",
+                                                    "model": "openai-codex/gpt-6-luna", "thinking": "medium"}))
+        env = dict(os.environ, TP_STATE_DIR=str(state))
+        cmd = [str(ROOT / "bin/tp-contract"), "escalate", "stopped", "--trigger", "model_error", "--reason", "error"]
+        for reported in ("working", "cancelled", "completed"):
+            (task / "state.json").write_text(json.dumps({"state": reported}))
+            result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, reported)
+            self.assertIn("blocked", result.stderr)
+            self.assertFalse((task / "escalation.json").exists())
+
+    def test_escalation_chain_cap_includes_target_lineage(self):
+        state = self.dir / "state2"
+        task = state / "tasks" / "task-2"
+        task.mkdir(parents=True)
+        meta = {"id": "task-2", "created": iso(T0), "pane": "%1", "worker": "pi",
+                "model": "openai-codex/gpt-6-sol", "thinking": "medium",
+                "escalated_from": {"id": "task-1", "trigger": "model_error"}}
+        (task / "meta.json").write_text(json.dumps(meta))
+        env = dict(os.environ, TP_STATE_DIR=str(state))
+        denied = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", "task-2", "--trigger", "model_error",
+                                 "--reason", "structured reporter error", "--evidence", "state.json:error"],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertTrue("already used its one automatic escalation" in denied.stderr or "automatic escalation is blocked" in denied.stderr)
+
+    def test_escalation_record_persists_and_ledger_includes_it(self):
+        task = self.dir / "tasks" / "research-esc"
+        task.mkdir(parents=True)
+        meta = dict(self.meta, id="research-esc")
+        (task / "meta.json").write_text(json.dumps(meta))
+        (task / "task.md").write_text("Find the official docs.\n")
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 3, "updated": iso(T0 + 300)}))
+        (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "auto-escalate", "at": T0 + 300}]}))
+        (self.dir / "report.md").write_text("Status: partial\n")
+        rec = escalation_record(meta, "budget", "time budget used up", "Status: partial", {"worker": "claude", "model": "claude-opus-5-5", "thinking": "medium"}, T0 + 301, outcome="started")
+        write_escalations(task, [rec])
+        self.assertEqual(read_escalations(task)[0]["trigger"], "budget")
+        self.assertEqual(ledger_row(task, T0 + 400)["escalation"]["target"]["model"], "claude-opus-5-5")
 
     def test_research_config(self):
         roster = load_config(ROOT / "config/router.json", local_path=False)["models"]
@@ -225,6 +591,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50), "settled")  # new turn since
         # Claude touches state.json after its idle notification; the reply time decides.
         self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50, replied_at=T0 + 40), "completed")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0", reply="New round", completed_at=T0 + 50,
+                                   replied_at=T0 + 120), "settled")
         self.assertEqual(lifecycle(at("waiting"), "alive", [{"action": "pause", "at": T0 + 30}], replied_at=T0 + 35), "paused")
         pause = [{"action": "pause", "at": T0 + 95}]
         self.assertEqual(lifecycle(dict(at("working"), tools=9), "alive", [{"action": "pause", "at": T0 + 95, "tools": 9}]), "paused")

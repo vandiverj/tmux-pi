@@ -22,7 +22,7 @@ for meta in "$state_dir"/tasks/*/meta.json; do
   [[ -f "$meta" ]] || continue
   d="$(dirname "$meta")"
   if [[ "$(tp_pane_state "$(tp_meta "$d" pane)")" == gone ]]; then
-    mv "$d" "$state_dir/archive/"
+    "$ROOT/bin/tp-task" --state-dir "$state_dir" archive-one "$d"
     n=$((n + 1))
   fi
 done

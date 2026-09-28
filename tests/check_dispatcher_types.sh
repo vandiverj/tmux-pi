@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pinned TypeScript check against the installed Pi package's extension + Node types.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+pi_package="${PI_CODING_AGENT_PACKAGE:-$(dirname "$(dirname "$(dirname "$(realpath "$(command -v pi)")")")")}"
+if [[ ! -f "$pi_package/package.json" || ! -d "$pi_package/node_modules/@types/node" ]]; then
+  echo 'Install Pi with its Node types or set PI_CODING_AGENT_PACKAGE' >&2
+  exit 1
+fi
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/node_modules/@earendil-works" "$tmp/node_modules/@types"
+cp "$root/agent/extensions/dispatcher.ts" "$tmp/dispatcher.ts"
+ln -s "$pi_package" "$tmp/node_modules/@earendil-works/pi-coding-agent"
+ln -s "$pi_package/node_modules/@types/node" "$tmp/node_modules/@types/node"
+npm exec --yes --package=typescript@5.9.3 -- tsc --noEmit --skipLibCheck --module nodenext --target es2023 \
+  --typeRoots "$tmp/node_modules/@types" --types node "$tmp/dispatcher.ts"

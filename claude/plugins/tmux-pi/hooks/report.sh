@@ -9,22 +9,42 @@
 # Does nothing outside a tp-spawn worker (no TP_TASK_DIR). Never fails the hook:
 # reporting must not block or change what Claude does.
 [[ -n "${TP_TASK_DIR:-}" && -d "$TP_TASK_DIR" ]] || exit 0
+# Hold a per-task advisory lock across the read, result and state writes. Python's
+# fcntl lock works on macOS (unlike flock(1)) and releases on process death. Hooks
+# can overlap; a shared .tmp name or an unlocked read/modify/write loses Stop.
+# The lock file intentionally remains in the task directory after each invocation.
+if [[ "${1:-}" != --locked ]]; then
+  python3 -c '
+import fcntl, subprocess, sys
+with open(sys.argv[2], "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    subprocess.run(["bash", sys.argv[1], "--locked"], input=sys.stdin.buffer.read())
+' "$0" "$TP_TASK_DIR/.report.lock" 2>/dev/null || true
+  exit 0
+fi
 input="$(cat)"
 state="$TP_TASK_DIR/state.json"
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
 prev='{}'
 if [[ -f "$state" ]]; then prev="$(cat "$state")"; fi
+# Malformed hook input must not turn an old result into a new settled reply.
+event="$(jq -r '.hook_event_name // empty' <<<"$input" 2>/dev/null)" || exit 0
 
-event="$(jq -r '.hook_event_name // empty' <<<"$input")"
-
-# The reply comes with the Stop event.
-if [[ "$event" == Stop ]]; then
-  jq -r '.last_assistant_message // empty' <<<"$input" > "$TP_TASK_DIR/result.md.tmp"
-  if [[ -s "$TP_TASK_DIR/result.md.tmp" ]]; then
-    mv "$TP_TASK_DIR/result.md.tmp" "$TP_TASK_DIR/result.md"
+# A new prompt invalidates the prior reply BEFORE changing state; reviewers
+# cannot see a waiting state alongside a previous turn's result. A Stop only
+# publishes a reply for an open prompt. Duplicate/late Stop cannot republish it.
+active="$(jq -rn --argjson prev "$prev" '
+  def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
+  def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
+  if turn > settled then "yes" else "no" end' 2>/dev/null)" || exit 0
+if [[ "$event" == UserPromptSubmit ]]; then
+  rm -f "$TP_TASK_DIR/result.md"
+elif [[ "$event" == Stop && "$active" == yes ]]; then
+  result_tmp="$(mktemp "$TP_TASK_DIR/.result.XXXXXXXX")" || exit 0
+  if jq -er '.last_assistant_message // empty | select(length > 0)' <<<"$input" > "$result_tmp" && [[ -s "$result_tmp" ]]; then
+    mv "$result_tmp" "$TP_TASK_DIR/result.md" || exit 0
   else
-    rm -f "$TP_TASK_DIR/result.md.tmp"
+    rm -f "$result_tmp" "$TP_TASK_DIR/result.md"
   fi
 fi
 
@@ -47,26 +67,33 @@ if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]
   if [[ -z "$usage" ]]; then usage='null'; fi
 fi
 
+state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   --arg id "${TP_TASK_ID:-}" --arg now "$now" '
+  def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
+  def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
+  def active: turn > settled;
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
   { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0, tools: 0, toolErrors: 0,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, error: "" }
   + $prev
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
-      elif $in.hook_event_name == "UserPromptSubmit" then { state: "working", error: "" }
-      elif $in.hook_event_name == "PreToolUse" then
+      elif $in.hook_event_name == "UserPromptSubmit" then
+        { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled }
+      elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
-      elif $in.hook_event_name == "PostToolUse" then { state: "working", tool: "", toolErrors: 0 }
-      elif $in.hook_event_name == "PostToolUseFailure" then
+      elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }
+      elif $in.hook_event_name == "PostToolUseFailure" and active then
         { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) }
-      elif $in.hook_event_name == "Notification" then
+      elif $in.hook_event_name == "Notification" and active then
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
-      elif $in.hook_event_name == "Stop" then { state: "waiting", tool: "" }
+      elif $in.hook_event_name == "Stop" and active then
+        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn }
       else {} end )
-  + ( if $usage != null then $usage | if .model == "" then del(.model) else . end else {} end )
+  + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
+      then $usage | if .model == "" then del(.model) else . end else {} end )
   + { updated: $now }
-' > "$state.tmp" 2>/dev/null && mv "$state.tmp" "$state"
-rm -f "$state.tmp"
+' > "$state_tmp" 2>/dev/null && mv "$state_tmp" "$state"
+rm -f "$state_tmp"
 exit 0

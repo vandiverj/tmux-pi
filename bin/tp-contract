@@ -3,13 +3,17 @@
 
 Usage: tp-contract build --workdir W --task-dir D --kind research|task [--artifact P]
                          [--budget time=20m,turns=60,tokens=400k] [--checkpoints outline=3m,draft=10m]
-                         [--stall 6m] [--grace 3m]
+                         [--stall 6m] [--grace 3m] [--no-edits (task only; reply-only)]
          print {"contract", "note"}; research defaults come from config/research.json
        tp-contract status    one line per task: id, state, then elapsed, turns, checkpoint state and,
                              for settled work, the artifact and a one-line summary of the reply
        tp-contract enforce   take the checkpoint actions due now; print one JSON line per action;
                              record settled contract tasks in the ledger
        tp-contract extend <id>          main's "continue": one more budget of the original size
+       tp-contract escalate <id> --trigger T --reason R [--evidence E]
+                                        select one automatic qualified escalation target
+       tp-contract escalated <id> --to ID --outcome started|queued|failed|needs_input [--record-json JSON]
+                                        record/finalize the escalation after spawn/registration
        tp-contract event <id> <action> [--to ID]  record discard, narrow or escalate
        tp-contract collect <id>         mark a settled task completed (its result was handed off);
                                         print its state
@@ -39,9 +43,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from contract import (DONE, RUNNING, ContractError, artifact_info, build, evaluate, extension,  # noqa: E402
-                      is_local, ledger_row, lifecycle, load_research, message, note, state_dir, summary_line,
-                      upsert)
+from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
+                      escalation_record, extension, is_local, ledger_row, lifecycle, load_research, message, note,
+                      read_escalations, select_escalation, state_dir, summary_line, upsert, write_escalations)
+from task_record import approved_delegated_review, read_json, unresolved_review, write_record  # noqa: E402
 
 RESEARCH = ROOT / "config" / "research.json"
 
@@ -65,7 +70,10 @@ def read(path):
 
 def panes():
     """{pane id: "alive" | "dead"}; a pane missing here is gone (killed)."""
-    out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True).stdout
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True).stdout
+    except OSError:
+        out = ""
     return {line.split()[0]: "alive" if line.endswith(" 0") else "dead" for line in out.splitlines() if line.strip()}
 
 
@@ -85,6 +93,8 @@ def task_state(d, meta, pane_map):
     life = lifecycle(state, pane_map.get(meta.get("pane"), "gone"), events, reply,
                      float(completed) if completed else None, text(d / "exit") or None, (d / "escalated").exists(),
                      (d / "result.md").stat().st_mtime if (d / "result.md").exists() else None)
+    if (d / "pending-capability.json").exists() and life not in ("failed", "killed", "escalated"):
+        life = "needs_input"
     return life, state, events, reply
 
 
@@ -92,6 +102,18 @@ def save_events(d, events):
     tmp = d / "checkpoints.json.tmp"
     tmp.write_text(json.dumps({"events": events}) + "\n")
     os.replace(tmp, d / "checkpoints.json")
+
+
+def trigger_for_event(action, reason):
+    """Structured trigger for tmux-pi-generated checkpoint/breaker actions."""
+    reason = reason or ""
+    if action == "stop" and "budget used up" in reason:
+        return "budget"
+    if "failed tool calls" in reason:
+        return "tool_errors"
+    if "no new writes" in reason:
+        return "tool_stall"
+    return "checkpoint"
 
 
 def find(root, task_id):
@@ -106,7 +128,12 @@ def tasks(root):
     base = Path(root) / "tasks"
     metas = sorted(base.glob("*/meta.json"), key=lambda p: p.stat().st_mtime) if base.is_dir() else []
     for meta_path in metas:
-        yield meta_path.parent, read(meta_path)
+        meta = read(meta_path)
+        # Slice 2 stop-mode/preflight records are main-owned task records, not
+        # worker processes; keep them out of subagent status/enforcement.
+        if meta.get("worker") == "main":
+            continue
+        yield meta_path.parent, meta
 
 
 def clock(seconds):
@@ -117,24 +144,39 @@ def clock(seconds):
 
 
 def cmd_build(args):
+    decision = {}
+    if args.decision_json:
+        try:
+            decision = json.loads(args.decision_json)
+        except ValueError as exc:
+            raise ContractError("--decision-json is not valid JSON: {}".format(exc)) from exc
+    if args.no_edits and args.kind != "task":
+        raise ContractError("--no-edits is only valid for task")
+    if args.no_edits and (args.checkpoints or args.artifact):
+        raise ContractError("reply-only task cannot have --checkpoints or --artifact")
+    config = research_config() if args.kind == "research" else {}
+    dynamic = dynamic_terms(args.kind, decision, model=decision.get("model"))
     if args.kind == "research":
-        config = research_config()
         budget, checkpoints = args.budget or config["budget"], args.checkpoints or config["checkpoints"]
         stall, grace = args.stall or config["stall"], args.grace or config["grace"]
         # Beside tasks/, not in the task dir: reports outlive tp-clean and tp-exit.
         artifact = args.artifact or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.task_dir))),
                                                  "research", os.path.basename(args.task_dir) + ".md")
+        profile = {**dynamic["profile"], "source": "research config"}
     else:
-        if not args.budget or not args.artifact:
-            raise ContractError("a task contract needs --artifact and --budget")
-        budget, checkpoints = args.budget, args.checkpoints or {}
-        stall, grace = args.stall or "10m", args.grace or "3m"
-        artifact = args.artifact
+        budget = args.budget or dynamic["budget"]
+        checkpoints = {} if args.no_edits else args.checkpoints or dynamic["checkpoints"]
+        stall, grace = args.stall or dynamic["stall"], args.grace or dynamic["grace"]
+        artifact = args.artifact or os.path.join(os.path.abspath(args.task_dir),
+                                                 "result.md" if args.no_edits else "artifact.md")
+        profile = dynamic["profile"]
     if not os.path.isabs(artifact):
         artifact = os.path.join(args.workdir, artifact)
-    errors = config["tool_errors"] if args.kind == "research" else 4
-    contract = build(args.kind, os.path.normpath(artifact), budget, checkpoints, stall, grace, errors)
-    os.makedirs(os.path.dirname(contract["artifact"]), exist_ok=True)
+    errors = config.get("tool_errors", 4)
+    contract = build(args.kind, os.path.normpath(artifact), budget, checkpoints, stall, grace, errors,
+                     profile=profile, no_edits=args.no_edits)
+    if not args.no_edits:
+        os.makedirs(os.path.dirname(contract["artifact"]), exist_ok=True)
     print(json.dumps({"contract": contract, "note": note(contract, time.time())}))
 
 
@@ -156,9 +198,14 @@ def cmd_status(_args):
                          "{} to {}".format("narrowed" if fate["action"] == "narrow" else "escalated", fate.get("to", "?")))
         if r["turns"]:
             parts.append("{} turns".format(r["turns"]))
+        if r.get("warnings"):
+            parts.append("warning: {} nearing limit".format("/".join(r["warnings"])))
         if contract:
             parts.append("{}: {}".format(contract["kind"], r["phase"]))
-            if art["mtime"]:
+            if contract.get("kind") == "task" and contract.get("no_edits") is True:
+                parts.append("reply-only; result.md recorded by reporter" if (d / "result.md").exists() else
+                             "reply-only; awaiting reporter result.md")
+            elif art["mtime"]:
                 parts.append("{} {} written {} ago".format(os.path.basename(contract["artifact"]),
                                                            r["status"] or "(no status)", clock(now - art["mtime"])))
             else:
@@ -167,8 +214,12 @@ def cmd_status(_args):
             parts.append("{} tool calls{}".format(state["tools"], ", {} failing".format(state["toolErrors"])
                                                   if state.get("toolErrors") else ""))
         if life in ("settled", "completed", "needs_input", "paused", "failed") and reply:
+            if life == "settled":
+                parts.append("result: {}".format(d / "result.md"))
             parts.append(summary_line(reply, question=life == "needs_input"))
-        print("{}\x1f{}\x1f{}".format(meta.get("id", d.name), life, " · ".join(parts)))
+        detail = " · ".join(parts)
+        write_record(d, lifecycle_state=life, detail=detail, meta=meta)
+        print("{}\x1f{}\x1f{}".format(meta.get("id", d.name), life, detail))
 
 
 def send(pane, text):
@@ -217,6 +268,7 @@ def cmd_enforce(_args):
         except subprocess.CalledProcessError:
             continue
         print(json.dumps({"id": meta.get("id", d.name), "action": action.split("@")[0], "reason": reason,
+                          "trigger": trigger_for_event(action.split("@")[0], reason),
                           "kind": contract["kind"], "artifact": contract["artifact"], "status": r["status"],
                           "extended": any(e["action"] == "extend" for e in events)}), flush=True)
 
@@ -228,13 +280,88 @@ def cmd_extend(args):
     events = read(d / "checkpoints.json").get("events", [])
     event = extension(meta, read(d / "state.json"), time.time(), events)
     save_events(d, events + [event])
+    write_record(d, lifecycle_state=task_state(d, meta, panes())[0], meta=meta, force=True)
     b, c = event["budget"], meta["contract"]["budget"]
     more = ["{} minutes".format(round(c["seconds"] / 60))] + \
         ["{} turns".format(c["turns"])] * bool(c["turns"]) + ["{} tokens".format(c["tokens"])] * bool(c["tokens"])
+    if meta["contract"].get("kind") == "task" and meta["contract"].get("no_edits") is True:
+        msg = ("tmux-pi: you have {} more. Continue in your reply only; do not edit files. "
+               "The reporter records result.md. If you run out again, reply with what you have and what is missing.").format(
+                   " and ".join(more))
+        print(json.dumps({"budget": b, "message": msg}))
+        return
     print(json.dumps({"budget": b, "message": (
         "tmux-pi: you have {} more. Continue from {}: keep its status line current, save as you go, and finish with "
         "`Status: final` (or `Status: partial` and what is missing if you run out again).").format(
             " and ".join(more), meta["contract"]["artifact"])}))
+
+
+def _roster():
+    from router import RouterError, load_config
+    try:
+        return load_config(ROOT / "config" / "router.json")["models"]
+    except RouterError as exc:
+        raise ContractError(str(exc)) from exc
+
+
+def cmd_escalate(args):
+    """Select one automatic escalation target; do not mutate source before the target exists."""
+    d, meta = find(state_dir(), args.id)
+    if (d / "pending-capability.json").exists():
+        raise ContractError("{} is waiting for human capability approval; automatic escalation is blocked".format(args.id))
+    life = task_state(d, meta, panes())[0]
+    reported = read(d / "state.json").get("state")
+    events = read(d / "checkpoints.json").get("events", [])
+    if life in ("killed", "completed", "escalated") or reported in ("killed", "cancelled", "canceled", "completed") or \
+            (d / "completed").exists() or any(e.get("action") == "discard" for e in events if isinstance(e, dict)):
+        raise ContractError("{} is {} or cancelled/completed; automatic escalation is blocked".format(args.id, life))
+    if (d / "escalated").exists() or meta.get("escalated_from") or read_escalations(d):
+        raise ContractError("{} already used its one automatic escalation; pause/ask instead".format(args.id))
+    preferred = research_config().get("escalate") if (meta.get("contract") or {}).get("kind") == "research" else None
+    if is_local(meta.get("model")) and not preferred:
+        # Local Qwen's single escalation should reach the roster-qualified GPT-6
+        # frontier profile, not an unavailable legacy model or a local peer.
+        preferred = {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"}
+    target = select_escalation(meta, _roster(), preferred=preferred)
+    if not target:
+        raise ContractError("no stronger qualified escalation target for {}".format(args.id))
+    now = time.time()
+    record = escalation_record(meta, args.trigger, args.reason, args.evidence or "", target, now)
+    print(json.dumps({"ok": True, "record": record, "target": target}))
+
+
+def _record_arg(args, records):
+    if args.record_json:
+        try:
+            return json.loads(args.record_json)
+        except ValueError as exc:
+            raise ContractError("--record-json is not valid JSON: {}".format(exc)) from exc
+    if records:
+        return records[-1]
+    raise ContractError("{} has no planned escalation record; pass --record-json".format(args.id))
+
+
+def cmd_escalated(args):
+    d, meta = find(state_dir(), args.id)
+    records = read_escalations(d)
+    record = _record_arg(args, records)
+    record["outcome"] = args.outcome
+    if args.to:
+        record.setdefault("target", {})["id"] = args.to
+        record["next_action"] = "follow target; if it halts, pause/needs-input"
+        (d / "escalated").write_text(args.to + "\n")
+    if args.message:
+        record["message"] = args.message
+    if records:
+        records[-1] = record
+    else:
+        records = [record]
+    write_escalations(d, records)
+    events = read(d / "checkpoints.json").get("events", [])
+    events.append({"action": "escalate", "at": time.time(), "to": args.to, "outcome": args.outcome,
+                   "reason": record.get("reason"), "trigger": record.get("trigger")})
+    save_events(d, events)
+    write_record(d, lifecycle_state="escalated" if args.to else task_state(d, meta, panes())[0], meta=meta, force=True)
 
 
 def cmd_event(args):
@@ -243,16 +370,47 @@ def cmd_event(args):
     event = {"action": args.action, "at": time.time()}
     if args.to:
         event["to"] = args.to
+    if args.reason:
+        event["reason"] = args.reason
     save_events(d, events + [event])
+    write_record(d, lifecycle_state="escalated" if args.action == "escalate" else task_state(d, meta, panes())[0], meta=meta, force=True)
 
 
 def cmd_collect(args):
     root = state_dir()
     d, meta = find(root, args.id)
+    if (d / "pending-capability.json").exists():
+        raise ContractError("{} is waiting for human capability approval; completion is blocked".format(args.id))
+    marker_path = d / "review-required.json"
+    required = isinstance(meta.get("decision"), dict) and meta["decision"].get("review") == "required"
+    if required and not marker_path.exists() and not marker_path.is_symlink():
+        # Legacy required-review tasks lacked a marker. Mint a human-resolvable
+        # blocker on first collect attempt, without overwriting a concurrent review.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", dir=d, prefix=".review-required-", delete=False) as tmp:
+            json.dump({"required": True, "status": "needs_human", "task_id": args.id,
+                       "reasons": ["Required review was not recorded before collection; human resolution required"]}, tmp)
+            tmp.write("\n")
+            pending = Path(tmp.name)
+        try:
+            try:
+                os.link(pending, marker_path)
+            except FileExistsError:
+                pass
+        finally:
+            pending.unlink()
+    marker = read_json(marker_path)
+    approved = approved_delegated_review(d, meta, marker)
+    if (unresolved_review(marker_path, args.id) and not approved) or (required and
+            not (approved or (isinstance(marker, dict) and marker.get("required") is True and marker.get("task_id") == args.id and
+                              marker.get("status") == "resolved" and isinstance(marker.get("resolution"), dict) and
+                              marker["resolution"].get("actor") == "human_cli"))):
+        raise ContractError("{} has unresolved required review; completion is blocked (tp-task review-list)".format(args.id))
     life = task_state(d, meta, panes())[0]
     if life == "settled":
         (d / "completed").write_text("{}\n".format(time.time()))
         life = "completed"
+    write_record(d, lifecycle_state=life, meta=meta, force=True)
     print(life)
 
 
@@ -297,15 +455,29 @@ def main():
     b.add_argument("--kind", choices=("research", "task"), required=True)
     for opt in ("--artifact", "--budget", "--checkpoints", "--stall", "--grace"):
         b.add_argument(opt)
+    b.add_argument("--decision-json")
+    b.add_argument("--no-edits", action="store_true", help="task only: bounded reply, no worker artifact/checkpoints")
     sub.add_parser("status")
     sub.add_parser("enforce")
     sub.add_parser("research")
     x = sub.add_parser("extend")
     x.add_argument("id")
+    ae = sub.add_parser("escalate")
+    ae.add_argument("id")
+    ae.add_argument("--trigger", required=True, choices=("budget", "checkpoint", "tool_stall", "tool_errors", "model_error", "missing_capability"))
+    ae.add_argument("--reason", required=True)
+    ae.add_argument("--evidence")
+    ad = sub.add_parser("escalated")
+    ad.add_argument("id")
+    ad.add_argument("--to")
+    ad.add_argument("--outcome", required=True, choices=("started", "queued", "failed", "needs_input"))
+    ad.add_argument("--message")
+    ad.add_argument("--record-json", help="record returned by tp-contract escalate; used after target spawn/registration")
     e = sub.add_parser("event")
     e.add_argument("id")
     e.add_argument("action", choices=("discard", "narrow", "escalate"))
     e.add_argument("--to")
+    e.add_argument("--reason")
     c = sub.add_parser("collect")
     c.add_argument("id")
     sl = sub.add_parser("slot")
@@ -319,7 +491,7 @@ def main():
             cmd_status(args)
         elif args.cmd == "enforce":
             cmd_enforce(args)
-        elif args.cmd in ("extend", "event", "collect", "slot"):
+        elif args.cmd in ("extend", "event", "escalate", "escalated", "collect", "slot"):
             globals()["cmd_" + args.cmd](args)
         else:
             print(json.dumps(research_config()))

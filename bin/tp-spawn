@@ -89,6 +89,12 @@ fi
 
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
+
+# LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
+if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then
+  "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
+    echo "tp-spawn: warning: ${model#lmstudio/} is not loaded in LM Studio; the worker may fail" >&2
+fi
 workdir="$(dirname "$state_dir")"
 
 # Limits keep packets to selected context rather than whole trees.

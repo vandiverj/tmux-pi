@@ -33,7 +33,7 @@ STATUSES = ("outline", "draft", "final", "partial")
 STATUS_LINE = re.compile(r"^\W*status\W*:?\W*(outline|draft|final|partial)\b", re.I)
 URL = re.compile(r"https?://[^\s)>\]]+")
 # Providers served from this machine; everything else is a frontier (cloud) model.
-LOCAL_PROVIDERS = ("mlx", "slotstream")
+LOCAL_PROVIDERS = ("lmstudio", "mlx", "slotstream")
 RUNNING = ("starting", "working", "needs_input")
 DONE = ("settled", "completed", "paused", "failed", "killed", "escalated")
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# tp-lmstudio — make sure the LM Studio models this machine's config uses are loaded.
+#
+# Usage: tp-lmstudio [ensure|status] [model-id...]
+#   ensure  start LM Studio's server if it is not answering, then load each model that
+#           is not loaded, with no idle unload (default); it asks for the contextWindow
+#           agent/models.json gives the model (LM Studio's MLX engine may fit a larger one)
+#   status  show each model as loaded or not; exit 1 if any is not
+#
+# Without model ids: the lmstudio models config/router.json and config/local.json can
+# send work to (routes, escalation, rules, and the follow-up judge when LM Studio
+# serves it). Nothing to do when the config uses none. TP_LMS names the lms binary.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+
+action="${1:-ensure}"
+case "$action" in ensure|status) shift || true ;; *) echo "usage: tp-lmstudio [ensure|status] [model-id...]" >&2; exit 2 ;; esac
+
+# One line per model: id and context window; the provider's base URL first.
+plan="$(python3 - "$ROOT" "$@" <<'EOF'
+import json, sys
+root, ids = sys.argv[1], sys.argv[2:]
+sys.path.insert(0, root + "/lib")
+from router import RouterError, load_config, provider_models
+try:
+    provider = json.load(open(root + "/agent/models.json"))["providers"].get("lmstudio")
+except (OSError, ValueError, KeyError) as exc:
+    sys.exit("tp-lmstudio: cannot read agent/models.json: {}".format(exc))
+if not provider:
+    if ids:
+        sys.exit("tp-lmstudio: agent/models.json has no lmstudio provider")
+    sys.exit(0)
+if not ids:
+    try:
+        ids = provider_models(load_config(root + "/config/router.json"), "lmstudio", provider["baseUrl"])
+    except RouterError as exc:
+        sys.exit("tp-lmstudio: {}".format(exc))
+windows = {m["id"]: m.get("contextWindow") for m in provider.get("models", [])}
+if ids:
+    print(provider["baseUrl"].rstrip("/"))
+for model in ids:
+    print(model, windows.get(model) or "")
+EOF
+)"
+[[ -n "$plan" ]] || exit 0
+base_url="$(head -1 <<<"$plan")"
+models="$(tail -n +2 <<<"$plan")"
+
+lms="${TP_LMS:-$(command -v lms || echo "$HOME/.lmstudio/bin/lms")}"
+[[ -x "$lms" ]] || { echo "tp-lmstudio: lms not found (install LM Studio, or set TP_LMS)" >&2; exit 1; }
+
+answering() { curl -s --noproxy '*' --max-time 2 -o /dev/null -w '%{http_code}' "$base_url/models" | grep -q '^200$'; }
+# identifier and context length of each loaded model
+loaded() { "$lms" ps --json </dev/null 2>/dev/null | jq -r '.[] | "\(.identifier) \(.contextLength // 0)"'; }
+context_of() { awk -v id="$1" '$1 == id { print $2 }' <<<"$2"; }
+
+if ! answering; then
+  if [[ "$action" == status ]]; then
+    echo "tp-lmstudio: LM Studio is not answering at $base_url" >&2
+    exit 1
+  fi
+  port="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]).port)' "$base_url")"
+  echo "tp-lmstudio: starting LM Studio's server on port $port" >&2
+  "$lms" server start --port "$port" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do answering && break; sleep 1; done
+  answering || { echo "tp-lmstudio: LM Studio's server did not answer at $base_url" >&2; exit 1; }
+fi
+
+current="$(loaded)"
+missing=0
+while read -r model window; do
+  have="$(context_of "$model" "$current")"
+  if [[ -n "$have" ]]; then
+    if [[ -n "$window" && "$have" -lt "$window" ]]; then
+      echo "tp-lmstudio: $model is loaded with a $have-token context, below the $window agent/models.json expects; reload it to fix" >&2
+    fi
+    [[ "$action" == status ]] && echo "$model: loaded (context $have)"
+    continue
+  fi
+  if [[ "$action" == status ]]; then
+    echo "$model: not loaded"
+    missing=1
+    continue
+  fi
+  args=(load "$model" -y)
+  [[ -z "$window" ]] || args+=(--context-length "$window")
+  echo "tp-lmstudio: loading $model in LM Studio${window:+ (context $window)}" >&2
+  if ! "$lms" "${args[@]}" </dev/null >/dev/null 2>&1 || [[ -z "$(context_of "$model" "$(loaded)")" ]]; then
+    echo "tp-lmstudio: could not load $model; try: $lms ${args[*]}" >&2
+    missing=1
+  fi
+done <<<"$models"
+exit "$missing"

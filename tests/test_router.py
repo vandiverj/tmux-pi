@@ -324,10 +324,10 @@ class RouterTests(unittest.TestCase):
     def test_example_local_config_is_valid(self):
         local = load_local(ROOT / "config/local.example.json", self.config)
         self.assertIn("standard", local["routes"])
-        self.assertIn("mlx/mlx-community/Qwen3.5-4B-MLX-4bit", local["prompts"])
+        self.assertIn("lmstudio/qwen/qwen3.6-35b-a3b", local["prompts"])
 
     def test_local_routes_override_and_validate(self):
-        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
         path = self.write_local({"_comment": "x", "routes": {"standard": {"model": qwen, "thinking": "off"}}})
         config = load_config(ROOT / "config/router.json", local_path=path)
         self.assertEqual(config["routes"]["standard"]["model"], qwen)
@@ -351,7 +351,7 @@ class RouterTests(unittest.TestCase):
                 load_config(ROOT / "config/router.json", local_path=self.write_local(local))
 
     def test_rules_redirect_matching_tasks(self):
-        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
         slot = "slotstream/qwen3.8-flash-next:4bit"
         path = self.write_local({"rules": [{"_why": "counting", "pattern": "(?i)\\bhow many\\b",
                                             "from": [qwen], "to": {"model": slot, "thinking": "low"}}]})
@@ -409,6 +409,11 @@ class RouterTests(unittest.TestCase):
                  {"id": "b", "task": "Write a haiku", "reply": "Done."}]
         self.assertEqual(follow_up("yes include them", tasks, config, opener=judge), {"target": "a", "ask": []})
         self.assertTrue(sent[0]["logprobs"])
+        self.assertNotIn("reasoning_effort", sent[0])
+        config["local"]["followup"]["extra_body"] = {"reasoning_effort": "none"}
+        follow_up("yes include them", tasks, config, opener=judge)
+        self.assertEqual((sent[-1]["reasoning_effort"], sent[-1]["max_tokens"]), ("none", 3))
+        del config["local"]["followup"]["extra_body"]
         worker.update(a=0.02)
         self.assertEqual(follow_up("what is 2+2", tasks, config, opener=judge), {"target": None, "ask": []})
         worker.update(a=0.6)  # unsure: the user picks
@@ -434,13 +439,16 @@ class RouterTests(unittest.TestCase):
     def test_followup_config_validation(self):
         good = {"base_url": "http://127.0.0.1:11437/v1", "model": "qwen", "ask_between": [0.25, 0.9]}
         self.assertEqual(load_local(self.write_local({"followup": good}), self.config)["followup"], good)
+        extra = {**good, "extra_body": {"reasoning_effort": "none"}}
+        self.assertEqual(load_local(self.write_local({"followup": extra}), self.config)["followup"], extra)
         for bad in ({**good, "ask_between": [0.9, 0.25]}, {**good, "base_url": "http://example.com:1/v1"},
-                    {"model": "qwen"}, {**good, "ask_between": [0, 2]}):
+                    {"model": "qwen"}, {**good, "ask_between": [0, 2]}, {**good, "extra_body": {"max_tokens": 50}},
+                    {**good, "extra_body": "none"}, {**good, "other": 1}):
             with self.assertRaises(RouterError):
                 load_local(self.write_local({"followup": bad}), self.config)
 
     def test_packet_files_config_validation(self):
-        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
         good = {"models": [qwen], "selector": "claude-sonnet-5"}
         self.assertEqual(load_local(self.write_local({"packet_files": good}), self.config)["packet_files"], good)
         for bad in ({"models": [], "selector": "claude-sonnet-5"}, {"models": ["nope/model"], "selector": "claude-sonnet-5"},
@@ -470,7 +478,7 @@ class RouterTests(unittest.TestCase):
 
     def test_pick_files(self):
         root = self.pick_workdir()
-        qwen = "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+        qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
         config = dict(self.config, local={"packet_files": {"models": [qwen], "selector": "claude-sonnet-5"}})
         calls = []
 

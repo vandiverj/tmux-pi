@@ -238,7 +238,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(lifecycle(at("working"), "alive", escalated=True), "escalated")
         self.assertEqual(summary_line("Answer: 3.11\n\nShall I go on?", question=True), "Shall I go on?")
         self.assertEqual(summary_line("Answer: 3.11\n\nmore"), "Answer: 3.11")
-        self.assertTrue(is_local("mlx/mlx-community/Qwen3.5-4B-MLX-4bit"))
+        self.assertTrue(is_local("lmstudio/qwen/qwen3.6-35b-a3b"))
         self.assertFalse(is_local("claude-sonnet-5") or is_local("openai-codex/gpt-5.5"))
 
     def test_ledger_stop_reason(self):

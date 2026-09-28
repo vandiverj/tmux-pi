@@ -184,8 +184,13 @@ def load_local(path, config):
             raise RouterError("mlx model must be a Hugging Face id or a local path")
     followup = local.get("followup")
     if followup is not None:
-        if not isinstance(followup, dict) or set(followup) != {"base_url", "model", "ask_between"}:
-            raise RouterError("followup needs exactly base_url, model and ask_between")
+        if not isinstance(followup, dict) or not {"base_url", "model", "ask_between"} <= set(followup) or \
+                set(followup) - {"base_url", "model", "ask_between", "extra_body"}:
+            raise RouterError("followup needs base_url, model and ask_between, and may set extra_body")
+        extra = followup.get("extra_body", {})
+        if not isinstance(extra, dict) or set(extra) & FOLLOW_UP_BODY_KEYS:
+            raise RouterError("followup extra_body must be an object that does not set {}".format(
+                ", ".join(sorted(FOLLOW_UP_BODY_KEYS))))
         local_base_url(followup["base_url"])
         _model(followup["model"], "followup model")
         band = followup["ask_between"]
@@ -272,6 +277,25 @@ def load_config(path, local_path=None):
         config["routes"] = {**config["routes"], **config["local"].get("routes", {})}
     return config
 
+
+
+def provider_models(config, provider, base_url=None):
+    """Model ids (provider prefix removed) this machine's config can send to a pi provider.
+
+    Covers the routes, the local escalation target and rule targets, plus the follow-up
+    judge's model when it is served from base_url (the provider's own URL). tp-lmstudio
+    loads these before workers need them.
+    """
+    local = config["local"]
+    targets = list(config["routes"].values()) + [rule["to"] for rule in local.get("rules", [])]
+    if local.get("escalation"):
+        targets.append(local["escalation"]["to"])
+    prefix = provider + "/"
+    ids = [target["model"][len(prefix):] for target in targets if target["model"].startswith(prefix)]
+    judge = local.get("followup")
+    if judge and base_url and local_base_url(judge["base_url"]) == local_base_url(base_url):
+        ids.append(judge["model"])
+    return list(dict.fromkeys(ids))
 
 def _post(endpoint, body, timeout, opener):
     request = urllib.request.Request(endpoint, data=json.dumps(body).encode("utf-8"),
@@ -598,7 +622,7 @@ def route_task(task, config, backend=None, base_url=None, router_model=None, ope
 
 # Follow-up routing: does a new message belong to a delegated task that is still running?
 # Laya separates these poorly (AUC 0.89; most messages land in its ask band), so a machine
-# with a fast local chat model uses it instead (55/56 on tests/calibration/followups.jsonl).
+# with a fast local chat model uses it instead (Qwen3.6-35B-A3B: 54/56 on tests/calibration/followups.jsonl).
 FOLLOW_UP_QUESTION = {"type": "score", "instructions": "How related is the new message to the active task?",
                       "criteria": ["unrelated", "loosely related", "same work"]}
 # Laya's score (0-2) is halved to a probability; between these it is unsure (from the
@@ -607,6 +631,9 @@ LAYA_FOLLOW_UP_BAND = (0.3, 0.73)
 # With several running tasks, the task that claims a message gets it only when every other
 # task is this far below it.
 FOLLOW_UP_MARGIN = 0.15
+# The judge request's own fields; extra_body (e.g. reasoning_effort for a model that thinks
+# by default) may add others but not change these.
+FOLLOW_UP_BODY_KEYS = {"model", "temperature", "max_tokens", "logprobs", "top_logprobs", "messages"}
 FOLLOW_UP_PROMPT = (
     "A worker is doing a task for the user. The user just sent a new message. Decide whether the message is "
     "meant for that worker (it answers the worker's question, corrects it, asks about its work, or extends or "
@@ -637,8 +664,8 @@ def follow_up_judge(message, task, reply, config, opener=None):
         return score / 2, LAYA_FOLLOW_UP_BAND
     user = "Worker's task: {}\nWorker's last reply: {}\nUser's new message: {}".format(
         _clip(task), _clip(reply, tail=True), message)
-    body = {"model": judge["model"], "temperature": 0, "max_tokens": 3, "logprobs": True, "top_logprobs": 5,
-            "messages": [{"role": "system", "content": FOLLOW_UP_PROMPT}, {"role": "user", "content": user}]}
+    body = dict(judge.get("extra_body", {}), model=judge["model"], temperature=0, max_tokens=3, logprobs=True,
+                top_logprobs=5, messages=[{"role": "system", "content": FOLLOW_UP_PROMPT}, {"role": "user", "content": user}])
     out = _post(local_base_url(judge["base_url"]) + "/chat/completions", body, config["timeout_seconds"], opener)
     try:
         top = out["choices"][0]["logprobs"]["content"][0]["top_logprobs"]

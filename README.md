@@ -244,7 +244,7 @@ credentials. Every key is optional:
 - `routes` overrides tier assignments from `config/router.json`
   (`simple`, `standard`, `coding`, `complex`, `expert`); each target must be in
   the `models` roster there.
-- `mlx` is the local model `bin/tp-mlx` serves: its id, port and sampling.
+- `mlx` is the local model `bin/tp-mlx` serves, if one is used: its id, port and sampling.
 - `escalation` names the models whose pi workers hand off after too many failed
   tool calls in a row, and what they hand off to.
 - `rules` redirect a task type a model is known to get wrong: when the router
@@ -253,38 +253,43 @@ credentials. Every key is optional:
   Claude), for a mistake it is known to make; `tp-spawn` appends it.
 - `followup` names a fast local chat model (loopback OpenAI-compatible URL,
   model id, and the `ask_between` probability band where the user is asked)
-  that decides whether a message belongs to a running delegated task.
+  that decides whether a message belongs to a running delegated task;
+  `extra_body` adds fields to its request (such as `reasoning_effort`).
 - `packet_files` lists models whose delegated workers get up to 3 files picked
   for the task in their packet, and the Claude model that picks them from the
   workdir's file list (`claude -p`, no tools; file names only, credentials
-  names left out). Qwen3.5-4B passed 53 of 60 chores with picked files and 44
-  without; stronger workers gain nothing, so leave them out.
+  names left out). Qwen3.6-35B-A3B passed 56 of 60 chores with picked files
+  and 52 without; stronger workers gain nothing, so leave them out.
 
 On a machine without Slotstream or MLX, leave those out and point `routes` at
 models it does have. `bin/tp-route --check` validates the result;
 `TP_LOCAL_CONFIG` points at a different file.
 
-### Local MLX server
+### Local model server
 
-`bin/tp-mlx` serves the `mlx` model with mlx-lm, bound to `127.0.0.1` and
-offline (a request for any other model fails instead of downloading one). pi
-reaches it as the `mlx` provider in [`agent/models.json`](agent/models.json),
-whose model id must match. Bootstrap once:
+The `standard` tier on this machine runs Qwen3.6-35B-A3B (MLX 4-bit) in LM
+Studio, which also serves the follow-up judge. pi reaches it as the `lmstudio`
+provider in [`agent/models.json`](agent/models.json); thinking off is sent as
+`reasoning_effort: "none"` (LM Studio ignores `enable_thinking`).
 
-```sh
-uv venv .mlx/venv --python 3.12
-VIRTUAL_ENV=.mlx/venv uv pip install "mlx-lm==0.31.3" "mlx==0.32.2"
-.mlx/venv/bin/hf download mlx-community/Qwen3.5-4B-MLX-4bit
-bin/tp-mlx start        # also: status, stop
-```
+`bin/tp-lmstudio` keeps it loaded: `tp` runs it at launch and `tp-spawn` before
+each worker on an `lmstudio/` model. It finds the LM Studio models the config
+can send work to (routes, escalation, rules, and the follow-up judge when LM
+Studio serves it), starts LM Studio's server if it is not answering, and loads
+any model that is not loaded, with no idle unload. When it fails, `tp` and
+`tp-spawn` warn and carry on. By hand: `bin/tp-lmstudio status` or
+`bin/tp-lmstudio ensure [model-id...]`.
 
-Qwen3.5-4B (4-bit, thinking off) handles `standard`-tier tool chores on this
-machine: on 40 repository chores it answered 92.5% correctly with a median of
-1.5 s, against 13 s for Slotstream. Its recurring mistake is exact
-counting: it reports a number without computing it. Its workers get a prompt to
-answer counts only from a counting command it ran (76% → 90% correct on
-counting chores), and a rule sends tasks that ask for a count to Slotstream
-(10/10).
+It takes about 20 GB while loaded. On 40 repository chores it answered 117 of
+120 correctly with a median of 1.1 s (Qwen3.5-4B, used before it: 111 of 120,
+1.5 s; Slotstream: 13 s). Like the 4B, it sometimes reports a count without
+computing one; its workers get a prompt that the grep tool never counts and
+counts come from `grep -c`, `wc -l` or `jq length` (82% → 96% correct on
+counting chores), so no rule sends counts elsewhere.
+
+`bin/tp-mlx` can serve a model with mlx-lm instead (bound to `127.0.0.1`,
+offline), from the `mlx` section of `config/local.json`; add a matching `mlx`
+provider to `agent/models.json` and roster entry to `config/router.json`.
 
 ### Escalation
 

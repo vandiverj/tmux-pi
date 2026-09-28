@@ -212,3 +212,36 @@ Kept: picked files for Qwen3.5-4B only (`packet_files` in `config/local.json`),
 picked by Sonnet 5; Slotstream and stronger workers get the core only, since
 they find files themselves at no loss. The plan assumed the local model would
 pick well from its locate-chore results; with only a file list it does not.
+
+## Standard-tier worker: Qwen3.6-35B-A3B replaces Qwen3.5-4B (2026-09-28)
+
+Candidates on the same chores, thinking off unless noted. Counting chores are the
+10 counting chores of the 40, 5 runs each; the held-out set adds 6 counting chores
+not used to write the prompts (16 × 5).
+
+| worker | counting (no prompt / prompt C) | 40 chores × 3 | median | packet chores (core / + Sonnet files) |
+|---|---|---|---|---|
+| Qwen3.5-4B (mlx-lm) | 38/50 / 45/50 | 111/120 | 1.5 s | 44/60 / 53/60 (33 s / 28 s) |
+| **Qwen3.6-35B-A3B MLX 4-bit (LM Studio)** | **41/50 / 46/50** | **117/120** | **1.1 s** | **52/60 / 56/60 (5.3 s / 5.1 s)** |
+| Qwen3.6-35B-A3B, thinking on | 48/50 | — | 7.5 s | — |
+| Qwen3.6-35B-A3B (mlx-lm) | — | 39/40 | 1.3 s | 28/30 (6.2 s) |
+| Bonsai 27B (LM Studio) | 21/50 off; 10/10 on (22 s) | — | — | — |
+| Hammer2.1-3B | — | 0/40 (ends with `[]`, no answer) | — | — |
+| Slotstream (Qwen3.8 Flash) | 10/10 | — | 13 s | 28/30 (101 s) |
+
+Counting prompts on Qwen3.6, held-out set: C (answer counts only from a counting
+command) 73/80, D 73/80, **E (the grep tool lists lines and never counts them;
+run `grep -c`, `wc -l` or `jq length` and report its number) 77/80**, 30/30 on
+the held-out chores. Qwen3.6 takes about 19 GB idle and 25 GB peak (long-prompt
+prefill); hybrid attention keeps the KV cache small. Slotstream cannot serve it
+(its checkpoint validation is specific to Qwen3.8 Flash).
+
+Follow-up judge, `followups.jsonl`, same prompt and band (0.25, 0.9),
+`reasoning_effort: "none"`: 54/56 greedy; auto-decided 30/20 (T/H), 0 wrong,
+asked 4/2, median 0.14 s (Qwen3.5-4B: 28/19, 0 wrong, 0.18 s). With a second
+unrelated running task: 36 right, 0 wrong, 20 asked.
+
+Kept: Qwen3.6-35B-A3B from LM Studio for the `standard` route, escalation,
+packet files and the follow-up judge, with prompt E; the counting rule to
+Slotstream is dropped (prompt E gets counts right at about 1 s against 13 s).
+The mlx-lm server for Qwen3.5-4B is no longer run.

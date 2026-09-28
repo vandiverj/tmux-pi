@@ -2,14 +2,14 @@
   "_comment": "Copy to config/local.json (git-ignored) and edit for this machine. Every key is optional. routes overrides the tier assignments in router.json; each target must be in router.json's models roster. Leave out models this machine does not have.",
   "routes": {
     "standard": {
-      "model": "mlx/mlx-community/Qwen3.5-4B-MLX-4bit",
+      "model": "lmstudio/qwen/qwen3.6-35b-a3b",
       "thinking": "off"
     }
   },
   "_escalation": "pi workers on these models hand off after more than after_consecutive_errors failed tool calls in a row.",
   "escalation": {
     "models": [
-      "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+      "lmstudio/qwen/qwen3.6-35b-a3b"
     ],
     "after_consecutive_errors": 3,
     "to": {
@@ -17,48 +17,27 @@
       "thinking": "low"
     }
   },
-  "_mlx": "The local model bin/tp-mlx serves; pi's mlx provider in agent/models.json must list the same model id.",
-  "mlx": {
-    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
-    "port": 11437,
-    "chat_template_args": {
-      "enable_thinking": false
-    },
-    "temp": 0.7,
-    "top_p": 0.8,
-    "top_k": 20
-  },
-  "_rules": "Send a task type a model is known to get wrong elsewhere: when the router picks a model in from and the task text matches pattern, use to.",
-  "rules": [
-    {
-      "_why": "Qwen3.5-4B reports counts without computing them (wrong on 4 of 24 counting chores; Slotstream 10/10). See tests/calibration/experiments.md.",
-      "pattern": "(?i)\\b(how many|count(s|ing)?|number of|total number)\\b",
-      "from": [
-        "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
-      ],
-      "to": {
-        "model": "slotstream/qwen3.8-flash-next:4bit",
-        "thinking": "low"
-      }
-    }
-  ],
-  "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.5-4B's counting: 76% correct without, 90% with (tests/calibration/experiments.md).",
+  "_rules": "Send a task type a model is known to get wrong elsewhere: when the router picks a model in from and the task text matches pattern, use to. None needed now: counting went to Slotstream while Qwen3.5-4B was the standard model; Qwen3.6-35B-A3B with the prompt below gets counts right (tests/calibration/experiments.md).",
+  "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.6-35B-A3B's counting: 82% correct without, 96% with (tests/calibration/experiments.md).",
   "prompts": {
-    "mlx/mlx-community/Qwen3.5-4B-MLX-4bit": "Only answer a count with a number printed by a counting command you have run (grep -c, wc -l, or jq length for JSON); if you have not run one yet, run it before answering."
+    "lmstudio/qwen/qwen3.6-35b-a3b": "The grep tool lists matching lines and never counts them. To answer a count, run a counting command with the bash tool (grep -c, wc -l, or jq length for JSON) and report the number it prints; do not count lines of tool output yourself."
   },
-  "_followup": "A fast local chat model judges whether a new message belongs to a running delegated task; between the two ask_between probabilities the user is asked. Without this key Laya judges, and asks more often (tests/calibration/experiments.md).",
+  "_followup": "A fast local chat model judges whether a new message belongs to a running delegated task; between the two ask_between probabilities the user is asked. extra_body is added to the judge's request (LM Studio's Qwen3.6 thinks unless reasoning_effort is none). Without this key Laya judges, and asks more often (tests/calibration/experiments.md).",
   "followup": {
-    "base_url": "http://127.0.0.1:11437/v1",
-    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "qwen/qwen3.6-35b-a3b",
     "ask_between": [
       0.25,
       0.9
-    ]
+    ],
+    "extra_body": {
+      "reasoning_effort": "none"
+    }
   },
-  "_packet_files": "Workers on these models get up to 3 files, picked by the selector (a Claude model, via claude -p), in their context packet. Qwen3.5-4B: 44/60 chores without, 53/60 with; Slotstream gained nothing (tests/calibration/experiments.md).",
+  "_packet_files": "Workers on these models get up to 3 files, picked by the selector (a Claude model, via claude -p), in their context packet. Qwen3.6-35B-A3B: 52/60 chores without, 56/60 with; Slotstream gained nothing (tests/calibration/experiments.md).",
   "packet_files": {
     "models": [
-      "mlx/mlx-community/Qwen3.5-4B-MLX-4bit"
+      "lmstudio/qwen/qwen3.6-35b-a3b"
     ],
     "selector": "claude-sonnet-5"
   }

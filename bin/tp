@@ -26,6 +26,10 @@ STATE_DIR="$WORKDIR/.tmux-pi"
 command -v tmux >/dev/null || { echo "tp: tmux not found (brew install tmux)" >&2; exit 1; }
 command -v pi   >/dev/null || { echo "tp: pi not found" >&2; exit 1; }
 
+# Load the LM Studio models this machine's config routes to; if that fails, say so and go on.
+"$ROOT/bin/tp-lmstudio" ensure ||
+  echo "tp: warning: LM Studio models are not ready; workers on them will fail (bin/tp-lmstudio status)" >&2
+
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   # Reattaching must not leave the client in the status/viewer or an old worker.
   # Pane ids survive client detach, so the recorded main pane is the reliable target.

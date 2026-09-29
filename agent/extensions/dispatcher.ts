@@ -1747,7 +1747,7 @@ export default function (pi: ExtensionAPI) {
 		// collect CLI, which independently rejects unresolved required review.
 		// Unknown tools (including powershell) may mutate state.
 		if ((!hand || !enabled || !hand.committed || !hand.allowMainEdits) &&
-			!["read", "bash", "grep", "find", "ls", "list_subagents", "collect_result", "tmux_pi_commit_contract"].includes(event.toolName)) {
+			!["read", "bash", "grep", "find", "ls", "list_subagents", "collect_result", "tmux_pi_commit_contract", "tmux_pi_find_skill"].includes(event.toolName)) {
 			return { block: true, reason: "Main tool execution needs an authorized direct edit contract." };
 		}
 		if (!hand && event.toolName === "bash" && !readOnlyBash(String((event.input as any)?.command ?? ""))) return { block: true, reason: "No active R5 handshake: shell execution is not authorized." };

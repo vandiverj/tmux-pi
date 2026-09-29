@@ -146,7 +146,7 @@ class ContractTests(unittest.TestCase):
         env = dict(os.environ, TP_STATE_DIR=str(state), TP_SESSION="fixture",
                    PATH=str(fake) + os.pathsep + os.environ["PATH"])
         env.pop("TMUX", None)
-        def spawn(label, pf, main):
+        def spawn(label, pf, main, task=None):
             preflight, main_file = self.dir / (label + "-pf.json"), self.dir / (label + "-main.json")
             preflight.write_text(json.dumps(pf))
             main_file.write_text(json.dumps(main))
@@ -154,8 +154,8 @@ class ContractTests(unittest.TestCase):
                                   "--preflight", str(preflight), "--main-contract", str(main_file),
                                   "--note", "Task contract preflight: no_edits=True; no edit/apply/write tools" if
                                   (main.get("no_edits") or pf.get("no_edits")) else "Edit allowed",
-                                  "+delegate Read fixture.txt and report the color of cedar; do not modify files" if
-                                  (main.get("no_edits") or pf.get("no_edits")) else "Fix fixture typo"],
+                                  task or ("+delegate Read fixture.txt and report the color of cedar; do not modify files" if
+                                  (main.get("no_edits") or pf.get("no_edits")) else "Fix fixture typo")],
                                  env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             d = state / "tasks" / run.stdout.strip()
@@ -178,6 +178,15 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("no_edits", edit_meta["contract"])
         self.assertIn("artifact.md", edit_packet)
         self.assertIn("Status: outline", edit_packet)
+        self.assertEqual(json.loads((edit / "skill-selection.json").read_text()), [])
+        doc, doc_meta, doc_packet = spawn("doc-read", {"no_edits": True}, {"no_edits": True},
+                                          "+delegate Explain how to convert report.docx to Markdown; do not write files")
+        selected = json.loads((doc / "skill-selection.json").read_text())
+        self.assertEqual([s["id"] for s in selected], ["document-transform"])
+        self.assertIn("# Selected Task Skills", doc_packet)
+        self.assertIn("DOCX → Markdown", doc_packet)
+        self.assertNotIn("Tester-owned setup", doc_packet)
+        self.assertTrue(doc_meta["contract"]["no_edits"])
         # Beyond the outline deadline, CLI enforcement must not send file-based nudges.
         import time
         from datetime import datetime, timezone

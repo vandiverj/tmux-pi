@@ -6,17 +6,17 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class MakeQaSkillTests(unittest.TestCase):
-    def test_short_slash_alias_loads_discoverable_skill_on_demand(self):
+    def test_short_slash_alias_loads_private_skill_on_demand(self):
         skill = (ROOT / "skills/make-qa/SKILL.md").read_text()
         alias = (ROOT / "agent/prompts/make-qa.md").read_text()
         launcher = (ROOT / "bin/tp-pi").read_text()
         self.assertTrue(skill.startswith("---\nname: make-qa\n"))
         self.assertIn("description:", skill.split("---", 2)[1])
         self.assertTrue(alias.startswith("---\n"))
-        self.assertIn("advertised `make-qa` skill", alias)
-        self.assertIn("Read its SKILL.md before drafting", alias)
+        self.assertIn("`make-qa` instructions in the task-selected system section", alias)
         self.assertIn("${@:-", alias)
-        self.assertIn('--skill "$ROOT/skills"', launcher)
+        self.assertIn("exec pi --no-skills \"$@\"", launcher)
+        self.assertNotIn('--skill "$ROOT/skills"', launcher)
 
     def test_skill_does_not_grant_ticket_or_deployment_authority(self):
         skill = (ROOT / "skills/make-qa/SKILL.md").read_text()

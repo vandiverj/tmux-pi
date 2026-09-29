@@ -32,7 +32,7 @@ ln -s "$PWD/bin/tp" ~/.local/bin/agent
 Re-running `tp` reattaches to the existing session. Set `TP_SESSION` to run more than one.
 
 tmux-pi is self-contained: pi (`bin/tp-pi`) and Claude Code workers (`bin/tp-claude`) load only
-this repo's `agent/`, `claude/` and `skills/`, never `~/.pi`, `~/.agents` or `~/.claude`.
+this repo's approved configuration and extensions, never user/project skill trees in `~/.pi`, `~/.agents` or `~/.claude`. Skills are selected per task from a private catalogue rather than globally registered with Pi.
 Run `/login` once inside the workspace for pi's subscription providers.
 
 A Claude worker stopped at a choice prompt (Claude Code's one-time folder trust
@@ -136,9 +136,9 @@ only for pi providers that price tokens.
 ### On-demand QA handoff
 
 Type `/make-qa <case or change>` to draft a tester-facing script. The small prompt
-alias loads the [`make-qa`](skills/make-qa/SKILL.md) skill only for QA authoring;
-ordinary turns carry only its name/description, not the full instructions. Pi's
-native `/skill:make-qa` command also works. The script assumes its change is
+alias selects the [`make-qa`](skills/make-qa/SKILL.md) instructions only for QA authoring;
+ordinary turns carry **no QA skill description**. Native `/skill:make-qa` is not
+registered, intentionally: Pi would advertise every registered skill on every turn. The script assumes its change is
 available **when QA runs it**, even when written before staging. Ordinary
 staging testers can set up safe fictional people through normal product flows;
 developer setup is an evidenced exception. Coverage includes the full changed
@@ -146,6 +146,12 @@ journey and plausible nearby regressions without generic busywork. This drafts
 in chat; it does **not** write YouTrack, deploy, enable an MCP, or grant edit
 authority. Expanded slash templates cannot authorize a worker or edit on their
 own; use a fresh explicit request and contract for any write.
+
+### Selective skill catalogue
+
+[`config/skill-catalog.json`](config/skill-catalog.json) stores private profiles and task triggers, not a model-facing list. The deterministic selector `bin/tp-skills` matches the original request (not retrieved file contents or conversation history). Pi includes the full instructions for **at most two matched skills on that turn** in a replaceable system section; unrelated turns carry none. Unlike a skill read-tool result, this does not leave the skill body in later conversation history. The single `tmux_pi_find_skill` tool can search by a specific task/format when the initial match misses; it returns only a small candidate set and asks for a new, specific turn to activate one, never lists the full catalogue. Worker packets include only instructions selected from the worker task and record the IDs/body hashes in `skill-selection.json`. Selection grants no tool, file-write or external-service authority.
+
+The independent [document transformation guidance](catalog/skills/document-transform/SKILL.md) covers PDF/DOCX ↔ Markdown using local tools. It is **experimental**: available converters differ by machine; no packages are auto-installed, no files are uploaded, and an unavailable conversion must be reported, not fabricated. Verify local dependencies, output and task authority before using it. The synced Claude skills were references only, not copied. The catalogue can grow without adding per-skill descriptions to every model call. Changes to already-running Pi extensions/templates require a safe `/reload` while idle (not during a pending review).
 
 See [docs/plan.md](docs/plan.md) for the design and milestones.
 

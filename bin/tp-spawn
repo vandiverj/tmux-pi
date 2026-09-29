@@ -187,6 +187,17 @@ fi
 
 # Build the packet before creating anything, so a bad path fails cleanly.
 packet="$(printf '# Task\n\n%s\n' "$task")"
+# Classify only the main-owned worker task, never conversation/context documents.
+# This is instruction disclosure, not a capability or edit grant. Pi and Claude
+# workers receive the same bounded instructions; neither loads a global skill tree.
+skill_result="$(printf '%s' "$task" | "$ROOT/bin/tp-skills" --mode packet)" || die "skill selection failed"
+skill_selection="$(jq -c .selected <<<"$skill_result")" || die "invalid skill selection"
+skill_packet="$(jq -r .packet <<<"$skill_result")" || die "invalid skill packet"
+if [[ -n "$skill_packet" ]]; then
+  packet+=$'\n\n# Selected Task Skills\n\n'
+  packet+="$skill_packet"
+  packet+=$'\n'
+fi
 if [[ -n "$conversation" ]]; then
   [[ -f "$conversation" ]] || die "conversation file not found: $conversation"
   body="$(cat "$conversation")"
@@ -263,6 +274,8 @@ fi
 # as the human-facing canonical record after meta.json exists.
 printf '%s\n' "$task" > "$task_dir/request.md"
 printf '%s\n' "$packet" > "$task_dir/packet.md"
+# Durable provenance: only matching skill profiles and their body hashes.
+printf '%s\n' "$skill_selection" | jq . > "$task_dir/skill-selection.json"
 if [[ -n "$main_contract_file" ]]; then
   jq . "$main_contract_file" > "$task_dir/main-contract.json"
 fi

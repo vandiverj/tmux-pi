@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "max_selected": 2,
+  "skills": [
+    {
+      "id": "make-qa",
+      "description": "Draft grounded, tester-facing staging QA scripts; no ticket or deployment action.",
+      "path": "skills/make-qa/SKILL.md",
+      "status": "pilot",
+      "authority": "instructions only; no write authority",
+      "markers": ["/make-qa"],
+      "phrases": ["qa test script", "qa script", "manual qa handoff", "tester-facing qa", "staging test script"]
+    },
+    {
+      "id": "document-transform",
+      "description": "Read or convert PDF/DOCX and Markdown with local, verified tools.",
+      "path": "catalog/skills/document-transform/SKILL.md",
+      "status": "experimental; local converters not qualified",
+      "authority": "instructions only; outputs need task write authority",
+      "markers": [],
+      "extensions": ["pdf", "docx"],
+      "phrases": ["markdown to pdf", "markdown to docx", "markdown to word", "pdf to markdown", "docx to markdown", "word to markdown", "convert a document", "convert this document", "extract from pdf", "extract from docx"]
+    }
+  ]
+}

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# tp-pi — run pi with only tmux-pi's config, extensions and skills.
+# tp-pi — run pi with only tmux-pi's config and extensions.
 #
-# Ignores ~/.pi/agent (PI_CODING_AGENT_DIR=agent/) and ~/.agents/skills and
-# project skill dirs (--no-skills); loads skills only from the repo's skills/.
+# Ignores ~/.pi/agent (PI_CODING_AGENT_DIR=agent/), ~/.agents/skills and
+# project skill dirs (--no-skills). The private catalogue selects task-specific
+# skill handles; no growing Pi skill inventory is advertised to every model.
 # Extra arguments are passed through to pi.
 set -euo pipefail
 
@@ -15,4 +16,4 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 
 export PI_CODING_AGENT_DIR="$ROOT/agent"
-exec pi --no-skills --skill "$ROOT/skills" "$@"
+exec pi --no-skills "$@"

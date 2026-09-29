@@ -341,6 +341,7 @@ export default function (pi: ExtensionAPI) {
 	const root = dirname(agentDir);
 	const bin = (name: string) => join(root, "bin", name);
 	let enabled = true;
+	let active = true;
 	let lastCtx: any;
 	let activeHandshake: Handshake | undefined;
 	let pendingAlignment: PendingAlignment | undefined;
@@ -360,11 +361,21 @@ export default function (pi: ExtensionAPI) {
 
 	// Post into main's conversation without starting a turn (pi holds it until a running turn ends);
 	// main sees it on its next turn.
-	const post = (content: string, details: Record<string, unknown>) =>
-		pi.sendMessage({ customType: "tmux-pi-auto", content, display: true, details }, { triggerTurn: false });
+	const post = (content: string, details: Record<string, unknown>) => {
+		if (!active) return;
+		try {
+			pi.sendMessage({ customType: "tmux-pi-auto", content, display: true, details }, { triggerTurn: false });
+		} catch (error) {
+			// Reload replaces Pi's extension runtime. Its former watcher may settle
+			// before session_shutdown runs; never let a stale ctx crash the new main.
+			if (!/extension ctx is stale/i.test(String(error))) throw error;
+			active = false;
+			lastCtx = undefined;
+		}
+	};
 
 	const showRunning = () => {
-		if (!lastCtx) return;
+		if (!active || !lastCtx) return;
 		const n = delegated.size;
 		lastCtx.ui.setStatus("auto-tasks", n ? `AUTO tasks: ${[...delegated.values()].map((t) => t.reviewer ?? t.id).join(", ")}` : undefined);
 	};
@@ -404,7 +415,9 @@ export default function (pi: ExtensionAPI) {
 		const started = Date.now();
 		let warned = false;
 		for (;;) {
+			if (!active) throw new Error("dispatcher session ended while waiting for worker");
 			const dir = await taskDir(id);
+			if (!active) throw new Error("dispatcher session ended while waiting for worker");
 			const escalatedTo = readText(join(dir, "escalated"));
 			if (escalatedTo) return { id, ok: false, escalatedTo };
 			const state = readJson(join(dir, "state.json"));
@@ -507,7 +520,9 @@ export default function (pi: ExtensionAPI) {
 	// Follow a delegated task through escalation, questions and review until it needs the user.
 	const watch = async (task: Delegated) => {
 		for (;;) {
+			if (!active) return;
 			const done = await settle(task.id, () => task.since);
+			if (!active) return;
 			if (done.escalatedTo) {
 				if (task.review === "required") {
 					if (!existsSync(join(await taskDir(done.escalatedTo), "review-required.json")))
@@ -586,6 +601,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const started = Date.now();
 			const r = await run(bin("tp-review"), ["--force", task.id]);
+			if (!active) return;
 			if (r.code !== 0) {
 				requireDelegatedReview(dir, task.id, `Required opposite-provider review unavailable: ${(r.stderr || r.stdout).trim()}`);
 				post(`${task.id} finished, but its required opposite-provider review could not start: ${(r.stderr || r.stdout).trim()}\n\nHuman action required: start an opposite-provider report-only review manually or decide to accept the risk. tmux-pi will not silently substitute a same-provider reviewer or mark this review skipped.\n\n${summary(reply, join(dir, "result.md"))}`, { kind: "review-needs-human", id: task.id, reason: (r.stderr || r.stdout).trim() });
@@ -597,6 +613,7 @@ export default function (pi: ExtensionAPI) {
 			showRunning();
 			lastCtx?.ui.setStatus("auto", `AUTO review · ${task.reviewer} checking ${task.id}`);
 			const reviewed = await settle(task.reviewer, () => started);
+			if (!active) return; // The durable pending marker survives; the old watcher owns no verdict.
 			const reviewDir = await taskDir(task.reviewer);
 			const verdict = await replyOf(task.reviewer);
 			await run(bin("tp-kill"), [task.reviewer]);
@@ -651,14 +668,14 @@ export default function (pi: ExtensionAPI) {
 			task.since = Date.now();
 			await typeInto(task.id, `A reviewer on another provider requested changes. Their findings are in ${join(reviewDir, "result.md")}. Address each finding, or explain why it does not apply, then report again.`);
 		}
-		lastCtx?.ui.setStatus("auto", "AUTO on");
+		if (active) lastCtx?.ui.setStatus("auto", "AUTO on");
 	};
 
 	const follow = (task: Delegated) => {
-		if (task.watching) return;
+		if (!active || task.watching) return;
 		task.watching = true;
 		void watch(task)
-			.catch((error) => post(`Stopped following ${task.id}: ${(error as Error).message}`, { kind: "failed", id: task.id }))
+			.catch((error) => { if (active) post(`Stopped following ${task.id}: ${(error as Error).message}`, { kind: "failed", id: task.id }); })
 			.finally(() => {
 				task.watching = false;
 			});
@@ -1400,20 +1417,27 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	let scanning = false;
+	pi.on("session_shutdown", () => {
+		// /reload replaces this runtime; orphaned watchers and scans must not use
+		// its captured pi/ctx or collect a review after the new runtime starts.
+		active = false;
+		lastCtx = undefined;
+	});
 	pi.on("session_start", (_event, ctx) => {
+		if (!active) return;
 		lastCtx = ctx;
 		if (scanning) return;
 		scanning = true;
 		void (async () => {
-			for (;;) {
+			while (active) {
 				await scanPrompts().catch(() => undefined);
-				await sleep(3000);
+				if (active) await sleep(3000);
 			}
 		})();
 		void (async () => {
-			for (;;) {
+			while (active) {
 				await enforceContracts().catch(() => undefined);
-				await sleep(15_000);
+				if (active) await sleep(15_000);
 			}
 		})();
 	});

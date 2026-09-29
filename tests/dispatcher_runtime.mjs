@@ -24,8 +24,8 @@ const statuses = [];
 // Pinned Laya-style decisions: implementation is subagent unless +here overrides;
 // review-required work stays blocked in main even for a low-risk text request.
 const direct = ['direct', 'direct-off', 'direct-review', 'main-pi', 'review-turn', 'resolved-turn', 'forged-resolved', 'wrong-id-resolved', 'task-blocker', 'archived-blocker', 'archived-renamed', 'unknown-marker', 'malformed-marker', 'approved-changed', 'resolved-changed', 'expanded', 'expanded-marker'].includes(scenario);
-const request = scenario === 'delegate-omitted' ? '+delegate Read only fixture.txt and answer: what color is cedar? Do not edit files.' : scenario === 'research-gate' ? '+research +review Summarize cache history' : ['expanded', 'expanded-marker'].includes(scenario) ? (scenario === 'expanded-marker' ? '+here /pwhash' : '/pwhash') : scenario === 'direct-subagent' ? 'Explain tp-view' : scenario === 'followup-blocked' ? '+delegate Fix typo in README.md' : ['review', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap'].includes(scenario) ? '+delegate Update password hashing in auth.py' : ['confirm', 'decline', 'no-ui'].includes(scenario) ? 'Deploy production migration and delete old backups' : ['review-turn', 'resolved-turn'].includes(scenario) ? '+here Go ahead and apply the change we discussed' : scenario === 'direct-review' || scenario === 'main-pi' ? '+here +review Explain tp-view' : direct ? '+here Explain tp-view' : 'Fix typo in README.md';
-let decision = { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'low', route: 'coding', intent: direct || scenario === 'direct-subagent' ? 'communication_or_documentation' : 'implementation', review: ['direct-review', 'main-pi', 'capability-resolved', 'capability-deleted', 'review-failed', 'review-invalid', 'formatted-verdict', 'review-changes', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'kill'].includes(scenario) ? 'required' : 'none', scope: 'brief', placement: direct ? 'main' : 'subagent', overrides: direct ? ['placement', ...(scenario === 'direct-review' || scenario === 'main-pi' ? ['review'] : [])] : ['placement'], task: direct ? 'Explain tp-view' : request.replace(/^\+delegate\s+/, '') };
+const request = scenario === 'delegate-omitted' ? '+delegate Read only fixture.txt and answer: what color is cedar? Do not edit files.' : scenario === 'research-gate' ? '+research +review Summarize cache history' : ['expanded', 'expanded-marker'].includes(scenario) ? (scenario === 'expanded-marker' ? '+here /pwhash' : '/pwhash') : scenario === 'direct-subagent' ? 'Explain tp-view' : scenario === 'followup-blocked' ? '+delegate Fix typo in README.md' : ['review', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload'].includes(scenario) ? '+delegate Update password hashing in auth.py' : ['confirm', 'decline', 'no-ui'].includes(scenario) ? 'Deploy production migration and delete old backups' : ['review-turn', 'resolved-turn'].includes(scenario) ? '+here Go ahead and apply the change we discussed' : scenario === 'direct-review' || scenario === 'main-pi' ? '+here +review Explain tp-view' : direct ? '+here Explain tp-view' : 'Fix typo in README.md';
+let decision = { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'low', route: 'coding', intent: direct || scenario === 'direct-subagent' ? 'communication_or_documentation' : 'implementation', review: ['direct-review', 'main-pi', 'capability-resolved', 'capability-deleted', 'review-failed', 'review-invalid', 'formatted-verdict', 'review-changes', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload', 'kill'].includes(scenario) ? 'required' : 'none', scope: 'brief', placement: direct ? 'main' : 'subagent', overrides: direct ? ['placement', ...(scenario === 'direct-review' || scenario === 'main-pi' ? ['review'] : [])] : ['placement'], task: direct ? 'Explain tp-view' : request.replace(/^\+delegate\s+/, '') };
 if (['direct', 'direct-off', 'direct-review', 'main-pi', 'review', 'review-gate', 'review-turn', 'resolved-turn', 'delegate-omitted'].includes(scenario)) {
   const fixture = spawnSync('python3', [path.join(root, 'tests/router_runtime_fixture.py'), request], { cwd: root, encoding: 'utf8' });
   if (fixture.status !== 0) throw new Error(fixture.stderr);
@@ -99,7 +99,7 @@ function command(cmd, args, input) {
     fs.writeFileSync(path.join(dir('review-live'), 'result.md'), 'REQUEST_CHANGES\nFix evidence.');
     fs.writeFileSync(path.join(dir('review-live'), 'state.json'), JSON.stringify({ state: 'starting' }));
     return 'review-live\n';
-  } if (['midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap'].includes(scenario)) {
+  } if (['midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload'].includes(scenario)) {
     const id = `review-${++globalThis.midRounds}`;
     task(id, { worker: 'claude' });
     fs.writeFileSync(path.join(dir(id), 'review-of'), 'auto-1');
@@ -182,7 +182,7 @@ try {
     console.log(JSON.stringify({ before: globalThis.markerAtRework, marker, blocked, collectDenied, collected: calls.filter(c => c.name === 'tp-contract' && c.args[0] === 'collect').length }));
     process.exit(0);
   }
-  if (['midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap'].includes(scenario)) {
+  if (['midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload'].includes(scenario)) {
     globalThis.midRounds = 0; globalThis.reviewSnapshots = [];
     task('auto-1', { decision: { review: 'required' } });
     fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify({ required: true, status: 'pending_review', task_id: 'auto-1', round_nonce: crypto.randomUUID() }));
@@ -194,6 +194,17 @@ try {
     for (let i = 0; i < 85 && !globalThis.midRounds; i++) await new Promise(r => setTimeout(r, 100));
     if (!globalThis.midRounds) throw new Error('review did not start');
     const firstNonce = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).round_nonce;
+    if (scenario === 'midreview-reload') {
+      handlers.session_shutdown({}, ctx); // Simulate Pi replacing this extension runtime.
+      // Late reviewer settlement must not use the captured Pi context or collect.
+      pi.sendMessage = () => { throw new Error('This extension ctx is stale after session replacement or reload'); };
+      fs.writeFileSync(path.join(dir('review-1'), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));
+      await new Promise(r => setTimeout(r, 3250));
+      const marker = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json')));
+      console.log(JSON.stringify({ marker, collected: calls.filter(c => c.name === 'tp-contract' && c.args[0] === 'collect').length,
+        messages: messages.map(m => m.details?.kind), reviewer: globalThis.midRounds }));
+      process.exit(0);
+    }
     if (['midreview-followup', 'midreview-nonce'].includes(scenario)) await handlers.input({ text: '+followup auto-1 Also change X', source: 'interactive' }, ctx);
     if (scenario !== 'midreview-nonce') fs.writeFileSync(path.join(dir('auto-1'), 'result.md'), 'Round 2 UNREVIEWED result.');
     fs.writeFileSync(path.join(dir('auto-1'), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));

@@ -141,6 +141,13 @@ class DispatcherRuntime(unittest.TestCase):
         self.assertTrue(d["inheritedTaskReview"])
         self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]))
 
+    def test_reload_during_pending_review_stops_old_watcher_without_collect(self):
+        d = scenario("midreview-reload")
+        self.assertEqual(d["reviewer"], 1)
+        self.assertEqual(d["marker"]["status"], "pending_review")
+        self.assertEqual(d["collected"], 0)
+        self.assertNotIn("review-needs-human", d["messages"])
+
     def test_task_and_archived_blockers_inherit_review_without_policy_risk(self):
         for name in ("task-blocker", "archived-blocker", "archived-renamed", "unknown-marker", "wrong-id-resolved"):
             d = scenario(name)

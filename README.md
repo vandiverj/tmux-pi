@@ -133,6 +133,20 @@ task using a macOS-compatible advisory lock; `tp-review` still requires both a
 result and a settled worker. Token counts include cached input; cost is shown
 only for pi providers that price tokens.
 
+### On-demand QA handoff
+
+Type `/make-qa <case or change>` to draft a tester-facing script. The small prompt
+alias loads the [`make-qa`](skills/make-qa/SKILL.md) skill only for QA authoring;
+ordinary turns carry only its name/description, not the full instructions. Pi's
+native `/skill:make-qa` command also works. The script assumes its change is
+available **when QA runs it**, even when written before staging. Ordinary
+staging testers can set up safe fictional people through normal product flows;
+developer setup is an evidenced exception. Coverage includes the full changed
+journey and plausible nearby regressions without generic busywork. This drafts
+in chat; it does **not** write YouTrack, deploy, enable an MCP, or grant edit
+authority. Expanded slash templates cannot authorize a worker or edit on their
+own; use a fresh explicit request and contract for any write.
+
 See [docs/plan.md](docs/plan.md) for the design and milestones.
 
 ## Local model router

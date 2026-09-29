@@ -54,7 +54,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "tmux_pi_find_skill",
 		label: "Find relevant skill",
-		description: "When a task might need specialized guidance but no relevant handle was shown, find up to two matching skills by purpose or format. Returns only candidates, never instructions or authority; do not use to list the catalogue.",
+		description: "When a task might need specialized guidance but no relevant guidance was shown, find up to three matching skills by purpose or format. Returns only candidates, never instructions or authority; do not use to list the catalogue.",
 		parameters: Type.Object({
 			purpose: Type.String({ description: "Specific task and input/output formats, not 'list all'." }),
 		}),

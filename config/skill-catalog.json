@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "max_selected": 2,
+  "max_selected": 3,
   "skills": [
     {
       "id": "make-qa",
@@ -20,6 +20,42 @@
       "markers": [],
       "extensions": ["pdf", "docx"],
       "phrases": ["markdown to pdf", "markdown to docx", "markdown to word", "pdf to markdown", "docx to markdown", "word to markdown", "convert a document", "convert this document", "extract from pdf", "extract from docx"]
+    },
+    {
+      "id": "counterpoint",
+      "description": "Human-requested challenge to a plan or decision, with a credible alternative and reconciliation.",
+      "path": "catalog/skills/counterpoint/SKILL.md",
+      "status": "pilot; report-only guidance",
+      "authority": "instructions only; no edits, approval or waiver",
+      "markers": ["/counterpoint"],
+      "phrases": ["challenge my plan", "challenge this plan", "devil's advocate", "play devil's advocate", "give me a counterpoint", "counterpoint on", "counterpoint for", "adversarial pass"]
+    },
+    {
+      "id": "product-fit",
+      "description": "Check actor, journey, assumptions and observable contract before consequential product work.",
+      "path": "catalog/skills/product-fit/SKILL.md",
+      "status": "pilot; planning guidance",
+      "authority": "instructions only; no implementation or approval",
+      "markers": ["/product-fit"],
+      "phrases": ["product-fit check", "product fit check", "product-fit review", "review product fit", "contract spec", "observable contract", "review the api contract", "review the ui contract"]
+    },
+    {
+      "id": "threat-model",
+      "description": "Focused report-only threat review for security, privacy, and agent/tool trust boundaries.",
+      "path": "catalog/skills/threat-model/SKILL.md",
+      "status": "pilot; report-only guidance",
+      "authority": "instructions only; no edits or review waiver",
+      "markers": ["/threat-model"],
+      "phrases": ["threat model", "security review", "review security", "privacy review", "prompt injection review", "agent security review"]
+    },
+    {
+      "id": "test-skill-behavior",
+      "description": "Bounded evaluation of a skill or catalogue selection change before relying on it.",
+      "path": "catalog/skills/test-skill-behavior/SKILL.md",
+      "status": "pilot; internal validation only",
+      "authority": "instructions only; no automation qualification",
+      "markers": [],
+      "phrases": ["test skill behavior", "pressure-test the skill", "evaluate skill selection", "test catalogue trigger", "test skill selection"]
     }
   ]
 }

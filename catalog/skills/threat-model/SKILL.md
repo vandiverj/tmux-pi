@@ -1,0 +1,7 @@
+# Focused security and privacy threat review
+
+Use for a requested threat model or security/privacy review of a **specified change**, especially auth, permissions, private data, untrusted documents, external tools/MCPs, agent automation, or public interfaces. Read the actual changed surfaces and applicable policy/contract first. This is report-only guidance, **not** a substitute for tmux-pi's required independent review or a tool/authority grant.
+
+Identify assets and data, actors, trust boundaries, entry points, outputs and actions the system can take. Choose the few risk lenses that matter: authorization/isolation, secrets and disclosure, input/output injection, path/shell/network execution, retention/deletion, dependency provenance, external-tool data boundaries, prompt/retrieval poisoning, or excessive agent authority. For each credible abuse path, cite the affected source/contract, likelihood or uncertainty, impact, existing safeguard, and a testable mitigation or missing evidence. Do not claim security from model agreement, a passing unrelated test, or a policy sentence without an enforcement check.
+
+Return scope; highest material risks; evidence and gaps; required mitigations/checks; residual risk; and **needs human approval** where authority expands. Distinguish possible risk from verified vulnerability. Do not modify files, enable MCPs, inspect production/private rows, waive a review blocker, or initiate a release based on this review alone.

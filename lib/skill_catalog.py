@@ -42,9 +42,14 @@ def _matches(item: dict, request: str) -> bool:
 
 def select(request: str, root: Path = ROOT) -> list[dict]:
     data = _catalog(root)
-    result = []
-    for item in data["skills"]:
+    ranked = []
+    tokens = request.lower()[:8000].split()
+    for order, item in enumerate(data["skills"]):
         if _matches(item, request):
-            result.append({key: item[key] for key in ("id", "description", "status", "authority")})
-            result[-1]["path"] = str((root / item["path"]).resolve())
-    return result[:data["max_selected"]]
+            result = {key: item[key] for key in ("id", "description", "status", "authority")}
+            result["path"] = str((root / item["path"]).resolve())
+            # A human's explicit /command must not disappear behind broad
+            # phrase/file matches when the bounded shortlist is full.
+            explicit = any(marker in tokens for marker in item.get("markers", []))
+            ranked.append((0 if explicit else 1, order, result))
+    return [item for _, _, item in sorted(ranked)[:data["max_selected"]]]

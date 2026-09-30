@@ -135,6 +135,10 @@ only for pi providers that price tokens.
 
 ### On-demand QA handoff
 
+Worker processes default to the registered main pane's current directory, not the directory containing session state. An explicit human-selected `tp-spawn --workdir /absolute/project` can override it; reviewers inherit the author's recorded directory. Unknown main directories fail closed. This selects a working directory, **not** Claude folder trust; genuine folder trust still belongs to the human.
+
+The status pane polls for updates but emits a terminal frame only when displayed content changes (or on resize). This reduces idle redraws; active elapsed-time changes and Pi's own redraws can still affect terminal-native selection. tmux copy mode is the reliable alternative while output is changing.
+
 Type `/make-qa <case or change>` to draft a tester-facing script. The small prompt
 alias selects the [`make-qa`](skills/make-qa/SKILL.md) instructions only for QA authoring;
 ordinary turns carry **no QA skill description**. Native `/skill:make-qa` is not
@@ -156,6 +160,12 @@ The private catalogue also offers on-demand `/counterpoint` (human-requested dec
 The independent [document transformation guidance](catalog/skills/document-transform/SKILL.md) covers PDF/DOCX ↔ Markdown using local tools. It is **experimental**: available converters differ by machine; no packages are auto-installed, no files are uploaded, and an unavailable conversion must be reported, not fabricated. Verify local dependencies, output and task authority before using it. The synced Claude skills were references only, not copied. The catalogue can grow without adding per-skill descriptions to every model call. Changes to already-running Pi extensions/templates require a safe `/reload` while idle (not during a pending review).
 
 See [docs/plan.md](docs/plan.md) for the design and milestones.
+
+## Goals and routing evaluation
+
+[Goal mode](docs/goal-mode.md) is opt-in, bounded continuation toward an explicitly approved objective, with durable progress and budget records. Ordinary tasks remain ordinary turns. Goal scope does not approve external writes, dependencies, deployments, destructive operations or folder trust; required independent review remains binding. Read the usage and recovery limitations before attaching a goal.
+
+[Laya routing evaluation](docs/routing-evals.md) records model/effort recommendations, configuration/instruction hashes, actual worker usage, escalations, reviews and human outcome ratings in project-local `.tmux-pi/evals/`. Logs omit request text by default. Use `tp-evals rate` and `tp-evals export` for later comparisons; no automatic retraining or policy self-modification occurs. Claude routes favor Sonnet 5.5 for ordinary work, with Opus reserved for heavy traits; multi-step work alone does not warrant Opus. Main Pi model switching remains a recommendation, not a new automatic capability.
 
 ## Local model router
 

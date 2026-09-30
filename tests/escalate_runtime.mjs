@@ -11,7 +11,7 @@ const sourceDir = path.join(tmp, 'tasks', 'old');
 const targetDir = path.join(tmp, 'tasks', 'new');
 fs.mkdirSync(sourceDir, { recursive: true });
 fs.mkdirSync(targetDir);
-const original = { id: 'old', worker: 'pi', decision: { review: 'required', scope: 'brief' },
+const original = { id: 'old', worker: 'pi', workdir: tmp, decision: { review: 'required', scope: 'brief' },
   blocked_by: ['task:prior'], contract: { kind: 'task', artifact: '/old/report.md' },
   preflight: { schema: 'preflight', no_edits: true }, handshake_id: 'h1' };
 fs.writeFileSync(path.join(sourceDir, 'meta.json'), JSON.stringify(original));
@@ -50,6 +50,7 @@ for (const flag of ['--preflight', '--main-contract', '--policy-decision', '--co
 assert.equal(JSON.parse(fs.readFileSync(spawn[spawn.indexOf('--preflight') + 1], 'utf8')).no_edits, true);
 assert.equal(JSON.parse(fs.readFileSync(path.join(sourceDir, 'preflight.json'), 'utf8')).no_edits, true);
 assert.equal(spawn.at(-1), 'Original task');
+assert.equal(spawn[spawn.indexOf('--workdir') + 1], tmp);
 const target = JSON.parse(fs.readFileSync(path.join(targetDir, 'meta.json')));
 assert.equal(target.decision.review, 'required');
 assert.deepEqual(target.blocked_by, ['task:prior']);
@@ -91,5 +92,18 @@ failed.tool_execution_end({ toolCallId: '2', toolName: 'read', isError: true, re
 assert.equal(fs.readFileSync(path.join(targetDir, 'meta.json'), 'utf8'), targetBefore);
 assert(calls.some(c => c.cmd === 'tp-kill' && c.args[0] === 'new'));
 assert.equal(fs.readdirSync(targetDir).some(name => name.endsWith('.tmp')), false);
+// Goal lineage is not transferable after the target pane starts: pause BEFORE spawn.
+fs.writeFileSync(path.join(sourceDir, 'meta.json'), JSON.stringify({ ...original,
+  goal: { id: 'approved-goal', ticket: 'owned-turn', spec_sha256: 'a'.repeat(64), workdir: tmp } }));
+const beforeGoalSpawns = calls.filter(c => c.cmd === 'tp-spawn').length;
+const goalHandlers = {};
+(await import(pathToFileURL(path.join(tmp, 'escalate.ts')).href + '?goal')).default({ on(name, fn) { goalHandlers[name] = fn; } });
+goalHandlers.model_select({ model: { provider: 'local', id: 'qwen' } });
+goalHandlers.tool_execution_start({ toolCallId: 'goal', toolName: 'read', args: {} });
+goalHandlers.tool_execution_end({ toolCallId: 'goal', toolName: 'read', isError: true, result: 'failed' },
+  { model: { provider: 'local', id: 'qwen' }, abort() { throw new Error('goal must not abort'); }, shutdown() {} });
+assert.equal(calls.filter(c => c.cmd === 'tp-spawn').length, beforeGoalSpawns);
+assert(calls.some(c => c.cmd === 'tp-goal' && c.args.includes('pause') && c.args.includes('approved-goal')));
+assert.match(fs.readFileSync(path.join(sourceDir, 'escalation-error.txt'), 'utf8'), /Goal escalation requires human/);
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('escalate handoff OK');

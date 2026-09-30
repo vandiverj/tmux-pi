@@ -187,6 +187,21 @@ export default function (pi: ExtensionAPI) {
 		const target = plan.target;
 		const sourceMeta = readJson(join(dir, "meta.json"));
 		if (!sourceMeta || typeof sourceMeta !== "object" || Array.isArray(sourceMeta)) throw new Error("source task metadata unavailable for escalation");
+		if (typeof sourceMeta.workdir !== "string" || !sourceMeta.workdir.startsWith("/")) throw new Error("source workdir unavailable for escalation; no implicit project fallback");
+		// Goal authority is bound to a counted attempt and independently reviewed
+		// author identity. tp-spawn starts its pane before we can durably link a new
+		// target, so never silently move an active goal to an unmetered worker.
+		if (sourceMeta.goal !== undefined) {
+			const goal = sourceMeta.goal;
+			if (typeof goal?.id === "string" && goal.workdir === sourceMeta.workdir) {
+				try {
+					execFileSync(join(root, "bin", "tp-goal"), ["--project", goal.workdir, "pause", goal.id,
+						"--reason", `Worker ${id} requested escalation; human must approve a fresh bounded R5 attempt and preserve review lineage`],
+						{ encoding: "utf8", timeout: 10_000 });
+				} catch { /* Still refuse the spawn if state is unavailable. */ }
+			}
+			throw new Error("Goal escalation requires human reconciliation; no unlinked target was spawned");
+		}
 		const context = ["packet.md", "escalation.md"].filter((name) => existsSync(join(dir, name)));
 		// tp-spawn stores the merged preflight in meta.json, not preflight.json.
 		// Materialize that authoritative restriction before the target's contract is
@@ -210,6 +225,7 @@ export default function (pi: ExtensionAPI) {
 				join(root, "bin", "tp-spawn"),
 				[
 					"--worker", target.worker,
+					"--workdir", sourceMeta.workdir,
 					"--model", target.model,
 					"--thinking", target.thinking,
 					"--name", `esc-${id}`,

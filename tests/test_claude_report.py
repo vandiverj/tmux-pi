@@ -20,7 +20,7 @@ class ClaudeReportTests(unittest.TestCase):
         self.task = self.state_dir / "tasks/w1"
         self.task.mkdir(parents=True)
         (self.state_dir / "archive").mkdir()
-        (self.task / "meta.json").write_text(json.dumps({"id": "w1", "worker": "claude"}))
+        (self.task / "meta.json").write_text(json.dumps({"id": "w1", "worker": "claude", "workdir": str(self.base)}))
         (self.task / "task.md").write_text("Read fixture")
         (self.task / "packet.md").write_text("Read fixture")
         fake = self.base / "fake-bin"

@@ -72,7 +72,7 @@ type Preflight = {
 
 type AutomationPolicy = {
 	action: "auto_dispatch" | "recommend_manual";
-	mode: "qualified" | "recommendation_manual" | "explicit_human_request";
+	mode: "qualified" | "recommendation_manual" | "explicit_human_request" | "approved_goal";
 	qualified_cell?: string;
 	candidate_cell?: string;
 	notice: string;
@@ -118,6 +118,7 @@ type Handshake = {
 	unverifiedExpansion?: boolean;
 	policyDecision?: any;
 	mainContract?: MainContract;
+	goal?: { id: string; ticket: string; spec_sha256: string; workdir: string; scope: string; allowed_paths: string[]; done: string; objective: string };
 };
 
 type PendingAlignment = {
@@ -351,6 +352,13 @@ export default function (pi: ExtensionAPI) {
 	const delegated = new Map<string, Delegated>();
 
 	const stateDir = () => must("tmux", ["display-message", "-p", "#{@tp_state_dir}"]);
+	const mainWorkdir = async () => {
+		const pane = (await must("tmux", ["display-message", "-p", "#{@tp_main_pane}"])).trim();
+		if (!/^%\d+$/.test(pane)) throw new Error("registered main pane unavailable; no workspace guess");
+		const cwd = (await must("tmux", ["display-message", "-p", "-t", pane, "#{pane_current_path}"])).trim();
+		if (!cwd.startsWith("/") || !cwd) throw new Error("registered main-pane cwd unavailable");
+		return cwd;
+	};
 	const taskDir = async (id: string) => join(await stateDir(), "tasks", id);
 
 	const paneAlive = async (dir: string) => {
@@ -609,6 +617,16 @@ export default function (pi: ExtensionAPI) {
 				break;
 			}
 			task.reviewer = r.stdout.trim();
+			const goal = readJson(join(dir, "meta.json"))?.goal;
+			if (goal?.id && goal?.workdir) {
+				const linked = await run(bin("tp-goal"), ["--project", goal.workdir, "link-reviewer", goal.id, "--author-id", task.id, "--reviewer-id", task.reviewer]);
+				if (linked.code !== 0) {
+					await run(bin("tp-kill"), [task.reviewer]);
+					requireDelegatedReview(dir, task.id, `Goal reviewer linkage failed: ${(linked.stderr || linked.stdout).trim()}`);
+					post(`${task.id} goal reviewer linkage failed; human reconciliation required.`, { kind: "review-needs-human", id: task.id });
+					break;
+				}
+			}
 			task.rounds += 1;
 			showRunning();
 			lastCtx?.ui.setStatus("auto", `AUTO review · ${task.reviewer} checking ${task.id}`);
@@ -708,8 +726,8 @@ export default function (pi: ExtensionAPI) {
 		} catch { return false; } // Inherited blocker still closes edit authority.
 	};
 
-	const selectContext = async (request: string, decision: Decision, preflight?: any) => {
-		const args = ["context", "--json", "--workdir", dirname(await stateDir()), "--decision-json", JSON.stringify(decision)];
+	const selectContext = async (request: string, decision: Decision, preflight?: any, workdir?: string) => {
+		const args = ["context", "--json", "--workdir", workdir ?? await mainWorkdir(), "--decision-json", JSON.stringify(decision)];
 		if (preflight?.preflight) args.push("--preflight-json", JSON.stringify(preflight.preflight));
 		return JSON.parse(await must(bin("tp-task"), args, request));
 	};
@@ -763,6 +781,7 @@ export default function (pi: ExtensionAPI) {
 			mode: hand.mode,
 			research: hand.research,
 			blocked_by: hand.blockedBy ?? [],
+			...(hand.goal ? { goal: { id: hand.goal.id, ticket: hand.goal.ticket, spec_sha256: hand.goal.spec_sha256 } } : {}),
 			unverified_expansion: !!hand.unverifiedExpansion,
 			note: "Deterministic scaffold only; not dispatch authority. Main Orient/Frame contract is required before substantive spawn/edit-authorized handoff.",
 		};
@@ -787,10 +806,11 @@ export default function (pi: ExtensionAPI) {
 		return `[tmux-pi ${title} contract]${where}\nMode: ${preflight.mode}; Tier ${preflight.artifact_tier}; no edits.\n${preflight.promotion_notice ?? ""}\n\nDo only this stop-mode work in chat. Do not edit files, run implementation, or spawn an implementation worker unless the user asks after this result. If ambiguity could materially change scope, security/data exposure, architecture, or acceptance evidence, ask first; otherwise state assumptions.\n\nUser request:\n${request}`;
 	};
 
-	const delegate = async (ctx: any, decision: Decision, foreground = false, preflight?: any): Promise<string> => {
+	const delegate = async (ctx: any, decision: Decision, foreground = false, preflight?: any, goal?: Handshake["goal"]): Promise<string> => {
 		const tmp = mkdtempSync(join(tmpdir(), "tp-dispatch-"));
 		try {
 			const args = ["--worker", decision.worker, "--model", decision.model, "--thinking", decision.thinking];
+			if (goal) args.push("--workdir", goal.workdir);
 			args.push(...(foreground ? ["--name", "fg", "--view"] : ["--name", "auto"]));
 			if (!foreground) args.push("--kind", "task");
 			args.push("--decision-json", JSON.stringify(decision));
@@ -800,6 +820,7 @@ export default function (pi: ExtensionAPI) {
 				args.push("--conversation", join(tmp, "conversation.md"));
 			}
 			args.push("--note", ASK_IF_UNCLEAR);
+			if (goal) args.push("--note", `Explicit bounded goal ${goal.id}: original objective ${goal.objective}; done ${goal.done}; approved scope ${goal.scope}; only paths ${goal.allowed_paths.join(", ") || "no edits"}. No push/deploy/release/destruction/external writes/new dependencies/MCPs/trust approval. Main's R5 per-attempt contract and independent review remain binding.`);
 			args.push("--note", 'Only if you encounter an observable model/tool failure that blocks work, report one line: TMUX_PI_ESCALATION_SIGNAL: {"trigger":"model_error","reason":"specific failure (8-300 chars)","evidence":"specific observed output (3-2000 chars)"}. Never emit this for cancellation or as a request for an upgrade.');
 			if (!foreground) args.push("--note", REPORT_BACK);
 			if (decision.review === "required") args.push("--note", "A reviewer on another provider will check this work when you report.");
@@ -817,7 +838,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const brokerContexts = new Set<string>();
 			try {
-				const broker = await selectContext(decision.task, decision, preflight);
+				const broker = await selectContext(decision.task, decision, preflight, goal?.workdir);
 				if (broker?.manifest) {
 					writeFileSync(join(tmp, "context-manifest.json"), JSON.stringify(broker.manifest));
 					args.push("--context-manifest", join(tmp, "context-manifest.json"));
@@ -834,7 +855,7 @@ export default function (pi: ExtensionAPI) {
 			// Models that explore poorly (local packet_files) get files a Claude model picked for the task.
 			// If picking fails the worker starts with the core packet and finds files itself.
 			if (!foreground) {
-				const picked = await run(bin("tp-route"), ["--pick-files", dirname(await stateDir()), "--model", decision.model], decision.task, 150_000);
+				const picked = await run(bin("tp-route"), ["--pick-files", goal?.workdir ?? await mainWorkdir(), "--model", decision.model], decision.task, 150_000);
 				if (picked.code === 0) for (const spec of picked.stdout.split("\n").filter(Boolean)) if (!brokerContexts.has(spec)) args.push("--context", spec);
 			}
 			return (await must(bin("tp-spawn"), args, decision.task, 60_000)).split("\n")[0];
@@ -869,9 +890,19 @@ export default function (pi: ExtensionAPI) {
 			});
 			return;
 		}
-		const review: Decision["review"] = plan.decision.review === "required" || plan.automation.review?.required ? "required" : plan.decision.review;
+		const review: Decision["review"] = plan.handshake.goal || plan.decision.review === "required" || plan.automation.review?.required ? "required" : plan.decision.review;
 		const authorDecision = { ...plan.decision, review };
-		const id = await delegate(ctx, authorDecision, plan.foreground, packet);
+		const id = await delegate(ctx, authorDecision, plan.foreground, packet, plan.handshake.goal);
+		if (plan.handshake.goal) {
+			const goal = plan.handshake.goal;
+			const metaFile = join(await taskDir(id), "meta.json");
+			writeJson(metaFile, { ...readJson(metaFile), goal: { id: goal.id, ticket: goal.ticket, spec_sha256: goal.spec_sha256, workdir: goal.workdir } });
+			const linked = await run(bin("tp-goal"), ["--project", goal.workdir, "link-task", goal.id, "--ticket", goal.ticket, "--task-id", id]);
+			if (linked.code !== 0) {
+				await run(bin("tp-kill"), [id]);
+				throw new Error(`Goal author linkage failed; worker stopped and review remains binding: ${(linked.stderr || linked.stdout).trim()}`);
+			}
+		}
 		if (review === "required") pendingDelegatedReview(await taskDir(id), id);
 		const task: Delegated = { id, request: plan.decision.task, review, rounds: 0, since: Date.now(), foreground: plan.foreground };
 		delegated.set(id, task);
@@ -1483,7 +1514,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.handshake_id !== hand.id || params.request_sha256 !== hand.requestHash) {
 				throw new Error("R5 contract nonce/hash mismatch; no dispatch or edit authorization granted.");
 			}
-			const decision = hand.decision;
+			let decision = hand.decision;
 			const preflight = hand.preflight?.preflight ?? {};
 			if (hand.mode && (params.action !== "stop" || params.mode !== hand.mode || !params.no_edits)) {
 				throw new Error(`+${hand.mode} requires a matching no-edit stop contract; no dispatch or edit authority granted.`);
@@ -1550,6 +1581,27 @@ export default function (pi: ExtensionAPI) {
 					automation = JSON.parse(policy.stdout);
 					policyDecision = automation;
 				}
+				if (hand.goal && mainContract.action === "delegate") {
+					const scopedDecision = { ...decision, task: mainContract.task_summary, placement: "subagent" as const, review: "required" as const, overrides: [] };
+					const goalGate = await run(bin("tp-goal"), ["--project", hand.goal.workdir, "gate-attempt", hand.goal.id,
+						"--ticket", hand.goal.ticket, "--spec-sha256", hand.goal.spec_sha256,
+						"--main-json", JSON.stringify(mainContract), "--decision-json", JSON.stringify(scopedDecision),
+						"--preflight-json", JSON.stringify(saved.enriched_preflight), "--policy-json", JSON.stringify(automation)]);
+					if (goalGate.code === 0) {
+						const authority = JSON.parse(goalGate.stdout);
+						decision = scopedDecision;
+						hand.decision = decision;
+						automation = { ...automation, action: "auto_dispatch", mode: "approved_goal", confirmation_required: false,
+							review: { ...automation.review, required: true, risk: authority.risk, reasons: ["Goal edit/review gate", ...(automation.review?.reasons ?? [])] },
+							notice: authority.notice };
+						policyDecision = { ...automation, goal_authority: { id: hand.goal.id, ticket: hand.goal.ticket, spec_sha256: hand.goal.spec_sha256,
+							workdir: hand.goal.workdir, allowed_paths: authority.allowed_paths } };
+						if (enriched.preflight?.allowed) enriched.preflight.allowed.paths = authority.allowed_paths;
+					} else {
+						automation = { ...automation, action: "recommend_manual", mode: "recommendation_manual", notice: `Approved goal attempt blocked: ${(goalGate.stderr || goalGate.stdout).trim()}` };
+						policyDecision = automation;
+					}
+				}
 				if (saved.handoff) writeJson(join(saved.handoff, "policy-decision.json"), policyDecision);
 				if (mainContract.action === "delegate" && automation.action === "auto_dispatch") {
 					if (automation.confirmation_required) {
@@ -1608,6 +1660,11 @@ export default function (pi: ExtensionAPI) {
 				if (saved.record?.id && !pendingStopRecord) pendingStopRecord = { id: saved.record.id, mode: mainContract.mode };
 				lastCtx?.ui.setStatus("auto", `AUTO ${mainContract.mode} stop contract · R5`);
 				return { content: [{ type: "text", text: `R5 ${mainContract.mode} stop contract persisted${pendingStopRecord ? ` in ${pendingStopRecord.id}` : ""}. Now produce only the stop-mode artifact in chat. Do not edit files or spawn a worker.` }], details: { handshake_id: hand.id, action: mainContract.action, record: saved.record, policy: policyDecision, handoff: saved.handoff } };
+			}
+			if (mainContract.action === "direct" && hand.goal) {
+				hand.allowMainEdits = false;
+				return { content: [{ type: "text", text: "Goal direct-main contract recorded. Main edits remain blocked: coding attempts require a fresh delegated contract, approved goal scope and independent review. Read-only investigation may continue." }],
+					details: { handshake_id: hand.id, action: mainContract.action, goal: hand.goal.id, handoff: saved.handoff } };
 			}
 			if (mainContract.action === "direct") {
 				const ownReview = await ownReviewFor(hand, automation, saved.enriched_preflight, mainContract);
@@ -1680,7 +1737,7 @@ export default function (pi: ExtensionAPI) {
 		return { text, handled: true };
 	};
 
-	const startHandshake = async (ctx: any, original: string, effective: string, decision?: Decision, mode?: string, researchSpec?: Handshake["research"]): Promise<{ action: "transform"; text: string } | { action: "continue" } | { action: "handled" }> => {
+	const startHandshake = async (ctx: any, original: string, effective: string, decision?: Decision, mode?: string, researchSpec?: Handshake["research"], goal?: Handshake["goal"]): Promise<{ action: "transform"; text: string } | { action: "continue" } | { action: "handled" }> => {
 		let blockers: string[];
 		try { blockers = await unresolvedReviews(); }
 		catch (error) {
@@ -1708,10 +1765,11 @@ export default function (pi: ExtensionAPI) {
 			mode,
 			research: researchSpec,
 			created: Date.now(),
-			requiresContract: blockers.length > 0 || needsPersistedContract(decision, pf, mode),
+			requiresContract: !!goal || blockers.length > 0 || needsPersistedContract(decision, pf, mode),
 			reviewRequired: blockers.length > 0,
 			ownReviewRequested,
 			blockedBy: blockers,
+			goal,
 		};
 		if (hand.requiresContract) {
 			try {
@@ -1765,6 +1823,27 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event, ctx) => {
 		lastCtx = ctx;
 		const text = event.text.trim();
+		// Only a verified extension-sourced admission can skip follow-up routing.
+		// A user/model-inserted marker is ordinary text, never goal authority.
+		const goalHeader = /^TP_GOAL_CONTINUATION ([A-Za-z0-9_][A-Za-z0-9_.-]{0,63}) ([a-f0-9]{32}) ([a-f0-9]{64})\n([\s\S]+)$/.exec(text);
+		if (goalHeader && event.source === "extension") {
+			if (!enabled || event.streamingBehavior) {
+				ctx.ui.notify("Goal continuation needs idle AUTO/R5; ticket is not replayed", "warning");
+				return { action: "handled" };
+			}
+			try {
+				const [, id, ticket, specSha, body] = goalHeader;
+				const authority = JSON.parse(await must(bin("tp-goal"), ["--project", ctx.cwd, "gate-input", id, "--ticket", ticket, "--spec-sha256", specSha]));
+				const routed = JSON.parse(await must(bin("tp-route"), ["--dispatch"], body)) as Decision;
+				if (!routed || !["pi", "claude"].includes(routed.worker) || !routed.model) throw new Error("Laya model/effort unavailable");
+				// Placement/review are deterministic for an approved goal, never Laya grants.
+				const decision: Decision = { ...routed, task: body, placement: "subagent", review: "required", overrides: [] };
+				return startHandshake(ctx, text, body, decision, undefined, undefined, authority);
+			} catch (error) {
+				ctx.ui.notify(`Goal admission refused; no routing or follow-up: ${(error as Error).message}`, "warning");
+				return { action: "handled" };
+			}
+		}
 		// A queued user input is not authorized by a previous request's nonce.
 		if (event.streamingBehavior) {
 			activeHandshake = undefined;

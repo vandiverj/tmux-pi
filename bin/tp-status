@@ -9,7 +9,7 @@
 #        x            kill it (asks first)
 #        c            archive killed subagents (tp-clean)
 #
-# Refreshes every second from each task's state.json (written by the reporters)
+# Checks every second, painting only when the displayed frame changes, from each task's state.json (written by the reporters)
 # and its pane. States (bin/tp-contract status): starting, working, needs_input,
 # paused, settled (a reply is ready), completed (handed off), failed, killed,
 # escalated. Under each row: elapsed time, turns, tool calls, for a contract (M9)
@@ -37,6 +37,7 @@ red="${esc}[31m" green="${esc}[32m" yellow="${esc}[33m" magenta="${esc}[35m" cya
 selected=""   # id of the selected row; kept across refreshes
 message=""    # one-line feedback shown in the footer
 ids=()
+last_frame="" last_cols="" last_lines=""
 
 printf '%s[?25l' "$esc"
 trap 'printf "%s[?25h%s[0m" "$esc" "$esc"' EXIT
@@ -61,6 +62,8 @@ pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) "";
 render() {
   local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life
   cols="$(tput cols)"
+  frame_cols="$cols"
+  frame_lines="$(tput lines)"
   rows="$(tp_rows "$session")"
   details=""
   if [[ -n "$rows" ]]; then details="$("$ROOT/bin/tp-contract" status 2>/dev/null)"; fi
@@ -125,7 +128,18 @@ render() {
   fi
   if [[ -n "$message" ]]; then out+="${esc}[K"$'\n'"${yellow}$(clip "$cols" "$message")${reset}${esc}[K"$'\n'; fi
   out+="${esc}[J"
-  printf '%s' "$out"
+  frame="$out"
+}
+
+# Keep the one-second bounded poll (including elapsed contract info), but leave
+# the terminal untouched when nothing visible changed. Repaint after a resize
+# even if clipping happens to produce the same bytes (tmux may have cleared it).
+paint() {
+  render
+  if [[ "$frame" != "$last_frame" || "$frame_cols" != "$last_cols" || "$frame_lines" != "$last_lines" ]]; then
+    printf '%s' "$frame"
+    last_frame="$frame" last_cols="$frame_cols" last_lines="$frame_lines"
+  fi
 }
 
 move() {
@@ -153,7 +167,7 @@ popup() {
 }
 
 while true; do
-  render
+  paint
   message=""
   key=""
   IFS= read -rsn1 -t 1 key; rc=$?
@@ -184,7 +198,7 @@ while true; do
     c) message="$("$ROOT/bin/tp-clean" 2>&1)" ;;
     x)
       if [[ -n "$selected" ]]; then
-        message="kill $selected? y/n"; render; message=""
+        message="kill $selected? y/n"; paint; message=""
         IFS= read -rsn1 answer
         if [[ "$answer" == y ]]; then run "$ROOT/bin/tp-kill" "$selected"; fi
       fi ;;

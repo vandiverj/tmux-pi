@@ -8,6 +8,11 @@ With --follow-up, read {"message", "tasks": [{"id", "task", "reply"}]} as JSON o
 and print {"target": id or null, "ask": [ids]}: the running task the message belongs to.
 With --pick-files WORKDIR --model M, print the tp-spawn -c specs to put in the packet of
 a worker on M, one per line (nothing unless M is listed in local packet_files).
+
+Routing and --dispatch append an experimental selection record to the session's
+.tmux-pi/evals log (lib/routing_evals.py; TP_ROUTING_EVALS=0 turns it off). The log is
+best-effort evidence: a failed append never changes the decision or the exit status, and
+--dispatch output gains a selection_id only when the record was written.
 """
 
 import argparse
@@ -19,6 +24,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from router import (RouterError, dispatch, follow_up, load_config, local_base_url, pick_files,  # noqa: E402
                     review_task, route_task)
+
+
+def log_selection(task, config, config_path, kind, backend, decision, trace, error=None):
+    """Append a selection record; return its id, or None. Never raises."""
+    try:
+        import routing_evals
+        record = routing_evals.selection_record(task, config, config_path, kind=kind, backend=backend,
+                                                decision=decision, trace=trace, error=error)
+        routing_evals.log_selection(record)
+        return record["selection_id"]
+    except Exception as exc:  # noqa: BLE001 - eval logging must never change routing
+        if "no tmux-pi state dir" not in str(exc):
+            print("tp-route: routing eval not logged: {}".format(exc), file=sys.stderr)
+        return None
 
 
 def main():
@@ -82,13 +101,30 @@ def main():
                 print(spec)
             return 0
         if args.dispatch:
-            print(json.dumps(dispatch(task, config, args.base_url, args.router_model), separators=(",", ":")))
+            trace = {}
+            try:
+                decision = dispatch(task, config, args.base_url, args.router_model, trace=trace)
+            except RouterError as exc:
+                log_selection(task, config, args.config, "dispatch", backend, None, trace, exc)
+                raise
+            selection_id = log_selection(task, config, args.config, "dispatch", backend, decision, trace)
+            if selection_id:
+                decision["selection_id"] = selection_id
+            print(json.dumps(decision, separators=(",", ":")))
             return 0
         if args.review:
             print(json.dumps({"review": review_task(task, config, args.base_url, args.router_model)},
                              separators=(",", ":")))
             return 0
-        print(json.dumps(route_task(task, config, backend, args.base_url, args.router_model), separators=(",", ":")))
+        trace = {}
+        try:
+            decision = route_task(task, config, backend, args.base_url, args.router_model, trace=trace)
+        except RouterError as exc:
+            log_selection(task, config, args.config, "route", backend, None, trace, exc)
+            raise
+        # Plain routing output stays exactly worker/model/thinking; it is joined by task hash.
+        log_selection(task, config, args.config, "route", backend, decision, trace)
+        print(json.dumps(decision, separators=(",", ":")))
         return 0
     except (RouterError, OSError) as exc:
         print("tp-route: {}".format(exc), file=sys.stderr)

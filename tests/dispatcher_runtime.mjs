@@ -50,7 +50,11 @@ function command(cmd, args, input) {
   const name = path.basename(cmd);
   calls.push({ name, args, input });
   if (name === 'tmux') {
-    if (args[0] === 'display-message') return state;
+    if (args[0] === 'display-message') {
+      if (args.at(-1) === '#{@tp_main_pane}') return '%1';
+      if (args.at(-1) === '#{pane_current_path}') return root;
+      return state;
+    }
     if (args[0] === 'list-panes') return pane ? Array.from({ length: seq }, (_, i) => `%${i + 1} 0`).join('\n') + '\n' : '';
     if (scenario === 'halted-dialog-continue' && args[0] === 'send-keys' && args.at(-1) === 'Enter')
       globalThis.markerAtContinue = JSON.parse(fs.readFileSync(path.join(dir('source-1'), 'review-required.json')));
@@ -75,6 +79,11 @@ function command(cmd, args, input) {
       fs.writeFileSync(path.join(dir('auto-1'), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));
     }
     return '';
+  }
+  if (name === 'tp-goal') {
+    if (args.includes('gate-input')) return JSON.stringify({ id: 'goal', ticket: args[args.indexOf('--ticket') + 1], spec_sha256: 'b'.repeat(64), workdir: root, scope: 'src only', objective: 'Fix parser fully', done: 'Tests and review pass', allowed_paths: ['src'] });
+    if (args.includes('gate-attempt')) return JSON.stringify({ id: 'goal', ticket: 'a'.repeat(32), spec_sha256: 'b'.repeat(64), workdir: root, scope: 'src only', objective: 'Fix parser fully', done: 'Tests and review pass', allowed_paths: ['src'], risk: 'low', review: 'required', notice: 'Goal gate verified' });
+    return '{}';
   }
   if (name === 'tp-route') return args[0] === '--dispatch' ? JSON.stringify({ ...decision, task: ['direct', 'direct-off', 'direct-review', 'main-pi', 'review', 'review-turn', 'resolved-turn'].includes(scenario) ? decision.task : input }) : JSON.stringify({ ask: [] });
   if (name === 'tp-task') {
@@ -129,7 +138,7 @@ globalThis.__fakeExecFile = (cmd, args, opts, callback) => {
   return child;
 };
 const pi = { on(name, fn) { handlers[name] = fn; }, registerTool(t) { pi.tool = t; }, registerCommand(name, c) { pi.command = c; }, sendMessage(msg) { messages.push(msg); } };
-const ctx = { hasUI: scenario !== 'no-ui', ui: { setStatus(...v) { statuses.push(v); }, notify() {}, setEditorText() {}, async input() { return 'A narrower question'; }, async select() { if (scenario.startsWith('halted-dialog-')) return ({ 'halted-dialog-continue': 'Continue with one more budget', 'halted-dialog-discard': 'Discard it', 'halted-dialog-narrow': 'Narrow the question (new research task)', 'halted-dialog-escalate': 'Escalate to openai-codex/gpt-6-sol (new research task)' })[scenario]; return scenario === 'alignment' ? 'Answer pending alignment' : scenario === 'decline' ? 'Do not dispatch' : 'Confirm dispatch'; } }, sessionManager: { getBranch() { return []; } } };
+const ctx = { cwd: root, hasUI: scenario !== 'no-ui', ui: { setStatus(...v) { statuses.push(v); }, notify() {}, setEditorText() {}, async input() { return 'A narrower question'; }, async select() { if (scenario.startsWith('halted-dialog-')) return ({ 'halted-dialog-continue': 'Continue with one more budget', 'halted-dialog-discard': 'Discard it', 'halted-dialog-narrow': 'Narrow the question (new research task)', 'halted-dialog-escalate': 'Escalate to openai-codex/gpt-6-sol (new research task)' })[scenario]; return scenario === 'alignment' ? 'Answer pending alignment' : scenario === 'decline' ? 'Do not dispatch' : 'Confirm dispatch'; } }, sessionManager: { getBranch() { return []; } } };
 try {
   const extension = (await import(pathToFileURL(path.join(moduleDir, 'dispatcher.ts')).href)).default;
   extension(pi);
@@ -309,8 +318,8 @@ try {
     console.log(JSON.stringify({ inheritedWhileWatched, target: marker, decision: JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'meta.json'))).decision, source: JSON.parse(fs.readFileSync(path.join(dir('source-1'), 'review-required.json'))), lineage: JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'meta.json'))).escalated_from }));
     process.exit(0);
   }
-  const original = ['stop', 'stop-no-commit', 'stop-retry'].includes(scenario) ? '+plan Plan the retry boundary' : ['slash', 'slash-off'].includes(scenario) ? '/template Fix typo in README.md' : request;
-  const source = ['extension', 'extension-off'].includes(scenario) ? 'extension' : 'interactive';
+  const original = ['goal', 'goal-spoof'].includes(scenario) ? `TP_GOAL_CONTINUATION goal ${'a'.repeat(32)} ${'b'.repeat(64)}\nFix parser in src/parser.py` : ['stop', 'stop-no-commit', 'stop-retry'].includes(scenario) ? '+plan Plan the retry boundary' : ['slash', 'slash-off'].includes(scenario) ? '/template Fix typo in README.md' : request;
+  const source = ['extension', 'extension-off', 'goal'].includes(scenario) ? 'extension' : 'interactive';
   if (['slash-off', 'extension-off'].includes(scenario)) await pi.command.handler('off', ctx);
   const noHand = async () => ({ edit: !!(await handlers.tool_call({ toolName: 'edit', input: {} }))?.block, bash: !!(await handlers.tool_call({ toolName: 'bash', input: { command: 'sed -i x README.md' } }))?.block, powershell: !!(await handlers.tool_call({ toolName: 'powershell', input: { command: 'Remove-Item x' } }))?.block, unknown: !!(await handlers.tool_call({ toolName: 'mutating_extension', input: {} }))?.block, read: !!(await handlers.tool_call({ toolName: 'read', input: { path: 'README.md' } }))?.block, contract: !!(await handlers.tool_call({ toolName: 'tmux_pi_commit_contract', input: {} }))?.block });
   if (['review-turn', 'resolved-turn', 'forged-resolved'].includes(scenario)) {
@@ -361,7 +370,7 @@ try {
   if (['expanded', 'expanded-marker'].includes(scenario)) {
     try { await pi.tool.execute('stale', { handshake_id: match[1], request_sha256: rawHash, action: 'direct', mode: 'direct', task_summary: 'stale', frame: 'stale', assumptions: [], no_edits: false, scope: 'brief', risk_notes: [], proof_path: [], done_when: [] }, null, null, ctx); } catch { staleHashRejected = true; }
   }
-  const params = { handshake_id: match[1], request_sha256: match[2], action: ['stop', 'stop-retry'].includes(scenario) ? 'stop' : scenario === 'alignment' ? 'ask_alignment' : ['review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'main-pi', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegate' : 'direct', mode: ['stop', 'stop-retry'].includes(scenario) ? 'plan' : ['review', 'review-failed', 'main-pi', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegated' : 'direct', task_summary: 'Scoped work', frame: 'Only requested work', assumptions: [], no_edits: ['stop', 'stop-retry'].includes(scenario), scope: 'brief', risk_notes: [], proof_path: ['diff'], done_when: ['done'] };
+  const params = { handshake_id: match[1], request_sha256: match[2], action: scenario === 'goal' ? 'delegate' : ['stop', 'stop-retry'].includes(scenario) ? 'stop' : scenario === 'alignment' ? 'ask_alignment' : ['review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'main-pi', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegate' : 'direct', mode: scenario === 'goal' ? 'delegated' : ['stop', 'stop-retry'].includes(scenario) ? 'plan' : ['review', 'review-failed', 'main-pi', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegated' : 'direct', task_summary: scenario === 'goal' ? 'Fix parser in src/parser.py' : 'Scoped work', frame: 'Only requested work', assumptions: [], no_edits: ['stop', 'stop-retry'].includes(scenario), scope: 'brief', risk_notes: [], proof_path: ['diff'], done_when: ['done'] };
   let mismatch = false, wrongStop = false;
   try { await pi.tool.execute('1', { ...params, handshake_id: 'wrong' }, null, null, ctx); } catch { mismatch = true; }
   if (['stop', 'stop-retry'].includes(scenario)) { try { await pi.tool.execute('1', { ...params, action: 'direct', mode: 'direct' }, null, null, ctx); } catch { wrongStop = true; } }
@@ -376,7 +385,7 @@ try {
   const postContractResolve = !!(await guard('bash', 'bin/tp-task --state-dir /tmp/state capability-resolve auto-1 --approve'))?.block;
   const postContractReviewResolve = !!(await guard('bash', 'bin/tp-task --state-dir /tmp/state review-resolve r5-test --outcome approved'))?.block;
   const editAfter = !!(await guard('edit', ''))?.block;
-  if (['review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario)) {
+  if (['goal', 'review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'review-changes', 'research-gate'].includes(scenario)) {
     await handlers.agent_end({ messages: [] }, ctx);
     await new Promise(resolve => setTimeout(resolve, 80));
     if (scenario === 'followup-blocked') {
@@ -390,6 +399,9 @@ try {
     if (scenario === 'research-gate') {
       for (let i = 0; i < 40 && !fs.existsSync(path.join(dir('auto-1'), 'review-required.json')); i++) await new Promise(resolve => setTimeout(resolve, 100));
       globalThis.researchGate = { marker: JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))), decision: JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'meta.json'))).decision };
+    }
+    if (scenario === 'goal') {
+      for (let i = 0; i < 60 && !calls.some(c => c.name === 'tp-contract' && c.args[0] === 'collect'); i++) await new Promise(resolve => setTimeout(resolve, 100));
     }
     if (scenario === 'review-gate') {
       const fakeBin = path.join(state, 'fake-bin'); fs.mkdirSync(fakeBin);
@@ -446,13 +458,19 @@ try {
   const stopCapturedBeforeSettle = fs.existsSync(path.join(dir('stop-1'), 'captured.md'));
   if (scenario === 'stop-retry') await handlers.agent_end({ messages: [{ role: 'assistant', content: [{ type: 'text', text: 'Retried final plan.' }] }] }, ctx);
   await handlers.agent_settled({ type: 'agent_settled' }, ctx);
+  if (scenario === 'goal') {
+    const follow = `TP_GOAL_CONTINUATION goal ${'c'.repeat(32)} ${'b'.repeat(64)}\nVerify the parser acceptance evidence`;
+    const next = await handlers.input({ text: follow, source: 'extension' }, ctx);
+    const hidden = await handlers.before_agent_start({ type: 'before_agent_start', prompt: next.text ?? follow });
+    globalThis.goalNextHandshake = hidden?.message?.content?.includes('Handshake:') || false;
+  }
   let inheritedTaskReview = false;
   if (scenario === 'review-failed') {
     const next = await handlers.input({ text: '+here Explain tp-view', source: 'interactive' }, ctx);
     inheritedTaskReview = JSON.parse(calls.filter(c => c.name === 'tp-task' && c.args[0] === 'preflight').at(-1).args.at(-1)).review === 'required';
     await handlers.before_agent_start({ type: 'before_agent_start', prompt: next.text ?? 'Explain tp-view' });
   }
-  console.log(JSON.stringify({ guards, preContractTools, mismatch, inheritedTaskReview, staleHashRejected, wrongStop, duplicate, continuation, postContractResolve, postContractReviewResolve, afterEndBeforeSettle, stopCapturedBeforeSettle, committed: committed.details, terminate: committed.terminate ?? false, editAfter, afterEnd: await noHand(), capabilityResolution: scenario === 'capability-resolved' ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'checkpoints.json'))).events.some(e => e.action === 'capability-resolve') : undefined, calls: calls.map(c => ({ name: c.name, args: c.args })), messages: messages.map(m => ({ kind: m.details?.kind, content: m.content })), stopCaptured: fs.existsSync(path.join(dir('stop-1'), 'captured.md')), capturedOutput: fs.existsSync(path.join(dir('stop-1'), 'captured.md')) ? fs.readFileSync(path.join(dir('stop-1'), 'captured.md'), 'utf8') : undefined, reviewBlocker: fs.readdirSync(path.join(state, 'handoffs')).some(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), decisionAtContract: JSON.parse(calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args[calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args.indexOf('--decision-json') + 1]), scaffold: fs.readFileSync(path.join(state, 'handoffs', match[1], 'scaffold.json'), 'utf8'), mainContract: JSON.parse(fs.readFileSync(path.join(state, 'handoffs', match[1], 'main-contract.json'))), handoffs: fs.readdirSync(path.join(state, 'handoffs')).length, newReviewMarkers: fs.readdirSync(path.join(state, 'handoffs')).filter(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), taskReviewMarker: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')), taskReview: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status : undefined, reviewReasons: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).reasons : undefined, reviewGate: globalThis.reviewGate, researchGate: globalThis.researchGate, reviewRoundMarkers: globalThis.reviewRoundMarkers, upgradeAtSend: globalThis.upgradeAtSend, inheritedReview: JSON.parse((() => { const a = calls.find(c => c.name === 'tp-task' && c.args[0] === 'preflight').args; return a.includes('--decision-json') ? a[a.indexOf('--decision-json') + 1] : '{}'; })()).review }));
+  console.log(JSON.stringify({ guards, preContractTools, mismatch, inheritedTaskReview, staleHashRejected, wrongStop, duplicate, continuation, postContractResolve, postContractReviewResolve, afterEndBeforeSettle, stopCapturedBeforeSettle, committed: committed.details, terminate: committed.terminate ?? false, editAfter, afterEnd: await noHand(), capabilityResolution: scenario === 'capability-resolved' ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'checkpoints.json'))).events.some(e => e.action === 'capability-resolve') : undefined, calls: calls.map(c => ({ name: c.name, args: c.args })), messages: messages.map(m => ({ kind: m.details?.kind, content: m.content })), stopCaptured: fs.existsSync(path.join(dir('stop-1'), 'captured.md')), capturedOutput: fs.existsSync(path.join(dir('stop-1'), 'captured.md')) ? fs.readFileSync(path.join(dir('stop-1'), 'captured.md'), 'utf8') : undefined, reviewBlocker: fs.readdirSync(path.join(state, 'handoffs')).some(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), decisionAtContract: JSON.parse(calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args[calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args.indexOf('--decision-json') + 1]), scaffold: fs.readFileSync(path.join(state, 'handoffs', match[1], 'scaffold.json'), 'utf8'), mainContract: JSON.parse(fs.readFileSync(path.join(state, 'handoffs', match[1], 'main-contract.json'))), handoffs: fs.readdirSync(path.join(state, 'handoffs')).length, newReviewMarkers: fs.readdirSync(path.join(state, 'handoffs')).filter(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), taskReviewMarker: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')), taskReview: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status : undefined, reviewReasons: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).reasons : undefined, reviewGate: globalThis.reviewGate, researchGate: globalThis.researchGate, goalNextHandshake: globalThis.goalNextHandshake, reviewRoundMarkers: globalThis.reviewRoundMarkers, upgradeAtSend: globalThis.upgradeAtSend, inheritedReview: JSON.parse((() => { const a = calls.find(c => c.name === 'tp-task' && c.args[0] === 'preflight').args; return a.includes('--decision-json') ? a[a.indexOf('--decision-json') + 1] : '{}'; })()).review }));
   }
   }
   }

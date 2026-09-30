@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Experimental routing evaluation log: inspect selections, record human outcomes, export joined rows.
+
+  tp-evals path                       print the eval dir for this session
+  tp-evals list [--limit N]           recent selections: id, route, recommended model/effort, placement
+  tp-evals rate (--selection ID | --task ID) [--rating good|acceptable|poor|wrong]
+                [--acceptance accepted|accepted_with_changes|rejected|unknown]
+                [--sizing right_sized|oversized|undersized|unknown]
+                [--correct-model M --correct-thinking T] [--note TEXT] [--rater NAME]
+  tp-evals export [--out FILE]        one JSON row per selection joined to tasks and outcomes
+
+The eval dir is <state dir>/evals (see lib/routing_evals.py); pass --dir or --state-dir to
+read another. Records are evidence only and never grant dispatch, edit or review authority.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+import routing_evals  # noqa: E402
+from router import RouterError, load_config  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dir", help="eval dir (default: <state dir>/evals)")
+    parser.add_argument("--state-dir", help="tmux-pi state dir whose tasks are joined (default: the eval dir's parent)")
+    parser.add_argument("--config", default=str(ROOT / "config/router.json"))
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("path")
+    listing = sub.add_parser("list")
+    listing.add_argument("--limit", type=int, default=20)
+    rate = sub.add_parser("rate")
+    rate.add_argument("--selection")
+    rate.add_argument("--task")
+    rate.add_argument("--rating", choices=routing_evals.RATINGS)
+    rate.add_argument("--acceptance", choices=routing_evals.ACCEPTANCE)
+    rate.add_argument("--sizing", choices=routing_evals.SIZING)
+    rate.add_argument("--correct-model")
+    rate.add_argument("--correct-thinking")
+    rate.add_argument("--note")
+    rate.add_argument("--rater", default="human")
+    export = sub.add_parser("export")
+    export.add_argument("--out", help="write JSONL here instead of stdout")
+    args = parser.parse_args()
+    try:
+        if args.dir:
+            directory = Path(args.dir)
+        elif args.state_dir:
+            directory = Path(args.state_dir) / "evals"
+        else:
+            directory = routing_evals.eval_dir()
+        if directory is None:
+            raise routing_evals.EvalLogError("no tmux-pi session state dir; pass --dir or --state-dir")
+        state_dir = Path(args.state_dir) if args.state_dir else directory.parent
+        if args.command == "path":
+            print(directory)
+        elif args.command == "list":
+            rows, bad = routing_evals.read_jsonl(directory / routing_evals.SELECTIONS)
+            for sel in rows[-max(args.limit, 1):]:
+                rec = sel.get("recommendation") or {}
+                final = rec.get("final") or {}
+                pref = rec.get("claude_preference") or {}
+                print("{}  {}  {:<8} {:<9} {}/{}  {}{}".format(
+                    sel.get("selection_id"), sel.get("created"), sel.get("kind", ""), rec.get("route") or sel.get("status"),
+                    final.get("model", "-"), final.get("thinking", "-"), rec.get("placement", "-"),
+                    "  claude:{}".format(pref["tier"]) if pref else ""))
+            if bad:
+                print("({} malformed line(s) skipped)".format(bad), file=sys.stderr)
+        elif args.command == "rate":
+            config = load_config(args.config)
+            record = routing_evals.outcome_record(
+                config, selection_id=args.selection, task_id=args.task, rating=args.rating,
+                acceptance=args.acceptance, sizing=args.sizing, correct_model=args.correct_model,
+                correct_thinking=args.correct_thinking, note=args.note, rater=args.rater)
+            routing_evals.append_jsonl(directory, routing_evals.OUTCOMES, record)
+            print(record["outcome_id"])
+        elif args.command == "export":
+            rows, summary = routing_evals.export_rows(directory, state_dir)
+            text = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows)
+            if args.out:
+                tmp = Path(args.out + ".tmp")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(tmp, args.out)
+            else:
+                sys.stdout.write(text)
+            print(json.dumps(summary, sort_keys=True), file=sys.stderr)
+        return 0
+    except (routing_evals.EvalLogError, RouterError, OSError) as exc:
+        print("tp-evals: {}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

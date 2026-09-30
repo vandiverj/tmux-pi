@@ -73,8 +73,13 @@ if [[ "$policy" == none ]]; then
 fi
 
 worker="$(tp_meta "$dir" worker)"
+# The state directory and current main pane can outlive the author's project.
+# A review must inspect the author's recorded working tree, even after restart.
+author_workdir="$(jq -r 'if (.workdir | type) == "string" then .workdir else empty end' "$dir/meta.json")" ||
+  die "cannot read author workdir for '$id'"
+[[ -n "$author_workdir" ]] || die "author workdir missing for '$id'; cannot choose a review directory"
 case "$worker" in
-  pi) reviewer=claude; model=claude-sonnet-5; thinking=medium ;;
+  pi) reviewer=claude; model=claude-sonnet-5-5; thinking=medium ;;
   claude) reviewer=pi; model=openai-codex/gpt-6-sol; thinking=medium ;;
   *) die "subagent '$id' has unknown worker '$worker'" ;;
 esac
@@ -92,7 +97,7 @@ fi
 # Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
 followups=()
 if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md"); fi
-if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" \
+if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} --context "$dir/packet.md" --context "$dir/result.md" \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy" \

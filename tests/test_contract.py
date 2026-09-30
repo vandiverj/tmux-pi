@@ -150,7 +150,7 @@ class ContractTests(unittest.TestCase):
             preflight, main_file = self.dir / (label + "-pf.json"), self.dir / (label + "-main.json")
             preflight.write_text(json.dumps(pf))
             main_file.write_text(json.dumps(main))
-            run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--kind", "task", "--name", label,
+            run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--workdir", str(self.dir), "--kind", "task", "--name", label,
                                   "--preflight", str(preflight), "--main-contract", str(main_file),
                                   "--note", "Task contract preflight: no_edits=True; no edit/apply/write tools" if
                                   (main.get("no_edits") or pf.get("no_edits")) else "Edit allowed",
@@ -219,7 +219,7 @@ class ContractTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, args)
         bad = self.dir / "invalid-pf.json"
         bad.write_text('{"no_edits":"true"}')
-        result = subprocess.run([str(ROOT / "bin/tp-spawn"), "-k", "task", "--preflight", str(bad),
+        result = subprocess.run([str(ROOT / "bin/tp-spawn"), "--workdir", str(self.dir), "-k", "task", "--preflight", str(bad),
                                  "Read fixture.txt"], env=env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be boolean", result.stderr)

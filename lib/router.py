@@ -221,8 +221,9 @@ def load_config(path, local_path=None):
     except (OSError, ValueError) as exc:
         raise RouterError("cannot read router config: {}".format(exc)) from exc
     required = {"backend", "laya", "openai", "timeout_seconds", "models", "routes", "laya_model"}
-    if not isinstance(config, dict) or set(config) != required:
-        raise RouterError("router config needs exactly {}".format(", ".join(sorted(required))))
+    if not isinstance(config, dict) or not required <= set(config) or set(config) - required - {"claude_preference"}:
+        raise RouterError("router config needs exactly {} (and may set claude_preference)".format(
+            ", ".join(sorted(required))))
     if config["backend"] not in ("laya", "openai"):
         raise RouterError("backend must be laya or openai")
     for backend in ("laya", "openai"):
@@ -264,6 +265,8 @@ def load_config(path, local_path=None):
             _target(target, config)
         except RouterError as exc:
             raise RouterError("invalid {} route: {}".format(name, exc)) from exc
+    if "claude_preference" in config:
+        _check_claude_preference(config["claude_preference"], config)
     if not isinstance(config["laya_model"], str) or not config["laya_model"]:
         raise RouterError("laya_model must be a path relative to the router config")
     config["model_path"] = Path(path).parent / config["laya_model"]
@@ -470,6 +473,56 @@ def laya_decision(reply, config):
     return _target(config["routes"][laya_route(reply, config["model"])], config)
 
 
+# Experimental Claude-branch preference (config claude_preference). It only re-picks among
+# Claude models for a Laya decision that is already a Claude worker: it never moves a pi/GPT
+# route to Claude, and never touches intent, review, placement or any authority.
+HEAVY_KEYS = {"difficulty_at_least", "high_risk_at_least", "sensitive_at_least", "scopes"}
+
+
+def _check_claude_preference(value, config):
+    if not isinstance(value, dict) or set(value) != {"ordinary", "heavy", "heavy_when"}:
+        raise RouterError("claude_preference needs exactly ordinary, heavy and heavy_when")
+    for tier in ("ordinary", "heavy"):
+        try:
+            target = _target(value[tier], config)
+        except RouterError as exc:
+            raise RouterError("invalid claude_preference {}: {}".format(tier, exc)) from exc
+        if target["worker"] != "claude":
+            raise RouterError("claude_preference {} must be a Claude model".format(tier))
+    when = value["heavy_when"]
+    if not isinstance(when, dict) or set(when) != HEAVY_KEYS:
+        raise RouterError("claude_preference heavy_when needs exactly {}".format(", ".join(sorted(HEAVY_KEYS))))
+    _number(when["difficulty_at_least"], "heavy_when.difficulty_at_least", len(QUESTIONS["difficulty"]["criteria"]) - 1)
+    _number(when["high_risk_at_least"], "heavy_when.high_risk_at_least")
+    _number(when["sensitive_at_least"], "heavy_when.sensitive_at_least")
+    if not isinstance(when["scopes"], list) or set(when["scopes"]) - set(QUESTIONS["execution_scope"]["criteria"]):
+        raise RouterError("heavy_when.scopes must list execution_scope choices")
+
+
+def claude_preference(decision, answers, config):
+    """(decision, record) after the Claude-branch preference; record is None when it does not apply.
+
+    A Claude decision is heavy (preference heavy target) when any Laya trait crosses
+    heavy_when; otherwise it is ordinary. Non-Claude decisions pass through unchanged.
+    """
+    pref = config.get("claude_preference")
+    if not pref or decision["worker"] != "claude":
+        return decision, None
+    when = pref["heavy_when"]
+    reasons = []
+    if answers["difficulty"]["score"] >= when["difficulty_at_least"]:
+        reasons.append("difficulty")
+    if answers["is_high_risk"]["noul"] >= when["high_risk_at_least"]:
+        reasons.append("high_risk")
+    if answers["is_sensitive"]["noul"] >= when["sensitive_at_least"]:
+        reasons.append("sensitive")
+    if answers["execution_scope"]["choice"] in when["scopes"]:
+        reasons.append("scope")
+    tier = "heavy" if reasons else "ordinary"
+    chosen = _target(pref[tier], config)
+    return chosen, {"tier": tier, "reasons": reasons, "from": decision, "changed": chosen != decision}
+
+
 CHANGE_INTENTS = ("implementation", "configuration_or_operations")
 
 
@@ -515,8 +568,14 @@ def review_task(task, config, base_url=None, router_model=None, opener=None, for
     return review_policy(classify_laya(task, config, base_url, router_model, opener), config["model"])
 
 
-def route_laya(task, config, base_url=None, router_model=None, opener=None):
-    return laya_decision(classify_laya(task, config, base_url, router_model, opener), config)
+def route_laya(task, config, base_url=None, router_model=None, opener=None, trace=None):
+    reply = classify_laya(task, config, base_url, router_model, opener)
+    laya_target = laya_decision(reply, config)
+    decision, preference = claude_preference(laya_target, laya_answers(reply), config)
+    if trace is not None:
+        trace.update(reply=reply, route=laya_route(reply, config["model"]), laya_target=laya_target,
+                     preference=preference)
+    return decision
 
 
 def route_openai(task, config, base_url=None, router_model=None, opener=None):
@@ -587,11 +646,12 @@ def placement_policy(reply, model, intent, review):
     return "subagent" if _probabilities(head, placement_features(laya_answers(reply)))[1] >= head["threshold"] else "main"
 
 
-def dispatch(text, config, base_url=None, router_model=None, opener=None):
+def dispatch(text, config, base_url=None, router_model=None, opener=None, trace=None):
     """Classify one request for the main agent: route, intent, review, scope and placement.
 
     Markers at the start of the request override placement or review; the route is
-    always a validated roster target.
+    always a validated roster target. A trace dict, when given, receives the raw Laya
+    reply and the route before the Claude preference and rules (for eval logging only).
     """
     overrides, task = parse_markers(text)
     if not task.strip():
@@ -600,7 +660,12 @@ def dispatch(text, config, base_url=None, router_model=None, opener=None):
     answers = laya_answers(reply)
     model = config["model"]
     route = laya_route(reply, model)
-    decision = apply_rules(task, _target(config["routes"][route], config), config)
+    laya_target = _target(config["routes"][route], config)
+    preferred, preference = claude_preference(laya_target, answers, config)
+    decision = apply_rules(task, preferred, config)
+    if trace is not None:
+        trace.update(reply=reply, route=route, laya_target=laya_target, preference=preference,
+                     rule_applied=decision != preferred)
     intent = laya_intent(reply, model)
     review = overrides.get("review") or review_policy(reply, model)
     scope = answers["execution_scope"]["choice"]
@@ -609,15 +674,18 @@ def dispatch(text, config, base_url=None, router_model=None, opener=None):
             "placement": placement, "overrides": sorted(overrides), "task": task}
 
 
-def route_task(task, config, backend=None, base_url=None, router_model=None, opener=None):
+def route_task(task, config, backend=None, base_url=None, router_model=None, opener=None, trace=None):
     selected = backend or config["backend"]
     if selected == "laya":
-        decision = route_laya(task, config, base_url, router_model, opener)
+        decision = route_laya(task, config, base_url, router_model, opener, trace)
     elif selected == "openai":
         decision = route_openai(task, config, base_url, router_model, opener)
     else:
         raise RouterError("backend must be laya or openai")
-    return apply_rules(task, decision, config)
+    ruled = apply_rules(task, decision, config)
+    if trace is not None:
+        trace["rule_applied"] = ruled != decision
+    return ruled
 
 
 # Follow-up routing: does a new message belong to a delegated task that is still running?

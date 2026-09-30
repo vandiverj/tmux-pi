@@ -307,7 +307,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         (archived / "meta.json").write_text(json.dumps({"id": base}))
         env = {**self.env, "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         env.pop("TMUX", None)
-        spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--name", "unique", "--decision-json",
+        spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--workdir", str(state.parent), "--name", "unique", "--decision-json",
                                   '{"review":"required"}', "New work"], env=env, text=True, capture_output=True)
         self.assertEqual(spawned.returncode, 0, spawned.stderr)
         identity = spawned.stdout.strip()

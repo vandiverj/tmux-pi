@@ -14,7 +14,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -105,13 +105,15 @@ export default function (pi: ExtensionAPI) {
 			"use, and facts from this conversation it cannot rediscover. Say what to report back. It can " +
 			"still read other files itself. Leave model and thinking unset to let the local router " +
 			"pick them; set them only when the user asked for a specific model. The subagent runs in the " +
-			"background; use collect_result to wait for its reply.",
+			"background; use collect_result to wait for its reply. Normally it uses the main pane's current " +
+			"directory; an explicit workdir requires a fresh human confirmation and does not grant Claude folder trust.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete, self-contained instructions for the subagent" }),
 			worker: Type.Optional(StringEnum(["pi", "claude"] as const, { description: "Harness; implied by the router or the model" })),
 			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-6-sol); claude: alias (sonnet, opus, haiku)" })),
 			thinking: Type.Optional(StringEnum(THINKING, { description: "Thinking level" })),
 			name: Type.Optional(Type.String({ description: "Short id prefix, e.g. 'tests' or 'review'" })),
+			workdir: Type.Optional(Type.String({ description: "Absolute project directory explicitly approved by the human; otherwise use the main pane cwd. Requires interactive confirmation." })),
 			files: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -124,7 +126,25 @@ export default function (pi: ExtensionAPI) {
 			notes: Type.Optional(Type.Array(Type.String(), { description: "Short facts, decisions or constraints to include in the packet" })),
 			view: Type.Optional(Type.Boolean({ description: "Show it in the viewer slot right away" })),
 		}),
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// A model's assertion of user approval is not approval. Confirm the
+			// exact requested path with the human; no headless auto-accept.
+			let approvedWorkdir: string | undefined;
+			if (params.workdir) {
+				if (!params.workdir.startsWith("/") || !ctx.hasUI) {
+					throw new Error("workdir override requires explicit human approval of an absolute project path");
+				}
+				try {
+					approvedWorkdir = realpathSync(params.workdir);
+					if (!statSync(approvedWorkdir).isDirectory()) throw new Error("not a directory");
+				} catch {
+					throw new Error(`workdir must be an existing directory: ${params.workdir}`);
+				}
+				if (!(await ctx.ui.confirm("Override worker project directory?",
+					`Run this worker (and its reviewer) in:\n${approvedWorkdir}\nThis does not grant Claude folder trust. Only approve a project you selected.`))) {
+					throw new Error("workdir override was not approved by the human");
+				}
+			}
 			let { worker, model, thinking } = params;
 			let routed = "";
 			if (!model) {
@@ -136,6 +156,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!worker) worker = model && !model.includes("/") ? "claude" : "pi";
 			const args = ["--worker", worker!];
+			if (approvedWorkdir) args.push("--workdir", approvedWorkdir);
 			if (model) args.push("--model", model);
 			if (thinking) args.push("--thinking", thinking);
 			if (params.name) args.push("--name", params.name.replace(/[^\w.-]+/g, "-"));

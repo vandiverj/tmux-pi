@@ -7,6 +7,8 @@
 #
 # Options:
 #   -w, --worker pi|claude   harness to run (default: pi)
+#   --workdir <absolute-dir>  explicit human-selected project directory; otherwise use
+#                            the live main-agent pane cwd (never the state dir)
 #   -m, --model <model>      pi: provider/id (e.g. slotstream/qwen3.8-flash-next:4bit)
 #                            claude: alias or id (e.g. sonnet, haiku)
 #   -t, --thinking <level>   off|minimal|low|medium|high|xhigh|max
@@ -38,7 +40,8 @@
 # notes. Workers load no context files (AGENTS.md, CLAUDE.md), so the packet is
 # all the project context they start with.
 #
-# Prints the subagent id. Files live in <workdir>/.tmux-pi/tasks/<id>/.
+# Prints the subagent id. Files live in the session's @tp_state_dir/tasks/<id>/.
+# --workdir selects execution scope, not Claude folder trust or model authority.
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -52,13 +55,14 @@ source "$ROOT/lib/tp.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
-worker=pi model="" thinking="" name="" file="" view=0 conversation=""
+worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -w|--worker)   worker="${2:?}"; shift 2 ;;
+    --workdir)     requested_workdir="${2:?}"; explicit_workdir=1; shift 2 ;;
     -m|--model)    model="${2:?}"; shift 2 ;;
     -t|--thinking) thinking="${2:?}"; shift 2 ;;
     -n|--name)     name="${2:?}"; shift 2 ;;
@@ -100,12 +104,32 @@ fi
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 
+# The session state location is stable even when the main agent moves to a
+# different project. Query the registered main pane, not the caller's pane or
+# the session's currently selected window (which may be a worker/viewer).
+if [[ -z "$requested_workdir" ]]; then
+  main_pane="$(tp_opt "$session" @tp_main_pane)"
+  [[ -n "$main_pane" ]] || die "main pane unavailable; supply an explicit human-selected --workdir"
+  requested_workdir="$(tmux display-message -p -t "$main_pane" '#{pane_current_path}')" ||
+    die "cannot read main pane cwd; supply an explicit human-selected --workdir"
+  [[ -n "$requested_workdir" ]] || die "main pane cwd unavailable; supply an explicit human-selected --workdir"
+fi
+[[ "$requested_workdir" == /* && -d "$requested_workdir" ]] ||
+  die "workdir must be an existing absolute directory: $requested_workdir"
+workdir="$(cd -- "$requested_workdir" && pwd -P)" || die "cannot enter workdir: $requested_workdir"
+# An explicit override is a project scope selected by a human, not a way to
+# point workers at the filesystem root or tmux-pi's private task records.
+if [[ "$explicit_workdir" == 1 ]]; then
+  state_path="$(cd -- "$state_dir" && pwd -P)" || die "state directory unavailable: $state_dir"
+  [[ "$workdir" != / && "$workdir" != "$state_path" && "$workdir" != "$state_path/"* ]] ||
+    die "--workdir must select a project directory outside tmux-pi state"
+fi
+
 # LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
 if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then
   "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
     echo "tp-spawn: warning: ${model#lmstudio/} is not loaded in LM Studio; the worker may fail" >&2
 fi
-workdir="$(dirname "$state_dir")"
 
 # Limits keep packets to selected context rather than whole trees.
 max_file=60000 max_packet=200000

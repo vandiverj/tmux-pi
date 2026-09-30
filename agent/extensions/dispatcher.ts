@@ -334,12 +334,22 @@ const spawnCommandPattern = /(?:^|[\s;&|"'(/])(?:tp-spawn|tp-review|tp-pi|tp-cla
 // Shell is a programming language, not a read-only API. Before edit authority,
 // allow only exact argument-free builtins; no flags, paths, aliases, or expansions.
 // Even this is cooperative model policy, not a process/OS sandbox.
-const readOnlyBash = (command: string) => /^(?:pwd|true)$/.test(command.trim());
+// Narrow exception: plain git inspection with simple flags/paths only. No shell
+// metacharacters, and no flags that write files or run helper programs.
+const readOnlyGit = /^git (?:status|diff|log|branch --show-current)(?: [A-Za-z0-9_.\/=:@,+-]+){0,8}$/;
+const unsafeGitFlag = /(?:^| )(?:--output|-O|--ext-diff|--textconv|--open-files-in-pager|--exec|--no-index)(?:[= ]|$)/;
+const readOnlyBash = (command: string) => {
+	const c = command.trim();
+	return /^(?:pwd|true)$/.test(c) || (readOnlyGit.test(c) && !unsafeGitFlag.test(c));
+};
 
 export default function (pi: ExtensionAPI) {
 	if (process.env.TP_TASK_DIR || !process.env.TMUX || !process.env.PI_CODING_AGENT_DIR) return;
 	const agentDir = process.env.PI_CODING_AGENT_DIR;
 	const root = dirname(agentDir);
+	// The contract handshake is opt-in: config/local.json {"mode": "strict"}. Otherwise
+	// assistant.ts (ask_local legwork tool + basic guardrails) is the main-window policy.
+	if (process.env.TP_MODE !== "strict" && readJson(join(root, "config/local.json")).mode !== "strict") return;
 	const bin = (name: string) => join(root, "bin", name);
 	let enabled = true;
 	let active = true;

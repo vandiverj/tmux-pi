@@ -14,7 +14,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -145,6 +145,12 @@ export default function (pi: ExtensionAPI) {
 					throw new Error("workdir override was not approved by the human");
 				}
 			}
+			// Runaway guard: cap simultaneous workers (config/local.json "max_workers", default 6).
+			const cap = Number(readJson(join(root, "config/local.json")).max_workers) || 6;
+			const tasksDir = join(await stateDir(), "tasks");
+			const active = existsSync(tasksDir) ? readdirSync(tasksDir).filter((d) =>
+				["starting", "working", "needs_input"].includes(readJson(join(tasksDir, d, "state.json")).state)).length : 0;
+			if (active >= cap) throw new Error(`${active} subagents already running (limit ${cap}); collect or kill one first`);
 			let { worker, model, thinking } = params;
 			let routed = "";
 			if (!model) {

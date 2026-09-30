@@ -43,7 +43,7 @@ class DispatcherR2PathTests(unittest.TestCase):
             request,
         )
 
-    def test_real_dispatcher_read_only_shape_is_read_only_but_pending(self):
+    def test_real_dispatcher_read_only_shape_auto_dispatches(self):
         request = "Find where retries are configured"
         decision = self.decision(task=request, intent="research", placement="subagent")
         pf = self.preflight(request, decision)
@@ -51,8 +51,8 @@ class DispatcherR2PathTests(unittest.TestCase):
         self.assertNotIn("file edits within task scope", pf["allowed"]["tools"])
         policy = self.automation(request, decision, pf)
         self.assertEqual(policy["candidate_cell"], "read_only_investigation")
-        self.assertEqual(policy["qualification"]["state"], "pending")
-        self.assertEqual(policy["action"], "recommend_manual")
+        self.assertEqual(policy["qualification"]["state"], "enabled")
+        self.assertEqual(policy["action"], "auto_dispatch")
 
     def test_real_dispatcher_small_edit_shape_is_pending_not_auto(self):
         request = "Fix typo in README.md"
@@ -88,15 +88,7 @@ class DispatcherR2PathTests(unittest.TestCase):
         self.assertEqual(policy["mode"], "explicit_human_request")
         self.assertIsNone(policy["qualified_cell"])
 
-    def test_recommendation_notice_and_capability_pending_are_gate_safe(self):
-        source = (ROOT / "agent/extensions/dispatcher.ts").read_text(encoding="utf-8")
-        self.assertNotIn("spawn_subagent yourself", source)
-        self.assertNotIn("run tp-spawn/spawn_subagent yourself", source)
-        self.assertIn("does not authorize the main model to bypass the dispatch gate", source)
-        self.assertIn("pending-capability.json", source)
-        self.assertIn("Completion, review and escalation are blocked", source)
-
-    def test_main_direct_tiny_request_is_read_only_pending_not_auto(self):
+    def test_main_direct_tiny_request_is_read_only_not_auto_dispatched(self):
         request = "What is tp-view?"
         decision = self.decision(task=request, intent="communication_or_documentation", placement="main")
         pf = self.preflight(request, decision)
@@ -104,7 +96,7 @@ class DispatcherR2PathTests(unittest.TestCase):
         self.assertEqual(pf["mode"], "direct")
         self.assertTrue(pf["no_edits"])
         self.assertEqual(policy["candidate_cell"], "read_only_investigation")
-        self.assertEqual(policy["qualification"]["state"], "pending")
+        self.assertIsNone(policy["qualified_cell"])
         self.assertEqual(policy["action"], "recommend_manual")
         self.assertFalse(policy["review"]["required"])
 

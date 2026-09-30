@@ -56,7 +56,7 @@ class LmStudioTests(unittest.TestCase):
             shutil.copy(ROOT / "config" / name, self.root / "config" / name)
         (self.root / "agent").mkdir()
         (self.root / "agent/models.json").write_text(json.dumps({"providers": {"lmstudio": {
-            "baseUrl": self.base_url, "models": [{"id": QWEN, "contextWindow": 65536}]}}}))
+            "baseUrl": self.base_url, "models": [{"id": QWEN, "contextWindow": 131072}]}}}))
         self.lms = self.root / "lms" / "lms"
         self.lms.parent.mkdir()
         self.lms.write_text(FAKE_LMS)
@@ -88,7 +88,7 @@ class LmStudioTests(unittest.TestCase):
         self.assertEqual((status.returncode, status.stdout.strip()), (1, QWEN + ": not loaded"))
         first = self.run_tool("ensure")
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn("load {} -y --context-length 65536".format(QWEN), self.calls())
+        self.assertIn("load {} -y --context-length 131072".format(QWEN), self.calls())
         self.run_tool()
         self.assertEqual(sum(call.startswith("load") for call in self.calls()), 1)
         self.assertEqual(self.run_tool("status").returncode, 0)

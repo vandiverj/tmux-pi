@@ -167,6 +167,18 @@ See [docs/plan.md](docs/plan.md) for the design and milestones.
 
 [Laya routing evaluation](docs/routing-evals.md) records model/effort recommendations, configuration/instruction hashes, actual worker usage, escalations, reviews and human outcome ratings in project-local `.tmux-pi/evals/`. Logs omit request text by default. Use `tp-evals rate` and `tp-evals export` for later comparisons; no automatic retraining or policy self-modification occurs. Claude routes favor Sonnet 5.5 for ordinary work, with Opus reserved for heavy traits; multi-step work alone does not warrant Opus. Main Pi model switching remains a recommendation, not a new automatic capability.
 
+## Local assistant (default mode)
+
+Your main model (choose it with `/model`) does the thinking. For file searches and multi-file
+reads it calls `ask_local`: a fresh, read-only local model (`assistant` in `config/local.json`,
+default LM Studio Qwen) does the legwork and returns exact paths, line numbers and snippets.
+Because each call starts clean, the local model never compacts mid-task and main keeps the
+knowledge. Main can also `spawn_subagent` for long or parallel work (at most `max_workers`,
+default 6). Destructive shell commands and edits outside the working directory are blocked.
+
+The contract handshake and qualified automatic routing described below are opt-in: set
+`"mode": "strict"` in `config/local.json` (or `TP_MODE=strict`).
+
 ## Local model router
 
 `bin/tp-route` uses Laya's `typed-decisions` checkpoint at

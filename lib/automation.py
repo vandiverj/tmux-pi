@@ -37,9 +37,9 @@ CHANGE_INTENTS = {"implementation", "configuration_or_operations"}
 # evidence exists. Unit tests of this policy are not qualification evidence.
 QUALIFIED_CELLS = {
     "read_only_investigation": {
-        "state": "pending",
-        "enabled": False,
-        "evidence": ["pending real dispatcher-path read-only/investigation fixture qualification"],
+        "state": "enabled",
+        "enabled": True,
+        "evidence": ["human-approved 2026-09-30: low-risk, no-edit, no-review investigation may dispatch automatically; risk/review/structural gates still apply"],
     },
     "small_scoped_edit": {
         "state": "pending",
@@ -193,6 +193,12 @@ def automation_policy(request, decision=None, preflight=None, main_contract=None
     mode = "qualified" if enabled else "recommendation_manual"
     if cell and not enabled:
         blockers = list(blockers) + ["automation cell {} is {} pending fixture qualification".format(cell, qualification.get("state", "unknown"))]
+    if enabled and decision.get("placement") == "main":
+        # Router kept this on the main model (tiny/direct); auto-dispatch must not spawn a worker for it.
+        enabled = False
+        action = "recommend_manual"
+        mode = "recommendation_manual"
+        blockers = list(blockers) + ["router placed this task on main; no worker dispatch needed"]
     contract_action = main_contract.get("action")
     if contract_action == "ask_alignment":
         blockers = list(blockers) + ["main contract requested material alignment before dispatch"]

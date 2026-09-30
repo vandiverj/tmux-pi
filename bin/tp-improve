@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""tp-improve — mechanical friction report over pi session transcripts. Uses no model.
+
+Usage:
+  tp-improve report [--last N] [--since YYYY-MM-DD] [--json] [session.jsonl ...]
+
+Reads agent/sessions/*/*.jsonl (newest N, default 5, or the files you name) and reports
+measurable friction, ranked by cost: compaction storms, files re-read, main-model work
+the local assistant could have done, guard blocks, repeated tool errors, guard or state
+files edited by the model itself, and tokens/cost per model. Findings cite the session
+and message index so they can be checked.
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SEARCH_BASH = re.compile(r"^\s*(?:cd [^;&]+(?:&&|;)\s*)?(?:grep|rg|find|ls|cat|head|tail|sed -n|wc)\b")
+BLOCK_TEXT = re.compile(r"blocked|not authorized|permits only|needs an authorized|policy did not authorize|outside the working", re.I)
+GUARD_PATHS = re.compile(r"/\.tmux-pi/(?:tasks|handoffs)/|review-required|config/local\.json")
+
+
+def parse(path):
+    """One session -> metrics dict."""
+    m = collections.defaultdict(list)
+    tools = collections.Counter()
+    reads = collections.defaultdict(list)       # path -> message indexes
+    usage = collections.defaultdict(lambda: {"tokens": 0, "cost": 0.0, "turns": 0})
+    main_model = None
+    err_streak = worst_streak = 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for idx, line in enumerate(fh, 1):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            kind = rec.get("type")
+            if kind == "model_change":
+                main_model = "{}/{}".format(rec.get("provider"), rec.get("modelId"))
+            elif kind == "compaction":
+                m["compactions"].append({"at": idx, "tokens": int(rec.get("tokensBefore") or 0), "model": main_model})
+            msg = rec.get("message") or {}
+            content = msg.get("content")
+            if msg.get("role") == "assistant":
+                u = msg.get("usage") or {}
+                key = "{}/{}".format(msg.get("provider"), msg.get("model"))
+                usage[key]["tokens"] += int(u.get("totalTokens") or 0)
+                usage[key]["cost"] += float((u.get("cost") or {}).get("total") or 0)
+                usage[key]["turns"] += 1
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "toolCall":
+                    name, args = part.get("name"), part.get("arguments") or {}
+                    tools[name] += 1
+                    if name == "read" and args.get("path"):
+                        reads[args["path"]].append(idx)
+                    if name == "bash" and SEARCH_BASH.search(str(args.get("command", ""))):
+                        tools["bash:search"] += 1
+                    if name in ("edit", "write") and GUARD_PATHS.search(str(args.get("path", ""))):
+                        m["guard_edits"].append({"at": idx, "tool": name, "path": args.get("path")})
+                elif msg.get("role") == "toolResult" and part.get("type") == "text":
+                    text = part.get("text", "")
+                    if msg.get("isError"):
+                        err_streak += 1
+                        worst_streak = max(worst_streak, err_streak)
+                        if BLOCK_TEXT.search(text):
+                            m["blocks"].append({"at": idx, "tool": msg.get("toolName"), "text": text[:140]})
+                        else:
+                            m["errors"].append({"at": idx, "tool": msg.get("toolName"), "text": text[:140]})
+                    else:
+                        err_streak = 0
+    reread = {p: v for p, v in reads.items() if len(v) > 1}
+    return {
+        "session": path, "tools": dict(tools), "usage": dict(usage), "compactions": m["compactions"],
+        "reread": {p: len(v) for p, v in reread.items()},
+        "blocks": m["blocks"], "errors": m["errors"], "guard_edits": m["guard_edits"],
+        "worst_error_streak": worst_streak,
+    }
+
+
+def findings(s):
+    out = []
+    n = len(s["compactions"])
+    if n >= 3:
+        local = sum(1 for c in s["compactions"] if c["model"] and not c["model"].startswith(("openai", "anthropic")))
+        out.append((n * 3 + local * 2, "compaction storm: {} compactions{} (tokens before: {})".format(
+            n, " ({} on a local main model)".format(local) if local else "",
+            ", ".join(str(c["tokens"]) for c in s["compactions"][:6]))))
+    if s["reread"]:
+        total = sum(v - 1 for v in s["reread"].values())
+        top = sorted(s["reread"].items(), key=lambda kv: -kv[1])[:3]
+        out.append((total * 2, "{} repeat reads; most repeated: {}".format(
+            total, "; ".join("{}x {}".format(v, os.path.basename(p)) for p, v in top))))
+    direct = s["tools"].get("read", 0) + s["tools"].get("bash:search", 0)
+    asks = s["tools"].get("ask_local", 0)
+    if direct >= 8 and asks * 4 < direct:
+        out.append((direct - asks * 4, "{} direct read/search calls vs {} ask_local; main model is doing legwork the local assistant could do".format(direct, asks)))
+    spawns = s["tools"].get("spawn_subagent", 0)
+    if spawns == 0 and s["tools"].get("tmux_pi_commit_contract", 0):
+        out.append((6, "delegation contract committed {}x but no subagent was started".format(s["tools"]["tmux_pi_commit_contract"])))
+    if s["blocks"]:
+        by = collections.Counter(b["text"][:70] for b in s["blocks"])
+        out.append((len(s["blocks"]) * 2, "{} guard blocks: {}".format(len(s["blocks"]), "; ".join("{}x {}".format(v, k) for k, v in by.most_common(2)))))
+    if s["guard_edits"]:
+        out.append((50, "model edited guard/state files itself ({}): {}".format(
+            len(s["guard_edits"]), "; ".join(sorted({g["path"] for g in s["guard_edits"]})[:3]))))
+    if s["worst_error_streak"] >= 3:
+        out.append((s["worst_error_streak"] * 2, "{} tool errors in a row".format(s["worst_error_streak"])))
+    return sorted(out, reverse=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("report")
+    rp.add_argument("sessions", nargs="*")
+    rp.add_argument("--last", type=int, default=5)
+    rp.add_argument("--since")
+    rp.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    files = args.sessions or sorted(glob.glob(os.path.join(ROOT, "agent/sessions/*/*.jsonl")), key=os.path.getmtime)
+    if args.since:
+        files = [f for f in files if os.path.basename(f) >= args.since]
+    if not args.sessions:
+        files = files[-args.last:]
+    results = [parse(f) for f in files]
+    for r in results:
+        r["findings"] = [{"score": sc, "text": t} for sc, t in findings(r)]
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0
+    totals = collections.defaultdict(lambda: {"tokens": 0, "cost": 0.0})
+    for r in results:
+        print("\n{}".format(os.path.relpath(r["session"], ROOT)))
+        calls = ", ".join("{} {}".format(k, v) for k, v in sorted(r["tools"].items(), key=lambda kv: -kv[1])[:8])
+        print("  tools: {}".format(calls or "none"))
+        for f in r["findings"] or [{"text": "no friction detected"}]:
+            print("  - {}".format(f["text"]))
+        for model, u in r["usage"].items():
+            totals[model]["tokens"] += u["tokens"]
+            totals[model]["cost"] += u["cost"]
+    print("\nTokens by model across {} session(s):".format(len(results)))
+    for model, u in sorted(totals.items(), key=lambda kv: -kv[1]["tokens"]):
+        print("  {:<48} {:>10,} tokens  ${:.2f}".format(model, u["tokens"], u["cost"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -14,6 +14,7 @@ const moduleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-module-'));
 const source = fs.readFileSync(path.join(root, 'agent/extensions/dispatcher.ts'), 'utf8');
 fs.writeFileSync(path.join(moduleDir, 'dispatcher.ts'), source.replace('import { execFile } from "node:child_process";', 'const execFile = globalThis.__fakeExecFile;'));
 process.env.TMUX = 'test';
+process.env.TP_MODE = 'strict';
 process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');
 delete process.env.TP_TASK_DIR;
 delete process.env.TP_TASK_ID;

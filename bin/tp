@@ -82,6 +82,18 @@ tmux select-pane -t "$viewer_pane" -T viewer
 tmux select-pane -t "$main_pane" -T main
 tmux set-option -t "$SESSION" pane-border-status top
 tmux set-option -t "$SESSION" mouse on
+# Mouse mode captures drags, so native Terminal selection stops working. Make a
+# drag-select copy straight to the system clipboard instead (Apple Terminal has
+# no OSC 52 support, so pipe to a clipboard tool when one is available).
+tmux set-option -s set-clipboard on
+for clip in pbcopy wl-copy "xclip -selection clipboard"; do
+  if command -v "${clip%% *}" >/dev/null 2>&1; then
+    for table in copy-mode copy-mode-vi; do
+      tmux bind-key -T "$table" MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "$clip"
+    done
+    break
+  fi
+done
 
 tmux send-keys -t "$main_pane" "$main_cmd" Enter
 

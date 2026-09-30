@@ -15,16 +15,25 @@ class AutomationPolicyTests(unittest.TestCase):
         data.update(kw)
         return data
 
-    def test_low_risk_read_only_investigation_cell_stays_pending(self):
+    def test_low_risk_read_only_investigation_cell_auto_dispatches(self):
         request = "Investigate where tp-review is documented; do not edit files"
         decision = self.decision(intent="research", scope="brief", placement="subagent")
         pf = select_preflight(request, decision, mode="investigate")
         policy = automation_policy(request, decision, pf)
-        self.assertEqual(policy["action"], "recommend_manual")
+        self.assertEqual(policy["action"], "auto_dispatch")
         self.assertEqual(policy["candidate_cell"], "read_only_investigation")
-        self.assertIsNone(policy["qualified_cell"])
-        self.assertEqual(policy["qualification"]["state"], "pending")
+        self.assertEqual(policy["qualified_cell"], "read_only_investigation")
+        self.assertEqual(policy["qualification"]["state"], "enabled")
         self.assertFalse(policy["review"]["required"])
+
+    def test_read_only_investigation_with_sensitive_or_structural_text_still_blocks(self):
+        for request in ("Investigate the production password rotation; do not edit files",
+                        "Investigate the new persistence service boundary architecture; do not edit files"):
+            decision = self.decision(intent="research", scope="brief", placement="subagent")
+            pf = select_preflight(request, decision, mode="investigate")
+            policy = automation_policy(request, decision, pf)
+            self.assertEqual(policy["action"], "recommend_manual", request)
+            self.assertIsNone(policy["qualified_cell"], request)
 
     def test_small_scoped_edit_cell_stays_pending_until_dispatcher_fixtures(self):
         request = "Fix the README typo in the tp-task cleanup example"

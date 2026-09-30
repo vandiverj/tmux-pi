@@ -317,6 +317,22 @@ if [[ "$worker" == pi ]]; then
   if [[ -n "$thinking" ]]; then cmd+=(--thinking "$thinking"); fi
 else
   cmd=("$ROOT/bin/tp-claude" --name "$id")
+  # Warn, never block: an untrusted workdir leaves the worker waiting on Claude's trust prompt.
+  python3 - "$workdir" <<'EOF' >&2 || true
+import json, os, sys
+try:
+    projects = json.load(open(os.path.expanduser("~/.claude.json"))).get("projects", {})
+except (OSError, ValueError):
+    sys.exit(0)
+p = sys.argv[1]
+while True:
+    if projects.get(p, {}).get("hasTrustDialogAccepted"):
+        sys.exit(0)
+    if p == os.path.dirname(p):
+        break
+    p = os.path.dirname(p)
+print("tp-spawn: Claude has not trusted %s; the worker will wait at the trust prompt. Run tp-claude-bootstrap there once." % sys.argv[1])
+EOF
   if [[ -n "$model" ]]; then cmd+=(--model "$model"); fi
   case "$thinking" in
     "") ;;

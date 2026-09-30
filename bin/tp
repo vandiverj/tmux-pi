@@ -30,10 +30,39 @@ command -v pi   >/dev/null || { echo "tp: pi not found" >&2; exit 1; }
 "$ROOT/bin/tp-lmstudio" ensure ||
   echo "tp: warning: LM Studio models are not ready; workers on them will fail (bin/tp-lmstudio status)" >&2
 
+# Slot commands: they must never exit (ignore ctrl-c/ctrl-\\/ctrl-z, and the status list restarts).
+status_cmd="trap '' INT QUIT TSTP; while true; do '$ROOT/bin/tp-status'; sleep 1; done"
+viewer_cmd="trap '' INT QUIT TSTP; stty -echo -icanon; clear; echo 'no subagent selected'; exec tail -f /dev/null"
+
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   # Reattaching must not leave the client in the status/viewer or an old worker.
   # Pane ids survive client detach, so the recorded main pane is the reliable target.
   main_pane="$(tmux show-options -qv -t "=$SESSION:" @tp_main_pane)"
+  # Repair the layout: a status or viewer pane that was closed is recreated.
+  # A viewer that is parked while a subagent occupies its slot is left alone.
+  if [[ -n "$main_pane" ]] && tmux list-panes -a -F '#{pane_id}' | grep -qx "$main_pane"; then
+    pane_alive() { [[ -n "$1" ]] && tmux list-panes -a -F '#{pane_id}' | grep -qx "$1"; }
+    opt() { tmux show-options -qv -t "=$SESSION:" "$1"; }
+    win="$(tmux display-message -p -t "$main_pane" '#{window_id}')"
+    # Right-hand column: any pane in the main window that is not main and not the status pane.
+    side_pane() { tmux list-panes -t "$win" -F '#{pane_id}' | grep -vx -e "$main_pane" -e "$(opt @tp_status_pane)" | head -1 || true; }
+    if ! pane_alive "$(opt @tp_status_pane)"; then
+      side="$(side_pane)"
+      if [[ -n "$side" ]]; then
+        new="$(tmux split-window -v -b -l 35% -P -F '#{pane_id}' -t "$side" -c "$WORKDIR" "$status_cmd")"
+      else
+        new="$(tmux split-window -h -l 50% -P -F '#{pane_id}' -t "$main_pane" -c "$WORKDIR" "$status_cmd")"
+      fi
+      tmux set-option -t "=$SESSION:" @tp_status_pane "$new"
+      tmux select-pane -t "$new" -T status
+    fi
+    if ! pane_alive "$(opt @tp_viewer_pane)"; then
+      new="$(tmux split-window -v -l 65% -P -F '#{pane_id}' -t "$(opt @tp_status_pane)" -c "$WORKDIR" "$viewer_cmd")"
+      tmux set-option -t "=$SESSION:" @tp_viewer_pane "$new"
+      tmux set-option -t "=$SESSION:" @tp_viewing ""
+      tmux select-pane -t "$new" -T viewer
+    fi
+  fi
   [[ -z "$main_pane" ]] || tmux select-pane -t "$main_pane"
   if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
   exec tmux attach -t "$SESSION"
@@ -50,9 +79,6 @@ main_cmd="'$ROOT/bin/tp-pi'"
 # The status and viewer slots must never exit: a closed slot pane breaks the
 # layout. Both ignore ctrl-c/ctrl-\\/ctrl-z (ignored signals carry into the
 # commands they run), and the status list is restarted if it ever exits.
-status_cmd="trap '' INT QUIT TSTP; while true; do '$ROOT/bin/tp-status'; sleep 1; done"
-viewer_cmd="trap '' INT QUIT TSTP; stty -echo -icanon; clear; echo 'no subagent selected'; exec tail -f /dev/null"
-
 cols="$(tput cols 2>/dev/null || echo 200)"
 lines="$(tput lines 2>/dev/null || echo 50)"
 

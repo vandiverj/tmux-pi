@@ -16,6 +16,7 @@ while [[ -L "$src" ]]; do
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 CLAUDE_DIR="$ROOT/claude"
+export TP_ROOT="$ROOT"
 
 exec claude \
   --setting-sources "" \

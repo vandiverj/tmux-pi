@@ -45,7 +45,11 @@ mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 # from the repo's agent/ dir — never from ~/.pi/agent.
 AGENT_DIR="$ROOT/agent"
 
-main_cmd="'$ROOT/bin/tp-pi'"
+case "${TP_MAIN:-pi}" in
+  pi)     main_cmd="'$ROOT/bin/tp-pi'" ;;
+  claude) main_cmd="'$ROOT/bin/tp-claude' --append-system-prompt-file '$ROOT/claude/main-prompt.md'" ;;
+  *)      echo "tp: TP_MAIN must be 'pi' or 'claude', got '$TP_MAIN'" >&2; exit 2 ;;
+esac
 
 # The status and viewer slots must never exit: a closed slot pane breaks the
 # layout. Both ignore ctrl-c/ctrl-\\/ctrl-z (ignored signals carry into the

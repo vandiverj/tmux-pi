@@ -1,3 +1,10 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "tmux-pi-subagents": {
+      "command": "node",
+      "args": [
+        "${TP_ROOT}/claude/mcp/subagents.mjs"
+      ]
+    }
+  }
 }

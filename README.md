@@ -109,6 +109,17 @@ its argument show below the row), `waiting` (finished its turn, ready for more),
 A second line shows elapsed time and turns and, for a task with a contract,
 its checkpoint state and when its artifact was last written. Settled work also shows the `result.md` path.
 
+### Claude as the main agent
+
+`TP_MAIN=claude bin/tp` starts Claude Code in the main pane instead of pi. It gets the same
+six tools (`spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`,
+`review_subagent`, `kill_subagent`) from an MCP server (`claude/mcp/subagents.mjs`) that wraps
+the same `tp-*` commands, plus `/reset` and `/end` as plugin commands. The server exposes no
+tools inside workers. Pi's dispatcher layer (contract gating, auto follow-up routing) is Pi-only;
+for Claude main its delegation policy (`+here`/`+delegate`/`+review` markers, packet writing,
+review rules) is carried as prompt guidance in `claude/main-prompt.md`, appended only to the main
+launch, so delegation is the model's judgment rather than enforced.
+
 ### Context packets
 
 A worker's first message is its `packet.md`: the task, then each file passed with

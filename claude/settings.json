@@ -1,1 +1,5 @@
-{}
+{
+  "permissions": {
+    "allow": ["mcp__tmux-pi-subagents"]
+  }
+}

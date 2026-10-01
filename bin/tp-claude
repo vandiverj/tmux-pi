@@ -17,6 +17,8 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 CLAUDE_DIR="$ROOT/claude"
 export TP_ROOT="$ROOT"
+# Auth headers for the HTTP MCP servers in mcp.json (git-ignored; see README).
+[[ ! -f "$CLAUDE_DIR/mcp.local.env" ]] || source "$CLAUDE_DIR/mcp.local.env"
 
 exec claude \
   --setting-sources "" \

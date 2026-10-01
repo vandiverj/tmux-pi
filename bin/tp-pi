@@ -16,4 +16,6 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 
 export PI_CODING_AGENT_DIR="$ROOT/agent"
+# Auth for the MCP servers in agent/mcp.json (git-ignored; shared with tp-claude).
+[[ ! -f "$ROOT/claude/mcp.local.env" ]] || source "$ROOT/claude/mcp.local.env"
 exec pi --no-skills "$@"

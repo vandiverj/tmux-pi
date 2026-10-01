@@ -5,6 +5,54 @@
       "args": [
         "${TP_ROOT}/claude/mcp/subagents.mjs"
       ]
+    },
+    "youtrack": {
+      "type": "http",
+      "url": "https://youtrack.devservices-internal.natacs.aero/mcp",
+      "headers": {
+        "Authorization": "${YOUTRACK_AUTH}"
+      }
+    },
+    "airteracode": {
+      "type": "http",
+      "url": "http://100.101.254.119:8378/mcp",
+      "headers": {
+        "Authorization": "${AIRTERACODE_AUTH}",
+        "Content-Type": "application/json"
+      }
+    },
+    "dacservice-postgres": {
+      "type": "stdio",
+      "command": "${HOME}/.local/bin/dacservice-dbhub",
+      "args": []
+    },
+    "natacs-dev-db": {
+      "type": "stdio",
+      "command": "mcp-sqlserver",
+      "args": [],
+      "env": {
+        "SQLSERVER_HOST": "${NATACS_DEV_HOST}",
+        "SQLSERVER_PORT": "${NATACS_DEV_PORT}",
+        "SQLSERVER_USER": "${NATACS_DEV_USER}",
+        "SQLSERVER_PASSWORD": "${NATACS_DEV_PASSWORD}",
+        "SQLSERVER_DATABASE": "NataDev",
+        "SQLSERVER_ENCRYPT": "true",
+        "SQLSERVER_TRUST_CERT": "true"
+      }
+    },
+    "natacs-dev-soc-db": {
+      "type": "stdio",
+      "command": "mcp-sqlserver",
+      "args": [],
+      "env": {
+        "SQLSERVER_HOST": "${NATACS_DEV_HOST}",
+        "SQLSERVER_PORT": "${NATACS_DEV_PORT}",
+        "SQLSERVER_USER": "${NATACS_DEV_USER}",
+        "SQLSERVER_PASSWORD": "${NATACS_DEV_PASSWORD}",
+        "SQLSERVER_DATABASE": "NataDevSoc",
+        "SQLSERVER_ENCRYPT": "true",
+        "SQLSERVER_TRUST_CERT": "true"
+      }
     }
   }
 }

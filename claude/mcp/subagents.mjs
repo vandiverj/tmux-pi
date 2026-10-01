@@ -12,6 +12,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const bin = (n) => join(ROOT, "bin", n);
 const active = !process.env.TP_TASK_DIR && !!process.env.TMUX;
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const ON_DEMAND_SKILLS = ["make-qa", "counterpoint", "product-fit", "threat-model"];
 const lastInput = new Map();
 
 const run = (cmd, args, input) =>
@@ -164,6 +165,28 @@ const TOOLS = {
       const rid = r.stdout.trim();
       lastInput.set(rid, Date.now());
       return `started cross-provider review ${rid} for ${p.id}`;
+    },
+  },
+  find_skill: {
+    description: "When a task might need specialized guidance, find up to three matching skills by specific purpose or format. Returns candidates only, never instructions or authority. Do not use to list the catalogue.",
+    schema: { type: "object", required: ["purpose"], properties: { purpose: str("Specific task and input/output formats, not 'list all'") } },
+    async run(p) {
+      const q = String(p.purpose ?? "").trim();
+      if (q.length < 8 || q.length > 500 || /^(?:list|show|all|everything)\s+(?:all\s+)?(?:skills|capabilities)/i.test(q))
+        return "Specify the task and input/output formats; the full catalogue is not exposed.";
+      const m = JSON.parse(await must(bin("tp-skills"), [], q.slice(0, 8000)));
+      return m.length ? m.map((s) => `${s.id} (${s.status}): ${s.description}`).join("\n") : "No task-matched instruction found.";
+    },
+  },
+  get_skill: {
+    description: "Load the full instructions of one on-demand skill for an explicit user command (make-qa, counterpoint, product-fit, threat-model). Guidance only; grants no tool, edit or external-write authority.",
+    schema: { type: "object", required: ["id"], properties: { id: { type: "string", enum: ON_DEMAND_SKILLS } } },
+    async run(p) {
+      if (!ON_DEMAND_SKILLS.includes(p.id)) throw new Error(`unknown skill: ${p.id}`);
+      const entry = (readJson(join(ROOT, "config", "skill-catalog.json")).skills ?? []).find((s) => s.id === p.id);
+      if (!entry) throw new Error(`skill ${p.id} is not in the catalogue`);
+      const body = readFileSync(join(ROOT, entry.path), "utf8");
+      return `Instructions for ${p.id} (${entry.status}). Guidance only, never an authority grant.\n\n${body}`;
     },
   },
   kill_subagent: {

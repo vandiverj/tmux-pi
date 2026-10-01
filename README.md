@@ -114,11 +114,13 @@ its checkpoint state and when its artifact was last written. Settled work also s
 `TP_MAIN=claude bin/tp` starts Claude Code in the main pane instead of pi. It gets the same
 six tools (`spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`,
 `review_subagent`, `kill_subagent`) from an MCP server (`claude/mcp/subagents.mjs`) that wraps
-the same `tp-*` commands, plus `/reset` and `/end` as plugin commands. The server exposes no
+the same `tp-*` commands, plus `find_skill` and `get_skill` (on-demand skills, no full catalogue), `/make-qa`, `/counterpoint`, `/product-fit` and `/threat-model` aliases that load their skill through `get_skill`, and `/reset` and `/end` as plugin commands. The server exposes no
 tools inside workers. Pi's dispatcher layer (contract gating, auto follow-up routing) is Pi-only;
 for Claude main its delegation policy (`+here`/`+delegate`/`+review` markers, packet writing,
 review rules) is carried as prompt guidance in `claude/main-prompt.md`, appended only to the main
 launch, so delegation is the model's judgment rather than enforced.
+
+Claude main and Claude workers also load the `youtrack` and `airteracode` (Context Engine) HTTP MCP servers from `claude/mcp.json`. Their auth headers come from the git-ignored `claude/mcp.local.env` (`YOUTRACK_AUTH`, `AIRTERACODE_AUTH`), which `bin/tp-claude` sources; without it those two servers fail to connect while the rest still works. Only the subagent tools are pre-allowed, so every YouTrack/Context Engine call prompts for permission. This bypasses the Pi-side capability-request flow for Claude, and Pi workers still have no MCPs.
 
 ### Context packets
 

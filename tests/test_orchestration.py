@@ -140,6 +140,108 @@ esac
         self.assertIn(first["id"], packet)
         self.assertEqual(self.cli("inspect", first["id"])["result_status"], "incomplete")
 
+    def test_retry_preserves_context_and_notes_without_stale_grants(self):
+        (self.project / "spec.txt").write_text("SPEC_MARKER\n")
+        (self.project / ".env").write_text("PRIVATE_TOKEN=example\n")
+        dep = self.dispatch(role="researcher", task="Dependency")
+        first = self.dispatch(task="Use spec", after=dep["id"], context="spec.txt", note="Keep API stable")
+        self.assertEqual(first["status"], "queued")
+        dep_task = self.state / "tasks" / dep["id"]
+        (dep_task / "state.json").write_text('{"state":"waiting"}')
+        (dep_task / "result.md").write_text("RESULT_STATUS: complete\n")
+        self.cli("tick")
+        sensitive = self.dispatch(task="Env", context=".env")
+        task = self.state / "tasks" / first["id"]
+        (task / "state.json").write_text('{"state":"waiting"}')
+        (task / "result.md").write_text("RESULT_STATUS: incomplete\n")
+        second = self.cli("retry", first["id"], "--reason", "Try again",
+                          "--worker", "pi", "--model", "openai-codex/gpt-6-sol")
+        packet = (self.state / "tasks" / second["id"] / "packet.md").read_text()
+        self.assertIn("SPEC_MARKER", packet)
+        self.assertIn("Keep API stable", packet)
+        self.assertIn("Prior packet:", packet)
+        self.assertNotIn("Dependency %s result" % dep["id"], packet)
+        # a retry of a retry does not accumulate retry notes
+        (self.state / "tasks" / second["id"] / "state.json").write_text('{"state":"waiting"}')
+        third = self.cli("retry", second["id"], "--reason", "Again", "--worker", "pi",
+                         "--model", "openai-codex/gpt-6-sol")
+        packet3 = (self.state / "tasks" / third["id"] / "packet.md").read_text()
+        self.assertEqual(packet3.count("Retry of "), 1)
+        self.assertIn("SPEC_MARKER", packet3)
+        # sensitive context stays omitted on retry
+        (self.state / "tasks" / sensitive["id"] / "state.json").write_text('{"state":"waiting"}')
+        retry = self.cli("retry", sensitive["id"], "--reason", "Again", "--worker", "pi",
+                         "--model", "openai-codex/gpt-6-sol")
+        packet4 = (self.state / "tasks" / retry["id"] / "packet.md").read_text()
+        self.assertNotIn("PRIVATE_TOKEN=example", packet4)
+        # the omitted input is recorded as omitted, never as admitted, and is not handed back to spawn
+        kept = json.loads((self.state / "tasks" / sensitive["id"] / "dispatch.json").read_text())
+        self.assertEqual((kept["context"], kept["omitted_context"]), ([], [".env"]))
+        self.assertNotIn("Sensitive context .env was omitted", packet4)
+        self.assertIn("1 context input(s) omitted as sensitive in the prior attempt were not replayed", packet4)
+        again = json.loads((self.state / "tasks" / retry["id"] / "dispatch.json").read_text())
+        self.assertEqual((again["context"], again["omitted_context"]), ([], []))
+
+    def settled(self, **extra):
+        item = self.dispatch(**extra)
+        task = self.state / "tasks" / item["id"]
+        (task / "state.json").write_text('{"state":"waiting"}')
+        return item, task
+
+    def retry_packet(self, item):
+        retry = self.cli("retry", item["id"], "--reason", "Again", "--worker", "pi",
+                         "--model", "openai-codex/gpt-6-sol")
+        return (self.state / "tasks" / retry["id"] / "packet.md").read_text()
+
+    def test_retry_does_not_replay_raw_sensitive_spec_from_older_record(self):
+        (self.project / ".env").write_text("PRIVATE_TOKEN=example\n")
+        (self.project / "spec.txt").write_text("SPEC_MARKER\n")
+        item, task = self.settled(context=".env")
+        # a record written before admission was tracked lists the raw operator specs
+        (task / "dispatch.json").write_text(json.dumps({"context": [".env", "spec.txt"], "notes": []}))
+        packet = self.retry_packet(item)
+        self.assertNotIn("PRIVATE_TOKEN=example", packet)
+        self.assertNotIn("Sensitive context .env was omitted", packet)
+        self.assertIn("SPEC_MARKER", packet)
+        self.assertIn("1 context input(s) omitted as sensitive", packet)
+
+    def test_retry_without_dispatch_record_points_at_prior_packet(self):
+        (self.project / "spec.txt").write_text("SPEC_MARKER\n")
+        item, task = self.settled(context="spec.txt", note="Keep API stable")
+        (task / "dispatch.json").unlink()
+        packet = self.retry_packet(item)
+        self.assertIn("has no dispatch record, so its selected context and notes were not replayed", packet)
+        self.assertIn(f"Prior packet: {(task / 'packet.md').resolve()}", packet)
+        self.assertNotIn("SPEC_MARKER", packet)
+
+    def test_retry_with_malformed_dispatch_record_replays_nothing(self):
+        (self.project / "spec.txt").write_text("SPEC_MARKER\n")
+        item, task = self.settled(context="spec.txt", note="Keep API stable")
+        for raw in ("[]", "null", "{not json", '{"context":null,"notes":[]}', '{"context":[],"notes":null}',
+                    '{"context":["spec.txt",7],"notes":[]}', '{"context":"spec.txt","notes":[]}',
+                    '{"context":["spec.txt"],"omitted_context":{},"notes":[]}'):
+            with self.subTest(raw=raw):
+                (task / "dispatch.json").write_text(raw)
+                packet = self.retry_packet(item)
+                self.assertIn("prior dispatch record is malformed", packet)
+                self.assertNotIn("SPEC_MARKER", packet)
+                self.assertNotIn("Keep API stable", packet)
+                for path in (self.state / "tasks").iterdir():
+                    (path / "state.json").write_text('{"state":"waiting"}')
+
+    def test_retry_replays_more_than_twenty_inputs(self):
+        args = ["dispatch", "--role", "coder", "--task", "Many inputs", "--worker", "pi",
+                "--model", "openai-codex/gpt-6-sol", "--workdir", str(self.project)]
+        for i in range(21):
+            (self.project / f"ctx{i}.txt").write_text(f"CTX_MARKER_{i:02d}\n")
+            args += ["--context", f"ctx{i}.txt", "--note", f"NOTE_MARKER_{i:02d}"]
+        item = self.cli(*args)
+        (self.state / "tasks" / item["id"] / "state.json").write_text('{"state":"waiting"}')
+        packet = self.retry_packet(item)
+        for i in range(21):
+            self.assertIn(f"CTX_MARKER_{i:02d}", packet)
+            self.assertIn(f"NOTE_MARKER_{i:02d}", packet)
+
     def test_incompatible_harness_model_is_rejected(self):
         run = subprocess.run([str(ROOT / "bin/tp-agent"), "dispatch", "--role", "coder",
                               "--task", "Check config", "--worker", "claude",

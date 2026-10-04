@@ -33,6 +33,15 @@ state_dir="$(tp_opt "$session" @tp_state_dir)"
 dir="$state_dir/tasks/$id"
 [[ -f "$dir/meta.json" ]] || die "no subagent '$id'"
 [[ ! -f "$dir/pending-capability.json" ]] || die "subagent '$id' is waiting for human capability approval; review is blocked"
+# An unanswered worker request means the author's evidence is incomplete, so no
+# review (not even --force) starts. Never echo the request's contents.
+if [[ -e "$dir/capability-request.json" || -L "$dir/capability-request.json" ]]; then
+  # Only an explicit string status "answered" resolves a request; missing, null,
+  # unknown, malformed, or unreadable records all stay blocking.
+  req_status="$(jq -r 'if type == "object" and (.status | type) == "string" then .status else "unreadable" end' "$dir/capability-request.json" 2>/dev/null)" || req_status=unreadable
+  [[ "$req_status" == answered ]] ||
+    die "subagent '$id' has an unresolved context/tool request; answer it before review (--force does not bypass this)"
+fi
 [[ -f "$dir/result.md" ]] || die "subagent '$id' has no result yet"
 # Interactive Pi/Claude sessions remain alive after replying and report `waiting`.
 # Accept that settled state as well as a cleanly exited worker.
@@ -84,21 +93,68 @@ case "$worker" in
   *) die "subagent '$id' has unknown worker '$worker'" ;;
 esac
 
-review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Follow it with a brief rationale or prioritized actionable findings including file paths and line references when possible."
+review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then a brief rationale or prioritized actionable findings including file paths and line references when possible."
 
 # A research report (M9) is checked for source support rather than code changes.
 extra=()
 if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
   report="$(jq -r '.contract.artifact' "$dir/meta.json")"
-  review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Follow it with a brief rationale or prioritized findings (unsupported or wrong claims first)."
+  review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then a brief rationale or prioritized findings (unsupported or wrong claims first)."
   extra=(--note "Research report: $report")
 fi
 
 # Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
 followups=()
 if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md"); fi
+# tp-spawn caps each context file at 60000 chars and the whole packet at 200000. An
+# oversized author packet/result is never excerpted: it is split into ordered, labelled
+# segments that together hold every character. If all evidence cannot fit in one
+# packet, fail before spawning rather than drop any of it.
+max_file=60000 max_packet=200000 packet_reserve=20000 per_file_overhead=300
+excerpt_dir=""
+cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; cleanup_route_tmp; }
+trap cleanup_excerpts EXIT
+ctx_list=()
+# add_segments <file> <label>: appends context paths to ctx_list (runs in this shell,
+# so excerpt_dir and ctx_list survive for cleanup and spawning).
+add_segments() {
+  local list line
+  [[ -n "$excerpt_dir" ]] || excerpt_dir="$(mktemp -d)"
+  list="$excerpt_dir/$2.list"
+  python3 - "$1" "$excerpt_dir" "$2" "$max_file" > "$list" <<'PYEOF' || die "cannot split '$1' for review"
+import sys
+path, outdir, label, limit = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+def size(t): return len(t.encode("utf-8", "surrogateescape"))
+if size(text) <= limit:
+    print(path); sys.exit()
+body_max = limit - 1000  # leaves room for the segment label
+segs, i = [], 0
+while i < len(text):
+    j = min(len(text), i + body_max)
+    while size(text[i:j]) > body_max: j = i + max(1, (j - i) * 9 // 10)
+    segs.append((i, j)); i = j
+for n, (a, b) in enumerate(segs, 1):
+    out = f"{outdir}/{label}-{n:02d}-of-{len(segs):02d}.md"
+    head = (f"[Review segment {n} of {len(segs)} of {label}; original path: {path}; "
+            f"characters {a}-{b} of {len(text)}. Segments are complete and in order; none omitted.]\n\n")
+    with open(out, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(head + text[a:b])
+    print(out)
+PYEOF
+  while IFS= read -r line; do ctx_list+=("$line"); done < "$list"
+}
+add_segments "$dir/packet.md" author-packet
+add_segments "$dir/result.md" author-result
+total=$(( packet_reserve + ${#review_task} ))
+for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
+  total=$(( total + $(wc -c < "$f") + per_file_overhead ))
+done
+(( total <= max_packet )) ||
+  die "review packet for '$id' needs ~$total chars (max $max_packet) without dropping author evidence; use a deliberate source-review workflow instead"
+ctx_args=()
+for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
 if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" \
-  --context "$dir/task.md" ${followups[@]+"${followups[@]}"} --context "$dir/packet.md" --context "$dir/result.md" \
+  --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy" \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \

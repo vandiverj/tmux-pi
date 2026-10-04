@@ -248,7 +248,7 @@ if [[ -n "$deliverable" ]]; then
   packet+=$'\n'
 fi
 packet+=$'\n\n# Return\n\n'
-packet+="Begin with one short sentence stating the assignment you understood. In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence."
+packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence."
 packet+=$'\n\n'
 packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
 # Classify only the main-owned worker task, never conversation/context documents.

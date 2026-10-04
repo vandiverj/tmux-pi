@@ -199,6 +199,39 @@ def capacity(base, proposed, worker, model):
     return True, ""
 
 
+def admitted_context(path, specs):
+    """Split context specs by tp-spawn's own omission notes in the packet; file contents are never read."""
+    try:
+        lines = set((path / "packet.md").read_text().splitlines())
+    except OSError:
+        return [], list(specs)  # admission cannot be confirmed
+    admitted, omitted = [], []
+    for spec in specs:
+        marker = f"- Sensitive context {spec} was omitted from the packet."
+        (omitted if any(line.startswith(marker) for line in lines) else admitted).append(spec)
+    return admitted, omitted
+
+
+def replay_inputs(previous):
+    """Return (context, notes, remark) to replay from a prior attempt; malformed records replay nothing."""
+    source = previous / "dispatch.json"
+    if not source.exists():
+        return [], [], "The prior attempt has no dispatch record, so its selected context and notes were not replayed"
+    try:
+        kept = json.loads(source.read_text())
+    except (OSError, ValueError):
+        kept = None
+    fields = [kept.get(key, []) for key in ("context", "omitted_context", "notes")] if isinstance(kept, dict) else [None]
+    if not all(isinstance(field, list) and all(isinstance(entry, str) for entry in field) for field in fields):
+        return [], [], "The prior dispatch record is malformed, so its selected context and notes were not replayed"
+    # Recheck against the prior packet too: records written before admission was tracked hold raw specs.
+    contexts, omitted = admitted_context(previous, fields[0])
+    omitted = len(set(fields[1] + omitted))
+    notes = [note for note in fields[2] if not note.startswith("Retry of ")]
+    return contexts, notes, (f"{omitted} context input(s) omitted as sensitive in the prior attempt were not replayed"
+                             if omitted else "")
+
+
 def launch(base, item):
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
             "--worker", item["worker"], "--model", item["model"], "--thinking", item["thinking"],
@@ -221,6 +254,11 @@ def launch(base, item):
     run = subprocess.run(args, text=True, capture_output=True)
     if run.returncode:
         raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
+    # Record what the packet actually admitted so retry never replays an omitted sensitive input.
+    path = task_dir(base, item["id"])
+    admitted, omitted = admitted_context(path, item.get("context", []))
+    atomic_json(path / "dispatch.json",
+                {"context": admitted, "omitted_context": omitted, "notes": item.get("notes", [])})
     return record(task_dir(base, item["id"]))
 
 
@@ -321,13 +359,17 @@ def main():
         if prior["status"] in {"starting", "working", "needs_input"}:
             raise ValueError("stop or settle the prior attempt before retrying")
         original = (previous / "request.md").read_text().strip()
+        # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
+        # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
+        contexts, notes, remark = replay_inputs(previous)
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
                                          task=args.task or original, worker=args.worker,
                                          model=args.model, thinking=args.thinking,
                                          workdir=meta.get("workdir"),
                                          deliverable=meta.get("deliverable", ""),
-                                         parent=args.id, after=[], context=[],
-                                         note=[f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion."])
+                                         parent=args.id, after=[], context=contexts,
+                                         note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
+                                                      + (f" {remark}; see the prior packet." if remark else "")])
         value = dispatch(replacement, base)
     elif args.command == "tick":
         value = tick(base)

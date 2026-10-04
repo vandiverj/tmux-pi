@@ -47,6 +47,60 @@ class SkillCatalogTests(unittest.TestCase):
         for request, expected in cases.items():
             self.assertEqual([s["id"] for s in run(request)], [expected], request)
 
+    def test_explicit_marker_tolerates_surrounding_punctuation(self):
+        cases = {
+            "/make-qa, test person search": "make-qa",
+            "Please run /threat-model.": "threat-model",
+            "(/threat-model) review the new tool boundary": "threat-model",
+            "Run `/product-fit` on the signup journey": "product-fit",
+            'Then "/counterpoint": is the split worth it?': "counterpoint",
+            "/Threat-Model!": "threat-model",
+        }
+        for request, expected in cases.items():
+            self.assertEqual([s["id"] for s in run(request)], [expected], request)
+
+    def test_marker_embedded_in_path_or_longer_name_is_not_explicit(self):
+        for request in ("See src/make-qa/notes for the old layout",
+                        "Fetch http://example.test/threat-model and summarize it",
+                        "Edit agent/prompts/threat-model.md wording",
+                        "Rename /threat-model.md to something clearer",
+                        "List /product-fit/drafts",
+                        "Add a /counterpoint-v2 command stub",
+                        "Compare and/counterpoint the two words"):
+            self.assertEqual(run(request), [], request)
+
+    def test_narrowed_phrases_reject_incidental_prose(self):
+        for request in ("Fix the security review comments in the PR",
+                        "Implement a security review checklist page",
+                        "Review security headers middleware naming",
+                        "Read the contract spec section of the docs",
+                        "Rename the contract spec fixture file",
+                        "Run an adversarial pass over the parser fuzz corpus",
+                        "Add adversarial pass counts to the fuzz report",
+                        "Rename the threat model fixture in the docs"):
+            self.assertEqual(run(request), [], request)
+
+    def test_narrowed_phrases_keep_deliberate_requests(self):
+        cases = {
+            "Write a threat model for the export endpoint": "threat-model",
+            "Conduct a security review of the new MCP tool boundary": "threat-model",
+            "Do a security threat review of the upload path": "threat-model",
+            "Please create a threat model for the upload path": "threat-model",
+            "Draft a contract spec for the person search endpoint": "product-fit",
+            "Sketch the observable contract for this CLI flag": "product-fit",
+            "Do an adversarial pass on this plan before we commit": "counterpoint",
+            "Give me a counterpoint on the migration decision": "counterpoint",
+        }
+        for request, expected in cases.items():
+            self.assertEqual([s["id"] for s in run(request)], [expected], request)
+
+    def test_selection_never_exceeds_three_and_explicit_ranks_first(self):
+        every = run("/make-qa, (/counterpoint) /product-fit. /threat-model: for report.pdf")
+        self.assertEqual([s["id"] for s in every], ["make-qa", "counterpoint", "product-fit"])
+        mixed = run("Read report.pdf, write a QA script, product-fit check, then /threat-model.")
+        self.assertEqual(len(mixed), 3)
+        self.assertEqual(mixed[0]["id"], "threat-model")
+
     def test_explicit_request_survives_bounded_multi_match(self):
         selection = run("Write a QA script for report.pdf, product-fit check, and /threat-model review")
         self.assertLessEqual(len(selection), 3)

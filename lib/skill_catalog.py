@@ -24,9 +24,18 @@ def _catalog(root: Path = ROOT) -> dict:
     return data
 
 
+def _explicit(item: dict, text: str) -> bool:
+    # A /command counts when it starts a token (optionally after an opening
+    # bracket or quote) and is not continued as a path, longer name or file:
+    # "/make-qa," "(/threat-model)" and "/threat-model." match;
+    # "src/make-qa/notes", "x/threat-model" and "/threat-model.md" do not.
+    return any(re.search(r"(?<![^\s(\[{\"'`])" + re.escape(marker) + r"(?![\w/-]|[.:]\w)", text)
+               for marker in item.get("markers", []))
+
+
 def _matches(item: dict, request: str) -> bool:
     text = request.lower()[:8000]
-    if any(marker in text.split() for marker in item.get("markers", [])):
+    if _explicit(item, text):
         return True
     if any(re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) for phrase in item.get("phrases", [])):
         return True
@@ -43,13 +52,12 @@ def _matches(item: dict, request: str) -> bool:
 def select(request: str, root: Path = ROOT) -> list[dict]:
     data = _catalog(root)
     ranked = []
-    tokens = request.lower()[:8000].split()
+    text = request.lower()[:8000]
     for order, item in enumerate(data["skills"]):
         if _matches(item, request):
             result = {key: item[key] for key in ("id", "description", "status", "authority")}
             result["path"] = str((root / item["path"]).resolve())
             # A human's explicit /command must not disappear behind broad
             # phrase/file matches when the bounded shortlist is full.
-            explicit = any(marker in tokens for marker in item.get("markers", []))
-            ranked.append((0 if explicit else 1, order, result))
+            ranked.append((0 if _explicit(item, text) else 1, order, result))
     return [item for _, _, item in sorted(ranked)[:data["max_selected"]]]

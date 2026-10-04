@@ -28,7 +28,7 @@
       "status": "pilot; report-only guidance",
       "authority": "instructions only; no edits, approval or waiver",
       "markers": ["/counterpoint"],
-      "phrases": ["challenge my plan", "challenge this plan", "devil's advocate", "play devil's advocate", "give me a counterpoint", "counterpoint on", "counterpoint for", "adversarial pass"]
+      "phrases": ["challenge my plan", "challenge this plan", "devil's advocate", "play devil's advocate", "give me a counterpoint", "counterpoint on", "counterpoint for", "adversarial pass on the plan", "adversarial pass on this plan", "adversarial pass on the design", "adversarial pass on this design", "adversarial pass on this decision"]
     },
     {
       "id": "product-fit",
@@ -37,7 +37,7 @@
       "status": "pilot; planning guidance",
       "authority": "instructions only; no implementation or approval",
       "markers": ["/product-fit"],
-      "phrases": ["product-fit check", "product fit check", "product-fit review", "review product fit", "contract spec", "observable contract", "review the api contract", "review the ui contract"]
+      "phrases": ["product-fit check", "product fit check", "product-fit review", "review product fit", "draft a contract spec", "write a contract spec", "draft the contract spec", "write the contract spec", "observable contract", "review the api contract", "review the ui contract"]
     },
     {
       "id": "threat-model",
@@ -46,7 +46,7 @@
       "status": "pilot; report-only guidance",
       "authority": "instructions only; no edits or review waiver",
       "markers": ["/threat-model"],
-      "phrases": ["threat model", "security review", "review security", "privacy review", "prompt injection review", "agent security review"]
+      "phrases": ["create a threat model", "write a threat model", "draft a threat model", "build a threat model", "review a threat model", "do a threat model", "perform a threat model", "run a threat model", "security threat review", "conduct a security review", "perform a security review", "do a security review", "privacy review", "prompt injection review", "agent security review"]
     },
     {
       "id": "test-skill-behavior",

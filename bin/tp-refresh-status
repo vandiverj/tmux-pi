@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# tp-refresh-status — reload this session's status pane and clear its history.
+#
+# Usage: tp-refresh-status
+#
+# Respawns only the pane recorded in @tp_status_pane (with its original command)
+# after checking it belongs to this session's main window, is not the main or
+# viewer pane, and was started with the tp-status loop that tp launches. A worker
+# swapped into the viewer slot shares the main window, so the start command is
+# what tells the status pane apart; anything else is refused untouched.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+source "$ROOT/lib/tp.sh"
+
+session="$(tp_session)"
+pane="$(tp_opt "$session" @tp_status_pane)"
+main="$(tp_opt "$session" @tp_main_pane)"
+viewer="$(tp_opt "$session" @tp_viewer_pane)"
+
+[[ -n "$pane" ]] || die "session '$session' has no recorded status pane"
+[[ -n "$main" ]] || die "session '$session' has no recorded main pane"
+# The value is used as a tmux target below; an empty or non-id target could resolve elsewhere.
+[[ "$pane" =~ ^%[0-9]+$ ]] || die "recorded status pane '$pane' is not a pane id; refusing"
+[[ "$main" =~ ^%[0-9]+$ ]] || die "recorded main pane '$main' is not a pane id; refusing"
+[[ "$pane" != "$main" && "$pane" != "$viewer" ]] || die "recorded status pane $pane is the main or viewer pane; refusing"
+
+# The status pane must be live in this session and share the main pane's window.
+# (display-message -t on a missing pane succeeds with empty output, and an empty
+# window target would mean the caller's current window.)
+win="$(tmux display-message -p -t "$main" '#{window_id}' 2>/dev/null)" || die "main pane $main is missing"
+[[ "$win" =~ ^@[0-9]+$ ]] || die "main pane $main is missing"
+tmux list-panes -s -t "=$session:" -F '#{pane_id}' | grep -Fqx -- "$pane" \
+  || die "status pane $pane is missing from session '$session'"
+tmux list-panes -t "$win" -F '#{pane_id}' | grep -Fqx -- "$pane" \
+  || die "status pane $pane is not in the session's main window"
+
+# The pane must be the status process itself: its start command (what respawn-pane
+# reruns) has to be exactly the loop bin/tp starts. tmux may print it double-quoted.
+want="trap '' INT QUIT TSTP; while true; do '$ROOT/bin/tp-status'; sleep 1; done"
+start="$(tmux display-message -p -t "$pane" '#{pane_start_command}' 2>/dev/null)" || start=""
+[[ "$start" == \"*\" ]] && { start="${start#\"}"; start="${start%\"}"; }
+[[ "$start" == "$want" ]] \
+  || die "pane $pane was not started as the tp-status loop; refusing to respawn it"
+
+# Leave copy-mode first so the respawned pane and cleared history are not shadowed.
+tmux copy-mode -q -t "$pane" 2>/dev/null || true
+tmux respawn-pane -k -t "$pane" || die "could not respawn status pane $pane"
+tmux clear-history -t "$pane" || die "status pane $pane respawned but history was not cleared"
+echo "refreshed status pane $pane in session '$session'"

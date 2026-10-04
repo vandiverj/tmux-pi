@@ -4,10 +4,12 @@ import { dirname, join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-function run(command: string, args: string[]): Promise<string> {
+const REFRESH_TIMEOUT_MS = 15_000;
+
+function run(command: string, args: string[], timeout = 180_000): Promise<string> {
 	return new Promise((resolve, reject) => {
-		execFile(command, args, { timeout: 180_000, maxBuffer: 2_000_000 }, (error, stdout, stderr) => {
-			if (error) reject(new Error((stderr || error.message).trim()));
+		execFile(command, args, { timeout, maxBuffer: 2_000_000 }, (error, stdout, stderr) => {
+			if (error) reject(new Error((stderr || (error.killed ? `timed out after ${timeout / 1000}s` : error.message)).trim()));
 			else resolve(stdout);
 		});
 	});
@@ -16,6 +18,19 @@ function run(command: string, args: string[]): Promise<string> {
 export default function (pi: ExtensionAPI) {
 	if (process.env.TP_TASK_DIR || !process.env.TMUX || !process.env.PI_CODING_AGENT_DIR) return;
 	const command = join(dirname(process.env.PI_CODING_AGENT_DIR), "bin", "tp-agent");
+	const refresh = join(dirname(process.env.PI_CODING_AGENT_DIR), "bin", "tp-refresh-status");
+	// Deterministic: runs the script directly and only notifies; no model turn or message.
+	pi.registerCommand("refresh-status", {
+		description: "Reload this session's status pane and clear its scrollback (no model turn)",
+		handler: async (_args, ctx) => {
+			try {
+				const out = (await run(refresh, [], REFRESH_TIMEOUT_MS)).trim();
+				ctx.ui.notify(out || "Status pane refreshed", "info");
+			} catch (error) {
+				ctx.ui.notify(`Status refresh failed: ${(error as Error).message}`, "error");
+			}
+		},
+	});
 	pi.registerTool({
 		name: "dispatch_role",
 		label: "Dispatch specialist",

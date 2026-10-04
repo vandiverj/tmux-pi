@@ -31,7 +31,7 @@ fs.writeFileSync(path.join(tmp, 'escalate.ts'), source.replace('import { execFil
 globalThis.__fakeExecFileSync = (cmd, args) => {
   calls.push({ cmd: path.basename(cmd), args });
   switch (path.basename(cmd)) {
-    case 'tp-contract': return args[0] === 'escalate' ? JSON.stringify({ target: { worker: 'claude', model: 'claude-sonnet-5', thinking: 'low' }, record: {} }) : '';
+    case 'tp-contract': return args[0] === 'escalate' ? JSON.stringify({ target: { worker: 'claude', model: 'claude-sonnet-5-5', thinking: 'low' }, record: {} }) : '';
     case 'tp-spawn': return 'new\n';
     default: return '';
   }

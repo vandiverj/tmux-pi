@@ -54,11 +54,13 @@ const TOOLS = {
       "Start a subagent in its own tmux-pi session to work on a task, and return its id. The subagent gets a context packet " +
       "and nothing else: no CLAUDE.md or this conversation. The packet is the task, then `files` (whole, or just the lines that " +
       "matter), then `notes`. Pick only what the task needs, and say what to report back. Leave model and thinking unset to let " +
-      "the local router pick them. Runs in the background; use collect_result to wait for its reply.",
+      "the local router pick them. The router sees `request`, not `task`: pass the user's own words there (their prompt, unedited), " +
+      "never the packet you wrote. Runs in the background; use collect_result to wait for its reply.",
     schema: {
       type: "object", required: ["task"],
       properties: {
         task: str("Complete, self-contained instructions for the subagent"),
+        request: str("The user's own request, in their words, for the local router to classify. Routing on the long task packet misreads length and boilerplate as difficulty and sensitivity. Omit only when no user request exists"),
         worker: { type: "string", enum: ["pi", "claude"], description: "Harness; implied by the router or the model" },
         model: str("pi: provider/id; claude: alias (sonnet, opus, haiku)"),
         thinking: { type: "string", enum: THINKING },
@@ -72,7 +74,7 @@ const TOOLS = {
       let { worker, model, thinking } = p;
       let routed = "";
       if (!model) {
-        const d = JSON.parse(await must(bin("tp-route"), [], p.task));
+        const d = JSON.parse(await must(bin("tp-route"), [], (p.request || "").trim() || p.task));
         worker = d.worker; model = d.model; thinking = thinking ?? d.thinking;
         routed = ` (routed: ${worker} ${model} ${thinking})`;
       }

@@ -42,7 +42,7 @@
     },
     {
       "worker": "claude",
-      "model": "claude-sonnet-5",
+      "model": "claude-sonnet-5-5",
       "thinking": ["low", "medium", "high"]
     },
     {

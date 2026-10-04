@@ -52,7 +52,7 @@ Ask the main agent to delegate. Its subagents extension
 
 | Tool | Does |
 |---|---|
-| `spawn_subagent` | Builds the context packet from the task, `files` (whole or line ranges) and `notes`; routes the task with `tp-route` unless a model is given; then `tp-spawn`s it |
+| `spawn_subagent` | Builds the context packet from the task, `files` (whole or line ranges) and `notes`; routes `request` (the user's own words; `task` when omitted) with `tp-route` unless a model is given; then `tp-spawn`s it |
 | `list_subagents` | `tp-list`; available without main edit authority |
 | `send_to_subagent` | Types a follow-up message into the subagent's session |
 | `collect_result` | State and last reply; `wait_seconds` waits until it finishes. Available without main edit authority, but its canonical collect step refuses unresolved required review. A subagent stuck at a prompt (Claude's folder trust, a permission request) comes back with its screen |

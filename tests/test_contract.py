@@ -29,7 +29,7 @@ class ContractTests(unittest.TestCase):
         self.contract = build("research", str(self.dir / "report.md"), "time=20m,turns=50",
                               "outline=4m,draft=12m", "6m", "3m")
         self.meta = {"id": "research-1", "created": iso(T0), "contract": self.contract, "pane": "%1",
-                     "worker": "claude", "model": "claude-sonnet-5", "thinking": "medium"}
+                     "worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"}
 
     def art(self, status=None, age=0, now=T0):
         if status is False:
@@ -256,7 +256,7 @@ class ContractTests(unittest.TestCase):
         task.mkdir(parents=True)
         (task / "meta.json").write_text(json.dumps(self.meta))
         (task / "task.md").write_text("Which HTTP caching headers does the CDN honor?\n")
-        (task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 12, "model": "claude-sonnet-5",
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 12, "model": "claude-sonnet-5-5",
                                                      "updated": iso(T0 + 900), "cost": 0,
                                                      "tokens": {"input": 10, "output": 20, "cacheRead": 30, "cacheWrite": 0}}))
         (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "nudge-draft", "at": T0 + 720, "reason": "x"}]}))
@@ -284,7 +284,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(brief["profile"]["source"], "dynamic")
         roster = load_config(ROOT / "config/router.json", local_path=False)["models"]
         preferred = {"worker": "claude", "model": "claude-opus-5-5", "thinking": "medium"}
-        self.assertEqual(select_escalation({"worker": "claude", "model": "claude-sonnet-5", "thinking": "medium"}, roster,
+        self.assertEqual(select_escalation({"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"}, roster,
                                            preferred=preferred), preferred)
         target = select_escalation({"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "medium"}, roster)
         self.assertEqual(target["model"], "openai-codex/gpt-6-sol")
@@ -616,7 +616,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(summary_line("Answer: 3.11\n\nShall I go on?", question=True), "Shall I go on?")
         self.assertEqual(summary_line("Answer: 3.11\n\nmore"), "Answer: 3.11")
         self.assertTrue(is_local("lmstudio/qwen/qwen3.6-35b-a3b"))
-        self.assertFalse(is_local("claude-sonnet-5") or is_local("openai-codex/gpt-5.5"))
+        self.assertFalse(is_local("claude-sonnet-5-5") or is_local("openai-codex/gpt-5.5"))
 
     def test_ledger_stop_reason(self):
         task = self.dir / "tasks" / "research-2"

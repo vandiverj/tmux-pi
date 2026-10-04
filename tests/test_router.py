@@ -56,10 +56,10 @@ class RouterTests(unittest.TestCase):
             captured["url"] = request.full_url
             captured["body"] = json.loads(request.data)
             captured["timeout"] = timeout
-            return self.reply({"model": "claude-sonnet-5", "thinking": "high"})
+            return self.reply({"model": "claude-sonnet-5-5", "thinking": "high"})
 
         result = route_openai("Review this change", self.config, opener=open_request)
-        self.assertEqual(result, {"worker": "claude", "model": "claude-sonnet-5", "thinking": "high"})
+        self.assertEqual(result, {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high"})
         self.assertEqual(captured["url"], "http://127.0.0.1:11435/v1/chat/completions")
         self.assertEqual(captured["body"]["model"], "qwen3.8-flash-next:4bit")
         self.assertEqual(captured["body"]["messages"][1]["content"], "Review this change")
@@ -69,9 +69,9 @@ class RouterTests(unittest.TestCase):
         with self.assertRaisesRegex(RouterError, "configured roster"):
             validate_decision({"model": "other", "thinking": "low"}, self.config)
         with self.assertRaisesRegex(RouterError, "not allowed"):
-            validate_decision({"model": "claude-sonnet-5", "thinking": "off"}, self.config)
+            validate_decision({"model": "claude-sonnet-5-5", "thinking": "off"}, self.config)
         with self.assertRaisesRegex(RouterError, "exactly model and thinking"):
-            validate_decision({"model": "claude-sonnet-5", "thinking": "low", "worker": "pi"}, self.config)
+            validate_decision({"model": "claude-sonnet-5-5", "thinking": "low", "worker": "pi"}, self.config)
 
     def test_rejects_invalid_or_truncated_completion(self):
         with self.assertRaisesRegex(RouterError, "invalid JSON completion"):
@@ -79,7 +79,7 @@ class RouterTests(unittest.TestCase):
                 {"choices": [{"message": {"content": "```json"}, "finish_reason": "stop"}]}))
         with self.assertRaisesRegex(RouterError, "incomplete"):
             route_openai("task", self.config, opener=lambda *_args, **_kwargs:
-                         self.reply({"model": "claude-sonnet-5", "thinking": "low"}, "length"))
+                         self.reply({"model": "claude-sonnet-5-5", "thinking": "low"}, "length"))
 
     def test_unavailable_endpoint_is_clear(self):
         def unavailable(*_args, **_kwargs):
@@ -449,9 +449,9 @@ class RouterTests(unittest.TestCase):
 
     def test_packet_files_config_validation(self):
         qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
-        good = {"models": [qwen], "selector": "claude-sonnet-5"}
+        good = {"models": [qwen], "selector": "claude-sonnet-5-5"}
         self.assertEqual(load_local(self.write_local({"packet_files": good}), self.config)["packet_files"], good)
-        for bad in ({"models": [], "selector": "claude-sonnet-5"}, {"models": ["nope/model"], "selector": "claude-sonnet-5"},
+        for bad in ({"models": [], "selector": "claude-sonnet-5-5"}, {"models": ["nope/model"], "selector": "claude-sonnet-5-5"},
                     {"models": [qwen], "selector": "gpt-5.5"}, {"models": [qwen]}, {**good, "extra": 1}):
             with self.assertRaises(RouterError):
                 load_local(self.write_local({"packet_files": bad}), self.config)
@@ -479,7 +479,7 @@ class RouterTests(unittest.TestCase):
     def test_pick_files(self):
         root = self.pick_workdir()
         qwen = "lmstudio/qwen/qwen3.6-35b-a3b"
-        config = dict(self.config, local={"packet_files": {"models": [qwen], "selector": "claude-sonnet-5"}})
+        config = dict(self.config, local={"packet_files": {"models": [qwen], "selector": "claude-sonnet-5-5"}})
         calls = []
 
         def runner(cmd, **kwargs):
@@ -493,7 +493,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(specs[1], "lib/small.py")
         self.assertRegex(specs[0], r"^lib/big\.py:1-\d+$")
         self.assertEqual(len(specs), 2)  # blob.bin is not text; .env was never listed
-        self.assertIn("claude-sonnet-5", calls[1])
+        self.assertIn("claude-sonnet-5-5", calls[1])
         self.assertNotIn(".env", calls[1][-1])
         self.assertEqual(pick_files("task", str(root), "slotstream/qwen3.8-flash-next:4bit", config, runner), [])
         self.assertEqual(pick_files("task", str(root), qwen, self.config, runner), [])
@@ -504,8 +504,8 @@ class RouterTests(unittest.TestCase):
 
     def test_explicit_openai_backend(self):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:
-                            self.reply({"model": "claude-sonnet-5", "thinking": "high"}))
-        self.assertEqual(result, {"worker": "claude", "model": "claude-sonnet-5", "thinking": "high"})
+                            self.reply({"model": "claude-sonnet-5-5", "thinking": "high"}))
+        self.assertEqual(result, {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high"})
 
 
 if __name__ == "__main__":

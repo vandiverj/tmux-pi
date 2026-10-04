@@ -104,10 +104,18 @@ export default function (pi: ExtensionAPI) {
 			"then `notes`. Pick only what the task needs: the files it will change, the interfaces it must " +
 			"use, and facts from this conversation it cannot rediscover. Say what to report back. It can " +
 			"still read other files itself. Leave model and thinking unset to let the local router " +
-			"pick them; set them only when the user asked for a specific model. The subagent runs in the " +
-			"background; use collect_result to wait for its reply.",
+			"pick them; set them only when the user asked for a specific model. The router sees `request`, " +
+			"not `task`: pass the user's own words there (their prompt, unedited), never the packet you wrote. " +
+			"The subagent runs in the background; use collect_result to wait for its reply.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Complete, self-contained instructions for the subagent" }),
+			request: Type.Optional(
+				Type.String({
+					description:
+						"The user's own request, in their words, for the local router to classify. Routing on the long task packet " +
+						"misreads length and boilerplate as difficulty and sensitivity. Omit only when no user request exists",
+				}),
+			),
 			worker: Type.Optional(StringEnum(["pi", "claude"] as const, { description: "Harness; implied by the router or the model" })),
 			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-6-sol); claude: alias (sonnet, opus, haiku)" })),
 			thinking: Type.Optional(StringEnum(THINKING, { description: "Thinking level" })),
@@ -128,7 +136,7 @@ export default function (pi: ExtensionAPI) {
 			let { worker, model, thinking } = params;
 			let routed = "";
 			if (!model) {
-				const decision = JSON.parse(await must(bin("tp-route"), [], params.task));
+				const decision = JSON.parse(await must(bin("tp-route"), [], params.request?.trim() || params.task));
 				worker = decision.worker;
 				model = decision.model;
 				thinking = thinking ?? decision.thinking;

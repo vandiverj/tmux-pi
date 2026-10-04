@@ -39,6 +39,6 @@
     "models": [
       "lmstudio/qwen/qwen3.6-35b-a3b"
     ],
-    "selector": "claude-sonnet-5"
+    "selector": "claude-sonnet-5-5"
   }
 }

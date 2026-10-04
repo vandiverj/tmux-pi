@@ -3,9 +3,11 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import subprocess
 import tempfile
+import termios
 import time
 import tty
 import unittest
@@ -14,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ESC = b"\x1b[H"
 
 
-class StatusRepaintTest(unittest.TestCase):
+class StatusPaneFixture(unittest.TestCase):
+    raw_slave = True   # False: leave the pty cooked (ECHO, ICANON on) like a real pane
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -32,22 +36,32 @@ case "$1" in
   show-options)
     case "$*" in
       *"@tp_state_dir"*) printf '%s\\n' "$FAKE_BASE/state" ;;
-      *"@tp_viewing"*) cat "$FAKE_BASE/viewing" 2>/dev/null ;;
+      *"@tp_viewer_pane"*) echo %9 ;;
+      *"@tp_viewing"*) cat "$FAKE_BASE/viewing" 2>/dev/null || true ;;
     esac ;;
-  list-panes) printf '%%1 0\\n%%2 0\\n' ;;
+  list-panes) printf '%%1 0\\n%%2 0\\n%%3 0\\n%%4 0\\n' ;;
+  swap-pane) echo "$*" >> "$FAKE_BASE/swaps" ;;
+  set-option) for last; do :; done; echo "$last" > "$FAKE_BASE/viewing" ;;
 esac
 ''')
-        self.env = dict(os.environ, FAKE_BASE=str(self.base),
+        self.environ = dict(os.environ, FAKE_BASE=str(self.base),
                         PATH=str(self.mockbin) + os.pathsep + os.environ["PATH"],
-                        TERM="xterm")
+                        TERM="xterm", TP_SESSION="fake")
+        self.environ.pop("TMUX", None)
+        self.environ.pop("TMUX_PANE", None)
         master, slave = pty.openpty()
-        tty.setraw(slave)
+        if self.raw_slave:
+            tty.setraw(slave)
+        self.slave = os.dup(slave)   # kept to read the tty mode back; closed in stop()
         self.master = master
-        self.proc = subprocess.Popen(["bash", str(ROOT / "bin/tp-status")],
+        self.proc = subprocess.Popen(self.command(),
                                      stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
-                                     env=self.env, start_new_session=True)
+                                     env=self.environ, start_new_session=True)
         os.close(slave)
         self.addCleanup(self.stop)
+
+    def command(self):
+        return ["bash", str(ROOT / "bin/tp-status")]
 
     def script(self, name, text):
         path = self.mockbin / name
@@ -58,6 +72,7 @@ esac
         # Close the pty first: on macOS a process in this session can remain
         # in the exiting state until its controlling pty is released.
         os.close(self.master)
+        os.close(self.slave)
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -78,8 +93,162 @@ esac
                     break
         return data
 
+    def output_until(self, predicate, seconds=5.0):
+        """Collect PTY output until a frame meets predicate, with a bounded wait."""
+        end = time.monotonic() + seconds
+        data = b""
+        while time.monotonic() < end:
+            ready, _, _ = select.select([self.master], [], [], max(0, end - time.monotonic()))
+            if ready:
+                try:
+                    data += os.read(self.master, 65536)
+                except OSError:
+                    break
+                if predicate(data.split(ESC)[-1]):
+                    break
+        return data
+
+    def first_frame(self, *needles, seconds=8.0, settle=0.3):
+        """Await the first frame containing every needle (bounded), then keep
+        reading briefly so a repeated paint still shows up in the result."""
+        data = b""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not all(n in data for n in needles):
+            data += self.output(0.05)
+        return data + self.output(settle)
+
+    def wait_viewing(self, name, seconds=5.0):
+        """Poll the fake tmux viewing option until it names `name`, bounded."""
+        path = self.base / "viewing"
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if path.exists() and path.read_text().strip() == name:
+                return
+            self.output(0.05)
+
+    def make_jobs(self, count):
+        tasks = self.state / "tasks"
+        for number in range(1, count + 1):
+            directory = tasks / f"job{number}"
+            directory.mkdir()
+            (directory / "meta.json").write_text(json.dumps({
+                "id": f"job{number}", "worker": "pi", "pane": f"%{number}",
+                "model": "", "thinking": ""}))
+            (directory / "state.json").write_text(json.dumps({
+                "state": "working", "model": "test-model", "tokens": {
+                    "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
+            (directory / "task.md").write_text(f"task {number}\n")
+
+    def swaps(self):
+        path = self.base / "swaps"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def click(self, y, x=5, button=0, final="M", wait=0.8):
+        os.write(self.master, f"\x1b[<{button};{x};{y}{final}".encode())
+        return self.output(wait)
+
+    def row_order(self, first):
+        return list(dict.fromkeys(re.findall(rb"job\d", first)))
+
+    def lflag(self):
+        return termios.tcgetattr(self.slave)[3]
+
+
+class StatusRepaintTest(StatusPaneFixture):
+    def test_mouse_tracking_lifecycle(self):
+        first = self.first_frame(b"\x1b[?1006h")
+        self.assertTrue(first.startswith(b"\x1b[?25l\x1b[?1000h\x1b[?1006h"), first[:40])
+        self.assertNotIn(b"\x1b[?1000l", first)
+        self.proc.terminate()
+        tail = self.output(1.0)
+        self.assertIn(b"\x1b[?1006l\x1b[?1000l", tail)
+        self.assertEqual(self.proc.wait(timeout=3), 143)
+
+    def test_click_maps_rendered_rows(self):
+        self.make_jobs(3)
+        first = self.first_frame(b"subagents 3", b"job1", b"job2", b"job3")
+        self.assertIn(b"subagents 3", first)
+        self.assertNotIn(b"subagents 3/", first)
+        order = [name.decode() for name in self.row_order(first)]
+        self.assertEqual(sorted(order), ["job1", "job2", "job3"])
+        # header=1, blank=2, then row + role detail line per task: 3,5,7.
+        for y in (1, 2, 4, 6, 8, 20):
+            self.click(y)
+        self.click(3, button=64)            # wheel
+        self.click(3, button=65)
+        self.click(3, button=32)            # drag
+        self.click(3, button=2)             # right button
+        self.click(3, final="m")            # release
+        self.click(3, button=4)             # shift-modified
+        self.assertEqual(self.swaps(), [])
+        for y, name in zip((3, 5, 7), order):
+            self.click(y, x=17)             # multi-digit coordinate handling
+            self.assertEqual((self.base / "viewing").read_text().strip(), name)
+        # Each click swaps the previous task back (restore) then the clicked one in.
+        self.assertEqual([line.split()[3] for line in self.swaps()],
+                         ["%" + order[0][-1], "%" + order[0][-1], "%" + order[1][-1],
+                          "%" + order[1][-1], "%" + order[2][-1]])
+        self.assertTrue(all(line.endswith("-t %9") for line in self.swaps()))
+
+    def test_multi_digit_coordinates_and_keyboard_unchanged(self):
+        self.make_jobs(2)
+        (self.base / "lines").write_text("120\n")
+        first = self.first_frame(b"job1", b"job2")
+        order = [name.decode() for name in self.row_order(first)]
+        self.click(5, x=100)
+        self.assertEqual((self.base / "viewing").read_text().strip(), order[1])
+        marker = f"── {order[0]} ".encode()
+        os.write(self.master, b"k")
+        moved = self.output_until(lambda frame: marker in frame)
+        self.assertIn(marker, moved.split(ESC)[-1])   # selection moved before Enter
+        os.write(self.master, b"\n")   # slave is raw (no ICRNL), so send what a cooked tty delivers for Enter
+        self.wait_viewing(order[0])
+        self.assertEqual((self.base / "viewing").read_text().strip(), order[0])
+        for key in (b"\x1b[B", b"\x1b[A"):
+            os.write(self.master, key)
+            self.output(0.5)
+
+    def test_partial_and_unknown_escape_sequences_do_nothing(self):
+        self.make_jobs(2)
+        self.first_frame(b"job1", b"job2")
+        os.write(self.master, b"\x1b[<0;5")      # truncated mouse report
+        self.output(1.6)                          # reader times out and drops it
+        os.write(self.master, b"\x1b[3~")         # other CSI, fully consumed
+        os.write(self.master, b"\x1b[<0;5;3m")    # release
+        self.output(0.8)
+        self.assertEqual(self.swaps(), [])
+        self.assertFalse((self.base / "viewing").exists())
+
+    def test_compact_and_clipped_rows(self):
+        self.make_jobs(4)
+        (self.base / "lines").write_text("5\n")
+        first = self.first_frame(b"subagents 3/4")
+        self.assertIn(b"subagents 3/4", first)
+        order = [name.decode() for name in self.row_order(first)]
+        self.assertEqual(len(order), 3)
+        # compact: no blank line or details; header=1, rows 2..4, 5 is clipped.
+        self.click(1)
+        self.click(5)
+        self.click(6)
+        self.assertEqual(self.swaps(), [])
+        self.click(3)
+        self.assertEqual((self.base / "viewing").read_text().strip(), order[1])
+
+    def test_queue_and_placeholder_rows_are_not_clickable(self):
+        first = self.first_frame(b"subagents 0")
+        self.assertIn(b"subagents 0", first)
+        self.click(3)
+        self.click(2)
+        queue = self.state / "queue"
+        queue.mkdir()
+        (queue / "q.json").write_text(json.dumps({"id": "queued1", "role": "coder"}))
+        self.assertIn(b"queued1", self.output(1.6))
+        self.click(3)
+        self.click(4)
+        self.assertEqual(self.swaps(), [])
+
     def test_idle_no_workers_and_resize(self):
-        first = self.output(0.6)
+        first = self.first_frame(b"no subagents")
         self.assertIn(b"no subagents", first)
         self.assertEqual(first.count(ESC), 1)
         self.assertEqual(self.output(1.4), b"")
@@ -104,21 +273,229 @@ esac
                 "state": "working", "model": "test-model", "tokens": {
                     "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
             (directory / "task.md").write_text(f"task {number}\n")
-        first = self.output(0.8)
+        first = self.output_until(lambda frame: "── job2 ".encode() in frame and b"task 2" in frame)
         self.assertIn(b"job2", first)
         self.assertEqual(self.output(1.4), b"")
         os.write(self.master, b"k")
-        moved = self.output(0.7)
+        moved = self.output_until(lambda frame: "── job1 ".encode() in frame and b"task 1" in frame)
         self.assertIn(b"task 1", moved)
         self.assertEqual(moved.count(ESC), 1)
         self.assertEqual(self.output(1.4), b"")
         (tasks / "job1" / "state.json").write_text(json.dumps({
             "state": "settled", "model": "test-model", "tokens": {
                 "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
-        changed = self.output(1.5)
+        changed = self.output_until(lambda frame: b"settled" in frame and "── job1 ".encode() in frame and b"task 1" in frame)
         self.assertIn(b"settled", changed)
         self.assertEqual(changed.count(ESC), 1)
         self.assertIn(b"task 1", changed)
+
+    def write_state(self, name, state, main=False):
+        if main:
+            directory = self.state / "main"
+            directory.mkdir(exist_ok=True)
+        else:
+            directory = self.state / "tasks" / name
+            directory.mkdir(exist_ok=True)
+            (directory / "meta.json").write_text(json.dumps({
+                "id": name, "worker": state.get("harness", "pi"), "pane": "%1",
+                "model": "", "thinking": ""}))
+            (directory / "task.md").write_text(f"task {name}\n")
+        (directory / "state.json").write_text(json.dumps(state))
+
+    def test_usage_summary_groups_models_and_keeps_legacy_separate(self):
+        z = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/beta", "cost": 0.3,
+            "tokens": {"input": 100, "output": 20, "cacheRead": 5000, "cacheWrite": 700},
+            "byModel": {"p/alpha": {"input": 60, "output": 10, "cacheRead": 4000, "cacheWrite": 700, "cost": 0.2},
+                        "p/beta": {"input": 40, "output": 10, "cacheRead": 1000, "cacheWrite": 0, "cost": 0.1}}})
+        self.write_state("cl1", {"harness": "claude", "state": "working", "model": "opus", "cost": 0,
+            "costKnown": False,
+            "tokens": {"input": 7, "output": 3, "cacheRead": 2000, "cacheWrite": 0},
+            "byModel": {"opus": {"input": 7, "output": 3, "cacheRead": 2000, "cacheWrite": 0}}})
+        self.write_state("old1", {"harness": "pi", "state": "settled", "model": "p/beta", "cost": 1,
+            "tokens": {"input": 1000, "output": 500, "cacheRead": 9000, "cacheWrite": 0}})
+        self.write_state("zero1", {"harness": "pi", "state": "starting", "tokens": z, "byModel": {}})
+        self.write_state("nostate", {}, main=False)
+        (self.state / "tasks" / "nostate" / "state.json").unlink()
+        self.write_state("", {"model": "p/beta", "tokens": {"input": 30, "output": 4, "cacheRead": 0, "cacheWrite": 0}}, main=True)
+        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", self.first_frame(b"records 5", settle=0.2)).decode()
+        for needle in ("p/alpha", "p/beta", "opus", "unattributed (legacy/partial",
+                       "last reported model: p/beta (not an attribution)"):
+            self.assertIn(needle, text)
+        self.assertIn("in 60  cache-read 4k  cache-write 700  out 10", text)   # alpha not merged with legacy
+        self.assertIn("in 7  cache-read 2k  cache-write 0  out 3  $?", text)   # Claude cost unknown
+        self.assertIn("in 1k  cache-read 9k  cache-write 0  out 504  $1", text)   # old1 + legacy main
+        self.assertIn("records 5 (main 1, workers 4); zero-token 1; workers with no usage data 1", text)
+        # in 100+7+1000+30 = 1137 -> 1.1k; cache-read 5000+2000+9000 = 16k; out 20+3+500+4 = 527
+        self.assertIn("total  in 1.1k  cache-read 16k  cache-write 700  out 527", text)
+        self.assertRegex(text, r"pi1\s+pi\s+working\s+↑100 c5\.7k ↓20")
+        self.assertRegex(text, r"cl1\s+claude\s+working\s+↑7 c2k ↓3\s+\$\?")
+
+    def test_overflow_is_bounded_and_navigation_scrolls(self):
+        tasks = self.state / "tasks"
+        now = time.time()
+        for number in range(1, 45):
+            self.write_state(f"job{number:02d}", {"state": "working", "model": "m",
+                "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}})
+            os.utime(tasks / f"job{number:02d}" / "meta.json", (now + number, now + number))
+        lines = 24
+        first = self.first_frame(b"/44", b"job44")
+        self.assertEqual(first.count(ESC), 1)
+        self.assertLessEqual(first.count(b"\n"), lines - 1)   # never scrolls the header away
+        self.assertIn(b"/44", first)
+        shown = list(dict.fromkeys(int(m) for m in re.findall(rb"job(\d\d)", first)))
+        self.assertEqual(shown, sorted(shown))
+        self.assertEqual(shown[-1], 44)                        # newest selected, in view
+        self.assertNotIn(1, shown)
+        # click mapping covers visible lines only: row at screen line 3 is shown[0].
+        self.click(3)
+        self.assertEqual((self.base / "viewing").read_text().strip(), f"job{shown[0]:02d}")
+        self.click(lines)                                      # beyond the frame
+        for _ in range(shown[0] - 1):                          # exactly to job01
+            os.write(self.master, b"k")
+        data = b""
+        deadline = time.monotonic() + 40                       # keys are processed one repaint each
+        while time.monotonic() < deadline:
+            data += self.output(1.0)
+            if b"job01" in data.split(ESC)[-1] and b"job02" in data.split(ESC)[-1]:
+                break
+        frames = data.split(ESC)[1:]
+        self.assertTrue(frames)
+        for frame in frames:
+            self.assertLessEqual(frame.count(b"\n"), lines - 1)
+        last = frames[-1]
+        self.assertIn(b"job01", last)
+        self.assertNotIn(b"job44", last)
+        os.write(self.master, b"j")
+        again = self.output(0.8)
+        self.assertLessEqual(again.count(b"\n"), lines - 1)
+        self.click(3)
+        self.assertEqual((self.base / "viewing").read_text().strip(), "job01")
+
+    def test_stats_page_toggle_is_bounded_and_keeps_list_semantics(self):
+        self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/a",
+            "tokens": {"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8},
+            "byModel": {"p/a": {"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8, "cost": 0.5}}})
+        (self.base / "lines").write_text("12\n")          # short pane: summary not inline
+        first = self.first_frame(b"s stats")
+        self.assertIn(b"s stats", first)
+        self.assertNotIn(b"session tokens", first)
+        os.write(self.master, b"s")
+        page = self.output(0.8)
+        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", page).decode()
+        self.assertIn("usage", text)
+        self.assertIn("p/a", text)
+        self.assertIn("in 5  cache-read 7  cache-write 8  out 6  $0.5", text)
+        self.assertNotIn("pi1  ", text)
+        self.assertLessEqual(page.count(b"\n"), 11)
+        self.click(2)                                     # no rows on the usage page
+        os.write(self.master, b"\r")
+        self.output(0.4)
+        self.assertEqual(self.swaps(), [])
+        os.write(self.master, b"s")
+        back = self.output(0.8)
+        self.assertIn(b"pi1", back)
+        self.click(2, x=5)                                # compact pane: header, then rows
+        self.assertEqual((self.base / "viewing").read_text().strip(), "pi1")
+
+    def test_stats_page_overflow_is_counted_not_scrolled(self):
+        self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/a",
+            "tokens": {"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8}})
+        (self.base / "lines").write_text("5\n")
+        self.first_frame(b"pi1")
+        os.write(self.master, b"s")
+        small = self.output(1.0)
+        self.assertIn(b"more lines", small)
+        self.assertLessEqual(small.count(b"\n"), 4)
+
+    def test_inline_summary_lines_are_clipped_to_pane_width(self):
+        long = "provider/" + "very-long-model-name-" * 6
+        self.write_state("pi1", {"harness": "pi", "state": "working", "model": long,
+            "tokens": {"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8},
+            "byModel": {long: {"input": 5, "output": 6, "cacheRead": 7, "cacheWrite": 8, "cost": 0.5}}})
+        first = self.first_frame(b"session tokens")
+        self.assertIn(b"session tokens", first)
+        plain = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", first).decode()
+        self.assertTrue(all(len(line) <= 80 for line in plain.split("\n")))
+        self.assertLessEqual(first.count(b"\n"), 23)
+
+
+class StatusEchoTtyTest(StatusPaneFixture):
+    """A cooked, echoing pty: what the status pane really gets from tmux."""
+    raw_slave = False
+
+    def command(self):
+        # A parent shell owns the tty and outlives the status process, as in a
+        # pane: it records the tty mode the status process left behind.
+        return ["bash", "-c", 'exec 3<&0; bash "$0" <&3 & echo $! > "$FAKE_BASE/pid"; wait $!; '
+                'echo $? > "$FAKE_BASE/rc.tmp"; stty -a > "$FAKE_BASE/stty_after"; '
+                'mv "$FAKE_BASE/rc.tmp" "$FAKE_BASE/rc"', str(ROOT / "bin/tp-status")]
+
+    def signal_status(self, number):
+        """Signal the status process; return (output, exit status, tty flags left to the parent)."""
+        os.kill(int((self.base / "pid").read_text()), number)
+        tail = b""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (self.base / "rc").exists():
+            tail += self.output(0.05)
+        flags = (self.base / "stty_after").read_text().split()
+        return tail, int((self.base / "rc").read_text()), flags
+
+    def test_wheel_flood_is_not_echoed_and_click_still_maps(self):
+        self.make_jobs(3)
+        self.assertTrue(self.lflag() & termios.ECHO)          # the fixture really echoes
+        first = self.output_until(lambda frame: b"task 3" in frame or b"\x1b[J" in frame)
+        first += self.output(0.5)
+        order = [name.decode() for name in self.row_order(first)]
+        self.assertEqual(sorted(order), ["job1", "job2", "job3"])
+        self.assertFalse(self.lflag() & termios.ECHO)         # off between reads too
+        start = time.monotonic()
+        data = b""
+        for burst in range(12):                               # 600 wheel reports
+            for number in range(50):
+                os.write(self.master, f"\x1b[<{64 + number % 2};56;{3 + number % 9}M".encode())
+            data += self.output(0.05)
+        os.write(self.master, b"\x1b[<0;17;5M\x1b[<0;17;5m")  # press + release on the second row
+        path = self.base / "viewing"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not path.exists():
+            data += self.output(0.05)
+        elapsed = time.monotonic() - start
+        data += self.output(1.5)
+        self.assertNotRegex(data, rb"<\d+;\d+;\d+[Mm]")       # no raw SGR, as ^[[<.. or bytes
+        self.assertNotIn(b"^[", data)
+        self.assertNotIn(b"\x07", data)                       # no input-queue overflow bell
+        self.assertTrue(path.exists(), "press after the flood was lost or still queued")
+        self.assertEqual(path.read_text().strip(), order[1])
+        self.assertEqual(len(self.swaps()), 1)                # the wheel viewed nothing
+        self.assertLess(elapsed, 8, "flood left an input backlog")
+        frames = data.split(ESC)[1:]
+        self.assertLessEqual(len(frames), int(elapsed + 1.5) + 3)   # bounded repaint, not per event
+        for frame in frames:
+            self.assertLessEqual(frame.count(b"\n"), 23)      # nothing scrolls the pane
+        self.assertEqual(data.split(ESC)[0], b"")             # nothing printed outside frames
+        self.assertFalse(self.lflag() & termios.ECHO)
+        tail, status, flags = self.signal_status(15)
+        self.assertIn(b"\x1b[?1006l\x1b[?1000l", tail)
+        self.assertEqual(status, 143)
+        self.assertIn("echo", flags)                          # previous mode restored on exit
+        self.assertIn("icanon", flags)
+
+    def test_keyboard_enter_and_mode_restore_on_hangup_signal(self):
+        self.make_jobs(2)
+        first = self.first_frame(b"job1", b"job2")
+        order = [name.decode() for name in self.row_order(first)]
+        os.write(self.master, b"k")
+        marker = f"── {order[0]} ".encode()
+        moved = self.output_until(lambda frame: marker in frame)
+        self.assertNotIn(b"k\x1b", moved)                     # the key itself is not echoed
+        os.write(self.master, b"\r")                          # cooked tty: ICRNL delivers Enter
+        self.wait_viewing(order[0])
+        self.assertEqual((self.base / "viewing").read_text().strip(), order[0])
+        _, status, flags = self.signal_status(1)              # SIGHUP
+        self.assertEqual(status, 143)
+        self.assertIn("echo", flags)
+        self.assertIn("icanon", flags)
 
 
 if __name__ == "__main__":

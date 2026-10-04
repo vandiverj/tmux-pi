@@ -3,6 +3,8 @@
 #
 # Keys:  j/k or ↑/↓   move
 #        enter        show the selected subagent in the viewer
+#        s            toggle session token usage page (by model; legacy bucket separate)
+#        click        left-click a subagent row = enter (other lines ignored)
 #        o            show it and move focus into it (to type to it)
 #        -            clear the viewer
 #        r / t        read its result / context packet in a popup
@@ -41,8 +43,32 @@ message=""    # one-line feedback shown in the footer
 ids=()
 last_frame="" last_cols="" last_lines=""
 
-printf '%s[?25l' "$esc"
-trap 'printf "%s[?25h%s[0m" "$esc" "$esc"' EXIT
+page=list    # list, or stats (s): session token usage page
+top=0         # first task shown when the list overflows the pane
+row_ids=()    # screen line (1-based) -> subagent id, from the last painted frame
+
+# Mouse tracking (button press + SGR coordinates) is on only while this process
+# runs, so tmux's own mouse handling (copy-mode, focus) is untouched elsewhere.
+#
+# The tty stays non-echoing and non-canonical for the whole life of this process,
+# not just inside `read -s` (which restores the mode it found after each read):
+# mouse reports arriving while a frame is being rendered would otherwise be
+# echoed into the pane as literal ^[[<64;x;yM. The previous mode is put back on
+# exit so a shell that owns this tty (or a restarted status process) is not left
+# without echo. No stty or no tty: carry on with per-read -s only.
+tty_saved=""
+if [[ -t 0 ]] && command -v stty >/dev/null 2>&1; then
+  tty_saved="$(stty -g 2>/dev/null)" || tty_saved=""
+  if [[ -n "$tty_saved" ]]; then stty -echo -icanon min 1 time 0 2>/dev/null || tty_saved=""; fi
+fi
+cleanup() {
+  printf '%s[?1006l%s[?1000l%s[?25h%s[0m' "$esc" "$esc" "$esc" "$esc"
+  if [[ -n "$tty_saved" ]]; then stty "$tty_saved" 2>/dev/null; fi
+  return 0
+}
+printf '%s[?25l%s[?1000h%s[?1006h' "$esc" "$esc" "$esc"
+trap cleanup EXIT
+trap 'exit 143' TERM HUP INT
 
 color_for() {
   case "$1" in
@@ -61,8 +87,69 @@ clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-
 # pad <width> <text> — left-align in characters (printf pads bytes, and ▸ ↑ ↓ are multibyte).
 pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
 
+# usage_summary — honest session token usage, one line per output line.
+# New states carry byModel (counted per message); states without it, and any
+# tokens byModel does not account for, go to an "unattributed" bucket rather
+# than being assigned to the last-reported model. Cache reads/writes stay apart
+# from uncached input. Claude cost is unknown (costKnown:false), never $0.
+usage_summary() {
+  local files=() f nt=0
+  for f in "$tasks"/*/state.json; do [[ -f "$f" ]] && files+=("$f"); done
+  nt=$(find "$tasks" -mindepth 2 -maxdepth 2 -name meta.json 2>/dev/null | wc -l)
+  main_state="$(dirname "$tasks")/main/state.json"
+  [[ -f "$main_state" ]] && files+=("$main_state")
+  (( ${#files[@]} )) || return 0
+  jq -nr --argjson nt "$nt" --arg main "$main_state" '
+    def k: if . >= 1000000 then "\(. / 100000 | floor / 10)M"
+           elif . >= 1000 then "\(. / 100 | floor / 10)k" else tostring end;
+    def num: if type == "number" then . else 0 end;
+    def tk: {input: (.input|num), output: (.output|num), cacheRead: (.cacheRead|num), cacheWrite: (.cacheWrite|num)};
+    def zero: {input:0, output:0, cacheRead:0, cacheWrite:0};
+    def plus($b): {input: (.input + $b.input), output: (.output + $b.output), cacheRead: (.cacheRead + $b.cacheRead), cacheWrite: (.cacheWrite + $b.cacheWrite)};
+    def minus0($b): {input: ([.input - $b.input, 0] | max), output: ([.output - $b.output, 0] | max), cacheRead: ([.cacheRead - $b.cacheRead, 0] | max), cacheWrite: ([.cacheWrite - $b.cacheWrite, 0] | max)};
+    def sum: reduce .[] as $t (zero; plus($t));
+    def empty4: (.input + .output + .cacheRead + .cacheWrite) == 0;
+    def costtxt: (map(select(.cost != null) | .cost) | add // 0) as $c
+      | (map(select(.cost == null)) | length > 0) as $u
+      | if $u then (if $c > 0 then "$\($c * 1000 | round / 1000)+?" else "$?" end) else "$\($c * 1000 | round / 1000)" end;
+    def counts: "  in \(.input|k)  cache-read \(.cacheRead|k)  cache-write \(.cacheWrite|k)  out \(.output|k)";
+    [inputs | select(type == "object") | {f: input_filename, s: .}] as $all
+    | [ $all[] | select((.s.tokens | type) == "object" or (.s.byModel | type) == "object") ] as $used
+    | [ $used[] | .s as $s
+        | (($s.harness == "claude") or ($s.costKnown == false)) as $unk
+        | (if ($s.byModel | type) == "object" then $s.byModel else {} end) as $bm
+        | ($bm | to_entries | map({model: .key, t: (.value | tk), cost: (if $unk then null else (.value.cost | if type == "number" then . else null end) end)})) as $att
+        | ($s.tokens | if type == "object" then tk else zero end) as $tot
+        | ($att | map(.t) | sum) as $got
+        | ($tot | minus0($got)) as $rem
+        | ((($s.cost | num) - ($att | map(.cost // 0) | add // 0)) | [., 0] | max) as $remcost
+        | $att
+          + (if ($rem | empty4) and ($att | length) > 0 then []
+             else [{model: null, t: (if ($att | length) > 0 then $rem else $tot end),
+                    cost: (if $unk then null else $remcost end), last: ($s.model // ""), partial: (($att | length) > 0)}] end)
+      ] | flatten as $ents
+    | ($ents | map(select(.model != null)) | group_by(.model) | map({model: .[0].model, t: (map(.t) | sum), cost: map({cost})})) as $models
+    | ($ents | map(select(.model == null and (.t | empty4 | not)))) as $leg
+    | ($used | length) as $nrec
+    | ([ $used[] | {f, zero: (.s | (if (.tokens | type) == "object" then (.tokens | tk) else ((.byModel // {}) | [.[] | tk] | sum) end) | empty4)} ]) as $recs
+    | ([ $recs[] | select(.f != $main) ] | length) as $nwork
+    | ([ $recs[] | select(.zero) ] | length) as $nzero
+    | (if ($recs | map(select(.f == $main)) | length) > 0 then 1 else 0 end) as $hasmain
+    | "session tokens (per-message by model; cache separate)",
+      ($models[] | "\(.model)", "\(.t | counts)  \(.cost | costtxt)"),
+      (if ($leg | length) > 0 then
+         ($leg | map(.last | select(. != "")) | unique) as $lasts
+         | "unattributed (legacy/partial; model switches not ruled out)",
+           "\($leg | map(.t) | sum | counts)  \($leg | map({cost}) | costtxt)",
+           (if ($lasts | length) > 0 then "  last reported model: \($lasts | join(", ")) (not an attribution)" else empty end)
+       else empty end),
+      ([$models[].t] + [$leg[].t] | sum | "total\(counts)"),
+      "records \($nrec) (main \($hasmain), workers \($nwork)); zero-token \($nzero); workers with no usage data \([$nt - $nwork, 0] | max)"
+  ' "${files[@]}" 2>/dev/null
+}
+
 render() {
-  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life queued role clock compact shown
+  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life queued role clock compact y header hint count_label n nq qfiles hdr budget sum_text sum_n sel_text sel_n msg_text msg_n need want used area full vis lines_left permission requested ul sl
   clock="$(date +%s)"
   if (( clock - last_tick >= 5 )); then
     "$ROOT/bin/tp-agent" tick >/dev/null 2>&1 || true
@@ -71,14 +158,14 @@ render() {
   cols="$(tput cols)"
   frame_cols="$cols"
   frame_lines="$(tput lines)"
-  compact=0 shown=0
+  compact=0
   (( frame_lines < 16 )) && compact=1
   rows="$(tp_rows "$session")"
   details=""
   if [[ -n "$rows" ]]; then details="$("$ROOT/bin/tp-contract" status 2>/dev/null)"; fi
   current="$(tp_opt "$session" @tp_viewing)"
 
-  ids=()
+  ids=() row_ids=()
   if [[ -n "$rows" ]]; then
     while IFS=$'\x1f' read -r id _; do ids+=("$id"); done <<<"$rows"
   fi
@@ -88,19 +175,93 @@ render() {
   if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
   if (( ${#ids[@]} == 0 )); then selected=""; fi
 
-  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean")${reset}${esc}[K"$'\n'
-  (( compact )) || out+="${esc}[K"$'\n'
-  if [[ -z "$rows" ]]; then
-    if compgen -G "$state_dir/queue/*.json" >/dev/null; then
-      out+="${dim}  waiting for a worker slot or dependency${reset}${esc}[K"$'\n'
-    else
-      out+="${dim}  no subagents yet${reset}${esc}[K"$'\n'
+  if [[ "$page" == stats ]]; then
+    # Usage page: bounded to the pane, no clickable rows, any overflow counted.
+    local ul=() nl keep=$(( frame_lines - 2 ))
+    while IFS= read -r line; do ul+=("$line"); done < <(usage_summary)   # no mapfile in bash 3.2
+    (( ${#ul[@]} )) || ul=("no usage reported yet")
+    nl=${#ul[@]}
+    if (( nl > keep )); then
+      (( keep < 1 )) && keep=1
+      ul=("${ul[@]:0:keep-1}" "… $((nl - keep + 1)) more lines (enlarge pane)")
     fi
-    shown=$((shown + 1))
+    out=""
+    for line in "${ul[@]}"; do out+="${dim}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'; done
+    header="${esc}[H${bold}usage${reset}${dim}  $(clip $((cols - 8)) "s back to list")${reset}${esc}[K"$'\n'
+    frame="${header}${out}${esc}[J"
+    return 0
+  fi
+  out=""
+  agents=0                   # task rows actually drawn
+  n=${#ids[@]}
+  nq=0; qfiles=()
+  for queued in "$state_dir"/queue/*.json; do [[ -f "$queued" ]] && qfiles+=("$queued"); done
+  nq=${#qfiles[@]}
+
+  # Frame budget: every line ends in a newline, so the last screen line stays
+  # free (a newline there would scroll the header away and shift click rows).
+  hdr=$(( compact ? 1 : 2 ))
+  budget=$(( frame_lines - 1 - hdr )); (( budget < 0 )) && budget=0
+
+  # Optional blocks, in priority order; each is dropped when it would squeeze
+  # the task list below min(need, 6) lines.
+  sum_text="" sum_n=0 sel_text="" sel_n=0 msg_text="" msg_n=0
+  if (( ! compact )); then
+    local ul=() sl
+    while IFS= read -r sl; do ul+=("$sl"); done < <(usage_summary)
+    if (( ${#ul[@]} )); then
+      sum_text="${esc}[K"$'\n'; sum_n=1
+      for sl in "${ul[@]}"; do sum_text+="${dim}$(clip "$cols" "$sl")${reset}${esc}[K"$'\n'; sum_n=$((sum_n + 1)); done
+    fi
+    if [[ -n "$selected" ]]; then
+      local d="$tasks/$selected" first
+      sel_text="${esc}[K"$'\n'"${cyan}$(clip "$cols" "── $selected ")${reset}${esc}[K"$'\n'
+      first="$(grep -m1 -v '^[[:space:]]*$' "$d/task.md" 2>/dev/null)"
+      sel_text+="${dim}task  ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
+      if [[ -s "$d/result.md" ]]; then
+        first="$(grep -m1 -v '^[[:space:]]*$' "$d/result.md")"
+        sel_text+="${dim}reply ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
+      fi
+      sel_n=$(( $(wc -l <<<"$sel_text") ))
+    fi
+    if [[ -n "$message" ]]; then
+      msg_text="${esc}[K"$'\n'"${yellow}$(clip "$cols" "$message")${reset}${esc}[K"$'\n'; msg_n=2
+    fi
+  fi
+  need=$(( (compact ? (n > 0 ? n : 1) : (n > 0 ? 2 * n : 1)) + nq ))
+  want=$(( need < 6 ? need : 6 ))
+  used=0
+  if (( budget - used - sum_n >= want )); then used=$((used + sum_n)); else sum_text=""; fi
+  if (( budget - used - sel_n >= want )); then used=$((used + sel_n)); else sel_text=""; fi
+  if (( budget - used - msg_n >= want )); then used=$((used + msg_n)); else msg_text=""; fi
+  area=$(( budget - used ))
+
+  full=0
+  (( ! compact && need <= area )) && full=1
+  vis=$n; (( vis > area )) && vis=$area
+  (( full )) && vis=$n
+  # Keep the selected task inside the visible window of an overflowing list.
+  if (( vis >= n )); then top=0; elif (( vis > 0 )); then
+    (( sel_index < top )) && top=$sel_index
+    (( sel_index >= top + vis )) && top=$(( sel_index - vis + 1 ))
+    (( top > n - vis )) && top=$(( n - vis ))
+    (( top < 0 )) && top=0
+  fi
+  y=$(( hdr + 1 ))           # first line below the header (and blank line)
+  lines_left=$area
+  if [[ -z "$rows" ]]; then
+    if (( area >= 1 )); then
+      if compgen -G "$state_dir/queue/*.json" >/dev/null; then
+        out+="${dim}  waiting for a worker slot or dependency${reset}${esc}[K"$'\n'
+      else
+        out+="${dim}  no subagents yet${reset}${esc}[K"$'\n'
+      fi
+      y=$((y + 1)); lines_left=$((lines_left - 1))
+    fi
   else
     i=0
     while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
-      if (( compact && shown >= frame_lines - 2 )); then i=$((i + 1)); continue; fi
+      if (( i < top || i >= top + vis )); then i=$((i + 1)); continue; fi
       life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
       if [[ -n "$life" ]]; then status="$life"; fi
       [[ ! -f "$tasks/$id/collected.json" ]] || status=completed
@@ -121,54 +282,28 @@ render() {
       c="$(color_for "$status")"
       if (( i == sel_index )); then c+="$rev"; fi
       out+="${c}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-      shown=$((shown + 1))
-      if (( ! compact )); then
+      agents=$((agents + 1)); lines_left=$((lines_left - 1))
+      row_ids[y]="$id"; y=$((y + 1))
+      if (( full )); then
         if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
-        if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; fi
+        if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; y=$((y + 1)); lines_left=$((lines_left - 1)); fi
       fi
       i=$((i + 1))
     done <<<"$rows"
   fi
-  for queued in "$state_dir"/queue/*.json; do
-    [[ -f "$queued" ]] || continue
-    if (( compact && shown >= frame_lines - 2 )); then continue; fi
+  for queued in "${qfiles[@]}"; do
+    (( lines_left >= 1 )) || break
     line="$(jq -r '"  \(.id)  \(.role)  queued  \(.queue_reason // "")"' "$queued")"
     out+="${magenta}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-    shown=$((shown + 1))
+    lines_left=$((lines_left - 1))
   done
-
-  # Aggregate main + all worker state by exact model. Keep cache separate from
-  # uncached input so the session's context reuse is visible.
-  local totals tm ti tc to
-  if (( ! compact )); then
-  totals="$( { find "$tasks" -mindepth 2 -maxdepth 2 -name state.json -print 2>/dev/null; echo "$(dirname "$tasks")/main/state.json"; } | while IFS= read -r f; do
-    [[ -f "$f" ]] && cat "$f"
-  done | jq -rs '
-    map(select(.model != null and .model != "" and .tokens != null))
-    | sort_by(.model) | group_by(.model)[]
-    | {model: .[0].model, input: (map(.tokens.input // 0) | add), cache: (map((.tokens.cacheRead // 0) + (.tokens.cacheWrite // 0)) | add), output: (map(.tokens.output // 0) | add)}
-    | "\(.model)\u001f\(.input)\u001f\(.cache)\u001f\(.output)"' -r 2>/dev/null)"
-  if [[ -n "$totals" ]]; then
-    out+="${esc}[K"$'\n'"${bold}session tokens by model${reset}${esc}[K"$'\n'
-    while IFS=$'\x1f' read -r tm ti tc to; do
-      out+="${dim}$(pad 30 "$tm")${reset}in $(pad 9 "$ti") cache $(pad 9 "$tc") out $to${esc}[K"$'\n'
-    done <<<"$totals"
-  fi
-
-  if [[ -n "$selected" ]]; then
-    local d="$tasks/$selected" first
-    out+="${esc}[K"$'\n'"${cyan}$(clip "$cols" "── $selected ")${reset}${esc}[K"$'\n'
-    first="$(grep -m1 -v '^[[:space:]]*$' "$d/task.md" 2>/dev/null)"
-    out+="${dim}task  ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
-    if [[ -s "$d/result.md" ]]; then
-      first="$(grep -m1 -v '^[[:space:]]*$' "$d/result.md")"
-      out+="${dim}reply ${reset}$(clip $((cols - 6)) "$first")${esc}[K"$'\n'
-    fi
-  fi
-  if [[ -n "$message" ]]; then out+="${esc}[K"$'\n'"${yellow}$(clip "$cols" "$message")${reset}${esc}[K"$'\n'; fi
-  fi
-  out+="${esc}[J"
-  frame="$out"
+  out+="$sum_text$sel_text$msg_text"
+  count_label="subagents $agents"
+  if (( agents < ${#ids[@]} )); then count_label+="/${#ids[@]}"; fi
+  hint="$(clip $((cols - ${#count_label} - 2)) "s stats · click/j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean")"
+  header="${esc}[H${bold}${count_label}${reset}${dim}  ${hint}${reset}${esc}[K"$'\n'
+  (( compact )) || header+="${esc}[K"$'\n'
+  frame="${header}${out}${esc}[J"
 }
 
 # Keep the one-second bounded poll (including elapsed contract info), but leave
@@ -206,18 +341,55 @@ popup() {
   run tmux display-popup -c "$client" -E -w 90% -h 80% -T " $selected: $1 " "less -R $(printf %q "$file")"
 }
 
+# Input that changes nothing (wheel, drag, release, unknown sequences) is drained
+# without a repaint, so a scroll flood cannot build a backlog behind one render
+# per event; the frame still refreshes at most once a second meanwhile.
+dirty=1 painted_at=-1
 while true; do
-  paint
-  message=""
+  if (( dirty || SECONDS != painted_at )); then
+    paint
+    painted_at=$SECONDS dirty=0
+    message=""
+  fi
   key=""
   IFS= read -rsn1 -t 1 key; rc=$?
-  if (( rc > 128 )); then continue; fi          # timeout: just refresh
-  if (( rc != 0 )); then sleep 1; continue; fi  # no tty (e.g. during resize)
+  if (( rc > 128 )); then dirty=1; continue; fi          # timeout: just refresh
+  if (( rc != 0 )); then sleep 1; dirty=1; continue; fi  # no tty (e.g. during resize)
   if [[ "$key" == "$esc" ]]; then
-    IFS= read -rsn2 -t 1 rest
-    case "$rest" in "[A") key=k ;; "[B") key=j ;; *) key="" ;; esac
+    key=ignore rest=""   # not Enter: unrecognised sequences and clicks fall through the key case
+    # Consume one whole CSI sequence (through its final byte) so no tail is left
+    # behind to be read as keys; a truncated sequence times out and is dropped.
+    if IFS= read -rsn1 -t 1 c && [[ "$c" == "[" ]]; then
+      n=0
+      while (( n < 32 )) && IFS= read -rsn1 -t 1 c; do
+        if [[ "$c" == "$esc" ]]; then   # cut short by the next sequence: start over on that one
+          rest="" n=0
+          IFS= read -rsn1 -t 1 c && [[ "$c" == "[" ]] || break
+          continue
+        fi
+        n=$((n + 1)); rest+="$c"
+        case "$c" in   # parameter/intermediate bytes continue; anything else is final
+          [0-9\;\<\=\>\?\ \!\"\#\$%\&\'\(\)\*+,./-]) ;;
+          *) break ;;
+        esac
+      done
+    fi
+    case "$rest" in
+      A) key=k ;;
+      B) key=j ;;
+      # SGR mouse "<b;x;yM": only a plain left press (b=0) on a task row acts.
+      "<0;"*";"*M)
+        if [[ "$rest" =~ ^\<0\;[0-9]+\;([0-9]+)M$ && -n "${row_ids[${BASH_REMATCH[1]}]:-}" ]]; then
+          selected="${row_ids[${BASH_REMATCH[1]}]}"
+          run "$ROOT/bin/tp-view" "$selected"
+          dirty=1
+        fi ;;
+    esac
   fi
+  [[ "$key" == ignore ]] || dirty=1
+  if [[ "$page" == stats && "$key" != s ]]; then key=ignore; fi   # list actions stay off the usage page
   case "$key" in
+    s) if [[ "$page" == stats ]]; then page=list; else page=stats; fi ;;
     j) move 1 ;;
     k) move -1 ;;
     "") if [[ -n "$selected" ]]; then run "$ROOT/bin/tp-view" "$selected"; fi ;;

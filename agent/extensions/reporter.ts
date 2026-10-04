@@ -13,9 +13,11 @@
  * tp-spawn's run.sh records the process exit separately.
  */
 
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+type Tokens = { input: number; output: number; cacheRead: number; cacheWrite: number };
 
 type State = {
 	id: string;
@@ -26,7 +28,9 @@ type State = {
 	turns: number;
 	tools: number;
 	toolErrors: number;
-	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	tokens: Tokens;
+	// Usage by the model that produced each assistant message, so a model switch keeps history.
+	byModel: Record<string, Tokens & { cost: number }>;
 	cost: number;
 	error: string;
 	updated: string;
@@ -77,6 +81,7 @@ export default function (pi: ExtensionAPI) {
 		tools: 0,
 		toolErrors: 0,
 		tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		byModel: {},
 		cost: 0,
 		error: "",
 		updated: "",
@@ -98,7 +103,24 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// A restarted or resumed worker reuses its task dir; carry over its totals instead of resetting.
+	const num = (v: any) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+	const restore = () => {
+		try {
+			const prev = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+			if (prev?.harness !== "pi" || prev.id !== s.id) return;
+			s.turns = num(prev.turns);
+			s.tools = num(prev.tools);
+			s.cost = num(prev.cost);
+			for (const k of Object.keys(s.tokens) as (keyof Tokens)[]) s.tokens[k] = num(prev.tokens?.[k]);
+			for (const [name, u] of Object.entries<any>(prev.byModel ?? {})) {
+				s.byModel[name] = { input: num(u?.input), output: num(u?.output), cacheRead: num(u?.cacheRead), cacheWrite: num(u?.cacheWrite), cost: num(u?.cost) };
+			}
+		} catch {}
+	};
+
 	pi.on("session_start", (_event, ctx) => {
+		restore();
 		s.model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 		save();
 	});
@@ -131,11 +153,22 @@ export default function (pi: ExtensionAPI) {
 		s.turns += 1;
 		const u = m.usage;
 		if (u) {
-			s.tokens.input += u.input ?? 0;
-			s.tokens.output += u.output ?? 0;
-			s.tokens.cacheRead += u.cacheRead ?? 0;
-			s.tokens.cacheWrite += u.cacheWrite ?? 0;
-			s.cost += u.cost?.total ?? 0;
+			const d = { input: num(u.input), output: num(u.output), cacheRead: num(u.cacheRead), cacheWrite: num(u.cacheWrite), cost: num(u.cost?.total) };
+			s.tokens.input += d.input;
+			s.tokens.output += d.output;
+			s.tokens.cacheRead += d.cacheRead;
+			s.tokens.cacheWrite += d.cacheWrite;
+			s.cost += d.cost;
+			// The message names the model that produced it; the selected model is only a fallback.
+			const name = m.model ? `${m.provider ? `${m.provider}/` : ""}${m.model}` : s.model;
+			if (name) {
+				const b = (s.byModel[name] ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+				b.input += d.input;
+				b.output += d.output;
+				b.cacheRead += d.cacheRead;
+				b.cacheWrite += d.cacheWrite;
+				b.cost += d.cost;
+			}
 		}
 		if (m.stopReason === "error" || m.errorMessage) s.error = String(m.errorMessage ?? "error");
 		const text = textOf(m).trim();

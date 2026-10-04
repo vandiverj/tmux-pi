@@ -50,7 +50,14 @@ fi
 
 # Token totals come from the transcript. At Stop it can still lack the final
 # message, so totals are recomputed on the next prompt too. Streaming writes one
-# line per content block with the same message id and usage, so dedupe by id.
+# line per content block with the same message id and usage, so dedupe by id (the
+# last line per id wins). byModel groups those unique messages by message.model;
+# empty and <synthetic> (Claude Code's zero-usage error/interrupt placeholder) are
+# left out of byModel and never become state.model (the last real model is kept).
+# Only UserPromptSubmit and Stop recompute: reading the whole transcript on every
+# tool event would be O(n^2). Caveat: Stop can fire before the final message is
+# flushed, so the last turn may be missing until the next prompt, which a one-shot
+# worker may never get; totals are a lower bound mid-turn and possibly after Stop.
 usage='null'
 transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
 if [[ -n "$transcript" ]]; then
@@ -59,14 +66,18 @@ if [[ -n "$transcript" ]]; then
 fi
 if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]]; then
   usage="$(jq -s '
-    [ .[] | select(.type == "assistant" and .message.usage != null) ]
-    | { turns: ([ .[].message.id ] | unique | length),
-        tokens: (group_by(.message.id) | map(last.message.usage) | {
-          input: (map(.input_tokens // 0) | add // 0),
-          output: (map(.output_tokens // 0) | add // 0),
-          cacheRead: (map(.cache_read_input_tokens // 0) | add // 0),
-          cacheWrite: (map(.cache_creation_input_tokens // 0) | add // 0) }),
-        model: (last.message.model // "") }
+    def tok: { input: (map(.input_tokens // 0) | add // 0),
+               output: (map(.output_tokens // 0) | add // 0),
+               cacheRead: (map(.cache_read_input_tokens // 0) | add // 0),
+               cacheWrite: (map(.cache_creation_input_tokens // 0) | add // 0) };
+    def real: . != null and . != "" and . != "<synthetic>";
+    [ .[] | select(.type == "assistant" and .message.usage != null) ] as $a
+    | ($a | group_by(.message.id) | map(last)) as $m
+    | { turns: ($m | length),
+        tokens: ($m | map(.message.usage) | tok),
+        byModel: ($m | map(select(.message.model | real)) | group_by(.message.model)
+                  | map({ key: .[0].message.model, value: (map(.message.usage) | tok) }) | from_entries),
+        model: ([ $a[].message.model | select(real) ] | last // "") }
   ' "$transcript" 2>/dev/null)" || usage='null'
   if [[ -z "$usage" ]]; then usage='null'; fi
 fi
@@ -79,8 +90,10 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   def active: turn > settled;
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
+  # Transcripts carry no cost. cost stays numeric 0 because lib/goal.py treats a
+  # non-numeric cost as unmetered and fails closed; costKnown:false marks it unknown.
   { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0, tools: 0, toolErrors: 0,
-    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, error: "" }
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, costKnown: false, error: "" }
   + $prev
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then

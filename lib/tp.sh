@@ -45,6 +45,7 @@ tp_pane_state() {
 # tp_rows <session> — one line per subagent, oldest first, fields separated by
 # \x1f (a tab would collapse empty fields in `read`):
 #   id worker status tool tokens cost model
+# tokens is ↑uncached-input cCACHE(read+write) ↓output; cost is $? when unknown (Claude).
 # status merges the reporter's state.json with the pane: a dead pane is done or
 # failed:<code> from run.sh's exit file, a missing pane is killed.
 tp_rows() {
@@ -58,8 +59,9 @@ tp_rows() {
       | def k: if . >= 1000000 then "\(. / 100000 | floor / 10)M"
                elif . >= 1000 then "\(. / 100 | floor / 10)k" else tostring end;
       [ $m.id, $m.worker, $m.pane, ($s.state // "starting"), ($s.tool // ""),
-        (if $s.tokens then "↑\(($s.tokens.input + $s.tokens.cacheRead + $s.tokens.cacheWrite) | k) ↓\($s.tokens.output | k)" else "" end),
-        (if ($s.cost // 0) > 0 then "$\($s.cost * 1000 | round / 1000)" else "" end),
+        (if $s.tokens then "↑\($s.tokens.input | k) c\((($s.tokens.cacheRead // 0) + ($s.tokens.cacheWrite // 0)) | k) ↓\($s.tokens.output | k)" else "" end),
+        (if $s.costKnown == false or ($s.harness == "claude" and ($s.cost // 0) == 0) then "$?"
+         elif ($s.cost // 0) > 0 then "$\($s.cost * 1000 | round / 1000)" else "" end),
         ([ ($s.model // (if $m.model == "" then "default" else $m.model end)),
            (if $m.thinking == "" then empty else $m.thinking end) ] | join(":")) ]
       | join("\u001f")' 2>/dev/null)" || continue

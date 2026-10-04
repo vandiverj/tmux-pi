@@ -109,6 +109,51 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertFalse((self.task / "result.md").exists())
         self.review()
 
+    def transcript(self, lines):
+        path = self.base / "t.jsonl"
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return str(path)
+
+    @staticmethod
+    def msg(mid, model, out, inp=1, cr=10, cw=2):
+        return {"type": "assistant", "message": {"id": mid, "model": model, "usage": {
+            "input_tokens": inp, "output_tokens": out, "cache_read_input_tokens": cr,
+            "cache_creation_input_tokens": cw}}}
+
+    def test_usage_by_model_dedupes_and_ignores_synthetic(self):
+        path = self.transcript([
+            self.msg("a", "m-one", 5), self.msg("a", "m-one", 20),  # streaming duplicate: last wins
+            self.msg("b", "m-two", 7),
+            self.msg("c", "m-one", 3),
+            self.msg("s", "<synthetic>", 0, inp=0, cr=0, cw=0),
+        ])
+        self.hook("SessionStart", model="m-one")
+        self.hook("UserPromptSubmit", transcript_path=path)
+        self.hook("PostToolUse", tool_name="Bash", transcript_path=path)
+        self.hook("Stop", last_assistant_message="r", transcript_path=path)
+        s = self.state()
+        self.assertEqual(s["model"], "m-one")  # last real model, not <synthetic>
+        self.assertEqual(s["turns"], 4)
+        self.assertEqual(s["tokens"], {"input": 3, "output": 30, "cacheRead": 30, "cacheWrite": 6})
+        self.assertEqual(s["byModel"], {
+            "m-one": {"input": 2, "output": 23, "cacheRead": 20, "cacheWrite": 4},
+            "m-two": {"input": 1, "output": 7, "cacheRead": 10, "cacheWrite": 2}})
+        self.assertEqual(s["cost"], 0)
+        self.assertIs(s["costKnown"], False)
+
+    def test_tool_events_do_not_read_transcript(self):
+        path = self.transcript([self.msg("a", "m-one", 5)])
+        self.hook("UserPromptSubmit", transcript_path=path)
+        self.hook("Stop", last_assistant_message="r", transcript_path=path)
+        before = self.state()["tokens"]
+        self.hook("UserPromptSubmit", transcript_path=self.transcript([self.msg("a", "m-one", 5), self.msg("b", "m-one", 9)]))
+        self.hook("PostToolUse", tool_name="Bash", transcript_path=path)
+        self.assertNotEqual(self.state()["tokens"], before)
+        self.assertEqual(self.state()["turns"], 2)
+        self.transcript([self.msg("a", "m-one", 5), self.msg("b", "m-one", 9), self.msg("c", "m-one", 9)])
+        self.hook("PostToolUse", tool_name="Bash", transcript_path=str(self.base / "t.jsonl"))
+        self.assertEqual(self.state()["turns"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

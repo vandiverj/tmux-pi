@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Shared task interface for Pi, Claude Code, and the tmux status pane."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from uuid import uuid4
+
+ROOT = Path(__file__).resolve().parent.parent
+ROLES = ROOT / "agent" / "roles"
+IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ACTIVE = {"starting", "working", "tool", "permission", "needs_input"}
+LOCAL = ("slotstream/", "lmstudio/", "mlx/", "ollama/")
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out, indent=2)
+            out.write("\n")
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def state_dir():
+    explicit = os.getenv("TP_STATE_DIR")
+    if explicit:
+        return Path(explicit).resolve()
+    if os.getenv("TMUX"):
+        target = ["-t", os.environ["TMUX_PANE"]] if os.getenv("TMUX_PANE") else []
+        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True).strip()
+    else:
+        session = os.getenv("TP_SESSION", "tmux-pi")
+    value = subprocess.check_output(["tmux", "show-options", "-qv", "-t", f"={session}:", "@tp_state_dir"], text=True).strip()
+    if not value:
+        raise ValueError("no tmux-pi state directory; start a workspace with tp")
+    return Path(value)
+
+
+def task_dir(base, ident):
+    if not IDENT.fullmatch(ident):
+        raise ValueError("invalid task id")
+    path = base / "tasks" / ident
+    if not (path / "meta.json").is_file():
+        raise ValueError(f"unknown task: {ident}")
+    return path
+
+
+def lifecycle(path):
+    state = read_json(path / "state.json")
+    if (path / "stopped.json").exists():
+        return "stopped"
+    if (path / "collected.json").exists():
+        return "completed"
+    if (path / "exit").exists():
+        return "settled" if (path / "exit").read_text().strip() == "0" and (path / "result.md").exists() else "failed"
+    raw = state.get("state", "starting")
+    status = {"waiting": "settled", "error": "failed", "tool": "working", "permission": "needs_input"}.get(raw, raw)
+    if status in {"starting", "working", "needs_input"} and any(
+            read_json(path / name).get("status") == "pending"
+            for name in ("permission-request.json", "capability-request.json")):
+        return "needs_input"
+    return status
+
+
+def record(path, include_result=False):
+    meta = read_json(path / "meta.json")
+    state = read_json(path / "state.json")
+    result_path = path / "result.md"
+    result_text = result_path.read_text() if result_path.exists() else ""
+    match = re.search(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", result_text, re.I)
+    result = {
+        "id": meta.get("id", path.name), "role": meta.get("role", "generic"),
+        "harness": meta.get("worker", "unknown"), "model": state.get("model") or meta.get("model"),
+        "effort": meta.get("thinking"), "status": lifecycle(path),
+        "assignment": (path / "request.md").read_text() if (path / "request.md").exists() else "",
+        "deliverable": meta.get("deliverable", ""), "parent": meta.get("parent", ""),
+        "route": meta.get("route_info", {}), "task_dir": str(path),
+        "packet": str(path / "packet.md"), "result_path": str(result_path) if result_path.exists() else None,
+        "result_status": match.group(1).lower() if match else None,
+        "tool": state.get("tool", ""), "updated": state.get("updated", meta.get("created")),
+        "tokens": state.get("tokens"), "cost": state.get("cost"),
+        "permission": read_json(path / "permission-request.json") if (path / "permission-request.json").exists() else None,
+        "capability_request": read_json(path / "capability-request.json") if (path / "capability-request.json").exists() else None,
+        "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
+                      else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
+    }
+    if include_result:
+        result["result"] = result_text
+    return result
+
+
+def all_records(base):
+    tasks = base / "tasks"
+    rows = [record(path) for path in tasks.iterdir() if (path / "meta.json").is_file()] if tasks.exists() else []
+    queue = base / "queue"
+    if queue.exists():
+        for path in queue.glob("*.json"):
+            item = read_json(path)
+            rows.append({"id": item.get("id"), "role": item.get("role"), "harness": item.get("worker"),
+                         "model": item.get("model"), "effort": item.get("thinking"), "status": "queued",
+                         "assignment": item.get("task"), "deliverable": item.get("deliverable"),
+                         "parent": item.get("parent"), "route": item.get("route_info"),
+                         "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created")})
+    return sorted(rows, key=lambda row: row.get("updated") or "")
+
+
+def write_index(base):
+    rows = all_records(base)
+    objective = base / "session-objective.md"
+    def brief(row):
+        return {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
+                "deliverable", "task_dir", "result_path", "permission", "capability_request", "updated")}
+    value = {
+        "schema": "tp-session-index:v1", "updated": now(),
+        "objective": objective.read_text().strip() if objective.exists() else "",
+        "active": [brief(r) for r in rows if r["status"] in {"queued", "starting", "working", "needs_input"}],
+        "pending": [brief(r) for r in rows if r["status"] in {"settled", "failed"}],
+        "recent": [brief(r) for r in rows[-12:]],
+    }
+    atomic_json(base / "session-index.json", value)
+    return value
+
+
+def route(task, role, worker, model, thinking, context=(), deliverable=""):
+    catalog = read_json(ROOT / "config/router.json").get("models", [])
+    known = next((entry for entry in catalog if entry.get("model") == model), None) if model else None
+    if model:
+        if known and worker and worker != known.get("worker"):
+            raise ValueError(f"model {model} belongs to {known['worker']}, not {worker}")
+        if not known and worker and (("/" in model) != (worker == "pi")):
+            raise ValueError(f"model {model} is not compatible with {worker}")
+        worker = worker or (known.get("worker") if known else "pi" if "/" in model else "claude")
+        return worker, model, thinking or "medium", {"source": "main_choice", "reason": "explicit dispatch selection"}
+    payload = (f"Worker role: {role}\nAssignment: {task}\n"
+               f"Expected deliverable: {deliverable}\nSelected context paths: {', '.join(context)}")
+    try:
+        raw = subprocess.run([str(ROOT / "bin/tp-route")], input=payload, text=True,
+                             capture_output=True, timeout=15, check=True)
+        decision = json.loads(raw.stdout)
+        if decision.get("worker") not in {"pi", "claude"} or not decision.get("model"):
+            raise ValueError("router returned an invalid model")
+        matched = next((entry for entry in catalog if entry.get("model") == decision["model"]
+                        and entry.get("worker") == decision["worker"]), None)
+        if not matched:
+            raise ValueError("router returned an incompatible model/harness pair")
+        if worker and worker != decision["worker"]:
+            raise ValueError("requested worker conflicts with router")
+        return decision["worker"], decision["model"], thinking or decision.get("thinking") or "medium", {
+            "source": "classifier", "recommendation": decision,
+            "reason": "classifier recommendation accepted",
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as error:
+        config = read_json(ROOT / "config/router.json")
+        fallback = config.get("claude_preference", {}).get("ordinary", {}) if worker == "claude" else config.get("routes", {}).get("coding", {})
+        return worker or "pi", fallback.get("model", "openai-codex/gpt-6-sol"), thinking or fallback.get("thinking", "medium"), {
+            "source": "main_fallback", "reason": f"classifier unavailable: {str(error)[:200]}",
+        }
+
+
+def capacity(base, proposed, worker, model):
+    cfg = read_json(ROOT / "config/orchestration.json")
+    active = [r for r in all_records(base) if r["status"] in {"starting", "working", "needs_input"}]
+    if len(active) >= int(cfg.get("max_active_workers", 4)):
+        return False, "global worker slots full"
+    if worker == "pi" and model.startswith(LOCAL):
+        local = [r for r in active if r.get("harness") == "pi" and str(r.get("model") or "").startswith(LOCAL)]
+        if len(local) >= int(cfg.get("max_local_workers", 2)):
+            return False, "local model slots full"
+    for parent in proposed.get("after", []):
+        try:
+            predecessor = record(task_dir(base, parent))
+        except ValueError:
+            return False, f"dependency {parent} has not started"
+        if predecessor["status"] not in {"settled", "completed"} or not predecessor["result_path"]:
+            return False, f"waiting for {parent}"
+    return True, ""
+
+
+def launch(base, item):
+    args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
+            "--worker", item["worker"], "--model", item["model"], "--thinking", item["thinking"],
+            "--route-json", json.dumps(item["route_info"])]
+    if item.get("deliverable"):
+        args += ["--deliverable", item["deliverable"]]
+    if item.get("workdir"):
+        args += ["--workdir", item["workdir"]]
+    if item.get("parent"):
+        args += ["--parent", item["parent"]]
+    for spec in item.get("context", []):
+        args += ["--context", spec]
+    for note in item.get("notes", []):
+        args += ["--note", note]
+    for parent in item.get("after", []):
+        predecessor = record(task_dir(base, parent))
+        if predecessor.get("result_path"):
+            args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
+    args += ["--", item["task"]]
+    run = subprocess.run(args, text=True, capture_output=True)
+    if run.returncode:
+        raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
+    return record(task_dir(base, item["id"]))
+
+
+def locked(base):
+    base.mkdir(parents=True, exist_ok=True)
+    lock = open(base / ".tp-agent.lock", "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def dispatch(args, base):
+    if not (ROLES / f"{args.role}.md").is_file():
+        raise ValueError(f"unknown role: {args.role}")
+    worker, model, thinking, route_info = route(args.task, args.role, args.worker, args.model, args.thinking,
+                                                 args.context or [], args.deliverable)
+    item = {"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
+            "task": args.task, "workdir": args.workdir, "worker": worker, "model": model,
+            "thinking": thinking, "route_info": route_info, "deliverable": args.deliverable or "",
+            "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
+            "notes": args.note or []}
+    with locked(base):
+        ok, reason = capacity(base, item, worker, model)
+        if ok:
+            value = launch(base, item)
+        else:
+            item["queue_reason"] = reason
+            atomic_json(base / "queue" / f"{item['id']}.json", item)
+            value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
+                     "harness": worker, "model": model, "effort": thinking}
+        write_index(base)
+    return value
+
+
+def tick(base):
+    started = []
+    with locked(base):
+        for path in sorted((base / "queue").glob("*.json"), key=lambda p: p.stat().st_mtime) if (base / "queue").exists() else []:
+            item = read_json(path)
+            ok, _ = capacity(base, item, item["worker"], item["model"])
+            if not ok:
+                continue
+            try:
+                started.append(launch(base, item)["id"])
+                path.unlink()
+            except RuntimeError as error:
+                item["queue_reason"] = f"start failed: {error}"
+                atomic_json(path, item)
+        write_index(base)
+    return {"started": started}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    d = sub.add_parser("dispatch", help="route and start or queue a role task")
+    d.add_argument("--role", required=True)
+    d.add_argument("--task", required=True)
+    d.add_argument("--worker", choices=["pi", "claude"])
+    d.add_argument("--model")
+    d.add_argument("--thinking")
+    d.add_argument("--workdir")
+    d.add_argument("--deliverable", default="")
+    d.add_argument("--parent")
+    d.add_argument("--after", action="append", default=[])
+    d.add_argument("--context", action="append", default=[])
+    d.add_argument("--note", action="append", default=[])
+    retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
+    retry.add_argument("id")
+    retry.add_argument("--reason", required=True)
+    retry.add_argument("--task")
+    retry.add_argument("--role")
+    retry.add_argument("--worker", choices=["pi", "claude"])
+    retry.add_argument("--model")
+    retry.add_argument("--thinking")
+    for name in ("list", "index", "tick"):
+        sub.add_parser(name)
+    for name in ("inspect", "collect", "stop"):
+        sub.add_parser(name).add_argument("id")
+    m = sub.add_parser("message")
+    m.add_argument("id")
+    m.add_argument("--text", required=True)
+    o = sub.add_parser("objective")
+    o.add_argument("text")
+    q = sub.add_parser("request", help="worker asks main for a skill, tool, or context")
+    q.add_argument("--kind", choices=["skill", "tool", "context"], required=True)
+    q.add_argument("--what", required=True)
+    q.add_argument("--reason", required=True)
+    args = parser.parse_args()
+    base = state_dir()
+    if args.command == "dispatch":
+        value = dispatch(args, base)
+    elif args.command == "retry":
+        if not args.reason.strip():
+            raise ValueError("retry reason must describe what changed")
+        previous = task_dir(base, args.id)
+        meta = read_json(previous / "meta.json")
+        prior = record(previous)
+        if prior["status"] in {"starting", "working", "needs_input"}:
+            raise ValueError("stop or settle the prior attempt before retrying")
+        original = (previous / "request.md").read_text().strip()
+        replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
+                                         task=args.task or original, worker=args.worker,
+                                         model=args.model, thinking=args.thinking,
+                                         workdir=meta.get("workdir"),
+                                         deliverable=meta.get("deliverable", ""),
+                                         parent=args.id, after=[], context=[],
+                                         note=[f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion."])
+        value = dispatch(replacement, base)
+    elif args.command == "tick":
+        value = tick(base)
+    elif args.command == "index":
+        tick(base)
+        value = write_index(base)
+    elif args.command == "list":
+        value = all_records(base)
+    elif args.command == "objective":
+        (base / "session-objective.md").write_text(args.text.strip() + "\n")
+        value = write_index(base)
+    elif args.command == "request":
+        own = os.getenv("TP_TASK_DIR")
+        if not own:
+            raise ValueError("request is only available inside a worker task")
+        path = Path(own).resolve()
+        if path.parent != (base / "tasks").resolve() or not (path / "meta.json").is_file():
+            raise ValueError("invalid worker task directory")
+        value = {"kind": args.kind, "what": args.what, "reason": args.reason,
+                 "status": "pending", "requested": now()}
+        atomic_json(path / "capability-request.json", value)
+        write_index(base)
+    elif args.command in {"inspect", "collect", "stop", "message"}:
+        queued = base / "queue" / f"{args.id}.json"
+        if args.command == "stop" and IDENT.fullmatch(args.id) and queued.is_file():
+            queued.unlink()
+            value = {"id": args.id, "status": "stopped"}
+            write_index(base)
+            print(json.dumps(value, indent=2))
+            return
+        path = task_dir(base, args.id)
+        if args.command == "inspect":
+            value = record(path, include_result=True)
+        elif args.command == "collect":
+            value = record(path, include_result=True)
+            if value["status"] == "settled":
+                atomic_json(path / "collected.json", {"collected": now()})
+                value["status"] = "completed"
+                write_index(base)
+        elif args.command == "stop":
+            run = subprocess.run([str(ROOT / "bin/tp-kill"), args.id], text=True, capture_output=True)
+            if run.returncode:
+                raise RuntimeError(run.stderr.strip())
+            value = {"id": args.id, "status": "stopped"}
+            write_index(base)
+        else:
+            pane = read_json(path / "meta.json").get("pane")
+            if not pane or lifecycle(path) in {"failed", "stopped"}:
+                raise ValueError("worker cannot receive a message")
+            subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)
+            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            (path / "collected.json").unlink(missing_ok=True)
+            with (path / "messages.jsonl").open("a") as out:
+                out.write(json.dumps({"sent": now(), "text": args.text}) + "\n")
+            requested = path / "capability-request.json"
+            if requested.exists():
+                pending = read_json(requested)
+                if pending.get("status") == "pending":
+                    pending.update({"status": "answered", "answered": now()})
+                    atomic_json(requested, pending)
+            value = {"id": args.id, "sent": True}
+    else:
+        raise ValueError("unknown command")
+    print(json.dumps(value, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
+        print(f"tp-agent: {error}", file=sys.stderr)
+        sys.exit(1)

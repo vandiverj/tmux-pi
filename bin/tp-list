@@ -20,14 +20,28 @@ source "$ROOT/lib/tp.sh"
 
 session="$(tp_session)"
 current="$(tp_opt "$session" @tp_viewing)"
+state_dir="$(tp_opt "$session" @tp_state_dir)"
 
 rows="$(tp_rows "$session")"
-if [[ -z "$rows" ]]; then echo "  no subagents"; exit 0; fi
+if [[ -z "$rows" && ! -d "$state_dir/queue" ]]; then echo "  no subagents"; exit 0; fi
 details="$("$ROOT/bin/tp-contract" status 2>/dev/null || true)"
-while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
+if [[ -n "$rows" ]]; then while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
   life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
   detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
   if [[ -n "$life" ]]; then status="$life"; fi
+  [[ ! -f "$state_dir/tasks/$id/collected.json" ]] || status=completed
+  [[ ! -f "$state_dir/tasks/$id/stopped.json" ]] || status=stopped
+  role="$(jq -r '.role // "generic"' "$state_dir/tasks/$id/meta.json" 2>/dev/null)"
+  detail="role $role${detail:+ · $detail}"
+  for request_file in permission-request.json capability-request.json; do
+    if [[ -f "$state_dir/tasks/$id/$request_file" ]]; then
+      request="$(jq -r 'select(.status == "pending") | (.target // .what // "input needed")' "$state_dir/tasks/$id/$request_file" 2>/dev/null)"
+      if [[ -n "$request" ]]; then
+        detail="$request · $detail"
+        [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input
+      fi
+    fi
+  done
   if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
   mark=" "; if [[ "$id" == "$current" ]]; then mark="▸"; fi
   # Pad by characters, not bytes (▸ ↑ ↓ are multibyte).
@@ -35,4 +49,8 @@ while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
     "$id" $((22 - ${#id})) "" "$worker" $((8 - ${#worker})) "" "$status" $((12 - ${#status})) "" \
     "$tokens" $((16 - ${#tokens})) "" "$cost" $((8 - ${#cost})) "" "$model"
   if [[ -n "$detail" ]]; then printf '    %s\n' "$detail"; fi
-done <<<"$rows"
+done <<<"$rows"; fi
+for queued in "$state_dir"/queue/*.json; do
+  [[ -f "$queued" ]] || continue
+  jq -r '"  \(.id)  \(.role)  queued  \(.queue_reason // "")"' "$queued"
+done

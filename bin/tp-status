@@ -28,7 +28,9 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
 session="$(tp_session)" || exit 1
-tasks="$(tp_opt "$session" @tp_state_dir)/tasks"
+state_dir="$(tp_opt "$session" @tp_state_dir)"
+tasks="$state_dir/tasks"
+last_tick=0
 
 esc=$'\e'
 reset="${esc}[0m" bold="${esc}[1m" dim="${esc}[2m" rev="${esc}[7m"
@@ -60,10 +62,17 @@ clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-
 pad() { local t="$2"; printf '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
 
 render() {
-  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life
+  local cols rows current out i id worker status tool tokens cost model line c sel_index details detail life queued role clock compact shown
+  clock="$(date +%s)"
+  if (( clock - last_tick >= 5 )); then
+    "$ROOT/bin/tp-agent" tick >/dev/null 2>&1 || true
+    last_tick="$clock"
+  fi
   cols="$(tput cols)"
   frame_cols="$cols"
   frame_lines="$(tput lines)"
+  compact=0 shown=0
+  (( frame_lines < 16 )) && compact=1
   rows="$(tp_rows "$session")"
   details=""
   if [[ -n "$rows" ]]; then details="$("$ROOT/bin/tp-contract" status 2>/dev/null)"; fi
@@ -79,29 +88,59 @@ render() {
   if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
   if (( ${#ids[@]} == 0 )); then selected=""; fi
 
-  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean")${reset}${esc}[K"$'\n'"${esc}[K"$'\n'
+  out="${esc}[H${bold}subagents${reset}${dim}  $(clip $((cols - 11)) "j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean")${reset}${esc}[K"$'\n'
+  (( compact )) || out+="${esc}[K"$'\n'
   if [[ -z "$rows" ]]; then
-    out+="${dim}$(clip "$cols" "  no subagents — tp-spawn \"task\" to start one")${reset}${esc}[K"$'\n'
+    if compgen -G "$state_dir/queue/*.json" >/dev/null; then
+      out+="${dim}  waiting for a worker slot or dependency${reset}${esc}[K"$'\n'
+    else
+      out+="${dim}  no subagents yet${reset}${esc}[K"$'\n'
+    fi
+    shown=$((shown + 1))
   else
     i=0
     while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
+      if (( compact && shown >= frame_lines - 2 )); then i=$((i + 1)); continue; fi
       life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
       if [[ -n "$life" ]]; then status="$life"; fi
+      [[ ! -f "$tasks/$id/collected.json" ]] || status=completed
+      [[ ! -f "$tasks/$id/stopped.json" ]] || status=stopped
+      detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
+      role="$(jq -r '.role // "generic"' "$tasks/$id/meta.json" 2>/dev/null)"
+      detail="role $role${detail:+ · $detail}"
+      if [[ -f "$tasks/$id/permission-request.json" ]]; then
+        permission="$(jq -r 'select(.status == "pending") | "permission: " + (.target // "sensitive read")' "$tasks/$id/permission-request.json" 2>/dev/null)"
+        if [[ -n "$permission" ]]; then detail="$permission · $detail"; [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input; fi
+      fi
+      if [[ -f "$tasks/$id/capability-request.json" ]]; then
+        requested="$(jq -r 'select(.status == "pending") | "asks for " + (.kind // "help") + ": " + (.what // "")' "$tasks/$id/capability-request.json" 2>/dev/null)"
+        if [[ -n "$requested" ]]; then detail="$requested · $detail"; [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input; fi
+      fi
       if [[ "$id" == "$current" ]]; then line="▸ "; else line="  "; fi
       line+="$(pad 20 "$id")$(pad 7 "$worker")$(pad 12 "$status")$(pad 15 "$tokens")$(pad 8 "$cost")$model"
       c="$(color_for "$status")"
       if (( i == sel_index )); then c+="$rev"; fi
       out+="${c}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-      detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
-      if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
-      if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; fi
+      shown=$((shown + 1))
+      if (( ! compact )); then
+        if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
+        if [[ -n "$detail" ]]; then out+="${dim}    $(clip $((cols - 4)) "$detail")${reset}${esc}[K"$'\n'; fi
+      fi
       i=$((i + 1))
     done <<<"$rows"
   fi
+  for queued in "$state_dir"/queue/*.json; do
+    [[ -f "$queued" ]] || continue
+    if (( compact && shown >= frame_lines - 2 )); then continue; fi
+    line="$(jq -r '"  \(.id)  \(.role)  queued  \(.queue_reason // "")"' "$queued")"
+    out+="${magenta}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
+    shown=$((shown + 1))
+  done
 
   # Aggregate main + all worker state by exact model. Keep cache separate from
   # uncached input so the session's context reuse is visible.
   local totals tm ti tc to
+  if (( ! compact )); then
   totals="$( { find "$tasks" -mindepth 2 -maxdepth 2 -name state.json -print 2>/dev/null; echo "$(dirname "$tasks")/main/state.json"; } | while IFS= read -r f; do
     [[ -f "$f" ]] && cat "$f"
   done | jq -rs '
@@ -127,6 +166,7 @@ render() {
     fi
   fi
   if [[ -n "$message" ]]; then out+="${esc}[K"$'\n'"${yellow}$(clip "$cols" "$message")${reset}${esc}[K"$'\n'; fi
+  fi
   out+="${esc}[J"
   frame="$out"
 }
@@ -189,7 +229,7 @@ while true; do
     -) run "$ROOT/bin/tp-view" - ;;
     r) if [[ -n "$selected" ]]; then
          popup result.md
-         "$ROOT/bin/tp-contract" collect "$selected" >/dev/null 2>&1   # read here = handed off
+         "$ROOT/bin/tp-agent" collect "$selected" >/dev/null 2>&1   # read here = handed off
        fi ;;
     t) if [[ -n "$selected" ]]; then
          # Tasks spawned before M4 have no packet.

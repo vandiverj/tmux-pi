@@ -19,6 +19,8 @@ session="$(tp_session)"
 task_dir="$(tp_task_dir "$session" "$id")"
 [[ -f "$task_dir/meta.json" ]] || die "no subagent '$id'"
 pane="$(tp_meta "$task_dir" pane)"
+printf '{"stopped":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$task_dir/stopped.json.tmp"
+mv "$task_dir/stopped.json.tmp" "$task_dir/stopped.json"
 
 # Never kill a pane while it sits in the viewer slot; that would break the layout.
 if [[ "$(tp_opt "$session" @tp_viewing)" == "$id" ]]; then

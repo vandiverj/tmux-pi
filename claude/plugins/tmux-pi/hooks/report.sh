@@ -53,6 +53,10 @@ fi
 # line per content block with the same message id and usage, so dedupe by id.
 usage='null'
 transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
+if [[ -n "$transcript" ]]; then
+  printf '%s\n' "$transcript" > "$TP_TASK_DIR/transcript-path.tmp"
+  mv "$TP_TASK_DIR/transcript-path.tmp" "$TP_TASK_DIR/transcript-path"
+fi
 if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]]; then
   usage="$(jq -s '
     [ .[] | select(.type == "assistant" and .message.usage != null) ]

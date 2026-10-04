@@ -347,9 +347,9 @@ export default function (pi: ExtensionAPI) {
 	if (process.env.TP_TASK_DIR || !process.env.TMUX || !process.env.PI_CODING_AGENT_DIR) return;
 	const agentDir = process.env.PI_CODING_AGENT_DIR;
 	const root = dirname(agentDir);
-	// The contract handshake is opt-in: config/local.json {"mode": "strict"}. Otherwise
-	// assistant.ts (ask_local legwork tool + basic guardrails) is the main-window policy.
-	if (process.env.TP_MODE !== "strict" && readJson(join(root, "config/local.json")).mode !== "strict") return;
+	// Legacy contract flow is only entered through an explicit legacy launch.
+	// The normal tp-main path sets TP_MODE=orchestrator, even if local.json is old.
+	if (process.env.TP_MODE !== "strict") return;
 	const bin = (name: string) => join(root, "bin", name);
 	let enabled = true;
 	let active = true;

@@ -13,7 +13,7 @@
  * tp-spawn's run.sh records the process exit separately.
  */
 
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -53,10 +53,14 @@ export default function (pi: ExtensionAPI) {
 	const taskDir = process.env.TP_TASK_DIR;
 	// Main runs have no TP_TASK_DIR; tp creates @tp_state_dir for the session.
 	let dir = taskDir;
+	if (!dir && process.env.TP_STATE_DIR) {
+		dir = join(process.env.TP_STATE_DIR, "main");
+		mkdirSync(dir, { recursive: true });
+	}
 	if (!dir && process.env.TMUX && process.env.PI_CODING_AGENT_DIR) {
 		try {
 			const { execFileSync } = require("node:child_process");
-			const session = execFileSync("tmux", ["display-message", "-p", "#S"], { encoding: "utf8" }).trim();
+			const session = execFileSync("tmux", ["display-message", "-p", ...(process.env.TMUX_PANE ? ["-t", process.env.TMUX_PANE] : []), "#S"], { encoding: "utf8" }).trim();
 			const stateDir = execFileSync("tmux", ["show-options", "-qv", "-t", `=${session}:`, "@tp_state_dir"], { encoding: "utf8" }).trim();
 			if (stateDir) { dir = join(stateDir, "main"); mkdirSync(dir, { recursive: true }); }
 		} catch {}
@@ -105,6 +109,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", () => {
 		s.state = "working";
 		s.error = "";
+		lastReply = "";
+		try { unlinkSync(join(dir, "result.md")); } catch {}
 		save();
 	});
 	pi.on("tool_execution_start", (event) => {

@@ -14,6 +14,11 @@
 #   -t, --thinking <level>   off|minimal|low|medium|high|xhigh|max
 #                            (claude: mapped to --effort; off/minimal -> low)
 #   -n, --name <name>        id prefix (default: worker name)
+#   -r, --role <role>        repository role in agent/roles/
+#   --task-id <id>           stable id reserved by the shared queue
+#   --parent <id>            parent task id, if any
+#   --deliverable <text>     expected result or artifact
+#   --route-json <json>      routing recommendation and actual selection
 #   -f, --file <path>        read the task from a file
 #   -c, --context <path>     add a file to the context packet; repeatable.
 #                            path[:start-end] adds only those lines.
@@ -56,6 +61,7 @@ source "$ROOT/lib/tp.sh"
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
+role="" reserved_id="" parent="" deliverable="" route_json="null"
 kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
@@ -66,6 +72,11 @@ while [[ $# -gt 0 ]]; do
     -m|--model)    model="${2:?}"; shift 2 ;;
     -t|--thinking) thinking="${2:?}"; shift 2 ;;
     -n|--name)     name="${2:?}"; shift 2 ;;
+    -r|--role)     role="${2:?}"; shift 2 ;;
+    --task-id)     reserved_id="${2:?}"; shift 2 ;;
+    --parent)      parent="${2:?}"; shift 2 ;;
+    --deliverable) deliverable="${2:?}"; shift 2 ;;
+    --route-json) route_json="${2:?}"; shift 2 ;;
     -f|--file)     file="${2:?}"; shift 2 ;;
     -c|--context)  contexts+=("${2:?}"); shift 2 ;;
     -N|--note)     notes+=("${2:?}"); shift 2 ;;
@@ -89,6 +100,12 @@ done
 
 case "$worker" in pi|claude) ;; *) die "--worker must be pi or claude" ;; esac
 case "$thinking" in ""|off|minimal|low|medium|high|xhigh|max) ;; *) die "bad --thinking: $thinking" ;; esac
+if [[ -n "$role" ]]; then
+  [[ "$role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$role.md" ]] || die "unknown role: $role"
+fi
+[[ -z "$reserved_id" || "$reserved_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad task id"
+[[ -z "$parent" || "$parent" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad parent id"
+jq -e 'type == "object" or . == null' <<<"$route_json" >/dev/null || die "bad route JSON"
 
 if [[ -n "$file" ]]; then
   task="$(cat "$file")"
@@ -136,10 +153,12 @@ max_file=60000 max_packet=200000
 
 # Never hand credentials to a worker (often a remote model).
 secret_file() {
-  case "$(basename "$1")" in
-    .env|.env.*|*.pem|*.key|*.p12|*.pfx|id_rsa*|id_ed25519*|id_ecdsa*|.netrc|.npmrc|.pypirc|auth.json|credentials*|*secret*) return 0 ;;
-  esac
-  return 1
+  local decision
+  decision="$(jq -cn --arg path "$1" '{tool_name:"Read",tool_input:{file_path:$path}}' |
+    "$ROOT/bin/tp-sensitive-read")" || return 0
+  jq -e '.sensitive == true' <<<"$decision" >/dev/null 2>&1 && return 0
+  jq -e '.sensitive == false' <<<"$decision" >/dev/null 2>&1 && return 1
+  return 0
 }
 
 # fence <text> — a backtick fence longer than any run inside the text.
@@ -149,7 +168,7 @@ fence() {
   printf '%s' "$f"
 }
 
-base_id="${name:-$worker}-$(date +%H%M%S)"
+base_id="${reserved_id:-${name:-${role:-$worker}}-$(date +%H%M%S)}"
 id="$base_id"
 # Archive directory names may have an -ended suffix; metadata keeps the original id.
 id_taken() {
@@ -160,7 +179,11 @@ id_taken() {
   done
   return 1
 }
-while id_taken; do id="$base_id-$RANDOM"; done
+if [[ -n "$reserved_id" ]]; then
+  id_taken && die "task id already exists: $id"
+else
+  while id_taken; do id="$base_id-$RANDOM"; done
+fi
 task_dir="$state_dir/tasks/$id"
 
 # A contract adds its terms as the first note and is recorded in meta.json.
@@ -211,12 +234,35 @@ fi
 
 # Build the packet before creating anything, so a bad path fails cleanly.
 packet="$(printf '# Task\n\n%s\n' "$task")"
+packet+=$'\n\n# Local Task Artifacts\n\n'
+packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree."
+packet+=$'\n'
+if [[ -n "$role" ]]; then
+  packet+=$'\n\n# Worker Role\n\n'
+  packet+="$(cat "$ROOT/agent/roles/$role.md")"
+  packet+=$'\n'
+fi
+if [[ -n "$deliverable" ]]; then
+  packet+=$'\n\n# Expected Deliverable\n\n'
+  packet+="$deliverable"
+  packet+=$'\n'
+fi
+packet+=$'\n\n# Return\n\n'
+packet+="Begin with one short sentence stating the assignment you understood. In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence."
+packet+=$'\n\n'
+packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
 # Classify only the main-owned worker task, never conversation/context documents.
 # This is instruction disclosure, not a capability or edit grant. Pi and Claude
 # workers receive the same bounded instructions; neither loads a global skill tree.
-skill_result="$(printf '%s' "$task" | "$ROOT/bin/tp-skills" --mode packet)" || die "skill selection failed"
-skill_selection="$(jq -c .selected <<<"$skill_result")" || die "invalid skill selection"
-skill_packet="$(jq -r .packet <<<"$skill_result")" || die "invalid skill packet"
+if skill_result="$(printf '%s' "$task" | "$ROOT/bin/tp-skills" --mode packet)" &&
+   skill_selection="$(jq -c '.selected | if type == "array" then . else error("invalid selection") end' <<<"$skill_result")" &&
+   skill_packet="$(jq -r '.packet | if type == "string" then . else error("invalid packet") end' <<<"$skill_result")"; then
+  :
+else
+  echo "tp-spawn: optional skill selection unavailable; starting with role instructions" >&2
+  skill_selection='[]'
+  skill_packet=''
+fi
 if [[ -n "$skill_packet" ]]; then
   packet+=$'\n\n# Selected Task Skills\n\n'
   packet+="$skill_packet"
@@ -243,7 +289,10 @@ for spec in ${contexts[@]+"${contexts[@]}"}; do
   fi
   [[ "$path" == /* ]] || path="$workdir/$path"
   [[ -f "$path" ]] || die "context file not found: $spec"
-  if secret_file "$path"; then die "refusing to put a credentials file in a packet: $spec"; fi
+  if secret_file "$path"; then
+    notes+=("Sensitive context $spec was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")
+    continue
+  fi
   if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
   if [[ -n "$range" ]]; then
     start="${range%-*}" end="${range#*-}"
@@ -312,27 +361,17 @@ fi
 
 # Build the worker command. Workers skip context files; the task is their context.
 if [[ "$worker" == pi ]]; then
-  cmd=("$ROOT/bin/tp-pi" --no-context-files --name "$id")
+  cmd=("$ROOT/bin/tp-pi" --no-context-files --name "$id" --session "$task_dir/transcript.jsonl")
   if [[ -n "$model" ]]; then cmd+=(--model "$model"); fi
   if [[ -n "$thinking" ]]; then cmd+=(--thinking "$thinking"); fi
 else
-  cmd=("$ROOT/bin/tp-claude" --name "$id")
-  # Warn, never block: an untrusted workdir leaves the worker waiting on Claude's trust prompt.
-  python3 - "$workdir" <<'EOF' >&2 || true
-import json, os, sys
-try:
-    projects = json.load(open(os.path.expanduser("~/.claude.json"))).get("projects", {})
-except (OSError, ValueError):
-    sys.exit(0)
-p = sys.argv[1]
-while True:
-    if projects.get(p, {}).get("hasTrustDialogAccepted"):
-        sys.exit(0)
-    if p == os.path.dirname(p):
-        break
-    p = os.path.dirname(p)
-print("tp-spawn: Claude has not trusted %s; the worker will wait at the trust prompt. Run tp-claude-bootstrap there once." % sys.argv[1])
-EOF
+  # Claude Code's default tool set omits Grep and Glob, and --tools does not combine
+  # "default" with names, so the default set is listed with those two added. Both pass
+  # through the sensitive-read PreToolUse hook like every other tool.
+  cmd=("$ROOT/bin/tp-claude" --name "$id" --tools
+    "Agent,Bash,Edit,Glob,Grep,ListAgents,Read,ReportFindings,ScheduleWakeup,Skill,ToolSearch,Workflow,Write")
+  # Trust is stored in the dedicated Claude config; the live pane displays any
+  # first-use trust prompt. A guessed read of ~/.claude.json would be wrong here.
   if [[ -n "$model" ]]; then cmd+=(--model "$model"); fi
   case "$thinking" in
     "") ;;
@@ -359,6 +398,7 @@ fi
 {
   echo '#!/usr/bin/env bash'
   echo "# tmux-pi subagent $id — generated by tp-spawn"
+  printf 'export PATH=%q:"$PATH"\n' "$ROOT/bin"
   printf 'cd %q\n' "$workdir"
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
@@ -378,11 +418,16 @@ tmux set-option -p -t "$pane" remain-on-exit on
 tmux select-pane -t "$pane" -T "$id"
 
 jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking "$thinking" \
+  --arg role "$role" --arg parent "$parent" --arg deliverable "$deliverable" --argjson route_info "$route_json" \
   --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson contract "$contract" --argjson preflight "$preflight" --argjson main_contract "$main_contract" \
   --argjson policy_decision "$policy_decision" --argjson context_manifest "$context_manifest" \
   --argjson decision "${decision_json:-null}" \
   '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}
+   + (if $role == "" then {} else {role:$role} end)
+   + (if $parent == "" then {} else {parent:$parent} end)
+   + (if $deliverable == "" then {} else {deliverable:$deliverable} end)
+   + (if $route_info == null then {} else {route_info:$route_info} end)
    + if $decision == null then {} else {decision:$decision} end
    + if $contract == null then {} else {contract:$contract} end
    + if $preflight == null then {} else {preflight:$preflight} end

@@ -7,8 +7,8 @@
 #   │              │ viewer slot  │
 #   └──────────────┴──────────────┘
 #
-# Usage: tp [workdir]    (defaults to the current directory)
-# Env:   TP_SESSION      tmux session name (default: tmux-pi)
+# Usage: tp [--resume] [--main pi|claude] [workdir]    (defaults to the current directory)
+# Env:   TP_SESSION      optional explicit tmux session name (default: a fresh project run)
 set -euo pipefail
 
 # Resolve symlinks (e.g. ~/.local/bin/agent -> bin/tp) to find the repo.
@@ -19,22 +19,79 @@ while [[ -L "$src" ]]; do
   [[ "$src" == /* ]] || src="$dir/$src"
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
-WORKDIR="$(cd "${1:-$PWD}" && pwd)"
-SESSION="${TP_SESSION:-tmux-pi}"
-STATE_DIR="$WORKDIR/.tmux-pi"
+MAIN_HARNESS="${TP_MAIN_HARNESS:-pi}"
+MAIN_HARNESS_EXPLICIT=0
+WORKDIR_ARG=""
+RESUME=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume) RESUME=1; shift ;;
+    --main) MAIN_HARNESS="${2:?choose pi or claude}"; MAIN_HARNESS_EXPLICIT=1; shift 2 ;;
+    -h|--help) echo "usage: tp [--resume] [--main pi|claude] [workdir]"; exit 0 ;;
+    -*) echo "tp: unknown option $1" >&2; exit 2 ;;
+    *) [[ -z "$WORKDIR_ARG" ]] || { echo "tp: only one workdir is allowed" >&2; exit 2; }
+       WORKDIR_ARG="$1"; shift ;;
+  esac
+done
+case "$MAIN_HARNESS" in pi|claude) ;; *) echo "tp: --main must be pi or claude" >&2; exit 2 ;; esac
+WORKDIR="$(cd "${WORKDIR_ARG:-$PWD}" && pwd -P)"
+SESSION="${TP_SESSION:-}"
+RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+STATE_DIR="$WORKDIR/.tmux-pi/sessions/$RUN_ID"
 
 command -v tmux >/dev/null || { echo "tp: tmux not found (brew install tmux)" >&2; exit 1; }
-command -v pi   >/dev/null || { echo "tp: pi not found" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "tp: python3 not found" >&2; exit 1; }
+command -v "$MAIN_HARNESS" >/dev/null || { echo "tp: $MAIN_HARNESS not found" >&2; exit 1; }
 
-# Load the LM Studio models this machine's config routes to; if that fails, say so and go on.
-"$ROOT/bin/tp-lmstudio" ensure ||
-  echo "tp: warning: LM Studio models are not ready; workers on them will fail (bin/tp-lmstudio status)" >&2
+# A live harness cannot be moved to another project by attaching to it.
+# Reuse a legacy session only when its recorded workspace is this directory.
+session_workdir() {
+  local directory state
+  directory="$(tmux show-options -qv -t "=$1:" @tp_workdir)"
+  if [[ -z "$directory" ]]; then
+    state="$(tmux show-options -qv -t "=$1:" @tp_state_dir)"
+    [[ "$state" == */.tmux-pi ]] && directory="${state%/.tmux-pi}"
+  fi
+  [[ -n "$directory" && -d "$directory" ]] || return 1
+  (cd "$directory" && pwd -P)
+}
+if [[ -z "$SESSION" ]]; then
+  if [[ "$RESUME" == 1 ]]; then
+    while IFS= read -r candidate; do
+      if [[ "$(session_workdir "$candidate" || true)" == "$WORKDIR" ]]; then
+        SESSION="$candidate"
+        break
+      fi
+    done < <(tmux list-sessions -F '#{session_created} #{session_name}' 2>/dev/null | sort -nr | cut -d ' ' -f2-)
+    [[ -n "$SESSION" ]] || { echo "tp: no running workspace for '$WORKDIR'; run agent to start one" >&2; exit 1; }
+  else
+    project_key="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$WORKDIR")"
+    SESSION="tmux-pi-$project_key-${RUN_ID:0:12}"
+  fi
+fi
+
+# Local models are loaded on demand by tp-spawn when selected for a worker.
+# Starting the workspace must not wait for an optional model service.
 
 # Slot commands: they must never exit (ignore ctrl-c/ctrl-\\/ctrl-z, and the status list restarts).
 status_cmd="trap '' INT QUIT TSTP; while true; do '$ROOT/bin/tp-status'; sleep 1; done"
 viewer_cmd="trap '' INT QUIT TSTP; stty -echo -icanon; clear; echo 'no subagent selected'; exec tail -f /dev/null"
 
-if tmux has-session -t "$SESSION" 2>/dev/null; then
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  if [[ "$RESUME" != 1 ]]; then
+    echo "tp: session '$SESSION' already exists; use --resume or unset TP_SESSION for a fresh run" >&2
+    exit 1
+  fi
+  existing_workdir="$(session_workdir "$SESSION" || true)"
+  if [[ "$existing_workdir" != "$WORKDIR" ]]; then
+    echo "tp: session '$SESSION' belongs to '${existing_workdir:-an unknown directory}', not '$WORKDIR'; unset TP_SESSION or choose another name" >&2
+    exit 1
+  fi
+  existing_harness="$(tmux show-options -qv -t "=$SESSION:" @tp_main_harness)"
+  if [[ "$MAIN_HARNESS_EXPLICIT" == 1 && -n "$existing_harness" && "$existing_harness" != "$MAIN_HARNESS" ]]; then
+    echo "tp: session '$SESSION' already runs $existing_harness as main; end it or choose another TP_SESSION to start $MAIN_HARNESS" >&2
+    exit 1
+  fi
   # Reattaching must not leave the client in the status/viewer or an old worker.
   # Pane ids survive client detach, so the recorded main pane is the reliable target.
   main_pane="$(tmux show-options -qv -t "=$SESSION:" @tp_main_pane)"
@@ -64,9 +121,12 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     fi
   fi
   [[ -z "$main_pane" ]] || tmux select-pane -t "$main_pane"
-  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
-  exec tmux attach -t "$SESSION"
+  if [[ "${TP_NO_ATTACH:-}" == 1 ]]; then exit 0; fi
+  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "=$SESSION"; fi
+  exec tmux attach -t "=$SESSION"
 fi
+
+[[ "$RESUME" != 1 ]] || { echo "tp: session '$SESSION' does not exist" >&2; exit 1; }
 
 mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 
@@ -74,7 +134,7 @@ mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 # from the repo's agent/ dir — never from ~/.pi/agent.
 AGENT_DIR="$ROOT/agent"
 
-main_cmd="'$ROOT/bin/tp-pi'"
+main_cmd="'$ROOT/bin/tp-main'"
 
 # The status and viewer slots must never exit: a closed slot pane breaks the
 # layout. Both ignore ctrl-c/ctrl-\\/ctrl-z (ignored signals carry into the
@@ -83,11 +143,16 @@ cols="$(tput cols 2>/dev/null || echo 200)"
 lines="$(tput lines 2>/dev/null || echo 50)"
 
 main_pane="$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n main -c "$WORKDIR" -x "$cols" -y "$lines" \
-  -e "PI_CODING_AGENT_DIR=$AGENT_DIR" -e "PATH=$ROOT/bin:$PATH")"
+  -e "PI_CODING_AGENT_DIR=$AGENT_DIR" -e "TP_MAIN_HARNESS=$MAIN_HARNESS" -e "TP_WORKDIR=$WORKDIR" -e "TP_STATE_DIR=$STATE_DIR" \
+  -e "TP_CLAUDE_CONFIG_DIR=${TP_CLAUDE_CONFIG_DIR:-}" -e "PATH=$ROOT/bin:$PATH")"
 # Session-level env so every later pane/window (subagents) gets it too, and
 # tp-* commands are on PATH for you and the agents.
 tmux set-environment -t "$SESSION" PI_CODING_AGENT_DIR "$AGENT_DIR"
 tmux set-environment -t "$SESSION" PATH "$ROOT/bin:$PATH"
+tmux set-environment -t "$SESSION" TP_MAIN_HARNESS "$MAIN_HARNESS"
+tmux set-environment -t "$SESSION" TP_WORKDIR "$WORKDIR"
+tmux set-environment -t "$SESSION" TP_STATE_DIR "$STATE_DIR"
+tmux set-environment -t "$SESSION" TP_CLAUDE_CONFIG_DIR "${TP_CLAUDE_CONFIG_DIR:-}"
 # pi needs extended keys for modified Enter (e.g. shift+enter). Server-wide option.
 tmux set-option -s extended-keys on
 tmux set-option -s extended-keys-format csi-u
@@ -95,6 +160,8 @@ tmux set-option -s extended-keys-format csi-u
 tmux set-option -t "$SESSION" @tp_root "$ROOT"
 tmux set-option -t "$SESSION" @tp_agent_dir "$AGENT_DIR"
 tmux set-option -t "$SESSION" @tp_state_dir "$STATE_DIR"
+tmux set-option -t "$SESSION" @tp_workdir "$WORKDIR"
+tmux set-option -t "$SESSION" @tp_main_harness "$MAIN_HARNESS"
 status_pane="$(tmux split-window -h -l 50% -P -F '#{pane_id}' -t "$main_pane" -c "$WORKDIR" "$status_cmd")"
 viewer_pane="$(tmux split-window -v -l 65% -P -F '#{pane_id}' -t "$status_pane" -c "$WORKDIR" "$viewer_cmd")"
 
@@ -128,5 +195,5 @@ tmux send-keys -t "$main_pane" "$main_cmd" Enter
 tmux select-pane -t "$main_pane"
 
 if [[ "${TP_NO_ATTACH:-}" == 1 ]]; then exit 0; fi
-if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$SESSION"; fi
-exec tmux attach -t "$SESSION"
+if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "=$SESSION"; fi
+exec tmux attach -t "=$SESSION"

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tp-claude — run Claude Code with only tmux-pi's settings, plugins and MCP servers.
 #
-# Skips user, project and local settings (so no ~/.claude plugins, skills, hooks,
-# or the target project's .claude/ and CLAUDE.md). Uses the normal Claude login,
-# so a subscription works. Claude Code's built-in skills and plugins still load.
+# Skips unrelated user, project and local settings. Uses a dedicated per-machine
+# config directory for this workspace's Claude login, trust, and session history.
+# Claude Code's built-in skills and plugins still load.
 # Extra arguments are passed through to claude. Run `tp-claude-bootstrap` once in
 # each target workdir to complete Claude Code's folder-trust prompt before workers run.
 set -euo pipefail
@@ -16,6 +16,13 @@ while [[ -L "$src" ]]; do
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 CLAUDE_DIR="$ROOT/claude"
+export CLAUDE_CONFIG_DIR="${TP_CLAUDE_CONFIG_DIR:-$HOME/.config/tmux-pi/claude}"
+export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1
+export CLAUDE_CODE_DISABLE_POLICY_SKILLS=1
+export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+mkdir -p "$CLAUDE_CONFIG_DIR"
 
 exec claude \
   --setting-sources "" \

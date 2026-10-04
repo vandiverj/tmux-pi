@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run the same orchestrator role through either supported main harness.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="$ROOT/bin:$PATH"
+harness="${TP_MAIN_HARNESS:-pi}"
+# Restore the launch directory even if login-shell startup changed cwd.
+if [[ -n "${TP_WORKDIR:-}" ]]; then
+  cd -- "$TP_WORKDIR"
+fi
+export TP_MODE=orchestrator
+core="$(cat "$ROOT/agent/orchestrator.md")"
+case "$harness" in
+  pi)
+    exec "$ROOT/bin/tp-pi" --append-system-prompt "$core
+
+$(cat "$ROOT/agent/orchestrator-pi.md")" "$@"
+    ;;
+  claude)
+    exec "$ROOT/bin/tp-claude" --allowedTools "Bash(tp-agent:*)" --append-system-prompt "$core
+
+$(cat "$ROOT/agent/orchestrator-claude.md")" "$@"
+    ;;
+  *) echo "tp-main: unsupported harness: $harness" >&2; exit 2 ;;
+esac

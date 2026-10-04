@@ -1,8 +1,7 @@
 /**
- * assistant — the local model as the main model's legwork assistant, plus guardrails.
+ * assistant — the local model as an optional short read/search assistant for the orchestrator.
  *
- * Active only in the main agent, unless config/local.json sets "mode": "strict"
- * (then dispatcher.ts's contract handshake runs instead).
+ * Active only in the main agent outside explicitly launched legacy strict mode.
  *
  *   ask_local    main hands a read/search job to the local model (config/local.json
  *                "assistant", default LM Studio Qwen). It runs fresh and read-only
@@ -10,27 +9,14 @@
  *                paths, line numbers and verbatim snippets. Main keeps the thinking and
  *                the knowledge; the local model's context never accumulates, so its
  *                window never compacts mid-task.
- *   guardrails   block destructive shell commands and edits outside the workdir.
- *
- * Long-running or parallel work is spawn_subagent (subagents.ts); no contract step.
+ * Substantial work is dispatched through orchestration.ts and tp-agent.
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-const DESTRUCTIVE = [
-	/\brm\s+(?:-\w*\s+)*-\w*[rf]\w*\s+(?:-\w+\s+)*(?:\/|~|\$HOME|\*|\.\.?)(?:\s|$)/,
-	/\bgit\s+push\b[^\n]*(?:--force\b|--force-with-lease\b|\s-f\b)/,
-	/\bgit\s+reset\s+--hard\b/,
-	/\bgit\s+clean\b[^\n]*\s-\w*[fd]/,
-	/\bsudo\b/,
-	/\b(?:mkfs|dd\s+[^\n]*of=\/dev\/|diskutil\s+erase)/,
-	/>\s*\/dev\/(?:sd|disk|nvme)/,
-	/\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/,
-];
 
 function readJson(file: string): any {
 	try {
@@ -49,11 +35,8 @@ const ASSISTANT_PROMPT =
 const MAX_REPLY = 24_000;
 
 const GUIDANCE =
-	"\n\nFor finding files, searching code, or reading several files, prefer the ask_local tool: a local " +
-	"assistant model does the legwork and returns exact paths, line numbers and snippets, which keeps your " +
-	"context small. Read a file yourself when you need to edit it or need its full text. " +
-		"For independent, self-contained work (a separate fix, a long investigation, a parallel task) use " +
-		"spawn_subagent instead of doing it inline, then collect_result.";
+    "\n\nFor a small read or search, ask_local can return paths, line numbers and snippets without growing your context. " +
+    "Dispatch substantial investigation, edits, testing, review, or design with dispatch_role and collect with task_collect.";
 
 function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
 	return new Promise((res, rej) => {
@@ -67,8 +50,7 @@ export default function (pi: ExtensionAPI) {
 	if (process.env.TP_TASK_DIR || !process.env.TMUX || !process.env.PI_CODING_AGENT_DIR) return;
 	const root = dirname(process.env.PI_CODING_AGENT_DIR);
 	const local = readJson(join(root, "config/local.json"));
-	if (local.mode === "strict") return;
-	const localProviders: string[] = Array.isArray(local.local_providers) ? local.local_providers : ["slotstream", "lmstudio"];
+	if (process.env.TP_MODE === "strict") return;
 
 	const assistant = { model: "lmstudio/qwen/qwen3.6-35b-a3b", thinking: "off", ...(local.assistant ?? {}) };
 
@@ -98,24 +80,4 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
-		const input = (event.input ?? {}) as Record<string, unknown>;
-		if (event.toolName === "bash") {
-			const command = String(input.command ?? "");
-			if (DESTRUCTIVE.some((re) => re.test(command))) {
-				return { block: true, reason: "tmux-pi blocked a destructive command. If you really need it, ask the user to run it themselves." };
-			}
-		}
-		if (event.toolName === "edit" || event.toolName === "write") {
-			const raw = String(input.path ?? input.file_path ?? "");
-			if (!raw) return undefined;
-			const base = realpathSync(ctx.cwd);
-			const abs = isAbsolute(raw) ? raw : resolve(base, raw);
-			const real = existsSync(abs) ? realpathSync(abs) : abs;
-			if (real !== base && !real.startsWith(base + sep)) {
-				return { block: true, reason: `tmux-pi blocked an edit outside the working directory (${base}).` };
-			}
-		}
-		return undefined;
-	});
 }

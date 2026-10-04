@@ -16,4 +16,17 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 
 export PI_CODING_AGENT_DIR="$ROOT/agent"
-exec pi --no-skills "$@"
+if [[ "${TP_MODE:-}" == strict ]]; then
+  exec pi --no-skills "$@"
+fi
+
+# Normal work loads only the orchestration extensions. Legacy goal, strict
+# dispatcher, generic subagent, and automatic escalation code remain available
+# for explicit legacy sessions but cannot quietly join this workflow.
+extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts")
+if [[ -z "${TP_TASK_DIR:-}" ]]; then
+  extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts")
+fi
+args=(--no-skills --no-context-files --no-extensions)
+for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done
+exec pi "${args[@]}" "$@"

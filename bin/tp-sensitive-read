@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Classify or request permission for credential-bearing reads."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from sensitive_read import classify, hook_response
+
+
+def save_request(result, status):
+    task = os.getenv("TP_TASK_DIR")
+    if not task:
+        return
+    path = Path(task) / "permission-request.json"
+    value = {"status": status, "target": result.get("target"), "reason": result.get("reason"),
+             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(value) + "\n")
+    tmp.replace(path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--claude-hook", action="store_true")
+    args = parser.parse_args()
+    event = json.load(sys.stdin)
+    if args.claude_hook:
+        name = event.get("hook_event_name")
+        if name in {"PostToolUse", "PermissionDenied"}:
+            old = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
+            if old.is_file():
+                prior = json.loads(old.read_text())
+                current = classify(event.get("tool_name", ""), event.get("tool_input", {}))
+                if prior.get("status") == "pending" and current.get("sensitive") and current.get("target") == prior.get("target"):
+                    save_request(prior, "authorized" if name == "PostToolUse" else "denied")
+            return
+        if name != "PreToolUse":
+            return
+        result = classify(event.get("tool_name", ""), event.get("tool_input", {}))
+        if result["sensitive"]:
+            save_request(result, "pending")
+            print(json.dumps(hook_response(event)))
+    else:
+        print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}))))
+
+
+if __name__ == "__main__":
+    main()

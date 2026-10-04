@@ -7,7 +7,11 @@ die() { echo "$(basename "$0"): $*" >&2; exit 1; }
 tp_session() {
   local s
   if [[ -n "${TMUX:-}" ]]; then
-    s="$(tmux display-message -p '#S')"
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+      s="$(tmux display-message -p -t "$TMUX_PANE" '#S')"
+    else
+      s="$(tmux display-message -p '#S')"
+    fi
   else
     s="${TP_SESSION:-tmux-pi}"
   fi
@@ -47,7 +51,7 @@ tp_rows() {
   local tasks panes meta d pane pstate code row
   tasks="$(tp_opt "$1" @tp_state_dir)/tasks"
   panes="$(tmux list-panes -a -F '#{pane_id} #{pane_dead}')"
-  for meta in $(ls -tr "$tasks"/*/meta.json 2>/dev/null); do
+  while IFS= read -r -d '' meta; do
     d="$(dirname "$meta")"
     row="$( { cat "$meta"; cat "$d/state.json" 2>/dev/null || echo '{}'; } | jq -rs '
       .[0] as $m | .[1] as $s
@@ -72,5 +76,10 @@ tp_rows() {
     # Drop the pane field; a dead or missing pane overrides the reported state.
     awk -F $'\x1f' -v OFS=$'\x1f' -v ps="$pstate" \
       '{ if (ps != "") { $4 = ps; $5 = "" } print $1, $2, $4, $5, $6, $7, $8 }' <<<"$row"
-  done
+  done < <(python3 -c '
+import os, pathlib, sys
+paths = pathlib.Path(sys.argv[1]).glob("*/meta.json")
+for path in sorted(paths, key=lambda p: p.stat().st_mtime):
+    sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+' "$tasks")
 }

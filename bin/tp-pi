@@ -25,7 +25,7 @@ fi
 # for explicit legacy sessions but cannot quietly join this workflow.
 extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts")
 if [[ -z "${TP_TASK_DIR:-}" ]]; then
-  extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts")
+  extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts" "$ROOT/agent/extensions/offload.ts")
 fi
 args=(--no-skills --no-context-files --no-extensions)
 for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done

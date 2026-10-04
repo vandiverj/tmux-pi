@@ -24,9 +24,20 @@ export DISABLE_TELEMETRY=1
 export DISABLE_ERROR_REPORTING=1
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
+settings="$CLAUDE_DIR/settings.json"
+# Orchestrator main only: successful Bash output over this many characters is saved
+# to a session file by Claude Code, and Claude gets a preview plus the path (default
+# 30000). Workers and strict sessions keep the shared file as is. Failure output is
+# not affected. The setting is session-wide, so Agent-tool children of main share it.
+if [[ -z "${TP_TASK_DIR:-}" && "${TP_MODE:-}" == orchestrator ]]; then
+  command -v jq >/dev/null 2>&1 || { echo "tp-claude: jq is required to compose main settings" >&2; exit 1; }
+  settings="$(jq -c '. + {bashOutputMaxChars: 10000}' "$settings")" && [[ -n "$settings" ]] ||
+    { echo "tp-claude: could not compose main settings from $CLAUDE_DIR/settings.json" >&2; exit 1; }
+fi
+
 exec claude \
   --setting-sources "" \
-  --settings "$CLAUDE_DIR/settings.json" \
+  --settings "$settings" \
   --strict-mcp-config --mcp-config "$CLAUDE_DIR/mcp.json" \
   --plugin-dir "$CLAUDE_DIR/plugins" \
   "$@"

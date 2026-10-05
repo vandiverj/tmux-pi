@@ -53,6 +53,28 @@ The hook checks known paths and common commands. It does not provide an operatin
 
 Task records, prompts, and logs stay local. Remote model inference receives the context sent to the selected provider; no observability service is configured by tmux-pi.
 
+## Status pane
+
+The status pane (top right) lists workers live. Click it to focus it, then:
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↑` / `↓` | move |
+| `enter` | show the selected worker in the viewer |
+| `o` | show it and move focus into it, to type to it |
+| `-` | clear the viewer |
+| `r` / `t` | read its last reply / its context packet in a popup |
+| `x` | kill it (asks first) |
+| `c` | archive killed workers |
+
+States come from each worker's reporter: `starting`, `working`, `tool`, `waiting`, `permission`, `error`, then `done`, `failed:<code>` or `killed` once the process ends. A second line shows elapsed time and turns, and settled work shows its `result.md` path. Token counts include cached input; cost is shown only for Pi providers that price tokens. If the pane looks stale, see `/refresh-status` above.
+
+## Claude as the main agent
+
+`bin/tp --main claude` uses the shared `tp-agent` orchestrator and its Claude prompt overlay; it does **not** expose the separate subagent MCP tools. The older `TP_MAIN=claude bin/tp` path instead appends `claude/main-prompt.md` and exposes `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `review_subagent`, `kill_subagent`, `find_skill`, and `get_skill` through `claude/mcp/subagents.mjs`. Those tools are not exposed inside workers. The tmux-pi plugin adds `/make-qa`, `/counterpoint`, `/product-fit`, `/threat-model`, `/reset`, and `/end` prompt aliases.
+
+`claude/mcp.json` also defines YouTrack, airteracode, and optional database integrations; `agent/mcp.json` defines Pi integrations. Availability depends on installed services and local configuration. HTTP auth headers come from the git-ignored `claude/mcp.local.env`, sourced by the launchers when present. Only the legacy subagent MCP tools are pre-allowed; other Claude MCP calls still prompt for permission.
+
 ## Validation and legacy path
 
 Run the repository tests with `python3 -m unittest discover -s tests -p 'test_*.py'` and the extension type check with `tests/check_dispatcher_types.sh`. Some tests bind loopback sockets. The old strict dispatcher and related commands remain in the repo for reference and rollback, but `bin/tp` does not load that flow. Its former user guide is preserved in [docs/legacy-workflow.md](docs/legacy-workflow.md).

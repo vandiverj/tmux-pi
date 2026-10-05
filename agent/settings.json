@@ -27,5 +27,6 @@
     "slotstream/*",
     "openrouter/*/*:free",
     "openrouter/openrouter/free"
-  ]
+  ],
+  "deviceId": "abb1157b-b7a8-4f47-836e-ff1d975f4878"
 }

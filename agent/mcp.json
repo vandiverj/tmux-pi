@@ -1,0 +1,76 @@
+{
+  "mcpServers": {
+    "youtrack": {
+      "url": "https://youtrack.devservices-internal.natacs.aero/mcp",
+      "headers": {
+        "Authorization": "${YOUTRACK_AUTH}"
+      },
+      "description": "YouTrack issues and articles (read tools only)",
+      "exposure": "codemode",
+      "toolExposure": {
+        "add_issue_comment": "hidden",
+        "change_issue_assignee": "hidden",
+        "create_article": "hidden",
+        "create_draft_issue": "hidden",
+        "create_issue": "hidden",
+        "link_issues": "hidden",
+        "log_work": "hidden",
+        "manage_issue_tags": "hidden",
+        "update_article": "hidden",
+        "update_issue": "hidden"
+      }
+    },
+    "airteracode": {
+      "url": "http://100.101.254.119:8378/mcp",
+      "headers": {
+        "Authorization": "${AIRTERACODE_AUTH}",
+        "Content-Type": "application/json"
+      },
+      "description": "Context Engine: code index, symbols, knowledge search (read tools only)",
+      "exposure": "codemode",
+      "toolExposure": {
+        "bootstrap_workspace": "hidden",
+        "clear_workspace_overlay": "hidden",
+        "push_workspace_overlay": "hidden",
+        "refresh_workspace": "hidden",
+        "remember_site_learning": "hidden",
+        "submit_knowledge_candidate": "hidden",
+        "feedback": "hidden",
+        "sdlc_feedback": "hidden"
+      }
+    },
+    "dacservice-postgres": {
+      "command": "~/.local/bin/dacservice-dbhub",
+      "args": [],
+      "description": "DacService staging Postgres (read-only login): schema search and SQL"
+    },
+    "natacs-dev-db": {
+      "command": "mcp-sqlserver",
+      "args": [],
+      "env": {
+        "SQLSERVER_HOST": "${NATACS_DEV_HOST}",
+        "SQLSERVER_PORT": "${NATACS_DEV_PORT}",
+        "SQLSERVER_USER": "${NATACS_DEV_USER}",
+        "SQLSERVER_PASSWORD": "${NATACS_DEV_PASSWORD}",
+        "SQLSERVER_DATABASE": "NataDev",
+        "SQLSERVER_ENCRYPT": "true",
+        "SQLSERVER_TRUST_CERT": "true"
+      },
+      "description": "NATACS dev SQL Server (read-only login): NataDev"
+    },
+    "natacs-dev-soc-db": {
+      "command": "mcp-sqlserver",
+      "args": [],
+      "env": {
+        "SQLSERVER_HOST": "${NATACS_DEV_HOST}",
+        "SQLSERVER_PORT": "${NATACS_DEV_PORT}",
+        "SQLSERVER_USER": "${NATACS_DEV_USER}",
+        "SQLSERVER_PASSWORD": "${NATACS_DEV_PASSWORD}",
+        "SQLSERVER_DATABASE": "NataDevSoc",
+        "SQLSERVER_ENCRYPT": "true",
+        "SQLSERVER_TRUST_CERT": "true"
+      },
+      "description": "NATACS dev SQL Server (read-only login): NataDevSoc"
+    }
+  }
+}

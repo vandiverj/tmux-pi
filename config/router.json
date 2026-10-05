@@ -42,11 +42,6 @@
     },
     {
       "worker": "claude",
-      "model": "claude-sonnet-5",
-      "thinking": ["low", "medium", "high"]
-    },
-    {
-      "worker": "claude",
       "model": "claude-sonnet-5-5",
       "thinking": ["low", "medium", "high"]
     },

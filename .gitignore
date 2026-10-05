@@ -11,3 +11,25 @@ agent/models-store.json
 __pycache__/
 .mlx/
 config/local.json
+claude/mcp.local.env
+agent/mcp-auth.json
+agent/mcp.log*
+
+# Local configuration and secrets — never commit
+.env
+.env.*
+!.env.example
+*.local.env
+*.local.json
+*.local.*
+!*.example.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+*secret*
+*.token
+.mcp.json
+.pi/
+.claude/settings.local.json

@@ -6,7 +6,8 @@
       "Bash(grep:*)", "Bash(rg:*)", "Bash(find:*)", "Bash(sed -n:*)",
       "Bash(tp-agent request:*)",
       "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git branch --show-current)",
-      "Bash(python3 -m unittest:*)", "Bash(pytest:*)", "Bash(npm test:*)", "Bash(npm run test:*)", "Bash(cargo test:*)", "Bash(go test:*)"
+      "Bash(python3 -m unittest:*)", "Bash(pytest:*)", "Bash(npm test:*)", "Bash(npm run test:*)", "Bash(cargo test:*)", "Bash(go test:*)",
+      "mcp__tmux-pi-subagents"
     ]
   }
 }

@@ -41,19 +41,18 @@ class ClaudeSubagentsMcpExposureTests(unittest.TestCase):
             self.assertTrue(tool["description"], tool["name"])
             self.assertEqual(tool["inputSchema"]["type"], "object", tool["name"])
 
-    def test_orchestrator_mode_exposes_no_tools(self):
-        self.assertEqual(self.tools(TMUX=FAKE_TMUX, TP_MAIN="claude", TP_MODE="orchestrator"), [])
-
-    def test_task_worker_exposes_no_tools(self):
-        self.assertEqual(self.tools(TMUX=FAKE_TMUX, TP_MAIN="claude", TP_TASK_DIR="/nonexistent/task"), [])
-
-    def test_outside_tmux_exposes_no_tools(self):
-        self.assertEqual(self.tools(TP_MAIN="claude"), [])
-        self.assertEqual(self.tools(TP_MAIN="claude", TMUX=""), [])
-
-    def test_only_the_orchestrator_mode_value_hides_the_tools(self):
-        names = {t["name"] for t in self.tools(TMUX=FAKE_TMUX, TP_MODE="worker")}
-        self.assertEqual(names, EXPECTED)
+    def test_tool_exposure_by_environment(self):
+        cases = (
+            ("orchestrator mode", dict(TMUX=FAKE_TMUX, TP_MAIN="claude", TP_MODE="orchestrator"), False),
+            ("task worker", dict(TMUX=FAKE_TMUX, TP_MAIN="claude", TP_TASK_DIR="/nonexistent/task"), False),
+            ("outside tmux", dict(TP_MAIN="claude"), False),
+            ("empty TMUX", dict(TP_MAIN="claude", TMUX=""), False),
+            ("non-orchestrator mode value", dict(TMUX=FAKE_TMUX, TP_MODE="worker"), True),
+        )
+        for label, env, exposed in cases:
+            with self.subTest(label):
+                names = {t["name"] for t in self.tools(**env)}
+                self.assertEqual(names, EXPECTED if exposed else set())
 
     def test_hidden_tools_cannot_be_called(self):
         call = {"id": 1, "method": "tools/call", "params": {"name": "get_skill", "arguments": {"id": "make-qa"}}}

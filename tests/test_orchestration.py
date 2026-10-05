@@ -8,6 +8,8 @@ import unittest
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
+MODEL = "openai-codex/gpt-6-sol"
+WAITING = '{"state":"waiting"}'
 sys.path.insert(0, str(ROOT / "lib"))
 from sensitive_read import classify, hook_response
 
@@ -38,15 +40,37 @@ esac
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
 
+    def raw(self, *args, env=None, timeout=25):
+        return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env or self.env, text=True,
+                              capture_output=True, timeout=timeout)
+
     def cli(self, *args):
-        run = subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=self.env, text=True,
-                             capture_output=True, timeout=25)
+        run = self.raw(*args)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
 
+    def task_dir(self, item):
+        return self.state / "tasks" / item["id"]
+
+    def packet(self, item):
+        return (self.task_dir(item) / "packet.md").read_text()
+
+    def settle(self, item, result=None):
+        task = self.task_dir(item)
+        (task / "state.json").write_text(WAITING)
+        if result is not None:
+            (task / "result.md").write_text(result)
+        return task
+
+    def retry(self, item, reason="Again"):
+        return self.cli("retry", item["id"], "--reason", reason, "--worker", "pi", "--model", MODEL)
+
+    def retry_packet(self, item):
+        return self.packet(self.retry(item))
+
     def dispatch(self, role="coder", task="Make a focused change", **extra):
         args = ["dispatch", "--role", role, "--task", task, "--worker", "pi",
-                "--model", "openai-codex/gpt-6-sol", "--thinking", "medium",
+                "--model", MODEL, "--thinking", "medium",
                 "--workdir", str(self.project), "--deliverable", "Report paths and checks"]
         for key, value in extra.items():
             args += ["--" + key.replace("_", "-"), value]
@@ -56,13 +80,12 @@ esac
         item = self.dispatch()
         self.assertEqual(item["role"], "coder")
         self.assertEqual(item["status"], "starting")
-        task = self.state / "tasks" / item["id"]
-        packet = (task / "packet.md").read_text()
+        task = self.task_dir(item)
+        packet = self.packet(item)
         self.assertIn("# Coder", packet)
         self.assertIn("RESULT_STATUS", packet)
         self.assertEqual(json.loads((task / "meta.json").read_text())["deliverable"], "Report paths and checks")
-        (task / "state.json").write_text('{"state":"waiting"}')
-        (task / "result.md").write_text("RESULT_STATUS: complete\nVerified one path.\n")
+        self.settle(item, "RESULT_STATUS: complete\nVerified one path.\n")
         collected = self.cli("collect", item["id"])
         self.assertEqual(collected["status"], "completed")
         self.assertEqual(collected["result_status"], "complete")
@@ -72,26 +95,19 @@ esac
         self.assertEqual(index["recent"][-1]["status"], "completed")
 
     def test_dispatch_without_optional_deliverable_starts_worker(self):
-        run = subprocess.run([str(ROOT / "bin/tp-agent"), "dispatch", "--role", "coder",
-                              "--task", "Check the parser", "--worker", "pi",
-                              "--model", "openai-codex/gpt-6-sol", "--thinking", "low",
-                              "--workdir", str(self.project)], env=self.env, text=True,
-                             capture_output=True, timeout=25)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        task = self.state / "tasks" / json.loads(run.stdout)["id"]
-        self.assertTrue((task / "meta.json").exists())
+        item = self.cli("dispatch", "--role", "coder", "--task", "Check the parser", "--worker", "pi",
+                        "--model", MODEL, "--thinking", "low", "--workdir", str(self.project))
+        self.assertTrue((self.task_dir(item) / "meta.json").exists())
 
     def test_dependency_queues_then_starts_with_result_pointer(self):
         first = self.dispatch(role="researcher", task="Find the relevant interface")
         second = self.dispatch(role="coder", task="Use the interface", after=first["id"])
         self.assertEqual(second["status"], "queued")
         self.assertIn("waiting for", second["reason"])
-        first_task = self.state / "tasks" / first["id"]
-        (first_task / "state.json").write_text('{"state":"waiting"}')
-        (first_task / "result.md").write_text("RESULT_STATUS: complete\nInterface found.\n")
+        self.settle(first, "RESULT_STATUS: complete\nInterface found.\n")
         started = self.cli("tick")
         self.assertEqual(started["started"], [second["id"]])
-        packet = (self.state / "tasks" / second["id"] / "packet.md").read_text()
+        packet = self.packet(second)
         self.assertIn(f"Dependency {first['id']} result:", packet)
         self.assertFalse((self.state / "queue" / f"{second['id']}.json").exists())
 
@@ -101,26 +117,22 @@ esac
         fifth = self.dispatch(task="Task 5")
         self.assertEqual(fifth["status"], "queued")
         self.assertIn("global worker slots", fifth["reason"])
-        task = self.state / "tasks" / active[0]["id"]
-        (task / "state.json").write_text('{"state":"waiting"}')
-        (task / "result.md").write_text("RESULT_STATUS: complete")
+        self.settle(active[0], "RESULT_STATUS: complete")
         self.assertEqual(self.cli("tick")["started"], [fifth["id"]])
 
     def test_sensitive_context_is_omitted_without_stopping_work(self):
         (self.project / ".env").write_text("PRIVATE_TOKEN=example\n")
         item = self.dispatch(context=".env")
-        packet = (self.state / "tasks" / item["id"] / "packet.md").read_text()
+        packet = self.packet(item)
         self.assertNotIn("PRIVATE_TOKEN=example", packet)
         self.assertIn("Sensitive context .env was omitted", packet)
         self.assertEqual(item["status"], "starting")
 
     def test_worker_request_is_visible_and_message_answers_it(self):
         item = self.dispatch()
-        task = self.state / "tasks" / item["id"]
-        asked = subprocess.run([str(ROOT / "bin/tp-agent"), "request", "--kind", "tool",
-                                "--what", "browser", "--reason", "Need rendered evidence"],
-                               env={**self.env, "TP_TASK_DIR": str(task)}, text=True,
-                               capture_output=True, timeout=10)
+        task = self.task_dir(item)
+        asked = self.raw("request", "--kind", "tool", "--what", "browser", "--reason", "Need rendered evidence",
+                         env={**self.env, "TP_TASK_DIR": str(task)}, timeout=10)
         self.assertEqual(asked.returncode, 0, asked.stderr)
         self.assertEqual(self.cli("inspect", item["id"])["status"], "needs_input")
         self.assertEqual(self.cli("index")["active"][0]["capability_request"]["what"], "browser")
@@ -129,13 +141,10 @@ esac
 
     def test_retry_links_prior_attempt_and_records_reason(self):
         first = self.dispatch()
-        task = self.state / "tasks" / first["id"]
-        (task / "state.json").write_text('{"state":"waiting"}')
-        (task / "result.md").write_text("RESULT_STATUS: incomplete\nCould not find the parser.\n")
-        second = self.cli("retry", first["id"], "--reason", "Look in the package directory",
-                          "--worker", "pi", "--model", "openai-codex/gpt-6-sol")
+        self.settle(first, "RESULT_STATUS: incomplete\nCould not find the parser.\n")
+        second = self.retry(first, "Look in the package directory")
         self.assertEqual(second["parent"], first["id"])
-        packet = (self.state / "tasks" / second["id"] / "packet.md").read_text()
+        packet = self.packet(second)
         self.assertIn("Look in the package directory", packet)
         self.assertIn(first["id"], packet)
         self.assertEqual(self.cli("inspect", first["id"])["result_status"], "incomplete")
@@ -146,52 +155,37 @@ esac
         dep = self.dispatch(role="researcher", task="Dependency")
         first = self.dispatch(task="Use spec", after=dep["id"], context="spec.txt", note="Keep API stable")
         self.assertEqual(first["status"], "queued")
-        dep_task = self.state / "tasks" / dep["id"]
-        (dep_task / "state.json").write_text('{"state":"waiting"}')
-        (dep_task / "result.md").write_text("RESULT_STATUS: complete\n")
+        self.settle(dep, "RESULT_STATUS: complete\n")
         self.cli("tick")
         sensitive = self.dispatch(task="Env", context=".env")
-        task = self.state / "tasks" / first["id"]
-        (task / "state.json").write_text('{"state":"waiting"}')
-        (task / "result.md").write_text("RESULT_STATUS: incomplete\n")
-        second = self.cli("retry", first["id"], "--reason", "Try again",
-                          "--worker", "pi", "--model", "openai-codex/gpt-6-sol")
-        packet = (self.state / "tasks" / second["id"] / "packet.md").read_text()
+        self.settle(first, "RESULT_STATUS: incomplete\n")
+        second = self.retry(first, "Try again")
+        packet = self.packet(second)
         self.assertIn("SPEC_MARKER", packet)
         self.assertIn("Keep API stable", packet)
         self.assertIn("Prior packet:", packet)
         self.assertNotIn("Dependency %s result" % dep["id"], packet)
         # a retry of a retry does not accumulate retry notes
-        (self.state / "tasks" / second["id"] / "state.json").write_text('{"state":"waiting"}')
-        third = self.cli("retry", second["id"], "--reason", "Again", "--worker", "pi",
-                         "--model", "openai-codex/gpt-6-sol")
-        packet3 = (self.state / "tasks" / third["id"] / "packet.md").read_text()
+        self.settle(second)
+        packet3 = self.retry_packet(second)
         self.assertEqual(packet3.count("Retry of "), 1)
         self.assertIn("SPEC_MARKER", packet3)
         # sensitive context stays omitted on retry
-        (self.state / "tasks" / sensitive["id"] / "state.json").write_text('{"state":"waiting"}')
-        retry = self.cli("retry", sensitive["id"], "--reason", "Again", "--worker", "pi",
-                         "--model", "openai-codex/gpt-6-sol")
-        packet4 = (self.state / "tasks" / retry["id"] / "packet.md").read_text()
+        self.settle(sensitive)
+        retry = self.retry(sensitive)
+        packet4 = self.packet(retry)
         self.assertNotIn("PRIVATE_TOKEN=example", packet4)
         # the omitted input is recorded as omitted, never as admitted, and is not handed back to spawn
-        kept = json.loads((self.state / "tasks" / sensitive["id"] / "dispatch.json").read_text())
+        kept = json.loads((self.task_dir(sensitive) / "dispatch.json").read_text())
         self.assertEqual((kept["context"], kept["omitted_context"]), ([], [".env"]))
         self.assertNotIn("Sensitive context .env was omitted", packet4)
         self.assertIn("1 context input(s) omitted as sensitive in the prior attempt were not replayed", packet4)
-        again = json.loads((self.state / "tasks" / retry["id"] / "dispatch.json").read_text())
+        again = json.loads((self.task_dir(retry) / "dispatch.json").read_text())
         self.assertEqual((again["context"], again["omitted_context"]), ([], []))
 
     def settled(self, **extra):
         item = self.dispatch(**extra)
-        task = self.state / "tasks" / item["id"]
-        (task / "state.json").write_text('{"state":"waiting"}')
-        return item, task
-
-    def retry_packet(self, item):
-        retry = self.cli("retry", item["id"], "--reason", "Again", "--worker", "pi",
-                         "--model", "openai-codex/gpt-6-sol")
-        return (self.state / "tasks" / retry["id"] / "packet.md").read_text()
+        return item, self.settle(item)
 
     def test_retry_does_not_replay_raw_sensitive_spec_from_older_record(self):
         (self.project / ".env").write_text("PRIVATE_TOKEN=example\n")
@@ -227,26 +221,24 @@ esac
                 self.assertNotIn("SPEC_MARKER", packet)
                 self.assertNotIn("Keep API stable", packet)
                 for path in (self.state / "tasks").iterdir():
-                    (path / "state.json").write_text('{"state":"waiting"}')
+                    (path / "state.json").write_text(WAITING)
 
     def test_retry_replays_more_than_twenty_inputs(self):
         args = ["dispatch", "--role", "coder", "--task", "Many inputs", "--worker", "pi",
-                "--model", "openai-codex/gpt-6-sol", "--workdir", str(self.project)]
+                "--model", MODEL, "--workdir", str(self.project)]
         for i in range(21):
             (self.project / f"ctx{i}.txt").write_text(f"CTX_MARKER_{i:02d}\n")
             args += ["--context", f"ctx{i}.txt", "--note", f"NOTE_MARKER_{i:02d}"]
         item = self.cli(*args)
-        (self.state / "tasks" / item["id"] / "state.json").write_text('{"state":"waiting"}')
+        self.settle(item)
         packet = self.retry_packet(item)
         for i in range(21):
             self.assertIn(f"CTX_MARKER_{i:02d}", packet)
             self.assertIn(f"NOTE_MARKER_{i:02d}", packet)
 
     def test_incompatible_harness_model_is_rejected(self):
-        run = subprocess.run([str(ROOT / "bin/tp-agent"), "dispatch", "--role", "coder",
-                              "--task", "Check config", "--worker", "claude",
-                              "--model", "openai-codex/gpt-6-sol"], env=self.env,
-                             text=True, capture_output=True, timeout=10)
+        run = self.raw("dispatch", "--role", "coder", "--task", "Check config", "--worker", "claude",
+                       "--model", MODEL, timeout=10)
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("belongs to pi", run.stderr)
 

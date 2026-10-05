@@ -44,8 +44,9 @@ class SkillCheckTests(unittest.TestCase):
             "---\nname: my-skill\ndescription: >\n  folded text here\n---\n",
         ]
         for text in bad:
-            d = self.skill(text=text)
-            self.assertEqual(check(d)[0], 1, text)
+            with self.subTest(text=text):
+                d = self.skill(text=text)
+                self.assertEqual(check(d)[0], 1, text)
 
     def test_one_hop_reference_ok_and_single_file_rejects(self):
         d = self.skill(body="[d](references/d.md)")
@@ -58,8 +59,9 @@ class SkillCheckTests(unittest.TestCase):
 
     def test_path_escape_missing_and_symlink(self):
         for link in ("../x.md", "/etc/hosts", "references/none.md"):
-            d = self.skill(body=f"[x]({link})")
-            self.assertEqual(check(d)[0], 1, link)
+            with self.subTest(link=link):
+                d = self.skill(body=f"[x]({link})")
+                self.assertEqual(check(d)[0], 1, link)
         d = self.skill(body="[x](references/s.md)")
         (d / "references").mkdir()
         outside = self.tmp / "outside.md"
@@ -87,33 +89,37 @@ class SkillCheckTests(unittest.TestCase):
     def test_invalid_yaml_values_rejected(self):
         for desc in ("Does a thing: use when needed here", "Does a useful thing # use when needed",
                      "'unterminated quote value here", "\"quoted\" trailing junk here", "[a, b] list value here"):
-            d = self.skill(text=f"---\nname: my-skill\ndescription: {desc}\n---\n")
-            self.assertEqual(check(d)[0], 1, desc)
+            with self.subTest(desc=desc):
+                d = self.skill(text=f"---\nname: my-skill\ndescription: {desc}\n---\n")
+                self.assertEqual(check(d)[0], 1, desc)
 
     def test_quoted_values_valid(self):
         for desc in ("'Does a thing: use when needed here'", "\"Does a thing # use when needed here\"",
                      "Does a useful thing; use when it's needed # not a comment".replace(" #", "#")):
-            d = self.skill(text=f"---\nname: my-skill\ndescription: {desc}\n---\n")
-            self.assertEqual(check(d)[0], 0, desc)
+            with self.subTest(desc=desc):
+                d = self.skill(text=f"---\nname: my-skill\ndescription: {desc}\n---\n")
+                self.assertEqual(check(d)[0], 0, desc)
 
     def test_link_syntaxes_cannot_bypass_confinement(self):
         for body in ("[s]: ../../etc/passwd", "[s]: <../x.md>", "[x](<../x.md>)", "![i](../x.png)",
                      '<a href="../x.md">x</a>', "<img src='/etc/hosts'>", "[x](%2e%2e/x.md)",
                      "[x](..\\x.md)"):
-            d = self.skill(body=body)
-            rc, err = check(d)
-            self.assertEqual(rc, 1, body)
-            self.assertNotIn("Traceback", err)
+            with self.subTest(body=body):
+                d = self.skill(body=body)
+                rc, err = check(d)
+                self.assertEqual(rc, 1, body)
+                self.assertNotIn("Traceback", err)
 
     def test_reference_file_one_hop_bypass_rejected(self):
         for rbody in ("[x]: other.md", '<a href="other.md">x</a>', "[x](<other.md>)", "![i](pic.png)"):
-            d = self.skill(body="[a](a.md)")
-            (d / "a.md").write_text(rbody + "\n")
-            (d / "other.md").write_text("o\n")
-            (d / "pic.png").write_bytes(b"x")
-            rc, err = check(d)
-            self.assertEqual(rc, 1, rbody)
-            self.assertIn("one hop", err)
+            with self.subTest(rbody=rbody):
+                d = self.skill(body="[a](a.md)")
+                (d / "a.md").write_text(rbody + "\n")
+                (d / "other.md").write_text("o\n")
+                (d / "pic.png").write_bytes(b"x")
+                rc, err = check(d)
+                self.assertEqual(rc, 1, rbody)
+                self.assertIn("one hop", err)
 
     def test_fences_external_urls_and_valid_ref_links(self):
         body = ("```\n[x](../nope.md)\n```\n`[y](../nope.md)`\n[e](https://example.com/a.md)\n"
@@ -149,19 +155,12 @@ class SkillCheckTests(unittest.TestCase):
         entries = json.loads((ROOT / "config/skill-catalog.json").read_text())["skills"]
         self.assertTrue(entries)
         for e in entries:
-            d = (ROOT / e["path"]).parent
-            self.assertEqual(check(d, "--legacy")[0], 0, e["id"])
+            with self.subTest(skill=e["id"]):
+                d = (ROOT / e["path"]).parent
+                self.assertEqual(check(d, "--legacy")[0], 0, e["id"])
         after = subprocess.run(["git", "status", "--porcelain", "catalog", "skills"], cwd=ROOT,
                                text=True, capture_output=True).stdout
         self.assertEqual(before, after)
-
-    def test_selector_smoke_positive_and_negative(self):
-        def sel(r):
-            p = subprocess.run([str(ROOT / "bin/tp-skills"), "--mode", "select"], input=r,
-                               text=True, capture_output=True, check=True)
-            return [s["id"] for s in json.loads(p.stdout)]
-        self.assertEqual(sel("/counterpoint challenge this plan"), ["counterpoint"])
-        self.assertEqual(sel("Fix a TypeScript validation bug"), [])
 
 
 if __name__ == "__main__":

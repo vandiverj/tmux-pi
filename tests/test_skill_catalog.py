@@ -25,13 +25,15 @@ class SkillCatalogTests(unittest.TestCase):
 
     def test_qa_command_and_natural_language(self):
         for request in ("/make-qa test person search", "Write a staging test script for person search"):
-            self.assertEqual([s["id"] for s in run(request)], ["make-qa"])
+            with self.subTest(request=request):
+                self.assertEqual([s["id"] for s in run(request)], ["make-qa"])
 
     def test_document_directions_are_selected_only_when_relevant(self):
         for request in ("Read report.pdf", "Convert report.docx to Markdown",
                         "Export Markdown to PDF", "Generate a Word document from Markdown",
                         "Extract from PDF and write report.docx"):
-            self.assertEqual([s["id"] for s in run(request)], ["document-transform"], request)
+            with self.subTest(request=request):
+                self.assertEqual([s["id"] for s in run(request)], ["document-transform"], request)
 
     def test_focused_review_and_planning_guidance(self):
         cases = {
@@ -45,7 +47,8 @@ class SkillCatalogTests(unittest.TestCase):
             "Test skill behavior before updating the selector": "test-skill-behavior",
         }
         for request, expected in cases.items():
-            self.assertEqual([s["id"] for s in run(request)], [expected], request)
+            with self.subTest(request=request, expected=expected):
+                self.assertEqual([s["id"] for s in run(request)], [expected], request)
 
     def test_explicit_marker_tolerates_surrounding_punctuation(self):
         cases = {
@@ -57,7 +60,8 @@ class SkillCatalogTests(unittest.TestCase):
             "/Threat-Model!": "threat-model",
         }
         for request, expected in cases.items():
-            self.assertEqual([s["id"] for s in run(request)], [expected], request)
+            with self.subTest(request=request, expected=expected):
+                self.assertEqual([s["id"] for s in run(request)], [expected], request)
 
     def test_marker_embedded_in_path_or_longer_name_is_not_explicit(self):
         for request in ("See src/make-qa/notes for the old layout",
@@ -67,7 +71,8 @@ class SkillCatalogTests(unittest.TestCase):
                         "List /product-fit/drafts",
                         "Add a /counterpoint-v2 command stub",
                         "Compare and/counterpoint the two words"):
-            self.assertEqual(run(request), [], request)
+            with self.subTest(request=request):
+                self.assertEqual(run(request), [], request)
 
     def test_narrowed_phrases_reject_incidental_prose(self):
         for request in ("Fix the security review comments in the PR",
@@ -78,7 +83,8 @@ class SkillCatalogTests(unittest.TestCase):
                         "Run an adversarial pass over the parser fuzz corpus",
                         "Add adversarial pass counts to the fuzz report",
                         "Rename the threat model fixture in the docs"):
-            self.assertEqual(run(request), [], request)
+            with self.subTest(request=request):
+                self.assertEqual(run(request), [], request)
 
     def test_narrowed_phrases_keep_deliberate_requests(self):
         cases = {
@@ -92,7 +98,8 @@ class SkillCatalogTests(unittest.TestCase):
             "Give me a counterpoint on the migration decision": "counterpoint",
         }
         for request, expected in cases.items():
-            self.assertEqual([s["id"] for s in run(request)], [expected], request)
+            with self.subTest(request=request, expected=expected):
+                self.assertEqual([s["id"] for s in run(request)], [expected], request)
 
     def test_selection_never_exceeds_three_and_explicit_ranks_first(self):
         every = run("/make-qa, (/counterpoint) /product-fit. /threat-model: for report.pdf")
@@ -125,7 +132,8 @@ class SkillCatalogTests(unittest.TestCase):
 
     def test_catalogue_paths_confined_to_repo(self):
         for skill in json.loads((ROOT / "config/skill-catalog.json").read_text())["skills"]:
-            self.assertTrue((ROOT / skill["path"]).resolve().is_relative_to(ROOT))
+            with self.subTest(skill=skill["id"]):
+                self.assertTrue((ROOT / skill["path"]).resolve().is_relative_to(ROOT))
 
 
 if __name__ == "__main__":

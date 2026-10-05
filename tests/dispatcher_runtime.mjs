@@ -12,7 +12,23 @@ const root = path.resolve(import.meta.dirname, '..');
 const state = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-runtime-'));
 const moduleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-module-'));
 const source = fs.readFileSync(path.join(root, 'agent/extensions/dispatcher.ts'), 'utf8');
-fs.writeFileSync(path.join(moduleDir, 'dispatcher.ts'), source.replace('import { execFile } from "node:child_process";', 'const execFile = globalThis.__fakeExecFile;'));
+// The production watcher/scanner poll every 3000ms; compress only that cadence so
+// settlement is noticed quickly. Other sleeps (2s, 15s contract scan) stay real.
+const POLL_MS = 3000, FAST_POLL_MS = Number(process.env.TP_TEST_POLL_MS || 150);
+const sleepLine = 'const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));';
+if (!source.includes(sleepLine)) throw new Error('dispatcher sleep helper changed; update the harness poll compression');
+// Only the two intended 3000ms cadences may be compressed: the task watcher (after its
+// stuck-warning check) and the prompt scanner (guarded by `active`). Fail if either moves
+// or a third appears, and if any sleep() call uses a non-literal delay we cannot audit.
+const pollSleeps = [...source.matchAll(/sleep\(3000\)/g)];
+const watcherPoll = /Date\.now\(\) - started > 45_000[\s\S]{0,400}?\n\t\t\tawait sleep\(3000\);\n\t\t\}\n\t\};/;
+const scannerPoll = /await scanPrompts\(\)\.catch\(\(\) => undefined\);\n\t+if \(active\) await sleep\(3000\);/;
+if (pollSleeps.length !== 2 || !watcherPoll.test(source) || !scannerPoll.test(source)
+  || [...source.matchAll(/sleep\(([^)]*)\)/g)].some(m => m[1] !== 'ms' && !/^[\d_]+$/.test(m[1]))) {
+  throw new Error(`dispatcher 3000ms poll sites changed (found ${pollSleeps.length}); update the harness poll compression`);
+}
+fs.writeFileSync(path.join(moduleDir, 'dispatcher.ts'), source.replace('import { execFile } from "node:child_process";', 'const execFile = globalThis.__fakeExecFile;')
+  .replace(sleepLine, `const sleep = (ms: number) => new Promise((resolve) => setTimeout(() => { if (ms === ${POLL_MS}) (globalThis.__pollTicks ||= []).push(Date.now()); resolve(undefined); }, ms === ${POLL_MS} ? ${FAST_POLL_MS} : ms));`));
 process.env.TMUX = 'test';
 process.env.TP_MODE = 'strict';
 process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');
@@ -209,7 +225,13 @@ try {
       // Late reviewer settlement must not use the captured Pi context or collect.
       pi.sendMessage = () => { throw new Error('This extension ctx is stale after session replacement or reload'); };
       fs.writeFileSync(path.join(dir('review-1'), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));
-      await new Promise(r => setTimeout(r, 3250));
+      // Wait for observed poll activity after the late settlement instead of a fixed delay:
+      // a compressed poll sleep must resolve after the write (the loop then re-checks state).
+      // Shutdown can cancel further polls, so require one observed wake, not more cycles.
+      const settledAt = Date.now(), ticks = () => (globalThis.__pollTicks || []).filter(t => t >= settledAt).length;
+      for (let i = 0; i < 200 && !ticks(); i++) await new Promise(r => setTimeout(r, 25));
+      if (!ticks()) throw new Error('no watcher/scanner poll tick observed after late settlement');
+      await new Promise(r => setTimeout(r, 50)); // let the woken loop body run
       const marker = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json')));
       console.log(JSON.stringify({ marker, collected: calls.filter(c => c.name === 'tp-contract' && c.args[0] === 'collect').length,
         messages: messages.map(m => m.details?.kind), reviewer: globalThis.midRounds }));

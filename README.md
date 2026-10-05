@@ -77,6 +77,6 @@ States come from each worker's reporter: `starting`, `working`, `tool`, `waiting
 
 ## Validation and legacy path
 
-Run the repository tests with `python3 -m unittest discover -s tests -p 'test_*.py'` and the extension type check with `tests/check_dispatcher_types.sh`. Some tests bind loopback sockets. The old strict dispatcher and related commands remain in the repo for reference and rollback, but `bin/tp` does not load that flow. Its former user guide is preserved in [docs/legacy-workflow.md](docs/legacy-workflow.md).
+Run the repository tests with `python3 -m unittest discover -s tests -p 'test_*.py'` and the extension type check with `tests/check_dispatcher_types.sh`, which covers every extension under `agent/extensions`. The Node runtime harnesses in `tests/*.mjs` run through that discovery and need Node with `--experimental-strip-types`. Some tests bind loopback sockets. `tests/run_parallel.py -j2` is an optional faster run: it gives each test module its own interpreter, runs at most four at once, and keeps the pseudo-terminal and loopback-server modules serial. The serial command stays the reference, so rerun it before trusting a parallel-only failure or pass. The old strict dispatcher and related commands remain in the repo for reference and rollback, but `bin/tp` does not load that flow. Its former user guide is preserved in [docs/legacy-workflow.md](docs/legacy-workflow.md).
 
 The product requirements and acceptance scenarios are in [docs/agent-development-environment-prd.md](docs/agent-development-environment-prd.md).

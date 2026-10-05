@@ -11,7 +11,7 @@ def run_json(*args, input_text=None):
     return json.loads(p.stdout)
 
 
-class DispatcherR2PathTests(unittest.TestCase):
+class TaskRecordR2CliTests(unittest.TestCase):
     def decision(self, **kw):
         data = {
             "worker": "pi",

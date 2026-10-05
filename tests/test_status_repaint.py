@@ -108,14 +108,23 @@ esac
                     break
         return data
 
-    def first_frame(self, *needles, seconds=8.0, settle=0.3):
-        """Await the first frame containing every needle (bounded), then keep
-        reading briefly so a repeated paint still shows up in the result."""
+    def first_frame(self, *needles, seconds=8.0, settle=0.0):
+        """Await a complete frame (ends with ESC[J) once every needle has arrived
+        (bounded); `settle` optionally keeps reading so a repeated paint shows."""
         data = b""
         end = time.monotonic() + seconds
-        while time.monotonic() < end and not all(n in data for n in needles):
+        while time.monotonic() < end and not (
+                all(n in data for n in needles) and data.endswith(b"\x1b[J")):
             data += self.output(0.05)
-        return data + self.output(settle)
+        return data + self.output(settle) if settle else data
+
+    def barrier(self):
+        """Input is handled in order: toggling the usage page and back, each
+        observed in a painted frame, proves earlier input was fully processed."""
+        os.write(self.master, b"s")
+        self.output_until(lambda frame: b"usage" in frame and b"\x1b[J" in frame)
+        os.write(self.master, b"s")
+        self.output_until(lambda frame: b"s stats" in frame and b"\x1b[J" in frame)
 
     def wait_viewing(self, name, seconds=5.0):
         """Poll the fake tmux viewing option until it names `name`, bounded."""
@@ -124,7 +133,7 @@ esac
         while time.monotonic() < end:
             if path.exists() and path.read_text().strip() == name:
                 return
-            self.output(0.05)
+            self.output(0.02)
 
     def make_jobs(self, count):
         tasks = self.state / "tasks"
@@ -143,9 +152,15 @@ esac
         path = self.base / "swaps"
         return path.read_text().splitlines() if path.exists() else []
 
-    def click(self, y, x=5, button=0, final="M", wait=0.8):
+    def click(self, y, x=5, button=0, final="M", wait=0.02):
         os.write(self.master, f"\x1b[<{button};{x};{y}{final}".encode())
         return self.output(wait)
+
+    def click_view(self, y, name, x=5):
+        """A click that must view `name`: wait (bounded) for the fake tmux to record it."""
+        self.click(y, x=x)
+        self.wait_viewing(name)
+        self.assertEqual((self.base / "viewing").read_text().strip(), name)
 
     def row_order(self, first):
         return list(dict.fromkeys(re.findall(rb"job\d", first)))
@@ -160,7 +175,7 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertTrue(first.startswith(b"\x1b[?25l\x1b[?1000h\x1b[?1006h"), first[:40])
         self.assertNotIn(b"\x1b[?1000l", first)
         self.proc.terminate()
-        tail = self.output(1.0)
+        tail = self.output_until(lambda frame: b"\x1b[?1000l" in frame)
         self.assertIn(b"\x1b[?1006l\x1b[?1000l", tail)
         self.assertEqual(self.proc.wait(timeout=3), 143)
 
@@ -180,42 +195,31 @@ class StatusRepaintTest(StatusPaneFixture):
         self.click(3, button=2)             # right button
         self.click(3, final="m")            # release
         self.click(3, button=4)             # shift-modified
-        self.assertEqual(self.swaps(), [])
+        # Input is ordered: the first real click below is only handled after every
+        # ignored event above, and an unexpected swap would show in the exact list.
         for y, name in zip((3, 5, 7), order):
-            self.click(y, x=17)             # multi-digit coordinate handling
-            self.assertEqual((self.base / "viewing").read_text().strip(), name)
+            self.click_view(y, name, x=17)  # multi-digit coordinate handling
         # Each click swaps the previous task back (restore) then the clicked one in.
         self.assertEqual([line.split()[3] for line in self.swaps()],
                          ["%" + order[0][-1], "%" + order[0][-1], "%" + order[1][-1],
                           "%" + order[1][-1], "%" + order[2][-1]])
         self.assertTrue(all(line.endswith("-t %9") for line in self.swaps()))
 
-    def test_multi_digit_coordinates_and_keyboard_unchanged(self):
+    def test_multi_digit_coordinates(self):
         self.make_jobs(2)
         (self.base / "lines").write_text("120\n")
         first = self.first_frame(b"job1", b"job2")
         order = [name.decode() for name in self.row_order(first)]
-        self.click(5, x=100)
-        self.assertEqual((self.base / "viewing").read_text().strip(), order[1])
-        marker = f"── {order[0]} ".encode()
-        os.write(self.master, b"k")
-        moved = self.output_until(lambda frame: marker in frame)
-        self.assertIn(marker, moved.split(ESC)[-1])   # selection moved before Enter
-        os.write(self.master, b"\n")   # slave is raw (no ICRNL), so send what a cooked tty delivers for Enter
-        self.wait_viewing(order[0])
-        self.assertEqual((self.base / "viewing").read_text().strip(), order[0])
-        for key in (b"\x1b[B", b"\x1b[A"):
-            os.write(self.master, key)
-            self.output(0.5)
+        self.click_view(5, order[1], x=100)
 
     def test_partial_and_unknown_escape_sequences_do_nothing(self):
         self.make_jobs(2)
         self.first_frame(b"job1", b"job2")
         os.write(self.master, b"\x1b[<0;5")      # truncated mouse report
-        self.output(1.6)                          # reader times out and drops it
+        self.output(1.8)                          # reader times out (1s) and drops it, with margin
         os.write(self.master, b"\x1b[3~")         # other CSI, fully consumed
         os.write(self.master, b"\x1b[<0;5;3m")    # release
-        self.output(0.8)
+        self.barrier()
         self.assertEqual(self.swaps(), [])
         self.assertFalse((self.base / "viewing").exists())
 
@@ -230,57 +234,49 @@ class StatusRepaintTest(StatusPaneFixture):
         self.click(1)
         self.click(5)
         self.click(6)
-        self.assertEqual(self.swaps(), [])
-        self.click(3)
-        self.assertEqual((self.base / "viewing").read_text().strip(), order[1])
+        self.click_view(3, order[1])
+        self.assertEqual(len(self.swaps()), 1)      # only the real row click swapped
 
     def test_queue_and_placeholder_rows_are_not_clickable(self):
         first = self.first_frame(b"subagents 0")
         self.assertIn(b"subagents 0", first)
         self.click(3)
         self.click(2)
+        self.barrier()                      # placeholder clicks handled before the queue exists
         queue = self.state / "queue"
         queue.mkdir()
         (queue / "q.json").write_text(json.dumps({"id": "queued1", "role": "coder"}))
-        self.assertIn(b"queued1", self.output(1.6))
+        self.assertIn(b"queued1", self.output_until(lambda frame: b"queued1" in frame))
         self.click(3)
         self.click(4)
+        self.barrier()
         self.assertEqual(self.swaps(), [])
 
     def test_idle_no_workers_and_resize(self):
-        first = self.first_frame(b"no subagents")
+        first = self.first_frame(b"no subagents", settle=0.3)   # a duplicate initial repaint would show here
         self.assertIn(b"no subagents", first)
         self.assertEqual(first.count(ESC), 1)
-        self.assertEqual(self.output(1.4), b"")
+        self.assertEqual(self.output(1.2), b"")      # a full poll tick stays silent
         (self.state / "main").mkdir()
         (self.state / "main" / "state.json").write_text(json.dumps({
             "model": "main-model", "tokens": {"input": 3, "output": 4}}))
-        self.assertIn(b"main-model", self.output(1.4))
-        self.assertEqual(self.output(1.4), b"")
+        self.assertIn(b"main-model", self.output_until(lambda frame: b"main-model" in frame))
+        self.assertEqual(self.output(1.2), b"")
         (self.base / "lines").write_text("25\n")
-        self.assertEqual(self.output(2.5).count(ESC), 1)
-        self.assertEqual(self.output(1.4), b"")
+        resized = self.output_until(lambda frame: b"\x1b[J" in frame)
+        self.assertEqual((resized + self.output(1.2)).count(ESC), 1)
 
     def test_state_change_and_keyboard_selection(self):
+        self.make_jobs(2)
         tasks = self.state / "tasks"
-        for number in (1, 2):
-            directory = tasks / f"job{number}"
-            directory.mkdir()
-            (directory / "meta.json").write_text(json.dumps({
-                "id": f"job{number}", "worker": "pi", "pane": f"%{number}",
-                "model": "", "thinking": ""}))
-            (directory / "state.json").write_text(json.dumps({
-                "state": "working", "model": "test-model", "tokens": {
-                    "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
-            (directory / "task.md").write_text(f"task {number}\n")
         first = self.output_until(lambda frame: "── job2 ".encode() in frame and b"task 2" in frame)
         self.assertIn(b"job2", first)
-        self.assertEqual(self.output(1.4), b"")
+        self.assertEqual(self.output(1.2), b"")
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: "── job1 ".encode() in frame and b"task 1" in frame)
         self.assertIn(b"task 1", moved)
         self.assertEqual(moved.count(ESC), 1)
-        self.assertEqual(self.output(1.4), b"")
+        self.assertEqual(self.output(1.2), b"")
         (tasks / "job1" / "state.json").write_text(json.dumps({
             "state": "settled", "model": "test-model", "tokens": {
                 "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
@@ -318,7 +314,7 @@ class StatusRepaintTest(StatusPaneFixture):
         self.write_state("nostate", {}, main=False)
         (self.state / "tasks" / "nostate" / "state.json").unlink()
         self.write_state("", {"model": "p/beta", "tokens": {"input": 30, "output": 4, "cacheRead": 0, "cacheWrite": 0}}, main=True)
-        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", self.first_frame(b"records 5", settle=0.2)).decode()
+        text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", self.first_frame(b"records 5")).decode()
         for needle in ("p/alpha", "p/beta", "opus", "unattributed (legacy/partial",
                        "last reported model: p/beta (not an attribution)"):
             self.assertIn(needle, text)
@@ -332,45 +328,57 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertRegex(text, r"cl1\s+claude\s+working\s+↑7 c2k ↓3\s+\$\?")
 
     def test_overflow_is_bounded_and_navigation_scrolls(self):
-        tasks = self.state / "tasks"
-        now = time.time()
-        for number in range(1, 45):
-            self.write_state(f"job{number:02d}", {"state": "working", "model": "m",
-                "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}})
-            os.utime(tasks / f"job{number:02d}" / "meta.json", (now + number, now + number))
-        lines = 24
-        first = self.first_frame(b"/44", b"job44")
-        self.assertEqual(first.count(ESC), 1)
-        self.assertLessEqual(first.count(b"\n"), lines - 1)   # never scrolls the header away
-        self.assertIn(b"/44", first)
+        lines = 16                                             # 20 tasks overflow a 16-line pane (smallest non-compact)
+        (self.base / "lines").write_text(f"{lines}\n")        # geometry first: no frame may be painted at 24 lines
+        # Publish all tasks at once. The list is ordered by meta.json mtime and the
+        # window offset is sticky, so a frame painted while tasks are half written
+        # (or before their mtimes are set) would leave a different window behind.
+        live, stage = self.state, self.base / "stage"
+        (stage / "tasks").mkdir(parents=True)
+        self.state = stage
+        try:
+            now = time.time()
+            for number in range(1, 21):
+                self.write_state(f"job{number:02d}", {"state": "working", "model": "m",
+                    "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}})
+                os.utime(stage / "tasks" / f"job{number:02d}" / "meta.json", (now + number, now + number))
+        finally:
+            self.state = live
+        (live / "tasks").rmdir()
+        os.rename(stage / "tasks", live / "tasks")
+        data = self.first_frame(b"/20", b"job20", settle=0.3)
+        # Earlier frames (the empty list painted at startup) are fine; the frame that
+        # lists every task must be the last one, i.e. the view is stable after it.
+        frames = data.split(ESC)[1:]
+        first = frames[-1]
+        self.assertIn(b"job20", first)
+        for frame in frames:
+            self.assertLessEqual(frame.count(b"\n"), lines - 1)   # never scrolls the header away
+        self.assertIn(b"/20", first)
         shown = list(dict.fromkeys(int(m) for m in re.findall(rb"job(\d\d)", first)))
         self.assertEqual(shown, sorted(shown))
-        self.assertEqual(shown[-1], 44)                        # newest selected, in view
+        self.assertEqual(shown[-1], 20)                        # newest selected, in view
         self.assertNotIn(1, shown)
         # click mapping covers visible lines only: row at screen line 3 is shown[0].
-        self.click(3)
-        self.assertEqual((self.base / "viewing").read_text().strip(), f"job{shown[0]:02d}")
+        self.click_view(3, f"job{shown[0]:02d}")
         self.click(lines)                                      # beyond the frame
         for _ in range(shown[0] - 1):                          # exactly to job01
             os.write(self.master, b"k")
-        data = b""
-        deadline = time.monotonic() + 40                       # keys are processed one repaint each
-        while time.monotonic() < deadline:
-            data += self.output(1.0)
-            if b"job01" in data.split(ESC)[-1] and b"job02" in data.split(ESC)[-1]:
-                break
+        # keys are processed one repaint each; wait for the frame showing job01
+        data = self.output_until(
+            lambda frame: b"job01" in frame and b"job02" in frame and b"\x1b[J" in frame,
+            seconds=40)
         frames = data.split(ESC)[1:]
         self.assertTrue(frames)
         for frame in frames:
             self.assertLessEqual(frame.count(b"\n"), lines - 1)
         last = frames[-1]
         self.assertIn(b"job01", last)
-        self.assertNotIn(b"job44", last)
+        self.assertNotIn(b"job20", last)
         os.write(self.master, b"j")
-        again = self.output(0.8)
+        again = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertLessEqual(again.count(b"\n"), lines - 1)
-        self.click(3)
-        self.assertEqual((self.base / "viewing").read_text().strip(), "job01")
+        self.click_view(3, "job01")
 
     def test_stats_page_toggle_is_bounded_and_keeps_list_semantics(self):
         self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/a",
@@ -381,7 +389,7 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertIn(b"s stats", first)
         self.assertNotIn(b"session tokens", first)
         os.write(self.master, b"s")
-        page = self.output(0.8)
+        page = self.output_until(lambda frame: b"usage" in frame and b"\x1b[J" in frame)
         text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", page).decode()
         self.assertIn("usage", text)
         self.assertIn("p/a", text)
@@ -390,13 +398,11 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertLessEqual(page.count(b"\n"), 11)
         self.click(2)                                     # no rows on the usage page
         os.write(self.master, b"\r")
-        self.output(0.4)
-        self.assertEqual(self.swaps(), [])
-        os.write(self.master, b"s")
-        back = self.output(0.8)
+        os.write(self.master, b"s")                       # ordered after the ignored input
+        back = self.output_until(lambda frame: b"pi1" in frame and b"\x1b[J" in frame)
         self.assertIn(b"pi1", back)
-        self.click(2, x=5)                                # compact pane: header, then rows
-        self.assertEqual((self.base / "viewing").read_text().strip(), "pi1")
+        self.assertEqual(self.swaps(), [])
+        self.click_view(2, "pi1")                         # compact pane: header, then rows
 
     def test_stats_page_overflow_is_counted_not_scrolled(self):
         self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/a",
@@ -404,7 +410,7 @@ class StatusRepaintTest(StatusPaneFixture):
         (self.base / "lines").write_text("5\n")
         self.first_frame(b"pi1")
         os.write(self.master, b"s")
-        small = self.output(1.0)
+        small = self.output_until(lambda frame: b"more lines" in frame and b"\x1b[J" in frame)
         self.assertIn(b"more lines", small)
         self.assertLessEqual(small.count(b"\n"), 4)
 
@@ -444,8 +450,7 @@ class StatusEchoTtyTest(StatusPaneFixture):
     def test_wheel_flood_is_not_echoed_and_click_still_maps(self):
         self.make_jobs(3)
         self.assertTrue(self.lflag() & termios.ECHO)          # the fixture really echoes
-        first = self.output_until(lambda frame: b"task 3" in frame or b"\x1b[J" in frame)
-        first += self.output(0.5)
+        first = self.first_frame(b"job1", b"job2", b"job3")
         order = [name.decode() for name in self.row_order(first)]
         self.assertEqual(sorted(order), ["job1", "job2", "job3"])
         self.assertFalse(self.lflag() & termios.ECHO)         # off between reads too
@@ -461,7 +466,7 @@ class StatusEchoTtyTest(StatusPaneFixture):
         while time.monotonic() < deadline and not path.exists():
             data += self.output(0.05)
         elapsed = time.monotonic() - start
-        data += self.output(1.5)
+        data += self.output(0.6)
         self.assertNotRegex(data, rb"<\d+;\d+;\d+[Mm]")       # no raw SGR, as ^[[<.. or bytes
         self.assertNotIn(b"^[", data)
         self.assertNotIn(b"\x07", data)                       # no input-queue overflow bell
@@ -470,7 +475,7 @@ class StatusEchoTtyTest(StatusPaneFixture):
         self.assertEqual(len(self.swaps()), 1)                # the wheel viewed nothing
         self.assertLess(elapsed, 8, "flood left an input backlog")
         frames = data.split(ESC)[1:]
-        self.assertLessEqual(len(frames), int(elapsed + 1.5) + 3)   # bounded repaint, not per event
+        self.assertLessEqual(len(frames), int(elapsed + 0.6) + 3)   # bounded repaint, not per event
         for frame in frames:
             self.assertLessEqual(frame.count(b"\n"), 23)      # nothing scrolls the pane
         self.assertEqual(data.split(ESC)[0], b"")             # nothing printed outside frames

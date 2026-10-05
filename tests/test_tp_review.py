@@ -77,19 +77,16 @@ echo review-1
             self.assertNotIn(SECRET, r.stdout + r.stderr)
         self.assertFalse(self.log.exists())
 
-    def test_unreadable_request_fails_closed(self):
-        (self.task / "capability-request.json").write_text("{not json")
-        self.assertEqual(self.review().returncode, 1)
-
-    def test_missing_null_unknown_or_non_object_status_blocks_even_forced(self):
-        for raw in ('{}', '{"what":"%s","status":null}' % SECRET, '{"status":"requested"}',
+    def test_unreadable_missing_null_unknown_or_non_object_status_blocks_even_forced(self):
+        for raw in ('{not json', '{}', '{"what":"%s","status":null}' % SECRET, '{"status":"requested"}',
                     '{"status":7}', '[]', '"answered"'):
             (self.task / "capability-request.json").write_text(raw)
             for args in ((), ("--force",)):
-                r = self.review(*args)
-                self.assertEqual(r.returncode, 1, raw)
-                self.assertIn("unresolved", r.stderr)
-                self.assertNotIn(SECRET, r.stdout + r.stderr)
+                with self.subTest(raw=raw, args=args):
+                    r = self.review(*args)
+                    self.assertEqual(r.returncode, 1)
+                    self.assertIn("unresolved", r.stderr)
+                    self.assertNotIn(SECRET, r.stdout + r.stderr)
         self.assertFalse(self.log.exists())
 
     def test_answered_or_absent_request_allows_review(self):

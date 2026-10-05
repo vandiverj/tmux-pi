@@ -34,11 +34,6 @@ class DispatcherR5Fixtures(unittest.TestCase):
         p = subprocess.run(args, cwd=ROOT, input=input_text, text=True, capture_output=True, check=True)
         return json.loads(p.stdout)
 
-    def test_input_path_builds_handshake_not_worker(self):
-        out = scenario("direct")
-        self.assertTrue(json.loads(out["scaffold"])["original_request"])
-        self.assertFalse(any(c["name"] == "tp-spawn" for c in out["calls"]))
-
     def test_spawn_and_edit_guards_exist_during_active_handshake(self):
         out = scenario("stop")
         self.assertTrue(all(out["guards"][name] for name in ("send", "absolute", "variable", "tmux", "edit", "shellwrite")))

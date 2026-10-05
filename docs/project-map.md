@@ -108,7 +108,7 @@ Design constants: state is plain files so any piece can be inspected or replaced
 tmux 3.3+, macOS (uses a macOS-compatible advisory lock), pi (0.87.1 verified), Claude Code (2.1.283 verified), a Claude subscription, ChatGPT/Codex subscription via pi `/login` (GPT-6 models), LM Studio with Qwen3.6-35B-A3B (about 20 GB), Slotstream (local Qwen3.8 Flash Next on port 11435), Laya (cloned into `.laya/`, pinned to a commit, Python 3.10+, torch), `jq`, Python 3 (numpy only for `--fit`), Node with `--experimental-strip-types` for TS runtime tests. GitHub private repo `vandiverj/tmux-pi`. Model IDs and prices must be rechecked before relying on the roster.
 
 ## 7. Quality and test posture
-- 27 files in `tests/`: about 22 Python unittest modules plus Node runtime harnesses and a pinned TypeScript 5.9.3 type check.
+- `tests/` holds 32 Python unittest modules (317 tests), 6 Node runtime harnesses that those modules invoke, a pinned TypeScript 5.9.3 type check over all ten extensions, and `tests/run_parallel.py`, an optional bounded module-level parallel runner. The serial `unittest discover` command is the reference.
 - Tests use fake child-process and tmux boundaries, pinned router decisions, and real policy/CLI logic. Docs state plainly that they are **not** live model-quality qualification, not a live Pi session, and not an OS sandbox.
 - No automation cell is qualified or enabled. Calibration labels are one person's judgment.
 

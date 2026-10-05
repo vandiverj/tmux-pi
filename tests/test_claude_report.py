@@ -58,8 +58,7 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("Stop", last_assistant_message="first reply")
         self.assertEqual(self.state()["state"], "waiting")
         self.review(accepted=True)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(lambda _: self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"}), range(16)))
+        self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})  # concurrency: see parallel test
         self.hook("PostToolUse", tool_name="Bash")
         self.hook("Notification", message="permission needed")
         self.hook("Stop", last_assistant_message="stale stop")

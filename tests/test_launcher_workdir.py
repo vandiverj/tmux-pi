@@ -107,6 +107,42 @@ p.write_text(json.dumps(s))
         self.assertNotEqual(wrong.returncode, 0)
         self.assertIn('already runs claude', wrong.stderr)
 
+    def sent_main(self):
+        return [c[-2] for c in self.calls() if c[0] == 'send-keys' and 'tp-main' in c[-2]]
+
+    def test_bare_agent_defaults_to_claude(self):
+        self.assertEqual(self.launch(self.a, TP_SESSION='bare').returncode, 0)
+        self.assertEqual(json.loads(self.state.read_text())['bare']['@tp_main_harness'], 'claude')
+        self.assertIn("TP_MAIN_HARNESS='claude'", self.sent_main()[0])
+        self.assertIn('TP_MAIN_HARNESS=claude', next(c for c in self.calls() if c[0] == 'new-session'))
+
+    def test_explicit_main_pi_overrides_agent_default(self):
+        self.assertEqual(self.launch(self.a, '--main', 'pi', TP_SESSION='pi-run').returncode, 0)
+        self.assertEqual(json.loads(self.state.read_text())['pi-run']['@tp_main_harness'], 'pi')
+        self.assertIn("TP_MAIN_HARNESS='pi'", self.sent_main()[0])
+
+    def test_explicit_main_claude_launches_claude(self):
+        tp = self.fake / 'tp'; tp.symlink_to(ROOT / 'bin/tp')
+        run = subprocess.run([str(tp), '--main', 'claude', str(self.a)], env={**self.env, 'TP_SESSION': 'c'},
+                             text=True, capture_output=True, timeout=15)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("TP_MAIN_HARNESS='claude'", self.sent_main()[0])
+
+    def test_tp_name_still_defaults_to_pi(self):
+        tp = self.fake / 'tp'; tp.symlink_to(ROOT / 'bin/tp')
+        run = subprocess.run([str(tp), str(self.a)], env={**self.env, 'TP_SESSION': 'p'},
+                             text=True, capture_output=True, timeout=15)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("TP_MAIN_HARNESS='pi'", self.sent_main()[0])
+
+    def test_resume_bare_agent_keeps_pi_session(self):
+        self.assertEqual(self.launch(self.a, '--main', 'pi', TP_SESSION='r').returncode, 0)
+        (self.fake / 'claude').unlink()
+        resume = self.launch(self.a, '--resume', TP_SESSION='r', PATH=str(self.fake) + ':/usr/bin:/bin')
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertEqual(json.loads(self.state.read_text())['r']['@tp_main_harness'], 'pi')
+        self.assertEqual(sum(c[0] == 'new-session' for c in self.calls()), 1)
+
     def test_fresh_same_project_preserves_history_and_resume_keeps_tasks(self):
         self.assertEqual(self.launch(self.a).returncode,0)
         first=json.loads(self.state.read_text())

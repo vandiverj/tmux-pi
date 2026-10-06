@@ -310,6 +310,20 @@ def tick(base):
     return {"started": started}
 
 
+def discover_context(task, workdir=None):
+    """Return {contexts, reasons, skipped} for dispatch --context; tp-spawn still caps and screens every
+    spec. skipped lists paths named in the task that were refused unread, each with its reason."""
+    root = Path(workdir or os.getcwd()).resolve()
+    if not root.is_dir():
+        raise ValueError(f"workdir is not a directory: {root}")
+    if not task.strip():
+        raise ValueError("context needs a task")
+    sys.path.insert(0, str(ROOT / "lib"))
+    from context_broker import context_reasons, select_context
+    out = select_context(task, root)
+    return {"contexts": out["contexts"], "reasons": context_reasons(out["manifest"]), "skipped": out["skipped"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -333,8 +347,10 @@ def main():
     retry.add_argument("--worker", choices=["pi", "claude"])
     retry.add_argument("--model")
     retry.add_argument("--thinking")
-    for name in ("list", "index", "tick"):
+    for name in ("list", "tick"):
         sub.add_parser(name)
+    # --no-tick: write and print the index without launching queued work.
+    sub.add_parser("index").add_argument("--no-tick", action="store_true")
     for name in ("inspect", "collect", "stop"):
         sub.add_parser(name).add_argument("id")
     m = sub.add_parser("message")
@@ -346,7 +362,14 @@ def main():
     q.add_argument("--kind", choices=["skill", "tool", "context"], required=True)
     q.add_argument("--what", required=True)
     q.add_argument("--reason", required=True)
+    c = sub.add_parser("context", help="suggest context specs for a task; prints contexts and reasons")
+    c.add_argument("--task", required=True)
+    c.add_argument("--workdir")
     args = parser.parse_args()
+    if args.command == "context":
+        # Read-only suggestion: needs no session state and writes no manifest or log.
+        print(json.dumps(discover_context(args.task, args.workdir), indent=2))
+        return
     base = state_dir()
     if args.command == "dispatch":
         value = dispatch(args, base)
@@ -374,7 +397,8 @@ def main():
     elif args.command == "tick":
         value = tick(base)
     elif args.command == "index":
-        tick(base)
+        if not args.no_tick:
+            tick(base)
         value = write_index(base)
     elif args.command == "list":
         value = all_records(base)

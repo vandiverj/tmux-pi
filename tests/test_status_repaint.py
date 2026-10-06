@@ -49,6 +49,7 @@ esac
                         TERM="xterm", TP_SESSION="fake")
         self.environ.pop("TMUX", None)
         self.environ.pop("TMUX_PANE", None)
+        self.environ.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir
         master, slave = pty.openpty()
         if self.raw_slave:
             tty.setraw(slave)

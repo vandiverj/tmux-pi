@@ -13,7 +13,7 @@ bin/tp --main pi /path/to/project
 bin/tp --main claude /path/to/project
 ```
 
-The default main harness is Pi. With no directory argument, `agent` (or `tp`) uses the current directory. Every launch starts a fresh workspace with an empty subagent list and its own `.tmux-pi/sessions/<run-id>/` records. Existing runs and their history remain available. Use `agent --resume` to attach to the most recently created running workspace for the current project, or `TP_SESSION=<name> agent --resume` for a specific run. `TP_SESSION` can also name a new run, but an existing name requires `--resume`. A stopped run cannot be reattached; its records can be read with `bin/tp-task --state-dir /path/to/project/.tmux-pi/sessions/<run-id> list`. Older project-level records remain at `.tmux-pi/` and can be read the same way. Outside tmux, set `TP_SESSION` when targeting a running workspace with other `tp-*` commands. The main pane is left, the status pane is above the viewer on the right. Select a worker in status and press Enter to view it; press `o` to enter its live pane. `r` and `t` show its result and packet.
+The console `agent` command defaults to Claude as the main harness; `tp` defaults to Pi. Use `--main pi` or `--main claude` to override either default. `TP_MAIN_HARNESS` also overrides the default when inherited from an existing workspace; use `--main` to override it explicitly. With no directory argument, `agent` (or `tp`) uses the current directory. Every launch starts a fresh workspace with an empty subagent list and its own `.tmux-pi/sessions/<run-id>/` records. Existing runs and their history remain available. Use `agent --resume` to attach to the most recently created running workspace for the current project, or `TP_SESSION=<name> agent --resume` for a specific run. `TP_SESSION` can also name a new run, but an existing name requires `--resume`. A stopped run cannot be reattached; its records can be read with `bin/tp-task --state-dir /path/to/project/.tmux-pi/sessions/<run-id> list`. Older project-level records remain at `.tmux-pi/` and can be read the same way. Outside tmux, set `TP_SESSION` when targeting a running workspace with other `tp-*` commands. The main pane is left, the status pane is above the viewer on the right. Select a worker in status and press Enter to view it; press `o` to enter its live pane. `r` and `t` show its result and packet.
 
 If the status pane looks stale, type `/refresh-status` in the Pi main agent (runs the script directly, no model turn) or run `bin/tp-refresh-status` to reload only this session's status pane (respawned with its original command) and clear its scrollback. It fails without touching anything outside a tmux-pi session or when the recorded status pane is missing or not in the main window; main, viewer, and workers are unaffected.
 
@@ -45,6 +45,14 @@ Roles are defined under [agent/roles](agent/roles): coder, researcher, code revi
 
 Each task has a local record under the project's ignored `.tmux-pi/sessions/<run-id>/tasks/<id>/`. The packet, metadata, state, result and transcript pointer remain inspectable. `tp-agent index` writes a short session index with the current objective, active work, pending results and artifact pointers. The main agent can recover from compaction or restart without loading all transcripts.
 
+## Codemode on the Pi main
+
+The Pi orchestrator main (started through `bin/tp-main`, so `TP_MODE=orchestrator` with no task directory) loads Pi's built-in `codemode` tool: the model can run a short script that makes several tool calls and returns only the script's output. `bin/tp-pi` passes an explicit `--tools` list for that launch, because `--tools` replaces the whole selection; a new main tool must be added to `MAIN_TOOLS` there or it is silently dropped, which `tests/test_pi_launcher.py` checks.
+
+Codemode on main is **not a read-only boundary**. Its scripts can call every tool in that list, including `bash`, `edit`, `write` and the dispatch tools. Nested calls still pass the sensitive-read check and are counted by the reporter. Workers, strict sessions and the `ask_local` child get no codemode.
+
+The same launch passes `--no-mcp`. This does not change what the Pi main can reach: `--no-extensions` already disabled Pi's built-in MCP support for main and workers, so the servers in `agent/mcp.json` were not connected there before either. The flag keeps MCP tools out of codemode's reach if the extension flags change later. A legacy strict session (`TP_MODE=strict`) does not pass `--no-extensions` and still loads Pi's MCP support.
+
 ## Sensitive reads
 
 A worker's supported read tools and common shell read/search commands ask before exposing a credential-bearing file or sensitive config. The permission appears in its live pane and in the status/task record; ordinary reads proceed without that prompt. A sensitive file selected for a context packet is omitted so the task can start, and the worker can request the specific information if needed.
@@ -72,6 +80,15 @@ States come from each worker's reporter: `starting`, `working`, `tool`, `waiting
 ## Claude as the main agent
 
 `bin/tp --main claude` uses the shared `tp-agent` orchestrator and its Claude prompt overlay; it does **not** expose the separate subagent MCP tools. The older `TP_MAIN=claude bin/tp` path instead appends `claude/main-prompt.md` and exposes `spawn_subagent`, `list_subagents`, `send_to_subagent`, `collect_result`, `review_subagent`, `kill_subagent`, `find_skill`, and `get_skill` through `claude/mcp/subagents.mjs`. Those tools are not exposed inside workers. The tmux-pi plugin adds `/make-qa`, `/counterpoint`, `/product-fit`, `/threat-model`, `/reset`, and `/end` prompt aliases.
+
+The plugin in `claude/plugins/tmux-pi` also loads a main-only module, `hooks/register.tsx`, beside its command hooks. It is active only in an interactive orchestrator main (`TP_TASK_DIR` unset, `TP_ROOT` set, `TP_MODE=orchestrator`); workers, headless runs and legacy mains load it and it does nothing. When active it:
+
+- injects the task index at session start and again after a compaction, so the main no longer runs `tp-agent index` by hand (the injection uses `tp-agent index --no-tick`, which only reads and never launches queued work);
+- polls `tp-agent list` every five seconds and, when a worker becomes `needs_input`, `settled` or `failed`, shows a toast and sends one wake-up message naming the task; tasks already waiting when the session starts are the baseline and wake nobody;
+- draws one line above the prompt with worker counts and the ids that need input;
+- adds `/workers`, `/worker-view <id>|-` and `/worker-collect <id>`, which run without a model turn (named `worker…` because the engine refuses a built-in's name such as `/tasks`, and `/tp` is the built-in alias of `/teleport`).
+
+Sensitive-read enforcement, `report.sh`, the status pane and `tp-agent` are unchanged and stay the shared contract for both harnesses; the Pi main has no equivalent notifier and polls with `task_index`. Check the module with `claude plugin validate claude/plugins/tmux-pi` and `claude plugin test claude/plugins/tmux-pi`.
 
 `claude/mcp.json` also defines YouTrack, airteracode, and optional database integrations; `agent/mcp.json` defines Pi integrations. Availability depends on installed services and local configuration. HTTP auth headers come from the git-ignored `claude/mcp.local.env`, sourced by the launchers when present. Only the legacy subagent MCP tools are pre-allowed; other Claude MCP calls still prompt for permission.
 

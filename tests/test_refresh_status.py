@@ -49,6 +49,7 @@ class RefreshStatusTests(unittest.TestCase):
         env = dict(os.environ, PATH=f"{base}:{os.environ['PATH']}", CFG=str(base / "cfg.json"),
                    LOG=str(base / "log"), TP_SESSION="tp")
         env.pop("TMUX", None); env.pop("TMUX_PANE", None)
+        env.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir
         r = subprocess.run([str(ROOT / "bin/tp-refresh-status")], env=env, capture_output=True, text=True)
         log = [json.loads(l) for l in (base / "log").read_text().splitlines()] if (base / "log").exists() else []
         return r, [l for l in log if l[0] in ("respawn-pane", "clear-history", "copy-mode")]

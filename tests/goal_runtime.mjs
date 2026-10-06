@@ -9,6 +9,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-goal-extension-'));
 fs.writeFileSync(path.join(tmp, 'goal.ts'), source
   .replace('import { execFile } from "node:child_process";', 'const execFile = globalThis.__execFile;'));
 process.env.TMUX = 'fake';
+fs.mkdirSync(path.join(tmp, '.tmux-pi')); // A session's state root always exists (bin/tp creates it).
 let state = { status: 'active', spec: { objective: 'Fix parser fully', done: 'All requirements checked', scope: 'parser only', workdir: tmp,
   budget: { turns: 3, tokens: 100, seconds: 300, attempts: 3, cost_micros: 100000 } }, spec_sha256: 'a'.repeat(64), usage: { turns: 0, tokens: 0, cost_micros: 0 }, reason: 'active', inflight: null };
 const calls = [];

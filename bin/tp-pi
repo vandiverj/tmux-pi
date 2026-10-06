@@ -5,7 +5,19 @@
 # project skill dirs (--no-skills). The private catalogue selects task-specific
 # skill handles; no growing Pi skill inventory is advertised to every model.
 # Extra arguments are passed through to pi.
+#
+# The orchestrator main (TP_TASK_DIR unset and TP_MODE=orchestrator, as set by
+# tp-main) also gets Pi's built-in codemode, with --tools naming every main
+# tool: --tools replaces the whole selection, so a tool missing from MAIN_TOOLS
+# is silently dropped (tests/test_pi_launcher.py checks the list against the
+# extensions). Codemode scripts can call every tool in that list, bash, edit and
+# write included; it is not a read-only boundary. --no-extensions already keeps
+# Pi's built-in MCP support off here; --no-mcp states that explicitly. Workers,
+# strict sessions and the ask_local child (which passes its own --tools and
+# clears TP_MODE) get none of this.
 set -euo pipefail
+
+MAIN_TOOLS=read,bash,edit,write,grep,find,ls,codemode,dispatch_role,task_index,task_collect,tmux_pi_find_skill,ask_local,tool_output
 
 src="${BASH_SOURCE[0]}"
 while [[ -L "$src" ]]; do
@@ -31,4 +43,7 @@ if [[ -z "${TP_TASK_DIR:-}" ]]; then
 fi
 args=(--no-skills --no-context-files --no-extensions)
 for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done
+if [[ -z "${TP_TASK_DIR:-}" && "${TP_MODE:-}" == orchestrator ]]; then
+  args+=(--extension builtin:codemode --no-mcp --tools "$MAIN_TOOLS")
+fi
 exec pi "${args[@]}" "$@"

@@ -28,24 +28,27 @@ def main():
     parser.add_argument("--claude-hook", action="store_true")
     args = parser.parse_args()
     event = json.load(sys.stdin)
+    # The shell's directory when the tool ran; relative paths and search roots are
+    # judged from it. Absent (older callers), the classifier assumes nothing.
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
     if args.claude_hook:
         name = event.get("hook_event_name")
         if name in {"PostToolUse", "PermissionDenied"}:
             old = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
             if old.is_file():
                 prior = json.loads(old.read_text())
-                current = classify(event.get("tool_name", ""), event.get("tool_input", {}))
+                current = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)
                 if prior.get("status") == "pending" and current.get("sensitive") and current.get("target") == prior.get("target"):
                     save_request(prior, "authorized" if name == "PostToolUse" else "denied")
             return
         if name != "PreToolUse":
             return
-        result = classify(event.get("tool_name", ""), event.get("tool_input", {}))
+        result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)
         if result["sensitive"]:
             save_request(result, "pending")
-            print(json.dumps(hook_response(event)))
+            print(json.dumps(hook_response(event, cwd)))
     else:
-        print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}))))
+        print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)))
 
 
 if __name__ == "__main__":

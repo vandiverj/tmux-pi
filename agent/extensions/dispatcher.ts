@@ -42,9 +42,9 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Decision = {
@@ -205,6 +205,9 @@ async function must(cmd: string, args: string[], input?: string, timeout?: numbe
 	return r.stdout.trim();
 }
 
+// Physical path when it exists, like tp_canon in lib/tp.sh.
+const canon = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+
 function readJson(file: string): any {
 	try {
 		return JSON.parse(readFileSync(file, "utf8"));
@@ -361,9 +364,27 @@ export default function (pi: ExtensionAPI) {
 	let lastAgentMessages: any[] = [];
 	const delegated = new Map<string, Delegated>();
 
-	const stateDir = () => must("tmux", ["display-message", "-p", "#{@tp_state_dir}"]);
+	// Session options are read from the session that owns this agent's pane. Without -t,
+	// tmux falls back to the most recently used session whenever it cannot place the
+	// caller, which can be another workspace.
+	const sessionOpt = (name: string) =>
+		must("tmux", ["display-message", "-p", ...(process.env.TMUX_PANE ? ["-t", process.env.TMUX_PANE] : []), `#{${name}}`]);
+	// TP_STATE_DIR is authoritative, as in lib/tp.sh tp_session(): a pane whose session keeps
+	// its state elsewhere is refused, so the state dir and the main pane never come from
+	// two workspaces.
+	const stateDir = async () => {
+		const have = await sessionOpt("@tp_state_dir");
+		if (!have) throw new Error("tmux-pi state dir unavailable for this pane; no workspace guess");
+		const want = process.env.TP_STATE_DIR;
+		if (!want) return have;
+		if (canon(have) !== canon(want)) {
+			const session = await sessionOpt("session_name");
+			throw new Error(`session '${session}' keeps its state in '${have}', not TP_STATE_DIR '${want}'; refusing to act on another workspace`);
+		}
+		return want;
+	};
 	const mainWorkdir = async () => {
-		const pane = (await must("tmux", ["display-message", "-p", "#{@tp_main_pane}"])).trim();
+		const pane = (await sessionOpt("@tp_main_pane")).trim();
 		if (!/^%\d+$/.test(pane)) throw new Error("registered main pane unavailable; no workspace guess");
 		const cwd = (await must("tmux", ["display-message", "-p", "-t", pane, "#{pane_current_path}"])).trim();
 		if (!cwd.startsWith("/") || !cwd) throw new Error("registered main-pane cwd unavailable");

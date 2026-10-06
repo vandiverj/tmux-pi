@@ -49,6 +49,7 @@ echo review-1
         tmux.chmod(0o755)
         self.env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "TP_SESSION": "t"}
         self.env.pop("TMUX", None)
+        self.env.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir
         self.env["TMPDIR"] = str(base / "tmp")
         (base / "tmp").mkdir()
         (self.task / "meta.json").write_text(json.dumps({"id": "w1", "worker": "pi", "workdir": str(self.work)}))

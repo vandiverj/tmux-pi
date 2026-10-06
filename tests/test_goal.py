@@ -3,6 +3,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 import sys
@@ -19,6 +20,11 @@ class GoalTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.project = Path(self.tmp.name).resolve()
+        # A worker shell carries its own TP_STATE_DIR; these tests use the legacy project root.
+        environ = patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
+        os.environ.pop("TP_STATE_DIR", None)
         self.spec = {"id": "repair", "objective": "Repair all parser behaviors and regression tests",
                      "done": "All original parser requirements verified; required reviews approved",
                      "scope": "Only this project parser and tests; no external writes",
@@ -183,6 +189,28 @@ class GoalTests(unittest.TestCase):
         s = self.settle(t)
         self.assertEqual(s["status"], "suspended")
         self.assertIn("not linked", s["reason"])
+
+    def test_task_evidence_follows_the_run_state_dir(self):
+        s = self.started()
+        run = self.project / ".tmux-pi" / "sessions" / "run"
+        os.environ["TP_STATE_DIR"] = str(run)
+        t = self.admit()
+        task = run / "tasks" / "author"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps({"id": "author", "workdir": str(self.project), "created": s["started"], "pane": "%1", **self.provenance()}))
+        (task / "state.json").write_text(json.dumps({"state": "working", "turns": 1, "tokens": {"input": 3, "output": 2}, "cost": 0.00001}))
+        self.assertEqual(self.act("link-task", ticket=t, task_id="author")["tasks"]["author"]["ticket"], t)
+        self.assertEqual(self.act("status")["usage"]["tokens"], 5)
+        # Another project's state dir, or a path that is not a run directory, is never read.
+        outside = self.project.parent / (self.project.name + "-other")
+        for foreign in (outside / ".tmux-pi" / "sessions" / "run", run / "tasks"):
+            os.environ["TP_STATE_DIR"] = str(foreign)
+            with self.assertRaises(GoalError):
+                self.act("status")
+        # Without TP_STATE_DIR only the legacy root can be meant; the linked task is not found there.
+        del os.environ["TP_STATE_DIR"]
+        with self.assertRaises(GoalError):
+            self.act("link-reviewer", author_id="author", reviewer_id="review-author")
 
     def test_wait_needs_authoritative_live_pane(self):
         self.started()

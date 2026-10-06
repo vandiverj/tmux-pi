@@ -34,6 +34,9 @@ process.env.TP_MODE = 'strict';
 process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');
 delete process.env.TP_TASK_DIR;
 delete process.env.TP_TASK_ID;
+// A worker shell's own workspace must not leak in: the fake tmux below names the state dir.
+delete process.env.TP_STATE_DIR;
+delete process.env.TMUX_PANE;
 const calls = [];
 const messages = [];
 const handlers = {};

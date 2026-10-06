@@ -15,7 +15,7 @@
 
 import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -39,6 +39,9 @@ async function must(cmd: string, args: string[], input?: string): Promise<string
 	if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `${cmd} exited with ${r.code}`);
 	return r.stdout.trim();
 }
+
+// Physical path when it exists, like tp_canon in lib/tp.sh.
+const canon = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
 
 const text = (t: string, details?: unknown) => ({ content: [{ type: "text" as const, text: t }], details });
 
@@ -75,7 +78,23 @@ export default function (pi: ExtensionAPI) {
 	// When each subagent was last given input; collect_result waits for a report newer than this.
 	const lastInput = new Map<string, number>();
 
-	const stateDir = () => must("tmux", ["display-message", "-p", "#{@tp_state_dir}"]);
+	// The state dir of the session that owns this agent's pane. Without -t, tmux falls back to
+	// the most recently used session whenever it cannot place the caller, which can be another
+	// workspace. TP_STATE_DIR is authoritative, as in lib/tp.sh tp_session(): a pane whose
+	// session keeps its state elsewhere is refused.
+	const stateDir = async () => {
+		const pane = process.env.TMUX_PANE;
+		const sessionOpt = (name: string) => must("tmux", ["display-message", "-p", ...(pane ? ["-t", pane] : []), `#{${name}}`]);
+		const have = await sessionOpt("@tp_state_dir");
+		if (!have) throw new Error("tmux-pi state dir unavailable for this pane; no workspace guess");
+		const want = process.env.TP_STATE_DIR;
+		if (!want) return have;
+		if (canon(have) !== canon(want)) {
+			const session = await sessionOpt("session_name");
+			throw new Error(`session '${session}' keeps its state in '${have}', not TP_STATE_DIR '${want}'; refusing to act on another workspace`);
+		}
+		return want;
+	};
 	const taskDir = async (id: string) => {
 		if (!/^[\w.-]+$/.test(id)) throw new Error(`bad subagent id: ${id}`);
 		const dir = join(await stateDir(), "tasks", id);

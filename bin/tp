@@ -3,23 +3,28 @@
 #
 #   ┌──────────────┬──────────────┐
 #   │              │ status       │
-#   │ main pi      ├──────────────┤
+#   │ main agent   ├──────────────┤
 #   │              │ viewer slot  │
 #   └──────────────┴──────────────┘
 #
-# Usage: tp [--resume] [--main pi|claude] [workdir]    (defaults to the current directory)
+# Usage: agent|tp [--resume] [--main pi|claude] [workdir] (defaults to the current directory)
+# Default main harness: claude when invoked as `agent` (the console symlink to
+# this script), pi when invoked as `tp`. TP_MAIN_HARNESS or --main overrides it.
 # Env:   TP_SESSION      optional explicit tmux session name (default: a fresh project run)
 set -euo pipefail
 
 # Resolve symlinks (e.g. ~/.local/bin/agent -> bin/tp) to find the repo.
 src="${BASH_SOURCE[0]}"
+invoked_as="$(basename "$src")"
 while [[ -L "$src" ]]; do
   dir="$(cd "$(dirname "$src")" && pwd)"
   src="$(readlink "$src")"
   [[ "$src" == /* ]] || src="$dir/$src"
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
-MAIN_HARNESS="${TP_MAIN_HARNESS:-pi}"
+default_harness=pi
+[[ "$invoked_as" != agent ]] || default_harness=claude
+MAIN_HARNESS="${TP_MAIN_HARNESS:-$default_harness}"
 MAIN_HARNESS_EXPLICIT=0
 WORKDIR_ARG=""
 RESUME=0
@@ -27,7 +32,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --resume) RESUME=1; shift ;;
     --main) MAIN_HARNESS="${2:?choose pi or claude}"; MAIN_HARNESS_EXPLICIT=1; shift 2 ;;
-    -h|--help) echo "usage: tp [--resume] [--main pi|claude] [workdir]"; exit 0 ;;
+    -h|--help) echo "usage: agent|tp [--resume] [--main pi|claude] [workdir] (agent defaults to claude; tp to pi)"; exit 0 ;;
     -*) echo "tp: unknown option $1" >&2; exit 2 ;;
     *) [[ -z "$WORKDIR_ARG" ]] || { echo "tp: only one workdir is allowed" >&2; exit 2; }
        WORKDIR_ARG="$1"; shift ;;
@@ -54,7 +59,8 @@ STATE_DIR="$WORKDIR/.tmux-pi/sessions/$RUN_ID"
 
 command -v tmux >/dev/null || { echo "tp: tmux not found (brew install tmux)" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "tp: python3 not found" >&2; exit 1; }
-command -v "$MAIN_HARNESS" >/dev/null || { echo "tp: $MAIN_HARNESS not found" >&2; exit 1; }
+# Check the selected harness only when creating a session. Resuming an existing
+# workspace must not require the invoking command's default harness to be installed.
 
 # A live harness cannot be moved to another project by attaching to it.
 # Reuse a legacy session only when its recorded workspace is this directory.
@@ -140,6 +146,7 @@ if tmux has-session -t "=$SESSION" 2>/dev/null; then
 fi
 
 [[ "$RESUME" != 1 ]] || { echo "tp: session '$SESSION' does not exist" >&2; exit 1; }
+command -v "$MAIN_HARNESS" >/dev/null || { echo "tp: $MAIN_HARNESS not found" >&2; exit 1; }
 
 mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 
@@ -148,7 +155,8 @@ mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
 AGENT_DIR="$ROOT/agent"
 
 case "${TP_MAIN:-}" in
-  ""|pi) main_cmd="'$ROOT/bin/tp-main'" ;;
+  # tp-main launches the harness recorded for this session (pi or claude).
+  ""|pi) main_cmd="TP_MAIN_HARNESS='$MAIN_HARNESS' '$ROOT/bin/tp-main'" ;;
   # Legacy remote entry point: plain Claude as main with its own prompt.
   claude) main_cmd="TP_MODE=legacy '$ROOT/bin/tp-claude' --append-system-prompt-file '$ROOT/claude/main-prompt.md'" ;;
   *)      echo "tp: TP_MAIN must be 'pi' or 'claude', got '$TP_MAIN'" >&2; exit 2 ;;
@@ -208,7 +216,7 @@ done
 
 tmux send-keys -t "$main_pane" "$main_cmd" Enter
 
-# Make the main Pi editor—not either read-only side pane—the active pane for
+# Make the main agent—not either read-only side pane—the active pane for
 # the client that is about to attach.
 tmux select-pane -t "$main_pane"
 

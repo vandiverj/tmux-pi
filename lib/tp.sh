@@ -2,21 +2,46 @@
 
 die() { echo "$(basename "$0"): $*" >&2; exit 1; }
 
-# The tmux-pi session to act on: the current session when inside tmux,
-# otherwise $TP_SESSION (default tmux-pi).
+# tp_canon <dir> — physical path when the directory exists, else the path as given.
+tp_canon() { (cd -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "${1%/}"; }
+
+# The tmux-pi session to act on: the current session when inside tmux, otherwise
+# $TP_SESSION, otherwise the session that owns $TP_STATE_DIR, otherwise tmux-pi.
+# $TP_STATE_DIR is authoritative: tp-agent and the Python helpers read task
+# records from it directly, so a session with any other state dir is refused
+# here rather than used. A main agent's tool shell can lack TMUX and TP_SESSION
+# while still carrying TP_STATE_DIR.
 tp_session() {
-  local s
+  local s="" want="" have name found=0
+  [[ -z "${TP_STATE_DIR:-}" ]] || want="$(tp_canon "$TP_STATE_DIR")"
   if [[ -n "${TMUX:-}" ]]; then
     if [[ -n "${TMUX_PANE:-}" ]]; then
       s="$(tmux display-message -p -t "$TMUX_PANE" '#S')"
     else
       s="$(tmux display-message -p '#S')"
     fi
+  elif [[ -n "${TP_SESSION:-}" ]]; then
+    s="$TP_SESSION"
+  elif [[ -n "$want" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      have="$(tmux show-options -qv -t "=$name:" @tp_state_dir 2>/dev/null)" || continue
+      if [[ -n "$have" && "$(tp_canon "$have")" == "$want" ]]; then
+        s="$name"
+        found=$((found + 1))
+      fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    [[ "$found" -gt 0 ]] || die "no tmux-pi session uses TP_STATE_DIR '$want' (start one with: agent)"
+    [[ "$found" -eq 1 ]] || die "$found tmux-pi sessions use TP_STATE_DIR '$want'; set TP_SESSION to choose one"
   else
-    s="${TP_SESSION:-tmux-pi}"
+    s="tmux-pi"
   fi
   tmux has-session -t "=$s" 2>/dev/null || die "no tmux-pi session '$s' (start one with: agent)"
-  [[ -n "$(tmux show-options -qv -t "=$s:" @tp_state_dir)" ]] || die "session '$s' is not a tmux-pi session"
+  have="$(tmux show-options -qv -t "=$s:" @tp_state_dir)"
+  [[ -n "$have" ]] || die "session '$s' is not a tmux-pi session"
+  if [[ -n "$want" && "$(tp_canon "$have")" != "$want" ]]; then
+    die "session '$s' keeps its state in '$have', not TP_STATE_DIR '$want'; refusing to act on another workspace"
+  fi
   echo "$s"
 }
 

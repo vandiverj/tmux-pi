@@ -39,8 +39,11 @@ const GUIDANCE =
     "Dispatch substantial investigation, edits, testing, review, or design with dispatch_role and collect with task_collect.";
 
 function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
+	// The child is not the orchestrator main: without TP_MODE, bin/tp-pi adds neither codemode nor a second --tools.
+	const env = { ...process.env };
+	delete env.TP_MODE;
 	return new Promise((res, rej) => {
-		const child = execFile(cmd, args, { cwd, timeout: 240_000, maxBuffer: 8_000_000, signal }, (error, stdout, stderr) =>
+		const child = execFile(cmd, args, { cwd, env, timeout: 240_000, maxBuffer: 8_000_000, signal }, (error, stdout, stderr) =>
 			error ? rej(new Error(String(stderr || error.message).trim().slice(-500))) : res(String(stdout)));
 		child.stdin?.end();
 	});

@@ -90,6 +90,22 @@ def state_path(project, ident):
     return goals / (ident + ".json")
 
 
+def task_state(project):
+    """Where this workspace keeps task records. The goal ledger stays project-level.
+
+    bin/tp gives every run <project>/.tmux-pi/sessions/<run> and exports it as
+    TP_STATE_DIR; without it only the legacy <project>/.tmux-pi can be meant.
+    """
+    base = project / ".tmux-pi"
+    raw = os.environ.get("TP_STATE_DIR")
+    if not raw:
+        return base
+    state = Path(raw).resolve()
+    if state != base and state.parent != base / "sessions":
+        raise GoalError("TP_STATE_DIR is not a tmux-pi state root of this project")
+    return state
+
+
 def unique_pairs(pairs):
     result = {}
     for k, v in pairs:
@@ -217,7 +233,7 @@ def _reconcile(s, project):
         s["reason"] = "unknown in-flight main turn after restart; human reconciliation required"
         log(s, "suspend", s["reason"])
     for task_id in s["tasks"]:
-        if locate(project / ".tmux-pi", task_id) is None:
+        if locate(task_state(project), task_id) is None:
             s["status"] = "suspended"
             s["reason"] = "missing or ambiguous linked task; human reconciliation required"
             log(s, "suspend", s["reason"])
@@ -227,7 +243,7 @@ def _reconcile(s, project):
 def _unlinked(s, project):
     # The dispatcher may have delegated during this turn. Without its durable
     # task-id/usage/review handoff we MUST NOT run the next turn or claim success.
-    for root in (project / ".tmux-pi" / "tasks", project / ".tmux-pi" / "archive"):
+    for root in (task_state(project) / "tasks", task_state(project) / "archive"):
         if root.is_symlink():
             return "unsafe task root"
         if not root.is_dir():
@@ -253,7 +269,7 @@ def _unlinked(s, project):
 def _unsafe_followup(project, excluded=()):
     # Dispatcher follow-up routing can consume extension-sourced input. Never send
     # a goal turn while any live worker in this session could claim that input.
-    base = project / ".tmux-pi" / "tasks"
+    base = task_state(project) / "tasks"
     if base.is_symlink():
         return "unsafe active task root"
     if not base.is_dir():
@@ -293,7 +309,7 @@ def _unsafe_followup(project, excluded=()):
 
 def _meter_tasks(s, project):
     for task_id, link in s["tasks"].items():
-        d = locate(project / ".tmux-pi", task_id)
+        d = locate(task_state(project), task_id)
         if d is None or (d / "state.json").is_symlink():
             return "missing or unsafe descendant reporter: " + task_id
         try:
@@ -321,7 +337,7 @@ def _meter_tasks(s, project):
 
 
 def _live_task(project, task_id):
-    d = locate(project / ".tmux-pi", task_id)
+    d = locate(task_state(project), task_id)
     if d is None:
         return False
     try:
@@ -338,10 +354,10 @@ def _live_task(project, task_id):
 
 def _stale_review_wait(s, project):
     reviewers = [rid for rid, link in s["tasks"].items() if link.get("author_id") == s["wait_for"]]
-    if any(_live_task(project, rid) and read(locate(project / ".tmux-pi", rid) / "state.json").get("state") in ("starting", "working", "tool") for rid in reviewers):
+    if any(_live_task(project, rid) and read(locate(task_state(project), rid) / "state.json").get("state") in ("starting", "working", "tool") for rid in reviewers):
         return False
     for task_id in [s["wait_for"]] + reviewers:
-        d = locate(project / ".tmux-pi", task_id)
+        d = locate(task_state(project), task_id)
         if d is None:
             return True
         try:
@@ -365,7 +381,7 @@ def _finalize_reviews(s, project):
     for author_id, link in s["tasks"].items():
         if "author_id" in link:
             continue
-        author = locate(project / ".tmux-pi", author_id)
+        author = locate(task_state(project), author_id)
         if author is None:
             return "author missing before review recovery"
         reviewers = [rid for rid, row in s["tasks"].items() if row.get("author_id") == author_id]
@@ -373,7 +389,7 @@ def _finalize_reviews(s, project):
         reviewer_id = (marker.get("approval") or {}).get("reviewer_id") if marker.get("status") == "approved" else None
         if reviewer_id not in reviewers:
             return "required opposite-provider approval not linked"
-        reviewer = locate(project / ".tmux-pi", reviewer_id)
+        reviewer = locate(task_state(project), reviewer_id)
         if reviewer is None or any((reviewer / name).is_symlink() for name in ("meta.json", "result.md", "review-of")):
             return "reviewer evidence unavailable or unsafe"
         try:
@@ -390,7 +406,7 @@ def _finalize_reviews(s, project):
             if not (author / "completed").exists():
                 root = Path(__file__).resolve().parent.parent
                 result = subprocess.run([str(root / "bin" / "tp-contract"), "collect", author_id],
-                                        env={**os.environ, "TP_STATE_DIR": str(project / ".tmux-pi")},
+                                        env={**os.environ, "TP_STATE_DIR": str(task_state(project))},
                                         capture_output=True, text=True, timeout=20)
                 if result.returncode != 0 or result.stdout.strip() != "completed":
                     return "canonical collect unavailable: " + (result.stderr or result.stdout).strip()[:300]
@@ -401,7 +417,7 @@ def _finalize_reviews(s, project):
 
 def _reviews(s, project):
     for task_id in s["tasks"]:
-        d = locate(project / ".tmux-pi", task_id)
+        d = locate(task_state(project), task_id)
         if d is None or any((d / name).is_symlink() for name in ("meta.json", "review-required.json", "result.md", "pending-capability.json")):
             return "linked task missing or unsafe"
         if (d / "pending-capability.json").exists():
@@ -613,7 +629,7 @@ def command(project, ident, action, **kw):
                 if s["tasks"][task_id].get("ticket") == kw["ticket"]:
                     return s
                 raise GoalError("task already linked to a different turn")
-            d = locate(project / ".tmux-pi", task_id)
+            d = locate(task_state(project), task_id)
             if d is None:
                 raise GoalError("task not uniquely present in approved workdir")
             meta = read(d / "meta.json")
@@ -635,8 +651,8 @@ def command(project, ident, action, **kw):
                 if s["tasks"][reviewer_id].get("author_id") == author_id:
                     return s
                 raise GoalError("reviewer already linked to another author")
-            author = locate(project / ".tmux-pi", author_id)
-            reviewer = locate(project / ".tmux-pi", reviewer_id)
+            author = locate(task_state(project), author_id)
+            reviewer = locate(task_state(project), reviewer_id)
             if author is None or reviewer is None or (reviewer / "review-of").is_symlink() or (reviewer / "review-of").read_text().strip() != author_id:
                 raise GoalError("reviewer/author linkage missing or unsafe")
             a, r = read(author / "meta.json"), read(reviewer / "meta.json")
@@ -667,7 +683,7 @@ def command(project, ident, action, **kw):
                 # Durable R5 task/review/collect and inherited handoff gates decide
                 # whether that evidence may complete this cooperative goal.
                 try:
-                    pending_reviews = review_inventory(project / ".tmux-pi")["blockers"]
+                    pending_reviews = review_inventory(task_state(project))["blockers"]
                 except (OSError, ValueError, TypeError) as exc:
                     pending_reviews = [{"error": str(exc)}]
                 review_problem = _unlinked(s, project) or _meter_tasks(s, project) or _reviews(s, project)

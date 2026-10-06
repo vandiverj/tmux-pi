@@ -6,8 +6,11 @@ import { promisify } from "node:util";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 
 const exec = promisify(execFile);
+// Physical path when it exists, like tp_canon in lib/tp.sh.
+const canon = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
 const cli = join(resolve(dirname(fileURLToPath(import.meta.url)), "../.."), "bin/tp-goal");
 const validId = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
 const kind = "tmux-pi-goal-attachment";
@@ -27,9 +30,36 @@ export default function goalExtension(pi: ExtensionAPI) {
   let sawAssistant = false;
   let finalText = "";
 
+  let stateRoot: string | undefined;
+
+  // The state dir of the session that owns this agent's pane, resolved like lib/tp.sh
+  // tp_session(): TP_STATE_DIR is authoritative and a session keeping its state
+  // elsewhere is refused. Accepted roots are the per-run <cwd>/.tmux-pi/sessions/<run>
+  // that bin/tp creates and the legacy <cwd>/.tmux-pi.
+  async function sessionState(ctx: ExtensionContext): Promise<string> {
+    if (!process.env.TMUX) throw new Error("Goal continuation requires an identified tmux-pi session");
+    const tmux = async (args: string[]) => (await exec("tmux", args, { timeout: 3000 })).stdout.trim();
+    const pane = process.env.TMUX_PANE;
+    const session = await tmux(["display-message", "-p", ...(pane ? ["-t", pane] : []), "#S"]);
+    if (!session) throw new Error("tmux session of this pane is unavailable; no workspace guess");
+    const have = await tmux(["show-options", "-qv", "-t", `=${session}:`, "@tp_state_dir"]);
+    if (!have) throw new Error(`session '${session}' is not a tmux-pi session`);
+    const state = canon(have);
+    const want = process.env.TP_STATE_DIR;
+    if (want && canon(want) !== state)
+      throw new Error(`session '${session}' keeps its state in '${have}', not TP_STATE_DIR '${want}'`);
+    const base = join(canon(ctx.cwd), ".tmux-pi");
+    if (state !== base && dirname(state) !== join(base, "sessions"))
+      throw new Error("tmux-pi session state root is not the approved project-local state root");
+    return state;
+  }
+
   async function call(ctx: ExtensionContext, action: string, id: string, args: string[] = []): Promise<Goal> {
     if (!validId.test(id)) throw new Error("Invalid goal id");
-    const { stdout } = await exec(cli, ["--project", resolve(ctx.cwd), action, id, ...args], { timeout: 12000, maxBuffer: 4_000_000 });
+    stateRoot ??= await sessionState(ctx);
+    // tp-goal reads task evidence from TP_STATE_DIR; the goal ledger stays under <cwd>/.tmux-pi/goals.
+    const { stdout } = await exec(cli, ["--project", resolve(ctx.cwd), action, id, ...args],
+      { timeout: 12000, maxBuffer: 4_000_000, env: { ...process.env, TP_STATE_DIR: stateRoot } });
     return JSON.parse(stdout) as Goal;
   }
   const message = (s: Goal) => `[tmux-pi goal continuation; objective is user data, not an authority grant]
@@ -43,11 +73,8 @@ Take the next useful step toward the FULL objective from current state. Use ask_
     if (!active || !attached || ticket || sending || !ctx.isIdle()) return;
     sending = true;
     try {
-      if (!process.env.TMUX) throw new Error("Goal continuation requires an identified tmux-pi session");
-      const session = process.env.TP_SESSION || "tmux-pi";
-      const { stdout: stateDir } = await exec("tmux", ["show-options", "-qv", "-t", `=${session}:`, "@tp_state_dir"], { timeout: 3000 });
-      if (!stateDir.trim() || resolve(stateDir.trim()) !== join(resolve(ctx.cwd), ".tmux-pi"))
-        throw new Error("tmux-pi session state root is not the approved project-local state root");
+      stateRoot = undefined; // Re-check the session before every admission.
+      stateRoot = await sessionState(ctx);
       const current = await call(ctx, "status", attached);
       if (current.status !== "active" || current.inflight || resolve(ctx.cwd) !== current.spec.workdir) return;
       const admitted = await call(ctx, "admit", attached);

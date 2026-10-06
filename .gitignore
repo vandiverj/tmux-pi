@@ -14,6 +14,8 @@ config/local.json
 claude/mcp.local.env
 agent/mcp-auth.json
 agent/mcp.log*
+# written by the Claude engine at every plugin load
+claude/plugins/tmux-pi/.claude-plugin/types/
 
 # Local configuration and secrets — never commit
 .env

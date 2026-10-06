@@ -199,7 +199,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         tmux = fake / "tmux"
         tmux.write_text('#!/bin/sh\ncase "$1" in\n has-session) exit 0;;\n show-options) echo "$TP_STATE_DIR";;\n list-panes) echo "%1 0";;\n esac\n')
         tmux.chmod(0o755)
-        env = {**self.env, "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+        env = {**self.env, "TP_SESSION": "fixture", "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         env.pop("TMUX", None)
         author = self.state / "tasks" / "w1"
         marker = self.marker(author, "pending_review", round_nonce="round-1")
@@ -305,7 +305,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         archived = state / "archive" / (base + "-ended-1")
         archived.mkdir()
         (archived / "meta.json").write_text(json.dumps({"id": base}))
-        env = {**self.env, "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+        env = {**self.env, "TP_SESSION": "fixture", "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         env.pop("TMUX", None)
         spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--workdir", str(state.parent), "--name", "unique", "--decision-json",
                                   '{"review":"required"}', "New work"], env=env, text=True, capture_output=True)

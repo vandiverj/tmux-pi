@@ -9,7 +9,8 @@
 #
 # Without model ids: the lmstudio models config/router.json and config/local.json can
 # send work to (routes, escalation, rules, and the follow-up judge when LM Studio
-# serves it). Nothing to do when the config uses none. TP_LMS names the lms binary.
+# serves it), plus the redaction reviewer in config/redaction.json. Nothing to do when
+# the config uses none. TP_LMS names the lms binary.
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -42,6 +43,13 @@ if not ids:
         ids = provider_models(load_config(root + "/config/router.json"), "lmstudio", provider["baseUrl"])
     except RouterError as exc:
         sys.exit("tp-lmstudio: {}".format(exc))
+    # The redaction reviewer (config/redaction.json) must be loaded too, or its candidates stay redacted.
+    try:
+        reviewer = json.load(open(root + "/config/redaction.json"))["model"]
+    except (OSError, ValueError, KeyError):
+        reviewer = None
+    if reviewer and reviewer not in ids:
+        ids.append(reviewer)
 windows = {m["id"]: m.get("contextWindow") for m in provider.get("models", [])}
 if ids:
     print(provider["baseUrl"].rstrip("/"))

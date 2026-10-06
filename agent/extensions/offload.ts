@@ -110,9 +110,18 @@ function sensitiveTarget(toolName: unknown, input: unknown): string | undefined 
 	}
 }
 
+// In redaction "on" mode sensitive.ts redacts every tool result, tool_output rereads included, so no
+// confirm is needed. Any other answer, or none, keeps the confirm. TP_REDACT_BIN lets tests stub it.
+function redactionMode(): string {
+	const bin = process.env.TP_REDACT_BIN || fileURLToPath(new URL("../../bin/tp-redact", import.meta.url));
+	try { return execFileSync(bin, ["--mode"], { encoding: "utf8", timeout: 5000 }).trim(); }
+	catch { return "unknown"; }
+}
+
 export default function (pi: ExtensionAPI) {
 	// Workers and legacy strict sessions keep their full context.
 	if (process.env.TP_TASK_DIR || process.env.TP_MODE === "strict") return;
+	let redactedAtSource: boolean | undefined; // read once per session, like sensitive.ts
 
 	pi.on("turn_end", (event, ctx) => {
 		// Nested helpers (ask_local) restrict --tools; never offload where retrieval is unavailable.
@@ -147,7 +156,9 @@ export default function (pi: ExtensionAPI) {
 				if (item.type !== "message" || item.message.role !== "assistant" || !Array.isArray(item.message.content)) continue;
 				call = item.message.content.find((part: any) => part?.type === "toolCall" && part.id === entry.message.toolCallId) ?? call;
 			}
-			const target = call ? sensitiveTarget(call.name, call.arguments) : "an unpaired tool call"; // fail closed
+			redactedAtSource ??= redactionMode() === "on";
+			const target = redactedAtSource ? undefined
+				: call ? sensitiveTarget(call.name, call.arguments) : "an unpaired tool call"; // fail closed
 			if (target) {
 				if (!ctx.hasUI) throw new Error(`Rereading ${target} needs user authorization in the active tmux pane.`);
 				const allowed = await ctx.ui.confirm("Reread sensitive tool output?", `Entry ${id} came from a read that may expose ${target}. Approve only if needed.`);

@@ -6,6 +6,12 @@
         "${TP_ROOT}/claude/mcp/subagents.mjs"
       ]
     },
+    "tmux-pi-safe": {
+      "command": "node",
+      "args": [
+        "${TP_ROOT}/claude/mcp/safe.mjs"
+      ]
+    },
     "youtrack": {
       "type": "http",
       "url": "https://youtrack.devservices-internal.natacs.aero/mcp",

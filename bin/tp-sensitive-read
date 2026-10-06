@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from sensitive_read import classify, hook_response
+from redact_hook import mode as redaction_mode
 
 
 def save_request(result, status):
@@ -32,6 +33,8 @@ def main():
     # judged from it. Absent (older callers), the classifier assumes nothing.
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
     if args.claude_hook:
+        if redaction_mode() == "on":
+            return  # tp-redact --claude-hook owns gating and permission records
         name = event.get("hook_event_name")
         if name in {"PostToolUse", "PermissionDenied"}:
             old = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"

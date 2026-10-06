@@ -270,7 +270,7 @@ render() {
       role="$(jq -r '.role // "generic"' "$tasks/$id/meta.json" 2>/dev/null)"
       detail="role $role${detail:+ · $detail}"
       if [[ -f "$tasks/$id/permission-request.json" ]]; then
-        permission="$(jq -r 'select(.status == "pending") | "permission: " + (.target // "sensitive read")' "$tasks/$id/permission-request.json" 2>/dev/null)"
+        permission="$(jq -r 'select(.status == "pending") | "permission: " + (if .placeholder then (if .scope == "once" then "reveal " else "use " end) + .placeholder + (if .source then " from " + .source else "" end) + (if .scope then " [" + .scope + "]" else "" end) else (.target // "sensitive read") end)' "$tasks/$id/permission-request.json" 2>/dev/null)"
         if [[ -n "$permission" ]]; then detail="$permission · $detail"; [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input; fi
       fi
       if [[ -f "$tasks/$id/capability-request.json" ]]; then

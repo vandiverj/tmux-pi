@@ -1,99 +1,14 @@
 {
-  "modules": [
-    "./register.tsx"
-  ],
+  "modules": ["./register.tsx"],
   "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\""
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\""
-          }
-        ]
-      }
-    ],
-    "PermissionDenied": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\""
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\""
-          }
-        ]
-      }
-    ]
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 10}] }],
+    "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
+    "PermissionDenied": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 10}] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 10}] }]
   }
 }

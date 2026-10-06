@@ -272,7 +272,7 @@ class SensitiveReadTests(unittest.TestCase):
                 event = {"hook_event_name": name, "tool_name": "Read", "tool_input": {"file_path": path}}
                 return subprocess.run([str(ROOT / "bin/tp-sensitive-read"), "--claude-hook"],
                                       input=json.dumps(event), text=True, capture_output=True,
-                                      env={**os.environ, "TP_TASK_DIR": folder}, check=True)
+                                      env={**os.environ, "TP_TASK_DIR": folder, "TP_REDACTION": "shadow"}, check=True)
             asked = hook("PreToolUse", ".env")
             self.assertEqual(json.loads(asked.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
             request = Path(folder) / "permission-request.json"
@@ -284,7 +284,7 @@ class SensitiveReadTests(unittest.TestCase):
     def test_claude_main_hook_asks_without_worker_task_directory(self):
         event = {"hook_event_name": "PreToolUse", "tool_name": "Read",
                  "tool_input": {"file_path": ".env"}}
-        env = dict(os.environ)
+        env = {**os.environ, "TP_REDACTION": "shadow"}  # in "on" mode tp-redact gates instead
         env.pop("TP_TASK_DIR", None)
         run = subprocess.run([str(ROOT / "claude/plugins/tmux-pi/hooks/sensitive-read.sh")],
                              input=json.dumps(event), text=True, capture_output=True,

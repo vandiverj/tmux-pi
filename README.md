@@ -57,6 +57,17 @@ The same launch passes `--no-mcp`. This does not change what the Pi main can rea
 
 A worker's supported read tools and common shell read/search commands ask before exposing a credential-bearing file or sensitive config. The permission appears in its live pane and in the status/task record; ordinary reads proceed without that prompt. A sensitive file selected for a context packet is omitted so the task can start, and the worker can request the specific information if needed.
 
+With `redaction.mode` set to `on` in `config/local.json` (or `TP_REDACTION=on`), tool output from Claude Code and pi is also scrubbed: secrets become stable numbered placeholders, ambiguous tokens are reviewed by a local LM Studio model (`config/redaction.json`, fails closed), and only real credential stores prompt. See `docs/sensitive-read-redaction-design.md`.
+
+In `on` mode an agent can use a secret without seeing it:
+- A Bash command that contains a placeholder asks you once per placeholder per session. The real value is then filled in locally and never shown.
+- Write content, or an Edit `new_string`, can carry placeholders from the same file. They are filled in silently.
+- The `tmux-pi-safe` MCP server gives Claude `safe_read`/`safe_grep` (redacted, no prompt) for files the normal tools refuse. Its `reveal` tool asks every time before sending one real value to the model.
+- pi's offloaded tool output can be reread without a prompt, because rereads are redacted too.
+- Pending placeholder requests show in the status pane, and the session's placeholder store is deleted when Claude exits.
+
+In `shadow` and `off` modes the older sensitive-read prompts above stay in charge.
+
 The hook checks known paths and common commands. It does not provide an operating-system sandbox against arbitrary code, computed paths, or an agent that intentionally bypasses its tools. Use normal harness and machine permissions for stronger isolation.
 
 Task records, prompts, and logs stay local. Remote model inference receives the context sent to the selected provider; no observability service is configured by tmux-pi.

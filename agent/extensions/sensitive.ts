@@ -1,5 +1,5 @@
 /** Ask the human before a worker reads a credential-bearing path. */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -15,6 +15,33 @@ export default function (pi: ExtensionAPI) {
 		writeFileSync(request + ".tmp", JSON.stringify(value) + "\n");
 		renameSync(request + ".tmp", request);
 	};
+	// Redact secrets in every tool result before the model or the session sees it. Only in "on" mode; fail closed.
+	const redactor = join(dirname(agentDir), "bin", "tp-redact");
+	const session = process.env.TP_TASK_ID || process.env.TP_REDACTION_SESSION || `pi-${process.ppid}`;
+	let active: boolean | undefined;
+	const redactionOn = () => {
+		if (active !== undefined) return active;
+		try { active = execFileSync(redactor, ["--mode"], { encoding: "utf8", timeout: 5000 }).trim() === "on"; }
+		catch { active = true; } // cannot tell: assume on, so results are redacted or withheld
+		return active;
+	};
+	const withheld = (why: string) => `[output withheld: redaction ${why}]`;
+	const redactText = (text: string, toolName: string, input: Record<string, unknown>): string => {
+		const args = ["--stdin", "--session", session];
+		const path = typeof input?.path === "string" ? input.path : typeof input?.file_path === "string" ? input.file_path : "";
+		if (toolName === "grep") args.push("--grep");
+		else if (path) args.push("--source", path);
+		const run = spawnSync(redactor, args, { input: text, encoding: "utf8", timeout: 60000, maxBuffer: 256 * 1024 * 1024 });
+		return run.status === 0 && typeof run.stdout === "string" ? run.stdout : withheld("failed");
+	};
+	pi.on("tool_result", (event) => {
+		if (!redactionOn()) return;
+		const content = event.content.map((block) =>
+			block.type === "text" ? { ...block, text: redactText(block.text, event.toolName, event.input) } : block);
+		const result: any = { content };
+		if (event.structuredContent !== undefined) result.structuredContent = null; // cannot be redacted structurally; `content` carries the text
+		return result;
+	});
 	pi.on("tool_call", async (event, ctx) => {
 		let decision: any;
 		try {

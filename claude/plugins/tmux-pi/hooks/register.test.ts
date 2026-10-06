@@ -181,7 +181,8 @@ test('a store that could not be read at start does not leave the module supersed
   w.rows = [{ id: 'coder-1', status: 'settled' }]
   await w.clock.advance(20000)
   expect(w.submitted.length).toBe(1)
-  expect(kept.notifier.epoch > 7).toBe(true)
+  // Only the failed-read path claims an epoch this high: proof that it ran.
+  expect(kept.notifier.epoch >= 1e15).toBe(true)
   expect(kept.notifier.delivered).toEqual(['coder-1:settled'])
 })
 

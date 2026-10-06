@@ -555,6 +555,17 @@ TOOL_MUST_PROMPT = [
     ("Grep", {**LINES, "pattern": "apiKey", "path": "config", "glob": "local.json"}),
     ("Grep", {**LINES, "pattern": "apiKey", "glob": "{auth,mcp}.json"}),
     ("Grep", {**LINES, "pattern": "apiKey", "path": "agent", "glob": "sessions/**"}),
+    # a filter that reaches a credential file by name below wildcard folders only
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "**/local.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "*/local.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "local.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"*/{MCP}"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"**/{AUTH}"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"**/{MODELS}"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"*/{MCP_ENV}"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"**/{ENV}"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": f"**/{ENV}.local"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "{**/local.json,*.py}"}),
     ("Grep", {**LINES, "pattern": "apiKey", "path": f"{HOME}/.config/tmux-pi"}),
     ("Grep", {**LINES, "pattern": "apiKey", "path": HOME}),
     ("Grep", {**LINES, "pattern": "apiKey", "path": ".."}),
@@ -599,7 +610,14 @@ TOOL_MUST_PASS = [
     ("Grep", {**LINES, "pattern": "apiKey"}),
     ("Grep", {**LINES, "pattern": "apiKey", "path": "."}),
     ("Grep", {**LINES, "pattern": "apiKey", "glob": "*.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "**/*.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "src/local.json"}),
+    ("Grep", {**LINES, "pattern": "apiKey", "glob": "!**/local.json"}),
     ("Grep", {**LINES, "pattern": "apiKey", "type": "json"}),
+    # Not a defect: a content search rooted in scratch space passes, because workers keep their
+    # working files in temporary directories.
+    ("Grep", {**LINES, "pattern": "token", "path": "/tmp"}),
+    ("Grep", {**LINES, "pattern": "token", "path": "/private/tmp"}),
     ("Grep", {**LINES, "pattern": "tp_session", "glob": "{lib,bin,tests,agent/extensions}/**"}),
     ("Grep", {**LINES, "pattern": "tp_session", "glob": "!{.tmux-pi/**,node_modules/**}"}),
     ("Grep", {**LINES, "pattern": "token", "path": "lib"}),
@@ -841,6 +859,9 @@ class SensitiveReadTableTests(unittest.TestCase):
     def test_classifier_command_passes_event_directory(self):
         def run(event, *args):
             env = {key: value for key, value in os.environ.items() if key != "TP_TASK_DIR"}
+            # This is the prompt gate: with redaction on, the hook hands gating to tp-redact
+            # and answers nothing, whatever this machine's local config says.
+            env["TP_REDACTION"] = "shadow"
             done = subprocess.run([sys.executable, str(ROOT / "bin/tp-sensitive-read"), *args],
                                   input=json.dumps(event), text=True, capture_output=True, env=env, cwd=CWD,
                                   check=True, timeout=30)
@@ -890,11 +911,13 @@ QUERY_NAMES = ["--raw", "-z", "--no-renames", "--no-relative", "--no-ext-diff", 
 QUERIES = {"diff": ["diff"] + QUERY_NAMES, "stash": ["stash", "show"] + QUERY_NAMES,
            "log": ["log", "--format=", "--no-show-signature"] + QUERY_NAMES}
 # Asked second, when the listing names no credential path: the settings that let a patch print more than it lists.
+QUERY_FILTERS = ["config", "-z", "--get-regexp", r"^filter\..+\.(clean|smudge|process)$"]
 QUERY_CONFIG = ["config", "-z", "--get-regexp", r"^diff\.(submodule|external|.+\.(textconv|command))$"]
 # One listed path as the query prints it: file modes, object names and status, then the name.
 RAW = ":100644 100644 1111111 2222222 M\\000{}\\000"
 SUBMODULE_REASON = "patch output touches a submodule and may include the files inside it"
 SUBMODULE_CONFIG_REASON = "diff.submodule=diff prints the files inside submodules"
+_FILTER_REASON = "a configured content filter would run a program to compare files"
 DRIVER_REASON = "a configured diff program or text conversion decides what the patch prints"
 UNPROVEN_REASON = "unscoped patch output may include credential files"
 UNSCOPED = ["git diff", "git diff HEAD", "git diff --cached", "git log -p", "git stash show -p"]
@@ -1242,20 +1265,21 @@ class UnscopedPatchTests(unittest.TestCase):
                 with self.subTest(command=command):
                     self.assertEqual(bash(command, str(top)), {"sensitive": False})
                     lines = record.read_text().split("\n")
-                    self.assertEqual(lines[0].split("\037")[:-1], QUERY_GUARD + query)
-                    self.assertEqual(lines[2].split("\037")[:-1], QUERY_GUARD + QUERY_CONFIG)
-                    self.assertEqual([lines[1], lines[3]], ["C|cat|0|", "C|cat|0|"])
-                    # the listing and then the settings, each asked once and without a terminal
-                    self.assertEqual(len(record.read_text().splitlines()), 4)
+                    self.assertEqual(lines[0].split("\037")[:-1], QUERY_GUARD + QUERY_FILTERS)
+                    self.assertEqual(lines[2].split("\037")[:-1], QUERY_GUARD + query)
+                    self.assertEqual(lines[4].split("\037")[:-1], QUERY_GUARD + QUERY_CONFIG)
+                    self.assertEqual([lines[1], lines[3], lines[5]], ["C|cat|0|"] * 3)
+                    # the filters, the listing and then the settings, each asked once and without a terminal
+                    self.assertEqual(len(record.read_text().splitlines()), 6)
                     record.unlink()
-        # A name the query lists decides the verdict, and only the name is reported. The settings are not asked for.
+        # A name the query lists decides the verdict, and only the name is reported. The filters are asked for before it; the settings are not asked for.
         listing = self.fake_git(f"echo asked >> '{record}'\nprintf '" + "".join(
             RAW.format(name) for name in ("README.md", "lib/goal.py", SECRETS)) + "'")
         with self.on_path(listing):
             result = bash("git diff", str(top))
         self.assertEqual(result, {"sensitive": True, "target": f"git diff of {SECRETS}",
                                   "reason": "patch output covers a credential-bearing path"})
-        self.assertEqual(record.read_text(), "asked\n")
+        self.assertEqual(record.read_text(), "asked\nasked\n")
         record.unlink()
         # So does a listed submodule entry, and so does a patch with nothing in it.
         for output, expected in ((RAW.format("README.md") + ":160000 160000 1111111 2222222 M\\000vendor\\000",
@@ -1263,7 +1287,7 @@ class UnscopedPatchTests(unittest.TestCase):
                                  ("", {"sensitive": False})):
             with self.subTest(output=output), self.on_path(self.fake_git(f"echo asked >> '{record}'\nprintf '{output}'")):
                 self.assertEqual(bash("git diff", str(top)), expected)
-                self.assertEqual(record.read_text(), "asked\n")
+                self.assertEqual(record.read_text(), "asked\nasked\n")
                 record.unlink()
         # A listing that is not entry and name in turn establishes nothing.
         for output in ("README.md\\000", RAW.format("README.md") + "lib/goal.py\\000", RAW.format(""),
@@ -1420,6 +1444,52 @@ class UnscopedPatchTests(unittest.TestCase):
         with self.on_path(fails):
             self.reasons(top, ["git diff", "git log -p"], UNPROVEN_REASON)
             self.reasons(top, ["git stash show -p"], "stash contents may include credential files")
+
+    def test_listing_runs_no_content_filter(self):
+        top = self.plain()
+        marker = top.parent / (top.name + ".filter-ran")
+        self.addCleanup(marker.unlink, True)
+        helper = top.parent / (top.name + ".filter.py")
+        self.addCleanup(helper.unlink, True)
+        helper.write_text("import sys\nopen(sys.argv[1], 'a').write('ran\\n')\nsys.stdout.write(sys.stdin.read())\n")
+        (top / ".gitattributes").write_text("*.md filter=plant\n")
+        git(top, "add", ".gitattributes")
+        git(top, "commit", "-q", "-m", "attributes")
+        self.change(top, "README.md")
+        git(top, "stash")
+        self.change(top, "README.md", "lib/goal.py")
+        git(top, "add", "lib/goal.py")
+        git(top, "config", "filter.plant.clean", f"{sys.executable} {helper} {marker}")
+        commands = ["git diff", "git diff --cached", "git stash show -p", "git log -p"]
+        # The filter is live: git itself runs it to compare the work tree for an ordinary diff.
+        subprocess.run([GIT, "diff"], cwd=top, env=GIT_ENV, capture_output=True, timeout=60)
+        self.assertTrue(marker.exists(), "the planted filter did not run, so this test proves nothing")
+        marker.unlink()
+        time.sleep(1.1)  # past the index timestamp, so a query has files to compare
+        self.change(top, "README.md")
+        # The three kinds of filter setting each stop the listing before it runs, and so does one that
+        # an included file holds; a repository without them is judged by its listing as before.
+        include = top.parent / (top.name + ".include")
+        self.addCleanup(include.unlink, True)
+        for key in ("clean", "smudge", "process"):
+            git(top, "config", "--remove-section", "filter.plant")
+            git(top, "config", f"filter.plant.{key}", f"{sys.executable} {helper} {marker}")
+            self.reasons(top, commands, _FILTER_REASON)
+            self.assertFalse(marker.exists(), f"a query ran the {key} filter")
+        git(top, "config", "--remove-section", "filter.plant")
+        self.verdicts(top, commands, False)
+        include.write_text(f"[filter \"plant\"]\n\tclean = {sys.executable} {helper} {marker}\n")
+        git(top, "config", "include.path", str(include))
+        self.reasons(top, commands, _FILTER_REASON)
+        self.assertFalse(marker.exists(), "a query ran a filter from an included file")
+        git(top, "config", "--unset", "include.path")
+        # When the settings cannot be read the listing does not run either.
+        git(top, "config", "filter.plant.clean", f"{sys.executable} {helper} {marker}")
+        fails = self.fake_git("for word in \"$@\"; do [ \"$word\" = config ] && exit 2; done\n"
+                              "touch '" + str(marker) + "'; printf ''")
+        with self.on_path(fails):
+            self.reasons(top, ["git diff", "git log -p"], UNPROVEN_REASON)
+        self.assertFalse(marker.exists())
 
     def test_relative_listing_is_judged_from_the_top(self):
         top = self.repo()

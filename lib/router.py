@@ -214,11 +214,12 @@ def load_local(path, config):
     return local
 
 
-def load_config(path, local_path=None):
+def load_config(path, local_path=None, laya_model=True):
     """Load the shared router config, then apply this machine's local assignments if present.
 
     local_path defaults to local.json next to the config (or $TP_LOCAL_CONFIG); pass
-    False to ignore local assignments.
+    False to ignore local assignments. laya_model=False skips loading the learned head
+    (the catalog router does not use it); `model` is then absent from the config.
     """
     try:
         config = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -274,7 +275,7 @@ def load_config(path, local_path=None):
     if not isinstance(config["laya_model"], str) or not config["laya_model"]:
         raise RouterError("laya_model must be a path relative to the router config")
     config["model_path"] = Path(path).parent / config["laya_model"]
-    if config["backend"] == "laya" or config["model_path"].exists():
+    if laya_model and (config["backend"] == "laya" or config["model_path"].exists()):
         config["model"] = load_model(config["model_path"])
     if local_path is None:
         local_path = os.environ.get("TP_LOCAL_CONFIG") or Path(path).parent / "local.json"

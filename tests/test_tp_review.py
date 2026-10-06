@@ -1,4 +1,5 @@
-"""tp-review gates and oversized-packet boundary (stubbed tmux/tp-spawn/tp-route; no models)."""
+"""tp-review gates, the reviewer chosen by the review plan, and the oversized-packet boundary (stubbed tmux/tp-spawn/tp-route;
+no models). The plan itself is tested in test_model_routing."""
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 SECRET = "SECRET-REQUEST-BODY"
+PLAN = {"review": "required", "policy": "required",
+        "reviewer": {"worker": "pi", "model": "openai-codex/gpt-6-sol", "thinking": "medium", "independence": "different_provider"}}
 
 
 class TpReviewTests(unittest.TestCase):
@@ -25,10 +28,14 @@ class TpReviewTests(unittest.TestCase):
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n")
         self.log = base / "spawn.log"
         self.state = base / "state"
-        self.stub("tp-route", "#!/usr/bin/env bash\necho '{\"review\":\"required\"}'\n")
+        # tp-route --review-plan: prints plan.json and exits with plan.rc (0 plan, 3 no review needed, 4 no independent reviewer)
+        self.plan = base / "plan.json"
+        self.plan.write_text(json.dumps(PLAN))
+        (base / "plan.rc").write_text("0")
+        self.stub("tp-route", f"#!/usr/bin/env bash\necho \"$@\" > \"{base}/route.args\"\ncat \"{self.plan}\"\nexit \"$(cat \"{base}/plan.rc\")\"\n")
         # Record each --context file's length and content head instead of launching a worker.
         self.stub("tp-spawn", f'''#!/usr/bin/env bash
-args=("$@"); : > "{self.log}"
+args=("$@"); : > "{self.log}"; echo "$*" > "{base}/spawn.args"
 [[ -z "$STUB_FAIL" ]] || {{ for ((i=0;i<${{#args[@]}};i++)); do [[ "${{args[i]}}" == --context ]] && echo "${{args[i+1]}}" >> "{self.log}.ctx"; done; exit 1; }}
 for ((i=0;i<${{#args[@]}};i++)); do
   if [[ "${{args[i]}}" == --context ]]; then f="${{args[i+1]}}"; echo "$f $(wc -c < "$f" | tr -d ' ')" >> "{self.log}"; cat "$f" >> "{self.log}.body"; mkdir -p "{self.log}.copies"; cp "$f" "{self.log}.copies/$(basename "$f")"; fi
@@ -68,6 +75,57 @@ echo review-1
 
     def request(self, status):
         (self.task / "capability-request.json").write_text(json.dumps({"kind": "tool", "what": SECRET, "status": status}))
+
+    def set_plan(self, rc=0, **plan):
+        self.plan.write_text(json.dumps({**PLAN, **plan}))
+        (self.plan.parent / "plan.rc").write_text(str(rc))
+
+    def spawn_args(self):
+        return (self.plan.parent / "spawn.args").read_text()
+
+    def test_reviewer_comes_from_the_review_plan(self):
+        self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--worker claude --model claude-sonnet-5-5 --thinking high", self.spawn_args())
+        self.assertIn("Review policy: required (different_provider)", self.spawn_args())
+        meta = json.loads((self.task / "meta.json").read_text())
+        self.assertEqual(meta["reviewer"], {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})
+        self.assertEqual(meta["review_policy"], "required")
+        self.assertIn(f"--review-plan {self.task}", (self.plan.parent / "route.args").read_text())
+
+    def test_no_review_needed_exits_3_without_a_reviewer_and_force_asks_for_one(self):
+        self.set_plan(rc=3, review="none")
+        r = self.review()
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("review not needed", r.stderr)
+        self.assertFalse(self.log.exists())
+        self.set_plan(review="forced")
+        self.assertEqual(self.review("--force").returncode, 0)
+        self.assertIn("--force", (self.plan.parent / "route.args").read_text())
+
+    def test_no_independent_provider_stops_and_asks_the_human(self):
+        self.set_plan(rc=4)
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no independent reviewer", r.stderr)
+        self.assertIn("ask the human", r.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_a_failed_plan_never_falls_back_to_a_fixed_reviewer(self):
+        self.set_plan(rc=1)
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("cannot plan a review", r.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_level_effort_and_approval_flags_reach_the_plan(self):
+        r = subprocess.run([str(self.root / "bin/tp-review"), "--level", "top", "--thinking", "high", "--approve-effort", "w1"],
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = (self.plan.parent / "route.args").read_text()
+        for part in ("--level top", "--thinking high", "--approve-effort"):
+            self.assertIn(part, args)
 
     def test_pending_request_blocks_even_forced_without_leaking(self):
         self.request("pending")

@@ -178,6 +178,9 @@ _GIT_QUERY = {"diff": ("diff",) + _GIT_NAMES,
 # The settings under which the real patch prints what no listing shows: files inside a submodule,
 # or the output of a program the configuration names for all files or for a diff attribute.
 _GIT_CONFIG = ("config", "-z", "--get-regexp", r"^diff\.(submodule|external|.+\.(textconv|command))$")
+# Content filters run a program on every work-tree file git compares, so the listing must not run
+# while one is configured, in any scope of configuration or through an include.
+_GIT_FILTERS = ("config", "-z", "--get-regexp", r"^filter\..+\.(clean|smudge|process)$")
 _GIT_ENV = {"LC_ALL": "C", "LANG": "C", "GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1"}
 # Variables that would point the query at a repository other than the working directory's, or give
@@ -190,6 +193,7 @@ _RAW_ENTRY = re.compile(r"^:+((?:[0-7]{6} )+)(?:[0-9a-f]+ )+[A-Z]+[0-9]*$")
 _GITLINK = "160000"
 _SUBMODULE_REASON = "patch output touches a submodule and may include the files inside it"
 _SUBMODULE_CONFIG_REASON = "diff.submodule=diff prints the files inside submodules"
+_FILTER_REASON = "a configured content filter would run a program to compare files"
 _DRIVER_REASON = "a configured diff program or text conversion decides what the patch prints"
 _GIT_TIMEOUT = 2.0
 _GIT_OUTPUT_LIMIT = 1 << 20
@@ -1116,6 +1120,17 @@ def _config_reason(base, deadline):
     return ""
 
 
+def _filter_reason(base, deadline):
+    """Why the listing must not run: "" when no content filter is configured, None when that is unknown."""
+    asked = _git_ask(_GIT_FILTERS, base, deadline, (0, 1))  # git ends with 1 when no setting matches
+    if asked is None:
+        return None
+    for entry in asked[0].split("\0"):
+        if re.match(r"^filter\..+\.(?:clean|smudge|process)$", entry.partition("\n")[0], re.I):
+            return _FILTER_REASON
+    return ""
+
+
 def _listed_hit(label, query, base, unproven):
     """Judge an unscoped patch by the paths it covers; `unproven` stands when they cannot be listed.
 
@@ -1124,6 +1139,13 @@ def _listed_hit(label, query, base, unproven):
     printing to a configured program. The two queries share one time allowance.
     """
     deadline = time.monotonic() + _GIT_TIMEOUT
+    if query:
+        # Before any listing: comparing files with the work tree runs the filters configured for them.
+        why = _filter_reason(base, deadline)
+        if why is None:
+            return unproven
+        if why:
+            return f"{label} patch output", why
     listed = _git_names(query, base, deadline) if query else None
     if listed is None:
         return unproven
@@ -1527,6 +1549,16 @@ def _glob_can_match(glob):
     return False
 
 
+def _filter_names(choice):
+    """Whether a project-wide Grep filter names a credential file, outright or below wildcard folders only."""
+    parts = [part for part in choice.split("/") if part]
+    if _named(parts):
+        return True
+    last = _plain_name(parts[-1].lower()) if parts else ""
+    return (not _GLOB.search(last) and (last == "local.json" or bool(SENSITIVE_NAME.match(last))) and
+            all(_GLOB.search(part) for part in parts[:-1]))
+
+
 def _tool_hit(tool, params):
     for key in TOOL_PATH_KEYS:
         value = params.get(key)
@@ -1547,8 +1579,7 @@ def _tool_hit(tool, params):
         return None
     if why == "the repository root":
         # A project-wide search prompts only when its filter names a credential file outright.
-        named = glob and any(_named([part for part in choice.lstrip("!").split("/") if part])
-                             for choice in _brace_expand(glob) if not choice.startswith("!"))
+        named = glob and any(_filter_names(choice) for choice in _brace_expand(glob) if not choice.startswith("!"))
         return (f"{glob} under {root}", "search filter names a credential-bearing file") if named else None
     reason = f"search root is {why} and may include credential files"
     if glob:

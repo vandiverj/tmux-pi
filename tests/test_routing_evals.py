@@ -288,9 +288,11 @@ class FakeLaya:
 
     def __init__(self, reply, status=200):
         body = json.dumps(reply).encode()
+        self.hits = hits = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
+                hits.append(self.path)
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -368,11 +370,27 @@ class CliTests(unittest.TestCase):
         rows, _ = routing_evals.read_jsonl(self.state / "evals" / routing_evals.SELECTIONS)
         self.assertEqual((rows[0]["status"], rows[0]["error"]["type"]), ("router_error", "RouterError"))
 
-    def test_plain_route_output_is_unchanged(self):
-        r = self.route(TP_STATE_DIR=str(self.state))
-        self.assertEqual(set(json.loads(r.stdout)), {"worker", "model", "thinking"})
-        rows, _ = routing_evals.read_jsonl(self.state / "evals" / routing_evals.SELECTIONS)
-        self.assertEqual(rows[0]["kind"], "route")
+    def test_plain_route_is_the_catalog_router_and_never_asks_laya(self):
+        # Changed from test_plain_route_output_is_unchanged: the plain route is no longer a Laya decision. It keeps
+        # worker, model and thinking first, adds the router's record, and writes a model-selection record instead.
+        import route_fixture
+        stubs = route_fixture.Stubs(self.tmp.name, {"claude": [{"text": route_fixture.reply(3, "medium", "optional", None, "stub")}]})
+        self.addCleanup(stubs.close)
+        # The fixture catalog (Haiku first) and the stubbed chat endpoint: no model is reached whatever the shipped order is,
+        # and the guard fails the test if the Laya port or the real LM Studio port is contacted.
+        guard, hits = route_fixture.laya_guard(self.tmp.name)
+        r = self.route(TP_STATE_DIR=str(self.state), **{k: v for k, v in stubs.env().items() if k in
+                                                       ("PATH", "STUB_LOG", "STUB_SCRIPT", "TP_LOCAL_CONFIG", "TP_CLAUDE_CONFIG_DIR",
+                                                        "TP_ROUTER_LLM_URL", "TP_MODEL_CATALOG")}, **guard)
+        self.assertFalse(hits.exists(), "a real model endpoint was contacted")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(list(out)[:3], ["worker", "model", "thinking"])
+        self.assertEqual((out["decided_by"], out["source"]), ("claude-haiku-4-5-20251001", "router"))
+        self.assertEqual(self.laya.hits, [])
+        rows, _ = routing_evals.read_jsonl(self.state / "evals" / "model-selections.jsonl")
+        self.assertEqual([row["kind"] for row in rows], ["route"])
+        self.assertFalse((self.state / "evals" / routing_evals.SELECTIONS).exists())
 
 
 class ExportTests(unittest.TestCase):

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# tp-review — spawn a cross-provider reviewer for a completed tmux-pi task.
+# tp-review — spawn an independent reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review [--force] <task-id>
+# Usage: tp-review [--force] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>
 #
-# Consults the review policy (tp-route --review) on the author's task first. When
-# the policy says `none`, no reviewer starts and tp-review exits 3; --force skips
-# the policy. If the policy can't be reached, the review runs anyway.
+# Asks the model router for a review plan (tp-route --review-plan): whether a review is needed
+# (the larger of a deterministic policy over role, files touched, level and effort and the
+# router's review field recorded at dispatch) and who reviews. When no review is needed no
+# reviewer starts and tp-review exits 3; --force skips the need check. The reviewer is on a
+# different provider from the author when one is available (GPT first for Claude- or
+# Qwen-authored work), at least mid level. A required review with no independent provider
+# stops and asks the human; an optional one may use the author's provider, marked in the record.
 # The review packet contains the original task, any follow-up requests, the result, and the
 # selected context packet.
-# The reviewer must be on the opposite provider (pi <-> claude) from the author.
 # Prints the review task id.
 set -euo pipefail
 
@@ -21,9 +24,16 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
-usage() { echo "usage: tp-review [--force] <task-id>" >&2; exit "${1:-1}"; }
-force=0
-if [[ "${1:-}" == --force ]]; then force=1; shift; fi
+usage() { echo "usage: tp-review [--force] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2; exit "${1:-1}"; }
+force=0 plan_opts=()
+while [[ $# -gt 1 ]]; do
+  case "$1" in
+    --force) force=1; shift ;;
+    --approve-effort) plan_opts+=(--approve-effort); shift ;;
+    --level|--thinking) [[ $# -gt 2 ]] || usage; plan_opts+=("$1" "$2"); shift 2 ;;
+    *) usage ;;
+  esac
+done
 [[ $# -eq 1 ]] || usage
 id="$1"
 [[ "$id" =~ ^[[:alnum:]_.-]+$ ]] || die "bad task id: $id"
@@ -52,46 +62,35 @@ if [[ "$completed" != 1 ]]; then
   [[ "$state" == waiting ]] || die "subagent '$id' has not completed successfully (state: ${state:-starting})"
 fi
 
-# Slice 6/R1: review policy classifies the verbatim request. The canonical
-# task record remains contextual evidence in the reviewer packet below.
-route_tmp=""
-route_file="$dir/request.md"
-if [[ ! -f "$route_file" ]]; then
-  route_tmp="$(mktemp)"
-  python3 - "$ROOT" "$dir" > "$route_tmp" <<'EOF'
-import sys
-sys.path.insert(0, sys.argv[1] + "/lib")
-from task_record import request_text
-print(request_text(sys.argv[2]))
-EOF
-  route_file="$route_tmp"
-fi
-cleanup_route_tmp() { [[ -z "$route_tmp" ]] || rm -f "$route_tmp"; }
-trap cleanup_route_tmp EXIT
-if [[ "$force" == 1 ]]; then
-  policy=forced
-elif out="$("$ROOT/bin/tp-route" --review --file "$route_file")"; then
-  policy="$(jq -r '.review' <<<"$out")"
-else
-  echo "tp-review: review policy unavailable; reviewing anyway" >&2
-  policy=unavailable
-fi
-if [[ "$policy" == none ]]; then
-  echo "tp-review: review not needed for '$id' (policy: none); use --force to review anyway" >&2
-  exit 3
-fi
-
+# The review plan: need and reviewer, from the catalog router's resolver (no classifier service).
+[[ "$force" == 0 ]] || plan_opts+=(--force)
+set +e
+plan="$("$ROOT/bin/tp-route" --review-plan "$dir" ${plan_opts[@]+"${plan_opts[@]}"})"
+plan_rc=$?
+set -e
+case "$plan_rc" in
+  0) ;;
+  3)
+    echo "tp-review: review not needed for '$id' (policy: none); use --force to review anyway" >&2
+    exit 3 ;;
+  4) die "no independent reviewer is available for '$id'; ask the human (no same-provider substitute or silent skip)" ;;
+  *) die "cannot plan a review for '$id' (tp-route --review-plan exited $plan_rc)" ;;
+esac
+policy="$(jq -r '.review' <<<"$plan")"
+reviewer="$(jq -r '.reviewer.worker' <<<"$plan")"
+model="$(jq -r '.reviewer.model' <<<"$plan")"
+thinking="$(jq -r '.reviewer.thinking' <<<"$plan")"
+independence="$(jq -r '.reviewer.independence' <<<"$plan")"
 worker="$(tp_meta "$dir" worker)"
+case "$worker" in
+  pi|claude) ;;
+  *) die "subagent '$id' has unknown worker '$worker'" ;;
+esac
 # The state directory and current main pane can outlive the author's project.
 # A review must inspect the author's recorded working tree, even after restart.
 author_workdir="$(jq -r 'if (.workdir | type) == "string" then .workdir else empty end' "$dir/meta.json")" ||
   die "cannot read author workdir for '$id'"
 [[ -n "$author_workdir" ]] || die "author workdir missing for '$id'; cannot choose a review directory"
-case "$worker" in
-  pi) reviewer=claude; model=claude-sonnet-5-5; thinking=medium ;;
-  claude) reviewer=pi; model=openai-codex/gpt-6-sol; thinking=medium ;;
-  *) die "subagent '$id' has unknown worker '$worker'" ;;
-esac
 
 review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then a brief rationale or prioritized actionable findings including file paths and line references when possible."
 
@@ -112,7 +111,7 @@ if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md");
 # packet, fail before spawning rather than drop any of it.
 max_file=60000 max_packet=200000 packet_reserve=20000 per_file_overhead=300
 excerpt_dir=""
-cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; cleanup_route_tmp; }
+cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
 trap cleanup_excerpts EXIT
 ctx_list=()
 # add_segments <file> <label>: appends context paths to ctx_list (runs in this shell,
@@ -156,15 +155,15 @@ for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
 if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
-  --note "Review policy: $policy" \
+  --note "Review policy: $policy ($independence)" \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
   -- "$review_task")"; then
-  die "opposite-provider reviewer '$reviewer' could not start; ask the human (no same-provider substitute or silent skip)"
+  die "reviewer '$reviewer' ($model) could not start; ask the human (no silent skip or substitute)"
 fi
 
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
-  --arg policy "$policy" \
-  '. + {review:$review, review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking}}' \
+  --arg policy "$policy" --arg independence "$independence" \
+  '. + {review:$review, review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking, independence:$independence}}' \
   "$dir/meta.json" > "$dir/meta.json.tmp"
 mv "$dir/meta.json.tmp" "$dir/meta.json"
 printf '%s\n' "$id" > "$(tp_task_dir "$session" "$review_id")/review-of"

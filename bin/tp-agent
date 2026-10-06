@@ -144,40 +144,76 @@ def write_index(base):
     return value
 
 
-def route(task, role, worker, model, thinking, context=(), deliverable=""):
-    catalog = read_json(ROOT / "config/router.json").get("models", [])
-    known = next((entry for entry in catalog if entry.get("model") == model), None) if model else None
-    if model:
-        if known and worker and worker != known.get("worker"):
-            raise ValueError(f"model {model} belongs to {known['worker']}, not {worker}")
-        if not known and worker and (("/" in model) != (worker == "pi")):
-            raise ValueError(f"model {model} is not compatible with {worker}")
-        worker = worker or (known.get("worker") if known else "pi" if "/" in model else "claude")
-        return worker, model, thinking or "medium", {"source": "main_choice", "reason": "explicit dispatch selection"}
-    payload = (f"Worker role: {role}\nAssignment: {task}\n"
-               f"Expected deliverable: {deliverable}\nSelected context paths: {', '.join(context)}")
-    try:
-        raw = subprocess.run([str(ROOT / "bin/tp-route")], input=payload, text=True,
-                             capture_output=True, timeout=15, check=True)
-        decision = json.loads(raw.stdout)
-        if decision.get("worker") not in {"pi", "claude"} or not decision.get("model"):
-            raise ValueError("router returned an invalid model")
-        matched = next((entry for entry in catalog if entry.get("model") == decision["model"]
-                        and entry.get("worker") == decision["worker"]), None)
-        if not matched:
-            raise ValueError("router returned an incompatible model/harness pair")
-        if worker and worker != decision["worker"]:
-            raise ValueError("requested worker conflicts with router")
-        return decision["worker"], decision["model"], thinking or decision.get("thinking") or "medium", {
-            "source": "classifier", "recommendation": decision,
-            "reason": "classifier recommendation accepted",
-        }
-    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as error:
-        config = read_json(ROOT / "config/router.json")
-        fallback = config.get("claude_preference", {}).get("ordinary", {}) if worker == "claude" else config.get("routes", {}).get("coding", {})
-        return worker or "pi", fallback.get("model", "openai-codex/gpt-6-sol"), thinking or fallback.get("thinking", "medium"), {
-            "source": "main_fallback", "reason": f"classifier unavailable: {str(error)[:200]}",
-        }
+ROUTE_INFO_KEYS = ("source", "level", "effort", "effort_abstract", "provider", "decided_by", "reason", "review",
+                   "router_review", "steps", "approvals", "local_only", "catalog_version", "prompt_sha256", "card_sha256",
+                   "selection_id")
+
+
+def route_info(result):
+    return {key: result.get(key) for key in ROUTE_INFO_KEYS}
+
+
+def route(task, role, worker, model, thinking, context=(), deliverable="", level=None, approve_effort=False,
+          local_only=False, workdir=None, base=None):
+    """Choose (worker, model, effort, route_info) with the catalog router (lib/model_router.py). Explicit --worker,
+    --model, --thinking and --level are constraints; the pair is always valid, or ValueError says why the user must
+    decide. Nothing here calls Laya."""
+    sys.path.insert(0, str(ROOT / "lib"))
+    import model_router
+    result = model_router.select({"task": task, "role": role, "deliverable": deliverable, "context": list(context),
+                                  "workdir": workdir, "worker": worker, "model": model, "thinking": thinking,
+                                  "level": level, "local_only": local_only, "approve_effort": approve_effort}, base=base)
+    return result["worker"], result["model"], result["thinking"], route_info(result)
+
+
+def escalation_evidence(base, previous):
+    """(failed attempts, REQUEST_CHANGES reviews) along the retry lineage that ends at `previous`."""
+    failed = changes = 0
+    seen, path = set(), previous
+    for _ in range(12):
+        meta = read_json(path / "meta.json")
+        if meta.get("id", path.name) in seen:
+            break
+        seen.add(meta.get("id", path.name))
+        rec = record(path)
+        if rec["status"] in {"failed", "stopped"} or rec["result_status"] in {"incomplete", "blocked"}:
+            failed += 1
+        if meta.get("review"):
+            try:
+                text = (task_dir(base, meta["review"]) / "result.md").read_text()
+                changes += 1 if (text.strip().splitlines() or [""])[0].strip() == "REQUEST_CHANGES" else 0
+            except (ValueError, OSError):
+                pass
+        if not meta.get("parent"):
+            break
+        try:
+            path = task_dir(base, meta["parent"])
+        except ValueError:
+            break
+    return failed, changes
+
+
+def escalation_route(base, previous, args):
+    """(worker, model, effort, route_info) for `retry --escalate`: effort up before level, only after the catalog's
+    number of failed attempts or REQUEST_CHANGES reviews."""
+    sys.path.insert(0, str(ROOT / "lib"))
+    import model_router
+    import router_catalog
+    catalog = router_catalog.load_catalog()
+    failed, changes = escalation_evidence(base, previous)
+    need = catalog["escalation"]["after"]
+    if max(failed, changes) < need:
+        raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
+                         f"{changes}. Retry without --escalate, or request a level explicitly with --level")
+    meta = read_json(previous / "meta.json")
+    try:  # the task text and admitted context, so the escalation record carries the same card hash as the dispatch
+        meta = dict(meta, task=(previous / "request.md").read_text().strip(), context=replay_inputs(previous)[0])
+    except OSError:
+        pass
+    result = model_router.escalate_route(meta, catalog, role=args.role or meta.get("role"), worker=args.worker,
+                                         approve_effort=args.approve_effort, base=base,
+                                         local_only=getattr(args, "local_only", False))
+    return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
 def capacity(base, proposed, worker, model):
@@ -272,11 +308,14 @@ def locked(base):
 def dispatch(args, base):
     if not (ROLES / f"{args.role}.md").is_file():
         raise ValueError(f"unknown role: {args.role}")
-    worker, model, thinking, route_info = route(args.task, args.role, args.worker, args.model, args.thinking,
-                                                 args.context or [], args.deliverable)
+    chosen = getattr(args, "preroute", None) or route(
+        args.task, args.role, args.worker, args.model, args.thinking, args.context or [], args.deliverable,
+        level=getattr(args, "level", None), approve_effort=getattr(args, "approve_effort", False),
+        local_only=getattr(args, "local_only", False), workdir=args.workdir, base=base)
+    worker, model, thinking, info = chosen
     item = {"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
             "task": args.task, "workdir": args.workdir, "worker": worker, "model": model,
-            "thinking": thinking, "route_info": route_info, "deliverable": args.deliverable or "",
+            "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
             "notes": args.note or []}
     with locked(base):
@@ -324,15 +363,38 @@ def discover_context(task, workdir=None):
     return {"contexts": out["contexts"], "reasons": context_reasons(out["manifest"]), "skipped": out["skipped"]}
 
 
+def review(base, args):
+    """Run bin/tp-review for a finished task. The reviewer is chosen by the resolver (lib/model_router.review_plan):
+    never the author's provider when another is available."""
+    command = [str(ROOT / "bin/tp-review")] + (["--force"] if args.force else [])
+    for flag, value in (("--level", args.level), ("--thinking", args.thinking)):
+        if value:
+            command += [flag, value]
+    if args.approve_effort:
+        command.append("--approve-effort")
+    run = subprocess.run(command + [args.id], text=True, capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
+    if run.returncode == 3:
+        return {"id": args.id, "review": None, "status": "not_needed", "reason": run.stderr.strip()}
+    if run.returncode:
+        raise RuntimeError(run.stderr.strip() or "tp-review failed")
+    value = {"id": args.id, "review": run.stdout.strip().splitlines()[-1], "status": "started"}
+    write_index(base)
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     d = sub.add_parser("dispatch", help="route and start or queue a role task")
     d.add_argument("--role", required=True)
     d.add_argument("--task", required=True)
-    d.add_argument("--worker", choices=["pi", "claude"])
-    d.add_argument("--model")
-    d.add_argument("--thinking")
+    d.add_argument("--worker", choices=["pi", "claude"], help="require this harness; the router still picks the model")
+    d.add_argument("--model", help="explicit model (skips the router)")
+    d.add_argument("--thinking", help="explicit effort; above high needs --approve-effort")
+    d.add_argument("--level", help="explicit catalog level key, e.g. top (skips the router)")
+    d.add_argument("--approve-effort", action="store_true",
+                   help="record that the user approved an effort above high for this task")
+    d.add_argument("--local-only", action="store_true", help="private work: local router and local model, or stop and ask")
     d.add_argument("--workdir")
     d.add_argument("--deliverable", default="")
     d.add_argument("--parent")
@@ -347,6 +409,17 @@ def main():
     retry.add_argument("--worker", choices=["pi", "claude"])
     retry.add_argument("--model")
     retry.add_argument("--thinking")
+    retry.add_argument("--level", help="explicit catalog level key")
+    retry.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
+    retry.add_argument("--local-only", action="store_true")
+    retry.add_argument("--escalate", action="store_true",
+                       help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
+    rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author)")
+    rv.add_argument("id")
+    rv.add_argument("--force", action="store_true", help="review even when the policy says none")
+    rv.add_argument("--level", help="explicit reviewer level key")
+    rv.add_argument("--thinking", help="explicit reviewer effort")
+    rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     for name in ("list", "tick"):
         sub.add_parser(name)
     # --no-tick: write and print the index without launching queued work.
@@ -385,15 +458,25 @@ def main():
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
         contexts, notes, remark = replay_inputs(previous)
+        preroute = None
+        if args.escalate:
+            if args.model or args.level or args.thinking:
+                raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
+            preroute = escalation_route(base, previous, args)
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
                                          task=args.task or original, worker=args.worker,
-                                         model=args.model, thinking=args.thinking,
+                                         model=args.model, thinking=args.thinking, level=args.level,
+                                         approve_effort=args.approve_effort, preroute=preroute,
+                                         local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
                                          workdir=meta.get("workdir"),
                                          deliverable=meta.get("deliverable", ""),
                                          parent=args.id, after=[], context=contexts,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
                                                       + (f" {remark}; see the prior packet." if remark else "")])
         value = dispatch(replacement, base)
+    elif args.command == "review":
+        task_dir(base, args.id)
+        value = review(base, args)
     elif args.command == "tick":
         value = tick(base)
     elif args.command == "index":

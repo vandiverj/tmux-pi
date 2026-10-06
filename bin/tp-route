@@ -1,33 +1,46 @@
 #!/usr/bin/env python3
-"""Choose a validated tmux-pi worker model and thinking level for a task.
+"""Choose a validated tmux-pi worker, model and effort for a task from the model catalog.
 
-With --review, print the task's review level (none, optional or required) instead.
-With --dispatch, print the main agent's full decision: route target, intent, review,
-execution scope and placement (main or subagent), honoring +here/+delegate/+review.
-With --follow-up, read {"message", "tasks": [{"id", "task", "reply"}]} as JSON on stdin
-and print {"target": id or null, "ask": [ids]}: the running task the message belongs to.
-With --pick-files WORKDIR --model M, print the tp-spawn -c specs to put in the packet of
-a worker on M, one per line (nothing unless M is listed in local packet_files).
+The task text is read from the arguments, --file or stdin (the "Worker role: ... Assignment: ..." payload form
+that tp-agent used to send is understood too). A small router model reads a fixed-form card of it, and the
+deterministic resolver (lib/route_resolve.py) turns that into a worker and model that are always a valid pair.
+Output is JSON: worker, model and thinking first, then level, effort, review, decided_by, reason, any
+substitution steps and the selection id. Explicit constraints: --worker, --model, --thinking, --level KEY (the
+top level only on request), --local-only, and --approve-effort (records the user's approval of an effort above
+high). Exit 2 means nothing suitable is available or allowed and the user must decide.
 
-Routing and --dispatch append an experimental selection record to the session's
-.tmux-pi/evals log (lib/routing_evals.py; TP_ROUTING_EVALS=0 turns it off). The log is
-best-effort evidence: a failed append never changes the decision or the exit status, and
---dispatch output gains a selection_id only when the record was written.
+With --review-plan TASK_DIR, decide whether the finished task needs a review and who reviews it (a different
+provider from the author when one is available): print the plan as JSON, exit 3 when no review is needed, exit 4
+when a required review has no independent provider. --force skips the need check.
+
+Every selection, explicit choices included, appends a record to the session's .tmux-pi/evals/model-selections.jsonl
+(TP_ROUTING_EVALS=0 turns it off for this command). A failed append never changes the decision.
+
+Legacy modes still backed by the Laya service, kept only for agent/extensions/dispatcher.ts until it is
+replaced: --dispatch prints the main agent's decision (route target, intent, review, execution scope and
+placement, honoring +here/+delegate/+review) and --follow-up reads {"message", "tasks": [{"id", "task", "reply"}]}
+as JSON on stdin and prints {"target": id or null, "ask": [ids]}. --pick-files WORKDIR --model M prints the
+tp-spawn -c specs for a worker on M (nothing unless M is listed in local packet_files); it calls no router.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from router import (RouterError, dispatch, follow_up, load_config, local_base_url, pick_files,  # noqa: E402
-                    review_task, route_task)
+from router import (RouterError, dispatch, follow_up, load_config, local_base_url, pick_files)  # noqa: E402
+import model_router  # noqa: E402
+import router_catalog  # noqa: E402
+
+PAYLOAD = re.compile(r"\AWorker role: (?P<role>[^\n]*)\nAssignment: (?P<task>.*?)\nExpected deliverable: (?P<deliverable>.*?)"
+                     r"\nSelected context paths: (?P<context>[^\n]*)\Z", re.S)
 
 
 def log_selection(task, config, config_path, kind, backend, decision, trace, error=None):
-    """Append a selection record; return its id, or None. Never raises."""
+    """Append a legacy (Laya) selection record; return its id, or None. Never raises."""
     try:
         import routing_evals
         record = routing_evals.selection_record(task, config, config_path, kind=kind, backend=backend,
@@ -40,93 +53,120 @@ def log_selection(task, config, config_path, kind, backend, decision, trace, err
         return None
 
 
+def split_payload(text):
+    """(role, task, deliverable, context) from the tp-agent payload form; (None, text, "", []) for plain text."""
+    match = PAYLOAD.match(text.strip())
+    if not match:
+        return None, text, "", []
+    role = match.group("role").strip()
+    paths = [p.strip() for p in match.group("context").split(",") if p.strip()]
+    return (role if role and role != "None" else None), match.group("task").strip(), match.group("deliverable").strip(), paths
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("task", nargs="*", help="task text; reads stdin when omitted")
     parser.add_argument("--file", help="read task text from a file")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "config/router.json"))
-    parser.add_argument("--backend", choices=("laya", "openai"), default=os.environ.get("TP_ROUTER_BACKEND"),
-                        help="classifier backend (default: config, which selects Laya)")
-    parser.add_argument("--base-url", default=os.environ.get("TP_ROUTER_BASE_URL"))
-    parser.add_argument("--router-model", default=os.environ.get("TP_ROUTER_MODEL"))
-    parser.add_argument("--check", action="store_true", help="validate config without contacting the endpoint")
+    parser.add_argument("--catalog", help="model catalog (default config/model-catalog.json)")
+    parser.add_argument("--role", help="the worker role, for role floors and caps")
+    parser.add_argument("--deliverable", default="")
+    parser.add_argument("--context", action="append", default=[], help="a context spec the task will carry (repeatable)")
+    parser.add_argument("--workdir")
+    parser.add_argument("--worker", choices=("pi", "claude"), help="require this harness")
+    parser.add_argument("--model", help="explicit model (skips the router); the packet model for --pick-files")
+    parser.add_argument("--thinking", help="explicit effort")
+    parser.add_argument("--level", help="explicit catalog level key (skips the router)")
+    parser.add_argument("--local-only", action="store_true", help="private work: local router and local model, or stop")
+    parser.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
+    parser.add_argument("--review-plan", metavar="TASK_DIR", help="decide whether a finished task needs review and who reviews")
+    parser.add_argument("--force", action="store_true", help="with --review-plan: review regardless of need")
+    parser.add_argument("--no-log", action="store_true", help="do not write a selection record")
+    parser.add_argument("--base-url", default=os.environ.get("TP_ROUTER_BASE_URL"), help="legacy Laya endpoint (--dispatch, --follow-up)")
+    parser.add_argument("--router-model", default=os.environ.get("TP_ROUTER_MODEL"), help="legacy Laya model (--dispatch)")
+    parser.add_argument("--check", action="store_true", help="validate config and catalog without calling a router")
     parser.add_argument("--dispatch", action="store_true",
-                        help="print the main agent's decision: target, intent, review, scope, placement")
+                        help="legacy, Laya-backed: print the main agent's decision: target, intent, review, scope, placement")
     parser.add_argument("--follow-up", action="store_true",
-                        help="print the running task a message belongs to (JSON on stdin)")
+                        help="legacy, Laya-backed: print the running task a message belongs to (JSON on stdin)")
     parser.add_argument("--pick-files", metavar="WORKDIR",
                         help="print packet file specs for a worker on --model (task on stdin)")
-    parser.add_argument("--model", help="worker model for --pick-files")
-    parser.add_argument("--review", action="store_true",
-                        help="print {\"review\": none|optional|required} from Laya instead of a route")
     args = parser.parse_args()
     try:
-        config = load_config(args.config)
-        backend = args.backend or config["backend"]
-        if backend not in ("laya", "openai"):
-            raise RouterError("backend must be laya or openai")
-        if args.base_url is not None:
-            local_base_url(args.base_url, backend)
-        if (args.review or args.dispatch) and backend != "laya":
-            raise RouterError("--review and --dispatch need the laya backend")
-        if args.router_model is not None and not args.router_model.strip():
-            raise RouterError("router model must be a nonempty string")
         if args.check:
-            print("router config valid: {} models".format(len(config["models"])))
+            config = load_config(args.config, laya_model=False)
+            catalog = router_catalog.load_catalog(args.catalog)
+            print("router config valid: {} models; catalog valid: {} levels ({} shown)".format(
+                len(config["models"]), len(catalog["levels"]), len(router_catalog.shown_keys(catalog))))
             return 0
-        if args.follow_up:
-            try:
-                request = json.loads(sys.stdin.read())
-                message, tasks = request["message"], request["tasks"]
-                if not isinstance(message, str) or not isinstance(tasks, list) or any(
-                        not isinstance(t, dict) or not isinstance(t.get("id"), str) or not isinstance(t.get("task"), str)
-                        or not isinstance(t.get("reply", ""), str) for t in tasks):
-                    raise ValueError("needs a message string and tasks with string id, task and reply")
-            except (ValueError, KeyError, TypeError) as exc:
-                raise RouterError("--follow-up input: {}".format(exc)) from exc
-            print(json.dumps(follow_up(message, tasks, config), separators=(",", ":")))
-            return 0
-        if args.file and args.task:
-            parser.error("use either --file or task arguments")
-        if args.file:
-            task = Path(args.file).read_text(encoding="utf-8")
-        elif args.task:
-            task = " ".join(args.task)
-        else:
-            task = sys.stdin.read()
-        if args.pick_files:
-            if not args.model:
-                raise RouterError("--pick-files needs --model")
-            for spec in pick_files(task, args.pick_files, args.model, config):
-                print(spec)
-            return 0
-        if args.dispatch:
+        if args.review_plan:
+            plan = model_router.review_plan(args.review_plan, force=args.force, level=args.level, thinking=args.thinking,
+                                            approve_effort=args.approve_effort, catalog_path=args.catalog,
+                                            log=not args.no_log)
+            print(json.dumps(plan, separators=(",", ":")))
+            return 3 if plan["review"] == "none" else 0
+        if args.dispatch or args.follow_up:
+            config = load_config(args.config)
+            if args.base_url is not None:
+                local_base_url(args.base_url, "laya")
+            if args.follow_up:
+                try:
+                    request = json.loads(sys.stdin.read())
+                    message, tasks = request["message"], request["tasks"]
+                    if not isinstance(message, str) or not isinstance(tasks, list) or any(
+                            not isinstance(t, dict) or not isinstance(t.get("id"), str) or not isinstance(t.get("task"), str)
+                            or not isinstance(t.get("reply", ""), str) for t in tasks):
+                        raise ValueError("needs a message string and tasks with string id, task and reply")
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise RouterError("--follow-up input: {}".format(exc)) from exc
+                print(json.dumps(follow_up(message, tasks, config), separators=(",", ":")))
+                return 0
+            task = Path(args.file).read_text(encoding="utf-8") if args.file else " ".join(args.task) if args.task else sys.stdin.read()
             trace = {}
             try:
                 decision = dispatch(task, config, args.base_url, args.router_model, trace=trace)
             except RouterError as exc:
-                log_selection(task, config, args.config, "dispatch", backend, None, trace, exc)
+                log_selection(task, config, args.config, "dispatch", "laya", None, trace, exc)
                 raise
-            selection_id = log_selection(task, config, args.config, "dispatch", backend, decision, trace)
+            selection_id = log_selection(task, config, args.config, "dispatch", "laya", decision, trace)
             if selection_id:
                 decision["selection_id"] = selection_id
             print(json.dumps(decision, separators=(",", ":")))
             return 0
-        if args.review:
-            print(json.dumps({"review": review_task(task, config, args.base_url, args.router_model)},
-                             separators=(",", ":")))
+        if args.file and args.task:
+            parser.error("use either --file or task arguments")
+        if args.file:
+            text = Path(args.file).read_text(encoding="utf-8")
+        elif args.task:
+            text = " ".join(args.task)
+        else:
+            text = sys.stdin.read()
+        if args.pick_files:
+            if not args.model:
+                raise RouterError("--pick-files needs --model")
+            for spec in pick_files(text, args.pick_files, args.model, load_config(args.config, laya_model=False)):
+                print(spec)
             return 0
-        trace = {}
+        if not text.strip():
+            raise RouterError("task must contain text")
+        role, task, deliverable, context = split_payload(text)
+        request = {"task": task, "role": args.role or role, "deliverable": args.deliverable or deliverable,
+                   "context": args.context or context, "workdir": args.workdir, "worker": args.worker, "model": args.model,
+                   "thinking": args.thinking, "level": args.level, "local_only": args.local_only,
+                   "approve_effort": args.approve_effort}
         try:
-            decision = route_task(task, config, backend, args.base_url, args.router_model, trace=trace)
-        except RouterError as exc:
-            log_selection(task, config, args.config, "route", backend, None, trace, exc)
-            raise
-        # Plain routing output stays exactly worker/model/thinking; it is joined by task hash.
-        log_selection(task, config, args.config, "route", backend, decision, trace)
-        print(json.dumps(decision, separators=(",", ":")))
+            result = model_router.select(request, config_path=args.config, catalog_path=args.catalog, log=not args.no_log)
+        except model_router.RouteStop as exc:
+            print("tp-route: stop and ask the user: {}".format(exc), file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            raise RouterError(str(exc)) from exc
+        print(json.dumps(result, separators=(",", ":")))
         return 0
-    except (RouterError, OSError) as exc:
+    except model_router.RouteStop as exc:
+        print("tp-route: stop and ask the user: {}".format(exc), file=sys.stderr)
+        return 4
+    except (RouterError, router_catalog.CatalogError, ValueError, OSError) as exc:
         print("tp-route: {}".format(exc), file=sys.stderr)
         return 1
 

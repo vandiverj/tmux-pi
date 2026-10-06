@@ -1,0 +1,277 @@
+{
+  "catalog_version": 1,
+  "description": "The model ladder the router chooses from. Everything the router prompt and the resolver need is data here: add a model by appending to a level's models, add a level by inserting an object into levels, hide a level that has no rostered model with shown:false. The router chain's order, each router's max_input_tokens, its transport (cli, or direct_chat straight to the local server with temperature and seed), thinking_off (a reply that reports thinking tokens fails the attempt) and an optional confirm rule (ask the next router when this one picks above a level or picks the local level for an unqualified shape) are data in router.chain. lib/router_catalog.py validates this file strictly; lib/route_resolve.py applies it.",
+  "default_level": "mid",
+  "effort": {
+    "order": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "vocabulary": ["low", "medium", "high"],
+    "default": "medium",
+    "ceiling": "high",
+    "ceiling_rule": "Never request an effort above the ceiling. xhigh and max exist in the roster for some models and stay unused until the user approves a specific task.",
+    "meaning": {
+      "low": "Mechanical, lookup or clearly bounded work. Resolves to the model's lowest setting (Qwen3.6: off).",
+      "medium": "The normal case. Most tasks.",
+      "high": "The level is right but the task has subtle logic, many cases, or a costly miss; more care on the same model is likely enough. Prefer this to moving up a level."
+    }
+  },
+  "providers": {
+    "anthropic": {"worker": "claude", "kind": "cloud"},
+    "openai": {"worker": "pi", "kind": "cloud"},
+    "local": {"worker": "pi", "kind": "local"},
+    "openrouter": {"worker": "pi", "kind": "cloud"}
+  },
+  "provider_order": {
+    "author": ["anthropic", "openai", "openrouter", "local"],
+    "review": ["openai", "anthropic", "openrouter", "local"]
+  },
+  "router": {
+    "chain": [
+      {
+        "provider": "local",
+        "worker": "pi",
+        "model": "lmstudio/qwen/qwen3.6-35b-a3b",
+        "effort": "lowest",
+        "timeout_seconds": 30,
+        "max_level": "mid",
+        "confirm": {"above_level": "mid", "unqualified_local": true},
+        "transport": "direct_chat",
+        "temperature": 0,
+        "seed": 7,
+        "thinking_off": true,
+        "max_input_tokens": 12000
+      },
+      {
+        "provider": "anthropic",
+        "worker": "claude",
+        "model": "claude-haiku-4-5-20251001",
+        "effort": "lowest",
+        "timeout_seconds": 20,
+        "env": {"MAX_THINKING_TOKENS": "0"},
+        "thinking_off": true,
+        "max_input_tokens": 50000
+      },
+      {
+        "provider": "openai",
+        "worker": "pi",
+        "model": "openai-codex/gpt-6-luna",
+        "effort": "lowest",
+        "timeout_seconds": 35,
+        "max_input_tokens": 50000
+      }
+    ],
+    "budget_seconds": 80,
+    "retries_on_invalid": 1
+  },
+  "escalation": {"after": 2},
+  "reviewer": {"min_level": "mid", "default_effort": "medium"},
+  "review_policy": {
+    "role_floor": {
+      "coder": "optional",
+      "infrastructure": "optional",
+      "architect": "optional",
+      "researcher": "none",
+      "tester": "none",
+      "code-reviewer": "none",
+      "vulnerability-reviewer": "none",
+      "data-flow-reviewer": "none"
+    },
+    "default_floor": "optional",
+    "files_optional_at": 1,
+    "files_required_at": 4,
+    "required_from_level": "top",
+    "high_effort_required_from_level": "mid"
+  },
+  "principles": [
+    "Choose the lowest level and the lowest effort that will reliably do the work. Choosing too high is the common mistake. A choice that is too low is caught by review and by the escalation rule after two failed attempts.",
+    "Judge by what the work requires, not by how the request is worded. Length, urgency, the words careful, critical, security, credentials, production or safety, and a long list of constraints do not make a task harder. Risk is handled by the review field, not by the level.",
+    "A long request is usually long because it carries context and rules. Find the one thing the worker has to do and judge that.",
+    "Effort medium is the normal choice. Use high instead of moving up a level when the level is right but the task needs more care: subtle logic, many interacting cases, an adversarial review. Use low for mechanical, lookup or clearly bounded work. Nothing above high exists.",
+    "When torn between two adjacent levels, choose the lower one and, if care is the worry, raise the effort instead.",
+    "The top level is rare. Choose it only for a very large breadth of scope, typically an architecture across many subsystems, or for work that needs a great deal of inference to reach any answer. Applying a known pattern, however large, sensitive or security-related, is not that, and neither is a long or urgent request.",
+    "{level:local} requires a listed shape and a request that names its files or an exact command. If either is missing, use the next level up."
+  ],
+  "review": {
+    "none": "Read-only answers, lookups and reports.",
+    "optional": "Ordinary changes that are easy to check by running tests or reading a short diff.",
+    "required": "Changes that touch permissions, secrets handling, deletion, data migration, concurrency, or anything hard to check by running a command, and every review of security-relevant code. The deterministic review policy still has the final word and can only raise this."
+  },
+  "shapes": {
+    "locate_quote": {
+      "status": "qualified",
+      "text": "find where something is defined or used in named files and quote it",
+      "evidence": "117/120 read-only chores"
+    },
+    "count_enumerate": {
+      "status": "qualified",
+      "text": "count or list items by running a counting command",
+      "evidence": "77/80 with the counting prompt"
+    },
+    "classify_short": {
+      "status": "qualified",
+      "text": "short classification of one message or snippet into given labels",
+      "evidence": "54/56 follow-up judge"
+    },
+    "summarize_files": {
+      "status": "candidate",
+      "text": "summarize or draft documentation from given files",
+      "evidence": "needs about 20 chores"
+    },
+    "small_edit": {
+      "status": "candidate",
+      "text": "small edit to a named file with a check command",
+      "evidence": "only 6 chores"
+    },
+    "run_named_checks": {
+      "status": "candidate",
+      "text": "run named tests or commands and report the output",
+      "evidence": "needs about 20 chores"
+    }
+  },
+  "protected_paths": [
+    {"pattern": "lib/sensitive_read.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "bin/tp-sensitive-read", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "lib/redact*.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "lib/redaction_store.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "lib/placeholders.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "bin/tp-redact", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "bin/tp-secret-exec", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "agent/extensions/sensitive.ts", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "claude/mcp/safe.mjs", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "claude/plugins/tmux-pi/hooks/*", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"}
+  ],
+  "roles": {
+    "vulnerability-reviewer": {"min_level": "mid", "min_effort": "high", "max_level": "strong"},
+    "data-flow-reviewer": {"min_level": "mid", "min_effort": "high", "max_level": "strong"},
+    "code-reviewer": {"min_level": "mid", "max_level": "strong"},
+    "coder": {"min_level": "mid", "below_floor_shapes": ["small_edit"]},
+    "architect": {"min_level": "mid"},
+    "infrastructure": {"min_level": "mid"},
+    "tester": {"max_level": "mid"},
+    "researcher": {"max_level": "mid"}
+  },
+  "levels": [
+    {
+      "key": "local",
+      "name": "Local Qwen",
+      "rank": 10,
+      "requires_shape": true,
+      "for": "Bounded read-only or mechanical work whose files or exact command are named in the request and whose answer can be checked by reading the output: find and quote, count, short classification. Free and private.",
+      "not_for": "Anything that changes more than one file, designs, judges trade-offs, reviews security or concurrency, or whose result cannot be checked cheaply. Never the only reviewer. Not for large packets (the 32k Slotstream model cannot hold one).",
+      "anchors": [
+        {"task": "Find where the request timeout default is set in config/net.py and quote the line.", "effort": "low", "shape": "locate_quote"},
+        {"task": "How many test files under tests/ import load_profile? Give the number and the file names.", "effort": "low", "shape": "count_enumerate"}
+      ],
+      "expected_share": [0.05, 0.12],
+      "models": [
+        {
+          "provider": "local", "worker": "pi", "model": "lmstudio/qwen/qwen3.6-35b-a3b",
+          "efforts": ["off"], "context_window": 131072, "max_output": 8192, "in_roster": true
+        },
+        {
+          "provider": "local", "worker": "pi", "model": "slotstream/qwen3.8-flash-next:4bit",
+          "efforts": ["off", "low", "medium"], "context_window": 32768, "max_output": 8192, "in_roster": true,
+          "max_packet_tokens": 8000
+        }
+      ],
+      "effort_map": {"low": "off", "medium": "off", "high": "off"}
+    },
+    {
+      "key": "small",
+      "name": "Haiku / GPT-6 luna",
+      "rank": 20,
+      "for": "Small, well-specified jobs with an obvious approach and an easy check: one named-file edit plus its check command, run named tests and report, look something up across a few files, summarize or draft short text from given material, a mechanical change. Also what a {level:local} job becomes when it lacks a listed shape.",
+      "not_for": "Choosing between designs, subtle bugs, reviewing a non-trivial diff, anything where a wrong answer would look plausible.",
+      "anchors": [
+        {"task": "Change the default page size in settings.py from 20 to 50 and run tests/test_settings.py.", "effort": "low"},
+        {"task": "Run the unit tests for the parser module and report which fail with the first error line of each.", "effort": "low"},
+        {"task": "Summarize the three attached design notes into ten bullet points.", "effort": "medium"}
+      ],
+      "expected_share": [0.08, 0.15],
+      "models": [
+        {
+          "provider": "anthropic", "worker": "claude", "model": "claude-haiku-4-5-20251001",
+          "efforts": ["low", "medium", "high"], "context_window": 200000, "max_output": 64000, "in_roster": true
+        },
+        {
+          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-luna",
+          "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          "context_window": 272000, "max_output": 128000, "in_roster": true
+        }
+      ],
+      "effort_map": {"low": "low", "medium": "medium", "high": "high"}
+    },
+    {
+      "key": "mid",
+      "name": "Sonnet / GPT-6 sol",
+      "rank": 30,
+      "for": "The ordinary software work and the default: a feature, a bug fix, tests, a focused investigation, a review of a normal diff, a routine design with an obvious best option. Effort medium by default; high for subtle correctness, adversarial or security-relevant review, or work across several components.",
+      "not_for": "An architecture across many subsystems or work that needs a great deal of inference. Trivial lookups and one-line edits.",
+      "anchors": [
+        {"task": "Add pagination to the /orders endpoint with tests, following the existing list endpoints.", "effort": "medium"},
+        {"task": "The nightly export drops rows when a customer has two billing addresses. Find the cause and fix it.", "effort": "medium"},
+        {"task": "Review this 200-line diff to the cache invalidation code for correctness bugs.", "effort": "medium"},
+        {"task": "Review a change to the payment retry logic for double-charge and ordering bugs.", "effort": "high"},
+        {"task": "Three modules each implement their own retry policy. Propose how to unify them and weigh two obvious designs.", "effort": "high"}
+      ],
+      "expected_share": [0.6, 0.75],
+      "models": [
+        {
+          "provider": "anthropic", "worker": "claude", "model": "claude-sonnet-5-5",
+          "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 128000, "in_roster": true
+        },
+        {
+          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-sol",
+          "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          "context_window": 272000, "max_output": 128000, "in_roster": true
+        }
+      ],
+      "effort_map": {"low": "low", "medium": "medium", "high": "high"}
+    },
+    {
+      "key": "strong",
+      "name": "GPT sol 6.1",
+      "rank": 40,
+      "shown": false,
+      "for": "Hard work with a known approach where Sonnet at high effort is likely to miss things: a very large review or refactor, an audit across many components, a long careful investigation. Rare. No Claude model sits at this level today.",
+      "not_for": "Anything Sonnet at high effort can reasonably do. Architecture across many subsystems or deep inference (that is the top level).",
+      "anchors": [
+        {"task": "After a change to the shared invoice library's rounding rules, check every consumer across eleven services for rounding and currency bugs and list each with a fix.", "effort": "high"},
+        {"task": "Review a 1,500-line change that moves the scheduler's locking across five modules, checking every lock order.", "effort": "high"}
+      ],
+      "expected_share": [0.0, 0.05],
+      "models": [
+        {
+          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6.1-sol",
+          "efforts": ["low", "medium", "high"], "context_window": 272000, "max_output": 128000, "in_roster": false,
+          "unverified": "listed by pi, not in config/router.json yet; efforts assumed to match gpt-6-sol"
+        }
+      ],
+      "effort_map": {"low": "low", "medium": "medium", "high": "high"}
+    },
+    {
+      "key": "top",
+      "name": "Opus / GPT-6 astra",
+      "rank": 50,
+      "restricted": true,
+      "for": "Work with a very large breadth of scope, typically an architecture or design across many subsystems, or work that needs a great deal of inference to reach any answer. Expected to be rare: a small fraction of tasks. The level is also reached by an explicit request and by escalation after two failed attempts; you cannot see those, and they are never a reason for you to choose it.",
+      "not_for": "Anything a mid-level model at high effort can do, however long, urgent, risky or security-related. Reviews of ordinary or even large diffs. Applying a known pattern. Security wording, length and risk never raise the level.",
+      "anchors": [
+        {"task": "Design the target architecture for splitting a monolith into services: eleven subsystems share state, and the order of the migration and every interface between them must be decided.", "effort": "high"},
+        {"task": "Reconcile the data model, sync protocol, auth and billing designs of a product spanning nine subsystems into one coherent architecture, deriving the constraints each imposes on the others.", "effort": "high"}
+      ],
+      "expected_share": [0.0, 0.03],
+      "models": [
+        {
+          "provider": "anthropic", "worker": "claude", "model": "claude-opus-5-5",
+          "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 128000, "in_roster": true
+        },
+        {
+          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-astra",
+          "efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+          "context_window": 272000, "max_output": 128000, "in_roster": true
+        }
+      ],
+      "effort_map": {"low": "low", "medium": "medium", "high": "high"}
+    }
+  ]
+}

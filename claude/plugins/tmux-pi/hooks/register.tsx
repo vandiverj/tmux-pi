@@ -193,9 +193,10 @@ async function restore($: EngineInterface) {
     held = stored.pending.filter(row => delivered.has(`${row.id}:${row.status}`))
   } catch {
     // The saved value could not be read, so its epoch is unknown. Claim far above any counter
-    // a readable store holds, so this module is never taken for a replaced one when the store
-    // answers again; a later module still claims above it with + 1.
-    epoch = UNREAD_EPOCH
+    // a readable store holds, plus the time, so this module is never taken for a replaced one
+    // when the store answers again, and a later module that also cannot read still claims
+    // above this one. A module that can read claims above whatever is stored with + 1.
+    epoch = UNREAD_EPOCH + (await $.clock.now().catch(() => 0))
     isIndexed = false
     delivered = new Set()
     held = []

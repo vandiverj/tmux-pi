@@ -3,6 +3,13 @@
 Status: experimental, on by default (2026-09-29). Evidence only: nothing here grants dispatch,
 edit or review authority, enables an automation cell, or changes a main-owned contract.
 
+> Update (2026-10-06): `tp-agent dispatch`, plain `tp-route` and `tp-review` no longer use Laya. Model and
+> effort come from the catalog router (`config/model-catalog.json`, README "Model choice"), and every selection
+> writes a `model-selections.jsonl` record in this directory (schema `tmux-pi-model-selection:v1`: role, task and
+> card hashes, level, effort, decided_by, reason, resolved model, substitution steps, router attempts). Only
+> `tp-route --dispatch` and `--follow-up`, which the strict dispatcher still calls, use Laya and still write the
+> `routing-selections.jsonl` records described below; `tp-evals export` does not join the new file yet.
+
 ## What was already live, and what this adds
 
 Already live before this change:

@@ -1,0 +1,19 @@
+{
+  "tool": "Read",
+  "event": "PostToolUse",
+  "response_type": "dict",
+  "response_shape": {
+    "type": "str",
+    "file": {
+      "filePath": "str",
+      "content": "str",
+      "numLines": "int",
+      "startLine": "int",
+      "totalLines": "int"
+    }
+  },
+  "redact_fields": [
+    "file.content"
+  ],
+  "captured": "2026-10-05 Claude Code 2.1.289 (Phase 0 probe; field names and types only)"
+}

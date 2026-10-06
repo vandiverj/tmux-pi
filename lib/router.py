@@ -107,7 +107,7 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction"}
 
 
 def load_local(path, config):
@@ -134,6 +134,10 @@ def load_local(path, config):
             _target(target, config)
         except RouterError as exc:
             raise RouterError("invalid local {} route: {}".format(name, exc)) from exc
+    redaction = local.get("redaction")
+    if redaction is not None and (not isinstance(redaction, dict) or set(redaction) != {"mode"} or
+                                  redaction["mode"] not in ("off", "shadow", "on")):
+        raise RouterError("redaction needs exactly mode, one of off, shadow or on")
     escalation = local.get("escalation")
     if escalation is not None:
         if not isinstance(escalation, dict) or set(escalation) != {"models", "after_consecutive_errors", "to"}:

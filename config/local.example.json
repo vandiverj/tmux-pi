@@ -40,5 +40,7 @@
       "lmstudio/qwen/qwen3.6-35b-a3b"
     ],
     "selector": "claude-sonnet-5-5"
-  }
+  },
+  "_redaction": "Secret redaction for tool output (docs/sensitive-read-redaction-design.md). shadow (default) keeps the per-call sensitive-read prompts and logs what redaction would do to ~/.config/tmux-pi/state/redaction/shadow.log; on redacts output with placeholders and prompts only for credential stores; off disables it. TP_REDACTION overrides.",
+  "redaction": {"mode": "shadow"}
 }

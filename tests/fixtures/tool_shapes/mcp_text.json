@@ -1,0 +1,15 @@
+{
+  "tool": "mcp__probe__get_config",
+  "event": "PostToolUse",
+  "response_type": "list",
+  "response_shape": [
+    {
+      "type": "str",
+      "text": "str"
+    }
+  ],
+  "redact_fields": [
+    "[].text"
+  ],
+  "captured": "2026-10-05 Claude Code 2.1.289 (Phase 0 probe; field names and types only)"
+}

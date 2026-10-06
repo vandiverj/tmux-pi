@@ -23,6 +23,8 @@ export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
 export DISABLE_TELEMETRY=1
 export DISABLE_ERROR_REPORTING=1
 export TP_ROOT="$ROOT"
+# One redaction store per Claude process: the hooks and the tmux-pi-safe MCP server share it through this id.
+export TP_REDACTION_LAUNCH="$(date +%s)-$$-$RANDOM$RANDOM"
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
 settings="$CLAUDE_DIR/settings.json"

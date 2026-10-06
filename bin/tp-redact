@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Redact secrets from text on stdin; placeholders are stable per session.
+
+Usage: tp-redact --stdin [--source PATH] [--session ID | --no-store] [--secret-file F]... [--json]
+       tp-redact --stdin --grep [--cwd DIR]   (grep-style `path:line:text` output; each path is the source of its lines)
+       tp-redact --claude-hook   (Claude Code hook event on stdin; see lib/redact_hook.py)
+       tp-redact --mode   (prints off, shadow or on)
+       tp-redact --reveal PLACEHOLDER   (prints the real value; only the reveal MCP tool calls this, after the user approved)
+--stdin exits nonzero without output on any error, so callers must treat failure as withheld output.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from redact import Redactor, exact_values
+from redaction_store import Store, current_session, store_holding
+import placeholders
+import redact_hook
+
+
+def secret_files(extra):
+    files = [ROOT / "claude/mcp.local.env"]
+    files += [Path(f) for f in os.getenv("TP_REDACTION_SECRET_FILES", "").split(os.pathsep) if f]
+    return files + [Path(f) for f in extra]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--stdin", action="store_true")
+    action.add_argument("--claude-hook", action="store_true")
+    action.add_argument("--reveal", metavar="PLACEHOLDER")
+    action.add_argument("--mode", action="store_true", help="print the redaction mode (off, shadow or on)")
+    parser.add_argument("--source", help="file the text came from; enables config-file rules and path:line pointers")
+    parser.add_argument("--session", default=current_session() or "default")
+    parser.add_argument("--grep", action="store_true", help="treat stdin as grep -n output")
+    parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--no-store", action="store_true", help="number placeholders for this call only")
+    parser.add_argument("--secret-file", action="append", default=[])
+    parser.add_argument("--json", action="store_true", help="print {text, findings} instead of text")
+    args = parser.parse_args()
+    if args.mode:
+        print(redact_hook.mode())
+        return
+    if args.reveal:
+        store = store_holding(args.reveal)
+        value = placeholders.resolve_value(store.entry(args.reveal)) if store else None
+        if value is None:
+            sys.exit("tp-redact: cannot recover " + args.reveal)
+        sys.stdout.write(value)
+        return
+    if args.claude_hook:
+        output = redact_hook.handle(json.load(sys.stdin))
+        if output:
+            print(json.dumps(output))
+        return
+    text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+    store = Store(persist=False) if args.no_store else Store(args.session)
+    redactor = Redactor(store, exact_values(files=secret_files(args.secret_file)))
+    if args.grep:
+        post = redact_hook.PostRedactor(redactor, args.cwd)
+        post.collect(text)
+        post.resolve()
+        redacted, findings = post.render(post.entries[0]), post.findings
+    else:
+        redacted, findings = redactor.redact(text, args.source)
+    if args.json:
+        sys.stdout.write(json.dumps({"text": redacted, "findings": findings}) + "\n")
+    else:
+        sys.stdout.buffer.write(redacted.encode("utf-8", "surrogateescape"))
+
+
+if __name__ == "__main__":
+    main()

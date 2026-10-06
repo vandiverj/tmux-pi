@@ -1,0 +1,7 @@
+{
+  "_comment": "Second-pass review of ambiguous high-entropy strings by a local LM Studio model (docs/sensitive-read-redaction-design.md §4.2). The model can only clear candidates; known formats, secret-named assignments and exact values are always redacted. If the model is down, slow or unsure, candidates stay redacted. The base URL comes from the lmstudio provider in agent/models.json.",
+  "model": "qwen/qwen3.6-35b-a3b",
+  "budget_seconds": 20,
+  "max_candidates": 20,
+  "down_retry_seconds": 60
+}

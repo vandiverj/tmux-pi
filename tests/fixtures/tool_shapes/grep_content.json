@@ -1,0 +1,17 @@
+{
+  "tool": "Grep",
+  "event": "PostToolUse",
+  "response_type": "dict",
+  "response_shape": {
+    "mode": "str",
+    "numFiles": "int",
+    "filenames": [],
+    "content": "str",
+    "numLines": "int",
+    "totalLines": "int"
+  },
+  "redact_fields": [
+    "content"
+  ],
+  "captured": "2026-10-05 Claude Code 2.1.289 (Phase 0 probe; field names and types only)"
+}

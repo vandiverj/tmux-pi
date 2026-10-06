@@ -1,0 +1,20 @@
+{
+  "tool": "Bash",
+  "event": "PostToolUse",
+  "response_type": "dict",
+  "response_shape": {
+    "stdout": "str",
+    "stderr": "str",
+    "interrupted": "bool",
+    "isImage": "bool",
+    "noOutputExpected": "bool",
+    "persistedOutputPath": "str",
+    "persistedOutputSize": "int"
+  },
+  "redact_fields": [
+    "stdout",
+    "stderr",
+    "file at persistedOutputPath (raw on disk)"
+  ],
+  "captured": "2026-10-05 Claude Code 2.1.289 (Phase 0 probe; field names and types only)"
+}

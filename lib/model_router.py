@@ -87,14 +87,59 @@ def explicit_pair(cat, worker, model):
     return worker or (known["worker"] if known else "pi" if "/" in model else "claude")
 
 
-def _emergency(config, worker):
-    """Last resort when the catalog cannot be read: the legacy router config's ordinary pair."""
+def _raw_catalogs(catalog_path):
+    """The catalog files that might say what a role's floor is, read leniently (the selected one failed validation, so
+    nothing in it is trusted beyond what is checked below): the selected file, then the shipped one. Unreadable ones are skipped."""
+    found = []
+    for path in dict.fromkeys(str(p) for p in (catalog_path or os.environ.get("TP_MODEL_CATALOG") or rc.CATALOG_PATH, rc.CATALOG_PATH)):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            found.append(data)
+    return found
+
+
+def _at_or_above_floor(raw, role, model):
+    """True when the raw catalog puts `model` in a level at or above the role's min_level; False on anything malformed."""
+    try:
+        keys = [level["key"] for level in raw["levels"]]
+        floor = keys.index(raw["roles"][role]["min_level"])
+        return any(entry["model"] == model for level in raw["levels"][floor:] for entry in level["models"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _emergency(config, worker, role=None, catalog_path=None):
+    """Last resort when the catalog cannot be read: the legacy router config's ordinary pair.
+
+    A model is returned only for a role that a leniently read catalog file names. A role with a strict floor, or with any min_level (the catalog is invalid, so a lost strict_floor flag is not trusted), gets the
+    pair only when it is confirmed at or above the floor; it is never replaced by another model of the worker. When no
+    readable catalog names the role (including an invalid shipped catalog that lost it) nothing is routed."""
     if not config:
         raise RouteStop("model catalog and router config are both unreadable; choose a model explicitly with --model")
     fallback = (config.get("claude_preference", {}).get("ordinary", {}) if worker == "claude"
                 else config.get("routes", {}).get("coding", {}))
     entry = next((m for m in config["models"] if m["model"] == fallback.get("model")), None)
-    if not entry or (worker and entry["worker"] != worker):
+    fits = bool(entry) and not (worker and entry["worker"] != worker)
+    raws = _raw_catalogs(catalog_path)
+    if not raws:
+        raise RouteStop("model catalog unreadable and no catalog file can say what role {} may run on, so it is not routed; "
+                        "fix the catalog".format(role))
+    named = [raw["roles"][role] for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)]
+    if not named:
+        # Absence of the role in a catalog that failed validation is not evidence that it has no floor.
+        raise RouteStop("model catalog unreadable and no catalog file confirms the floor of role {}, so it is not routed; "
+                        "fix the catalog or use --model".format(role))
+    strict = [raw for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)
+              and (raw["roles"][role].get("strict_floor") or "min_level" in raw["roles"][role])]
+    if strict:
+        if not fits or not all(_at_or_above_floor(raw, role, entry["model"]) for raw in strict):
+            raise RouteStop("model catalog unreadable and the configured fallback ({}) cannot be confirmed at or above the floor "
+                            "of role {} for worker {}, so the user must decide (use --model)".format(fallback.get("model"), role, worker))
+    elif not fits:
         entry = next((m for m in config["models"] if not worker or m["worker"] == worker), None)
     if not entry:
         raise RouteStop("no model available for worker {}".format(worker))
@@ -207,7 +252,7 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
             # checked, so the choice is refused rather than started unchecked.
             raise RouteStop("model catalog unreadable ({}): --model {} cannot be validated, so it is not routed".format(
                 str(exc)[:120], model))
-        w, m, t = _emergency(config, worker)
+        w, m, t = _emergency(config, worker, req.get("role"), catalog_path)
         return _finish("route", req, None, {"source": "catalog_error_fallback", "worker": w, "model": m, "effort": thinking or t,
                        "reason": "model catalog unreadable: {}".format(str(exc)[:160]), "steps": []},
                        card, None, config_error, started, base, log)

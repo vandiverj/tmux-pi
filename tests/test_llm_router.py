@@ -113,7 +113,7 @@ class ChainTests(ChainTestCase):
 
     def test_invalid_reply_is_retried_once_on_the_same_router(self):
         self.script(claude=[{"text": "I think level three."}, {"text": reply(2, "low", "none", "small_edit", "small")}])
-        r = self.select()
+        r = self.select(role="scribe")
         self.assertEqual((r["decided_by"], r["level"], r["model"]), (HAIKU, "small", HAIKU))
         self.assertEqual(self.models_called(), ["claude", "claude"])
 
@@ -201,11 +201,11 @@ class ThinkingTests(ChainTestCase):
     def test_the_local_router_reporting_reasoning_tokens_fails_and_a_missing_count_is_accepted(self):
         self.script(chat=[{"text": reply(1, "low", "none", "locate_quote", "find"), "reasoning_tokens": 120}])
         with self.assertRaises(model_router.RouteStop):
-            self.select(local_only=True, role="researcher", base=self.base, log=True)
+            self.select(local_only=True, role="scribe", base=self.base, log=True)
         self.assertEqual(self.models_called(), ["chat", "chat"])
         self.assertIn("thinking is meant to be off", self.rows()[-1]["attempts"][0]["error"])
         self.script(chat=[{"text": reply(1, "low", "none", "locate_quote", "find"), "no_usage": True}])
-        r = self.select(local_only=True, role="researcher", base=self.base, log=True)
+        r = self.select(local_only=True, role="scribe", base=self.base, log=True)
         self.assertEqual(r["decided_by"], QWEN)
         self.assertIn("not reported", self.rows()[-1]["attempts"][0]["note"])
 
@@ -215,7 +215,7 @@ class DirectChatTests(ChainTestCase):
 
     def ask_local(self, **req):
         self.script(chat=text((1, "low", "none", "locate_quote", "find")))
-        return self.select(local_only=True, role="researcher", base=self.base, log=True, **req)
+        return self.select(local_only=True, role="scribe", base=self.base, log=True, **req)
 
     def test_request_is_deterministic_and_not_through_the_cli(self):
         r = self.ask_local()
@@ -229,14 +229,14 @@ class DirectChatTests(ChainTestCase):
         self.assertEqual(body["model"], "qwen/qwen3.6-35b-a3b")
         self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
         self.assertEqual(body["messages"][0]["content"], rc.build_system(CAT))
-        self.assertIn("Role: researcher", body["messages"][1]["content"])
+        self.assertIn("Role: scribe", body["messages"][1]["content"])
         self.assertLessEqual(body["max_tokens"], 400)
 
     def test_the_same_card_gives_the_same_request_every_time(self):
         self.ask_local()
         first = self.stubs.calls("chat")[0]["body"]
         self.script(chat=text((1, "low", "none", "locate_quote", "find")))
-        self.select(local_only=True, role="researcher")
+        self.select(local_only=True, role="scribe")
         self.assertEqual(self.stubs.calls("chat")[0]["body"], first)
 
     def test_temperature_and_seed_are_catalog_data(self):
@@ -245,7 +245,7 @@ class DirectChatTests(ChainTestCase):
         path = self.base / "catalog.json"
         path.write_text(json.dumps(cat))
         self.script(chat=text((1, "low", "none", "locate_quote", "find")))
-        model_router.select({"task": TASK, "role": "researcher", "local_only": True}, log=False, catalog_path=path)
+        model_router.select({"task": TASK, "role": "scribe", "local_only": True}, log=False, catalog_path=path)
         body = self.stubs.calls("chat")[0]["body"]
         self.assertEqual((body["temperature"], body["seed"]), (0.5, 99))
 
@@ -290,10 +290,10 @@ class DirectChatTests(ChainTestCase):
     def test_a_server_error_and_a_cut_off_reply_fail_the_router(self):
         self.script(chat=[{"status": 500}])
         with self.assertRaises(model_router.RouteStop):
-            self.select(local_only=True, role="researcher")
+            self.select(local_only=True, role="scribe")
         self.script(chat=[{"text": "{", "finish": "length"}])
         with self.assertRaises(model_router.RouteStop):
-            self.select(local_only=True, role="researcher")
+            self.select(local_only=True, role="scribe")
 
     def test_no_router_call_is_made_by_a_cli_when_the_chain_is_the_local_router_alone(self):
         self.ask_local()
@@ -368,7 +368,7 @@ class ChainDataTests(ChainTestCase):
     def test_confirm_when_the_local_level_is_picked_for_an_unqualified_shape(self):
         path = self.catalog_file(lambda c: c["router"]["chain"][0].update(confirm={"unqualified_local": True}), order=(QWEN, HAIKU, LUNA))
         self.script(chat=text((1, "low", "none", None, "lookup")), claude=text((2, "low", "none", "small_edit", "small")))
-        r = self.route(path)
+        r = self.route(path, role="scribe")
         self.assertEqual((r["decided_by"], r["level"]), (HAIKU, "small"))
         self.assertEqual(self.models_called(), ["chat", "claude"])
         # a qualified shape is not confirmed
@@ -394,7 +394,7 @@ class ShippedChainTests(ChainTestCase):
     def test_qwen_picks_small_or_mid_and_decides_alone(self):
         for pick, level, shape in ((2, "small", "small_edit"), (3, "mid", None)):
             self.script(chat=text((pick, "medium", "optional", shape, "qwen")), claude=text((4, "high")))
-            r = self.select()
+            r = self.select(role="scribe")
             self.assertEqual((r["decided_by"], r["level"], r["source"]), (QWEN, level, "router"))
             self.assertEqual(self.models_called(), ["chat"])
 
@@ -413,12 +413,12 @@ class ShippedChainTests(ChainTestCase):
 
     def test_qwen_picks_the_local_level_for_an_unqualified_shape_and_haiku_is_asked(self):
         self.script(chat=text((1, "low", "none", None, "lookup")), claude=text((2, "low", "none", "small_edit", "small")))
-        r = self.select()
+        r = self.select(role="scribe")
         self.assertEqual((r["decided_by"], r["level"]), (HAIKU, "small"))
         self.assertEqual(self.models_called(), ["chat", "claude"])
         # a qualified shape is not asked about
         self.script(chat=text((1, "low", "none", "locate_quote", "lookup")), claude=text((3,)))
-        r = self.select(role="researcher")
+        r = self.select(role="scribe")
         self.assertEqual((r["decided_by"], r["level"]), (QWEN, "local"))
         self.assertEqual(self.models_called(), ["chat"])
 
@@ -466,14 +466,14 @@ class NoLayaTests(ChainTestCase):
 class LocalOnlyTests(ChainTestCase):
     def test_local_only_uses_only_the_local_router_and_a_local_model(self):
         self.script(claude=text((3,)), **{"pi/" + LUNA: text((3,)), "chat": text((1, "low", "none", "locate_quote", "find"))})
-        r = self.select(local_only=True, role="researcher")
+        r = self.select(local_only=True, role="scribe")
         self.assertEqual((r["decided_by"], r["provider"], r["model"], r["thinking"]), (QWEN, "local", QWEN, "off"))
         self.assertEqual(self.models_called(), ["chat"])
 
     def test_local_only_stops_when_the_local_router_fails_and_never_calls_the_cloud(self):
         self.script(claude=text((3,)), **{"pi/" + LUNA: text((3,)), "chat": [{"status": 500}]})
         with self.assertRaises(model_router.RouteStop) as caught:
-            self.select(local_only=True, role="researcher")
+            self.select(local_only=True, role="scribe")
         self.assertIn("no local router answered", str(caught.exception))
         self.assertEqual(self.models_called(), ["chat"])
 
@@ -498,6 +498,18 @@ class ExplicitChoiceTests(ChainTestCase):
         self.assertEqual([x["source"] for x in rows], ["explicit"])
         self.assertEqual(rows[0]["constraints"]["model"], OPUS)
 
+
+    def test_an_explicit_level_overrides_the_role_floor_but_the_routers_pick_does_not(self):
+        for role in ("coder", "tester", "researcher"):
+            with self.subTest(role=role):
+                r = self.select(level="small", role=role)
+                self.assertEqual((r["source"], r["level"], r["model"]), ("explicit_level", "small", HAIKU))
+                self.assertFalse(any("floor" in step for step in r["steps"]), r["steps"])
+                self.script(claude=text((2, "low", "none", "small_edit", "small")))
+                self.assertEqual(self.select(role=role)["level"], "mid")  # the router's own pick is raised to the floor
+                self.script(chat=text((1, "low", "none", "locate_quote", "find")))
+                with self.assertRaises(model_router.RouteStop):
+                    self.select(role=role, local_only=True)  # and --local-only stops rather than run a local model
     def test_explicit_effort_above_high_needs_approval(self):
         r = self.select(model=SOL, thinking="xhigh")
         self.assertEqual((r["thinking"], r["approvals"]), ("high", {"effort_above_high": False}))

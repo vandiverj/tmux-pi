@@ -72,15 +72,30 @@ class ChoiceTests(unittest.TestCase):
         # and an availability fallback never walks into it
         health = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
         for allow in (False, True):
-            r = R(D("mid"), role="coder", health=health, allow_unrostered=allow)
+            r = R(D("mid"), role="scribe", health=health, allow_unrostered=allow)
             self.assertNotEqual(r["level_key"], "strong")
 
     def test_availability_never_moves_work_up_into_the_restricted_top_level(self):
         health = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
-        r = R(D("mid"), role="coder", health=health)
+        r = R(D("mid"), role="scribe", health=health)
         self.assertEqual((r["level_key"], r["degraded"], r["review"]), ("small", "down", "required"))
         self.assertIn("moved down: review forced to required", r["steps"])
 
+    def test_coder_fallback_never_moves_below_the_floor(self):
+        # both mid models out: a tester falls to small, a coder stops and asks (it never lands on Haiku or luna)
+        health = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        for shape in (None, "small_edit"):
+            r = R(D("mid", shape=shape), role="coder", health=health)
+            self.assertEqual(r["source"], "stop_and_ask", r)
+            self.assertIn("floor for role coder", r["reason"])
+        # whole provider down: same
+        r = R(D("mid"), role="coder", health={"anthropic": {"status": "exhausted"}, "openai": {"status": "exhausted"}})
+        self.assertEqual(r["source"], "stop_and_ask")
+        # one mid model out: the other mid model is used, still mid
+        r = R(D("mid"), role="coder", health={"anthropic:" + SONNET: {"status": "exhausted"}})
+        self.assertEqual((r["level_key"], r["model"]), ("mid", SOL))
+        # a failed router (no reply) defaults to mid, never lower
+        self.assertEqual(R(None, role="coder")["level_key"], "mid")
     def test_top_request_falls_down_with_review_when_top_is_out(self):
         health = {"anthropic:" + OPUS: {"status": "exhausted"}, "openai:" + ASTRA: {"status": "exhausted"}}
         r = R(D("top", "high"), role="architect", health=health)
@@ -96,28 +111,28 @@ class ChoiceTests(unittest.TestCase):
     def test_all_cloud_down_stops_above_light_work(self):
         health = {"anthropic": {"status": "exhausted"}, "openai": {"status": "exhausted"}}
         self.assertEqual(R(D("mid"), role="coder", health=health)["source"], "stop_and_ask")
-        r = R(D("local", "low", "none", "locate_quote"), role="researcher", health=health)
+        r = R(D("local", "low", "none", "locate_quote"), role="scribe", health=health)
         self.assertEqual(r["provider"], "local")
 
     def test_lowest_level_needs_a_qualified_shape(self):
         for shape in (None, "small_edit"):
-            r = R(D("local", "low", "none", shape), role="tester")
+            r = R(D("local", "low", "none", shape), role="scribe")
             self.assertEqual(r["level_key"], "small")
             self.assertIn("shape not qualified for the lowest level: moved to level small", r["steps"])
-        r = R(D("local", "high", "none", "locate_quote"), role="researcher")
+        r = R(D("local", "high", "none", "locate_quote"), role="scribe")
         self.assertEqual((r["provider"], r["model"], r["effort"]), ("local", QWEN, "off"))
 
     def test_local_down_or_too_large_moves_up_never_down_into_local(self):
-        r = R(D("local", "low", "none", "locate_quote"), role="researcher", health={"local": {"status": "exhausted"}})
+        r = R(D("local", "low", "none", "locate_quote"), role="scribe", health={"local": {"status": "exhausted"}})
         self.assertEqual(r["level_key"], "small")
-        r = R(D("local", "low", "none", "locate_quote"), role="researcher", est_tokens=100000)
+        r = R(D("local", "low", "none", "locate_quote"), role="scribe", est_tokens=100000)
         self.assertEqual(r["level_key"], "small")
 
     def test_small_context_model_only_for_small_packets(self):
         health = {"local:" + QWEN: {"status": "limited"}}
-        small = R(D("local", "low", "none", "locate_quote"), role="researcher", health=health, est_tokens=2000)
+        small = R(D("local", "low", "none", "locate_quote"), role="scribe", health=health, est_tokens=2000)
         self.assertEqual(small["model"], "slotstream/qwen3.8-flash-next:4bit")
-        big = R(D("local", "low", "none", "locate_quote"), role="researcher", health=health, est_tokens=12000)
+        big = R(D("local", "low", "none", "locate_quote"), role="scribe", health=health, est_tokens=12000)
         self.assertEqual(big["level_key"], "small")
 
     def test_worker_is_a_real_constraint(self):
@@ -132,7 +147,7 @@ class ChoiceTests(unittest.TestCase):
 
     def test_local_only_work_needs_a_local_shape(self):
         self.assertEqual(R(D("mid"), role="coder", local_only=True)["source"], "stop_and_ask")
-        r = R(D("local", "low", "none", "count_enumerate"), role="researcher", local_only=True)
+        r = R(D("local", "low", "none", "count_enumerate"), role="scribe", local_only=True)
         self.assertEqual(r["provider"], "local")
         self.assertEqual(R(None, role="coder", local_only=True)["source"], "stop_and_ask")
 
@@ -168,7 +183,7 @@ class EffortTests(unittest.TestCase):
         self.assertTrue(any("not allowed" in s for s in r["steps"]))
 
     def test_effort_is_mapped_onto_the_models_allowed_list(self):
-        r = R(D("local", "high", "none", "locate_quote"), role="researcher")
+        r = R(D("local", "high", "none", "locate_quote"), role="scribe")
         self.assertEqual(r["effort"], "off")
         self.assertEqual(R(D("small", "low", "none"), role="coder")["effort"], "low")
 
@@ -202,39 +217,101 @@ class EffortTests(unittest.TestCase):
                     r = R(D(asked, "low", shape="locate_quote" if asked == "local" else None), role=role)
                     self.assertEqual(r["level_key"], "mid")
                     self.assertIn("role {} floor: level mid".format(role), r["steps"])
-        # The one waiver: a coder's small edit to a named file with a check command.
-        r = R(D("small", "low", shape="small_edit"), role="coder")
-        self.assertEqual(r["level_key"], "small")
-        self.assertFalse(any("floor" in step for step in r["steps"]))
-        # The waiver is the coder's, not every role's, and other shapes do not earn it.
+        # No waiver: a coder's small edit with a check command is held at mid too (owner decision 2026-10-07).
+        for shape in ("small_edit", "run_named_checks", None):
+            r = R(D("small", "low", shape=shape), role="coder")
+            self.assertEqual(r["level_key"], "mid")
+            self.assertIn("role coder floor: level mid", r["steps"])
+        self.assertIn(R(D("small", "low"), role="coder")["model"], (SONNET, SOL))
         self.assertEqual(R(D("small", "low", shape="small_edit"), role="architect")["level_key"], "mid")
-        self.assertEqual(R(D("small", "low", shape="run_named_checks"), role="coder")["level_key"], "mid")
-        # Roles without a floor still go down: research and test work.
-        self.assertEqual(R(D("small", "low"), role="researcher")["level_key"], "small")
-        self.assertEqual(R(D("small", "low"), role="tester")["level_key"], "small")
+        # Roles without a floor still go down (a role the catalog does not name; tester and researcher now have the coder's floor).
+        self.assertEqual(R(D("small", "low"), role="scribe")["level_key"], "small")
+        self.assertEqual(R(D("small", "low"), role="scribe")["level_key"], "small")
 
     def test_protected_paths_keep_guard_code_at_mid_with_high_effort(self):
         guard = ["lib/sensitive_read.py"]
-        # The small-edit waiver does not apply: the path floor comes after the role floor.
+        # A coder is already at mid by the role floor; the path adds the effort floor.
         r = R(D("small", "low", shape="small_edit"), role="coder", paths=guard)
         self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
-        self.assertIn("protected path lib/sensitive_read.py: level mid", r["steps"])
+        self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
         self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
         # An absolute path, a glob pattern and a hooks file all match.
         for path in ("/repo/bin/tp-sensitive-read", "lib/redact_hook.py", "claude/plugins/tmux-pi/hooks/hooks.json"):
             with self.subTest(path=path):
                 self.assertEqual(R(D("small", "low", shape="small_edit"), role="coder", paths=[path])["level_key"], "mid")
-        # Other files keep the waiver, and a similar name is not a match.
+        # A similar name is not a match: no high-effort floor (the coder level floor still applies).
         for path in ("bin/tp-list", "lib/sensitive_reader_notes.py", "docs/redact.md"):
             with self.subTest(path=path):
-                self.assertEqual(R(D("small", "low", shape="small_edit"), role="coder", paths=[path])["level_key"], "small")
+                r = R(D("small", "low", shape="small_edit"), role="coder", paths=[path])
+                self.assertEqual((r["level_key"], r["effort"]), ("mid", "low"))
         # The rule is for roles that change the code: reading it for a lookup is not held to it.
-        r = R(D("local", "low", "none", "locate_quote"), role="researcher", paths=guard)
+        r = R(D("local", "low", "none", "locate_quote"), role="scribe", paths=guard)
         self.assertEqual(r["level_key"], "local")
         # It never raises above what was asked, and never into the top level.
         r = R(D("mid", "high"), role="coder", paths=guard)
         self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
         self.assertFalse(any("protected path" in step for step in r["steps"]))
+
+    def test_an_explicit_level_never_waives_a_protected_path_minimum(self):
+        # the reviewer's reproduction: --level small on a guard file with both mid models gone must stop, not fall to Haiku
+        mid_gone = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        explicit = dict(K("small", "low"), source="explicit_level")
+        r = R(explicit, role="coder", paths=["lib/sensitive_read.py"], skip_caps=True, health=mid_gone)
+        self.assertEqual(r["source"], "stop_and_ask")
+        self.assertIn("protected path lib/sensitive_read.py", r["reason"])
+
+    def test_one_lower_bound_holds_for_role_explicit_level_protected_path_and_mid_availability(self):
+        mid_gone = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        guard = ["lib/sensitive_read.py"]
+        guarded_roles = ("coder", "architect", "infrastructure")  # the roles the shipped protected-path rules list
+        for role in ("coder", "tester", "researcher", "architect", "infrastructure", "scribe"):
+            rule = CAT["roles"].get(role, {})
+            for asked in (None, "small", "mid"):  # None: the router's own pick (small)
+                for paths in ([], guard):
+                    for mid_up in (True, False):
+                        with self.subTest(role=role, asked=asked, paths=bool(paths), mid_up=mid_up):
+                            if asked:
+                                r = R(dict(K(asked, "low"), source="explicit_level"), role=role, paths=paths, skip_caps=True,
+                                      health=None if mid_up else mid_gone)
+                            else:
+                                r = R(D("small", "low"), role=role, paths=paths, health=None if mid_up else mid_gone)
+                            protected = bool(paths) and role in guarded_roles
+                            # the role floor applies unless an explicit level lowered it; the protected path never gives way
+                            role_floor_mid = "min_level" in rule and asked != "small"
+                            strict_mid = protected or (rule.get("strict_floor") and role_floor_mid)
+                            wants_mid = protected or role_floor_mid or asked == "mid"
+                            if wants_mid and not mid_up:
+                                if strict_mid:
+                                    self.assertEqual(r["source"], "stop_and_ask", r["steps"])
+                                else:  # a floor that is not strict still moves down for availability, with forced review
+                                    self.assertEqual((r["level_key"], r["degraded"], r["review"]), ("small", "down", "required"))
+                                continue
+                            self.assertNotEqual(r["source"], "stop_and_ask", r.get("reason"))
+                            self.assertEqual(r["level_key"], "mid" if wants_mid else "small", r["steps"])
+                            self.assertEqual(r["effort"] == "high" or r["effort_abstract"] == "high", protected, r["steps"])
+
+    def test_a_protected_path_stops_a_role_without_the_strict_floor_instead_of_falling_down(self):
+        mid_gone = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        guard = ["bin/tp-redact"]
+        for role in ("architect", "infrastructure"):
+            r = R(D("mid"), role=role, paths=guard, health=mid_gone)
+            self.assertEqual(r["source"], "stop_and_ask", role)
+            self.assertIn("mid minimum for protected path bin/tp-redact", r["reason"])
+            # the same work not on a guard file still moves down with forced review, as before
+            r = R(D("mid"), role=role, paths=["docs/x.md"], health=mid_gone)
+            self.assertEqual((r["level_key"], r["degraded"], r["review"]), ("small", "down", "required"))
+
+    def test_a_protected_path_stops_a_local_only_task_that_would_gate_below_it(self):
+        r = R(D("local", "low", "none", "locate_quote"), role="architect", paths=["bin/tp-redact"], local_only=True)
+        self.assertEqual(r["source"], "stop_and_ask")
+        self.assertIn("protected path bin/tp-redact", r["reason"])
+
+    def test_a_redirect_below_a_protected_path_minimum_is_a_problem(self):
+        target = {"worker": "claude", "model": HAIKU, "thinking": "low"}
+        problems, _ = rr.redirect_problems(CAT, target, {"role": "architect", "paths": ["bin/tp-redact"]}, {}, False)
+        self.assertTrue(any("protected path bin/tp-redact" in p for p in problems), problems)
+        problems, _ = rr.redirect_problems(CAT, target, {"role": "architect", "paths": ["docs/x.md"]}, {}, False)
+        self.assertEqual(problems, [])
 
     def test_review_is_the_larger_of_router_and_policy(self):
         self.assertEqual(R(D("mid", "medium", "none"), role="coder")["review"], "optional")
@@ -492,7 +569,7 @@ class DataOnlyChangeTests(unittest.TestCase):
         self.assertEqual(rr.resolve(dict(d, level=5), cat, ctx={"role": "coder"})["level_key"], "top")
         # a new model at an existing level is used when it is the one available
         health = {"anthropic": {"status": "exhausted"}, "openai": {"status": "exhausted"}}
-        r = rr.resolve(dict(d, level=2, effort="low"), cat, health, {"role": "tester"})
+        r = rr.resolve(dict(d, level=2, effort="low"), cat, health, {"role": "scribe"})
         self.assertEqual(r["model"], "openrouter/acme/flash-9")
         # the original catalog's behaviour is unchanged
         self.assertEqual(rr.resolve(D("mid"), CAT, ctx={"role": "coder"})["model"], SONNET)
@@ -507,6 +584,93 @@ class DataOnlyChangeTests(unittest.TestCase):
         # unrostered, the level has no model: the request moves up only if the next level is not restricted, else down
         r = rr.resolve({"level": 4, "effort": "high", "review": "none", "shape": None, "reason": "t"}, cat, ctx={"role": "coder"})
         self.assertEqual((r["level_key"], r["degraded"]), ("mid", "down"))
+
+
+class CoderFloorTests(unittest.TestCase):
+    """The coder's floor is per-role data in the catalog (roles.coder.min_level with strict_floor); nothing names a model."""
+
+    def test_the_shipped_floor_is_data(self):
+        self.assertEqual(CAT["roles"]["coder"], {"min_level": "mid", "strict_floor": True})
+
+    def test_lowest_level_choices_resolve_to_mid_or_higher_on_a_mid_model(self):
+        for asked in ("local", "small"):
+            for shape in (None, "small_edit", "locate_quote", "run_named_checks"):
+                with self.subTest(asked=asked, shape=shape):
+                    r = R(D(asked, "low", "none", shape), role="coder")
+                    self.assertEqual(r["level_key"], "mid")
+                    self.assertIn(r["model"], (SONNET, SOL))
+                    self.assertNotIn(r["model"], (HAIKU, LUNA, QWEN))
+
+    def test_other_roles_are_unchanged(self):
+        self.assertEqual(R(D("small", "low", "none", "small_edit"), role="scribe")["level_key"], "small")
+        self.assertEqual(R(D("small", "low"), role="scribe")["level_key"], "small")
+        self.assertEqual(R(D("local", "low", "none", "locate_quote"), role="scribe")["provider"], "local")
+        self.assertEqual(R(D("small", "low"), role=None)["level_key"], "small")
+
+    def test_local_only_coder_stops_instead_of_running_below_the_floor(self):
+        r = R(D("local", "low", "none", "locate_quote"), role="coder", local_only=True)
+        self.assertEqual(r["source"], "stop_and_ask")
+        self.assertIn("mid floor for role coder", r["reason"])
+        # the same private work for a role without the strict floor stays local
+        self.assertEqual(R(D("local", "low", "none", "locate_quote"), role="scribe", local_only=True)["provider"], "local")
+
+    def test_tester_and_researcher_have_the_coders_strict_floor(self):
+        for role in ("tester", "researcher"):
+            self.assertEqual(CAT["roles"][role], {"min_level": "mid", "max_level": "mid", "strict_floor": True})
+            for asked, shape in (("local", "locate_quote"), ("small", None), ("local", None)):
+                r = R(D(asked, "low", "none", shape), role=role)
+                self.assertEqual((r["level_key"], r["model"] in (SONNET, SOL)), ("mid", True), (role, asked, shape))
+            r = R(D("local", "low", "none", "locate_quote"), role=role, local_only=True)
+            self.assertEqual(r["source"], "stop_and_ask")
+            self.assertIn("mid floor for role " + role, r["reason"])
+            health = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+            self.assertEqual(R(D("mid"), role=role, health=health)["source"], "stop_and_ask")
+            r = R(None, role=role)
+            self.assertEqual((r["source"], r["level_key"]), ("router_failed_default", "mid"))
+
+    def test_an_explicit_level_overrides_the_floor_but_not_the_router_or_escalation(self):
+        for role in ("coder", "tester", "researcher"):
+            with self.subTest(role=role):
+                r = R(dict(K("small", "low"), source="explicit_level"), role=role, skip_caps=True)
+                self.assertEqual((r["level_key"], r["model"]), ("small", HAIKU))
+                self.assertNotIn("role {} floor: level mid".format(role), r["steps"])
+                self.assertEqual(R(D("small", "low"), role=role)["level_key"], "mid")
+                r = R(dict(K("local", "low", shape="locate_quote"), source="explicit_level"), role=role, skip_caps=True, local_only=True)
+                self.assertEqual((r["level_key"], r["provider"]), ("local", "local"))
+        # an escalation from an explicit small pick climbs by the ordinary rules and is held to the floor
+        e = rr.escalate(R(dict(K("small", "low"), source="explicit_level"), role="coder", skip_caps=True), CAT, ctx={"role": "coder"})
+        self.assertNotIn(e.get("level_key"), ("local", "small"))
+
+    def test_an_explicit_level_lowers_the_floor_only_as_far_as_it_asked(self):
+        mid_gone = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        small_gone = {"anthropic:" + HAIKU: {"status": "exhausted"}, "openai:" + LUNA: {"status": "exhausted"}}
+        for role in ("coder", "tester", "researcher"):
+            with self.subTest(role=role):
+                explicit = dict(K("mid", "low"), source="explicit_level")
+                r = R(explicit, role=role, skip_caps=True)
+                self.assertEqual((r["level_key"], r["model"] in (SONNET, SOL)), ("mid", True))
+                # --level mid with no mid model: stop and ask, never Haiku at small
+                r = R(explicit, role=role, skip_caps=True, health=mid_gone)
+                self.assertEqual(r["source"], "stop_and_ask")
+                self.assertIn("floor for role " + role, r["reason"])
+                # --level small resolves to small; with no small model it moves up, never down to local
+                small = dict(K("small", "low"), source="explicit_level")
+                self.assertEqual(R(small, role=role, skip_caps=True)["level_key"], "small")
+                r = R(small, role=role, skip_caps=True, health=small_gone)
+                self.assertEqual(r["level_key"], "mid")
+
+    def test_an_explicit_model_still_overrides(self):
+        r = R(None, role="coder", explicit={"model": HAIKU})
+        self.assertEqual((r["source"], r["model"]), ("explicit", HAIKU))
+
+    def test_lowering_the_floor_is_a_config_edit(self):
+        cat = copy.deepcopy(CAT)
+        cat["roles"]["coder"] = {"min_level": "small"}
+        r = rr.resolve(D("small", "low", cat=cat), cat, None, {"role": "coder"})
+        self.assertEqual(r["level_key"], "small")
+        health = {"anthropic:" + SONNET: {"status": "exhausted"}, "openai:" + SOL: {"status": "exhausted"}}
+        r = rr.resolve(D("mid", cat=cat), cat, health, {"role": "coder"})
+        self.assertEqual(r["level_key"], "small")  # no strict_floor: availability may still move it down, with review
 
 
 if __name__ == "__main__":

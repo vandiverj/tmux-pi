@@ -169,6 +169,9 @@ def redirect_problems(cat, target, ctx, health, may_enter_restricted):
         problems.append("level {} is restricted (reached only by the router's own pick, escalation or an explicit request)".format(level["key"]))
     if target["worker"] != entry["worker"]:
         problems.append("{} does not run on {}".format(target["model"], target["worker"]))
+    bound, why = route_bound(cat, ctx, _strict_role_floor(cat, ctx.get("role")))
+    if bound is not None and level["key"] in shown_keys(cat) and level_keys(cat).index(level["key"]) < bound:
+        problems.append("level {} is below the {}".format(level["key"], why))
     reason = unusable_reason(cat, entry, ctx, health)
     if reason:
         problems.append(reason)
@@ -191,6 +194,25 @@ def confirm_reason(cat, entry, decision):
             and not _qualified(cat, decision.get("shape"))):
         return "{} picked level {} for a shape that is not qualified".format(entry["model"], picked)
     return None
+
+
+def _strict_role_floor(cat, role):
+    """Index of the level a strict-floor role may not go below, or None."""
+    rule = cat["roles"].get(role or "") or {}
+    return _shown_at_or_above(cat, rule["min_level"]) if rule.get("strict_floor") and "min_level" in rule else None
+
+
+def route_bound(cat, ctx, role_floor):
+    """(level index, reason) of the one lower bound of a route, or (None, None): the highest of the strict role floor
+    (role_floor, already lowered by an explicit level where that applies) and the protected-path minimum, which an
+    explicit level never lowers. Every downward move (availability, redirect, local-only) stays at or above it."""
+    bounds = []
+    if role_floor is not None:
+        bounds.append((role_floor, "{} floor for role {}".format(level_keys(cat)[role_floor], ctx.get("role"))))
+    hit = protected_hit(cat, ctx.get("role"), ctx.get("paths"))
+    if hit:
+        bounds.append((_shown_at_or_above(cat, hit[0]["min_level"]), "{} minimum for protected path {}".format(hit[0]["min_level"], hit[1])))
+    return max(bounds, key=lambda b: b[0]) if bounds else (None, None)
 
 
 def _shown_at_or_above(cat, key):
@@ -305,9 +327,13 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
     # role floors and caps: a floor always applies, a cap only to the router's own choice
     rule = cat["roles"].get(ctx.get("role") or "", {})
     # The floor is waived only for the task shapes the role lists (a coder's small named-file edit with a check).
-    if ("min_level" in rule and idx < _shown_at_or_above(cat, rule["min_level"])
-            and shape not in rule.get("below_floor_shapes", ())):
-        idx = _shown_at_or_above(cat, rule["min_level"])
+    # An explicit --level from the orchestrator lowers the floor only as far as the level it asked for (as --model
+    # overrides it); the router's own pick, fallbacks, redirects and escalation never do.
+    role_floor = _shown_at_or_above(cat, rule["min_level"]) if "min_level" in rule else None
+    if role_floor is not None and rec["source"] == "explicit_level":
+        role_floor = min(role_floor, idx)
+    if (role_floor is not None and idx < role_floor and shape not in rule.get("below_floor_shapes", ())):
+        idx = role_floor
         steps.append("role {} floor: level {}".format(ctx["role"], keys[idx]))
     if "min_effort" in rule and effort_rank(cat, eff) < effort_rank(cat, rule["min_effort"]):
         eff = rule["min_effort"]
@@ -328,6 +354,9 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
             eff = entry["min_effort"]
             steps.append("protected path {}: effort {}".format(path, eff))
 
+    # The route's one lower bound: no later step crosses it, not the local-only gate, not moving down for availability.
+    strict_floor, bound_why = route_bound(cat, ctx, role_floor if rule.get("strict_floor") else None)
+
     qualified = _qualified(cat, shape)
     if ctx.get("local_only"):
         locals_ = [i for i, lv in enumerate(cat["levels"]) if any(
@@ -345,12 +374,15 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
             gate = locals_[0]
             if cat["levels"][gate].get("requires_shape") and not qualified:
                 return _stop(rec, "local-only task outside the qualified local shapes")
+            if strict_floor is not None and gate < strict_floor:
+                return _stop(rec, "local-only task, but the {} allows no level below it and no local model is that high; "
+                                  "the user must decide (drop --local-only or lower the floor in the catalog)".format(bound_why))
             idx = gate
             steps.append("local-only: level {}".format(keys[idx]))
 
     # find a model: this level, then up (never into a restricted or hidden level), then down with forced review
     up = [j for j in range(idx + 1, len(keys)) if keys[j] in shown and not cat["levels"][j].get("restricted")]
-    down = [j for j in range(idx - 1, -1, -1) if keys[j] in shown]
+    down = [j for j in range(idx - 1, -1, -1) if keys[j] in shown and (strict_floor is None or j >= strict_floor)]
     chosen = None
     for j in [idx] + up + down:
         if j != idx and cat["levels"][j].get("requires_shape") and not qualified:
@@ -360,6 +392,9 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
             chosen = (j, found[0])
             break
     if not chosen:
+        if strict_floor is not None:
+            return _stop(rec, "no available model at level {} or above, the {}; the user must decide".format(
+                keys[strict_floor], bound_why))
         return _stop(rec, "no available model at any level")
     j, model = chosen
     degraded = None

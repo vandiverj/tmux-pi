@@ -276,7 +276,10 @@ def validate_catalog(cat):
             _fail("shape {} status must be qualified or candidate".format(name))
         _text(shape["text"], "shape {} text".format(name))
     for role, rule in cat["roles"].items():
-        _object(rule, "role " + role, (), ("min_level", "max_level", "min_effort", "below_floor_shapes"))
+        _object(rule, "role " + role, (), ("min_level", "max_level", "min_effort", "below_floor_shapes", "strict_floor"))
+        if "strict_floor" in rule:
+            if rule["strict_floor"] is not True or "min_level" not in rule or "below_floor_shapes" in rule:
+                _fail("role {}: strict_floor must be true, needs min_level and excludes below_floor_shapes".format(role))
         if "below_floor_shapes" in rule:
             listed = rule["below_floor_shapes"]
             if "min_level" not in rule or not isinstance(listed, list) or not listed or any(name not in cat["shapes"] for name in listed):
@@ -414,7 +417,7 @@ def build_system(cat):
     out += ["", "SHAPES (field `shape`; name the one the task matches, else null.%s):" % where]
     out += ["  %s: %s" % (k, shapes[k]["text"]) for k in qualified]
     if candidates:
-        # The shape is still named: role floors can be waived for it (a coder's small named-file edit).
+        # The shape is still named: a role may list below_floor_shapes to waive its floor for it (the coder no longer does).
         out.append("  Not yet proven%s; name the shape all the same:" % (" (use the next level up)" if gated else ""))
         out += ["  %s: %s" % (k, shapes[k]["text"]) for k in candidates]
     out += ["", "REVIEW (field `review`):"] + ["  %s: %s" % (k, v) for k, v in cat["review"].items()]

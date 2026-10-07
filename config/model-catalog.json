@@ -143,11 +143,11 @@
     "vulnerability-reviewer": {"min_level": "mid", "min_effort": "high", "max_level": "strong"},
     "data-flow-reviewer": {"min_level": "mid", "min_effort": "high", "max_level": "strong"},
     "code-reviewer": {"min_level": "mid", "max_level": "strong"},
-    "coder": {"min_level": "mid", "below_floor_shapes": ["small_edit"]},
+    "coder": {"min_level": "mid", "strict_floor": true},
     "architect": {"min_level": "mid"},
     "infrastructure": {"min_level": "mid"},
-    "tester": {"max_level": "mid"},
-    "researcher": {"max_level": "mid"}
+    "tester": {"min_level": "mid", "max_level": "mid", "strict_floor": true},
+    "researcher": {"min_level": "mid", "max_level": "mid", "strict_floor": true}
   },
   "levels": [
     {

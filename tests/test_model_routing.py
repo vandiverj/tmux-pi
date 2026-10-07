@@ -177,10 +177,10 @@ class TpRouteTests(Base):
         out = json.loads(self.tp_route("--role", "coder", stdin="Close one hole in lib/sensitive_read.py and run its tests.").stdout)
         self.assertEqual((out["level"], out["effort"], out["model"]), ("mid", "high", SONNET))
         self.assertTrue(any(step.startswith("protected path lib/sensitive_read.py") for step in out["steps"]), out["steps"])
-        # the same small edit elsewhere keeps the waiver
+        # the same small edit elsewhere is held at mid too: the coder floor has no waiver
         self.stubs.set({"claude": [{"text": reply(2, "low", "none", "small_edit", "small")}]})
         out = json.loads(self.tp_route("--role", "coder", stdin="Fix the usage text in bin/tp-list and run its test.").stdout)
-        self.assertEqual(out["level"], "small")
+        self.assertEqual((out["level"], out["model"]), ("mid", SONNET))
 
     def test_explicit_model_is_refused_when_the_catalog_cannot_be_read(self):
         for model in ("madeup/nonexistent-model", SONNET):
@@ -344,8 +344,8 @@ class LocalOnlyCommandTests(Base):
         self.assertEqual((out["model"], out["local_only"]), (QWEN, True))
 
     def local_task(self, *extra):
-        self.stubs.set({"chat": [{"text": reply(1, "low", "none", "locate_quote", "find")}]})
-        return self.dispatch("--local-only", *extra, role="researcher")
+        # an explicit --level overrides the researcher's floor; the router's pick and escalation would not
+        return self.dispatch("--local-only", "--level", "local", *extra, role="researcher")
 
     def fail(self, item):
         (self.state / "tasks" / item["id"] / "exit").write_text("1")
@@ -354,7 +354,7 @@ class LocalOnlyCommandTests(Base):
         first = self.local_task()
         self.assertEqual(self.meta(first)["model"], QWEN)
         self.fail(first)
-        second = self.agent("retry", first["id"], "--reason", "again")
+        second = self.agent("retry", first["id"], "--reason", "again", "--level", "local")  # a plain retry would be routed, and held to the floor
         self.assertTrue(self.meta(second)["route_info"]["local_only"])  # the constraint survives a plain retry
         self.fail(second)
         before = sorted(p.name for p in (self.state / "tasks").iterdir())
@@ -374,7 +374,7 @@ class LocalOnlyCommandTests(Base):
         # the flag is read from the failed attempt's route, so a retry that forgets --local-only cannot drop it
         first = self.local_task()
         self.fail(first)
-        second = self.agent("retry", first["id"], "--reason", "again")
+        second = self.agent("retry", first["id"], "--reason", "again", "--level", "local")  # a plain retry would be routed, and held to the floor
         self.fail(second)
         sys.path.insert(0, str(ROOT / "lib"))
         import router_catalog
@@ -448,6 +448,13 @@ class CardHashTests(Base):
 
 
 class LocalRuleConstraintTests(Base):
+    def floorless_catalog(self):
+        cat = json.loads((ROOT / "config" / "model-catalog.json").read_text())
+        cat["roles"]["scribe"] = {"max_level": "mid"}  # no min_level: nothing to confirm
+        path = self.root / "floorless-catalog.json"
+        path.write_text(json.dumps(cat))
+        return path
+
     def rule(self, source, target, thinking="medium", pattern="pagination"):
         path = self.root / "local.json"
         path.write_text(json.dumps({"rules": [{"pattern": pattern, "from": [source], "to": {"model": target, "thinking": thinking}}]}))
@@ -466,7 +473,7 @@ class LocalRuleConstraintTests(Base):
     def test_a_redirect_that_breaks_local_only_is_dropped(self):
         env = self.rule(QWEN, SONNET, "medium", pattern=".")
         self.stubs.set({"chat": [{"text": reply(1, "low", "none", "locate_quote", "find")}]})
-        run = self.run_cmd("tp-route", "--no-log", "--role", "researcher", "--local-only", stdin="Find where the timeout is set in net.py.", env=env)
+        run = self.run_cmd("tp-route", "--no-log", "--role", "scribe", "--local-only", stdin="Find where the timeout is set in net.py.", env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
         out = json.loads(run.stdout)
         self.assertEqual((out["model"], out["provider"]), (QWEN, "local"))
@@ -485,12 +492,175 @@ class LocalRuleConstraintTests(Base):
         out = self.route(self.rule(SONNET, SOL, "max"), "--approve-effort")
         self.assertEqual(out["thinking"], "max")
 
+    def test_a_coder_redirect_below_the_floor_is_dropped(self):
+        for target in (HAIKU, QWEN, LUNA):
+            with self.subTest(target=target):
+                out = self.route(self.rule(SONNET, target, "low"))
+                self.assertEqual((out["model"], out["level"]), (SONNET, "mid"))
+                # a local-model target may be refused earlier still (steps empty); the model must stay at the floor either way
+                self.assertTrue(not out["steps"] or any("dropped" in s for s in out["steps"]), out["steps"])
+                if target == HAIKU:
+                    self.assertTrue(any("floor for role coder" in s for s in out["steps"]), out["steps"])
+
+    def test_a_redirect_for_a_role_without_a_floor_still_applies(self):
+        env = self.rule(SONNET, HAIKU, "low", pattern=".")
+        run = self.run_cmd("tp-route", "--no-log", "--role", "scribe", stdin=TASK, env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        out = json.loads(run.stdout)
+        self.assertEqual((out["model"], out["level"]), (HAIKU, "small"))
+
+    def test_the_emergency_fallback_never_substitutes_below_a_strict_floor(self):
+        config = {"claude_preference": {"ordinary": {"model": "nope"}}, "routes": {}, "models": [
+            {"model": HAIKU, "worker": "claude", "thinking": ["low"]}]}
+        self.assertEqual(model_router._emergency(config, "claude", "scribe", self.floorless_catalog())[1], HAIKU)
+        for role in ("coder", "tester", "researcher"):
+            with self.subTest(role=role), self.assertRaises(model_router.RouteStop):
+                model_router._emergency(config, "claude", role, None)
+
+    def test_the_emergency_fallback_for_a_coder_is_the_configured_pair_only_when_it_is_at_the_floor(self):
+        config = json.loads((ROOT / "config" / "router.json").read_text())
+        self.assertEqual(model_router._emergency(config, "claude", "coder")[:2], ("claude", SONNET))
+        self.assertEqual(model_router._emergency(config, "pi", "coder")[:2], ("pi", SOL))
+        config["claude_preference"]["ordinary"]["model"] = HAIKU
+        config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
+        for worker in ("claude", "pi"):
+            with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
+                model_router._emergency(config, worker, "coder")
+        # the same configuration still serves a role that has no strict floor
+        self.assertEqual(model_router._emergency(config, "claude", "scribe", self.floorless_catalog())[1], HAIKU)
+        for role in ("tester", "researcher"):
+            with self.subTest(role=role), self.assertRaises(model_router.RouteStop):
+                model_router._emergency(config, "claude", role)
+
     def test_a_redirect_that_does_not_fit_the_packet_is_dropped(self):
         (self.project / "big.txt").write_text("x" * 40000)
         env = self.rule(SONNET, "slotstream/qwen3.8-flash-next:4bit", "low")
         out = self.route(env, "--workdir", str(self.project), "--context", "big.txt")
         self.assertEqual(out["model"], SONNET)
         self.assertTrue(any("dropped" in s and "over" in s for s in out["steps"]), out["steps"])
+
+
+class InvalidCatalogCoderFloorTests(Base):
+    """A catalog that fails validation is not trusted, but the coder still must not land on Haiku or a local model."""
+
+    def setUp(self):
+        super().setUp()
+        cat = json.loads((ROOT / "config" / "model-catalog.json").read_text())
+        cat["unexpected_key"] = True  # valid JSON, fails strict validation, roles and levels intact
+        self.bad_catalog = self.root / "bad-catalog.json"
+        self.bad_catalog.write_text(json.dumps(cat))
+        self.config = json.loads((ROOT / "config" / "router.json").read_text())
+
+    def route(self, role, *args, config=None, catalog=None):
+        cfg = self.root / "router.json"
+        cfg.write_text(json.dumps(config or self.config))
+        return self.run_cmd("tp-route", "--no-log", "--role", role, "--catalog", str(catalog or self.bad_catalog), "--config", str(cfg),
+                            *args, stdin=TASK)
+
+    def test_the_configured_mid_pairs_are_used(self):
+        for worker, model in (("claude", SONNET), ("pi", SOL)):
+            with self.subTest(worker=worker):
+                run = self.route("coder", "--worker", worker)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                out = json.loads(run.stdout)
+                self.assertEqual((out["source"], out["worker"], out["model"]), ("catalog_error_fallback", worker, model))
+
+    def test_a_configured_pair_below_the_floor_stops_instead_of_routing_a_coder_to_it(self):
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        self.config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
+        for worker in ("claude", "pi", None):
+            with self.subTest(worker=worker):
+                run = self.route("coder", *(("--worker", worker) if worker else ()))
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn("cannot be confirmed", run.stderr)
+                self.assertNotIn(HAIKU, run.stdout)
+                self.assertNotIn(QWEN, run.stdout)
+
+    def test_a_configured_pair_missing_from_the_roster_stops_a_coder_without_substituting(self):
+        self.config["claude_preference"]["ordinary"]["model"] = "no-such-model"
+        run = self.route("coder", "--worker", "claude")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertNotIn(HAIKU, run.stdout)
+
+    def test_a_malformed_catalog_file_still_takes_the_floor_from_the_shipped_catalog(self):
+        broken = self.root / "broken.json"
+        broken.write_text("{ not json")
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        run = self.route("coder", "--worker", "claude", catalog=broken)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertNotIn(HAIKU, run.stdout)
+        run = self.route("coder", "--worker", "claude", config=json.loads((ROOT / "config" / "router.json").read_text()), catalog=broken)
+        self.assertEqual(json.loads(run.stdout)["model"], SONNET)
+
+    def test_a_catalog_whose_coder_rule_was_dropped_cannot_lower_the_floor(self):
+        cat = json.loads(self.bad_catalog.read_text())
+        del cat["roles"]["coder"]
+        self.bad_catalog.write_text(json.dumps(cat))
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        run = self.route("coder", "--worker", "claude")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+
+    def test_a_configured_pair_the_catalog_places_below_mid_is_not_confirmed(self):
+        # the model is in the roster, but the lenient read of the catalog puts it at the small level
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        run = self.route("coder", "--worker", "claude")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("floor", run.stderr)
+
+    def test_a_role_without_a_min_level_keeps_the_configured_pair_even_below_mid(self):
+        cat = json.loads(self.bad_catalog.read_text())
+        cat["roles"]["scribe"] = {"max_level": "mid"}
+        self.bad_catalog.write_text(json.dumps(cat))
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        run = self.route("scribe", "--worker", "claude")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["model"], HAIKU)
+
+    def test_tester_and_researcher_are_held_to_the_floor_too(self):
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        for role in ("tester", "researcher"):
+            with self.subTest(role=role):
+                run = self.route(role, "--worker", "claude")
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertNotIn(HAIKU, run.stdout)
+
+    def test_a_coder_rule_that_lost_strict_floor_but_kept_min_level_still_stops_a_coder(self):
+        from unittest import mock
+        cat = json.loads(self.bad_catalog.read_text())
+        del cat["roles"]["coder"]["strict_floor"]
+        self.bad_catalog.write_text(json.dumps(cat))
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        self.config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
+        cfg = self.root / "router.json"
+        cfg.write_text(json.dumps(self.config))
+        with mock.patch.object(model_router.rc, "CATALOG_PATH", self.bad_catalog):
+            for worker in ("claude", "pi", None):
+                with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
+                    model_router.select({"role": "coder", "worker": worker, "task": "fix named code"},
+                                        catalog_path=self.bad_catalog, config_path=cfg, log=False)
+
+    def test_an_invalid_shipped_catalog_that_lost_the_coder_rule_stops_a_coder(self):
+        # the shipped catalog itself is the invalid one, so no valid copy can restore the rule
+        from unittest import mock
+        cat = json.loads(self.bad_catalog.read_text())
+        del cat["roles"]["coder"]
+        self.bad_catalog.write_text(json.dumps(cat))
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
+        cfg = self.root / "router.json"
+        cfg.write_text(json.dumps(self.config))
+        with mock.patch.object(model_router.rc, "CATALOG_PATH", self.bad_catalog):
+            for worker in ("claude", "pi", None):
+                with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
+                    model_router.select({"role": "coder", "worker": worker, "task": "fix named code"},
+                                        catalog_path=self.bad_catalog, config_path=cfg, log=False)
+            # a role the broken catalog still names with a floor is held to it
+            with self.assertRaises(model_router.RouteStop):
+                model_router.select({"role": "tester", "worker": "claude", "task": "t"},
+                                    catalog_path=self.bad_catalog, config_path=cfg, log=False)
+            # a role it does not name cannot be confirmed either
+            with self.assertRaises(model_router.RouteStop):
+                model_router.select({"role": "unlisted", "worker": "claude", "task": "t"},
+                                    catalog_path=self.bad_catalog, config_path=cfg, log=False)
 
 
 class ReviewPlanTests(Base):

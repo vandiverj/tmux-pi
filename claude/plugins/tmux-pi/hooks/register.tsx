@@ -98,6 +98,7 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
       permission: row.permission ?? null,
       capability_request: row.capability_request ?? null,
       capability_pending: row.capability_pending === true,
+      reason: typeof row.reason === 'string' ? row.reason : null,
       result_status: typeof row.result_status === 'string' ? row.result_status : null,
     })
   }
@@ -145,6 +146,7 @@ function awaiting(row: { permission?: unknown; capability_request?: unknown; cap
 }
 
 function hint(row: TaskRow): string {
+  if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or tp-agent stop ${row.id}`
   if (row.status === 'settled') return `${row.id} settled: tp-agent collect ${row.id}`
   if (row.status === 'paused') {
     const why = row.result_status === null ? 'replied without a result status' : 'is paused'
@@ -159,11 +161,20 @@ function hint(row: TaskRow): string {
   return `${row.id} needs input (${why}): tp-agent inspect ${row.id}`
 }
 
+// The key a row is announced under, or undefined when it is not news: `id:status` for a notable status, and
+// `id:refused` for a queue entry tp-agent will not start (it keeps status queued, so the status alone cannot say).
+function noticeKey(row: unknown): string | undefined {
+  const { id, status } = (row ?? {}) as Record<string, unknown>
+  if (typeof id !== 'string' || typeof status !== 'string') return undefined
+  if (NOTABLE.has(status)) return `${id}:${status}`
+  return isRefused(row) ? `${id}:refused` : undefined
+}
+
 // What the injected index already told the main is waiting wakes nobody.
 function baseline(rows: readonly unknown[]) {
   for (const row of rows) {
-    const { id, status } = (row ?? {}) as Record<string, unknown>
-    if (typeof id === 'string' && typeof status === 'string' && NOTABLE.has(status)) delivered.add(`${id}:${status}`)
+    const key = noticeKey(row)
+    if (key !== undefined) delivered.add(key)
   }
 }
 
@@ -171,12 +182,12 @@ function baseline(rows: readonly unknown[]) {
 // before anything is sent. A key leaves `delivered` when its task leaves that status,
 // so a second permission prompt on the same task notifies again.
 function transitions(rows: readonly TaskRow[]): TaskRow[] {
-  const now = new Set(rows.map(row => `${row.id}:${row.status}`))
+  const now = new Set(rows.map(noticeKey))
   for (const key of delivered) if (!now.has(key)) delivered.delete(key)
   const fresh: TaskRow[] = []
   for (const row of rows) {
-    const key = `${row.id}:${row.status}`
-    if (!NOTABLE.has(row.status) || delivered.has(key)) continue
+    const key = noticeKey(row)
+    if (key === undefined || delivered.has(key)) continue
     delivered.add(key)
     fresh.push(row)
   }
@@ -211,7 +222,7 @@ async function restore($: EngineInterface) {
     epoch = stored.epoch + 1
     isIndexed = stored.isIndexed
     delivered = new Set(stored.delivered)
-    held = stored.pending.filter(row => delivered.has(`${row.id}:${row.status}`))
+    held = stored.pending.filter(row => delivered.has(noticeKey(row) ?? ''))
   } catch {
     // The saved value could not be read, so its epoch is unknown. Claim far above any counter
     // a readable store holds, plus the time, so this module is never taken for a replaced one
@@ -259,7 +270,7 @@ async function poll($: EngineInterface) {
     await update($, tasks, () => summary).catch(() => undefined)
     const fresh = transitions(rows)
     // A row whose task left its status while waiting for a submit is no longer news.
-    held = [...held, ...fresh].filter(row => delivered.has(`${row.id}:${row.status}`))
+    held = [...held, ...fresh].filter(row => delivered.has(noticeKey(row) ?? ''))
     for (const row of fresh) $.ui.toast(hint(row))
     await persist($)
     // Not awaited: the submit resolves only when its turn starts, and polling (the band,
@@ -286,11 +297,9 @@ function indexLine(row: unknown): string | undefined {
 }
 
 // The protected part of the index, within `room` characters: workers that wait for the main (paused,
-// replied without a result status, needs input) and queue entries tp-agent refused to start. Their wait is a
-// decision only the main can make and no other signal reaches it (a refused entry has no pane, no state and no
-// worker, never starts, and holds back every --after dependent until `tp-agent stop <id>` removes it), so they
-// are never dropped silently: full rows when they all fit, else their ids only, else as many ids as fit and a
-// line counting the rest.
+// replied without a result status, needs input). Their wait is a decision only the main can make and no
+// other signal reaches it, so they are never dropped silently: full rows when
+// they all fit, else their ids only, else as many ids as fit and a line counting the rest.
 // An id in the ids-only tiers keeps a short mark of what the worker awaits.
 function idMark(row: Record<string, unknown>): string {
   const awaits = awaiting(row)
@@ -304,26 +313,49 @@ function isRefused(row: unknown): boolean {
   return status === 'queued' && typeof reason === 'string' && reason.startsWith('start refused: ')
 }
 
-// A group is [name, rows] or [name, rows, what the main runs on an id]; the default is tp-agent inspect.
-function pausedLines(groups: readonly (readonly [string, unknown] | readonly [string, unknown, string])[], room: number): { lines: string[]; rows: unknown[] } {
-  const named = groups.map(([name, group, command]) => ({
+// The queue entries tp-agent refused to start, after the rows above, in the room those left (`room` counts the newline
+// before each line). A refused entry has no pane, no state and no worker, never starts, and holds back every --after
+// dependent until `tp-agent stop <id>` removes it, so the main has to act on it; but it takes only what the workers
+// that wait for the main left over, never an id they would have had without it. Full rows when they fit, else ids
+// only, else as many ids as fit. Rows not shown are counted on a short line that may use the index's reserve beyond
+// `room`, and they stay eligible for a wake (the poll announces what the index did not show).
+function refusedLines(rows: Record<string, unknown>[], room: number): { lines: string[]; rows: unknown[] } {
+  if (rows.length === 0) return { lines: [], rows: [] }
+  const name = 'queue entries that will not start'
+  const fits = (lines: readonly string[]) => lines.join('\n').length + 1 <= room
+  const full = [`${name}:`, ...rows.map(row => indexLine(row) as string)]
+  if (fits(full)) return { lines: full, rows }
+  const header = `${name} (ids only; tp-agent stop <id> removes one):`
+  const ids = [`${header} ${rows.map(row => row.id).join(', ')}`]
+  if (fits(ids)) return { lines: ids, rows }
+  const shown: Record<string, unknown>[] = []
+  for (const row of rows) {
+    if (!fits([`${header} ${[...shown, row].map(each => each.id).join(', ')}`])) break
+    shown.push(row)
+  }
+  const lines = shown.length === 0 ? [] : [`${header} ${shown.map(row => row.id).join(', ')}`]
+  lines.push(`… ${rows.length - shown.length} refused not shown`)
+  return { lines, rows: shown }
+}
+
+function pausedLines(groups: readonly (readonly [string, unknown])[], room: number): { lines: string[]; rows: unknown[] } {
+  const named = groups.map(([name, group]) => ({
     name,
-    command: command ?? 'tp-agent inspect <id>',
     rows: (Array.isArray(group) ? group : []).filter(row => indexLine(row) !== undefined) as Record<string, unknown>[],
   }))
   const all = named.flatMap(group => group.rows)
   const full = named.flatMap(({ name, rows }) => [`${name}:${rows.length === 0 ? ' none' : ''}`, ...rows.map(row => indexLine(row) as string)])
   if (full.join('\n').length <= room) return { lines: full, rows: all }
-  const idsHeader = (name: string, command: string) => `${name} (ids only; ${command}):`
-  const ids = named.map(({ name, command, rows }) => (rows.length === 0 ? `${name}: none` : `${idsHeader(name, command)} ${rows.map(idMark).join(', ')}`))
+  const idsHeader = (name: string) => `${name} (ids only; tp-agent inspect <id>):`
+  const ids = named.map(({ name, rows }) => (rows.length === 0 ? `${name}: none` : `${idsHeader(name)} ${rows.map(idMark).join(', ')}`))
   if (ids.join('\n').length <= room) return { lines: ids, rows: all }
   const rest = (hidden: number) => `… ${hidden} more workers waiting for you not shown; run tp-agent list to see them`
   const lines: string[] = []
   const shown: unknown[] = []
   let size = rest(all.length).length
   let isFull = false
-  for (const { name, command, rows } of named) {
-    let line = idsHeader(name, command)
+  for (const { name, rows } of named) {
+    let line = idsHeader(name)
     let count = 0
     for (const row of rows) {
       const piece = `${count === 0 ? ' ' : ', '}${idMark(row)}`
@@ -357,23 +389,19 @@ async function readIndex($: EngineInterface): Promise<{ text: string; rows: unkn
   lines.push(`objective: ${(typeof objective === 'string' && objective.trim() !== '' ? objective.trim() : '(none set)').slice(0, 1000)}`)
   // Room kept for the active and pending headers and the omission line, so the whole text fits.
   const limit = INDEX_CHARS - 120
-  // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause), and
-  // the queue entries that will never start; the other active rows and the pending ones take what room is left.
+  // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause), then the
+  // queue entries that will never start, in what room those left; the other active rows and the pending ones take the rest.
   const activeRows = Array.isArray(active) ? active : []
   const isAsking = (row: unknown) => typeof row === 'object' && row !== null && (row as { status?: unknown }).status === 'needs_input'
-  const refused = activeRows.filter(isRefused)
   const first = pausedLines(
-    [
-      ['replied without a result status', unstatused],
-      ['paused', paused],
-      ['needs input', activeRows.filter(isAsking)],
-      // Listed only when there is one: unlike the others it is not a state every session has a line for.
-      ...(refused.length === 0 ? [] : [['queue entries that will not start', refused, 'tp-agent stop <id> removes one'] as const]),
-    ],
+    [['replied without a result status', unstatused], ['paused', paused], ['needs input', activeRows.filter(isAsking)]],
     limit - lines.join('\n').length - 1,
   )
   lines.push(...first.lines)
-  const shown = [...first.rows]
+  // Listed only when there is one: unlike the others it is not a state every session has a line for.
+  const refused = refusedLines(activeRows.filter(row => isRefused(row) && indexLine(row) !== undefined), limit - lines.join('\n').length)
+  lines.push(...refused.lines)
+  const shown = [...first.rows, ...refused.rows]
   let size = lines.join('\n').length
   let cut = 0
   for (const [name, group] of [['active', activeRows.filter(row => !isAsking(row) && !isRefused(row))], ['pending', pending]] as const) {

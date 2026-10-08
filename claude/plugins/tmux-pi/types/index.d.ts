@@ -5,6 +5,7 @@ export type TaskRow = {
   permission: unknown
   capability_request: unknown
   capability_pending: boolean
+  reason: string | null
   result_status: string | null
 }
 

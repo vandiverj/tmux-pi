@@ -802,7 +802,7 @@ test('refused queue entries sit with paused and awaiting rows, ahead of the acti
   expect(quiet).not.toContain('queue entries that will not start')
 })
 
-test('refused queue entries saturating the index are protected by the same cap and count line', async ($, on) => {
+test('refused queue entries saturating the index stay within the cap and are counted when cut', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [...busyRows(100), ...Array.from({ length: 400 }, (_, i) => refusedRow(`shape${String(i).padStart(4, '0')}-0123456789abcdef`))]
   w.paused = [{ id: 'coder-p', role: 'coder', status: 'paused', result_status: 'blocked', capability_pending: true }]
@@ -813,10 +813,109 @@ test('refused queue entries saturating the index are protected by the same cap a
   const listed = refused.filter(row => text.includes(row.id))
   expect(listed.length > 50).toBe(true)
   expect(listed.length < refused.length).toBe(true)
-  expect(text).toContain(`… ${refused.length - listed.length} more workers waiting for you not shown; run tp-agent list to see them`)
+  expect(text).toContain(`… ${refused.length - listed.length} refused not shown`)
   expect(text).toContain('queue entries that will not start (ids only; tp-agent stop <id> removes one): shape0000-0123456789abcdef,')
-  expect(text).toContain('coder-p [capability approval pending]')   // the paused worker keeps its mark under the same cap
+  // the paused worker is ahead of them and keeps its full row
+  expect(text).toContain('- coder-p coder paused result=blocked [awaits: capability approval pending]')
   expect(text).not.toContain('researcher-0100-abcdef')
+})
+
+// A refusal takes only the room that the workers waiting for the main leave. 189 paused ids fit the index (ids only)
+// with 15 characters to spare; one refused entry must not cost the last of them its place.
+test('one refused queue entry never displaces a paused id that fits without it', async ($, on) => {
+  const idsIn = async (w: ReturnType<typeof world>) => {
+    const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+    expect(text.length <= 6000).toBe(true)
+    return text
+  }
+  const w = world(on, MAIN)
+  w.paused = pausedRows(189, 'coder-p', 'blocked', '-0123456789abcdef')
+  w.rows = []
+  await $.session.start(start(true))
+  const without = await idsIn(w)
+  for (const row of w.paused) expect(without).toContain(row.id)
+  expect(without).not.toContain('workers waiting for you not shown')
+  w.rows = [refusedRow('shape01')]
+  const withOne = await idsIn(w)
+  for (const row of w.paused) expect(withOne).toContain(row.id)
+  expect(withOne).not.toContain('workers waiting for you not shown')
+  // the refusal is counted, not silently dropped: its id does not fit, so a short count line says so
+  expect(withOne).toContain('… 1 refused not shown')
+  // and at every size around the boundary, whatever fits without a refusal fits with it
+  for (const n of [150, 180, 185, 187, 188, 189, 190, 191, 195, 250]) {
+    w.paused = pausedRows(n, 'coder-p', 'blocked', '-0123456789abcdef')
+    w.rows = []
+    const before = await idsIn(w)
+    w.rows = [refusedRow('shape01'), refusedRow('shape02')]
+    const after = await idsIn(w)
+    for (const row of w.paused) if (before.includes(row.id)) expect(after).toContain(row.id)
+    const hidden = w.paused.filter(row => !after.includes(row.id)).length
+    if (hidden > 0) expect(after).toContain(`… ${hidden} more workers waiting for you not shown`)
+    if (!after.includes('shape02')) expect(after).toMatch(/… \d+ refused not shown/)
+  }
+})
+
+// ---- a queue entry refused after the session started ----
+
+test('a queue entry that becomes refused after session start wakes the main once, with its id and reason', async ($, on) => {
+  const w = world(on, MAIN)
+  w.acceptsAppend = true
+  w.rows = [{ id: 'coder-1', status: 'working', role: 'coder' }]
+  await $.session.start(start(true))
+  await w.clock.advance(5000)
+  expect(w.submitted).toEqual([])
+  w.rows = [...w.rows, refusedRow('shape01')]
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('shape01 will not start (start refused: the queue entry is not an object)')
+  expect(w.submitted[0]).toContain('tp-agent stop shape01')
+  expect(w.toasts.length).toBe(1)
+  // deduplicated: the same refusal is not announced again
+  await w.clock.advance(15000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.toasts.length).toBe(1)
+  // an ordinary queued row is not news
+  w.rows = [...w.rows, { id: 'queued-ok', status: 'queued', role: 'coder' }]
+  await w.clock.advance(10000)
+  expect(w.submitted.length).toBe(1)
+  // fixed, then refused again: that is a new refusal
+  w.rows = w.rows.filter(row => row.id !== 'shape01')
+  await w.clock.advance(5000)
+  w.rows = [...w.rows, refusedRow('shape01')]
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(2)
+})
+
+test('a refused row already in the injected index does not alert again; one the index cut does', async ($, on) => {
+  const w = world(on, MAIN)
+  w.acceptsAppend = true
+  w.rows = [refusedRow('shape01'), ...Array.from({ length: 400 }, (_, i) => refusedRow(`cut${String(i).padStart(4, '0')}-0123456789abcdef`))]
+  await $.session.start(start(true))
+  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  expect(text).toContain('shape01')
+  expect(text).not.toContain('cut0399-0123456789abcdef')
+  await w.clock.advance(5000)
+  const woken = w.submitted.join('\n')
+  expect(woken).not.toContain('shape01 will not start')
+  expect(woken).toContain('cut0399-0123456789abcdef will not start (start refused:')
+  expect(woken).not.toContain('cut0000-0123456789abcdef will not start')
+})
+
+test('a refusal is delivered after a reload only when it was not acknowledged', async ($, on) => {
+  const w = world(on, MAIN)
+  const kept: Record<string, unknown> = { notifier: { epoch: 1, isIndexed: true, delivered: ['shape01:refused'], pending: [] } }
+  on('state.get', { plugin: 'tmux-pi' }, (_$, e, next) => (e.key in kept ? { value: { value: kept[e.key], version: 1 } } : next(e)))
+  on('state.set', { plugin: 'tmux-pi' }, (_$, e, next) => {
+    if (!(e.key in kept)) return next(e)
+    kept[e.key] = e.value
+    return { value: { isSet: true, version: 2 } }
+  })
+  w.rows = [refusedRow('shape01'), refusedRow('shape02')]
+  await $.session.start(start(true))
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('shape02 will not start')
+  expect(w.submitted[0]).not.toContain('shape01')
 })
 
 test('the wake hint for a paused worker names a pending request', async ($, on) => {

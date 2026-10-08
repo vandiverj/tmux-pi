@@ -5,8 +5,9 @@ Usage: tp-contract build --workdir W --task-dir D --kind research|task [--artifa
                          [--budget time=20m,turns=60,tokens=400k] [--checkpoints outline=3m,draft=10m]
                          [--stall 6m] [--grace 3m] [--no-edits (task only; reply-only)]
          print {"contract", "note"}; research defaults come from config/research.json
-       tp-contract status    one line per task: id, state, then elapsed, turns, checkpoint state and,
-                             for settled work, the artifact and a one-line summary of the reply
+       tp-contract status [ID ...]  one line per task: id, state, then elapsed, turns, checkpoint state and,
+                             for settled work, the artifact and a one-line summary of the reply; with ids, only
+                             those tasks (the status pane asks for the few it shows), and only those are read
        tp-contract enforce   take the checkpoint actions due now; print one JSON line per action;
                              record settled contract tasks in the ledger
        tp-contract extend <id>          main's "continue": one more budget of the original size
@@ -118,11 +119,16 @@ def find(root, task_id):
     return d, meta
 
 
-def tasks(root):
+def tasks(root, only=None):
     base = Path(root) / "tasks"
-    metas = sorted(base.glob("*/meta.json"), key=lambda p: p.stat().st_mtime) if base.is_dir() else []
+    if only is not None:   # named tasks, in the order given; one that is gone is simply not listed
+        metas = [base / name / "meta.json" for name in only if name and "/" not in name and name not in (".", "..")]
+    else:
+        metas = sorted(base.glob("*/meta.json"), key=lambda p: p.stat().st_mtime) if base.is_dir() else []
     for meta_path in metas:
         meta = read(meta_path)
+        if only is not None and not meta:
+            continue
         # Slice 2 stop-mode/preflight records are main-owned task records, not
         # worker processes; keep them out of subagent status/enforcement.
         if meta.get("worker") == "main":
@@ -174,9 +180,9 @@ def cmd_build(args):
     print(json.dumps({"contract": contract, "note": note(contract, time.time())}))
 
 
-def cmd_status(_args):
+def cmd_status(args):
     root, pane_map, now = state_dir(), panes(), time.time()
-    for d, meta in tasks(root):
+    for d, meta in tasks(root, args.ids or None):
         life, state, events, reply = task_state(d, meta, pane_map)
         alive = pane_map.get(meta.get("pane")) == "alive"
         contract = meta.get("contract")
@@ -246,6 +252,12 @@ def cmd_enforce(_args):
         events.append(dict({"action": action, "reason": reason, "at": now},
                            **({"tools": state.get("tools") or 0} if action == "pause" else {})))
         save_events(d, events)
+        # The event can change the state (a pause), so task.md is brought up to date here, before the send that may fail:
+        # a failed send must not leave the record saying the old state. A failure here is said, and the action goes on.
+        try:
+            write_record(d, lifecycle_state=task_state(d, meta, pane_map)[0], meta=meta, force=True)
+        except Exception as error:  # noqa: BLE001 - the checkpoint is already saved; report, never undo
+            print("tp-contract: task.md of {} was not refreshed: {}".format(meta.get("id", d.name), error), file=sys.stderr)
         try:
             if action == "halted":
                 pass  # main decides; nothing is typed
@@ -465,7 +477,8 @@ def main():
         b.add_argument(opt)
     b.add_argument("--decision-json")
     b.add_argument("--no-edits", action="store_true", help="task only: bounded reply, no worker artifact/checkpoints")
-    sub.add_parser("status")
+    st = sub.add_parser("status")
+    st.add_argument("ids", nargs="*")
     sub.add_parser("enforce")
     sub.add_parser("research")
     x = sub.add_parser("extend")

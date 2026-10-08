@@ -29,6 +29,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import request_file
+from lifecycle_files import LIFECYCLE_FILES
 from task_record import request_text
 
 KINDS = ("research", "task")
@@ -505,23 +507,33 @@ def _lifecycle(state, pane, events, reply, completed_at, exit_code, escalated, r
     return "completed" if done else "settled"
 
 
+# Every file task_lifecycle reads is in lifecycle_files.LIFECYCLE_FILES, which it refuses to go beyond.
+REQUEST_FILES = request_file.REQUEST_NAMES
+
+
 def task_lifecycle(d, pane=None):
     """(lifecycle state, state.json, checkpoint events, reply) for a task directory.
 
     The one reader of a task's files for `lifecycle`, used by tp-agent and tp-contract alike, so
-    both hand it the same facts; pane is the only fact not on disk."""
+    both hand it the same facts; pane is the only fact not on disk. The files it reads are LIFECYCLE_FILES and no others.
+    A request file that cannot be read as one JSON object counts as a pending request (lib/request_file.py)."""
     d = Path(d)
+
+    def path(name):
+        if name not in LIFECYCLE_FILES:
+            raise ValueError("task_lifecycle read {!r}, which is not in LIFECYCLE_FILES".format(name))
+        return d / name
 
     def obj(name):
         try:
-            value = json.loads((d / name).read_text())
+            value = json.loads(path(name).read_text())
         except (OSError, ValueError):
             return {}
         return value if isinstance(value, dict) else {}
 
     def text(name):
         try:
-            return (d / name).read_text().strip()
+            return path(name).read_text().strip()
         except OSError:
             return ""
 
@@ -531,13 +543,13 @@ def task_lifecycle(d, pane=None):
     except ValueError:
         completed_at = None
     try:
-        replied_at = (d / "result.md").stat().st_mtime
+        replied_at = path("result.md").stat().st_mtime
     except OSError:
         replied_at = None
-    life = lifecycle(state, pane, events, reply, completed_at, text("exit") or None, (d / "escalated").exists(), replied_at,
-                     stopped=(d / "stopped.json").exists(), collected=(d / "collected.json").exists(),
-                     asking=any(obj(name).get("status") == "pending" for name in ("permission-request.json", "capability-request.json")),
-                     capability_pending=(d / "pending-capability.json").exists())
+    life = lifecycle(state, pane, events, reply, completed_at, text("exit") or None, path("escalated").exists(), replied_at,
+                     stopped=path("stopped.json").exists(), collected=path("collected.json").exists(),
+                     asking=any(request_file.is_pending(path(name)) for name in REQUEST_FILES),
+                     capability_pending=path("pending-capability.json").exists())
     return life, state, events, reply
 
 

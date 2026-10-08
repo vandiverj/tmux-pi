@@ -531,6 +531,8 @@ export default function (pi: ExtensionAPI) {
 		pendingDelegatedReview(dir, id);
 		// An earlier collection is not the completion of this new round.
 		rmSync(join(dir, "completed"), { force: true });
+		// The record (task.md) must not keep saying "completed"; tp-contract status rewrites it (run never rejects).
+		void run(bin("tp-contract"), ["status", id]);
 	};
 	const linkDelegatedReview = (source: string, target: string) => {
 		const marker = reviewMarker(source);

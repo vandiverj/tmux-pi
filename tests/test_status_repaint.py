@@ -19,6 +19,7 @@ ESC = b"\x1b[H"
 
 class StatusPaneFixture(unittest.TestCase):
     raw_slave = True   # False: leave the pty cooked (ECHO, ICANON on) like a real pane
+    extra_env = {}     # more environment for the pane (a test class sets TP_STATUS_WINDOW here)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -50,9 +51,10 @@ case "$1" in
   set-option) for last; do :; done; echo "$last" > "$FAKE_BASE/viewing" ;;
 esac
 ''')
-        self.environ = dict(os.environ, FAKE_BASE=str(self.base),
+        (self.base / "tmp").mkdir()   # the pane's private cache directory (mktemp) lands here and goes with the test, even if the pane is killed
+        self.environ = dict(os.environ, FAKE_BASE=str(self.base), TMPDIR=str(self.base / "tmp"),
                         PATH=str(self.mockbin) + os.pathsep + os.environ["PATH"],
-                        TERM="xterm", TP_SESSION="fake")
+                        TERM="xterm", TP_SESSION="fake", **self.extra_env)
         self.environ.pop("TMUX", None)
         self.environ.pop("TMUX_PANE", None)
         self.environ.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir
@@ -440,6 +442,7 @@ class StatusRepaintTest(StatusPaneFixture):
             json.dumps({"status": "pending", "target": "~/.ssh"}))
         self.first_frame(b"job6", settle=0.2)
         self.assert_keys_only_redraw()
+        self.output(0.8)    # frames of the keys above may still be queued (the barrier can match an earlier one); read them off
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertIn("── job".encode(), moved)    # the redraw still shows the moved selection
@@ -565,6 +568,278 @@ class StatusRepaintTest(StatusPaneFixture):
         plain = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", first).decode()
         self.assertTrue(all(len(line) <= 80 for line in plain.split("\n")))
         self.assertLessEqual(first.count(b"\n"), 23)
+
+
+class StatusWindowTest(StatusPaneFixture):
+    """The pane keeps a window of the task list (lib/tp_window.py), follows a new worker, and jumps with g / G."""
+    extra_env = {"TP_STATUS_WINDOW": "5"}
+    LIVE = {"state": "working", "model": "m", "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}
+    DONE = {"state": "waiting", "model": "m", "tokens": {"input": 3, "cacheRead": 0, "cacheWrite": 0, "output": 4}}
+
+    def setUp(self):
+        super().setUp()
+        (self.base / "lines").write_text("30\n")
+
+    def write_state(self, name, state):
+        directory = self.state / "tasks" / name
+        directory.mkdir(exist_ok=True)
+        (directory / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": "%1", "model": "", "thinking": ""}))
+        (directory / "task.md").write_text(f"task of {name}\n")
+        (directory / "state.json").write_text(json.dumps(state))
+
+    def add(self, number, state=None):
+        """Task f<number>: finished (a reply with a RESULT_STATUS line) unless a state is given. Each is newer than the last."""
+        name = "f%02d" % number
+        self.write_state(name, state or self.DONE)
+        if state is None:
+            (self.state / "tasks" / name / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
+        return name
+
+    @staticmethod
+    def plain(data):
+        return re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", data).decode("utf-8", "replace")
+
+    def last_frame(self, *needles, seconds=8.0):
+        """The last complete frame once one holds every needle (bounded wait)."""
+        data = b""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            data += self.output(0.05)
+            frames = [f for f in data.split(ESC) if f.endswith(b"\x1b[J")]
+            if frames and all(n.encode() in frames[-1] for n in needles):
+                return self.plain(frames[-1])
+        self.fail("no frame with %r; last: %r" % (needles, self.plain(data.split(ESC)[-1])[:600]))
+
+    def selected_line(self, frame):
+        return re.search(r"── (f\d\d)", frame).group(1)
+
+    def test_a_new_worker_is_followed_while_the_newest_is_selected(self):
+        for n in range(1, 9):
+            self.add(n)
+        frame = self.last_frame("f08", "subagents 5/8")
+        self.assertEqual(self.selected_line(frame), "f08")
+        self.add(9)
+        frame = self.last_frame("f09", "subagents 5/9")
+        self.assertEqual(self.selected_line(frame), "f09")
+        self.assertNotIn("new worker", frame.split("\n")[0])
+
+    def test_a_new_worker_does_not_move_a_selection_the_owner_scrolled_away_from(self):
+        for n in range(1, 9):
+            self.add(n)
+        self.last_frame("f08", "subagents 5/8")
+        os.write(self.master, b"kk")
+        frame = self.last_frame("── f06")
+        self.add(9)
+        frame = self.last_frame("new worker", "/9")
+        self.assertEqual(self.selected_line(frame), "f06")
+        self.assertIn("↓ new worker", frame.split("\n")[0])
+        os.write(self.master, b"G")                                        # G is the way down, and it follows from there
+        frame = self.last_frame("── f09")
+        self.assertNotIn("new worker", frame.split("\n")[0])
+        self.add(10)
+        self.assertEqual(self.selected_line(self.last_frame("f10", "/10")), "f10")
+
+    def test_moving_down_to_the_newest_follows_again(self):
+        for n in range(1, 7):
+            self.add(n)
+        self.last_frame("── f06")
+        os.write(self.master, b"k")
+        self.last_frame("── f05")
+        os.write(self.master, b"j")
+        self.last_frame("── f06")
+        self.add(7)
+        self.assertEqual(self.selected_line(self.last_frame("f07", "/7")), "f07")
+
+    def test_g_and_G_jump_to_the_oldest_and_the_newest_task_and_the_help_lists_them(self):
+        for n in range(1, 31):
+            self.add(n)
+        frame = self.last_frame("── f30", "subagents 5/30")
+        self.assertIn("g/G top/bottom", frame.split("\n")[0])
+        self.assertNotIn("f01", frame)                  # only the window is on screen
+        os.write(self.master, b"g")
+        frame = self.last_frame("── f01")
+        self.assertIn("reply of f01", frame)            # an older task shows the details a recent one shows
+        self.assertIn("task of f01", frame)
+        self.assertNotIn("f30", frame)
+        os.write(self.master, b"G")
+        frame = self.last_frame("── f30")
+        self.assertIn("reply of f30", frame)
+        for key, name in ((b"\x1b[H", "f01"), (b"\x1b[F", "f30"), (b"\x1b[1~", "f01"), (b"\x1b[4~", "f30"),
+                         (b"\x1bOH", "f01"), (b"\x1bOF", "f30")):
+            os.write(self.master, key)
+            self.assertEqual(self.selected_line(self.last_frame("── " + name)), name, key)
+
+    def test_paging_reaches_older_tasks_read_from_disk_and_back(self):
+        for n in range(1, 31):
+            self.add(n)
+        self.last_frame("── f30")
+        presses = 0
+        for presses in range(1, 12):                       # a page is several tasks (4 here: the window holds 5), also past the loaded window
+            os.write(self.master, b"\x1b[5~")
+            frame = self.last_frame("── f")
+            if self.selected_line(frame) == "f01":
+                break
+        self.assertEqual(self.selected_line(frame), "f01")
+        self.assertLessEqual(presses, 9)                   # 29 tasks back, a page at a time, not one at a time
+        self.assertIn("reply of f01", frame)
+        os.write(self.master, b"\x1b[6~")
+        self.assertNotEqual(self.selected_line(self.last_frame("── f")), "f01")
+        os.write(self.master, b"G")
+        self.assertEqual(self.selected_line(self.last_frame("── f30")), "f30")
+
+    def test_j_and_k_slide_the_window_one_task_at_a_time(self):
+        for n in range(1, 16):
+            self.add(n)
+        self.last_frame("── f15")
+        for number in range(14, 5, -1):                    # past the 5 loaded tasks: older ones are loaded as it goes
+            os.write(self.master, b"k")
+            self.assertEqual(self.selected_line(self.last_frame("── f%02d" % number)), "f%02d" % number)
+        for number in range(7, 12):
+            os.write(self.master, b"j")
+            self.assertEqual(self.selected_line(self.last_frame("── f%02d" % number)), "f%02d" % number)
+
+    def test_active_tasks_stay_on_screen_whatever_their_age(self):
+        self.add(1, state=self.LIVE)                       # the oldest task is a live worker
+        for n in range(2, 31):
+            self.add(n)
+        frame = self.last_frame("── f30", "f01", "subagents 6/30")
+        self.assertRegex(frame, r"f01\s+pi\s+working")
+        self.assertNotIn("f02 ", frame)
+        self.assertNotIn("f20 ", frame)
+
+    def test_moving_from_an_old_active_task_goes_to_the_task_next_to_it_in_the_list(self):
+        self.add(1, state=self.LIVE)
+        for n in range(2, 31):
+            self.add(n)
+        self.last_frame("── f30", "f01")
+        os.write(self.master, b"g")
+        self.assertEqual(self.selected_line(self.last_frame("── f01")), "f01")
+        os.write(self.master, b"j")                        # f02 is not loaded: the window slides to it
+        frame = self.last_frame("── f02")
+        self.assertIn("reply of f02", frame)
+        os.write(self.master, b"k")
+        self.assertEqual(self.selected_line(self.last_frame("── f01")), "f01")
+
+    def test_the_window_size_must_be_a_positive_number(self):
+        for bad in ("0", "-1", "lots", ""):
+            run = subprocess.run(["bash", str(ROOT / "bin/tp-status")], env=dict(self.environ, TP_STATUS_WINDOW=bad),
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(run.returncode, 0, bad)
+            self.assertIn("TP_STATUS_WINDOW must be a positive number", run.stderr)
+
+
+class StatusBackgroundWorkTest(StatusPaneFixture):
+    """The background tick (tp-agent tick) and the record refresh for tasks outside the window. The pane runs from a copy of
+    the install whose tp-agent and tp-contract are wrappers that log what they are asked, so a test sees both."""
+    extra_env = {"TP_STATUS_WINDOW": "3"}
+    DONE = {"state": "waiting", "model": "m", "tokens": {"input": 3, "cacheRead": 0, "cacheWrite": 0, "output": 4}}
+
+    def command(self):
+        root = self.base / "root"
+        (root / "bin").mkdir(parents=True)
+        for entry in ROOT.iterdir():
+            if entry.name not in ("bin", ".git") and not entry.name.startswith("."):
+                (root / entry.name).symlink_to(entry)
+        for entry in (ROOT / "bin").iterdir():
+            if entry.name == "tp-status":
+                shutil.copy(entry, root / "bin" / entry.name)    # a real file, so the pane finds its install in the copy
+            elif entry.is_file():
+                (root / "bin" / entry.name).symlink_to(entry)
+        now = "python3 -c 'import time; print(time.time())'"
+        agent = root / "bin" / "tp-agent"
+        agent.unlink()
+        agent.write_text('#!/bin/sh\necho "start $(%s)" >> "$FAKE_BASE/ticks"\n'
+                         '[ -f "$FAKE_BASE/tick_sleep" ] && sleep "$(cat "$FAKE_BASE/tick_sleep")"\n'
+                         'if [ -f "$FAKE_BASE/tick_fail" ]; then echo "boom: disk full" >&2; exit 3; fi\n'
+                         'echo "end $(%s)" >> "$FAKE_BASE/ticks"\nexit 0\n' % (now, now))
+        agent.chmod(0o755)
+        contract = root / "bin" / "tp-contract"
+        contract.unlink()
+        contract.write_text('#!/bin/sh\necho "$*" >> "$FAKE_BASE/asked"\nexec "%s" "$@"\n' % (ROOT / "bin" / "tp-contract"))
+        contract.chmod(0o755)
+        return ["bash", str(root / "bin" / "tp-status")]
+
+    def ticks(self):
+        path = self.base / "ticks"
+        return [line.split() for line in path.read_text().splitlines()] if path.exists() else []
+
+    def add(self, name, **files):
+        directory = self.state / "tasks" / name
+        if not directory.exists():     # a task's place in the list is its meta.json's age: a change later must not move it
+            directory.mkdir()
+            (directory / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": "%1", "model": "", "thinking": ""}))
+            (directory / "task.md").write_text("task of %s\n" % name)
+            (directory / "state.json").write_text(json.dumps(self.DONE))
+            (directory / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
+            time.sleep(0.02)
+        for fname, value in files.items():
+            (directory / fname).write_text(json.dumps(value))
+
+    def asked(self):
+        path = self.base / "asked"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_a_failed_background_tick_is_shown_in_the_footer_until_a_tick_succeeds(self):
+        (self.base / "tick_fail").write_text("")
+        self.add("f1")
+        frame = self.first_frame(b"background tick failed (exit 3): boom: disk full", seconds=12)
+        self.assertIn(b"background tick failed (exit 3): boom: disk full", frame)
+        self.assertIn(b"f1", frame)                              # the list is still there
+        (self.base / "tick_fail").unlink()
+        data = self.first_frame(b"f1", seconds=12)               # the next tick, within a few seconds, succeeds
+        gone = self.output_until(lambda frame: b"background tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
+        self.assertNotIn(b"background tick failed", (data + gone).split(ESC)[-1])
+
+    def test_a_failed_tick_is_flagged_in_the_header_of_the_usage_page(self):
+        (self.base / "tick_fail").write_text("")
+        self.add("f1")
+        self.first_frame(b"background tick failed", seconds=12)       # the list page has said it in its footer
+        os.write(self.master, b"s")
+        page = self.output_until(lambda frame: b"usage" in frame and b"tick failed" in frame and b"\x1b[J" in frame, seconds=6)
+        usage = page.split(ESC)[-1]
+        self.assertIn(b"usage", usage)
+        self.assertIn(b"tick failed", usage.split(b"\n")[0])          # on the header line: the page has no footer
+        (self.base / "tick_fail").unlink()
+        gone = self.output_until(lambda frame: b"usage" in frame and b"tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
+        self.assertNotIn(b"tick failed", gone.split(ESC)[-1])         # a later tick succeeded: the flag goes
+
+    def test_a_failed_tick_is_flagged_in_the_header_of_a_compact_pane(self):
+        (self.base / "lines").write_text("10\n")                      # under 16 lines: no footer is drawn
+        (self.base / "tick_fail").write_text("")
+        for n in range(1, 4):
+            self.add("f%d" % n)
+        frame = self.first_frame(b"tick failed", seconds=12).split(ESC)[-1]
+        self.assertIn(b"tick failed", frame.split(b"\n")[0])
+        self.assertNotIn(b"boom: disk full", frame)                   # the footer's words do not fit; the flag is all there is
+        self.assertIn(b"f3", frame)                                   # and the list is still drawn
+        (self.base / "tick_fail").unlink()
+        gone = self.output_until(lambda frame: b"f3" in frame and b"tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
+        self.assertNotIn(b"tick failed", gone.split(ESC)[-1])
+
+    def test_a_tick_that_is_still_running_is_not_started_again_and_the_next_follows_it_closely(self):
+        (self.base / "tick_sleep").write_text("6")
+        self.add("f1")
+        self.assertTrue(self.wait_for(lambda: len([t for t in self.ticks() if t[0] == "end"]) >= 1, 12.0), "no tick finished")
+        self.assertEqual(len([t for t in self.ticks() if t[0] == "start"]), 1)    # none started while the first ran
+        first_end = float([t for t in self.ticks() if t[0] == "end"][0][1])
+        self.assertTrue(self.wait_for(lambda: len([t for t in self.ticks() if t[0] == "start"]) >= 2, 12.0), "no second tick")
+        second_start = float([t for t in self.ticks() if t[0] == "start"][1][1])
+        # last_tick moves only when a tick is started: the second one starts at the next check (about a second), not 5 s later
+        self.assertLess(second_start - first_end, 3.0)
+
+    def test_a_task_outside_the_window_whose_files_changed_is_asked_about_so_its_record_is_refreshed(self):
+        for n in range(1, 9):
+            self.add("f%d" % n)
+        self.first_frame(b"f8", settle=0.5)
+        self.assertTrue(self.asked())
+        self.assertTrue(all("f1" not in line.split() for line in self.asked()))     # the oldest is outside the window of 3
+        before = len(self.asked())
+        self.add("f1", **{"collected.json": {"at": "2026-01-01T00:00:00Z"}})
+        self.assertTrue(self.wait_for(lambda: any("f1" in line.split() for line in self.asked()[before:]), 8.0),
+                        "tp-contract status was not asked about f1: %r" % self.asked()[before:])
+        before = len(self.asked())
+        self.output(2.5)                                                        # once only: the next loads leave it alone
+        self.assertTrue(all("f1" not in line.split() for line in self.asked()[before:]), self.asked())
 
 
 class StatusEchoTtyTest(StatusPaneFixture):

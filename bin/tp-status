@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # tp-status — interactive subagent list for the status slot.
 #
-# Keys:  j/k or ↑/↓   move
+# Keys:  j/k or ↑/↓   move (past the first or last row it loads older or newer tasks)
+#        g / G        top / bottom of the whole list (also Home / End)
+#        PgUp / PgDn  move a page
 #        enter        show the selected subagent in the viewer
 #        s            toggle session token usage page (by model; legacy bucket separate)
 #        click        left-click a subagent row = enter (other lines ignored)
@@ -13,7 +15,15 @@
 #
 # Checks every second, painting only when the displayed frame changes, from each task's state.json (written by the reporters)
 # and its pane. A key only redraws from what the last check read (load_data); only the once-a-second timer, and a key that
-# changes something (view, kill, clean, read), reads the task records again. States (bin/tp-contract status): starting, working, needs_input,
+# changes something (view, kill, clean, read, or a move past the loaded window), reads the task records again.
+#
+# However many tasks the session has, the pane holds a window of them (lib/tp_window.py): the newest $TP_STATUS_WINDOW
+# (60), and every task that is starting, working, needs_input or paused whatever its age. Older tasks are read from their
+# records when a key moves to them (j/k at the first row, PgUp, g). Nothing on disk is deleted. When the newest task is
+# selected the pane follows new workers; a task outside the window whose files changed gets its record (task.md) refreshed
+# through tp-contract status (the C lines of tp_window.py); a background tick (tp-agent tick) that fails, or runs over a
+# minute, is said in the footer on every frame until a later one succeeds; once the selection is anywhere else it stays put and the header says
+# "new worker below" until G or moving down reaches the newest again. States (bin/tp-contract status): starting, working, needs_input,
 # paused, settled (a reply is ready), completed (handed off), failed, killed, stopped (tp-kill),
 # escalated. Under each row: elapsed time, turns, tool calls, for a contract (M9)
 # its checkpoint state and when its artifact was last written, and for settled work
@@ -33,13 +43,24 @@ source "$ROOT/lib/tp.sh"
 session="$(tp_session)" || exit 1
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 tasks="$state_dir/tasks"
-last_tick=0
+last_tick=-5 tick_pid="" tick_note=""   # tick_note: why the background tick is not doing its work, shown in the footer
+keep="${TP_STATUS_WINDOW-60}"
+[[ "$keep" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "tp-status: TP_STATUS_WINDOW must be a positive number, not '$keep'" >&2; exit 1; }
+# What lib/tp_window.py learns about the tasks is kept between refreshes in this file, so a refresh reads only the records
+# that changed. It is derived from the task files, private to this process, and removed with it.
+cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/tp-status.XXXXXX")" || { echo "tp-status: cannot make a cache directory" >&2; exit 1; }
 
 esc=$'\e'
 reset="${esc}[0m" bold="${esc}[1m" dim="${esc}[2m" rev="${esc}[7m"
 red="${esc}[31m" green="${esc}[32m" yellow="${esc}[33m" magenta="${esc}[35m" cyan="${esc}[36m"
 
 selected=""   # id of the selected row; kept across refreshes
+follow=1      # 1 while the newest task is selected: a new worker is selected and scrolled to
+win_start=newest   # where the loaded window starts: a list position, or newest while following
+wstart=0 total=0 newest="" prev_newest="" seen_newest="" new_below=0   # from the last load
+want="" want_pos=""   # what to select once a slid window has loaded: first / last row (g, G), or the row at a list position
+row_pos=()    # list position of each row in ids
+page_step=10  # rows a page key moves (the rows the last frame could show, less one)
 message=""    # one-line feedback shown in the footer
 ids=()
 last_frame="" last_cols="" last_lines=""
@@ -63,6 +84,7 @@ if [[ -t 0 ]] && command -v stty >/dev/null 2>&1; then
   if [[ -n "$tty_saved" ]]; then stty -echo -icanon min 1 time 0 2>/dev/null || tty_saved=""; fi
 fi
 cleanup() {
+  [[ -z "$cache_dir" ]] || rm -rf -- "$cache_dir"
   printf '%s[?1006l%s[?1000l%s[?25h%s[0m' "$esc" "$esc" "$esc" "$esc"
   if [[ -n "$tty_saved" ]]; then stty "$tty_saved" 2>/dev/null; fi
   return 0
@@ -89,90 +111,123 @@ clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-
 # pad <width> <text> — left-align in characters (printf pads bytes, and ▸ ↑ ↓ are multibyte).
 pad() { local t="$2"; printf -v R '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }
 
-# usage_summary — honest session token usage, one line per output line.
-# New states carry byModel (counted per message); states without it, and any
-# tokens byModel does not account for, go to an "unattributed" bucket rather
-# than being assigned to the last-reported model. Cache reads/writes stay apart
-# from uncached input. Claude cost is unknown (costKnown:false), never $0.
-usage_summary() {
-  local files=() f nt=0
-  for f in "$tasks"/*/state.json; do [[ -f "$f" ]] && files+=("$f"); done
-  nt=$(find "$tasks" -mindepth 2 -maxdepth 2 -name meta.json 2>/dev/null | wc -l)
-  main_state="$(dirname "$tasks")/main/state.json"
-  [[ -f "$main_state" ]] && files+=("$main_state")
-  (( ${#files[@]} )) || return 0
-  jq -nr --argjson nt "$nt" --arg main "$main_state" '
-    def k: if . >= 1000000 then "\(. / 100000 | floor / 10)M"
-           elif . >= 1000 then "\(. / 100 | floor / 10)k" else tostring end;
-    def num: if type == "number" then . else 0 end;
-    def tk: {input: (.input|num), output: (.output|num), cacheRead: (.cacheRead|num), cacheWrite: (.cacheWrite|num)};
-    def zero: {input:0, output:0, cacheRead:0, cacheWrite:0};
-    def plus($b): {input: (.input + $b.input), output: (.output + $b.output), cacheRead: (.cacheRead + $b.cacheRead), cacheWrite: (.cacheWrite + $b.cacheWrite)};
-    def minus0($b): {input: ([.input - $b.input, 0] | max), output: ([.output - $b.output, 0] | max), cacheRead: ([.cacheRead - $b.cacheRead, 0] | max), cacheWrite: ([.cacheWrite - $b.cacheWrite, 0] | max)};
-    def sum: reduce .[] as $t (zero; plus($t));
-    def empty4: (.input + .output + .cacheRead + .cacheWrite) == 0;
-    def costtxt: (map(select(.cost != null) | .cost) | add // 0) as $c
-      | (map(select(.cost == null)) | length > 0) as $u
-      | if $u then (if $c > 0 then "$\($c * 1000 | round / 1000)+?" else "$?" end) else "$\($c * 1000 | round / 1000)" end;
-    def counts: "  in \(.input|k)  cache-read \(.cacheRead|k)  cache-write \(.cacheWrite|k)  out \(.output|k)";
-    [inputs | select(type == "object") | {f: input_filename, s: .}] as $all
-    | [ $all[] | select((.s.tokens | type) == "object" or (.s.byModel | type) == "object") ] as $used
-    | [ $used[] | .s as $s
-        | (($s.harness == "claude") or ($s.costKnown == false)) as $unk
-        | (if ($s.byModel | type) == "object" then $s.byModel else {} end) as $bm
-        | ($bm | to_entries | map({model: .key, t: (.value | tk), cost: (if $unk then null else (.value.cost | if type == "number" then . else null end) end)})) as $att
-        | ($s.tokens | if type == "object" then tk else zero end) as $tot
-        | ($att | map(.t) | sum) as $got
-        | ($tot | minus0($got)) as $rem
-        | ((($s.cost | num) - ($att | map(.cost // 0) | add // 0)) | [., 0] | max) as $remcost
-        | $att
-          + (if ($rem | empty4) and ($att | length) > 0 then []
-             else [{model: null, t: (if ($att | length) > 0 then $rem else $tot end),
-                    cost: (if $unk then null else $remcost end), last: ($s.model // ""), partial: (($att | length) > 0)}] end)
-      ] | flatten as $ents
-    | ($ents | map(select(.model != null)) | group_by(.model) | map({model: .[0].model, t: (map(.t) | sum), cost: map({cost})})) as $models
-    | ($ents | map(select(.model == null and (.t | empty4 | not)))) as $leg
-    | ($used | length) as $nrec
-    | ([ $used[] | {f, zero: (.s | (if (.tokens | type) == "object" then (.tokens | tk) else ((.byModel // {}) | [.[] | tk] | sum) end) | empty4)} ]) as $recs
-    | ([ $recs[] | select(.f != $main) ] | length) as $nwork
-    | ([ $recs[] | select(.zero) ] | length) as $nzero
-    | (if ($recs | map(select(.f == $main)) | length) > 0 then 1 else 0 end) as $hasmain
-    | "session tokens (per-message by model; cache separate)",
-      ($models[] | "\(.model)", "\(.t | counts)  \(.cost | costtxt)"),
-      (if ($leg | length) > 0 then
-         ($leg | map(.last | select(. != "")) | unique) as $lasts
-         | "unattributed (legacy/partial; model switches not ruled out)",
-           "\($leg | map(.t) | sum | counts)  \($leg | map({cost}) | costtxt)",
-           (if ($lasts | length) > 0 then "  last reported model: \($lasts | join(", ")) (not an attribution)" else empty end)
-       else empty end),
-      ([$models[].t] + [$leg[].t] | sum | "total\(counts)"),
-      "records \($nrec) (main \($hasmain), workers \($nwork)); zero-token \($nzero); workers with no usage data \([$nt - $nwork, 0] | max)"
-  ' "${files[@]}" 2>/dev/null
+# parse_window <output of lib/tp_window.py> — the task rows (R lines), the usage summary (U lines) and the window's
+# facts (H line: total tasks, where the window starts, the newest task, each row's list position).
+parse_window() {
+  local line pos
+  rows="" usage_lines=() row_pos=() changed_ids=()
+  while IFS= read -r line; do
+    case "$line" in
+      H*) IFS=$'\x1f' read -r _ total wstart newest pos <<<"$line"
+          IFS=, read -ra row_pos <<<"$pos" ;;
+      R*) rows+="${line:1}"$'\n' ;;
+      C*) changed_ids+=("${line:1}") ;;
+      U*) usage_lines+=("${line:1}") ;;
+    esac
+  done <<<"$1"
+  rows="${rows%$'\n'}"
 }
 
-# load_data — read everything the frame is drawn from: the task rows, their lifecycle details, the viewed task, the
-# queue, the pane size, the usage page. render draws from these variables alone, so redrawing (a key that only moves
-# the selection or scrolls) reads no file and runs no program. Per row (lib/tp_detail.py, one process for all rows):
-# final status, detail line, and the first lines of task.md and result.md that the selected row shows.
+# in_ids <id> — is the task one of the loaded rows?
+in_ids() { local i; for i in "${!ids[@]}"; do [[ "${ids[$i]}" == "$1" ]] && return 0; done; return 1; }
+
+# pick_wanted — select what a key asked for once the window it asked for has loaded: the first or last row (g, G), or the
+# row at (the nearest to) the list position a move past the loaded rows asked for.
+pick_wanted() {
+  local i n=${#ids[@]} best=-1 gap
+  (( n > 0 )) || { want="" want_pos=""; return 0; }
+  case "$want" in
+    first) selected="${ids[0]}" ;;
+    last) selected="${ids[n - 1]}" ;;
+  esac
+  if [[ -n "$want_pos" ]]; then
+    for (( i = 0; i < n; i++ )); do
+      gap=$(( row_pos[i] > want_pos ? row_pos[i] - want_pos : want_pos - row_pos[i] ))
+      if (( best < 0 || gap < best )); then best=$gap selected="${ids[i]}"; fi
+    done
+  fi
+  want="" want_pos=""
+}
+
+# settle_follow — follow new workers exactly while the newest task is the selected one. Anywhere else the window stays
+# where it is, and the newest task seen is remembered so a newer one can be announced.
+settle_follow() {
+  if [[ -z "$newest" || "$selected" == "$newest" ]]; then
+    follow=1 win_start=newest seen_newest=""
+  else
+    if (( follow )); then seen_newest="$newest"; fi
+    follow=0 win_start="$wstart"
+  fi
+  new_below=0
+  if (( ! follow )) && [[ "$newest" != "$seen_newest" ]]; then new_below=1; fi
+}
+
+# tick_check — look at the background tick (tp-agent tick) started earlier without waiting for it. One that ended with a
+# failure leaves tick_note, which the footer shows on every frame until a later tick succeeds; one that is still running
+# after a minute is said too. The pane keeps painting either way.
+tick_check() {
+  local rc=0 detail
+  [[ -n "$tick_pid" ]] || return 0
+  if kill -0 "$tick_pid" 2>/dev/null; then
+    (( SECONDS - last_tick > 60 )) && tick_note="background tick has run for $(( SECONDS - last_tick )) s"
+    return 0
+  fi
+  wait "$tick_pid" 2>/dev/null || rc=$?
+  tick_pid=""
+  if (( rc == 0 )); then tick_note=""; return 0; fi
+  detail="$(head -c 160 "$cache_dir/tick.err" 2>/dev/null | tr '\n' ' ')"
+  tick_note="background tick failed (exit $rc)${detail:+: $detail}"
+}
+
+# load_data — read everything the frame is drawn from: the task rows of the window, their lifecycle details, the viewed
+# task, the queue, the pane size, the usage page. render draws from these variables alone, so redrawing (a key that only
+# moves the selection or scrolls) reads no file and runs no program. One process (lib/tp_window.py) picks the window
+# and reads only the task records that changed since the last load; another (lib/tp_detail.py) works out, per row: final
+# status, detail line, and the first lines of task.md and result.md that the selected row shows. The lifecycle details
+# (tp-contract status) are asked for only the rows shown.
 rows="" details="" current="" has_queue=0 nq=0 cols=80 frame_lines=24
 rc_status=() rc_detail=() rc_has_reply=() rc_task=() rc_reply=()   # per row index
-usage_lines=() queue_lines=()
+usage_lines=() queue_lines=() changed_ids=()   # changed_ids: tasks outside the window whose files changed since the last load
 load_data() {
-  local clock id queued line
-  clock="$(date +%s)"
-  if (( clock - last_tick >= 5 )); then
-    "$ROOT/bin/tp-agent" tick >/dev/null 2>&1 || true
-    last_tick="$clock"
+  local out id queued line panes pass
+  tick_check
+  if (( SECONDS - last_tick >= 5 )) && [[ -z "$tick_pid" ]]; then   # tp-agent tick reads every record; never wait for it here
+    "$ROOT/bin/tp-agent" tick >/dev/null 2>"$cache_dir/tick.err" &
+    tick_pid=$! last_tick=$SECONDS   # last_tick moves only when a tick was started, not while the last one still runs
   fi
   cols="$(tput cols)"
   frame_lines="$(tput lines)"
-  rows="$(tp_rows "$session")"
+  panes="$(tmux list-panes -a -F '#{pane_id} #{pane_dead}')"
+  for pass in 1 2; do
+    if ! out="$(python3 "$TP_LIB_DIR/tp_window.py" "$tasks" "$panes" "$cache_dir/window.json" "$keep" "$win_start" 2>"$cache_dir/err")"; then
+      message="cannot read the task list: $(head -c 200 "$cache_dir/err" | tr '\n' ' ')"
+      return 0
+    fi
+    parse_window "$out"
+    ids=()
+    if [[ -n "$rows" ]]; then
+      while IFS=$'\x1f' read -r id _; do ids+=("$id"); done <<<"$rows"
+    fi
+    pick_wanted
+    if (( follow )) && [[ -n "$newest" ]] && [[ -z "$selected" || "$newest" != "$prev_newest" ]]; then selected="$newest"; fi
+    prev_newest="$newest"
+    # A selection that is no longer a row (cleaned away, or aged out of a window that was not following): the newest.
+    if [[ -n "$selected" ]] && ! in_ids "$selected"; then
+      selected="$newest" follow=1 win_start=newest
+      (( pass == 1 )) && continue   # load the window of the newest tasks
+    fi
+    break
+  done
+  settle_follow
   details=""
-  if [[ -n "$rows" ]]; then details="$("$ROOT/bin/tp-contract" status 2>/dev/null)"; fi
+  # Asked for: the rows shown, and the tasks outside the window whose files just changed (C lines): tp-contract status is the
+  # writer of task.md, so asking is what keeps the record of a task nobody is looking at from going stale.
+  if [[ -n "$rows" || ${#changed_ids[@]} -gt 0 ]]; then
+    details="$("$ROOT/bin/tp-contract" status "${ids[@]}" "${changed_ids[@]}" 2>/dev/null)"
+  fi
   current="$(tp_opt "$session" @tp_viewing)"
-  ids=() rc_status=() rc_detail=() rc_has_reply=() rc_task=() rc_reply=()
+  rc_status=() rc_detail=() rc_has_reply=() rc_task=() rc_reply=()
   if [[ -n "$rows" ]]; then
-    while IFS=$'\x1f' read -r id _; do ids+=("$id"); done <<<"$rows"
     local st de hr tf rf
     while IFS=$'\x1f' read -r st de hr tf rf; do
       rc_status+=("$st") rc_detail+=("$de") rc_has_reply+=("$hr") rc_task+=("$tf") rc_reply+=("$rf")
@@ -183,8 +238,6 @@ load_data() {
   nq=${#qfiles[@]}
   has_queue=0
   if compgen -G "$state_dir/queue/*.json" >/dev/null; then has_queue=1; fi
-  usage_lines=()
-  while IFS= read -r line; do usage_lines+=("$line"); done < <(usage_summary)   # no mapfile in bash 3.2
   queue_lines=()
   if (( nq )); then
     while IFS= read -r line; do queue_lines+=("$line"); done < <(tp_queue_lines "$state_dir")
@@ -204,6 +257,15 @@ render() {
   if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
   if (( ${#ids[@]} == 0 )); then selected=""; fi
 
+  # A tick that failed (or that runs too long) is flagged in the header, which every page and every pane height draws; the
+  # footer carries the words, but the usage page and a compact pane have no footer.
+  tick_flag=""
+  case "$tick_note" in
+    "background tick failed"*) tick_flag=" · ⚠ tick failed" ;;
+    "") ;;
+    *) tick_flag=" · ⚠ tick slow" ;;
+  esac
+
   if [[ "$page" == stats ]]; then
     # Usage page: bounded to the pane, no clickable rows, any overflow counted.
     local nl keep=$(( frame_lines - 2 ))
@@ -216,8 +278,8 @@ render() {
     fi
     out=""
     for line in "${ul[@]}"; do clip "$cols" "$line"; out+="${dim}${R}${reset}${esc}[K"$'\n'; done
-    clip $((cols - 8)) "s back to list"
-    header="${esc}[H${bold}usage${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
+    clip $((cols - 8 - ${#tick_flag})) "s back to list"
+    header="${esc}[H${bold}usage${tick_flag}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
     frame="${header}${out}${esc}[J"
     return 0
   fi
@@ -249,8 +311,8 @@ render() {
         sel_text+="${dim}reply ${reset}${R}${esc}[K"$'\n'; sel_n=5
       fi
     fi
-    if [[ -n "$message" ]]; then
-      clip "$cols" "$message"
+    if [[ -n "$message" || -n "$tick_note" ]]; then   # a key's feedback first; the tick's failure otherwise, until it is gone
+      clip "$cols" "${message:-$tick_note}"
       msg_text="${esc}[K"$'\n'"${yellow}${R}${reset}${esc}[K"$'\n'; msg_n=2
     fi
   fi
@@ -266,6 +328,7 @@ render() {
   (( ! compact && need <= area )) && full=1
   vis=$n; (( vis > area )) && vis=$area
   (( full )) && vis=$n
+  page_step=$(( vis > 2 ? vis - 1 : 1 ))
   # Keep the selected task inside the visible window of an overflowing list.
   if (( vis >= n )); then top=0; elif (( vis > 0 )); then
     (( sel_index < top )) && top=$sel_index
@@ -315,8 +378,10 @@ render() {
   fi
   out+="$sum_text$sel_text$msg_text"
   count_label="subagents $agents"
-  if (( agents < ${#ids[@]} )); then count_label+="/${#ids[@]}"; fi
-  clip $((cols - ${#count_label} - 2)) "s stats · click/j/k move · enter view · o focus · - clear · r result · t packet · x kill · c clean"
+  if (( agents < total )); then count_label+="/$total"; fi
+  if (( new_below )); then count_label+=" · ↓ new worker (G)"; fi
+  count_label+="$tick_flag"
+  clip $((cols - ${#count_label} - 2)) "s stats · click/j/k move · g/G top/bottom · PgUp/PgDn · enter view · o focus · - clear · r result · t packet · x kill · c clean"
   header="${esc}[H${bold}${count_label}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
   (( compact )) || header+="${esc}[K"$'\n'
   frame="${header}${out}${esc}[J"
@@ -333,16 +398,37 @@ paint() {
   fi
 }
 
+# move <rows> — move the selection by that many tasks of the whole list. A task that is loaded is selected at once; one
+# that is not (past the first or last loaded row, or in a gap between an old active task and the rest) is asked for: the
+# window slides to put it in the middle and the next load reads it.
 move() {
-  local i n=${#ids[@]}
+  local i idx=-1 n=${#ids[@]} pos target
   (( n > 0 )) || return 0
-  for i in "${!ids[@]}"; do
-    if [[ "${ids[$i]}" == "$selected" ]]; then
-      i=$(( i + $1 )); (( i < 0 )) && i=0; (( i >= n )) && i=$(( n - 1 ))
-      selected="${ids[$i]}"; return 0
-    fi
+  for i in "${!ids[@]}"; do if [[ "${ids[$i]}" == "$selected" ]]; then idx=$i; fi; done
+  (( idx >= 0 )) || return 0
+  pos=${row_pos[idx]}
+  target=$(( pos + $1 ))
+  (( target < 0 )) && target=0
+  (( target > total - 1 )) && target=$(( total - 1 ))
+  (( target == pos )) && return 0
+  for i in "${!row_pos[@]}"; do
+    if (( row_pos[i] == target )); then selected="${ids[$i]}"; settle_follow; return 0; fi
   done
+  leave_follow
+  win_start=$(( target - keep / 2 )); (( win_start > total - keep )) && win_start=$(( total - keep )); (( win_start < 0 )) && win_start=0
+  want_pos=$target reload=1
 }
+
+# leave_follow — the selection is about to leave the newest task: remember which one that was.
+leave_follow() { if (( follow )); then seen_newest="$newest"; fi; follow=0; }
+
+# go_top / go_bottom — g and G: the oldest and the newest task of the whole list.
+go_top() {
+  leave_follow
+  if (( wstart == 0 && ${#ids[@]} > 0 )); then selected="${ids[0]}"; settle_follow; return 0; fi
+  win_start=0 want=first reload=1
+}
+go_bottom() { follow=1 win_start=newest want=last reload=1; }
 
 # run <cmd...> — run a tp-* command, showing its error (if any) in the footer.
 run() { local err; if ! err="$("$@" 2>&1 >/dev/null)"; then message="${err##*: }"; fi; }
@@ -362,7 +448,8 @@ popup() {
 # per event; the frame still refreshes at most once a second meanwhile.
 #
 # reload: read the task records again (load_data). The timer sets it, and so does any key that changes what is
-# shown (view, focus, clear, read, clean, kill, click). dirty: only redraw from what was last read (j/k, s).
+# shown (view, focus, clear, read, clean, kill, click, g/G, a move past the loaded window). dirty: only redraw from what
+# was last read (j/k, PgUp/PgDn inside the window, s).
 dirty=1 reload=1 painted_at=-1
 while true; do
   if (( dirty || reload || SECONDS != painted_at )); then
@@ -393,14 +480,20 @@ while true; do
           *) break ;;
         esac
       done
+    elif [[ "$c" == O ]]; then   # application-mode keys (ESC O H / ESC O F): one more byte
+      IFS= read -rsn1 -t 1 c && rest="$c"
     fi
     case "$rest" in
       A) key=k ;;
       B) key=j ;;
+      H|1~|7~) key=g ;;   # Home
+      F|4~|8~) key=G ;;   # End
+      5~) key=pgup ;;
+      6~) key=pgdn ;;
       # SGR mouse "<b;x;yM": only a plain left press (b=0) on a task row acts.
       "<0;"*";"*M)
         if [[ "$rest" =~ ^\<0\;[0-9]+\;([0-9]+)M$ && -n "${row_ids[${BASH_REMATCH[1]}]:-}" ]]; then
-          selected="${row_ids[${BASH_REMATCH[1]}]}"
+          selected="${row_ids[${BASH_REMATCH[1]}]}"; settle_follow
           run "$ROOT/bin/tp-view" "$selected"
           dirty=1 reload=1
         fi ;;
@@ -412,6 +505,10 @@ while true; do
     s) if [[ "$page" == stats ]]; then page=list; else page=stats; fi ;;
     j) move 1 ;;
     k) move -1 ;;
+    g) go_top ;;
+    G) go_bottom ;;
+    pgup) move $(( -page_step )) ;;
+    pgdn) move "$page_step" ;;
     "") if [[ -n "$selected" ]]; then run "$ROOT/bin/tp-view" "$selected"; fi; reload=1 ;;
     o)
       reload=1

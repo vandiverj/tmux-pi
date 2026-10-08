@@ -34,3 +34,8 @@ fi
 python3 "$helper" finish "$task_dir" "$pane"
 printf '{"stopped":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$task_dir/stopped.json.tmp"
 mv "$task_dir/stopped.json.tmp" "$task_dir/stopped.json"
+# The record (task.md) says "stopped" from now on, not what it said before; the stop stands if this cannot be done.
+problem="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from task_record import refresh_record; print(refresh_record(sys.argv[2], sys.argv[3]))' \
+  "$ROOT/lib" "$(dirname "$(dirname "$task_dir")")" "$id")" || problem="the record refresh did not run"
+[[ -z "$problem" ]] || echo "tp-kill: $problem" >&2
+exit 0

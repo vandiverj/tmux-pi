@@ -221,7 +221,9 @@ echo review-1
             self.assertIn("first line of your final reply must be exactly APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES", task)
             self.assertIn("Return every finding in this one pass, ranked most severe first", task)
             self.assertIn("'defect'", task)
-            self.assertIn("'design disagreement'", task)
+            self.assertIn("'note'", task)
+            self.assertIn("Notes are returned in full but never justify another round", task)
+            self.assertIn("REQUEST_CHANGES only when at least one finding is a defect", task)
             self.assertIn("name the family it belongs to", task)
             self.assertNotIn("review round", task)  # a first review does not claim earlier rounds
             self.assertRegex(task, r"RESULT_STATUS: complete\|empty\|blocked\|incomplete on the second line")

@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Owner command: grant, revoke, list, show and check per-repository trust records (T7, slice 2).
+
+A record says "this working tree holds no credentials". Only a person at a terminal can write or
+remove one: grant and revoke need stdin and /dev/tty to be terminals and a random code typed back
+from /dev/tty. Everything that decides whether a record counts is lib/trust.py, the reader the
+classifier will use; this command adds no judgment of its own to `check`.
+
+Every check that decides a grant or revoke is one `if` carrying a `check:<name>` comment marker.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import secrets
+import signal
+import stat
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import sensitive_read  # noqa: E402
+import trust  # noqa: E402
+
+WORDS = ("amber", "birch", "cedar", "delta", "ember", "fjord", "grove", "harbor", "ivory", "jasper",
+         "kelp", "lunar", "maple", "nectar", "onyx", "pearl", "quartz", "raven", "sable", "tundra",
+         "umber", "velvet", "willow", "yarrow", "zephyr", "basalt", "coral", "dune", "flint", "glacier",
+         "heron", "indigo")
+SCAN_ENTRIES = 200000
+SCAN_SECONDS = 10.0
+SHOW_FINDINGS = 30
+MAX_DAYS = 3650
+TMP_PREFIX = ".grant-"
+_ID = re.compile(r"^[0-9a-f]{8,32}$")
+_CRED_PAIRS = frozenset(p for p in sensitive_read.SENSITIVE_PAIRS if p[0] != ".git")
+_GIT_PAIRS = frozenset(p for p in sensitive_read.SENSITIVE_PAIRS if p[0] == ".git")
+_CRED_SINGLE = frozenset(sensitive_read.SENSITIVE_DIR)
+
+
+class Refused(Exception):
+    pass
+
+
+def clean(text, limit=300):
+    """Printable ASCII only: names come from a tree a worker may have written."""
+    out = "".join(c if " " <= c <= "~" else "?" for c in str(text))
+    return out if len(out) <= limit else out[:limit] + "..."
+
+
+def say(text=""):
+    print(text)
+
+
+# ---- paths and settings -------------------------------------------------------------------------
+
+class Env:
+    """Where things live. Only tests override anything, and only together with --trust-dir."""
+
+    def __init__(self, args):
+        self.test = args.trust_dir is not None
+        if not self.test and (args.home or args.temp_root):
+            raise Refused("--home and --temp-root are for tests and need --trust-dir")
+        self.home = os.path.realpath(args.home) if args.home else trust.home_dir()
+        self.dir = args.trust_dir or os.path.join(trust.home_dir(), ".config", "tmux-pi", "trust")
+        self.temp_roots = tuple(args.temp_root) if args.temp_root else trust.DEFAULT_TEMP_ROOTS
+        self.log = os.path.join(os.path.dirname(os.path.normpath(self.dir)), "state", "trust", "skipped.jsonl")
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# ---- resolving what the owner named -------------------------------------------------------------
+
+def resolve_root(path):
+    """(real top, main root, kind) for the repository root named by `path`, or Refused."""
+    if not os.path.lexists(path):
+        raise Refused("no such path: %s" % clean(path))
+    if os.path.islink(path.rstrip(os.sep) or os.sep):                                 # check:symlink_arg
+        raise Refused("%s is a symbolic link; name the real directory" % clean(path))
+    real = os.path.realpath(path)
+    if not os.path.isdir(real):
+        raise Refused("not a directory: %s" % clean(real))
+    top, kind, main = trust.tree_info(real)
+    if kind == "none" or kind == "gitfile":                                            # check:not_git
+        raise Refused("%s is not a git repository root (kind: %s)" % (clean(real), kind))
+    if top != real:                                                                    # check:not_top
+        raise Refused("%s is inside the repository at %s; name its root" % (clean(real), clean(top)))
+    return real, main, kind
+
+
+def _credential_path(parts):
+    return any(p in _CRED_SINGLE for p in parts) or any(tuple(parts[i:i + 2]) in _CRED_PAIRS
+                                                        for i in range(len(parts)))
+
+
+def breadth_refusal(main, env):
+    """Why a root is too broad or in a place the reader would ignore, else None."""
+    tdir = os.path.realpath(env.dir)
+    cfg = os.path.dirname(os.path.dirname(os.path.normpath(env.dir)))     # the config directory holding tmux-pi/
+    cfg = os.path.realpath(cfg) if os.path.isdir(cfg) else cfg
+    if main == os.sep:                                                                 # check:root_slash
+        return "the root of the file system"
+    if trust._within(env.home, main):                                                  # check:home
+        return "your home directory or a parent of it"
+    if trust._within(cfg, main):                                                       # check:config_ancestor
+        return "a parent of the config directory"
+    if trust._within(main, tdir) or trust._within(tdir, main):                         # check:trust_dir_overlap
+        return "the trust directory or a parent of it"
+    if any(trust._within(main, os.path.realpath(t)) for t in env.temp_roots):          # check:temp_root
+        return "inside a temporary directory"
+    if _credential_path([p for p in main.split(os.sep) if p]):                         # check:cred_path
+        return "inside a known credential location"
+    return None
+
+
+def find_record(arg, env):
+    """(root or None, file name) for a path or a record id from `list`."""
+    if _ID.match(arg) and not os.path.lexists(arg):
+        names = [n for n in sorted(os.listdir(env.dir)) if n.endswith(".json") and n.startswith(arg)] \
+            if os.path.isdir(env.dir) else []
+        if len(names) != 1:
+            raise Refused("no unique record with id %s" % arg if not names else "id %s is ambiguous" % arg)
+        text = trust._read_small(os.path.join(env.dir, names[0]), trust.MAX_RECORD)
+        try:
+            root = json.loads(text).get("root") if text else None
+        except ValueError:
+            root = None
+        return (root if isinstance(root, str) else None), names[0]
+    real, main, _ = resolve_root(arg)
+    return main, trust.record_name(main)
+
+
+# ---- scan ---------------------------------------------------------------------------------------
+
+def _hit(r):
+    """True for a path (tuple of names) the classifier's own list names as a credential location."""
+    return r[-1] in _CRED_SINGLE or (len(r) > 1 and tuple(r[-2:]) in _CRED_PAIRS)
+
+
+def scan(root):
+    """Names only, never contents, never following links. Returns a dict of findings.
+
+    Each directory is read as a stream and the budget is checked per entry, so one huge directory
+    cannot run past it. The root .git is read one level deep for the classifier's known locations
+    inside it (.git/config, .git/credentials); a .git below the root marks a nested repository.
+    """
+    found = {"strong": [], "locations": [], "nested": [], "entries": 0, "complete": True, "why": ""}
+    t0 = time.monotonic()
+    stack = [(root, ())]
+    while stack:
+        d, rel = stack.pop()
+        strong, locs, subdirs, nested, git_dir = [], [], [], False, None
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    found["entries"] += 1
+                    if found["entries"] > SCAN_ENTRIES or time.monotonic() - t0 > SCAN_SECONDS:
+                        found["complete"], found["why"] = False, "tree too large to scan fully"
+                        found["strong"] += strong
+                        found["locations"] += locs
+                        return found
+                    r = rel + (e.name,)
+                    if e.name == ".git":
+                        if rel:
+                            nested = True                                              # another repository
+                            break
+                        git_dir = e.path
+                        continue
+                    if sensitive_read.STRONG_NAME.match(e.name):
+                        strong.append("/".join(r))
+                    if _hit(r):
+                        locs.append("/".join(r))
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            subdirs.append((e.path, r))
+                    except OSError:
+                        pass
+        except OSError:
+            found["complete"], found["why"] = False, "a directory could not be read"
+        if nested:
+            found["nested"].append("/".join(rel))
+            continue
+        found["strong"] += strong
+        found["locations"] += locs
+        stack += subdirs
+        if git_dir:
+            if not _scan_git(git_dir, found, t0):
+                return found
+    return found
+
+
+def _scan_git(git_dir, found, t0):
+    """Names directly inside the root .git that the classifier lists. False when over budget."""
+    try:
+        if os.path.islink(git_dir) or not os.path.isdir(git_dir):
+            return True
+        with os.scandir(git_dir) as it:
+            for e in it:
+                found["entries"] += 1
+                if found["entries"] > SCAN_ENTRIES or time.monotonic() - t0 > SCAN_SECONDS:
+                    found["complete"], found["why"] = False, "tree too large to scan fully"
+                    return False
+                if (".git", e.name) in _GIT_PAIRS:
+                    found["locations"].append(".git/" + e.name)
+    except OSError:
+        found["complete"], found["why"] = False, "the .git directory could not be read"
+    return True
+
+
+def show_scan(found):
+    say("Scan (names only, links not followed, %d entries):" % found["entries"])
+    for label, key in (("strong credential file names", "strong"), ("credential locations", "locations"),
+                       ("nested repositories (not scanned)", "nested")):
+        items = sorted(found[key])
+        if not items:
+            say("  %s: none" % label)
+            continue
+        say("  %s: %d" % (label, len(items)))
+        for i in items[:SHOW_FINDINGS]:
+            say("    " + clean(i))
+        if len(items) > SHOW_FINDINGS:
+            say("    ... and %d more" % (len(items) - SHOW_FINDINGS))
+    if not found["complete"]:
+        say("  WARNING: scan incomplete (%s); there may be more." % found["why"])
+    # every repository has .git/config, so on its own it is listed but does not raise the warning
+    if found["strong"] or [i for i in found["locations"] if i != ".git/config"]:
+        say("  WARNING: this tree appears to hold credentials. The statement would be false for it.")
+
+
+# ---- the typed code -----------------------------------------------------------------------------
+
+def open_terminal():
+    """The controlling terminal, or Refused. Nothing is created before this succeeds."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):                               # check:stdin_tty
+        raise Refused("stdin and stdout must be a terminal; run this yourself in a terminal")
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        raise Refused("no controlling terminal (/dev/tty); run this yourself in a terminal")
+    return fd
+
+
+def ask_code(fd, what):
+    code = "-".join(secrets.choice(WORDS) for _ in range(4))
+    tty = clean(os.ttyname(fd)) if os.isatty(fd) else "?"
+    os.write(fd, ("\n%s\nTerminal: %s   Directory: %s\nType this code to confirm, anything else cancels:\n  %s\n> "
+                  % (what, tty, clean(os.getcwd()), code)).encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = os.read(fd, 256)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 512:
+            break
+    typed = buf.decode("utf-8", "replace").strip()
+    return secrets.compare_digest(typed.encode(), code.encode())                      # check:code
+
+
+def refuse_agent_env():
+    for name in ("TP_TASK_ID", "TP_TASK_DIR", "TP_MODE"):
+        if name in os.environ:                                                         # check:task_env
+            raise Refused("%s is set: this looks like an agent session; the owner runs this command" % name)
+
+
+class Interrupted(BaseException):
+    pass
+
+
+_state = {"committed": False}
+
+
+def _raise_interrupted(signum, frame):
+    """Cancel the operation, unless it has reached its commit point (the rename or unlink)."""
+    if not _state["committed"]:
+        raise Interrupted()
+
+
+def _step(name):
+    """A named point in a grant or revoke. Does nothing; tests make one of them fail."""
+
+
+def _fsync_dir(directory):
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+# ---- writing ------------------------------------------------------------------------------------
+
+def prepare_dir(env):
+    bad = trust._check_dir_chain(env.dir, env.home, env.temp_roots)
+    if bad == "absent":
+        os.makedirs(env.dir, mode=0o700, exist_ok=True)
+        bad = trust._check_dir_chain(env.dir, env.home, env.temp_roots)
+    if bad:                                                                            # check:dir_ok
+        raise Refused("the trust directory is not acceptable (%s)" % trust._WORDS.get(bad, bad))
+
+
+def sweep_temp(directory):
+    """Remove temporary files a killed grant left behind (the reader never looks at them)."""
+    for n in os.listdir(directory):
+        if n.startswith(TMP_PREFIX) and n.endswith(".tmp"):
+            p = os.path.join(directory, n)
+            try:
+                st = os.lstat(p)
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+                    os.unlink(p)
+            except OSError:
+                pass
+
+
+def _tmp_name(directory):
+    return os.path.join(directory, "%s%d-%s.tmp" % (TMP_PREFIX, os.getpid(), secrets.token_hex(4)))
+
+
+def _write_file(path, data, step):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        _step(step + "_write")
+        if os.write(fd, data) != len(data):
+            raise OSError("short write")
+        os.fchmod(fd, 0o400)
+        _step(step + "_fsync")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _quiet_unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _read_existing(path):
+    """Bytes of a regular record file at `path`, None when there is none. A link or odd file is not
+    kept as a copy: the rename replaces the directory entry and nothing is lost."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > trust.MAX_RECORD:
+        return None
+    with open(path, "rb") as f:
+        return f.read(trust.MAX_RECORD + 1)
+
+
+def commit_record(directory, name, rec, accept):
+    """Replace the record `name` with `rec`; returns a list of warnings.
+
+    Every step that can fail comes before the rename, which is the commit. The previous record
+    (if any) is kept as a copy until the new one has been read back through `accept(): reason or
+    None`. After the rename: a failed directory sync is only a warning; a new record the reader
+    does not accept is rolled back (the old one restored from the copy, or the new one removed).
+    Raises on any failure before the rename with the old record untouched, and Refused after a
+    rollback. A signal after the point of no return is held off, so the outcome is never "interrupted".
+    """
+    final = os.path.join(directory, name)
+    tmp, bak, warnings = _tmp_name(directory), None, []
+    try:
+        _step("tmp_create")
+        _write_file(tmp, (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode(), "tmp")
+        old = _read_existing(final)
+        _step("read_old")
+        if old is not None:
+            bak = _tmp_name(directory)
+            _write_file(bak, old, "bak")
+        _step("before_rename")
+        _state["committed"] = True
+        os.rename(tmp, final)
+    except BaseException:
+        _state["committed"] = False
+        _quiet_unlink(tmp)
+        if bak:
+            _quiet_unlink(bak)
+        raise
+    # Committed: the new record is in place. Nothing below may make the grant look failed unless
+    # the new record is also taken out again.
+    try:
+        _step("fsync_dir")
+        _fsync_dir(directory)
+    except OSError as e:
+        warnings.append("the directory could not be synced (%s); the record is in place" % clean(e))
+    try:
+        _step("verify")
+        reason = accept()
+    except Exception as e:
+        reason = "check failed: %s" % clean(e)
+    if reason:
+        try:
+            _step("rollback")
+            if bak:
+                os.rename(bak, final)
+                bak = None
+            else:
+                os.unlink(final)
+        except OSError as e:
+            where = " The previous record is kept at %s." % clean(bak) if bak else ""
+            raise Refused("the new record is not accepted by the reader (%s) and could not be taken out (%s)."
+                          "%s Run `tp-trust list`." % (reason, clean(e), where))
+        raise Refused("the new record is not accepted by the reader (%s); %s" % (
+            reason, "the previous record was restored" if old is not None else "it was removed"))
+    if bak:
+        try:
+            _step("cleanup")
+            os.unlink(bak)
+        except OSError:
+            warnings.append("a temporary copy of the old record was left in the trust directory")
+    return warnings
+
+
+# ---- commands -----------------------------------------------------------------------------------
+
+def cmd_grant(args, env):
+    refuse_agent_env()
+    if args.days is not None and not 1 <= args.days <= MAX_DAYS:
+        raise Refused("--days must be between 1 and %d" % MAX_DAYS)
+    note = args.note or ""
+    if len(note) > trust.MAX_NOTE or note != clean(note, 10 ** 6):                     # check:note
+        raise Refused("--note must be printable ASCII of at most %d characters" % trust.MAX_NOTE)
+    fd = open_terminal()
+    try:
+        real, main, kind = resolve_root(args.path)
+        why = breadth_refusal(main, env)
+        if why:
+            raise Refused("%s is %s" % (clean(main), why))
+        ident = os.lstat(main)
+        found = scan(main)
+        old = trust.load(main, env.dir, home=env.home, temp_roots=env.temp_roots)
+        say("Grant trust: \"%s\"" % trust.STATEMENT)
+        say("  Repository root: %s" % clean(main))
+        if real != main:
+            say("  (named from the linked worktree %s; the record covers the main root)" % clean(real))
+        say("  Linked worktrees inherit it: %s" % ("yes" if not args.no_worktrees else "no"))
+        say("  Expires: %s" % ("in %d days" % args.days if args.days else "never"))
+        if old.state != "absent":
+            say("  Replaces the existing record (%s)." % (old.state if old.trusted else "ignored: " + str(old.reason)))
+        show_scan(found)
+        sys.stdout.flush()
+        _state["committed"] = False
+        handlers = {n: signal.signal(n, _raise_interrupted) for n in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+        try:
+            if not ask_code(fd, "Granting trust for %s" % clean(main)):
+                raise Refused("code did not match; nothing written")
+            prepare_dir(env)
+            sweep_temp(env.dir)
+            # The tree must be the same one the owner was shown.
+            real2, main2, _ = resolve_root(args.path)
+            st2 = os.lstat(main2)
+            if (main2, st2.st_dev, st2.st_ino) != (main, ident.st_dev, ident.st_ino):  # check:changed
+                raise Refused("the directory changed while waiting; nothing written")
+            granted = now()
+            rec = {"version": trust.VERSION, "statement": trust.STATEMENT, "root": main,
+                   "root_dev": ident.st_dev, "root_ino": ident.st_ino, "worktrees": not args.no_worktrees,
+                   "granted_at": granted.strftime("%Y-%m-%dT%H:%M:%SZ"), "granted_by": "uid %d" % os.getuid(),
+                   "expires": (granted + datetime.timedelta(days=args.days)).isoformat(timespec="seconds")
+                   if args.days else None}
+            if note:
+                rec["note"] = note
+
+            def accept():
+                res = trust.load(main, env.dir, home=env.home, temp_roots=env.temp_roots)
+                return None if res.trusted else str(res.reason)                        # check:verify
+            warnings = commit_record(env.dir, trust.record_name(main), rec, accept)
+        finally:
+            for n, h in handlers.items():
+                signal.signal(n, h)
+            _state["committed"] = False
+    except Interrupted:
+        raise Refused("interrupted; nothing written")
+    finally:
+        os.close(fd)
+    for w in warnings:
+        say("WARNING: " + w)
+    say("Granted. Record %s." % trust.record_name(main)[:8])
+    return 0
+
+
+def cmd_revoke(args, env):
+    refuse_agent_env()
+    fd = open_terminal()
+    warnings = []
+    try:
+        root, name = find_record(args.target, env)
+        path = os.path.join(env.dir, name)
+        if not os.path.lexists(path):
+            raise Refused("no record for %s" % clean(args.target))
+        say("Revoke trust record %s for %s" % (name[:8], clean(root) if root else "(unreadable root)"))
+        _state["committed"] = False
+        handlers = {n: signal.signal(n, _raise_interrupted) for n in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+        try:
+            if not ask_code(fd, "Revoking trust record %s" % name[:8]):
+                raise Refused("code did not match; nothing removed")
+            _step("before_unlink")
+            _state["committed"] = True          # the unlink is the commit; nothing after it can undo it
+            try:
+                os.unlink(path)
+            except BaseException:
+                _state["committed"] = False
+                raise
+            try:
+                _step("fsync_dir")
+                _fsync_dir(env.dir)
+            except OSError as e:
+                warnings.append("the directory could not be synced (%s); the record is removed" % clean(e))
+        finally:
+            for n, h in handlers.items():
+                signal.signal(n, h)
+            _state["committed"] = False
+    except Interrupted:
+        raise Refused("interrupted; nothing removed")
+    finally:
+        os.close(fd)
+    for w in warnings:
+        say("WARNING: " + w)
+    say("Revoked.")
+    return 0
+
+
+def skip_counts(env):
+    """{record id: skips in the last 7 days} from the skip log, best effort."""
+    counts, cutoff = {}, now() - datetime.timedelta(days=7)
+    for line in tail_lines(env.log, 5000):
+        try:
+            ev = json.loads(line)
+            if ev.get("event") == "trust_skip" and isinstance(ev.get("record"), str) and \
+                    datetime.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00")) >= cutoff:
+                counts[ev["record"]] = counts.get(ev["record"], 0) + 1
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return counts
+
+
+def tail_lines(path, n, window=1 << 20):
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - window))
+            data = f.read(window)
+    except OSError:
+        return []
+    return data.decode("utf-8", "replace").splitlines()[-n:] if n > 0 else []
+
+
+def state_text(res):
+    return "trusted" if res.trusted else "absent" if res.state == "absent" else "ignored: %s" % \
+        trust._WORDS.get(res.reason, res.reason)
+
+
+def verdict(name, root, env):
+    """The reader's judgment of the file `name` holding a record for `root`. The reader opens only
+    the file named for a root, so a copy under another name is reported as the mismatch it is."""
+    if name != trust.record_name(root):                                                # check:list_name
+        return trust.Result("ignored", "name_mismatch")
+    return trust.load(root, env.dir, home=env.home, temp_roots=env.temp_roots)
+
+
+def cmd_list(args, env):
+    bad = trust._check_dir_chain(env.dir, env.home, env.temp_roots)
+    if bad == "absent":
+        say("No trust records (%s does not exist)." % clean(env.dir))
+        return 0
+    if bad:
+        say("WARNING: trust directory not acceptable (%s); the reader ignores every record." %
+            trust._WORDS.get(bad, bad))
+    counts = skip_counts(env)
+    n = 0
+    for name in sorted(os.listdir(env.dir)):
+        if not name.endswith(".json"):
+            continue
+        n += 1
+        text = trust._read_small(os.path.join(env.dir, name), trust.MAX_RECORD)
+        try:
+            rec = json.loads(text) if text else None
+        except ValueError:
+            rec = None
+        root = rec.get("root") if isinstance(rec, dict) and isinstance(rec.get("root"), str) else None
+        if root is None:
+            say("%s  (unreadable record)" % clean(name[:8]))
+            continue
+        res = verdict(name, root, env)
+        say("%s  %s  [%s]  granted %s  expires %s  skips(7d) %d" % (
+            name[:8], clean(root), state_text(res), clean(rec.get("granted_at")),
+            clean(rec.get("expires") or "never"), counts.get(name[:8], 0)))
+    if not n:
+        say("No trust records.")
+    return 0
+
+
+def cmd_show(args, env):
+    root, name = find_record(args.target, env)
+    path = os.path.join(env.dir, name)
+    text = trust._read_small(path, trust.MAX_RECORD)
+    if text is None:
+        say("No readable record file %s." % name)
+        return 1
+    say("File: %s" % clean(path))
+    say(clean(text.rstrip(), 5000))
+    say("Reader verdict: %s" % (state_text(verdict(name, root, env)) if root else "ignored: unreadable record"))
+    return 0
+
+
+def cmd_check(args, env):
+    res = trust.lookup(args.path, env.dir, home=env.home, temp_roots=env.temp_roots)
+    top, kind, main = trust.tree_info(args.path)
+    say("Path: %s" % clean(os.path.realpath(args.path)))
+    if kind in ("main", "worktree"):
+        say("Repository: %s (%s); record root %s" % (clean(top), kind, clean(main)))
+    if res.trusted:
+        via = "worktree" if kind == "worktree" else "root"
+        say("TRUSTED (via %s): %s" % (via, trust.STATEMENT))
+        return 0
+    why = {"no_repo": "not inside a git repository", "unverified_tree": "a .git file git's own links do not confirm",
+           "worktrees_off": "the record excludes linked worktrees", "absent": "no trust record for this repository"}
+    say("NOT trusted: %s" % (why.get(res.reason) or "record ignored: " + trust._WORDS.get(res.reason, str(res.reason))))
+    return 1
+
+
+def cmd_log(args, env):
+    if args.n < 1:
+        raise Refused("-n must be at least 1")
+    lines = tail_lines(env.log, args.n)
+    if not lines:
+        say("No skip log entries (%s)." % clean(env.log))
+    for ln in lines:
+        say(clean(ln, 2000))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="tp-trust", description=__doc__.splitlines()[0])
+    p.add_argument("--trust-dir", help=argparse.SUPPRESS)
+    p.add_argument("--home", help=argparse.SUPPRESS)
+    p.add_argument("--temp-root", action="append", help=argparse.SUPPRESS)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("grant", help="trust a repository (needs a terminal and a typed code)",
+                       epilog="The scan lists names only. Because you are at a terminal it may look at up to "
+                              "%d entries or %d seconds (the classifier's own walk uses 20,000 entries and 1 "
+                              "second); past that it warns that the scan is incomplete."
+                              % (SCAN_ENTRIES, SCAN_SECONDS))
+    g.add_argument("path")
+    g.add_argument("--days", type=int, help="expire after N days (default: never)")
+    g.add_argument("--note", help="owner text, up to 200 printable characters")
+    g.add_argument("--no-worktrees", action="store_true", help="linked worktrees do not inherit the record")
+    r = sub.add_parser("revoke", help="remove a record (needs a terminal and a typed code)")
+    r.add_argument("target", help="repository path or record id from `list`")
+    sub.add_parser("list", help="all records, with the reader's verdict and recent skip counts")
+    s = sub.add_parser("show", help="print one record and the reader's verdict")
+    s.add_argument("target")
+    c = sub.add_parser("check", help="say why a path is or is not trusted (exit 0 only when trusted)")
+    c.add_argument("path")
+    lg = sub.add_parser("log", help="tail the skip log")
+    lg.add_argument("-n", type=int, default=50)
+    args = p.parse_args(argv)
+    try:
+        env = Env(args)
+        return {"grant": cmd_grant, "revoke": cmd_revoke, "list": cmd_list, "show": cmd_show,
+                "check": cmd_check, "log": cmd_log}[args.cmd](args, env)
+    except Refused as e:
+        print("tp-trust: %s" % e, file=sys.stderr)
+        return 1
+    except OSError as e:
+        print("tp-trust: %s" % clean(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

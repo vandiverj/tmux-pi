@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import router_catalog  # noqa: E402
 
 CATALOG_PATH = ROOT / "config" / "model-catalog.json"
-HAIKU = "claude-haiku-4-5-20251001"
+HAIKU = "claude-haiku-5-5"
 LUNA = "openai-codex/gpt-6-luna"
 QWEN = "lmstudio/qwen/qwen3.6-35b-a3b"
 SONNET = "claude-sonnet-5-5"

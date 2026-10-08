@@ -155,7 +155,7 @@ class ClaudePreferenceTests(unittest.TestCase):
 
     def test_preference_is_a_pure_function_of_bounded_traits(self):
         answers = laya_answers(self.h.laya_reply(difficulty=2, risk=0.49, sensitive=0.49, scope="brief"))
-        target = {"worker": "claude", "model": "claude-haiku-4-5-20251001", "thinking": "low"}
+        target = {"worker": "claude", "model": "claude-haiku-5-5", "thinking": "low"}
         chosen, record = claude_preference(target, answers, self.config)
         self.assertEqual(chosen["model"], "claude-sonnet-5-5")
         self.assertEqual(record["reasons"], [])
@@ -386,7 +386,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
         self.assertEqual(list(out)[:3], ["worker", "model", "thinking"])
-        self.assertEqual((out["decided_by"], out["source"]), ("claude-haiku-4-5-20251001", "router"))
+        self.assertEqual((out["decided_by"], out["source"]), ("claude-haiku-5-5", "router"))
         self.assertEqual(self.laya.hits, [])
         rows, _ = routing_evals.read_jsonl(self.state / "evals" / "model-selections.jsonl")
         self.assertEqual([row["kind"] for row in rows], ["route"])

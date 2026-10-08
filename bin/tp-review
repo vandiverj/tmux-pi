@@ -15,6 +15,10 @@
 # On a retried task (or a task reviewed before) the reviewer also receives the earlier review rounds'
 # findings, oldest first, and the diff of the working tree since the last reviewed state (lib/review_rounds.py).
 # The reply's first line is APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES (lib/review_verdict.py).
+# --force-alive skips the checks that end the author's process and look for a writer on the working tree (this session's
+# tasks). It does NOT apply to a lane's working tree: a lane's one writer is enforced by the lane's lease, shared by every
+# session, and a reviewer is refused beside a live writer whatever flags are given. To review a lane task, end its writer:
+# `tp-agent stop <writer task id>` (the id and session are named in the refusal), then run tp-review again.
 # Prints the review task id.
 set -euo pipefail
 
@@ -27,8 +31,13 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
-usage() { echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2; exit "${1:-1}"; }
+usage() {
+  echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2
+  echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
+  exit "${1:-1}"
+}
 force=0 force_alive=0 plan_opts=()
+[[ "${1:-}" != -h && "${1:-}" != --help ]] || usage 0
 while [[ $# -gt 1 ]]; do
   case "$1" in
     --force) force=1; shift ;;
@@ -108,6 +117,19 @@ esac
 author_workdir="$(jq -r 'if (.workdir | type) == "string" then .workdir else empty end' "$dir/meta.json")" ||
   die "cannot read author workdir for '$id'"
 [[ -n "$author_workdir" ]] || die "author workdir missing for '$id'; cannot choose a review directory"
+# A lane task's reviewer stays in its lane and step and reads the same repository preamble (the lane's worktree has none of
+# its own): the three tags are copied from the author's record. A value that is present but not text, or a lane with no
+# step, refuses; a task with none of them is not a lane task.
+lane_args=()
+lane_tag() {  # the record's text field $1, empty when absent, BAD when present but not non-empty text
+  jq -r --arg k "$1" 'if has($k) then (if (.[$k] | type) == "string" and (.[$k] | length) > 0 then .[$k] else "BAD" end) else "" end' "$dir/meta.json"
+}
+author_lane="$(lane_tag lane)" && author_step="$(lane_tag lane_step)" && author_preamble="$(lane_tag preamble_from)" ||
+  die "cannot read the lane tags of '$id'"
+[[ "$author_lane$author_step$author_preamble" != *BAD* ]] || die "'$id' has an unreadable lane tag in its record; review refused"
+[[ -z "$author_lane" && -z "$author_step" ]] || [[ -n "$author_lane" && -n "$author_step" ]] || die "'$id' records a lane without a step (or a step without a lane); review refused"
+if [[ -n "$author_lane" ]]; then lane_args+=(--lane "$author_lane" --lane-step "$author_step"); fi
+if [[ -n "$author_preamble" ]]; then lane_args+=(--preamble-from "$author_preamble"); fi
 
 findings_rule="Return every finding in this one pass, ranked most severe first and numbered F1, F2, ...; do not hold any back for a later round. Mark each finding 'defect' (the work is wrong, unsafe or misses a requirement) or 'design disagreement' (it works, but you would build it differently). When a finding repeats an earlier one, name the family it belongs to."
 coverage_rule="Review the whole change every time: every changed file, and every area the change can affect (callers and readers of changed functions, files, records and command output; other writers of the same state; documentation and tests that describe the old behaviour). Do not stop when you have enough findings for a verdict; finish the whole change first. End your final reply (the reply itself, not only a findings file) with a section headed Coverage that lists each changed file with 'reviewed' or 'not reviewed: reason', and each affected area with what you checked there and what the change may affect that you could not check. A review without that section is incomplete."
@@ -194,12 +216,12 @@ done
 # author is the writer that matters: its process is ended first (pane and scrollback kept, task not collected), and the review
 # is refused if that cannot be done or checked. The guard then covers every task on the tree, the author included.
 if [[ "$force_alive" != 1 ]]; then
-  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" end-author "$id" >/dev/null || die "review of '$id' refused: its process could not be ended (--force-alive overrides)"
-  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" guard-review "$id" >/dev/null || die "review of '$id' refused (--force-alive overrides)"
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" end-author "$id" >/dev/null || die "review of '$id' refused: its process could not be ended; end it (tp-agent stop $id) or pass --force-alive${author_lane:+ (--force-alive does not apply to lane $author_lane: end the writer instead)}"
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" guard-review "$id" >/dev/null || die "review of '$id' refused; end the writer it names (tp-agent stop ID) or pass --force-alive${author_lane:+ (--force-alive does not apply to lane $author_lane: end the writer instead)}"
 fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
-if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer \
+if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer ${lane_args[@]+"${lane_args[@]}"} \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy ($independence)" \

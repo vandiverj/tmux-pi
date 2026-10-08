@@ -44,6 +44,18 @@
 #                            the top of the packet (omitted when not given)
 #   --check                  resolve the workdir, validate its preamble and print the workdir, then exit without
 #                            starting anything (tp-agent dispatch uses it before routing)
+#   --lane <name> --lane-step <id>  tag the task as belonging to a lane's step (tp-agent dispatch --lane, tp-review); both
+#                            or neither. Without --lane a workdir inside a lane's working tree (a nested repository in it
+#                            included) refuses. With --lane the lane's lease (lib/lane_lease.py, in the repository's git
+#                            directory, so shared by every session) is reserved before anything is made and refuses when
+#                            another task holds the lane: one writer, or any number of reviewers. The reservation names the
+#                            command that ends the holder. A start that fails is undone (pane, task directory, reservation).
+#   --lane-replaces <task>   with --lane: the running task of this lane (this session) that is handing its work to the new one
+#                            and ends right after (escalation); it must be the caller's own TP_TASK_ID. Its hold does not keep
+#                            the new task out and stays until its process is gone
+#   --preamble-from <dir>    the main working tree to read .tmux-pi/worker-preamble.md from when the workdir has none
+#                            (a lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored); recorded in meta. With --lane
+#                            and no --preamble-from, the lane repository's main working tree is used
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role
 #
@@ -71,7 +83,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" check=0
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" check=0 lane="" lane_step="" preamble_from="" lane_replaces=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -103,6 +115,10 @@ while [[ $# -gt 0 ]]; do
     --tests)       tests="${2:?}"; shift 2 ;;
     --check)       check=1; shift ;;
     --preamble-role) preamble_role="${2:?}"; shift 2 ;;
+    --lane)        lane="${2:?}"; shift 2 ;;
+    --lane-step)   lane_step="${2:?}"; shift 2 ;;
+    --lane-replaces) lane_replaces="${2:?}"; shift 2 ;;
+    --preamble-from) preamble_from="${2:?}"; shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
     -*)            die "unknown option: $1" ;;
@@ -117,6 +133,16 @@ if [[ -n "$role" ]]; then
 fi
 if [[ -n "$preamble_role" ]]; then
   [[ "$preamble_role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$preamble_role.md" ]] || die "unknown --preamble-role: $preamble_role"
+fi
+[[ -z "$lane" || "$lane" =~ ^[a-z0-9][a-z0-9-]{0,23}$ ]] || die "bad --lane: $lane"
+[[ -z "$lane_step" || "$lane_step" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]] || die "bad --lane-step: $lane_step"
+[[ -n "$lane" || -z "$lane_step" ]] || die "--lane-step needs --lane"
+[[ -z "$lane" || -n "$lane_step" ]] || die "--lane needs --lane-step"
+[[ -z "$lane_replaces" ]] || { [[ -n "$lane" && "${TP_TASK_ID:-}" == "$lane_replaces" ]] ||
+  die "--lane-replaces is for a lane worker handing its own task over: it needs --lane and must be the caller's TP_TASK_ID"; }
+if [[ -n "$preamble_from" ]]; then
+  [[ "$preamble_from" == /* && -d "$preamble_from" ]] || die "--preamble-from must be an existing absolute directory: $preamble_from"
+  preamble_from="$(cd -- "$preamble_from" && pwd -P)" || die "cannot enter --preamble-from: $preamble_from"
 fi
 case "$tests" in ""|affected|full|none) ;; *) die "--tests must be affected, full or none" ;; esac
 [[ -z "$reserved_id" || "$reserved_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad task id"
@@ -157,6 +183,13 @@ if [[ "$explicit_workdir" == 1 ]]; then
   [[ "$workdir" != / && "$workdir" != "$state_path" && "$workdir" != "$state_path/"* ]] ||
     die "--workdir must select a project directory outside tmux-pi state"
 fi
+# A lane task always reads the repository's preamble: without --preamble-from it comes from the lane repository's main working
+# tree (the lane's own checkout has none: .tmux-pi/ is git-ignored), so a direct start is no different from a dispatched one.
+if [[ -n "$lane" && -z "$preamble_from" ]]; then
+  preamble_from="$(python3 "$ROOT/lib/lanes.py" main-checkout "$workdir")" || exit 1
+fi
+# A task with no lane may not write in a lane's working tree: that would be a second writer the lane cannot see.
+if [[ -z "$lane" ]]; then python3 "$ROOT/lib/lanes.py" check-tree "$workdir" || exit 1; fi
 
 # Limits keep packets to selected context rather than whole trees.
 max_file=60000 max_packet=200000
@@ -223,7 +256,7 @@ read_context() {
 }
 
 if [[ "$check" == 1 ]]; then
-  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" >/dev/null || exit 1
+  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" >/dev/null || exit 1
   for spec in ${contexts[@]+"${contexts[@]}"}; do read_context "$spec" || true; done
   printf '%s\n' "$workdir"
   exit 0
@@ -319,7 +352,7 @@ if [[ -n "$tests" ]]; then
 fi
 # The repository preamble goes to the worker's system prompt, not the packet (see below), so it sits ahead of
 # everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
-preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}")" || exit 1
+preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from")" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
 packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
 packet+=$'\n'
@@ -404,7 +437,45 @@ if [[ ${#notes[@]} -gt 0 ]]; then
 fi
 (( ${#packet} <= max_packet )) || die "packet is ${#packet} chars (max $max_packet); select fewer files or line ranges"
 
+# A lane task takes its lane first: one reservation in the lane's lease (shared by every session of the repository, kept in its
+# common git directory) that refuses when another task holds the lane, and is held until this task is registered below. If
+# anything fails before then the pane and the task directory made here are removed and the reservation released, for a task
+# with a lane or not. A pane that cannot be ended is never abandoned: it keeps the task directory and the lane (a reservation
+# is released only once nothing runs from the task), and the message names the command that ends it. A refusal comes before
+# anything is made. See lib/lane_lease.py.
+lease_held=0 registered=0 pane="" made_task_dir=0
+undo_start() {
+  [[ "$registered" != 1 ]] || return 0
+  local panes tries rc
+  if [[ -n "$pane" ]] && ! tmux kill-pane -t "$pane" 2>/dev/null; then
+    if ! panes="$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)" || grep -qxF -- "$pane" <<<"$panes"; then
+      echo "tp-spawn: pane $pane of $id could not be ended; its task directory${lane:+ and lane $lane} stay as they are. End it with: tmux kill-pane -t $pane" >&2
+      return 0
+    fi
+  fi
+  if [[ "$lease_held" == 1 ]]; then
+    for tries in 1 2 3 4 5 6; do  # the pane was just killed; its process may need a moment to go
+      rc=0; python3 "$ROOT/lib/lane_lease.py" release --lane "$lane" --workdir "$workdir" --task "$id" 2>/dev/null || rc=$?
+      [[ "$rc" == 3 ]] || break
+      sleep 0.5
+    done
+    if [[ "$rc" == 3 ]]; then
+      python3 "$ROOT/lib/lane_lease.py" release --lane "$lane" --workdir "$workdir" --task "$id" >&2 || true
+      return 0
+    elif [[ "$rc" != 0 ]]; then
+      echo "tp-spawn: could not release lane $lane for $id; its reservation ends with this process" >&2
+    fi
+  fi
+  if [[ "$made_task_dir" == 1 && "$task_dir" == "$state_dir/tasks/$id" ]]; then rm -rf -- "$task_dir"; fi
+}
+trap undo_start EXIT
+if [[ -n "$lane" ]]; then
+  python3 "$ROOT/lib/lane_lease.py" reserve --lane "$lane" --workdir "$workdir" --task "$id" --role "$role" --session "$state_dir" --pid "$$" \
+    ${lane_replaces:+--replaces "$lane_replaces"} || exit 1
+  lease_held=1
+fi
 mkdir -p "$task_dir"
+made_task_dir=1
 # A required review must exist before the worker pane (or task id) is observable.
 # Use atomic replacement so collect never sees a partial marker.
 if [[ -n "$decision_json" ]] && jq -e '.review == "required"' <<<"$decision_json" >/dev/null; then
@@ -492,12 +563,16 @@ chmod +x "$task_dir/run.sh"
 
 pane="$(tmux new-window -d -P -F '#{pane_id}' -t "=$session:" -n "sa:$id" -c "$workdir" \
   "bash $(printf %q "$task_dir/run.sh")")"
+if [[ "$lease_held" == 1 ]]; then  # the reservation becomes the worker's own pane process, before anything else is done to the pane
+  python3 "$ROOT/lib/lane_lease.py" activate --lane "$lane" --workdir "$workdir" --task "$id" --pane "$pane" || exit 1
+fi
 # Keep the pane after the worker exits so its output can still be viewed.
 tmux set-option -p -t "$pane" remain-on-exit on
 tmux select-pane -t "$pane" -T "$id"
 
 jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking "$thinking" \
   --arg role "$role" --arg parent "$parent" --arg deliverable "$deliverable" --argjson route_info "$route_json" \
+  --arg lane "$lane" --arg lane_step "$lane_step" --arg preamble_from "$preamble_from" \
   --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson contract "$contract" --argjson preflight "$preflight" --argjson main_contract "$main_contract" \
   --argjson policy_decision "$policy_decision" --argjson context_manifest "$context_manifest" \
@@ -505,6 +580,8 @@ jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking 
   '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}
    + (if $role == "" then {} else {role:$role} end)
    + (if $parent == "" then {} else {parent:$parent} end)
+   + (if $lane == "" then {} else {lane:$lane, lane_step:$lane_step} end)
+   + (if $preamble_from == "" then {} else {preamble_from:$preamble_from} end)
    + (if $deliverable == "" then {} else {deliverable:$deliverable} end)
    + (if $route_info == null then {} else {route_info:$route_info} end)
    + if $decision == null then {} else {decision:$decision} end
@@ -521,6 +598,7 @@ sys.path.insert(0, sys.argv[1] + "/lib")
 from task_record import write_record
 write_record(sys.argv[2], lifecycle_state="starting")
 EOF
+registered=1  # the worker is a recorded task now; its lease stays until its process ends
 
 echo "$id"
 if [[ "$view" == 1 ]]; then "$ROOT/bin/tp-view" "$id"; fi

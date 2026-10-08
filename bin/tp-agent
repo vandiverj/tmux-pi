@@ -15,12 +15,16 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import lane_commands  # noqa: E402
+import lane_lease  # noqa: E402
+import lanes  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 from task_archive import find_archived_task  # noqa: E402
 from task_record import refresh_record  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
-from worker_process import FINISHED, end_or_refuse, end_process, end_orphan, guard_retry, guard_review, live_process, orphans, pane_table  # noqa: E402
+from worker_process import (FINISHED, READ_ONLY_ROLES, alive_on_workdir, describe, end_or_refuse, end_process, end_orphan,  # noqa: E402
+                            guard_retry, guard_review, live_process, orphans, pane_table, same_tree)
 
 ROLES = ROOT / "agent" / "roles"
 TESTS_SCOPES = ("affected", "full", "none")
@@ -314,9 +318,48 @@ def escalation_route(base, previous, args, contexts):
     return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
+def lane_holders(base, lane, worktree, role, own=None):
+    """[(task id, description)] of everything that holds lane `lane` against a new task of `role`. Three sources, because no
+    one of them sees everything: the lane's lease (shared by every session of the repository: a worker or a start in ANY
+    session), a process alive on its working tree among this session's tasks (read from the pane table, so a task started
+    around the tool counts), and a queued item of this session for the lane or its tree (a queued item holds its lane's claim;
+    queues are per session, and tick's start goes through the lease like any other). A read-only role (a reviewer) is held
+    back only by a writer. When `own` is the id of a queued item, only the entries ahead of it in the queue count (tick: the
+    oldest starts first). A lease, task directory, pane table or queue entry that cannot be read refuses: a writer cannot be
+    ruled out. This is the early look that lets dispatch refuse and tick wait; the authority is the reservation tp-spawn makes."""
+    holders = []
+    common = lanes.git_common_dir(worktree)
+    holders += [(h["task"], lane_lease.describe([h])) for h in lane_lease.conflicts(common, lane, role, own)]
+    tasks = base / "tasks"
+    if tasks.is_dir():
+        holders += [(row[0], describe([row])) for row in alive_on_workdir(tasks, worktree) if role not in READ_ONLY_ROLES or row[1] not in READ_ONLY_ROLES]
+    for path in queue_files(base):
+        if own is not None and path.stem == own:
+            break
+        raw, item, reason = queue_entry(path)
+        if item is None:
+            if isinstance(raw, dict) and raw.get("lane") != lane and isinstance(raw.get("workdir"), str) \
+                    and not same_tree(raw["workdir"], worktree):
+                continue  # an unusable entry that names another tree is not this lane's
+            raise ValueError(f"queue entry {path.name} cannot be read ({reason}), so a queued item for lane {lane} cannot be ruled out; "
+                             "remove it with: tp-agent stop " + path.stem)
+        if (item.get("lane") == lane or same_tree(item["workdir"], worktree)) and (role not in READ_ONLY_ROLES or item["role"] not in READ_ONLY_ROLES):
+            holders.append((item["id"], f"{item['id']} (queued)"))
+    seen, unique = set(), []
+    for task, text in holders:  # the lease and the pane scan can both see one task
+        if task not in seen:
+            seen.add(task)
+            unique.append((task, text))
+    return unique
+
+
 def capacity(base, item):
     """(ok, reason) for starting a queue item now. The item is validated here, so no caller can pass raw data."""
     item = queue_item(item)
+    if "lane" in item:  # the one-writer rule again at start, for what was written around the tool
+        holders = lane_holders(base, item["lane"], item["workdir"], item["role"], own=item["id"])
+        if holders:
+            return False, f"waiting for lane {item['lane']}'s writer {holders[0][0]}"
     worker, model = item["worker"], item["model"]
     cfg = read_json(ROOT / "config/orchestration.json")
     active = [r for r in all_records(base) if r["status"] in {"starting", "working", "needs_input"}]
@@ -385,6 +428,8 @@ def launch(base, item):
     args += ["--workdir", item["workdir"]]
     if item["parent"]:
         args += ["--parent", item["parent"]]
+    if "lane" in item:
+        args += ["--lane", item["lane"], "--lane-step", item["lane_step"], "--preamble-from", item["preamble_from"]]
     for spec in item["context"]:
         args += ["--context", spec]
     for note in item["notes"]:
@@ -401,7 +446,8 @@ def launch(base, item):
     path = task_dir(base, item["id"])
     admitted, omitted = admitted_context(path, item["context"])
     atomic_json(path / "dispatch.json",
-                {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"]})
+                {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"],
+                 **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {})})  # shown only; retry reads meta.json
     return record(task_dir(base, item["id"]))
 
 
@@ -412,12 +458,14 @@ def locked(base):
     return lock
 
 
-def check_workdir(role, workdir=None, contexts=()):
+def check_workdir(role, workdir=None, contexts=(), lane=None):
     """The canonical absolute workdir tp-spawn --check validated (explicit, else the main pane's); ValueError if
     tp-spawn refuses it or reports anything but an absolute path. The same check refuses a --context spec that is missing,
     binary or over the size cap, saying the cap, the size and the largest range that fits, so it fails here and not when
     a queued task starts."""
     command = [str(ROOT / "bin/tp-spawn"), "--check", "--role", role] + (["--workdir", workdir] if workdir else [])
+    if lane:  # (name, step, preamble source): the lane's tree is the lane's to use, and its preamble comes from the repository
+        command += ["--lane", lane[0], "--lane-step", lane[1]] + (["--preamble-from", lane[2]] if lane[2] else [])
     for spec in contexts:
         command += ["--context", spec]
     command += ["--", "check"]
@@ -474,6 +522,17 @@ def queue_item(value, name=None):
         raise ValueError("the record's after list holds an invalid task id")
     clean = {key: value[key] for key in QUEUE_TEXT + ("workdir", "route_info", "created", "deliverable", "parent")}
     clean.update({key: list(value[key]) for key in ("after", "context", "notes")}, tests=tests)
+    if ("lane" in value) != ("lane_step" in value):
+        raise ValueError("the record has a lane without a lane_step, or a lane_step without a lane")
+    if "lane" in value:  # a lane task: the lane, its step and where its repository's preamble is read from (all required together)
+        if not lanes.valid_lane_name(value["lane"]):
+            raise ValueError(f"the record has an invalid lane {value['lane']!r}")
+        if not isinstance(value["lane_step"], str) or not lanes.STEP_ID.fullmatch(value["lane_step"]):
+            raise ValueError(f"the record has an invalid lane_step {value['lane_step']!r}")
+        source = value.get("preamble_from")
+        if not isinstance(source, str) or not source.startswith("/") or "\n" in source:
+            raise ValueError(f"the record has no usable preamble_from ({source!r}); a lane task reads its repository's preamble from there")
+        clean.update(lane=value["lane"], lane_step=value["lane_step"], preamble_from=source)
     if "queue_reason" in value:  # optional (tp-agent's own note, only displayed), but a present value must be text
         if not isinstance(value["queue_reason"], str):
             raise ValueError("the record's queue_reason is not text")
@@ -561,12 +620,149 @@ def dispatch_record(previous):
             "notes": list(kept["notes"]), "tests": tests}
 
 
+def lane_tags(meta):
+    """The lane tags of a prior task's meta.json for retry: None when it has none, else {lane, lane_step, preamble_from, workdir}.
+    A retry stays in the lane and step of the attempt it replaces and takes them from nowhere else; tags that are half there,
+    or not text, refuse."""
+    if "lane" not in meta and "lane_step" not in meta:
+        return None
+    tags = {key: meta.get(key) for key in ("lane", "lane_step", "preamble_from", "workdir")}
+    if not all(isinstance(value, str) and value for value in tags.values()):
+        raise ValueError("the prior task records an incomplete lane (lane, lane_step, preamble_from and workdir must all be text); "
+                         "it cannot be retried into its lane. Start a new task instead: tp-agent dispatch --lane NAME --step ID ...")
+    return tags
+
+
 def prior_dispatch(previous):
     """(record, None) from dispatch_record, or (None, the RecordError)."""
     try:
         return dispatch_record(previous), None
     except RecordError as error:
         return None, error
+
+
+LANE_FLAGS = (("step", "--step"), ("domain", "--domain"), ("touches", "--touches"), ("repo", "--repo"), ("base", "--base"))
+
+
+def lane_plan(args, base, tests):
+    """Checks 1-14 of `dispatch --lane` (design 3.1), in their order and without taking a lock: everything that can refuse
+    before a task is routed. Returns what the locked part needs. A retry (args.lane_meta, the prior task's own lane tags)
+    skips only the checks about flags it cannot have. Creating a lane is left to the locked part."""
+    retry = getattr(args, "lane_meta", None)
+    name, step = (retry["lane"], retry["lane_step"]) if retry else (args.lane, getattr(args, "step", None))
+    lane_commands.check_lane_name(name)  # 1
+    if step is not None and not lanes.STEP_ID.fullmatch(step):  # 2
+        raise ValueError(f"invalid step id {step!r}: use up to 40 characters of letters, digits, . _ -")
+    if not step:  # 3
+        raise ValueError(f"dispatch --lane {name} needs --step ID, the slice this task belongs to")
+    if getattr(args, "workdir", None) and not retry:  # 4
+        raise ValueError("--lane chooses the working tree; remove --workdir")
+    if tests == "full":  # 5
+        raise ValueError("lane tasks run the tests that check their change: pass --tests affected or --tests none. The whole suite "
+                         "is run once, from the main checkout, when the lanes are integrated (tp-agent integrate ships in a later slice; "
+                         "until then run it there yourself)")
+    if retry:
+        directory = retry["preamble_from"]
+    elif getattr(args, "repo", None):
+        directory = os.path.abspath(args.repo)
+    else:  # the repository of the main pane's directory, as tp-spawn --check reports it
+        directory = check_workdir(args.role, None, (), (name, step, None))
+    try:
+        common, repo = lane_commands._main_repo(directory)
+    except ValueError as error:
+        raise ValueError(f"cannot find a git repository for lane {name} from {directory} ({error})")
+    machine = lanes.load_machine_config()  # 6: absent keys default, malformed ones refuse naming key and file
+    repo_config = lanes.load_repo_config(repo)
+    plan = {"name": name, "step": step, "common": common, "repo": repo, "machine": machine, "repo_config": repo_config,
+            "preamble_from": repo}
+    if name in lanes.lane_names(common):
+        record = lanes.read_lane(common, name)  # 7
+        if not retry:
+            lane_declaration_check(record, args)  # 10
+        lane_use_checks(record)  # 11, 12
+        if retry and os.path.realpath(retry["workdir"]) != record["worktree"]:
+            raise ValueError(f"the task being retried ran in {retry['workdir']}, which is not lane {name}'s working tree "
+                             f"{record['worktree']}; start a new task with --lane {name} instead")
+        plan.update(exists=True, route_workdir=record["worktree"])
+        return plan
+    if retry:
+        raise ValueError(f"lane {name} has no record, so a task of it cannot be retried; its record would be in {lanes.lanes_dir(common)}. "
+                         f"Start the lane again: tp-agent dispatch --lane {name} --step ID --domain TEXT --touches PATH ...")
+    lanes.precheck_lane_slot(common, repo_config, name)  # 8 (and an existing branch)
+    if not getattr(args, "domain", None) or not getattr(args, "touches", None):  # 9
+        raise ValueError(f"lane {name} does not exist; pass --domain TEXT and --touches PATH [PATH ...] to create it")
+    lanes.check_lane_capacity(common, machine["max_active_lanes"])  # 13
+    touches = lane_commands.validate_declaration(repo_config, name, args.domain, args.touches)  # 14
+    base_ref, base_commit = lane_commands._resolve_base(repo, getattr(args, "base", None), repo_config["integration_branch"])
+    plan.update(exists=False, route_workdir=repo, domain=args.domain, touches=touches, base_ref=base_ref, base_commit=base_commit)
+    return plan
+
+
+def lane_declaration_check(record, args):
+    """Check 10: a lane that has a record takes no declaration flags."""
+    if any(getattr(args, attr, None) for attr in ("domain", "touches", "repo", "base")):
+        raise ValueError(f"lane {record['name']} already exists (domain: {record['domain']}); its declaration is set when it is created")
+
+
+def lane_use_checks(record):
+    """Checks 11 and 12 for a lane that has a record: it is open, and git agrees with the record."""
+    if record["state"] != "open":
+        raise ValueError(f"lane {record['name']} is {record['state']}; start a new lane from the integration branch")
+    lanes.lane_reality(record)
+
+
+def lane_admit(base, plan, item):
+    """With .tp-agent.lock held: the lane's record (created now when it has none) and the one-writer look (checks 18 and 19)
+    under the lane lock, then start or queue the task. The lane lock is NOT held while the task starts: tp-spawn takes the
+    lane's reservation (lane_lease.reserve, under that same lock) and is the authority, so a start that loses a race to another
+    session or to a reviewer refuses there. Returns (value, record, created, warnings). A lane this call created is undone
+    again when the task could not be started or queued and nothing else holds the lane; nothing is undone once it has."""
+    name, common = plan["name"], plan["common"]
+    created = False
+    with lanes.lane_lock(common):
+        if name in lanes.lane_names(common):
+            record = lanes.read_lane(common, name)  # 7 again, under the lock
+            lane_use_checks(record)  # 11, 12 again; the flag check (10) needs no lock
+            warnings = lane_commands._warnings(name, record["domain"], record["touches"], [lanes.read_lane(common, n) for n in lanes.lane_names(common)])
+        else:
+            if not plan.get("domain"):
+                raise ValueError(f"lane {name} has no record any more; dispatch again")
+            record, warnings = lane_commands.create_lane_locked(common, plan["repo"], name, plan["domain"], plan["touches"], plan["base_ref"],
+                                                               plan["base_commit"], plan["machine"], plan["repo_config"])
+            created = True
+        try:
+            holders = lane_holders(base, name, record["worktree"], item["role"])  # 18; 19 is the refusals worker_process raises
+            if holders:
+                raise ValueError(f"lane {name} already has a writer: {', '.join(text for _, text in holders)}. Wait for it to finish, "
+                                 f"or end it with `tp-agent stop {holders[0][0]}` (in the session named above when it is not this one), "
+                                 "then dispatch again")
+        except BaseException:
+            if created:
+                lane_commands.undo_created_lane(record)  # nothing could hold a lane made a moment ago; raises if it cannot be undone
+            raise
+    started = False
+    try:
+        item = queue_item(dict(item, workdir=record["worktree"], lane=name, lane_step=plan["step"], preamble_from=plan["preamble_from"]))
+        ok, reason = capacity(base, item)
+        if ok:
+            value = launch(base, item)
+        else:
+            item["queue_reason"] = reason
+            atomic_json(base / "queue" / f"{item['id']}.json", item)
+            value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
+                     "harness": item["worker"], "model": item["model"], "effort": item["thinking"]}
+        started = True
+    except BaseException as error:
+        if created and not started:
+            try:
+                with lanes.lane_lock(common):
+                    if lane_lease.live(lane_lease.read(common, name)):
+                        raise ValueError(f"another task holds lane {name} now, so the lane is kept")
+                    lane_commands.undo_created_lane(record)
+            except ValueError as left:
+                raise ValueError(f"{error}. The lane {name} created for it was not removed again: {left}")
+        raise
+    return dict(value, lane=name, lane_step=plan["step"], lane_created=created), record, warnings
 
 
 def dispatch(args, base):
@@ -577,13 +773,26 @@ def dispatch(args, base):
         tests = TESTS_DEFAULT
     if tests not in TESTS_SCOPES:
         raise ValueError(f"--tests must be one of {', '.join(TESTS_SCOPES)}")
+    plan = warnings = None
+    if getattr(args, "lane", None) is None and not getattr(args, "lane_meta", None):
+        for attr, flag in LANE_FLAGS:
+            if getattr(args, attr, None):
+                raise ValueError(f"{flag} needs --lane")
+        if args.workdir and args.workdir.startswith("/"):
+            lanes.refuse_lane_tree(args.workdir)  # the lane's tree is the lane's to use: no way around its one writer
+    else:
+        plan = lane_plan(args, base, tests)
     # Refuse before routing or queueing. tp-spawn resolves the effective workdir (the explicit one, else the main
     # pane's) exactly as it will when it builds the packet, so both dispatch forms are checked the same way.
     # The canonical directory it reports is what the task stores, routing reads and launch passes back, so a queued
     # task cannot start in a different repository than the one validated here.
-    workdir = check_workdir(args.role, args.workdir, args.context or [])
-    if not args.workdir:  # recheck the resolved directory the way launch will pass it (an explicit --workdir)
-        workdir = check_workdir(args.role, workdir)
+    if plan:  # a lane's tree, or for a lane not created yet the repository's, which has the same preamble and files
+        workdir = check_workdir(args.role, plan["route_workdir"], args.context or [], (plan["name"], plan["step"], plan["preamble_from"]))
+    else:
+        workdir = check_workdir(args.role, args.workdir, args.context or [])
+        if not args.workdir:  # recheck the resolved directory the way launch will pass it (an explicit --workdir)
+            workdir = check_workdir(args.role, workdir)
+        warnings = lanes.refuse_lane_tree(workdir)  # a lane's tree refuses; a hand-made linked worktree only warns
     chosen = getattr(args, "preroute", None) or route(
         args.task, args.role, args.worker, args.model, args.thinking, args.context or [], args.deliverable,
         level=getattr(args, "level", None), approve_effort=getattr(args, "approve_effort", False),
@@ -594,16 +803,25 @@ def dispatch(args, base):
             "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
             "notes": args.note or [], "tests": tests})
-    with locked(base):
-        ok, reason = capacity(base, item)
-        if ok:
-            value = launch(base, item)
-        else:
-            item["queue_reason"] = reason
-            atomic_json(base / "queue" / f"{item['id']}.json", item)
-            value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
-                     "harness": worker, "model": model, "effort": thinking}
-        write_index(base)
+    if plan:
+        with locked(base):
+            value, _, warnings = lane_admit(base, plan, item)
+            write_index(base)
+    else:
+        with locked(base):
+            ok, reason = capacity(base, item)
+            if ok:
+                value = launch(base, item)
+            else:
+                item["queue_reason"] = reason
+                atomic_json(base / "queue" / f"{item['id']}.json", item)
+                value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
+                         "harness": worker, "model": model, "effort": thinking}
+            write_index(base)
+    if warnings:
+        value = dict(value, warnings=warnings)
+        for warning in warnings:
+            print(lane_commands.warning_text(warning), file=sys.stderr)
     return value
 
 
@@ -697,6 +915,12 @@ def main():
     d.add_argument("--tests", choices=TESTS_SCOPES, default=TESTS_DEFAULT,
                    help="how much of the test suite the worker runs: affected (default) = the tests that check "
                         "what it changed, full = everything, none")
+    d.add_argument("--lane", help="run the task in this lane's worktree (T10); the lane is created on first use")
+    d.add_argument("--step", help="with --lane: the slice this task belongs to")
+    d.add_argument("--domain", help="with --lane, creating it: the independence claim in words")
+    d.add_argument("--touches", nargs="+", metavar="PATH", help="with --lane, creating it: repo-relative path prefixes the lane will change")
+    d.add_argument("--repo", help="with --lane, creating it: the repository (default: the main pane's)")
+    d.add_argument("--base", help="with --lane, creating it: branch or commit to start from (default: the integration branch)")
     retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
     retry.add_argument("id")
     retry.add_argument("--reason", required=True)
@@ -710,7 +934,7 @@ def main():
     retry.add_argument("--local-only", action="store_true")
     retry.add_argument("--tests", choices=TESTS_SCOPES, help="test scope; default is the prior attempt's")
     retry.add_argument("--force-alive", action="store_true",
-                       help="start the attempt although a process is still alive on the same working tree")
+                       help="start the attempt although a process is still alive on the same working tree (skips only the retry guard; a lane's one writer is still enforced: stop the writer instead)")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
     rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author)")
@@ -719,7 +943,7 @@ def main():
     rv.add_argument("--level", help="explicit reviewer level key")
     rv.add_argument("--thinking", help="explicit reviewer effort")
     rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
-    rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree")
+    rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree (does not apply to a lane: stop its writer with tp-agent stop)")
     ea = sub.add_parser("end-author", help="end a settled task's process before its review starts (bin/tp-review runs this)")
     ea.add_argument("id")
     gr = sub.add_parser("guard-review", help="refuse while a writer is alive on the task's working tree (bin/tp-review runs this)")
@@ -761,15 +985,12 @@ def main():
     args = parser.parse_args()
     if args.command in ("lane", "lanes"):
         # Lanes live in the repository's git directory, not in a session: no session state is read or written.
-        import lane_commands
         if args.command == "lanes":
             print(json.dumps(lane_commands.list_lanes(args.repo, args.name), indent=2))
             return
         value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base)
         for warning in value["warnings"]:
-            print(f"tp-agent: warning: lanes {' and '.join(warning['lanes'])} overlap on {', '.join(warning['paths'])} "
-                  f"({', '.join(warning['basis'])}). They were claimed independent ("
-                  + "; ".join(f"{k}: {v!r}" for k, v in warning["claims"].items()) + ").", file=sys.stderr)
+            print(lane_commands.warning_text(warning), file=sys.stderr)
         print(json.dumps(value, indent=2))
         return
     if args.command == "context":
@@ -804,6 +1025,7 @@ def main():
             raise ValueError(f"{problem}; the prior attempt's test scope is unknown, pass --tests")
         else:
             tests = kept["tests"] or TESTS_DEFAULT  # None only in an older valid record
+        lane_meta = lane_tags(meta)
         preroute = None
         if args.escalate:
             if args.model or args.level or args.thinking:
@@ -814,7 +1036,7 @@ def main():
                                          model=args.model, thinking=args.thinking, level=args.level,
                                          approve_effort=args.approve_effort, preroute=preroute,
                                          local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
-                                         workdir=meta.get("workdir"),
+                                         workdir=meta.get("workdir"), lane_meta=lane_meta,
                                          deliverable=meta.get("deliverable", ""),
                                          parent=args.id, after=[], context=contexts,
                                          tests=tests,

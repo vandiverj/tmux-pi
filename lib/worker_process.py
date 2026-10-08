@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from contract import task_lifecycle
@@ -18,6 +19,7 @@ FINISHED = {"completed", "stopped"}
 # marker is written, and before its reviewer starts.
 ENDABLE = FINISHED | {"settled"}
 READ_ONLY_ROLES = {"code-reviewer", "data-flow-reviewer", "vulnerability-reviewer"}
+FORCE_ALIVE = "pass --force-alive"  # retry and review have it; dispatch and tick do not (see alive_on_workdir)
 
 
 def _now():
@@ -25,15 +27,21 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def strict_meta(path):
-    """The task's meta.json as an object, or a refusal naming the task."""
+def _or(override):
+    return f", or {override}" if override else ""
+
+
+def strict_meta(path, override=""):
+    """The task's meta.json as an object, or a refusal naming the task. `override` is the flag the caller has to proceed
+    anyway (retry and review have --force-alive; dispatch and tick have none and name nothing)."""
     try:
         value = json.loads((Path(path) / "meta.json").read_text())
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot read {Path(path).name}/meta.json ({error.__class__.__name__}), so a live process of "
-                         "it cannot be ruled out; pass --force-alive") from error
+                         f"it cannot be ruled out. Restore the file{_or(override)}") from error
     if not isinstance(value, dict):
-        raise ValueError(f"{Path(path).name}/meta.json is not an object, so a live process of it cannot be ruled out; pass --force-alive")
+        raise ValueError(f"{Path(path).name}/meta.json is not an object, so a live process of it cannot be ruled out. "
+                         f"Restore the file{_or(override)}")
     return value
 
 
@@ -42,7 +50,8 @@ def pane_table():
     a guess could end the wrong process or let a second writer start."""
     run = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead} #{pane_pid}"], text=True, capture_output=True)
     if run.returncode:
-        raise RuntimeError(f"cannot read tmux panes: {run.stderr.strip() or 'tmux failed'}")
+        raise RuntimeError(f"cannot read tmux panes: {run.stderr.strip() or 'tmux failed'}. Run this from inside the tmux session "
+                           "(`tmux list-panes -a` must work there), then try again")
     table = {}
     for line in run.stdout.splitlines():
         parts = line.split()
@@ -60,7 +69,8 @@ def live_process(path, table, meta=None):
     if pane is None or pane == "":
         return None
     if not isinstance(pane, str):
-        raise ValueError(f"{Path(path).name} records an unreadable pane {pane!r}, so a live process of it cannot be ruled out; pass --force-alive")
+        raise ValueError(f"{Path(path).name} records an unreadable pane {pane!r}, so a live process of it cannot be ruled out. "
+                         f"Set pane in {Path(path).name}/meta.json to the pane id (like %3) or remove the key")
     entry = table.get(pane)
     return (pane, entry[1]) if entry and entry[0] else None
 
@@ -69,29 +79,91 @@ def same_tree(a, b):
     return os.path.realpath(a) == os.path.realpath(b)
 
 
-def alive_on_tree(path, skip=None):
-    """Live tasks (id, role, pane, pid) on `path`'s working tree. Refuses when the task's own working tree, or the
-    record of any other task that might be alive, cannot be read."""
-    path = Path(path)
-    workdir = strict_meta(path).get("workdir")
-    if not isinstance(workdir, str) or not workdir:
-        raise ValueError(f"{path.name} has no recorded working tree, so a live process on it cannot be ruled out; pass --force-alive")
-    table, found = pane_table(), []
-    for other in sorted(path.parent.iterdir()):
+def effective_role(role, task_id):
+    """The role a task counts as: its recorded one, else a reviewer when it is named review-..., else generic."""
+    return role or ("code-reviewer" if task_id.startswith("review-") else "generic")
+
+
+def _commands():
+    """[(pid, command)] of every running (not zombie) process; an unreadable table refuses."""
+    run = subprocess.run(["ps", "-ww", "-ax", "-o", "pid=,stat=,command="], text=True, capture_output=True)
+    if run.returncode:
+        raise RuntimeError(f"cannot read the process table: {run.stderr.strip() or 'ps failed'}")
+    rows = []
+    for line in run.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and not parts[1].startswith("Z"):
+            rows.append((int(parts[0]), parts[2]))
+    return rows
+
+
+def task_processes(task_dir, rows=None):
+    """The pids of running processes started from the task's own run.sh (tp-spawn starts a worker as `bash <task dir>/run.sh`).
+    It needs no record of the task: it is how a task whose meta.json was never written, or whose reservation outlived the
+    tp-spawn that made it, is still found. The path is compared with backslashes removed (tp-spawn quotes it) and in both its
+    given and resolved form."""
+    task_dir = Path(task_dir)
+    wanted = {f"{task_dir}/run.sh", f"{os.path.realpath(task_dir)}/run.sh"}
+    return [pid for pid, command in (_commands() if rows is None else rows)
+            if any(path in command.replace("\\", "") for path in wanted)]
+
+
+def end_command(pids, table):
+    """The command that ends the processes `pids`: their pane when one of them is a pane's process, else kill."""
+    for pane, (alive, pid) in sorted(table.items()):
+        if alive and pid in pids:
+            return f"tmux kill-pane -t {pane}"
+    return f"kill {pids[0]}"
+
+
+def _warn(message):
+    print(f"tp-agent: warning: {message}", file=sys.stderr)
+
+
+def alive_on_workdir(tasks, workdir, skip=None, override="", warn=_warn):
+    """Live tasks (id, role, pane, pid) whose recorded working tree is `workdir`, among the task directories of `tasks`.
+    The one scan behind the retry/review guards and a lane's one-writer rule. A live task with no recorded working tree
+    refuses: its tree is unknown, so it cannot be ruled out as a writer here. A task directory with no readable record (a
+    spawn that failed or was killed after making it) refuses only when something still runs from it (its run.sh is a live
+    process); a dead one is not a holder, and `warn` says so. `override` names the caller's flag to go on anyway, if any."""
+    tasks = Path(tasks)
+    table, found, rows = pane_table(), [], None
+    for other in sorted(tasks.iterdir()):
         if not other.is_dir() or other.name.startswith(".") or other.name == skip:
             continue
-        meta = strict_meta(other)  # a task directory with no readable record refuses: its pane is unknown
+        try:
+            meta = strict_meta(other, override)
+        except ValueError as unreadable:
+            rows = _commands() if rows is None else rows
+            running = task_processes(other, rows)
+            if running:
+                raise ValueError(f"{other.name} has no readable meta.json and a process of it is running (pid {', '.join(map(str, running))}), "
+                                 f"so it may write on this tree. End it with `{end_command(running, table)}`{_or(override)}") from unreadable
+            warn(f"{other.name} has no readable meta.json and nothing runs from it, so it is not a holder of any tree; "
+                 f"it is left in place. Once you do not need it: rm -r {other}")
+            continue
         live = live_process(other, table, meta)
         if not live:
             continue
         other_dir = meta.get("workdir")
         if not isinstance(other_dir, str) or not other_dir:
             raise ValueError(f"{other.name} is alive (pane {live[0]}, pid {live[1]}) with no recorded working tree, so it cannot be "
-                             "ruled out as a writer on this one; pass --force-alive")
+                             f"ruled out as a writer on this one. End it with `tmux kill-pane -t {live[0]}`{_or(override)}")
         if same_tree(other_dir, workdir):
-            role = meta.get("role") or ("code-reviewer" if other.name.startswith("review-") else "generic")
+            role = effective_role(meta.get("role"), other.name)
             found.append((other.name, role, *live))
     return found
+
+
+def alive_on_tree(path, skip=None):
+    """Live tasks (id, role, pane, pid) on `path`'s working tree. Refuses when the task's own working tree, or the
+    record of any other task that might be alive, cannot be read."""
+    path = Path(path)
+    workdir = strict_meta(path, FORCE_ALIVE).get("workdir")
+    if not isinstance(workdir, str) or not workdir:
+        raise ValueError(f"{path.name} has no recorded working tree, so a live process on it cannot be ruled out; "
+                         f"add workdir to {path.name}/meta.json, or {FORCE_ALIVE}")
+    return alive_on_workdir(path.parent, workdir, skip, FORCE_ALIVE)
 
 
 def describe(found):
@@ -111,7 +183,8 @@ def guard_review(path):
     busy = [row for row in alive_on_tree(path) if row[1] not in READ_ONLY_ROLES]
     if busy:
         raise ValueError(f"a writer is alive on {Path(path).name}'s working tree: {describe(busy)}; a reviewer must not run beside it. "
-                         "End it (tp-agent reap) or pass --force-alive")
+                         f"End it (`tp-agent stop {busy[0][0]}`, or tp-agent reap for finished ones) or pass --force-alive; "
+                         "--force-alive does not apply to a lane's working tree, where only ending the writer helps")
 
 
 def _ended(path, life, pane, pid, how):

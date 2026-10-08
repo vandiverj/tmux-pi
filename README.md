@@ -42,7 +42,7 @@ tp-agent reap [<id>...] [--yes]
 tp-agent index
 ```
 
-`collect` of a finished task (also `tp-contract collect`, which the legacy Claude-main MCP tools use) and `stop` end the worker's process (the pane and its scrollback stay). `retry` and `tp-review` (so `tp-agent review` and the MCP `review_subagent` too) refuse, naming the process, while another worker is alive on the same working tree (`--force-alive` overrides), and refuse when a live task's record, or the tmux pane list, cannot be read; `reap` lists finished tasks whose process is still alive and ends them with `--yes`. A worker's own `report.md` in the task directory is never overwritten by its final reply (`result.md`); `collect` and `inspect` show its path and size. `agent/extensions/subagents.ts` and `dispatcher.ts` (the old strict flow, loaded only under `TP_MODE=strict`, which nothing in `bin/` sets) are not covered by any of this.
+`collect` of a finished task (also `tp-contract collect`, which the legacy Claude-main MCP tools use) and `stop` end the worker's process (the pane and its scrollback stay). `retry` and `tp-review` (so `tp-agent review` and the MCP `review_subagent` too) refuse, naming the process, while another worker is alive on the same working tree (`--force-alive` overrides, except on a lane's working tree: see Lanes), and refuse when a live task's record, or the tmux pane list, cannot be read; `reap` lists finished tasks whose process is still alive and ends them with `--yes`. A worker's own `report.md` in the task directory is never overwritten by its final reply (`result.md`); `collect` and `inspect` show its path and size. `agent/extensions/subagents.ts` and `dispatcher.ts` (the old strict flow, loaded only under `TP_MODE=strict`, which nothing in `bin/` sets) are not covered by any of this.
 
 A dispatch records the role, assignment, expected result and how the model was chosen. Use `--worker` (a constraint: the router still picks the model on that harness), `--model`, `--thinking`, and `--level KEY` to make an explicit choice; an explicit choice skips the router and is still recorded. `--after <id>` queues a task until that result is ready. The initial limits are two local-model workers and four active workers total, configurable in [config/orchestration.json](config/orchestration.json). Queued tasks start as slots and dependencies clear.
 
@@ -63,6 +63,44 @@ Every selection (explicit ones included) writes a record to `<state>/evals/model
 Roles are defined under [agent/roles](agent/roles): coder, researcher, code reviewer, tester, vulnerability reviewer, data-flow reviewer, architect, and infrastructure. Role and harness are separate choices. The orchestrator instructions live in [agent/orchestrator.md](agent/orchestrator.md), with thin Pi and Claude Code overlays.
 
 Each task has a local record under the project's ignored `.tmux-pi/sessions/<run-id>/tasks/<id>/`. The packet, metadata, state, result and transcript pointer remain inspectable. `tp-agent index` writes a short session index with the current objective, active work, pending results and artifact pointers. The main agent can recover from compaction or restart without loading all transcripts.
+
+## Lanes
+
+A lane is a git worktree and branch that one stream of work owns (`tp-agent lane create`, `tp-agent lanes`). Work goes into it with `tp-agent dispatch --lane NAME --step ID ...` (a lane that does not exist yet is created from `--domain` and `--touches`). Lanes need a `lanes` block in `config/orchestration.json`.
+
+- **One writer per lane.** Every start on a lane's tree (`dispatch`, `tick`, `retry`, `tp-review`, and `tp-spawn --lane` called directly or by a worker's escalation) first takes the lane's lease, `<git common dir>/tmux-pi/lanes/NAME/lease.json`, which every session of the repository shares. A second writer is refused, naming the holder and the command that ends it; any number of reviewers may share the lane, but not with a writer. Starting anything in a lane's working tree without `--lane` (a nested repository in it included) is refused too.
+- **Tags.** A lane task records `lane` and `lane_step`; `retry` and `tp-review` copy them, so a retry or a review stays in its lane and step. A lane task reads the repository's `.tmux-pi/worker-preamble.md` from the main checkout (the lane's checkout has none): `--preamble-from` names it, and `tp-spawn --lane` uses the main checkout when it is left out.
+- **Escalation.** A lane worker that escalates (`agent/extensions/escalate.ts`) hands the lane to the stronger worker (`tp-spawn --lane-replaces`): both hold the lane until the first one ends, which it does right after the handoff.
+- **`--force-alive`** (on `retry` and `review`) skips only the check of this session's tasks for a process on the tree. It does not apply to a lane: the lane's lease still refuses a second writer, or a reviewer beside a writer. To review or retry a lane task while its writer runs, end the writer: `tp-agent stop WRITER` (run it in the session the refusal names).
+
+### Lane recovery
+
+A holder is released when its process ends; nothing is released by age. Each refusal names its fix. In order of how often they happen:
+
+| What you see | What it means | Clear it with |
+| --- | --- | --- |
+| `lane NAME already has a writer or a task starting on it: TASK (running, pid P, session S; to end it: CMD)` | another task is running on the lane | wait, or run CMD (for example `TP_STATE_DIR=S tp-agent stop TASK`). The lane is free once the process is gone |
+| the same with `wait: TASK is still starting` | a `tp-spawn` is mid-start (a few seconds) | wait and dispatch again. If it is still there after a minute, nothing runs from it: the next dispatch drops it by itself |
+| the same with `kill PID` or `tmux kill-pane -t %N` | a `tp-spawn` was killed after it made the pane; the pane still runs, so the lane stays held | run that command; the lane is free once the pane's process ends |
+| `pane %N of TASK could not be ended; its task directory and lane NAME stay as they are` | a failed start could not remove its own pane | `tmux kill-pane -t %N`, then dispatch again |
+| `TASK has no readable meta.json and a process of it is running` | a start was killed after it made its task directory, and its pane runs | the command in the message; a task directory with no `meta.json` and nothing running is only a warning (`rm -r DIR` when you no longer need it) |
+| `lease ... is not valid JSON` / `not a tp-lane-lease:v1 lease` | the lease file is damaged and might hide a writer, so it is not used | check nothing runs on the lane (`tp-agent lanes`, `tmux list-panes -a`), then `rm` the file named in the message; the lane starts with no holder |
+| `queue entry X.json cannot be read` | a queued item the lane cannot rule out as a holder | `tp-agent stop X` removes it |
+| `TASK has no recorded working tree` / `cannot read TASK/meta.json` / `records an unreadable pane` | a task of this session whose record is damaged and that might be running | if it runs (`tmux list-panes -a`), end it: `tmux kill-pane -t %N`. Otherwise add `"workdir": "PATH"` to its `meta.json` (or fix the pane id) and dispatch again |
+| `cannot read tmux panes` / `cannot read the process table` | tmux or `ps` could not be asked, so a writer cannot be ruled out | run `tp-agent` from inside the tmux session (`tmux list-panes -a` must work there) and dispatch again; it clears itself once the table reads |
+| `lane NAME has an unreadable record PATH` | the lane's `lane.json` does not parse or belongs to another repository | `python3 -m json.tool PATH` names the broken line; fix it, comparing with a healthy `lane.json` of another lane. Or retire the lane (below) |
+| `worktree W does not exist` / `is on X, expected BRANCH` / `is not registered with git` | the lane's tree was moved, deleted or switched by hand | `git -C W switch BRANCH` for a switched tree; for a missing or unregistered one retire the lane (below) and make a new one |
+| `N lanes are open (limit M)` | `lanes.max_active_lanes` is reached | retire a lane you no longer need (below), or raise `lanes.max_active_lanes` in `config/orchestration.json` |
+| `lane NAME is integrating` / `integrated` / `abandoned` | the lane takes no more work | dispatch into a new lane with another name |
+| a malformed `lanes` block in `config/orchestration.json` or the repository's `lanes.json` (the message names the key and file) | the configuration cannot be used | set the named key to the value the message states, in the named file |
+| `invalid lane name` / `needs --step` / `--lane chooses the working tree; remove --workdir` / `lane NAME does not exist; pass --domain ... --touches ...` / `already exists ... its declaration is set when it is created` / `--touches X is owned by the orchestrator` | a flag is missing, wrong or not allowed | run the same command with the flag change the message names |
+| `lane tasks run the tests that check their change` | `--tests full` in a lane | pass `--tests affected` or `--tests none`; run the whole suite once from the main checkout |
+| `X is inside lane NAME's working tree; pass --lane NAME --step ID` | a start in a lane's tree without the lane | repeat it with `--lane NAME --step ID` (or start it in the main checkout) |
+| `waiting for lane NAME's writer TASK` (tick, queued) | not a refusal: the item starts when the writer is gone | nothing, or `tp-agent stop TASK` / `tp-agent stop ITEM` |
+
+#### Retiring a lane by hand
+
+`tp-agent lane remove` and `integrate` ship in a later slice. Until then, to drop a lane that is no longer wanted (this discards its unmerged work; look at `tp-agent lanes` first): end its tasks (`tp-agent stop ID`), then `git -C REPO worktree remove WORKTREE` (add `--force` only when you have kept what is in it), `git -C REPO branch -D BRANCH`, and `rm -r GIT_COMMON_DIR/tmux-pi/lanes/NAME`. REPO, WORKTREE and BRANCH are in the lane's row of `tp-agent lanes`; GIT_COMMON_DIR is `git -C REPO rev-parse --git-common-dir`.
 
 ## Codemode on the Pi main
 

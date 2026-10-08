@@ -419,7 +419,7 @@ def read_lane(common_dir, name):
         if record["git_common_dir"] != os.path.realpath(common_dir):
             raise ValueError(f"it belongs to the repository at {record['git_common_dir']}")
     except (OSError, ValueError, RecursionError) as error:
-        raise ValueError(f"lane {name} has an unreadable record {path} ({error}); it is not used. Fix or move it")
+        raise ValueError(f"lane {name} has an unreadable record {path} ({error}); it is not used. Fix the file, or retire the lane (README.md, Lane recovery)")
     return record
 
 
@@ -506,6 +506,71 @@ def write_lane(common_dir, record):
     return record
 
 
+def read_lane_file(common_dir, name, filename):
+    """The text of lanes/<name>/<filename> (a file kept beside the record, e.g. the lease), or None when the lane directory or
+    the file does not exist. Reached with no symlink followed; anything else that is wrong with it refuses naming the file."""
+    path = lane_path(common_dir, name).parent / filename
+    try:
+        fd = _walk(common_dir, LANES_SUBDIR.parts + (name,))
+        if fd is None:
+            return None
+        try:
+            return _read_regular(fd, filename, path)
+        except FileNotFoundError:
+            return None
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read {path} ({error})")
+
+
+def write_lane_file(common_dir, name, filename, text):
+    """Replace lanes/<name>/<filename> atomically with `text`, or remove it when `text` is None. Same lock rule as write_lane;
+    the lane's directory must exist (the lane has a record), and an existing entry that is not a regular file refuses."""
+    path = lane_path(common_dir, name).parent / filename
+    try:
+        lanes_fd = _walk(common_dir, LANES_SUBDIR.parts)
+        try:
+            if lanes_fd is None or _held.get(_dir_key(lanes_fd)) != _me():
+                raise ValueError("write_lane_file needs the lane lock (lane_lock) held by this thread")
+            try:
+                dir_fd = _open_dir(lanes_fd, name, path.parent)
+            except FileNotFoundError:
+                raise ValueError(f"lane {name} has no directory {path.parent}")
+        finally:
+            if lanes_fd is not None:
+                os.close(lanes_fd)
+        try:
+            try:
+                if not stat.S_ISREG(os.lstat(filename, dir_fd=dir_fd).st_mode):
+                    raise ValueError(f"{path} exists and is not a regular file")
+                exists = True
+            except FileNotFoundError:
+                exists = False
+            if text is None:
+                if exists:
+                    os.unlink(filename, dir_fd=dir_fd)
+                    os.fsync(dir_fd)
+                return
+            tmp = f".lane.json.{secrets.token_hex(6)}"  # discard_lane_record sweeps this name too
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            try:
+                with os.fdopen(fd, "w") as out:
+                    out.write(text)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(tmp, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=dir_fd)
+                raise
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as error:
+        raise _fail_os(error, path)
+
+
 def discard_lane_record(common_dir, name):
     """Undo a record write that this process just made: remove lanes/<name>/lane.json, any temporary file left beside it
     and the then-empty directory. Same lock rule as write_lane. Only regular files are unlinked; a directory that holds
@@ -584,7 +649,7 @@ def lane_reality(record):
         if main_worktree(record["git_common_dir"]) != repo:
             fail(f"{repo} is not the repository's main working tree")
         if not os.path.isdir(worktree):
-            fail(f"worktree {worktree} does not exist; run tp-agent lane remove {name} --abandon")
+            fail(f"worktree {worktree} does not exist; restore it, or retire the lane by hand (README.md, Lane recovery)")
         if os.path.realpath(worktree) != worktree or worktree not in registered_worktrees(record["git_common_dir"]):
             fail(f"worktree {worktree} is not registered with git")
         common = record["git_common_dir"]
@@ -596,7 +661,7 @@ def lane_reality(record):
         actual = head.strip()
         if actual != f"refs/heads/{branch}":
             fail(f"worktree {worktree} is on {actual[len('refs/heads/'):] if actual.startswith('refs/heads/') else 'a detached HEAD'}, "
-                 f"expected {branch}; fix it or run tp-agent lane remove {name} --abandon")
+                 f"expected {branch}; check it out again, or retire the lane by hand (README.md, Lane recovery)")
         # From here on ask the repository itself (the common git dir), never the worktree directory.
         code, out = _git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}"], common, ok=(0, 1))
         if code:
@@ -627,6 +692,61 @@ def lane_reality(record):
             raise
         raise ValueError(f"lane {name}: cannot check the record against git ({error})")
     return {"tip": tip}
+
+
+# ---------------------------------------------------------------- which lane owns a directory
+
+def _checkout_tops(real):
+    """Every directory at or above `real` that holds a `.git` entry (a repository's main tree, a linked worktree, a nested
+    repository or a submodule), nearest first. Found by looking at the filesystem, so a git failure cannot turn into "not in a
+    repository"."""
+    tops, current = [], real
+    while True:
+        if os.path.lexists(os.path.join(current, ".git")):
+            tops.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return tops
+        current = parent
+
+
+def lane_containing(path):
+    """(record, unrecorded) for the directory `path`: `record` is the validated record of the lane whose worktree is `path` or
+    contains it, else None; `unrecorded` is True when the nearest checkout holding `path` is a linked worktree that no lane
+    records (a hand-made one, allowed with a warning). A directory in no repository gives (None, False).
+
+    EVERY checkout above `path` is asked, not only the nearest: a nested repository or a submodule inside a lane's tree has a
+    git directory of its own, and its own lane records say nothing about the tree around it, but the enclosing checkout is
+    the lane's linked worktree and its repository's records do. The path is resolved through symlinks first, so a link to
+    a directory inside a lane's tree is that tree. Anything unreadable refuses: git failing in a checkout, a lane record
+    that cannot be read (it may hold this very tree). Nothing is created or changed."""
+    real = os.path.realpath(path)
+    tops = _checkout_tops(real)
+    if not tops:
+        return None, False
+    seen = set()
+    for top in tops:
+        common = git_common_dir(top)
+        if common in seen:
+            continue
+        seen.add(common)
+        for name in lane_names(common):
+            record = read_lane(common, name)
+            if _inside(real, os.path.realpath(record["worktree"])):
+                return record, False
+    return None, os.path.realpath(tops[0]) != main_worktree(git_common_dir(tops[0]))
+
+
+def refuse_lane_tree(path, step_flag="--step"):
+    """Refuse a dispatch that names no lane but whose working tree is a lane's: it would be a second way to write there,
+    around the one-writer rule. Returns the warnings for a hand-made (unrecorded) linked worktree, which is allowed."""
+    record, unrecorded = lane_containing(path)
+    if record is not None:
+        raise ValueError(f"{path} is inside lane {record['name']}'s working tree; pass --lane {record['name']} {step_flag} ID")
+    if unrecorded:
+        return [{"kind": "unrecorded-worktree", "path": os.path.realpath(path),
+                 "note": "a linked git worktree that no lane records; it is used as it is, with no lane rules"}]
+    return []
 
 
 # ---------------------------------------------------------------- configuration
@@ -843,5 +963,20 @@ def check_lane_capacity(common_dir, max_active_lanes):
     """Refuse when creating one more work lane would exceed `max_active_lanes` (see active_lane_names)."""
     names = active_lane_names(common_dir)
     if len(names) >= max_active_lanes:
-        raise ValueError(f"{len(names)} lanes are open (limit {max_active_lanes}): {', '.join(names)}. Integrate or remove one first")
+        raise ValueError(f"{len(names)} lanes are open (limit {max_active_lanes}): {', '.join(names)}. Retire one first: tp-agent lane integrate and lane remove ship in a later slice, "
+                         "so today follow README.md, Lane recovery, Retiring a lane by hand")
     return len(names)
+
+
+if __name__ == "__main__":  # tp-spawn: check-tree <workdir> (no --lane was given: refuse a lane's tree) | main-checkout <workdir>
+    import sys
+    try:
+        if len(sys.argv) != 3 or sys.argv[1] not in ("check-tree", "main-checkout"):
+            raise ValueError("usage: lanes.py check-tree|main-checkout <workdir>")
+        if sys.argv[1] == "check-tree":
+            refuse_lane_tree(sys.argv[2], "--lane-step")
+        else:  # the repository's main working tree, where the preamble of a lane's tasks is read
+            print(main_worktree(git_common_dir(sys.argv[2])))
+    except ValueError as error:
+        print(f"tp-spawn: {error}", file=sys.stderr)
+        sys.exit(1)

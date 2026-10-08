@@ -385,7 +385,7 @@ class ExplicitValidationTests(unittest.TestCase):
         self.assertEqual(X(SONNET, "claude")["effort"], "medium")
 
     def test_a_packet_that_does_not_fit_is_rejected(self):
-        self.rejected("does not fit", HAIKU, "claude", est_tokens=150000)
+        self.rejected("does not fit", HAIKU, "claude", est_tokens=700000)
         self.rejected("over", "slotstream/qwen3.8-flash-next:4bit", "pi", est_tokens=9000)
         self.assertEqual(X(SONNET, "claude", est_tokens=150000)["model"], SONNET)
 
@@ -445,7 +445,7 @@ class RedirectTests(unittest.TestCase):
             ("madeup/model", "pi", "low", {}, "not in the model catalog"),
             ("openai-codex/gpt-6.1-sol", "pi", "high", {}, "not offered"),
             (SONNET, "claude", "medium", {"health": {"anthropic": {"status": "exhausted"}}}, "marked unavailable"),
-            (HAIKU, "claude", "high", {"est_tokens": 150000}, "does not fit"),
+            (HAIKU, "claude", "high", {"est_tokens": 700000}, "does not fit"),
             (QWEN, "pi", "high", {}, "not allowed"),
         ]
         for model, worker, thinking, ctx, needle in cases:

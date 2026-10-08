@@ -43,7 +43,7 @@
       {
         "provider": "anthropic",
         "worker": "claude",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-5-5",
         "effort": "lowest",
         "timeout_seconds": 20,
         "env": {"MAX_THINKING_TOKENS": "0"},
@@ -189,8 +189,8 @@
       "expected_share": [0.08, 0.15],
       "models": [
         {
-          "provider": "anthropic", "worker": "claude", "model": "claude-haiku-4-5-20251001",
-          "efforts": ["low", "medium", "high"], "context_window": 200000, "max_output": 64000, "in_roster": true
+          "provider": "anthropic", "worker": "claude", "model": "claude-haiku-5-5",
+          "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 64000, "in_roster": true
         },
         {
           "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-luna",

@@ -53,7 +53,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from contract import ContractError, state_dir as tmux_state_dir  # noqa: E402
+from contract import ContractError, state_dir as tmux_state_dir, task_lifecycle  # noqa: E402
 from task_record import (archive_task, capture_main_output, end_session_retention, find_task, format_record_for_resume, iter_task_dirs, parse_record, retention_report,  # noqa: E402
                          approved_delegated_review, author_result_hash, review_inventory, unresolved_review, set_pin, write_record)
 from automation import automation_policy  # noqa: E402
@@ -680,7 +680,9 @@ def cmd_capability_resolve(args):
                                                     "outcome": event["decision"], "request": request, "id": event.get("id")})
     _write_json(d / "checkpoints.json", checkpoints)
     pending_path.unlink()
-    write_record(d, lifecycle_state="working", meta=meta)
+    # What the files now say (pending-capability.json is gone), not a fixed state: a worker that has finished or is
+    # asking something else must not be written back as working.
+    write_record(d, lifecycle_state=task_lifecycle(d)[0], meta=meta)
     result = {"id": args.id, "event": event, "pending_cleared": True,
               "worker_signaled": "signal_error" not in event}
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else

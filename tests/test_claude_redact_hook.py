@@ -159,6 +159,14 @@ class RedactHookTests(unittest.TestCase):
         out = self.pre("Bash", {"command": "npm run dev", "run_in_background": True})
         self.assertIsNone(out)
 
+    def test_wrap_is_idempotent_and_an_unchanged_command_emits_no_updated_input(self):
+        done = "ls" + SUFFIX
+        self.assertEqual(wrap(done), done)
+        self.assertEqual(wrap(wrap("ls")), done)
+        self.assertIsNone(wrap("ls # note" + SUFFIX))  # the suffix inside a comment is no wrapper
+        self.assertIsNone(self.bash(done))
+        self.assertEqual(self.bash("ls;")["updatedInput"]["command"], done)
+
     def test_subagent_events_get_the_same_decisions(self):
         main = self.pre("Read", {"file_path": "apps/web/.env.production"})
         sub = self.pre("Read", {"file_path": "apps/web/.env.production"}, agent_id="a1", agent_type="Explore")

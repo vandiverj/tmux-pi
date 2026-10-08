@@ -383,6 +383,24 @@ def _task_dirs(state_dir):
                     yield d
 
 
+def measured_total(values, digits=None):
+    """(sum of the values that were measured, how many were not): the sum is None when none was measured (unknown, not
+    0), and a mixed selection reports the unmeasured count so the sum reads as partial."""
+    known = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    total = sum(known) if known else None
+    return (round(total, digits) if digits is not None and total is not None else total), len(values) - len(known)
+
+
+def totals(tasks):
+    if not tasks:
+        return {"cost": None, "output_tokens": None}
+    cost, cost_missing = measured_total([t.get("cost") for t in tasks], 6)
+    output, output_missing = measured_total([(t.get("tokens") or {}).get("output") for t in tasks])
+    return {"cost": cost, "cost_unknown_tasks": cost_missing, "cost_partial": bool(cost_missing and cost is not None),
+            "output_tokens": output, "output_tokens_unknown_tasks": output_missing,
+            "output_tokens_partial": bool(output_missing and output is not None)}
+
+
 def task_summary(d, dirs_by_id):
     """Joinable, text-free facts about one task dir: actual model, state, review, escalation, usage."""
     meta = _read_json(d / "meta.json") or {}
@@ -419,7 +437,7 @@ def task_summary(d, dirs_by_id):
         "turns": state.get("turns"),
         "tool_errors": state.get("toolErrors"),
         "tokens": {k: tokens.get(k) for k in ("input", "output", "cacheRead", "cacheWrite")} if tokens else None,
-        "cost": state.get("cost") if isinstance(state.get("cost"), (int, float)) else None,
+        "cost": state.get("cost") if isinstance(state.get("cost"), (int, float)) and state.get("costKnown") is not False else None,  # a harness that reports none (Claude) has no cost, not 0
         "duration_seconds": int((updated - created).total_seconds()) if created and updated and updated >= created else None,
         "review": review,
         "review_required": {"status": marker.get("status")} if marker else None,
@@ -495,10 +513,7 @@ def export_rows(directory, state_dir):
                 "overridden": bool(first and final and first != final),
                 "escalated": any(t.get("escalated_to") for t in tasks),
             },
-            "totals": {
-                "cost": round(sum(t["cost"] for t in tasks if t.get("cost") is not None), 6) if tasks else None,
-                "output_tokens": sum((t.get("tokens") or {}).get("output") or 0 for t in tasks) if tasks else None,
-            },
+            "totals": totals(tasks),
             "labels": {
                 "acceptance": latest("acceptance") or "unknown",
                 "acceptance_source": "human" if latest("acceptance") else None,

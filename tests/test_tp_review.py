@@ -29,7 +29,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py"):   # the last two: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n")
@@ -91,6 +91,24 @@ echo review-1
 
     def spawn_args(self):
         return (self.plan.parent / "spawn.args").read_text()
+
+    def test_a_task_in_the_session_archive_is_named_by_place_under_either_archive_name(self):
+        archive = self.state / "archive"
+        archive.mkdir()
+        for name in ("w1", "w1-ended-20261008010101", "w1-ended-20261008010101-1"):
+            with self.subTest(archived_as=name):
+                if self.task.exists():
+                    self.task.rename(archive / name)
+                else:
+                    (archive / "w1").rename(archive / name)
+                r = self.review()
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(f"in the session archive at {archive / name}", r.stderr)
+                self.assertNotIn("no subagent", r.stderr)
+                (archive / name).rename(archive / "w1") if name != "w1" else None
+                self.task = archive / "w1"
+        r = subprocess.run([str(self.root / "bin/tp-review"), "nope"], env=self.env, capture_output=True, text=True)
+        self.assertIn("no subagent 'nope'", r.stderr)
 
     def test_reviewer_comes_from_the_review_plan(self):
         self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})

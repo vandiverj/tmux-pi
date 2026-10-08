@@ -187,6 +187,8 @@ def wrap(command):
             return None
     except ValueError:
         return None
+    if text.endswith(SUFFIX):  # already wrapped (a retry of a rewritten call): wrapping again would stack it
+        return text
     lines[-1] = line.rstrip() + SUFFIX
     return "\n".join(lines)
 
@@ -334,7 +336,7 @@ def pre_decision(event):
     if holds and holds["decision"] == "deny":
         return holds
     wrapped = None if params.get("run_in_background") or holds else wrap(command)
-    if wrapped:
+    if wrapped and wrapped != command:  # nothing to change: no updated input
         result["input"] = {**params, "command": wrapped}
     if "blocked" in kinds:
         path = next(p for k, p in reads if k == "blocked")

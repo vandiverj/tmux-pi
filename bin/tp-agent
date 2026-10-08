@@ -15,7 +15,9 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
+from task_archive import find_archived_task  # noqa: E402
 from task_record import refresh_record  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
 from worker_process import FINISHED, end_or_refuse, end_process, end_orphan, guard_retry, guard_review, live_process, orphans, pane_table  # noqa: E402
@@ -83,6 +85,10 @@ def task_dir(base, ident):
         raise ValueError("invalid task id")
     path = base / "tasks" / ident
     if not (path / "meta.json").is_file():
+        archived = find_archived_task(base, ident)
+        if archived:  # stop and collect move a task here; every command that works on a task refuses it by place
+            raise ValueError(f"task {ident} is in the session archive at {archived}, not among the active tasks; "
+                             "retry and review work only on active tasks (a retry's lineage and review rounds are read from tasks/)")
         raise ValueError(f"unknown task: {ident}")
     return path
 
@@ -93,6 +99,22 @@ RESULT_STATUS = re.compile(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incom
 def lifecycle(path):
     # tp-agent does not look at panes: contract.lifecycle reads an unobserved pane as present.
     return task_lifecycle(path)[0]
+
+
+def usage_fields(state):
+    """(tokens, cost) for a task record, only what the harness measured. Tokens are null until the reporter has counted some
+    (a Claude worker's are counted from its transcript at each prompt and at Stop, so a zero before that is not a count).
+    A harness that reports no cost (Claude's transcripts carry none; the reporter sets costKnown false) has no cost key at all:
+    a 0 there read as free work."""
+    tokens = state.get("tokens")
+    if isinstance(tokens, dict) and not any(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 for v in tokens.values()):
+        tokens = None
+    fields = {"tokens": tokens}
+    if state.get("costKnown") is False:
+        fields["cost_known"] = False
+    else:
+        fields["cost"] = state.get("cost")
+    return fields
 
 
 def record(path, include_result=False):
@@ -113,7 +135,7 @@ def record(path, include_result=False):
         "packet": str(path / "packet.md"), "result_path": str(result_path) if result_path.exists() else None,
         "result_status": match.group(1).lower() if match else None,
         "tool": state.get("tool", ""), "updated": state.get("updated", meta.get("created")),
-        "tokens": state.get("tokens"), "cost": state.get("cost"),
+        **usage_fields(state),
         "permission": read_json(path / "permission-request.json") if (path / "permission-request.json").exists() else None,
         "capability_request": read_json(path / "capability-request.json") if (path / "capability-request.json").exists() else None,
         # the same test lib/contract.py uses to hold a task at needs_input for human capability approval
@@ -233,14 +255,20 @@ def route(task, role, worker, model, thinking, context=(), deliverable="", level
 
 
 def escalation_evidence(base, previous):
-    """(failed attempts, REQUEST_CHANGES reviews) along the retry lineage that ends at `previous`."""
+    """(failed attempts, REQUEST_CHANGES reviews) along the retry lineage that ends at `previous`. The walk has the
+    limits lib/review_rounds.py puts on the same lineage: a loop or more than MAX_ANCESTORS tasks refuses (ValueError)
+    instead of counting only part of the evidence."""
     failed = changes = 0
     seen, path = set(), previous
-    for _ in range(12):
+    while True:
         meta = read_json(path / "meta.json")
-        if meta.get("id", path.name) in seen:
-            break
-        seen.add(meta.get("id", path.name))
+        ident = meta.get("id", path.name)
+        if ident in seen:
+            raise ValueError(f"the retry lineage of '{previous.name}' loops back to '{ident}'; cannot count its failed attempts")
+        if len(seen) >= review_rounds.MAX_ANCESTORS:
+            raise ValueError(f"the retry lineage of '{previous.name}' is longer than {review_rounds.MAX_ANCESTORS} tasks; "
+                             "refusing rather than counting only part of it")
+        seen.add(ident)
         rec = record(path)
         if rec["status"] in {"failed", "stopped"} or rec["result_status"] in {"incomplete", "blocked"}:
             failed += 1
@@ -256,7 +284,9 @@ def escalation_evidence(base, previous):
             break
         try:
             path = task_dir(base, meta["parent"])
-        except ValueError:
+        except ValueError as error:
+            if find_archived_task(base, meta["parent"]):  # an archived ancestor: counting without it would understate the evidence
+                raise ValueError(f"the retry lineage of '{previous.name}' passes through an archived task: {error}")
             break
     return failed, changes
 
@@ -305,6 +335,9 @@ def capacity(base, item):
             predecessor = record(predecessor_dir)
             life, state, events, reply = task_lifecycle(predecessor_dir)
         except ValueError:
+            archived = find_archived_task(base, parent)
+            if archived:
+                return False, f"dependency {parent} is in the session archive at {archived}, not among the active tasks"
             return False, f"dependency {parent} has not started"
         # The shared answer first (a pause or an unstatused reply never satisfies), then admission's own
         # stricter rule: only a task that has a reply, settled or completed.
@@ -379,10 +412,15 @@ def locked(base):
     return lock
 
 
-def check_workdir(role, workdir=None):
+def check_workdir(role, workdir=None, contexts=()):
     """The canonical absolute workdir tp-spawn --check validated (explicit, else the main pane's); ValueError if
-    tp-spawn refuses it or reports anything but an absolute path."""
-    command = [str(ROOT / "bin/tp-spawn"), "--check", "--role", role] + (["--workdir", workdir] if workdir else []) + ["--", "check"]
+    tp-spawn refuses it or reports anything but an absolute path. The same check refuses a --context spec that is missing,
+    binary or over the size cap, saying the cap, the size and the largest range that fits, so it fails here and not when
+    a queued task starts."""
+    command = [str(ROOT / "bin/tp-spawn"), "--check", "--role", role] + (["--workdir", workdir] if workdir else [])
+    for spec in contexts:
+        command += ["--context", spec]
+    command += ["--", "check"]
     run = subprocess.run(command, text=True, capture_output=True)
     if run.returncode:
         raise ValueError(run.stderr.strip() or "tp-spawn could not check the workdir")
@@ -543,7 +581,7 @@ def dispatch(args, base):
     # pane's) exactly as it will when it builds the packet, so both dispatch forms are checked the same way.
     # The canonical directory it reports is what the task stores, routing reads and launch passes back, so a queued
     # task cannot start in a different repository than the one validated here.
-    workdir = check_workdir(args.role, args.workdir)
+    workdir = check_workdir(args.role, args.workdir, args.context or [])
     if not args.workdir:  # recheck the resolved directory the way launch will pass it (an explicit --workdir)
         workdir = check_workdir(args.role, workdir)
     chosen = getattr(args, "preroute", None) or route(
@@ -589,8 +627,10 @@ def tick(base):
                 refused.append({"id": path.stem, "reason": reason})
                 continue
             try:
-                ok, _ = capacity(base, item)
+                ok, why = capacity(base, item)
                 if not ok:
+                    if isinstance(raw, dict) and "queue_reason" in raw:  # an entry that carries a reason says why it waits now,
+                        note_queue_reason(path, raw, why)             # not what an earlier tick or failed start said
                     continue
                 started.append(launch(base, item)["id"])
                 path.unlink()

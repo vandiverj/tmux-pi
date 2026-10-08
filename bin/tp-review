@@ -45,7 +45,13 @@ id="$1"
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 dir="$state_dir/tasks/$id"
-[[ -f "$dir/meta.json" ]] || die "no subagent '$id'"
+if [[ ! -f "$dir/meta.json" ]]; then
+  # the lookup tp-agent uses (lib/task_record.py): stop and collect archive under <id> or <id>-ended-<stamp>[-N]
+  archived="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from task_archive import find_archived_task; found = find_archived_task(sys.argv[2], sys.argv[3]); print(found or "")' "$ROOT/lib" "$state_dir" "$id")" ||
+    die "cannot search the session archive for '$id'"
+  [[ -z "$archived" ]] || die "subagent '$id' is in the session archive at $archived, not among the active tasks; review works only on active tasks"
+  die "no subagent '$id'"
+fi
 [[ ! -f "$dir/pending-capability.json" ]] || die "subagent '$id' is waiting for human capability approval; review is blocked"
 # An unanswered worker request means the author's evidence is incomplete, so no
 # review (not even --force) starts. Never echo the request's contents.

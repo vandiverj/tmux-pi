@@ -106,7 +106,7 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
 }
 
 function summarize(rows: readonly TaskRow[]): TaskSummary {
-  const summary: TaskSummary = { active: 0, toCollect: 0, paused: 0, pausedWithStatus: 0, failed: 0, needsInput: [] }
+  const summary: TaskSummary = { active: 0, toCollect: 0, paused: 0, pausedWithStatus: 0, failed: 0, refused: 0, needsInput: [] }
   for (const row of rows) {
     if (row.status === 'needs_input') summary.needsInput.push(row.id)
     else if (row.status === 'settled') summary.toCollect += 1
@@ -115,19 +115,21 @@ function summarize(rows: readonly TaskRow[]): TaskSummary {
       else summary.pausedWithStatus += 1
     }
     else if (row.status === 'failed') summary.failed += 1
+    else if (isRefused(row)) summary.refused += 1  // never starts, so it is not active work
     else if (row.status === 'queued' || row.status === 'starting' || row.status === 'working') summary.active += 1
   }
   return summary
 }
 
 function isQuiet(summary: TaskSummary): boolean {
-  return summary.active + summary.toCollect + summary.paused + summary.pausedWithStatus + summary.failed + summary.needsInput.length === 0
+  return summary.active + summary.toCollect + summary.paused + summary.pausedWithStatus + summary.failed + summary.refused + summary.needsInput.length === 0
 }
 
 function bandText(summary: TaskSummary): string {
   const parts = [`${summary.active} active`, `${summary.toCollect} to collect`, `${summary.failed} failed`]
   if (summary.paused > 0) parts.push(`${summary.paused} replied without a result status`)
   if (summary.pausedWithStatus > 0) parts.push(`${summary.pausedWithStatus} paused`)
+  if (summary.refused > 0) parts.push(`${summary.refused} refused`)
   if (summary.needsInput.length > 0) parts.push(`needs input: ${summary.needsInput.join(', ')}`)
   return `workers: ${parts.join(' · ')}`
 }

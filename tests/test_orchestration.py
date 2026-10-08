@@ -245,6 +245,9 @@ esac
 
 class SensitiveReadTests(unittest.TestCase):
     def test_known_files_and_common_shell_routes_prompt(self):
+        # A relative root such as `find .` is judged against the working directory, so name it
+        # rather than inherit the directory the test run happens to start in.
+        cwd = str(ROOT)
         cases = [
             ("Read", {"file_path": ".env"}),
             ("Read", {"file_path": "config/appsettings.Production.json"}),
@@ -260,11 +263,11 @@ class SensitiveReadTests(unittest.TestCase):
         ]
         for tool, params in cases:
             with self.subTest(tool=tool, params=params):
-                self.assertTrue(classify(tool, params)["sensitive"])
-                response = hook_response({"tool_name": tool, "tool_input": params})
+                self.assertTrue(classify(tool, params, cwd)["sensitive"])
+                response = hook_response({"tool_name": tool, "tool_input": params, "cwd": cwd})
                 self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertFalse(classify("Bash", {"command": "rg handler src"})["sensitive"])
-        self.assertFalse(classify("Read", {"file_path": "src/handler.py"})["sensitive"])
+        self.assertFalse(classify("Bash", {"command": "rg handler src"}, cwd)["sensitive"])
+        self.assertFalse(classify("Read", {"file_path": "src/handler.py"}, cwd)["sensitive"])
 
     def test_claude_hook_keeps_request_pending_until_matching_tool_settles(self):
         with tempfile.TemporaryDirectory() as folder:

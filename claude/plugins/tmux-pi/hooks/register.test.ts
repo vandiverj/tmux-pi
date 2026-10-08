@@ -9,9 +9,10 @@ const BAND = { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 80 }
 type Row = { id: string; status: string; role?: string; capability_request?: unknown }
 
 // Stands for the engine beneath the plugin: answers the environment, the clock, the
-// session and every host command from memory, and records what the module did. The kit
-// has no stand-in for a plugin's own `$.session.append`, so the index row appended at
-// start is not asserted here; the text it carries is, through the compaction route.
+// session and every host command from memory, and records what the module did. A plugin's
+// own `$.session.append` is refused here (a deny from the test's hook; newer kits
+// store the row when nothing refuses it), so the index row appended at start is not asserted;
+// the text it carries is, through the compaction route.
 function world(on: On, env: Record<string, string>) {
   const w = {
     rows: [] as Row[],
@@ -34,6 +35,7 @@ function world(on: On, env: Record<string, string>) {
     w.commands.push(e.name)
     return { value: { command: e.name } }
   })
+  on('session.append', () => ({ deny: 'the test refuses the index row' }) as never)
   on('command.run', () => ({ text: 'engine' }))
   on('classic.SessionStart', () => ({}))
   on('ui.toast', (_$, e) => {
@@ -101,8 +103,8 @@ test('a failing tp-agent leaves the session start untouched', async ($, on) => {
 
 // ---- notifier ----
 
-// The kit cannot store a plugin's own session append, so here the index never reaches
-// the conversation; that is the refused-append path, where waiting tasks must be announced.
+// The world refuses the module's session append, so the index never reaches the
+// conversation; that is the refused-append path, where waiting tasks must be announced.
 test('when the index append is refused, what is already waiting is announced once', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'settled' }, { id: 'coder-2', status: 'needs_input' }]

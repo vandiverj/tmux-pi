@@ -486,9 +486,16 @@ class ContractTests(unittest.TestCase):
         task.mkdir(parents=True)
         (task / "meta.json").write_text(json.dumps({"id": "stopped", "pane": "%1", "worker": "pi",
                                                     "model": "openai-codex/gpt-6-luna", "thinking": "medium"}))
-        env = dict(os.environ, TP_STATE_DIR=str(state))
+        # Never ask the real tmux server: its pane %1 may be alive, which would make "killed" untestable.
+        panes = self.dir / "panes"
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\ncat "%s"\n' % panes)
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "escalate", "stopped", "--trigger", "model_error", "--reason", "error"]
-        for reported in ("working", "cancelled", "completed"):
+        # killed: the pane is gone; cancelled and completed: the pane is still alive.
+        for reported, listing in (("working", ""), ("cancelled", "%1 0\n"), ("completed", "%1 0\n")):
+            panes.write_text(listing)
             (task / "state.json").write_text(json.dumps({"state": reported}))
             result = subprocess.run(cmd, env=env, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0, reported)

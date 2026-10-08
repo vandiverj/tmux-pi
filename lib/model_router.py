@@ -207,7 +207,7 @@ def _local_rule(rec, req, config, ctx, health):
         return
     here = rc.level_of(cat, rec["model"])[0]
     entering = rec.get("source") in ("explicit_level", "escalation") or bool(here and here.get("restricted"))
-    problems, effort = rr.redirect_problems(cat, target, ctx, health, entering)
+    problems, effort = rr.redirect_problems(cat, target, ctx, health, entering, rec.get("route_bound"))
     if problems:
         rec["steps"].append("local rule redirect of {} to {} dropped: {}".format(rec["model"], target["model"], "; ".join(problems)))
         return

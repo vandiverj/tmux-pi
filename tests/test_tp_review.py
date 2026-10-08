@@ -270,6 +270,15 @@ echo review-1
         self.assertIn("+two", diff)
         self.assertIn("This is review round 2 of this work", self.log.read_text())
         self.assertIn("round 1 F2", self.log.read_text())
+        # every round is a full review: the whole change and what it can affect, with a Coverage section, never only the fixes
+        self.assertIn("Review the whole change every time", self.log.read_text())
+        self.assertIn("Do not stop when you have enough findings", self.log.read_text())
+        self.assertIn("section headed Coverage", self.log.read_text())
+        self.assertIn("not only the fixes", self.log.read_text())
+        for role in ("code-reviewer", "data-flow-reviewer", "vulnerability-reviewer"):
+            text = (ROOT / "agent/roles" / f"{role}.md").read_text()
+            self.assertIn("section headed Coverage", text, role)
+            self.assertIn("Do not stop when you have enough findings", text, role)
 
     def retried_with_secrets(self):
         """A first review, then a retry w2 whose working tree gained a .env and a secret-bearing note (made-up values)."""

@@ -102,7 +102,7 @@ The status pane (top right) lists workers live. Click it to focus it, then:
 | `x` | kill it (asks first) |
 | `c` | archive killed workers |
 
-States come from each worker's reporter: `starting`, `working`, `tool`, `waiting`, `permission`, `error`, then `done`, `failed:<code>` or `killed` once the process ends. A second line shows elapsed time and turns, and settled work shows its `result.md` path. Token counts include cached input; cost is shown only for Pi providers that price tokens. If the pane looks stale, see `/refresh-status` above.
+States come from each worker's reporter: `starting`, `working`, `tool`, `waiting`, `permission`, `error`, then `done`, `failed:<code>` or `killed` once the process ends. A second line shows elapsed time and turns, and settled work shows its `result.md` path; a reply with no `RESULT_STATUS:` line shows as `paused`, not settled, and is listed under `paused` in the session index. Token counts include cached input; cost is shown only for Pi providers that price tokens. If the pane looks stale, see `/refresh-status` above.
 
 ## Claude as the main agent
 
@@ -111,7 +111,7 @@ States come from each worker's reporter: `starting`, `working`, `tool`, `waiting
 The plugin in `claude/plugins/tmux-pi` also loads a main-only module, `hooks/register.tsx`, beside its command hooks. It is active only in an interactive orchestrator main (`TP_TASK_DIR` unset, `TP_ROOT` set, `TP_MODE=orchestrator`); workers, headless runs and legacy mains load it and it does nothing. When active it:
 
 - injects the task index at session start and again after a compaction, so the main no longer runs `tp-agent index` by hand (the injection uses `tp-agent index --no-tick`, which only reads and never launches queued work);
-- polls `tp-agent list` every five seconds and, when a worker becomes `needs_input`, `settled` or `failed`, shows a toast and sends one wake-up message naming the task; tasks already waiting when the session starts are the baseline and wake nobody;
+- polls `tp-agent list` every five seconds and, when a worker becomes `needs_input`, `settled`, `paused` (a reply with no result status, or a budget pause) or `failed`, shows a toast and sends one wake-up message naming the task; tasks already waiting when the session starts are the baseline and wake nobody;
 - draws one line above the prompt with worker counts and the ids that need input;
 - adds `/workers`, `/worker-view <id>|-` and `/worker-collect <id>`, which run without a model turn (named `worker…` because the engine refuses a built-in's name such as `/tasks`, and `/tp` is the built-in alias of `/teleport`).
 

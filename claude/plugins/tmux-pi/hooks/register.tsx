@@ -9,7 +9,7 @@ import type { NotifierState, TaskRow, TaskSummary } from '../types'
 const TP_AGENT_TIMEOUT_MS = 20000
 const POLL_MS = 5000
 const INDEX_CHARS = 6000
-const NOTABLE = new Set(['needs_input', 'settled', 'failed'])
+const NOTABLE = new Set(['needs_input', 'settled', 'paused', 'failed'])
 const WAKE_TRIES = 3
 const UNREAD_EPOCH = 1e15
 // tp-agent's own id pattern (IDENT in bin/tp-agent): no leading dash, so never an option.
@@ -97,16 +97,22 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
       role: typeof row.role === 'string' ? row.role : null,
       permission: row.permission ?? null,
       capability_request: row.capability_request ?? null,
+      capability_pending: row.capability_pending === true,
+      result_status: typeof row.result_status === 'string' ? row.result_status : null,
     })
   }
   return found
 }
 
 function summarize(rows: readonly TaskRow[]): TaskSummary {
-  const summary: TaskSummary = { active: 0, toCollect: 0, failed: 0, needsInput: [] }
+  const summary: TaskSummary = { active: 0, toCollect: 0, paused: 0, pausedWithStatus: 0, failed: 0, needsInput: [] }
   for (const row of rows) {
     if (row.status === 'needs_input') summary.needsInput.push(row.id)
     else if (row.status === 'settled') summary.toCollect += 1
+    else if (row.status === 'paused') {
+      if (row.result_status === null) summary.paused += 1
+      else summary.pausedWithStatus += 1
+    }
     else if (row.status === 'failed') summary.failed += 1
     else if (row.status === 'queued' || row.status === 'starting' || row.status === 'working') summary.active += 1
   }
@@ -114,11 +120,13 @@ function summarize(rows: readonly TaskRow[]): TaskSummary {
 }
 
 function isQuiet(summary: TaskSummary): boolean {
-  return summary.active + summary.toCollect + summary.failed + summary.needsInput.length === 0
+  return summary.active + summary.toCollect + summary.paused + summary.pausedWithStatus + summary.failed + summary.needsInput.length === 0
 }
 
 function bandText(summary: TaskSummary): string {
   const parts = [`${summary.active} active`, `${summary.toCollect} to collect`, `${summary.failed} failed`]
+  if (summary.paused > 0) parts.push(`${summary.paused} replied without a result status`)
+  if (summary.pausedWithStatus > 0) parts.push(`${summary.pausedWithStatus} paused`)
   if (summary.needsInput.length > 0) parts.push(`needs input: ${summary.needsInput.join(', ')}`)
   return `workers: ${parts.join(' · ')}`
 }
@@ -128,8 +136,21 @@ function clip(text: string, columns: number): string {
   return columns === 1 ? '…' : `${text.slice(0, columns - 1)}…`
 }
 
+// What a worker that waits for the main is waiting on, beyond its state: a pending capability request
+// (capability-request.json), a capability awaiting human approval (pending-capability.json, exported
+// as capability_pending) or a pending permission prompt. tp-agent keeps returning an answered request, so only pending counts.
+function awaiting(row: { permission?: unknown; capability_request?: unknown; capability_pending?: unknown }): string {
+  const pending = (value: unknown) => typeof value === 'object' && value !== null && (value as { status?: unknown }).status === 'pending'
+  return [pending(row.capability_request) ? 'capability request pending' : '', row.capability_pending === true ? 'capability approval pending' : '', pending(row.permission) ? 'permission prompt pending' : ''].filter(Boolean).join(', ')
+}
+
 function hint(row: TaskRow): string {
   if (row.status === 'settled') return `${row.id} settled: tp-agent collect ${row.id}`
+  if (row.status === 'paused') {
+    const why = row.result_status === null ? 'replied without a result status' : 'is paused'
+    const awaits = awaiting(row)
+    return `${row.id} ${why}${awaits === '' ? '' : ` (${awaits})`}: tp-agent inspect ${row.id}`
+  }
   if (row.status === 'failed') return `${row.id} failed: tp-agent inspect ${row.id}`
   // tp-agent keeps returning a capability request after it is answered: only a pending
   // one is the reason the worker waits.
@@ -259,30 +280,91 @@ function indexLine(row: unknown): string | undefined {
   if (typeof result_status === 'string') fields.push(`result=${result_status}`)
   if (typeof result_path === 'string') fields.push(result_path)
   if (typeof reason === 'string' && reason !== '') fields.push(`(${reason})`)
+  const awaits = awaiting(row as Record<string, unknown>)
+  if (awaits !== '') fields.push(`[awaits: ${awaits}]`)
   return `- ${fields.join(' ')}`
 }
 
-// The session index as the main reads it: objective, active and pending (not recent).
+// The protected part of the index, within `room` characters: workers that wait for the main (paused,
+// replied without a result status, needs input). Their wait is a decision only the main can make and no
+// other signal reaches it, so they are never dropped silently: full rows when
+// they all fit, else their ids only, else as many ids as fit and a line counting the rest.
+// An id in the ids-only tiers keeps a short mark of what the worker awaits.
+function idMark(row: Record<string, unknown>): string {
+  const awaits = awaiting(row)
+  return awaits === '' ? String(row.id) : `${row.id} [${awaits}]`
+}
+
+function pausedLines(groups: readonly (readonly [string, unknown])[], room: number): { lines: string[]; rows: unknown[] } {
+  const named = groups.map(([name, group]) => ({
+    name,
+    rows: (Array.isArray(group) ? group : []).filter(row => indexLine(row) !== undefined) as Record<string, unknown>[],
+  }))
+  const all = named.flatMap(group => group.rows)
+  const full = named.flatMap(({ name, rows }) => [`${name}:${rows.length === 0 ? ' none' : ''}`, ...rows.map(row => indexLine(row) as string)])
+  if (full.join('\n').length <= room) return { lines: full, rows: all }
+  const idsHeader = (name: string) => `${name} (ids only; tp-agent inspect <id>):`
+  const ids = named.map(({ name, rows }) => (rows.length === 0 ? `${name}: none` : `${idsHeader(name)} ${rows.map(idMark).join(', ')}`))
+  if (ids.join('\n').length <= room) return { lines: ids, rows: all }
+  const rest = (hidden: number) => `… ${hidden} more workers waiting for you not shown; run tp-agent list to see them`
+  const lines: string[] = []
+  const shown: unknown[] = []
+  let size = rest(all.length).length
+  let isFull = false
+  for (const { name, rows } of named) {
+    let line = idsHeader(name)
+    let count = 0
+    for (const row of rows) {
+      const piece = `${count === 0 ? ' ' : ', '}${idMark(row)}`
+      // A group's first id also pays for its header and the newline before it.
+      const cost = piece.length + (count === 0 ? line.length + 1 : 0)
+      if (isFull || size + cost > room) {
+        isFull = true
+        break
+      }
+      size += cost
+      line += piece
+      count += 1
+      shown.push(row)
+    }
+    if (count > 0) lines.push(line)
+  }
+  lines.push(rest(all.length - shown.length))
+  return { lines, rows: shown }
+}
+
+// The session index as the main reads it: objective, paused, active and pending (not recent),
+// never longer than INDEX_CHARS.
 // --no-tick: injection only reads; it never launches queued work.
-// `rows` are only the rows whose line made it into `text`: a row cut for length was not
-// shown to the main, so it must stay eligible for a wake.
+// `rows` are only the rows shown in `text` (as a line, or by id): a row cut for length was
+// not shown to the main, so it must stay eligible for a wake.
 async function readIndex($: EngineInterface): Promise<{ text: string; rows: unknown[] } | undefined> {
   const index = await runTpAgent($, ['index', '--no-tick'])
   if (typeof index !== 'object' || index === null) return undefined
-  const { objective, active, pending } = index as Record<string, unknown>
+  const { objective, active, pending, paused, unstatused } = index as Record<string, unknown>
   const lines = ['tmux-pi task index (injected; run `tp-agent index` only if this is missing):']
   lines.push(`objective: ${(typeof objective === 'string' && objective.trim() !== '' ? objective.trim() : '(none set)').slice(0, 1000)}`)
-  const shown: unknown[] = []
-  // Reserve room for the two group headers and the omission line, so the whole text fits.
-  let size = lines.join('\n').length + 120
+  // Room kept for the active and pending headers and the omission line, so the whole text fits.
+  const limit = INDEX_CHARS - 120
+  // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause);
+  // the other active rows and the pending ones take what room is left.
+  const activeRows = Array.isArray(active) ? active : []
+  const isAsking = (row: unknown) => typeof row === 'object' && row !== null && (row as { status?: unknown }).status === 'needs_input'
+  const first = pausedLines(
+    [['replied without a result status', unstatused], ['paused', paused], ['needs input', activeRows.filter(isAsking)]],
+    limit - lines.join('\n').length - 1,
+  )
+  lines.push(...first.lines)
+  const shown = [...first.rows]
+  let size = lines.join('\n').length
   let cut = 0
-  for (const [name, group] of [['active', active], ['pending', pending]] as const) {
+  for (const [name, group] of [['active', activeRows.filter(row => !isAsking(row))], ['pending', pending]] as const) {
     const rows = Array.isArray(group) ? group : []
     lines.push(`${name}:${rows.length === 0 ? ' none' : ''}`)
     for (const row of rows) {
       const line = indexLine(row)
       if (line === undefined) continue
-      if (size + line.length + 1 > INDEX_CHARS) {
+      if (size + line.length + 1 > limit) {
         cut += 1
         continue
       }
@@ -401,6 +483,16 @@ export const register: Register = on => {
       status = JSON.parse(ran.stdout)?.status
     } catch {
       status = undefined
+    }
+    if (status === 'paused') {
+      let resultStatus: unknown
+      try {
+        resultStatus = JSON.parse(ran.stdout)?.result_status
+      } catch {
+        resultStatus = undefined
+      }
+      const why = typeof resultStatus === 'string' ? 'is paused' : 'replied without a result status (paused)'
+      return { text: `${id} ${why}; nothing was collected.` }
     }
     if (status !== 'completed') return { text: `${id} is ${typeof status === 'string' ? status : 'in an unknown state'}; nothing was collected.` }
     return { text: `Collected ${id}.`, context: [`tp-agent collect ${id}:\n${ran.stdout}`] }

@@ -616,6 +616,79 @@ esac
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("omitted_context is not a list of strings", run.stderr)
 
+    def test_reply_without_result_status_is_paused_and_not_collected(self):
+        item = self.dispatch()
+        task = self.settle(item, "Started a background sleep; waiting for it.\n")
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "paused")
+        self.assertEqual(self.cli("index")["recent"][-1]["status"], "paused")
+        index = self.cli("index")
+        self.assertEqual(index["pending"], [])
+        self.assertEqual([r["id"] for r in index["unstatused"]], [item["id"]])
+        self.assertEqual(index["paused"], [])
+        run = self.raw("collect", item["id"])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        notice = f"{item['id']} replied without a result status (paused); nothing was collected."
+        out = json.loads(run.stdout)  # stdout stays pure JSON
+        self.assertEqual((out["status"], out["notice"]), ("paused", notice))
+        self.assertEqual(next(iter(out)), "notice")
+        self.assertIn(notice, run.stderr)
+        self.assertFalse((task / "collected.json").exists())
+        # A later reply that carries a status settles it.
+        (task / "result.md").write_text("RESULT_STATUS: complete\nDone.\n")
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "settled")
+        # A clean exit with an unstatused reply is paused too; with a status it settles.
+        (task / "exit").write_text("0\n")
+        (task / "result.md").write_text("no status here\n")
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "paused")
+        (task / "result.md").write_text("RESULT_STATUS: blocked\n")
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "settled")
+        # A dependent task does not start from a paused predecessor.
+        (task / "result.md").write_text("no status here\n")
+        run = self.raw("dispatch", "--role", "coder", "--task", "next", "--worker", "pi", "--model", MODEL,
+                       "--thinking", "medium", "--workdir", str(self.project), "--after", item["id"])
+        self.assertNotEqual(json.loads(run.stdout).get("status"), "starting")
+
+    def test_paused_with_a_result_status_is_not_called_unstatused(self):
+        item = self.dispatch()
+        task = self.settle(item, "RESULT_STATUS: blocked\nOver budget.\n")
+        state = json.loads((task / "state.json").read_text())
+        (task / "state.json").write_text(json.dumps(dict(state, state="paused", updated="2020-01-01T00:00:00Z")))
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "paused")
+        # A paused predecessor never starts a dependent task, with or without a result status.
+        dependent = self.raw("dispatch", "--role", "coder", "--task", "next", "--worker", "pi", "--model", MODEL,
+                             "--thinking", "medium", "--workdir", str(self.project), "--after", item["id"])
+        self.assertEqual(dependent.returncode, 0, dependent.stderr)
+        self.assertNotEqual(json.loads(dependent.stdout).get("status"), "starting")
+        run = self.raw("collect", item["id"])
+        out = json.loads(run.stdout)
+        self.assertEqual((out["status"], out["result_status"]), ("paused", "blocked"))
+        self.assertEqual(out["notice"], f"{item['id']} is paused; nothing was collected.")
+        self.assertNotIn("without a result status", run.stderr + run.stdout)
+        index = self.cli("index")
+        self.assertEqual(index["unstatused"], [])
+        self.assertEqual([r["id"] for r in index["paused"]], [item["id"]])
+        # still listed when 14 newer tasks push it out of the recent window (rows sort by second-resolution time)
+        for _ in range(14):
+            self.dispatch()
+        index = self.cli("index")
+        self.assertNotIn(item["id"], [r["id"] for r in index["recent"]])
+        self.assertEqual([r["id"] for r in index["paused"]], [item["id"]])
+
+    def test_raw_settled_state_without_a_result_status_is_paused(self):
+        item = self.dispatch()
+        task = self.settle(item, "Still going.\n")
+        state = json.loads((task / "state.json").read_text())
+        for raw in ("settled", "waiting"):
+            (task / "state.json").write_text(json.dumps(dict(state, state=raw)))
+            self.assertEqual(self.cli("inspect", item["id"])["status"], "paused", raw)
+            self.assertNotIn("completed", self.raw("collect", item["id"]).stdout.split('"status"')[1][:20])
+            self.assertFalse((task / "collected.json").exists())
+        (task / "result.md").unlink()
+        (task / "state.json").write_text(json.dumps(dict(state, state="settled")))
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "paused")
+        (task / "result.md").write_text("RESULT_STATUS: complete\n")
+        self.assertEqual(self.cli("inspect", item["id"])["status"], "settled")
+
     def test_dispatch_without_optional_deliverable_starts_worker(self):
         item = self.cli("dispatch", "--role", "coder", "--task", "Check the parser", "--worker", "pi",
                         "--model", MODEL, "--thinking", "low", "--workdir", str(self.project))

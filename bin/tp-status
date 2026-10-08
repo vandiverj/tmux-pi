@@ -13,7 +13,7 @@
 #
 # Checks every second, painting only when the displayed frame changes, from each task's state.json (written by the reporters)
 # and its pane. States (bin/tp-contract status): starting, working, needs_input,
-# paused, settled (a reply is ready), completed (handed off), failed, killed,
+# paused, settled (a reply is ready), completed (handed off), failed, killed, stopped (tp-kill),
 # escalated. Under each row: elapsed time, turns, tool calls, for a contract (M9)
 # its checkpoint state and when its artifact was last written, and for settled work
 # the first line of its reply (or its question). Started by tp in the status slot;
@@ -76,7 +76,7 @@ color_for() {
     working|tool|starting) echo "$yellow" ;;
     needs_input|permission|paused) echo "$magenta" ;;
     failed*|error) echo "$red" ;;
-    killed|completed|escalated) echo "$dim" ;;
+    killed|stopped|completed|escalated) echo "$dim" ;;
     *) echo "" ;;
   esac
 }

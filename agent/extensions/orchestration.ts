@@ -72,7 +72,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "task_collect",
 		label: "Collect task",
-		description: "Read a settled worker's concise result and mark it handed off. Active tasks remain active.",
+		description: "Read a settled worker's concise result and mark it handed off. Active and paused tasks (including a worker that replied without a result status) are not collected.",
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_id, p) {
 			const value = JSON.parse(await run(command, ["collect", p.id]));

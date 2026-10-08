@@ -15,7 +15,7 @@ import textwrap
 from pathlib import Path
 
 MARKER = "<!-- tmux-pi-task-record:v1 -->"
-ACCEPTED_STATES = {"starting", "working", "needs_input", "settled", "completed", "paused", "failed", "killed", "escalated"}
+ACCEPTED_STATES = {"starting", "working", "needs_input", "settled", "completed", "paused", "failed", "killed", "stopped", "escalated"}
 RESUMABLE_STATES = {"starting", "working", "needs_input", "settled", "paused"}
 STOP_RECORD_MODES = {"plan", "prototype", "investigate"}
 TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,12}-\d+)\b")
@@ -274,8 +274,8 @@ def next_action(state, task_id):
         return "Choose continue, narrow, escalate, or discard; do not silently retry."
     if state == "failed":
         return "Inspect `result.md`, `state.json`, and the pane/exit code before retrying."
-    if state == "killed":
-        return "Task was killed; start a new task only if the work is still needed."
+    if state in ("killed", "stopped"):
+        return "Task was {}; start a new task only if the work is still needed.".format(state)
     if state == "escalated":
         return "Continue from the escalated task recorded in this directory."
     return "Check task state before continuing."

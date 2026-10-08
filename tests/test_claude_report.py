@@ -55,7 +55,7 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("SessionStart", model="claude-opus-5-5")
         self.hook("UserPromptSubmit", prompt="first")
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "fixture.txt"})
-        self.hook("Stop", last_assistant_message="first reply")
+        self.hook("Stop", last_assistant_message="first reply\nRESULT_STATUS: complete")
         self.assertEqual(self.state()["state"], "waiting")
         self.review(accepted=True)
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})  # concurrency: see parallel test
@@ -64,7 +64,7 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("Stop", last_assistant_message="stale stop")
         self.assertEqual(self.state()["state"], "waiting")
         self.assertEqual(self.state()["tools"], 1)
-        self.assertEqual((self.task / "result.md").read_text(), "first reply\n")
+        self.assertEqual((self.task / "result.md").read_text(), "first reply\nRESULT_STATUS: complete\n")
         self.assertFalse(list(self.task.glob(".state.*")) + list(self.task.glob(".result.*")))
 
         self.hook("UserPromptSubmit", prompt="confirm")
@@ -79,10 +79,10 @@ class ClaudeReportTests(unittest.TestCase):
         self.review()
         self.hook("PostToolUse", tool_name="Bash")
         self.assertEqual(self.state()["state"], "working")
-        self.hook("Stop", last_assistant_message="new reply")
+        self.hook("Stop", last_assistant_message="new reply\nRESULT_STATUS: complete")
         self.assertEqual(self.state()["state"], "waiting")
         self.assertEqual(self.state()["settledTurn"], 2)
-        self.assertEqual((self.task / "result.md").read_text(), "new reply\n")
+        self.assertEqual((self.task / "result.md").read_text(), "new reply\nRESULT_STATUS: complete\n")
         self.review(accepted=True)
 
     def test_parallel_active_hooks_do_not_lose_counts_or_clobber_stop(self):

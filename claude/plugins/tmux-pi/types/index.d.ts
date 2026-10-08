@@ -4,11 +4,15 @@ export type TaskRow = {
   role: string | null
   permission: unknown
   capability_request: unknown
+  capability_pending: boolean
+  result_status: string | null
 }
 
 export type TaskSummary = {
   active: number
   toCollect: number
+  paused: number
+  pausedWithStatus: number
   failed: number
   needsInput: string[]
 }

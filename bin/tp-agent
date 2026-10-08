@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
+
 ROLES = ROOT / "agent" / "roles"
 TESTS_SCOPES = ("affected", "full", "none")
 TESTS_DEFAULT = "affected"
@@ -28,9 +31,10 @@ def now():
 
 def read_json(path, default=None):
     try:
-        return json.loads(Path(path).read_text())
+        value = json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return {} if default is None else default
+    return value if isinstance(value, dict) else {} if default is None else default  # every record here is an object
 
 
 def atomic_json(path, value):
@@ -71,21 +75,12 @@ def task_dir(base, ident):
     return path
 
 
+RESULT_STATUS = re.compile(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", re.I)
+
+
 def lifecycle(path):
-    state = read_json(path / "state.json")
-    if (path / "stopped.json").exists():
-        return "stopped"
-    if (path / "collected.json").exists():
-        return "completed"
-    if (path / "exit").exists():
-        return "settled" if (path / "exit").read_text().strip() == "0" and (path / "result.md").exists() else "failed"
-    raw = state.get("state", "starting")
-    status = {"waiting": "settled", "error": "failed", "tool": "working", "permission": "needs_input"}.get(raw, raw)
-    if status in {"starting", "working", "needs_input"} and any(
-            read_json(path / name).get("status") == "pending"
-            for name in ("permission-request.json", "capability-request.json")):
-        return "needs_input"
-    return status
+    # tp-agent does not look at panes: contract.lifecycle reads an unobserved pane as present.
+    return task_lifecycle(path)[0]
 
 
 def record(path, include_result=False):
@@ -93,7 +88,7 @@ def record(path, include_result=False):
     state = read_json(path / "state.json")
     result_path = path / "result.md"
     result_text = result_path.read_text() if result_path.exists() else ""
-    match = re.search(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", result_text, re.I)
+    match = RESULT_STATUS.search(result_text)
     result = {
         "id": meta.get("id", path.name), "role": meta.get("role", "generic"),
         "harness": meta.get("worker", "unknown"), "model": state.get("model") or meta.get("model"),
@@ -107,6 +102,8 @@ def record(path, include_result=False):
         "tokens": state.get("tokens"), "cost": state.get("cost"),
         "permission": read_json(path / "permission-request.json") if (path / "permission-request.json").exists() else None,
         "capability_request": read_json(path / "capability-request.json") if (path / "capability-request.json").exists() else None,
+        # the same test lib/contract.py uses to hold a task at needs_input for human capability approval
+        "capability_pending": (path / "pending-capability.json").exists(),
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
@@ -135,12 +132,16 @@ def write_index(base):
     objective = base / "session-objective.md"
     def brief(row):
         return {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
-                "deliverable", "task_dir", "result_path", "permission", "capability_request", "reason", "updated")}
+                "deliverable", "task_dir", "result_path", "permission", "capability_request", "capability_pending",
+                "reason", "updated")}
     value = {
         "schema": "tp-session-index:v1", "updated": now(),
         "objective": objective.read_text().strip() if objective.exists() else "",
         "active": [brief(r) for r in rows if r["status"] in {"queued", "starting", "working", "needs_input"}],
         "pending": [brief(r) for r in rows if r["status"] in {"settled", "failed"}],
+        # paused workers, however old: shown to the main agent, never collected
+        "unstatused": [brief(r) for r in rows if r["status"] == "paused" and not r.get("result_status")],
+        "paused": [brief(r) for r in rows if r["status"] == "paused" and r.get("result_status")],
         "recent": [brief(r) for r in rows[-12:]],
     }
     atomic_json(base / "session-index.json", value)
@@ -233,10 +234,18 @@ def capacity(base, item):
             return False, "local model slots full"
     for parent in item["after"]:
         try:
-            predecessor = record(task_dir(base, parent))
+            predecessor_dir = task_dir(base, parent)
+            meta = read_json(predecessor_dir / "meta.json")
+            if not meta:
+                return False, f"dependency {parent} is unreadable"
+            predecessor = record(predecessor_dir)
+            life, state, events, reply = task_lifecycle(predecessor_dir)
         except ValueError:
             return False, f"dependency {parent} has not started"
-        if predecessor["status"] not in {"settled", "completed"} or not predecessor["result_path"]:
+        # The shared answer first (a pause or an unstatused reply never satisfies), then admission's own
+        # stricter rule: only a task that has a reply, settled or completed.
+        if not satisfies_dependency(life, state, events, reply) or predecessor["status"] not in {"settled", "completed"} \
+                or not predecessor["result_path"]:
             return False, f"waiting for {parent}"
     return True, ""
 
@@ -719,6 +728,11 @@ def main():
                 atomic_json(path / "collected.json", {"collected": now()})
                 value["status"] = "completed"
                 write_index(base)
+            elif value["status"] == "paused" and value["result_path"]:
+                notice = (f"{args.id} is paused; nothing was collected." if value.get("result_status")
+                          else f"{args.id} replied without a result status (paused); nothing was collected.")
+                value = {"notice": notice, **value}  # first key, so a reader sees it at once
+                print(notice, file=sys.stderr)
         elif args.command == "stop":
             run = subprocess.run([str(ROOT / "bin/tp-kill"), args.id], text=True, capture_output=True)
             if run.returncode:

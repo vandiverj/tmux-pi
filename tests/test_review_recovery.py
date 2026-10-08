@@ -75,13 +75,13 @@ class ReviewRecoveryTests(unittest.TestCase):
         reviewer.mkdir()
         (reviewer / "meta.json").write_text(json.dumps({"id": "r1", "worker": "claude"}))
         (reviewer / "review-of").write_text("w1")
-        (reviewer / "result.md").write_text("\ufeffAPPROVED: checked.\n")
+        (reviewer / "result.md").write_text("\ufeffAPPROVED\nchecked.\n")
         meta = json.loads((author / "meta.json").read_text())
         meta["review"] = "r1"
         (author / "meta.json").write_text(json.dumps(meta))
         (author / "result.md").write_text("Reviewed result")
         path.write_text(json.dumps({"required": True, "task_id": "w1", "status": "approved", "round_nonce": "test-w1-round", "approval": {
-            "reviewer_id": "r1", "round_nonce": "test-w1-round", "evidence_sha256": hashlib.sha256(b"APPROVED: checked.").hexdigest(),
+            "reviewer_id": "r1", "round_nonce": "test-w1-round", "evidence_sha256": hashlib.sha256(b"APPROVED\nchecked.").hexdigest(),
             "author_sha256": hashlib.sha256(b"Reviewed result").hexdigest()}}))
         self.assertTrue(approved_delegated_review(author, meta, json.loads(path.read_text())))
         self.assertFalse(unresolved_review(path, "w1"))
@@ -207,7 +207,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         reviewer.mkdir()
         (reviewer / "meta.json").write_text(json.dumps({"id": "r1", "worker": "claude", "pane": "%2"}))
         (reviewer / "review-of").write_text("w1")
-        verdict = "APPROVED: checked."
+        verdict = "APPROVED\nchecked."
         (reviewer / "result.md").write_text(verdict)
         (author / "result.md").write_text("Done.")
         meta = json.loads((author / "meta.json").read_text())

@@ -28,6 +28,8 @@ class TpReviewTests(unittest.TestCase):
         # tp-review asks tp-agent's classifier whether the worker is paused (tp-agent shares lib/contract.py's pause rule).
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
+        for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py"):
+            shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n")
         self.log = base / "spawn.log"
         self.state = base / "state"
@@ -195,9 +197,175 @@ echo review-1
         self.review()
         research = self.log.read_text()
         for task in (generic, research):
-            self.assertIn("first line of your final reply must be exactly APPROVED or REQUEST_CHANGES", task)
+            self.assertIn("first line of your final reply must be exactly APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES", task)
+            self.assertIn("Return every finding in this one pass, ranked most severe first", task)
+            self.assertIn("'defect'", task)
+            self.assertIn("'design disagreement'", task)
+            self.assertIn("name the family it belongs to", task)
+            self.assertNotIn("review round", task)  # a first review does not claim earlier rounds
             self.assertRegex(task, r"RESULT_STATUS: complete\|empty\|blocked\|incomplete on the second line")
         self.assertIn("report.md", research)
+
+    def git(self, *args):
+        subprocess.run(["git", "-C", str(self.work), "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True, capture_output=True)
+
+    def reviewer_dir(self, ident, text, workdir_state=None):
+        directory = self.state / "tasks" / ident
+        directory.mkdir()
+        (directory / "meta.json").write_text(json.dumps({"id": ident, "worker": "claude"}))
+        (directory / "result.md").write_text(text)
+        if workdir_state:
+            (directory / "reviewed-state.json").write_text(json.dumps(workdir_state))
+        return directory
+
+    def test_a_first_review_outside_git_attaches_nothing_extra_and_records_no_state(self):
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertEqual(names, ["task.md", "packet.md", "result.md"])
+        self.assertFalse((self.state / "tasks" / "review-1" / "reviewed-state.json").exists())
+        meta = json.loads((self.task / "meta.json").read_text())
+        self.assertEqual(meta["reviews"], ["review-1"])
+
+    def test_a_first_review_in_a_repository_records_the_reviewed_tree_and_no_rounds(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md"])
+        state = json.loads((self.state / "tasks" / "review-1" / "reviewed-state.json").read_text())
+        self.assertRegex(state["tree"], r"^[0-9a-f]{40,64}$")
+        self.assertEqual(Path(state["workdir"]).resolve(), self.work.resolve())
+        # the repository's own index is not touched
+        status = subprocess.run(["git", "-C", str(self.work), "status", "--porcelain"], capture_output=True, text=True).stdout
+        self.assertIn("?? a.txt", status)
+
+    def test_a_retried_task_gets_earlier_findings_in_order_and_the_diff_since_the_last_review(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        first = self.review()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        (self.state / "tasks" / "review-1" / "result.md").write_text("REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 defect: A-FIRST-FINDING\n")
+        # a retry of w1 that edits the file and is reviewed in turn
+        (self.work / "a.txt").write_text("two\n")
+        retry = self.state / "tasks" / "w2"
+        shutil.copytree(self.task, retry)
+        meta = json.loads((retry / "meta.json").read_text())
+        meta.update({"id": "w2", "parent": "w1"})
+        meta.pop("review", None), meta.pop("reviews", None)
+        (retry / "meta.json").write_text(json.dumps(meta))
+        r = subprocess.run([str(self.root / "bin/tp-review"), "w2"], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertEqual(names[:3], ["task.md", "packet.md", "result.md"])
+        self.assertEqual(names[3], "earlier-findings-01-review-1.md")
+        self.assertEqual(names[4], "diff-since-round-1.md")
+        copies = Path(str(self.log) + ".copies")
+        self.assertIn("A-FIRST-FINDING", (copies / names[3]).read_text())
+        diff = (copies / names[4]).read_text()
+        self.assertIn("-one", diff)
+        self.assertIn("+two", diff)
+        self.assertIn("This is review round 2 of this work", self.log.read_text())
+        self.assertIn("round 1 F2", self.log.read_text())
+
+    def retried_with_secrets(self):
+        """A first review, then a retry w2 whose working tree gained a .env and a secret-bearing note (made-up values)."""
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        first = self.review()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        (self.state / "tasks" / "review-1" / "result.md").write_text(
+            "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 defect: the env dump shows\nDB_PASSWORD=madeup-FINDING-77qz\nand a key AKIAMADEUP7QZ81VXKD3\n")
+        (self.work / "a.txt").write_text("two\n")
+        (self.work / ".env").write_text("DB_PASSWORD=madeup-ENVFILE-55kd\n")
+        (self.work / "notes.txt").write_text("DB_PASSWORD=madeup-NOTES-31mv\n")
+        retry = self.state / "tasks" / "w2"
+        shutil.copytree(self.task, retry)
+        meta = json.loads((retry / "meta.json").read_text())
+        meta.update({"id": "w2", "parent": "w1"})
+        meta.pop("review", None), meta.pop("reviews", None)
+        (retry / "meta.json").write_text(json.dumps(meta))
+
+    def test_no_file_the_reviewer_is_given_carries_a_secret_from_the_diff_or_the_findings(self):
+        self.retried_with_secrets()
+        r = subprocess.run([str(self.root / "bin/tp-review"), "w2"], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("'.env' changed since the last round", r.stderr)
+        copies = Path(str(self.log) + ".copies")
+        files = list(copies.iterdir())
+        self.assertGreaterEqual(len(files), 5)
+        for f in files:
+            for secret in ("madeup-FINDING-77qz", "AKIAMADEUP7QZ81VXKD3", "madeup-ENVFILE-55kd", "madeup-NOTES-31mv"):
+                self.assertNotIn(secret, f.read_text(), f.name)
+        self.assertNotIn("madeup-", self.log.read_text())
+        self.assertIn("+two", (copies / "diff-since-round-1.md").read_text())
+
+    def test_a_review_whose_diff_cannot_be_checked_refuses_and_starts_nothing(self):
+        self.retried_with_secrets()
+        # the rule cannot be loaded: lib/sensitive_read.py is unreadable as a module in this copy of the install
+        (self.root / "lib" / "sensitive_read.py").write_text("raise ImportError('rule unavailable')\n")
+        r = subprocess.run([str(self.root / "bin/tp-review"), "w2"], text=True, capture_output=True, env=self.env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot gather the earlier review rounds", r.stderr)
+        self.assertIn("sensitive-read rule", r.stderr)
+        self.assertFalse((Path(str(self.log) + ".copies") / "diff-since-round-1.md").exists())  # nothing was sent for round 2
+        self.assertNotIn("reviews", json.loads((self.state / "tasks" / "w2" / "meta.json").read_text()))
+
+    def test_two_earlier_rounds_are_attached_oldest_first_across_the_retry_lineage_and_a_rereview(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.reviewer_dir("old-1", "REQUEST_CHANGES\nF1 OLDEST\n")
+        self.reviewer_dir("old-2", "REQUEST_CHANGES\nF1 MIDDLE\n")
+        parent = self.state / "tasks" / "w0"
+        parent.mkdir()
+        (parent / "meta.json").write_text(json.dumps({"id": "w0", "worker": "pi", "workdir": str(self.work), "review": "old-1", "reviews": ["old-1"]}))
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"parent": "w0", "review": "old-2", "reviews": ["old-2"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [Path(p).name for p in self.spawn_contexts() if "earlier-findings" in p or "diff-since" in p]
+        self.assertEqual(names, ["earlier-findings-01-old-1.md", "earlier-findings-02-old-2.md", "diff-since-round-2.md"])
+        copies = Path(str(self.log) + ".copies")
+        self.assertIn("OLDEST", (copies / names[0]).read_text())
+        self.assertIn("MIDDLE", (copies / names[1]).read_text())
+        # no recorded state for round 2: said so, not guessed
+        self.assertIn("recorded no reviewed state", (copies / names[2]).read_text())
+        self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviews"], ["old-2", "review-1"])
+
+    def test_recorded_state_that_cannot_be_used_refuses_before_spawning(self):
+        self.git("init", "-q")
+        self.reviewer_dir("old-1", "REQUEST_CHANGES\nF1\n", {"workdir": str(self.work.resolve()), "tree": "0" * 40})
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"review": "old-1", "reviews": ["old-1"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("cannot gather the earlier review rounds", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_unreadable_recorded_state_refuses(self):
+        self.reviewer_dir("old-1", "REQUEST_CHANGES\nF1\n")
+        (self.state / "tasks" / "old-1" / "reviewed-state.json").write_text("not json")
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"review": "old-1"})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_inspect_reports_a_reviewers_verdict_and_notes(self):
+        for ident, text, verdict in (("rv-n", "APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nN1 test gap", "APPROVED_WITH_NOTES"),
+                                     ("rv-x", "APPROVED_PENDING\nRESULT_STATUS: complete", "unparseable")):
+            directory = self.reviewer_dir(ident, text)
+            (directory / "review-of").write_text("w1\n")
+            run = subprocess.run([str(self.root / "bin/tp-agent"), "inspect", ident], text=True, capture_output=True,
+                                 env={**self.env, "TP_STATE_DIR": str(self.state)})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            got = json.loads(run.stdout)
+            self.assertEqual(got["verdict"], verdict)
+        self.assertEqual(json.loads(subprocess.run([str(self.root / "bin/tp-agent"), "inspect", "rv-n"], text=True, capture_output=True,
+                                                   env={**self.env, "TP_STATE_DIR": str(self.state)}).stdout)["verdict_notes"], "N1 test gap")
 
     def spawn_contexts(self):
         return [l.split()[0] for l in self.log.read_text().splitlines() if l.startswith("/")]

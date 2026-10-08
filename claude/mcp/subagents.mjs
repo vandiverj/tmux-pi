@@ -159,7 +159,7 @@ const TOOLS = {
   },
   review_subagent: {
     description:
-      "Start an independent reviewer on the other provider for a successfully completed subagent. It reports APPROVED or REQUEST_CHANGES and never edits files. " +
+      "Start an independent reviewer on the other provider for a successfully completed subagent. It reports APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES and never edits files. " +
       "Use collect_result on the returned id. Local policy decides first; set force only when the user asked for a review.",
     schema: { type: "object", required: ["id"], properties: { id: str("Completed subagent id"), force: { type: "boolean" } } },
     async run(p) {

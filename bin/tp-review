@@ -12,6 +12,9 @@
 # stops and asks the human; an optional one may use the author's provider, marked in the record.
 # The review packet contains the original task, any follow-up requests, the result, and the
 # selected context packet.
+# On a retried task (or a task reviewed before) the reviewer also receives the earlier review rounds'
+# findings, oldest first, and the diff of the working tree since the last reviewed state (lib/review_rounds.py).
+# The reply's first line is APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES (lib/review_verdict.py).
 # Prints the review task id.
 set -euo pipefail
 
@@ -99,13 +102,15 @@ author_workdir="$(jq -r 'if (.workdir | type) == "string" then .workdir else emp
   die "cannot read author workdir for '$id'"
 [[ -n "$author_workdir" ]] || die "author workdir missing for '$id'; cannot choose a review directory"
 
-review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then a brief rationale or prioritized actionable findings including file paths and line references when possible."
+findings_rule="Return every finding in this one pass, ranked most severe first and numbered F1, F2, ...; do not hold any back for a later round. Mark each finding 'defect' (the work is wrong, unsafe or misses a requirement) or 'design disagreement' (it works, but you would build it differently). When a finding repeats an earlier one, name the family it belongs to."
+verdict_rule="The first line of your final reply must be exactly APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES, with no Markdown or other formatting: REQUEST_CHANGES when any finding is a defect; APPROVED_WITH_NOTES when there is no defect but you have notes (test gaps, wording gaps, design disagreements), listed after the second line; APPROVED when you have nothing to report. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then"
+review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. $findings_rule $verdict_rule a brief rationale or the findings, including file paths and line references when possible."
 
 # A research report (M9) is checked for source support rather than code changes.
 extra=()
 if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
   report="$(jq -r '.contract.artifact' "$dir/meta.json")"
-  review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. The first line of your final reply must be exactly APPROVED or REQUEST_CHANGES, with no Markdown or other formatting. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then a brief rationale or prioritized findings (unsupported or wrong claims first)."
+  review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. $findings_rule $verdict_rule a brief rationale or the findings (unsupported or wrong claims first)."
   extra=(--note "Research report: $report")
 fi
 
@@ -121,11 +126,11 @@ excerpt_dir=""
 cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
 trap cleanup_excerpts EXIT
 ctx_list=()
+excerpt_dir="$(mktemp -d)"
 # add_segments <file> <label>: appends context paths to ctx_list (runs in this shell,
 # so excerpt_dir and ctx_list survive for cleanup and spawning).
 add_segments() {
   local list line
-  [[ -n "$excerpt_dir" ]] || excerpt_dir="$(mktemp -d)"
   list="$excerpt_dir/$2.list"
   python3 - "$1" "$excerpt_dir" "$2" "$max_file" > "$list" <<'PYEOF' || die "cannot split '$1' for review"
 import sys
@@ -151,6 +156,25 @@ PYEOF
 }
 add_segments "$dir/packet.md" author-packet
 add_segments "$dir/result.md" author-result
+# Earlier review rounds of this task and its retry ancestors, then the change since the last reviewed state.
+# Recorded state that cannot be used refuses; nothing is guessed.
+mkdir "$excerpt_dir/rounds"
+rounds="$(python3 "$ROOT/lib/review_rounds.py" prepare "$state_dir" "$id" "$author_workdir" "$excerpt_dir/rounds")" ||
+  die "cannot gather the earlier review rounds for '$id'"
+round_count="$(jq -r '.rounds' <<<"$rounds")"
+snapshot="$(jq -c '.snapshot' <<<"$rounds")"
+while IFS= read -r skipped; do
+  echo "tp-review: earlier review '$skipped' has no reply; not attached" >&2
+done < <(jq -r '.skipped[]' <<<"$rounds")
+while IFS= read -r withheld; do
+  echo "tp-review: sensitive path '$withheld' changed since the last round; its contents were withheld from the diff" >&2
+done < <(jq -r '.withheld[]' <<<"$rounds")
+redactions="$(jq -r '.redactions' <<<"$rounds")"
+if (( redactions > 0 )); then echo "tp-review: $redactions secret-like value(s) in the earlier findings and diff were replaced with placeholders" >&2; fi
+while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -r '.contexts[]' <<<"$rounds")
+if (( round_count > 0 )); then
+  review_task="$review_task This is review round $(( round_count + 1 )) of this work. The findings of the $round_count earlier round(s) are attached oldest first, then the diff of the working tree since the last reviewed state. For each earlier finding say whether it is fixed, citing it by round and number (for example round 1 F2); when a new finding repeats an earlier one, name that family. Review the whole change again: the diff shows only what changed since the last round."
+fi
 total=$(( packet_reserve + ${#review_task} ))
 for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
   total=$(( total + $(wc -c < "$f") + per_file_overhead ))
@@ -170,8 +194,11 @@ fi
 
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
   --arg policy "$policy" --arg independence "$independence" \
-  '. + {review:$review, review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking, independence:$independence}}' \
+  '. + {review:$review, reviews:((.reviews // (if .review then [.review] else [] end)) + [$review]), review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking, independence:$independence}}' \
   "$dir/meta.json" > "$dir/meta.json.tmp"
 mv "$dir/meta.json.tmp" "$dir/meta.json"
-printf '%s\n' "$id" > "$(tp_task_dir "$session" "$review_id")/review-of"
+review_dir="$(tp_task_dir "$session" "$review_id")"
+printf '%s\n' "$id" > "$review_dir/review-of"
+# The working tree this reviewer saw; the next round's diff starts here. Absent when the workdir is not a git repository.
+if [[ "$snapshot" != null ]]; then printf '%s\n' "$snapshot" > "$review_dir/reviewed-state.json"; fi
 printf '%s\n' "$review_id"

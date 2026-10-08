@@ -12,7 +12,12 @@ import os
 import re
 import tempfile
 import textwrap
+import sys
 from pathlib import Path
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import review_verdict  # noqa: E402
 
 MARKER = "<!-- tmux-pi-task-record:v1 -->"
 ACCEPTED_STATES = {"starting", "working", "needs_input", "settled", "completed", "paused", "failed", "killed", "stopped", "escalated"}
@@ -580,7 +585,7 @@ def approved_delegated_review(task_dir, meta, marker, index=None):
     except OSError:
         return False
     return (approval.get("evidence_sha256") == hashlib.sha256(verdict.encode()).hexdigest() and
-            bool(re.match(r"APPROVED\b", verdict)) and not re.search(r"\bREQUEST_CHANGES\b", verdict) and
+            review_verdict.approves(verdict) and
             bool(verdict) and approval.get("reviewer_id") == meta.get("review") and
             isinstance(approval.get("author_sha256"), str) and approval["author_sha256"] == author_hash)
 

@@ -163,6 +163,29 @@ class DispatcherRuntime(unittest.TestCase):
             self.assertEqual(d["taskReview"], "needs_human", name)
             self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]), name)
 
+    def test_approval_with_notes_clears_the_gate_and_lists_the_notes(self):
+        d = scenario("notes-verdict")
+        done = next(m for m in d["messages"] if m["kind"] == "result")
+        self.assertIn("approved it with notes", done["content"])
+        self.assertIn("N1 test gap: no test for the empty case.", done["content"])
+        self.assertIn("N2 wording", done["content"])
+        self.assertNotIn("RESULT_STATUS", done["content"].split("Notes (")[1].split("Full review:")[0])
+        self.assertTrue(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]))
+
+    def test_notes_quoting_an_earlier_rounds_verdict_still_approve_with_notes(self):
+        d = scenario("notes-quote")
+        done = next(m for m in d["messages"] if m["kind"] == "result")
+        self.assertIn("approved it with notes", done["content"])
+        self.assertIn("Round 1 REQUEST_CHANGES F1 was fixed.", done["content"])
+        self.assertTrue(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]))
+
+    def test_unknown_or_note_less_verdicts_keep_the_human_gate(self):
+        for name in ("unknown-verdict", "notes-empty", "notes-suffix", "approved-suffix"):
+            d = scenario(name)
+            self.assertEqual(d["taskReview"], "needs_human", name)
+            self.assertIn("unparseable", d["reviewReasons"][-1], name)
+            self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]), name)
+
     def test_final_review_round_requests_changes_without_collecting(self):
         d = scenario("review-changes")
         self.assertEqual(len([c for c in d["calls"] if c["name"] == "tp-review"]), 2)

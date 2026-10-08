@@ -29,6 +29,7 @@ import time
 import uuid
 from pathlib import Path
 
+import review_verdict
 import router
 
 SELECTION_SCHEMA = "tmux-pi-routing-selection:v1"
@@ -394,7 +395,7 @@ def task_summary(d, dirs_by_id):
         reviewer_dir = dirs_by_id.get(meta["review"])
         verdict = _read_line(reviewer_dir / "result.md") if reviewer_dir else None
         review = {"id": meta["review"], "reviewer": _target(meta.get("reviewer")),
-                  "verdict": verdict if verdict in ("APPROVED", "REQUEST_CHANGES") else ("unparsed" if verdict else None)}
+                  "verdict": (review_verdict.first_line_verdict(verdict or "") or (None,))[0] or ("unparsed" if verdict else None)}
     marker = _read_json(d / "review-required.json")
     escalated_to = meta.get("escalated_to") if isinstance(meta.get("escalated_to"), dict) else None
     return {

@@ -506,6 +506,37 @@ def write_lane(common_dir, record):
     return record
 
 
+def discard_lane_record(common_dir, name):
+    """Undo a record write that this process just made: remove lanes/<name>/lane.json, any temporary file left beside it
+    and the then-empty directory. Same lock rule as write_lane. Only regular files are unlinked; a directory that holds
+    anything else is left and refuses. Used by creation's rollback; closed lanes are archived by later slices, not here."""
+    path = lane_path(common_dir, name)
+    try:
+        lanes_fd = _walk(common_dir, LANES_SUBDIR.parts)
+        try:
+            if lanes_fd is None or _held.get(_dir_key(lanes_fd)) != _me():
+                raise ValueError("discard_lane_record needs the lane lock (lane_lock) held by this thread")
+            try:
+                dir_fd = _open_dir(lanes_fd, name, path.parent)
+            except FileNotFoundError:
+                return
+            try:
+                for entry in os.listdir(dir_fd):
+                    if entry != "lane.json" and not entry.startswith(".lane.json."):
+                        raise ValueError(f"{path.parent} holds {entry}, which is not part of the record; left in place")
+                    if not stat.S_ISREG(os.lstat(entry, dir_fd=dir_fd).st_mode):
+                        raise ValueError(f"{path.parent}/{entry} is not a regular file; left in place")
+                    os.unlink(entry, dir_fd=dir_fd)
+            finally:
+                os.close(dir_fd)
+            os.rmdir(name, dir_fd=lanes_fd)
+        finally:
+            if lanes_fd is not None:
+                os.close(lanes_fd)
+    except OSError as error:
+        raise _fail_os(error, path)
+
+
 # ---------------------------------------------------------------- the record against git
 
 def worktree_identity(common_dir, worktree):
@@ -796,17 +827,21 @@ def precheck_lane_slot(common_dir, repo_config, name, integration=False):
     return {"branch": branch, "worktree": worktree}
 
 
-def active_lane_count(common_dir):
-    """How many work lanes are in use (state open or integrating), counted from every record in the common git directory,
-    so it covers every session of the repository. A record that cannot be read refuses (the count would be unknown)."""
+def active_lane_names(common_dir):
+    """Names of the work lanes in use (state open or integrating), read from every record in the common git directory, so it
+    covers every session of the repository. A record that cannot be read refuses (the count would be unknown)."""
     common_dir = os.path.realpath(common_dir)
     records = [read_lane(common_dir, name) for name in lane_names(common_dir)]
-    return sum(1 for r in records if r["kind"] == "work" and r["state"] in ("open", "integrating"))
+    return sorted(r["name"] for r in records if r["kind"] == "work" and r["state"] in ("open", "integrating"))
+
+
+def active_lane_count(common_dir):
+    return len(active_lane_names(common_dir))
 
 
 def check_lane_capacity(common_dir, max_active_lanes):
-    """Refuse when creating one more work lane would exceed `max_active_lanes` (see active_lane_count)."""
-    count = active_lane_count(common_dir)
-    if count >= max_active_lanes:
-        raise ValueError(f"{count} lanes are active in this repository (limit {max_active_lanes})")
-    return count
+    """Refuse when creating one more work lane would exceed `max_active_lanes` (see active_lane_names)."""
+    names = active_lane_names(common_dir)
+    if len(names) >= max_active_lanes:
+        raise ValueError(f"{len(names)} lanes are open (limit {max_active_lanes}): {', '.join(names)}. Integrate or remove one first")
+    return len(names)

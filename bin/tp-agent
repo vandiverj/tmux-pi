@@ -708,7 +708,30 @@ def main():
     c = sub.add_parser("context", help="suggest context specs for a task; prints contexts and reasons")
     c.add_argument("--task", required=True)
     c.add_argument("--workdir")
+    ln = sub.add_parser("lane", help="lane commands (T10)").add_subparsers(dest="lane_command", required=True)
+    lc = ln.add_parser("create", help="create a lane: a branch, a worktree and a record; nothing is left behind on failure")
+    lc.add_argument("name")
+    lc.add_argument("--domain", required=True, help="the independence claim in words")
+    lc.add_argument("--touches", nargs="+", required=True, metavar="PATH", help="repo-relative path prefixes the lane will change")
+    lc.add_argument("--repo", default=".", help="the repository (default: the current directory)")
+    lc.add_argument("--base", help="branch or commit to start from (default: the repository's integration branch, lane/integrate unless configured)")
+    ls = sub.add_parser("lanes", help="list the repository's lanes and unrecorded worktrees (read-only)")
+    ls.add_argument("name", nargs="?")
+    ls.add_argument("--repo", default=".")
     args = parser.parse_args()
+    if args.command in ("lane", "lanes"):
+        # Lanes live in the repository's git directory, not in a session: no session state is read or written.
+        import lane_commands
+        if args.command == "lanes":
+            print(json.dumps(lane_commands.list_lanes(args.repo, args.name), indent=2))
+            return
+        value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base)
+        for warning in value["warnings"]:
+            print(f"tp-agent: warning: lanes {' and '.join(warning['lanes'])} overlap on {', '.join(warning['paths'])} "
+                  f"({', '.join(warning['basis'])}). They were claimed independent ("
+                  + "; ".join(f"{k}: {v!r}" for k, v in warning["claims"].items()) + ").", file=sys.stderr)
+        print(json.dumps(value, indent=2))
+        return
     if args.command == "context":
         # Read-only suggestion: needs no session state and writes no manifest or log.
         print(json.dumps(discover_context(args.task, args.workdir), indent=2))

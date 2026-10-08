@@ -5,6 +5,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import subprocess
 import tempfile
 import termios
@@ -29,7 +30,12 @@ class StatusPaneFixture(unittest.TestCase):
         self.mockbin.mkdir()
         (self.base / "cols").write_text("80\n")
         (self.base / "lines").write_text("24\n")
-        self.script("tput", '#!/bin/sh\ncase "$1" in cols|lines) cat "$FAKE_BASE/$1";; esac\n')
+        self.script("tput", '#!/bin/sh\necho tput >> "$FAKE_BASE/calls"\ncase "$1" in cols|lines) cat "$FAKE_BASE/$1";; esac\n')
+        # Every program the pane might start is wrapped, so a test can count what a redraw runs.
+        for name in ("grep", "sed", "cat", "jq", "awk", "wc", "python3", "date", "find", "dirname", "cut", "head", "stat", "tr", "sort"):
+            real = shutil.which(name)
+            if real:
+                self.script(name, '#!/bin/sh\necho %s >> "$FAKE_BASE/calls"\nexec %s "$@"\n' % (name, real))
         self.script("tmux", '''#!/bin/sh
 case "$1" in
   has-session) exit 0 ;;
@@ -39,7 +45,7 @@ case "$1" in
       *"@tp_viewer_pane"*) echo %9 ;;
       *"@tp_viewing"*) cat "$FAKE_BASE/viewing" 2>/dev/null || true ;;
     esac ;;
-  list-panes) printf '%%1 0\\n%%2 0\\n%%3 0\\n%%4 0\\n' ;;
+  list-panes) echo x >> "$FAKE_BASE/loads"; echo tmux >> "$FAKE_BASE/calls"; printf '%%1 0\\n%%2 0\\n%%3 0\\n%%4 0\\n' ;;
   swap-pane) echo "$*" >> "$FAKE_BASE/swaps" ;;
   set-option) for last; do :; done; echo "$last" > "$FAKE_BASE/viewing" ;;
 esac
@@ -118,6 +124,14 @@ esac
                 all(n in data for n in needles) and data.endswith(b"\x1b[J")):
             data += self.output(0.05)
         return data + self.output(settle) if settle else data
+
+    def wait_for(self, predicate, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if predicate():
+                return True
+            self.output(0.02)
+        return predicate()
 
     def barrier(self):
         """Input is handled in order: toggling the usage page and back, each
@@ -393,6 +407,53 @@ class StatusRepaintTest(StatusPaneFixture):
         again = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertLessEqual(again.count(b"\n"), lines - 1)
         self.click_view(3, "job01")
+
+    def test_keys_that_only_move_redraw_without_reading_or_running_anything(self):
+        self.make_jobs(6)
+        for n in range(1, 7):   # every row shows the lines the selected row needs: a task, a reply, a pending request
+            d = self.state / "tasks" / ("job%d" % n)
+            (d / "task.md").write_text("\n  task line %d\nmore\n" % n)
+            (d / "result.md").write_text("reply line %d\n" % n)
+        (self.state / "tasks" / "job2" / "permission-request.json").write_text(
+            json.dumps({"status": "pending", "target": "~/.ssh"}))
+        self.first_frame(b"job6", settle=0.2)
+        loads, calls = self.base / "loads", self.base / "calls"
+        count = lambda path: len(path.read_text().splitlines()) if path.exists() else 0
+        for attempt in range(6):
+            # Start just after a load has finished, so the 1 s timer cannot fire during the keys.
+            seen = count(loads)
+            self.assertTrue(self.wait_for(lambda: count(loads) > seen, 3.0), "no timer load seen")
+            time.sleep(0.45)
+            loads_before, calls_before = count(loads), count(calls)
+            for _ in range(10):
+                for key in (b"k", b"k", b"j", b"s", b"s", b"j", b"k"):
+                    os.write(self.master, key)
+            self.barrier()                   # every key above is handled before this returns
+            if count(loads) == loads_before:
+                break
+        else:
+            self.fail("the timer kept firing during the keys")
+        extra = calls.read_text().splitlines()[calls_before:]
+        self.assertEqual(extra, [], "a key-only redraw ran programs: %r" % extra[:10])
+        os.write(self.master, b"k")
+        moved = self.output_until(lambda frame: b"\x1b[J" in frame)
+        self.assertIn("── job".encode(), moved)    # the redraw still shows the moved selection
+        self.assertIn(b"task line", moved)
+        self.assertIn(b"reply line", moved)
+
+    def test_request_and_reply_lines_come_from_the_load_for_every_row(self):
+        self.make_jobs(3)
+        for n in (1, 2, 3):
+            (self.state / "tasks" / ("job%d" % n) / "task.md").write_text("task text %d\n" % n)
+        (self.state / "tasks" / "job1" / "result.md").write_text("\n\nreply text 1\n")
+        (self.state / "tasks" / "job2" / "permission-request.json").write_text(
+            json.dumps({"status": "pending", "target": "~/.ssh"}))
+        self.first_frame(b"job3", settle=0.2)
+        os.write(self.master, b"k")
+        os.write(self.master, b"k")
+        seen = self.output_until(lambda frame: b"reply text 1" in frame)
+        self.assertIn(b"task text 1", seen)
+        self.assertIn(b"permission: ~/.ssh", self.output(0.1) + seen)
 
     def test_stats_page_toggle_is_bounded_and_keeps_list_semantics(self):
         self.write_state("pi1", {"harness": "pi", "state": "working", "model": "p/a",

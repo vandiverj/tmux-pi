@@ -28,6 +28,20 @@ if (scenario === 'dispatcher') {
   catch (error) { notices.push(String(error)); }
   finish();
 }
+if (scenario === 'subagents-collect') {
+  const stub = 'const StringEnum = (values: readonly string[]) => ({ values }); const Type: any = new Proxy({}, { get: () => () => ({}) });';
+  const source = fs.readFileSync(extension('subagents.ts'), 'utf8');
+  const line = 'import { StringEnum, Type } from "@earendil-works/pi-ai";';
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-subagents-module-'));
+  fs.writeFileSync(path.join(tmp, 'subagents.ts'), source.replace(line, stub));
+  (await import(pathToFileURL(path.join(tmp, 'subagents.ts')).href)).default(pi);
+  fs.rmSync(tmp, { recursive: true, force: true });
+  for (const id of process.argv.slice(4)) {
+    const result = await tools.collect_result.execute('call', { id });
+    notices.push(result.content.map(c => c.text).join('\n'));
+  }
+  finish();
+}
 if (scenario === 'subagents') {
   // Only the schema helpers come from pi-ai; the tool bodies under test do not use them.
   const stub = 'const StringEnum = (values: readonly string[]) => ({ values }); const Type: any = new Proxy({}, { get: () => () => ({}) });';

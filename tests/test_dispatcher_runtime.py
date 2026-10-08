@@ -186,6 +186,14 @@ class DispatcherRuntime(unittest.TestCase):
             self.assertIn("unparseable", d["reviewReasons"][-1], name)
             self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]), name)
 
+    def test_a_review_without_or_with_an_empty_coverage_section_keeps_the_human_gate(self):
+        for name in ("no-coverage", "empty-coverage"):
+            d = scenario(name)
+            self.assertEqual(d["taskReview"], "needs_human", name)
+            self.assertIn("Review incomplete", d["reviewReasons"][-1], name)
+            self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]), name)
+            self.assertFalse(any(m["kind"] == "result" for m in d["messages"]), name)
+
     def test_final_review_round_requests_changes_without_collecting(self):
         d = scenario("review-changes")
         self.assertEqual(len([c for c in d["calls"] if c["name"] == "tp-review"]), 2)

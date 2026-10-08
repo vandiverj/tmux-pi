@@ -393,9 +393,19 @@ def task_summary(d, dirs_by_id):
     review = None
     if isinstance(meta.get("review"), str) and TASK_ID.match(meta["review"]):
         reviewer_dir = dirs_by_id.get(meta["review"])
-        verdict = _read_line(reviewer_dir / "result.md") if reviewer_dir else None
-        review = {"id": meta["review"], "reviewer": _target(meta.get("reviewer")),
-                  "verdict": (review_verdict.first_line_verdict(verdict or "") or (None,))[0] or ("unparsed" if verdict else None)}
+        review = {"id": meta["review"], "reviewer": _target(meta.get("reviewer")), "verdict": None}
+        if reviewer_dir is not None:
+            # review_verdict.assess decides on the whole reply; anything it refuses is "unparsed", a review without a usable
+            # Coverage section is "incomplete" and is never counted as the verdict it states
+            try:
+                stated, _, incomplete = review_verdict.assess(review_verdict.read_review(reviewer_dir / "result.md"))
+                review["verdict"] = stated
+                if incomplete:
+                    review.update({"verdict": "incomplete", "stated_verdict": stated, "incomplete_reason": incomplete})
+            except review_verdict.ReviewMissing:
+                pass
+            except ValueError as exc:
+                review.update({"verdict": "unparsed", "incomplete_reason": str(exc)})
     marker = _read_json(d / "review-required.json")
     escalated_to = meta.get("escalated_to") if isinstance(meta.get("escalated_to"), dict) else None
     return {

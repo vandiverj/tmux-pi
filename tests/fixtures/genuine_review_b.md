@@ -1,0 +1,12 @@
+REQUEST_CHANGES
+RESULT_STATUS: complete
+# Independent review — changes requested
+
+1. **P1: Metadata-only or HTML-comment Coverage approves without a genuine Coverage report.** `lib/review_verdict.py:83-86,93-105`: `_substantive` strips `RESULT_STATUS:` only at column zero, then regards `- RESULT_STATUS: complete` as coverage content. `_unfenced` does not exclude HTML comments, so a heading and body inside `<!-- ... -->` also count. Reproductions (both `review_verdict.assess(text)[2] is None` and `review_verdict.approves(text) is True`): `APPROVED\nCoverage\n- RESULT_STATUS: complete\n` and `APPROVED\n<!--\nCoverage\nreviewed a.py\n-->\n`. Thus `task_record.approved_delegated_review` and dispatcher can clear a gate using a review without an actual substantive, unquoted Coverage section. Ignore metadata even if formatted as a list and ignore headings inside Markdown HTML comments; add regressions at shared parser and gate.
+
+2. **P2: Malformed/unreadable review result does not fail closed consistently.** `bin/tp-agent:103` reads result.md *before* its review assessment/error handling; invalid UTF-8 raises `UnicodeDecodeError`, causing `record`, `inspect`, `collect`, and `write_index` to fail rather than report `result_status=incomplete` with a reason. `lib/review_verdict.py:129-134` instead decodes with `errors='surrogateescape'`, so `b'APPROVED\nCoverage\nreviewed a.py\xff\n'` returns exit 0 with `"complete": true` and can approve via the dispatcher CLI; `lib/routing_evals.py:401` uses replacement decoding and also reports APPROVED. Treat undecodable review results as unreadable/incomplete consistently in all readers, with a test for corrupt bytes.
+
+Verification: `python3.12 -m unittest discover -s tests -p 'test_review_coverage.py'` (19 passed), `test_review_verdict.py` (9 passed), `git diff --check` (clean). Reproduced parser outputs and `tp-agent.record` UnicodeDecodeError with standalone Python 3.12 invocations. No files in project changed; no live worker or entire suite run.
+
+## Coverage
+Inspected task packet, author result/report, previous reviewer findings, diff and relevant code in `lib/review_verdict.py`, `lib/routing_evals.py`, `bin/tp-agent`, `agent/extensions/dispatcher.ts`, `agent/extensions/subagents.ts`, `claude/mcp/subagents.mjs`, `tests/test_review_coverage.py`, and grep-checked remaining verdict readers. Not checked: live worker flow, full suite, type check, all unrelated project files.

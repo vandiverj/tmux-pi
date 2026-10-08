@@ -782,6 +782,27 @@ test('needs_input workers saturating the index are protected by the same cap and
 // main can act on it (tp-agent stop <id>), so it sits in the protected part of the index beside paused and awaiting rows.
 const refusedRow = (id: string) => ({ id, status: 'queued', reason: 'start refused: the queue entry is not an object' })
 
+test('/worker-collect says in words that an incomplete review is not an approval', async ($, on) => {
+  const w = world(on, MAIN)
+  w.collectReport = { review_notice: 'review-1 review is incomplete: the review has no Coverage section.' }
+  await $.session.start(start(true))
+  const text = (await $.command.run(command('worker-collect', 'review-1'))).text
+  expect(text).toContain('NOT AN APPROVAL: review-1 review is incomplete: the review has no Coverage section.')
+})
+
+test('the injected index marks an incomplete review and leaves a complete one plain', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [
+    { id: 'rv-bad', role: 'code-reviewer', status: 'settled', result_status: 'incomplete', verdict: 'APPROVED', review_complete: false },
+    { id: 'rv-ok', role: 'code-reviewer', status: 'settled', result_status: 'complete', verdict: 'APPROVED', review_complete: true },
+  ]
+  await $.session.start(start(true))
+  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  expect(text).toContain('verdict=APPROVED [review incomplete: not an approval]')
+  expect(text).toContain('rv-ok code-reviewer settled result=complete verdict=APPROVED')
+  expect(text).not.toContain('rv-ok code-reviewer settled result=complete verdict=APPROVED [')
+})
+
 test('refused queue entries sit with paused and awaiting rows, ahead of the active rows', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [

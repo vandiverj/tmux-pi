@@ -31,7 +31,7 @@ class VerdictTests(unittest.TestCase):
         verdict, notes = review_verdict.parse("APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nN1 test gap: empty case.\nN2 wording.")
         self.assertEqual(verdict, "APPROVED_WITH_NOTES")
         self.assertEqual(notes, "N1 test gap: empty case.\nN2 wording.")
-        self.assertTrue(review_verdict.approves("APPROVED_WITH_NOTES\nnotes"))
+        self.assertTrue(review_verdict.approves("APPROVED_WITH_NOTES\nnotes\nCoverage\nreviewed a.py and checked its callers"))
 
     def test_a_suffix_after_the_verdict_never_approves(self):
         # the only longer form is "REQUEST_CHANGES: reason"; every other suffix is an unknown verdict
@@ -56,7 +56,7 @@ class VerdictTests(unittest.TestCase):
 
     def test_notes_may_quote_earlier_rounds_verdicts(self):
         text = ("APPROVED_WITH_NOTES\nRESULT_STATUS: complete\n"
-                "Round 1 REQUEST_CHANGES F1 was fixed; round 2 said REQUEST_CHANGES for F2, also fixed.\nN1 wording.")
+                "Round 1 REQUEST_CHANGES F1 was fixed; round 2 said REQUEST_CHANGES for F2, also fixed.\nN1 wording.\nCoverage\nreviewed a.py and checked its callers")
         verdict, notes = review_verdict.parse(text)
         self.assertEqual(verdict, "APPROVED_WITH_NOTES")
         self.assertIn("Round 1 REQUEST_CHANGES F1 was fixed", notes)
@@ -71,10 +71,11 @@ class VerdictTests(unittest.TestCase):
     def test_command_line_prints_json_or_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             good, bad = Path(tmp, "good.md"), Path(tmp, "bad.md")
-            good.write_text("APPROVED_WITH_NOTES\nnote")
+            good.write_text("APPROVED_WITH_NOTES\nnote\nCoverage\nreviewed a.py and checked its callers")
             bad.write_text("maybe")
             ok = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), str(good)], capture_output=True, text=True)
-            self.assertEqual(json.loads(ok.stdout), {"verdict": "APPROVED_WITH_NOTES", "notes": "note"})
+            self.assertEqual(json.loads(ok.stdout), {"verdict": "APPROVED_WITH_NOTES", "notes": "note\nCoverage\nreviewed a.py and checked its callers",
+                                                  "complete": True, "incomplete_reason": None})
             no = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), str(bad)], capture_output=True, text=True)
             self.assertEqual(no.returncode, 1)
             self.assertIn("unparseable", no.stderr)

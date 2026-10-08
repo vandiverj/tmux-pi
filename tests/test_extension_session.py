@@ -145,6 +145,26 @@ class PaneTargetingTests(ExtensionSessionCase):
         (root / "bin" / "tp-task").chmod(0o755)
         self.env.update(PI_CODING_AGENT_DIR=str(root / "agent"), TP_MODE="strict")
 
+    def test_collect_result_says_an_incomplete_review_is_not_an_approval(self):
+        (self.base / "root" / "lib").symlink_to(ROOT / "lib", target_is_directory=True)
+        for ident, reply in (("rv", "APPROVED\nRESULT_STATUS: complete\nfine"),
+                             ("rv-ok", "APPROVED\nRESULT_STATUS: complete\nCoverage\nreviewed a.py and checked its callers"),
+                             ("plain", "APPROVED\nRESULT_STATUS: complete\nfine")):
+            task = self.state / "tasks" / ident
+            task.mkdir()
+            (task / "meta.json").write_text(json.dumps({"id": ident, "worker": "pi", "pane": "%7"}))
+            (task / "state.json").write_text(json.dumps({"state": "waiting"}))
+            (task / "result.md").write_text(reply)
+            if ident != "plain":
+                (task / "review-of").write_text("author")
+        run = subprocess.run(["node", "--experimental-strip-types", str(HARNESS), "subagents-collect", str(self.project), "rv", "rv-ok", "plain"],
+                             cwd=ROOT, env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        incomplete, complete, plain = json.loads(run.stdout)["notices"]
+        self.assertIn("NOT AN APPROVAL: this review is incomplete (the review has no Coverage section)", incomplete)
+        self.assertNotIn("NOT AN APPROVAL", complete)
+        self.assertNotIn("NOT AN APPROVAL", plain)
+
     def assert_typed_into_own_task(self, scenario, **updates):
         self.log.write_text("")
         result = self.node(scenario, **updates)

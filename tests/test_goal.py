@@ -258,12 +258,12 @@ class GoalTests(unittest.TestCase):
         (author / "completed").write_text("1\n")
         (author / "state.json").write_text(json.dumps({"state": "waiting", "turns": 2, "tokens": {"input": 10, "output": 4}, "cost": 0.0001}))
         (reviewer / "meta.json").write_text(json.dumps({"id": "review-author", "worker": "claude", "workdir": str(self.project), "created": s["started"]}))
-        (reviewer / "result.md").write_text("APPROVED\nIndependent check")
+        (reviewer / "result.md").write_text("APPROVED\nIndependent check\nCoverage\nreviewed the changed files.")
         (reviewer / "state.json").write_text(json.dumps({"state": "waiting", "turns": 1, "tokens": {"input": 5, "output": 3}, "cost": 0.00005}))
         (reviewer / "review-of").write_text("author")
         marker = {"required": True, "status": "approved", "task_id": "author", "round_nonce": "nonce",
                   "approval": {"round_nonce": "nonce", "reviewer_id": "review-author", "author_sha256": hashlib.sha256(b"Work").hexdigest(),
-                               "evidence_sha256": hashlib.sha256(b"APPROVED\nIndependent check").hexdigest()}}
+                               "evidence_sha256": hashlib.sha256(b"APPROVED\nIndependent check\nCoverage\nreviewed the changed files.").hexdigest()}}
         (author / "review-required.json").write_text(json.dumps(marker))
         self.act("link-task", ticket=t, task_id="author")
         self.act("link-task", ticket=t, task_id="review-author")

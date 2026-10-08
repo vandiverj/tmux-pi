@@ -534,7 +534,7 @@ def task_lifecycle(d, pane=None):
     def text(name):
         try:
             return path(name).read_text().strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):  # unreadable counts as absent here; a review's verdict never comes from this reader
             return ""
 
     state, events, reply = obj("state.json"), obj("checkpoints.json").get("events", []), text("result.md")

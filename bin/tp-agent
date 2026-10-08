@@ -100,7 +100,8 @@ def record(path, include_result=False):
     state = read_json(path / "state.json")
     result_path = path / "result.md"
     report_path = path / "report.md"
-    result_text = result_path.read_text() if result_path.exists() else ""
+    # display text only (a lossy decode never feeds a verdict); a review's verdict comes from review_verdict.read_review below
+    result_text = result_path.read_bytes().decode("utf-8", "replace") if result_path.exists() else ""
     match = RESULT_STATUS.search(result_text)
     result = {
         "id": meta.get("id", path.name), "role": meta.get("role", "generic"),
@@ -123,12 +124,22 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
-    if (path / "review-of").is_file() and result_text:
-        # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval
+    if (path / "review-of").is_file():
+        # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval. A review without a
+        # Coverage section keeps its stated verdict but is incomplete: result_status says so and it approves nothing.
         try:
-            result["verdict"], result["verdict_notes"] = review_verdict.parse(result_text)
+            result["verdict"], result["verdict_notes"], incomplete = review_verdict.assess(review_verdict.read_review(result_path))
+        except review_verdict.ReviewMissing:
+            result["verdict"], result["verdict_notes"], incomplete = "unparseable", "the review has no result yet", "the review has no result yet"
         except ValueError as exc:
-            result["verdict"], result["verdict_notes"] = "unparseable", str(exc)
+            result["verdict"], result["verdict_notes"], incomplete = "unparseable", str(exc), str(exc)
+        result["review_complete"] = incomplete is None
+        if incomplete:
+            result["review_incomplete_reason"] = incomplete
+            result["stated_result_status"], result["result_status"] = result["result_status"], "incomplete"
+            result["review_notice"] = (f"{result['id']}'s review is incomplete: {incomplete}. Its verdict "
+                                       f"({result['verdict']}) is kept for the record but does not count as an approval; "
+                                       "ask for the review again.")
     if include_result:
         result["result"] = result_text
     return result
@@ -179,9 +190,12 @@ def write_index(base):
     rows = all_records(base)
     objective = base / "session-objective.md"
     def brief(row):
-        return {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
-                "deliverable", "task_dir", "result_path", "permission", "capability_request", "capability_pending",
-                "reason", "updated")}
+        out = {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
+               "deliverable", "task_dir", "result_path", "permission", "capability_request", "capability_pending",
+               "reason", "updated")}
+        # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason") if key in row})
+        return out
     value = {
         "schema": "tp-session-index:v1", "updated": now(),
         "objective": objective.read_text().strip() if objective.exists() else "",
@@ -232,9 +246,10 @@ def escalation_evidence(base, previous):
             failed += 1
         if meta.get("review"):
             try:
-                text = (task_dir(base, meta["review"]) / "result.md").read_text()
-                # APPROVED_WITH_NOTES approves; only REQUEST_CHANGES counts toward escalation
-                changes += 1 if review_verdict.parse(text)[0] == "REQUEST_CHANGES" else 0
+                text = review_verdict.read_review(task_dir(base, meta["review"]) / "result.md")
+                # only a stated REQUEST_CHANGES counts toward escalation, complete or not (an incomplete review is never an
+                # approval); APPROVED, APPROVED_WITH_NOTES and incomplete approvals count as neither
+                changes += 1 if review_verdict.assess(text)[0] == "REQUEST_CHANGES" else 0
             except (ValueError, OSError):
                 pass
         if not meta.get("parent"):
@@ -793,8 +808,13 @@ def main():
         path = task_dir(base, args.id)
         if args.command == "inspect":
             value = record(path, include_result=True)
+            if value.get("review_notice"):
+                value = {"notice": value["review_notice"], **value}
         elif args.command == "collect":
             value = record(path, include_result=True)
+            if value.get("review_notice"):
+                value = {"notice": value["review_notice"], **value}  # first key, so a reader sees it at once
+                print(value["notice"], file=sys.stderr)
             if value["status"] in {"settled", "completed"}:
                 # The process is ended BEFORE the completed marker is written (tp-contract collect does the same): a process that
                 # survives, or cannot be looked up, fails the command with the task still settled, and the next collect tries

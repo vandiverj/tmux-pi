@@ -430,7 +430,7 @@ class ExportTests(unittest.TestCase):
                    "cost": 0.25, "updated": "2026-09-29T10:05:00Z"},
                   {"result.md": "done", "review-required.json": json.dumps({"required": True, "status": "pending_review"})})
         self.task("review-auto-1", {"worker": "pi", "model": "openai-codex/gpt-6-sol", "thinking": "medium"},
-                  files={"result.md": "APPROVED\nlooks right"})
+                  files={"result.md": "APPROVED\nlooks right\nCoverage\nreviewed the changed files."})
         self.task("auto-2", {"worker": "claude", "model": "claude-opus-5-5", "thinking": "high",
                              "escalated_from": {"id": "auto-1"}},
                   {"state": "waiting", "cost": 1.0, "tokens": {"output": 10}, "updated": "2026-09-29T10:09:00Z"})

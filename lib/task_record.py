@@ -595,8 +595,8 @@ def approved_delegated_review(task_dir, meta, marker, index=None):
     try:
         if (reviewer / "review-of").read_text().strip() != meta["id"]:
             return False
-        report = (reviewer / "result.md").read_text()
-    except (OSError, KeyError):
+        report = review_verdict.read_review(reviewer / "result.md")
+    except (OSError, KeyError, ValueError):
         return False
     verdict = report.strip().strip("\ufeff").strip()
     try:

@@ -372,6 +372,17 @@ export default function (pi: ExtensionAPI) {
 	// The normal tp-main path sets TP_MODE=orchestrator, even if local.json is old.
 	if (process.env.TP_MODE !== "strict") return;
 	const bin = (name: string) => join(root, "bin", name);
+	// Why a review is incomplete (no Coverage section, or its result cannot be read), or "" when it is complete.
+	const reviewIncomplete = async (resultFile: string): Promise<string> => {
+		const r = await run("python3", [join(root, "lib", "review_verdict.py"), resultFile]);
+		if (r.code !== 0) return `review_verdict refused: ${(r.stderr || r.stdout).trim()}`;
+		try {
+			const out = JSON.parse(r.stdout);
+			return out.complete === true ? "" : String(out.incomplete_reason || "incomplete");
+		} catch {
+			return "review_verdict output unreadable";
+		}
+	};
 	let enabled = true;
 	let active = true;
 	let lastCtx: any;
@@ -690,7 +701,10 @@ export default function (pi: ExtensionAPI) {
 			task.reviewer = undefined;
 			showRunning();
 			const parsed = parseVerdict(verdict);
-				const verdictApproved = reviewed.ok && (parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES");
+			// A review without a Coverage section is incomplete whatever its first line says; lib/review_verdict.py decides, and
+			// a refusal or unreadable answer from it counts as incomplete too.
+			const incomplete = parsed.verdict ? await reviewIncomplete(join(reviewDir, "result.md")) : undefined;
+				const verdictApproved = reviewed.ok && !incomplete && (parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES");
 			const changed = reviewMarker(dir).round_nonce !== nonce || authorHash(dir) !== snapshot;
 			if (changed && reviewed.ok && reviewMarker(dir).status !== "needs_human") {
 				// The old verdict (including REQUEST_CHANGES) describes an older result. Never collect it.
@@ -723,7 +737,8 @@ export default function (pi: ExtensionAPI) {
 				break;
 			}
 			if (!reviewed.ok || verdictApproved || parsed.verdict !== "REQUEST_CHANGES") {
-				const reason = !reviewed.ok ? "Required review failed before approval" : verdictApproved ?
+				const reason = !reviewed.ok ? "Required review failed before approval" : incomplete ?
+					`Review incomplete (${incomplete}); its stated verdict ${parsed.verdict} does not count as an approval` : verdictApproved ?
 					"Approval cannot clear an existing human gate or lacks independent evidence" :
 					`Reviewer verdict unparseable: ${parsed.error ?? "whole first line must be APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES without formatting"}`;
 				requireDelegatedReview(dir, task.id, reason, reviewer);

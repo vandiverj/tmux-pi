@@ -28,6 +28,16 @@ const must = async (cmd, args, input) => {
   if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `${cmd} exited with ${r.code}`);
   return r.stdout.trim();
 };
+// A reviewer's reply without a Coverage section (or that cannot be checked, or is missing) is announced in words before the reply;
+// lib/review_verdict.py decides. Empty for a task that is not a review or a complete review.
+const reviewNotice = async (dir, reply) => {
+  if (!existsSync(join(dir, "review-of"))) return "";
+  const r = await run("python3", [join(ROOT, "lib", "review_verdict.py"), join(dir, "result.md")]);
+  let out = null;
+  try { out = JSON.parse(r.stdout); } catch { /* refused below */ }
+  if (r.code !== 0 || !out) return `NOT AN APPROVAL: this review is incomplete (${(r.stderr || r.stdout).trim() || "no answer"}).\n\n`;
+  return out.complete ? "" : `NOT AN APPROVAL: this review is incomplete (${out.incomplete_reason}). Its stated verdict ${out.verdict} is kept for the record but does not count; ask for the review again.\n\n`;
+};
 const readText = (f) => { try { return readFileSync(f, "utf8").trim(); } catch { return ""; } };
 const readJson = (f) => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return {}; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -161,7 +171,7 @@ const TOOLS = {
       }
       const reply = readText(join(dir, "result.md"));
       const body = reply.length > 20000 ? `${reply.slice(0, 20000)}\n…(truncated; full reply in ${join(dir, "result.md")})` : reply;
-      return `${lines.join("\n")}\n\n${body || "(no reply yet)"}`;
+      return `${lines.join("\n")}\n\n${await reviewNotice(dir, reply)}${body || "(no reply yet)"}`;
     },
   },
   review_subagent: {

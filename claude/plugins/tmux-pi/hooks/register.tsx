@@ -285,10 +285,12 @@ async function poll($: EngineInterface) {
 
 function indexLine(row: unknown): string | undefined {
   if (typeof row !== 'object' || row === null) return undefined
-  const { id, role, harness, status, result_status, result_path, reason } = row as Record<string, unknown>
+  const { id, role, harness, status, result_status, result_path, reason, verdict, review_complete } = row as Record<string, unknown>
   if (typeof id !== 'string') return undefined
   const fields = [id, role, harness, status].filter(field => typeof field === 'string' && field !== '')
   if (typeof result_status === 'string') fields.push(`result=${result_status}`)
+  // a review's stated verdict never reads as an approval unless its Coverage section was there (tp-agent: review_complete)
+  if (typeof verdict === 'string') fields.push(review_complete === true ? `verdict=${verdict}` : `verdict=${verdict} [review incomplete: not an approval]`)
   if (typeof result_path === 'string') fields.push(result_path)
   if (typeof reason === 'string' && reason !== '') fields.push(`(${reason})`)
   const awaits = awaiting(row as Record<string, unknown>)
@@ -544,8 +546,9 @@ export const register: Register = on => {
     // The worker's own report.md is kept apart from the last reply: say where it is and how big.
     let report = ''
     try {
-      const { report_path: path, report_bytes: bytes } = JSON.parse(ran.stdout)
+      const { report_path: path, report_bytes: bytes, review_notice: notice } = JSON.parse(ran.stdout)
       if (typeof path === 'string' && typeof bytes === 'number') report = ` Report: ${path} (${bytes} bytes).`
+      if (typeof notice === 'string') report += ` NOT AN APPROVAL: ${notice}`
     } catch {
       report = ''
     }

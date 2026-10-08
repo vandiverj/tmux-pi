@@ -9,6 +9,8 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 const scenario = process.argv[2];
 // A worker's default reply: it carries a result status, or the task reads paused.
+// A review ends with a Coverage section or it is incomplete (lib/review_verdict.py).
+const COV = '\nCoverage\nreviewed every changed file.';
 const DONE = 'Done.\nRESULT_STATUS: complete\n';
 const root = path.resolve(import.meta.dirname, '..');
 const state = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-runtime-'));
@@ -47,7 +49,7 @@ const statuses = [];
 // review-required work stays blocked in main even for a low-risk text request.
 const direct = ['direct', 'direct-off', 'direct-review', 'main-pi', 'review-turn', 'resolved-turn', 'forged-resolved', 'wrong-id-resolved', 'task-blocker', 'archived-blocker', 'archived-renamed', 'unknown-marker', 'malformed-marker', 'approved-changed', 'resolved-changed', 'expanded', 'expanded-marker'].includes(scenario);
 const request = scenario === 'delegate-omitted' ? '+delegate Read only fixture.txt and answer: what color is cedar? Do not edit files.' : scenario === 'research-gate' ? '+research +review Summarize cache history' : ['expanded', 'expanded-marker'].includes(scenario) ? (scenario === 'expanded-marker' ? '+here /pwhash' : '/pwhash') : scenario === 'direct-subagent' ? 'Explain tp-view' : scenario === 'followup-blocked' ? '+delegate Fix typo in README.md' : ['review', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload'].includes(scenario) ? '+delegate Update password hashing in auth.py' : ['confirm', 'decline', 'no-ui'].includes(scenario) ? 'Deploy production migration and delete old backups' : ['review-turn', 'resolved-turn'].includes(scenario) ? '+here Go ahead and apply the change we discussed' : scenario === 'direct-review' || scenario === 'main-pi' ? '+here +review Explain tp-view' : direct ? '+here Explain tp-view' : 'Fix typo in README.md';
-let decision = { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'low', route: 'coding', intent: direct || scenario === 'direct-subagent' ? 'communication_or_documentation' : 'implementation', review: ['direct-review', 'main-pi', 'capability-resolved', 'capability-deleted', 'review-failed', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'notes-quote', 'notes-verdict', 'review-changes', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload', 'kill'].includes(scenario) ? 'required' : 'none', scope: 'brief', placement: direct ? 'main' : 'subagent', overrides: direct ? ['placement', ...(scenario === 'direct-review' || scenario === 'main-pi' ? ['review'] : [])] : ['placement'], task: direct ? 'Explain tp-view' : request.replace(/^\+delegate\s+/, '') };
+let decision = { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'low', route: 'coding', intent: direct || scenario === 'direct-subagent' ? 'communication_or_documentation' : 'implementation', review: ['direct-review', 'main-pi', 'capability-resolved', 'capability-deleted', 'review-failed', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'no-coverage', 'empty-coverage', 'notes-quote', 'notes-verdict', 'review-changes', 'review-gate', 'midreview-followup', 'midreview-pane', 'midreview-nonce', 'midreview-cap', 'midreview-reload', 'kill'].includes(scenario) ? 'required' : 'none', scope: 'brief', placement: direct ? 'main' : 'subagent', overrides: direct ? ['placement', ...(scenario === 'direct-review' || scenario === 'main-pi' ? ['review'] : [])] : ['placement'], task: direct ? 'Explain tp-view' : request.replace(/^\+delegate\s+/, '') };
 if (['direct', 'direct-off', 'direct-review', 'main-pi', 'review', 'review-gate', 'review-turn', 'resolved-turn', 'delegate-omitted'].includes(scenario)) {
   const fixture = spawnSync('python3', [path.join(root, 'tests/router_runtime_fixture.py'), request], { cwd: root, encoding: 'utf8' });
   if (fixture.status !== 0) throw new Error(fixture.stderr);
@@ -70,6 +72,12 @@ function task(id, meta = {}) {
 }
 function command(cmd, args, input) {
   const name = path.basename(cmd);
+  // the real shared Coverage check (lib/review_verdict.py), not a fake
+  if (name === 'python3' && path.basename(args[0]) === 'review_verdict.py') {
+    const p = spawnSync('python3', args, { encoding: 'utf8' });
+    if (p.status !== 0) throw Object.assign(new Error(p.stderr), { code: p.status });
+    return p.stdout;
+  }
   calls.push({ name, args, input });
   if (name === 'tmux') {
     if (args[0] === 'display-message') {
@@ -134,7 +142,7 @@ function command(cmd, args, input) {
     const id = `review-${++globalThis.midRounds}`;
     task(id, { worker: 'claude' });
     fs.writeFileSync(path.join(dir(id), 'review-of'), 'auto-1');
-    fs.writeFileSync(path.join(dir(id), 'result.md'), 'APPROVED\nold snapshot.');
+    fs.writeFileSync(path.join(dir(id), 'result.md'), 'APPROVED\nold snapshot.' + COV);
     fs.writeFileSync(path.join(dir(id), 'state.json'), JSON.stringify({ state: globalThis.midRounds === 1 || scenario === 'midreview-cap' ? 'starting' : 'waiting', updated: new Date().toISOString() }));
     fs.writeFileSync(path.join(dir('auto-1'), 'meta.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'meta.json'))), review: id }));
     globalThis.reviewSnapshots.push(fs.readFileSync(path.join(dir('auto-1'), 'result.md'), 'utf8'));
@@ -142,10 +150,10 @@ function command(cmd, args, input) {
   } if (scenario === 'rework-approved') {
     task('review-2', { worker: 'claude' });
     fs.writeFileSync(path.join(dir('review-2'), 'review-of'), 'auto-1');
-    fs.writeFileSync(path.join(dir('review-2'), 'result.md'), 'APPROVED\nnew round.');
+    fs.writeFileSync(path.join(dir('review-2'), 'result.md'), 'APPROVED\nnew round.' + COV);
     fs.writeFileSync(path.join(dir('auto-1'), 'meta.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'meta.json'))), review: 'review-2' }));
     return 'review-2\n';
-  } if (['review-changes', 'resolved-changes'].includes(scenario)) (globalThis.reviewRoundMarkers ??= []).push(JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status); if (['review-failed', 'resolved-failed'].includes(scenario)) throw new Error('review unavailable'); task('review-1', { worker: scenario === 'review-gate' ? 'pi' : 'claude' }); fs.writeFileSync(path.join(dir('review-1'), 'review-of'), args.at(-1)); fs.writeFileSync(path.join(dir('review-1'), 'result.md'), scenario === 'review-invalid' ? 'No verdict.' : scenario === 'formatted-verdict' ? '**APPROVED**: checked.' : scenario === 'unknown-verdict' ? 'APPROVED_PENDING: later.' : scenario === 'notes-verdict' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nN1 test gap: no test for the empty case.\nN2 wording: the error says "bad".' : scenario === 'notes-empty' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete' : scenario === 'notes-suffix' ? 'APPROVED_WITH_NOTES: N1 wording gap.' : scenario === 'approved-suffix' ? 'APPROVED-OTHER\nRESULT_STATUS: complete' : scenario === 'notes-quote' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nRound 1 REQUEST_CHANGES F1 was fixed.\nN1 wording gap.' : ['review-changes', 'resolved-changes'].includes(scenario) ? 'REQUEST_CHANGES: fix the evidence.' : 'APPROVED\nindependently checked.'); fs.writeFileSync(path.join(dir(args.at(-1)), 'meta.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(dir(args.at(-1)), 'meta.json'))), review: 'review-1' })); return 'review-1\n'; }
+  } if (['review-changes', 'resolved-changes'].includes(scenario)) (globalThis.reviewRoundMarkers ??= []).push(JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status); if (['review-failed', 'resolved-failed'].includes(scenario)) throw new Error('review unavailable'); task('review-1', { worker: scenario === 'review-gate' ? 'pi' : 'claude' }); fs.writeFileSync(path.join(dir('review-1'), 'review-of'), args.at(-1)); fs.writeFileSync(path.join(dir('review-1'), 'result.md'), scenario === 'review-invalid' ? 'No verdict.' : scenario === 'formatted-verdict' ? '**APPROVED**: checked.' : scenario === 'unknown-verdict' ? 'APPROVED_PENDING: later.' : scenario === 'notes-verdict' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nN1 test gap: no test for the empty case.\nN2 wording: the error says "bad".' + COV : scenario === 'notes-empty' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete' : scenario === 'notes-suffix' ? 'APPROVED_WITH_NOTES: N1 wording gap.' : scenario === 'no-coverage' ? 'APPROVED\nchecked, no problems.' : scenario === 'empty-coverage' ? 'APPROVED_WITH_NOTES\nN1 wording.\nCoverage\n\n' : scenario === 'approved-suffix' ? 'APPROVED-OTHER\nRESULT_STATUS: complete' : scenario === 'notes-quote' ? 'APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nRound 1 REQUEST_CHANGES F1 was fixed.\nN1 wording gap.' + COV : ['review-changes', 'resolved-changes'].includes(scenario) ? 'REQUEST_CHANGES: fix the evidence.' : 'APPROVED\nindependently checked.' + COV); fs.writeFileSync(path.join(dir(args.at(-1)), 'meta.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(dir(args.at(-1)), 'meta.json'))), review: 'review-1' })); return 'review-1\n'; }
   if (name === 'tp-contract') { if (args[0] === 'escalate' && scenario.startsWith('halted-dialog-')) throw new Error('automatic escalation unavailable'); if (args[0] === 'extend') return JSON.stringify({ message: 'Continue with bounded budget' }); if (args[0] === 'enforce' && (['halted-restart', 'halted-marker-restart'].includes(scenario) || scenario.startsWith('halted-dialog-')) && !globalThis.haltedEmitted) { globalThis.haltedEmitted = true; return JSON.stringify({ action: 'halted', id: 'source-1', reason: 'budget', trigger: 'budget', artifact: path.join(dir('source-1'), 'result.md'), kind: scenario.startsWith('halted-dialog-') ? 'research' : 'task' }); } if (args[0] === 'research') return JSON.stringify({ worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'low', escalate: { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'high' } }); if (args[0] === 'slot') return JSON.stringify({ ok: true }); if (args[0] === 'escalate') return JSON.stringify({ target: { worker: 'pi', model: 'openai-codex/gpt-6-sol', thinking: 'high' }, record: { trigger: 'budget' } }); return ''; }
   return '';
 }
@@ -170,7 +178,7 @@ try {
     fs.mkdirSync(reviewer, { recursive: true });
     fs.writeFileSync(path.join(reviewer, 'meta.json'), JSON.stringify({ id: 'review-1', worker: 'claude' }));
     fs.writeFileSync(path.join(reviewer, 'review-of'), 'auto-1');
-    const verdict = 'APPROVED\nindependently checked.';
+    const verdict = 'APPROVED\nindependently checked.' + COV;
     fs.writeFileSync(path.join(reviewer, 'result.md'), verdict);
     fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'resolved-changed' ?
       { required: true, status: 'resolved', task_id: 'auto-1', round_nonce: 'r1', resolution: { actor: 'human_cli', round_nonce: 'r1', author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } } :
@@ -263,7 +271,7 @@ try {
     task('auto-1', { decision: { review: 'required' }, review: 'review-1' });
     task('review-1', { worker: 'claude' });
     fs.writeFileSync(path.join(dir('review-1'), 'review-of'), 'auto-1');
-    const verdict = 'APPROVED\nprevious round.';
+    const verdict = 'APPROVED\nprevious round.' + COV;
     fs.writeFileSync(path.join(dir('review-1'), 'result.md'), verdict);
     fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'needs-human-followup' ? { required: true, status: 'needs_human', task_id: 'auto-1', reasons: ['Earlier failure'] } : ['resolved-restart', 'resolved-failed', 'resolved-changes'].includes(scenario) ? { required: true, status: 'resolved', task_id: 'auto-1', resolution: { actor: 'human_cli', reason: 'Older work' } } : { required: true, status: 'approved', task_id: 'auto-1', approval: { reviewer_id: 'review-1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'), author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } }));
     fs.writeFileSync(path.join(dir('auto-1'), 'completed'), '1\n');
@@ -398,7 +406,7 @@ try {
   if (['expanded', 'expanded-marker'].includes(scenario)) {
     try { await pi.tool.execute('stale', { handshake_id: match[1], request_sha256: rawHash, action: 'direct', mode: 'direct', task_summary: 'stale', frame: 'stale', assumptions: [], no_edits: false, scope: 'brief', risk_notes: [], proof_path: [], done_when: [] }, null, null, ctx); } catch { staleHashRejected = true; }
   }
-  const params = { handshake_id: match[1], request_sha256: match[2], action: scenario === 'goal' ? 'delegate' : ['stop', 'stop-retry'].includes(scenario) ? 'stop' : scenario === 'alignment' ? 'ask_alignment' : ['review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'main-pi', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'notes-quote', 'notes-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegate' : 'direct', mode: scenario === 'goal' ? 'delegated' : ['stop', 'stop-retry'].includes(scenario) ? 'plan' : ['review', 'review-failed', 'main-pi', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'notes-quote', 'notes-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegated' : 'direct', task_summary: scenario === 'goal' ? 'Fix parser in src/parser.py' : 'Scoped work', frame: 'Only requested work', assumptions: [], no_edits: ['stop', 'stop-retry'].includes(scenario), scope: 'brief', risk_notes: [], proof_path: ['diff'], done_when: ['done'] };
+  const params = { handshake_id: match[1], request_sha256: match[2], action: scenario === 'goal' ? 'delegate' : ['stop', 'stop-retry'].includes(scenario) ? 'stop' : scenario === 'alignment' ? 'ask_alignment' : ['review', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'main-pi', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'no-coverage', 'empty-coverage', 'notes-quote', 'notes-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegate' : 'direct', mode: scenario === 'goal' ? 'delegated' : ['stop', 'stop-retry'].includes(scenario) ? 'plan' : ['review', 'review-failed', 'main-pi', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'no-coverage', 'empty-coverage', 'notes-quote', 'notes-verdict', 'review-changes', 'research-gate'].includes(scenario) ? 'delegated' : 'direct', task_summary: scenario === 'goal' ? 'Fix parser in src/parser.py' : 'Scoped work', frame: 'Only requested work', assumptions: [], no_edits: ['stop', 'stop-retry'].includes(scenario), scope: 'brief', risk_notes: [], proof_path: ['diff'], done_when: ['done'] };
   let mismatch = false, wrongStop = false;
   try { await pi.tool.execute('1', { ...params, handshake_id: 'wrong' }, null, null, ctx); } catch { mismatch = true; }
   if (['stop', 'stop-retry'].includes(scenario)) { try { await pi.tool.execute('1', { ...params, action: 'direct', mode: 'direct' }, null, null, ctx); } catch { wrongStop = true; } }
@@ -413,7 +421,7 @@ try {
   const postContractResolve = !!(await guard('bash', 'bin/tp-task --state-dir /tmp/state capability-resolve auto-1 --approve'))?.block;
   const postContractReviewResolve = !!(await guard('bash', 'bin/tp-task --state-dir /tmp/state review-resolve r5-test --outcome approved'))?.block;
   const editAfter = !!(await guard('edit', ''))?.block;
-  if (['goal', 'review', 'notes-verdict', 'notes-quote', 'notes-suffix', 'approved-suffix', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'review-changes', 'research-gate'].includes(scenario)) {
+  if (['goal', 'review', 'notes-verdict', 'notes-quote', 'notes-suffix', 'approved-suffix', 'no-coverage', 'empty-coverage', 'review-failed', 'followup-blocked', 'kill', 'capability', 'capability-resolved', 'capability-deleted', 'confirm', 'decline', 'auto-off', 'no-ui', 'review-gate', 'review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'review-changes', 'research-gate'].includes(scenario)) {
     await handlers.agent_end({ messages: [] }, ctx);
     await new Promise(resolve => setTimeout(resolve, 80));
     if (scenario === 'followup-blocked') {
@@ -450,7 +458,7 @@ try {
     if (scenario === 'review-changes') {
       for (let i = 0; i < 85 && (!fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) || JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status !== 'needs_human'); i++) await new Promise(resolve => setTimeout(resolve, 100));
     }
-    if (['review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix'].includes(scenario)) {
+    if (['review-invalid', 'formatted-verdict', 'unknown-verdict', 'notes-empty', 'notes-suffix', 'approved-suffix', 'no-coverage', 'empty-coverage'].includes(scenario)) {
       for (let i = 0; i < 80 && (!fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) || JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status !== 'needs_human'); i++) await new Promise(resolve => setTimeout(resolve, 100));
     }
     if (['notes-verdict', 'notes-quote'].includes(scenario)) {

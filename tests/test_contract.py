@@ -421,7 +421,7 @@ class ContractTests(unittest.TestCase):
         reviewer.mkdir()
         (reviewer / "meta.json").write_text(json.dumps({"id": "reviewer", "worker": "pi"}))
         (reviewer / "review-of").write_text("author\n")
-        report = "APPROVED\nindependently inspected."
+        report = "APPROVED\nindependently inspected.\nCoverage\nreviewed the changed files."
         (reviewer / "result.md").write_text(report)
         approved = {"required": True, "status": "approved", "task_id": "author", "round_nonce": "test-author-round",
                     "approval": {"reviewer_id": "reviewer", "round_nonce": "test-author-round", "evidence_sha256": hashlib.sha256(report.encode()).hexdigest(),
@@ -437,7 +437,7 @@ class ContractTests(unittest.TestCase):
         approved["approval"]["evidence_sha256"] = hashlib.sha256(b"NOT APPROVED: fail.").hexdigest()
         marker.write_text(json.dumps(approved))
         self.assertFalse(collect_ok())  # A negated keyword is not an approval.
-        for text, collects in (("APPROVED_WITH_NOTES\nN1 wording gap.", True), ("APPROVED_WITH_NOTES\n", False), ("APPROVED_PENDING: x", False)):
+        for text, collects in (("APPROVED_WITH_NOTES\nN1 wording gap.\nCoverage\nreviewed the changed files.", True), ("APPROVED_WITH_NOTES\nN1 wording gap.", False), ("APPROVED_WITH_NOTES\n", False), ("APPROVED_PENDING: x", False)):
             (reviewer / "result.md").write_text(text)
             approved["approval"]["evidence_sha256"] = hashlib.sha256(text.encode()).hexdigest()
             marker.write_text(json.dumps(approved))
@@ -467,7 +467,7 @@ class ContractTests(unittest.TestCase):
         (target / "meta.json").write_text(json.dumps({"id": "target", "worker": "pi", "review": "reviewer", "escalated_from": {"id": "source"}}))
         (reviewer / "meta.json").write_text(json.dumps({"id": "reviewer", "worker": "claude"}))
         (reviewer / "review-of").write_text("target")
-        report = "APPROVED\nchecked source and target."
+        report = "APPROVED\nchecked source and target.\nCoverage\nreviewed the changed files."
         (reviewer / "result.md").write_text(report)
         marker = {"required": True, "task_id": "target", "status": "pending_review"}
         (target / "review-required.json").write_text(json.dumps(marker))

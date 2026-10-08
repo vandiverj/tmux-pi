@@ -239,7 +239,9 @@ class GoalTests(unittest.TestCase):
             self.assertEqual(self.act("poll")["status"], "waiting")
         with self.assertRaises(GoalError):
             self.act("admit")
-        s = self.act("poll")
+        # The handle is gone now. Say so; the real tmux would be asked otherwise, and any live pane %1 on the machine would keep it waiting.
+        with patch("goal._live_task", return_value=False):
+            s = self.act("poll")
         self.assertEqual(s["status"], "suspended")
         self.assertIn("review", s["reason"])
 

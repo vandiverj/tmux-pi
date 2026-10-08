@@ -261,6 +261,22 @@ class RedactHookTests(unittest.TestCase):
         self.assertEqual(json.loads(old("shadow"))["hookSpecificOutput"]["permissionDecision"], "ask")
         self.assertEqual(old("on"), "")
 
+    def test_trust_guard_denies_in_on_mode_where_the_old_gate_is_silent(self):
+        # Both run as the real hooks, with the temporary home and a temporary log directory.
+        target = str(self.home / ".config/tmux-pi/trust/grant.json")
+        event = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": str(self.proj),
+                            "tool_input": {"file_path": target, "content": "{}"}})
+        env = {**self.env, "TP_REDACTION": "on", "TP_TRUST_GUARD_LOG_DIR": str(self.store / "guard-log")}
+        def run(name):
+            return subprocess.run([str(ROOT / "claude/plugins/tmux-pi/hooks" / name)], input=event, text=True,
+                                  capture_output=True, env=env, timeout=10)
+        self.assertEqual(run("sensitive-read.sh").stdout, "")
+        guard = run("trust-guard.sh")
+        self.assertEqual(guard.returncode, 0, guard.stderr)
+        output = json.loads(guard.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertTrue((self.store / "guard-log/guard.jsonl").is_file())
+
     def test_ask_is_recorded_and_settled_for_tp_status(self):
         request = self.task / "permission-request.json"
         self.bash("cat ~/.aws/credentials")

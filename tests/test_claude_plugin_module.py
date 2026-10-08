@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import unittest
@@ -18,6 +19,24 @@ class ClaudePluginModuleTests(unittest.TestCase):
         commands = json.dumps(hooks["hooks"])
         self.assertIn("report.sh", commands)
         self.assertIn("sensitive-read.sh", commands)
+
+    def test_trust_guard_runs_first_and_only_before_tools(self):
+        hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
+        names = lambda group: [Path(h["command"].strip('"')).name for h in group["hooks"]]
+        pre = hooks["PreToolUse"]
+        self.assertEqual(len(pre), 1)
+        self.assertEqual(pre[0]["matcher"], "*")
+        order = names(pre[0])
+        self.assertEqual(order[0], "trust-guard.sh")
+        self.assertLess(order.index("trust-guard.sh"), order.index("sensitive-read.sh"))
+        self.assertLess(order.index("trust-guard.sh"), order.index("redact.sh"))
+        self.assertEqual(order.count("trust-guard.sh"), 1)
+        for event, groups in hooks.items():
+            if event != "PreToolUse":
+                self.assertNotIn("trust-guard.sh", [n for g in groups for n in names(g)], event)
+        script = PLUGIN / "hooks" / "trust-guard.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertTrue(os.access(ROOT / "bin" / "tp-trust-guard", os.X_OK))
 
     def test_manifest_names_the_state_contract(self):
         manifest = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())

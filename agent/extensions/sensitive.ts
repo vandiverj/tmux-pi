@@ -9,6 +9,7 @@ export default function (pi: ExtensionAPI) {
 	const agentDir = process.env.PI_CODING_AGENT_DIR;
 	if (!agentDir) return;
 	const classifier = join(dirname(agentDir), "bin", "tp-sensitive-read");
+	const trustGuard = join(dirname(agentDir), "bin", "tp-trust-guard");
 	const request = taskDir ? join(taskDir, "permission-request.json") : "";
 	const save = (value: object) => {
 		if (!request) return;
@@ -46,6 +47,32 @@ export default function (pi: ExtensionAPI) {
 		let decision: any;
 		// The session's directory, as the Claude hook sends it. Left out when absent or odd, so the classifier assumes nothing and prompts.
 		const cwd = typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : undefined;
+		// The trust-store guard comes first, in every redaction mode. It denies; the one thing it asks about is a tree, glob or brace
+		// list too large for it to check, far from the store (`ask: true`, sent with `deny: true` so a reader that does
+		// not know the ask blocks). Every other answer, and any answer not understood, blocks. An ask is never lifted by the classifier.
+		let guard: { deny: unknown; ask: unknown; reason: unknown };
+		try {
+			const answer = JSON.parse(execFileSync(trustGuard, [], {
+				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),
+				encoding: "utf8", timeout: 5000,
+			}));
+			guard = { deny: answer.deny, ask: answer.ask, reason: answer.reason };
+		} catch {
+			return { block: true, reason: "Trust-store guard unavailable; the worker cannot verify this tool call." };
+		}
+		if (guard.deny !== false || guard.ask === true) {
+			const why = typeof guard.reason === "string" ? guard.reason : "Trust-store guard denied this tool call.";
+			if (guard.deny !== true || guard.ask !== true) return { block: true, reason: why };
+			const asked = { target: "a call the trust-store guard could not fully check", reason: why, updated: new Date().toISOString() };
+			save({ ...asked, status: "pending" });
+			if (!ctx.hasUI) return { block: true, reason: `${why} It needs user authorization in the active tmux pane.` };
+			const allowed = await ctx.ui.confirm(
+				"Authorize a call the guard could not fully check?",
+				`${why} Approve only if the call is needed for this task.`,
+			);
+			save({ ...asked, status: allowed ? "authorized" : "denied", updated: new Date().toISOString() });
+			if (!allowed) return { block: true, reason: "User denied a call the trust-store guard could not fully check." };
+		}
 		try {
 			decision = JSON.parse(execFileSync(classifier, [], {
 				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),

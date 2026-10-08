@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Deny tool calls that touch the trust store or try to change it (lib/trust_guard.py).
+
+Claude hook: `--claude-hook` reads the hook event and prints a deny decision, an ask decision, or nothing.
+Pi gate: no flag; reads {tool_name, tool_input, cwd} and prints {"deny": bool, "reason": ...}; an ask also has "ask": true
+and "deny": true, so a reader that does not know the ask blocks.
+An ask is only ever the answer for a tree, glob or brace list too large to check, far from the store (lib/trust_guard.py).
+Every reason is printed with its own "What to do instead".
+A call this cannot read exits non-zero, which both callers treat as a block.
+`--home DIR` places the trust store under another home; it is for tests and changes no decision rule.
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import trust_guard
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--claude-hook", action="store_true")
+    parser.add_argument("--home")
+    args = parser.parse_args()
+    event = json.load(sys.stdin)
+    if not isinstance(event, dict):
+        sys.exit(2)
+    name = event.get("hook_event_name")
+    if args.claude_hook and name not in (None, "PreToolUse"):
+        return
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+    tool = event.get("tool_name")
+    answer = trust_guard.check_within(trust_guard._JUDGE_SECONDS, tool if isinstance(tool, str) else "",
+                                      event.get("tool_input"), cwd, home=args.home)
+    if answer.kind != trust_guard.ALLOW:
+        trust_guard.log_denial(answer.reason, tool, "claude" if args.claude_hook else "pi", home=args.home,
+                               kind=answer.kind)
+    if args.claude_hook:
+        if answer.kind != trust_guard.ALLOW:
+            print(json.dumps(trust_guard.hook_response(answer)))
+    else:
+        print(json.dumps(trust_guard.gate_response(answer)))
+
+
+if __name__ == "__main__":
+    main()

@@ -141,7 +141,7 @@ class ContractTests(unittest.TestCase):
         fake = self.dir / "fake-bin"
         fake.mkdir()
         tmux = fake / "tmux"
-        tmux.write_text('#!/bin/sh\ncase "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0";;\n esac\n')
+        tmux.write_text('#!/bin/sh\ncase "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0 99999999";;\n esac\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), TP_SESSION="fixture",
                    PATH=str(fake) + os.pathsep + os.environ["PATH"])
@@ -318,7 +318,7 @@ class ContractTests(unittest.TestCase):
         marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True,
                                       "reasons": ["reviewer unavailable"]}))
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "worker-1"]
@@ -350,7 +350,7 @@ class ContractTests(unittest.TestCase):
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "result.md").write_text("Started a sleep; waiting.\n")
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 0"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 0 99999999"\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
@@ -372,7 +372,7 @@ class ContractTests(unittest.TestCase):
         (task / "result.md").write_text("Out of budget.\nRESULT_STATUS: blocked\n")
         (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "reason": "budget", "at": T0}]}))
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 0"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 0 99999999"\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
@@ -396,7 +396,7 @@ class ContractTests(unittest.TestCase):
         (task / "exit").write_text("0\n")
         (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "author"]
@@ -476,7 +476,7 @@ class ContractTests(unittest.TestCase):
     def test_local_escalation_cli_prefers_available_gpt6(self):
         state = self.dir / "state"
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
         tmux.chmod(0o755)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         for idx, model in enumerate(("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b")):
@@ -504,7 +504,7 @@ class ContractTests(unittest.TestCase):
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0 + 60)}))
         (task / "checkpoints.json").write_text(json.dumps({"events": []}))
         tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1"\n')
+        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
         tmux.chmod(0o755)
         (task / "exit").write_text("1\n")
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))

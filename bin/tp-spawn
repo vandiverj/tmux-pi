@@ -269,7 +269,7 @@ fi
 # everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
 preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}")" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
-packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree."
+packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
 packet+=$'\n'
 if [[ -n "$role" ]]; then
   packet+=$'\n\n# Worker Role\n\n'

@@ -541,6 +541,14 @@ export const register: Register = on => {
       return { text: `${id} ${why}; nothing was collected.` }
     }
     if (status !== 'completed') return { text: `${id} is ${typeof status === 'string' ? status : 'in an unknown state'}; nothing was collected.` }
-    return { text: `Collected ${id}.`, context: [`tp-agent collect ${id}:\n${ran.stdout}`] }
+    // The worker's own report.md is kept apart from the last reply: say where it is and how big.
+    let report = ''
+    try {
+      const { report_path: path, report_bytes: bytes } = JSON.parse(ran.stdout)
+      if (typeof path === 'string' && typeof bytes === 'number') report = ` Report: ${path} (${bytes} bytes).`
+    } catch {
+      report = ''
+    }
+    return { text: `Collected ${id}.${report}`, context: [`tp-agent collect ${id}:\n${ran.stdout}`] }
   })
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tp-review — spawn an independent reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review [--force] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>
+# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>
 #
 # Asks the model router for a review plan (tp-route --review-plan): whether a review is needed
 # (the larger of a deterministic policy over role, files touched, level and effort and the
@@ -24,11 +24,12 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
-usage() { echo "usage: tp-review [--force] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2; exit "${1:-1}"; }
-force=0 plan_opts=()
+usage() { echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2; exit "${1:-1}"; }
+force=0 force_alive=0 plan_opts=()
 while [[ $# -gt 1 ]]; do
   case "$1" in
     --force) force=1; shift ;;
+    --force-alive) force_alive=1; shift ;;
     --approve-effort) plan_opts+=(--approve-effort); shift ;;
     --level|--thinking) [[ $# -gt 2 ]] || usage; plan_opts+=("$1" "$2"); shift 2 ;;
     *) usage ;;
@@ -157,6 +158,13 @@ for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
 done
 (( total <= max_packet )) ||
   die "review packet for '$id' needs ~$total chars (max $max_packet) without dropping author evidence; use a deliberate source-review workflow instead"
+# A reviewer is read-only and runs beside no writer on the same working tree (T3); every caller passes here. The settled
+# author is the writer that matters: its process is ended first (pane and scrollback kept, task not collected), and the review
+# is refused if that cannot be done or checked. The guard then covers every task on the tree, the author included.
+if [[ "$force_alive" != 1 ]]; then
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" end-author "$id" >/dev/null || die "review of '$id' refused: its process could not be ended (--force-alive overrides)"
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" guard-review "$id" >/dev/null || die "review of '$id' refused (--force-alive overrides)"
+fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
 if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer \

@@ -16,6 +16,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
+from worker_process import FINISHED, end_or_refuse, end_process, end_orphan, guard_retry, guard_review, live_process, orphans, pane_table  # noqa: E402
 
 ROLES = ROOT / "agent" / "roles"
 TESTS_SCOPES = ("affected", "full", "none")
@@ -87,6 +88,7 @@ def record(path, include_result=False):
     meta = read_json(path / "meta.json")
     state = read_json(path / "state.json")
     result_path = path / "result.md"
+    report_path = path / "report.md"
     result_text = result_path.read_text() if result_path.exists() else ""
     match = RESULT_STATUS.search(result_text)
     result = {
@@ -104,12 +106,41 @@ def record(path, include_result=False):
         "capability_request": read_json(path / "capability-request.json") if (path / "capability-request.json").exists() else None,
         # the same test lib/contract.py uses to hold a task at needs_input for human capability approval
         "capability_pending": (path / "pending-capability.json").exists(),
+        # The worker's own report file, kept apart from result.md (the last reply, rewritten at every Stop).
+        "report_path": str(report_path) if report_path.is_file() else None,
+        "report_bytes": report_path.stat().st_size if report_path.is_file() else None,
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
     if include_result:
         result["result"] = result_text
     return result
+
+
+def reap(base, args):
+    """List finished tasks whose process is still alive; end them only with --yes."""
+    for ident in args.ids:
+        task_dir(base, ident)  # an unknown id refuses by name
+    table, found = pane_table(), []
+    tasks = base / "tasks"
+    for path in sorted(tasks.iterdir()) if tasks.exists() else []:
+        if not (path / "meta.json").is_file() or (args.ids and path.name not in args.ids):
+            continue
+        live = live_process(path, table)
+        if live and lifecycle(path) in FINISHED:
+            found.append({"id": path.name, "status": lifecycle(path), "pane": live[0], "pid": live[1]})
+    found += orphans(tasks, args.ids)  # a failed stop's process, its pane gone (process.json)
+    failed = []
+    for row in found:
+        if args.yes:
+            row.update(end_orphan(tasks, row) if row.get("orphan") else end_process(tasks / row["id"]))
+            if row.get("ended") is False:
+                failed.append(row)
+    if failed:  # the requested cleanup was not done: non-zero, the survivors named; a later reap retries
+        raise RuntimeError("; ".join(f"{row['id']}'s process is still alive: {row.get('reason')} (pane {row.get('pane')}, pid {row.get('pid')})"
+                                     for row in failed))
+    return {"confirmed": bool(args.yes), "tasks": found,
+            **({} if args.yes or not found else {"note": "nothing ended; run again with --yes to end these processes"})}
 
 
 def all_records(base):
@@ -555,7 +586,7 @@ def discover_context(task, workdir=None):
 def review(base, args):
     """Run bin/tp-review for a finished task. The reviewer is chosen by the resolver (lib/model_router.review_plan):
     never the author's provider when another is available."""
-    command = [str(ROOT / "bin/tp-review")] + (["--force"] if args.force else [])
+    command = [str(ROOT / "bin/tp-review")] + (["--force"] if args.force else []) + (["--force-alive"] if args.force_alive else [])
     for flag, value in (("--level", args.level), ("--thinking", args.thinking)):
         if value:
             command += [flag, value]
@@ -605,6 +636,8 @@ def main():
     retry.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     retry.add_argument("--local-only", action="store_true")
     retry.add_argument("--tests", choices=TESTS_SCOPES, help="test scope; default is the prior attempt's")
+    retry.add_argument("--force-alive", action="store_true",
+                       help="start the attempt although a process is still alive on the same working tree")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
     rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author)")
@@ -613,6 +646,15 @@ def main():
     rv.add_argument("--level", help="explicit reviewer level key")
     rv.add_argument("--thinking", help="explicit reviewer effort")
     rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
+    rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree")
+    ea = sub.add_parser("end-author", help="end a settled task's process before its review starts (bin/tp-review runs this)")
+    ea.add_argument("id")
+    gr = sub.add_parser("guard-review", help="refuse while a writer is alive on the task's working tree (bin/tp-review runs this)")
+    gr.add_argument("id")
+    gr.add_argument("--force-alive", action="store_true")
+    rp = sub.add_parser("reap", help="list finished tasks whose process is still alive; --yes ends them")
+    rp.add_argument("ids", nargs="*")
+    rp.add_argument("--yes", action="store_true", help="confirm: end the listed processes")
     for name in ("list", "tick"):
         sub.add_parser(name)
     # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
@@ -653,6 +695,8 @@ def main():
         prior = record(previous)
         if prior["status"] in {"starting", "working", "needs_input"}:
             raise ValueError("stop or settle the prior attempt before retrying")
+        if not args.force_alive:
+            guard_retry(previous)
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
@@ -683,6 +727,14 @@ def main():
         value = dispatch(replacement, base)
         if problem is not None:  # reachable only through an explicit --tests
             value = dict(value, prior_record=f"not used: {problem}")
+    elif args.command == "reap":
+        value = reap(base, args)
+    elif args.command == "end-author":
+        value = {"id": args.id, "process": end_or_refuse(task_dir(base, args.id))}
+    elif args.command == "guard-review":
+        if not args.force_alive:
+            guard_review(task_dir(base, args.id))
+        value = {"id": args.id, "guard": "clear"}
     elif args.command == "review":
         task_dir(base, args.id)
         value = review(base, args)
@@ -724,10 +776,15 @@ def main():
             value = record(path, include_result=True)
         elif args.command == "collect":
             value = record(path, include_result=True)
-            if value["status"] == "settled":
-                atomic_json(path / "collected.json", {"collected": now()})
-                value["status"] = "completed"
-                write_index(base)
+            if value["status"] in {"settled", "completed"}:
+                # The process is ended BEFORE the completed marker is written (tp-contract collect does the same): a process that
+                # survives, or cannot be looked up, fails the command with the task still settled, and the next collect tries
+                # again. A task already completed has its cleanup retried here too.
+                value["process"] = end_or_refuse(path)
+                if value["status"] == "settled":
+                    atomic_json(path / "collected.json", {"collected": now()})
+                    value["status"] = "completed"
+                    write_index(base)
             elif value["status"] == "paused" and value["result_path"]:
                 notice = (f"{args.id} is paused; nothing was collected." if value.get("result_status")
                           else f"{args.id} replied without a result status (paused); nothing was collected.")
@@ -743,6 +800,8 @@ def main():
             pane = read_json(path / "meta.json").get("pane")
             if not pane or lifecycle(path) in {"failed", "stopped"}:
                 raise ValueError("worker cannot receive a message")
+            if (path / "reaped.json").exists():
+                raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
             subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)
             subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
             (path / "collected.json").unlink(missing_ok=True)

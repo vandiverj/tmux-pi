@@ -219,6 +219,14 @@ export default function (pi: ExtensionAPI) {
 		] as const).flatMap(([name, flag]) => existsSync(join(dir, name)) ? [flag, join(dir, name)] : []);
 		const decision = { ...(sourceMeta.decision && typeof sourceMeta.decision === "object" ? sourceMeta.decision : {}),
 			worker: target.worker, model: target.model, thinking: target.thinking, route: "escalated" };
+		// A lane worker hands its lane over: the new worker carries the lane, step and preamble source, and tp-spawn reserves the
+		// lane for it as the task replacing this one (this worker's own hold ends with it). Without the tags tp-spawn refuses a
+		// lane's tree. Only text tags are passed; a half-set pair is left for tp-spawn to refuse.
+		const laneArgs = typeof sourceMeta.lane === "string" && sourceMeta.lane
+			? ["--lane", sourceMeta.lane, "--lane-step", String(sourceMeta.lane_step ?? ""), "--lane-replaces", id,
+				...(typeof sourceMeta.preamble_from === "string" && sourceMeta.preamble_from ? ["--preamble-from", sourceMeta.preamble_from] : []),
+				...(typeof sourceMeta.role === "string" && sourceMeta.role ? ["--role", sourceMeta.role] : [])]
+			: [];
 		let newId = "";
 		try {
 			newId = execFileSync(
@@ -229,6 +237,7 @@ export default function (pi: ExtensionAPI) {
 					"--model", target.model,
 					"--thinking", target.thinking,
 					"--name", `esc-${id}`,
+					...laneArgs,
 					...(sourceMeta.contract ? ["--kind", sourceMeta.contract.kind === "research" ? "research" : "task"] : []),
 					...(sourceMeta.contract || decision.review === "required" ? ["--decision-json", JSON.stringify(decision)] : []),
 					...lineage,

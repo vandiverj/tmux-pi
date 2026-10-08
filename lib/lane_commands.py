@@ -150,55 +150,92 @@ def _roll_back(common, repo, name, slot, base_commit, made):
     return left
 
 
-def create_lane(repo_dir, name, domain, touches, base=None, machine=None, repo_config=None):
-    """Create work lane `name`: a branch from `base`, a worktree for it and the record. Returns {"lane": record,
-    "warnings": [...]}. Order: validate every input; load configuration (absent values default, recorded in "defaulted");
-    under the lane lock check the slot is free (precheck_lane_slot) and the active-lane limit (check_lane_capacity); then
-    create the worktree and branch with one `git worktree add -b`, write the record and check it with lane_reality.
-    A failure at any step rolls back and raises with the original reason; if something cannot be undone the error says
-    what, and the command that does it. `machine` / `repo_config` are the loaded configurations (loaded here when None)."""
-    common, repo = _main_repo(repo_dir)
+def check_lane_name(name):
     if not lanes.valid_lane_name(name):
         raise ValueError(f"invalid lane name {name!r}: use 1-24 characters of a-z, 0-9 and -, starting with a letter or digit"
                          if name != "archive" else "the lane name 'archive' is reserved")
+
+
+def warning_text(warning):
+    """The stderr line for one warning from `warnings` (lane-overlap or unrecorded-worktree)."""
+    if warning["kind"] == "lane-overlap":
+        return (f"tp-agent: warning: lanes {' and '.join(warning['lanes'])} overlap on {', '.join(warning['paths'])} "
+                f"({', '.join(warning['basis'])}). They were claimed independent ("
+                + "; ".join(f"{k}: {v!r}" for k, v in warning["claims"].items()) + ").")
+    return f"tp-agent: warning: {warning['path']} is {warning['note']}"
+
+
+def validate_declaration(repo_config, name, domain, touches):
+    """The checked (touches, domain) of a new lane: the name, the touches (none may overlap an owned path, check 14) and the
+    domain text. Raises before anything is read from git or created."""
+    check_lane_name(name)
     touches = lanes.path_prefixes(list(touches or []), "touches", minimum=1)
     if not isinstance(domain, str) or not domain.strip() or len(domain) > lanes.MAX_DOMAIN or any(ord(c) < 32 for c in domain):
         raise ValueError(f"--domain must be 1-{lanes.MAX_DOMAIN} characters of text on one line")
-    machine = machine if machine is not None else lanes.load_machine_config()
-    repo_config = repo_config if repo_config is not None else lanes.load_repo_config(repo)
     for path in touches:
         for owned in repo_config.get("owned", []):
             if lanes.paths_overlap(path, owned):
                 raise ValueError(f"--touches {path} is owned by the orchestrator (repo lanes.json \"owned\": {owned}); "
                                  "it cannot be a lane's area")
+    return touches
+
+
+def create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config):
+    """Create the lane with the lane lock ALREADY held by this thread (create_lane and dispatch --lane take it): the slot
+    and the active-lane limit are checked, then the worktree and branch are made with one `git worktree add -b`, the record
+    is written and checked with lane_reality. Returns (record, warnings). A failure rolls back and raises with the original
+    reason; if something cannot be undone the error says what, and the command that does it."""
+    slot = lanes.precheck_lane_slot(common, repo_config, name)
+    lanes.check_lane_capacity(common, machine["max_active_lanes"])
+    others = _all_records(common)
+    warnings = _warnings(name, domain, touches, others)
+    made = {"record": False, "worktree": False, "branch": False}
+    try:
+        try:
+            lanes._git(["worktree", "add", "--quiet", "-b", slot["branch"], slot["worktree"], base_commit], repo)
+        finally:
+            # The slot was proven free above, so whatever exists now was made by this command (even if git failed halfway).
+            made["branch"] = lanes._branch_in_use(common, slot["branch"]) == slot["branch"]
+            made["worktree"] = slot["worktree"] in lanes.registered_worktrees(common) or os.path.lexists(slot["worktree"])
+        made["record"] = True
+        record = lanes.write_lane(common, {
+            "schema": lanes.SCHEMA, "name": name, "kind": "work", "state": "open", "repo": repo, "git_common_dir": common,
+            "branch": slot["branch"], "worktree": slot["worktree"], "base": {"ref": base_ref, "commit": base_commit},
+            "created": lanes.utc_now(), "domain": domain, "touches": touches, "closed": [], "integrated": None,
+            "defaulted": lanes.defaulted_values(machine, repo_config)})
+        lanes.lane_reality(record)
+    except BaseException as error:
+        left = _roll_back(common, repo, name, slot, base_commit, made)
+        if left:
+            raise ValueError(f"lane {name} was not created: {error}. These could not be undone and are left: " + "; ".join(left))
+        if isinstance(error, ValueError):
+            raise ValueError(f"lane {name} was not created: {error}. Nothing was left behind.")
+        raise
+    return record, warnings
+
+
+def undo_created_lane(record):
+    """Undo a lane this same call just created (dispatch --lane, when the task could not be started or queued afterwards), with
+    the lane lock held. Returns nothing; raises naming what could not be undone, with the commands that do it."""
+    slot = {"branch": record["branch"], "worktree": record["worktree"]}
+    left = _roll_back(record["git_common_dir"], record["repo"], record["name"], slot, record["base"]["commit"],
+                      {"record": True, "worktree": True, "branch": True})
+    if left:
+        raise ValueError("these could not be undone and are left: " + "; ".join(left))
+
+
+def create_lane(repo_dir, name, domain, touches, base=None, machine=None, repo_config=None):
+    """Create work lane `name`: a branch from `base`, a worktree for it and the record. Returns {"lane": record,
+    "warnings": [...]}. Order: validate every input; load configuration (absent values default, recorded in "defaulted");
+    resolve the base; then under the lane lock create_lane_locked. `machine` / `repo_config` are the loaded configurations
+    (loaded here when None)."""
+    common, repo = _main_repo(repo_dir)
+    machine = machine if machine is not None else lanes.load_machine_config()
+    repo_config = repo_config if repo_config is not None else lanes.load_repo_config(repo)
+    touches = validate_declaration(repo_config, name, domain, touches)
     base_ref, base_commit = _resolve_base(repo, base, repo_config["integration_branch"])
     with lanes.lane_lock(common):
-        slot = lanes.precheck_lane_slot(common, repo_config, name)
-        lanes.check_lane_capacity(common, machine["max_active_lanes"])
-        others = _all_records(common)
-        warnings = _warnings(name, domain, touches, others)
-        made = {"record": False, "worktree": False, "branch": False}
-        try:
-            try:
-                lanes._git(["worktree", "add", "--quiet", "-b", slot["branch"], slot["worktree"], base_commit], repo)
-            finally:
-                # The slot was proven free above, so whatever exists now was made by this command (even if git failed halfway).
-                made["branch"] = lanes._branch_in_use(common, slot["branch"]) == slot["branch"]
-                made["worktree"] = slot["worktree"] in lanes.registered_worktrees(common) or os.path.lexists(slot["worktree"])
-            made["record"] = True
-            record = lanes.write_lane(common, {
-                "schema": lanes.SCHEMA, "name": name, "kind": "work", "state": "open", "repo": repo, "git_common_dir": common,
-                "branch": slot["branch"], "worktree": slot["worktree"], "base": {"ref": base_ref, "commit": base_commit},
-                "created": lanes.utc_now(), "domain": domain, "touches": touches, "closed": [], "integrated": None,
-                "defaulted": lanes.defaulted_values(machine, repo_config)})
-            lanes.lane_reality(record)
-        except BaseException as error:
-            left = _roll_back(common, repo, name, slot, base_commit, made)
-            if left:
-                raise ValueError(f"lane {name} was not created: {error}. These could not be undone and are left: " + "; ".join(left))
-            if isinstance(error, ValueError):
-                raise ValueError(f"lane {name} was not created: {error}. Nothing was left behind.")
-            raise
+        record, warnings = create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config)
     return {"lane": record, "warnings": warnings}
 
 

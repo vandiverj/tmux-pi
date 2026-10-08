@@ -6,7 +6,11 @@ section naming a role tmux-pi does not have) is an error, never a silent skip, s
 instructions the repository meant it to have. The cap is checked on the whole file, so a refusal does not
 depend on which role is running.
 
-    python3 preamble.py <workdir> [role]    prints the text for the worker system prompt (nothing when there is none)
+    python3 preamble.py <workdir> [role [source]]    prints the text for the worker system prompt (nothing when there is none)
+
+A lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored, so it has no preamble of its own. `source` (a lane
+task's preamble_from, the repository's main working tree) is read when the working tree has no such file; a file in the
+working tree wins (a repository that tracks its preamble versions it with the branch).
 """
 
 import re
@@ -19,13 +23,18 @@ MAX_BYTES = 8000
 SECTION = re.compile(r"^##[ \t]+Role:[ \t]*(\S.*?)[ \t]*$", re.I)
 
 
-def load(workdir, role=""):
-    path = Path(workdir) / RELATIVE
+def _present(path):
     try:
-        present = path.exists() or path.is_symlink()
+        return path.exists() or path.is_symlink()
     except OSError as error:  # e.g. a directory we may not search: not the same as "no file"
         raise ValueError(f"cannot check {path}: {error.strerror or error}")
-    if not present:
+
+
+def load(workdir, role="", source=None):
+    path = Path(workdir) / RELATIVE
+    if not _present(path) and source:
+        path = Path(source) / RELATIVE
+    if not _present(path):
         return ""
     try:
         raw = path.read_bytes()
@@ -57,6 +66,6 @@ def load(workdir, role=""):
 
 if __name__ == "__main__":
     try:
-        sys.stdout.write(load(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ""))
+        sys.stdout.write(load(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "", sys.argv[3] if len(sys.argv) > 3 else None))
     except (ValueError, IndexError) as error:
         sys.exit(f"worker preamble: {error}")

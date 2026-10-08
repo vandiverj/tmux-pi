@@ -71,6 +71,20 @@ plain.tool_execution_end({ toolCallId: 'plain', toolName: 'read', isError: true,
 const plainSpawn = calls.filter(c => c.cmd === 'tp-spawn').at(-1).args;
 assert(!plainSpawn.includes('--kind'));
 assert.equal(JSON.parse(plainSpawn[plainSpawn.indexOf('--decision-json') + 1]).review, 'required');
+assert(!plainSpawn.includes('--lane') && !plainSpawn.includes('--lane-replaces'));
+// A lane worker hands the lane to its target: lane, step, preamble source and role are carried, and the target replaces this task.
+fs.writeFileSync(path.join(sourceDir, 'meta.json'), JSON.stringify({ ...original, contract: undefined, lane: 'alpha', lane_step: 's1', preamble_from: '/repo', role: 'coder' }));
+fs.writeFileSync(path.join(targetDir, 'meta.json'), JSON.stringify({ id: 'new', worker: 'claude', pane: '%1' }));
+const laneHandlers = {};
+(await import(pathToFileURL(path.join(tmp, 'escalate.ts')).href + '?lane')).default({ on(name, fn) { laneHandlers[name] = fn; } });
+laneHandlers.model_select({ model: { provider: 'local', id: 'qwen' } });
+laneHandlers.tool_execution_start({ toolCallId: 'lane', toolName: 'read', args: {} });
+laneHandlers.tool_execution_end({ toolCallId: 'lane', toolName: 'read', isError: true, result: 'failed' },
+  { model: { provider: 'local', id: 'qwen' }, abort() {}, shutdown() {} });
+const laneSpawn = calls.filter(c => c.cmd === 'tp-spawn').at(-1).args;
+const after = (flag) => laneSpawn[laneSpawn.indexOf(flag) + 1];
+assert.deepEqual([after('--lane'), after('--lane-step'), after('--lane-replaces'), after('--preamble-from'), after('--role')],
+  ['alpha', 's1', 'old', '/repo', 'coder']);
 // A rename failure must leave the original target JSON intact and kill the orphan.
 fs.writeFileSync(path.join(sourceDir, 'meta.json'), JSON.stringify(original));
 const targetBefore = JSON.stringify({ id: 'new', worker: 'claude', pane: '%1' });

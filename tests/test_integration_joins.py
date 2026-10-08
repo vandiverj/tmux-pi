@@ -182,6 +182,87 @@ class PendingCapabilityRowTest(JoinFixture):
         self.assertEqual(pane_side["file-newline"][1].split(" · ")[0], "capability approval pending: line one line two")
 
 
+class UnreadableRequestTest(JoinFixture):
+    """A request file that is not exactly one JSON object shows its task as needing attention, in the words "unreadable
+    request", in tp-list, in `tp-contract status` and in the pane's reader, and never aborts the list."""
+
+    SHAPES = {"null-then-object": 'null\n{"status":"pending","target":"db"}',
+              "two-objects": '{"status":"pending","target":"a"}\n{"status":"pending","target":"b"}',
+              "truncated": '{"status":"pend', "empty": ""}
+
+    def test_tp_list_the_lifecycle_and_the_pane_agree_on_every_shape(self):
+        for shape, content in self.SHAPES.items():
+            self.task("perm-" + shape, files={"permission-request.json": content})
+            self.task("cap-" + shape, files={"capability-request.json": content})
+        self.task("neighbour")
+        listed, _ = self.tp_list()
+        self.assertEqual(len(listed), 2 * len(self.SHAPES) + 1)
+        lifecycle = self.run_tool("tp-contract", "status")
+        life = {line.split(SEP)[0]: line.split(SEP)[1] for line in lifecycle.splitlines()}
+        rows = subprocess.run(["python3", str(ROOT / "lib/tp_rows.py"), str(self.state / "tasks"), "".join(f"%{n} 0\n" for n in range(1, 17))],
+                              text=True, capture_output=True, check=True, env=self.env).stdout
+        detail = subprocess.run(["python3", str(ROOT / "lib/tp_detail.py"), str(self.state / "tasks"), lifecycle], input=rows,
+                                text=True, capture_output=True, check=True, env=self.env).stdout
+        pane_side = {row.split(SEP)[0]: tuple(out.split(SEP)[:2]) for row, out in zip(rows.splitlines(), detail.splitlines())}
+        for ident in listed:
+            with self.subTest(task=ident):
+                if ident == "neighbour":
+                    self.assertEqual(listed[ident][0], "working")
+                    self.assertNotIn("unreadable request", listed[ident][1])
+                    continue
+                self.assertEqual(life[ident], "needs_input")
+                self.assertEqual(listed[ident][0], "needs_input")
+                self.assertTrue(listed[ident][1].startswith("unreadable request: "), listed[ident])
+                self.assertEqual(listed[ident], pane_side[ident])
+
+
+    def test_an_entry_that_exists_but_cannot_be_read_is_unreadable_in_tp_list_the_lifecycle_and_the_pane(self):
+        for kind in ("dangling", "dir"):
+            for key, fname in (("perm", "permission-request.json"), ("cap", "capability-request.json")):
+                d = self.task("%s-%s" % (key, kind))
+                if kind == "dangling":
+                    os.symlink("missing-request.json", d / fname)
+                else:
+                    (d / fname).mkdir()
+        self.task("neighbour")
+        listed, _ = self.tp_list()
+        self.assertEqual(len(listed), 5)
+        lifecycle = self.run_tool("tp-contract", "status")
+        life = {line.split(SEP)[0]: line.split(SEP)[1] for line in lifecycle.splitlines()}
+        rows = subprocess.run(["python3", str(ROOT / "lib/tp_rows.py"), str(self.state / "tasks"), "".join(f"%{n} 0\n" for n in range(1, 17))],
+                              text=True, capture_output=True, check=True, env=self.env).stdout
+        detail = subprocess.run(["python3", str(ROOT / "lib/tp_detail.py"), str(self.state / "tasks"), lifecycle], input=rows,
+                                text=True, capture_output=True, check=True, env=self.env).stdout
+        pane_side = {row.split(SEP)[0]: tuple(out.split(SEP)[:2]) for row, out in zip(rows.splitlines(), detail.splitlines())}
+        for ident in listed:
+            with self.subTest(task=ident):
+                if ident == "neighbour":
+                    self.assertEqual(listed[ident][0], "working")
+                    self.assertNotIn("unreadable request", listed[ident][1])
+                    continue
+                self.assertEqual(life[ident], "needs_input")
+                self.assertEqual(listed[ident][0], "needs_input")
+                self.assertTrue(listed[ident][1].startswith("unreadable request: "), listed[ident])
+                self.assertEqual(listed[ident], pane_side[ident])
+
+
+class StatusOfNamedTasksTest(JoinFixture):
+    """The status pane asks `tp-contract status ID...` for the rows it shows, not for every record."""
+
+    def test_named_tasks_get_the_lines_the_whole_listing_gives_them_and_no_others(self):
+        self.task("a")
+        self.task("b", state="paused", result="Done, I think.\n", events=[PAUSE])
+        self.task("c", files={"permission-request.json": {"status": "pending", "target": "db"}})
+        self.task("d")
+        everything = self.run_tool("tp-contract", "status").splitlines()
+        self.assertEqual(sorted(line.split(SEP)[0] for line in everything), ["a", "b", "c", "d"])
+        named = self.run_tool("tp-contract", "status", "d", "b").splitlines()
+        self.assertEqual(sorted(named), sorted(line for line in everything if line.split(SEP)[0] in ("b", "d")))
+        self.assertEqual(self.run_tool("tp-contract", "status", "nope"), "")      # an id that is not a task has no line
+        self.assertEqual(self.run_tool("tp-contract", "status", "a", "nope").splitlines(),
+                         [line for line in everything if line.startswith("a" + SEP)])
+
+
 class WaitingRowsTest(JoinFixture):
     def test_paused_awaiting_and_refused_rows_appear_together_in_every_reader(self):
         self.task("dep", state="paused", result="Done, I think.\n", events=[PAUSE])
@@ -282,6 +363,35 @@ class QueueBehindAPausedPredecessorTest(JoinFixture):
         command = spawned[0]
         self.assertEqual(command[command.index("--task-id") + 1], "next")
         self.assertIn(f"Dependency dep result: {self.state / 'tasks' / 'dep' / 'result.md'}", command)
+
+
+class StopWarningTest(JoinFixture):
+    """tp-kill ended the process but could not refresh task.md: `tp-agent stop` stays a success and says so."""
+
+    def stop(self, kill_stderr):
+        import contextlib
+        import io
+        self.task("task1")
+        done = subprocess.CompletedProcess([], 0, "", kill_stderr)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(AGENT.subprocess, "run", return_value=done) as run, \
+                mock.patch.object(sys, "argv", ["tp-agent", "stop", "task1"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            AGENT.main()
+        self.assertEqual(run.call_args[0][0][-1], "task1")
+        return json.loads(out.getvalue()), err.getvalue()
+
+    def test_a_refresh_warning_from_tp_kill_is_passed_on_in_stderr_and_in_the_json(self):
+        warning = "tp-kill: task.md of task1 was not refreshed: tp-contract status failed"
+        value, err = self.stop(warning + "\n")
+        self.assertEqual((value["id"], value["status"]), ("task1", "stopped"))
+        self.assertEqual(value["warning"], warning)
+        self.assertIn(warning, err)
+
+    def test_a_clean_stop_has_no_warning(self):
+        value, err = self.stop("")
+        self.assertEqual(value, {"id": "task1", "status": "stopped"})
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

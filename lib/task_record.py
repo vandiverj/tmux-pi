@@ -10,6 +10,7 @@ import datetime as _dt
 import json
 import os
 import re
+import subprocess
 import tempfile
 import textwrap
 import sys
@@ -422,6 +423,26 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
         _write_atomic(d / "task.md", rendered)
     return {"id": meta.get("id") or d.name, "title": title, "ticket": ticket, "state": state,
             "pinned": ret["pinned"], "request": req}
+
+
+def refresh_record(state_dir, task_id):
+    """Bring one task's canonical record (task.md) up to date after something changed its lifecycle.
+
+    What a writer of a state change calls (collect, stop, message, a capability request), so the record is never left saying
+    the old state until some pane happens to look at the task. `tp-contract status ID` is the one place that works the state
+    out (with the pane's state) and writes the record. Returns "" or why it did not work; the change itself is already made,
+    so a caller reports this rather than failing."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        run = subprocess.run([str(root / "bin" / "tp-contract"), "status", task_id], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, TP_STATE_DIR=str(state_dir)))
+    except (OSError, subprocess.SubprocessError) as error:
+        return "task.md of {} was not refreshed: {}".format(task_id, error)
+    if run.returncode:
+        return "task.md of {} was not refreshed: {}".format(task_id, (run.stderr.strip() or "tp-contract status failed")[:200])
+    if not run.stdout.strip():
+        return "task.md of {} was not refreshed: tp-contract status listed no such task".format(task_id)
+    return ""
 
 
 def parse_record(task_dir):

@@ -698,5 +698,57 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(ledger_row(task, T0 + 1600)["stop"], "escalate to research-3")
 
 
+class EnforceKeepsTheRecordTests(unittest.TestCase):
+    """cmd_enforce persists a pause in checkpoints.json; task.md must say so too, even when typing the Escape fails."""
+
+    def setUp(self):
+        import importlib.machinery
+        import importlib.util
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name) / ".tmux-pi"
+        self.task = self.state / "tasks" / "coder-1"
+        self.task.mkdir(parents=True)
+        contract = build("task", str(self.task / "artifact.md"), "time=20m", "", "6m", "3m")
+        (self.task / "meta.json").write_text(json.dumps({"id": "coder-1", "created": iso(T0), "contract": contract,
+                                                         "pane": "%1", "worker": "claude"}))
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        loader = importlib.machinery.SourceFileLoader("tp_contract_for_enforce", str(ROOT / "bin/tp-contract"))
+        self.tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.tool)
+
+    def recorded_state(self):
+        import re
+        match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
+        return match.group(1) if match else None
+
+    def enforce(self, send_fails):
+        from unittest import mock
+        self.tool.write_record(self.task, lifecycle_state="working", force=True)
+        self.assertEqual(self.recorded_state(), "working")
+
+        def run(command, *args, **kwargs):
+            if send_fails:
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+        decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
+        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state)}), \
+                mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
+                mock.patch.object(self.tool, "evaluate", return_value=decision), \
+                mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.tool.time, "sleep"):
+            self.tool.cmd_enforce(None)
+
+    def test_a_pause_updates_the_record_with_no_pane_involved(self):
+        self.enforce(send_fails=False)
+        self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
+        self.assertEqual(self.recorded_state(), "paused")
+
+    def test_a_pause_whose_escape_cannot_be_sent_still_updates_the_record(self):
+        self.enforce(send_fails=True)
+        self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "pause")
+        self.assertEqual(self.recorded_state(), "paused")
+
+
 if __name__ == "__main__":
     unittest.main()

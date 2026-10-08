@@ -130,12 +130,38 @@ def read_bytes(path):
         return None
 
 
-def main(tasks, panes_text):
+def dead_flags(panes_text):
+    """{pane id: dead flag text} from `tmux list-panes -a -F '#{pane_id} #{pane_dead}'`; the first line for a pane wins."""
     dead_by_pane = {}
     for line in panes_text.splitlines():
         parts = line.split()
         if len(parts) >= 2:
             dead_by_pane.setdefault(parts[0], parts[1])
+    return dead_by_pane
+
+
+def row_line(directory, dead_by_pane):
+    """The output line for one task directory, or None when its records are missing or jq would refuse them."""
+    meta_bytes = read_bytes(os.path.join(directory, "meta.json"))
+    if meta_bytes is None:
+        return None
+    try:
+        id_, worker, pane, state, tool, tokens, cost, model = row_fields(
+            meta_bytes, read_bytes(os.path.join(directory, "state.json")))
+    except (Refused, RecursionError):
+        return None
+    dead = dead_by_pane.get(pane)
+    if dead == "1":
+        code = read_bytes(os.path.join(directory, "exit"))
+        code = "?" if code is None else code.decode("utf-8", "replace").rstrip("\n")
+        state, tool = ("done" if code == "0" else "failed:" + code), ""
+    elif dead != "0":
+        state, tool = "killed", ""
+    return SEP.join((id_, worker, state, tool, tokens, cost, model)) + "\n"
+
+
+def main(tasks, panes_text):
+    dead_by_pane = dead_flags(panes_text)
     found = []
     try:
         entries = list(os.scandir(tasks))
@@ -144,28 +170,11 @@ def main(tasks, panes_text):
     for entry in entries:
         meta = os.path.join(entry.path, "meta.json")
         try:
-            found.append((os.stat(meta).st_mtime, entry.path, meta))
+            found.append((os.stat(meta).st_mtime, entry.path))
         except OSError:
             continue
     found.sort(key=lambda item: item[0])
-    out = []
-    for _, directory, meta in found:
-        meta_bytes = read_bytes(meta)
-        if meta_bytes is None:
-            continue
-        try:
-            id_, worker, pane, state, tool, tokens, cost, model = row_fields(
-                meta_bytes, read_bytes(os.path.join(directory, "state.json")))
-        except (Refused, RecursionError):
-            continue
-        dead = dead_by_pane.get(pane)
-        if dead == "1":
-            code = read_bytes(os.path.join(directory, "exit"))
-            code = "?" if code is None else code.decode("utf-8", "replace").rstrip("\n")
-            state, tool = ("done" if code == "0" else "failed:" + code), ""
-        elif dead != "0":
-            state, tool = "killed", ""
-        out.append(SEP.join((id_, worker, state, tool, tokens, cost, model)) + "\n")
+    out = [line for line in (row_line(directory, dead_by_pane) for _, directory in found) if line is not None]
     sys.stdout.buffer.write("".join(out).encode("utf-8", "replace"))
 
 

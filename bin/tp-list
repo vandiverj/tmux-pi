@@ -25,34 +25,6 @@ state_dir="$(tp_opt "$session" @tp_state_dir)"
 rows="$(tp_rows "$session")"
 if [[ -z "$rows" && ! -d "$state_dir/queue" ]]; then echo "  no subagents"; exit 0; fi
 details="$("$ROOT/bin/tp-contract" status 2>/dev/null || true)"
-if [[ -n "$rows" ]]; then while IFS=$'\x1f' read -r id worker status tool tokens cost model; do
-  life="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $2 }' <<<"$details")"
-  detail="$(awk -F $'\x1f' -v id="$id" '$1 == id { print $3 }' <<<"$details")"
-  if [[ -n "$life" ]]; then status="$life"; fi
-  [[ ! -f "$state_dir/tasks/$id/collected.json" ]] || status=completed
-  [[ ! -f "$state_dir/tasks/$id/stopped.json" ]] || status=stopped
-  role="$(jq -r '.role // "generic"' "$state_dir/tasks/$id/meta.json" 2>/dev/null)"
-  detail="role $role${detail:+ · $detail}"
-  for request_file in permission-request.json capability-request.json; do
-    if [[ -f "$state_dir/tasks/$id/$request_file" ]]; then
-      request="$(jq -r 'select(.status == "pending") | (.target // .what // "input needed")' "$state_dir/tasks/$id/$request_file" 2>/dev/null)"
-      if [[ -n "$request" ]]; then
-        detail="$request · $detail"
-        [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input
-      fi
-    fi
-  done
-  if [[ -e "$state_dir/tasks/$id/pending-capability.json" ]]; then   # a capability awaiting human approval; same wording as lib/tp_detail.py
-    request="capability approval pending$(jq -r 'select(type == "object") | .request | select(type == "string" and . != "") | ": " + gsub("\n"; " ")' "$state_dir/tasks/$id/pending-capability.json" 2>/dev/null || true)"
-    detail="$request · $detail"
-    [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input
-  fi
-  if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
-  mark=" "; if [[ "$id" == "$current" ]]; then mark="▸"; fi
-  # Pad by characters, not bytes (▸ ↑ ↓ are multibyte).
-  printf '%s %s%*s%s%*s%s%*s%s%*s%s%*s%s\n' "$mark" \
-    "$id" $((22 - ${#id})) "" "$worker" $((8 - ${#worker})) "" "$status" $((12 - ${#status})) "" \
-    "$tokens" $((16 - ${#tokens})) "" "$cost" $((8 - ${#cost})) "" "$model"
-  if [[ -n "$detail" ]]; then printf '    %s\n' "$detail"; fi
-done <<<"$rows"; fi
+# One process works out every row's status, detail and padding (lib/tp_detail.py --list); it used to be a jq/awk chain per row.
+if [[ -n "$rows" ]]; then python3 "$ROOT/lib/tp_detail.py" --list "$state_dir/tasks" "$details" "$current" <<<"$rows"; fi
 tp_queue_lines "$state_dir"

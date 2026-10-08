@@ -16,6 +16,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import review_verdict  # noqa: E402
+from task_record import refresh_record  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
 from worker_process import FINISHED, end_or_refuse, end_process, end_orphan, guard_retry, guard_review, live_process, orphans, pane_table  # noqa: E402
 
@@ -66,6 +67,15 @@ def state_dir():
     if not value:
         raise ValueError("no tmux-pi state directory; start a workspace with tp")
     return Path(value)
+
+
+def refreshed(base, ident, value):
+    """After a change of a task's state, bring its canonical record (task.md) up to date, so no reader sees the old state.
+    The change stands whatever happens here: a failure is said on stderr and in the answer, not turned into a failed command."""
+    problem = refresh_record(base, ident)
+    if problem:
+        print(f"tp-agent: {problem}", file=sys.stderr)
+        value["record"] = problem
 
 
 def task_dir(base, ident):
@@ -768,6 +778,7 @@ def main():
                  "status": "pending", "requested": now()}
         atomic_json(path / "capability-request.json", value)
         write_index(base)
+        refreshed(base, path.name, value)
     elif args.command in {"inspect", "collect", "stop", "message"}:
         queued = base / "queue" / f"{args.id}.json"
         if args.command == "stop" and IDENT.fullmatch(args.id) and (queued.is_symlink() or queued.exists()):
@@ -793,6 +804,7 @@ def main():
                     atomic_json(path / "collected.json", {"collected": now()})
                     value["status"] = "completed"
                     write_index(base)
+                    refreshed(base, args.id, value)
             elif value["status"] == "paused" and value["result_path"]:
                 notice = (f"{args.id} is paused; nothing was collected." if value.get("result_status")
                           else f"{args.id} replied without a result status (paused); nothing was collected.")
@@ -803,6 +815,10 @@ def main():
             if run.returncode:
                 raise RuntimeError(run.stderr.strip())
             value = {"id": args.id, "status": "stopped"}
+            warning = run.stderr.strip()
+            if warning:  # the process is ended; tp-kill still said something (task.md not refreshed): a success that says so
+                print(warning, file=sys.stderr)
+                value["warning"] = warning
             write_index(base)
         else:
             pane = read_json(path / "meta.json").get("pane")
@@ -813,15 +829,18 @@ def main():
             subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)
             subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
             (path / "collected.json").unlink(missing_ok=True)
-            with (path / "messages.jsonl").open("a") as out:
-                out.write(json.dumps({"sent": now(), "text": args.text}) + "\n")
-            requested = path / "capability-request.json"
-            if requested.exists():
-                pending = read_json(requested)
-                if pending.get("status") == "pending":
-                    pending.update({"status": "answered", "answered": now()})
-                    atomic_json(requested, pending)
             value = {"id": args.id, "sent": True}
+            try:
+                with (path / "messages.jsonl").open("a") as out:
+                    out.write(json.dumps({"sent": now(), "text": args.text}) + "\n")
+                requested = path / "capability-request.json"
+                if requested.exists():
+                    pending = read_json(requested)
+                    if pending.get("status") == "pending":
+                        pending.update({"status": "answered", "answered": now()})
+                        atomic_json(requested, pending)
+            finally:  # collected.json is already gone: the record is refreshed even if a later write fails
+                refreshed(base, args.id, value)
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))

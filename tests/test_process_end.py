@@ -617,6 +617,89 @@ fi
         self.assertIsNone(record["report_path"])
         self.assertIsNone(record["report_bytes"])
 
+    # --- T11: the writer of a state change brings task.md up to date, whether or not a status pane is watching ----------
+
+    @staticmethod
+    def recorded_state(task):
+        import re
+        match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (task / "task.md").read_text())
+        return match.group(1) if match else None
+
+    def stale_record(self, task, state):
+        import sys
+        sys.path.insert(0, str(ROOT / "lib"))
+        from task_record import write_record
+        write_record(task, lifecycle_state=state, force=True)
+        self.assertEqual(self.recorded_state(task), state)
+
+    def test_collect_updates_the_record_itself(self):
+        item, task, _, _ = self.live_task()
+        self.stale_record(task, "settled")
+        self.assertEqual(self.cli("collect", item["id"])["status"], "completed")
+        self.assertEqual(self.recorded_state(task), "completed")
+
+    def test_message_to_a_collected_worker_that_is_still_there_updates_the_record_itself(self):
+        item, task, _, _ = self.live_task()
+        (task / "collected.json").write_text('{"collected":"x"}\n')
+        self.stale_record(task, "completed")
+        self.cli("message", item["id"], "--text", "carry on")
+        self.assertFalse((task / "collected.json").exists())
+        self.assertEqual(self.recorded_state(task), "settled")
+
+    def test_message_whose_later_write_fails_has_still_updated_the_record_for_the_collected_marker_it_removed(self):
+        item, task, _, _ = self.live_task()
+        (task / "collected.json").write_text('{"collected":"x"}\n')
+        self.stale_record(task, "completed")
+        (task / "messages.jsonl").mkdir()   # the log append after the marker is removed cannot work
+        run = self.raw("message", item["id"], "--text", "carry on")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertFalse((task / "collected.json").exists())
+        self.assertEqual(self.recorded_state(task), "settled")
+
+    def test_stop_updates_the_record_itself(self):
+        item, task, pane, _ = self.live_task()
+        self.stale_record(task, "settled")
+        self.assertEqual(self.cli("stop", item["id"])["status"], "stopped")
+        self.assertEqual(self.recorded_state(task), "stopped")
+
+    def test_tp_kill_run_on_its_own_updates_the_record_itself(self):
+        item, task, pane, _ = self.live_task(state="working", result=None)
+        self.stale_record(task, "working")
+        run = subprocess.run([str(ROOT / "bin/tp-kill"), item["id"]], env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.recorded_state(task), "stopped")
+
+    def test_a_worker_capability_request_updates_the_record_itself(self):
+        item, task, _, _ = self.live_task(state="working", result=None)
+        self.stale_record(task, "working")
+        run = subprocess.run([str(ROOT / "bin/tp-agent"), "request", "--kind", "tool", "--what", "jq", "--reason", "parse"],
+                             env=dict(self.env, TP_TASK_DIR=str(task)), text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.recorded_state(task), "needs_input")
+
+    def test_stop_whose_record_refresh_fails_is_still_a_success_and_says_so_in_stderr_and_json(self):
+        item, task, pane, _ = self.live_task(state="working", result=None)
+        (task / "task.md").unlink(missing_ok=True)
+        (task / "task.md").mkdir()  # tp-contract status cannot replace a directory with the record: the refresh fails
+        run = self.raw("stop", item["id"])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        value = json.loads(run.stdout)
+        self.assertEqual(value["status"], "stopped")
+        self.assertIn("was not refreshed", value["warning"])
+        self.assertIn("was not refreshed", run.stderr)
+        self.assertFalse(self.alive(pane), "the process is ended whatever the record did")
+        self.assertTrue((task / "stopped.json").exists())
+
+    def test_a_record_that_cannot_be_refreshed_is_said_not_hidden_and_the_change_stands(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "lib"))
+        from task_record import refresh_record
+        item, task, _, _ = self.live_task()
+        self.assertEqual(refresh_record(self.state, item["id"]), "")
+        for state, ident in ((self.state, "no-such-task"), (self.root / "elsewhere", item["id"])):
+            problem = refresh_record(state, ident)
+            self.assertIn("was not refreshed", problem)
+
 
 if __name__ == "__main__":
     unittest.main()

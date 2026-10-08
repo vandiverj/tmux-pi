@@ -9,10 +9,17 @@ and capability requests, a capability awaiting human approval); task_first / rep
 shows for the selected row. Reading them for every row at load time is what lets a key redraw touch no file.
 Each file is streamed line by line to its first non-blank line, however deep that is, without holding more than one
 line. Only a single line longer than LINE bytes (64 KiB, far wider than any terminal) is cut there.
+
+`tp_detail.py --list TASKS LIFECYCLE CURRENT` prints what bin/tp-list prints for those rows instead: the same status and
+detail, but with tp-list's own words for a pending permission or capability request (the target / what, not "permission:" /
+"asks for"), the task row padded into columns, a ▸ in front of the row whose id is CURRENT, and the detail on the line below.
 """
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import request_file  # noqa: E402
 
 SEP = "\x1f"
 LINE = 65536
@@ -86,9 +93,21 @@ def role_of(directory):
     return json.dumps(role, ensure_ascii=False, separators=(",", ":"))
 
 
+def request(directory, name):
+    """The request file as an object, or None when there is none, it is unreadable (see unreadable) or it is not pending."""
+    kind, req = request_file.read_request(os.path.join(directory, name))
+    return req if kind == request_file.OBJECT and req.get("status") == "pending" else None
+
+
+def unreadable(directory):
+    """Words for each request file that exists but is not exactly one JSON object; they are never skipped."""
+    broken = request_file.unreadable_names(directory)
+    return "%s: %s" % (request_file.WORDS, ", ".join(broken)) if broken else ""
+
+
 def permission(directory):
-    req = read_json(os.path.join(directory, "permission-request.json"))
-    if not isinstance(req, dict) or req.get("status") != "pending":
+    req = request(directory, "permission-request.json")
+    if req is None:
         return ""
     try:
         if truthy(req.get("placeholder")):
@@ -102,8 +121,8 @@ def permission(directory):
 
 
 def capability(directory):
-    req = read_json(os.path.join(directory, "capability-request.json"))
-    if not isinstance(req, dict) or req.get("status") != "pending":
+    req = request(directory, "capability-request.json")
+    if req is None:
         return ""
     kind, what = req.get("kind"), req.get("what")
     try:
@@ -122,7 +141,33 @@ def approval(directory):
     return "capability approval pending" + (": " + request if isinstance(request, str) and request else "")
 
 
-def main(tasks, lifecycle_text):
+def jq_text(value):
+    """What `jq -r` prints for a value: a string as it is, anything else as JSON."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def listed_request(directory, name):
+    """bin/tp-list's words for a pending permission-request.json / capability-request.json: target // what // "input needed"."""
+    req = request(directory, name)
+    if req is None:
+        return ""
+    for key in ("target", "what"):
+        if truthy(req.get(key)):
+            return jq_text(req[key])
+    return "input needed"
+
+
+def pad(text, width):
+    """printf's `%*s` with width - len(text): a negative count pads on the other side, so too long still gets spaces."""
+    return " " * abs(width - len(text))
+
+
+def main(tasks, lifecycle_text, current=None):
+    listing = current is not None
     life = {}
     for line in lifecycle_text.split("\n"):
         parts = line.split(SEP)
@@ -143,11 +188,32 @@ def main(tasks, lifecycle_text):
         if os.path.isfile(os.path.join(d, "stopped.json")):
             status = "stopped"
         detail = "role " + role_of(d) + (" · " + detail if detail else "")
-        for found in (permission(d), capability(d), approval(d)):
+        if listing:
+            found_all = (listed_request(d, "permission-request.json"), listed_request(d, "capability-request.json"),
+                         approval(d).replace("\n", " "))   # tp-list has always flattened this one only
+        else:
+            found_all = (permission(d), capability(d), approval(d))
+        for found in found_all:
             if found:
                 detail = found + " · " + detail
                 if status in ("working", "starting", "needs_input"):
                     status = "needs_input"
+        broken = unreadable(d)
+        if broken:   # never dropped, whatever the task's state: the owner has to look at it
+            detail = broken + " · " + detail
+            if status in ("working", "starting", "needs_input", "settled"):
+                status = "needs_input"
+        if listing:
+            fields += [""] * (7 - len(fields))
+            worker, tool, tokens, cost, model = fields[1], fields[3], fields[4], fields[5], fields[6]
+            if tool:
+                detail = (detail + " · " if detail else "") + tool
+            out.append("%s %s%s%s%s%s%s%s%s%s%s%s\n" % (
+                "▸" if id_ == current else " ", id_, pad(id_, 22), worker, pad(worker, 8), status, pad(status, 12),
+                tokens, pad(tokens, 16), cost, pad(cost, 8), model))
+            if detail:
+                out.append("    " + detail + "\n")
+            continue
         result = os.path.join(d, "result.md")
         try:
             has_reply = os.stat(result).st_size > 0
@@ -160,4 +226,7 @@ def main(tasks, lifecycle_text):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "")
+    if sys.argv[1:2] == ["--list"]:
+        main(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else "")
+    else:
+        main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "")

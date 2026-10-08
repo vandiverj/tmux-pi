@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DISPATCHER = ROOT / "agent/extensions/dispatcher.ts"
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(ROOT / "tests"))
 from task_record import write_record  # noqa: E402
 from test_dispatcher_runtime import scenario  # noqa: E402
 

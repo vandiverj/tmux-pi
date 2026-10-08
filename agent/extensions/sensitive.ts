@@ -44,9 +44,11 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("tool_call", async (event, ctx) => {
 		let decision: any;
+		// The session's directory, as the Claude hook sends it. Left out when absent or odd, so the classifier assumes nothing and prompts.
+		const cwd = typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : undefined;
 		try {
 			decision = JSON.parse(execFileSync(classifier, [], {
-				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {} }),
+				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),
 				encoding: "utf8", timeout: 5000,
 			}));
 		} catch {

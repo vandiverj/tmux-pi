@@ -2,6 +2,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 
@@ -41,4 +42,44 @@ process.env.TP_REDACTION = 'off';
 const h3 = {};
 mod.default({ on(name, fn) { h3[name] = fn; } });
 assert.equal(h3.tool_result(event('plain')), undefined);
+
+// tool_call sends the session's directory to the classifier. A stub records what it receives.
+const stubRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-sens-stub-'));
+fs.mkdirSync(path.join(stubRoot, 'agent')); fs.mkdirSync(path.join(stubRoot, 'bin'));
+const seen = path.join(stubRoot, 'seen.json');
+const stub = path.join(stubRoot, 'bin/tp-sensitive-read');
+fs.writeFileSync(stub, `#!/bin/sh\ncat > "${seen}"\necho '{"sensitive":false}'\n`, { mode: 0o755 });
+process.env.PI_CODING_AGENT_DIR = path.join(stubRoot, 'agent');
+const h4 = {};
+mod.default({ on(name, fn) { h4[name] = fn; } });
+const call = (toolName, input) => ({ type: 'tool_call', toolName, input });
+await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: '/some/session/dir', hasUI: false });
+assert.equal(JSON.parse(fs.readFileSync(seen, 'utf8')).cwd, '/some/session/dir');
+// A missing or odd cwd is left out, so the classifier assumes nothing.
+for (const odd of [undefined, '', 42, null]) {
+  fs.rmSync(seen, { force: true });
+  await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: odd, hasUI: false });
+  assert.ok(!('cwd' in JSON.parse(fs.readFileSync(seen, 'utf8'))), `cwd ${String(odd)} sent`);
+}
+
+// With the real classifier in a scratch repository: an unscoped diff is judged by the files it touches.
+process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');
+const h5 = {};
+mod.default({ on(name, fn) { h5[name] = fn; } });
+const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tp-sens-repo-')));
+const git = (...args) => execFileSync('git', ['-C', repo, ...args], { stdio: 'pipe' });
+git('init', '-q', '-b', 'main', '.');
+git('config', 'user.email', 't@example.invalid'); git('config', 'user.name', 't');
+for (const name of ['README.md', 'config/local.json']) {
+  fs.mkdirSync(path.dirname(path.join(repo, name)), { recursive: true });
+  fs.writeFileSync(path.join(repo, name), 'one\n');
+}
+git('add', '-f', '.'); git('commit', '-q', '-m', 'first');
+const diff = (cwd) => h5.tool_call(call('bash', { command: 'git diff' }), { cwd, hasUI: false });
+fs.appendFileSync(path.join(repo, 'README.md'), 'more\n');
+assert.equal(await diff(repo), undefined, 'plain diff prompted');
+assert.equal((await diff(undefined))?.block, true, 'no cwd must prompt');
+assert.equal((await diff(path.join(repo, 'missing')))?.block, true, 'odd cwd must prompt');
+fs.appendFileSync(path.join(repo, 'config/local.json'), 'more\n');
+assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json must prompt');
 console.log('ok');

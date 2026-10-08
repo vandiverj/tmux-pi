@@ -156,9 +156,12 @@ def validate_explicit(cat, model, worker, thinking, ctx, health):
     return level, entry, effort, notes
 
 
-def redirect_problems(cat, target, ctx, health, may_enter_restricted):
+def redirect_problems(cat, target, ctx, health, may_enter_restricted, bound=None):
     """Reasons a machine-local redirect to target {worker, model, thinking} breaks a constraint, and the effort to
-    use (clamped to the ceiling unless approved). An empty list means the redirect is allowed."""
+    use (clamped to the ceiling unless approved). An empty list means the redirect is allowed.
+
+    bound is the route's effective lower bound, the (level index, reason) that resolve recorded as rec["route_bound"]
+    (lowered by an explicit level). Without it the bound is recomputed from the role's full floor, the stricter way."""
     level, entry = level_of(cat, target["model"])
     if not entry:
         return ["{} is not in the model catalog".format(target["model"])], target["thinking"]
@@ -169,7 +172,9 @@ def redirect_problems(cat, target, ctx, health, may_enter_restricted):
         problems.append("level {} is restricted (reached only by the router's own pick, escalation or an explicit request)".format(level["key"]))
     if target["worker"] != entry["worker"]:
         problems.append("{} does not run on {}".format(target["model"], target["worker"]))
-    bound, why = route_bound(cat, ctx, _strict_role_floor(cat, ctx.get("role")))
+    if bound is None:
+        bound = route_bound(cat, ctx, _strict_role_floor(cat, ctx.get("role")))
+    bound, why = bound
     if bound is not None and level["key"] in shown_keys(cat) and level_keys(cat).index(level["key"]) < bound:
         problems.append("level {} is below the {}".format(level["key"], why))
     reason = unusable_reason(cat, entry, ctx, health)
@@ -202,16 +207,25 @@ def _strict_role_floor(cat, role):
     return _shown_at_or_above(cat, rule["min_level"]) if rule.get("strict_floor") and "min_level" in rule else None
 
 
+def lowered_by_explicit(floor_idx, asked_idx):
+    """A floor (level index) after an explicit level request: lowered only as far as the level asked, never raised.
+    The one rule for a role floor in resolve and for the reviewer minimum in pick_reviewer."""
+    return min(floor_idx, asked_idx)
+
+
 def route_bound(cat, ctx, role_floor):
     """(level index, reason) of the one lower bound of a route, or (None, None): the highest of the strict role floor
     (role_floor, already lowered by an explicit level where that applies) and the protected-path minimum, which an
-    explicit level never lowers. Every downward move (availability, redirect, local-only) stays at or above it."""
+    explicit level never lowers, and the level named by ctx["min_level_key"] (the reviewer minimum, already lowered by
+    resolve for an explicit level). Every downward move (availability, redirect, local-only) stays at or above it."""
     bounds = []
     if role_floor is not None:
         bounds.append((role_floor, "{} floor for role {}".format(level_keys(cat)[role_floor], ctx.get("role"))))
     hit = protected_hit(cat, ctx.get("role"), ctx.get("paths"))
     if hit:
         bounds.append((_shown_at_or_above(cat, hit[0]["min_level"]), "{} minimum for protected path {}".format(hit[0]["min_level"], hit[1])))
+    if ctx.get("min_level_key"):
+        bounds.append((_shown_at_or_above(cat, ctx["min_level_key"]), "{} minimum for the role".format(ctx["min_level_key"])))
     return max(bounds, key=lambda b: b[0]) if bounds else (None, None)
 
 
@@ -261,7 +275,8 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
     level for an internal request, or None when no router gave a usable reply.
     ctx keys: role, explicit {model, worker, thinking}, local_only, exclude_providers, require_worker,
     est_tokens, is_review, approvals {"effort_above_high"}, files_touched, floor_review, allow_unrostered,
-    decided_cap (level key), skip_caps (escalation and explicit level), explicit_effort.
+    decided_cap (level key), skip_caps (escalation and explicit level), explicit_effort, min_level_key (the reviewer
+    minimum, a floor) with min_level_explicit (an explicit level request lowers it only as far as the level asked).
     """
     health = health or {}
     ctx = dict(ctx or {})
@@ -331,7 +346,7 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
     # overrides it); the router's own pick, fallbacks, redirects and escalation never do.
     role_floor = _shown_at_or_above(cat, rule["min_level"]) if "min_level" in rule else None
     if role_floor is not None and rec["source"] == "explicit_level":
-        role_floor = min(role_floor, idx)
+        role_floor = lowered_by_explicit(role_floor, idx)
     if (role_floor is not None and idx < role_floor and shape not in rule.get("below_floor_shapes", ())):
         idx = role_floor
         steps.append("role {} floor: level {}".format(ctx["role"], keys[idx]))
@@ -354,8 +369,18 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
             eff = entry["min_effort"]
             steps.append("protected path {}: effort {}".format(path, eff))
 
+    # The reviewer minimum (ctx["min_level_key"]) is a floor of the same kind: an explicit level request lowers it only
+    # as far as the level asked (ctx["min_level_explicit"]), by the same rule and at the same point as a role floor.
+    bound_ctx = ctx
+    if ctx.get("min_level_key"):
+        min_floor = _shown_at_or_above(cat, ctx["min_level_key"])
+        if ctx.get("min_level_explicit"):
+            min_floor = lowered_by_explicit(min_floor, idx)
+        bound_ctx = dict(ctx, min_level_key=keys[min_floor])
+
     # The route's one lower bound: no later step crosses it, not the local-only gate, not moving down for availability.
-    strict_floor, bound_why = route_bound(cat, ctx, role_floor if rule.get("strict_floor") else None)
+    strict_floor, bound_why = route_bound(cat, bound_ctx, role_floor if rule.get("strict_floor") else None)
+    rec["route_bound"] = (strict_floor, bound_why)
 
     qualified = _qualified(cat, shape)
     if ctx.get("local_only"):
@@ -464,6 +489,10 @@ def pick_reviewer(author_provider, author_level_key, cat, health=None, review_le
     effort = ctx.get("explicit_effort") or cat["reviewer"]["default_effort"]
     request = {"level_key": keys[start], "effort": effort, "review": "optional", "shape": None,
                "reason": "review of {} work".format("/".join(excluded)), "source": "review"}
+    # The route's bound includes the reviewer minimum. resolve lowers it for an explicit reviewer level exactly as it
+    # lowers a role floor for an explicit --level; with no level, availability may not move a review below it.
+    ctx["min_level_key"] = keys[floor]
+    ctx["min_level_explicit"] = bool(ctx.get("level_key"))
     first = resolve(request, cat, health, dict(ctx, exclude_providers=excluded))
     if first["source"] != "stop_and_ask":
         first["independence"] = "different_provider"
@@ -473,4 +502,5 @@ def pick_reviewer(author_provider, author_level_key, cat, health=None, review_le
         if second["source"] != "stop_and_ask":
             second["independence"] = "same_provider"
             return second
-    return dict(first, source="stop_and_ask", reason="no independent reviewer available; review is {}".format(review_level))
+    return dict(first, source="stop_and_ask", reason="no independent reviewer available; review is {} ({})".format(
+        review_level, first.get("reason", "no reason recorded")))

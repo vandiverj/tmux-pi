@@ -20,6 +20,7 @@ function world(on: On, env: Record<string, string>) {
     isIndexFailing: false,
     collectStatus: 'completed',
     collectResult: undefined as string | undefined,
+    collectReport: undefined as { report_path: string; report_bytes: number } | undefined,
     objective: 'ship it',
     paused: undefined as Record<string, unknown>[] | undefined,
     unstatused: undefined as Record<string, unknown>[] | undefined,
@@ -60,7 +61,7 @@ function world(on: On, env: Record<string, string>) {
     if (tool !== AGENT) stdout = `viewing ${verb}`
     else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.rows)
     else if (verb === 'index') stdout = JSON.stringify({ objective: w.objective, active: w.rows, pending: [], paused: w.paused ?? [], unstatused: w.unstatused ?? [], recent: [] })
-    else if (verb === 'collect') stdout = JSON.stringify({ id, status: w.collectStatus, result_status: w.collectResult })
+    else if (verb === 'collect') stdout = JSON.stringify({ id, status: w.collectStatus, result_status: w.collectResult, ...w.collectReport })
     const exitCode = w.isFailing || (verb === 'index' && w.isIndexFailing) ? 1 : 0
     return { value: { exitCode, stdout: exitCode === 0 ? stdout : '', stderr: exitCode === 0 ? '' : 'boom', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -513,6 +514,13 @@ test('/worker-view and /worker-collect pass the id as one argument', async ($, o
   expect(collected.text).toBe('Collected coder-1.')
   expect(collected.context?.[0]).toContain('completed')
   expect(w.ran.at(-1)).toEqual([AGENT, 'collect', 'coder-1'])
+})
+
+test('/worker-collect shows the worker report path and size when it wrote one', async ($, on) => {
+  const w = world(on, MAIN)
+  w.collectReport = { report_path: '/t/coder-1/report.md', report_bytes: 1234 }
+  await $.session.start(start(true))
+  expect((await $.command.run(command('worker-collect', 'coder-1'))).text).toBe('Collected coder-1. Report: /t/coder-1/report.md (1234 bytes).')
 })
 
 test('the band counts a paused worker, and a band of only paused workers is not quiet', async ($, on) => {

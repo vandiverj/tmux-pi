@@ -30,6 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py"):
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
+        shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n")
         self.log = base / "spawn.log"
         self.state = base / "state"
@@ -47,6 +48,7 @@ for ((i=0;i<${{#args[@]}};i++)); do
   if [[ "${{args[i]}}" == -- ]]; then echo "TASK ${{args[i+1]}}" >> "{self.log}"; fi
 done
 mkdir -p "{self.state}/tasks/review-1"
+echo '{{"id":"review-1"}}' > "{self.state}/tasks/review-1/meta.json"
 echo review-1
 ''')
         self.state = base / "state"
@@ -57,7 +59,7 @@ echo review-1
         fake = base / "fakebin"
         fake.mkdir()
         tmux = fake / "tmux"
-        tmux.write_text(f'#!/usr/bin/env bash\necho "{self.state}"\n')
+        tmux.write_text(f'#!/usr/bin/env bash\nif [[ "$1" == list-panes ]]; then echo "%0 1 99999999"; else echo "{self.state}"; fi\n')
         tmux.chmod(0o755)
         self.env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "TP_SESSION": "t"}
         self.env.pop("TMUX", None)
@@ -439,6 +441,7 @@ done
 python3 "$(dirname "$0")/../lib/preamble.py" "$workdir" "$role" > "{base}/preamble.out" || exit 1
 echo "$*" > "{base}/spawn.args"
 mkdir -p "{self.state}/tasks/review-1"
+echo '{{"id":"review-1"}}' > "{self.state}/tasks/review-1/meta.json"
 echo review-1
 ''')
         (self.work / ".tmux-pi").mkdir()

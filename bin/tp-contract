@@ -47,6 +47,7 @@ from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynami
                       escalation_record, extension, is_local, ledger_row, load_research, message, note,
                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
                       write_escalations)
+from worker_process import end_or_refuse  # noqa: E402
 from task_record import approved_delegated_review, read_json, unresolved_review, write_record  # noqa: E402
 
 RESEARCH = ROOT / "config" / "research.json"
@@ -400,6 +401,13 @@ def cmd_collect(args):
                               marker["resolution"].get("actor") == "human_cli"))):
         raise ContractError("{} has unresolved required review; completion is blocked (tp-task review-list)".format(args.id))
     life = task_state(d, meta, panes())[0]
+    if life in {"settled", "completed"}:
+        # Ended BEFORE the completed marker is written (tp-agent collect does the same): a process that cannot be ended or looked
+        # up fails the command with the task still settled, and the next collect tries again; a completed one is retried too.
+        try:
+            end_or_refuse(d)
+        except (ValueError, RuntimeError, OSError) as error:
+            raise ContractError("{} is not collected: its process could not be ended: {}".format(args.id, error))
     if life == "settled":
         (d / "completed").write_text("{}\n".format(time.time()))
         life = "completed"

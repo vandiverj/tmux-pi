@@ -207,7 +207,7 @@ try {
     if (scenario === 'resolved-inflight') {
       fs.writeFileSync(path.join(dir('auto-1'), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));
       const fakeBin = path.join(state, 'fake-bin'); fs.mkdirSync(fakeBin);
-      fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1"\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1 99999999"\n', { mode: 0o755 });
       collectDenied = spawnSync(path.join(root, 'bin/tp-contract'), ['collect', 'auto-1'], { env: { ...env, PATH: `${fakeBin}:${process.env.PATH}` }, encoding: 'utf8' }).status !== 0;
     }
     console.log(JSON.stringify({ before: globalThis.markerAtRework, marker, blocked, collectDenied, collected: calls.filter(c => c.name === 'tp-contract' && c.args[0] === 'collect').length }));
@@ -272,7 +272,7 @@ try {
     const pending = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json')));
     const staleCompleted = fs.existsSync(path.join(dir('auto-1'), 'completed'));
     const fakeBin = path.join(state, 'fake-bin'); fs.mkdirSync(fakeBin);
-    fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1 99999999"\n', { mode: 0o755 });
     const env = { ...process.env, TP_STATE_DIR: state, PATH: `${fakeBin}:${process.env.PATH}` };
     const collect = () => spawnSync(path.join(root, 'bin/tp-contract'), ['collect', 'auto-1'], { env, encoding: 'utf8' });
     const denied = collect().status !== 0;
@@ -433,7 +433,7 @@ try {
     }
     if (scenario === 'review-gate') {
       const fakeBin = path.join(state, 'fake-bin'); fs.mkdirSync(fakeBin);
-      fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1"\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(fakeBin, 'tmux'), '#!/bin/sh\necho "%1 1 99999999"\n', { mode: 0o755 });
       const env = { ...process.env, TP_STATE_DIR: state, PATH: `${fakeBin}:${process.env.PATH}` };
       const collect = () => spawnSync(path.join(root, 'bin/tp-contract'), ['collect', 'auto-1'], { env, encoding: 'utf8' });
       const marker = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json')));

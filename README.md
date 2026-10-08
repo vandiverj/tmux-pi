@@ -38,8 +38,11 @@ tp-agent retry <id> --reason "Two attempts failed" --escalate
 tp-agent review <id>
 tp-agent message <id> --text "Please check the empty input case"
 tp-agent stop <id>
+tp-agent reap [<id>...] [--yes]
 tp-agent index
 ```
+
+`collect` of a finished task (also `tp-contract collect`, which the legacy Claude-main MCP tools use) and `stop` end the worker's process (the pane and its scrollback stay). `retry` and `tp-review` (so `tp-agent review` and the MCP `review_subagent` too) refuse, naming the process, while another worker is alive on the same working tree (`--force-alive` overrides), and refuse when a live task's record, or the tmux pane list, cannot be read; `reap` lists finished tasks whose process is still alive and ends them with `--yes`. A worker's own `report.md` in the task directory is never overwritten by its final reply (`result.md`); `collect` and `inspect` show its path and size. `agent/extensions/subagents.ts` and `dispatcher.ts` (the old strict flow, loaded only under `TP_MODE=strict`, which nothing in `bin/` sets) are not covered by any of this.
 
 A dispatch records the role, assignment, expected result and how the model was chosen. Use `--worker` (a constraint: the router still picks the model on that harness), `--model`, `--thinking`, and `--level KEY` to make an explicit choice; an explicit choice skips the router and is still recorded. `--after <id>` queues a task until that result is ready. The initial limits are two local-model workers and four active workers total, configurable in [config/orchestration.json](config/orchestration.json). Queued tasks start as slots and dependencies clear.
 

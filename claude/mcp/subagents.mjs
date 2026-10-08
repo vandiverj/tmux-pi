@@ -3,7 +3,7 @@
 // Exposes spawn/list/send/collect/review/kill over the bin/tp-* commands. Exposes no
 // tools in a tp-spawn worker (TP_TASK_DIR), the shared orchestrator mode, or outside tmux.
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -151,6 +151,13 @@ const TOOLS = {
         const pane = readJson(join(dir, "meta.json")).pane;
         const screen = (await run("tmux", ["capture-pane", "-p", "-t", pane])).stdout.split("\n").filter((l) => l.trim()).slice(-15).join("\n");
         lines.push(`${p.id} may be waiting for the user (enter in the status pane to view it). Its screen:`, screen);
+      }
+      // The worker's own report.md is kept apart from result.md (the last reply); show where it is and how big.
+      try {
+        const report = join(dir, "report.md");
+        if (statSync(report).isFile()) lines.push(`report_path: ${report}`, `report_bytes: ${statSync(report).size}`);
+      } catch (e) {
+        if (e.code !== "ENOENT") throw new Error(`cannot read ${join(dir, "report.md")}: ${e.message}`);
       }
       const reply = readText(join(dir, "result.md"));
       const body = reply.length > 20000 ? `${reply.slice(0, 20000)}\n…(truncated; full reply in ${join(dir, "result.md")})` : reply;

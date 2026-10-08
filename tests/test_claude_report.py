@@ -108,6 +108,13 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertFalse((self.task / "result.md").exists())
         self.review()
 
+    def test_prompts_and_stops_never_touch_report_md(self):
+        (self.task / "report.md").write_text("worker's report\n")
+        for event, fields in (("UserPromptSubmit", {"prompt": "go"}), ("Stop", {"last_assistant_message": "RESULT_STATUS: complete\nDone."}),
+                              ("UserPromptSubmit", {"prompt": "again"}), ("Stop", {"last_assistant_message": ""})):
+            self.hook(event, **fields)
+        self.assertEqual((self.task / "report.md").read_text(), "worker's report\n")
+
     def transcript(self, lines):
         path = self.base / "t.jsonl"
         path.write_text("".join(json.dumps(x) + "\n" for x in lines))

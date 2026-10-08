@@ -50,7 +50,4 @@ if [[ -n "$rows" ]]; then while IFS=$'\x1f' read -r id worker status tool tokens
     "$tokens" $((16 - ${#tokens})) "" "$cost" $((8 - ${#cost})) "" "$model"
   if [[ -n "$detail" ]]; then printf '    %s\n' "$detail"; fi
 done <<<"$rows"; fi
-for queued in "$state_dir"/queue/*.json; do
-  [[ -f "$queued" ]] || continue
-  jq -r '"  \(.id)  \(.role)  queued  \(.queue_reason // "")"' "$queued"
-done
+tp_queue_lines "$state_dir"

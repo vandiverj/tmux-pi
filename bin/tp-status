@@ -195,7 +195,7 @@ render() {
   agents=0                   # task rows actually drawn
   n=${#ids[@]}
   nq=0; qfiles=()
-  for queued in "$state_dir"/queue/*.json; do [[ -f "$queued" ]] && qfiles+=("$queued"); done
+  for queued in "$state_dir"/queue/*.json; do [[ -e "$queued" || -L "$queued" ]] && qfiles+=("$queued"); done
   nq=${#qfiles[@]}
 
   # Frame budget: every line ends in a newline, so the last screen line stays
@@ -291,12 +291,13 @@ render() {
       i=$((i + 1))
     done <<<"$rows"
   fi
-  for queued in "${qfiles[@]}"; do
-    (( lines_left >= 1 )) || break
-    line="$(jq -r '"  \(.id)  \(.role)  queued  \(.queue_reason // "")"' "$queued")"
-    out+="${magenta}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
-    lines_left=$((lines_left - 1))
-  done
+  if (( nq )); then
+    while IFS= read -r line; do
+      (( lines_left >= 1 )) || break
+      out+="${magenta}$(clip "$cols" "$line")${reset}${esc}[K"$'\n'
+      lines_left=$((lines_left - 1))
+    done < <(tp_queue_lines "$state_dir")
+  fi
   out+="$sum_text$sel_text$msg_text"
   count_label="subagents $agents"
   if (( agents < ${#ids[@]} )); then count_label+="/${#ids[@]}"; fi

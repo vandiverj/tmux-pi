@@ -152,7 +152,7 @@ done
   die "review packet for '$id' needs ~$total chars (max $max_packet) without dropping author evidence; use a deliberate source-review workflow instead"
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
-if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" \
+if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy ($independence)" \

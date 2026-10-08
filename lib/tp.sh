@@ -110,3 +110,18 @@ for path in sorted(paths, key=lambda p: p.stat().st_mtime):
     sys.stdout.buffer.write(os.fsencode(path) + b"\0")
 ' "$tasks")
 }
+
+# tp_queue_lines <state-dir> — one display line per queued task, from tp-agent's own queue validation. An entry that
+# is not a complete record shows its file name and why it was refused, never as an ordinary queued row. If the view
+# itself cannot run, every entry is shown refused; nothing is read here with jq.
+tp_queue_lines() {
+  local dir="$1" out file
+  if out="$(TP_STATE_DIR="$dir" "$ROOT/bin/tp-agent" queue-view 2>/dev/null)"; then
+    [[ -z "$out" ]] || printf '%s\n' "$out"
+    return 0
+  fi
+  for file in "$dir"/queue/*.json; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    printf '  %s  queued  start refused: the queue view could not run\n' "$(basename "$file" .json)"
+  done
+}

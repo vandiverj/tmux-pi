@@ -40,6 +40,15 @@
 #   --policy-decision <path>  deterministic post-contract policy decision JSON to copy/record
 #   --context-manifest <path>  Slice 3/5 context+capability manifest JSON to copy into the task dir
 #   --decision-json <json>  Slice 4 route/task info for dynamic contract budgets
+#   --tests affected|full|none  how much of the test suite the worker runs; shown near
+#                            the top of the packet (omitted when not given)
+#   --check                  resolve the workdir, validate its preamble and print the workdir, then exit without
+#                            starting anything (tp-agent dispatch uses it before routing)
+#   --preamble-role <role>   pick the preamble section of this role without loading the role's
+#                            instructions (tp-review passes the reviewer's); default is --role
+#
+# If <workdir>/.tmux-pi/worker-preamble.md exists, its text (and the section for the
+# worker's role) is appended to the worker's system prompt (not the packet; a copy is kept as system-prompt.md in the task dir); see lib/preamble.py. An unusable file refuses.
 #
 # The worker's first message is packet.md: the task, then the selected files and
 # notes. Workers load no context files (AGENTS.md, CLAUDE.md), so the packet is
@@ -62,7 +71,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json=""
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" check=0
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -91,6 +100,9 @@ while [[ $# -gt 0 ]]; do
     --policy-decision) policy_decision_file="${2:?}"; shift 2 ;;
     --context-manifest) context_manifest_file="${2:?}"; shift 2 ;;
     --decision-json) decision_json="${2:?}"; shift 2 ;;
+    --tests)       tests="${2:?}"; shift 2 ;;
+    --check)       check=1; shift ;;
+    --preamble-role) preamble_role="${2:?}"; shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
     -*)            die "unknown option: $1" ;;
@@ -103,6 +115,10 @@ case "$thinking" in ""|off|minimal|low|medium|high|xhigh|max) ;; *) die "bad --t
 if [[ -n "$role" ]]; then
   [[ "$role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$role.md" ]] || die "unknown role: $role"
 fi
+if [[ -n "$preamble_role" ]]; then
+  [[ "$preamble_role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$preamble_role.md" ]] || die "unknown --preamble-role: $preamble_role"
+fi
+case "$tests" in ""|affected|full|none) ;; *) die "--tests must be affected, full or none" ;; esac
 [[ -z "$reserved_id" || "$reserved_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad task id"
 [[ -z "$parent" || "$parent" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad parent id"
 jq -e 'type == "object" or . == null' <<<"$route_json" >/dev/null || die "bad route JSON"
@@ -140,6 +156,12 @@ if [[ "$explicit_workdir" == 1 ]]; then
   state_path="$(cd -- "$state_dir" && pwd -P)" || die "state directory unavailable: $state_dir"
   [[ "$workdir" != / && "$workdir" != "$state_path" && "$workdir" != "$state_path/"* ]] ||
     die "--workdir must select a project directory outside tmux-pi state"
+fi
+
+if [[ "$check" == 1 ]]; then
+  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" >/dev/null || exit 1
+  printf '%s\n' "$workdir"
+  exit 0
 fi
 
 # LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
@@ -234,6 +256,18 @@ fi
 
 # Build the packet before creating anything, so a bad path fails cleanly.
 packet="$(printf '# Task\n\n%s\n' "$task")"
+if [[ -n "$tests" ]]; then
+  packet+=$'\n\n# Test Scope\n\n'
+  case "$tests" in
+    affected) packet+="Run the tests that check the code you changed, whether or not those test files were edited, plus any test you add or edit. Say how you decided which tests cover the change. Do not run the whole suite." ;;
+    full)     packet+="Run the whole test suite." ;;
+    none)     packet+="Do not run tests. Say that none were run." ;;
+  esac
+  packet+=$'\n'
+fi
+# The repository preamble goes to the worker's system prompt, not the packet (see below), so it sits ahead of
+# everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
+preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}")" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
 packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree."
 packet+=$'\n'
@@ -379,8 +413,14 @@ else
     *) cmd+=(--effort "$thinking") ;;
   esac
 fi
-# A machine can give a model a standing instruction for a mistake it is known to
-# make (config/local.json "prompts"); both harnesses append it to their system prompt.
+# Standing instructions go in the system prompt, which both harnesses accept as --append-system-prompt (one
+# flag, one value, so no harness has to merge repeats). Order is fixed and holds nothing per task, so a prompt
+# cache can reuse it: the repository's general preamble, then the worker's role section, then the machine's
+# instruction for this model (config/local.json "prompts", for a mistake the model is known to make).
+system_prompt=""
+if [[ -n "$preamble" ]]; then
+  system_prompt="# Repository Instructions"$'\n\n'"$preamble"
+fi
 if [[ -n "$model" ]]; then
   prompt="$(python3 - "$ROOT" "$model" <<'EOF'
 import sys
@@ -392,7 +432,11 @@ except RouterError as exc:
     sys.exit("tp-spawn: {}".format(exc))
 EOF
 )" || exit 1
-  if [[ -n "$prompt" ]]; then cmd+=(--append-system-prompt "$prompt"); fi
+  if [[ -n "$prompt" ]]; then system_prompt+="${system_prompt:+$'\n\n'}$prompt"; fi
+fi
+if [[ -n "$system_prompt" ]]; then
+  printf '%s' "$system_prompt" > "$task_dir/system-prompt.md"  # exactly what the worker is given
+  cmd+=(--append-system-prompt "$system_prompt")
 fi
 
 {

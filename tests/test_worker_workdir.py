@@ -80,7 +80,7 @@ esac
     def test_explicit_project_and_review_inherit_across_main_move(self):
         author, meta = self.meta(self.cli("tp-spawn", "--worker", "pi", "--workdir", str(self.original), "Task"))
         self.assertEqual(meta["workdir"], str(self.original.resolve()))
-        (author / "result.md").write_text("Done")
+        (author / "result.md").write_text("Done\nRESULT_STATUS: complete\n")
         (author / "state.json").write_text('{"state":"waiting"}')
         # The current pane now belongs to a different project, but review must
         # use the durable author cwd. --force skips policy routing only.
@@ -94,7 +94,7 @@ esac
     def test_claude_author_pi_reviewer_and_explicit_path_without_main(self):
         author, meta = self.meta(self.cli("tp-spawn", "--worker", "claude", "--workdir", str(self.project),
                                           "Task", TP_MAIN_PANE=""))
-        (author / "result.md").write_text("Done")
+        (author / "result.md").write_text("Done\nRESULT_STATUS: complete\n")
         (author / "exit").write_text("0")
         _, reviewer_meta = self.meta(self.cli("tp-review", "--force", meta["id"], TP_MAIN_PANE=""))
         self.assertEqual(reviewer_meta["worker"], "pi")
@@ -107,7 +107,7 @@ esac
         task = self.state / "tasks" / "old"
         task.mkdir()
         (task / "meta.json").write_text('{"id":"old","worker":"pi"}')
-        (task / "result.md").write_text("Done")
+        (task / "result.md").write_text("Done\nRESULT_STATUS: complete\n")
         (task / "state.json").write_text('{"state":"waiting"}')
         run = self.cli("tp-review", "--force", "old")
         self.assertNotEqual(run.returncode, 0)

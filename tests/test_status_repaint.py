@@ -278,6 +278,7 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertIn(b"task 1", moved)
         self.assertEqual(moved.count(ESC), 1)
         self.assertEqual(self.output(1.2), b"")
+        (tasks / "job1" / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         (tasks / "job1" / "state.json").write_text(json.dumps({
             "state": "settled", "model": "test-model", "tokens": {
                 "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))

@@ -312,7 +312,7 @@ class ContractTests(unittest.TestCase):
         task.mkdir(parents=True)
         (task / "meta.json").write_text(json.dumps({"id": "worker-1", "worker": "pi", "pane": "%1"}))
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
-        (task / "result.md").write_text("Done.\n")
+        (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         (task / "exit").write_text("0\n")
         marker = task / "review-required.json"
         marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True,
@@ -342,6 +342,49 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(collected.stdout.strip(), "completed")
         self.assertTrue((task / "completed").exists())
 
+    def test_slot_after_waits_for_a_reply_with_a_result_status(self):
+        state = self.dir / "slot-state"
+        task = state / "tasks" / "dep"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps({"id": "dep", "worker": "pi", "pane": "%1"}))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
+        (task / "result.md").write_text("Started a sleep; waiting.\n")
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 0"\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        slot = lambda: json.loads(subprocess.run(
+            [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
+            env=env, text=True, capture_output=True, check=True).stdout)
+        held = slot()
+        self.assertFalse(held["ok"], held)
+        self.assertEqual(held["states"]["dep"], "paused")
+        self.assertIn("dep", held["reason"])
+        (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
+        self.assertTrue(slot()["ok"])
+
+    def test_slot_after_waits_for_a_paused_predecessor_even_with_a_result_status(self):
+        state = self.dir / "slot-paused-state"
+        task = state / "tasks" / "dep"
+        task.mkdir(parents=True)
+        (task / "meta.json").write_text(json.dumps({"id": "dep", "worker": "pi", "pane": "%1"}))
+        (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
+        (task / "result.md").write_text("Out of budget.\nRESULT_STATUS: blocked\n")
+        (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "reason": "budget", "at": T0}]}))
+        tmux = self.dir / "tmux"
+        tmux.write_text('#!/bin/sh\necho "%1 0"\n')
+        tmux.chmod(0o755)
+        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        slot = lambda: json.loads(subprocess.run(
+            [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
+            env=env, text=True, capture_output=True, check=True).stdout)
+        held = slot()
+        self.assertEqual(held["states"]["dep"], "paused")
+        self.assertFalse(held["ok"], held)
+        self.assertIn("dep", held["reason"])
+        (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "at": T0}, {"action": "extend", "at": T0 + 100}]}))
+        self.assertTrue(slot()["ok"])  # continued and settled with a status: the dependency is met
+
     def test_required_review_without_marker_and_independent_approval(self):
         import hashlib
         state = self.dir / "review-state"
@@ -351,7 +394,7 @@ class ContractTests(unittest.TestCase):
         (task / "meta.json").write_text(json.dumps(meta))
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "exit").write_text("0\n")
-        (task / "result.md").write_text("Done.\n")
+        (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         tmux = self.dir / "tmux"
         tmux.write_text('#!/bin/sh\necho "%1 1"\n')
         tmux.chmod(0o755)
@@ -590,17 +633,24 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(evaluate(self.meta, dict(working, turns=70), partial, T0 + 1600, True, events)["action"][0], "stop")
 
     def test_lifecycle(self):
+        OK = "Done.\nRESULT_STATUS: complete"
         at = lambda s: {"state": s, "updated": iso(T0 + 100)}
         self.assertEqual(lifecycle({}, "alive"), "starting")
         self.assertEqual(lifecycle(at("tool"), "alive"), "working")
         self.assertEqual(lifecycle(at("permission"), "alive"), "needs_input")
-        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.\nWhich file?"), "needs_input")
-        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done."), "settled")
-        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 120), "completed")
-        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50), "settled")  # new turn since
+        # A question without a RESULT_STATUS line is still a reply without one: paused, never needs_input.
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.\nWhich file?"), "paused")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.\nRESULT_STATUS: blocked\nWhich file?"), "needs_input")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply=OK), "settled")
+        # A reply with no RESULT_STATUS line is paused, never settled.
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done."), "paused")
+        self.assertEqual(lifecycle(at("waiting"), "alive"), "paused")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0", reply="Done."), "paused")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply=OK, completed_at=T0 + 120), "completed")
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply=OK, completed_at=T0 + 50), "settled")  # new turn since
         # Claude touches state.json after its idle notification; the reply time decides.
-        self.assertEqual(lifecycle(at("waiting"), "alive", reply="Done.", completed_at=T0 + 50, replied_at=T0 + 40), "completed")
-        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0", reply="New round", completed_at=T0 + 50,
+        self.assertEqual(lifecycle(at("waiting"), "alive", reply=OK, completed_at=T0 + 50, replied_at=T0 + 40), "completed")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0", reply="New round\n"+OK, completed_at=T0 + 50,
                                    replied_at=T0 + 120), "settled")
         self.assertEqual(lifecycle(at("waiting"), "alive", [{"action": "pause", "at": T0 + 30}], replied_at=T0 + 35), "paused")
         pause = [{"action": "pause", "at": T0 + 95}]
@@ -608,8 +658,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(lifecycle(dict(at("working"), tools=10), "alive", [{"action": "pause", "at": T0 + 95, "tools": 9}]), "working")
         self.assertEqual(lifecycle(at("error"), "alive", pause), "paused")
         self.assertEqual(lifecycle(at("error"), "alive"), "failed")
-        self.assertEqual(lifecycle(at("waiting"), "alive", pause + [{"action": "extend", "at": T0 + 99}]), "settled")
-        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0"), "settled")
+        self.assertEqual(lifecycle(at("waiting"), "alive", pause + [{"action": "extend", "at": T0 + 99}], reply=OK), "settled")
+        self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="0", reply=OK), "settled")
         self.assertEqual(lifecycle(at("waiting"), "dead", exit_code="1"), "failed")
         self.assertEqual(lifecycle(at("working"), "gone"), "killed")
         self.assertEqual(lifecycle(at("working"), "alive", escalated=True), "escalated")

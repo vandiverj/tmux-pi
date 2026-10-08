@@ -80,7 +80,7 @@ Design constants: state is plain files so any piece can be inspected or replaced
 | `lib/context_broker.py` | Slice 3 provenance-aware context manifest; retrieved text is recorded as untrusted evidence. |
 | `lib/capabilities.py` (586 lines) | Slice 5 versioned capability registry with progressive disclosure. Profile-only stubs (YouTrack, Context Engine, read-only DB, official docs, browser validation) are documented but inactive. |
 | `lib/automation.py` | Slice 6 automation gating. **Both automatic cells are currently pending or disabled**, so unqualified work becomes a recommendation or manual status. |
-| `bin/tp-contract`, `lib/contract.py` (677 lines) | Budgets, checkpoints, stall and tool-error circuit breakers, lifecycle states (starting, working, needs_input, paused, settled, completed, failed, killed, escalated), extend, slot/parallelism limits, research queue. |
+| `bin/tp-contract`, `lib/contract.py` (677 lines) | Budgets, checkpoints, stall and tool-error circuit breakers, lifecycle states (starting, working, needs_input, paused, settled, completed, failed, killed, stopped, escalated), extend, slot/parallelism limits, research queue. |
 | `bin/tp-review` | Cross-provider read-only reviewer (Pi author gets Claude Sonnet, Claude author gets Pi/Codex); review policy from the learned classifier; `APPROVED` or `REQUEST_CHANGES`; one automatic revision round. |
 | `bin/tp-ledger` | Research and contract run ledger with human ratings. |
 | `bin/tp-goal`, `lib/goal.py` (709 lines) | Approval-gated, budgeted goal records; the human-only start needs `--confirm START-GOAL`. |

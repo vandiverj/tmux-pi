@@ -8,6 +8,8 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 const scenario = process.argv[2];
+// A worker's default reply: it carries a result status, or the task reads paused.
+const DONE = 'Done.\nRESULT_STATUS: complete\n';
 const root = path.resolve(import.meta.dirname, '..');
 const state = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-runtime-'));
 const moduleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-module-'));
@@ -64,7 +66,7 @@ function task(id, meta = {}) {
   fs.mkdirSync(dir(id), { recursive: true });
   fs.writeFileSync(path.join(dir(id), 'meta.json'), JSON.stringify({ id, worker: 'pi', pane: `%${++seq}`, ...meta }));
   fs.writeFileSync(path.join(dir(id), 'state.json'), JSON.stringify({ state: 'waiting', updated: new Date().toISOString() }));
-  fs.writeFileSync(path.join(dir(id), 'result.md'), 'Done.');
+  fs.writeFileSync(path.join(dir(id), 'result.md'), DONE);
 }
 function command(cmd, args, input) {
   const name = path.basename(cmd);
@@ -171,10 +173,10 @@ try {
     const verdict = 'APPROVED: independently checked.';
     fs.writeFileSync(path.join(reviewer, 'result.md'), verdict);
     fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'resolved-changed' ?
-      { required: true, status: 'resolved', task_id: 'auto-1', round_nonce: 'r1', resolution: { actor: 'human_cli', round_nonce: 'r1', author_sha256: crypto.createHash('sha256').update('Done.').digest('hex') } } :
+      { required: true, status: 'resolved', task_id: 'auto-1', round_nonce: 'r1', resolution: { actor: 'human_cli', round_nonce: 'r1', author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } } :
       { required: true, status: 'approved', task_id: 'auto-1', round_nonce: 'r1', approval: {
         reviewer_id: 'review-1', round_nonce: 'r1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'),
-        author_sha256: crypto.createHash('sha256').update('Done.').digest('hex') } }));
+        author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } }));
     const check = async () => { await handlers.input({ text: '+here Explain tp-view', source: 'interactive' }, ctx);
       const a = calls.filter(c => c.name === 'tp-task' && c.args[0] === 'preflight').at(-1).args;
       return JSON.parse(a[a.indexOf('--decision-json') + 1]).review; };
@@ -263,7 +265,7 @@ try {
     fs.writeFileSync(path.join(dir('review-1'), 'review-of'), 'auto-1');
     const verdict = 'APPROVED: previous round.';
     fs.writeFileSync(path.join(dir('review-1'), 'result.md'), verdict);
-    fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'needs-human-followup' ? { required: true, status: 'needs_human', task_id: 'auto-1', reasons: ['Earlier failure'] } : ['resolved-restart', 'resolved-failed', 'resolved-changes'].includes(scenario) ? { required: true, status: 'resolved', task_id: 'auto-1', resolution: { actor: 'human_cli', reason: 'Older work' } } : { required: true, status: 'approved', task_id: 'auto-1', approval: { reviewer_id: 'review-1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'), author_sha256: crypto.createHash('sha256').update('Done.').digest('hex') } }));
+    fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'needs-human-followup' ? { required: true, status: 'needs_human', task_id: 'auto-1', reasons: ['Earlier failure'] } : ['resolved-restart', 'resolved-failed', 'resolved-changes'].includes(scenario) ? { required: true, status: 'resolved', task_id: 'auto-1', resolution: { actor: 'human_cli', reason: 'Older work' } } : { required: true, status: 'approved', task_id: 'auto-1', approval: { reviewer_id: 'review-1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'), author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } }));
     fs.writeFileSync(path.join(dir('auto-1'), 'completed'), '1\n');
     fs.writeFileSync(path.join(dir('auto-1'), 'state.json'), JSON.stringify({ state: 'starting' }));
     await handlers.input({ text: '+followup auto-1 Please rework this', source: 'interactive' }, ctx);

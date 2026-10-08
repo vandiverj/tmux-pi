@@ -44,8 +44,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
-                      escalation_record, extension, is_local, ledger_row, lifecycle, load_research, message, note,
-                      read_escalations, select_escalation, state_dir, summary_line, upsert, write_escalations)
+                      escalation_record, extension, is_local, ledger_row, load_research, message, note,
+                      read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
+                      write_escalations)
 from task_record import approved_delegated_review, read_json, unresolved_review, write_record  # noqa: E402
 
 RESEARCH = ROOT / "config" / "research.json"
@@ -63,9 +64,10 @@ def research_config():
 
 def read(path):
     try:
-        return json.loads(Path(path).read_text())
+        value = json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return {}
+    return value if isinstance(value, dict) else {}
 
 
 def panes():
@@ -86,16 +88,7 @@ def text(path):
 
 def task_state(d, meta, pane_map):
     """(lifecycle state, state.json, checkpoint events, reply) for a task dir."""
-    state = read(d / "state.json")
-    events = read(d / "checkpoints.json").get("events", [])
-    reply = text(d / "result.md")
-    completed = text(d / "completed")
-    life = lifecycle(state, pane_map.get(meta.get("pane"), "gone"), events, reply,
-                     float(completed) if completed else None, text(d / "exit") or None, (d / "escalated").exists(),
-                     (d / "result.md").stat().st_mtime if (d / "result.md").exists() else None)
-    if (d / "pending-capability.json").exists() and life not in ("failed", "killed", "escalated"):
-        life = "needs_input"
-    return life, state, events, reply
+    return task_lifecycle(d, pane_map.get(meta.get("pane"), "gone"))
 
 
 def save_events(d, events):
@@ -312,7 +305,7 @@ def cmd_escalate(args):
     life = task_state(d, meta, panes())[0]
     reported = read(d / "state.json").get("state")
     events = read(d / "checkpoints.json").get("events", [])
-    if life in ("killed", "completed", "escalated") or reported in ("killed", "cancelled", "canceled", "completed") or \
+    if life in ("killed", "stopped", "completed", "escalated") or reported in ("killed", "cancelled", "canceled", "completed") or \
             (d / "completed").exists() or any(e.get("action") == "discard" for e in events if isinstance(e, dict)):
         raise ContractError("{} is {} or cancelled/completed; automatic escalation is blocked".format(args.id, life))
     if (d / "escalated").exists() or meta.get("escalated_from") or read_escalations(d):
@@ -418,11 +411,14 @@ def cmd_slot(args):
     """May a research task on args.model start now: its dependencies are done and there is room."""
     root, pane_map = state_dir(), panes()
     config = research_config()
-    states = {}
+    states, met = {}, set()
     local = frontier = active = 0
     for d, meta in tasks(root):
-        life = task_state(d, meta, pane_map)[0]
-        states[meta.get("id", d.name)] = life
+        life, state, events, reply = task_state(d, meta, pane_map)
+        if meta:  # an unreadable meta.json is an unknown predecessor, never a killed one
+            states[meta.get("id", d.name)] = life
+            if satisfies_dependency(life, state, events, reply):
+                met.add(meta.get("id", d.name))
         if life not in RUNNING:
             continue
         active += 1
@@ -431,8 +427,13 @@ def cmd_slot(args):
                 local += 1
             else:
                 frontier += 1
-    waiting = [i for i in filter(None, (args.after or "").split(",")) if states.get(i, "killed") not in DONE]
-    if waiting:
+    after = list(filter(None, (args.after or "").split(",")))
+    # A predecessor with no readable record is unknown: it refuses, and is not the recorded state "killed".
+    unknown = [i for i in after if i not in states]
+    waiting = [i for i in after if i in states and i not in met]
+    if unknown:
+        reason = "unknown task {} (no readable record); it is not treated as finished".format(", ".join(unknown))
+    elif waiting:
         reason = "waits for {}".format(", ".join(waiting))
     elif is_local(args.model) and local >= config["max_local"]:
         reason = "{} local research worker{} running (limit {})".format(local, "s" * (local != 1), config["max_local"])
@@ -442,8 +443,7 @@ def cmd_slot(args):
         reason = "{} workers running (limit {})".format(active, config["max_active"])
     else:
         reason = ""
-    print(json.dumps({"ok": not reason, "reason": reason, "states": {i: states.get(i, "killed") for i in
-                                                                      filter(None, (args.after or "").split(","))}}))
+    print(json.dumps({"ok": not reason, "reason": reason, "states": {i: states.get(i, "unknown") for i in after}}))
 
 
 def main():

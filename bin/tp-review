@@ -61,6 +61,13 @@ if [[ "$completed" != 1 ]]; then
   state="$(jq -r '.state // empty' "$dir/state.json" 2>/dev/null || true)"
   [[ "$state" == waiting ]] || die "subagent '$id' has not completed successfully (state: ${state:-starting})"
 fi
+# A paused task (a recorded pause, or a reply with no RESULT_STATUS line) has nothing to review yet; the
+# state comes from tp-agent's classifier, which a recorded pause wins in whatever the exit code says.
+status="$(TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" inspect "$id" 2>/dev/null | jq -r '.status // empty')" || status=
+[[ -n "$status" ]] || die "cannot read the state of subagent '$id'"
+[[ "$status" != paused ]] || die "subagent '$id' is paused (replied without a result status, or a pause is recorded); it is not ready for review"
+grep -Eiq '^RESULT_STATUS:[[:space:]]*(complete|empty|blocked|incomplete)\b' "$dir/result.md" ||
+  die "subagent '$id' replied without a result status (paused); it is not ready for review"
 
 # The review plan: need and reviewer, from the catalog router's resolver (no classifier service).
 [[ "$force" == 0 ]] || plan_opts+=(--force)

@@ -25,6 +25,9 @@ class TpReviewTests(unittest.TestCase):
         (self.root / "lib").mkdir()
         shutil.copy(ROOT / "bin/tp-review", self.root / "bin/tp-review")
         shutil.copy(ROOT / "lib/tp.sh", self.root / "lib/tp.sh")
+        # tp-review asks tp-agent's classifier whether the worker is paused (tp-agent shares lib/contract.py's pause rule).
+        shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
+        shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n")
         self.log = base / "spawn.log"
         self.state = base / "state"
@@ -62,6 +65,7 @@ echo review-1
         (self.task / "meta.json").write_text(json.dumps({"id": "w1", "worker": "pi", "workdir": str(self.work)}))
         for name in ("task.md", "packet.md", "result.md"):
             (self.task / name).write_text(f"{name}\n")
+        (self.task / "result.md").write_text("result.md\nRESULT_STATUS: complete\n")
         (self.task / "state.json").write_text('{"state":"waiting"}')
         (self.task / "request.md").write_text("do it\n")
 
@@ -154,6 +158,30 @@ echo review-1
         r = self.review()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "review-1"), r.stderr)
 
+    def test_waiting_worker_without_a_result_status_is_not_reviewed(self):
+        (self.task / "result.md").write_text("Started a sleep; waiting.\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without a result status", r.stderr)
+        self.assertFalse(self.log.exists())
+        (self.task / "exit").write_text("0\n")  # a clean exit does not excuse a missing status
+        self.assertEqual(self.review().returncode, 1)
+        (self.task / "result.md").write_text("RESULT_STATUS: blocked\n")
+        self.assertEqual(self.review().returncode, 0)
+
+    def test_recorded_pause_is_not_reviewed_whatever_the_exit_and_status_say(self):
+        (self.task / "exit").write_text("0\n")  # clean exit and a statused reply (set up above)
+        (self.task / "state.json").write_text('{"state":"paused"}')
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is paused", r.stderr)
+        self.assertFalse(self.log.exists())
+        (self.task / "state.json").write_text('{"state":"waiting","tools":3}')
+        (self.task / "checkpoints.json").write_text('{"events":[{"action":"pause","at":1,"tools":3}]}')
+        self.assertEqual(self.review().returncode, 1)
+        (self.task / "checkpoints.json").write_text('{"events":[{"action":"pause","at":1,"tools":3},{"action":"extend","at":2}]}')
+        self.assertEqual(self.review().returncode, 0)
+
     def test_legacy_pending_capability_still_blocks(self):
         (self.task / "pending-capability.json").write_text("{}")
         self.assertEqual(self.review().returncode, 1)
@@ -176,7 +204,7 @@ echo review-1
 
     def test_oversized_packet_and_result_are_split_losslessly_in_order(self):
         packet = "".join(chr(97 + i % 26) for i in range(100000)) + "PACKET-TAIL-MARKER"
-        result = "R" * 70000 + "RESULT-TAIL-MARKER"
+        result = "RESULT_STATUS: complete\n" + "R" * 70000 + "RESULT-TAIL-MARKER"
         (self.task / "packet.md").write_text(packet)
         (self.task / "result.md").write_text(result)
         r = self.review()
@@ -201,7 +229,7 @@ echo review-1
 
     def test_aggregate_overflow_fails_before_spawn_and_cleans_up(self):
         (self.task / "packet.md").write_text("p" * 150000)
-        (self.task / "result.md").write_text("r" * 70000)
+        (self.task / "result.md").write_text("RESULT_STATUS: complete\n" + "r" * 70000)
         r = self.review()
         self.assertEqual(r.returncode, 1)
         self.assertIn("without dropping author evidence", r.stderr)

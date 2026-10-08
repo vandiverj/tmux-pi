@@ -38,7 +38,10 @@ URL = re.compile(r"https?://[^\s)>\]]+")
 # Providers served from this machine; everything else is a frontier (cloud) model.
 LOCAL_PROVIDERS = ("lmstudio", "mlx", "slotstream")
 RUNNING = ("starting", "working", "needs_input")
-DONE = ("settled", "completed", "paused", "failed", "killed", "escalated")
+DONE = ("settled", "completed", "paused", "failed", "killed", "stopped", "escalated")
+# A dependency (--after) is met by an ended task, never a paused one: paused work is not finished,
+# whether or not its reply carries a RESULT_STATUS line.
+DEPENDENCY_DONE = tuple(s for s in DONE if s != "paused")
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),
            "useful": ("yes", "partly", "no")}
 THINKING_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
@@ -394,41 +397,148 @@ def extension(meta, state, now, events):
                        "tokens": r["tokens"] + b["tokens"] if b["tokens"] else None}}
 
 
-def lifecycle(state, pane, events=(), reply="", completed_at=None, exit_code=None, escalated=False, replied_at=None):
-    """A task's state for people: starting, working, needs_input, paused, settled, completed,
-    failed, killed or escalated. pane is "alive", "dead" (process exited) or "gone".
-    replied_at is when the last reply was written (result.md): state.json can be touched
-    later (Claude's idle notification), so paused and completed compare against the reply."""
+RESULT_STATUS_RE = re.compile(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", re.I)
+
+
+def recorded_pause(state, events=()):
+    """Is a pause on record for this task and not yet cleared by a resume?
+
+    `lifecycle` consults this before it looks at an exit code, a pane or a result status.
+    A pause is on record when state.json says "paused" or the last
+    pause/extend checkpoint event is a pause. It is cleared by a later `extend` (main's
+    "continue"), or by the worker visibly working again: state "working"/"tool" with a tool
+    count past the one the pause recorded. Nothing else clears it, in particular not an exit
+    code, a dead or missing pane, or a RESULT_STATUS line: a paused task is not finished."""
+    state = state if isinstance(state, dict) else {}
+    if state.get("state") == "paused":
+        return True
+    events = [e for e in events if isinstance(e, dict)] if isinstance(events, (list, tuple)) else []
+    last = next((e for e in reversed(events) if e.get("action") in ("pause", "extend")), None)
+    if not last or last["action"] != "pause":
+        return False
+    tools = last.get("tools")
+    working_again = state.get("state") in ("working", "tool") and isinstance(tools, (int, float)) and \
+        (state.get("tools") or 0) > tools
+    return not working_again
+
+
+def lifecycle(state, pane=None, events=(), reply="", completed_at=None, exit_code=None, escalated=False, replied_at=None,
+              stopped=False, collected=False, asking=False, capability_pending=False):
+    """A task's state for people, decided in this one place for tp-agent, tp-contract and tp-review:
+    starting, working, needs_input, paused, settled, completed, failed, killed, stopped or escalated.
+
+    Plain inputs only. pane is "alive", "dead" (process exited), "gone", or None when the caller
+    did not look at panes (tp-agent), which is read as present. exit_code is the exit file's text,
+    None when there is none. reply is result.md's text; replied_at its write time (state.json can
+    be touched later by an idle notification, so completed compares against the reply).
+    escalated and stopped are main's explicit hand-off markers; collected and completed_at are the
+    two hand-off records; asking is a pending permission or capability request, capability_pending
+    a capability waiting for human approval.
+
+    Order: main's own markers (escalated, stopped) first. Then paused, before any pane or exit
+    code is read: a recorded pause (recorded_pause), or a reply without a RESULT_STATUS line from
+    a worker that is not visibly at work. A paused task is not finished, so no exit code, dead or
+    missing pane or hand-off record turns it into a state that satisfies --after."""
+    state = state if isinstance(state, dict) else {}
+    life = _lifecycle(state, pane, [e for e in events if isinstance(e, dict)] if isinstance(events, (list, tuple)) else [],
+                      reply or "", completed_at, exit_code, escalated, replied_at, stopped, collected)
+    # A paused task stays paused when a request coexists with the pause: the request is noted on its row
+    # (permission, capability_request), but the state, and so the index tier, is decided by the pause alone.
+    if capability_pending and life not in ("failed", "killed", "stopped", "escalated", "paused"):
+        return "needs_input"
+    if asking and life in RUNNING:
+        return "needs_input"
+    return life
+
+
+def satisfies_dependency(life, state=None, events=(), reply=""):
+    """May a task in lifecycle state `life` be the predecessor of a --after dependent? The one answer, used by
+    tp-agent (queue admission) and tp-contract (slot).
+
+    Never when a pause is on record or the reply lacks a RESULT_STATUS line, whatever state is reported:
+    main's own markers (stopped, escalated) outrank the reported state but not this. Otherwise the ended
+    states in DEPENDENCY_DONE satisfy it. A task with no reply at all (killed, failed) has nothing to be
+    unstatused about and keeps satisfying."""
+    if life not in DEPENDENCY_DONE:
+        return False
+    if recorded_pause(state, events):
+        return False
+    reply = reply if isinstance(reply, str) else ""
+    return not (reply.strip() and not RESULT_STATUS_RE.search(reply))
+
+
+def _lifecycle(state, pane, events, reply, completed_at, exit_code, escalated, replied_at, stopped, collected):
     if escalated:
         return "escalated"
+    if stopped:
+        return "stopped"
+    s = state.get("state")
+    live = pane not in ("dead", "gone") and exit_code is None
+    if recorded_pause(state, events):
+        return "paused"
+    statused = bool(RESULT_STATUS_RE.search(reply))
+    at_work = live and s in (None, "starting", "working", "tool", "permission")
+    if reply.strip() and not statused and not at_work:
+        # Replied without a result status: paused, whatever the pane, the exit code or a trailing question say.
+        return "paused"
     if pane == "gone":
         return "killed"
     updated = _epoch(state.get("updated")) or 0
-    if pane == "dead":
-        return "failed" if str(exit_code) != "0" else "completed" if completed_at and completed_at >= (replied_at or updated) - 1 else "settled"
-    s = state.get("state")
-    events = [e for e in events if isinstance(e, dict)]
-    pause = next((e for e in reversed(events) if e.get("action") in ("pause", "extend")), None)
-    pause = pause if pause and pause["action"] == "pause" else None
-    # An interrupted Claude worker still says "working"; its tool count has not moved.
-    if pause and s in ("working", "tool") and "tools" in pause and (state.get("tools") or 0) <= pause["tools"]:
-        return "paused"
+    done = collected or bool(completed_at and completed_at >= (replied_at or updated) - 1)
+    if not live:
+        # The process ended. Only a clean exit that left a reply is a result.
+        if str(exit_code) != "0" or not reply.strip():
+            return "failed"
+        return "completed" if done else "settled"
     if s in (None, "starting"):
         return "starting"
     if s in ("working", "tool"):
         return "working"
     if s == "permission":
         return "needs_input"
-    replied = replied_at or updated
-    if pause and replied <= pause.get("at", 0) + 30:
-        return "paused"
     if s == "error":
         return "failed"
     if reply.rstrip().endswith("?"):
         return "needs_input"
-    if completed_at and completed_at >= replied - 1:
-        return "completed"
-    return "settled"
+    if not statused:
+        return "paused"
+    return "completed" if done else "settled"
+
+
+def task_lifecycle(d, pane=None):
+    """(lifecycle state, state.json, checkpoint events, reply) for a task directory.
+
+    The one reader of a task's files for `lifecycle`, used by tp-agent and tp-contract alike, so
+    both hand it the same facts; pane is the only fact not on disk."""
+    d = Path(d)
+
+    def obj(name):
+        try:
+            value = json.loads((d / name).read_text())
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def text(name):
+        try:
+            return (d / name).read_text().strip()
+        except OSError:
+            return ""
+
+    state, events, reply = obj("state.json"), obj("checkpoints.json").get("events", []), text("result.md")
+    try:
+        completed_at = float(text("completed"))
+    except ValueError:
+        completed_at = None
+    try:
+        replied_at = (d / "result.md").stat().st_mtime
+    except OSError:
+        replied_at = None
+    life = lifecycle(state, pane, events, reply, completed_at, text("exit") or None, (d / "escalated").exists(), replied_at,
+                     stopped=(d / "stopped.json").exists(), collected=(d / "collected.json").exists(),
+                     asking=any(obj(name).get("status") == "pending" for name in ("permission-request.json", "capability-request.json")),
+                     capability_pending=(d / "pending-capability.json").exists())
+    return life, state, events, reply
 
 
 def summary_line(reply, question=False):

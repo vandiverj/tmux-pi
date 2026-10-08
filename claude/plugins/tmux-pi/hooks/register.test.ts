@@ -407,6 +407,14 @@ test('SessionStart after a compaction carries the index as context', async ($, o
   expect(answer.additionalContext?.[0]).toContain('coder-1')
 })
 
+test('the index carries why a queued task was refused', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'shape01', status: 'queued', reason: 'start refused: the queue entry is not an object' }]
+  await $.session.start(start(true))
+  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  expect(text).toContain('- shape01 queued (start refused: the queue entry is not an object)')
+})
+
 test('an index too long to inject says how many rows it left out', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = Array.from({ length: 400 }, (_, i) => ({ id: `researcher-${String(i).padStart(4, '0')}-abcdef`, status: 'working', role: 'researcher' }))

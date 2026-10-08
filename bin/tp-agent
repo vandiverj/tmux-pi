@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 ROLES = ROOT / "agent" / "roles"
+TESTS_SCOPES = ("affected", "full", "none")
+TESTS_DEFAULT = "affected"
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ACTIVE = {"starting", "working", "tool", "permission", "needs_input"}
 LOCAL = ("slotstream/", "lmstudio/", "mlx/", "ollama/")
@@ -115,15 +118,15 @@ def record(path, include_result=False):
 def all_records(base):
     tasks = base / "tasks"
     rows = [record(path) for path in tasks.iterdir() if (path / "meta.json").is_file()] if tasks.exists() else []
-    queue = base / "queue"
-    if queue.exists():
-        for path in queue.glob("*.json"):
-            item = read_json(path)
-            rows.append({"id": item.get("id"), "role": item.get("role"), "harness": item.get("worker"),
-                         "model": item.get("model"), "effort": item.get("thinking"), "status": "queued",
-                         "assignment": item.get("task"), "deliverable": item.get("deliverable"),
-                         "parent": item.get("parent"), "route": item.get("route_info"),
-                         "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created")})
+    for path in queue_files(base):
+        _, item, reason = queue_entry(path)
+        item = item or {}  # a refused entry shows only its file name and why
+        rows.append({"id": item.get("id", path.stem), "role": item.get("role"), "harness": item.get("worker"),
+                     "model": item.get("model"), "effort": item.get("thinking"), "status": "queued",
+                     "assignment": item.get("task"), "deliverable": item.get("deliverable"),
+                     "parent": item.get("parent"), "route": item.get("route_info"),
+                     "reason": reason or item.get("queue_reason") or None,
+                     "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created")})
     return sorted(rows, key=lambda row: row.get("updated") or "")
 
 
@@ -132,7 +135,7 @@ def write_index(base):
     objective = base / "session-objective.md"
     def brief(row):
         return {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
-                "deliverable", "task_dir", "result_path", "permission", "capability_request", "updated")}
+                "deliverable", "task_dir", "result_path", "permission", "capability_request", "reason", "updated")}
     value = {
         "schema": "tp-session-index:v1", "updated": now(),
         "objective": objective.read_text().strip() if objective.exists() else "",
@@ -193,7 +196,7 @@ def escalation_evidence(base, previous):
     return failed, changes
 
 
-def escalation_route(base, previous, args):
+def escalation_route(base, previous, args, contexts):
     """(worker, model, effort, route_info) for `retry --escalate`: effort up before level, only after the catalog's
     number of failed attempts or REQUEST_CHANGES reviews."""
     sys.path.insert(0, str(ROOT / "lib"))
@@ -207,7 +210,7 @@ def escalation_route(base, previous, args):
                          f"{changes}. Retry without --escalate, or request a level explicitly with --level")
     meta = read_json(previous / "meta.json")
     try:  # the task text and admitted context, so the escalation record carries the same card hash as the dispatch
-        meta = dict(meta, task=(previous / "request.md").read_text().strip(), context=replay_inputs(previous)[0])
+        meta = dict(meta, task=(previous / "request.md").read_text().strip(), context=contexts)
     except OSError:
         pass
     result = model_router.escalate_route(meta, catalog, role=args.role or meta.get("role"), worker=args.worker,
@@ -216,7 +219,10 @@ def escalation_route(base, previous, args):
     return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
-def capacity(base, proposed, worker, model):
+def capacity(base, item):
+    """(ok, reason) for starting a queue item now. The item is validated here, so no caller can pass raw data."""
+    item = queue_item(item)
+    worker, model = item["worker"], item["model"]
     cfg = read_json(ROOT / "config/orchestration.json")
     active = [r for r in all_records(base) if r["status"] in {"starting", "working", "needs_input"}]
     if len(active) >= int(cfg.get("max_active_workers", 4)):
@@ -225,7 +231,7 @@ def capacity(base, proposed, worker, model):
         local = [r for r in active if r.get("harness") == "pi" and str(r.get("model") or "").startswith(LOCAL)]
         if len(local) >= int(cfg.get("max_local_workers", 2)):
             return False, "local model slots full"
-    for parent in proposed.get("after", []):
+    for parent in item["after"]:
         try:
             predecessor = record(task_dir(base, parent))
         except ValueError:
@@ -248,41 +254,36 @@ def admitted_context(path, specs):
     return admitted, omitted
 
 
-def replay_inputs(previous):
-    """Return (context, notes, remark) to replay from a prior attempt; malformed records replay nothing."""
-    source = previous / "dispatch.json"
-    if not source.exists():
-        return [], [], "The prior attempt has no dispatch record, so its selected context and notes were not replayed"
-    try:
-        kept = json.loads(source.read_text())
-    except (OSError, ValueError):
-        kept = None
-    fields = [kept.get(key, []) for key in ("context", "omitted_context", "notes")] if isinstance(kept, dict) else [None]
-    if not all(isinstance(field, list) and all(isinstance(entry, str) for entry in field) for field in fields):
-        return [], [], "The prior dispatch record is malformed, so its selected context and notes were not replayed"
+def replay_inputs(previous, kept, problem=None):
+    """Return (context, notes, remark) to replay from a prior attempt. `kept` is dispatch_record's return value, or
+    None with its RecordError as `problem`; an unusable record replays nothing."""
+    if kept is None:
+        return [], [], ("The prior attempt has no dispatch record, so its selected context and notes were not replayed"
+                        if problem is not None and problem.missing
+                        else "The prior dispatch record is malformed, so its selected context and notes were not replayed")
     # Recheck against the prior packet too: records written before admission was tracked hold raw specs.
-    contexts, omitted = admitted_context(previous, fields[0])
-    omitted = len(set(fields[1] + omitted))
-    notes = [note for note in fields[2] if not note.startswith("Retry of ")]
+    contexts, omitted = admitted_context(previous, kept["context"])
+    omitted = len(set(kept["omitted_context"] + omitted))
+    notes = [note for note in kept["notes"] if not note.startswith("Retry of ")]
     return contexts, notes, (f"{omitted} context input(s) omitted as sensitive in the prior attempt were not replayed"
                              if omitted else "")
 
 
 def launch(base, item):
+    item = queue_item(item)  # every field below comes from the validator's return value
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
             "--worker", item["worker"], "--model", item["model"], "--thinking", item["thinking"],
-            "--route-json", json.dumps(item["route_info"])]
-    if item.get("deliverable"):
+            "--route-json", json.dumps(item["route_info"]), "--tests", item["tests"]]
+    if item["deliverable"]:
         args += ["--deliverable", item["deliverable"]]
-    if item.get("workdir"):
-        args += ["--workdir", item["workdir"]]
-    if item.get("parent"):
+    args += ["--workdir", item["workdir"]]
+    if item["parent"]:
         args += ["--parent", item["parent"]]
-    for spec in item.get("context", []):
+    for spec in item["context"]:
         args += ["--context", spec]
-    for note in item.get("notes", []):
+    for note in item["notes"]:
         args += ["--note", note]
-    for parent in item.get("after", []):
+    for parent in item["after"]:
         predecessor = record(task_dir(base, parent))
         if predecessor.get("result_path"):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
@@ -292,9 +293,9 @@ def launch(base, item):
         raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
     # Record what the packet actually admitted so retry never replays an omitted sensitive input.
     path = task_dir(base, item["id"])
-    admitted, omitted = admitted_context(path, item.get("context", []))
+    admitted, omitted = admitted_context(path, item["context"])
     atomic_json(path / "dispatch.json",
-                {"context": admitted, "omitted_context": omitted, "notes": item.get("notes", [])})
+                {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"]})
     return record(task_dir(base, item["id"]))
 
 
@@ -305,21 +306,185 @@ def locked(base):
     return lock
 
 
+def check_workdir(role, workdir=None):
+    """The canonical absolute workdir tp-spawn --check validated (explicit, else the main pane's); ValueError if
+    tp-spawn refuses it or reports anything but an absolute path."""
+    command = [str(ROOT / "bin/tp-spawn"), "--check", "--role", role] + (["--workdir", workdir] if workdir else []) + ["--", "check"]
+    run = subprocess.run(command, text=True, capture_output=True)
+    if run.returncode:
+        raise ValueError(run.stderr.strip() or "tp-spawn could not check the workdir")
+    effective = run.stdout.strip()
+    if not effective.startswith("/") or "\n" in effective:
+        raise ValueError(f"tp-spawn did not report a usable workdir: {run.stdout.strip()!r}")
+    return effective
+
+
+def string_list(value):
+    return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+
+
+QUEUE_TEXT = ("id", "role", "worker", "model", "thinking", "task")
+
+
+def queue_item(value, name=None):
+    """The one check of a queue item (what dispatch writes to queue/<id>.json). It covers every field any reader uses
+    and returns a new dict of just those fields, normalised; launch, capacity, tick, the index and the queue views take
+    their data only from this return value. Every field but queue_reason is required, tests included: the default
+    scope is applied only where dispatch builds the record from the command line, never to a stored one. `name` is
+    the file stem the id must match. ValueError says which field is wrong."""
+    if not isinstance(value, dict):
+        raise ValueError("the queue entry is not an object")
+    for key in QUEUE_TEXT:
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError(f"the record has no usable {key}")
+    if not IDENT.fullmatch(value["id"]) or (name is not None and value["id"] != name):
+        raise ValueError(f"the record id {value['id']!r} is not a valid id matching its file")
+    if not IDENT.fullmatch(value["role"]) or not (ROLES / f"{value['role']}.md").is_file():
+        raise ValueError(f"the record has an unknown role {value['role']!r}")
+    if value["worker"] not in ("pi", "claude"):
+        raise ValueError(f"the record has an unknown worker {value['worker']!r}")
+    workdir = value.get("workdir")
+    if not isinstance(workdir, str) or not workdir.startswith("/"):
+        raise ValueError(f"the record has no validated workdir ({workdir!r}); dispatch it again with --workdir")
+    if "tests" not in value:
+        raise ValueError("the record has no test scope")
+    tests = value["tests"]
+    if not isinstance(tests, str) or tests not in TESTS_SCOPES:
+        raise ValueError(f"the record has an invalid test scope {tests!r}")
+    if not isinstance(value.get("route_info"), dict):
+        raise ValueError("the record has no route information")
+    for key in ("created", "deliverable", "parent"):
+        if not isinstance(value.get(key), str):
+            raise ValueError(f"the record has no usable {key}")
+    for key in ("after", "context", "notes"):
+        if not string_list(value.get(key)):
+            raise ValueError(f"the record's {key} is not a list of strings")
+    if not all(IDENT.fullmatch(parent) for parent in value["after"]):
+        raise ValueError("the record's after list holds an invalid task id")
+    clean = {key: value[key] for key in QUEUE_TEXT + ("workdir", "route_info", "created", "deliverable", "parent")}
+    clean.update({key: list(value[key]) for key in ("after", "context", "notes")}, tests=tests)
+    if "queue_reason" in value:  # optional (tp-agent's own note, only displayed), but a present value must be text
+        if not isinstance(value["queue_reason"], str):
+            raise ValueError("the record's queue_reason is not text")
+        clean["queue_reason"] = value["queue_reason"]
+    return clean
+
+
+def read_queue_file(path):
+    """The decoded content of a queue file. The entry is lstat'ed first and anything that is not a regular file
+    (a symlink, readable or dangling, a FIFO, socket, device, directory) is refused unopened, so it can neither block
+    a reader nor be followed to a record elsewhere."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError("it is not a regular file")
+        return json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError) as error:
+        raise ValueError(f"cannot read {path.name} ({error})")
+
+
+def queue_files(base):
+    """The queue entries, oldest first. Every *.json name is an entry, a dangling symlink or a directory included
+    (queue_entry refuses it with a reason); only one that vanishes while listing is skipped."""
+    found = []
+    for path in (base / "queue").glob("*.json"):
+        try:
+            found.append((path.lstat().st_mtime, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(found)]
+
+
+def queue_entry(path):
+    """(raw, item, reason) for one queue file. raw is the decoded content (None if unreadable); item is queue_item's
+    return value, or None with reason 'start refused: why'. The one way any reader gets an item from a file."""
+    raw = None
+    try:
+        raw = read_queue_file(path)
+        return raw, queue_item(raw, path.stem), ""
+    except ValueError as error:
+        return raw, None, f"start refused: {error}"
+
+
+def printable(text):
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(text))
+
+
+def queue_view(base):
+    """One display line per queue entry, for tp-list and tp-status. A refused entry shows its file name and why;
+    it is never shown as an ordinary queued task."""
+    lines = []
+    for path in queue_files(base):
+        _, item, reason = queue_entry(path)
+        lines.append(printable(f"  {path.stem}  queued  {reason}") if item is None else
+                     printable(f"  {item['id']}  {item['role']}  queued  {item.get('queue_reason', '')}"))
+    return lines
+
+
+class RecordError(ValueError):
+    def __init__(self, message, missing=False):
+        super().__init__(message)
+        self.missing = missing
+
+
+def dispatch_record(previous):
+    """The one check of a task's dispatch.json (what launch writes). Covers every field a reader uses and returns
+    {"context", "omitted_context", "notes", "tests"}; tests is None only in an older record that predates the field.
+    Retry's replay and its recorded test scope take their data only from this return value. RecordError otherwise;
+    omitted_context is optional (older records lack it) but a list of strings when present."""
+    path = previous / "dispatch.json"
+    try:
+        kept = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise RecordError(f"cannot read the prior dispatch record {path} (no such file)", missing=True)
+    except (OSError, ValueError) as error:
+        raise RecordError(f"cannot read the prior dispatch record {path} ({error})")
+    if not isinstance(kept, dict):
+        raise RecordError(f"the prior dispatch record {path} is malformed (not an object)")
+    for key in ("context", "notes") + (("omitted_context",) if "omitted_context" in kept else ()):
+        if not string_list(kept[key] if key in kept else None):
+            raise RecordError(f"the prior dispatch record {path} is malformed ({key} is not a list of strings)")
+    tests = kept.get("tests")
+    if "tests" in kept and (not isinstance(tests, str) or tests not in TESTS_SCOPES):
+        raise RecordError(f"the prior dispatch record {path} has an invalid test scope {tests!r}")
+    return {"context": list(kept["context"]), "omitted_context": list(kept.get("omitted_context", [])),
+            "notes": list(kept["notes"]), "tests": tests}
+
+
+def prior_dispatch(previous):
+    """(record, None) from dispatch_record, or (None, the RecordError)."""
+    try:
+        return dispatch_record(previous), None
+    except RecordError as error:
+        return None, error
+
+
 def dispatch(args, base):
     if not (ROLES / f"{args.role}.md").is_file():
         raise ValueError(f"unknown role: {args.role}")
+    tests = getattr(args, "tests", None)
+    if tests is None:  # a caller that never sets the field (not a read value) gets the dispatch default
+        tests = TESTS_DEFAULT
+    if tests not in TESTS_SCOPES:
+        raise ValueError(f"--tests must be one of {', '.join(TESTS_SCOPES)}")
+    # Refuse before routing or queueing. tp-spawn resolves the effective workdir (the explicit one, else the main
+    # pane's) exactly as it will when it builds the packet, so both dispatch forms are checked the same way.
+    # The canonical directory it reports is what the task stores, routing reads and launch passes back, so a queued
+    # task cannot start in a different repository than the one validated here.
+    workdir = check_workdir(args.role, args.workdir)
+    if not args.workdir:  # recheck the resolved directory the way launch will pass it (an explicit --workdir)
+        workdir = check_workdir(args.role, workdir)
     chosen = getattr(args, "preroute", None) or route(
         args.task, args.role, args.worker, args.model, args.thinking, args.context or [], args.deliverable,
         level=getattr(args, "level", None), approve_effort=getattr(args, "approve_effort", False),
-        local_only=getattr(args, "local_only", False), workdir=args.workdir, base=base)
+        local_only=getattr(args, "local_only", False), workdir=workdir, base=base)
     worker, model, thinking, info = chosen
-    item = {"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
-            "task": args.task, "workdir": args.workdir, "worker": worker, "model": model,
+    item = queue_item({"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
+            "task": args.task, "workdir": workdir, "worker": worker, "model": model,
             "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
-            "notes": args.note or []}
+            "notes": args.note or [], "tests": tests})
     with locked(base):
-        ok, reason = capacity(base, item, worker, model)
+        ok, reason = capacity(base, item)
         if ok:
             value = launch(base, item)
         else:
@@ -331,22 +496,37 @@ def dispatch(args, base):
     return value
 
 
+def note_queue_reason(path, raw, reason):
+    """Leave the entry queued with why it did not start. Only an object can carry a reason; an unreadable or
+    non-object entry is never rewritten (that would destroy it) and is reported in tick's output instead."""
+    if isinstance(raw, dict) and raw.get("queue_reason") != reason:
+        try:
+            atomic_json(path, dict(raw, queue_reason=reason))
+        except OSError:
+            pass
+
+
 def tick(base):
-    started = []
+    started, refused = [], []
     with locked(base):
-        for path in sorted((base / "queue").glob("*.json"), key=lambda p: p.stat().st_mtime) if (base / "queue").exists() else []:
-            item = read_json(path)
-            ok, _ = capacity(base, item, item["worker"], item["model"])
-            if not ok:
+        for path in queue_files(base):
+            raw, item, reason = queue_entry(path)
+            if item is None:
+                note_queue_reason(path, raw, reason)
+                refused.append({"id": path.stem, "reason": reason})
                 continue
             try:
+                ok, _ = capacity(base, item)
+                if not ok:
+                    continue
                 started.append(launch(base, item)["id"])
                 path.unlink()
-            except RuntimeError as error:
-                item["queue_reason"] = f"start failed: {error}"
-                atomic_json(path, item)
+            except (ValueError, RuntimeError, OSError) as error:
+                reason = f"start failed: {error}"
+                note_queue_reason(path, raw, reason)
+                refused.append({"id": item["id"], "reason": reason})
         write_index(base)
-    return {"started": started}
+    return {"started": started, "refused": refused}
 
 
 def discover_context(task, workdir=None):
@@ -401,6 +581,9 @@ def main():
     d.add_argument("--after", action="append", default=[])
     d.add_argument("--context", action="append", default=[])
     d.add_argument("--note", action="append", default=[])
+    d.add_argument("--tests", choices=TESTS_SCOPES, default=TESTS_DEFAULT,
+                   help="how much of the test suite the worker runs: affected (default) = the tests that check "
+                        "what it changed, full = everything, none")
     retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
     retry.add_argument("id")
     retry.add_argument("--reason", required=True)
@@ -412,6 +595,7 @@ def main():
     retry.add_argument("--level", help="explicit catalog level key")
     retry.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     retry.add_argument("--local-only", action="store_true")
+    retry.add_argument("--tests", choices=TESTS_SCOPES, help="test scope; default is the prior attempt's")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
     rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author)")
@@ -422,6 +606,8 @@ def main():
     rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     for name in ("list", "tick"):
         sub.add_parser(name)
+    # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
+    sub.add_parser("queue-view")
     # --no-tick: write and print the index without launching queued work.
     sub.add_parser("index").add_argument("--no-tick", action="store_true")
     for name in ("inspect", "collect", "stop"):
@@ -444,6 +630,10 @@ def main():
         print(json.dumps(discover_context(args.task, args.workdir), indent=2))
         return
     base = state_dir()
+    if args.command == "queue-view":
+        for line in queue_view(base):
+            print(line)
+        return
     if args.command == "dispatch":
         value = dispatch(args, base)
     elif args.command == "retry":
@@ -457,12 +647,19 @@ def main():
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
-        contexts, notes, remark = replay_inputs(previous)
+        kept, problem = prior_dispatch(previous)
+        contexts, notes, remark = replay_inputs(previous, kept, problem)
+        if args.tests:
+            tests = args.tests
+        elif kept is None:
+            raise ValueError(f"{problem}; the prior attempt's test scope is unknown, pass --tests")
+        else:
+            tests = kept["tests"] or TESTS_DEFAULT  # None only in an older valid record
         preroute = None
         if args.escalate:
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
-            preroute = escalation_route(base, previous, args)
+            preroute = escalation_route(base, previous, args, contexts)
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
                                          task=args.task or original, worker=args.worker,
                                          model=args.model, thinking=args.thinking, level=args.level,
@@ -471,9 +668,12 @@ def main():
                                          workdir=meta.get("workdir"),
                                          deliverable=meta.get("deliverable", ""),
                                          parent=args.id, after=[], context=contexts,
+                                         tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
                                                       + (f" {remark}; see the prior packet." if remark else "")])
         value = dispatch(replacement, base)
+        if problem is not None:  # reachable only through an explicit --tests
+            value = dict(value, prior_record=f"not used: {problem}")
     elif args.command == "review":
         task_dir(base, args.id)
         value = review(base, args)
@@ -501,8 +701,11 @@ def main():
         write_index(base)
     elif args.command in {"inspect", "collect", "stop", "message"}:
         queued = base / "queue" / f"{args.id}.json"
-        if args.command == "stop" and IDENT.fullmatch(args.id) and queued.is_file():
-            queued.unlink()
+        if args.command == "stop" and IDENT.fullmatch(args.id) and (queued.is_symlink() or queued.exists()):
+            if queued.is_dir() and not queued.is_symlink():
+                queued.rmdir()  # an empty directory named like an entry; a full one refuses (OSError)
+            else:
+                queued.unlink()
             value = {"id": args.id, "status": "stopped"}
             write_index(base)
             print(json.dumps(value, indent=2))

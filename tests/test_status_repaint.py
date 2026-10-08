@@ -246,8 +246,20 @@ class StatusRepaintTest(StatusPaneFixture):
         self.barrier()                      # placeholder clicks handled before the queue exists
         queue = self.state / "queue"
         queue.mkdir()
-        (queue / "q.json").write_text(json.dumps({"id": "queued1", "role": "coder"}))
-        self.assertIn(b"queued1", self.output_until(lambda frame: b"queued1" in frame))
+        (queue / "queued1.json").write_text(json.dumps({
+            "id": "queued1", "created": "2026-10-08T00:00:00+00:00", "role": "coder", "task": "t", "workdir": "/tmp",
+            "worker": "pi", "model": "m", "thinking": "low", "route_info": {}, "deliverable": "", "parent": "",
+            "after": [], "context": [], "notes": [], "tests": "affected", "queue_reason": "global worker slots full"}))
+        # an entry that is not a complete record shows its file name and why, never as an ordinary queued row
+        (queue / "q-null.json").write_text("null")
+        (queue / "q-partial.json").write_text(json.dumps({"id": "q-partial", "role": "coder"}))
+        (queue / "q-broken.json").write_text("{not json")
+        shown = self.output_until(lambda frame: all(n in frame for n in (b"queued1", b"q-null", b"q-partial", b"q-broken")))
+        frame = shown.split(ESC)[-1]
+        self.assertIn(b"queued1  coder  queued  global worker slots full", frame)
+        for name in (b"q-null", b"q-partial", b"q-broken"):
+            self.assertRegex(frame, name + rb"  queued  start refused: ")
+        self.assertNotIn(b"null  null", frame)
         self.click(3)
         self.click(4)
         self.barrier()

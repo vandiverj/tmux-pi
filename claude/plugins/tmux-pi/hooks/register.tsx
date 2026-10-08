@@ -253,11 +253,12 @@ async function poll($: EngineInterface) {
 
 function indexLine(row: unknown): string | undefined {
   if (typeof row !== 'object' || row === null) return undefined
-  const { id, role, harness, status, result_status, result_path } = row as Record<string, unknown>
+  const { id, role, harness, status, result_status, result_path, reason } = row as Record<string, unknown>
   if (typeof id !== 'string') return undefined
   const fields = [id, role, harness, status].filter(field => typeof field === 'string' && field !== '')
   if (typeof result_status === 'string') fields.push(`result=${result_status}`)
   if (typeof result_path === 'string') fields.push(result_path)
+  if (typeof reason === 'string' && reason !== '') fields.push(`(${reason})`)
   return `- ${fields.join(' ')}`
 }
 

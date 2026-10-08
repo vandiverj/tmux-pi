@@ -240,14 +240,14 @@ class DispatchTests(Base):
         self.assertIn("router unavailable", meta["route_info"]["reason"])
 
     def test_stop_and_ask_is_an_error_not_a_guess(self):
-        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--local-only", check=False)
+        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--local-only", "--workdir", str(self.project), check=False)
         self.assertEqual(run.returncode, 1)
         self.assertIn("tp-agent:", run.stderr)
         self.assertEqual(list((self.state / "tasks").iterdir()), [])
         self.assertEqual(self.selections()[-1]["status"], "stop_and_ask")
 
     def test_level_hidden_is_rejected(self):
-        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--level", "strong", check=False)
+        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--level", "strong", "--workdir", str(self.project), check=False)
         self.assertEqual(run.returncode, 1)
         self.assertIn("not offered", run.stderr)
 
@@ -331,7 +331,7 @@ class LocalOnlyCommandTests(Base):
     def test_dispatch_rejects_an_explicit_choice_that_is_not_local_and_starts_nothing(self):
         for args in self.CLOUD_CHOICES:
             with self.subTest(args=args):
-                run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--local-only", *args, check=False)
+                run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--local-only", "--workdir", str(self.project), *args, check=False)
                 self.assertEqual(run.returncode, 1, run.stdout)
                 self.assertIn("local", run.stderr)
         self.assertEqual(list((self.state / "tasks").iterdir()), [])
@@ -401,8 +401,8 @@ class ExplicitValidationCommandTests(Base):
                 run = self.tp_route(*args)
                 self.assertEqual((run.returncode, run.stdout), (1, ""), run.stderr)
                 self.assertIn(needle, run.stderr)
-                run = self.agent("dispatch", "--role", "coder", "--task", TASK, *[a for a in args if a != "--workdir" and a != str(self.project)],
-                                 check=False) if "--context" not in args else None
+                run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--workdir", str(self.project),
+                                 *[a for a in args if a != "--workdir" and a != str(self.project)], check=False) if "--context" not in args else None
                 if run:
                     self.assertEqual(run.returncode, 1, run.stdout)
         self.assertEqual(list((self.state / "tasks").iterdir()), [])

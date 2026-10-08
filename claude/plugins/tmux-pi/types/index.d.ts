@@ -15,6 +15,7 @@ export type TaskSummary = {
   paused: number
   pausedWithStatus: number
   failed: number
+  refused: number
   needsInput: string[]
 }
 

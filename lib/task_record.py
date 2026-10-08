@@ -19,6 +19,7 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import review_verdict  # noqa: E402
+from task_archive import find_archived_task  # noqa: E402,F401  (re-exported: archive_task names what it finds)
 
 MARKER = "<!-- tmux-pi-task-record:v1 -->"
 ACCEPTED_STATES = {"starting", "working", "needs_input", "settled", "completed", "paused", "failed", "killed", "stopped", "escalated"}

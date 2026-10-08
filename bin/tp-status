@@ -43,6 +43,7 @@ source "$ROOT/lib/tp.sh"
 session="$(tp_session)" || exit 1
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 tasks="$state_dir/tasks"
+session_label="session ${session//[[:cntrl:]]/?}"   # the header says whose tasks these are; they are this session's alone
 last_tick=-5 tick_pid="" tick_note=""   # tick_note: why the background tick is not doing its work, shown in the footer
 keep="${TP_STATUS_WINDOW-60}"
 [[ "$keep" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "tp-status: TP_STATUS_WINDOW must be a positive number, not '$keep'" >&2; exit 1; }
@@ -245,7 +246,7 @@ load_data() {
 }
 
 render() {
-  local out i id worker status tool tokens cost model line c sel_index detail life role y header hint count_label n hdr budget sum_text sum_n sel_text sel_n msg_text msg_n need want used area full vis lines_left permission requested ul sl compact
+  local qi qshow out i id worker status tool tokens cost model line c sel_index detail life role y header hint count_label n hdr budget sum_text sum_n sel_text sel_n msg_text msg_n need want used area full vis lines_left permission requested ul sl compact
   frame_cols="$cols"
   compact=0
   (( frame_lines < 16 )) && compact=1
@@ -278,8 +279,8 @@ render() {
     fi
     out=""
     for line in "${ul[@]}"; do clip "$cols" "$line"; out+="${dim}${R}${reset}${esc}[K"$'\n'; done
-    clip $((cols - 8 - ${#tick_flag})) "s back to list"
-    header="${esc}[H${bold}usage${tick_flag}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
+    clip $((cols - 8 - ${#tick_flag} - ${#session_label} - 3)) "s back to list"
+    header="${esc}[H${bold}usage${tick_flag} · ${session_label}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
     frame="${header}${out}${esc}[J"
     return 0
   fi
@@ -368,19 +369,29 @@ render() {
       i=$((i + 1))
     done <<<"$rows"
   fi
-  if (( nq )); then
-    for line in "${queue_lines[@]}"; do
-      (( lines_left >= 1 )) || break
-      clip "$cols" "$line"
+  if (( nq && lines_left >= 1 )); then
+    # Every queue line that does not fit is counted: the last line left says how many are not shown (an entry shown
+    # there instead would hide that others exist).
+    qshow=${#queue_lines[@]}
+    if (( qshow > lines_left )); then qshow=$(( lines_left - 1 )); fi
+    for (( qi = 0; qi < qshow; qi++ )); do
+      clip "$cols" "${queue_lines[qi]}"
       out+="${magenta}${R}${reset}${esc}[K"$'\n'
-      lines_left=$((lines_left - 1))
     done
+    if (( qshow < ${#queue_lines[@]} )); then
+      clip "$cols" "+$(( ${#queue_lines[@]} - qshow )) more queued (enlarge pane)"
+      out+="${magenta}${R}${reset}${esc}[K"$'\n'
+    fi
+    lines_left=$(( lines_left - qshow - (qshow < ${#queue_lines[@]} ? 1 : 0) ))
   fi
   out+="$sum_text$sel_text$msg_text"
   count_label="subagents $agents"
   if (( agents < total )); then count_label+="/$total"; fi
+  # No line was left for the queue (active rows filled the pane): the header carries the count instead, so queued and
+  # refused entries are never silently absent.
+  if (( nq && lines_left < 1 )); then count_label+=" · ${#queue_lines[@]} queued/refused (enlarge pane)"; fi
   if (( new_below )); then count_label+=" · ↓ new worker (G)"; fi
-  count_label+="$tick_flag"
+  count_label+="$tick_flag · $session_label"
   clip $((cols - ${#count_label} - 2)) "s stats · click/j/k move · g/G top/bottom · PgUp/PgDn · enter view · o focus · - clear · r result · t packet · x kill · c clean"
   header="${esc}[H${bold}${count_label}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
   (( compact )) || header+="${esc}[K"$'\n'

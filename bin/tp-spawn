@@ -158,18 +158,6 @@ if [[ "$explicit_workdir" == 1 ]]; then
     die "--workdir must select a project directory outside tmux-pi state"
 fi
 
-if [[ "$check" == 1 ]]; then
-  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" >/dev/null || exit 1
-  printf '%s\n' "$workdir"
-  exit 0
-fi
-
-# LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
-if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then
-  "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
-    echo "tp-spawn: warning: ${model#lmstudio/} is not loaded in LM Studio; the worker may fail" >&2
-fi
-
 # Limits keep packets to selected context rather than whole trees.
 max_file=60000 max_packet=200000
 
@@ -182,6 +170,70 @@ secret_file() {
   jq -e '.sensitive == false' <<<"$decision" >/dev/null 2>&1 && return 1
   return 0
 }
+
+# largest_range <path> <start> <end> — the last line of start..end whose lines fit max_file characters, or nothing when
+# line start alone does not.
+largest_range() {
+  python3 - "$1" "$2" "$3" "$max_file" <<'PY'
+import sys
+path, start, end, cap = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+size = last = 0
+for number in range(start, min(end, len(lines)) + 1):
+    size += len(lines[number - 1]) + (1 if number > start else 0)
+    if size > cap:
+        break
+    last = number
+print(last or "")
+PY
+}
+
+# read_context <spec> — sets path, range, body and label for one --context spec and returns 0; returns 1 for a sensitive
+# file (nothing is read); dies for a missing, binary or too large one. A body over the cap is refused with the cap, the size
+# and the largest range from the same first line that fits. tp-spawn --check runs it too, so dispatch refuses a spec before
+# routing instead of at the launch.
+read_context() {
+  local spec="$1" start end fit lines
+  path="$spec" range="" body="" label=""
+  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
+    path="${BASH_REMATCH[1]}" range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+  fi
+  [[ "$path" == /* ]] || path="$workdir/$path"
+  [[ -f "$path" ]] || die "context file not found: $spec"
+  secret_file "$path" && return 1
+  if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
+  if [[ -n "$range" ]]; then
+    start="${range%-*}" end="${range#*-}"
+    (( start >= 1 && end >= start )) || die "bad line range: $spec"
+    body="$(sed -n "${start},${end}p" "$path")"
+    label="${path#"$workdir"/} (lines $start-$end)"
+  else
+    start=1 end=2147483647
+    body="$(cat "$path")"
+    label="${path#"$workdir"/}"
+  fi
+  if (( ${#body} > max_file )); then
+    fit="$(largest_range "$path" "$start" "$end")"
+    if [[ -n "$fit" ]]; then
+      die "$spec is ${#body} chars; the limit is $max_file. The largest range that fits from line $start is ${path#"$workdir"/}:$start-$fit; pass a line range with path:start-end"
+    fi
+    die "$spec is ${#body} chars; the limit is $max_file, and line $start alone is over it. Pass a range of other lines with path:start-end"
+  fi
+  return 0
+}
+
+if [[ "$check" == 1 ]]; then
+  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" >/dev/null || exit 1
+  for spec in ${contexts[@]+"${contexts[@]}"}; do read_context "$spec" || true; done
+  printf '%s\n' "$workdir"
+  exit 0
+fi
+
+# LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
+if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then
+  "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
+    echo "tp-spawn: warning: ${model#lmstudio/} is not loaded in LM Studio; the worker may fail" >&2
+fi
 
 # fence <text> — a backtick fence longer than any run inside the text.
 fence() {
@@ -317,27 +369,10 @@ if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file"
   packet+=$'\n'
 fi
 for spec in ${contexts[@]+"${contexts[@]}"}; do
-  path="$spec" range=""
-  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
-    path="${BASH_REMATCH[1]}" range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-  fi
-  [[ "$path" == /* ]] || path="$workdir/$path"
-  [[ -f "$path" ]] || die "context file not found: $spec"
-  if secret_file "$path"; then
+  if ! read_context "$spec"; then
     notes+=("Sensitive context $spec was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")
     continue
   fi
-  if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
-  if [[ -n "$range" ]]; then
-    start="${range%-*}" end="${range#*-}"
-    (( start >= 1 && end >= start )) || die "bad line range: $spec"
-    body="$(sed -n "${start},${end}p" "$path")"
-    label="${path#"$workdir"/} (lines $start-$end)"
-  else
-    body="$(cat "$path")"
-    label="${path#"$workdir"/}"
-  fi
-  (( ${#body} <= max_file )) || die "$spec is ${#body} chars (max $max_file); pass a line range with path:start-end"
   ext="${path##*.}"; [[ "$ext" == "$path" || "$ext" == */* ]] && ext=""
   f="$(fence "$body")"
   packet+=$'\n'"## $label"$'\n\n'"$f$ext"$'\n'"$body"$'\n'"$f"$'\n'

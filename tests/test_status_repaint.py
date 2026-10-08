@@ -281,6 +281,35 @@ class StatusRepaintTest(StatusPaneFixture):
         self.barrier()
         self.assertEqual(self.swaps(), [])
 
+    def test_a_small_pane_counts_the_queue_lines_it_cannot_show(self):
+        self.make_jobs(1)
+        queue = self.state / "queue"
+        queue.mkdir()
+        for name in ("q-a", "q-b", "q-c", "q-d"):
+            (queue / (name + ".json")).write_text("null")
+        (self.base / "lines").write_text("6\n")      # compact: header, the job, then three lines for four queue entries
+        frame = self.first_frame(b"more queued", seconds=10).split(ESC)[-1]
+        self.assertIn(b"+2 more queued", frame)
+        self.assertEqual(frame.count(b"start refused: "), 2)    # the last line left is the count, not a third entry
+        (self.base / "lines").write_text("7\n")      # room for all four: nothing to count
+        frame = self.output_until(lambda f: f.count(b"start refused: ") == 4).split(ESC)[-1]
+        self.assertNotIn(b"more queued", frame)
+
+    def test_a_pane_full_of_active_rows_still_counts_the_queue_in_the_header(self):
+        self.make_jobs(1)
+        queue = self.state / "queue"
+        queue.mkdir()
+        for name in ("q-a", "q-b", "q-c", "q-d"):
+            (queue / (name + ".json")).write_text("null")
+        (self.base / "lines").write_text("3\n")      # header, the job, and no line left for the queue (lines_left 0)
+        frame = self.first_frame(b"queued/refused", seconds=10).split(ESC)[-1]
+        self.assertIn(b"4 queued/refused", frame)
+        self.assertNotIn(b"start refused: ", frame)
+
+    def test_the_header_says_which_session_the_pane_shows(self):
+        frame = self.first_frame(b"subagents 0", seconds=10).split(ESC)[-1]
+        self.assertIn(b"subagents 0 \xc2\xb7 session fake", frame)
+
     def test_idle_no_workers_and_resize(self):
         first = self.first_frame(b"no subagents", settle=0.3)   # a duplicate initial repaint would show here
         self.assertIn(b"no subagents", first)

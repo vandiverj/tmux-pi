@@ -728,7 +728,7 @@ def ledger_row(task_dir, now):
             "started": meta.get("created"),
             "elapsed_s": round(result["elapsed"]) if result else None,
             "turns": state.get("turns"), "tokens": {k: tokens.get(k, 0) for k in ("input", "output", "cacheRead", "cacheWrite")},
-            "cost": state.get("cost"),
+            "cost": None if state.get("costKnown") is False else state.get("cost"),  # a harness that reports none (Claude) has no cost, not 0
             "artifact": contract["artifact"] if contract else None,
             "artifact_status": "reply-only" if reply_only else art["status"] if art else None,
             "artifact_chars": art["size"] if art else None,

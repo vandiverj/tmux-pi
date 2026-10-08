@@ -475,6 +475,18 @@ test('the band shows counts and who needs input, on each surface', async ($, on)
   }
 })
 
+test('the band does not count a refused queue entry as active', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }, { id: 'shape01', status: 'queued', reason: 'start refused: the queue entry is not an object' },
+    { id: 'coder-9', status: 'queued', reason: 'waiting for coder-1' }]
+  await $.session.start(start(true))
+  const ui = await $.ui.mount({ plugin: 'tmux-pi', surface: 'terminal', component: 'AbovePrompt', props: BAND as never })
+  const band = await ui.find({ type: 'Text', text: /workers:/ })
+  expect(band?.text).toContain('2 active')
+  expect(band?.text).toContain('1 refused')
+  await ui.unmount()
+})
+
 test('a long id list is cut to the band width', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = Array.from({ length: 12 }, (_, i) => ({ id: `researcher-${i}abcdef`, status: 'needs_input' }))

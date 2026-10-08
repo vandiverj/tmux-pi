@@ -49,6 +49,11 @@ fs.mkdirSync(path.join(stubRoot, 'agent')); fs.mkdirSync(path.join(stubRoot, 'bi
 const seen = path.join(stubRoot, 'seen.json');
 const stub = path.join(stubRoot, 'bin/tp-sensitive-read');
 fs.writeFileSync(stub, `#!/bin/sh\ncat > "${seen}"\necho '{"sensitive":false}'\n`, { mode: 0o755 });
+// A stub trust-store guard: records what it receives and answers with the contents of `verdict`.
+const guardSeen = path.join(stubRoot, 'guard-seen.json');
+const verdict = path.join(stubRoot, 'verdict');
+fs.writeFileSync(verdict, '{"deny":false,"reason":null}');
+fs.writeFileSync(path.join(stubRoot, 'bin/tp-trust-guard'), `#!/bin/sh\ncat > "${guardSeen}"\ncat "${verdict}"\n`, { mode: 0o755 });
 process.env.PI_CODING_AGENT_DIR = path.join(stubRoot, 'agent');
 const h4 = {};
 mod.default({ on(name, fn) { h4[name] = fn; } });
@@ -61,6 +66,87 @@ for (const odd of [undefined, '', 42, null]) {
   await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: odd, hasUI: false });
   assert.ok(!('cwd' in JSON.parse(fs.readFileSync(seen, 'utf8'))), `cwd ${String(odd)} sent`);
 }
+
+// The trust-store guard runs first, in every redaction mode; a deny, a crash or an unreadable answer blocks and never reaches the classifier.
+assert.equal(JSON.parse(fs.readFileSync(guardSeen, 'utf8')).cwd, undefined, 'guard saw the last (cwd-less) call');
+for (const mode of ['on', 'shadow', 'off']) {
+  process.env.TP_REDACTION = mode;
+  fs.rmSync(seen, { force: true }); fs.rmSync(guardSeen, { force: true });
+  await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: '/some/session/dir', hasUI: false });
+  const sent = JSON.parse(fs.readFileSync(guardSeen, 'utf8'));
+  assert.deepEqual([sent.tool_name, sent.cwd], ['bash', '/some/session/dir']);
+  assert.ok(fs.existsSync(seen), `classifier skipped when the guard allowed (${mode})`);
+  fs.writeFileSync(verdict, '{"deny":true,"reason":"trust store"}');
+  fs.rmSync(seen, { force: true });
+  const denied = await h4.tool_call(call('write', { path: '/x' }), { cwd: '/some/session/dir', hasUI: true });
+  assert.equal(denied.block, true, `guard deny did not block (${mode})`);
+  assert.match(denied.reason, /trust store/);
+  assert.ok(!fs.existsSync(seen), `classifier ran after a guard deny (${mode})`);
+  for (const bad of ['not json', '{}', '{"deny":"no"}', '']) {
+    fs.writeFileSync(verdict, bad);
+    assert.equal((await h4.tool_call(call('bash', { command: 'ls' }), { cwd: '/some/session/dir', hasUI: true }))?.block, true, `guard answer ${JSON.stringify(bad)} let the call through (${mode})`);
+    assert.ok(!fs.existsSync(seen), 'classifier ran after an unreadable guard answer');
+  }
+  fs.writeFileSync(verdict, '{"deny":false,"reason":null}');
+}
+// The guard's ask (a tree, glob or brace list too large to check, far from the store) goes to the owner as the classifier's prompts do; it is sent with
+// deny: true as well, and every other shape blocks. The classifier's own answer never lifts it, and it is not asked about when denied.
+{
+  const asked = '{"deny":true,"ask":true,"reason":"too large to check"}';
+  const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-sens-task-'));
+  process.env.TP_TASK_DIR = taskDir;
+  const hAsk = {};
+  mod.default({ on(name, fn) { hAsk[name] = fn; } });
+  delete process.env.TP_TASK_DIR;
+  const request = () => JSON.parse(fs.readFileSync(path.join(taskDir, 'permission-request.json'), 'utf8'));
+  const prompts = [];
+  const ui = (answer) => ({ cwd: '/some/session/dir', hasUI: true, ui: { confirm: async (title, message) => { prompts.push([title, message]); return answer; } } });
+  const run = (verdictText, ctx) => { fs.writeFileSync(verdict, verdictText); fs.rmSync(seen, { force: true }); prompts.length = 0; return hAsk.tool_call(call('bash', { command: 'grep -R foo .' }), ctx); };
+  for (const mode of ['on', 'shadow', 'off']) {
+    process.env.TP_REDACTION = mode;
+    let result = await run(asked, { cwd: '/some/session/dir', hasUI: false });
+    assert.equal(result.block, true, `ask without a terminal let the call through (${mode})`);
+    assert.match(result.reason, /too large to check/);
+    assert.equal(request().status, 'pending');
+    assert.ok(!fs.existsSync(seen), 'classifier ran after an unanswered guard ask');
+    result = await run(asked, ui(false));
+    assert.equal(result.block, true, `ask answered no let the call through (${mode})`);
+    assert.equal(request().status, 'denied');
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0][1], /too large to check/);
+    // The wording fits a brace list or a glob as well as a tree.
+    assert.match(prompts[0][0], /could not fully check/);
+    assert.match(request().target, /could not fully check/);
+    assert.match(result.reason, /could not fully check/);
+    assert.doesNotMatch(prompts[0][0] + request().target + result.reason, /tree/);
+    assert.ok(!fs.existsSync(seen), 'classifier ran after the owner refused');
+    result = await run(asked, ui(true));
+    assert.equal(result, undefined, `ask answered yes still blocked (${mode})`);
+    assert.equal(request().status, 'authorized');
+    assert.ok(fs.existsSync(seen), 'classifier skipped after the owner approved');
+    // Anything else blocks without asking: a plain deny, an ask that is not marked as a deny, odd values.
+    for (const other of ['{"deny":true,"reason":"trust store"}', '{"deny":true,"ask":false,"reason":"x"}', '{"deny":false,"ask":true}',
+                         '{"ask":true}', '{"deny":"yes","ask":true}', '{"deny":true,"ask":"yes"}', '{"deny":true,"ask":1}']) {
+      result = await run(other, ui(true));
+      assert.equal(result?.block, true, `${other} let the call through (${mode})`);
+      assert.equal(prompts.length, 0, `${other} asked the owner`);
+      assert.ok(!fs.existsSync(seen), `classifier ran after ${other}`);
+    }
+  }
+  // The classifier still asks on its own after the guard's ask is approved, and a refusal there still blocks.
+  fs.writeFileSync(path.join(stubRoot, 'bin/tp-sensitive-read'), '#!/bin/sh\ncat > /dev/null\necho \'{"sensitive":true,"target":"~/.aws","reason":"r"}\'\n', { mode: 0o755 });
+  let result = await run(asked, ui(true));
+  assert.equal(result, undefined);
+  assert.equal(prompts.length, 2);
+  fs.writeFileSync(stub, `#!/bin/sh\ncat > "${seen}"\necho '{"sensitive":false}'\n`, { mode: 0o755 });
+  process.env.TP_REDACTION = 'off';
+  fs.writeFileSync(verdict, '{"deny":false,"reason":null}');
+}
+fs.writeFileSync(path.join(stubRoot, 'bin/tp-trust-guard'), '#!/bin/sh\nexit 3\n', { mode: 0o755 });
+assert.equal((await h4.tool_call(call('bash', { command: 'ls' }), { cwd: '/some/session/dir', hasUI: true }))?.block, true, 'a crashed guard let the call through');
+fs.rmSync(path.join(stubRoot, 'bin/tp-trust-guard'));
+assert.equal((await h4.tool_call(call('bash', { command: 'ls' }), { cwd: '/some/session/dir', hasUI: true }))?.block, true, 'a missing guard let the call through');
+process.env.TP_REDACTION = 'off';
 
 // With the real classifier in a scratch repository: an unscoped diff is judged by the files it touches.
 process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');

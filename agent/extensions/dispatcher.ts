@@ -163,6 +163,24 @@ const REPORT_BACK =
 const RESEARCH_REPORT =
 	"Finish with a short reply: the answer in a few sentences and how confident you are; tmux-pi adds the report's path.";
 const MAX_REVIEW_ROUNDS = 2;
+
+// A reviewer's verdict (same rules as lib/review_verdict.py): the whole first line is APPROVED, APPROVED_WITH_NOTES or
+// REQUEST_CHANGES, or "REQUEST_CHANGES: reason" (the one longer form). Anything else is refused. APPROVED_WITH_NOTES approves
+// and must carry its notes. Only the RESULT_STATUS line can contradict an approval; the notes may quote earlier rounds.
+const VERDICT_LINE = /^(APPROVED_WITH_NOTES|APPROVED|REQUEST_CHANGES)(?::[ \t]*(\S.*))?$/;
+const parseVerdict = (text: string): { verdict?: "APPROVED" | "APPROVED_WITH_NOTES" | "REQUEST_CHANGES"; notes: string; error?: string } => {
+	const body = text.trim().replace(/^\ufeff/, "").trim();
+	const [first, ...others] = body.split("\n");
+	const match = VERDICT_LINE.exec(first.trimEnd());
+	if (!match || (match[2] && match[1] !== "REQUEST_CHANGES")) return { notes: "", error: "the whole first line must be APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES (or 'REQUEST_CHANGES: reason') without formatting" };
+	const verdict = match[1] as "APPROVED" | "APPROVED_WITH_NOTES" | "REQUEST_CHANGES";
+	const rest = others.join("\n");
+	const status = /^RESULT_STATUS:(.*)$/im.exec(rest);
+	if (verdict !== "REQUEST_CHANGES" && status && /\bREQUEST_CHANGES\b/.test(status[1])) return { notes: "", error: `${verdict} but its RESULT_STATUS line says REQUEST_CHANGES` };
+	const notes = [match[2] ?? "", rest.replace(/^RESULT_STATUS:.*$/gim, "").trim()].filter(Boolean).join("\n");
+	if (verdict === "APPROVED_WITH_NOTES" && !notes) return { notes: "", error: "APPROVED_WITH_NOTES has no notes" };
+	return { verdict, notes };
+};
 const MAX_FOLLOW_UP_TASKS = 3;
 const REPLY_LIMIT = 4000;
 
@@ -669,7 +687,8 @@ export default function (pi: ExtensionAPI) {
 			const reviewer = task.reviewer;
 			task.reviewer = undefined;
 			showRunning();
-			const verdictApproved = reviewed.ok && /^APPROVED\b/.test(verdict) && !/\bREQUEST_CHANGES\b/.test(verdict);
+			const parsed = parseVerdict(verdict);
+				const verdictApproved = reviewed.ok && (parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES");
 			const changed = reviewMarker(dir).round_nonce !== nonce || authorHash(dir) !== snapshot;
 			if (changed && reviewed.ok && reviewMarker(dir).status !== "needs_human") {
 				// The old verdict (including REQUEST_CHANGES) describes an older result. Never collect it.
@@ -697,13 +716,14 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (approved) {
 				await complete(task.id, dir);
-				post(`${task.id} finished and ${reviewer} approved it.\n\n${summary(reply, join(dir, "result.md"))}\n\nReview:\n${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "result", id: task.id, review: reviewer });
+				const withNotes = parsed.verdict === "APPROVED_WITH_NOTES";
+					post(`${task.id} finished and ${reviewer} approved it${withNotes ? " with notes" : ""}.\n\n${summary(reply, join(dir, "result.md"))}\n\n${withNotes ? `Notes (${reviewer}'s verdict is APPROVED_WITH_NOTES; handle them or say why not):\n${clip(parsed.notes, REPLY_LIMIT)}\n\nFull review:\n` : "Review:\n"}${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "result", id: task.id, review: reviewer, ...(withNotes ? { notes: parsed.notes } : {}) });
 				break;
 			}
-			if (!reviewed.ok || verdictApproved || !/^REQUEST_CHANGES\b/.test(verdict)) {
+			if (!reviewed.ok || verdictApproved || parsed.verdict !== "REQUEST_CHANGES") {
 				const reason = !reviewed.ok ? "Required review failed before approval" : verdictApproved ?
 					"Approval cannot clear an existing human gate or lacks independent evidence" :
-					"Reviewer verdict unparseable: first line must start with APPROVED or REQUEST_CHANGES without formatting";
+					`Reviewer verdict unparseable: ${parsed.error ?? "whole first line must be APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES without formatting"}`;
 				requireDelegatedReview(dir, task.id, reason, reviewer);
 				post(`${task.id} still needs human review resolution; ${reviewer} did not clear the durable gate.\n\n${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "review-needs-human", id: task.id, review: reviewer });
 				break;

@@ -286,6 +286,38 @@ class EscalationTests(Base):
         self.assertEqual([r["source"] for r in self.selections()][-3:], ["escalation_effort_up", "escalation_level_up", "stop_and_ask"])
         self.assert_no_laya()
 
+    def review_with(self, item, ident, text):
+        """Record a finished review `ident` of `item` whose reply is `text`."""
+        directory = self.state / "tasks" / ident
+        directory.mkdir()
+        (directory / "meta.json").write_text(json.dumps({"id": ident, "worker": "claude"}))
+        (directory / "result.md").write_text(text)
+        (self.state / "tasks" / item["id"] / "exit").write_text("0")  # settled, so it can be retried
+        (self.state / "tasks" / item["id"] / "result.md").write_text("done\nRESULT_STATUS: complete\n")
+        meta_path = self.state / "tasks" / item["id"] / "meta.json"
+        meta_path.write_text(json.dumps({**json.loads(meta_path.read_text()), "review": ident}))
+
+    def test_an_approval_with_notes_does_not_count_toward_escalation(self):
+        first = self.dispatch("--model", SONNET, "--thinking", "medium")
+        self.review_with(first, "rv-1", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 defect: x")
+        second = self.retry(first, "--model", SONNET, "--thinking", "medium")
+        self.review_with(second, "rv-2", "APPROVED_WITH_NOTES\nRESULT_STATUS: complete\nF1 wording gap")
+        early = self.retry(second, "--escalate", check=False)
+        self.assertEqual(early.returncode, 1)
+        self.assertIn("found 0 and 1", early.stderr)
+        third = self.retry(second, "--model", SONNET, "--thinking", "medium")
+        self.review_with(third, "rv-3", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 defect: y")
+        fourth = self.retry(third, "--escalate")
+        self.assertEqual(self.meta(fourth)["route_info"]["source"], "escalation_effort_up")
+
+    def test_a_review_reply_that_is_not_a_verdict_does_not_count_toward_escalation(self):
+        first = self.dispatch("--model", SONNET, "--thinking", "medium")
+        self.review_with(first, "rv-1", "REQUEST_CHANGES\nF1")
+        second = self.retry(first, "--model", SONNET, "--thinking", "medium")
+        self.review_with(second, "rv-2", "REQUEST_CHANGES_PLEASE\nF1")
+        early = self.retry(second, "--escalate", check=False)
+        self.assertIn("found 0 and 1", early.stderr)
+
     def test_escalate_cannot_be_combined_with_an_explicit_model(self):
         first = self.dispatch("--model", SONNET)
         self.fail(first)

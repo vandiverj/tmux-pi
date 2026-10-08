@@ -234,7 +234,7 @@ _REGISTRY = [
         "discovery": {"keywords": ["review", "second opinion", "cross-provider"], "laya_labels": ["independent_review", "independent review"]},
         "disclosure": {
             "summary": "A separate reviewer can inspect and report; this selection does not auto-start new review policy.",
-            "instructions": "Use only through existing explicit/required review flow. Reviewer reports APPROVED or REQUEST_CHANGES and does not edit.",
+            "instructions": "Use only through existing explicit/required review flow. Reviewer reports APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES and does not edit.",
             "request_schema": "CAPABILITY_REQUEST: independent review | reason=<what needs independent checking>",
         },
     },

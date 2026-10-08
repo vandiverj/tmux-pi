@@ -15,6 +15,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import review_verdict  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
 
 ROLES = ROOT / "agent" / "roles"
@@ -107,6 +108,12 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
+    if (path / "review-of").is_file() and result_text:
+        # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval
+        try:
+            result["verdict"], result["verdict_notes"] = review_verdict.parse(result_text)
+        except ValueError as exc:
+            result["verdict"], result["verdict_notes"] = "unparseable", str(exc)
     if include_result:
         result["result"] = result_text
     return result
@@ -185,7 +192,8 @@ def escalation_evidence(base, previous):
         if meta.get("review"):
             try:
                 text = (task_dir(base, meta["review"]) / "result.md").read_text()
-                changes += 1 if (text.strip().splitlines() or [""])[0].strip() == "REQUEST_CHANGES" else 0
+                # APPROVED_WITH_NOTES approves; only REQUEST_CHANGES counts toward escalation
+                changes += 1 if review_verdict.parse(text)[0] == "REQUEST_CHANGES" else 0
             except (ValueError, OSError):
                 pass
         if not meta.get("parent"):

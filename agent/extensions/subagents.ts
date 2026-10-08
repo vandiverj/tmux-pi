@@ -308,7 +308,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Review subagent result",
 		description:
 			"Start an independent reviewer on the other provider (Pi versus Claude) for a successfully completed subagent. " +
-			"The reviewer receives the original task, context packet, and result, checks the working tree, and reports APPROVED or REQUEST_CHANGES. " +
+			"The reviewer receives the original task, context packet, and result, checks the working tree, and reports APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES. " +
 			"It never edits files. Use collect_result on the returned id. " +
 			"The local review policy decides first: routine research and summaries are not reviewed. " +
 			"Set force only when the user asked for a review.",

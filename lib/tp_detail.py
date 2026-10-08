@@ -5,7 +5,7 @@ Reads the rows tp_rows.py printed on stdin and LIFECYCLE (the output of `tp-cont
 \\x1f). Prints one line per input row, in the same order, fields joined by \\x1f:
     status detail has_reply task_first reply_first
 status and detail are what the old per-row shell block worked out (lifecycle, collected/stopped, role, pending permission
-and capability requests); task_first / reply_first are the first non-blank line of task.md / result.md, which the pane
+and capability requests, a capability awaiting human approval); task_first / reply_first are the first non-blank line of task.md / result.md, which the pane
 shows for the selected row. Reading them for every row at load time is what lets a key redraw touch no file.
 Each file is streamed line by line to its first non-blank line, however deep that is, without holding more than one
 line. Only a single line longer than LINE bytes (64 KiB, far wider than any terminal) is cut there.
@@ -112,6 +112,16 @@ def capability(directory):
         return ""
 
 
+def approval(directory):
+    """A capability waiting for human approval (pending-capability.json, the same test lib/contract.py uses)."""
+    path = os.path.join(directory, "pending-capability.json")
+    if not os.path.exists(path):
+        return ""
+    req = read_json(path)
+    request = req.get("request") if isinstance(req, dict) else None
+    return "capability approval pending" + (": " + request if isinstance(request, str) and request else "")
+
+
 def main(tasks, lifecycle_text):
     life = {}
     for line in lifecycle_text.split("\n"):
@@ -133,7 +143,7 @@ def main(tasks, lifecycle_text):
         if os.path.isfile(os.path.join(d, "stopped.json")):
             status = "stopped"
         detail = "role " + role_of(d) + (" · " + detail if detail else "")
-        for found in (permission(d), capability(d)):
+        for found in (permission(d), capability(d), approval(d)):
             if found:
                 detail = found + " · " + detail
                 if status in ("working", "starting", "needs_input"):

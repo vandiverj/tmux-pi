@@ -770,6 +770,55 @@ test('needs_input workers saturating the index are protected by the same cap and
   expect(text).not.toContain('researcher-0100-abcdef')
 })
 
+// A queue entry tp-agent refused to start never starts, has no pane and holds back its --after dependents: only the
+// main can act on it (tp-agent stop <id>), so it sits in the protected part of the index beside paused and awaiting rows.
+const refusedRow = (id: string) => ({ id, status: 'queued', reason: 'start refused: the queue entry is not an object' })
+
+test('refused queue entries sit with paused and awaiting rows, ahead of the active rows', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [
+    ...busyRows(3),
+    { id: 'queued-ok', status: 'queued', role: 'coder', reason: 'waiting for coder-1' },
+    refusedRow('shape01'),
+    { id: 'coder-ask', role: 'coder', status: 'needs_input', capability_pending: true },
+  ]
+  w.paused = [{ id: 'coder-p', role: 'coder', status: 'paused', result_status: 'blocked', capability_pending: true }]
+  w.unstatused = [{ id: 'coder-u', role: 'coder', status: 'paused', result_status: null }]
+  await $.session.start(start(true))
+  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const at = (needle: string) => text.indexOf(needle)
+  expect(text).toContain('queue entries that will not start:\n- shape01 queued (start refused: the queue entry is not an object)')
+  expect(text).toContain('- coder-p coder paused result=blocked [awaits: capability approval pending]')
+  expect(text).toContain('- coder-u coder paused')
+  expect(text).toContain('- coder-ask coder needs_input [awaits: capability approval pending]')
+  // protected group, before the active rows; an ordinary queued row stays an active row
+  expect(at('- shape01') < at('\nactive:')).toBe(true)
+  expect(at('\nactive:') < at('- queued-ok')).toBe(true)
+  expect(text.slice(at('\nactive:'))).not.toContain('shape01')
+  // a session with no refused entry has no such line
+  w.rows = busyRows(3)
+  const quiet = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  expect(quiet).toContain('researcher-0000-abcdef')
+  expect(quiet).not.toContain('queue entries that will not start')
+})
+
+test('refused queue entries saturating the index are protected by the same cap and count line', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [...busyRows(100), ...Array.from({ length: 400 }, (_, i) => refusedRow(`shape${String(i).padStart(4, '0')}-0123456789abcdef`))]
+  w.paused = [{ id: 'coder-p', role: 'coder', status: 'paused', result_status: 'blocked', capability_pending: true }]
+  await $.session.start(start(true))
+  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  expect(text.length <= 6000).toBe(true)
+  const refused = w.rows.filter(row => row.status === 'queued')
+  const listed = refused.filter(row => text.includes(row.id))
+  expect(listed.length > 50).toBe(true)
+  expect(listed.length < refused.length).toBe(true)
+  expect(text).toContain(`… ${refused.length - listed.length} more workers waiting for you not shown; run tp-agent list to see them`)
+  expect(text).toContain('queue entries that will not start (ids only; tp-agent stop <id> removes one): shape0000-0123456789abcdef,')
+  expect(text).toContain('coder-p [capability approval pending]')   // the paused worker keeps its mark under the same cap
+  expect(text).not.toContain('researcher-0100-abcdef')
+})
+
 test('the wake hint for a paused worker names a pending request', async ($, on) => {
   const w = world(on, MAIN)
   await $.session.start(start(true))

@@ -408,15 +408,9 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertLessEqual(again.count(b"\n"), lines - 1)
         self.click_view(3, "job01")
 
-    def test_keys_that_only_move_redraw_without_reading_or_running_anything(self):
-        self.make_jobs(6)
-        for n in range(1, 7):   # every row shows the lines the selected row needs: a task, a reply, a pending request
-            d = self.state / "tasks" / ("job%d" % n)
-            (d / "task.md").write_text("\n  task line %d\nmore\n" % n)
-            (d / "result.md").write_text("reply line %d\n" % n)
-        (self.state / "tasks" / "job2" / "permission-request.json").write_text(
-            json.dumps({"status": "pending", "target": "~/.ssh"}))
-        self.first_frame(b"job6", settle=0.2)
+    def assert_keys_only_redraw(self):
+        """Keys that only move the selection or flip the usage page repaint from the last load: they read no file and
+        start no process (every program the pane might start is wrapped and logged by the fixture)."""
         loads, calls = self.base / "loads", self.base / "calls"
         count = lambda path: len(path.read_text().splitlines()) if path.exists() else 0
         for attempt in range(6):
@@ -435,11 +429,83 @@ class StatusRepaintTest(StatusPaneFixture):
             self.fail("the timer kept firing during the keys")
         extra = calls.read_text().splitlines()[calls_before:]
         self.assertEqual(extra, [], "a key-only redraw ran programs: %r" % extra[:10])
+
+    def test_keys_that_only_move_redraw_without_reading_or_running_anything(self):
+        self.make_jobs(6)
+        for n in range(1, 7):   # every row shows the lines the selected row needs: a task, a reply, a pending request
+            d = self.state / "tasks" / ("job%d" % n)
+            (d / "task.md").write_text("\n  task line %d\nmore\n" % n)
+            (d / "result.md").write_text("reply line %d\n" % n)
+        (self.state / "tasks" / "job2" / "permission-request.json").write_text(
+            json.dumps({"status": "pending", "target": "~/.ssh"}))
+        self.first_frame(b"job6", settle=0.2)
+        self.assert_keys_only_redraw()
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertIn("── job".encode(), moved)    # the redraw still shows the moved selection
         self.assertIn(b"task line", moved)
         self.assertIn(b"reply line", moved)
+
+    def make_waiting_world(self):
+        """The places the slices meet: job1 paused (an unstatused reply), job2 waiting on a human capability approval
+        (pending-capability.json), job3 with a pending capability request, job4 with a pending permission prompt; beside
+        them a refused queue entry, a malformed one and a valid entry that waits on the paused job1."""
+        self.make_jobs(4)
+        (self.base / "lines").write_text("40\n")
+        tasks = self.state / "tasks"
+        state = {"model": "test-model", "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}
+        (tasks / "job1" / "state.json").write_text(json.dumps(dict(state, state="paused", tools=3)))
+        (tasks / "job1" / "result.md").write_text("Done, I think.\n")
+        (tasks / "job1" / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "at": 1000, "tools": 3}]}))
+        (tasks / "job2" / "pending-capability.json").write_text(json.dumps({"request": "jq tool"}))
+        (tasks / "job3" / "capability-request.json").write_text(json.dumps({"status": "pending", "kind": "tool", "what": "jq"}))
+        (tasks / "job4" / "permission-request.json").write_text(json.dumps({"status": "pending", "target": "db"}))
+        queue = self.state / "queue"
+        queue.mkdir()
+        (queue / "q-waits.json").write_text(json.dumps({
+            "id": "q-waits", "created": "2026-10-08T00:00:00+00:00", "role": "coder", "task": "t", "workdir": "/tmp",
+            "worker": "pi", "model": "m", "thinking": "low", "route_info": {}, "deliverable": "", "parent": "",
+            "after": ["job1"], "context": [], "notes": [], "tests": "affected", "queue_reason": "waiting for job1"}))
+        (queue / "q-null.json").write_text("null")
+        (queue / "q-broken.json").write_text("{not json")
+
+    WAITING = (b"job4", b"q-waits", b"q-null", b"q-broken", b"capability approval pending")
+
+    def test_paused_and_awaiting_rows_sit_with_refused_queue_entries(self):
+        self.make_waiting_world()
+        frame = self.first_frame(*self.WAITING, settle=0.3).split(ESC)[-1]
+        plain = [re.sub(rb"\x1b\[[0-9;]*[A-Za-z]", b"", line).replace("\u25b8".encode(), b" ").strip() for line in frame.split(b"\n")]
+        rows = {name: line for name in (b"job1", b"job2", b"job3", b"job4") for line in plain if line.startswith(name + b" ")}
+        self.assertIn(b"paused", rows[b"job1"])
+        self.assertIn(b"needs_input", rows[b"job2"])    # a human capability approval holds the worker at needs_input
+        self.assertIn(b"needs_input", rows[b"job3"])
+        self.assertIn(b"needs_input", rows[b"job4"])
+        self.assertIn(b"capability approval pending: jq tool", frame)
+        self.assertIn(b"asks for tool: jq", frame)
+        self.assertIn(b"permission: db", frame)
+        # the queue lines come after the task rows: the entry waiting on the paused job1, and one line per refusal
+        self.assertIn(b"q-waits  coder  queued  waiting for job1", frame)
+        for name in (b"q-null", b"q-broken"):
+            self.assertRegex(frame, name + rb"  queued  start refused: ")
+        self.assertLess(frame.index(b"job4"), frame.index(b"q-waits"))
+        self.assertLess(frame.index(b"job4"), frame.index(b"q-null"))
+        self.assertIn(b"subagents 4", frame)
+        for y in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):    # only the four task rows are clickable, never a queue line
+            self.click(y)
+        self.barrier()
+        self.assertTrue(set(line.split()[3] for line in self.swaps()) <= {"%1", "%2", "%3", "%4"})
+
+    def test_keys_redraw_paused_awaiting_and_refused_rows_without_reading_or_running_anything(self):
+        self.make_waiting_world()
+        self.first_frame(*self.WAITING, settle=0.2)
+        self.assert_keys_only_redraw()
+        self.output(0.3)    # frames the pane painted for the keys above may still be unread; they are not the answer to this key
+        os.write(self.master, b"k")
+        needles = (b"paused", b"capability approval pending", b"start refused: ")
+        moved = self.output_until(lambda frame: b"\x1b[J" in frame and all(n in frame for n in needles))
+        last = moved.split(ESC)[-1]
+        for needle in needles:
+            self.assertIn(needle, last)
 
     def test_request_and_reply_lines_come_from_the_load_for_every_row(self):
         self.make_jobs(3)

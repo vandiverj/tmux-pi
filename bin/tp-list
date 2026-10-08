@@ -42,6 +42,11 @@ if [[ -n "$rows" ]]; then while IFS=$'\x1f' read -r id worker status tool tokens
       fi
     fi
   done
+  if [[ -e "$state_dir/tasks/$id/pending-capability.json" ]]; then   # a capability awaiting human approval; same wording as lib/tp_detail.py
+    request="capability approval pending$(jq -r 'select(type == "object") | .request | select(type == "string" and . != "") | ": " + gsub("\n"; " ")' "$state_dir/tasks/$id/pending-capability.json" 2>/dev/null || true)"
+    detail="$request · $detail"
+    [[ "$status" == working || "$status" == starting || "$status" == needs_input ]] && status=needs_input
+  fi
   if [[ -n "$tool" ]]; then detail="${detail:+$detail · }$tool"; fi
   mark=" "; if [[ "$id" == "$current" ]]; then mark="▸"; fi
   # Pad by characters, not bytes (▸ ↑ ↓ are multibyte).

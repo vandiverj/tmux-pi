@@ -256,6 +256,61 @@ echo review-1
         self.assertEqual(self.review().returncode, 0)
         self.assertIn(str(self.task / "packet.md"), self.log.read_text())
 
+    def preamble_world(self):
+        """The reviewer's launch joined to the author's lifecycle: the stub spawner resolves the repository preamble for the
+        --preamble-role and --workdir it is handed (the real lib/preamble.py), as tp-spawn does."""
+        shutil.copy(ROOT / "lib/preamble.py", self.root / "lib/preamble.py")
+        shutil.copytree(ROOT / "agent/roles", self.root / "agent/roles")
+        base = self.plan.parent
+        self.stub("tp-spawn", f'''#!/usr/bin/env bash
+args=("$@"); workdir="" role=""
+for ((i=0;i<${{#args[@]}};i++)); do
+  [[ "${{args[i]}}" == --workdir ]] && workdir="${{args[i+1]}}"
+  [[ "${{args[i]}}" == --preamble-role ]] && role="${{args[i+1]}}"
+done
+python3 "$(dirname "$0")/../lib/preamble.py" "$workdir" "$role" > "{base}/preamble.out" || exit 1
+echo "$*" > "{base}/spawn.args"
+mkdir -p "{self.state}/tasks/review-1"
+echo review-1
+''')
+        (self.work / ".tmux-pi").mkdir()
+        (self.work / ".tmux-pi/worker-preamble.md").write_text(
+            "Repo-wide rule.\n\n## Role: code-reviewer\nREVIEWER-ONLY SECTION\n\n## Role: coder\nCODER-ONLY SECTION\n")
+
+    def test_a_paused_author_gets_no_reviewer_and_a_settled_one_gets_the_reviewer_preamble(self):
+        self.preamble_world()
+        (self.task / "exit").write_text("0\n")
+        (self.task / "state.json").write_text('{"state":"waiting","tools":3}')
+        (self.task / "checkpoints.json").write_text('{"events":[{"action":"pause","at":1,"tools":3}]}')
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is paused", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())   # no reviewer started, so no preamble was resolved for one
+        self.assertFalse((self.plan.parent / "preamble.out").exists())
+        (self.task / "checkpoints.json").write_text('{"events":[{"action":"pause","at":1,"tools":3},{"action":"extend","at":2}]}')
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"--workdir {self.work} --preamble-role code-reviewer", self.spawn_args())   # the author's tree, the reviewer's role
+        preamble = (self.plan.parent / "preamble.out").read_text()
+        self.assertIn("Repo-wide rule.", preamble)
+        self.assertIn("REVIEWER-ONLY SECTION", preamble)
+        self.assertNotIn("CODER-ONLY SECTION", preamble)   # the author's role section does not reach the reviewer
+
+    def test_the_pause_is_the_reason_given_even_when_the_repository_preamble_is_unusable(self):
+        self.preamble_world()
+        (self.work / ".tmux-pi/worker-preamble.md").write_text("## Role: no-such-role\nx\n")
+        (self.task / "state.json").write_text('{"state":"waiting","tools":3}')
+        (self.task / "checkpoints.json").write_text('{"events":[{"action":"pause","at":1,"tools":3}]}')
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is paused", r.stderr)
+        self.assertNotIn("could not start", r.stderr)
+        (self.task / "checkpoints.json").unlink()    # not paused: now the preamble is what stops it
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not start", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

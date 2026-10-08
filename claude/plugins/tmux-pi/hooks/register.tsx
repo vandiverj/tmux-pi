@@ -286,33 +286,44 @@ function indexLine(row: unknown): string | undefined {
 }
 
 // The protected part of the index, within `room` characters: workers that wait for the main (paused,
-// replied without a result status, needs input). Their wait is a decision only the main can make and no
-// other signal reaches it, so they are never dropped silently: full rows when
-// they all fit, else their ids only, else as many ids as fit and a line counting the rest.
+// replied without a result status, needs input) and queue entries tp-agent refused to start. Their wait is a
+// decision only the main can make and no other signal reaches it (a refused entry has no pane, no state and no
+// worker, never starts, and holds back every --after dependent until `tp-agent stop <id>` removes it), so they
+// are never dropped silently: full rows when they all fit, else their ids only, else as many ids as fit and a
+// line counting the rest.
 // An id in the ids-only tiers keeps a short mark of what the worker awaits.
 function idMark(row: Record<string, unknown>): string {
   const awaits = awaiting(row)
   return awaits === '' ? String(row.id) : `${row.id} [${awaits}]`
 }
 
-function pausedLines(groups: readonly (readonly [string, unknown])[], room: number): { lines: string[]; rows: unknown[] } {
-  const named = groups.map(([name, group]) => ({
+// A queue entry tp-agent could not start: `tp-agent list` gives it status queued and the reason "start refused: …"
+// (bin/tp-agent queue_entry), which tests/test_orchestration.py pins.
+function isRefused(row: unknown): boolean {
+  const { status, reason } = (row ?? {}) as Record<string, unknown>
+  return status === 'queued' && typeof reason === 'string' && reason.startsWith('start refused: ')
+}
+
+// A group is [name, rows] or [name, rows, what the main runs on an id]; the default is tp-agent inspect.
+function pausedLines(groups: readonly (readonly [string, unknown] | readonly [string, unknown, string])[], room: number): { lines: string[]; rows: unknown[] } {
+  const named = groups.map(([name, group, command]) => ({
     name,
+    command: command ?? 'tp-agent inspect <id>',
     rows: (Array.isArray(group) ? group : []).filter(row => indexLine(row) !== undefined) as Record<string, unknown>[],
   }))
   const all = named.flatMap(group => group.rows)
   const full = named.flatMap(({ name, rows }) => [`${name}:${rows.length === 0 ? ' none' : ''}`, ...rows.map(row => indexLine(row) as string)])
   if (full.join('\n').length <= room) return { lines: full, rows: all }
-  const idsHeader = (name: string) => `${name} (ids only; tp-agent inspect <id>):`
-  const ids = named.map(({ name, rows }) => (rows.length === 0 ? `${name}: none` : `${idsHeader(name)} ${rows.map(idMark).join(', ')}`))
+  const idsHeader = (name: string, command: string) => `${name} (ids only; ${command}):`
+  const ids = named.map(({ name, command, rows }) => (rows.length === 0 ? `${name}: none` : `${idsHeader(name, command)} ${rows.map(idMark).join(', ')}`))
   if (ids.join('\n').length <= room) return { lines: ids, rows: all }
   const rest = (hidden: number) => `… ${hidden} more workers waiting for you not shown; run tp-agent list to see them`
   const lines: string[] = []
   const shown: unknown[] = []
   let size = rest(all.length).length
   let isFull = false
-  for (const { name, rows } of named) {
-    let line = idsHeader(name)
+  for (const { name, command, rows } of named) {
+    let line = idsHeader(name, command)
     let count = 0
     for (const row of rows) {
       const piece = `${count === 0 ? ' ' : ', '}${idMark(row)}`
@@ -346,19 +357,26 @@ async function readIndex($: EngineInterface): Promise<{ text: string; rows: unkn
   lines.push(`objective: ${(typeof objective === 'string' && objective.trim() !== '' ? objective.trim() : '(none set)').slice(0, 1000)}`)
   // Room kept for the active and pending headers and the omission line, so the whole text fits.
   const limit = INDEX_CHARS - 120
-  // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause);
-  // the other active rows and the pending ones take what room is left.
+  // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause), and
+  // the queue entries that will never start; the other active rows and the pending ones take what room is left.
   const activeRows = Array.isArray(active) ? active : []
   const isAsking = (row: unknown) => typeof row === 'object' && row !== null && (row as { status?: unknown }).status === 'needs_input'
+  const refused = activeRows.filter(isRefused)
   const first = pausedLines(
-    [['replied without a result status', unstatused], ['paused', paused], ['needs input', activeRows.filter(isAsking)]],
+    [
+      ['replied without a result status', unstatused],
+      ['paused', paused],
+      ['needs input', activeRows.filter(isAsking)],
+      // Listed only when there is one: unlike the others it is not a state every session has a line for.
+      ...(refused.length === 0 ? [] : [['queue entries that will not start', refused, 'tp-agent stop <id> removes one'] as const]),
+    ],
     limit - lines.join('\n').length - 1,
   )
   lines.push(...first.lines)
   const shown = [...first.rows]
   let size = lines.join('\n').length
   let cut = 0
-  for (const [name, group] of [['active', activeRows.filter(row => !isAsking(row))], ['pending', pending]] as const) {
+  for (const [name, group] of [['active', activeRows.filter(row => !isAsking(row) && !isRefused(row))], ['pending', pending]] as const) {
     const rows = Array.isArray(group) ? group : []
     lines.push(`${name}:${rows.length === 0 ? ' none' : ''}`)
     for (const row of rows) {

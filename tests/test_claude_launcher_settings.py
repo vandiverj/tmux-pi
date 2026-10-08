@@ -85,5 +85,66 @@ class ClaudeLauncherSettingsTests(unittest.TestCase):
         self.assertTrue(self.args.exists())
 
 
+class ContextWindowSettingTests(unittest.TestCase):
+    """The owner's 200k-window variable (env in claude/settings.json) must reach every launch path.
+
+    The repository copy of settings.json may not carry the variable yet, so these tests launch
+    from a scratch copy of the launchers whose settings.json does.
+    """
+    ENV = {"CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name).resolve()
+        self.root = self.base / "root"
+        (self.root / "bin").mkdir(parents=True)
+        (self.root / "claude").mkdir()
+        for name in ("tp-claude", "tp-claude-bootstrap"):
+            shutil.copy(ROOT / "bin" / name, self.root / "bin" / name)
+        settings = json.loads(SHARED.read_text())
+        settings["env"] = {**settings.get("env", {}), **self.ENV}
+        self.settings = self.root / "claude" / "settings.json"
+        self.settings.write_text(json.dumps(settings))
+        fake = self.base / "fake"
+        fake.mkdir()
+        self.args = self.base / "args"
+        claude = fake / "claude"
+        claude.write_text('#!/bin/sh\nprintf \'%s\\0\' "$@" > "$TEST_CLAUDE_ARGS"\n')
+        claude.chmod(0o755)
+        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"],
+                    "TEST_CLAUDE_ARGS": str(self.args), "TP_CLAUDE_CONFIG_DIR": str(self.base / "config")}
+        for key in ("TP_TASK_DIR", "TP_MODE"):
+            self.env.pop(key, None)
+
+    def launched_settings(self, script, *args, **extra):
+        run = subprocess.run([shutil.which("bash"), str(self.root / "bin" / script), *args],
+                             env={**self.env, **extra}, text=True, capture_output=True,
+                             timeout=15, cwd=self.base)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        argv = self.args.read_text().split("\0")[:-1]
+        value = argv[argv.index("--settings") + 1]
+        # A path is read by Claude Code from the file; anything else is inline JSON.
+        return json.loads(Path(value).read_text() if value == str(self.settings) else value)
+
+    def test_main_inline_settings_carry_the_variable(self):
+        value = self.launched_settings("tp-claude", TP_MODE="orchestrator")
+        self.assertEqual(value["env"], self.ENV)
+        self.assertEqual(value["bashOutputMaxChars"], 10000)
+
+    def test_worker_settings_file_carries_the_variable(self):
+        value = self.launched_settings("tp-claude", TP_MODE="orchestrator", TP_TASK_DIR=str(self.base / "task"))
+        self.assertEqual(value["env"], self.ENV)
+
+    def test_bootstrap_carries_the_variable(self):
+        value = self.launched_settings("tp-claude-bootstrap", str(self.base))
+        self.assertEqual(value["env"], self.ENV)
+
+    def test_spawn_launches_claude_workers_through_tp_claude(self):
+        spawn = (ROOT / "bin" / "tp-spawn").read_text()
+        self.assertIn('cmd=("$ROOT/bin/tp-claude" --name "$id"', spawn)
+        self.assertNotIn("--settings", spawn)
+
+
 if __name__ == "__main__":
     unittest.main()

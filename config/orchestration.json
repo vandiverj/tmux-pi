@@ -1,4 +1,4 @@
 {
   "max_local_workers": 2,
-  "max_active_workers": 4
+  "max_active_workers": 10
 }

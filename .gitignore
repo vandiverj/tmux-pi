@@ -8,6 +8,7 @@ agent/sessions/
 agent/npm/
 agent/bin/
 agent/models-store.json
+agent/settings.json
 __pycache__/
 .mlx/
 config/local.json

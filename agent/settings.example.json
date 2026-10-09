@@ -1,0 +1,18 @@
+{
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-6-sol",
+  "defaultThinkingLevel": "medium",
+  "packages": [],
+  "theme": "dark",
+  "enabledModels": [
+    "anthropic/claude-haiku-5-5",
+    "anthropic/claude-fable-5-1",
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-sonnet-5-5",
+    "openai-codex/*",
+    "lmstudio/*/*",
+    "slotstream/*",
+    "openrouter/*/*:free",
+    "openrouter/openrouter/free"
+  ]
+}

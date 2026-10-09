@@ -360,7 +360,7 @@ class QueueBehindAPausedPredecessorTest(JoinFixture):
 
         with mock.patch.object(AGENT.subprocess, "run", side_effect=spawn):
             AGENT.launch(self.state, item)
-        command = spawned[0]
+        command = next(c for c in spawned if "--task-id" in c)  # launch also asks git for the start commit (T12)
         self.assertEqual(command[command.index("--task-id") + 1], "next")
         self.assertIn(f"Dependency dep result: {self.state / 'tasks' / 'dep' / 'result.md'}", command)
 

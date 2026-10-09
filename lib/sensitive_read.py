@@ -11,6 +11,12 @@ One kind of command is judged by asking git: an unscoped `git diff`, `git log -p
 in the caller's working directory. No file content is read, and the patch prompts whenever that
 list cannot be established or the patch may print more than the list names: files inside a
 submodule, or whatever a configured diff program or text conversion writes.
+
+A caller that prompts the owner may pass a `trust` resolver (lib/trust_lift.py). Where the owner has
+stated that a working tree holds no credentials, two guesses are lifted for paths inside that tree:
+a weak name (`*secret*`, `*credentials*`) that is not a known credential file name, and the name of a
+directory (`agent`, `claude`, `config`) whose entries, read by name only, hold no credential location.
+Nothing else changes, and with no resolver the result is what it always was.
 """
 import fnmatch
 import json
@@ -20,6 +26,7 @@ import posixpath
 import re
 import select
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -181,6 +188,8 @@ _GIT_CONFIG = ("config", "-z", "--get-regexp", r"^diff\.(submodule|external|.+\.
 # Content filters run a program on every work-tree file git compares, so the listing must not run
 # while one is configured, in any scope of configuration or through an include.
 _GIT_FILTERS = ("config", "-z", "--get-regexp", r"^filter\..+\.(clean|smudge|process)$")
+# Where git itself says the work tree is, with `core.worktree` and includes applied.
+_GIT_TOPLEVEL = ("rev-parse", "--show-toplevel")
 _GIT_ENV = {"LC_ALL": "C", "LANG": "C", "GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1"}
 # Variables that would point the query at a repository other than the working directory's, or give
@@ -248,9 +257,23 @@ _BULK_REASON = "dynamic file selection may include credential files"
 _GLOB_REASON = "a glob that can match credential files"
 _GLOB_PROMPTS = {_CREDENTIAL_DIR, "a credential-bearing path", _GLOB_REASON, "a home directory"}
 
+# Names that are weak by pattern but are credential files by name. An owner's trust statement never lifts
+# them (T7 3.3): the file names the redaction hook also treats as credential files, the exact names in
+# _FILE_SAMPLES, `*.env`, and (as directories only, see _lift_name) `secrets` and `.secrets`.
+_CREDENTIAL_FILE = re.compile(r"^(?:credentials(?:\.json)?|\.credentials\.json|\.git-credentials|"
+                              r"secrets?\.(?:json|ya?ml|toml)|client_secret.*\.json|.*\.tfvars|.*\.env)$", re.I)
+_SECRET_DIRS = {"secrets", ".secrets"}
+# A walk of a directory the owner has vouched for: what it may spend, and which segments it never lifts.
+WALK_ENTRIES = 20000
+WALK_SECONDS = 1.0
+_NEVER_LIFTED_SEGMENTS = (".git", ".config")
+
 # The working directory of the shell or tool being judged, when the caller knows it.
 # `unknown` is set when the caller named a directory that cannot be placed.
-_SHELL = {"cwd": None, "unknown": False}
+# `trust` is the caller's resolver, or None. `walk` says what a read of a directory visits: whether it
+# follows links and which directory names it skips. `memo` holds walks already done in this call.
+WALK_CALL_SECONDS = 2.0     # all the walks one call may make, so the caller's own time limit holds
+_SHELL = {"cwd": None, "unknown": False, "trust": None, "walk": (True, ()), "memo": {}, "until": None}
 
 
 def _shell_cwd():
@@ -281,9 +304,78 @@ def _parts_hit(parts):
             any(pair in SENSITIVE_PAIRS for pair in zip(parts, parts[1:])))
 
 
-def _named(parts):
-    return _parts_hit(parts) or any(part in (".git", ".config") or SENSITIVE_NAME.match(_plain_name(part))
-                                    for part in parts)
+def _named(parts, lift=None):
+    """Whether a path's parts name a credential location or file. `lift(index)` is asked about a part that
+    is only a weak name; it answers True when the owner's trust covers that part, which then counts as clear."""
+    if _parts_hit(parts):
+        return True
+    for index, part in enumerate(parts):
+        if part in _NEVER_LIFTED_SEGMENTS:
+            return True
+        if SENSITIVE_NAME.match(_plain_name(part)) and not (lift and lift(index)):
+            return True
+    return False
+
+
+class _Refused(str):
+    """A root reason that stays equal to the plain reason, with what the owner's trust walk found."""
+
+    def __new__(cls, text, detail):
+        self = super().__new__(cls, text)
+        self.detail = detail
+        return self
+
+
+def _said(why):
+    """The reason as shown in a prompt: with what a trust walk found, when it found something."""
+    detail = getattr(why, "detail", None)
+    return f"{why} ({detail})" if detail else str(why)
+
+
+def _weak_only(name):
+    """A name that is only weak: not a strong name or key suffix, and not a known credential file name."""
+    return bool(_WEAK_NAME.match(name)) and not _STRONG_OR_KEY.match(name) and not _CREDENTIAL_FILE.match(name)
+
+
+def _tree_for(path):
+    """The trusted tree that holds this absolute path, or None: no resolver, no record, or not inside it."""
+    trust = _SHELL["trust"]
+    if trust is None or not path:
+        return None
+    try:
+        return trust.tree(path)
+    except Exception:       # a resolver that fails lifts nothing
+        return None
+
+
+def _lift_name(absolute, name):
+    """Whether a weak-name guess at this absolute path is lifted by the owner's trust (T7 L1).
+
+    Only a weak name that is not a known credential file name, at a path that really lies in the trusted
+    tree, with no `.git`, `.config` or credential directory on the way. The name is a literal one: a pattern
+    could stand for any name. `absolute` is the path as written (`_absolute(..., raw=True)`), and where it
+    leads is what `_opens` says: a path that leaves the tree through a link and ends outside is not covered,
+    and the name that counts is the one it ends at as well as the one written.
+    """
+    if absolute is None or _SHELL["trust"] is None or _GLOB.search(name):
+        return False
+    plain = _plain_name(name)
+    if not _weak_only(plain):
+        return False
+    real = _opens(absolute)
+    tree = _tree_for(real)
+    if tree is None:
+        return False
+    ends = _plain_name(posixpath.basename(real))
+    if SENSITIVE_NAME.match(ends) and not _weak_only(ends):
+        return False        # the path ends at a strong or exact credential name, whatever it was called on the way
+    below = [part for part in real[len(tree.top):].split("/") if part]
+    if any(part.lower() in _NEVER_LIFTED_SEGMENTS for part in below) or _parts_hit(below):
+        return False
+    if {plain.lower(), ends.lower()} & _SECRET_DIRS and (not os.path.exists(real) or os.path.isdir(real)):
+        return False        # a directory named for its secrets, or one that is not there to be told apart
+    _SHELL["trust"].note("L1", real, "credential-bearing path")
+    return True
 
 
 def _expand(path):
@@ -298,8 +390,10 @@ def _expand(path):
     return path
 
 
-def _absolute(path):
-    """The path as the shell would resolve it; None when that depends on run-time state."""
+def _absolute(path, raw=False):
+    """The path as the shell would resolve it; None when that depends on run-time state.
+
+    `raw` leaves the text as written (`link/..` is not folded away), for `_opens`, which asks the file system."""
     path = _expand(path)
     if "$" in path or "`" in path or path.startswith("~"):
         return None
@@ -308,7 +402,14 @@ def _absolute(path):
         if cwd is None:
             return None
         path = posixpath.join(cwd, path)
-    return "/" + posixpath.normpath(path).lstrip("/")
+    return path if raw else "/" + posixpath.normpath(path).lstrip("/")
+
+
+def _opens(written):
+    """The real path the kernel opens for an absolute path as written: each link followed where it is met and
+    each `..` applied to what is left after the links before it, so `link/..` is the parent of the link's target.
+    Every trusted lift (T7 L1, L2) asks where a path really leads through this one function."""
+    return os.path.realpath(written)
 
 
 def _pair_tail(path, weak):
@@ -329,7 +430,10 @@ def _sensitive(value, weak=True):
         return False
     value = value.strip().strip("'\"")
     path = Path(value)
-    if (SENSITIVE_NAME if weak else STRONG_NAME).match(_plain_name(path.name)) or _parts_hit(path.parts):
+    if _parts_hit(path.parts):
+        return True
+    if (SENSITIVE_NAME if weak else STRONG_NAME).match(_plain_name(path.name)) and not (
+            weak and _lift_name(_absolute(value, True), path.name)):
         return True
     absolute = _absolute(value)
     if absolute is None:
@@ -345,9 +449,12 @@ def _sensitive(value, weak=True):
         except (OSError, ValueError):
             return False
         return _parts_hit(parent.split("/") + [posixpath.basename(absolute)])
-    return str(resolved) != absolute and (
-        (SENSITIVE_NAME if weak else _STRONG_OR_KEY).match(_plain_name(resolved.name)) is not None or
-        _parts_hit(resolved.parts))
+    if str(resolved) == absolute:
+        return False
+    if _parts_hit(resolved.parts):
+        return True
+    return (SENSITIVE_NAME if weak else _STRONG_OR_KEY).match(_plain_name(resolved.name)) is not None and not (
+        weak and _lift_name(_absolute(value, True), resolved.name))
 
 
 def sensitive_path(value):
@@ -363,10 +470,15 @@ def _join(base, path):
     return posixpath.join(base, path)
 
 
-def _cd(base, target):
+def _cd(base, target, physical=False):
     joined = _join(base, target)
     if "$" in joined or "`" in joined or joined.startswith("~"):
         return joined
+    if physical:
+        # `cd -P link/..` lands in the parent of the link's target, not in the folded text.
+        cwd = joined if joined.startswith("/") else _shell_cwd()
+        if cwd is not None:
+            return _opens(posixpath.join(cwd, joined))
     joined = posixpath.normpath(joined)
     return "" if joined == "." else joined
 
@@ -415,13 +527,118 @@ def _glob_hits(pattern, samples=_SAMPLES):
     return any(fnmatch.fnmatchcase(sample, pattern.lower()) for sample in samples)
 
 
-def _layout(parts, tree=True, anchor=None, pathspec=False):
-    """Judge a path relative to a project root by this repository's layout."""
-    if _named(parts):
+def _part_lift(anchor, parts):
+    """The lift `_named` asks about a weak part of a path below `anchor`; None when nothing can be lifted."""
+    if anchor is None or _SHELL["trust"] is None:
+        return None
+
+    def lift(index):
+        if any(_GLOB.search(part) for part in parts[:index + 1]):
+            return False
+        return _lift_name(posixpath.join(anchor, *parts[:index + 1]), parts[index])
+    return lift
+
+
+def _walk_hit(parent, name, is_dir):
+    """Whether an entry of a directory is a credential location or file by its name and its folder's."""
+    if name.lower() in _NEVER_LIFTED_SEGMENTS or _parts_hit([parent, name]):
+        return True
+    plain = _plain_name(name)
+    if not SENSITIVE_NAME.match(plain):
+        return False
+    return not _weak_only(plain) or (plain.lower() in _SECRET_DIRS and is_dir)
+
+
+def _shown(path):
+    return path if len(path) <= 200 and _PATHISH.match(path) else "a path"
+
+
+def _walk(root, tree, follow, exclude):
+    """None when nothing a read of this directory would visit is a credential location, else why not.
+
+    Reads names only, never content, and does not follow links found on the way unless the command
+    does. A link that leads out of the tree (or into another repository) when followed is a hit, and so
+    is a nested `.git`. A tree over the entry or time allowance is not verified.
+    """
+    deadline = time.monotonic() + WALK_SECONDS
+    if _SHELL["until"] is not None:
+        deadline = min(deadline, _SHELL["until"])
+    top = os.path.realpath(root)
+    label = posixpath.basename(top)
+    try:
+        info = os.lstat(top)
+    except OSError:
+        return "it could not be read"
+    if not stat.S_ISDIR(info.st_mode):
+        return None if stat.S_ISREG(info.st_mode) else "it is not a directory"
+    todo, seen, count = [(top, label, label)], {(info.st_dev, info.st_ino)}, 0
+    while todo:
+        folder, parent, shown = todo.pop()
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    count += 1
+                    if count > WALK_ENTRIES or time.monotonic() > deadline:
+                        return "tree too large to verify"
+                    name, here = entry.name, shown + "/" + entry.name
+                    link = entry.is_symlink()
+                    target = os.path.realpath(entry.path) if link else entry.path
+                    is_dir = os.path.isdir(target) if link else entry.is_dir(follow_symlinks=False)
+                    if is_dir and any(fnmatch.fnmatchcase(name, skip) for skip in exclude):
+                        continue
+                    if _walk_hit(parent, name, is_dir):
+                        return "reaches " + _shown(here)
+                    if link:
+                        if not follow:
+                            continue
+                        there = _tree_for(target)
+                        if there is None or there.top != tree.top:
+                            return "follows a link out of the tree at " + _shown(here)
+                        if _walk_hit(posixpath.basename(posixpath.dirname(target)), posixpath.basename(target), is_dir):
+                            return "reaches " + _shown(here) + " through a link"
+                    if not is_dir:
+                        continue
+                    seen_key = os.stat(target)
+                    if (seen_key.st_dev, seen_key.st_ino) not in seen:
+                        seen.add((seen_key.st_dev, seen_key.st_ino))
+                        todo.append((target, name, here))
+        except OSError:
+            return "a folder in it could not be read"
+    return None
+
+
+def _credential_dir(parts, anchor, pathspec):
+    """The reason a directory named `agent`, `claude` or `config` is a bulk root, unless the owner's trust lifts it (T7 L2).
+
+    Lifted when the directory lies in the trusted tree and a walk of what a read of it would visit
+    finds no credential location. Git pathspecs are never lifted here: a patch also covers history.
+    """
+    if anchor is None or pathspec or _SHELL["trust"] is None:
+        return _CREDENTIAL_DIR
+    path = posixpath.join(anchor, *parts)
+    tree = _tree_for(path)
+    if tree is None:
+        return _CREDENTIAL_DIR
+    follow, exclude = _SHELL["walk"]
+    key = (os.path.realpath(path), follow, exclude)
+    if key not in _SHELL["memo"]:
+        _SHELL["memo"][key] = _walk(path, tree, follow, exclude)
+    refusal = _SHELL["memo"][key]
+    if refusal:
+        return _Refused(_CREDENTIAL_DIR, refusal)
+    _SHELL["trust"].note("L2", os.path.realpath(path), _CREDENTIAL_DIR)
+    return None
+
+
+def _layout(parts, tree=True, anchor=None, pathspec=False, lift=True):
+    """Judge a path relative to a project root by this repository's layout.
+
+    `lift` is false when the owner's trust may not be applied to these parts (see `_root_reason`)."""
+    if _named(parts, _part_lift(anchor if lift else None, parts)):
         return "a credential-bearing path"
     globs = [index for index, part in enumerate(parts) if _GLOB.search(part)]
     if not globs:
-        return _CREDENTIAL_DIR if parts[-1].lower() in CREDENTIAL_DIRS else None
+        return _credential_dir(parts, anchor if lift else None, pathspec) if parts[-1].lower() in CREDENTIAL_DIRS else None
     prefix = parts[:globs[0]]
     if (prefix and prefix[-1].lower() not in CREDENTIAL_DIRS) or not any(_glob_hits(parts[i]) for i in globs):
         return None
@@ -484,7 +701,23 @@ def _root_reason(root, base="", tree=True, pathspec=False):
     parts = parts[len([part for part in anchor.split("/") if part]):]
     if not parts:
         return "the repository root"
-    return _layout(parts, tree, anchor, pathspec)
+    return _layout(parts, tree, anchor, pathspec, _same_place(joined, literal))
+
+
+def _same_place(joined, literal):
+    """Whether the literal part of a root, as written, opens where the judged (folded) path says it does.
+
+    `_root_reason` judges a path with `link/..` folded away, as the shell's text would read; the kernel opens
+    it somewhere else when `link` leads out of that directory. The owner's trust is applied only where the
+    two agree, so a root that really ends elsewhere is judged, and prompts, as it does without trust."""
+    if _SHELL["trust"] is None:
+        return False
+    written = _absolute(joined, True)
+    if written is None:
+        return False
+    pieces = [part for part in written.split("/") if part]
+    stop = next((index for index, part in enumerate(pieces) if _GLOB.search(part)), len(pieces))
+    return _opens("/" + "/".join(pieces[:stop])) == literal
 
 
 def _heredoc_body(text, i, delimiter, dash):
@@ -778,21 +1011,24 @@ def _read_hit(word, base, globs=True):
                 # A variable below a written-out directory selects among that directory's files.
                 why = _root_reason(_VARIABLE.sub("*", piece), base, False)
             if why:
-                return piece, f"glob over {why} may include credential files"
+                return piece, f"glob over {_said(why)} may include credential files"
     return None
 
 
-def _weak_file(piece, interpreter):
-    """A path token, not a prose word, whose name says it stores credentials."""
+def _weak_file(piece, interpreter, base=None):
+    """A path token, not a prose word, whose name says it stores credentials. With `base`, a name the
+    owner's trust covers (T7 L1) is not one."""
     name = _plain_name(posixpath.basename(piece)).lower()
     if not _WEAK_NAME.match(name):
         return False
     stem, dot, extension = name.rpartition(".")
     if dot and stem:
-        return bool(_DATA_EXT.match(extension)) and extension not in _CODE_EXT
-    if name.startswith("."):
-        return True
-    return name.endswith("credentials") and (interpreter or "/" in piece or name != "credentials")
+        hit = bool(_DATA_EXT.match(extension)) and extension not in _CODE_EXT
+    elif name.startswith("."):
+        hit = True
+    else:
+        hit = name.endswith("credentials") and (interpreter or "/" in piece or name != "credentials")
+    return hit and not (base is not None and _lift_name(_absolute(_join(base, piece), True), posixpath.basename(piece)))
 
 
 def _other_hit(args, base, interpreter=False):
@@ -807,7 +1043,7 @@ def _other_hit(args, base, interpreter=False):
             if not piece or not _PLAIN.match(piece):
                 continue
             if (_SUFFIX_TOKEN.match(posixpath.basename(piece)) or _sensitive(_join(base, piece), False) or
-                    _weak_file(piece, interpreter)):
+                    _weak_file(piece, interpreter, base)):
                 return piece, _NAME_REASON
     return None
 
@@ -837,7 +1073,7 @@ def _roots_hit(label, roots, base, reason, pathspec=False):
     for root in roots:
         why = _root_reason(root, base, True, pathspec)
         if why:
-            return f"{label} of {root}", reason.format(why=why)
+            return f"{label} of {root}", reason.format(why=_said(why))
     return None
 
 
@@ -888,10 +1124,50 @@ def _narrowed(prog, args, spec):
             not any(_glob_can_match(glob) for glob in globs))
 
 
+def _search_walk(prog, args, spec):
+    """What a search visits below its roots, for a trust walk: (whether it follows links, directory names it skips).
+
+    Only what the command line plainly says is believed: grep follows links found on the way only for -R,
+    rg only for -L or --follow, and the other searches are taken to follow. A directory is skipped only for
+    a literal `--exclude-dir`, which grep and ugrep apply to the names of the directories they meet.
+    """
+    exclude, follow, letters, i = [], prog not in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga"), spec[1] + spec[3], 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            break
+        if not arg.startswith("-") or len(arg) < 2:
+            continue
+        name, equals, value = arg.partition("=")
+        short = not arg.startswith("--")
+        if not equals and (name in spec[0] or name in spec[2] or (short and arg[-1] in letters)):
+            value, i = "".join(args[i:i + 1]), i + 1
+        if name in ("--exclude-dir",) and value:
+            exclude.append(value)
+        elif short and re.match(r"^-[A-Za-z]*(?:L)", arg) and prog in ("rg", "rga"):
+            follow = True
+        elif short and re.match(r"^-[A-Za-z]*R", arg) and prog in ("grep", "egrep", "fgrep", "zgrep"):
+            follow = True
+        elif name in ("--follow", "--dereference-recursive"):
+            follow = True
+    return follow, tuple(exclude)
+
+
 def _search_hit(prog, args, cmd, base, bulk, git=False, listing=False):
+    """A search command, judged with the walk it implies (see `_search_walk`)."""
+    spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
+    saved = _SHELL["walk"]
+    _SHELL["walk"] = _search_walk(prog, args, spec) if not git else (True, ())
+    try:
+        return _search_scan(prog, args, cmd, base, bulk, git, listing, spec)
+    finally:
+        _SHELL["walk"] = saved
+
+
+def _search_scan(prog, args, cmd, base, bulk, git, listing, spec):
     """A search command. `bulk` means file names are appended at run time; `listing` means its output
     feeds a reader, so even a names-only search is judged by its roots."""
-    spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
     opts, before, after, values, has_pattern = _split_args(args, *spec)
     if any(opt in _INFO_OPTS for opt in opts):
         return None
@@ -1151,14 +1427,32 @@ def _listed_hit(label, query, base, unproven):
         return unproven
     names, links, folder = listed
     folder = os.path.realpath(folder)
-    above = [part for part in (_top(folder) or folder).split("/") if part]
+    top = _top(folder) or folder
+    above = [part for part in top.split("/") if part]
 
     def shown(name):
         return name if len(name) <= 200 and _PATHISH.match(name) else "a credential-bearing path"
 
+    placed = []
+
+    def where_git_reads():
+        """Whether git's own top level is the work tree the names were placed under (T7 3.3). `core.worktree`,
+        an include that sets it, or a `.git` file pointing elsewhere make git list files of a directory this
+        process never looked at; then no listed name is lifted. Asked once, only when a lift is wanted."""
+        if not placed:
+            asked = _git_ask(_GIT_TOPLEVEL, base, deadline)
+            answer = asked[0][:-1] if asked and asked[0].endswith("\n") else None
+            placed.append(bool(answer) and os.path.realpath(answer) == top)
+        return placed[0]
+
+    def lifted(name, parts):
+        return (_SHELL["trust"] is not None and _weak_only(_plain_name(name)) and where_git_reads() and
+                _lift_name("/" + "/".join(above + parts), name))
+
     for name in names:
         parts = [part for part in name.split("/") if part]
-        if parts and (SENSITIVE_NAME.match(_plain_name(parts[-1])) or _parts_hit(above + parts)):
+        if parts and (_parts_hit(above + parts) or (SENSITIVE_NAME.match(_plain_name(parts[-1])) and not
+                                                    lifted(parts[-1], parts))):
             return f"{label} of {shown(name)}", "patch output covers a credential-bearing path"
     if links:
         link = links[0] if len(links[0]) <= 200 and _PATHISH.match(links[0]) else "a submodule"
@@ -1516,7 +1810,9 @@ def _shell_hit(command, base="", depth=0):
             loops.append((_read_names(args) if fed else (), fed, True))
         if prog == "cd":
             target = next((arg for arg in args if arg == "-" or not arg.startswith("-")), "~")
-            base, previous = previous if target == "-" else _cd(base, target), base
+            flags = args[:args.index(target)] if target in args else args
+            physical = any(flag.startswith("-") and "P" in flag for flag in flags)
+            base, previous = previous if target == "-" else _cd(base, target, physical), base
         elif prog == "pushd":
             target = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
             pushed.append(base)
@@ -1574,6 +1870,7 @@ def _tool_hit(tool, params):
     root, glob, kind = params.get("path"), params.get("glob"), params.get("type")
     root = root.strip() if isinstance(root, str) and root.strip() else "."
     glob = glob.strip() if isinstance(glob, str) and glob.strip() else None
+    _SHELL["walk"] = (False, ())    # the tool's search does not follow links
     why = _root_reason(root)
     if not why:
         return None
@@ -1581,7 +1878,7 @@ def _tool_hit(tool, params):
         # A project-wide search prompts only when its filter names a credential file outright.
         named = glob and any(_filter_names(choice) for choice in _brace_expand(glob) if not choice.startswith("!"))
         return (f"{glob} under {root}", "search filter names a credential-bearing file") if named else None
-    reason = f"search root is {why} and may include credential files"
+    reason = f"search root is {_said(why)} and may include credential files"
     if glob:
         return (f"{glob} under {root}", reason) if _glob_can_match(glob) else None
     if isinstance(kind, str) and kind.lower() in _CODE_TYPES:
@@ -1589,18 +1886,28 @@ def _tool_hit(tool, params):
     return f"search of {root}", reason
 
 
-def classify(tool, params, cwd=None):
+def classify(tool, params, cwd=None, trust=None):
     """Judge one tool call. `cwd` is the working directory the call runs in, when the caller knows it.
 
     With no `cwd` the call is judged from this process's directory. A `cwd` that is not an absolute
     path is not replaced by it: the directory is unknown, and relative paths are judged on their own.
+
+    `trust` is a resolver (lib/trust_lift.py) from a caller that prompts the owner. Without one the
+    result is the same whatever records exist. With one, a prompt that only a name or a directory guess
+    raised is lifted for paths in a tree the owner vouched for; see the module docstring.
     """
     params = params or {}
     saved = dict(_SHELL)
     placed = isinstance(cwd, str) and cwd.startswith("/")
-    _SHELL.update(cwd=cwd if placed else None, unknown=cwd is not None and not placed)
+    _SHELL.update(cwd=cwd if placed else None, unknown=cwd is not None and not placed, trust=trust,
+                  walk=(True, ()), memo={}, until=time.monotonic() + WALK_CALL_SECONDS)
+    hit = None
     try:
-        hit = None
+        if trust is not None:
+            try:
+                trust.begin(tool, params, cwd if placed else None)
+            except Exception:   # a resolver that cannot start lifts nothing
+                trust = _SHELL["trust"] = None
         if tool in _READ_TOOLS:
             hit = _tool_hit(tool, params)
         elif tool in _SHELL_TOOLS:
@@ -1610,13 +1917,24 @@ def classify(tool, params, cwd=None):
         hit = "unparsed tool call", "the call could not be analysed"
     finally:
         _SHELL.update(saved)
+    if trust is not None:
+        try:
+            # What the call would have said without the owner's trust is asked of this same function, only if
+            # the log needs it: the reason in the log is then the reason the prompt would have given.
+            trust.finish(bool(hit), lambda: classify(tool, params, cwd).get("reason"))
+        except Exception:       # a log that cannot be written changes nothing
+            pass
     if hit:
         return {"sensitive": True, "target": hit[0], "reason": hit[1]}
     return {"sensitive": False}
 
 
-def hook_response(event, cwd=None):
-    result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd or event.get("cwd"))
+def hook_response(event, cwd=None, trust=None):
+    return response_for(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd or event.get("cwd"), trust))
+
+
+def response_for(result):
+    """The PreToolUse `ask` for a classification, or None when it is not sensitive."""
     if not result["sensitive"]:
         return None
     reason = f"Read may expose {result['target']}. Authorize this specific tool call only if its scope is needed."

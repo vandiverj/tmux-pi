@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from sensitive_read import classify, hook_response
+from sensitive_read import classify, response_for
 from redact_hook import mode as redaction_mode
 
 
@@ -24,9 +24,30 @@ def save_request(result, status):
     tmp.replace(path)
 
 
+def resolver(args, quiet=False):
+    """The owner's trust record as the classifier's resolver (lib/trust_lift.py), or None.
+
+    Only a caller that prompts the owner asks for it (`--trusted`); anything that goes wrong building it
+    means no lifts, which is what every caller without the flag gets.
+    """
+    if not args.trusted:
+        return None
+    try:
+        import trust_lift
+        return (trust_lift.Quiet if quiet else trust_lift.Resolver)(
+            "claude" if args.claude_hook else "pi", home=args.home, temp_roots=args.temp_root)
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--claude-hook", action="store_true")
+    parser.add_argument("--trusted", action="store_true",
+                        help="lift prompts that a name or directory guess raised in a tree the owner vouched for")
+    # Test seams: where the trust store and its log live, and which directories count as temporary.
+    parser.add_argument("--home", help=argparse.SUPPRESS)
+    parser.add_argument("--temp-root", action="append", help=argparse.SUPPRESS)
     args = parser.parse_args()
     event = json.load(sys.stdin)
     # The shell's directory when the tool ran; relative paths and search roots are
@@ -40,18 +61,19 @@ def main():
             old = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
             if old.is_file():
                 prior = json.loads(old.read_text())
-                current = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)
+                current = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd,
+                                   resolver(args, quiet=True))
                 if prior.get("status") == "pending" and current.get("sensitive") and current.get("target") == prior.get("target"):
                     save_request(prior, "authorized" if name == "PostToolUse" else "denied")
             return
         if name != "PreToolUse":
             return
-        result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)
+        result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
         if result["sensitive"]:
             save_request(result, "pending")
-            print(json.dumps(hook_response(event, cwd)))
+            print(json.dumps(response_for(result)))
     else:
-        print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd)))
+        print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))))
 
 
 if __name__ == "__main__":

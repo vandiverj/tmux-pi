@@ -48,7 +48,8 @@ const stubRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-sens-stub-'));
 fs.mkdirSync(path.join(stubRoot, 'agent')); fs.mkdirSync(path.join(stubRoot, 'bin'));
 const seen = path.join(stubRoot, 'seen.json');
 const stub = path.join(stubRoot, 'bin/tp-sensitive-read');
-fs.writeFileSync(stub, `#!/bin/sh\ncat > "${seen}"\necho '{"sensitive":false}'\n`, { mode: 0o755 });
+const seenArgs = path.join(stubRoot, 'seen-args');
+fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" > "${seenArgs}"\ncat > "${seen}"\necho '{"sensitive":false}'\n`, { mode: 0o755 });
 // A stub trust-store guard: records what it receives and answers with the contents of `verdict`.
 const guardSeen = path.join(stubRoot, 'guard-seen.json');
 const verdict = path.join(stubRoot, 'verdict');
@@ -60,6 +61,8 @@ mod.default({ on(name, fn) { h4[name] = fn; } });
 const call = (toolName, input) => ({ type: 'tool_call', toolName, input });
 await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: '/some/session/dir', hasUI: false });
 assert.equal(JSON.parse(fs.readFileSync(seen, 'utf8')).cwd, '/some/session/dir');
+// The worker gate prompts the owner, so it asks for the trusted lifts (T7 slice 4); offload.ts, which does not, never does.
+assert.equal(fs.readFileSync(seenArgs, 'utf8'), '--trusted\n');
 // A missing or odd cwd is left out, so the classifier assumes nothing.
 for (const odd of [undefined, '', 42, null]) {
   fs.rmSync(seen, { force: true });

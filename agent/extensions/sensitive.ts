@@ -74,7 +74,9 @@ export default function (pi: ExtensionAPI) {
 			if (!allowed) return { block: true, reason: "User denied a call the trust-store guard could not fully check." };
 		}
 		try {
-			decision = JSON.parse(execFileSync(classifier, [], {
+			// `--trusted`: this caller prompts the owner, so a name or directory guess in a tree the owner vouched for is lifted.
+			// offload.ts asks the same classifier whether to send text to a model and does not pass it.
+			decision = JSON.parse(execFileSync(classifier, ["--trusted"], {
 				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),
 				encoding: "utf8", timeout: 5000,
 			}));

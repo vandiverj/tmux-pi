@@ -31,6 +31,7 @@ from pathlib import Path
 
 import request_file
 from lifecycle_files import LIFECYCLE_FILES
+from result_status import RESULT_STATUS_RE  # noqa: F401  (the one RESULT_STATUS reader: lib/result_status.py)
 from task_record import request_text
 
 KINDS = ("research", "task")
@@ -397,9 +398,6 @@ def extension(meta, state, now, events):
             "budget": {"seconds": int(max(r["elapsed"], 0) + b["seconds"]),
                        "turns": r["turns"] + b["turns"] if b["turns"] else None,
                        "tokens": r["tokens"] + b["tokens"] if b["tokens"] else None}}
-
-
-RESULT_STATUS_RE = re.compile(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", re.I)
 
 
 def recorded_pause(state, events=()):

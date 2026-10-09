@@ -136,7 +136,7 @@ class DispatchIntoALaneTests(LaneCase):
         pane2, _ = self.pane()
         self.attach(reviewer_task, pane2)
         self.lane_ok(role="code-reviewer", step="s1", extra=())
-        self.refused(self.lane_dispatch(step="s2", extra=()), "already has a writer", reviewer["id"])
+        self.refused(self.lane_dispatch(step="s2", extra=()), "in use by a reviewer", reviewer["id"])
 
     def test_a_dead_pane_does_not_hold_the_lane(self):
         item, task = self.lane_ok()

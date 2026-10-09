@@ -629,7 +629,10 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         notice = f"{item['id']} replied without a result status (paused); nothing was collected."
         out = json.loads(run.stdout)  # stdout stays pure JSON
-        self.assertEqual((out["status"], out["notice"]), ("paused", notice))
+        self.assertEqual(out["status"], "paused")
+        # the notice goes on to state the accepted form and the command that goes on (tests/test_refusal_remedies.py proves them)
+        self.assertTrue(out["notice"].startswith(notice + " A reply is collected when it has a line of its own that reads "
+                                                 "RESULT_STATUS: complete"), out["notice"])
         self.assertEqual(next(iter(out)), "notice")
         self.assertIn(notice, run.stderr)
         self.assertFalse((task / "collected.json").exists())
@@ -662,7 +665,8 @@ esac
         run = self.raw("collect", item["id"])
         out = json.loads(run.stdout)
         self.assertEqual((out["status"], out["result_status"]), ("paused", "blocked"))
-        self.assertEqual(out["notice"], f"{item['id']} is paused; nothing was collected.")
+        self.assertTrue(out["notice"].startswith(f"{item['id']} is paused; nothing was collected."), out["notice"])
+        self.assertIn(f"`tp-agent stop {item['id']}`", out["notice"])
         self.assertNotIn("without a result status", run.stderr + run.stdout)
         index = self.cli("index")
         self.assertEqual(index["unstatused"], [])

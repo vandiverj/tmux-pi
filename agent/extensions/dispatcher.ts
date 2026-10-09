@@ -168,6 +168,9 @@ const MAX_REVIEW_ROUNDS = 2;
 // REQUEST_CHANGES, or "REQUEST_CHANGES: reason" (the one longer form). Anything else is refused. APPROVED_WITH_NOTES approves
 // and must carry its notes. Only the RESULT_STATUS line can contradict an approval; the notes may quote earlier rounds.
 const VERDICT_LINE = /^(APPROVED_WITH_NOTES|APPROVED|REQUEST_CHANGES)(?::[ \t]*(\S.*))?$/;
+// The RESULT_STATUS line as lib/result_status.py reads it (its RESULT_STATUS_LEAD): plain or with a heading, list, bold, italic or
+// backtick marker around it. tests/test_refusal_remedies.py runs both readers over the same lines.
+const RESULT_STATUS_LEAD = "^[ \\t]{0,3}(?:(?:#{1,6}|[-+*]|\\d+[.)])[ \\t]+)*[*_`~]*RESULT_STATUS[ \\t]*[*_`~]*[ \\t]*:";
 const parseVerdict = (text: string): { verdict?: "APPROVED" | "APPROVED_WITH_NOTES" | "REQUEST_CHANGES"; notes: string; error?: string } => {
 	const body = text.trim().replace(/^\ufeff/, "").trim();
 	const [first, ...others] = body.split("\n");
@@ -175,9 +178,9 @@ const parseVerdict = (text: string): { verdict?: "APPROVED" | "APPROVED_WITH_NOT
 	if (!match || (match[2] && match[1] !== "REQUEST_CHANGES")) return { notes: "", error: "the whole first line must be APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES (or 'REQUEST_CHANGES: reason') without formatting" };
 	const verdict = match[1] as "APPROVED" | "APPROVED_WITH_NOTES" | "REQUEST_CHANGES";
 	const rest = others.join("\n");
-	const status = /^RESULT_STATUS:(.*)$/im.exec(rest);
+	const status = new RegExp(`${RESULT_STATUS_LEAD}(.*)$`, "im").exec(rest);
 	if (verdict !== "REQUEST_CHANGES" && status && /\bREQUEST_CHANGES\b/.test(status[1])) return { notes: "", error: `${verdict} but its RESULT_STATUS line says REQUEST_CHANGES` };
-	const notes = [match[2] ?? "", rest.replace(/^RESULT_STATUS:.*$/gim, "").trim()].filter(Boolean).join("\n");
+	const notes = [match[2] ?? "", rest.replace(new RegExp(`${RESULT_STATUS_LEAD}.*$`, "gim"), "").trim()].filter(Boolean).join("\n");
 	if (verdict === "APPROVED_WITH_NOTES" && !notes) return { notes: "", error: "APPROVED_WITH_NOTES has no notes" };
 	return { verdict, notes };
 };

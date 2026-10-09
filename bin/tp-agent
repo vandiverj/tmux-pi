@@ -23,8 +23,10 @@ import review_verdict  # noqa: E402
 from task_archive import find_archived_task  # noqa: E402
 from task_record import refresh_record  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
-from worker_process import (FINISHED, READ_ONLY_ROLES, alive_on_workdir, describe, end_or_refuse, end_process, end_orphan,  # noqa: E402
-                            guard_retry, guard_review, live_process, orphans, pane_table, same_tree)
+from result_status import RESULT_STATUS_FORM, result_status  # noqa: E402  (the one RESULT_STATUS reader)
+from worker_process import (FINISHED, READ_ONLY_ROLES, alive_on_workdir, clear_commands, describe_state, end_or_refuse, end_process,  # noqa: E402
+                            end_orphan, finishes_alone, guard_retry, guard_review, live_process, orphans, pane_table, same_tree,
+                            state_words, task_state)
 
 ROLES = ROOT / "agent" / "roles"
 TESTS_SCOPES = ("affected", "full", "none")
@@ -97,9 +99,6 @@ def task_dir(base, ident):
     return path
 
 
-RESULT_STATUS = re.compile(r"(?m)^RESULT_STATUS:\s*(complete|empty|blocked|incomplete)\b", re.I)
-
-
 def lifecycle(path):
     # tp-agent does not look at panes: contract.lifecycle reads an unobserved pane as present.
     return task_lifecycle(path)[0]
@@ -128,7 +127,6 @@ def record(path, include_result=False):
     report_path = path / "report.md"
     # display text only (a lossy decode never feeds a verdict); a review's verdict comes from review_verdict.read_review below
     result_text = result_path.read_bytes().decode("utf-8", "replace") if result_path.exists() else ""
-    match = RESULT_STATUS.search(result_text)
     result = {
         "id": meta.get("id", path.name), "role": meta.get("role", "generic"),
         "harness": meta.get("worker", "unknown"), "model": state.get("model") or meta.get("model"),
@@ -137,7 +135,7 @@ def record(path, include_result=False):
         "deliverable": meta.get("deliverable", ""), "parent": meta.get("parent", ""),
         "route": meta.get("route_info", {}), "task_dir": str(path),
         "packet": str(path / "packet.md"), "result_path": str(result_path) if result_path.exists() else None,
-        "result_status": match.group(1).lower() if match else None,
+        "result_status": result_status(result_text),
         "tool": state.get("tool", ""), "updated": state.get("updated", meta.get("created")),
         **usage_fields(state),
         "permission": read_json(path / "permission-request.json") if (path / "permission-request.json").exists() else None,
@@ -169,6 +167,27 @@ def record(path, include_result=False):
     if include_result:
         result["result"] = result_text
     return result
+
+
+def paused_notice(base, path, ident, status):
+    """What collect says of a paused task: why nothing was collected, the form a reply needs, and the commands that go on.
+    A worker whose pane still runs is asked with `tp-agent message`; one whose pane is gone cannot be, so the notice offers a
+    retry instead of a command that would fail."""
+    try:
+        asked = live_process(path, pane_table()) is not None
+    except (RuntimeError, ValueError):
+        asked = True  # the pane list cannot be read here; the message command is still the right one to try
+    if status:
+        why = f"{ident} is paused; nothing was collected."
+        ask = f"tp-agent message {ident} --text \"Continue, or reply with your final result\""
+    else:
+        why = (f"{ident} replied without a result status (paused); nothing was collected. A reply is collected when it has "
+               f"{RESULT_STATUS_FORM}.")
+        ask = f"tp-agent message {ident} --text \"End your reply with a line that reads exactly RESULT_STATUS: complete\""
+    if asked:
+        return f"{why} Ask the worker with: `{ask}`. Or end it: `tp-agent stop {ident}`."
+    return (f"{why} Its pane is gone, so it cannot be asked: `tp-agent retry {ident} --reason \"say what changed\"` starts it again, "
+            f"or `tp-agent stop {ident}` marks it stopped.")
 
 
 def reap(base, args):
@@ -329,10 +348,13 @@ def lane_holders(base, lane, worktree, role, own=None):
     ruled out. This is the early look that lets dispatch refuse and tick wait; the authority is the reservation tp-spawn makes."""
     holders = []
     common = lanes.git_common_dir(worktree)
-    holders += [(h["task"], lane_lease.describe([h])) for h in lane_lease.conflicts(common, lane, role, own)]
+    holders += [(h["task"], lane_lease.describe([h], base), h["access"] == "write", lane_lease.waiting_helps([h]))
+                for h in lane_lease.conflicts(common, lane, role, own)]
     tasks = base / "tasks"
     if tasks.is_dir():
-        holders += [(row[0], describe([row])) for row in alive_on_workdir(tasks, worktree) if role not in READ_ONLY_ROLES or row[1] not in READ_ONLY_ROLES]
+        holders += [(row[0], describe_state(tasks, [row]) + f"; to end it: {' or '.join(clear_commands(task_state(tasks, row[0]), row[0]))}",
+                     row[1] not in READ_ONLY_ROLES, finishes_alone(task_state(tasks, row[0])))
+                    for row in alive_on_workdir(tasks, worktree) if role not in READ_ONLY_ROLES or row[1] not in READ_ONLY_ROLES]
     for path in queue_files(base):
         if own is not None and path.stem == own:
             break
@@ -341,16 +363,25 @@ def lane_holders(base, lane, worktree, role, own=None):
             if isinstance(raw, dict) and raw.get("lane") != lane and isinstance(raw.get("workdir"), str) \
                     and not same_tree(raw["workdir"], worktree):
                 continue  # an unusable entry that names another tree is not this lane's
+            # tp-agent stop removes a queue entry by its id; a file whose name is no id can only be deleted by hand
+            remove = f"`tp-agent stop {path.stem}`" if IDENT.fullmatch(path.stem) else f"delete the file {path}"
             raise ValueError(f"queue entry {path.name} cannot be read ({reason}), so a queued item for lane {lane} cannot be ruled out; "
-                             "remove it with: tp-agent stop " + path.stem)
+                             f"remove it with: {remove}")
         if (item.get("lane") == lane or same_tree(item["workdir"], worktree)) and (role not in READ_ONLY_ROLES or item["role"] not in READ_ONLY_ROLES):
-            holders.append((item["id"], f"{item['id']} (queued)"))
+            holders.append((item["id"], f"{item['id']} (queued; to remove it: `tp-agent stop {item['id']}`)", item["role"] not in READ_ONLY_ROLES, True))
     seen, unique = set(), []
-    for task, text in holders:  # the lease and the pane scan can both see one task
-        if task not in seen:
-            seen.add(task)
-            unique.append((task, text))
+    for held in holders:  # the lease and the pane scan can both see one task
+        if held[0] not in seen:
+            seen.add(held[0])
+            unique.append(held)
     return unique
+
+
+def lane_refusal(name, holders):
+    """The refusal for a lane that `holders` (lane_holders) keep: who holds it, in what state, and what frees it. A reviewer is
+    called a reviewer; waiting is offered only when every holder is at work and will finish by itself."""
+    first = f"lane {name} already has a writer" if any(held[2] for held in holders) else f"lane {name} is in use by a reviewer"
+    return f"{first}: {', '.join(held[1] for held in holders)}. {lane_lease.advice_text(all(held[3] for held in holders))}, then dispatch again"
 
 
 def capacity(base, item):
@@ -359,7 +390,9 @@ def capacity(base, item):
     if "lane" in item:  # the one-writer rule again at start, for what was written around the tool
         holders = lane_holders(base, item["lane"], item["workdir"], item["role"], own=item["id"])
         if holders:
-            return False, f"waiting for lane {item['lane']}'s writer {holders[0][0]}"
+            first = holders[0]
+            # a holder that will not finish by itself (settled, paused) is not waited for: say what it is and what ends it
+            return False, f"waiting for lane {item['lane']}'s writer {first[0]}" + ("" if first[3] else f" (it will not finish by itself: {first[1]})")
     worker, model = item["worker"], item["model"]
     cfg = read_json(ROOT / "config/orchestration.json")
     active = [r for r in all_records(base) if r["status"] in {"starting", "working", "needs_input"}]
@@ -733,9 +766,7 @@ def lane_admit(base, plan, item):
         try:
             holders = lane_holders(base, name, record["worktree"], item["role"])  # 18; 19 is the refusals worker_process raises
             if holders:
-                raise ValueError(f"lane {name} already has a writer: {', '.join(text for _, text in holders)}. Wait for it to finish, "
-                                 f"or end it with `tp-agent stop {holders[0][0]}` (in the session named above when it is not this one), "
-                                 "then dispatch again")
+                raise ValueError(lane_refusal(name, holders))
         except BaseException:
             if created:
                 lane_commands.undo_created_lane(record)  # nothing could hold a lane made a moment ago; raises if it cannot be undone
@@ -1011,7 +1042,9 @@ def main():
         meta = read_json(previous / "meta.json")
         prior = record(previous)
         if prior["status"] in {"starting", "working", "needs_input"}:
-            raise ValueError("stop or settle the prior attempt before retrying")
+            wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
+            raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
+                             f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
         if not args.force_alive:
             guard_retry(previous)
         original = (previous / "request.md").read_text().strip()
@@ -1111,8 +1144,7 @@ def main():
                     write_index(base)
                     refreshed(base, args.id, value)
             elif value["status"] == "paused" and value["result_path"]:
-                notice = (f"{args.id} is paused; nothing was collected." if value.get("result_status")
-                          else f"{args.id} replied without a result status (paused); nothing was collected.")
+                notice = paused_notice(base, path, args.id, value.get("result_status"))
                 value = {"notice": notice, **value}  # first key, so a reader sees it at once
                 print(notice, file=sys.stderr)
         elif args.command == "stop":
@@ -1128,7 +1160,8 @@ def main():
         else:
             pane = read_json(path / "meta.json").get("pane")
             if not pane or lifecycle(path) in {"failed", "stopped"}:
-                raise ValueError("worker cannot receive a message")
+                raise ValueError("worker cannot receive a message (it has no pane, or it failed or was stopped); "
+                                 f"start it again with: `tp-agent retry {args.id} --reason \"say what changed\"`")
             if (path / "reaped.json").exists():
                 raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
             subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)

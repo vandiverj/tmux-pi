@@ -19,12 +19,13 @@ import json
 import re
 import sys
 
+from result_status import RESULT_STATUS_LEAD, RESULT_STATUS_LINE  # the one reader of the RESULT_STATUS line
+
 VERDICTS = ("APPROVED", "APPROVED_WITH_NOTES", "REQUEST_CHANGES")
 # The whole first line: exactly one of the three tokens, or (the one accepted longer form) "REQUEST_CHANGES: reason".
 # The dispatcher's parseVerdict (agent/extensions/dispatcher.ts) must keep the same pattern.
 FIRST_LINE = re.compile(r"(APPROVED_WITH_NOTES|APPROVED|REQUEST_CHANGES)(?::[ \t]*(\S.*))?")
-RESULT_STATUS_LINE = re.compile(r"(?mi)^RESULT_STATUS:.*$")
-FIRST_RESULT_STATUS = re.compile(r"(?mi)^RESULT_STATUS:(.*)$")
+FIRST_RESULT_STATUS = re.compile(RESULT_STATUS_LEAD + r"(.*)$", re.I | re.M)
 
 
 def first_line_verdict(line):

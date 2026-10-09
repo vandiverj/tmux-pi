@@ -170,21 +170,89 @@ def describe(found):
     return ", ".join(f"{ident} (pane {pane}, pid {pid})" for ident, _, pane, pid in found)
 
 
+# --- what a live process on a tree is, and what ends it -------------------------------------------------------------
+# A refusal names a command only if that command clears the refusal in the state the task is in when it is printed:
+#   running / starting   tp-agent stop            (it finishes by itself too, so waiting also works)
+#   needs input / paused tp-agent stop            (waiting never clears it: it waits for an answer; tp-agent message answers it)
+#   settled              tp-agent collect, or stop (it never finishes by itself: its pane stays open until collected)
+#   completed            tp-agent collect (ends the process again), tp-agent reap ID --yes, or stop
+#   stopped              tp-agent reap ID --yes, or stop (reap lists only completed and stopped tasks)
+
+def task_state(tasks, ident):
+    """The lifecycle word of task `ident` in the task directory `tasks`, or "" when it cannot be read."""
+    try:
+        return task_lifecycle(Path(tasks) / ident)[0]
+    except Exception:  # an unreadable record is shown as "running": the state is only for wording, never for a decision
+        return ""
+
+
+STATE_WORDS = {"settled": "settled: finished, not collected", "completed": "collected, its process still alive",
+               "stopped": "stopped, its process still alive", "paused": "paused", "needs_input": "waiting for an answer"}
+
+
+def state_words(life):
+    return STATE_WORDS.get(life, "running")
+
+
+def clear_commands(life, ident, prefix=""):
+    """The commands that end the process of task `ident` when it is in lifecycle state `life`, the cheapest first. Each is in
+    backticks, so a sentence can go on after it without its punctuation becoming part of a pasted command (an id may end in a dot)."""
+    commands = []
+    if life in {"settled", "completed"}:
+        commands.append(f"`{prefix}tp-agent collect {ident}`")
+    if life in {"completed", "stopped"}:
+        commands.append(f"`{prefix}tp-agent reap {ident} --yes`")
+    commands.append(f"`{prefix}tp-agent stop {ident}`")
+    return commands
+
+
+def finishes_alone(life):
+    """May waiting clear it? Only a task that is at work ends by itself."""
+    return life not in {"settled", "completed", "stopped", "paused", "needs_input"}
+
+
+def _kind(role):
+    return "reviewer" if role in READ_ONLY_ROLES else "writer"
+
+
+def describe_state(tasks, found):
+    """Like describe, with each task's role and state: `id (reviewer, settled: finished, not collected; pane %3, pid 4)`."""
+    return ", ".join(f"{ident} ({_kind(role)}, {state_words(task_state(tasks, ident))}; pane {pane}, pid {pid})"
+                     for ident, role, pane, pid in found)
+
+
+def _ending(tasks, found):
+    """'tp-agent collect A or tp-agent stop A' for each task of `found`: what ends each one, in the state it is in."""
+    return "; ".join(" or ".join(clear_commands(task_state(tasks, row[0]), row[0])) for row in found)
+
+
+def _lane_tagged(path):
+    meta = strict_meta(path)
+    return bool(meta.get("lane"))
+
+
 def guard_retry(path):
+    path = Path(path)
     busy = alive_on_tree(path)
     if busy:
-        raise ValueError(f"a process is alive on the same working tree: {describe(busy)}. Collect or stop it "
-                         "(tp-agent reap ends finished ones), or pass --force-alive")
+        tasks = path.parent
+        seen = f"a process is alive on the same working tree: {describe_state(tasks, busy)}. End it with {_ending(tasks, busy)}"
+        if _lane_tagged(path):  # the lane's lease refuses a second writer whatever the flag says, so the flag is not offered
+            raise ValueError(f"{seen}. --force-alive does not apply to a lane's working tree; only ending it helps")
+        raise ValueError(f"{seen}, or pass --force-alive to start the attempt beside it")
 
 
 def guard_review(path):
     """A reviewer is read-only, so it may run beside other reviewers but beside nothing that writes, the reviewed task's
     own process included: tp-review ends that one (end_or_refuse) before this runs, so a live author refuses here too."""
+    path = Path(path)
     busy = [row for row in alive_on_tree(path) if row[1] not in READ_ONLY_ROLES]
     if busy:
-        raise ValueError(f"a writer is alive on {Path(path).name}'s working tree: {describe(busy)}; a reviewer must not run beside it. "
-                         f"End it (`tp-agent stop {busy[0][0]}`, or tp-agent reap for finished ones) or pass --force-alive; "
-                         "--force-alive does not apply to a lane's working tree, where only ending the writer helps")
+        tasks = path.parent
+        seen = f"a writer is alive on {path.name}'s working tree: {describe_state(tasks, busy)}; a reviewer must not run beside it. End it with {_ending(tasks, busy)}"
+        if _lane_tagged(path):
+            raise ValueError(f"{seen}. --force-alive does not apply to a lane's working tree; only ending the writer helps")
+        raise ValueError(f"{seen}, or pass --force-alive to review beside it")
 
 
 def _ended(path, life, pane, pid, how):
@@ -200,7 +268,8 @@ def end_process(path):
     path = Path(path)
     life = task_lifecycle(path)[0]
     if life not in ENDABLE:
-        raise ValueError(f"{path.name} is {life}, not finished; its process is left running")
+        how = "Wait for it to finish, or end it" if finishes_alone(life) else "It will not finish by itself: end it"
+        raise ValueError(f"{path.name} is {life}, not finished; its process is left running. {how} with `tp-agent stop {path.name}`")
     live = live_process(path, pane_table())
     if not live:
         return {"ended": False, "reason": "no live process"}
@@ -291,6 +360,14 @@ def _survivor(rec):
     return f"pid {rec['pid']}, process group {rec['pgid']}"
 
 
+def _by_hand(rec, ident):
+    """What to do about a recorded process that cannot be shown to be the worker: reap never signals it, so the owner ends it
+    (after looking) and reap then drops the record, which it does once nothing of the recorded target runs."""
+    target = f"-{rec['pgid']}" if rec["group"] else str(rec["pid"])
+    return (f"it is not signalled; if {_survivor(rec)} is the worker, end it with `kill -KILL -- {target}` "
+            f"and then `tp-agent reap {ident} --yes` drops the record")
+
+
 def prepare_stop(path, pane):
     """Validate the pane's process and record it as process.json before anything is ended. A pane that is gone or dead has
     nothing to record. A pid that cannot be read or is no valid worker pid (0, 1, the caller's own group) refuses."""
@@ -352,9 +429,12 @@ def finish_stop(path, pane):
     if state == "gone":
         (path / "process.json").unlink(missing_ok=True)
         return rec
-    if state != "ours" or not _escalate(rec):
-        raise RuntimeError(f"{path.name}: {'cannot tell that the process is the worker' if state != 'ours' else 'process survived SIGKILL'} "
-                           f"({_survivor(rec)}); recorded in {path.name}/process.json, `tp-agent reap --yes` retries")
+    if state != "ours":
+        raise RuntimeError(f"{path.name}: cannot tell that the process is the worker; recorded in {path.name}/process.json, "
+                           f"and tp-agent reap --yes will not signal it either: {_by_hand(rec, path.name)}")
+    if not _escalate(rec):
+        raise RuntimeError(f"{path.name}: process survived SIGKILL ({_survivor(rec)}); recorded in {path.name}/process.json, "
+                           "`tp-agent reap --yes` retries")
     (path / "process.json").unlink(missing_ok=True)
     return rec
 
@@ -393,7 +473,7 @@ def end_orphan(tasks, row):
         (path / "process.json").unlink(missing_ok=True)
         return {"ended": True, "signal": "none"}
     if orphan_state(rec) != "ours":
-        return {"ended": False, "reason": "cannot tell that the process is the worker's, so it is not signalled"}
+        return {"ended": False, "reason": f"cannot tell that the process is the worker's; {_by_hand(rec, row['id'])}"}
     if not _escalate(rec):
         return {"ended": False, "reason": "process survived SIGKILL"}
     (path / "process.json").unlink(missing_ok=True)

@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -111,23 +112,75 @@ def conflicts(common_dir, name, role, task=None):
     return [h for h in blocking(live(read(common_dir, name)), access) if h["task"] != task]
 
 
-def clear_command(holder):
-    """The command that ends this (live) holder, for a refusal to name."""
+def in_session(holder, here=None):
+    """The words to put before a tp-agent command so it acts on the session the holder is in, from wherever it is typed.
+    Another session's state directory is chosen with TP_STATE_DIR, but a pane of a different tmux session wins over it
+    (lib/tp.sh tp_session refuses "another workspace"), so the pane's own session is dropped too. In the holder's own
+    session the plain command does."""
+    if here is not None and os.path.realpath(str(here)) == os.path.realpath(holder["session"]):
+        return ""
+    return f"env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR={shlex.quote(holder['session'])} "
+
+
+def holder_state(holder):
+    """The lifecycle word of the holder's task (see worker_process.task_state); "" for a reservation or an unreadable record."""
+    if holder["kind"] != "worker" or not (_task_dir(holder) / "meta.json").is_file():
+        return ""
+    return worker_process.task_state(_task_dir(holder).parent, holder["task"])
+
+
+def clear_commands(holder, here=None):
+    """The commands that end this (live) holder, cheapest first, for a refusal to name: each one clears it in the state the
+    holder is in now. `here` is the state directory of the session that prints them."""
     pids = worker_process.task_processes(_task_dir(holder))
     if holder["kind"] == "worker" and (_task_dir(holder) / "meta.json").is_file():
-        return f"TP_STATE_DIR={holder['session']} tp-agent stop {holder['task']}"
+        return worker_process.clear_commands(holder_state(holder), holder["task"], in_session(holder, here))
     if pids:
         try:
             table = worker_process.pane_table()
         except RuntimeError:
             table = {}
-        return worker_process.end_command(pids, table)
-    return f"wait: {holder['task']} is still starting"
+        return [f"`{worker_process.end_command(pids, table)}`"]
+    return [f"wait: {holder['task']} is still starting"]
 
 
-def describe(holders):
-    return ", ".join(f"{h['task']} ({'starting' if h['kind'] == 'reservation' else 'running'}, pid {h['pid']}, session {h['session']}; "
-                     f"to end it: {clear_command(h)})" for h in holders)
+def clear_command(holder, here=None):
+    return " or ".join(clear_commands(holder, here))
+
+
+def describe(holders, here=None):
+    """`task (reviewer, settled: finished, not collected, pid P, session S; to end it: CMD or CMD)` for each holder."""
+    parts = []
+    for h in holders:
+        kind = "reviewer" if h["access"] == "read" else "writer"
+        life = holder_state(h)
+        state = "starting" if h["kind"] == "reservation" else worker_process.state_words(life)
+        parts.append(f"{h['task']} ({kind}, {state}, pid {h['pid']}, session {h['session']}; "
+                     f"to end it: {clear_command(h, here)})")
+    return ", ".join(parts)
+
+
+def waiting_helps(holders):
+    """Does waiting free the lane? Only if every holder is still at work (or starting): a settled one never finishes by itself."""
+    return all(h["kind"] == "reservation" or worker_process.finishes_alone(holder_state(h)) for h in holders)
+
+
+def occupied(name, holders):
+    """The first words of a refusal: who holds lane `name`. A reviewer is called a reviewer, never a writer."""
+    if any(h["access"] == "write" for h in holders):
+        return f"lane {name} already has a writer"
+    return f"lane {name} is in use by a reviewer"
+
+
+def advice_text(waits):
+    """What to do: wait only when waiting can help (every holder is at work), else end it with the command named for it."""
+    if waits:
+        return "Wait for it to finish, or end it with the command named for it"
+    return "It will not finish by itself (waiting never frees the lane): end it with the command named for it"
+
+
+def advice(holders):
+    return advice_text(waiting_helps(holders))
 
 
 class StillRunning(ValueError):
@@ -165,11 +218,10 @@ def reserve(common_dir, name, task, role, session, pid, replaces=None):
         if any(h["task"] == task for h in kept):
             raise ValueError(f"task {task} already holds lane {name}")
         if busy and access == "write":
-            raise ValueError(f"lane {name} already has a writer or a task starting on it: {describe(busy)}. "
-                             "Wait for it to finish or end it with that command, then start this task again")
+            raise ValueError(f"{occupied(name, busy)}: {describe(busy, session)}. {advice(busy)}, then start this task again")
         if busy:
-            raise ValueError(f"lane {name} has a writer: {describe(busy)}; a reviewer must not run beside it. End the writer with "
-                             "that command (--force-alive does not change this), then review again")
+            raise ValueError(f"{occupied(name, busy)}: {describe(busy, session)}; a reviewer must not run beside it. "
+                             f"{advice(busy)} (--force-alive does not change this), then review again")
         holder = {"kind": "reservation", "access": access, "task": task, "role": worker_process.effective_role(role, task),
                   "session": session, "pid": pid, "start": row[2], "pane": None, "taken": lanes.utc_now()}
         _write(common_dir, name, kept + [holder])
@@ -189,7 +241,7 @@ def release(common_dir, name, task):
             _write(common_dir, name, kept)
         if running:
             raise StillRunning(f"task {task} still has a process running, so lane {name} stays held by it. End it with "
-                               f"`{clear_command(running[0])}`; the lane is free once it is gone")
+                               f"{clear_command(running[0])}; the lane is free once it is gone")
 
 
 def activate(common_dir, name, task, pane):

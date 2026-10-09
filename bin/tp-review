@@ -84,9 +84,9 @@ fi
 # state comes from tp-agent's classifier, which a recorded pause wins in whatever the exit code says.
 status="$(TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" inspect "$id" 2>/dev/null | jq -r '.status // empty')" || status=
 [[ -n "$status" ]] || die "cannot read the state of subagent '$id'"
-[[ "$status" != paused ]] || die "subagent '$id' is paused (replied without a result status, or a pause is recorded); it is not ready for review"
-grep -Eiq '^RESULT_STATUS:[[:space:]]*(complete|empty|blocked|incomplete)\b' "$dir/result.md" ||
-  die "subagent '$id' replied without a result status (paused); it is not ready for review"
+[[ "$status" != paused ]] || die "subagent '$id' is paused (replied without a result status, or a pause is recorded); it is not ready for review. See what it needs with: tp-agent collect $id (nothing is collected while it is paused); ask it to finish with: tp-agent message $id --text \"Finish, ending with a line that reads exactly RESULT_STATUS: complete\". If its pane is gone it cannot be asked: tp-agent retry $id --reason \"say what changed\""
+python3 "$ROOT/lib/result_status.py" "$dir/result.md" >/dev/null ||
+  die "subagent '$id' replied without a result status (paused); it is not ready for review. A reply needs a line of its own that reads RESULT_STATUS: complete (or empty, blocked or incomplete), Markdown around it is fine. Ask for it with: tp-agent message $id --text \"End your reply with a line that reads exactly RESULT_STATUS: complete\", then review again. If its pane is gone it cannot be asked: tp-agent retry $id --reason \"say what changed\""
 
 # The review plan: need and reviewer, from the catalog router's resolver (no classifier service).
 [[ "$force" == 0 ]] || plan_opts+=(--force)
@@ -216,8 +216,8 @@ done
 # author is the writer that matters: its process is ended first (pane and scrollback kept, task not collected), and the review
 # is refused if that cannot be done or checked. The guard then covers every task on the tree, the author included.
 if [[ "$force_alive" != 1 ]]; then
-  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" end-author "$id" >/dev/null || die "review of '$id' refused: its process could not be ended; end it (tp-agent stop $id) or pass --force-alive${author_lane:+ (--force-alive does not apply to lane $author_lane: end the writer instead)}"
-  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" guard-review "$id" >/dev/null || die "review of '$id' refused; end the writer it names (tp-agent stop ID) or pass --force-alive${author_lane:+ (--force-alive does not apply to lane $author_lane: end the writer instead)}"
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" end-author "$id" >/dev/null || die "review of '$id' refused: its process could not be ended; end it with \`tp-agent stop $id\`, or pass --force-alive${author_lane:+ (--force-alive does not apply to lane $author_lane: end the writer instead)}"
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-agent" guard-review "$id" >/dev/null || die "review of '$id' refused; end the writer it names with the command above${author_lane:+ (--force-alive does not apply to lane $author_lane)}"
 fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done

@@ -130,7 +130,61 @@ The hook checks known paths and common commands. It does not provide an operatin
 
 Task records, prompts, and logs stay local. Remote model inference receives the context sent to the selected provider; no observability service is configured by tmux-pi.
 
-## Status pane
+## Folder trust
+
+In a repository you know holds no credentials, the sensitive-read prompts for names that only *look* sensitive are noise. `tp-trust` lets you say so once per repository. A record states exactly this: *"this working tree holds no credentials"*. It is yours alone to write: `grant` and `revoke` need a real terminal and a random four-word code typed back from it, and they refuse inside an agent session (`TP_TASK_ID`, `TP_TASK_DIR` or `TP_MODE` set). Agents cannot touch the trust store either: a tool call that names `~/.config/tmux-pi/trust/` or `state/trust/`, or runs `tp-trust grant|revoke`, is denied (reading with `list`, `show`, `check`, `log` is allowed).
+
+```
+tp-trust grant ~/code/site --days 90 --note "static site, no secrets"   # repository root only
+tp-trust list                      # id, root, verdict, grant and expiry, skips in the last 7 days
+tp-trust check ~/code/site         # why a path is or is not trusted; exit 0 only when trusted
+tp-trust show <path or id>         # the record file and the reader's verdict
+tp-trust revoke ~/code/site        # or: tp-trust revoke <id from list>; also needs the typed code
+tp-trust log -n 20                 # the skip log
+```
+
+`grant` prints the statement, the root, whether linked worktrees inherit, the expiry and a names-only scan of the tree, and warns when it finds credential-looking names (the statement would then be false, but you may still grant). Nothing is written unless you type the code. Granting again replaces the record. Records live in `~/.config/tmux-pi/trust/<id>.json` and are checked on every use: a record that is expired, edited, has the wrong owner or permissions, sits in a moved directory, or is not for a repository root is ignored, and `list` says why.
+
+**What a record lifts.** Inside the trusted tree, when every path the call touches is in the tree: weak names (`*secret*` and `*credentials*` that are not on the exact-name list below, such as `notes_secret.txt`), the "directory that may hold credentials" guess for `agent`, `claude`, `config`, searches or copies rooted at the repository root, hidden searches, and git patch output (`git log -p`, `git diff`) when git's names-only listing shows nothing credential-bearing. Lifts after a directory guess depend on a walk of the real tree (names only, symbolic links not followed): any hit prompts and names the hit. One outside path keeps the whole call prompting.
+
+**What still prompts, whatever the record says.**
+- Strong credential names anywhere in the tree: `.env`, `.env.*`, `.envrc`, `.netrc`, `.npmrc`, `.pypirc`, `auth.json`, `.mcp.json`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.token`, `id_rsa*`, `*.local.*` (so `settings.local.json`), and exact credential file names: `credentials`, `credentials.json`, `secrets.json|yml|yaml|toml`, `*.tfvars`, `prod.env`.
+- Credential directories and `.git` contents: `.aws`, `.ssh`, `.gnupg`, `.kube`, `.docker`, `.config/gcloud`, `.config/gh`, `.git/config`, `.git/credentials`. `grep -r foo .` still prompts because it reads `.git`; `rg foo .` skips it and does not. `rg --hidden` reads it and prompts.
+- A symbolic link out of the tree, a nested repository or submodule (it needs its own record), a tree over the walk budget (20,000 entries or 1 second), a ripgrep config (`RIPGREP_CONFIG_PATH`: it can change what is searched), a git configuration that runs programs (filters, diff drivers), a stash patch, and anything outside the repository: your home directory, a parent of the repository, the temporary directory.
+- Raw command text that names `~/.ssh` and the like, and everything `redact_hook` and the `tmux-pi-safe` tools decide. A record only touches `sensitive_read`.
+
+**Worktrees and expiry.** Linked git worktrees of a trusted repository inherit its record after git itself confirms the link; `--no-worktrees` turns that off (a worktree holding credential directories or placed in your home or a temporary directory does not inherit). `--days N` (1-3650) makes the record lapse; without it the record never expires. When it lapses prompts return and `list` shows `ignored: expired`; `tp-trust grant` again renews it.
+
+**Revoking.** `tp-trust revoke <path or id>` and type the code. Prompts return on the next call.
+
+**The skip log.** Every call that a record let through writes one `trust_skip` line to `~/.config/tmux-pi/state/trust/skipped.jsonl` (rotated at 5 MB to `skipped.jsonl.1`): the time, harness, task, tool, record id, root, `via` (`root` or `worktree`), and for each lifted prompt its rule (`L1` weak name, `L2` directory guess, `L3` root or hidden search, `L4` git patch), target and the reason it would have prompted with. A record that was refused writes a `trust_ignored` line with the reason. `tp-trust log -n 50` tails it and `tp-trust list` shows each record's skips over seven days. Calls the guard refused are in `guard.jsonl` beside it. Review the log; if it shows reads you did not expect, revoke.
+
+**Every prompt or refusal you can meet.** "Clears itself" means it stops without your action.
+
+| You see | Clears itself? | What clears it |
+|---|---|---|
+| Sensitive-read prompt: `credential-bearing or sensitive configuration path` on a weak name (`notes_secret.txt`) | Only with a record | Approve it, or `tp-trust grant <repo root>` |
+| Same prompt on a strong or exact credential name (`.env`, `prod.env`, `settings.local.json`, `credentials.json`) | No | Approve it for this read. A record never lifts it; move the file out of the tree or use `tmux-pi-safe` |
+| `search root is the repository root (reaches repo/<path>) and may include credential files` | If the named path goes away | Search a narrower directory, use `rg` rather than `grep -r` to skip `.git`, remove or exclude the named path, or approve |
+| `broad hidden/unignored search` | Only with a record and a clean tree | Drop `--hidden`/`--no-ignore`, or approve |
+| `search root is a directory known to hold credentials` (`config`, `agent`, `claude`) | Only with a record and a clean walk | `tp-trust grant`, or search a narrower directory |
+| `sensitive path in shell command` (`~/.ssh`, `.aws/credentials`) | No | Approve, or leave the path out |
+| `tree too large to verify` or `follows a link out of the tree at ...` | No | Search a smaller directory, or remove the link |
+| `unscoped patch output may include credential files`, `patch output covers a credential-bearing path`, `stash contents ...` | Only with a record (not for stash or submodules) | Limit the patch with a path (`git log -p -- src/`), or `tp-trust grant` |
+| `search root is a home directory` / `a parent directory` / `a directory outside the working tree` | No | Search inside the repository, or approve |
+| `command nesting is too deep to verify`, `unparsed tool call`, `the call could not be analysed` | No | Split the call into simpler ones, or approve |
+| Guard: `tmux-pi trust store guard denied this tool call: ... What to do instead: ...` | No (a denial, not a prompt) | Leave the trust store out of the call. Only you grant or revoke, in a terminal |
+| Guard: `... could not check this tool call and needs your approval` | No | Approve, or give a narrower directory or fewer paths |
+| `tp-trust: TP_TASK_ID is set: this looks like an agent session` | No | Run `tp-trust` yourself in a terminal outside the agent session |
+| `tp-trust: stdin and stdout must be a terminal` / `no controlling terminal` | No | Run it in a real terminal; not through a pipe, script or agent tool |
+| `code did not match; nothing written` (or `nothing removed`) | No | Run the command again and type the new code exactly |
+| `<path> is not a git repository root` / `is inside the repository at <root>; name its root` | No | Name the repository root (`git rev-parse --show-toplevel`) |
+| `<path> is a symbolic link; name the real directory` | No | Name the real directory |
+| `<root> is your home directory or a parent of it`, `inside a temporary directory`, `inside a known credential location`, `a parent of the config directory` | No | Trust the project directory itself, not a parent, and keep it outside `/tmp` and `~/.config` |
+| `--days must be between 1 and 3650` / `--note must be printable ASCII of at most 200 characters` | No | Correct the option |
+| `the directory changed while waiting; nothing written` | No | Run `tp-trust grant` again |
+| `tp-trust list` shows `ignored: <reason>` (`expired`, `bad permissions`, `wrong owner`, `root moved`, `name does not match root`, `trust directory inside a repository` ...) | No | `tp-trust grant <root>` replaces it, or `tp-trust revoke <id>` removes it, then check with `tp-trust check <root>` |
+| `NOT trusted: no trust record for this repository` / `the record excludes linked worktrees` | No | `tp-trust grant <main root>` (without `--no-worktrees` for worktrees) |
 
 The status pane (top right) lists workers live. Click it to focus it, then:
 

@@ -39,6 +39,29 @@ _GIT_PAIRS = frozenset(p for p in sensitive_read.SENSITIVE_PAIRS if p[0] == ".gi
 _CRED_SINGLE = frozenset(sensitive_read.SENSITIVE_DIR)
 
 
+HELP = """Say that a repository holds no credentials, so tmux-pi stops asking before it reads names that merely
+look sensitive there. A record states: "%s".
+Only you can write or remove one: grant and revoke need a terminal and a code typed back from it, and an agent
+session is refused.
+
+Inside a trusted repository (and its linked worktrees, unless you said --no-worktrees) these stop prompting:
+weak names such as notes_secret.txt, a search or copy of a directory such as config or of the repository root, a
+hidden search, and git patches, each only after a names-only walk found nothing real. Never lifted: .env, .netrc,
+*.pem, *.key and the other strong names, credentials.json, secrets.yml, *.tfvars, .aws, .ssh, .git/config, a symlink
+out of the tree, a nested repository, a tree over the 20,000-entry or 1-second walk budget, a ripgrep config, and
+anything outside the repository.""" % trust.STATEMENT
+
+HELP_END = """examples:
+  tp-trust grant ~/code/site --days 90 --note "static site, no secrets"
+  tp-trust list                    records, the reader's verdict, skips in the last 7 days
+  tp-trust check ~/code/site       why this path is or is not trusted (exit 0 only when trusted)
+  tp-trust revoke ~/code/site      or: tp-trust revoke <id from list>
+  tp-trust log -n 20               what was skipped, and why a record was ignored
+
+records: ~/.config/tmux-pi/trust/<id>.json    log: ~/.config/tmux-pi/state/trust/skipped.jsonl
+Details: the "Folder trust" section of the README."""
+
+
 class Refused(Exception):
     pass
 
@@ -635,7 +658,8 @@ def cmd_log(args, env):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="tp-trust", description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(prog="tp-trust", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                description=HELP, epilog=HELP_END)
     p.add_argument("--trust-dir", help=argparse.SUPPRESS)
     p.add_argument("--home", help=argparse.SUPPRESS)
     p.add_argument("--temp-root", action="append", help=argparse.SUPPRESS)
@@ -645,7 +669,7 @@ def main(argv=None):
                               "%d entries or %d seconds (the classifier's own walk uses 20,000 entries and 1 "
                               "second); past that it warns that the scan is incomplete."
                               % (SCAN_ENTRIES, SCAN_SECONDS))
-    g.add_argument("path")
+    g.add_argument("path", help="the repository root (not a subdirectory, not a symbolic link)")
     g.add_argument("--days", type=int, help="expire after N days (default: never)")
     g.add_argument("--note", help="owner text, up to 200 printable characters")
     g.add_argument("--no-worktrees", action="store_true", help="linked worktrees do not inherit the record")
@@ -653,11 +677,11 @@ def main(argv=None):
     r.add_argument("target", help="repository path or record id from `list`")
     sub.add_parser("list", help="all records, with the reader's verdict and recent skip counts")
     s = sub.add_parser("show", help="print one record and the reader's verdict")
-    s.add_argument("target")
+    s.add_argument("target", help="repository path or record id from `list`")
     c = sub.add_parser("check", help="say why a path is or is not trusted (exit 0 only when trusted)")
-    c.add_argument("path")
-    lg = sub.add_parser("log", help="tail the skip log")
-    lg.add_argument("-n", type=int, default=50)
+    c.add_argument("path", help="any path; a linked worktree is judged through its main repository's record")
+    lg = sub.add_parser("log", help="tail the skip log (trust_skip: prompts lifted; trust_ignored: a record refused)")
+    lg.add_argument("-n", type=int, default=50, help="number of lines (default 50)")
     args = p.parse_args(argv)
     try:
         env = Env(args)

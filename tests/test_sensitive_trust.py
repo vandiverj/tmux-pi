@@ -756,9 +756,10 @@ class IdenticalTests(World):
 
     COMMANDS = ("cat " + MLPACKAGE, "cat tests/" + TEST_SECRETS, "cat " + CREDS_HELPER, "rg foo claude", "grep -rn foo agent",
                 "cat " + ENV, "cat certs/" + PEM, "cat " + LOCAL, "cat %s %s" % (MLPACKAGE, ENV), "ls", "git status",
-                "python3 -c \"open('" + ENV + "')\"", "cat *secret*", "echo hi", "cat src/app.py")
+                "python3 -c \"open('" + ENV + "')\"", "cat *secret*", "echo hi", "cat src/app.py", "rg foo .", "rg -n foo",
+                "rg --hidden foo lib", "grep -rn foo .", "git diff --check", "git diff -- agent")
     TOOLS = (("Read", {"file_path": MLPACKAGE}), ("Read", {"file_path": "src/app.py"}), ("Grep", {"pattern": "x", "path": "claude"}),
-             ("Read", {"file_path": ENV}))
+             ("Read", {"file_path": ENV}), ("Grep", {"pattern": "x", "path": ".", "output_mode": "content"}))
 
     def same(self, resolver):
         for command in self.COMMANDS:
@@ -856,11 +857,494 @@ class DifferentialTests(unittest.TestCase):
                     self.assertIn(before["reason"], ("sensitive path in shell command", sr._BULK_REASON,
                                                     "credential-bearing or sensitive configuration path",
                                                     "search root is a directory known to hold credentials and may include credential files",
-                                                    "patch output covers a credential-bearing path"))
+                                                    "patch output covers a credential-bearing path",
+                                                    "search may include credential files"))
         self.assertGreater(len(changed), 0)
         skipped = [json.loads(line) for line in Path(keep, "log", trust_lift.LOG_NAME).read_text().splitlines()]
         self.assertTrue(all(line["event"] == "trust_skip" for line in skipped))
-        self.assertTrue(all(item["rule"] in ("L1", "L2") for line in skipped for item in line["lifted"]))
+        self.assertTrue(all(item["rule"] in ("L1", "L2", "L3", "L4") for line in skipped for item in line["lifted"]))
+
+
+# --- slice 5: the repository root, hidden searches, git patches, worktrees ---------------------------------------
+
+def clean_tree(top):
+    """Take out of a `World.make_tree` tree everything a walk names as a credential location."""
+    for name in (ENV, RSA, LOCAL, "certs/" + PEM):
+        os.unlink(os.path.join(top, name))
+    shutil.rmtree(os.path.join(top, SESSIONS))
+
+
+class RootLiftTests(World):
+    """L3: a search of the repository root is cleared by the walk of what the search would visit, as a directory guess is."""
+
+    def setUp(self):
+        super().setUp()
+        clean_tree(self.repo)
+        self.grant()
+
+    def lifted(self, command, cwd=None, rule="L3", target="."):
+        """The command no longer prompts, because of this record, and the log says so in the words of today's prompt."""
+        before = len(self.log())
+        self.assertEqual(self.bash(command, cwd), {"sensitive": False}, command)
+        plain = self.plain(command, cwd)
+        self.assertTrue(plain["sensitive"], command)
+        lines = self.log()
+        self.assertEqual(len(lines), before + 1, command)
+        line = lines[-1]
+        self.assertEqual(line["event"], "trust_skip")
+        self.assertEqual([(item["rule"], item["target"], item["would_have"]) for item in line["lifted"]],
+                         [(rule, target, plain["reason"])], command)
+
+    def prompts(self, command, cwd=None, reaches=None):
+        """The command still prompts, for the reason it gave before, with what the walk found added to it."""
+        before = len(self.log())
+        result = self.bash(command, cwd)
+        plain = self.plain(command, cwd)
+        self.assertTrue(result["sensitive"], command)
+        self.assertEqual(result["target"], plain["target"], command)
+        if reaches:
+            self.assertIn("(reaches " + os.path.basename(self.repo) + "/" + reaches, result["reason"], command)
+        self.assertEqual(len(self.log()), before, command)      # a call that prompts lifted nothing the owner sees
+        return result
+
+    def test_a_nested_repository_is_not_passed_over_by_an_excluded_git_folder(self):
+        command = "grep -rn --exclude-dir=.git foo ."
+        self.lifted(command)
+        os.makedirs(os.path.join(self.repo, "vendor", ".git"))
+        self.prompts(command)
+        shutil.rmtree(os.path.join(self.repo, "vendor", ".git"))
+        Path(self.repo, "vendor", ".git").write_text("gitdir: ../elsewhere\n")
+        self.prompts(command)
+
+    def test_a_ripgrep_config_named_on_the_line_keeps_the_prompt(self):
+        Path(self.repo, "ripgreprc").write_text("--hidden\n")
+        for command in ("RIPGREP_CONFIG_PATH=ripgreprc rg foo .", "env RIPGREP_CONFIG_PATH=ripgreprc rg foo .",
+                        "export RIPGREP_CONFIG_PATH=ripgreprc; rg foo ."):
+            with self.subTest(command=command):
+                self.prompts(command)
+
+    def test_a_search_of_the_root_stops_prompting_when_the_walk_is_clean(self):
+        for command in ("rg foo .", "rg -n foo", "rg foo ./", "rg -i foo ./.", "rg foo " + self.repo, "rg foo -- .",
+                        "rg -L foo ."):
+            with self.subTest(command=command):
+                self.lifted(command)
+        self.lifted("rg foo ..", cwd=os.path.join(self.repo, "src"))
+        self.lifted("rg foo ../.", cwd=os.path.join(self.repo, "lib"))
+
+    def test_a_search_of_a_subdirectory_is_not_the_root(self):
+        for command in ("rg foo lib", "rg foo src docs", "grep -rn foo lib"):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash(command), self.plain(command))
+        self.assertEqual(self.log(), [])
+
+    def test_grep_reaches_git_and_rg_does_not(self):
+        for command in ("grep -r foo .", "grep -rn foo .", "grep -rn foo", "grep -R foo ."):
+            with self.subTest(command=command):
+                self.prompts(command, reaches=".git")
+        self.lifted("grep -rn --exclude-dir=.git foo .")
+        self.prompts("grep -rn --exclude-dir=lib foo .", reaches=".git")
+
+    def test_an_env_file_is_named(self):
+        for name in (ENV, "lib/" + ENV, "a/b/" + ENV, "prod" + ENV, "keys/" + PEM, RSA, LOCAL, SESSIONS + "/x", CREDS,
+                     "secrets/a", ".config/x", SSH + "/k", "client_secret_1.json", SECRETS_YML):
+            with self.subTest(name=name):
+                path = os.path.join(self.repo, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                Path(path).write_text("x\n")
+                for command in ("rg foo .", "rg -n foo", "rg --files-with-matches foo ."):
+                    self.prompts(command, reaches=name.split("/")[0])
+                self.assertEqual(self.bash("rg foo docs"), {"sensitive": False})       # one folder away, the search is clear
+                os.unlink(path)
+                folder = os.path.dirname(path)
+                while folder != self.repo and not os.listdir(folder):
+                    os.rmdir(folder)
+                    folder = os.path.dirname(folder)
+        self.assertEqual(self.bash("rg foo ."), {"sensitive": False})
+
+    def test_hidden_and_unignored_searches_follow_the_same_walk(self):
+        for command in ("rg --hidden foo lib", "rg --no-ignore foo lib", "rg -uu foo src", "rg -u foo lib", "rg --hidden foo lib docs",
+                        "rg -. foo src"):
+            with self.subTest(command=command):
+                self.lifted_hidden(command)
+        # the root holds `.git`, which these searches read
+        for command in ("rg --hidden foo .", "rg -uu foo .", "rg --hidden foo", "rg --no-ignore foo ."):
+            with self.subTest(command=command):
+                self.prompts(command)
+        Path(self.repo, "lib", ENV).write_text("x\n")
+        result = self.bash("rg --hidden foo lib")
+        self.assertEqual(result, self.plain("rg --hidden foo lib"))
+        self.assertTrue(result["sensitive"])
+        # a hidden search of the whole tree is not cleared by a clean walk of one folder
+        self.assertEqual(self.bash("rg --hidden foo docs"), {"sensitive": False})
+
+    def lifted_hidden(self, command):
+        before = len(self.log())
+        self.assertEqual(self.bash(command), {"sensitive": False}, command)
+        self.assertTrue(self.plain(command)["sensitive"], command)
+        lines = self.log()
+        self.assertEqual(len(lines), before + 1, command)
+        items = lines[-1]["lifted"]
+        self.assertTrue(items and all(item["rule"] == "L3" for item in items), command)
+        self.assertEqual({item["would_have"] for item in items}, {self.plain(command)["reason"]})
+
+    def test_rg_is_taken_to_read_git_when_anything_could_make_it(self):
+        for command in ("rg -g '.git/**' foo .", "rg --glob=.git/config foo .", "rg --iglob '.GIT/*' foo .", "rg -ug foo .",
+                        "rg --hidden foo ."):
+            with self.subTest(command=command):
+                self.prompts(command)
+        self.lifted("rg -g '!*.md' foo .")
+        self.lifted("rg --glob '!lib' foo .")
+        with mock.patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": os.path.join(self.tmp, "ripgreprc")}):
+            self.prompts("rg foo .", reaches=".git")
+
+    def test_symlinks_are_followed_only_where_the_command_follows_them(self):
+        os.symlink(self.outside, os.path.join(self.repo, "out"))
+        for command in ("rg foo .", "rg -n foo", "grep -rn --exclude-dir=.git foo ."):
+            with self.subTest(command=command):
+                self.lifted(command)
+        for command in ("rg -L foo .", "rg --follow foo .", "grep -Rn --exclude-dir=.git foo ."):
+            with self.subTest(command=command):
+                result = self.prompts(command)
+                self.assertIn("follows a link out of the tree at " + os.path.basename(self.repo) + "/out", result["reason"])
+        os.unlink(os.path.join(self.repo, "out"))
+        os.symlink(os.path.join(self.repo, "lib"), os.path.join(self.repo, "inner"))
+        self.lifted("rg -L foo .")      # a link that stays in the tree, to a place with nothing in it, is the place
+        Path(self.repo, "lib", ENV).write_text("x\n")
+        self.prompts("rg -L foo .")
+
+    def test_a_walk_over_budget_prompts(self):
+        self.lifted("rg foo .")
+        with mock.patch.object(sr, "WALK_ENTRIES", 5):
+            result = self.prompts("rg foo .")
+            self.assertIn("tree too large to verify", result["reason"])
+        with mock.patch.object(sr, "WALK_SECONDS", -1.0):
+            self.assertIn("tree too large to verify", self.prompts("rg foo .")["reason"])
+        with mock.patch.object(sr, "WALK_CALL_SECONDS", -1.0):
+            self.assertIn("tree too large to verify", self.prompts("rg foo .")["reason"])
+
+    def test_one_walk_serves_every_root_of_a_call(self):
+        calls = []
+        real = sr._walk
+        with mock.patch.object(sr, "_walk", lambda *a, **k: calls.append(a[0]) or real(*a, **k)):
+            self.assertEqual(self.bash("rg foo . ./ " + self.repo), {"sensitive": False})
+        self.assertEqual(len(calls), 1)
+
+    def test_a_nested_repository_or_submodule_is_not_covered(self):
+        inner = os.path.join(self.repo, "vendor")
+        os.makedirs(os.path.join(inner, ".git"))
+        Path(inner, "a.py").write_text("x\n")
+        self.prompts("rg foo .", reaches="vendor/.git")
+        # a submodule keeps a `.git` file
+        shutil.rmtree(os.path.join(inner, ".git"))
+        Path(inner, ".git").write_text("gitdir: ../.git/modules/vendor\n")
+        self.prompts("rg foo .", reaches="vendor/.git")
+        # and a search made from inside it is a search of a tree nobody vouched for
+        for command in ("rg foo .", "rg -n foo"):
+            self.assertEqual(self.bash(command, cwd=inner), self.plain(command, cwd=inner))
+            self.assertTrue(self.bash(command, cwd=inner)["sensitive"])
+        self.assertEqual(self.log(), [])
+
+    def test_a_planted_git_is_not_a_tree(self):
+        plant = os.path.join(self.tmp, "plant")
+        os.makedirs(plant)
+        Path(plant, "a.py").write_text("x\n")
+        Path(plant, ".git").write_text("gitdir: %s\n" % os.path.join(self.repo, ".git"))
+        self.assertEqual(self.bash("rg foo .", cwd=plant), self.plain("rg foo .", cwd=plant))
+        self.assertTrue(self.bash("rg foo .", cwd=plant)["sensitive"])
+        # the trusted tree's own `.git` swapped for a file that points elsewhere
+        shutil.rmtree(os.path.join(self.repo, ".git"))
+        Path(self.repo, ".git").write_text("gitdir: %s\n" % os.path.join(self.outside, "kept.git"))
+        self.assertEqual(self.bash("rg foo ."), self.plain("rg foo ."))
+        self.assertTrue(self.bash("rg foo .")["sensitive"])
+        self.assertEqual(self.log(), [])
+
+    def test_a_link_in_the_written_path_that_leaves_the_tree_is_judged_where_it_leads(self):
+        os.symlink(self.outside, os.path.join(self.repo, "linkout"))
+        for command in ("rg foo linkout/..", "rg foo ./linkout/../", "rg foo linkout"):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash(command), self.plain(command))
+        self.assertEqual(self.log(), [])
+
+    def test_the_tool_search_is_not_changed(self):
+        for params in ({"pattern": "x", "path": ".", "output_mode": "content"}, {"pattern": "x", "output_mode": "content"},
+                       {"pattern": "x", "output_mode": "content", "glob": "*" + ENV}):
+            with self.subTest(params=params):
+                self.assertEqual(sr.classify("Grep", params, self.repo, self.resolver()), sr.classify("Grep", params, self.repo))
+
+    def test_a_refused_guard_and_a_missing_record_lift_nothing(self):
+        commands = ("rg foo .", "rg --hidden foo lib", "rg -n foo")
+        for kind in (trust_guard.ASK, trust_guard.DENY):
+            guard = lambda *a, **k: trust_guard.Answer(kind, "no")  # noqa: E731
+            for command in commands:
+                with self.subTest(kind=kind, command=command):
+                    self.assertEqual(self.bash(command, trust=self.resolver(guard=guard)), self.plain(command))
+        path = os.path.join(self.tdir, trust.record_name(self.repo))
+        os.chmod(path, 0o600)
+        os.unlink(path)
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.bash(command), self.plain(command))
+                self.assertTrue(self.bash(command)["sensitive"])
+        self.assertEqual(self.log(), [])
+
+
+class _Git:
+    """A tree of `World.make_tree` as a real repository with one commit, without the credential files."""
+
+    def make_repo(self):
+        shutil.rmtree(os.path.join(self.repo, ".git"))
+        clean_tree(self.repo)
+        self.git("init", "-q", "-b", "main", ".")
+        self.git("add", "-f", ".")
+        self.git("commit", "-q", "-m", "first")
+
+    def change(self, *names, top=None):
+        for name in names:
+            with open(os.path.join(top or self.repo, name), "a") as handle:
+                handle.write("more \n")
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class PatchLiftTests(_Git, World):
+    """L4: `--check` and a patch over a credential directory or the root, cleared by git's own listing in a trusted tree."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_repo()
+        self.grant()
+
+    def lifted(self, command, cwd=None):
+        before = len(self.log())
+        self.assertEqual(self.bash(command, cwd), {"sensitive": False}, command)
+        plain = self.plain(command, cwd)
+        self.assertTrue(plain["sensitive"], command)
+        lines = self.log()
+        self.assertEqual(len(lines), before + 1, command)
+        items = lines[-1]["lifted"]
+        self.assertEqual({item["rule"] for item in items}, {"L4"}, command)
+        self.assertEqual({item["would_have"] for item in items}, {plain["reason"]}, command)
+
+    def prompts(self, command, cwd=None, names=None):
+        """Still prompts, as it did without a record; the listing may have narrowed the reason to the file it found."""
+        before = len(self.log())
+        result = self.bash(command, cwd)
+        self.assertTrue(result["sensitive"], command)
+        self.assertTrue(self.plain(command, cwd)["sensitive"], command)
+        if names:
+            self.assertIn(names, result["target"], command)
+        self.assertEqual(len(self.log()), before, command)
+        return result
+
+    def test_check_stops_prompting(self):
+        self.change("README.md", "lib/goal.py", MLPACKAGE)
+        for command in ("git diff --check", "git diff --check HEAD", "git --no-pager diff --check", "git log -p --check -1"):
+            with self.subTest(command=command):
+                self.lifted(command)
+        self.git("add", "-A")
+        self.lifted("git diff --cached --check")
+        self.lifted("git diff --check", cwd=os.path.join(self.repo, "lib"))
+
+    def test_check_with_a_credential_in_the_listing_prompts(self):
+        Path(self.repo, "agent").mkdir(exist_ok=True)
+        Path(self.repo, "agent", "mcp.json").write_text("x\n")
+        self.git("add", "-f", "agent/mcp.json")
+        self.git("commit", "-q", "-m", "second")
+        self.change("README.md", "agent/mcp.json")
+        for command in ("git diff --check", "git diff --check HEAD", "git diff HEAD --check"):
+            with self.subTest(command=command):
+                self.prompts(command, names="mcp.json")
+
+    def test_pathspec_over_a_credential_directory_or_the_root(self):
+        self.change("README.md", "lib/goal.py", "agent/settings.json" if os.path.exists(os.path.join(self.repo, "agent/settings.json")) else "src/app.py")
+        for command in ("git diff -- agent", "git diff agent", "git diff HEAD -- agent config", "git diff -- .", "git log -p -1 -- agent",
+                        "git log -p -- .", "git diff --cached -- config"):
+            with self.subTest(command=command):
+                self.lifted(command)
+
+    def test_pathspec_patch_whose_listing_holds_a_credential_prompts(self):
+        Path(self.repo, "agent", "mcp.json").write_text("x\n")
+        self.git("add", "-f", "agent/mcp.json")
+        self.git("commit", "-q", "-m", "adds it")
+        self.git("rm", "-q", "agent/mcp.json")
+        self.git("commit", "-q", "-m", "removes it")
+        # history holds it still, so a patch of history does
+        for command in ("git log -p -- agent", "git log -p -- ."):
+            with self.subTest(command=command):
+                self.prompts(command, names="mcp.json")
+        # while the work tree, compared with the index, holds none of it
+        self.lifted("git diff -- agent")
+        # a changed weak name in the listing is lifted, as in an unscoped patch
+        self.change(MLPACKAGE)
+        self.lifted("git diff -- .")
+        self.assertEqual(self.log()[-1]["lifted"][0]["rule"], "L4")
+
+    def test_a_gitlink_and_a_filter_still_prompt(self):
+        self.change("README.md")
+        sha = self.git("rev-parse", "HEAD").strip()
+        self.git("update-index", "--add", "--cacheinfo", "160000,%s,vendor/sub" % sha)
+        for command in ("git diff --check --cached", "git diff --cached -- ."):
+            with self.subTest(command=command):
+                self.prompts(command, names="vendor/sub")
+        self.git("rm", "-q", "--cached", "vendor/sub")
+        self.git("config", "filter.x.clean", "cat")
+        self.prompts("git diff --check")
+        self.prompts("git diff -- agent")
+
+    def test_unproven_git_cases_prompt(self):
+        self.change("README.md")
+        folder = Path(tempfile.mkdtemp(prefix="trust-fake-git-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        script = folder / "git"
+        script.write_text("#!/bin/sh\nexit 1\n")
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(folder) + os.pathsep + os.environ["PATH"]}):
+            for command in ("git diff --check", "git diff -- agent"):
+                self.prompts(command)
+        # a revision the listing cannot name, and an option it does not understand
+        for command in ("git diff --check no-such-revision", "git diff --check --some-unknown-option"):
+            with self.subTest(command=command):
+                self.prompts(command)
+
+    def test_core_worktree_and_a_git_file_pointing_elsewhere_are_not_lifted(self):
+        Path(self.outside, "README.md").write_text("x\n")
+        self.change("README.md")
+        self.git("config", "core.worktree", self.outside)
+        top = self.git("rev-parse", "--show-toplevel").strip()
+        self.assertEqual(os.path.realpath(top), self.outside)
+        for command in ("git diff --check", "git diff -- agent", "git diff -- ."):
+            with self.subTest(command=command):
+                self.prompts(command)
+        self.git("config", "--unset", "core.worktree")
+        self.lifted("git diff --check")
+        self.git("config", "core.worktree", self.repo)
+        self.lifted("git diff --check")
+
+    def test_without_a_record_nothing_changes(self):
+        os.chmod(os.path.join(self.tdir, trust.record_name(self.repo)), 0o600)
+        os.unlink(os.path.join(self.tdir, trust.record_name(self.repo)))
+        self.change("README.md")
+        for command in ("git diff --check", "git diff -- agent", "git diff -- .", "git log -p -1 -- agent"):
+            with self.subTest(command=command):
+                self.prompts(command)
+
+    def test_a_subdirectory_pathspec_is_not_a_credential_directory(self):
+        self.change("lib/goal.py")
+        for command in ("git diff -- lib", "git diff --check lib"):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash(command), {"sensitive": False})
+                self.assertEqual(self.plain(command), {"sensitive": False})
+        self.assertEqual(self.log(), [])
+
+
+@unittest.skipUnless(GIT, "git is not installed")
+class WorktreeLiftTests(_Git, World):
+    """A linked worktree of a trusted tree gets the lifts of the main tree, and loses them as the record's rules say."""
+
+    COMMANDS = ("rg foo .", "rg -n foo", "git diff", "git diff --check", "git log -p -1", "rg --hidden foo lib", "rg foo claude",
+                "cat " + MLPACKAGE, "grep -rn foo .", "rg --hidden foo .", "git diff -- agent")
+
+    def setUp(self):
+        super().setUp()
+        self.make_repo()
+        self.work = os.path.realpath(os.path.join(self.tmp, "wt"))
+        self.git("worktree", "add", "-q", self.work)
+        self.change("README.md", MLPACKAGE)
+        self.change("README.md", MLPACKAGE, top=self.work)
+
+    def answers(self, top):
+        return {command: self.bash(command, top)["sensitive"] for command in self.COMMANDS}
+
+    def test_the_same_result_in_the_main_tree_and_the_worktree(self):
+        self.grant()
+        main, work = self.answers(self.repo), self.answers(self.work)
+        self.assertEqual(main, work)
+        self.assertEqual({command for command, prompts in main.items() if not prompts},
+                         {"rg foo .", "rg -n foo", "git diff", "git diff --check", "git log -p -1", "rg --hidden foo lib",
+                          "rg foo claude", "cat " + MLPACKAGE, "git diff -- agent"})
+        self.assertEqual({command for command, prompts in main.items() if prompts}, {"grep -rn foo .", "rg --hidden foo ."})
+        line = [entry for entry in self.log() if entry["via"] == "worktree"][0]
+        self.assertEqual((line["worktree"], line["root"]), (self.work, self.repo))
+
+    def test_each_lift_in_the_worktree_is_logged_with_its_rule(self):
+        self.grant()
+        for command, rule in (("rg foo .", "L3"), ("git diff --check", "L4"), ("rg foo claude", "L2"), ("cat " + MLPACKAGE, "L1")):
+            with self.subTest(command=command):
+                before = len(self.log())
+                self.assertEqual(self.bash(command, self.work), {"sensitive": False})
+                line = self.log()[-1]
+                self.assertEqual(len(self.log()), before + 1)
+                self.assertEqual((line["via"], line["worktree"]), ("worktree", self.work))
+                self.assertEqual({item["rule"] for item in line["lifted"]}, {rule})
+                self.assertEqual({item["would_have"] for item in line["lifted"]}, {self.plain(command, self.work)["reason"]})
+
+    def assertNothingLifted(self, cwd, commands=None):
+        for command in commands or self.COMMANDS:
+            with self.subTest(cwd=cwd, command=command):
+                self.assertEqual(self.bash(command, cwd), self.plain(command, cwd))
+
+    def test_revoking_the_record_takes_the_lifts_from_both(self):
+        path = self.grant()
+        self.assertEqual(self.bash("rg foo .", self.work), {"sensitive": False})
+        os.chmod(path, 0o600)
+        os.unlink(path)
+        before = len(self.log())
+        self.assertNothingLifted(self.work)
+        self.assertNothingLifted(self.repo)
+        self.assertEqual(len(self.log()), before)
+
+    def test_a_missing_or_wrong_back_link_takes_the_lifts_from_the_worktree_only(self):
+        self.grant()
+        entry = os.path.join(self.repo, ".git", "worktrees", os.path.basename(self.work))
+        back = os.path.join(entry, "gitdir")
+        kept = Path(back).read_text()
+        os.unlink(back)
+        self.assertNothingLifted(self.work)
+        self.assertEqual(self.bash("rg foo .", self.repo), {"sensitive": False})
+        Path(back).write_text(os.path.join(self.outside, ".git") + "\n")
+        self.assertNothingLifted(self.work)
+        Path(back).write_text(kept)
+        self.assertEqual(self.bash("rg foo .", self.work), {"sensitive": False})
+        # the worktree's own link to the main tree, pointed elsewhere
+        gitfile = Path(self.work, ".git")
+        text = gitfile.read_text()
+        gitfile.write_text("gitdir: %s\n" % os.path.join(self.outside, "nowhere"))
+        self.assertNothingLifted(self.work)
+        gitfile.write_text(text)
+        self.assertEqual(self.bash("rg foo .", self.work), {"sensitive": False})
+
+    def test_worktrees_false_takes_the_lifts_from_the_worktree_only(self):
+        self.grant(worktrees=False)
+        self.assertEqual(self.bash("rg foo .", self.repo), {"sensitive": False})
+        self.assertEqual(self.bash("git diff --check", self.repo), {"sensitive": False})
+        self.assertNothingLifted(self.work)
+        self.assertEqual({entry["via"] for entry in self.log()}, {"root"})
+
+    def test_a_worktree_holding_a_credential_is_judged_by_its_own_walk(self):
+        self.grant()
+        Path(self.work, ENV).write_text("x\n")
+        result = self.bash("rg foo .", self.work)
+        self.assertTrue(result["sensitive"])
+        self.assertIn("(reaches wt/" + ENV, result["reason"])
+        self.assertEqual(self.bash("rg foo .", self.repo), {"sensitive": False})
+
+    def test_a_worktree_inside_the_main_tree_is_a_nested_repository(self):
+        self.grant()
+        inside = os.path.join(self.repo, "wt-inside")
+        self.git("worktree", "add", "-q", inside)
+        result = self.bash("rg foo .", self.repo)
+        self.assertTrue(result["sensitive"])
+        self.assertIn("wt-inside/.git", result["reason"])
+
+    def test_a_worktree_of_another_tree_is_not_covered(self):
+        self.grant()
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        self.git("init", "-q", "-b", "main", ".", cwd=other)
+        self.git("commit", "-q", "--allow-empty", "-m", "x", cwd=other)
+        work = os.path.realpath(os.path.join(self.tmp, "other-wt"))
+        self.git("worktree", "add", "-q", work, cwd=other)
+        self.assertNothingLifted(work, ("rg foo .", "git diff --check"))
+        self.assertNothingLifted(os.path.realpath(other), ("rg foo .", "git diff --check"))
 
 
 # --- the skip log -----------------------------------------------------------------------------------------------

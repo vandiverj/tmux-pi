@@ -1154,6 +1154,17 @@ class UnscopedPatchTests(unittest.TestCase):
         self.verdicts(top, ["git diff --cached", "git diff --staged", "git diff --cached HEAD", "git diff HEAD"], True)
         self.verdicts(top, ["git diff"], False)  # the work tree now matches the index
 
+    def test_check_and_credential_pathspec_patches_prompt_without_a_record(self):
+        # Neither the lines `--check` prints nor a patch over a credential directory is cleared by its listing alone;
+        # only the owner's trust record does that (tests/test_sensitive_trust.py, PatchLiftTests).
+        top = self.repo()
+        self.change(top, "README.md", "lib/goal.py", "agent/settings.json")
+        self.verdicts(top, ["git diff --check", "git diff --check HEAD", "git diff --cached --check", "git log -p --check -1",
+                            "git diff -- agent", "git diff agent", "git diff HEAD -- agent config", "git diff -- .",
+                            "git log -p -1 -- agent", "git log -p -- ."], True)
+        self.verdicts(top, ["git diff --check lib", "git diff -- lib README.md", "git log -p -1 -- lib"], False)
+        self.verdicts(top, ["git diff --check"], True, str(top / "lib"))
+
     def test_stash(self):
         top = self.repo()
         self.verdicts(top, ["git stash show -p"], True)  # no stash: the query fails

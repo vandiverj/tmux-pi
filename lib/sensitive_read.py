@@ -13,11 +13,19 @@ list cannot be established or the patch may print more than the list names: file
 submodule, or whatever a configured diff program or text conversion writes.
 
 A caller that prompts the owner may pass a `trust` resolver (lib/trust_lift.py). Where the owner has
-stated that a working tree holds no credentials, two guesses are lifted for paths inside that tree:
-a weak name (`*secret*`, `*credentials*`) that is not a known credential file name, and the name of a
-directory (`agent`, `claude`, `config`) whose entries, read by name only, hold no credential location.
+stated that a working tree holds no credentials, these guesses are lifted for paths inside that tree
+(or inside a linked worktree of it that the record covers):
+
+  L1  a weak name (`*secret*`, `*credentials*`) that is not a known credential file name;
+  L2  the name of a directory (`agent`, `claude`, `config`) whose entries, read by name only, hold no
+      credential location;
+  L3  the repository root, or any root of a hidden or unignored search, when the same walk of what the
+      command would visit finds no credential location (`rg foo .` passes, `grep -r foo .` reaches `.git`);
+  L4  an unscoped, `--check` or pathspec patch whose names-only git listing holds no credential path.
+
 Nothing else changes, and with no resolver the result is what it always was.
 """
+import collections
 import fnmatch
 import json
 import os
@@ -140,6 +148,7 @@ _LISTERS = {"ls", "ll", "la", "stat", "test", "[", "[[", "file", "tree", "du", "
 _COPIERS = {"cp", "mv", "ln", "scp", "rsync", "ditto", "zip", "copy-item"}
 _DESTINATION = {"cp", "mv", "ln", "scp", "rsync", "ditto", "copy-item"}
 _CREDENTIAL_DIR = "a directory known to hold credentials"
+_ROOT_REASON = "the repository root"
 _BULK = _READERS | _GREPS | _SCRIPT_FIRST | _SHELLS | _INTERPRETERS
 _INNER = _BULK - {".", "source"}
 # Programs whose arguments are another command line; elsewhere a reader name only counts after run/exec/--.
@@ -268,12 +277,24 @@ WALK_ENTRIES = 20000
 WALK_SECONDS = 1.0
 _NEVER_LIFTED_SEGMENTS = (".git", ".config")
 
+
+class Walk(collections.namedtuple("Walk", "follow exclude skip_git root", defaults=(False, True))):
+    """What a read of a directory visits, as far as the command line says.
+
+    `follow`: it follows links it meets. `exclude`: directory names it skips (a literal `--exclude-dir`).
+    `skip_git`: it never reads the `.git` of the tree it starts in (rg without a hidden flag or config).
+    `root`: the owner's trust may lift the repository root for it (false for the Grep tool, which judges the
+    root by its filter). The default visits everything.
+    """
+    __slots__ = ()
+
+
 # The working directory of the shell or tool being judged, when the caller knows it.
 # `unknown` is set when the caller named a directory that cannot be placed.
-# `trust` is the caller's resolver, or None. `walk` says what a read of a directory visits: whether it
-# follows links and which directory names it skips. `memo` holds walks already done in this call.
+# `trust` is the caller's resolver, or None. `walk` says what a read of a directory visits (see `Walk`).
+# `memo` holds walks already done in this call.
 WALK_CALL_SECONDS = 2.0     # all the walks one call may make, so the caller's own time limit holds
-_SHELL = {"cwd": None, "unknown": False, "trust": None, "walk": (True, ()), "memo": {}, "until": None}
+_SHELL = {"cwd": None, "unknown": False, "trust": None, "walk": Walk(True, ()), "memo": {}, "until": None, "text": ""}
 
 
 def _shell_cwd():
@@ -348,8 +369,8 @@ def _tree_for(path):
         return None
 
 
-def _lift_name(absolute, name):
-    """Whether a weak-name guess at this absolute path is lifted by the owner's trust (T7 L1).
+def _lift_name(absolute, name, rule="L1"):
+    """Whether a weak-name guess at this absolute path is lifted by the owner's trust (T7 L1; L4 for a name in a git listing).
 
     Only a weak name that is not a known credential file name, at a path that really lies in the trusted
     tree, with no `.git`, `.config` or credential directory on the way. The name is a literal one: a pattern
@@ -374,7 +395,7 @@ def _lift_name(absolute, name):
         return False
     if {plain.lower(), ends.lower()} & _SECRET_DIRS and (not os.path.exists(real) or os.path.isdir(real)):
         return False        # a directory named for its secrets, or one that is not there to be told apart
-    _SHELL["trust"].note("L1", real, "credential-bearing path")
+    _SHELL["trust"].note(rule, real, "credential-bearing path")
     return True
 
 
@@ -553,13 +574,15 @@ def _shown(path):
     return path if len(path) <= 200 and _PATHISH.match(path) else "a path"
 
 
-def _walk(root, tree, follow, exclude):
+def _walk(root, tree, walk):
     """None when nothing a read of this directory would visit is a credential location, else why not.
 
     Reads names only, never content, and does not follow links found on the way unless the command
     does. A link that leads out of the tree (or into another repository) when followed is a hit, and so
-    is a nested `.git`. A tree over the entry or time allowance is not verified.
+    is a nested `.git`; the `.git` of the tree itself is passed over only for a walk that never reads it
+    (`Walk.skip_git`). A tree over the entry or time allowance is not verified.
     """
+    follow, exclude = walk.follow, walk.exclude
     deadline = time.monotonic() + WALK_SECONDS
     if _SHELL["until"] is not None:
         deadline = min(deadline, _SHELL["until"])
@@ -584,7 +607,10 @@ def _walk(root, tree, follow, exclude):
                     link = entry.is_symlink()
                     target = os.path.realpath(entry.path) if link else entry.path
                     is_dir = os.path.isdir(target) if link else entry.is_dir(follow_symlinks=False)
-                    if is_dir and any(fnmatch.fnmatchcase(name, skip) for skip in exclude):
+                    nested = name == ".git" and folder != tree.top  # another repository: never passed over
+                    if is_dir and not nested and any(fnmatch.fnmatchcase(name, skip) for skip in exclude):
+                        continue
+                    if walk.skip_git and name == ".git" and folder == tree.top:
                         continue
                     if _walk_hit(parent, name, is_dir):
                         return "reaches " + _shown(here)
@@ -607,27 +633,52 @@ def _walk(root, tree, follow, exclude):
     return None
 
 
-def _credential_dir(parts, anchor, pathspec):
-    """The reason a directory named `agent`, `claude` or `config` is a bulk root, unless the owner's trust lifts it (T7 L2).
+def _walked(path, tree, walk):
+    """`_walk` of this directory, done once per call for the same place and the same way of reading it."""
+    key = (os.path.realpath(path), walk.follow, walk.exclude, walk.skip_git)
+    if key not in _SHELL["memo"]:
+        _SHELL["memo"][key] = _walk(path, tree, walk)
+    return _SHELL["memo"][key]
 
-    Lifted when the directory lies in the trusted tree and a walk of what a read of it would visit
-    finds no credential location. Git pathspecs are never lifted here: a patch also covers history.
+
+def _walk_lift(rule, path, reason, pathspec):
+    """The trusted lift of a bulk-read guess at this directory: None when lifted, else the reason, with what the walk found.
+
+    Lifted when the directory lies in the trusted tree and a walk of what a read of it would visit finds no
+    credential location. A git pathspec is never walked: a patch also covers history (and is judged by its own
+    listing instead, see `_patch_listing`), and the files a git search reads are not the files on disk.
     """
-    if anchor is None or pathspec or _SHELL["trust"] is None:
-        return _CREDENTIAL_DIR
-    path = posixpath.join(anchor, *parts)
+    walk = _SHELL["walk"]
+    if _SHELL["trust"] is None or pathspec:
+        return reason
     tree = _tree_for(path)
     if tree is None:
-        return _CREDENTIAL_DIR
-    follow, exclude = _SHELL["walk"]
-    key = (os.path.realpath(path), follow, exclude)
-    if key not in _SHELL["memo"]:
-        _SHELL["memo"][key] = _walk(path, tree, follow, exclude)
-    refusal = _SHELL["memo"][key]
+        return reason
+    refusal = _walked(path, tree, walk)
     if refusal:
-        return _Refused(_CREDENTIAL_DIR, refusal)
-    _SHELL["trust"].note("L2", os.path.realpath(path), _CREDENTIAL_DIR)
+        return _Refused(reason, refusal)
+    _SHELL["trust"].note(rule, os.path.realpath(path), reason)
     return None
+
+
+def _credential_dir(parts, anchor, pathspec):
+    """The reason a directory named `agent`, `claude` or `config` is a bulk root, unless the owner's trust lifts it (T7 L2)."""
+    if anchor is None:
+        return _CREDENTIAL_DIR
+    return _walk_lift("L2", posixpath.join(anchor, *parts), _CREDENTIAL_DIR, pathspec)
+
+
+def _repository_root(anchor, pathspec, lift):
+    """The reason the root of the repository is a bulk root, unless the owner's trust lifts it (T7 L3).
+
+    Lifted when the root is the top of the trusted tree (or of a linked worktree of it), the written path
+    opens there (`lift`), and the same walk a read of it would make finds no credential location. A search of
+    the whole tree is not cleared by the name alone: `rg foo .` has to pass the walk, `grep -r foo .` reaches
+    `.git/config` in it, and an `.env` anywhere under the root is named in the prompt.
+    """
+    if not lift or not _SHELL["walk"].root:
+        return _ROOT_REASON
+    return _walk_lift("L3", anchor, _ROOT_REASON, pathspec)
 
 
 def _layout(parts, tree=True, anchor=None, pathspec=False, lift=True):
@@ -699,9 +750,10 @@ def _root_reason(root, base="", tree=True, pathspec=False):
     else:
         return "a directory outside the working tree"
     parts = parts[len([part for part in anchor.split("/") if part]):]
+    same = _same_place(joined, literal)
     if not parts:
-        return "the repository root"
-    return _layout(parts, tree, anchor, pathspec, _same_place(joined, literal))
+        return _repository_root(anchor, pathspec, same)
+    return _layout(parts, tree, anchor, pathspec, same)
 
 
 def _same_place(joined, literal):
@@ -1125,13 +1177,19 @@ def _narrowed(prog, args, spec):
 
 
 def _search_walk(prog, args, spec):
-    """What a search visits below its roots, for a trust walk: (whether it follows links, directory names it skips).
+    """What a search visits below its roots, for a trust walk (see `Walk`).
 
     Only what the command line plainly says is believed: grep follows links found on the way only for -R,
     rg only for -L or --follow, and the other searches are taken to follow. A directory is skipped only for
     a literal `--exclude-dir`, which grep and ugrep apply to the names of the directories they meet.
+    The `.git` of the tree is passed over only by rg, and only when nothing on the line (a hidden or unignored
+    flag, a positive glob) or in its environment (a config file) could make it read there. Hidden entries
+    below the root are walked all the same: the walk looks at what the tree holds, not at what rg would skip.
     """
     exclude, follow, letters, i = [], prog not in ("grep", "egrep", "fgrep", "zgrep", "rg", "rga"), spec[1] + spec[3], 0
+    # A config file named anywhere on the line (inline, through env, or exported earlier) counts as one in force.
+    unhidden = (prog in ("rg", "rga") and not os.environ.get("RIPGREP_CONFIG_PATH")
+                and "RIPGREP_CONFIG_PATH" not in _SHELL["text"])
     while i < len(args):
         arg = args[i]
         i += 1
@@ -1151,14 +1209,47 @@ def _search_walk(prog, args, spec):
             follow = True
         elif name in ("--follow", "--dereference-recursive"):
             follow = True
-    return follow, tuple(exclude)
+        if name in _HIDDEN_LONG or (short and _HIDDEN_SHORT.match(arg)):
+            unhidden = False
+        elif name in ("--glob", "--iglob") or (short and "g" in arg[1:]):
+            # a positive glob can bring back what the search would pass over; an exclusion cannot
+            if not (value.startswith("!") and (not short or arg[-1] == "g")):
+                unhidden = False
+    return Walk(follow, tuple(exclude), unhidden)
+
+
+def _hidden_roots_clear(roots, base):
+    """Whether the owner's trust clears a hidden or unignored search of these roots (T7 L3).
+
+    Such a search reads what the name-based rules cannot see, so it prompts unless every root is benign by
+    its name, really lies inside the trusted tree, and the same walk as any other search of it (hidden
+    entries and `.git` included) finds no credential location.
+    """
+    if _SHELL["trust"] is None:
+        return False
+    walk, places = _SHELL["walk"], []
+    for root in roots:
+        written = _absolute(_expand(_join(base, root)), True)
+        if written is None or _GLOB.search(root) or _root_reason(root, base):
+            return False
+        real = _opens(written)
+        tree = _tree_for(real)
+        if tree is None or not _within(real, tree.top):
+            return False
+        below = [part for part in real[len(tree.top):].split("/") if part]
+        if _named(below) or _walked(real, tree, walk):
+            return False
+        places.append(real)
+    for real in places:
+        _SHELL["trust"].note("L3", real, "broad hidden/unignored search")
+    return bool(places)
 
 
 def _search_hit(prog, args, cmd, base, bulk, git=False, listing=False):
     """A search command, judged with the walk it implies (see `_search_walk`)."""
     spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
     saved = _SHELL["walk"]
-    _SHELL["walk"] = _search_walk(prog, args, spec) if not git else (True, ())
+    _SHELL["walk"] = _search_walk(prog, args, spec) if not git else Walk(True, ())
     try:
         return _search_scan(prog, args, cmd, base, bulk, git, listing, spec)
     finally:
@@ -1199,7 +1290,11 @@ def _search_scan(prog, args, cmd, base, bulk, git, listing, spec):
     # hidden or unignored search is cleared by it only over roots that are themselves benign.
     narrowed = not git and _narrowed(prog, args, spec)
     if any(opt in _HIDDEN_LONG or (prog in _ALWAYS_RECURSIVE and _HIDDEN_SHORT.match(opt)) for opt in opts):
-        if not narrowed or _first(_root_reason(root, base) for root in roots or ["."]):
+        if narrowed:
+            unclear = _first(_root_reason(root, base) for root in roots or ["."])
+        else:
+            unclear = not _hidden_roots_clear(roots or ["."], base)
+        if unclear:
             return "broad hidden/unignored search", "search may include credential files"
     if not recursive or (names_only and not listing) or narrowed:
         return None  # a names-only search lists files as find does
@@ -1266,6 +1361,30 @@ def _git_patch_hit(sub, before, after, base):
     if sub == "show":
         return None  # one named commit or object, not a sweep of history
     return f"git {sub} patch output", _UNSCOPED_REASON
+
+
+_PATHSPEC_LISTED = {f"patch output over {why} may include credential files" for why in (_CREDENTIAL_DIR, _ROOT_REASON)}
+
+
+def _patch_listing(sub, rest, before, after, base, hit):
+    """A diff or log patch that `hit` stops, judged by the names git lists for it instead where that is allowed.
+
+    An unscoped patch is judged by its listing always (the stand-in for a sweep of history); with `--check`, which
+    prints the lines it flags, and with a pathspec over a credential directory or the repository root, the
+    listing stands in for the name only in a tree the owner vouched for (T7 L4), and `hit` stands elsewhere.
+    The pathspecs go to git as given, after `--`, so the listing covers what the patch does.
+    """
+    head = rest[:rest.index("--")] if "--" in rest else rest
+    plain = [arg for arg in head if arg != "--check"]
+    if hit[1] == _UNSCOPED_REASON:
+        if after:
+            return hit
+        return _listed_hit(f"git {sub}", _patch_query(sub, plain, base), base, hit, lift="--check" in head)
+    if hit[1] not in _PATHSPEC_LISTED:
+        return hit
+    paths = after if after is not None else [word for word in before if _git_path(word, base)]
+    query = _patch_query(sub, [arg for arg in plain if after is not None or arg not in paths], base)
+    return _listed_hit(f"git {sub}", query + ["--", *paths] if query else None, base, hit, lift=True)
 
 
 def _patch_query(sub, rest, base=""):
@@ -1407,13 +1526,23 @@ def _filter_reason(base, deadline):
     return ""
 
 
-def _listed_hit(label, query, base, unproven):
-    """Judge an unscoped patch by the paths it covers; `unproven` stands when they cannot be listed.
+def _listed_hit(label, query, base, unproven, lift=False):
+    """Judge a patch by the paths it covers; `unproven` stands when they cannot be listed.
 
     A patch that covers no credential path still prompts when it may print more than the paths listed:
     when it touches a submodule, and when the settings in force print submodule files or hand the
     printing to a configured program. The two queries share one time allowance.
+
+    `lift` is for a patch that prompts today even when its listing is clean (T7 L4: `--check`, a pathspec
+    over a credential directory). It stands only in a trusted tree that is the work tree git itself reports,
+    and clears the call there; anywhere else `unproven` stands, as it does without a record.
     """
+    if lift:    # nothing is asked of git before the tree is known to be one the owner vouched for
+        folder = _absolute(base) if base else _SHELL["cwd"]
+        here = _top(os.path.realpath(folder)) if folder else None
+        tree = _tree_for(here) if here and _SHELL["trust"] is not None else None
+        if tree is None or tree.top != here:
+            return unproven
     deadline = time.monotonic() + _GIT_TIMEOUT
     if query:
         # Before any listing: comparing files with the work tree runs the filters configured for them.
@@ -1447,8 +1576,15 @@ def _listed_hit(label, query, base, unproven):
 
     def lifted(name, parts):
         return (_SHELL["trust"] is not None and _weak_only(_plain_name(name)) and where_git_reads() and
-                _lift_name("/" + "/".join(above + parts), name))
+                _lift_name("/" + "/".join(above + parts), name, "L4"))
 
+    def cleared():
+        """The call is clear: a patch that prompted for the listing alone is lifted here, and says so."""
+        _SHELL["trust"].note("L4", top, unproven[1])
+        return None
+
+    if lift and not where_git_reads():
+        return unproven
     for name in names:
         parts = [part for part in name.split("/") if part]
         if parts and (_parts_hit(above + parts) or (SENSITIVE_NAME.match(_plain_name(parts[-1])) and not
@@ -1458,11 +1594,13 @@ def _listed_hit(label, query, base, unproven):
         link = links[0] if len(links[0]) <= 200 and _PATHISH.match(links[0]) else "a submodule"
         return f"{label} of {link}", _SUBMODULE_REASON
     if not names:
-        return None  # nothing is printed, whatever would have printed it
+        return cleared() if lift else None  # nothing is printed, whatever would have printed it
     why = _config_reason(base, deadline)
     if why is None:
         return unproven
-    return (f"{label} patch output", why) if why else None
+    if why:
+        return f"{label} patch output", why
+    return cleared() if lift else None
 
 
 def _git_archive_hit(args, cmd, base):
@@ -1602,9 +1740,8 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         if hit or sub not in _GIT_HISTORY | _GIT_DIFFS or not _git_patch(sub, opts):
             return hit
         hit = _git_patch_hit(sub, before, after, base)
-        if (hit and hit[1] == _UNSCOPED_REASON and sub in ("diff", "log") and not after and
-                _queried(args, rest, cmd, depth, bulk)):
-            return _listed_hit(f"git {sub}", _patch_query(sub, [arg for arg in rest if arg != "--"], base), base, hit)
+        if hit and sub in ("diff", "log") and _queried(args, rest, cmd, depth, bulk):
+            return _patch_listing(sub, rest, before, after, base, hit)
         return hit
     if prog in _GREPS:
         return _search_hit(prog, args, cmd, base, bulk)
@@ -1870,11 +2007,12 @@ def _tool_hit(tool, params):
     root, glob, kind = params.get("path"), params.get("glob"), params.get("type")
     root = root.strip() if isinstance(root, str) and root.strip() else "."
     glob = glob.strip() if isinstance(glob, str) and glob.strip() else None
-    _SHELL["walk"] = (False, ())    # the tool's search does not follow links
+    # The tool's search does not follow links, and judges the project root by its filter alone (below).
+    _SHELL["walk"] = Walk(False, (), root=False)
     why = _root_reason(root)
     if not why:
         return None
-    if why == "the repository root":
+    if why == _ROOT_REASON:
         # A project-wide search prompts only when its filter names a credential file outright.
         named = glob and any(_filter_names(choice) for choice in _brace_expand(glob) if not choice.startswith("!"))
         return (f"{glob} under {root}", "search filter names a credential-bearing file") if named else None
@@ -1900,7 +2038,8 @@ def classify(tool, params, cwd=None, trust=None):
     saved = dict(_SHELL)
     placed = isinstance(cwd, str) and cwd.startswith("/")
     _SHELL.update(cwd=cwd if placed else None, unknown=cwd is not None and not placed, trust=trust,
-                  walk=(True, ()), memo={}, until=time.monotonic() + WALK_CALL_SECONDS)
+                  walk=Walk(True, ()), memo={}, until=time.monotonic() + WALK_CALL_SECONDS,
+                  text=str(params.get("command") or ""))
     hit = None
     try:
         if trust is not None:

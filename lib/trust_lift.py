@@ -1,4 +1,8 @@
-"""The classifier's view of the owner's trust record, and the log of what it lifted (T7, slice 4).
+"""The classifier's view of the owner's trust record, and the log of what it lifted (T7).
+
+A lift is a prompt that a tree walk or git's own listing proved empty of credentials inside a trusted tree:
+L1 a weak name, L2 a credential-directory guess, L3 a search of the repository root or a hidden search, L4 a
+git patch judged by the names-only listing. Each is logged under its rule.
 
 `lib/sensitive_read.py` knows nothing of trust. A caller that prompts the owner builds a `Resolver` and
 passes it to `classify`; the classifier asks it two things while it judges one call:

@@ -29,10 +29,11 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "result_status.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "result_status.py"):   # the last two: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
-        (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n")
+        (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
+                                                      "def iter_task_dirs(state_dir, include_archive=True):\n    return iter(())\n")  # lane_steps scans the session with it
         self.log = base / "spawn.log"
         self.state = base / "state"
         # tp-route --review-plan: prints plan.json and exits with plan.rc (0 plan, 3 no review needed, 4 no independent reviewer)

@@ -90,12 +90,12 @@ class SharedOccupancyTests(LeaseCase):
         (self.state / "live-window").write_text("")
         item, _ = self.lane_ok()
         [holder] = self.lease()
-        run = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        run = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.refused(run, "lane alpha already has a writer", item["id"], str(self.state))
         self.assertEqual(list(self.state2.glob("tasks/*")), [])
         self.tmux("kill-pane", "-t", holder["pane"])  # its process ends: the lease is stale, by death and not by age
         self.gone(holder["pid"])
-        run = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        run = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(list(self.state2.glob("tasks/*"))), 1)
 
@@ -110,18 +110,18 @@ class SharedOccupancyTests(LeaseCase):
         dead = subprocess.Popen(["true"])
         dead.wait()
         self.put_lease([self.holder(pid=dead.pid, start="Mon Jan  1 00:00:00 2001")])
-        item, _ = self.existing(step="s2")
+        item, _ = self.existing(step="s1")
         self.assertNotIn("coder-held00001", [h["task"] for h in self.lease()])
 
     def test_a_recycled_pid_with_another_start_time_is_not_the_holder(self):
         self.made_lane()
         self.put_lease([self.holder(start="Mon Jan  1 00:00:00 2001")])  # a live pid (this process), but not the recorded process
-        self.existing(step="s2")
+        self.existing(step="s1")
 
     def test_a_live_holder_holds_however_old_the_lease_is(self):
         self.made_lane()
         self.put_lease([self.holder(taken="2001-01-01T00:00:00Z")])
-        self.refused(self.lane_dispatch(step="s2", extra=()), "coder-held00001", "already has a writer")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "coder-held00001", "already has a writer")
 
     def test_an_unreadable_or_invalid_lease_refuses_naming_the_file(self):
         self.made_lane()
@@ -129,37 +129,37 @@ class SharedOccupancyTests(LeaseCase):
         for raw in ("{not json", json.dumps({"schema": "other", "holders": []}), json.dumps({"schema": lane_lease.SCHEMA, "holders": [1]}),
                     json.dumps({"schema": lane_lease.SCHEMA, "holders": [dict(self.holder(), pid="x")]})):
             self.put_lease(None, raw)
-            self.refused(self.lane_dispatch(step="s2", extra=()), "lease.json")
+            self.refused(self.lane_dispatch(step="s1", extra=()), "lease.json")
             self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), before)
         lease = self.lane_dir() / "lease.json"
         lease.unlink()
         lease.symlink_to(self.root / "elsewhere.json")  # a lease that is a link is not read
-        self.refused(self.lane_dispatch(step="s2", extra=()), "lease.json")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "lease.json")
         self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), before)
 
     def test_a_reader_does_not_hold_another_reader_but_holds_a_writer(self):
         self.made_lane()
         self.put_lease([self.holder(task="review-other0001", access="read", role="code-reviewer")])
         self.lane_ok(role="code-reviewer", step="s1", extra=())
-        self.refused(self.lane_dispatch(step="s2", extra=()), "review-other0001")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "review-other0001")
 
 
 class ReservationTests(LeaseCase):
     def test_a_failed_start_releases_the_reservation(self):
         self.made_lane()
         (self.state / "window-fail").write_text("")
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.assertNotEqual(run.returncode, 0, run.stdout)
         self.assertEqual(self.lease(), [])
         (self.state / "window-fail").unlink()
-        self.existing(step="s2")  # the lane is free again
+        self.existing(step="s1")  # the lane is free again
 
     def test_a_start_that_fails_after_the_pane_exists_ends_the_pane_and_releases(self):
         self.made_lane()
         (self.state / "live-window").write_text("")
         (self.state / "break-after-window").write_text("")  # the pane table cannot be read when the worker is registered
         before = self.tmux("list-panes", "-a", "-F", "#{pane_id}").split()
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.assertNotEqual(run.returncode, 0, run.stdout)
         self.assertEqual(self.tmux("list-panes", "-a", "-F", "#{pane_id}").split(), before)  # the new pane was ended
         self.assertEqual(self.lease(), [])
@@ -177,7 +177,7 @@ class ReservationTests(LeaseCase):
         child.kill()
         child.wait()
         self.put_lease([holder])
-        self.existing(step="s2")
+        self.existing(step="s1")
 
     def test_the_task_holds_the_lane_once(self):
         self.made_lane()
@@ -232,7 +232,7 @@ class EveryStartGoesThroughTheReservationTests(LeaseCase):
     def test_a_dispatch_started_between_a_reviews_guard_and_its_start_is_refused(self):
         self.made_lane()
         reviewer = self.holder(task="review-held00001", access="read", role="code-reviewer")
-        code, out, err = self.held_then(reviewer, [str(ROOT / "bin/tp-agent"), *self.lane_args(step="s2", extra=())])
+        code, out, err = self.held_then(reviewer, [str(ROOT / "bin/tp-agent"), *self.lane_args(step="s1", extra=())])
         self.assertNotEqual(code, 0, out)
         self.assertIn("review-held00001", err)
         self.assertEqual(len(list((self.state / "tasks").iterdir())), 1)
@@ -241,7 +241,7 @@ class EveryStartGoesThroughTheReservationTests(LeaseCase):
         self.made_lane()
         item = {"id": "coder-aaaaaaaaaa", "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
                 "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
-                "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s2", "preamble_from": str(self.repo)}
+                "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s1", "preamble_from": str(self.repo)}
         (self.state / "queue").mkdir(exist_ok=True)
         (self.state / "queue/coder-aaaaaaaaaa.json").write_text(json.dumps(item))
         code, out, err = self.held_then(self.holder(), [str(ROOT / "bin/tp-agent"), "tick"])

@@ -101,7 +101,7 @@ class DispatchIntoALaneTests(LaneCase):
         self.attach(first, pane)
         self.settle(first)
         self.cli("collect", first.name)
-        item, task = self.existing(step="s2")
+        item, task = self.existing(step="s1")
         prompt = (task / "system-prompt.md").read_text()
         self.assertIn("PREAMBLE-OF-THE-LANE", prompt)
         self.assertNotIn("PREAMBLE-OF-THE-MAIN-TREE", prompt)
@@ -110,7 +110,7 @@ class DispatchIntoALaneTests(LaneCase):
         item, task = self.lane_ok()
         pane, _ = self.pane()
         self.attach(task, pane)
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "lane alpha already has a writer", item["id"])
         self.assertEqual(len(list((self.state / "tasks").iterdir())), 1)
 
@@ -118,10 +118,10 @@ class DispatchIntoALaneTests(LaneCase):
         item, task = self.lane_ok()  # the stub gives it no live pane, so it is not "alive"; queue one by hand
         queued = {"id": "coder-queued0001", "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
                   "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
-                  "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s0", "preamble_from": str(self.repo)}
+                  "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s1", "preamble_from": str(self.repo)}
         (self.state / "queue").mkdir(exist_ok=True)
         (self.state / "queue/coder-queued0001.json").write_text(json.dumps(queued))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "already has a writer", "coder-queued0001")
 
     def test_a_reviewer_waits_for_a_writer_but_not_for_another_reviewer_check_18(self):
@@ -136,20 +136,20 @@ class DispatchIntoALaneTests(LaneCase):
         pane2, _ = self.pane()
         self.attach(reviewer_task, pane2)
         self.lane_ok(role="code-reviewer", step="s1", extra=())
-        self.refused(self.lane_dispatch(step="s2", extra=()), "in use by a reviewer", reviewer["id"])
+        self.refused(self.lane_dispatch(step="s1", extra=()), "in use by a reviewer", reviewer["id"])
 
     def test_a_dead_pane_does_not_hold_the_lane(self):
         item, task = self.lane_ok()
         pane, _ = self.pane()
         self.attach(task, pane)
         self.tmux("kill-pane", "-t", pane)
-        item2, _ = self.existing(step="s2")
+        item2, _ = self.existing(step="s1")
         self.assertEqual(item2["lane_created"], False)
 
     def test_two_dispatches_at_once_create_the_lane_once_and_only_one_gets_the_writer(self):
         _, pid = self.pane()
         (self.state / "list-rows").write_text(f"%9999 0 {pid}\n")  # a started task's stub pane is live, so it holds the lane
-        procs = [subprocess.Popen([str(ROOT / "bin/tp-agent"), *self.lane_args(step=f"s{i}")], env=self.env, text=True,
+        procs = [subprocess.Popen([str(ROOT / "bin/tp-agent"), *self.lane_args(step="s1")], env=self.env, text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(2)]
         outs = [p.communicate(timeout=90) + (p.returncode,) for p in procs]
         self.assertEqual(sorted(o[2] for o in outs), [0, 1], outs)
@@ -213,7 +213,7 @@ class RefusalTableTests(LaneCase):
         self.lane_ok()
         record = self.lane_dir() / "lane.json"
         record.write_text("{broken")
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "lane.json")
 
     def test_08_a_branch_or_path_in_the_way_refuses_before_anything_is_made(self):
@@ -240,7 +240,7 @@ class RefusalTableTests(LaneCase):
         self.settle(task)
         self.cli("collect", item["id"])
         for flags in (("--domain", "other"), ("--touches", "docs"), ("--repo", str(self.repo)), ("--base", "main")):
-            self.refused(self.lane_dispatch(step="s2", extra=flags), "already exists")
+            self.refused(self.lane_dispatch(step="s1", extra=flags), "already exists")
 
     def test_11_a_lane_that_is_not_open_refuses(self):
         item, task = self.lane_ok()
@@ -250,14 +250,14 @@ class RefusalTableTests(LaneCase):
         record = json.loads(path.read_text())
         record["state"] = "abandoned"
         path.write_text(json.dumps(record))
-        self.refused(self.lane_dispatch(step="s2", extra=()), "abandoned")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "abandoned")
 
     def test_12_a_lane_git_does_not_agree_with_refuses(self):
         item, task = self.lane_ok()
         self.settle(task)
         self.cli("collect", item["id"])
         git(self.worktree, "checkout", "-q", "--detach")
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.assertEqual(run.returncode, 1, run.stdout)
         self.assertNotEqual(run.stderr.strip(), "")
 
@@ -292,19 +292,19 @@ class RefusalTableTests(LaneCase):
         other.mkdir()
         (other / "meta.json").write_text(json.dumps({"id": other.name, "pane": "%9999", "role": "coder"}))
         (self.state / "list-rows").write_text(f"%9999 0 {self.pane()[1]}\n")
-        self.refused(self.lane_dispatch(step="s2", extra=()), "no recorded working tree")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "no recorded working tree")
         (self.state / "list-rows").unlink()
         # a task directory with no readable record, while a process of it runs (its run.sh): it may be writing anywhere
         (other / "meta.json").write_text("{broken")
         pane, _ = self.pane(self.worker_command(other))
-        self.refused(self.lane_dispatch(step="s2", extra=()), other.name, "no readable meta.json", f"tmux kill-pane -t {pane}")
+        self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json", f"tmux kill-pane -t {pane}")
         (other / "meta.json").unlink()
-        self.refused(self.lane_dispatch(step="s2", extra=()), other.name, "no readable meta.json")
+        self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json")
         self.tmux("kill-pane", "-t", pane)
         # a pane table that cannot be read
         other.rmdir()
         (self.state / "list-fail").write_text("")
-        self.refused(self.lane_dispatch(step="s2", extra=()), "tmux panes")
+        self.refused(self.lane_dispatch(step="s1", extra=()), "tmux panes")
         (self.state / "list-fail").unlink()
         self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), [item["id"]])
 
@@ -384,7 +384,7 @@ class RetryAndReviewTests(LaneCase):
         item, task = self.lane_ok()
         self.settle(task)
         self.cli("collect", item["id"])
-        second, task2 = self.existing(step="s2")
+        second, task2 = self.existing(step="s1")
         pane, _ = self.pane()
         self.attach(task2, pane)
         run = self.raw("retry", item["id"], "--reason", "Again", "--worker", "pi", "--model", MODEL)
@@ -416,7 +416,7 @@ class TickTests(LaneCase):
         item, task = self.lane_ok()
         pane, _ = self.pane()
         self.attach(task, pane)
-        self.queued("coder-aaaaaaaaaa", "s2")
+        self.queued("coder-aaaaaaaaaa", "s1")
         self.cli("tick")
         entry = json.loads((self.state / "queue/coder-aaaaaaaaaa.json").read_text())
         self.assertIn("waiting for lane alpha's writer", entry.get("queue_reason", ""))
@@ -430,8 +430,8 @@ class TickTests(LaneCase):
         self.settle(task)
         self.attach(task, "%8888")  # not on the pane table: the first task is over
         self.cli("collect", item["id"])
-        self.queued("coder-aaaaaaaaaa", "s2")
-        self.queued("coder-bbbbbbbbbb", "s3")
+        self.queued("coder-aaaaaaaaaa", "s1")
+        self.queued("coder-bbbbbbbbbb", "s1")
         _, pid = self.pane()  # every launched task has the stub's pane %9999; this row makes that pane live, as a started worker's is
         (self.state / "list-rows").write_text(f"%9999 0 {pid}\n")
         self.cli("tick")
@@ -443,7 +443,7 @@ class TickTests(LaneCase):
         self.lane_ok()
         (self.state / "queue").mkdir(exist_ok=True)
         (self.state / "queue/coder-broken0001.json").write_text(json.dumps({"id": "coder-broken0001", "lane": "alpha"}))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "cannot be read")
 
 

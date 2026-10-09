@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import lane_commands  # noqa: E402
 import lane_lease  # noqa: E402
+import lane_steps  # noqa: E402
 import lanes  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
@@ -713,6 +714,7 @@ def lane_plan(args, base, tests):
         if not retry:
             lane_declaration_check(record, args)  # 10
         lane_use_checks(record)  # 11, 12
+        lane_steps.next_step_checks(lane_steps.Session(base), record, step)  # 15, 16, 17
         if retry and os.path.realpath(retry["workdir"]) != record["worktree"]:
             raise ValueError(f"the task being retried ran in {retry['workdir']}, which is not lane {name}'s working tree "
                              f"{record['worktree']}; start a new task with --lane {name} instead")
@@ -739,9 +741,7 @@ def lane_declaration_check(record, args):
 
 def lane_use_checks(record):
     """Checks 11 and 12 for a lane that has a record: it is open, and git agrees with the record."""
-    if record["state"] != "open":
-        raise ValueError(f"lane {record['name']} is {record['state']}; start a new lane from the integration branch")
-    lanes.lane_reality(record)
+    lane_steps.lane_use_checks(record)
 
 
 def lane_admit(base, plan, item):
@@ -756,6 +756,7 @@ def lane_admit(base, plan, item):
         if name in lanes.lane_names(common):
             record = lanes.read_lane(common, name)  # 7 again, under the lock
             lane_use_checks(record)  # 11, 12 again; the flag check (10) needs no lock
+            lane_steps.next_step_checks(lane_steps.Session(base), record, plan["step"])  # 15, 16, 17 again
             warnings = lane_commands._warnings(name, record["domain"], record["touches"], [lanes.read_lane(common, n) for n in lanes.lane_names(common)])
         else:
             if not plan.get("domain"):
@@ -1010,14 +1011,33 @@ def main():
     lc.add_argument("--touches", nargs="+", required=True, metavar="PATH", help="repo-relative path prefixes the lane will change")
     lc.add_argument("--repo", default=".", help="the repository (default: the current directory)")
     lc.add_argument("--base", help="branch or commit to start from (default: the repository's integration branch, lane/integrate unless configured)")
+    lcl = ln.add_parser("close", help="record that a step is finished: its review approved the committed work (lane close NAME STEP)")
+    lcl.add_argument("name")
+    lcl.add_argument("step")
+    lcl.add_argument("--repo", default=".", help="the repository (default: the current directory)")
     ls = sub.add_parser("lanes", help="list the repository's lanes and unrecorded worktrees (read-only)")
     ls.add_argument("name", nargs="?")
     ls.add_argument("--repo", default=".")
     args = parser.parse_args()
     if args.command in ("lane", "lanes"):
-        # Lanes live in the repository's git directory, not in a session: no session state is read or written.
+        # Lanes live in the repository's git directory, not in a session. Creating or listing one needs no session; the steps
+        # of a lane (lane close, and the open_step / queued / waiting_on of a row) are read from this session's tasks.
         if args.command == "lanes":
-            print(json.dumps(lane_commands.list_lanes(args.repo, args.name), indent=2))
+            try:
+                session = lane_steps.Session(state_dir())
+            except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                session = None
+                print(f"tp-agent: warning: no session state directory ({error}), so open_step, queued and waiting_on are not shown; "
+                      "run this from the workspace (tp), or with TP_STATE_DIR set", file=sys.stderr)
+            print(json.dumps(lane_commands.list_lanes(args.repo, args.name, steps=session and (lambda record: lane_steps.row_fields(session, record))), indent=2))
+            return
+        if args.lane_command == "close":
+            try:
+                state = state_dir()
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
+            common, _ = lane_commands._main_repo(args.repo)
+            print(json.dumps(lane_steps.close_step(state, common, args.name, args.step), indent=2))
             return
         value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base)
         for warning in value["warnings"]:

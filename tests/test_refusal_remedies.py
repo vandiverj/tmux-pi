@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -22,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from lane_fixture import MODEL, ROOT, TMUX  # noqa: E402
 from test_lane_lease import LeaseCase  # noqa: E402
+from test_lane_writer import git  # noqa: E402
+from test_lane_steps import APPROVED, CHANGES, StepCase  # noqa: E402
 import contract  # noqa: E402
 import lane_lease  # noqa: E402
 import result_status  # noqa: E402
@@ -75,7 +78,7 @@ class CrossSessionStopTests(RemedyCase):
 
     def test_f1_the_printed_stop_works_from_another_tmux_session(self):
         item, task, pane = self.live_holder()
-        refused = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        refused = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.assertEqual(refused.returncode, 1, refused.stdout)
         commands = [c for c in named(refused.stderr) if " stop " in c]
         self.assertEqual(len(commands), 1, refused.stderr)
@@ -91,12 +94,12 @@ class CrossSessionStopTests(RemedyCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse(self.alive(pane))
         self.assertTrue((task / "stopped.json").is_file())
-        again = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        again = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.assertEqual(again.returncode, 0, again.stderr)
 
     def test_f1_the_stop_printed_in_the_holders_own_session_is_the_plain_command(self):
         item, task, pane = self.live_holder()
-        refused = self.lane_dispatch(step="s2", extra=())
+        refused = self.lane_dispatch(step="s1", extra=())
         self.assertEqual(refused.returncode, 1)
         self.assertIn(f"tp-agent stop {item['id']}", refused.stderr)
         self.assertNotIn("env -u TMUX", refused.stderr)
@@ -104,12 +107,12 @@ class CrossSessionStopTests(RemedyCase):
     def test_f1_a_settled_holder_in_another_session_names_collect_with_the_same_prefix(self):
         item, task, pane = self.live_holder()
         self.settle(task)
-        refused = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        refused = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         commands = named(refused.stderr)
         self.assertEqual([c.split(" tp-agent ")[1] for c in commands], [f"collect {item['id']}", f"stop {item['id']}"], refused.stderr)
         done = self.shell(commands[0], self.typed)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.run_in(self.env2, *self.lane_args(step="s2", extra=())).returncode, 0)
+        self.assertEqual(self.run_in(self.env2, *self.lane_args(step="s1", extra=())).returncode, 0)
 
 
 class ReviewerHoldingTests(RemedyCase):
@@ -124,7 +127,7 @@ class ReviewerHoldingTests(RemedyCase):
 
     def test_f2_dispatch_says_a_reviewer_holds_the_lane(self):
         reviewer, task, pane = self.hold_with_a_reviewer()
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "lane alpha is in use by a reviewer", reviewer["id"], "(reviewer, running")
         self.assertNotIn("already has a writer", run.stderr)
         self.assertNotIn("(writer", run.stderr)
@@ -134,7 +137,7 @@ class ReviewerHoldingTests(RemedyCase):
         self.assertEqual(stop, [f"tp-agent stop {reviewer['id']}"])
         self.assertEqual(self.shell(stop[0]).returncode, 0)
         self.assertFalse(self.alive(pane))
-        self.lane_ok(step="s2", extra=())
+        self.lane_ok(step="s1", extra=())
 
     def test_f2_the_reservation_says_a_reviewer_holds_the_lane_too(self):
         self.lane_ok()
@@ -149,7 +152,7 @@ class ReviewerHoldingTests(RemedyCase):
         item, task = self.lane_ok()
         pane, _ = self.pane(self.worker_command(task))
         self.attach(task, pane)
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "lane alpha already has a writer", f"{item['id']} (writer, running")
         self.assertNotIn("in use by a reviewer", run.stderr)
 
@@ -167,7 +170,7 @@ class SettledHolderTests(RemedyCase):
     def test_f3_a_settled_worker_is_called_settled_and_collect_comes_before_stop(self):
         item, task = self.settled_holder()
         self.assertEqual([h["task"] for h in self.lease()], [item["id"]])
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "lane alpha already has a writer", f"{item['id']} (writer, settled: finished, not collected")
         self.assertNotIn("running", run.stderr)
         self.assertNotIn("Wait for it", run.stderr)
@@ -177,25 +180,25 @@ class SettledHolderTests(RemedyCase):
 
     def test_f3_collect_as_named_frees_the_lane(self):
         item, task = self.settled_holder()
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         done = self.shell(named(run.stderr)[0])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(json.loads(done.stdout)["status"], "completed")
-        self.lane_ok(step="s2", extra=())
+        self.lane_ok(step="s1", extra=())
 
     def test_f3_stop_as_named_frees_the_lane_too(self):
         item, task = self.settled_holder()
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         done = self.shell(named(run.stderr)[1])
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.lane_ok(step="s2", extra=())
+        self.lane_ok(step="s1", extra=())
 
     def test_f3_a_worker_still_at_work_is_running_and_may_be_waited_for(self):
         (self.state / "live-window").write_text("")
         item, task = self.lane_ok()
         (self.state / "live-window").unlink()
         (task / "state.json").write_text(json.dumps({"state": "working"}))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, f"{item['id']} (writer, running", "Wait for it to finish")
         self.assertEqual(named(run.stderr), [f"tp-agent stop {item['id']}"])
 
@@ -203,7 +206,7 @@ class SettledHolderTests(RemedyCase):
         item, task = self.settled_holder()
         queued = {"id": "coder-queued0001", "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
                   "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
-                  "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s2", "preamble_from": str(self.repo),
+                  "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s1", "preamble_from": str(self.repo),
                   "queue_reason": ""}  # an entry that carries a reason is told why it waits on every tick
         (self.state / "queue").mkdir(exist_ok=True)
         (self.state / "queue/coder-queued0001.json").write_text(json.dumps(queued))
@@ -227,7 +230,7 @@ class RetryRefusalTests(RemedyCase):
         first, first_task = self.lane_ok()
         self.settle(first_task)
         self.collect(first["id"])
-        second, second_task = self.existing(step="s2")
+        second, second_task = self.existing(step="s1")
         pane, _ = self.pane(self.worker_command(second_task))
         self.attach(second_task, pane)
         self.settle(second_task)
@@ -251,7 +254,7 @@ class RetryRefusalTests(RemedyCase):
         first, first_task = self.lane_ok()
         self.settle(first_task)
         self.collect(first["id"])
-        second, second_task = self.existing(step="s2")
+        second, second_task = self.existing(step="s1")
         pane, _ = self.pane(self.worker_command(second_task))
         self.attach(second_task, pane)
         self.settle(second_task)
@@ -497,7 +500,7 @@ class AuditTests(RemedyCase):
         # `--tests full` refusal: "tp-agent integrate ships in a later slice; until then run it there yourself")
         prose = {"does", "uses", "command", "calls", "integrate"}
         files = [ROOT / "bin" / name for name in ("tp-agent", "tp-spawn", "tp-review", "tp-kill")]
-        files += [ROOT / "lib" / name for name in ("worker_process.py", "lane_lease.py", "lanes.py", "lane_commands.py")]
+        files += [ROOT / "lib" / name for name in ("worker_process.py", "lane_lease.py", "lanes.py", "lane_commands.py", "lane_steps.py")]
         named_somewhere = {word for file in files for word in re.findall(r"tp-agent ([a-z][a-z-]*)", file.read_text())}
         self.assertTrue({"collect", "stop", "reap", "retry", "message"} <= named_somewhere)
         for word in sorted(named_somewhere - prose):
@@ -508,22 +511,22 @@ class AuditTests(RemedyCase):
         self.lane_ok()
         (self.state / "queue").mkdir(exist_ok=True)
         (self.state / "queue/coder-broken0001.json").write_text(json.dumps({"id": "coder-broken0001", "lane": "alpha"}))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "cannot be read", "remove it with: `tp-agent stop coder-broken0001`")
         self.assertEqual(self.shell(named(run.stderr)[0]).returncode, 0)
         self.assertFalse((self.state / "queue/coder-broken0001.json").exists())
-        self.lane_ok(step="s2", extra=())
+        self.lane_ok(step="s1", extra=())
 
     def test_an_unreadable_queue_entry_whose_name_is_no_id_is_not_given_a_stop_that_cannot_work(self):
         self.lane_ok()
         (self.state / "queue").mkdir(exist_ok=True)
         entry = self.state / "queue/_broken.json"
         entry.write_text(json.dumps({"id": "_broken", "lane": "alpha"}))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "cannot be read", f"remove it with: delete the file {entry}")
         self.assertNotIn("tp-agent stop _broken", run.stderr)
         entry.unlink()
-        self.lane_ok(step="s2", extra=())
+        self.lane_ok(step="s1", extra=())
 
     def test_a_message_to_a_worker_without_a_pane_names_retry_and_retry_works(self):
         item, task = self.dispatch()
@@ -563,6 +566,356 @@ class AuditTests(RemedyCase):
         self.tmux("kill-pane", "-t", other)
         self.assertEqual(self.cli("reap", item["id"], "--yes")["confirmed"], True)
         self.assertFalse((task / "process.json").exists())
+
+
+
+def backticked(text):
+    """Every command in backticks in a refusal, in order: what a person pastes."""
+    return re.findall(r"`([^`]+)`", text)
+
+
+class StepRemedyTests(StepCase):
+    """L4: every refusal of the review gate, `lane close` and the next-step rule names a command; each test prints the refusal,
+    runs what it names (through sh, as typed, with only the placeholders the text itself marks as ones to fill: NEW-ID, ROLE) and
+    shows the refusal gone or moved on to the next step of the way. The last test walks one lane from a working writer to a
+    closed step by only typing what the refusals said."""
+
+    def shell(self, command, cwd=None):
+        env = dict(self.env)
+        env["PATH"] = os.pathsep.join([str(ROOT / "bin"), env["PATH"]])
+        return subprocess.run(["sh", "-c", command], env=env, cwd=cwd or self.repo, text=True, capture_output=True, timeout=90)
+
+    def type_(self, command, **fill):
+        for word, value in fill.items():
+            command = command.replace(word, value)
+        run = self.shell(command)
+        self.assertEqual(run.returncode, 0, f"{command}\n{run.stderr}")
+        return run
+
+    def printed(self, make_run, *words):
+        """The commands (in backticks) the refusal prints, after checking it is a clean refusal that says `words`."""
+        return backticked(self.untouched(make_run, *words))
+
+    def new_reviewer(self, author, command=None):
+        before = {p.name for p in (self.state / "tasks").glob("review-*")}
+        run = self.type_(command or f"tp-agent review {author} --force")
+        found = [p for p in (self.state / "tasks").glob("review-*") if p.name not in before]
+        self.assertEqual(len(found), 1, run.stdout)
+        return found[0]
+
+    # --- the gate ---------------------------------------------------------------------------------------------------
+
+    def test_a_working_writer_names_stop_and_stop_clears_it(self):
+        author, task = self.writer(settled=False)
+        self.edit()
+        self.commit()
+        commands = self.printed(self.next_step, author, f"`tp-agent stop {author}`")
+        self.assertIn(f"tp-agent stop {author}", commands)
+        self.type_(f"tp-agent stop {author}")
+        # moved on: the next refusal does not mention the writer as unfinished, and it names a command too
+        stderr = self.untouched(self.next_step, "step s1 is not closed", "No writer of the step can be reviewed")
+        self.assertNotIn("so the step's work is not finished", stderr)
+
+    def test_a_queued_task_names_stop_and_stop_takes_it_out(self):
+        self.writer()
+        self.edit()
+        self.commit()
+        queued = {"id": "coder-queued0002", "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
+                  "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
+                  "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": "s1", "preamble_from": str(self.repo)}
+        (self.state / "queue").mkdir(exist_ok=True)
+        (self.state / "queue/coder-queued0002.json").write_text(json.dumps(queued))
+        self.printed(self.close, "coder-queued0002 is queued for step s1", "`tp-agent stop coder-queued0002`")
+        self.type_("tp-agent stop coder-queued0002")
+        self.assertFalse((self.state / "queue/coder-queued0002.json").exists())
+        self.untouched(self.close, "step s1 of lane alpha cannot be closed", "has no review yet")
+
+    def test_a_settled_unreviewed_author_names_review_and_the_review_it_starts_counts(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.printed(self.close, "has no review yet", f"`tp-agent review {author} --force`")
+        reviewer = self.new_reviewer(author)
+        # the gate sees the reviewer tp-review made: started (so waiting), then, answered, approving
+        self.untouched(self.close, f"{reviewer.name} is reviewing this tree")
+        self.settle(reviewer, result=APPROVED)
+        self.assertEqual(self.closes()["closed"][0]["review"], reviewer.name)
+
+    def test_a_running_review_names_stop_and_a_stopped_one_names_review_again(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        reviewer = self.new_reviewer(author)
+        self.printed(self.close, f"{reviewer.name} is reviewing this tree", f"`tp-agent stop {reviewer.name}`")
+        self.type_(f"tp-agent stop {reviewer.name}")
+        self.printed(self.close, f"{reviewer.name}: it ended stopped", f"`tp-agent review {author} --force`")
+        second = self.new_reviewer(author)
+        self.settle(second, result=APPROVED)
+        self.assertEqual(self.closes()["closed"][0]["review"], second.name)
+
+    def test_a_review_that_asked_for_changes_names_retry_and_retry_puts_a_new_writer_in_the_step(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        reviewer, _ = self.review(author, CHANGES)
+        commands = self.printed(self.next_step, f"{reviewer} asked for changes")
+        retry = next(c for c in commands if c.startswith("tp-agent retry"))
+        self.type_(retry + " --worker pi --model " + MODEL)
+        stderr = self.untouched(self.next_step, "step s1 is not closed")
+        self.assertRegex(stderr, r"coder-[0-9a-f]+ is (starting|running)")  # the new writer, in the same step: the lane is moving
+
+    def test_approved_work_that_is_not_committed_names_the_commit_and_the_close(self):
+        author, _ = self.writer()
+        self.edit()
+        self.review(author)
+        commands = self.printed(self.close, "the approved work is not committed")
+        commit = next(c for c in commands if c.startswith("git -C"))
+        self.type_(commit)  # `git -C WT add -A && git -C WT commit -m "..."`
+        close = next(c for c in commands if c.startswith("tp-agent lane close"))
+        self.type_(close)
+        self.assertEqual(len(self.record()["closed"]), 1)
+
+    def test_a_review_without_a_usable_verdict_names_review_and_a_second_review_settles_it(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        bad, _ = self.review(author, "no verdict here\n\nRESULT_STATUS: complete\n")
+        self.printed(self.close, f"{bad}: ", f"`tp-agent review {author} --force`")
+        second = self.new_reviewer(author)
+        self.settle(second, result=APPROVED)
+        self.assertEqual(self.closes()["closed"][0]["review"], second.name)
+
+    def test_a_stale_review_names_review_and_the_new_review_counts(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(author)
+        self.edit("later.py", "after the review\n")
+        self.commit("later")
+        self.printed(self.close, "the earlier ones judged other work", f"`tp-agent review {author} --force`")
+        fresh = self.new_reviewer(author)
+        self.settle(fresh, result=APPROVED)
+        self.assertEqual(self.closes()["closed"][0]["review"], fresh.name)
+
+    def test_with_no_writer_to_review_the_printed_dispatch_makes_one(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        (self.state / "archive").mkdir()
+        shutil.move(str(self.state / "tasks" / author), str(self.state / "archive" / author))
+        commands = self.printed(self.close, "No writer of the step can be reviewed")
+        dispatch = next(c for c in commands if c.startswith("tp-agent dispatch"))
+        self.type_(dispatch + " --worker pi --model " + MODEL)
+        stderr = self.untouched(self.close, "cannot be closed")
+        self.assertRegex(stderr, r"coder-[0-9a-f]+ is (starting|running)")
+
+    def test_approved_and_committed_but_not_recorded_names_the_close_and_the_close_clears_it(self):
+        self.approved_and_committed()
+        commands = self.printed(self.next_step, "it is approved and committed but not recorded", "`tp-agent lane close alpha s1`")
+        self.type_(next(c for c in commands if c.startswith("tp-agent lane close")))
+        self.existing(step="s2")
+
+    # --- lane close -------------------------------------------------------------------------------------------------
+
+    def test_a_close_in_a_session_that_has_no_such_step_names_lanes_and_lanes_runs(self):
+        self.writer()
+        commands = self.printed(lambda: self.close("nope"), "lane alpha has no step nope in this session", "`tp-agent lanes alpha`")
+        run = self.type_(next(c for c in commands if c.startswith("tp-agent lanes")))
+        self.assertEqual(json.loads(run.stdout)[0]["open_step"], "s1")
+
+    def test_a_close_from_another_session_names_the_state_directory_and_that_works(self):
+        self.approved_and_committed()
+        other = self.root / "other-state"
+        (other / "tasks").mkdir(parents=True)
+        env = {**self.env, "TP_STATE_DIR": str(other)}
+        run = subprocess.run([str(ROOT / "bin/tp-agent"), "lane", "close", "alpha", "s1", "--repo", str(self.repo)], env=env, text=True, capture_output=True)
+        self.refused(run, "TP_STATE_DIR=<its state directory> tp-agent lane close alpha s1")
+        fixed = subprocess.run([str(ROOT / "bin/tp-agent"), "lane", "close", "alpha", "s1", "--repo", str(self.repo)],
+                               env={**self.env, "TP_STATE_DIR": str(self.state)}, text=True, capture_output=True)
+        self.assertEqual(fixed.returncode, 0, fixed.stderr)
+
+    def test_closing_a_closed_step_names_a_new_step_and_that_dispatch_works(self):
+        self.approved_and_committed()
+        self.closes()
+        commands = self.printed(self.close, "is already closed at")
+        self.type_(next(c for c in commands if c.startswith("tp-agent dispatch")) + " --worker pi --model " + MODEL, **{"NEW-ID": "s2", "ROLE": "coder"})
+
+    def test_closing_a_step_that_is_not_the_open_one_names_the_open_one_and_that_close_runs(self):
+        self.writer("s1")
+        newer = self.state / "tasks/coder-newer00002"
+        newer.mkdir()
+        meta = json.loads(next((self.state / "tasks").glob("coder-*/meta.json")).read_text())
+        meta.update(id="coder-newer00002", lane_step="s2", created="2999-01-01T00:00:00Z")
+        (newer / "meta.json").write_text(json.dumps(meta))
+        self.settle(newer)
+        commands = self.printed(lambda: self.close("s2"), "is not lane alpha's open step (s1, the oldest that is not closed)", "`tp-agent lane close alpha s1`")
+        run = self.shell(next(c for c in commands if c.startswith("tp-agent lane close")))
+        self.assertEqual(run.returncode, 0, run.stderr)  # s1 changed nothing: it closes empty, and s2 is then the open one
+        self.assertEqual(self.lanes()["open_step"], "s2")
+
+    def test_an_older_step_that_was_never_closed_holds_the_next_one_and_its_close_is_printed(self):
+        author, _ = self.approved_and_committed()
+        self.closes()
+        # a step left unclosed from before the rule, older than the closed s1's tasks: it is open, whatever the newest task is
+        old = self.state / "tasks/coder-oldstep0001"
+        old.mkdir()
+        meta = json.loads((self.state / "tasks" / author / "meta.json").read_text())
+        meta.update(id="coder-oldstep0001", lane_step="s0", created="2000-01-01T00:00:00Z")
+        (old / "meta.json").write_text(json.dumps(meta))
+        self.settle(old)
+        commands = self.printed(self.next_step, "lane alpha: step s0 is not closed", "it changed nothing, so it needs no review, only the close",
+                                "`tp-agent lane close alpha s0`")
+        self.type_(next(c for c in commands if c.startswith("tp-agent lane close")))
+        self.existing(step="s2")
+
+    def test_a_late_review_of_a_closed_step_does_not_let_the_next_step_past_the_open_one(self):
+        author, _ = self.approved_and_committed()
+        self.closes()
+        second, _ = self.writer("s2")
+        self.edit("s2.py")
+        self.commit("s2 work")
+        self.review(author, step="s1")  # a review of the closed s1, newer than every task of s2
+        commands = self.printed(lambda: self.next_step("s3"), "lane alpha: step s2 is not closed", f"`tp-agent review {second} --force`")
+        reviewer = self.new_reviewer(second, next(c for c in commands if c.startswith("tp-agent review")))
+        self.settle(reviewer, result=APPROVED)
+        commands = self.printed(lambda: self.next_step("s3"), "it is approved and committed but not recorded", "`tp-agent lane close alpha s2`")
+        self.type_(next(c for c in commands if c.startswith("tp-agent lane close")))
+        self.existing(step="s3")
+
+    def test_an_empty_step_needs_only_the_close_and_the_printed_close_runs(self):
+        self.writer()
+        commands = self.printed(self.next_step, "lane alpha: step s1 is not closed", "it changed nothing, so it needs no review, only the close",
+                                "`tp-agent lane close alpha s1`")
+        run = self.type_(next(c for c in commands if c.startswith("tp-agent lane close")))
+        self.assertEqual(json.loads(run.stdout)["closed"][0]["verdict"], "EMPTY")
+        self.existing(step="s2")
+
+    # --- an unreadable record that the lane names -------------------------------------------------------------------
+
+    def test_an_unreadable_task_of_the_open_step_names_its_directory_and_the_removal_clears_it(self):
+        author, task = self.writer()  # nothing changed: the removal leaves a clean lane at its base
+        (task / "meta.json").write_text("{broken")
+        commands = self.printed(self.next_step, "lane alpha: step s1 is not closed", f"{author} ({task})", "meta.json cannot be read")
+        remove = next(c for c in commands if c.startswith("rm -r"))
+        self.assertEqual(remove, f"rm -r {task}")
+        self.type_(remove)
+        self.existing(step="s2")  # the refusal is gone and nothing else holds the lane
+
+    def test_the_same_refusal_from_lane_close_names_the_same_command(self):
+        author, task = self.writer()
+        (task / "meta.json").unlink()
+        commands = self.printed(self.close, "step s1 of lane alpha cannot be closed", f"{author} ({task})")
+        self.type_(next(c for c in commands if c.startswith("rm -r")))
+        self.untouched(self.close, "has no step s1 in this session")  # nothing names the step any more
+
+    def test_after_the_removal_work_left_in_the_tree_is_held_by_the_next_check_whose_commands_work(self):
+        author, task = self.writer()
+        self.edit()
+        self.commit()
+        (task / "meta.json").write_text("{broken")
+        commands = self.printed(self.next_step, f"{author} ({task})")
+        self.type_(next(c for c in commands if c.startswith("rm -r")))
+        for command in self.printed(self.next_step, "lane alpha has changes since the lane's base", "1 commit(s) after the closed one"):
+            self.type_(command)
+        self.existing(step="s2")
+
+    def test_a_running_process_of_an_unreadable_task_is_ended_by_the_printed_command_then_removed(self):
+        author, task = self.writer()
+        pane, _ = self.pane(self.worker_command(task))
+        (task / "meta.json").write_text("{broken")
+        commands = self.printed(self.next_step, f"{author} ({task})", "a process of it is running")
+        kill = next(c for c in commands if c.startswith("tmux kill-pane"))
+        self.assertEqual(kill, f"tmux kill-pane -t {pane}")
+        self.type_(kill)
+        self.assertFalse(self.alive(pane))
+        commands = self.printed(self.next_step, f"{author} ({task})")
+        self.assertEqual([c for c in commands if c.startswith("rm -r")], [f"rm -r {task}"])
+        self.type_(f"rm -r {task}")
+        self.existing(step="s2")
+
+    def test_a_task_only_the_lease_names_is_cleared_by_the_same_removal(self):
+        author, task = self.writer()
+        (task / "dispatch.json").unlink()
+        (task / "meta.json").write_text("{broken")
+        (self.lane_dir() / "lease.json").write_text(json.dumps({"schema": "tp-lane-lease:v1", "holders": [
+            {"kind": "worker", "access": "write", "task": author, "role": "coder", "session": str(self.state), "pid": 99999999,
+             "start": "Mon Jan  1 00:00:00 2001", "pane": None, "taken": "2026-10-08T00:00:00+00:00"}]}))
+        commands = self.printed(self.next_step, f"lane alpha: {author} ({task})", "belongs to an open step of this lane")
+        self.type_(next(c for c in commands if c.startswith("rm -r")))
+        self.existing(step="s2")
+
+    # --- checks 15 and 17 -------------------------------------------------------------------------------------------
+
+    def test_a_task_into_a_closed_step_names_a_new_id_and_a_new_id_works(self):
+        self.approved_and_committed()
+        self.closes()
+        commands = self.printed(lambda: self.lane_dispatch(step="s1", extra=()), "was closed at")
+        self.type_(next(c for c in commands if c.startswith("tp-agent dispatch")) + " --worker pi --model " + MODEL, **{"NEW-ID": "s1b", "ROLE": "coder"})
+
+    def test_changes_made_by_hand_after_a_close_name_the_stash_and_the_stash_works(self):
+        self.approved_and_committed()
+        self.closes()
+        self.edit("by-hand.py", "x\n")
+        commands = self.printed(self.next_step, "lane alpha has changes since step s1 closed")
+        for command in commands:
+            self.type_(command)
+        self.existing(step="s2")
+        self.assertIn("by-hand.py", git(self.worktree, "stash", "show", "--include-untracked", "--name-only", "stash@{0}"))
+
+    def test_commits_made_by_hand_after_a_close_name_the_save_and_reset_and_they_work(self):
+        self.approved_and_committed()
+        closed = self.closes()["closed"][0]["commit"]
+        self.edit("by-hand.py", "x\n")
+        by_hand = self.commit("by hand")
+        self.edit("dirty.py", "y\n")  # both at once: the stash must come first or the reset would take the file
+        commands = self.printed(self.next_step, "lane alpha has changes since step s1 closed", "1 commit(s) after the closed one", "1 uncommitted path(s)")
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.type_(command)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), closed)
+        self.assertEqual(git(self.repo, "rev-parse", f"saved/alpha-{by_hand[:8]}"), by_hand)
+        self.assertIn("dirty.py", git(self.worktree, "stash", "show", "--include-untracked", "--name-only", "stash@{0}"))
+        self.existing(step="s2")
+
+    # --- one lane, from the first task to a closed step, typing only what the refusals said -------------------------------
+
+    def test_a_lane_is_never_stuck_a_walk_from_a_working_writer_to_a_closed_step(self):
+        author, task = self.writer(settled=False)
+        self.edit("first.py", "a first try\n")  # the step changed the tree, so it needs a review and not only a close
+        # 1. the writer is working: wait or stop it
+        stop = next(c for c in self.printed(self.next_step, "step s1 is not closed") if c.startswith("tp-agent stop"))
+        self.type_(stop)
+        # 2. nothing to review: the printed dispatch makes a writer in the same step
+        dispatch = next(c for c in self.printed(self.next_step, "No writer of the step can be reviewed") if c.startswith("tp-agent dispatch"))
+        self.type_(dispatch + " --worker pi --model " + MODEL)
+        second = next(p for p in (self.state / "tasks").glob("coder-*") if p.name != author)
+        self.settle(second)
+        self.edit()
+        # 3. settled, work in the tree, no review: review it
+        review = next(c for c in self.printed(self.next_step, "has no review yet") if c.startswith("tp-agent review"))
+        self.type_(review)
+        reviewer = next((self.state / "tasks").glob("review-*"))
+        # 4. the reviewer is working: it finishes, and rejects
+        self.untouched(self.next_step, f"{reviewer.name} is reviewing this tree")
+        self.settle(reviewer, result=CHANGES)
+        retry = next(c for c in self.printed(self.next_step, "asked for changes") if c.startswith("tp-agent retry"))
+        # 5. the rejected tree changes, a new review of the new tree approves it
+        self.type_(retry + " --worker pi --model " + MODEL)
+        third = next(p for p in (self.state / "tasks").glob("coder-*") if p.name not in (author, second.name))
+        self.settle(third)
+        self.edit("fix.py", "the fix\n")
+        review = next(c for c in self.printed(self.next_step, "the earlier ones judged other work") if c.startswith("tp-agent review"))
+        self.type_(review)
+        newest = max((p for p in (self.state / "tasks").glob("review-*") if p != reviewer), key=lambda p: p.stat().st_mtime_ns)
+        self.settle(newest, result=APPROVED)
+        # 6. approved, not committed: commit as reviewed, close
+        commands = self.printed(self.next_step, "the approved work is not committed")
+        self.type_(next(c for c in commands if c.startswith("git -C")))
+        close = next(c for c in self.printed(self.next_step, "it is approved and committed but not recorded") if c.startswith("tp-agent lane close"))
+        self.type_(close)
+        # 7. step s2 starts, from the closed commit
+        self.existing(step="s2")
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), self.record()["closed"][0]["commit"])
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ SCHEMA = "tp-lane:v1"
 KINDS = ("work", "integration")
 STATES = ("open", "integrating", "integrated", "abandoned")
 VERDICTS = ("APPROVED", "APPROVED_WITH_NOTES")
+EMPTY = "EMPTY"  # the verdict of a step closed without a review because its work left the tree as the last closed commit had it
 LANE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 RESERVED_NAMES = ("archive",)  # lane_names skips this directory, so a lane called so would be invisible to the count
 
@@ -212,10 +213,14 @@ def _closed_entry(value, index):
             raise ValueError(f"{where} has no {key}")
     if not isinstance(value["step"], str) or not STEP_ID.fullmatch(value["step"]):
         raise ValueError(f"{where}.step {value['step']!r} is not a valid step id")
-    if not isinstance(value["review"], str) or not TASK_ID.fullmatch(value["review"]):
+    empty = value["verdict"] == EMPTY  # an empty step has no review: nothing was changed to review
+    if empty:
+        if value["review"] is not None:
+            raise ValueError(f"{where}.review {value['review']!r} must be null for an {EMPTY} step")
+    elif not isinstance(value["review"], str) or not TASK_ID.fullmatch(value["review"]):
         raise ValueError(f"{where}.review {value['review']!r} is not a task id")
-    if value["verdict"] not in VERDICTS:
-        raise ValueError(f"{where}.verdict {value['verdict']!r} is not one of {', '.join(VERDICTS)}")
+    if not empty and value["verdict"] not in VERDICTS:
+        raise ValueError(f"{where}.verdict {value['verdict']!r} is not one of {', '.join(VERDICTS)} (or {EMPTY})")
     return {"step": value["step"], "commit": _hex(value["commit"], f"{where}.commit"), "tree": _hex(value["tree"], f"{where}.tree"),
             "review": value["review"], "verdict": value["verdict"], "closed_at": _timestamp(value["closed_at"], f"{where}.closed_at")}
 
@@ -680,12 +685,18 @@ def lane_reality(record):
         for entry in record["closed"]:
             what = f"closed step {entry['step']}"
             if not commit_exists(entry["commit"]) or not ancestor(entry["commit"], tip):
-                fail(f"{what} commit {entry['commit']} is not on branch {branch}")
+                if commit_exists(entry["commit"]):  # moved off by a reset or a rewrite: the commit is still there to go back to
+                    back = (f"git -C {worktree} stash push -u -m \"lane {name}\"; git -C {worktree} branch saved/{name}-{tip[:8]} {tip} && "
+                            f"git -C {worktree} reset --hard {entry['commit']}")
+                    fail(f"{what} commit {entry['commit']} is not on branch {branch}; put the branch back on it, keeping what is there now "
+                         f"(`{back}`)")
+                fail(f"{what} commit {entry['commit']} is not on branch {branch} and no longer exists (README.md, Lane recovery)")
             if not ancestor(previous, entry["commit"]):
-                fail(f"{what} commit {entry['commit']} does not follow {previous_what}")
+                fail(f"{what} commit {entry['commit']} does not follow {previous_what} (README.md, Lane recovery)")
             _, tree = _git(["rev-parse", f"{entry['commit']}^{{tree}}"], common)
             if tree.strip() != entry["tree"]:
-                fail(f"{what} records tree {entry['tree']} but its commit's tree is {tree.strip()}")
+                fail(f"{what} records tree {entry['tree']} but its commit's tree is {tree.strip()}; lane.json was changed by hand "
+                     f"(README.md, Lane recovery)")
             previous, previous_what = entry["commit"], what
     except ValueError as error:
         if str(error).startswith(f"lane {name}:"):

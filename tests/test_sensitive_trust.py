@@ -1105,6 +1105,78 @@ class _Git:
 
 
 @unittest.skipUnless(GIT, "git is not installed")
+class IgnoredEnvTests(_Git, World):
+    """A plain rg does not read an `.env` that git confirms is ignored, so the walk passes over it (F2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_repo()
+        Path(self.repo, ".gitignore").write_text(ENV + "\n")
+        Path(self.repo, ENV).write_text("x\n")
+        self.grant()
+
+    def prompts_for_env(self, command):
+        result = self.bash(command)
+        self.assertTrue(result["sensitive"], command)
+        self.assertIn("(reaches " + os.path.basename(self.repo) + "/" + ENV, result["reason"], command)
+
+    def test_an_ignored_env_does_not_stop_a_plain_rg(self):
+        for command in ("rg foo .", "rg -n foo", "rg -l foo ."):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash(command), {"sensitive": False})
+                self.assertTrue(self.plain(command)["sensitive"])
+
+    def test_what_defeats_the_ignore_still_stops_on_the_env(self):
+        for args in ("--no-ignore", "--no-ignore-vcs", "--no-ignore-global", "--no-ignore-parent", "--unrestricted",
+                     "--ignore-file x", "-g '*.py'", "--glob=*", "-u", "-uu"):
+            with self.subTest(args=args):
+                walk = sr._search_walk("rg", args.replace("'", "").split(), sr._RG_ARGS)
+                self.assertFalse(walk.ignored_env)
+        for prog, args in (("rg", ["--hidden"]), ("rg", ["-g", "!*.md"]), ("rg", [])):
+            self.assertTrue(sr._search_walk(prog, args, sr._RG_ARGS).ignored_env, args)
+        for prog in ("rga", "ag", "ack", "grep"):
+            self.assertFalse(sr._search_walk(prog, [], sr._RG_ARGS).ignored_env, prog)
+        with mock.patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": "/x"}):
+            self.assertFalse(sr._search_walk("rg", [], sr._RG_ARGS).ignored_env)
+        for command in ("rg --no-ignore foo .", "rg -uu foo .", "rg --ignore-file x foo .", "rg foo .env", "rg foo ./.env",
+                        "grep -rn foo .", "rga foo ."):
+            with self.subTest(command=command):
+                self.assertTrue(self.bash(command)["sensitive"])
+
+    def test_git_must_confirm_it(self):
+        git_dir = os.path.join(self.repo, ".git")
+        # tracked: git does not call it ignored
+        self.git("add", "-f", ENV)
+        self.prompts_for_env("rg foo .")
+        self.git("rm", "-q", "--cached", ENV)
+        self.assertEqual(self.bash("rg foo ."), {"sensitive": False})
+        # not ignored
+        Path(self.repo, ".gitignore").write_text("other\n")
+        self.prompts_for_env("rg foo .")
+        Path(self.repo, ".gitignore").write_text(ENV + "\n")
+        # an .ignore file can bring it back for rg
+        Path(self.repo, ".ignore").write_text("!" + ENV + "\n")
+        self.prompts_for_env("rg foo .")
+        os.unlink(os.path.join(self.repo, ".ignore"))
+        self.assertEqual(self.bash("rg foo ."), {"sensitive": False})
+        # git cannot say, here because the folder is no repository
+        shutil.rmtree(git_dir)
+        os.mkdir(git_dir)
+        self.prompts_for_env("rg foo .")
+
+    def test_only_an_env_file_is_passed_over(self):
+        for name in (".env.local", ".envrc", "id_rsa"):
+            with self.subTest(name=name):
+                Path(self.repo, ".gitignore").write_text(name + "\n" + ENV + "\n")
+                Path(self.repo, name).write_text("x\n")
+                self.assertTrue(self.bash("rg foo .")["sensitive"])
+                os.unlink(os.path.join(self.repo, name))
+        folder = os.path.join(self.repo, "lib", ENV)       # a directory by that name is not a file rg skips by the ignore
+        os.mkdir(folder)
+        self.assertTrue(self.bash("rg foo .")["sensitive"])
+
+
+@unittest.skipUnless(GIT, "git is not installed")
 class PatchLiftTests(_Git, World):
     """L4: `--check` and a patch over a credential directory or the root, cleared by git's own listing in a trusted tree."""
 

@@ -281,13 +281,14 @@ WALK_SECONDS = 1.0
 _NEVER_LIFTED_SEGMENTS = (".git", ".config")
 
 
-class Walk(collections.namedtuple("Walk", "follow exclude skip_git root", defaults=(False, True))):
+class Walk(collections.namedtuple("Walk", "follow exclude skip_git root ignored_env", defaults=(False, True, False))):
     """What a read of a directory visits, as far as the command line says.
 
     `follow`: it follows links it meets. `exclude`: directory names it skips (a literal `--exclude-dir`).
     `skip_git`: it never reads the `.git` of the tree it starts in (rg without a hidden flag or config).
     `root`: the owner's trust may lift the repository root for it (false for the Grep tool, which judges the
-    root by its filter). The default visits everything.
+    root by its filter). `ignored_env`: a plain rg, which honours ignore files, so an `.env` that git
+    confirms is ignored is not read by it. The default visits everything.
     """
     __slots__ = ()
 
@@ -615,7 +616,9 @@ def _walk(root, tree, walk):
                         continue
                     if walk.skip_git and name == ".git" and folder == tree.top:
                         continue
-                    if _walk_hit(parent, name, is_dir):
+                    if _walk_hit(parent, name, is_dir) and not (
+                            walk.ignored_env and name == ".env" and not is_dir and not link and
+                            not _parts_hit([parent, name]) and _env_ignored(folder, deadline)):
                         return "reaches " + _shown(here)
                     if link:
                         if not follow:
@@ -636,9 +639,25 @@ def _walk(root, tree, walk):
     return None
 
 
+def _env_ignored(folder, deadline):
+    """Whether git confirms the `.env` of this folder is ignored, so a plain rg passes over it (F2).
+
+    `git check-ignore -q` ends with 0 only for an ignored path; a tracked file, an unknown path and a folder
+    that is no repository end otherwise and are not confirmed. A `.ignore` or `.rgignore` in the folder or
+    above it can bring the file back for rg, and then nothing is confirmed.
+    """
+    parents, up = [folder], folder
+    while up != posixpath.dirname(up):
+        up = posixpath.dirname(up)
+        parents.append(up)
+    if any(os.path.lexists(posixpath.join(parent, name)) for parent in parents for name in (".ignore", ".rgignore")):
+        return False
+    return _git_ask(("check-ignore", "-q", "--", ".env"), folder, min(deadline, time.monotonic() + _GIT_TIMEOUT)) is not None
+
+
 def _walked(path, tree, walk):
     """`_walk` of this directory, done once per call for the same place and the same way of reading it."""
-    key = (os.path.realpath(path), walk.follow, walk.exclude, walk.skip_git)
+    key = (os.path.realpath(path), walk.follow, walk.exclude, walk.skip_git, walk.ignored_env)
     if key not in _SHELL["memo"]:
         _SHELL["memo"][key] = _walk(path, tree, walk)
     return _SHELL["memo"][key]
@@ -1193,6 +1212,8 @@ def _search_walk(prog, args, spec):
     # A config file named anywhere on the line (inline, through env, or exported earlier) counts as one in force.
     unhidden = (prog in ("rg", "rga") and not os.environ.get("RIPGREP_CONFIG_PATH")
                 and "RIPGREP_CONFIG_PATH" not in _SHELL["text"])
+    # Whatever turns the ignore files off, adds one, or re-includes a path defeats the pass over an ignored `.env`.
+    honours = unhidden and prog == "rg"
     while i < len(args):
         arg = args[i]
         i += 1
@@ -1217,8 +1238,11 @@ def _search_walk(prog, args, spec):
         elif name in ("--glob", "--iglob") or (short and "g" in arg[1:]):
             # a positive glob can bring back what the search would pass over; an exclusion cannot
             if not (value.startswith("!") and (not short or arg[-1] == "g")):
-                unhidden = False
-    return Walk(follow, tuple(exclude), unhidden)
+                unhidden = honours = False
+        if (name.startswith(("--no-ignore", "--ignore-file")) or name == "--unrestricted" or
+                (short and re.match(r"^-[A-Za-z]*u", arg))):
+            honours = False
+    return Walk(follow, tuple(exclude), unhidden, ignored_env=honours)
 
 
 def _hidden_roots_clear(roots, base):

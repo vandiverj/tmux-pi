@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import lane_commands  # noqa: E402
 import lane_lease  # noqa: E402
+import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import lanes  # noqa: E402
 import review_rounds  # noqa: E402
@@ -1015,6 +1016,10 @@ def main():
     lcl.add_argument("name")
     lcl.add_argument("step")
     lcl.add_argument("--repo", default=".", help="the repository (default: the current directory)")
+    lr = ln.add_parser("remove", help="remove an integrated lane (or, with --abandon, an open one): worktree, branch; the record is archived")
+    lr.add_argument("name")
+    lr.add_argument("--abandon", action="store_true", help="remove an open lane whose work is not integrated; its tip is printed first so the branch can be restored")
+    lr.add_argument("--repo", default=".", help="the repository (default: the current directory)")
     ls = sub.add_parser("lanes", help="list the repository's lanes and unrecorded worktrees (read-only)")
     ls.add_argument("name", nargs="?")
     ls.add_argument("--repo", default=".")
@@ -1038,6 +1043,13 @@ def main():
                 raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
             common, _ = lane_commands._main_repo(args.repo)
             print(json.dumps(lane_steps.close_step(state, common, args.name, args.step), indent=2))
+            return
+        if args.lane_command == "remove":
+            try:
+                state = state_dir()
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError("no tmux-pi state directory (queued work cannot be ruled out without it); start a workspace with tp, or set TP_STATE_DIR") from error
+            print(json.dumps(lane_remove.remove_lane(state, args.repo, args.name, args.abandon), indent=2))
             return
         value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base)
         for warning in value["warnings"]:

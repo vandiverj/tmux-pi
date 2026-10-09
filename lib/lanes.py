@@ -607,6 +607,43 @@ def discard_lane_record(common_dir, name):
         raise _fail_os(error, path)
 
 
+def archive_lane_record(common_dir, name, stamp):
+    """Move lanes/<name> (the record, its lease and anything else beside them) to lanes/archive/<name>-<stamp>/ and return
+    the new path. The record is kept, never deleted; lane_names skips `archive`, so the name is free again. Same lock rule as
+    write_lane. An existing archive entry of that name is never replaced: a counter is added."""
+    path = lane_path(common_dir, name).parent
+    try:
+        lanes_fd = _walk(common_dir, LANES_SUBDIR.parts)
+        try:
+            if lanes_fd is None or _held.get(_dir_key(lanes_fd)) != _me():
+                raise ValueError("archive_lane_record needs the lane lock (lane_lock) held by this thread")
+            if not stat.S_ISDIR(os.lstat(name, dir_fd=lanes_fd).st_mode):
+                raise ValueError(f"{path} is not a directory")
+            with contextlib.suppress(FileExistsError):
+                os.mkdir("archive", 0o777, dir_fd=lanes_fd)
+            archive_fd = _open_dir(lanes_fd, "archive", path.parent / "archive")
+            try:
+                label, count = f"{name}-{stamp}", 1
+                while True:
+                    try:
+                        os.lstat(label, dir_fd=archive_fd)
+                    except FileNotFoundError:
+                        break
+                    count += 1
+                    label = f"{name}-{stamp}-{count}"
+                os.rename(name, label, src_dir_fd=lanes_fd, dst_dir_fd=archive_fd)
+                os.fsync(archive_fd)
+            finally:
+                os.close(archive_fd)
+            os.fsync(lanes_fd)
+        finally:
+            if lanes_fd is not None:
+                os.close(lanes_fd)
+    except OSError as error:
+        raise _fail_os(error, path)
+    return path.parent / "archive" / label
+
+
 # ---------------------------------------------------------------- the record against git
 
 def worktree_identity(common_dir, worktree):

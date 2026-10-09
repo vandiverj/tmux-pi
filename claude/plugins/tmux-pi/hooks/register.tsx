@@ -100,6 +100,7 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
       capability_pending: row.capability_pending === true,
       reason: typeof row.reason === 'string' ? row.reason : null,
       result_status: typeof row.result_status === 'string' ? row.result_status : null,
+      ...(typeof row.failing_tests === 'object' && row.failing_tests !== null ? { failing_tests: true as const } : {}),
     })
   }
   return found
@@ -149,7 +150,11 @@ function awaiting(row: { permission?: unknown; capability_request?: unknown; cap
 
 function hint(row: TaskRow): string {
   if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or tp-agent stop ${row.id}`
-  if (row.status === 'settled') return `${row.id} settled: tp-agent collect ${row.id}`
+  if (row.status === 'settled') {
+    return row.failing_tests === true
+      ? `${row.id} settled and reports failing tests it does not own: tp-agent collect ${row.id}, then tp-agent dispatch --investigate-failure ${row.id}`
+      : `${row.id} settled: tp-agent collect ${row.id}`
+  }
   if (row.status === 'paused') {
     const why = row.result_status === null ? 'replied without a result status' : 'is paused'
     const awaits = awaiting(row)

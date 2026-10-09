@@ -66,7 +66,7 @@ Each task has a local record under the project's ignored `.tmux-pi/sessions/<run
 
 ## Lanes
 
-A lane is a git worktree and branch that one stream of work owns (`tp-agent lane create`, `tp-agent lanes`). Work goes into it with `tp-agent dispatch --lane NAME --step ID ...` (a lane that does not exist yet is created from `--domain` and `--touches`). Lanes need a `lanes` block in `config/orchestration.json`.
+A lane is a git worktree and branch that one stream of work owns (`tp-agent lane create`, `tp-agent lanes`). Work goes into it with `tp-agent dispatch --lane NAME --step ID ...` (a lane that does not exist yet is created from `--domain` and `--touches`). Lanes work with no configuration; the defaults and the keys are in [docs/lanes.md](docs/lanes.md).
 
 - **One writer per lane.** Every start on a lane's tree (`dispatch`, `tick`, `retry`, `tp-review`, and `tp-spawn --lane` called directly or by a worker's escalation) first takes the lane's lease, `<git common dir>/tmux-pi/lanes/NAME/lease.json`, which every session of the repository shares. A second writer is refused, naming the holder and the command that ends it; any number of reviewers may share the lane, but not with a writer. Starting anything in a lane's working tree without `--lane` (a nested repository in it included) is refused too.
 - **Tags.** A lane task records `lane` and `lane_step`; `retry` and `tp-review` copy them, so a retry or a review stays in its lane and step. A lane task reads the repository's `.tmux-pi/worker-preamble.md` from the main checkout (the lane's checkout has none): `--preamble-from` names it, and `tp-spawn --lane` uses the main checkout when it is left out.

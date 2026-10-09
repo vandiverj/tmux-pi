@@ -10,8 +10,9 @@ never forces: a worktree a hook dirtied stays, with the command that discards it
 `list_lanes` is read-only: it takes no lock, runs git with `--no-optional-locks`, and writes nothing.
 
 What later slices must not assume:
-- `waiting_on` is only `orchestrator-dispatch` (state open) or `none`; the other values need the one-writer and review
-  derivations of L3-L5. `open_step`, `occupant` and `queued` are always null here, so an open lane may in fact have a writer.
+- `open_step`, `occupant`, `queued` and `waiting_on` come from a session's tasks and the lane's lease, which this module does
+  not read: `list_lanes(..., steps=)` takes the function that gives them (lib/lane_steps.py row_fields; `tp-agent lanes`
+  passes it). Without it they are null, and an open lane may in fact have a writer.
 - `overlaps` compares declared `touches` with each other and with the other lane's measured paths
   (`git diff --name-only base..tip` plus uncommitted paths); it is a warning, never a refusal.
 - Creation holds the lane lock while it creates, so two creations in one repository queue; it does not hold git's own
@@ -254,8 +255,9 @@ def _disk_kb(worktree):
     return int(first), None
 
 
-def _row(record, others):
-    """The `lanes` row of one validated, reality-checked record."""
+def _row(record, others, steps=None):
+    """The `lanes` row of one validated, reality-checked record. `steps(record)` gives the fields that come from a session's
+    tasks (open_step, occupant, queued, waiting_on: lane_steps.row_fields); without it they are null, because tasks are not known."""
     tip = lanes.lane_reality(record)["tip"]
     _, ahead = lanes._git(["rev-list", "--count", f"{record['base']['commit']}..{tip}"], record["git_common_dir"])
     _, status = lanes._git(["--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"], record["worktree"])
@@ -264,15 +266,17 @@ def _row(record, others):
     row = {"name": record["name"], "kind": record["kind"], "state": record["state"], "repo": record["repo"],
            "branch": record["branch"], "worktree": record["worktree"], "base": record["base"], "domain": record["domain"],
            "touches": record["touches"], "open_step": None, "steps_closed": len(record["closed"]), "occupant": None,
-           "queued": None, "waiting_on": "orchestrator-dispatch" if record["state"] == "open" else "none",
+           "queued": None, "waiting_on": None,
            "ahead": int(ahead.strip()), "dirty": len(_status_entries(status)),
            "last_closed": record["closed"][-1]["step"] if record["closed"] else None, "overlaps": overlaps, "disk_kb": disk}
     if disk_error:
         row["disk_error"] = disk_error
+    if steps:
+        row.update(steps(record))
     return row
 
 
-def list_lanes(repo_dir, name=None):
+def list_lanes(repo_dir, name=None, steps=None):
     """One row per recorded lane of the repository, then one per unrecorded linked worktree (only when the repository has a
     recorded lane; only its path and directory name are read). A record that cannot be read or does not match git gives a
     row with `error` and its reason, and the other rows are still listed. With `name`, only that lane (refuses when it has
@@ -295,7 +299,7 @@ def list_lanes(repo_dir, name=None):
             continue
         record = records[lane]
         try:
-            rows.append(_row(record, [r for r in records.values() if r["name"] != lane]))
+            rows.append(_row(record, [r for r in records.values() if r["name"] != lane], steps))
         except ValueError as error:
             rows.append({"name": lane, "kind": record["kind"], "state": record["state"], "worktree": record["worktree"],
                          "error": str(error)})

@@ -377,7 +377,8 @@ class ListTests(Scratch):
                                     "steps_closed", "occupant", "queued", "waiting_on", "ahead", "dirty", "last_closed",
                                     "overlaps", "disk_kb"})
         self.assertEqual((row["ahead"], row["dirty"], row["steps_closed"], row["last_closed"]), (1, 1, 0, None))
-        self.assertEqual((row["open_step"], row["occupant"], row["queued"], row["waiting_on"]), (None, None, None, "orchestrator-dispatch"))
+        # these come from a session's tasks and the lease (lib/lane_steps.py), which a listing without a session does not read
+        self.assertEqual((row["open_step"], row["occupant"], row["queued"], row["waiting_on"]), (None, None, None, None))
         self.assertIsInstance(row["disk_kb"], int)
         self.assertGreater(row["disk_kb"], 0)
 

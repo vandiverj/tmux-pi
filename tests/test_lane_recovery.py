@@ -20,7 +20,7 @@ import worker_process  # noqa: E402
 
 
 class RecoveryCase(LeaseCase):
-    def queue(self, ident, step="s2"):
+    def queue(self, ident, step="s1"):
         item = {"id": ident, "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
                 "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
                 "context": [], "notes": [], "tests": "none", "lane": "alpha", "lane_step": step, "preamble_from": str(self.repo)}
@@ -83,7 +83,7 @@ class StuckSessionTests(RecoveryCase):
         self.assertEqual(out["started"], ["coder-aaaaaaaaaa"], out)
         self.assertTrue(orphan.is_dir())
         orphan.rmdir()  # the command the warning names clears it for good
-        run = self.lane_dispatch(step="s3", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.assertNotIn("coder-orphan0001", run.stderr)
 
     def test_a_task_directory_with_no_record_but_a_running_process_refuses_naming_the_command_that_ends_it(self):
@@ -91,7 +91,7 @@ class StuckSessionTests(RecoveryCase):
         orphan = self.state / "tasks" / "coder-orphan0002"
         orphan.mkdir()
         pane, _ = self.pane(self.worker_command(orphan))
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "coder-orphan0002", "no readable meta.json", f"tmux kill-pane -t {pane}")
         self.assertNotIn("--force-alive", run.stderr)
         self.queue("coder-aaaaaaaaaa")
@@ -109,10 +109,10 @@ class StuckSessionTests(RecoveryCase):
     def test_no_dispatch_refusal_offers_a_flag_dispatch_does_not_have(self):
         (self.state / "live-window").write_text("")
         item, _ = self.lane_ok()
-        for run in (self.lane_dispatch(step="s2", extra=()), self.lane_dispatch(tests="full"),
-                    self.lane_dispatch(role="code-reviewer", step="s2", extra=()), self.lane_dispatch(name="beta", step="s1")):
+        for run in (self.lane_dispatch(step="s1", extra=()), self.lane_dispatch(tests="full"),
+                    self.lane_dispatch(role="code-reviewer", step="s1", extra=()), self.lane_dispatch(name="beta", step="s1")):
             self.assertNotIn("--force-alive", run.stderr)
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, item["id"], f"tp-agent stop {item['id']}")
 
 
@@ -122,12 +122,12 @@ class KilledStarterTests(RecoveryCase):
         self.assertEqual((holder["task"], holder["kind"]), (task, holder_kind))
         pids = worker_process.task_processes(self.state / "tasks" / task)
         self.assertTrue(pids, "the pane should still run")
-        for run in (self.run_in(self.env2, *self.lane_args(step="s2", extra=())),
-                    self.run_in(self.env2, *self.lane_args(role="code-reviewer", step="s2", extra=()))):
+        for run in (self.run_in(self.env2, *self.lane_args(step="s1", extra=())),
+                    self.run_in(self.env2, *self.lane_args(role="code-reviewer", step="s1", extra=()))):
             self.refused(run, "lane alpha", task, str(self.state), "to end it:")
         self.assertEqual(self.tasks(self.state2), [])
         # the first session cannot start beside it either, and a task directory with no record is no excuse to force
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, task)
         self.assertNotIn("--force-alive", run.stderr)
         return holder
@@ -137,14 +137,14 @@ class KilledStarterTests(RecoveryCase):
         self.assertFalse((self.state / "tasks" / task / "meta.json").exists())  # nothing registered it
         self.check_second_session_is_kept_out_until_the_pane_ends(task, "reservation")
         pane = self.tmux("list-panes", "-a", "-F", "#{pane_id} #{window_name}").splitlines()[-1].split()[0]
-        run = self.lane_dispatch(step="s2", extra=())
+        run = self.lane_dispatch(step="s1", extra=())
         self.assertIn(f"tmux kill-pane -t {pane}", run.stderr)  # the message names the command that clears it
         self.tmux("kill-pane", "-t", pane)
         for _ in range(100):
             if not worker_process.task_processes(self.state / "tasks" / task):
                 break
             time.sleep(0.05)
-        run = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))  # the reservation is stale now: its process is gone
+        run = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))  # the reservation is stale now: its process is gone
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(self.tasks(self.state2)), 1)
 
@@ -154,7 +154,7 @@ class KilledStarterTests(RecoveryCase):
         holder = self.check_second_session_is_kept_out_until_the_pane_ends(task, "worker")
         self.tmux("kill-pane", "-t", holder["pane"])
         self.gone(holder["pid"])
-        run = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        run = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.assertEqual(run.returncode, 0, run.stderr)
 
     def test_a_pane_that_cannot_be_ended_keeps_the_holder_and_the_task_directory(self):
@@ -171,16 +171,16 @@ class KilledStarterTests(RecoveryCase):
         self.assertIn(f"tmux kill-pane -t {pane}", run.stderr)
         for switch in ("list-fail", "kill-fail", "break-after-window", "live-window"):
             (self.state / switch).unlink()
-        run2 = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        run2 = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.refused(run2, task, f"tmux kill-pane -t {pane}")
         self.tmux("kill-pane", "-t", pane)  # the named command
         for _ in range(100):
             if not worker_process.task_processes(self.state / "tasks" / task):
                 break
             time.sleep(0.05)
-        run2 = self.run_in(self.env2, *self.lane_args(step="s2", extra=()))
+        run2 = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.assertEqual(run2.returncode, 0, run2.stderr)
-        run = self.lane_dispatch(step="s3", extra=())  # and the leftover directory only warns now
+        run = self.lane_dispatch(step="s1", extra=())  # and the leftover directory only warns now
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertNotIn("--force-alive", run.stderr)
 
@@ -255,7 +255,7 @@ class ReviewOverrideTests(RecoveryCase):
     def test_a_different_live_writer_is_ended_with_the_command_the_refusal_names(self):
         item, task = self.lane_ok()
         self.settle(task)
-        other, other_task = self.lane_ok(step="s2", extra=())
+        other, other_task = self.lane_ok(step="s1", extra=())
         pane, _ = self.pane(self.worker_command(other_task))
         self.attach(other_task, pane)
         run = self.review(item)

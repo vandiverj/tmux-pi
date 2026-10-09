@@ -1448,7 +1448,12 @@ class UnscopedPatchTests(unittest.TestCase):
                             ("GIT_CONFIG_PARAMETERS", "'diff.submodule=diff'"), ("GIT_CONFIG_GLOBAL", os.devnull),
                             ("GIT_CONFIG_SYSTEM", os.devnull), ("GIT_CONFIG_NOSYSTEM", "1")):
             with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
-                self.reasons(top, ["git diff", "git log -p -1"], UNPROVEN_REASON)
+                self.verdicts(top, ["git diff", "git log -p -1"], True)
+                for command in ("git diff", "git log -p -1"):
+                    reason = bash(command, str(top))["reason"]
+                    self.assertIn(f"{name} set in the environment can point git at another configuration file", reason)
+                    self.assertIn(f"env -u {name} git", reason)
+                    self.assertIn("git -c key=value", reason)
         # When the settings cannot be read the patch is not waved through.
         fails = self.fake_git("for word in \"$@\"; do [ \"$word\" = config ] && exit 2; done\n"
                               "printf '" + RAW.format("README.md") + "'")

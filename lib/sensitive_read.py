@@ -213,6 +213,9 @@ _SUBMODULE_REASON = "patch output touches a submodule and may include the files 
 _SUBMODULE_CONFIG_REASON = "diff.submodule=diff prints the files inside submodules"
 _FILTER_REASON = "a configured content filter would run a program to compare files"
 _DRIVER_REASON = "a configured diff program or text conversion decides what the patch prints"
+_GIT_ENV_REASON = ("{names} set in the environment can point git at another configuration file, so the patch cannot be "
+                   "checked; run the same command without {them} (`env -u {first} git ...`) or give the setting "
+                   "with `git -c key=value`")
 _GIT_TIMEOUT = 2.0
 _GIT_OUTPUT_LIMIT = 1 << 20
 _GIT_PLAIN_GLOBALS = {"--no-pager", "-P"}
@@ -1537,6 +1540,11 @@ def _listed_hit(label, query, base, unproven, lift=False):
     over a credential directory). It stands only in a trusted tree that is the work tree git itself reports,
     and clears the call there; anywhere else `unproven` stands, as it does without a record.
     """
+    set_here = sorted(name for name in _GIT_ELSEWHERE if name in os.environ)
+    if set_here and _SHELL["cwd"]:  # the same prompt as `unproven`, with the reason in plain words
+        return unproven[0], _GIT_ENV_REASON.format(
+            names=", ".join(set_here),
+            them="it" if len(set_here) == 1 else "them", first=set_here[0])
     if lift:    # nothing is asked of git before the tree is known to be one the owner vouched for
         folder = _absolute(base) if base else _SHELL["cwd"]
         here = _top(os.path.realpath(folder)) if folder else None

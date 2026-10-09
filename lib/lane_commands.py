@@ -19,6 +19,7 @@ What later slices must not assume:
   locks, so a hand-run `git worktree add` or `git branch` for the same name in between is caught by git, not by us."""
 import os
 import subprocess
+from datetime import datetime, timezone
 
 import lanes
 
@@ -255,6 +256,15 @@ def _disk_kb(worktree):
     return int(first), None
 
 
+def age_text(created, now=None):
+    """How long ago `created` (a record's UTC time) was: the largest whole unit of d, h, m, s ("3d", "5h", "12m", "40s")."""
+    seconds = int(((now or datetime.now(timezone.utc)) - datetime.fromisoformat(created)).total_seconds())
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{max(seconds, 0)}s"
+
+
 def _row(record, others, steps=None):
     """The `lanes` row of one validated, reality-checked record. `steps(record)` gives the fields that come from a session's
     tasks (open_step, occupant, queued, waiting_on: lane_steps.row_fields); without it they are null, because tasks are not known."""
@@ -265,7 +275,7 @@ def _row(record, others, steps=None):
     overlaps = _warnings(record["name"], record["domain"], record["touches"], others) if record["state"] in OPEN_STATES else []
     row = {"name": record["name"], "kind": record["kind"], "state": record["state"], "repo": record["repo"],
            "branch": record["branch"], "worktree": record["worktree"], "base": record["base"], "domain": record["domain"],
-           "touches": record["touches"], "open_step": None, "steps_closed": len(record["closed"]), "occupant": None,
+           "touches": record["touches"], "created": record["created"], "age": age_text(record["created"]), "open_step": None, "steps_closed": len(record["closed"]), "occupant": None,
            "queued": None, "waiting_on": None,
            "ahead": int(ahead.strip()), "dirty": len(_status_entries(status)),
            "last_closed": record["closed"][-1]["step"] if record["closed"] else None, "overlaps": overlaps, "disk_kb": disk}

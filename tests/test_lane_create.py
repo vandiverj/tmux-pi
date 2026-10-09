@@ -373,8 +373,8 @@ class ListTests(Scratch):
         git(record["worktree"], "commit", "-q", "-am", "c")
         Path(record["worktree"], "scratch.txt").write_text("s\n")
         (row,) = lane_commands.list_lanes(str(self.repo))
-        self.assertEqual(set(row), {"name", "kind", "state", "repo", "branch", "worktree", "base", "domain", "touches", "open_step",
-                                    "steps_closed", "occupant", "queued", "waiting_on", "ahead", "dirty", "last_closed",
+        self.assertEqual(set(row), {"name", "kind", "state", "repo", "branch", "worktree", "base", "domain", "touches", "created", "age",
+                                    "open_step", "steps_closed", "occupant", "queued", "waiting_on", "ahead", "dirty", "last_closed",
                                     "overlaps", "disk_kb"})
         self.assertEqual((row["ahead"], row["dirty"], row["steps_closed"], row["last_closed"]), (1, 1, 0, None))
         # these come from a session's tasks and the lease (lib/lane_steps.py), which a listing without a session does not read

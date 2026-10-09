@@ -150,6 +150,8 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
+    if "lane" in meta and "lane_step" in meta:  # shown only; a task with no lane has neither key
+        result.update(lane=meta["lane"], lane_step=meta["lane_step"])
     if (path / "review-of").is_file():
         # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval. A review without a
         # Coverage section keeps its stated verdict but is incomplete: result_status says so and it approves nothing.
@@ -229,7 +231,8 @@ def all_records(base):
                      "assignment": item.get("task"), "deliverable": item.get("deliverable"),
                      "parent": item.get("parent"), "route": item.get("route_info"),
                      "reason": reason or item.get("queue_reason") or None,
-                     "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created")})
+                     "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created"),
+                     **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item and "lane_step" in item else {})})
     return sorted(rows, key=lambda row: row.get("updated") or "")
 
 
@@ -241,7 +244,7 @@ def write_index(base):
                "deliverable", "task_dir", "result_path", "permission", "capability_request", "capability_pending",
                "reason", "updated")}
         # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves
-        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason") if key in row})
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "lane", "lane_step") if key in row})
         return out
     value = {
         "schema": "tp-session-index:v1", "updated": now(),
@@ -253,6 +256,16 @@ def write_index(base):
         "paused": [brief(r) for r in rows if r["status"] == "paused" and r.get("result_status")],
         "recent": [brief(r) for r in rows[-12:]],
     }
+    summary = {}  # lane -> its tasks by status and the steps they ran; no lane tasks, no block
+    for row in rows:
+        if "lane" in row:
+            entry = summary.setdefault(row["lane"], {"tasks": 0, "by_status": {}, "steps": []})
+            entry["tasks"] += 1
+            entry["by_status"][row["status"]] = entry["by_status"].get(row["status"], 0) + 1
+            if row["lane_step"] not in entry["steps"]:
+                entry["steps"] = sorted(entry["steps"] + [row["lane_step"]])
+    if summary:
+        value["lanes"] = summary
     atomic_json(base / "session-index.json", value)
     return value
 

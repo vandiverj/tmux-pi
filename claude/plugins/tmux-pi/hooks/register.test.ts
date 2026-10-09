@@ -261,6 +261,17 @@ test('a second session start in the same module keeps one timer', async ($, on) 
   expect(verbs(w.ran).filter(verb => verb === 'list').length).toBe(before + 2)
 })
 
+test('a settled task that reports failing tests it does not own says so and names the investigation', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{ id: 'coder-1', status: 'settled', failing_tests: { entries: [{ test: 'tests.test_x' }] } }]
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain('reports failing tests it does not own')
+  expect(w.submitted[0]).toContain('tp-agent dispatch --investigate-failure coder-1')
+})
+
 test('one transition gives one toast and one wake; the same status later gives none', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'working' }]

@@ -370,6 +370,8 @@ packet+=$'\n\n# Return\n\n'
 packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence."
 packet+=$'\n\n'
 packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
+packet+=$'\n\n'
+packet+="If you see a test fail that you believe is not caused by your change, do not edit or skip the test. Report it in a block that starts with a line FAILING_TESTS: then, for each test, lines '- test: NAME', '  command: THE EXACT COMMAND', '  unmodified_base: yes, with the evidence, or not checked' (yes only if you reproduced the failure on an unmodified checkout in this run). The main agent sends an investigator; your belief that the failure predates your change is not taken as the answer."
 # Classify only the main-owned worker task, never conversation/context documents.
 # This is instruction disclosure, not a capability or edit grant. Pi and Claude
 # workers receive the same bounded instructions; neither loads a global skill tree.

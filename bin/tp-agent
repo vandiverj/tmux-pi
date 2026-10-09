@@ -19,6 +19,7 @@ import lane_commands  # noqa: E402
 import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
+import failing_tests  # noqa: E402
 import lanes  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
@@ -152,6 +153,9 @@ def record(path, include_result=False):
     }
     if "lane" in meta and "lane_step" in meta:  # shown only; a task with no lane has neither key
         result.update(lane=meta["lane"], lane_step=meta["lane_step"])
+    reported = failing_tests.read(path)
+    if reported:  # a report without the block has no such key
+        result["failing_tests"] = reported
     if (path / "review-of").is_file():
         # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval. A review without a
         # Coverage section keeps its stated verdict but is incomplete: result_status says so and it approves nothing.
@@ -245,6 +249,8 @@ def write_index(base):
                "reason", "updated")}
         # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves
         out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "lane", "lane_step") if key in row})
+        if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
+            out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1
         return out
     value = {
         "schema": "tp-session-index:v1", "updated": now(),
@@ -487,6 +493,7 @@ def launch(base, item):
         if predecessor.get("result_path"):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
     args += ["--", item["task"]]
+    started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
     run = subprocess.run(args, text=True, capture_output=True)
     if run.returncode:
         raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
@@ -494,7 +501,7 @@ def launch(base, item):
     path = task_dir(base, item["id"])
     admitted, omitted = admitted_context(path, item["context"])
     atomic_json(path / "dispatch.json",
-                {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"],
+                {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"], "base_commit": started_at,
                  **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {})})  # shown only; retry reads meta.json
     return record(task_dir(base, item["id"]))
 
@@ -939,12 +946,62 @@ def review(base, args):
     return value
 
 
+def investigate(base, args):
+    """tp-agent dispatch --investigate-failure TASK_ID (T12): a tester on the failing tests a task reported as not its own,
+    in a clean worktree at the commit the task started from, with the task's diff. Every refusal names a command that clears it."""
+    ident = args.investigate_failure
+    if not IDENT.fullmatch(ident) or not ((base / "tasks" / ident / "meta.json").is_file() or find_archived_task(base, ident)):
+        raise ValueError(f"unknown task: {ident}; list the tasks with: tp-agent list")
+    path = base / "tasks" / ident if (base / "tasks" / ident / "meta.json").is_file() else find_archived_task(base, ident)
+    reported = failing_tests.read(path)
+    if args.failing_test:  # the main agent names the test itself, when the worker's report has no block
+        reported = {"entries": [{"test": text} for text in args.failing_test], "text": "\n".join(f"- test: {text}" for text in args.failing_test),
+                    "malformed": [], "source": "--failing-test"}
+    if not reported:
+        raise ValueError(f"{ident} reports no failing tests (no FAILING_TESTS: block in its report.md or result.md). To investigate a "
+                         f"failure you saw in its output, name the test: tp-agent dispatch --investigate-failure {ident} "
+                         "--failing-test 'TEST NAME and the command that fails'")
+    workdir = read_json(path / "meta.json").get("workdir")
+    if not workdir or not Path(workdir).is_dir():
+        raise ValueError(f"{ident}'s working directory is gone ({workdir}); see what it reported with: tp-agent inspect {ident}")
+    base_commit = args.base or read_json(path / "dispatch.json").get("base_commit")
+    if not base_commit:
+        raise ValueError(f"{ident} did not record the commit it started from. Name one: tp-agent dispatch --investigate-failure "
+                         f"{ident} --base COMMIT (git -C {workdir} log --oneline shows the candidates)")
+    for other in (base / "tasks").iterdir() if (base / "tasks").is_dir() else ():  # an open investigation of the same task: said, not refused
+        if read_json(other / "dispatch.json").get("investigates") == ident and record(other)["status"] not in {"completed", "failed", "stopped"}:
+            print(f"tp-agent: note: {other.name} already investigates {ident}'s failing tests; this starts another", file=sys.stderr)
+    patch = failing_tests.diff_of(workdir, base_commit)  # git errors (an unknown commit) surface as the ValueError they are
+    moved = failing_tests.moved_commits(workdir, base_commit)
+    folder = base / "investigations" / f"{ident}-{uuid4().hex[:6]}"
+    folder.mkdir(parents=True)
+    (folder / "failing-tests.md").write_text(reported["text"] + "\n")
+    (folder / "diff.patch").write_text(patch)
+    top = Path(failing_tests.repo_top(workdir))  # beside the repository, as a lane's worktree is: tp-spawn refuses a workdir inside the state directory
+    tree = failing_tests.clean_worktree(workdir, base_commit, top.parent / f"{top.name}-investigate-{folder.name}")
+    replacement = argparse.Namespace(
+        role="tester", worker=args.worker, model=args.model, thinking=args.thinking, level=args.level,
+        approve_effort=args.approve_effort, local_only=args.local_only, workdir=tree, deliverable=args.deliverable or "investigation.md",
+        parent=ident, after=[], context=[], tests="affected", note=[], lane=None, preroute=None,
+        task=failing_tests.task_text(ident, reported["text"], base_commit, workdir, tree, folder / "diff.patch", patch.count("\n"), moved))
+    try:
+        value = dispatch(replacement, base)
+    except BaseException:
+        failing_tests.remove_worktree(workdir, tree)  # nothing is left behind when the investigator cannot start
+        raise
+    if value.get("id") and (base / "tasks" / value["id"]).is_dir():
+        atomic_json(base / "tasks" / value["id"] / "dispatch.json", dict(read_json(base / "tasks" / value["id"] / "dispatch.json"), investigates=ident))
+    return dict(value, investigates=ident, worktree=tree, diff=str(folder / "diff.patch"), base_commit=base_commit,
+                patch_note=failing_tests.PATCH_NOTE.format(workdir=workdir) + (f" HEAD has moved since the task started: {len(moved)} commit(s)." if moved else ""),
+                cleanup=f"git -C {workdir} worktree remove --force {tree}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     d = sub.add_parser("dispatch", help="route and start or queue a role task")
-    d.add_argument("--role", required=True)
-    d.add_argument("--task", required=True)
+    d.add_argument("--role")
+    d.add_argument("--task")
     d.add_argument("--worker", choices=["pi", "claude"], help="require this harness; the router still picks the model")
     d.add_argument("--model", help="explicit model (skips the router)")
     d.add_argument("--thinking", help="explicit effort; above high needs --approve-effort")
@@ -966,7 +1023,13 @@ def main():
     d.add_argument("--domain", help="with --lane, creating it: the independence claim in words")
     d.add_argument("--touches", nargs="+", metavar="PATH", help="with --lane, creating it: repo-relative path prefixes the lane will change")
     d.add_argument("--repo", help="with --lane, creating it: the repository (default: the main pane's)")
-    d.add_argument("--base", help="with --lane, creating it: branch or commit to start from (default: the integration branch)")
+    d.add_argument("--base", help="with --lane, creating it: branch or commit to start from (default: the integration branch); "
+                                  "with --investigate-failure: the commit to check out clean (default: the one the task started from)")
+    d.add_argument("--investigate-failure", metavar="TASK_ID",
+                   help="start a tester on the failing tests TASK_ID reported as not its own (its FAILING_TESTS: block), with that task's "
+                        "diff and a clean worktree at the commit it started from")
+    d.add_argument("--failing-test", action="append", default=[], metavar="TEXT",
+                   help="with --investigate-failure: name the failing test and command yourself, when the report has no block")
     retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
     retry.add_argument("id")
     retry.add_argument("--reason", required=True)
@@ -1078,7 +1141,12 @@ def main():
         for line in queue_view(base):
             print(line)
         return
-    if args.command == "dispatch":
+    if args.command == "dispatch" and args.investigate_failure:
+        value = investigate(base, args)
+        write_index(base)
+    elif args.command == "dispatch":
+        if not (args.role and args.task):
+            parser.error("the following arguments are required: " + ", ".join(f for f, v in (("--role", args.role), ("--task", args.task)) if not v))
         value = dispatch(args, base)
     elif args.command == "retry":
         if not args.reason.strip():
@@ -1178,6 +1246,8 @@ def main():
             if value.get("review_notice"):
                 value = {"notice": value["review_notice"], **value}  # first key, so a reader sees it at once
                 print(value["notice"], file=sys.stderr)
+            if value.get("failing_tests"):
+                print(failing_tests.notice(args.id, value["failing_tests"]), file=sys.stderr)
             if value["status"] in {"settled", "completed"}:
                 # The process is ended BEFORE the completed marker is written (tp-contract collect does the same): a process that
                 # survives, or cannot be looked up, fails the command with the task still settled, and the next collect tries

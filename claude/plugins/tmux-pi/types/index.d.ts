@@ -7,6 +7,7 @@ export type TaskRow = {
   capability_pending: boolean
   reason: string | null
   result_status: string | null
+  failing_tests?: true
 }
 
 export type TaskSummary = {

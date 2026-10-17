@@ -97,3 +97,15 @@ tp_queue_lines() {
     printf '  %s  queued  start refused: the queue view could not run\n' "$(basename "$file" .json)"
   done
 }
+
+# Writing tmux-pi state without following a link planted at the target (lib/safe_write.py). `>` and `>>` open the path and
+# follow a symlink there to any file the user can write; these replace it (tp_write) or refuse it (the others).
+# tp_write <path> [--root STATE_DIR] [--mode OCT | --executable | --fresh] — stdin becomes the file: a temp file in the same
+# directory, then one rename. --root refuses a link in any directory below it; --fresh gives the mode a new file would get.
+tp_write() { python3 "$TP_LIB_DIR/safe_write.py" write "$@"; }
+# tp_append <path> — stdin is appended; a symlink at the path is refused.
+tp_append() { python3 "$TP_LIB_DIR/safe_write.py" append "$@"; }
+# tp_owned_dir <dir>... — mkdir -p for a directory tmux-pi owns; a symlink in its place is refused, not entered.
+tp_owned_dir() { python3 "$TP_LIB_DIR/safe_write.py" mkdir "$@"; }
+# tp_not_link <path>... — refuse (exit 1, saying so) when any path is a symlink.
+tp_not_link() { python3 "$TP_LIB_DIR/safe_write.py" check "$@"; }

@@ -28,6 +28,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+import safe_write
 import work
 from work import WorkError
 
@@ -354,6 +355,7 @@ def _fsync_dir(path):
 
 
 def _private(path):
+    work.check_owned(path, work.store_root(), "checkpoint directory")  # checkpoints/ and checkpoints/<id>, neither a link
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
 
@@ -779,7 +781,10 @@ def arm(state_dir, reason="compaction"):
         raise WorkError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR")
     before = marker(state_dir)["pending"]
     folder = Path(state_dir) / RECOVERY_DIR
-    folder.mkdir(mode=0o700, exist_ok=True)
+    try:
+        safe_write.ensure_dir(folder, mode=0o700, what="recovery directory", root=state_dir)
+    except safe_write.UnsafePath as exc:
+        raise WorkError(str(exc))
     body = {"since": work.now(), "reason": re.sub(r"\s+", " ", str(reason or "compaction")).strip()[:MARKER_REASON_CHARS]}
     fd, name = tempfile.mkstemp(prefix=".arm.", dir=folder)
     try:
@@ -824,11 +829,14 @@ def recovered(state_dir, evidence, accepted=(), check=None):
         if check is not None:
             check()
         if found is None:  # never armed, or removed (which autonomy reads as pending): after the check it comes back empty, i.e. clear
-            (Path(state_dir) / RECOVERY_DIR).mkdir(mode=0o700, exist_ok=True)
+            try:
+                safe_write.ensure_dir(Path(state_dir) / RECOVERY_DIR, mode=0o700, what="recovery directory", root=state_dir)
+            except safe_write.UnsafePath as exc:
+                raise WorkError(str(exc))
         if not before["pending"]:
             return {"pending": False, "changed": found is None, "cleared_generation": before["cleared_generation"]}
         value = {"cleared_generation": validated, "cleared": work.now(),
                  "evidence": re.sub(r"\s+", " ", str(evidence)).strip()[:MARKER_REASON_CHARS * 2],
                  "accepted": sorted(accepted), "since": before["since"], "reason": before["reason"]}
-        work.atomic_write(Path(state_dir) / RECOVERY_FILE, json.dumps(value, indent=2) + "\n")
+        work.atomic_write(Path(state_dir) / RECOVERY_FILE, json.dumps(value, indent=2) + "\n", root=state_dir)
         return {**value, "pending": marker(state_dir)["pending"], "changed": True}

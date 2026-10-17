@@ -14,9 +14,10 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import time
 from datetime import date, datetime, timezone
+
+import safe_write
 
 ROOT = Path(__file__).resolve().parent.parent
 KINDS = {"workspace": "workspaces", "note": "notes"}
@@ -79,12 +80,34 @@ def setting(name):
 
 
 def store_root():
-    explicit = os.getenv("TP_WORK_DIR")
-    raw = explicit or config().get("store") or "~/.config/tmux-pi/work"
-    return Path(os.path.expanduser(raw)).resolve()
+    """The store root, resolved. The root itself is the user's choice (TP_WORK_DIR or config `store`) and may be a link on
+    purpose, a synced folder for one, so it is accepted as it resolves. Every component BELOW it (archive, workspaces, notes,
+    checkpoints and what is in them) is the store's own and is checked with lstat, never resolved: `_private_dir`,
+    `check_owned` and `atomic_write` take this resolved path as the root they check from."""
+    return Path(_store_spelling()).resolve()
 
 
-def _private_dir(path):
+def _store_spelling():
+    """The store root as the user wrote it, made absolute but not resolved."""
+    raw = os.getenv("TP_WORK_DIR") or config().get("store") or "~/.config/tmux-pi/work"
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def check_owned(path, root, what="work directory"):
+    """WorkError when path, or any directory between the store root and it, is a symlink. The root is where the store is."""
+    try:
+        if root is None:  # nothing above path to compare with: the link at path itself
+            safe_write.refuse_link(path, what)
+        else:
+            safe_write.check_below(root, path, what)
+    except safe_write.UnsafePath as exc:
+        raise WorkError(str(exc))
+
+
+def _private_dir(path, root=None):
+    """The store's own directories are never entered through a link, nor is one below them (chmod and the writes would
+    follow it). With no root the path itself is the one thing checked (the store root, which `store_root` resolved)."""
+    check_owned(path, root)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
 
@@ -93,8 +116,9 @@ def ensure_store():
     root = store_root()
     _private_dir(root)
     for sub in (*KINDS.values(),):
-        _private_dir(root / sub)
-        _private_dir(root / "archive" / sub)
+        _private_dir(root / sub, root)
+        _private_dir(root / "archive", root)  # the archive directory itself, not only what is in it
+        _private_dir(root / "archive" / sub, root)
     return root
 
 
@@ -132,17 +156,26 @@ def locked(timeout=None):
         os.close(fd)
 
 
-def atomic_write(path, text, exclusive=False):
+def atomic_write(path, text, exclusive=False, root=None):
+    """Write path whole or not at all. A link at path is refused; so is one in any directory between root and path. Root is
+    the work store root when path is inside the store; a session file's caller passes its state directory. It is never
+    guessed from the path's ancestors."""
     path = Path(path)
+    if root is None:
+        try:
+            # Either spelling of the root: a path under the user's linked root must still be checked below it.
+            tops = [store_root(), Path(_store_spelling())]
+        except OSError:
+            tops = []
+        here = os.path.abspath(path)
+        root = next((top for top in tops if here.startswith(str(top) + os.sep)), None)
     if path.is_symlink():
         raise WorkError(f"unsafe work file (symlink): {path}")
-    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(text)
-            out.flush()
-            os.fsync(out.fileno())
-        os.chmod(name, 0o600)
+        name = safe_write.write_temp(path, text, mode=0o600, fsync=True, root=root)
+    except safe_write.UnsafePath as exc:
+        raise WorkError(str(exc))
+    try:
         if exclusive:
             try:
                 os.link(name, path)  # fails if the id is taken, and the file appears whole or not at all

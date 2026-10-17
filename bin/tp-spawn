@@ -488,29 +488,28 @@ if [[ -n "$lane" ]]; then
     ${lane_replaces:+--replaces "$lane_replaces"} || exit 1
   lease_held=1
 fi
-mkdir -p "$task_dir"
+tp_owned_dir --root "$state_dir" "$state_dir/tasks" "$task_dir"  # a symlinked tasks/ or task directory is refused, not entered
 made_task_dir=1
 # A required review must exist before the worker pane (or task id) is observable.
 # Use atomic replacement so collect never sees a partial marker.
 if [[ -n "$decision_json" ]] && jq -e '.review == "required"' <<<"$decision_json" >/dev/null; then
   nonce="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-  jq -n --arg id "$id" --arg nonce "$nonce" '{required:true, status:"pending_review", task_id:$id, round_nonce:$nonce, reasons:["Required opposite-provider review pending"]}' > "$task_dir/review-required.json.tmp"
-  mv "$task_dir/review-required.json.tmp" "$task_dir/review-required.json"
+  jq -n --arg id "$id" --arg nonce "$nonce" '{required:true, status:"pending_review", task_id:$id, round_nonce:$nonce, reasons:["Required opposite-provider review pending"]}' | tp_write "$task_dir/review-required.json" --root "$state_dir" --fresh
 fi
 # Keep the verbatim request for legacy/review compatibility; task.md is written
 # as the human-facing canonical record after meta.json exists.
-printf '%s\n' "$task" > "$task_dir/request.md"
-printf '%s\n' "$packet" > "$task_dir/packet.md"
+printf '%s\n' "$task" | tp_write "$task_dir/request.md" --root "$state_dir"
+printf '%s\n' "$packet" | tp_write "$task_dir/packet.md" --root "$state_dir"
 # Durable provenance: only matching skill profiles and their body hashes.
-printf '%s\n' "$skill_selection" | jq . > "$task_dir/skill-selection.json"
+printf '%s\n' "$skill_selection" | jq . | tp_write "$task_dir/skill-selection.json" --root "$state_dir"
 if [[ -n "$main_contract_file" ]]; then
-  jq . "$main_contract_file" > "$task_dir/main-contract.json"
+  jq . "$main_contract_file" | tp_write "$task_dir/main-contract.json" --root "$state_dir"
 fi
 if [[ -n "$policy_decision_file" ]]; then
-  jq . "$policy_decision_file" > "$task_dir/policy-decision.json"
+  jq . "$policy_decision_file" | tp_write "$task_dir/policy-decision.json" --root "$state_dir"
 fi
 if [[ -n "$context_manifest_file" ]]; then
-  jq . "$context_manifest_file" > "$task_dir/context-manifest.json"
+  jq . "$context_manifest_file" | tp_write "$task_dir/context-manifest.json" --root "$state_dir"
 fi
 
 # Build the worker command. Workers skip context files; the task is their context.
@@ -555,7 +554,7 @@ EOF
   if [[ -n "$prompt" ]]; then system_prompt+="${system_prompt:+$'\n\n'}$prompt"; fi
 fi
 if [[ -n "$system_prompt" ]]; then
-  printf '%s' "$system_prompt" > "$task_dir/system-prompt.md"  # exactly what the worker is given
+  printf '%s' "$system_prompt" | tp_write "$task_dir/system-prompt.md" --root "$state_dir"  # exactly what the worker is given
   cmd+=(--append-system-prompt "$system_prompt")
 fi
 
@@ -570,10 +569,9 @@ fi
   # a file in the task dir, and models then resolve relative paths against that).
   printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"
   echo 'status=$?'
-  printf 'echo "$status" > %q\n' "$task_dir/exit"
+  printf 'echo "$status" | python3 %q write %q --root %q\n' "$ROOT/lib/safe_write.py" "$task_dir/exit" "$state_dir"
   printf 'echo; echo "[%s exited with status $status]"\n' "$id"
-} > "$task_dir/run.sh"
-chmod +x "$task_dir/run.sh"
+} | tp_write "$task_dir/run.sh" --root "$state_dir" --executable
 
 pane="$(tmux new-window -d -P -F '#{pane_id}' -t "=$session:" -n "sa:$id" -c "$workdir" \
   "bash $(printf %q "$task_dir/run.sh")")"
@@ -604,7 +602,7 @@ jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking 
    + if $main_contract == null then {} else {main_contract:$main_contract, handshake_id:$main_contract.handshake_id} end
    + if $policy_decision == null then {} else {policy_decision:$policy_decision} end
    + if $context_manifest == null then {} else {context_manifest:$context_manifest, context_manifest_path:"context-manifest.json"} end' \
-  > "$task_dir/meta.json"
+  | tp_write "$task_dir/meta.json" --root "$state_dir"
 
 python3 - "$ROOT" "$task_dir" <<'EOF'
 import sys

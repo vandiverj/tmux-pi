@@ -251,7 +251,7 @@ def enable(state_dir, env, workspace, reason=""):
         value = {"on": True, "since": (current or {}).get("since") or work.now(), "harness": "claude", "workspace": workspace,
                  "reason": _clip(reason, 200)}
         work_checkpoint.arm(state_dir, "autonomy on")
-        work.atomic_write(Path(state_dir) / FILE, json.dumps(value, indent=2) + "\n")
+        work.atomic_write(Path(state_dir) / FILE, json.dumps(value, indent=2) + "\n", root=state_dir)
     return value
 
 

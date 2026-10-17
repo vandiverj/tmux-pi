@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import request_file  # noqa: E402
+import safe_write  # noqa: E402
 import tp_rows  # noqa: E402
 import tp_usage  # noqa: E402
 from lifecycle_files import LIFECYCLE_FILES  # noqa: E402
@@ -87,16 +88,12 @@ def load_cache(path):
 def save_cache(path, entries):
     if not path or path == "-":
         return
-    tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"v": VERSION, "e": entries}, f, separators=(",", ":"))
-        os.replace(tmp, path)
+        # a path the caller named: nothing above its directory is ours to judge. A new file each time (0666 less the umask)
+        safe_write.write_atomic(path, json.dumps({"v": VERSION, "e": entries}, separators=(",", ":")), keep_mode=False,
+                                root=os.path.dirname(os.path.abspath(path)))
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        pass
 
 
 def usage_of(directory):

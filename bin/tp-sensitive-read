@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import safe_write
 from sensitive_read import classify, response_for
 from redact_hook import mode as redaction_mode
 
@@ -19,9 +20,7 @@ def save_request(result, status):
     path = Path(task) / "permission-request.json"
     value = {"status": status, "target": result.get("target"), "reason": result.get("reason"),
              "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(value) + "\n")
-    tmp.replace(path)
+    safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
 
 
 def resolver(args, quiet=False):

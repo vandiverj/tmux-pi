@@ -9,7 +9,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -24,6 +23,7 @@ import failing_tests  # noqa: E402
 import lanes  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
+import safe_write  # noqa: E402
 import work  # noqa: E402
 import work_commands  # noqa: E402
 import work_find  # noqa: E402
@@ -56,22 +56,17 @@ def read_json(path, default=None):
     return value if isinstance(value, dict) else {} if default is None else default  # every record here is an object
 
 
-def atomic_text(path, text):
-    """Temp file in the same directory, then one rename: a reader (or a crash) sees the old file or the new one, never half."""
+def atomic_text(path, text, root=None):
+    """Temp file in the same directory, then one rename: a reader (or a crash) sees the old file or the new one, never half.
+    A link at path is replaced, never written through; one in a directory below root (the session state directory, which
+    every caller passes) is refused."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as out:
-            out.write(text)
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
+    safe_write.ensure_dir(path.parent, root=root)
+    safe_write.write_atomic(path, text, mode=0o600, root=root)
 
 
-def atomic_json(path, value):
-    atomic_text(path, json.dumps(value, indent=2) + "\n")
+def atomic_json(path, value, root=None):
+    atomic_text(path, json.dumps(value, indent=2) + "\n", root)
 
 
 def state_dir():
@@ -102,6 +97,7 @@ def task_dir(base, ident):
     if not IDENT.fullmatch(ident):
         raise ValueError("invalid task id")
     path = base / "tasks" / ident
+    safe_write.check_below(base, path, f"task directory {ident}")  # tasks/ and tasks/<id> are both owned: neither may be a link
     if not (path / "meta.json").is_file():
         archived = find_archived_task(base, ident)
         if archived:  # stop and collect move a task here; every command that works on a task refuses it by place
@@ -293,7 +289,7 @@ def build_index(base):
 
 def write_index(base):
     value = build_index(base)
-    atomic_json(base / "session-index.json", value)
+    atomic_json(base / "session-index.json", value, base)
     return value
 
 
@@ -527,13 +523,13 @@ def launch(base, item):
     admitted, omitted = admitted_context(path, item["context"])
     atomic_json(path / "dispatch.json",
                 {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"], "base_commit": started_at,
-                 **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {})})  # shown only; retry reads meta.json
+                 **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {})}, base)  # shown only; retry reads meta.json
     return record(task_dir(base, item["id"]))
 
 
 def locked(base):
     base.mkdir(parents=True, exist_ok=True)
-    lock = open(base / ".tp-agent.lock", "a")
+    lock = safe_write.open_append(base / ".tp-agent.lock", root=base)
     fcntl.flock(lock, fcntl.LOCK_EX)
     return lock
 
@@ -827,7 +823,7 @@ def lane_admit(base, plan, item):
             value = launch(base, item)
         else:
             item["queue_reason"] = reason
-            atomic_json(base / "queue" / f"{item['id']}.json", item)
+            atomic_json(base / "queue" / f"{item['id']}.json", item, base)
             value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
                      "harness": item["worker"], "model": item["model"], "effort": item["thinking"]}
         started = True
@@ -900,7 +896,7 @@ def dispatch(args, base):
                 value = launch(base, item)
             else:
                 item["queue_reason"] = reason
-                atomic_json(base / "queue" / f"{item['id']}.json", item)
+                atomic_json(base / "queue" / f"{item['id']}.json", item, base)
                 value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
                          "harness": worker, "model": model, "effort": thinking}
             write_index(base)
@@ -916,7 +912,7 @@ def note_queue_reason(path, raw, reason):
     non-object entry is never rewritten (that would destroy it) and is reported in tick's output instead."""
     if isinstance(raw, dict) and raw.get("queue_reason") != reason:
         try:
-            atomic_json(path, dict(raw, queue_reason=reason))
+            atomic_json(path, dict(raw, queue_reason=reason), path.parent.parent)
         except OSError:
             pass
 
@@ -1012,9 +1008,10 @@ def investigate(base, args):
     patch = failing_tests.diff_of(workdir, base_commit)  # git errors (an unknown commit) surface as the ValueError they are
     moved = failing_tests.moved_commits(workdir, base_commit)
     folder = base / "investigations" / f"{ident}-{uuid4().hex[:6]}"
-    folder.mkdir(parents=True)
-    (folder / "failing-tests.md").write_text(reported["text"] + "\n")
-    (folder / "diff.patch").write_text(patch)
+    safe_write.ensure_dir(folder.parent, what="investigations directory", root=base)
+    folder.mkdir()
+    safe_write.write_atomic(folder / "failing-tests.md", reported["text"] + "\n", root=base)
+    safe_write.write_atomic(folder / "diff.patch", patch, root=base)
     top = Path(failing_tests.repo_top(workdir))  # beside the repository, as a lane's worktree is: tp-spawn refuses a workdir inside the state directory
     tree = failing_tests.clean_worktree(workdir, base_commit, top.parent / f"{top.name}-investigate-{folder.name}")
     replacement = argparse.Namespace(
@@ -1028,7 +1025,8 @@ def investigate(base, args):
         failing_tests.remove_worktree(workdir, tree)  # nothing is left behind when the investigator cannot start
         raise
     if value.get("id") and (base / "tasks" / value["id"]).is_dir():
-        atomic_json(base / "tasks" / value["id"] / "dispatch.json", dict(read_json(base / "tasks" / value["id"] / "dispatch.json"), investigates=ident))
+        atomic_json(base / "tasks" / value["id"] / "dispatch.json", dict(read_json(base / "tasks" / value["id"] / "dispatch.json"), investigates=ident),
+                    base)
     return dict(value, investigates=ident, worktree=tree, diff=str(folder / "diff.patch"), base_commit=base_commit,
                 patch_note=failing_tests.PATCH_NOTE.format(workdir=workdir) + (f" HEAD has moved since the task started: {len(moved)} commit(s)." if moved else ""),
                 cleanup=f"git -C {workdir} worktree remove --force {tree}")
@@ -1285,18 +1283,22 @@ def main():
     elif args.command == "list":
         value = all_records(base)
     elif args.command == "objective":
-        atomic_text(base / "session-objective.md", args.text.strip() + "\n")
+        atomic_text(base / "session-objective.md", args.text.strip() + "\n", base)
         value = write_index(base)
     elif args.command == "request":
         own = os.getenv("TP_TASK_DIR")
         if not own:
             raise ValueError("request is only available inside a worker task")
-        path = Path(own).resolve()
-        if path.parent != (base / "tasks").resolve() or not (path / "meta.json").is_file():
+        path = Path(own)
+        try:  # tasks/ and the task directory are looked at themselves, never resolved: a link at either is refused
+            rel = safe_write.check_below(base, path, "worker task directory")
+        except ValueError:
+            rel = None
+        if rel is None or Path(rel).parts != ("tasks", path.name) or not (path / "meta.json").is_file():
             raise ValueError("invalid worker task directory")
         value = {"kind": args.kind, "what": args.what, "reason": args.reason,
                  "status": "pending", "requested": now()}
-        atomic_json(path / "capability-request.json", value)
+        atomic_json(path / "capability-request.json", value, base)
         write_index(base)
         refreshed(base, path.name, value)
     elif args.command in {"inspect", "collect", "stop", "message"}:
@@ -1328,7 +1330,7 @@ def main():
                 # again. A task already completed has its cleanup retried here too.
                 value["process"] = end_or_refuse(path)
                 if value["status"] == "settled":
-                    atomic_json(path / "collected.json", {"collected": now()})
+                    atomic_json(path / "collected.json", {"collected": now()}, base)
                     value["status"] = "completed"
                     write_index(base)
                     refreshed(base, args.id, value)
@@ -1358,14 +1360,13 @@ def main():
             (path / "collected.json").unlink(missing_ok=True)
             value = {"id": args.id, "sent": True}
             try:
-                with (path / "messages.jsonl").open("a") as out:
-                    out.write(json.dumps({"sent": now(), "text": args.text}) + "\n")
+                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text}) + "\n", root=base)
                 requested = path / "capability-request.json"
                 if requested.exists():
                     pending = read_json(requested)
                     if pending.get("status") == "pending":
                         pending.update({"status": "answered", "answered": now()})
-                        atomic_json(requested, pending)
+                        atomic_json(requested, pending, base)
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
     else:

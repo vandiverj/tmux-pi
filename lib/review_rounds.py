@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import safe_write  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IDENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 MAX_ANCESTORS = 200  # a safety limit on the walk to the root; reaching it refuses the review
@@ -297,8 +298,7 @@ def safe_diff(top, old, new):
 
 
 def write(path, text):
-    Path(path).write_text(text, encoding="utf-8", errors="surrogateescape")
-    return str(path)
+    return safe_write.write_atomic(path, text, errors="surrogateescape", root=safe_write.task_root(Path(path).parent))
 
 
 def prepare(state_dir, task_id, workdir, out_dir):
@@ -413,19 +413,7 @@ def literal(text):
 def write_list_file(path, text):
     """Write text to path atomically without following a link there: a temp file in the same directory replaces whatever
     is at path (a symlink is replaced, never written through). Raises OSError when it cannot."""
-    directory = os.path.dirname(os.path.abspath(path))
-    fd, temp = tempfile.mkstemp(prefix=".review-changed-files-", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.chmod(temp, 0o644)
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+    safe_write.write_atomic(path, text, mode=0o644, root=safe_write.task_root(Path(path).parent))
 
 
 def scope_text(workdir, lane="", list_file=None, budget=None):

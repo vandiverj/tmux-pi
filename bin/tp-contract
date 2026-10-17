@@ -44,6 +44,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import safe_write  # noqa: E402
 from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
                       escalation_record, extension, is_local, ledger_row, load_research, message, note,
                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
@@ -94,9 +95,7 @@ def task_state(d, meta, pane_map):
 
 
 def save_events(d, events):
-    tmp = d / "checkpoints.json.tmp"
-    tmp.write_text(json.dumps({"events": events}) + "\n")
-    os.replace(tmp, d / "checkpoints.json")
+    safe_write.write_atomic(d / "checkpoints.json", json.dumps({"events": events}) + "\n", root=safe_write.task_root(d), keep_mode=False)
 
 
 def trigger_for_event(action, reason):
@@ -113,6 +112,7 @@ def trigger_for_event(action, reason):
 
 def find(root, task_id):
     d = Path(root) / "tasks" / task_id
+    safe_write.check_below(root, d, "task directory")  # a linked tasks/ or task directory is refused, not entered
     meta = read(d / "meta.json")
     if not meta:
         raise ContractError("no subagent '{}'".format(task_id))
@@ -121,11 +121,15 @@ def find(root, task_id):
 
 def tasks(root, only=None):
     base = Path(root) / "tasks"
+    if base.is_symlink():  # an owned directory that is a link holds no task of ours
+        return
     if only is not None:   # named tasks, in the order given; one that is gone is simply not listed
         metas = [base / name / "meta.json" for name in only if name and "/" not in name and name not in (".", "..")]
     else:
         metas = sorted(base.glob("*/meta.json"), key=lambda p: p.stat().st_mtime) if base.is_dir() else []
     for meta_path in metas:
+        if meta_path.parent.is_symlink():
+            continue
         meta = read(meta_path)
         if only is not None and not meta:
             continue
@@ -240,7 +244,7 @@ def cmd_enforce(_args):
         mark = "{}@{}".format(life, state.get("updated"))
         if life in DONE + ("needs_input",) and text(d / "ledger") != mark:
             upsert(Path(root) / "ledger.jsonl", ledger_row(d, now))
-            (d / "ledger").write_text(mark + "\n")
+            safe_write.write_atomic(d / "ledger", mark + "\n", root=safe_write.task_root(d))
         if pane_map.get(meta.get("pane")) != "alive" or (d / "escalated").exists():
             continue
         r = evaluate(meta, state, artifact_info(contract["artifact"]), now, True, events)
@@ -355,7 +359,7 @@ def cmd_escalated(args):
     if args.to:
         record.setdefault("target", {})["id"] = args.to
         record["next_action"] = "follow target; if it halts, pause/needs-input"
-        (d / "escalated").write_text(args.to + "\n")
+        safe_write.write_atomic(d / "escalated", args.to + "\n", root=safe_write.task_root(d))
     if args.message:
         record["message"] = args.message
     if records:
@@ -421,7 +425,7 @@ def cmd_collect(args):
         except (ValueError, RuntimeError, OSError) as error:
             raise ContractError("{} is not collected: its process could not be ended: {}".format(args.id, error))
     if life == "settled":
-        (d / "completed").write_text("{}\n".format(time.time()))
+        safe_write.write_atomic(d / "completed", "{}\n".format(time.time()), root=safe_write.task_root(d))
         life = "completed"
     write_record(d, lifecycle_state=life, meta=meta, force=True)
     print(life)
@@ -516,7 +520,7 @@ def main():
             globals()["cmd_" + args.cmd](args)
         else:
             print(json.dumps(research_config()))
-    except ContractError as exc:
+    except (ContractError, safe_write.UnsafePath) as exc:
         print("tp-contract: {}".format(exc), file=sys.stderr)
         return 1
     return 0

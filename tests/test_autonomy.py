@@ -541,12 +541,12 @@ class RecoveredRaceTests(AutonomyCase):
         real = autonomy.work.atomic_write
         seen = {}
 
-        def write(path, text):
+        def write(path, text, **kw):
             if Path(path).name == autonomy.FILE:
                 with self.long_wait(), self.assertRaisesRegex(work_checkpoint.WorkError, "locked") as caught:
                     self.recovered_with(lambda: None)
                 seen["refused"] = str(caught.exception)
-            real(path, text)
+            real(path, text, **kw)
 
         with mock.patch.object(autonomy.work, "atomic_write", write):
             autonomy.enable(self.state, CLAUDE, "demo", "race")
@@ -579,10 +579,10 @@ class RecoveredRaceTests(AutonomyCase):
         seen = []
         real = autonomy.work.atomic_write
 
-        def write(path, text):
+        def write(path, text, **kw):
             if Path(path).name == autonomy.FILE:
                 seen.append(("before", autonomy.gate(self.state, role="coder")))
-            real(path, text)
+            real(path, text, **kw)
             if Path(path).name == autonomy.FILE:
                 seen.append(("after", autonomy.gate(self.state, role="coder")))
 

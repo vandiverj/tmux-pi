@@ -148,7 +148,10 @@ fi
 [[ "$RESUME" != 1 ]] || { echo "tp: session '$SESSION' does not exist" >&2; exit 1; }
 command -v "$MAIN_HARNESS" >/dev/null || { echo "tp: $MAIN_HARNESS not found" >&2; exit 1; }
 
-mkdir -p "$STATE_DIR/state" "$STATE_DIR/tasks"
+# The workdir is the root these are checked from: a link at .tmux-pi, sessions, the session dir, state or tasks (a repo can
+# commit one) is refused, so the session state never lands outside the project.
+python3 "$ROOT/lib/safe_write.py" mkdir --root "$WORKDIR" "$STATE_DIR/state" "$STATE_DIR/tasks" \
+  || { echo "tp: refusing to start: a symlink in the session state path under $WORKDIR/.tmux-pi" >&2; exit 1; }
 
 # pi reads settings, models, auth, extensions, skills, prompts and themes only
 # from the repo's agent/ dir — never from ~/.pi/agent.

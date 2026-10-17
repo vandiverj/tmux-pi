@@ -16,6 +16,7 @@ import subprocess
 import unicodedata
 from pathlib import Path
 
+import safe_write
 from capabilities import disclosure_note, select_capabilities
 from sensitive_read import sensitive_path
 from task_record import ticket_in, tickets_in
@@ -923,4 +924,4 @@ def packet_note(manifest):
 
 
 def write_manifest(path, manifest):
-    Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    safe_write.write_atomic(path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", root=safe_write.task_root(Path(path).parent))

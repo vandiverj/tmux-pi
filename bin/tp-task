@@ -48,11 +48,11 @@ import subprocess
 import time
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import safe_write  # noqa: E402
 from contract import ContractError, state_dir as tmux_state_dir, task_lifecycle  # noqa: E402
 from task_record import (archive_task, capture_main_output, end_session_retention, find_task, format_record_for_resume, iter_task_dirs, parse_record, retention_report,  # noqa: E402
                          approved_delegated_review, author_result_hash, review_inventory, unresolved_review, set_pin, write_record)
@@ -175,9 +175,12 @@ def _cleanup_batch(root, days):
 
 
 def _safe_task_path(root, path):
-    root = Path(root).resolve()
-    p = Path(path).resolve()
-    return (root / "tasks") in p.parents or (root / "archive") in p.parents
+    try:  # tasks/ (archive/) and the task directory are looked at themselves, never resolved: a link at either is not ours
+        rel = safe_write.check_below(root, path, "task directory")
+    except (OSError, ValueError):
+        return False
+    parts = Path(rel).parts
+    return len(parts) >= 2 and parts[0] in ("tasks", "archive")
 
 
 def _delete_reviewed(root, review_file, confirm):
@@ -217,9 +220,8 @@ def _delete_reviewed(root, review_file, confirm):
         shutil.rmtree(row["path"])
         deleted.append(row)
     log = Path(root) / "cleanup.log"
-    with log.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"event": "cleanup-delete-reviewed", "review_file": str(review_file),
-                            "deleted": [r["id"] for r in deleted], "skipped": skipped}, sort_keys=True) + "\n")
+    safe_write.append_text(log, json.dumps({"event": "cleanup-delete-reviewed", "review_file": str(review_file),
+                                            "deleted": [r["id"] for r in deleted], "skipped": skipped}, sort_keys=True) + "\n", root=root)
     return {"deleted": deleted, "skipped": skipped, "log": str(log)}
 
 
@@ -242,7 +244,8 @@ def cmd_cleanup(args):
     batch = _cleanup_batch(root, args.days)
     rows = batch["tasks"]
     if args.write_review:
-        Path(args.write_review).write_text(json.dumps(batch, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        safe_write.write_atomic(args.write_review, json.dumps(batch, indent=2, sort_keys=True) + "\n",
+                                root=os.path.dirname(os.path.abspath(args.write_review)))  # a path the user named
     if args.json:
         print(json.dumps(batch, indent=2, sort_keys=True))
         return
@@ -358,9 +361,9 @@ def _safe_handshake_id(value):
     return text
 
 
-def _write_json(path, data):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _write_json(path, data, root=None):
+    safe_write.ensure_dir(Path(path).parent, root=root)
+    safe_write.write_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n", root=root)
 
 
 def cmd_main_contract(args):
@@ -383,7 +386,7 @@ def cmd_main_contract(args):
     enriched = merge_main_contract(preflight, contract)
     root = Path(resolve_state_dir(args))
     handoff = root / "handoffs" / handshake_id
-    handoff.mkdir(parents=True, exist_ok=True)
+    safe_write.ensure_dir(handoff, what="handoff directory", root=root)  # handoffs/ and handoffs/<id>: neither may be a link
     existing = {}
     try:
         existing = json.loads((handoff / "scaffold.json").read_text(encoding="utf-8"))
@@ -396,8 +399,8 @@ def cmd_main_contract(args):
         "decision": decision,
         "preflight": preflight,
     }
-    _write_json(handoff / "scaffold.json", scaffold)
-    _write_json(handoff / "main-contract.json", contract)
+    _write_json(handoff / "scaffold.json", scaffold, root)
+    _write_json(handoff / "main-contract.json", contract, root)
     request = preflight.get("task") or decision.get("task") or contract.get("task_summary") or ""
     make_record = args.record == "always"
     if args.record == "auto":
@@ -484,18 +487,8 @@ def cmd_capability_request(args):
         print(disclosure_note(cap_manifest))
 
 
-def _write_json_atomic(path, data):
-    path = Path(path)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix="." + path.name + ".", delete=False) as f:
-        tmp = Path(f.name)
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+def _write_json_atomic(path, data, root=None):
+    safe_write.write_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600, fsync=True, root=root)
 
 
 def cmd_review_list(args):
@@ -593,7 +586,7 @@ def cmd_review_resolve(args):
         blocker = {**blocker, "round_nonce": nonce}
     updated = {**blocker, "status": "resolved", "resolution": resolution}
     # Atomic replacement prevents a partial JSON write from clearing the gate.
-    _write_json_atomic(path, updated)
+    _write_json_atomic(path, updated, root)
     # Direct-main records can carry a copy of the authoritative handoff marker.
     if kind == "handoff":
         for base in ("tasks", "archive"):
@@ -605,11 +598,10 @@ def cmd_review_resolve(args):
                 if copy.is_file() and not copy.is_symlink():
                     local = _json_file(copy)
                     if local.get("handshake_id") == blocker_id and local.get("status") == "needs_human":
-                        _write_json_atomic(copy, {**local, "status": "resolved", "resolution": resolution})
+                        _write_json_atomic(copy, {**local, "status": "resolved", "resolution": resolution}, root)
     audit = {"schema": "tmux-pi-review-resolution:v1", id_key: task_identity if kind == "task" else blocker_id,
              kind: str(target), "resolution": resolution}
-    with (root / "review-resolutions.log").open("a", encoding="utf-8") as log:
-        log.write(json.dumps(audit, sort_keys=True) + "\n")
+    safe_write.append_text(root / "review-resolutions.log", json.dumps(audit, sort_keys=True) + "\n", root=root)
     print(json.dumps(updated, indent=2, sort_keys=True) if args.json else
           "resolved review-required {} {} as {}".format(kind, blocker_id, args.outcome))
 
@@ -783,7 +775,7 @@ def main():
     args = parser.parse_args()
     try:
         globals()["cmd_" + args.cmd.replace("-", "_")](args)
-    except ContractError as exc:
+    except (ContractError, safe_write.UnsafePath) as exc:
         print("tp-task: {}".format(exc), file=sys.stderr)
         return 1
     return 0

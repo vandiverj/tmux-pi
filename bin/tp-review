@@ -54,6 +54,7 @@ id="$1"
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 dir="$state_dir/tasks/$id"
+tp_not_link --root "$state_dir" "$dir"
 if [[ ! -f "$dir/meta.json" ]]; then
   # the lookup tp-agent uses (lib/task_record.py): stop and collect archive under <id> or <id>-ended-<stamp>[-N]
   archived="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from task_archive import find_archived_task; found = find_archived_task(sys.argv[2], sys.argv[3]); print(found or "")' "$ROOT/lib" "$state_dir" "$id")" ||
@@ -248,10 +249,10 @@ fi
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
   --arg policy "$policy" --arg independence "$independence" \
   '. + {review:$review, reviews:((.reviews // (if .review then [.review] else [] end)) + [$review]), review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking, independence:$independence}}' \
-  "$dir/meta.json" > "$dir/meta.json.tmp"
-mv "$dir/meta.json.tmp" "$dir/meta.json"
+  "$dir/meta.json" | tp_write "$dir/meta.json" --root "$state_dir" --fresh
 review_dir="$(tp_task_dir "$session" "$review_id")"
-printf '%s\n' "$id" > "$review_dir/review-of"
+tp_not_link --root "$state_dir" "$review_dir"
+printf '%s\n' "$id" | tp_write "$review_dir/review-of" --root "$state_dir"
 # The working tree this reviewer saw; the next round's diff starts here. Absent when the workdir is not a git repository.
-if [[ "$snapshot" != null ]]; then printf '%s\n' "$snapshot" > "$review_dir/reviewed-state.json"; fi
+if [[ "$snapshot" != null ]]; then printf '%s\n' "$snapshot" | tp_write "$review_dir/reviewed-state.json" --root "$state_dir"; fi
 printf '%s\n' "$review_id"

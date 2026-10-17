@@ -16,7 +16,7 @@ source "$ROOT/lib/tp.sh"
 
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"
-mkdir -p "$state_dir/archive"
+tp_owned_dir --root "$state_dir" "$state_dir/archive"
 n=0
 for meta in "$state_dir"/tasks/*/meta.json; do
   [[ -f "$meta" ]] || continue

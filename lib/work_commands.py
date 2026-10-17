@@ -481,7 +481,7 @@ def _write_command(args, session_dir, task_status):
         except (OSError, ValueError, AttributeError):
             current = []
         attached = list(dict.fromkeys([*current, doc.id]))
-        work.atomic_write(path, json.dumps({"attached": attached}, indent=2) + "\n")
+        work.atomic_write(path, json.dumps({"attached": attached}, indent=2) + "\n", root=session_dir)
         # A run that attaches a workspace is a restart that needs reconciling: recovery is pending (adds a recovery generation).
         work_checkpoint.compacted(session_dir, "attach")
         return {"attached": attached}

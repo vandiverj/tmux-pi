@@ -15,6 +15,7 @@ import shlex
 import signal
 import time
 
+import safe_write
 from placeholders import find, rehydrate, resolve_all
 from redact import Redactor, exact_values
 from redact_llm import LocalClassifier
@@ -550,9 +551,7 @@ def save_request(target, reason, status, **extra):
     value = {"status": status, "target": target, "reason": reason,
              "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              **{k: v for k, v in extra.items() if v}}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(value) + "\n")
-    tmp.replace(path)
+    safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
 
 
 def settle(event, decision):

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 
+import safe_write
 from contract import task_lifecycle
 
 # Lifecycles from which a worker's process is no longer wanted: its task is collected or stopped.
@@ -257,8 +258,9 @@ def guard_review(path):
 
 def _ended(path, life, pane, pid, how):
     if life != "stopped":  # a stopped task keeps its stopped marker; an ended settled or collected one is not a failure
-        (path / "exit").write_text("0\n")
-    (path / "reaped.json").write_text(json.dumps({"reaped": _now(), "pane": pane, "pid": pid, "signal": how}) + "\n")
+        safe_write.write_atomic(path / "exit", "0\n", root=safe_write.task_root(path))
+    safe_write.write_atomic(path / "reaped.json", json.dumps({"reaped": _now(), "pane": pane, "pid": pid, "signal": how}) + "\n",
+                            root=safe_write.task_root(path))
     return {"ended": True, "pane": pane, "pid": pid, "signal": how}
 
 
@@ -390,9 +392,7 @@ def prepare_stop(path, pane):
         raise RuntimeError(f"pane {pane} pid {pid} is not in the process table; nothing was stopped")
     rec["members"] = [[p, row[2]] for p, row in sorted(_members(rec, rows).items())]
     rec["recorded"] = _now()
-    tmp = path / "process.json.tmp"
-    tmp.write_text(json.dumps(rec) + "\n")
-    os.replace(tmp, path / "process.json")
+    safe_write.write_atomic(path / "process.json", json.dumps(rec) + "\n", root=safe_write.task_root(path), keep_mode=False)
     return rec
 
 

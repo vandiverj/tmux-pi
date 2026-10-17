@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import request_file
+import safe_write
 from lifecycle_files import LIFECYCLE_FILES
 from result_status import RESULT_STATUS_RE  # noqa: F401  (the one RESULT_STATUS reader: lib/result_status.py)
 from task_record import request_text
@@ -689,9 +690,8 @@ def read_escalations(task_dir):
 
 def write_escalations(task_dir, records):
     path = Path(task_dir) / "escalation.json"
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps({"records": records}, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    safe_write.write_atomic(path, json.dumps({"records": records}, indent=2, sort_keys=True) + "\n",
+                            root=safe_write.task_root(task_dir), keep_mode=False)
 
 
 def ledger_row(task_dir, now):
@@ -778,9 +778,8 @@ def read_ledger(ledger):
 
 
 def _write_ledger(ledger, rows):
-    tmp = Path(str(ledger) + ".tmp")
-    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    os.replace(tmp, ledger)
+    safe_write.write_atomic(ledger, "".join(json.dumps(r) + "\n" for r in rows), root=safe_write.task_root(Path(ledger).parent),
+                            keep_mode=False)
 
 
 def state_dir(runner=subprocess.run):

@@ -11,7 +11,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import textwrap
 import sys
 from pathlib import Path
@@ -19,6 +18,7 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import review_verdict  # noqa: E402
+import safe_write  # noqa: E402
 from task_archive import find_archived_task  # noqa: E402,F401  (re-exported: archive_task names what it finds)
 
 MARKER = "<!-- tmux-pi-task-record:v1 -->"
@@ -50,21 +50,12 @@ def _read(path):
 
 
 def _write_atomic(path, text):
+    """Replace path through a temp file (0600, fsynced). A link at path is replaced; one at the task directory or at the
+    tasks/ (archive/) above it, i.e. anything below the state directory, is refused."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                     prefix=".{}.".format(path.name), suffix=".tmp", delete=False) as f:
-        tmp = Path(f.name)
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        os.replace(tmp, path)
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    root = safe_write.task_root(path.parent)
+    safe_write.ensure_dir(path.parent, what="task directory", root=root)
+    safe_write.write_atomic(path, text, mode=0o600, fsync=True, root=root)
 
 
 def _fence(text):
@@ -299,7 +290,7 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
     before replacing task.md with the canonical record.
     """
     d = Path(task_dir)
-    d.mkdir(parents=True, exist_ok=True)
+    safe_write.ensure_dir(d, what="task directory", root=safe_write.task_root(d))  # tasks/ and the task directory: a link at either is refused
     meta = meta or read_json(d / "meta.json")
     old_task = _read(d / "task.md")
     if old_task.strip() and not is_canonical(old_task) and not (d / "request.md").exists():
@@ -474,8 +465,11 @@ def iter_task_dirs(state_dir, include_archive=True):
         base = root / base_name
         if not base.is_dir():
             continue
+        if base.is_symlink():  # a linked tasks/ or archive/ is not ours: nothing in it is a task
+            continue
         for meta in sorted(base.glob("*/meta.json"), key=lambda p: p.stat().st_mtime):
-            yield meta.parent, base_name
+            if not meta.parent.is_symlink():
+                yield meta.parent, base_name
 
 
 def find_task(state_dir, query, include_archive=True):
@@ -819,10 +813,14 @@ def archive_task(state_dir, task_dir):
     """Move one active task to a distinct archive name and reconcile its record."""
     root = Path(state_dir)
     d = Path(task_dir)
-    if d.parent.resolve() != (root / "tasks").resolve() or d.is_symlink() or not d.is_dir():
+    try:  # tasks/ and the task directory are looked at themselves (lstat), never resolved: a link at either is refused
+        rel = safe_write.check_below(root, d, "task directory")
+    except ValueError:
+        rel = None
+    if rel is None or Path(rel).parts != ("tasks", d.name) or not d.is_dir():
         raise ValueError("not an active task directory: {}".format(d))
     archive_dir = root / "archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    safe_write.ensure_dir(archive_dir, what="archive directory", root=root)
     dest = _archive_destination(archive_dir, d.name)
     # An exclusive empty-directory reservation prevents nesting into an existing
     # archive; rename replaces only that empty reservation on the same filesystem.
@@ -863,12 +861,14 @@ def end_session_retention(state_dir, archive_workers=True):
     root = Path(state_dir)
     tasks_dir = root / "tasks"
     archive_dir = root / "archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    safe_write.ensure_dir(archive_dir, what="archive directory", root=root)
     rows_by_path = {r["resolved_path"]: r for r in retention_report(root, days=0)}
     actions = []
-    if tasks_dir.is_dir():
+    if tasks_dir.is_dir() and not tasks_dir.is_symlink():  # a linked tasks/ is not ours: nothing in it is archived
         for meta_path in sorted(tasks_dir.glob("*/meta.json")):
             d = meta_path.parent
+            if d.is_symlink():  # nor is a linked task directory (archive_task refuses one)
+                continue
             meta = read_json(meta_path)
             rec = parse_record(d)
             if not rec["canonical"]:
@@ -887,8 +887,7 @@ def end_session_retention(state_dir, archive_workers=True):
                 for d in sorted((root / "handoffs").iterdir()) if d.is_dir()] if (root / "handoffs").is_dir() else []
     event = {"event": "session-end-retention", "at": _now(), "archive_workers": archive_workers,
              "actions": actions, "handoffs": handoffs}
-    with (root / "cleanup.log").open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, sort_keys=True) + "\n")
+    safe_write.append_text(root / "cleanup.log", json.dumps(event, sort_keys=True) + "\n", root=root)
     return {"archived": [a for a in actions if a["action"] == "archive"],
             "retained": [a for a in actions if a["action"] == "retain"],
             "handoffs": handoffs, "log": str(root / "cleanup.log")}

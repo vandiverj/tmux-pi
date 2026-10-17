@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+import safe_write
 from task_record import write_record
 
 STOP_MODES = {"plan", "prototype", "investigate"}
@@ -381,7 +382,7 @@ def contract_note(preflight):
 def create_preflight_record(state_dir, request, preflight, name="contract", main_contract=None, policy_decision=None, lifecycle_state="working"):
     """Create a durable main-owned task directory without spawning a worker."""
     tasks = Path(state_dir) / "tasks"
-    tasks.mkdir(parents=True, exist_ok=True)
+    safe_write.ensure_dir(tasks, what="tasks directory", root=state_dir)
     stamp = _dt.datetime.now().strftime("%H%M%S")
     safe = re.sub(r"[^\w.-]+", "-", name or "contract").strip("-") or "contract"
     task_id = f"{safe}-{stamp}"
@@ -391,7 +392,7 @@ def create_preflight_record(state_dir, request, preflight, name="contract", main
         task_id = f"{safe}-{stamp}-{n}"
     d = tasks / task_id
     d.mkdir()
-    (d / "request.md").write_text((request or preflight.get("task") or "").strip() + "\n", encoding="utf-8")
+    safe_write.write_atomic(d / "request.md", (request or preflight.get("task") or "").strip() + "\n", root=state_dir)
     meta = {
         "id": task_id,
         "worker": "main",
@@ -402,12 +403,12 @@ def create_preflight_record(state_dir, request, preflight, name="contract", main
     }
     if main_contract:
         meta["main_contract"] = main_contract
-        (d / "main-contract.json").write_text(json.dumps(main_contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        safe_write.write_atomic(d / "main-contract.json", json.dumps(main_contract, indent=2, sort_keys=True) + "\n", root=state_dir)
         if main_contract.get("handshake_id"):
             meta["handshake_id"] = main_contract.get("handshake_id")
     if policy_decision:
         meta["policy_decision"] = policy_decision
-        (d / "policy-decision.json").write_text(json.dumps(policy_decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (d / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        safe_write.write_atomic(d / "policy-decision.json", json.dumps(policy_decision, indent=2, sort_keys=True) + "\n", root=state_dir)
+    safe_write.write_atomic(d / "meta.json", json.dumps(meta, indent=2, sort_keys=True) + "\n", root=state_dir)
     write_record(d, lifecycle_state=lifecycle_state, meta=meta)
     return {"id": task_id, "dir": str(d), "record": str(d / "task.md")}

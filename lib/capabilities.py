@@ -15,6 +15,7 @@ import re
 from copy import deepcopy
 from pathlib import Path
 
+import safe_write
 from task_record import ticket_in
 
 REGISTRY_SCHEMA = "tmux-pi-capability-registry:v1"
@@ -583,4 +584,4 @@ def disclosure_note(capability_manifest):
 
 
 def write_capability_manifest(path, manifest):
-    Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    safe_write.write_atomic(path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", root=safe_write.task_root(Path(path).parent))

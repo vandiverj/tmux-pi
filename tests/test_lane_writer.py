@@ -158,6 +158,21 @@ class DispatchIntoALaneTests(LaneCase):
         self.assertEqual(len(list(self.root.glob("proj-wt-*"))), 1)
         self.assertEqual(len(list((self.state / "tasks").iterdir())), 1)
 
+    def test_an_explicit_branch_names_the_new_lanes_branch(self):
+        item, _ = self.lane_ok(extra=("--repo", None, "--domain", "lib part", "--touches", "lib", "--branch", "DMP-23-Seed-Scaffold"))
+        self.assertTrue(item["lane_created"])
+        record = json.loads((self.lane_dir() / "lane.json").read_text())
+        self.assertEqual(record["branch"], "DMP-23-Seed-Scaffold")
+        self.assertEqual(git(self.worktree, "symbolic-ref", "--short", "HEAD"), "DMP-23-Seed-Scaffold")
+        self.assertEqual(git(self.repo, "branch", "--list", "lane/alpha"), "")
+
+    def test_a_case_insensitive_branch_clash_is_refused_before_any_worktree_exists(self):
+        git(self.repo, "branch", "DMP-23-Seed-Scaffold")
+        run = self.lane_dispatch(extra=("--repo", None, "--domain", "lib part", "--touches", "lib", "--branch", "dmp-23-seed-scaffold"))
+        self.refused(run, "dmp-23-seed-scaffold")
+        self.no_lane()
+        self.assertEqual(len(list((self.state / "tasks").iterdir())) if (self.state / "tasks").exists() else 0, 0)
+
 
 class RefusalTableTests(LaneCase):
     """The design's numbered checks, one test each. A refusal makes no lane, no task and no queue entry."""
@@ -452,6 +467,30 @@ class TickTests(LaneCase):
         (self.state / "queue/coder-broken0001.json").write_text(json.dumps({"id": "coder-broken0001", "lane": "alpha"}))
         run = self.lane_dispatch(step="s1", extra=())
         self.refused(run, "cannot be read")
+
+
+class ConcurrentCreateTests(LaneCase):
+    """A dispatch planned for a new lane that finds the lane made meanwhile keeps only a declaration that matches the record."""
+
+    def admit(self, **declared):
+        from importlib.machinery import SourceFileLoader
+        agent = SourceFileLoader("tp_agent_admit", str(ROOT / "bin/tp-agent")).load_module()
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lane_commands
+        import lanes
+        lane_commands.create_lane(str(self.repo), "alpha", "lib part", ["lib"], machine={"max_active_lanes": 2, "defaulted": []})
+        plan = {"name": "alpha", "step": "s1", "common": lanes.git_common_dir(self.repo), "domain": "lib part", **declared}
+        agent.lane_admit(self.state, plan, {"role": "coder"})
+
+    def test_a_different_branch_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.admit(branch="DMP-1-Other")
+        self.assertIn("created meanwhile with branch lane/alpha", str(caught.exception))
+
+    def test_a_different_base_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.admit(base_requested="main")
+        self.assertIn("created meanwhile with base lane/integrate", str(caught.exception))
 
 
 class AliveOnWorkdirTests(unittest.TestCase):

@@ -487,6 +487,37 @@ class CommandTests(Scratch):
         self.assertEqual(run.returncode, 1)
         self.assertIn("tp-agent:", run.stderr)
 
+    def test_the_cli_flag_sets_the_branch(self):
+        run = self.run_agent("lane", "create", "alpha", "--domain", "d", "--touches", "lib/a", "--repo", str(self.repo),
+                             "--branch", "DMP-1-Alpha", cwd=self.repo)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["lane"]["branch"], "DMP-1-Alpha")
+
+
+class ExplicitBranchTests(Scratch):
+    """`--branch` names the lane's git branch instead of branch_prefix + name; the record stores it."""
+    def test_an_explicit_branch_is_used_and_stored(self):
+        lane = self.create("dmp-23-seed", branch="DMP-23-Seed-Scaffold")["lane"]
+        self.assertEqual(lane["branch"], "DMP-23-Seed-Scaffold")
+        self.assertEqual(git(self.repo, "branch", "--list", "DMP-23-Seed-Scaffold", "--format=%(refname:short)"), "DMP-23-Seed-Scaffold")
+        self.assertEqual(git(lane["worktree"], "symbolic-ref", "--short", "HEAD"), "DMP-23-Seed-Scaffold")
+        self.assertEqual(lanes.read_lane(self.common, "dmp-23-seed")["branch"], "DMP-23-Seed-Scaffold")
+        self.assertEqual(git(self.repo, "branch", "--list", "lane/dmp-23-seed"), "")
+
+    def test_without_branch_the_prefix_and_name_still_apply(self):
+        self.assertEqual(self.create("alpha")["lane"]["branch"], "lane/alpha")
+
+    def test_refused_branches_leave_nothing_behind(self):
+        git(self.repo, "branch", "Taken-One")
+        self.create("beta", branch="Other-Branch")
+        for branch in ("lane/integrate", "main", "Taken-One", "taken-one", "TAKEN-ONE", "OTHER-branch", "other-branch",
+                       "a..b", "-x", "a b", "@{-1}", ""):
+            with self.subTest(branch=branch):
+                before = self.snapshot()
+                with self.assertRaises(ValueError):
+                    self.create("alpha", branch=branch)
+                self.assertEqual(self.snapshot(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

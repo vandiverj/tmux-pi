@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -345,6 +346,94 @@ class AgeColumnTests(RemoveCase):
         for delta, text in ((timedelta(seconds=40), "40s"), (timedelta(minutes=12, seconds=5), "12m"), (timedelta(hours=5, minutes=59), "5h"),
                             (timedelta(days=3, hours=23), "3d"), (timedelta(seconds=-5), "0s")):
             self.assertEqual(lane_commands.age_text((now - delta).isoformat(timespec="seconds"), now), text)
+
+
+class ConfiguredIntegrationBranchTests(unittest.TestCase):
+    """`lane remove` honours integration_branch from lanes.json; branch_prefix "" names branches exactly like the lane."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.parent = Path(os.path.realpath(self.tmp.name))
+        self.repo = self.parent / "proj"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "a.txt").write_text("a\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+        self.state = self.parent / "state"
+        self.state.mkdir()
+
+    def configure(self, **config):
+        (self.repo / ".tmux-pi").mkdir(exist_ok=True)
+        (self.repo / ".tmux-pi/lanes.json").write_text(json.dumps(config))
+
+    def create(self, name="alpha"):
+        machine = {"max_active_lanes": 2, "defaulted": []}
+        return lane_commands.create_lane(str(self.repo), name, "d", ["lib"], machine=machine)["lane"]
+
+    def commit_in(self, worktree):
+        (Path(worktree) / "w.txt").write_text("work\n")
+        git(worktree, "add", ".")
+        git(worktree, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "work")
+
+    def merge_into(self, branch, lane_branch):
+        other = self.parent / "merge-tree"
+        git(self.repo, "worktree", "add", "-q", str(other), branch)
+        git(other, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "-m", "merge", lane_branch)
+        git(self.repo, "worktree", "remove", str(other))
+
+    def test_a_lane_merged_into_the_configured_integration_branch_is_removed(self):
+        self.configure(integration_branch="dmp-phase-1")
+        git(self.repo, "branch", "dmp-phase-1")
+        record = self.create()
+        self.assertEqual(record["base"]["ref"], "dmp-phase-1")
+        self.commit_in(record["worktree"])
+        self.merge_into("dmp-phase-1", record["branch"])
+        done = lane_remove.remove_lane(str(self.state), str(self.repo), "alpha")
+        self.assertEqual((done["abandoned"], done["integrated_in"]), (False, ["dmp-phase-1"]))
+        self.assertEqual(git(self.repo, "branch", "--list", record["branch"]), "")
+        self.assertFalse(Path(record["worktree"]).exists())
+
+    def test_an_unmerged_lane_is_refused_naming_the_configured_branch(self):
+        self.configure(integration_branch="dmp-phase-1")
+        git(self.repo, "branch", "dmp-phase-1")
+        record = self.create()
+        self.commit_in(record["worktree"])
+        with self.assertRaises(ValueError) as caught:
+            lane_remove.remove_lane(str(self.state), str(self.repo), "alpha")
+        self.assertIn("dmp-phase-1", str(caught.exception))
+        self.assertNotIn("lane/integrate", str(caught.exception))
+        self.assertTrue(Path(record["worktree"]).exists())
+
+    def test_the_default_configuration_still_uses_lane_integrate(self):
+        git(self.repo, "branch", "lane/integrate")
+        record = self.create()
+        self.commit_in(record["worktree"])
+        with self.assertRaises(ValueError) as caught:
+            lane_remove.remove_lane(str(self.state), str(self.repo), "alpha")
+        self.assertIn("lane/integrate", str(caught.exception))
+        self.merge_into("lane/integrate", record["branch"])
+        done = lane_remove.remove_lane(str(self.state), str(self.repo), "alpha")
+        self.assertEqual(done["integrated_in"], ["lane/integrate"])
+
+    def test_an_empty_prefix_names_the_branch_like_the_lane_and_an_existing_branch_is_refused(self):
+        self.configure(branch_prefix="", integration_branch="dmp-phase-1")
+        git(self.repo, "branch", "dmp-phase-1")
+        self.assertEqual(self.create("dmp-23-example")["branch"], "dmp-23-example")
+        git(self.repo, "branch", "dmp-24-taken")
+        for name in ("dmp-24-taken", "main", "dmp-phase-1"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    self.create(name)
+        self.assertFalse((self.parent / "proj-wt-dmp-24-taken").exists())
+
+    def test_a_non_empty_malformed_prefix_is_still_refused(self):
+        for prefix in ("a..b/", "-x", " "):
+            with self.subTest(prefix=prefix):
+                self.configure(branch_prefix=prefix)
+                with self.assertRaises(ValueError) as caught:
+                    self.create()
+                self.assertIn("branch_prefix", str(caught.exception))
 
 
 if __name__ == "__main__":

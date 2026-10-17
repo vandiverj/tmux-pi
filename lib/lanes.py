@@ -843,6 +843,7 @@ def load_machine_config(path=None):
 def load_repo_config(repo):
     """The per-repository lane settings from <repo main working tree>/.tmux-pi/lanes.json: branch_prefix,
     worktree_pattern ({repo} = the repository folder name, {name} = the lane name), integration_branch, integration_lane.
+    branch_prefix may be "" (every other key must be non-empty).
     A file that does not exist, or a key that is absent, takes its default (DEFAULT_REPO) and is listed in "defaulted";
     a key that is present but malformed or of the wrong type, or a file that exists but cannot be read, refuses naming
     key and file. Optional and validated when present: owned (path prefixes only the orchestrator edits) and tests
@@ -852,17 +853,19 @@ def load_repo_config(repo):
     cfg = _read_config(path, "the repository lane config", absent_ok=True)
     defaulted = []
 
-    def text(key):
+    def text(key, may_be_empty=False):
         if cfg is None or key not in cfg:
             defaulted.append(key)
             return DEFAULT_REPO[key]
         value = cfg[key]
+        if isinstance(value, str) and value == "" and may_be_empty:
+            return value
         if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
             raise ValueError(f"{path} {key} must be non-empty text, got {value!r}")
         return value
 
     cfg_has = cfg or {}
-    prefix = text("branch_prefix")
+    prefix = text("branch_prefix", may_be_empty=True)  # "" gives branches named exactly like the lane
     if not valid_branch(prefix + "x"):
         raise ValueError(f"{path} branch_prefix {prefix!r} does not make valid branch names")
     pattern = text("worktree_pattern")
@@ -909,20 +912,33 @@ def defaulted_values(*configs):
 
 # ---------------------------------------------------------------- names and the precheck
 
-def lane_branch(repo_config, name, integration=False):
-    """The branch for lane `name`: the configured prefix plus the name. The integration lane's name is reserved: a work
+def explicit_branch(branch):
+    """`branch` (a lane's --branch) when `git check-ref-format --branch` accepts it as written, else ValueError."""
+    run = None
+    if isinstance(branch, str) and branch and not branch.startswith("-") and "\n" not in branch and "\x00" not in branch:
+        run = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True)
+    if run is None or run.returncode != 0 or run.stdout.strip() != branch:
+        raise ValueError(f"--branch {branch!r} is not a valid branch name")
+    return branch
+
+
+def lane_branch(repo_config, name, integration=False, branch=None):
+    """The branch for lane `name`: `branch` when one is given explicitly (a work lane only), else the configured prefix
+    plus the name. The integration lane's name is reserved: a work
     lane may not have it, and with integration=True only that name is accepted and the integration branch is returned.
     A work branch equal to the integration branch refuses."""
     if not valid_lane_name(name):
         raise ValueError(f"invalid lane name {name!r}")
     reserved = repo_config["integration_lane"]
     if integration:
+        if branch is not None:
+            raise ValueError("the integration lane's branch is the configured integration branch; --branch does not apply")
         if name != reserved:
             raise ValueError(f"the integration lane is named {reserved!r}, not {name!r}")
         return repo_config["integration_branch"]
     if name == reserved:
         raise ValueError(f"the lane name {name!r} is reserved for the integration lane")
-    branch = repo_config["branch_prefix"] + name
+    branch = explicit_branch(branch) if branch is not None else repo_config["branch_prefix"] + name
     if branch == repo_config["integration_branch"]:
         raise ValueError(f"branch {branch!r} is the integration branch; choose another lane name")
     if not valid_branch(branch):
@@ -967,24 +983,44 @@ def _branch_in_use(common_dir, branch):
     return None
 
 
-def precheck_lane_slot(common_dir, repo_config, name, integration=False):
+def _case_clash(common_dir, branch):
+    """An existing local branch that equals `branch` or conflicts with its path when case is ignored, or None."""
+    _, out = _git(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], common_dir)
+    low = branch.lower()
+    for existing in out.splitlines():
+        e = existing.lower()
+        if e == low or e.startswith(low + "/") or low.startswith(e + "/"):
+            return existing
+    return None
+
+
+def precheck_lane_slot(common_dir, repo_config, name, integration=False, branch=None):
     """Before anything is created for lane `name`: render its branch and worktree and refuse if either is already in use,
     so an existing branch or directory is never adopted. Refuses when: a record for the lane exists or another record
     uses the branch or worktree; the branch exists (or conflicts with an existing branch's path); the worktree path
     exists or git lists it; the worktree is inside the repository (lane_worktree). A record that cannot be read refuses,
-    because it may hold the slot. Returns {"branch", "worktree"}. Nothing is created or changed."""
+    because it may hold the slot. An explicit `branch` is also refused when it is the main checkout's current branch, or
+    matches an existing local branch or another lane's branch ignoring case. Returns {"branch", "worktree"}. Nothing is
+    created or changed."""
     common_dir = os.path.realpath(common_dir)
     repo = main_worktree(common_dir)
-    branch = lane_branch(repo_config, name, integration)
+    explicit = branch is not None
+    branch = lane_branch(repo_config, name, integration, branch)
     worktree = lane_worktree(repo_config, repo, name, integration)
+    if explicit:
+        _, current = _git(["symbolic-ref", "-q", "--short", "HEAD"], repo, ok=(0, 1))
+        if branch == current.strip():
+            raise ValueError(f"branch {branch!r} is the main checkout's current branch; choose another --branch")
     taken = lane_names(common_dir)
     if name in taken:
         raise ValueError(f"lane {name} already has a record in {lanes_dir(common_dir)}")
     for other in taken:
         record = read_lane(common_dir, other)
-        if record["branch"] == branch or record["worktree"] == worktree:
+        if record["branch"] == branch or record["worktree"] == worktree or (explicit and record["branch"].lower() == branch.lower()):
             raise ValueError(f"lane {other} already uses the branch {branch} or the worktree {worktree}")
     clash = _branch_in_use(common_dir, branch)
+    if clash is None and explicit:
+        clash = _case_clash(common_dir, branch)
     if clash is not None:
         raise ValueError(f"branch {branch} cannot be used: branch {clash} already exists" if clash != branch
                          else f"branch {branch} already exists; it is not adopted")

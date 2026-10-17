@@ -182,12 +182,12 @@ def validate_declaration(repo_config, name, domain, touches):
     return touches
 
 
-def create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config):
+def create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config, branch=None):
     """Create the lane with the lane lock ALREADY held by this thread (create_lane and dispatch --lane take it): the slot
     and the active-lane limit are checked, then the worktree and branch are made with one `git worktree add -b`, the record
     is written and checked with lane_reality. Returns (record, warnings). A failure rolls back and raises with the original
     reason; if something cannot be undone the error says what, and the command that does it."""
-    slot = lanes.precheck_lane_slot(common, repo_config, name)
+    slot = lanes.precheck_lane_slot(common, repo_config, name, branch=branch)
     lanes.check_lane_capacity(common, machine["max_active_lanes"])
     others = _all_records(common)
     warnings = _warnings(name, domain, touches, others)
@@ -226,18 +226,18 @@ def undo_created_lane(record):
         raise ValueError("these could not be undone and are left: " + "; ".join(left))
 
 
-def create_lane(repo_dir, name, domain, touches, base=None, machine=None, repo_config=None):
+def create_lane(repo_dir, name, domain, touches, base=None, machine=None, repo_config=None, branch=None):
     """Create work lane `name`: a branch from `base`, a worktree for it and the record. Returns {"lane": record,
     "warnings": [...]}. Order: validate every input; load configuration (absent values default, recorded in "defaulted");
     resolve the base; then under the lane lock create_lane_locked. `machine` / `repo_config` are the loaded configurations
-    (loaded here when None)."""
+    (loaded here when None). `branch` names the lane's git branch explicitly instead of branch_prefix + name; the record stores it."""
     common, repo = _main_repo(repo_dir)
     machine = machine if machine is not None else lanes.load_machine_config()
     repo_config = repo_config if repo_config is not None else lanes.load_repo_config(repo)
     touches = validate_declaration(repo_config, name, domain, touches)
     base_ref, base_commit = _resolve_base(repo, base, repo_config["integration_branch"])
     with lanes.lane_lock(common):
-        record, warnings = create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config)
+        record, warnings = create_lane_locked(common, repo, name, domain, touches, base_ref, base_commit, machine, repo_config, branch)
     return {"lane": record, "warnings": warnings}
 
 

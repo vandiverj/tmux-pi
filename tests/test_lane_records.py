@@ -665,7 +665,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_present_but_invalid_never_takes_the_default(self):
         """Missing-vs-invalid: each key absent defaults (above); the same key present and bad refuses naming key and file."""
-        bad = {"branch_prefix": ["", 5, None, "a..b/", "-x"], "worktree_pattern": ["", None, "{repo}-wt", "{repo}-{name}-{name}", "wt-{name}", "{repo}-{x}-{name}"],
+        bad = {"branch_prefix": [5, None, " ", "a..b/", "-x"], "worktree_pattern": ["", None, "{repo}-wt", "{repo}-{name}-{name}", "wt-{name}", "{repo}-{x}-{name}"],
                "integration_branch": ["", None, "a b", 3], "integration_lane": ["", None, "Int", 4]}
         for key, values in bad.items():
             for value in values:
@@ -674,6 +674,12 @@ class ConfigTests(unittest.TestCase):
                         self.repo_config(self.full(**{key: value}))
                     self.assertIn(key, str(caught.exception))
                     self.assertIn("lanes.json", str(caught.exception))
+
+    def test_an_empty_branch_prefix_is_accepted_and_no_other_key_may_be_empty(self):
+        clean = self.repo_config(self.full(branch_prefix=""))
+        self.assertEqual(clean["branch_prefix"], "")
+        self.assertNotIn("branch_prefix", clean["defaulted"])
+        self.assertEqual(lanes.lane_branch(clean, "dmp-23-example"), "dmp-23-example")
 
     def test_bad_optional_repo_values_refuse(self):
         for over in ({"owned": "x"}, {"owned": ["/abs"]}, {"owned": ["a", "a"]}, {"tests": {}}, {"tests": {"full": {"argv": []}}},

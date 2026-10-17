@@ -1,7 +1,7 @@
 """Lanes L6: `tp-agent lane remove NAME [--abandon]` (design 3.5).
 
 A lane may go when its work is already in the repository: its branch tip is an ancestor of the main checkout's HEAD or of the
-integration branch (INTEGRATION, fixed name). The tip decides, never the recorded state: integration, L7, does not exist yet,
+configured integration branch (integration_branch in the repository's lanes.json, lane/integrate unless set). The tip decides, never the recorded state: integration, L7, does not exist yet,
 and a state that is only a word (open, integrating, integrated, abandoned) must not be a dead end. A lane whose tip is in
 neither is removed only with --abandon, whatever its state. Under the lane lock, in this order:
 
@@ -13,7 +13,7 @@ neither is removed only with --abandon, whatever its state. Under the lane lock,
      output does not, and goes with the tree);
   4. the branch: a tip that is integrated is deleted with `git update-ref -d refs/heads/BRANCH TIP`, which deletes only while
      the branch is still at the tip our ancestry check proved integrated (no -D, no force; `git branch -d` would test the tip
-     against HEAD or the upstream only, and so refuse a branch that is merged into lane/integrate); with --abandon and an
+     against HEAD or the upstream only, and so refuse a branch that is merged into the integration branch); with --abandon and an
      unintegrated tip, `git branch -D`, after the tip and the command that restores the branch were printed;
   5. the lane's directory is moved to lanes/archive/NAME-TIMESTAMP/.
 
@@ -34,9 +34,6 @@ import lane_lease  # noqa: E402
 import lane_steps  # noqa: E402
 import lanes  # noqa: E402
 
-INTEGRATION = "lane/integrate"
-
-
 def _stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -45,16 +42,16 @@ def _is_ancestor(common, tip, ref):
     return lanes._git(["merge-base", "--is-ancestor", tip, ref], common, ok=(0, 1))[0] == 0
 
 
-def _integrated_in(repo, common, tip):
-    """The names of the refs that already hold `tip`: the main checkout's current branch (or its commit), and lane/integrate."""
+def _integrated_in(repo, common, tip, integration_branch):
+    """The names of the refs that already hold `tip`: the main checkout's current branch (or its commit), and `integration_branch`."""
     found = []
     _, head = lanes._git(["rev-parse", "HEAD"], repo)
     _, head_branch = lanes._git(["symbolic-ref", "-q", "--short", "HEAD"], repo, ok=(0, 1))
     if _is_ancestor(common, tip, head.strip()):
         found.append(head_branch.strip() or f"HEAD {head.strip()[:12]}")
-    code, integration = lanes._git(["rev-parse", "--verify", "-q", f"refs/heads/{INTEGRATION}^{{commit}}"], repo, ok=(0, 1))
+    code, integration = lanes._git(["rev-parse", "--verify", "-q", f"refs/heads/{integration_branch}^{{commit}}"], repo, ok=(0, 1))
     if code == 0 and _is_ancestor(common, tip, integration.strip()):
-        found.append(INTEGRATION)
+        found.append(integration_branch)
     return found
 
 
@@ -80,10 +77,10 @@ def _stop_command(ident, session, here):
     return f"`{lane_lease.in_session({'session': str(session)}, here)}tp-agent stop {ident}`"
 
 
-def _unmerged_refusal(record, repo, tip):
+def _unmerged_refusal(record, repo, tip, integration_branch):
     name, state = record["name"], record["state"]
     return (f"lane {name} is {state} with {len(record['closed'])} closed step(s) not integrated (its tip {tip[:12]} is in neither "
-            f"the main checkout's branch nor {INTEGRATION}); integrate it or pass --abandon: "
+            f"the main checkout's branch nor {integration_branch}); integrate it or pass --abandon: "
             f"`tp-agent lane remove {name} --abandon --repo {repo}` discards the branch after printing its tip, which restores it")
 
 
@@ -120,10 +117,11 @@ def remove_lane(state, repo_dir, name, abandon=False, notify=None):
         worktree, branch = record["worktree"], record["branch"]
         if worktree == repo:
             raise ValueError(f"lane {name}'s worktree is the repository's main working tree; it is not removed")
-        where = _integrated_in(repo, common, tip)
+        integration_branch = lanes.load_repo_config(repo)["integration_branch"]
+        where = _integrated_in(repo, common, tip, integration_branch)
         merged = bool(where)
         if not merged and not abandon:
-            raise ValueError(_unmerged_refusal(record, repo, tip))
+            raise ValueError(_unmerged_refusal(record, repo, tip, integration_branch))
         holders = lane_lease.live(lane_lease.read(common, name))
         if holders:
             raise ValueError(f"lane {name} has a live process: {lane_lease.describe(holders, state)}. Once it is gone, remove the lane again")

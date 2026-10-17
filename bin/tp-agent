@@ -717,7 +717,7 @@ def prior_dispatch(previous):
         return None, error
 
 
-LANE_FLAGS = (("step", "--step"), ("domain", "--domain"), ("touches", "--touches"), ("repo", "--repo"), ("base", "--base"))
+LANE_FLAGS = (("step", "--step"), ("domain", "--domain"), ("touches", "--touches"), ("repo", "--repo"), ("base", "--base"), ("branch", "--branch"))
 
 
 def lane_plan(args, base, tests):
@@ -765,20 +765,21 @@ def lane_plan(args, base, tests):
     if retry:
         raise ValueError(f"lane {name} has no record, so a task of it cannot be retried; its record would be in {lanes.lanes_dir(common)}. "
                          f"Start the lane again: tp-agent dispatch --lane {name} --step ID --domain TEXT --touches PATH ...")
-    lanes.precheck_lane_slot(common, repo_config, name)  # 8 (and an existing branch)
+    lanes.precheck_lane_slot(common, repo_config, name, branch=getattr(args, "branch", None))  # 8 (and an existing branch)
     if not getattr(args, "domain", None) or not getattr(args, "touches", None):  # 9
         raise ValueError(f"lane {name} does not exist; pass --domain TEXT and --touches PATH [PATH ...] to create it")
     lanes.check_lane_capacity(common, machine["max_active_lanes"])  # 13
     touches = lane_commands.validate_declaration(repo_config, name, args.domain, args.touches)  # 14
     base_ref, base_commit = lane_commands._resolve_base(repo, getattr(args, "base", None), repo_config["integration_branch"])
-    plan.update(exists=False, route_workdir=repo, domain=args.domain, touches=touches, base_ref=base_ref, base_commit=base_commit)
+    plan.update(exists=False, route_workdir=repo, branch=getattr(args, "branch", None), domain=args.domain, touches=touches, base_ref=base_ref, base_commit=base_commit,
+                base_requested=getattr(args, "base", None))
     return plan
 
 
 def lane_declaration_check(record, args):
     """Check 10: a lane that has a record takes no declaration flags. --repo is allowed: it only locates the lane (the
     record was found in that repository), which a main pane in another repository needs."""
-    if any(getattr(args, attr, None) for attr in ("domain", "touches", "base")):
+    if any(getattr(args, attr, None) for attr in ("domain", "touches", "base", "branch")):
         raise ValueError(f"lane {record['name']} already exists (domain: {record['domain']}); its declaration is set when it is created")
 
 
@@ -798,6 +799,12 @@ def lane_admit(base, plan, item):
     with lanes.lane_lock(common):
         if name in lanes.lane_names(common):
             record = lanes.read_lane(common, name)  # 7 again, under the lock
+            if plan.get("domain"):  # planned as a new lane: a concurrent dispatch made it, so what was declared must match
+                declared = (("branch", plan.get("branch"), record["branch"]), ("base", plan.get("base_requested"), record["base"]["ref"]))
+                for flag, wanted, stored in declared:
+                    if wanted and wanted != stored:
+                        raise ValueError(f"lane {name} was created meanwhile with {flag} {stored}, not the {wanted} this dispatch declared; "
+                                         f"dispatch again without --{flag} (the lane now exists, so it takes neither --branch nor --base)")
             lane_use_checks(record)  # 11, 12 again; the flag check (10) needs no lock
             lane_steps.next_step_checks(lane_steps.Session(base), record, plan["step"])  # 15, 16, 17 again
             warnings = lane_commands._warnings(name, record["domain"], record["touches"], [lanes.read_lane(common, n) for n in lanes.lane_names(common)])
@@ -805,7 +812,7 @@ def lane_admit(base, plan, item):
             if not plan.get("domain"):
                 raise ValueError(f"lane {name} has no record any more; dispatch again")
             record, warnings = lane_commands.create_lane_locked(common, plan["repo"], name, plan["domain"], plan["touches"], plan["base_ref"],
-                                                               plan["base_commit"], plan["machine"], plan["repo_config"])
+                                                               plan["base_commit"], plan["machine"], plan["repo_config"], plan.get("branch"))
             created = True
         try:
             holders = lane_holders(base, name, record["worktree"], item["role"])  # 18; 19 is the refusals worker_process raises
@@ -1061,6 +1068,8 @@ def main():
     d.add_argument("--repo", help="with --lane, creating it: the repository (default: the main pane's)")
     d.add_argument("--base", help="with --lane, creating it: branch or commit to start from (default: the integration branch); "
                                   "with --investigate-failure: the commit to check out clean (default: the one the task started from)")
+    d.add_argument("--branch", help="with --lane, creating it: the lane's git branch (default: branch_prefix + lane name); "
+                                    "not the integration branch or the main checkout's, and not one that exists")
     d.add_argument("--investigate-failure", metavar="TASK_ID",
                    help="start a tester on the failing tests TASK_ID reported as not its own (its FAILING_TESTS: block), with that task's "
                         "diff and a clean worktree at the commit it started from")
@@ -1129,6 +1138,8 @@ def main():
     lc.add_argument("--touches", nargs="+", required=True, metavar="PATH", help="repo-relative path prefixes the lane will change")
     lc.add_argument("--repo", default=".", help="the repository (default: the current directory)")
     lc.add_argument("--base", help="branch or commit to start from (default: the repository's integration branch, lane/integrate unless configured)")
+    lc.add_argument("--branch", help="the lane's git branch (default: branch_prefix + NAME); not the integration branch or the main "
+                                     "checkout's, and not one that exists, whatever the case")
     lcl = ln.add_parser("close", help="record that a step is finished: its review approved the committed work (lane close NAME STEP)")
     lcl.add_argument("name")
     lcl.add_argument("step")
@@ -1194,7 +1205,7 @@ def main():
                 raise ValueError("no tmux-pi state directory (queued work cannot be ruled out without it); start a workspace with tp, or set TP_STATE_DIR") from error
             print(json.dumps(lane_remove.remove_lane(state, args.repo, args.name, args.abandon), indent=2))
             return
-        value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base)
+        value = lane_commands.create_lane(args.repo, args.name, args.domain, args.touches, args.base, branch=args.branch)
         for warning in value["warnings"]:
             print(lane_commands.warning_text(warning), file=sys.stderr)
         print(json.dumps(value, indent=2))

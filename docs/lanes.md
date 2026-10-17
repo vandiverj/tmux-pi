@@ -8,9 +8,11 @@ Use one when two or more substantial streams of work change different paths at t
 
 ## Commands
 
-### `tp-agent lane create NAME --domain TEXT --touches PATH... [--repo DIR] [--base REF]`
+### `tp-agent lane create NAME --domain TEXT --touches PATH... [--repo DIR] [--base REF] [--branch BRANCH]`
 
 Makes the branch (`lane/NAME`), the worktree (`/tmp/demo-wt-NAME`) and the lane record. `--domain` says in words why the lane is independent; `--touches` lists the repo-relative path prefixes it will change (no trailing `/`). The base is the integration branch (`lane/integrate`) unless `--base` is given; the branch must exist (`git branch lane/integrate main`). Nothing is left behind if it fails.
+
+`--branch BRANCH` names the lane's git branch instead of `branch_prefix` + NAME (for example lane `dmp-23-seed`, branch `DMP-23-Seed-Scaffold`). It must pass `git check-ref-format --branch`, and is refused if it is the integration branch, the main checkout's current branch, or matches an existing local branch or another lane's branch ignoring case. The branch is stored in the lane record; `lane remove`, status and list use the stored value, and records without one (older lanes) keep `branch_prefix` + name. `tp-agent dispatch --lane NAME --step ID ... --domain ... --touches ... --branch BRANCH` takes it too, when it creates the lane.
 
 ```
 $ tp-agent lane create api --domain "HTTP handlers" --touches app
@@ -116,7 +118,7 @@ tp-agent: step d1 of lane docs cannot be closed: step d1 has no review yet. No w
 
 ### `tp-agent lane remove NAME [--abandon] [--repo DIR]`
 
-Removes the lane's worktree and branch and archives its record under `<git common dir>/tmux-pi/lanes/archive/`. A lane whose branch tip is already in the main checkout's current branch or in `lane/integrate` goes without `--abandon`; any other needs it, and the tip and the command that restores the branch are printed.
+Removes the lane's worktree and branch and archives its record under `<git common dir>/tmux-pi/lanes/archive/`. A lane whose branch tip is already in the main checkout's current branch or in the configured `integration_branch` (default `lane/integrate`) goes without `--abandon`; any other needs it, and the tip and the command that restores the branch are printed.
 
 ```
 $ tp-agent lane remove docs
@@ -163,9 +165,9 @@ Per repository, `.tmux-pi/lanes.json` in the main checkout (values shown are the
 | Key | Meaning |
 | --- | --- |
 | `max_active_lanes` | the most lanes open at once (positive integer) |
-| `branch_prefix` | a lane's branch is `branch_prefix` + name |
+| `branch_prefix` | a lane's branch is `branch_prefix` + name; it may be `""` (the branch is then just the name, which is lowercase because lane names are; use `--branch` for a name like `DMP-23-Example`) |
 | `worktree_pattern` | where the worktree goes; `{repo}` is the repository folder name, `{name}` the lane name (once); it starts with `{repo}` or is absolute |
-| `integration_branch` | the default base of a new lane; also where `lane remove` looks for integrated work |
+| `integration_branch` | the default base of a new lane; also the branch `lane remove` checks for integrated work (besides the main checkout's branch) |
 | `integration_lane` | the lane name reserved for integration |
 | `owned` | path prefixes only the orchestrator edits; a lane's `--touches` may not overlap them |
 
@@ -201,7 +203,7 @@ Each refusal names the command that clears it. "Clears itself" means the state g
 | `invalid lane name` / `needs --step` / `--lane chooses the working tree; remove --workdir` / `lane NAME does not exist; pass --domain ... --touches ...` / `already exists ... its declaration is set when it is created` / `--touches X is owned by the orchestrator` | a flag is missing, wrong or not allowed | No | run the same command with the flag change the message names |
 | `lane tasks run the tests that check their change` | `--tests full` in a lane | No | pass `--tests affected` or `--tests none`; run the whole suite once from the main checkout |
 | `X is inside lane NAME's working tree; pass --lane NAME --step ID` | a start in a lane's tree without the lane | No | repeat it with `--lane NAME --step ID` (or start it in the main checkout) |
-| `lane NAME is STATE with N closed step(s) not integrated` (from `lane remove`; STATE is any recorded state) | the lane's branch tip is in neither the main checkout's current branch nor `lane/integrate`; removing would drop its work. The recorded state alone never refuses | No | `tp-agent lane remove NAME --abandon` (prints the tip and the command that restores the branch), or merge the lane into the main branch or `lane/integrate` first |
+| `lane NAME is STATE with N closed step(s) not integrated` (from `lane remove`; STATE is any recorded state) | the lane's branch tip is in neither the main checkout's current branch nor the configured `integration_branch` (default `lane/integrate`); removing would drop its work. The recorded state alone never refuses | No | `tp-agent lane remove NAME --abandon` (prints the tip and the command that restores the branch), or merge the lane into the main branch or the integration branch first |
 | `lane NAME has a live process: TASK (…; to end it: CMD)` (from `lane remove`) | a worker still runs in the lane | Yes, when the worker ends | run `CMD` as printed, then remove again |
 | `lane NAME has queued work: ID, ID` (from `lane remove`) | queued items, in this session or any other session of the same state root, would start in the lane | No | run each `tp-agent stop ID` as printed (an item of another session comes with `env ... TP_STATE_DIR=THAT_SESSION`), then remove again |
 | `lane NAME's tree has N uncommitted path(s)` (git's message is in the text) | tracked changes or untracked files that git does not ignore; ignored build output never blocks | No | `git -C WORKTREE stash push -u -m "..."` (keeps them), then remove again |
@@ -209,7 +211,7 @@ Each refusal names the command that clears it. "Clears itself" means the state g
 
 ## Removing a lane
 
-`tp-agent lane remove NAME [--abandon]` removes the lane's worktree (`git worktree remove`, never `--force`; git-ignored build output goes with it), deletes its branch and moves its record to `<git common dir>/tmux-pi/lanes/archive/NAME-TIMESTAMP/`. It only touches the worktree its record names and git registered. A lane may go when its branch tip is already in the main checkout's current branch or in `lane/integrate` (the tip decides, never the recorded state: no state is a dead end), or, with `--abandon`, in any state: then `git branch -D` runs after the tip and the restoring command (`git -C REPO branch BRANCH SHA`) are printed. A tip that is already integrated has its branch deleted with `git update-ref -d refs/heads/BRANCH TIP` (it deletes only while the branch is still at that tip; no `-D`, no force), because `git branch -d` from the main checkout refuses a branch merged only into `lane/integrate`. Refusals are in the table above. `tp-agent lanes` shows each lane's `created` time and `age`.
+`tp-agent lane remove NAME [--abandon]` removes the lane's worktree (`git worktree remove`, never `--force`; git-ignored build output goes with it), deletes its branch and moves its record to `<git common dir>/tmux-pi/lanes/archive/NAME-TIMESTAMP/`. It only touches the worktree its record names and git registered. A lane may go when its branch tip is already in the main checkout's current branch or in the configured `integration_branch` (default `lane/integrate`; the tip decides, never the recorded state: no state is a dead end), or, with `--abandon`, in any state: then `git branch -D` runs after the tip and the restoring command (`git -C REPO branch BRANCH SHA`) are printed. A tip that is already integrated has its branch deleted with `git update-ref -d refs/heads/BRANCH TIP` (it deletes only while the branch is still at that tip; no `-D`, no force), because `git branch -d` from the main checkout refuses a branch merged only into the integration branch. Refusals are in the table above. `tp-agent lanes` shows each lane's `created` time and `age`.
 
 ## Retiring a lane by hand
 

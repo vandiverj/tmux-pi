@@ -58,10 +58,10 @@ esac
 exit 0
 ''')
         tmux.chmod(0o755)
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "joins",
+        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "joins", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
-        patcher = mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state)})
+        patcher = mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_WORK_DIR": str(self.root / "work-store")})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.panes = 0

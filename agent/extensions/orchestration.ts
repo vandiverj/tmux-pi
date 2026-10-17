@@ -62,10 +62,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "task_index",
 		label: "Task index",
-		description: "Rebuild and read the short session index after compaction or to see active and pending specialist work.",
+		description: "Rebuild and read the short session index after compaction or to see active and pending specialist work. Open decisions come as counts, the first ids that fit, and the command that lists every one (tp-agent work decisions).",
 		parameters: Type.Object({}),
 		async execute() {
-			const value = JSON.parse(await run(command, ["index"]));
+			// --bounded: the work block's open decisions as a short summary, never the full list (that stays in session-index.json).
+			const value = JSON.parse(await run(command, ["index", "--bounded"]));
 			return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
 		},
 	});

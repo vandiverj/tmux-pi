@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 ROOT = Path(__file__).resolve().parent.parent
 KINDS = {"workspace": "workspaces", "note": "notes"}
@@ -43,12 +43,38 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def config():
+DEFAULTS = {"inject_candidates": 3, "inject_notes": 3, "recent_days": 14, "inject_decisions_chars": 1200, "find_line_max": 4000,
+            "shared": {"path": "", "promote_dir": "", "search": False}, "projects": {}}
+
+
+def _json_file(path):
     try:
-        value = json.loads((ROOT / "config" / "work.json").read_text())
+        value = json.loads(Path(path).read_text())
     except (OSError, ValueError):
-        value = {}
+        return {}
     return value if isinstance(value, dict) else {}
+
+
+def config():
+    """config/work.json, with config/work.local.json (git-ignored) laid over it; a map such as `shared` or `projects` is
+    merged one level deep. TP_WORK_CONFIG names one file that replaces both (tests, and a machine with its own location)."""
+    explicit = os.getenv("TP_WORK_CONFIG")
+    layers = [_json_file(explicit)] if explicit else [_json_file(ROOT / "config" / "work.json"), _json_file(ROOT / "config" / "work.local.json")]
+    value = {}
+    for layer in layers:
+        for key, item in layer.items():
+            value[key] = {**value[key], **item} if isinstance(item, dict) and isinstance(value.get(key), dict) else item
+    return value
+
+
+def setting(name):
+    """One configured value, else its default; a value of the wrong type falls back to the default."""
+    value, default = config().get(name), DEFAULTS[name]
+    if isinstance(default, dict):
+        return {**default, **value} if isinstance(value, dict) else dict(default)
+    if isinstance(default, bool) or not isinstance(value, type(default)) or isinstance(value, bool):
+        return default
+    return value
 
 
 def store_root():
@@ -292,6 +318,43 @@ class Doc:
         atomic_write(self.path, self.render())
 
 
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_when(value):
+    """An aware UTC datetime from a date, a datetime or an ISO date/datetime string; None for anything else."""
+    try:
+        if isinstance(value, datetime):
+            when = value
+        elif isinstance(value, date):
+            when = datetime(value.year, value.month, value.day)
+        elif isinstance(value, str) and value.strip():
+            text = value.strip()
+            when = datetime.fromisoformat(text[:-1] + "+00:00" if text[-1] in "Zz" else text)
+        else:
+            return None
+        return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def updated_at(doc):
+    """When a document was last updated, as an aware UTC datetime. The one accessor for every sort and freshness test: the
+    `updated` field (any date or ISO datetime form), else the file's mtime, else the epoch. A hand-edited or missing value
+    never raises and never makes a document look newer than its file is."""
+    when = _parse_when(doc.meta.get("updated"))
+    if when is not None:
+        return when
+    try:
+        return datetime.fromtimestamp(Path(doc.path).stat().st_mtime, timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return datetime.fromtimestamp(0, timezone.utc)
+
+
+def updated_iso(doc):
+    return updated_at(doc).strftime(STAMP)
+
+
 def _read(kind, path, in_archive):
     text = path.read_text(encoding="utf-8", errors="replace")
     meta, body = parse(text)
@@ -314,23 +377,56 @@ def load(kind, ident, include_archived=True):
     raise WorkError(f"unknown {kind}: {ident}")
 
 
-def iter_docs(kind, archived=False):
-    """Documents that are live (`archived=False`) or archived, by what they are and not by where they sit."""
+def iter_docs(kind, archived=False, skipped=None):
+    """Documents that are live (`archived=False`) or archived, by what they are and not by where they sit. A file that cannot
+    be read or parsed is skipped, and its name is appended to `skipped` when that list is given: one bad file never hides the others."""
     seen = set()
     for in_archive in ((True, False) if archived else (False,)):
         folder = store_root() / ("archive" if in_archive else "") / KINDS[kind]
         if not folder.is_dir():
             continue
         for path in sorted(folder.glob("*.md")):
-            if path.stem in seen or not path.is_file() or path.is_symlink():
-                continue
             try:
+                if path.stem in seen or not path.is_file() or path.is_symlink():
+                    continue
                 doc = _read(kind, path, in_archive)
-            except OSError:
+            except Exception:  # noqa: BLE001 - per-document isolation: an unreadable file is counted, never fatal
+                note_skipped(skipped, path)
                 continue
             if doc.archived == archived:
                 seen.add(path.stem)
                 yield doc
+
+
+def note_skipped(skipped, path):
+    """Record that the store file at `path` was skipped because it could not be processed (`skipped` is a list, or None to ignore).
+    Files are told apart by their full path, so `workspaces/a.md` and `notes/a.md` are two."""
+    if skipped is not None:
+        skipped.append(str(path))
+
+
+def skipped_files(skipped):
+    """The distinct files of `skipped` as store-relative names (`notes/a.md`), first seen first. Only the commands that print through the
+    output boundary may show these: a file name can hold anything, so the index carries the count and never a name."""
+    root = store_root()
+    names = []
+    for path in dict.fromkeys(skipped or []):
+        try:
+            names.append(Path(path).relative_to(root).as_posix())
+        except ValueError:
+            names.append(Path(path).name)
+    return names
+
+
+def skipped_count(skipped):
+    """How many distinct files `skipped` names (by full path)."""
+    return len(set(skipped or []))
+
+
+def skipped_line(skipped):
+    """The one short line that tells a user some work files could not be read, or '' when none were skipped."""
+    count = skipped_count(skipped)
+    return f"{count} unreadable work files; tp-agent work list" if count else ""
 
 
 def slugify(title):
@@ -496,12 +592,17 @@ def find_decision(ident):
 PRIORITY_RANK = {name: i for i, name in enumerate(PRIORITIES)}
 
 
-def open_decisions(include_closed=False):
-    """Every decision across all non-archived workspaces, blocking first, then priority, then age (workspace updated, oldest first)."""
+def open_decisions(include_closed=False, skipped=None):
+    """Every decision across all non-archived workspaces, blocking first, then priority, then age (workspace updated, oldest first).
+    A workspace whose decisions cannot be read is skipped (named in `skipped`); the others are still listed."""
     rows = []
-    for doc in iter_docs("workspace"):
-        for entry in decisions_of(doc):
-            if include_closed or entry["status"] == "open":
-                rows.append({**{k: v for k, v in entry.items() if not k.startswith("_")}, "workspace": doc.id, "workspace_updated": doc.meta.get("updated", "")})
+    for doc in iter_docs("workspace", skipped=skipped):
+        try:
+            found = [{**{k: v for k, v in entry.items() if not k.startswith("_")}, "workspace": doc.id, "workspace_updated": updated_iso(doc)}
+                     for entry in decisions_of(doc) if include_closed or entry["status"] == "open"]
+        except Exception:  # noqa: BLE001 - per-document isolation
+            note_skipped(skipped, doc.path)
+            continue
+        rows += found
     rows.sort(key=lambda r: (not r["blocking"], PRIORITY_RANK.get(r["priority"], 9), r["workspace_updated"], r["id"]))
     return rows

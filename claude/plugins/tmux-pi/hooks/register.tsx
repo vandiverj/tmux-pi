@@ -385,13 +385,140 @@ function pausedLines(groups: readonly (readonly [string, unknown])[], room: numb
   return { lines, rows: shown }
 }
 
-// The session index as the main reads it: objective, paused, active and pending (not recent),
+// ---- the durable `work` block of the index (tp-agent work ...) ----
+// Per open decision the index carries only id, workspace, priority and blocking: never the question text. The injected text
+// shows the counts, the first ids that fit `chars`, and the command that lists them all, so it cannot grow with the backlog.
+const WORK_COMMAND = 'tp-agent work decisions'
+const PRIORITY_RANK: Record<string, number> = { high: 0, normal: 1, low: 2 }
+const DEFAULT_DECISION_CHARS = 1200
+
+function plain(text: unknown, size: number): string {
+  const one = (typeof text === 'string' ? text : '').replace(/\s+/g, ' ').trim()
+  return one.length <= size ? one : `${one.slice(0, size - 1)}…`
+}
+
+function decisionTrailer(more: number, moreBlocking: number): string {
+  return more > 0 ? `+${more} more (${moreBlocking} blocking): ${WORK_COMMAND}` : `${WORK_COMMAND} (every question and detail)`
+}
+
+// Same text as lib/work_index.py decision_summary: header, then blocking-first ids (one line each) while they fit, then the trailer.
+// The trailer is reserved first. `chars` of 0 gives the minimum: the header and the trailer.
+function decisionSummary(decisions: unknown, chars: number): string {
+  if (typeof decisions !== 'object' || decisions === null) return ''
+  const d = decisions as { open?: unknown; blocking?: unknown; items?: unknown }
+  const items = (Array.isArray(d.items) ? d.items : []).filter(
+    (item): item is { id: string; priority?: unknown; blocking?: unknown } =>
+      typeof item === 'object' && item !== null && typeof (item as { id?: unknown }).id === 'string',
+  )
+  const opened = typeof d.open === 'number' ? d.open : items.length
+  if (opened <= 0) return ''
+  const blocking = typeof d.blocking === 'number' ? d.blocking : items.filter(item => item.blocking === true).length
+  const rank = (item: { priority?: unknown }) => PRIORITY_RANK[String(item.priority)] ?? 9
+  const ordered = [...items].sort((a, b) => Number(b.blocking === true) - Number(a.blocking === true) || rank(a) - rank(b))
+  const header = `decisions: ${opened} open (${blocking} blocking)`
+  let size = header.length + 1 + Math.max(decisionTrailer(opened, blocking).length, decisionTrailer(0, 0).length)
+  const lines: string[] = []
+  let shownBlocking = 0
+  for (const item of ordered) {
+    const line = `- ${plain(item.id, 80)} [${plain(item.priority, 10)}]${item.blocking === true ? ' blocking' : ''}`
+    if (chars <= 0 || size + line.length + 1 > chars) break
+    size += line.length + 1
+    lines.push(line)
+    shownBlocking += item.blocking === true ? 1 : 0
+  }
+  return [header, ...lines, decisionTrailer(opened - lines.length, blocking - shownBlocking)].join('\n')
+}
+
+function decisionChars(work: Record<string, unknown>): number {
+  const chars = (work.decisions as { chars?: unknown } | undefined)?.chars
+  return typeof chars === 'number' && chars > 0 ? chars : DEFAULT_DECISION_CHARS
+}
+
+// What the decisions block costs at least, so the protected tiers leave it room.
+function workReserve(index: Record<string, unknown>): number {
+  const work = index.work
+  if (typeof work !== 'object' || work === null) return 0
+  const text = decisionSummary((work as Record<string, unknown>).decisions, 0)
+  return text === '' ? 0 : text.length + 1
+}
+
+function workRow(row: unknown): string | undefined {
+  if (typeof row !== 'object' || row === null) return undefined
+  const r = row as Record<string, unknown>
+  if (typeof r.id !== 'string') return undefined
+  const status = typeof r.status === 'string' && r.status !== '' && r.status !== 'active' ? ` [${plain(r.status, 12)}]` : ''
+  const next = plain(r.next, 100)
+  const sessions = (Array.isArray(r.sessions) ? r.sessions : []).filter((x): x is string => typeof x === 'string')
+  return (
+    `- ${plain(r.id, 60)} "${plain(r.title, 80)}"${status}` +
+    (next === '' ? '' : ` — next: ${next}`) +
+    (sessions.length === 0 ? '' : ` (${sessions.slice(-3).map(x => plain(x, 40)).join(', ')})`)
+  )
+}
+
+function noteList(label: string, notes: unknown): string | undefined {
+  const rows = (Array.isArray(notes) ? notes : []).filter(
+    (n): n is { id: string; title?: unknown } => typeof n === 'object' && n !== null && typeof (n as { id?: unknown }).id === 'string',
+  )
+  if (rows.length === 0) return undefined
+  return `${label}: ${rows.map(n => `${plain(n.id, 60)} "${plain(n.title, 80)}"`).join('; ')}`
+}
+
+// The `work` lines, most useful first, never more than `room` characters (each line counts its newline). Every line, the error
+// line and the decisions header and trailer included, goes through the one `append` below, which adds it only if it fits;
+// the optional groups also leave the decisions minimum its room. No block and no error: nothing, so the text is unchanged.
+function workLines(index: Record<string, unknown>, room: number): string[] {
+  const lines: string[] = []
+  let size = 0
+  // A lead line and its rows: the rows that fit with `after` characters kept free, and none of it if no row fits (never a lead alone).
+  const append = (lead: string, rest: string[], after: number) => {
+    let cost = lead.length + 1
+    if (size + cost + after > room) return
+    const fit = rest.filter(line => {
+      if (size + cost + line.length + 1 + after > room) return false
+      cost += line.length + 1
+      return true
+    })
+    if (rest.length > 0 && fit.length === 0) return
+    size += cost
+    lines.push(lead, ...fit)
+  }
+  const error = index.work_error
+  const work = index.work
+  if (typeof work !== 'object' || work === null) {
+    if (typeof error === 'string' && error !== '') append(`work context not read: ${plain(error, 160)}`, [], 0)
+    return lines
+  }
+  const w = work as Record<string, unknown>
+  const reserve = workReserve(index)
+  const rows = (group: unknown) => (Array.isArray(group) ? group : []).map(workRow).filter((x): x is string => x !== undefined)
+  const attached = rows(w.attached)
+  const candidates = rows(w.candidates)
+  const others = typeof w.others === 'number' && w.others > 0 ? w.others : 0
+  const notes = (typeof w.notes === 'object' && w.notes !== null ? w.notes : {}) as Record<string, unknown>
+  if (attached.length > 0) append('work attached to this session (tp-agent work show ID):', attached, reserve)
+  if (candidates.length > 0) append('work in this directory, not attached (tp-agent work attach ID):', candidates, reserve)
+  if (others > 0) append(`+${others} other active workspaces: tp-agent work list`, [], reserve)
+  for (const line of [noteList('notes', notes.recent), noteList('important notes', notes.important)]) if (line !== undefined) append(line, [], reserve)
+  // Files that could not be read are counted by the index, one short line here; the rest of the block is unaffected.
+  const unreadable = (w.skipped as { count?: unknown } | null | undefined)?.count
+  if (typeof unreadable === 'number' && unreadable > 0) append(`${Math.floor(unreadable)} unreadable work files; tp-agent work list`, [], reserve)
+  const decisions = decisionSummary(w.decisions, Math.min(decisionChars(w), Math.max(0, room - size)))
+  if (decisions !== '') {
+    const [head, ...tail] = decisions.split('\n')
+    // all or nothing: a decisions block that does not fit whole is left out, never cut mid-way
+    if (size + decisions.length + 1 <= room) append(head, tail, 0)
+  }
+  return lines
+}
+
+// The session index as the main reads it: objective, work, paused, active and pending (not recent),
 // never longer than INDEX_CHARS.
-// --no-tick: injection only reads; it never launches queued work.
+// --no-write: injection only reads; it neither launches queued work nor rewrites the index file.
 // `rows` are only the rows shown in `text` (as a line, or by id): a row cut for length was
 // not shown to the main, so it must stay eligible for a wake.
 async function readIndex($: EngineInterface): Promise<{ text: string; rows: unknown[] } | undefined> {
-  const index = await runTpAgent($, ['index', '--no-tick'])
+  const index = await runTpAgent($, ['index', '--no-write'])
   if (typeof index !== 'object' || index === null) return undefined
   const { objective, active, pending, paused, unstatused } = index as Record<string, unknown>
   const lines = ['tmux-pi task index (injected; run `tp-agent index` only if this is missing):']
@@ -402,14 +529,24 @@ async function readIndex($: EngineInterface): Promise<{ text: string; rows: unkn
   // queue entries that will never start, in what room those left; the other active rows and the pending ones take the rest.
   const activeRows = Array.isArray(active) ? active : []
   const isAsking = (row: unknown) => typeof row === 'object' && row !== null && (row as { status?: unknown }).status === 'needs_input'
+  // The protected tiers are sized first and hold back only the decisions minimum; the work block takes what they leave and is
+  // placed ahead of them.
+  const whole = index as Record<string, unknown>
+  const reserve = workReserve(whole)
+  const head = lines.length
   const first = pausedLines(
     [['replied without a result status', unstatused], ['paused', paused], ['needs input', activeRows.filter(isAsking)]],
-    limit - lines.join('\n').length - 1,
+    limit - lines.join('\n').length - 1 - reserve,
   )
   lines.push(...first.lines)
   // Listed only when there is one: unlike the others it is not a state every session has a line for.
-  const refused = refusedLines(activeRows.filter(row => isRefused(row) && indexLine(row) !== undefined), limit - lines.join('\n').length)
+  const refused = refusedLines(
+    activeRows.filter(row => isRefused(row) && indexLine(row) !== undefined),
+    limit - lines.join('\n').length - reserve,
+  )
   lines.push(...refused.lines)
+  // workLines counts each line with its newline, so what is left is exactly `limit` less the text so far.
+  lines.splice(head, 0, ...workLines(whole, limit - lines.join('\n').length))
   const shown = [...first.rows, ...refused.rows]
   let size = lines.join('\n').length
   let cut = 0

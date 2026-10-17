@@ -85,7 +85,7 @@ class PauseClassificationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
         (self.base / "tasks").mkdir()
-        patcher = mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.base)})
+        patcher = mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.base), "TP_WORK_DIR": str(self.base / "work-store")})
         patcher.start()
         self.addCleanup(patcher.stop)
 

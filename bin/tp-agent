@@ -25,6 +25,8 @@ import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import work  # noqa: E402
 import work_commands  # noqa: E402
+import work_find  # noqa: E402
+import work_index  # noqa: E402
 from task_archive import find_archived_task  # noqa: E402
 from task_record import refresh_record  # noqa: E402
 from contract import satisfies_dependency, task_lifecycle  # noqa: E402  (the one lifecycle classifier, shared with tp-contract)
@@ -53,18 +55,22 @@ def read_json(path, default=None):
     return value if isinstance(value, dict) else {} if default is None else default  # every record here is an object
 
 
-def atomic_json(path, value):
+def atomic_text(path, text):
+    """Temp file in the same directory, then one rename: a reader (or a crash) sees the old file or the new one, never half."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as out:
-            json.dump(value, out, indent=2)
-            out.write("\n")
+            out.write(text)
         os.replace(name, path)
     finally:
         if os.path.exists(name):
             os.unlink(name)
+
+
+def atomic_json(path, value):
+    atomic_text(path, json.dumps(value, indent=2) + "\n")
 
 
 def state_dir():
@@ -242,7 +248,7 @@ def all_records(base):
     return sorted(rows, key=lambda row: row.get("updated") or "")
 
 
-def write_index(base):
+def build_index(base):
     rows = all_records(base)
     objective = base / "session-objective.md"
     def brief(row):
@@ -274,6 +280,18 @@ def write_index(base):
                 entry["steps"] = sorted(entry["steps"] + [row["lane_step"]])
     if summary:
         value["lanes"] = summary
+    try:
+        block = work_index.build(base)
+    except Exception as error:  # an unreadable or malformed work store never blocks the task index
+        value["work_error"] = str(error)[:200]
+    else:
+        if block:  # no workspace and no note anywhere: no key, and the index is what it was before this block existed
+            value["work"] = block
+    return value
+
+
+def write_index(base):
+    value = build_index(base)
     atomic_json(base / "session-index.json", value)
     return value
 
@@ -1068,7 +1086,12 @@ def main():
     # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
     sub.add_parser("queue-view")
     # --no-tick: write and print the index without launching queued work.
-    sub.add_parser("index").add_argument("--no-tick", action="store_true")
+    ix = sub.add_parser("index")
+    ix.add_argument("--no-tick", action="store_true")
+    ix.add_argument("--no-write", action="store_true", help="print the index without writing session-index.json (implies --no-tick: nothing is launched or rewritten)")
+    ix.add_argument("--bounded", action="store_true",
+                    help="print the open decisions as the bounded summary (counts, top ids, the command), not the full list; "
+                         "session-index.json still has the full list")
     for name in ("inspect", "collect", "stop"):
         sub.add_parser(name).add_argument("id")
     m = sub.add_parser("message")
@@ -1102,30 +1125,24 @@ def main():
     ls.add_argument("name", nargs="?")
     ls.add_argument("--repo", default=".")
     work_commands.add_parsers(sub)
+    fd = sub.add_parser("find", help="search workspaces, notes, decisions and the archived tasks of earlier sessions (read-only; ~160-char snippets)")
+    fd.add_argument("terms", nargs="*", help="all must match (case-insensitive substring); none means filters only")
+    fd.add_argument("--kind", choices=list(work_find.KINDS), help="workspace|note|decision|task|session|shared (a read-only shared clone; only when shared.search is on in config/work.local.json); default: all of them")
+    fd.add_argument("--ticket")
+    fd.add_argument("--tag")
+    fd.add_argument("--status")
+    fd.add_argument("--workspace", help="only this workspace, its linked notes, and decisions")
+    fd.add_argument("--since", metavar="YYYY-MM-DD")
+    fd.add_argument("--all", action="store_true", help="include archived and superseded workspaces and notes")
+    fd.add_argument("--limit", type=int, default=20)
+    fd.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    # The output boundary for the whole `find` and `work` family: every subcommand, every exception type, stdout, stderr and JSON
+    # go through work_find.bounded, which relabels configured roots and redacts the complete output once before it is printed.
+    if args.command == "find":
+        sys.exit(work_find.bounded(lambda: run_find(args)))
     if args.command == "work":
-        # The work store is user-level and needs no session, except `attach`, which writes this run's session-work.json.
-        session = None
-        task_status = None
-        if args.work_command == "attach" or (args.work_command == "decision" and args.decision_command == "answer"):
-            try:
-                session = state_dir()
-            except (ValueError, OSError, subprocess.CalledProcessError) as error:
-                if args.work_command == "attach":
-                    raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
-
-            if session is not None:
-                def task_status(ident):
-                    try:
-                        return record(task_dir(session, ident))["status"]
-                    except (ValueError, OSError, KeyError):
-                        return "unknown"
-        try:
-            value = work_commands.run(args, session, task_status)
-        except work.WorkError as error:
-            raise ValueError(str(error)) from error
-        print(value if isinstance(value, str) else json.dumps(value, indent=2))
-        return
+        sys.exit(work_find.bounded(lambda: run_work(args)))
     if args.command in ("lane", "lanes"):
         # Lanes live in the repository's git directory, not in a session. Creating or listing one needs no session; the steps
         # of a lane (lane close, and the open_step / queued / waiting_on of a row) are read from this session's tasks.
@@ -1231,13 +1248,15 @@ def main():
     elif args.command == "tick":
         value = tick(base)
     elif args.command == "index":
-        if not args.no_tick:
+        if not args.no_tick and not args.no_write:  # tick launches queued work and rewrites the index: --no-write is a pure read
             tick(base)
-        value = write_index(base)
+        value = build_index(base) if args.no_write else write_index(base)
+        if args.bounded:
+            value = work_index.bounded(value)
     elif args.command == "list":
         value = all_records(base)
     elif args.command == "objective":
-        (base / "session-objective.md").write_text(args.text.strip() + "\n")
+        atomic_text(base / "session-objective.md", args.text.strip() + "\n")
         value = write_index(base)
     elif args.command == "request":
         own = os.getenv("TP_TASK_DIR")
@@ -1323,6 +1342,37 @@ def main():
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))
+
+
+def run_find(args):
+    """`tp-agent find`: returns what to print (text, or a dict for --json); work_find.bounded prints it."""
+    incomplete = []
+    rows, total = work_find.search(args.terms, args.kind, args.ticket, args.tag, args.status, args.workspace, args.since,
+                                   args.all, args.limit, incomplete)
+    if args.json:
+        return {"total": total, "rows": rows, "incomplete": bool(incomplete), "incomplete_reasons": incomplete}
+    return work_find.format_rows(rows, total, incomplete)
+
+
+def run_work(args):
+    """`tp-agent work ...`: returns what to print (text, or a JSON-able value); work_find.bounded prints it."""
+    # The work store is user-level and needs no session, except `attach`, which writes this run's session-work.json.
+    session = None
+    task_status = None
+    if args.work_command == "attach" or (args.work_command == "decision" and args.decision_command == "answer"):
+        try:
+            session = state_dir()
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            if args.work_command == "attach":
+                raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
+
+        if session is not None:
+            def task_status(ident):
+                try:
+                    return record(task_dir(session, ident))["status"]
+                except (ValueError, OSError, KeyError):
+                    return "unknown"
+    return work_commands.run(args, session, task_status)
 
 
 if __name__ == "__main__":

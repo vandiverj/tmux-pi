@@ -2,6 +2,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -54,6 +56,45 @@ class WorkCli(unittest.TestCase):
         self.assertEqual(self.ok("show", ident, "--section", "next")["text"].count("- ["), 2)
         self.assertEqual([r["id"] for r in self.ok("list")], [ident])
         self.assertEqual(self.ok("list", "--status", "done"), [])
+
+    def test_list_shows_workspaces_or_notes_newest_first(self):
+        old = self.ok("new", "Older")["id"]
+        self.ok("new", "Newer")
+        path = self.store / "workspaces" / f"{old}.md"
+        path.write_text("\n".join("updated: 2020-01-01T00:00:00Z" if line.startswith("updated:") else line for line in path.read_text().split("\n")))
+        self.assertEqual([r["id"] for r in self.ok("list")], ["newer", "older"])
+        self.ok("note", "add", "A note", "--body", "x")
+        self.assertEqual([r["id"] for r in self.ok("list", "--kind", "note")], ["a-note"])
+        self.assertEqual([r["id"] for r in self.ok("list", "--kind", "note", "--status", "superseded")], [])
+
+    def test_note_add_warns_about_a_similar_note_but_still_creates_it(self):
+        first = self.raw("note", "add", "Loader batch limits", "--body", "a", "--ticket", "DMP-77", "--tag", "loader")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stderr, "")  # nothing similar yet: no warning
+        same_title = self.raw("note", "add", "Loader batch limits", "--body", "b")
+        self.assertEqual(same_title.returncode, 0, same_title.stderr)
+        self.assertIn("warning: similar note loader-batch-limits (same title)", same_title.stderr)
+        self.assertNotIn("work note supersede", same_title.stderr)
+        self.assertIn("work supersede loader-batch-limits --title", same_title.stderr)
+        created = json.loads(same_title.stdout)
+        self.assertEqual(created["near_duplicates"], ["loader-batch-limits"])
+        self.assertTrue((self.store / "notes" / f"{created['id']}.md").is_file())
+        shared = self.raw("note", "add", "Different words entirely", "--ticket", "DMP-77", "--tag", "loader")
+        self.assertIn("same ticket and tag", shared.stderr)
+        unrelated = self.raw("note", "add", "Gardening", "--ticket", "ZZ-1", "--tag", "garden")
+        self.assertEqual(unrelated.stderr, "")
+
+    def test_the_suggested_replacement_command_runs_through_the_parser(self):
+        self.ok("note", "add", "Loader batch limits", "--body", "old facts")
+        warning = self.raw("note", "add", "Loader batch limits", "--body", "again").stderr
+        suggested = re.search(r"`(work supersede [^`]+)`", warning).group(1)
+        body = self.tmp / "replacement.md"
+        body.write_text("replacement facts\n")
+        words = [{"<new title>": "Loader batch limits v2", "<file>": str(body)}.get(w, w) for w in shlex.split(suggested)]
+        self.assertEqual(words[:2], ["work", "supersede"])
+        done = self.ok(*words[1:])
+        self.assertEqual((done["superseded"], done["by"]), ("loader-batch-limits", "loader-batch-limits-v2"))
+        self.assertIn("replacement facts", (self.store / "notes" / "loader-batch-limits-v2.md").read_text())
 
     def test_note_supersede_archive(self):
         ws = self.ok("new", "Work")["id"]

@@ -71,7 +71,7 @@ if [ -f "$TP_STATE_DIR/ghost-ps" ]; then
 fi
 ''')
         (fake / "ps").chmod(0o755)
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture",
+        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
         self.env.pop("TMUX_PANE", None)

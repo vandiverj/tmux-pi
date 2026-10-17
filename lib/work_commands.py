@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 import re
 
+import sys
+
 import work
+import work_find
+import work_promote
 from work import WorkError, append_line, get_section, set_section
 
 TICKET = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
@@ -28,7 +32,8 @@ def add_parsers(sub):
     p = ws.add_parser("show", help="print a workspace (or one section)")
     ident(p)
     p.add_argument("--section", help="objective|scope|decisions|open-decisions|blockers|next|links|progress|sessions")
-    p = ws.add_parser("list", help="list workspaces")
+    p = ws.add_parser("list", help="list workspaces (or notes with --kind note), newest first")
+    p.add_argument("--kind", choices=list(work.KINDS), default="workspace")
     p.add_argument("--status")
     p.add_argument("--all", action="store_true", help="include archived")
     p = ws.add_parser("set", help="change workspace fields")
@@ -100,6 +105,14 @@ def add_parsers(sub):
     p = d.add_parser("withdraw", help="withdraw a decision; the entry stays")
     p.add_argument("id")
     p.add_argument("--reason", default="")
+    p = ws.add_parser("promote", help="write a DRAFT *.context.md from a note or workspace into a working tree (no git is run)")
+    p.add_argument("id", help="note or workspace id")
+    p.add_argument("--as", dest="kind_as", choices=["context", "task"], default="context")
+    p.add_argument("--ticket", help="a ticket id; the file goes under tasks/<ticket>/")
+    p.add_argument("--confidence", choices=list(work_promote.CONFIDENCE), default=None,
+                   help="default low for a new file; with --update, omitted leaves the file's reviewed confidence")
+    p.add_argument("--target", help="the working tree to write into (default: config)")
+    p.add_argument("--update", action="store_true", help="replace an existing draft (the diff is shown)")
     p = d.add_parser("list", help="same as `work decisions`")
     p.add_argument("--all", action="store_true")
     p.add_argument("--json", action="store_true")
@@ -131,8 +144,8 @@ def _text(value, path):
 
 def _summary(doc):
     d = doc.meta
-    return {"id": doc.id, "title": d.get("title"), "status": d.get("status"), "updated": d.get("updated"),
-            "tickets": d.get("tickets", []), "repos": d.get("repos", []), "path": str(doc.path)}
+    return {"id": doc.id, "title": d.get("title"), "status": d.get("status"), "updated": work.updated_iso(doc),
+            "tickets": d.get("tickets", []), "repos": d.get("repos", []), "path": work_find.store_path(doc.path)}
 
 
 SECTION_NAMES = {"objective": "Objective", "scope": "Scope", "decisions": "Decisions", "open-decisions": "Open decisions",
@@ -177,10 +190,16 @@ def run(args, session_dir=None, task_status=None):
 def _read_command(args):
     cmd = args.work_command
     if cmd == "list":
-        rows = [_summary(d) for d in work.iter_docs("workspace") if not args.status or d.meta.get("status") == args.status]
-        if args.all:
-            rows += [_summary(d) for d in work.iter_docs("workspace", archived=True) if not args.status or d.meta.get("status") == args.status]
-        return rows
+        skipped, rows = [], []
+        for archived in ((False, True) if args.all else (False,)):
+            for d in work.iter_docs(args.kind, archived=archived, skipped=skipped):
+                try:
+                    if not args.status or d.meta.get("status") == args.status:
+                        rows.append((work.updated_at(d), _summary(d)))
+                except Exception:  # noqa: BLE001 - per-document isolation: one malformed file never hides the others
+                    work.note_skipped(skipped, d.path)
+        _report_skipped(skipped)
+        return [row for _, row in sorted(rows, key=lambda r: r[0], reverse=True)]
     if cmd == "show":
         doc = work.load("workspace", args.id)
         value = _summary(doc)
@@ -197,9 +216,17 @@ def _read_command(args):
     if cmd == "note":
         doc = work.load("note", args.id)
         return {**_summary(doc), "meta": doc.meta, "text": doc.body}
-    if getattr(args, "json", False):
-        return work.open_decisions(args.all)
-    return decisions_text(work.open_decisions(args.all))
+    skipped = []
+    rows = work.open_decisions(args.all, skipped=skipped)
+    _report_skipped(skipped)
+    return rows if getattr(args, "json", False) else decisions_text(rows)
+
+
+def _report_skipped(skipped):
+    """Names the work files that could not be read on stderr (stdout, and so --json, stays what it was)."""
+    names = work.skipped_files(skipped)
+    if names:
+        print(f"warning: {len(names)} unreadable work files skipped: {', '.join(names)}", file=sys.stderr)
 
 
 def decisions_text(rows):
@@ -227,6 +254,8 @@ def _write_command(args, session_dir, task_status):
         return _summary(doc)
     if cmd == "note" and args.note_command == "add":
         return _note_add(args)
+    if cmd == "promote":
+        return work_promote.promote(args.id, args.kind_as, args.ticket, args.confidence, args.target, args.update)
     if cmd == "supersede":
         return _supersede(args)
     if cmd == "archive":
@@ -302,13 +331,23 @@ def _note_add(args):
     tickets = list(dict.fromkeys([*args.ticket, *TICKET.findall(args.title)]))
     for ws in args.workspace:
         work.load("workspace", ws, include_archived=False)
-    similar = [d.id for d in work.iter_docs("note") if d.id == work.slugify(args.title)
-               or (tickets and set(tickets) & set(d.meta.get("tickets", [])) and set(args.tag) & set(d.meta.get("tags", [])))]
+    unreadable = []
+    similar = work_find.near_duplicates(args.title, tickets, args.tag, unreadable)
+    for dup in similar:  # a warning, not a refusal: the note is still created. Screened values only, then the output boundary.
+        what = (f"its id or path is withheld; locate it with `tp-agent find --kind note`" if dup["withheld"] else
+                f"read it first, or replace it with `work supersede {dup['id']} --title \"<new title>\" --body-file <file>`")
+        print(work_find.guard(f"warning: similar note {dup['id']} ({dup['why']}): {dup['title']} — {dup['path']}; {what}"),
+              file=sys.stderr)
+    skipped = work.skipped_count(unreadable)
+    if skipped:  # the note is still created: say only that the check was incomplete
+        print(work_find.guard(f"warning: duplicate check incomplete: {skipped} unreadable notes skipped"), file=sys.stderr)
     meta = {"workspaces": args.workspace, "tickets": tickets, "tags": args.tag, "sources": args.source, "important": args.important}
     doc = work.create("note", args.title, args.id, meta, _text(args.body, args.body_file))
     value = _summary(doc)
     if similar:
-        value["near_duplicates"] = similar
+        value["near_duplicates"] = [d["id"] for d in similar]
+    if skipped:
+        value["near_duplicates_incomplete"] = skipped
     return value
 
 
@@ -329,7 +368,8 @@ def _supersede(args):
             inherited = {k: old.meta[k] for k in ("workspaces", "tickets", "tags", "important") if old.meta.get(k)}
             new = work.create("note", args.title, args.new_id, {**inherited, "supersedes": old.id}, _text(args.body, args.body_file))
     work.move_to_archive(old, "superseded", {"superseded_by": new.id})
-    return {"superseded": old.id, "by": new.id, "archived_path": str(old.path), "path": str(new.path)}
+    return {"superseded": old.id, "by": new.id, "archived_path": work_find.store_path(old.path),
+            "path": work_find.store_path(new.path)}
 
 
 def _archive(args):

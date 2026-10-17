@@ -85,6 +85,15 @@ const started = Date.now();
 assert.deepEqual(await invoke(load(fast).commands), [['Status refresh failed: timed out after 0.3s', 'error']]);
 assert(Date.now() - started < 5000, 'hung script was not awaited');
 
+// task_index asks for the bounded index (R3-F3): open decisions as counts, top ids and the command, never the uncapped list.
+const agent = path.join(bin, 'tp-agent');
+fs.writeFileSync(agent, `#!/bin/sh\nprintf '{"argv":"%s","work":{"decisions":{"open":300,"blocking":2,"summary":"decisions: 300 open"}}}' "$*"\n`);
+fs.chmodSync(agent, 0o755);
+const indexed = await tools.task_index.execute();
+assert.equal(indexed.details.argv, 'index --bounded');
+assert.equal(indexed.details.work.decisions.items, undefined, 'no uncapped decision list reaches the model');
+assert.equal(indexed.content[0].text, JSON.stringify(indexed.details));
+
 assert.deepEqual(model, [], 'no model-facing message, entry, or event hook');
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('ok');

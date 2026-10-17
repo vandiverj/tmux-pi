@@ -1,3 +1,13 @@
 {
-  "store": "~/.config/tmux-pi/work"
+  "store": "~/.config/tmux-pi/work",
+  "inject_candidates": 3,
+  "inject_notes": 3,
+  "recent_days": 14,
+  "inject_decisions_chars": 1200,
+  "find_line_max": 4000,
+  "shared": {
+    "path": "",
+    "promote_dir": "",
+    "search": false
+  }
 }

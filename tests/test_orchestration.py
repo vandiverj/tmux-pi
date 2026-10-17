@@ -711,9 +711,10 @@ esac
         self.assertFalse((self.state / "queue" / f"{second['id']}.json").exists())
 
     def test_total_slots_queue_without_blocking_direct_answers(self):
-        active = [self.dispatch(task=f"Task {i}") for i in range(4)]
+        limit = json.loads((ROOT / "config/orchestration.json").read_text())["max_active_workers"]
+        active = [self.dispatch(task=f"Task {i}") for i in range(limit)]
         self.assertTrue(all(item["status"] == "starting" for item in active))
-        fifth = self.dispatch(task="Task 5")
+        fifth = self.dispatch(task=f"Task {limit + 1}")
         self.assertEqual(fifth["status"], "queued")
         self.assertIn("global worker slots", fifth["reason"])
         self.settle(active[0], "RESULT_STATUS: complete")

@@ -7,6 +7,10 @@ task that bin/tp-review launches with `--review-of`. Nothing is dissolved by tim
 and only `tp-agent autonomy off` (a user action by policy, not authentication) turns the protection off. It reads only this run's
 state, so another run or another workspace is never affected, and it never touches a running worker.
 
+Phase D2 adds the second condition: with recovery clear, an open `blocking` decision in a workspace attached to this run refuses the
+dispatch its `Affects` covers (`workspace` all, `lane:<n>` that --lane, `task:<id>` that --parent) and admits the rest. Only a
+`--by user` answer with a `--quote`, or a withdrawal, closes it (lib/work_commands.py): policy, not authentication.
+
 One policy, three callers: bin/tp-spawn (every start, whoever asks), tp-agent's `dispatch` (before any lane or branch is written) and
 tp-agent's `capacity` (so a queued item reports why it waits). `python3 lib/autonomy.py gate ...` is the shell entry for the first.
 The gate fails closed: a record it cannot read refuses.
@@ -21,6 +25,7 @@ import sys
 import contract
 import work
 import work_checkpoint
+import work_index
 
 FILE = "session-autonomy.json"
 REVIEW_ROLE = "code-reviewer"
@@ -129,21 +134,79 @@ def refusal_text(state, review_note=""):
             f"Only the user turns protection off: tp-agent autonomy off --reason \"...\"" + review_note)
 
 
-def gate(state_dir, role="", preamble_role="", review_of="", deliverable="", lane="", lane_step=""):
+def _covers(entry, lane, parent):
+    """Whether an open blocking decision's `Affects` covers this dispatch: `lane:<n>` only that --lane, `task:<id>` only that --parent,
+    `workspace` everything, and an entry with no recognised target (e.g. only `next:<n>`) blocks as `workspace`."""
+    recognised = False
+    for target in entry["affects"]:
+        kind, _, value = target.partition(":")
+        if kind == "lane" and value:
+            recognised = True
+            if lane == value:
+                return True
+        elif kind == "task" and value:
+            recognised = True
+            if parent == value:
+                return True
+        elif target == "workspace":
+            return True
+    return not recognised
+
+
+def _attached_strict(state_dir):
+    """The workspaces attached to this run. No record is no attachments; a record that exists but cannot be read raises, so the gate
+    refuses rather than losing the scope (work_index.attached_ids is the tolerant reader for the index)."""
+    path = Path(state_dir) / "session-work.json"
+    if not (path.exists() or path.is_symlink()):
+        return []
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"attachment record {path.name} cannot be read: {error}")
+    # The writer always records {"attached": [ids]}; any other shape is malformed, never "nothing attached".
+    value = record.get("attached") if isinstance(record, dict) else None
+    if not isinstance(value, list) or not all(isinstance(i, str) and i for i in value):
+        raise ValueError(f"attachment record {path.name} is malformed")
+    return value
+
+
+def blocking_decision(state_dir, lane="", parent="", any_scope=False):
+    """The first open blocking decision, in a workspace attached to this run, that covers the dispatch (a work.decisions_of entry plus
+    its workspace), else None. any_scope ignores what it covers (for status). A workspace or attachment record that cannot be read
+    raises: the gate then refuses."""
+    for ident in dict.fromkeys(_attached_strict(state_dir)):
+        doc = work.load("workspace", ident, include_archived=False)
+        for entry in work.decisions_of(doc):
+            if entry["status"] == "open" and entry["blocking"] and (any_scope or _covers(entry, lane, parent)):
+                return {**entry, "workspace": ident}
+    return None
+
+
+def decision_refusal(entry):
+    return (f"autonomy is on and blocking decision {entry['id']} is open ({_clip(entry['question'], 100)}; affects {', '.join(entry['affects'])}): "
+            f"dispatch it covers waits, other work continues. Only the user clears it: ask them, then record their words with "
+            f"tp-agent work decision answer {entry['id']} --text \"...\" --by user --quote \"their exact words\" "
+            f"(an answer by the agent does not clear it), or the user withdraws it: tp-agent work decision withdraw {entry['id']}")
+
+
+def gate(state_dir, role="", preamble_role="", review_of="", deliverable="", lane="", lane_step="", parent=""):
     """None when this start is admitted, else the refusal (a sentence naming the cause and the command that clears it).
 
-    Autonomy off (no file) admits everything. Otherwise a start is admitted while no recovery is pending, or when it is the launch of a
-    review of an existing finished task (review_problem). Never raises: a record that cannot be read is a refusal."""
+    Autonomy off (no file) admits everything. Otherwise a start is admitted when it is the launch of a review of an existing finished
+    task (review_problem), or when (1) no recovery is pending and (2) no open blocking decision of an attached workspace covers it
+    (blocking_decision). Never raises: a record that cannot be read is a refusal."""
     try:
         if record(state_dir) is None:
             return None
         state = recovery(state_dir)
-        if not state["pending"]:
-            return None
         problem = review_problem(state_dir, review_of, role, preamble_role, deliverable, lane, lane_step)
         if problem is None:
             return None
-        return refusal_text(state, f" [not admitted as a review: {problem}]" if review_of else "")
+        review_note = f" [not admitted as a review: {problem}]" if review_of else ""
+        if state["pending"]:
+            return refusal_text(state, review_note)
+        decision = blocking_decision(state_dir, lane, parent)
+        return decision_refusal(decision) + review_note if decision else None
     except (ValueError, OSError) as error:
         return f"autonomy state cannot be read, so no worker starts: {error}"
 
@@ -218,6 +281,15 @@ def status(state_dir):
            "reason": current.get("reason", ""), "recovery": state, "blocked": None}
     if state["pending"]:
         out["blocked"] = {"since": state["since"], "by": "recovery", "clear": CLEAR}
+        return out
+    try:
+        decision = blocking_decision(state_dir, any_scope=True)
+    except (ValueError, OSError) as error:
+        out["blocked"] = {"by": "unreadable work state", "clear": f"repair it ({_clip(str(error), 120)})"}
+        return out
+    if decision:
+        out["blocked"] = {"by": f"blocking decision {decision['id']}", "decision": decision["id"], "affects": decision["affects"],
+                          "clear": f"the user answers it: tp-agent work decision answer {decision['id']} --text \"...\" --by user --quote \"their exact words\""}
     return out
 
 
@@ -232,7 +304,11 @@ def index_entry(state_dir):
         line = f"autonomy on (workspace {_clip(value['workspace'], 60)}): recovery clear, dispatch admitted"
     else:
         since = f" since {_clip(blocked.get('since'), 40)}" if blocked.get("since") else ""
-        line = f"autonomy on: dispatch blocked{since} by {blocked['by']}; clear it with `{blocked['clear']}`"
+        if blocked.get("decision"):
+            line = (f"autonomy on: dispatch covered by blocking decision {blocked['decision']} refused (other work continues); "
+                    f"it clears when the user answers: `{blocked['clear']}`")
+        else:
+            line = f"autonomy on: dispatch blocked{since} by {blocked['by']}; clear it with `{blocked['clear']}`"
     return {"on": value["autonomy"] == "on", "workspace": value.get("workspace", ""), "blocked_since": (blocked or {}).get("since") or None,
             "blocked": blocked is not None, "line": line}
 
@@ -243,10 +319,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="the autonomy gate, for bin/tp-spawn")
     parser.add_argument("command", choices=["gate"])
     parser.add_argument("--state-dir", required=True)
-    for name in ("role", "preamble-role", "review-of", "deliverable", "lane", "lane-step"):
+    for name in ("role", "preamble-role", "review-of", "deliverable", "lane", "lane-step", "parent"):
         parser.add_argument(f"--{name}", default="")
     args = parser.parse_args(argv)
-    refusal = gate(args.state_dir, args.role, args.preamble_role, args.review_of, args.deliverable, args.lane, args.lane_step)
+    refusal = gate(args.state_dir, args.role, args.preamble_role, args.review_of, args.deliverable, args.lane, args.lane_step, args.parent)
     if refusal:
         print(f"tp-spawn: refused: {refusal}", file=sys.stderr)
         return REFUSED

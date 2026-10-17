@@ -272,7 +272,7 @@ fi
 # of a finished task, whoever asked (tp-agent, the dispatcher, a direct call), before any pane, lane reservation or directory exists.
 # With autonomy off it admits everything. It never stops a running worker. An error in the gate refuses too.
 python3 "$ROOT/lib/autonomy.py" gate --state-dir "$state_dir" --role "$role" --preamble-role "$preamble_role" --review-of "$review_of" \
-  --deliverable "$deliverable" --lane "$lane" --lane-step "$lane_step" || exit 1
+  --deliverable "$deliverable" --lane "$lane" --lane-step "$lane_step" --parent "$parent" || exit 1
 
 # LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
 if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then

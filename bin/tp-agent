@@ -429,7 +429,8 @@ def lane_refusal(name, holders):
 def capacity(base, item):
     """(ok, reason) for starting a queue item now. The item is validated here, so no caller can pass raw data."""
     item = queue_item(item)
-    refusal = autonomy.gate(base, role=item["role"], deliverable=item["deliverable"], lane=item.get("lane", ""), lane_step=item.get("lane_step", ""))
+    refusal = autonomy.gate(base, role=item["role"], deliverable=item["deliverable"], lane=item.get("lane", ""), lane_step=item.get("lane_step", ""),
+                            parent=item["parent"])
     if refusal:  # the early look at tp-spawn's own gate: a queued item keeps waiting, with the reason, and starts once recovery is done
         return False, refusal
     if "lane" in item:  # the one-writer rule again at start, for what was written around the tool
@@ -847,7 +848,9 @@ def dispatch(args, base):
         raise ValueError(f"unknown role: {args.role}")
     # Autonomy's recovery gate comes before anything is written: a refused dispatch creates no lane, branch, worktree or queue entry.
     # (A dispatch is never a review, so the lane and the deliverable change nothing: while recovery is pending all of them wait.)
-    refusal = autonomy.gate(base, role=args.role, deliverable=args.deliverable or "")
+    retry = getattr(args, "lane_meta", None)
+    refusal = autonomy.gate(base, role=args.role, deliverable=args.deliverable or "", parent=args.parent or "",
+                            lane=(retry["lane"] if retry else getattr(args, "lane", None)) or "")
     if refusal:
         raise ValueError(refusal)
     tests = getattr(args, "tests", None)
@@ -981,7 +984,7 @@ def investigate(base, args):
     ident = args.investigate_failure
     # The recovery gate comes before the investigation folder, the diff and the clean worktree (git) are written: dispatch() below asks
     # the same question, but only after those exist.
-    refusal = autonomy.gate(base, role="tester", deliverable=args.deliverable or "investigation.md")
+    refusal = autonomy.gate(base, role="tester", deliverable=args.deliverable or "investigation.md", parent=ident)
     if refusal:
         raise ValueError(refusal)
     if not IDENT.fullmatch(ident) or not ((base / "tasks" / ident / "meta.json").is_file() or find_archived_task(base, ident)):

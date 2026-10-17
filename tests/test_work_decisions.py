@@ -134,7 +134,7 @@ class Decisions(unittest.TestCase):
         self.assertEqual(out["can_resume"], [])
         self.assertEqual(out["next_actions_mentioning"], [])
         self.assertIn("blocking", out["note"])
-        user = self.ok("decision", "answer", d["id"], "--text", "go", "--by", "user")
+        user = self.ok("decision", "answer", d["id"], "--text", "go", "--by", "user", "--quote", "go ahead")
         self.assertEqual([t["target"] for t in user["can_resume"]], ["task:t-1", "next:1"])
         self.assertEqual(len(user["next_actions_mentioning"]), 1)
 

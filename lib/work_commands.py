@@ -103,8 +103,9 @@ def add_parsers(sub):
     p = d.add_parser("answer", help="record the resolution and print what can resume")
     p.add_argument("id")
     p.add_argument("--text", required=True)
-    p.add_argument("--by", choices=["user", "agent"], default="user")
-    p.add_argument("--quote", default="")
+    p.add_argument("--by", choices=["user", "agent"], default="user",
+                   help="who answered; recorded on the entry. A blocking decision is cleared only by --by user with their exact words in a non-empty --quote (policy, not authentication: --by cannot prove who spoke)")
+    p.add_argument("--quote", default="", help="the user's exact words, verbatim; recorded on the entry")
     p = d.add_parser("withdraw", help="withdraw a decision; the entry stays")
     p.add_argument("id")
     p.add_argument("--reason", default="")
@@ -620,8 +621,9 @@ def _decision(args, task_status):
         raise WorkError(f"{entry['id']} is already {entry['status']}")
     entry["_dirty"] = True
     if sub == "answer":
-        cleared = not (entry["blocking"] and args.by != "user")
-        # An agent's answer is stored but never clears a blocking entry: it stays open, in the queue, until the user answers or it is withdrawn.
+        cleared = not (entry["blocking"] and not (args.by == "user" and args.quote.strip()))
+        # An answer that is not --by user with a --quote is stored (by and quote on the entry) but never clears a blocking entry: it stays open, in the queue, until
+        # the user answers or it is withdrawn. Policy only: nothing authenticates --by.
         entry.update(status="answered" if cleared else "open", resolution=args.text, by=args.by, at=work.now(), quote=args.quote)
         work.put_decisions(doc, entries)
         mentions = [l.strip() for l in _lines(get_section(doc.body, "Next actions")) if entry["id"] in l]
@@ -630,7 +632,7 @@ def _decision(args, task_status):
                  "can_resume": resume_targets(entry, task_status) if cleared else [],
                  "next_actions_mentioning": mentions if cleared else []}
         if not cleared:
-            value["note"] = "recorded by agent: the blocking decision stays open until the user answers it (or it is withdrawn)"
+            value["note"] = "recorded, but the blocking decision stays open until the user answers it with --by user and their exact words in --quote (or it is withdrawn)"
         return value
     entry.update(status="withdrawn", withdrawn=args.reason or "withdrawn", at=work.now())
     work.put_decisions(doc, entries)

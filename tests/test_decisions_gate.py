@@ -151,6 +151,47 @@ class AnswerRuleTests(DecisionCase):
         self.assertIn("not authentication", " ".join(run.stdout.split()))
 
 
+class ScopeTextTests(DecisionCase):
+    """The scope sentences (dispatch --help, `work decision add --help`, the refusal) say what autonomy._covers does."""
+
+    def flat(self, *args):
+        run = self.run_cli(*args)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return " ".join(run.stdout.split())
+
+    def test_dispatch_help_says_how_affects_scopes_a_blocking_decision(self):
+        text = self.flat("dispatch", "--help")
+        for part in ("an open blocking decision of an attached workspace holds back the dispatches its --affects covers",
+                     "workspace (the default) every dispatch", "task:<id> a dispatch with --parent <id>",
+                     "--investigate-failure <id> counts as --parent <id>", "lane:<name> a dispatch with --lane <name>",
+                     "a decision with only next: or no target blocks every dispatch", "Any one matching target blocks"):
+            self.assertIn(part, text)
+        self.assertIn("dispatch --parent <id>", self.flat("work", "decision", "add", "--help"))
+
+    def test_the_refusal_states_the_scopes_it_enforces(self):
+        self.decide("demo", "lane:beta")
+        entry = autonomy.blocking_decision(self.state, lane="beta")
+        text = autonomy.decision_refusal(entry)
+        self.assertIn("Its --affects scopes it: workspace blocks every dispatch, task:<id> only --parent <id>, lane:<name> only --lane <name>", text)
+        run = self.dispatch_role(extra=["--lane", "beta"])
+        self.gated(run)
+        self.assertIn("lane:<name> only --lane <name>", run.stderr)
+
+    def test_what_the_text_says_is_what_the_gate_does(self):
+        """Each sentence of the help as a gate decision: (affects, dispatch lane, dispatch parent) -> covered?"""
+        cases = [(["workspace"], "", "", True), ([], "", "", True), (["next:2"], "alpha", "coder-x2", True),
+                 (["task:coder-x1"], "", "coder-x1", True), (["task:coder-x1"], "", "coder-x2", False), (["task:coder-x1"], "beta", "", False),
+                 (["lane:beta"], "beta", "", True), (["lane:beta"], "alpha", "coder-x1", False), (["lane:beta"], "", "", False),
+                 (["task:coder-x1", "lane:beta"], "beta", "coder-x2", True), (["task:coder-x1", "lane:beta"], "alpha", "coder-x1", True),
+                 (["next:2", "lane:beta"], "alpha", "", False)]
+        for affects, lane, parent, covered in cases:
+            with self.subTest(affects=affects, lane=lane, parent=parent):
+                ident = self.decide("demo", *affects)["id"]
+                found = autonomy.blocking_decision(self.state, lane=lane, parent=parent)
+                self.assertEqual(found is not None, covered)
+                self.answer(ident, "user", "--quote", "go")
+
+
 class QueueTests(DecisionCase):
     def test_queued_work_waits_with_the_decision_and_starts_after_the_user_answers(self):
         ident = self.queue()

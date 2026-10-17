@@ -97,7 +97,8 @@ def add_parsers(sub):
     p.add_argument("--background", default="")
     p.add_argument("--options", default="")
     p.add_argument("--recommended", default="")
-    p.add_argument("--affects", action="append", default=[], help="workspace | task:<id> | lane:<name> | next:<n> (repeatable)")
+    p.add_argument("--affects", action="append", default=[], help="what a blocking decision holds back under autonomy: workspace (default: every dispatch) | task:<id> (dispatch --parent <id>) | "
+                        "lane:<name> (dispatch --lane <name>) | next:<n> (a next action; alone it blocks every dispatch) (repeatable)")
     p.add_argument("--priority", choices=work.PRIORITIES, default="normal")
     p.add_argument("--blocking", action="store_true")
     p = d.add_parser("answer", help="record the resolution and print what can resume")
@@ -240,8 +241,23 @@ def _run_id(session_dir):
     return Path(session_dir).name if session_dir else ""
 
 
+def public(value):
+    """What a command prints: the same value without the internal keys (names starting with `_`, such as the `_dirty` flag that tells
+    the writer to re-render a decision), at any depth."""
+    if isinstance(value, dict):
+        return {key: public(item) for key, item in value.items() if not (isinstance(key, str) and key.startswith("_"))}
+    if isinstance(value, list):
+        return [public(item) for item in value]
+    return value
+
+
 def run(args, session_dir=None, task_status=None, tasks=None):
-    """`tasks`: a callable returning the live task records of this session (for the checkpoint diff), or None."""
+    """`tasks`: a callable returning the live task records of this session (for the checkpoint diff), or None. The value never carries
+    internal keys (`public`)."""
+    return public(_run(args, session_dir, task_status, tasks))
+
+
+def _run(args, session_dir, task_status, tasks):
     cmd = args.work_command
     if cmd == "compacted":  # touches the session's state directory only, never the work store
         return work_checkpoint.compacted(session_dir, args.reason)

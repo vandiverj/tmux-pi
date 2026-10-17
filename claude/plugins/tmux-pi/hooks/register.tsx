@@ -392,9 +392,24 @@ const WORK_COMMAND = 'tp-agent work decisions'
 const PRIORITY_RANK: Record<string, number> = { high: 0, normal: 1, low: 2 }
 const DEFAULT_DECISION_CHARS = 1200
 
+// The first `size` UTF-16 code units, except that a surrogate pair the cut would split is left out whole (lib/index_text.py _head does the same).
+function cutUnits(text: string, size: number): string {
+  const high = text.charCodeAt(size - 1)
+  const low = text.charCodeAt(size)
+  return high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff ? text.slice(0, size - 1) : text.slice(0, size)
+}
+
+// The C0 controls other than newline and tab dropped, then every lone surrogate replaced by U+FFFD (lib/index_text.py _clean does the
+// same, in the same order). Run on the finished text: it never lengthens it, so the budget still holds.
+function wellFormed(text: string): string {
+  return text
+    .replace(/[\x00-\x08\x0b-\x1f]/g, '')
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd')
+}
+
 function plain(text: unknown, size: number): string {
   const one = (typeof text === 'string' ? text : '').replace(/\s+/g, ' ').trim()
-  return one.length <= size ? one : `${one.slice(0, size - 1)}…`
+  return one.length <= size ? one : `${cutUnits(one, size - 1)}…`
 }
 
 function decisionTrailer(more: number, moreBlocking: number): string {
@@ -541,7 +556,7 @@ async function readIndex($: EngineInterface): Promise<{ text: string; rows: unkn
   if (typeof index !== 'object' || index === null) return undefined
   const { objective, active, pending, paused, unstatused } = index as Record<string, unknown>
   const lines = ['tmux-pi task index (injected; run `tp-agent index` only if this is missing):']
-  lines.push(`objective: ${(typeof objective === 'string' && objective.trim() !== '' ? objective.trim() : '(none set)').slice(0, 1000)}`)
+  lines.push(`objective: ${cutUnits(typeof objective === 'string' && objective.trim() !== '' ? objective.trim() : '(none set)', 1000)}`)
   // Room kept for the active and pending headers and the omission line, so the whole text fits.
   const limit = INDEX_CHARS - 120
   // Workers that await the main come first (paused, unstatused, and needs_input: a request with no pause), then the
@@ -585,7 +600,7 @@ async function readIndex($: EngineInterface): Promise<{ text: string; rows: unkn
     }
   }
   if (cut > 0) lines.push(`… ${cut} more not shown; run tp-agent index for all of them`)
-  return { text: lines.join('\n'), rows: shown }
+  return { text: wellFormed(lines.join('\n')), rows: shown }
 }
 
 async function registerCommands($: EngineInterface) {
@@ -636,17 +651,11 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // After a compaction the index goes in as SessionStart context: an append made while
-  // compacting lands before the boundary and the model never reads it.
-  on('classic.SessionStart', async ($, e, next) => {
-    const answer = await next(e)
-    if (!isActive || e.source !== 'compact') return answer
-    // Mark recovery pending before the index is read (set-only and idempotent; the PreCompact hook has usually done it already).
-    await runTpAgent($, ['work', 'compacted', '--reason', 'session-start:compact'])
-    const index = await readIndex($)
-    if (index === undefined) return answer
-    return { ...answer, additionalContext: [...(answer.additionalContext ?? []), index.text] }
-  }).catch(($, e, next) => next(e))
+  // The index after a compaction is not injected here. A `classic.SessionStart` handler was written for it, but the engine never
+  // delivered its answer (no hook-context record after the compaction boundary, in a live test and across 7 compactions of a
+  // long session), and an append made while compacting lands before the boundary, which the model never reads. The command
+  // hook hooks/sessionstart-compact.sh (SessionStart, matcher compact in hooks.json) marks recovery pending and delivers the
+  // index as additionalContext, from `tp-agent index --no-write --hook-json`. The startup append above stays.
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!isActive || e.props.hasSurvey) return next(e)

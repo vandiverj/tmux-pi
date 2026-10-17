@@ -370,7 +370,8 @@ class CliIndexTests(IndexBase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_the_injection_reader_calls_index_no_write_and_that_leaves_the_file_alone(self):
-        """The Claude plugin's startup and compaction injection share one `readIndex` call; the file it reads must not change."""
+        """The Claude plugin module's startup injection is one `readIndex` call (the compaction one is the SessionStart command hook, which
+        runs `tp-agent index --no-write --hook-json`); the file it reads must not change."""
         source = (ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "register.tsx").read_text()
         called = [m for m in re.findall(r"runTpAgent\(\$, \[([^\]]*)\]\)", source) if "index" in m]
         self.assertEqual(called, ["'index', '--no-write'"])

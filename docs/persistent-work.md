@@ -68,10 +68,11 @@ What a checkpoint cannot capture: a `PreCompact` hook runs no model, so a decisi
 the workspace is not in it. Write decisions through `work decide|next|block|decision add` as they are made; the injection also
 says how long ago the workspace was last updated and asks for re-confirmation with the user.
 
-After a compaction the injected task index (Claude: `SessionStart` with source `compact`; Pi: `task_index`) names the attached
+After a compaction the injected task index (Claude: the `SessionStart` command hook for source `compact`,
+`hooks/sessionstart-compact.sh`, which prints the hook output `tp-agent index --no-write --hook-json` builds; Pi: `task_index`) names the attached
 workspace, the checkpoint's age and validity, any task that changed since, and `tp-agent work recover`. Building that text reads
 files and writes none, so injecting twice gives the same text. The recovery-pending marker in the run's state directory is a
-generation: the `PreCompact` hook, the `SessionStart(compact)` handler (whether or not a checkpoint could be written), `work
+generation: the `PreCompact` hook, the `SessionStart(compact)` command hook (whether or not a checkpoint could be written), `work
 attach` in a run (a restart that attaches a workspace) and `autonomy on` each add one under `session-recovery/` without taking a
 lock. `tp-agent work recovered --evidence "..."` (after the same reconciliation `work recover` prints; `--accept T1,T2` for tasks
 that changed, `--no-checkpoint` when this run has none; it refuses when the live task records cannot be read) records in

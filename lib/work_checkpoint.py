@@ -713,13 +713,16 @@ def _event(state_dir, generation):
 
 
 def marker(state_dir, missing_is_pending=False):
-    """{pending, generation, cleared_generation, since, reason, problem, evidence}. Reads only and never raises.
+    """{pending, generation, cleared_generation, since, reason, events_pending, latest_since, latest_reason, problem, evidence}. Reads
+    only and never raises.
 
     `since`/`reason` are those of the oldest event not yet cleared (so the first compaction's time stays while more happen), or of the
-    last cleared one. Whatever cannot be read is pending (`problem` says why): not knowing is not recovered. A missing generation
+    last cleared one; `events_pending` counts the events not yet cleared and `latest_since`/`latest_reason` are the newest of them
+    (empty and 0 when none), so a status that shows an older event than the one a reader just caused says how many there are. Whatever cannot be read is pending (`problem` says why): not knowing is not recovered. A missing generation
     directory is clear for an interactive run, and pending with `missing_is_pending` (autonomy on armed it, so its absence means it
     was removed)."""
-    out = {"pending": False, "generation": 0, "cleared_generation": 0, "since": "", "reason": "", "problem": "", "evidence": ""}
+    out = {"pending": False, "generation": 0, "cleared_generation": 0, "since": "", "reason": "", "events_pending": 0, "latest_since": "",
+           "latest_reason": "", "problem": "", "evidence": ""}
     path = Path(state_dir) / RECOVERY_FILE
     legacy = None
     try:
@@ -753,10 +756,10 @@ def marker(state_dir, missing_is_pending=False):
     newer = [n for n in found if n > out["cleared_generation"]]
     if out["generation"] < out["cleared_generation"]:
         out["problem"] = out["problem"] or "the recovery generations are behind the clear record"
-    if newer:
-        out.update(_event(state_dir, newer[0]))
-    elif legacy:
-        out.update(legacy)
+    if newer or legacy:  # an uncleared Phase C marker predates every generation, so it is the oldest event
+        out.update(legacy or _event(state_dir, newer[0]))
+        latest = _event(state_dir, newer[-1]) if newer else legacy
+        out.update(events_pending=len(newer) + bool(legacy), latest_since=latest["since"], latest_reason=latest["reason"])
     out["pending"] = bool(newer or legacy or out["problem"])
     return out
 

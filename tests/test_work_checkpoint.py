@@ -743,6 +743,15 @@ class Marker(Base):
         (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"pending": False, "since": "x", "reason": "old"}))
         self.assertFalse(cp.marker(self.state)["pending"])
 
+    def test_a_phase_c_marker_stays_the_oldest_event_when_a_generation_is_armed(self):
+        (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"pending": True, "since": "2026-10-01T00:00:00Z", "reason": "precompact:manual"}))
+        cp.compacted(self.state, "session-start:compact")
+        marker = cp.marker(self.state)
+        self.assertEqual((marker["pending"], marker["reason"], marker["events_pending"], marker["latest_reason"]),
+                         (True, "precompact:manual", 2, "session-start:compact"))
+        self.assertTrue(cp.recovered(self.state, "checked")["changed"])
+        self.assertFalse(cp.marker(self.state)["pending"])
+
     def test_the_marker_needs_no_work_store(self):
         cp.compacted(self.state)
         self.assertFalse(self.store.exists())

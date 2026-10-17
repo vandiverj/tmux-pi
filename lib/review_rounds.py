@@ -494,7 +494,9 @@ def render_scope(found, lane, list_file, max_bytes):
                f"`{git} diff --stat {base} -- <path> ...`. Run both the working-tree and the staged command for a path: a staged change "
                "the working tree undoes shows only in the staged one. "
                "Every `git diff`, `git show` and `git log -p` you run must keep that prefix and must name explicit file paths from the list above; never run them "
-               "unscoped, with a bare directory, or on a path that is withheld. Untracked files do not appear in `git diff`: read them directly.")
+               "unscoped, with a bare directory, or on a path that is withheld. Write each path literally in the command; never put paths in a "
+               "shell variable or array (`$p`, `\"${p[@]}\"`): the sensitive-read guard cannot see them and stops for permission. Split a long list "
+               "over several commands instead. Untracked files do not appear in `git diff`: read them directly.")
     return "\n".join(out), size, True
 
 

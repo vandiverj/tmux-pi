@@ -77,7 +77,11 @@ lock. `tp-agent work recovered --evidence "..."` (after the same reconciliation 
 that changed, `--no-checkpoint` when this run has none; it refuses when the live task records cannot be read) records in
 `session-recovery.json` the generation it validated, so a compaction during or after it stays pending. Nothing clears it by
 time. With `tp-agent autonomy on --workspace ID` (Claude orchestrator main only) a pending marker refuses every new worker start
-except a `tp-review` of a finished task; `autonomy off` is the user's way out. An attached workspace whose file is missing or corrupt is still named in the injected text, with
+except a `tp-review` of a finished task; `autonomy off` is the user's way out. With recovery clear, an open `blocking` decision in an attached workspace
+refuses only the dispatch its `Affects` covers (`workspace` all, `lane:<n>` that lane, `task:<id>` that parent); `autonomy status` and the
+index name the decision id and say covered dispatch is refused. It clears only by `tp-agent work decision answer ID --text ... --by user
+--quote "their exact words"` (an agent answer, or `--by user` with no quote, is recorded but leaves it open) or a withdrawal; this is
+policy, not authentication. An unreadable attachment record refuses with autonomy on. An attached workspace whose file is missing or corrupt is still named in the injected text, with
 `(file missing)` or `(corrupt: ...)`, and `work recover` prints the checkpoint's copy of it.
 
 Settings (`config/work.json`): `checkpoints_keep`, `checkpoint_max_bytes` (and the Phase A/B ones: `inject_*`, `recent_days`,

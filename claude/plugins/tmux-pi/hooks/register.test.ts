@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import indexTextCases from './index-text-cases'
+
 const ROOT = '/opt/tmux-pi'
 const AGENT = `${ROOT}/bin/tp-agent`
 const MAIN = { TP_ROOT: ROOT, TP_MODE: 'orchestrator' }
@@ -26,9 +28,11 @@ function world(on: On, env: Record<string, string>) {
     unstatused: undefined as Record<string, unknown>[] | undefined,
     indexWrites: 0, // `tp-agent index` runs that, unlike `index --no-write`, rewrite the index file
     work: undefined as Record<string, unknown> | undefined,
+    indexJson: undefined as unknown, // when set, `tp-agent index` answers exactly this
     workError: undefined as string | undefined,
     isRejecting: false,
     acceptsAppend: false,
+    appended: [] as string[], // the text of every row the module tried to append to the session
     listOut: undefined as string | undefined,
     ran: [] as string[][],
     submitted: [] as string[],
@@ -44,7 +48,11 @@ function world(on: On, env: Record<string, string>) {
     w.commands.push(e.name)
     return { value: { command: e.name } }
   })
-  on('session.append', (_$, e, next) => (w.acceptsAppend ? next(e) : ({ deny: 'the test refuses the index row' } as never)))
+  on('session.append', (_$, e, next) => {
+    const first = (e.message as { content?: { text?: string }[] }).content?.[0]
+    w.appended.push(first?.text ?? '')
+    return w.acceptsAppend ? next(e) : ({ deny: 'the test refuses the index row' } as never)
+  })
   on('command.run', () => ({ text: 'engine' }))
   on('classic.SessionStart', () => ({}))
   on('ui.toast', (_$, e) => {
@@ -64,6 +72,7 @@ function world(on: On, env: Record<string, string>) {
     if (tool === AGENT && verb === 'index' && !e.argv.includes('--no-write')) w.indexWrites += 1
     if (tool !== AGENT) stdout = `viewing ${verb}`
     else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.rows)
+    else if (verb === 'index' && w.indexJson !== undefined) stdout = JSON.stringify(w.indexJson)
     else if (verb === 'index') stdout = JSON.stringify({ objective: w.objective, active: w.rows, pending: [], paused: w.paused ?? [], unstatused: w.unstatused ?? [], recent: [], ...(w.work === undefined ? {} : { work: w.work }), ...(w.workError === undefined ? {} : { work_error: w.workError }) })
     else if (verb === 'collect') stdout = JSON.stringify({ id, status: w.collectStatus, result_status: w.collectResult, ...w.collectReport })
     const exitCode = w.isFailing || (verb === 'index' && w.isIndexFailing) ? 1 : 0
@@ -75,6 +84,13 @@ function world(on: On, env: Record<string, string>) {
 const start = (isInteractive: boolean) => ({ cwd: '/work', surface: isInteractive ? ('terminal' as const) : null, isInteractive })
 const verbs = (ran: string[][]) => ran.map(argv => argv[1])
 const command = (name: string, args = '') => ({ command: name, args }) as never
+// The index text the module appends at start. The index after a compaction is the SessionStart command hook's
+// (tests/test_sessionstart_compact.py). A start whose append is refused (the default here) reads the index again,
+// so this starts the session again for the current state; a world that accepts the append has it from the first start.
+const injected = async ($: never, w: { appended: string[] }) => {
+  await ($ as { session: { start: (e: never) => Promise<unknown> } }).session.start(start(true) as never)
+  return w.appended.at(-1) ?? ''
+}
 
 // ---- gate ----
 
@@ -426,24 +442,34 @@ test('a failing or garbled list skips the tick without a wake', async ($, on) =>
   expect(w.submitted.length).toBe(1)
 })
 
-// ---- index after compaction ----
+// ---- the index text the module appends at start ----
 
-test('SessionStart after a compaction carries the index as context', async ($, on) => {
+test('the index appended at start carries the objective and the rows', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'working', role: 'coder' }]
   await $.session.start(start(true))
-  const answer = await $.classic.SessionStart({ source: 'compact' } as never)
-  expect(answer.additionalContext?.length).toBe(1)
-  expect(answer.additionalContext?.[0]).toContain('tmux-pi task index')
-  expect(answer.additionalContext?.[0]).toContain('ship it')
-  expect(answer.additionalContext?.[0]).toContain('coder-1')
+  expect(w.appended.length).toBe(1)
+  expect(w.appended[0]).toContain('tmux-pi task index')
+  expect(w.appended[0]).toContain('ship it')
+  expect(w.appended[0]).toContain('coder-1')
 })
 
-test('injecting the index, at start and after a compaction, never rewrites the index file', async ($, on) => {
+// lib/index_text.py renders the same text for `tp-agent index --text` and `--hook-json` (the SessionStart command hook). The cases are shared:
+// tests/test_index_text.py checks the Python renderer against the same file. Regenerate `text` only from a deliberate change to
+// both renderers.
+for (const { name, index, text } of indexTextCases as { name: string; index: unknown; text: string }[]) {
+  test(`the appended index is the text lib/index_text.py renders: ${name}`, async ($, on) => {
+    const w = world(on, MAIN)
+    w.indexJson = index
+    expect(await injected($ as never, w)).toBe(text)
+  })
+}
+
+test('injecting the index never rewrites the index file', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'working', role: 'coder' }]
   await $.session.start(start(true))
-  await $.classic.SessionStart({ source: 'compact' } as never)
+  await $.session.start(start(true))
   expect(w.ran.filter(argv => argv[1] === 'index').length).toBeGreaterThanOrEqual(2)
   expect(w.indexWrites).toBe(0)
 })
@@ -452,7 +478,7 @@ test('the index carries why a queued task was refused', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'shape01', status: 'queued', reason: 'start refused: the queue entry is not an object' }]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text).toContain('- shape01 queued (start refused: the queue entry is not an object)')
 })
 
@@ -460,26 +486,34 @@ test('an index too long to inject says how many rows it left out', async ($, on)
   const w = world(on, MAIN)
   w.rows = Array.from({ length: 400 }, (_, i) => ({ id: `researcher-${String(i).padStart(4, '0')}-abcdef`, status: 'working', role: 'researcher' }))
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text).toContain('researcher-0000-abcdef')
   expect(text).toContain('more not shown; run tp-agent index')
   expect(text).not.toContain('researcher-0399-abcdef')
 })
 
-test('SessionStart from startup adds nothing, and neither does a failing index', async ($, on) => {
+test('a failing index appends nothing', async ($, on) => {
   const w = world(on, MAIN)
-  await $.session.start(start(true))
-  expect((await $.classic.SessionStart({ source: 'startup' } as never)).additionalContext ?? []).toEqual([])
   w.isFailing = true
-  expect((await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext ?? []).toEqual([])
+  await $.session.start(start(true))
+  expect(w.appended).toEqual([])
 })
 
-test('a worker gets no index after a compaction', async ($, on) => {
+test('a worker gets no index', async ($, on) => {
   const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1' })
   await $.session.start(start(true))
-  expect((await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext ?? []).toEqual([])
+  expect(w.appended).toEqual([])
   expect(w.ran).toEqual([])
+})
+
+test('a compaction is left to the SessionStart command hook: the module neither marks recovery nor injects the index', async ($, on) => {
+  const w = world(on, MAIN)
+  await $.session.start(start(true))
+  const before = w.ran.length
+  expect(await $.classic.SessionStart({ source: 'compact' } as never)).toEqual({})
+  expect(w.ran.length).toBe(before)
+  expect(w.ran.some(argv => argv[1] === 'work')).toBe(false)
 })
 
 // ---- band ----
@@ -625,11 +659,11 @@ test('the injected index lists a worker that replied without a result status', a
   w.unstatused = [{ id: 'coder-9', role: 'coder', harness: 'pi', status: 'paused', result_status: null }]
   w.paused = [{ id: 'coder-8', role: 'coder', harness: 'pi', status: 'paused', result_status: 'blocked' }]
   await $.session.start(start(true))
-  const answer = await $.classic.SessionStart({ source: 'compact' } as never)
-  expect(answer.additionalContext?.[0]).toContain('replied without a result status:')
-  expect(answer.additionalContext?.[0]).toContain('coder-9')
-  expect(answer.additionalContext?.[0]).toContain('paused:')
-  expect(answer.additionalContext?.[0]).toContain('coder-8')
+  const text = await injected($ as never, w)
+  expect(text).toContain('replied without a result status:')
+  expect(text).toContain('coder-9')
+  expect(text).toContain('paused:')
+  expect(text).toContain('coder-8')
 })
 
 test('paused and unstatused workers are injected even when active rows fill the index', async ($, on) => {
@@ -638,7 +672,7 @@ test('paused and unstatused workers are injected even when active rows fill the 
   w.unstatused = Array.from({ length: 6 }, (_, i) => ({ id: `coder-u${i}`, role: 'coder', harness: 'pi', status: 'paused', result_status: null }))
   w.paused = Array.from({ length: 6 }, (_, i) => ({ id: `coder-p${i}`, role: 'coder', harness: 'pi', status: 'paused', result_status: 'blocked' }))
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   for (let i = 0; i < 6; i++) {
     expect(text).toContain(`coder-u${i}`)
@@ -665,7 +699,7 @@ test('index tier 1: paused workers that fit are full rows, within the cap', asyn
   w.unstatused = pausedRows(10, 'coder-u', null)
   w.paused = pausedRows(10, 'coder-p', 'blocked')
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   for (const row of [...w.unstatused, ...w.paused]) expect(text).toContain(`- ${row.id} coder pi paused`)
   for (const row of w.unstatused) expect(text).toContain(row.result_path)
@@ -680,7 +714,7 @@ test('index tier 2: paused workers too many for full rows are all listed by id, 
   w.unstatused = pausedRows(60, 'coder-u', null)
   w.paused = pausedRows(60, 'coder-p', 'blocked')
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text).toContain('replied without a result status (ids only; tp-agent inspect <id>): coder-u0000, ')
   expect(text).toContain('paused (ids only; tp-agent inspect <id>): coder-p0000, ')
@@ -697,7 +731,7 @@ test('index tier 3: when even the ids do not fit, as many as fit are shown with 
   w.unstatused = pausedRows(300, 'coder-u', null, '-0123456789abcdef')
   w.paused = pausedRows(300, 'coder-p', 'blocked', '-0123456789abcdef')
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text.length > 5000).toBe(true)
   const all = [...w.unstatused, ...w.paused]
@@ -715,7 +749,7 @@ test('index tier 3 with a long objective and one paused group only still fits an
   w.rows = busyRows(50)
   w.paused = pausedRows(500, 'coder-p', 'blocked', '-0123456789abcdef')
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   const listed = w.paused.filter(row => text.includes(row.id))
   expect(listed.length > 50).toBe(true)
@@ -731,7 +765,7 @@ test('a paused worker left out of a saturated index stays eligible for a wake', 
   w.paused = pausedRows(500, 'coder-p', 'blocked', '-0123456789abcdef')
   w.rows = w.paused
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text).not.toContain('coder-p0499')
   await w.clock.advance(5000)
   expect(w.submitted.join('\n')).toContain('coder-p0499-0123456789abcdef is paused')
@@ -745,7 +779,7 @@ test('at every size the index stays within the cap and names each paused worker 
   for (const n of [0, 1, 20, 25, 30, 35, 40, 100, 150, 200, 250, 300, 301, 302, 303, 304, 305, 320, 400, 900]) {
     w.unstatused = pausedRows(Math.ceil(n / 2), 'coder-u', null)
     w.paused = pausedRows(Math.floor(n / 2), 'coder-p', 'blocked')
-    const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+    const text = await injected($ as never, w)
     expect(text.length <= 6000).toBe(true)
     const missing = [...w.unstatused, ...w.paused].filter(row => !text.includes(row.id)).length
     if (missing > 0) expect(text).toContain(`… ${missing} more workers waiting for you not shown; run tp-agent list to see them`)
@@ -773,7 +807,7 @@ test('workers awaiting the main are injected with what they await, among 80+ oth
     { id: 'coder-uq', role: 'coder', harness: 'pi', status: 'paused', result_status: null, capability_request: null, permission: null },
   ]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   const line = (id: string) => text.split('\n').find(l => l.startsWith(`- ${id} `)) ?? ''
   expect(text.length <= 6000).toBe(true)
   expect(line('coder-pcap')).toContain('[awaits: capability request pending]')
@@ -803,7 +837,7 @@ test('needs_input workers saturating the index are protected by the same cap and
     })),
   ]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   const asking = w.rows.filter(row => row.status === 'needs_input')
   const listed = asking.filter(row => text.includes(row.id))
@@ -833,7 +867,7 @@ test('the injected index marks an incomplete review and leaves a complete one pl
     { id: 'rv-ok', role: 'code-reviewer', status: 'settled', result_status: 'complete', verdict: 'APPROVED', review_complete: true },
   ]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text).toContain('verdict=APPROVED [review incomplete: not an approval]')
   expect(text).toContain('rv-ok code-reviewer settled result=complete verdict=APPROVED')
   expect(text).not.toContain('rv-ok code-reviewer settled result=complete verdict=APPROVED [')
@@ -850,7 +884,7 @@ test('refused queue entries sit with paused and awaiting rows, ahead of the acti
   w.paused = [{ id: 'coder-p', role: 'coder', status: 'paused', result_status: 'blocked', capability_pending: true }]
   w.unstatused = [{ id: 'coder-u', role: 'coder', status: 'paused', result_status: null }]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   const at = (needle: string) => text.indexOf(needle)
   expect(text).toContain('queue entries that will not start:\n- shape01 queued (start refused: the queue entry is not an object)')
   expect(text).toContain('- coder-p coder paused result=blocked [awaits: capability approval pending]')
@@ -862,7 +896,7 @@ test('refused queue entries sit with paused and awaiting rows, ahead of the acti
   expect(text.slice(at('\nactive:'))).not.toContain('shape01')
   // a session with no refused entry has no such line
   w.rows = busyRows(3)
-  const quiet = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const quiet = await injected($ as never, w)
   expect(quiet).toContain('researcher-0000-abcdef')
   expect(quiet).not.toContain('queue entries that will not start')
 })
@@ -872,7 +906,7 @@ test('refused queue entries saturating the index stay within the cap and are cou
   w.rows = [...busyRows(100), ...Array.from({ length: 400 }, (_, i) => refusedRow(`shape${String(i).padStart(4, '0')}-0123456789abcdef`))]
   w.paused = [{ id: 'coder-p', role: 'coder', status: 'paused', result_status: 'blocked', capability_pending: true }]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   const refused = w.rows.filter(row => row.status === 'queued')
   const listed = refused.filter(row => text.includes(row.id))
@@ -889,7 +923,7 @@ test('refused queue entries saturating the index stay within the cap and are cou
 // with 15 characters to spare; one refused entry must not cost the last of them its place.
 test('one refused queue entry never displaces a paused id that fits without it', async ($, on) => {
   const idsIn = async (w: ReturnType<typeof world>) => {
-    const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+    const text = await injected($ as never, w)
     expect(text.length <= 6000).toBe(true)
     return text
   }
@@ -956,7 +990,7 @@ test('a refused row already in the injected index does not alert again; one the 
   w.acceptsAppend = true
   w.rows = [refusedRow('shape01'), ...Array.from({ length: 400 }, (_, i) => refusedRow(`cut${String(i).padStart(4, '0')}-0123456789abcdef`))]
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text).toContain('shape01')
   expect(text).not.toContain('cut0399-0123456789abcdef')
   await w.clock.advance(5000)
@@ -1009,7 +1043,7 @@ test('ids-only rows keep the capability approval mark', async ($, on) => {
     capability_request: null, capability_pending: true, permission: null,
   }))
   await $.session.start(start(true))
-  const text = (await $.classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? ''
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text).toContain('coder-f0000-0123456789abcdef [capability approval pending]')
 })
@@ -1021,7 +1055,6 @@ const workBlock = (extra: Record<string, unknown> = {}) => ({
 })
 const decisionItems = (n: number, blockingEvery = 0) =>
   Array.from({ length: n }, (_, i) => ({ id: `ws-${String(i).padStart(3, '0')}/D1`, workspace: `ws-${String(i).padStart(3, '0')}`, priority: i % 3 === 0 ? 'high' : 'normal', blocking: blockingEvery > 0 && i % blockingEvery === 0 }))
-const injected = async ($: never) => ((await ($ as { classic: { SessionStart: (e: never) => Promise<{ additionalContext?: string[] }> } }).classic.SessionStart({ source: 'compact' } as never)).additionalContext?.[0] ?? '')
 
 test('work block: attached and candidate workspaces show id, title and next action, and no old objective is needed', async ($, on) => {
   const w = world(on, MAIN)
@@ -1033,7 +1066,7 @@ test('work block: attached and candidate workspaces show id, title and next acti
     notes: { recent: [{ id: 'loader-note', title: 'Loader quirks' }], important: [{ id: 'hard-rule', title: 'Never reload twice' }] },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('work attached to this session')
   expect(text).toContain('- import-dmp "Title of import-dmp" — next: rerun the loader (run1/coder-1)')
   expect(text).toContain('work in this directory, not attached (tp-agent work attach ID):')
@@ -1047,7 +1080,7 @@ test('work block: attached and candidate workspaces show id, title and next acti
 test('no work key leaves the index text exactly as it was', async ($, on) => {
   const w = world(on, MAIN)
   await $.session.start(start(true))
-  expect(await injected($ as never)).toBe(
+  expect(await injected($ as never, w)).toBe(
     [
       'tmux-pi task index (injected; run `tp-agent index` only if this is missing):',
       'objective: ship it',
@@ -1065,7 +1098,7 @@ test('work block: a work_error is one line and the rest of the index is intact',
   const w = world(on, MAIN)
   w.workError = 'cannot read the store'
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('work context not read: cannot read the store')
   expect(text).toContain('objective: ship it')
 })
@@ -1074,7 +1107,7 @@ test('work block: unreadable work files are one short line beside the valid work
   const w = world(on, MAIN)
   w.work = workBlock({ attached: [summary('good-one')], skipped: { count: 2 } })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('- good-one "Title of good-one"')
   expect(text).toContain('2 unreadable work files; tp-agent work list')
 })
@@ -1091,7 +1124,7 @@ test('work block: a work_error never pushes a saturated index past the cap or ta
   for (let n = 0; n <= 700; n += 7) {
     w.unstatused = pausedRows(Math.ceil(n / 2), 'coder-u', null, '-0123456789abcdef')
     w.paused = pausedRows(Math.floor(n / 2), 'coder-p', 'blocked', '-0123456789abcdef')
-    const text = await injected($ as never)
+    const text = await injected($ as never, w)
     expect(text.length <= 6000).toBe(true)
     const error = `work context not read: ${'e'.repeat(159)}…`
     const lines = text.split('\n').filter(line => line.startsWith('work context not read'))
@@ -1114,7 +1147,7 @@ test('work decisions: three open are all listed, blocking first, with the comman
   ]
   w.work = workBlock({ decisions: { open: 3, blocking: 1, chars: 1200, items: items.map(item => ({ ...item, question: 'SECRET QUESTION TEXT' })) } })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('decisions: 3 open (1 blocking)\n- b/D2 [normal] blocking\n- c/D1 [high]\n- a/D1 [low]\ntp-agent work decisions (every question and detail)')
   expect(text).not.toContain('SECRET QUESTION TEXT')
 })
@@ -1125,7 +1158,7 @@ test('work decisions: 300 open give blocking-first ids that fit, a +N more count
   const items = decisionItems(300, 50)
   w.work = workBlock({ decisions: { open: 300, blocking: 6, chars: 600, items } })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   const start_ = text.indexOf('decisions: 300 open (6 blocking)')
   expect(start_ >= 0).toBe(true)
@@ -1146,7 +1179,7 @@ test('work decisions with 300 open and the default room: lines stay within injec
   w.paused = pausedRows(60, 'coder-p', 'blocked')
   w.work = workBlock({ attached: [summary('big', { next: 'n'.repeat(300) })], decisions: { open: 300, blocking: 0, chars: 1200, items: decisionItems(300) } })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   const from = text.indexOf('decisions: 300 open')
   const block = text.slice(from, text.indexOf('\n', text.indexOf('tp-agent work decisions', from)))
@@ -1166,7 +1199,7 @@ test('work block: paused workers keep their rows when the work block is large, a
     decisions: { open: 300, blocking: 300, chars: 1200, items: decisionItems(300, 1) },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text).toContain('decisions: 300 open (300 blocking)')
   expect(text).toContain('tp-agent work decisions')
@@ -1182,31 +1215,6 @@ const checkpoint = (extra: Record<string, unknown> = {}) => ({
   ...extra,
 })
 
-test('a compaction marks recovery pending before the index is read, and a start does not', async ($, on) => {
-  const w = world(on, MAIN)
-  await $.session.start(start(true))
-  expect(w.ran.some(argv => argv[1] === 'work')).toBe(false)
-  await $.classic.SessionStart({ source: 'compact' } as never)
-  const verbsRan = w.ran.map(argv => argv.slice(1, 3).join(' '))
-  expect(verbsRan.indexOf('work compacted') >= 0).toBe(true)
-  expect(w.ran.find(argv => argv[1] === 'work')).toEqual([AGENT, 'work', 'compacted', '--reason', 'session-start:compact'])
-  expect(verbsRan.lastIndexOf('index --no-write') > verbsRan.indexOf('work compacted')).toBe(true)
-})
-
-test('a startup source never marks recovery', async ($, on) => {
-  const w = world(on, MAIN)
-  await $.session.start(start(true))
-  await $.classic.SessionStart({ source: 'startup' } as never)
-  expect(w.ran.some(argv => argv[1] === 'work')).toBe(false)
-})
-
-test('a worker never marks recovery after a compaction', async ($, on) => {
-  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1' })
-  await $.session.start(start(true))
-  await $.classic.SessionStart({ source: 'compact' } as never)
-  expect(w.ran).toEqual([])
-})
-
 test('work block: the checkpoint line, the recovery line and the caution follow the attached workspaces after a compaction', async ($, on) => {
   const w = world(on, MAIN)
   w.work = workBlock({
@@ -1215,7 +1223,7 @@ test('work block: the checkpoint line, the recovery line and the caution follow 
     recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'precompact:auto' },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   const at = (needle: string) => text.indexOf(needle)
   expect(text).toContain('recovery pending (compaction at 2026-10-15T10:40:00Z): run tp-agent work recover; re-verify any "done" claim against live records first')
   expect(text).toContain('checkpoint: valid snapshot, 41 min old (workspace updated 12 min ago; no task changed since)')
@@ -1229,12 +1237,12 @@ test('work block: with no recovery pending the caution is left out, and no check
   const w = world(on, MAIN)
   w.work = workBlock({ attached: [summary('import-dmp')], checkpoint: checkpoint() })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('checkpoint: valid snapshot')
   expect(text).not.toContain('re-confirm with the user')
   expect(text).not.toContain('recovery pending')
   w.work = workBlock({ attached: [summary('import-dmp')] })
-  const plain = await injected($ as never)
+  const plain = await injected($ as never, w)
   expect(plain).not.toContain('checkpoint')
   expect(plain).not.toContain('recovery')
 })
@@ -1246,7 +1254,7 @@ test('work block: a missing workspace file and an older checkpoint are said as t
     recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'precompact:manual' },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('checkpoint: last valid is older (3h old; newest failed validation)')
   expect(text).toContain('workspace file missing')
 })
@@ -1258,7 +1266,7 @@ test('work block: an attached workspace whose file is missing or corrupt is stil
     checkpoint: checkpoint({ workspace_file: 'file missing', line: 'checkpoint: valid snapshot, 5 min old (workspace file missing; `tp-agent work recover` prints the checkpoint state)' }),
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('- gone-ws (file missing)')
   expect(text).toContain('- bad-ws (corrupt: no frontmatter)')
   expect(text).toContain('- fine-ws "Title of fine-ws"')
@@ -1268,7 +1276,7 @@ test('work block: a recovery pending because a workspace was attached says so, n
   const w = world(on, MAIN)
   w.work = workBlock({ attached: [summary('import-dmp')], recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'attach' } })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain('recovery pending (workspace attached at 2026-10-15T10:40:00Z): run tp-agent work recover')
   expect(text).not.toContain('compaction at')
 })
@@ -1282,11 +1290,11 @@ test('work block: the autonomy line says what is blocked and since when, and is 
     autonomy: { on: true, workspace: 'import-dmp', blocked: true, blocked_since: '2026-10-15T10:40:00Z', line },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text).toContain(line)
   expect(text.indexOf('recovery pending') < text.indexOf('autonomy on: dispatch blocked')).toBe(true)
   w.work = workBlock({ attached: [summary('import-dmp')] })
-  expect(await injected($ as never)).not.toContain('autonomy')
+  expect(await injected($ as never, w)).not.toContain('autonomy')
 })
 
 test('work block: the recovery lines are short and do not push out paused workers', async ($, on) => {
@@ -1300,7 +1308,7 @@ test('work block: the recovery lines are short and do not push out paused worker
     decisions: { open: 300, blocking: 300, chars: 1200, items: decisionItems(300, 1) },
   })
   await $.session.start(start(true))
-  const text = await injected($ as never)
+  const text = await injected($ as never, w)
   expect(text.length <= 6000).toBe(true)
   expect(text).toContain('decisions: 300 open (300 blocking)')
   const lines = text.split('\n').filter(line => line.startsWith('c') && line.length > 100)

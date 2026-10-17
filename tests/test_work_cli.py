@@ -143,6 +143,48 @@ class WorkCli(unittest.TestCase):
         self.assertNotIn("Traceback", run.stderr)
         self.assertEqual(self.raw("new", "x", "--id", "Bad_ID").returncode, 1)
 
+    def test_no_command_prints_an_internal_key(self):
+        """Keys starting with `_` (the `_dirty` flag of a decision entry, the `_extra` lines of a checkpoint entry) are the writers' own."""
+        def internal(value, path=""):
+            if isinstance(value, dict):
+                return [f"{path}.{k}" for k in value if str(k).startswith("_")] + [p for k, v in value.items() for p in internal(v, f"{path}.{k}")]
+            if isinstance(value, list):
+                return [p for i, v in enumerate(value) for p in internal(v, f"{path}[{i}]")]
+            return []
+
+        ws = self.ok("new", "W", "--objective", "o")["id"]
+        note = self.ok("note", "add", "A note")["id"]
+        added = self.ok("decision", "add", ws, "--question", "Ship it?", "--blocking")
+        self.assertEqual(added["id"], f"{ws}/D1")  # the entry itself is still printed, minus the flag
+        self.assertEqual(added["question"], "Ship it?")
+        self.assertNotIn("_dirty", added)
+        self.ok("decision", "add", ws, "--question", "Again?")
+        self.ok("attach", ws)
+        commands = {
+            "decision answer": ("decision", "answer", f"{ws}/D1", "--text", "go", "--by", "user", "--quote", "go"),
+            "decision withdraw": ("decision", "withdraw", f"{ws}/D2", "--reason", "moot"),
+            "decision list": ("decision", "list"),
+            "decisions": ("decisions",),
+            "show": ("show", ws),
+            "list": ("list",),
+            "next": ("next", ws, "one"),
+            "decide": ("decide", ws, "A call", "--source", "user"),
+            "block": ("block", ws, "waiting"),
+            "set": ("set", ws, "--status", "active"),
+            "link": ("link", ws, "--note", note),
+            "note show": ("note", "show", note),
+            "checkpoint": ("checkpoint",),
+            "recover": ("recover", ws),
+            "compacted": ("compacted", "--reason", "test"),
+            "recovered": ("recovered", "--evidence", "checked the records", "--no-checkpoint"),
+        }
+        for name, args in commands.items():
+            with self.subTest(name):
+                out = self.text(*args)  # most print JSON, some print text
+                self.assertNotIn("_dirty", out)
+                if out.lstrip().startswith(("{", "[")):
+                    self.assertEqual(internal(json.loads(out)), [])
+
     def test_no_session_needed_except_attach(self):
         env = {k: v for k, v in self.env.items() if k != "TP_STATE_DIR"}
         env["PATH"] = str(self.tmp)  # no tmux

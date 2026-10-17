@@ -217,6 +217,82 @@ class OffAndOnTests(AutonomyCase):
         self.refuses(self.spawn("--", "x"))
 
 
+class RecoveryEventTests(AutonomyCase):
+    """`since`/`reason` are the oldest uncleared recovery event's; `events_pending` and `latest_*` say there are more and what the newest is."""
+
+    def test_autonomy_on_is_two_events_and_the_status_names_the_first(self):
+        self.on("one run")  # `autonomy on` arms recovery, then attaches the workspace (a second event)
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual((value["pending"], value["reason"], value["events_pending"], value["latest_reason"]), (True, "autonomy on", 2, "attach"))
+        self.assertIn("(autonomy on); 2 events are pending, the first shown, the newest attach at " + value["latest_since"], self.dispatch_role().stderr)
+
+    def test_one_event_is_its_own_latest_and_the_refusal_stays_as_it_was(self):
+        self.ok("work", "compacted", "--reason", "precompact:auto")
+        self.ok("autonomy", "on", "--workspace", "demo", "--reason", "x", env=CLAUDE)
+        self.clear()
+        self.ok("work", "compacted", "--reason", "precompact:auto")
+        value = self.marker()
+        self.assertEqual((value["reason"], value["events_pending"], value["latest_reason"], value["latest_since"]),
+                         ("precompact:auto", 1, "precompact:auto", value["since"]))
+        self.assertNotIn("events are pending", autonomy.refusal_text(autonomy.recovery(self.state)))
+
+    def test_status_names_the_oldest_event_and_says_there_are_more(self):
+        self.on("long run")
+        self.ok("work", "compacted", "--reason", "precompact:auto")
+        self.ok("work", "compacted", "--reason", "session-start:compact")
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual((value["pending"], value["reason"], value["events_pending"], value["latest_reason"]),
+                         (True, "autonomy on", 4, "session-start:compact"))
+        self.assertTrue(value["since"] and value["latest_since"] and value["since"] <= value["latest_since"])
+        marker = self.marker()
+        self.assertEqual((marker["reason"], marker["events_pending"], marker["latest_reason"], marker["latest_since"]),
+                         ("autonomy on", 4, "session-start:compact", value["latest_since"]))
+        run = self.dispatch_role()
+        self.refuses(run)
+        self.assertIn("(autonomy on); 4 events are pending, the first shown, the newest session-start:compact at " + value["latest_since"], run.stderr)
+
+    def test_recovered_clears_every_event_and_the_fields_with_them(self):
+        self.on()
+        self.ok("work", "compacted", "--reason", "precompact:auto")
+        self.clear()
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual((value["pending"], value["events_pending"], value["since"], value["reason"], value["latest_since"], value["latest_reason"]),
+                         (False, 0, "", "", "", ""))
+
+    def test_an_event_after_a_clear_counts_from_one(self):
+        self.on()
+        self.clear()
+        self.ok("work", "compacted", "--reason", "precompact:manual")
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual((value["reason"], value["events_pending"], value["latest_reason"]), ("precompact:manual", 1, "precompact:manual"))
+
+    def test_a_damaged_record_still_shows_the_latest_readable_event_and_reports_the_error_apart(self):
+        self.on()
+        self.ok("work", "compacted", "--reason", "session-start:compact")
+        (self.state / work_checkpoint.RECOVERY_FILE).write_text("{not json")
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual((value["pending"], value["latest_reason"], value["events_pending"]), (True, "session-start:compact", 3))
+        self.assertTrue(value["latest_since"])
+        self.assertIn("the recovery record is unreadable", value["problem"])
+        self.assertNotIn("unreadable", value["latest_reason"])
+
+    def test_with_no_readable_event_the_problem_stands_in_for_the_latest_reason(self):
+        self.on()
+        for path in (self.state / work_checkpoint.RECOVERY_DIR).iterdir():
+            path.write_text("{not json")
+        value = self.ok("autonomy", "status")["recovery"]
+        self.assertEqual(value["latest_reason"], "an unreadable recovery event")
+
+    def test_the_fields_the_status_always_had_are_still_there(self):
+        self.on()
+        self.assertTrue({"pending", "since", "reason"} <= set(self.ok("autonomy", "status")["recovery"]))
+        self.assertTrue({"pending", "generation", "cleared_generation", "since", "reason", "problem", "evidence"} <= set(self.marker()))
+
+    def test_the_marker_of_a_state_that_never_compacted_has_the_new_fields_empty(self):
+        marker = self.marker()
+        self.assertEqual((marker["pending"], marker["events_pending"], marker["latest_since"], marker["latest_reason"]), (False, 0, "", ""))
+
+
 class QueueTests(AutonomyCase):
     def test_a_queued_item_waits_with_the_reason_and_starts_after_recovered(self):
         ident = self.queue()

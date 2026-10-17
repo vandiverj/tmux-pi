@@ -20,6 +20,7 @@ import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import failing_tests  # noqa: E402
+import index_text  # noqa: E402
 import lanes  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
@@ -1042,7 +1043,12 @@ def investigate(base, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    d = sub.add_parser("dispatch", help="route and start or queue a role task")
+    d = sub.add_parser("dispatch", help="route and start or queue a role task",
+                       epilog="With autonomy on, an open blocking decision of an attached workspace holds back the dispatches its --affects "
+                              "covers (tp-agent work decision add --affects): workspace (the default) every dispatch, task:<id> a dispatch "
+                              "with --parent <id> (--investigate-failure <id> counts as --parent <id>), lane:<name> a dispatch with --lane "
+                              "<name>; next:<n> names a next action and covers none, so a decision with only next: or no target blocks "
+                              "every dispatch. Any one matching target blocks. The user answers or withdraws the decision to release it.")
     d.add_argument("--role")
     d.add_argument("--task")
     d.add_argument("--worker", choices=["pi", "claude"], help="require this harness; the router still picks the model")
@@ -1114,6 +1120,12 @@ def main():
     ix = sub.add_parser("index")
     ix.add_argument("--no-tick", action="store_true")
     ix.add_argument("--no-write", action="store_true", help="print the index without writing session-index.json (implies --no-tick: nothing is launched or rewritten)")
+    ix.add_argument("--text", action="store_true",
+                    help="print the index as the text the main agent reads (what the SessionStart hook injects: objective, work, "
+                         "paused, active and pending rows within 6000 characters) instead of JSON")
+    ix.add_argument("--hook-json", action="store_true",
+                    help="print that text as the finished SessionStart hook output, one JSON line: "
+                         "{\"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": TEXT}}")
     ix.add_argument("--bounded", action="store_true",
                     help="print the open decisions as the bounded summary (counts, top ids, the command), not the full list; "
                          "session-index.json still has the full list")
@@ -1289,6 +1301,12 @@ def main():
         if not args.no_tick and not args.no_write:  # tick launches queued work and rewrites the index: --no-write is a pure read
             tick(base)
         value = build_index(base) if args.no_write else write_index(base)
+        if args.hook_json:  # ASCII-only JSON, so the hook script passes it through untouched by locale or shell
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": index_text.render(value)}}))
+            return
+        if args.text:
+            print(index_text.render(value))
+            return
         if args.bounded:
             value = work_index.bounded(value)
     elif args.command == "list":

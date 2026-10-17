@@ -64,13 +64,18 @@ def record(state_dir):
 
 
 def recovery(state_dir):
-    """The recovery marker of a run with autonomy on, as {pending, since, reason}: pending while a generation newer than the last
-    `work recovered` exists. Generation state that is unreadable or missing counts as pending (`autonomy on` armed it, so it cannot be
-    legitimately absent): not knowing is not recovered."""
+    """The recovery marker of a run with autonomy on, as {pending, since, reason, events_pending, latest_since, latest_reason, problem}: pending
+    while a generation newer than the last `work recovered` exists. `since` and `reason` are those of the FIRST pending event (the oldest
+    not yet cleared; `attach` stays first when a compaction follows), `events_pending` counts them, `latest_*` are the newest one's.
+    Generation state that is unreadable or missing counts as pending (`autonomy on` armed it, so it cannot be
+    legitimately absent): not knowing is not recovered. `latest_*` name the newest readable event even when the record is damaged;
+    what cannot be read is in `problem` (and stands in for `reason`, and for `latest_reason` only when no event could be read)."""
     value = work_checkpoint.marker(state_dir, missing_is_pending=True)
     if not value["pending"]:
-        return {"pending": False, "since": "", "reason": ""}
-    return {"pending": True, "since": _clip(value["since"], 40), "reason": _clip(value["problem"] or value["reason"], 80)}
+        return {"pending": False, "since": "", "reason": "", "events_pending": 0, "latest_since": "", "latest_reason": "", "problem": ""}
+    return {"pending": True, "since": _clip(value["since"], 40), "reason": _clip(value["problem"] or value["reason"], 80),
+            "events_pending": value["events_pending"], "latest_since": _clip(value["latest_since"], 40),
+            "latest_reason": _clip(value["latest_reason"] or value["problem"], 80), "problem": _clip(value["problem"], 160)}
 
 
 # ------------------------------------------------------------------------ the gate
@@ -128,6 +133,9 @@ def review_problem(state_dir, review_of, role="", preamble_role="", deliverable=
 def refusal_text(state, review_note=""):
     since = f" since {state['since']}" if state["since"] else ""
     why = f" ({state['reason']})" if state["reason"] else ""
+    if state.get("events_pending", 0) > 1:  # since/reason are the oldest event's: say so, and what the newest is
+        why += (f"; {state['events_pending']} events are pending, the first shown, the newest {state['latest_reason'] or 'unnamed'}"
+                f"{' at ' + state['latest_since'] if state['latest_since'] else ''}")
     return (f"autonomy is on and recovery is pending{since}{why}: no new worker starts, whatever its role, until recovery is done. "
             f"Reconcile by reading records (tp-agent work show, work recover, inspect, collect, list), then clear it with: {CLEAR} "
             f"(add --accept T1,T2 for tasks that changed, or --no-checkpoint when there is no checkpoint to compare). "
@@ -186,7 +194,8 @@ def decision_refusal(entry):
     return (f"autonomy is on and blocking decision {entry['id']} is open ({_clip(entry['question'], 100)}; affects {', '.join(entry['affects'])}): "
             f"dispatch it covers waits, other work continues. Only the user clears it: ask them, then record their words with "
             f"tp-agent work decision answer {entry['id']} --text \"...\" --by user --quote \"their exact words\" "
-            f"(an answer by the agent does not clear it), or the user withdraws it: tp-agent work decision withdraw {entry['id']}")
+            f"(an answer by the agent does not clear it), or the user withdraws it: tp-agent work decision withdraw {entry['id']}. "
+            f"Its --affects scopes it: workspace blocks every dispatch, task:<id> only --parent <id>, lane:<name> only --lane <name>")
 
 
 def gate(state_dir, role="", preamble_role="", review_of="", deliverable="", lane="", lane_step="", parent=""):

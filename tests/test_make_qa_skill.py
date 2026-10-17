@@ -15,7 +15,7 @@ class MakeQaSkillTests(unittest.TestCase):
         self.assertTrue(alias.startswith("---\n"))
         self.assertIn("`make-qa` instructions in the task-selected system section", alias)
         self.assertIn("${@:-", alias)
-        self.assertIn("exec pi --no-skills \"$@\"", launcher)
+        self.assertIn("pi --no-skills \"$@\"", launcher)
         self.assertNotIn('--skill "$ROOT/skills"', launcher)
 
     def test_skill_does_not_grant_ticket_or_deployment_authority(self):

@@ -21,7 +21,7 @@ class SettingsTemplateTests(unittest.TestCase):
         fake.mkdir()
         (fake / "pi").write_text("#!/bin/sh\nexit 0\n")
         (fake / "pi").chmod(0o755)
-        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
         for key in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE", "PI_CODING_AGENT_DIR"):
             self.env.pop(key, None)
 

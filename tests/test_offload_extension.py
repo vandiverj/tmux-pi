@@ -34,7 +34,7 @@ class OffloadExtensionTests(unittest.TestCase):
             fake = Path(folder) / "pi"
             fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
             fake.chmod(0o755)
-            env = {**os.environ, "PATH": folder + os.pathsep + os.environ["PATH"]}
+            env = {**os.environ, "PATH": folder + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
             for key in ("TP_TASK_DIR", "TP_MODE"):
                 env.pop(key, None)
 

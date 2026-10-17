@@ -6,6 +6,11 @@ tp-review records the working tree it reviewed as reviewed-state.json in the rev
 tree object made from a throwaway index, so the repository's index and files are untouched); the diff for the
 next round is the change from that tree to the tree now.
 
+  review_rounds.py scope <workdir> [<lane> [<list-file> [<budget>]]]
+      (<budget>: most characters the text may have; the inline list shrinks to fit. <lane> may be "" for a non-lane task; the full changed-file list is written to <list-file> (atomically, replacing a link there), which the assignment names, when it is longer than the assignment lists (200 paths or 16 KB); it is not attached to the packet)
+      prints {"text": the changed-file list and scoped git commands for the reviewer's assignment, "withheld": [paths]};
+      always exits 0 (a workdir that is not a git repository, or a list that cannot be made, is said in one line)
+
   review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir>
       writes the earlier findings files and the diff into out-dir and prints
       {"contexts": [paths, in order], "rounds": N, "snapshot": {...} | null}
@@ -19,6 +24,7 @@ files for tp-spawn do not. A path that cannot be checked, or a rule or redactor 
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -347,7 +353,168 @@ def prepare(state_dir, task_id, workdir, out_dir):
             "withheld": withheld, "redactions": redactions}
 
 
+MAX_SCOPE_PATHS = 200  # changed paths named in the assignment (safe and withheld together); the rest go to the list file
+MAX_SCOPE_BYTES = 16384  # and at most this many bytes of them, so long names cannot crowd out the packet's author evidence
+
+
+def scope_lines(workdir, lane=""):
+    """(base, top, safe paths [(path, untracked)], withheld paths) for the author's change, or None outside git; raises Refused."""
+    top = git(workdir, "rev-parse", "--show-toplevel")
+    if top.returncode:
+        return None
+    top = top.stdout.strip()
+    if git(top, "rev-parse", "--verify", "-q", "HEAD").returncode:
+        base = git(top, "hash-object", "-t", "tree", "/dev/null").stdout.strip()  # no commit yet: everything is new
+    elif lane:
+        try:
+            import lanes
+            record = lanes.read_lane(lanes.git_common_dir(top), lane)
+            base = record["base"]["commit"]
+        except Exception as exc:
+            raise Refused(f"cannot read the base of lane {lane}: {exc}")
+        merged = git(top, "merge-base", base, "HEAD")
+        base = merged.stdout.strip() if merged.returncode == 0 and merged.stdout.strip() else base
+    else:
+        base = "HEAD"
+    # The working tree and the index each against the base: a staged change that the working tree undoes (MM) is in the
+    # second only, and any path where the two differ from each other is in one of them.
+    working = git(top, "diff", "--name-only", "-z", "--no-renames", base, "--")
+    staged = git(top, "diff", "--cached", "--name-only", "-z", "--no-renames", base, "--")
+    untracked = git(top, "ls-files", "--others", "--exclude-standard", "-z")
+    if working.returncode or staged.returncode or untracked.returncode:
+        raise Refused(f"git could not list the changed files: {(working.stderr or staged.stderr or untracked.stderr).strip()}")
+    new = {p for p in untracked.stdout.split("\0") if p}
+    paths = sorted({p for run in (working, staged) for p in run.stdout.split("\0") if p} | new)
+    check = sensitive_checker()
+    flagged = {path for path in paths if check(top, path)}
+    # git matches even a literal pathspec as a directory prefix, so a path above a withheld one (a file that became a
+    # directory, or the reverse) would select it: such a path is withheld too.
+    withheld = [path for path in paths if path in flagged or any(f.startswith(path + "/") for f in flagged)]
+    held = set(withheld)
+    safe = [(path, path in new) for path in paths if path not in held]
+    return base, top, safe, withheld
+
+
+def literal(text):
+    """One shell word for text, on one line: shlex.quote when every character prints, else bash $'...' with escapes."""
+    if text and all(c.isprintable() for c in text):
+        return shlex.quote(text)
+    out = []
+    for c in text:
+        if c in "\\'":
+            out.append("\\" + c)
+        elif c.isprintable():
+            out.append(c)
+        else:
+            out.append("".join(f"\\x{b:02x}" for b in c.encode("utf-8", "surrogateescape")))
+    return "$'" + "".join(out) + "'"
+
+
+def write_list_file(path, text):
+    """Write text to path atomically without following a link there: a temp file in the same directory replaces whatever
+    is at path (a symlink is replaced, never written through). Raises OSError when it cannot."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temp = tempfile.mkstemp(prefix=".review-changed-files-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def scope_text(workdir, lane="", list_file=None, budget=None):
+    """(assignment text, withheld paths): the changed files and the scoped git commands a reviewer may use. Never raises:
+    when the list cannot be made it says so in one line and the review goes on as it did before. At most MAX_SCOPE_PATHS paths
+    and MAX_SCOPE_BYTES bytes of path lines (safe and withheld together) are named in the assignment; when more changed and
+    list_file is given, the whole list (one quoted path per line, withheld ones marked) is written there. When budget (characters)
+    is given the text never exceeds it: the inline list shrinks to fit, down to the pointer line alone, and when even that does not
+    fit (or the list file cannot be written) the one-line unavailable text is returned."""
+    try:
+        found = scope_lines(workdir, lane)
+    except Refused as exc:
+        return f"Diff scope: the changed-file list could not be computed ({' '.join(str(exc).split())[:200]}); inspect the files you need directly.", []
+    if found is None:
+        return "Diff scope: the working directory is not a git repository, so there is no changed-file list.", []
+    limit = MAX_SCOPE_BYTES if budget is None else max(0, min(MAX_SCOPE_BYTES, budget))
+    while True:
+        text, used, usable = render_scope(found, lane, list_file, limit)
+        if not usable:
+            return text, []
+        excess = 0 if budget is None else len(text) - budget
+        if excess <= 0 or not used and limit == 0:
+            break
+        limit = max(0, used - excess - 1) if used else 0
+    if budget is not None and len(text) > budget:
+        text = "Diff scope: the changed-file list could not be computed (no room left in the review packet); inspect the files you need directly."
+        return text, []
+    return text, found[3]
+
+
+def render_scope(found, lane, list_file, max_bytes):
+    """(text, bytes of path lines used, False when the text is the unavailable line) for found = scope_lines(...) with at most max_bytes of path lines inline."""
+    base, top, safe, withheld = found
+    kinds = "committed on the lane since its base, staged, unstaged and untracked" if lane else "staged, unstaged and untracked"
+    out = [f"Diff scope: {len(safe)} file(s) changed relative to {base[:12] if lane else 'HEAD'} ({kinds}) in the repository at {literal(top)}:"]
+    count, size = 0, 0
+
+    def room(line):
+        nonlocal count, size
+        cost = len(line.encode("utf-8", "surrogateescape")) + 1
+        if count >= MAX_SCOPE_PATHS or size + cost > max_bytes:
+            return False
+        count, size = count + 1, size + cost
+        return True
+    listed = 0
+    for path, is_new in safe:
+        line = f"- {literal(path)}{' (untracked: read the file)' if is_new else ''}"
+        if not room(line):
+            break
+        out.append(line)
+        listed += 1
+    if not safe:
+        out.append("- (none)")
+    shown_withheld = []
+    for path in withheld:
+        if not room(literal(path) + ","):
+            break
+        shown_withheld.append(path)
+    more_safe, more_withheld = len(safe) - listed, len(withheld) - len(shown_withheld)
+    if more_safe or more_withheld:
+        what = " and ".join(part for part in (f"{more_safe} more changed file(s)" if more_safe else "",
+                                              f"{more_withheld} more withheld path(s)" if more_withheld else "") if part)
+        try:
+            if not list_file:
+                raise OSError("no list file was given")
+            write_list_file(list_file, "".join(f"{literal(p)}{' (untracked)' if n else ''}\n" for p, n in safe)
+                            + "".join(f"withheld: {literal(p)}\n" for p in withheld))
+        except OSError as exc:  # a partial list would leave changed files unnamed: say the list is unavailable instead
+            reason = " ".join(f"the complete list of {len(safe) + len(withheld)} paths could not be written: {exc}".split())[:200]
+            return f"Diff scope: the changed-file list could not be computed ({reason}); inspect the files you need directly.", 0, False
+        out.append(f"- and {what}: the complete list is in {literal(str(Path(list_file).resolve()))} (one quoted path per line; withheld paths marked); read it with your file-read tool, not a git command")
+    if shown_withheld or more_withheld:
+        out.append(f"Withheld (sensitive paths; never diff, show or read them): {', '.join(literal(p) for p in shown_withheld) or '(see the list file)'}"
+                   + (f" and {more_withheld} more" if shown_withheld and more_withheld else ""))
+    git = f"GIT_LITERAL_PATHSPECS=1 git -C {literal(top)}"
+    out.append(f"Scoped commands (keep the GIT_LITERAL_PATHSPECS=1 prefix: it makes each path a literal file name, never a glob or pathspec magic): "
+               f"`{git} diff {base} -- <path> [<path> ...]` (working tree), `{git} diff --cached {base} -- <path> [<path> ...]` (staged), "
+               f"`{git} diff --stat {base} -- <path> ...`. Run both the working-tree and the staged command for a path: a staged change "
+               "the working tree undoes shows only in the staged one. "
+               "Every `git diff`, `git show` and `git log -p` you run must keep that prefix and must name explicit file paths from the list above; never run them "
+               "unscoped, with a bare directory, or on a path that is withheld. Untracked files do not appear in `git diff`: read them directly.")
+    return "\n".join(out), size, True
+
+
 def main(argv):
+    if len(argv) in (3, 4, 5, 6) and argv[1] == "scope":
+        text, withheld = scope_text(*argv[2:5], budget=int(argv[5]) if len(argv) == 6 else None)
+        print(json.dumps({"text": text, "withheld": withheld}))
+        return
     if len(argv) != 6 or argv[1] != "prepare":
         sys.exit(__doc__)
     try:

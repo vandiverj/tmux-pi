@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,7 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "failing_tests.py", "result_status.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py"):   # the last two: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
@@ -250,6 +251,257 @@ echo review-1
         self.assertFalse((self.state / "tasks" / "review-1" / "reviewed-state.json").exists())
         meta = json.loads((self.task / "meta.json").read_text())
         self.assertEqual(meta["reviews"], ["review-1"])
+
+    def task_text(self):
+        return self.log.read_text().split("TASK ", 1)[1]
+
+    def test_a_non_lane_review_lists_changed_and_untracked_files_and_the_scoped_commands(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "first")
+        (self.work / "a.txt").write_text("two\n")
+        (self.work / "new.txt").write_text("fresh\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        self.assertIn("Diff scope: 2 file(s) changed relative to HEAD", task)
+        self.assertIn("- a.txt\n", task)
+        self.assertIn("- new.txt (untracked: read the file)", task)
+        self.assertIn(f"git -C {self.work.resolve()} diff HEAD -- <path>", task)
+        self.assertIn("must name explicit file paths from the list above; never run them unscoped", task)
+
+    def test_a_sensitive_path_is_listed_as_withheld_and_not_offered_for_diffing(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        (self.work / ".env").write_text("TOKEN=x\n")
+        task = self.review() and self.task_text()
+        self.assertIn("- a.txt", task)
+        self.assertNotIn("- .env", task)
+        self.assertIn('Withheld (sensitive paths; never diff, show or read them): .env', task)
+
+    def test_outside_git_the_scope_is_one_line_and_the_review_still_starts(self):
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Diff scope: the working directory is not a git repository, so there is no changed-file list.", self.task_text())
+
+    def test_a_long_list_is_bounded_with_the_command_for_the_rest(self):
+        self.git("init", "-q")
+        for i in range(205):
+            (self.work / f"f{i:03d}.txt").write_text("x\n")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        self.assertIn("Diff scope: 205 file(s)", task)
+        self.assertIn("- f199.txt", task)
+        self.assertNotIn("- f200.txt", task)
+        full = self.task / "review-changed-files.txt"
+        self.assertIn(f"and 5 more changed file(s): the complete list is in {full.resolve()} (one quoted path per line", task)
+        self.assertNotIn("diff --name-only", task)
+        self.assertNotIn("changed-files", [Path(p).name for p in self.spawn_contexts()])
+        listed = full.read_text().splitlines()
+        self.assertEqual(len(listed), 205)
+        self.assertIn("f204.txt (untracked)", listed)
+
+    def test_a_list_larger_than_the_packet_budget_still_starts_the_review(self):
+        self.git("init", "-q")
+        long = "d" * 120
+        for i in range(2000):
+            (self.work / f"{long}{i:04d}.txt").write_text("x\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        full = self.task / "review-changed-files.txt"
+        self.assertGreater(full.stat().st_size, 200000)
+        self.assertEqual(len(full.read_text().splitlines()), 2000)
+        self.assertIn(str(full.resolve()), self.task_text())
+        self.assertTrue(all("changed-files" not in Path(p).name for p in self.spawn_contexts()))
+
+    def test_the_suggested_commands_are_literal_so_a_magic_file_name_cannot_select_a_withheld_file(self):
+        self.git("init", "-q")
+        (self.work / ":(glob)*").write_text("one\n")
+        (self.work / ".env").write_text("TOKEN=x\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "first")
+        (self.work / ":(glob)*").write_text("two\n")
+        (self.work / ".env").write_text("TOKEN=y\n")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        top = os.path.realpath(self.work)
+        self.assertIn(f"`GIT_LITERAL_PATHSPECS=1 git -C {top} diff HEAD -- <path> [<path> ...]`", task)
+        self.assertIn("keep the GIT_LITERAL_PATHSPECS=1 prefix", task)
+        self.assertIn("- ':(glob)*'\n", task)
+        self.assertIn("Withheld (sensitive paths; never diff, show or read them): .env", task)
+        diff = ["git", "-C", top, "diff", "--name-only", "HEAD", "--", ":(glob)*"]
+        literal = subprocess.run(diff, text=True, capture_output=True, env={**os.environ, "GIT_LITERAL_PATHSPECS": "1"}).stdout.split("\n")
+        self.assertEqual([l for l in literal if l], [":(glob)*"])
+        control = subprocess.run(diff, text=True, capture_output=True, env={k: v for k, v in os.environ.items() if k != "GIT_LITERAL_PATHSPECS"}).stdout
+        self.assertIn(".env", control.split("\n"))  # without the prefix the same command does select the withheld file
+
+    def test_the_overflow_list_is_written_without_following_a_link_at_its_path(self):
+        self.git("init", "-q")
+        for i in range(201):
+            (self.work / f"f{i:03d}.txt").write_text("x\n")
+        victim = self.task.parent / "victim.txt"
+        victim.write_text("original\n")
+        (self.task / "review-changed-files.txt").symlink_to(victim)
+        self.assertEqual(self.review().returncode, 0)
+        self.assertEqual(victim.read_text(), "original\n")
+        full = self.task / "review-changed-files.txt"
+        self.assertFalse(full.is_symlink())
+        self.assertEqual(len(full.read_text().splitlines()), 201)
+        self.assertIn(str(full.resolve()), self.task_text())
+        self.assertEqual([p.name for p in self.task.iterdir() if p.name.startswith(".review-changed-files-")], [])
+
+    def test_long_names_are_bounded_by_bytes_and_a_near_limit_packet_still_starts_the_review(self):
+        self.git("init", "-q")
+        for i in range(200):
+            (self.work / f"{i:03d}{'n' * 237}.txt"[:240]).write_text("x\n")
+        (self.work / ".env").write_text("TOKEN=x\n")
+        (self.task / "packet.md").write_text("p" * 95000)
+        (self.task / "result.md").write_text("r" * 35000 + "\nRESULT_STATUS: complete\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        scope = task[task.index("Diff scope:"):]
+        listed = [line for line in scope.splitlines() if line.startswith("- ") and not line.startswith("- and ")]
+        self.assertGreater(len(listed), 10)
+        self.assertLess(len(listed), 200)
+        self.assertLessEqual(sum(len(l) + 1 for l in listed), 16384)
+        full = self.task / "review-changed-files.txt"
+        self.assertIn(f"changed file(s): the complete list is in {full.resolve()}", task)
+        lines = full.read_text().splitlines()
+        self.assertEqual(len(lines), 201)
+        self.assertIn("withheld: .env", lines)
+
+    def test_the_scope_shrinks_to_the_packets_headroom_so_a_near_cap_packet_still_starts(self):
+        self.git("init", "-q")
+        for i in range(200):
+            (self.work / f"f{i:03d}{'a' * 55}").write_text("x\n")
+        (self.task / "packet.md").write_text("p" * 159000)
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        scope = task[task.index("Diff scope:"):]
+        self.assertIn("the complete list is in", scope)
+        self.assertEqual(len((self.task / "review-changed-files.txt").read_text().splitlines()), 200)
+
+    def test_a_file_that_became_a_directory_holding_a_withheld_path_is_withheld_too(self):
+        self.git("init", "-q")
+        (self.work / "box").write_text("one\n")
+        (self.work / "a.txt").write_text("one\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "first")
+        (self.work / "box").unlink()
+        (self.work / "box").mkdir()
+        (self.work / "box/inner.txt").write_text("x\n")
+        (self.work / "box/.env").write_text("TOKEN=x\n")
+        (self.work / "a.txt").write_text("two\n")
+        self.git("add", "-A")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        scope = task[task.index("Diff scope:"):]
+        listed = [line[2:].split(" (")[0] for line in scope.splitlines() if line.startswith("- ")]
+        self.assertEqual(listed, ["a.txt", "box/inner.txt"])
+        self.assertIn("Withheld (sensitive paths; never diff, show or read them): box, box/.env", scope)
+        # every offered command, on every listed path, leaves the withheld file out
+        top = os.path.realpath(self.work)
+        env = {**os.environ, "GIT_LITERAL_PATHSPECS": "1"}
+        for layer in ([], ["--cached"]):
+            names = subprocess.run(["git", "-C", top, "diff", "--name-only", *layer, "HEAD", "--", *listed],
+                                   text=True, capture_output=True, env=env).stdout.split("\n")
+            self.assertNotIn("box/.env", names)
+            self.assertNotIn("box", names)
+        control = subprocess.run(["git", "-C", top, "diff", "--name-only", "HEAD", "--", "box"], text=True, capture_output=True, env=env).stdout
+        self.assertIn("box/.env", control.split("\n"))  # the directory path itself would have selected it
+
+    def test_a_staged_change_the_working_tree_undoes_is_listed_with_the_staged_command(self):
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "first")
+        (self.work / "a.txt").write_text("two\n")
+        self.git("add", "a.txt")
+        (self.work / "a.txt").write_text("one\n")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        top = os.path.realpath(self.work)
+        self.assertIn("Diff scope: 1 file(s) changed relative to HEAD", task)
+        self.assertIn("- a.txt\n", task)
+        self.assertIn(f"`GIT_LITERAL_PATHSPECS=1 git -C {top} diff --cached HEAD -- <path> [<path> ...]` (staged)", task)
+        staged = subprocess.run(["git", "-C", top, "diff", "--cached", "HEAD", "--", "a.txt"], text=True, capture_output=True).stdout
+        self.assertIn("+two", staged)
+
+    def test_an_overflow_list_that_cannot_be_written_gives_the_one_line_fallback(self):
+        self.git("init", "-q")
+        for i in range(201):
+            (self.work / f"f{i:03d}.txt").write_text("x\n")
+        (self.task / "review-changed-files.txt").mkdir()
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        scope = task[task.index("Diff scope:"):]
+        self.assertTrue(scope.startswith("Diff scope: the changed-file list could not be computed (the complete list of 201 paths could not be written"))
+        self.assertIn("inspect the files you need directly.", scope)
+        self.assertNotIn("- f000.txt", task)
+        self.assertNotIn("not listed here", task)
+
+    def test_a_filename_with_a_newline_stays_one_quoted_literal(self):
+        self.git("init", "-q")
+        (self.work / "odd\nname.txt").write_text("x\n")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        self.assertIn("- $'odd\\x0aname.txt' (untracked: read the file)", task)
+        self.assertEqual(len([line for line in task.splitlines() if line.startswith("- ")]), 1)
+
+    def test_a_directory_with_a_space_is_quoted_in_the_suggested_commands(self):
+        spaced = self.work.parent / "my work"
+        spaced.mkdir()
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta["workdir"] = str(spaced)
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        subprocess.run(["git", "-C", str(spaced), "init", "-q"], check=True)
+        (spaced / "a b.txt").write_text("x\n")
+        self.assertEqual(self.review().returncode, 0)
+        task = self.task_text()
+        top = os.path.realpath(spaced)
+        self.assertIn(f"git -C '{top}' diff ", task)
+        self.assertIn("- 'a b.txt' (untracked", task)
+
+    def test_a_lane_task_is_scoped_to_the_lanes_base(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lanes
+        self.git("init", "-q", "-b", "main")
+        (self.work / "a.txt").write_text("one\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "base")
+        base = subprocess.run(["git", "-C", str(self.work), "rev-parse", "HEAD"], text=True, capture_output=True).stdout.strip()
+        wt = self.work.parent / "lane-wt"
+        self.git("worktree", "add", "-q", "-b", "lane-b", str(wt))
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        (wt / "b.txt").write_text("committed\n")
+        subprocess.run(["git", "-C", str(wt), "add", "b.txt"], check=True)
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "on the lane"], check=True)
+        (wt / "c.txt").write_text("untracked\n")
+        work, wt = os.path.realpath(self.work), os.path.realpath(wt)
+        common = lanes.git_common_dir(work)
+        record = {"schema": "tp-lane:v1", "name": "alpha", "kind": "work", "state": "open", "repo": work, "git_common_dir": common,
+                  "branch": "lane-b", "worktree": wt, "base": {"ref": "main", "commit": base}, "created": "2026-10-08T10:00:00+00:00",
+                  "domain": "d", "touches": ["lib"], "closed": [], "integrated": None, "defaulted": []}
+        with lanes.lane_lock(common):
+            lanes.write_lane(common, record)
+        work = wt
+        out = subprocess.run([sys.executable, str(self.root / "lib/review_rounds.py"), "scope", work, "alpha"],
+                             text=True, capture_output=True, env=self.env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        text = json.loads(out.stdout)["text"]
+        self.assertIn(f"Diff scope: 2 file(s) changed relative to {base[:12]} (committed on the lane since its base", text)
+        self.assertIn("- b.txt\n", text)
+        self.assertIn("- c.txt (untracked", text)
+        self.assertNotIn("a.txt", text)
+        self.assertIn(f"diff {base} -- <path>", text)
+        # a lane the record does not hold: one line, exit 0
+        gone = subprocess.run([sys.executable, str(self.root / "lib/review_rounds.py"), "scope", work, "nope"], text=True, capture_output=True)
+        self.assertEqual(gone.returncode, 0)
+        self.assertIn("could not be computed", json.loads(gone.stdout)["text"])
 
     def test_a_first_review_in_a_repository_records_the_reviewed_tree_and_no_rounds(self):
         self.git("init", "-q")

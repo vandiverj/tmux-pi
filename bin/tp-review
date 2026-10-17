@@ -203,6 +203,21 @@ done < <(jq -r '.withheld[]' <<<"$rounds")
 redactions="$(jq -r '.redactions' <<<"$rounds")"
 if (( redactions > 0 )); then echo "tp-review: $redactions secret-like value(s) in the earlier findings and diff were replaced with placeholders" >&2; fi
 while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -r '.contexts[]' <<<"$rounds")
+# The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
+# The scope text is sized to the packet's remaining headroom. Any overflow list goes to $dir/review-changed-files.txt (named in the assignment, not attached, so it cannot exceed the packet budget).
+# Never fails the review: when the list cannot be made, the assignment says so in one line.
+scope=""
+if [[ -z "${extra[*]+x}" ]]; then  # a research report has no diff
+  # The scope text may use only what the packet has left after the evidence and the round text (reserve 2000 chars for that line).
+  scope_budget=$(( max_packet - packet_reserve - ${#review_task} - 2000 ))
+  for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
+    scope_budget=$(( scope_budget - $(wc -c < "$f") - per_file_overhead ))
+  done
+  (( scope_budget >= 0 )) || scope_budget=0
+  scope="$(python3 "$ROOT/lib/review_rounds.py" scope "$author_workdir" "$author_lane" "$dir/review-changed-files.txt" "$scope_budget" 2>/dev/null | jq -r '.text' 2>/dev/null)" || scope=""
+  [[ -n "$scope" ]] || scope="Diff scope: the changed-file list could not be computed; inspect the files you need directly."
+  review_task="$review_task $scope"
+fi
 if (( round_count > 0 )); then
   review_task="$review_task This is review round $(( round_count + 1 )) of this work. The findings of the $round_count earlier round(s) are attached oldest first, then the diff of the working tree since the last reviewed state. For each earlier finding say whether it is fixed, citing it by round and number (for example round 1 F2); when a new finding repeats an earlier one, name that family. Review the whole change again, not only the fixes: the diff shows only what changed since the last round, and a fix can break what an earlier round passed."
 fi

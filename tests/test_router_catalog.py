@@ -167,8 +167,8 @@ class PromptTests(unittest.TestCase):
         """Rename every level, model and provider and blank the catalog's prose: nothing of the originals is left,
         so the generator adds no name of its own."""
         models = {"claude-haiku-5-5": "zed-one", "claude-sonnet-5-5": "zed-two", "claude-opus-5-5": "zed-three",
-                  "openai-codex/gpt-6-luna": "vend/zed-four", "openai-codex/gpt-6-sol": "vend/zed-five",
-                  "openai-codex/gpt-6-astra": "vend/zed-six", "openai-codex/gpt-6.1-sol": "vend/zed-seven",
+                  "openai/gpt-6-luna": "vend/zed-four", "openai/gpt-6-sol": "vend/zed-five",
+                  "openai/gpt-6-astra": "vend/zed-six", "openai/gpt-6.1-sol": "vend/zed-seven",
                   "lmstudio/qwen/qwen3.6-35b-a3b": "box/zed-eight", "slotstream/qwen3.8-flash-next:4bit": "box/zed-nine"}
         providers = {"anthropic": "vendor_a", "openai": "vendor_b", "local": "vendor_c", "openrouter": "vendor_d"}
         text = json.dumps(CAT)

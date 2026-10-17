@@ -27,6 +27,22 @@ while [[ -L "$src" ]]; do
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 
+# Pi runs on its own pinned Node, not the `node` a project's mise/nvm puts first on
+# PATH: a repo pinned to Node 22.14 lacks zlib zstd and pi crashes reading responses.
+# Only pi's process uses it; PATH is unchanged, so commands pi runs keep the project's
+# Node. TP_PI_NODE overrides the interpreter; set it empty to run `pi` from PATH.
+PI_NODE="${TP_PI_NODE-$HOME/.nvm/versions/node/v24.16.0/bin/node}"
+pi() {
+  [[ -n "$PI_NODE" ]] || exec pi "$@"
+  if [[ ! -x "$PI_NODE" || ! -e "$(dirname "$PI_NODE")/pi" ]]; then
+    echo "tp-pi: pi is pinned to $PI_NODE with pi installed beside it; run" \
+      "'nvm install 24.16.0' and that Node's 'npm install -g @earendil-works/pi-coding-agent'," \
+      "or set TP_PI_NODE" >&2
+    exit 1
+  fi
+  exec "$PI_NODE" "$(dirname "$PI_NODE")/pi" "$@"
+}
+
 export PI_CODING_AGENT_DIR="$ROOT/agent"
 # agent/settings.json is local state (pi rewrites it); seed it from the template once, never overwrite.
 [[ -e "$ROOT/agent/settings.json" || ! -f "$ROOT/agent/settings.example.json" ]] ||
@@ -34,7 +50,7 @@ export PI_CODING_AGENT_DIR="$ROOT/agent"
 # Auth for the MCP servers in agent/mcp.json (git-ignored; shared with tp-claude).
 [[ ! -f "$ROOT/claude/mcp.local.env" ]] || source "$ROOT/claude/mcp.local.env"
 if [[ "${TP_MODE:-}" == strict ]]; then
-  exec pi --no-skills "$@"
+  pi --no-skills "$@"
 fi
 
 # Normal work loads only the orchestration extensions. Legacy goal, strict
@@ -49,4 +65,4 @@ for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done
 if [[ -z "${TP_TASK_DIR:-}" && "${TP_MODE:-}" == orchestrator ]]; then
   args+=(--extension builtin:codemode --no-mcp --tools "$MAIN_TOOLS")
 fi
-exec pi "${args[@]}" "$@"
+pi "${args[@]}" "$@"

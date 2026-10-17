@@ -422,7 +422,7 @@ class ExplicitValidationCommandTests(Base):
         big.write_text("x" * 40000)  # about 10000 tokens: over the 32k Slotstream model's packet limit
         slot = "slotstream/qwen3.8-flash-next:4bit"
         cases = [(("--model", "madeup/nonexistent-model"), "not in the model catalog"),
-                 (("--model", "openai-codex/gpt-6.1-sol"), "not offered"),
+                 (("--model", "openai/gpt-6.1-sol"), "not offered"),
                  (("--model", "claude-opus-9"), "not in the model catalog"),
                  (("--model", HAIKU, "--thinking", "off"), "does not allow effort"),
                  (("--model", QWEN, "--thinking", "high"), "does not allow effort"),

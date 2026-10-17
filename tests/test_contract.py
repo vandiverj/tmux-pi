@@ -279,25 +279,25 @@ class ContractTests(unittest.TestCase):
 
     def test_dynamic_terms_and_escalation_target(self):
         brief = dynamic_terms("task", {"route": "standard", "scope": "brief", "model": "mlx/qwen"})
-        strong = dynamic_terms("task", {"route": "complex", "scope": "multi_step", "model": "openai-codex/gpt-6-sol"})
+        strong = dynamic_terms("task", {"route": "complex", "scope": "multi_step", "model": "openai/gpt-6-sol"})
         self.assertLess(duration(brief["budget"]["time"]), duration(strong["budget"]["time"]))
         self.assertEqual(brief["profile"]["source"], "dynamic")
         roster = load_config(ROOT / "config/router.json", local_path=False)["models"]
         preferred = {"worker": "claude", "model": "claude-opus-5-5", "thinking": "medium"}
         self.assertEqual(select_escalation({"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"}, roster,
                                            preferred=preferred), preferred)
-        target = select_escalation({"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "medium"}, roster)
-        self.assertEqual(target["model"], "openai-codex/gpt-6-sol")
+        target = select_escalation({"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "medium"}, roster)
+        self.assertEqual(target["model"], "openai/gpt-6-sol")
         self.assertNotIn(target["thinking"], ("off", "minimal"))
-        local_preferred = {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"}
+        local_preferred = {"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "low"}
         for local_model in ("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b"):
             escalated = select_escalation({"worker": "pi", "model": local_model, "thinking": "off"}, roster,
                                           preferred=local_preferred)
             self.assertIsNotNone(escalated)
             self.assertEqual(escalated, local_preferred)
             self.assertIn(escalated["thinking"], next(r["thinking"] for r in roster if r["model"] == escalated["model"]))
-        self.assertNotIn("openai-codex/gpt-5.3-codex-spark", [r["model"] for r in roster])
-        self.assertNotIn("off", next(r["thinking"] for r in roster if r["model"] == "openai-codex/gpt-6-astra"))
+        self.assertNotIn("openai/gpt-5.3-codex-spark", [r["model"] for r in roster])
+        self.assertNotIn("off", next(r["thinking"] for r in roster if r["model"] == "openai/gpt-6-astra"))
         self.assertIsNone(select_escalation({"worker": "pi", "model": "unknown/model", "thinking": "medium"}, roster))
         local_roster = [
             {"worker": "pi", "model": "slotstream/qwen3.8-flash-next:4bit", "thinking": ["low"]},
@@ -499,14 +499,14 @@ class ContractTests(unittest.TestCase):
                                      text=True, capture_output=True, env=env)
             self.assertEqual(outcome.returncode, 0, outcome.stderr)
             self.assertEqual(json.loads(outcome.stdout)["target"],
-                             {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"})
+                             {"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "low"})
 
     def test_escalation_cli_plans_without_marking_and_failed_spawn_is_recoverable(self):
         state = self.dir / "state"
         task = state / "tasks" / "task-1"
         task.mkdir(parents=True)
         meta = {"id": "task-1", "created": iso(T0), "pane": "%1", "worker": "pi",
-                "model": "openai-codex/gpt-6-luna", "thinking": "medium"}
+                "model": "openai/gpt-6-luna", "thinking": "medium"}
         (task / "meta.json").write_text(json.dumps(meta))
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0 + 60)}))
         (task / "checkpoints.json").write_text(json.dumps({"events": []}))
@@ -519,7 +519,7 @@ class ContractTests(unittest.TestCase):
                                "--reason", "structured reporter error", "--evidence", "state.json:error"],
                               env=env, text=True, capture_output=True, check=True)
         out = json.loads(plan.stdout)
-        self.assertEqual(out["target"]["model"], "openai-codex/gpt-6-sol")
+        self.assertEqual(out["target"]["model"], "openai/gpt-6-sol")
         self.assertFalse((task / "escalation.json").exists())
         failed = subprocess.run([str(ROOT / "bin/tp-contract"), "escalated", "task-1", "--outcome", "failed",
                                  "--record-json", json.dumps(out["record"]), "--message", "spawn failed"],
@@ -535,7 +535,7 @@ class ContractTests(unittest.TestCase):
         task = state / "tasks" / "stopped"
         task.mkdir(parents=True)
         (task / "meta.json").write_text(json.dumps({"id": "stopped", "pane": "%1", "worker": "pi",
-                                                    "model": "openai-codex/gpt-6-luna", "thinking": "medium"}))
+                                                    "model": "openai/gpt-6-luna", "thinking": "medium"}))
         # Never ask the real tmux server: its pane %1 may be alive, which would make "killed" untestable.
         panes = self.dir / "panes"
         tmux = self.dir / "tmux"
@@ -557,7 +557,7 @@ class ContractTests(unittest.TestCase):
         task = state / "tasks" / "task-2"
         task.mkdir(parents=True)
         meta = {"id": "task-2", "created": iso(T0), "pane": "%1", "worker": "pi",
-                "model": "openai-codex/gpt-6-sol", "thinking": "medium",
+                "model": "openai/gpt-6-sol", "thinking": "medium",
                 "escalated_from": {"id": "task-1", "trigger": "model_error"}}
         (task / "meta.json").write_text(json.dumps(meta))
         env = dict(os.environ, TP_STATE_DIR=str(state))
@@ -680,7 +680,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(summary_line("Answer: 3.11\n\nShall I go on?", question=True), "Shall I go on?")
         self.assertEqual(summary_line("Answer: 3.11\n\nmore"), "Answer: 3.11")
         self.assertTrue(is_local("lmstudio/qwen/qwen3.6-35b-a3b"))
-        self.assertFalse(is_local("claude-sonnet-5-5") or is_local("openai-codex/gpt-5.5"))
+        self.assertFalse(is_local("claude-sonnet-5-5") or is_local("openai/gpt-5.5"))
 
     def test_ledger_stop_reason(self):
         task = self.dir / "tasks" / "research-2"

@@ -50,7 +50,7 @@ p.write_text(json.dumps(s))
             harness.chmod(0o755)
         self.env = {**os.environ, 'PATH': str(self.fake)+os.pathsep+os.environ['PATH'],
                     'TEST_TMUX_STATE':str(self.state), 'TEST_TMUX_LOG':str(self.log),
-                    'TEST_HARNESS_CWD':str(self.base/'cwd'), 'TP_NO_ATTACH':'1'}
+                    'TEST_HARNESS_CWD':str(self.base/'cwd'), 'TP_NO_ATTACH':'1', 'TP_PI_NODE':''}
         for key in ('TP_SESSION','TMUX','TP_WORKDIR','TP_MAIN_HARNESS'):
             self.env.pop(key,None)
         self.alias = self.fake/'agent'

@@ -9,7 +9,7 @@ import unittest
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai-codex/gpt-6-sol"
+MODEL = "openai/gpt-6-sol"
 WAITING = '{"state":"waiting"}'
 sys.path.insert(0, str(ROOT / "lib"))
 from sensitive_read import classify, hook_response

@@ -148,7 +148,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			worker: Type.Optional(StringEnum(["pi", "claude"] as const, { description: "Harness; implied by the router or the model" })),
-			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai-codex/gpt-6-sol); claude: alias (sonnet, opus, haiku)" })),
+			model: Type.Optional(Type.String({ description: "pi: provider/id (e.g. openai/gpt-6-sol); claude: alias (sonnet, opus, haiku)" })),
 			thinking: Type.Optional(StringEnum(THINKING, { description: "Thinking level" })),
 			name: Type.Optional(Type.String({ description: "Short id prefix, e.g. 'tests' or 'review'" })),
 			workdir: Type.Optional(Type.String({ description: "Absolute project directory explicitly approved by the human; otherwise use the main pane cwd. Requires interactive confirmation." })),

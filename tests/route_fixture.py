@@ -23,12 +23,12 @@ import router_catalog  # noqa: E402
 
 CATALOG_PATH = ROOT / "config" / "model-catalog.json"
 HAIKU = "claude-haiku-5-5"
-LUNA = "openai-codex/gpt-6-luna"
+LUNA = "openai/gpt-6-luna"
 QWEN = "lmstudio/qwen/qwen3.6-35b-a3b"
 SONNET = "claude-sonnet-5-5"
 OPUS = "claude-opus-5-5"
-SOL = "openai-codex/gpt-6-sol"
-ASTRA = "openai-codex/gpt-6-astra"
+SOL = "openai/gpt-6-sol"
+ASTRA = "openai/gpt-6-astra"
 LAYA_PORT = 11436
 LMSTUDIO_PORT = 1234
 # The chain order the mechanics tests are written against; a test that wants another passes order=.

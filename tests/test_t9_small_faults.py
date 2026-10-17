@@ -181,7 +181,7 @@ class T9Tests(unittest.TestCase):
         fit = 60000 // 30    # n lines hold 30n - 1 characters
         for spec, start in (("big.txt", 1), ("big.txt:10-3000", 10)):
             with self.subTest(spec):
-                run = self.raw("dispatch", "--role", "coder", "--task", "t", "--worker", "pi", "--model", "openai-codex/gpt-6-sol",
+                run = self.raw("dispatch", "--role", "coder", "--task", "t", "--worker", "pi", "--model", "openai/gpt-6-sol",
                                "--thinking", "medium", "--workdir", str(self.project), "--context", spec)
                 self.assertEqual(run.returncode, 1)
                 last = start + fit - 1

@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 SECRET = "SECRET-REQUEST-BODY"
 PLAN = {"review": "required", "policy": "required",
-        "reviewer": {"worker": "pi", "model": "openai-codex/gpt-6-sol", "thinking": "medium", "independence": "different_provider"}}
+        "reviewer": {"worker": "pi", "model": "openai/gpt-6-sol", "thinking": "medium", "independence": "different_provider"}}
 
 
 class TpReviewTests(unittest.TestCase):

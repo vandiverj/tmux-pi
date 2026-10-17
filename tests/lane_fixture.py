@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai-codex/gpt-6-sol"
+MODEL = "openai/gpt-6-sol"
 TMUX = shutil.which("tmux")
 
 

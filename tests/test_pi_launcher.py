@@ -58,7 +58,7 @@ class PiLauncherTests(unittest.TestCase):
                       'print("stub reply")\n')
         pi.chmod(0o755)
         self.env = {**os.environ, "PATH": str(self.fake) + os.pathsep + os.environ["PATH"],
-                    "TEST_PI_ARGV": str(self.record)}
+                    "TEST_PI_ARGV": str(self.record), "TP_PI_NODE": ""}
         for key in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE"):
             self.env.pop(key, None)
 

@@ -53,7 +53,7 @@
       {
         "provider": "openai",
         "worker": "pi",
-        "model": "openai-codex/gpt-6-luna",
+        "model": "openai/gpt-6-luna",
         "effort": "lowest",
         "timeout_seconds": 35,
         "max_input_tokens": 50000
@@ -193,7 +193,7 @@
           "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 64000, "in_roster": true
         },
         {
-          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-luna",
+          "provider": "openai", "worker": "pi", "model": "openai/gpt-6-luna",
           "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
           "context_window": 272000, "max_output": 128000, "in_roster": true
         }
@@ -220,7 +220,7 @@
           "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 128000, "in_roster": true
         },
         {
-          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-sol",
+          "provider": "openai", "worker": "pi", "model": "openai/gpt-6-sol",
           "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
           "context_window": 272000, "max_output": 128000, "in_roster": true
         }
@@ -241,7 +241,7 @@
       "expected_share": [0.0, 0.05],
       "models": [
         {
-          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6.1-sol",
+          "provider": "openai", "worker": "pi", "model": "openai/gpt-6.1-sol",
           "efforts": ["low", "medium", "high"], "context_window": 272000, "max_output": 128000, "in_roster": false,
           "unverified": "listed by pi, not in config/router.json yet; efforts assumed to match gpt-6-sol"
         }
@@ -266,7 +266,7 @@
           "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 128000, "in_roster": true
         },
         {
-          "provider": "openai", "worker": "pi", "model": "openai-codex/gpt-6-astra",
+          "provider": "openai", "worker": "pi", "model": "openai/gpt-6-astra",
           "efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
           "context_window": 272000, "max_output": 128000, "in_roster": true
         }

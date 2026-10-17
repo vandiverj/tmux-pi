@@ -35,7 +35,7 @@ tp-agent dispatch --role researcher --task "Find the cache invalidation rule" --
 tp-agent list
 tp-agent inspect <id>
 tp-agent collect <id>
-tp-agent retry <id> --reason "The first attempt misread the task" --worker pi --model openai-codex/gpt-6-sol
+tp-agent retry <id> --reason "The first attempt misread the task" --worker pi --model openai/gpt-6-sol
 tp-agent retry <id> --reason "Two attempts failed" --escalate
 tp-agent review <id>
 tp-agent message <id> --text "Please check the empty input case"

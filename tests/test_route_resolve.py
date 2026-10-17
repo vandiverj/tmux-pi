@@ -39,7 +39,7 @@ class RosterTests(unittest.TestCase):
                 self.assertIn(name, roster)
                 self.assertEqual((roster[name]["worker"], roster[name]["thinking"]), (entry["worker"], entry["efforts"]), name)
         self.assertEqual(sorted(set(roster) - set(catalog)), [])
-        self.assertFalse(catalog["openai-codex/gpt-6.1-sol"]["in_roster"])
+        self.assertFalse(catalog["openai/gpt-6.1-sol"]["in_roster"])
 
 
 class ChoiceTests(unittest.TestCase):
@@ -362,7 +362,7 @@ class ExplicitValidationTests(unittest.TestCase):
         self.rejected(SONNET, "madeup/nonexistent-model")  # the message lists what is valid
 
     def test_hidden_and_unrostered_models_are_rejected(self):
-        self.rejected("not offered", "openai-codex/gpt-6.1-sol")
+        self.rejected("not offered", "openai/gpt-6.1-sol")
         cat = copy.deepcopy(CAT)
         for lv in cat["levels"]:
             for m in lv["models"]:
@@ -443,7 +443,7 @@ class RedirectTests(unittest.TestCase):
             (OPUS, "claude", "high", {}, "restricted"),
             (SONNET, "claude", "medium", {"local_only": True}, "local-only"),
             ("madeup/model", "pi", "low", {}, "not in the model catalog"),
-            ("openai-codex/gpt-6.1-sol", "pi", "high", {}, "not offered"),
+            ("openai/gpt-6.1-sol", "pi", "high", {}, "not offered"),
             (SONNET, "claude", "medium", {"health": {"anthropic": {"status": "exhausted"}}}, "marked unavailable"),
             (HAIKU, "claude", "high", {"est_tokens": 700000}, "does not fit"),
             (QWEN, "pi", "high", {}, "not allowed"),
@@ -580,7 +580,7 @@ class DataOnlyChangeTests(unittest.TestCase):
         self.assertEqual(rc.shown_keys(cat), ["local", "small", "mid", "strong", "top"])
         r = rr.resolve({"level": 4, "effort": "high", "review": "none", "shape": None, "reason": "t"}, cat,
                        ctx={"role": "coder", "allow_unrostered": True})
-        self.assertEqual(r["model"], "openai-codex/gpt-6.1-sol")
+        self.assertEqual(r["model"], "openai/gpt-6.1-sol")
         # unrostered, the level has no model: the request moves up only if the next level is not restricted, else down
         r = rr.resolve({"level": 4, "effort": "high", "review": "none", "shape": None, "reason": "t"}, cat, ctx={"role": "coder"})
         self.assertEqual((r["level_key"], r["degraded"]), ("mid", "down"))

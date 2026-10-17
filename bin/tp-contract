@@ -327,7 +327,7 @@ def cmd_escalate(args):
     if is_local(meta.get("model")) and not preferred:
         # Local Qwen's single escalation should reach the roster-qualified GPT-6
         # frontier profile, not an unavailable legacy model or a local peer.
-        preferred = {"worker": "pi", "model": "openai-codex/gpt-6-luna", "thinking": "low"}
+        preferred = {"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "low"}
     target = select_escalation(meta, _roster(), preferred=preferred)
     if not target:
         raise ContractError("no stronger qualified escalation target for {}".format(args.id))

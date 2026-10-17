@@ -76,8 +76,8 @@ class ClaudePreferenceTests(unittest.TestCase):
         self.assertEqual((pref["ordinary"]["model"], pref["ordinary"]["thinking"]), ("claude-sonnet-5-5", "medium"))
         self.assertEqual((pref["heavy"]["model"], pref["heavy"]["thinking"]), ("claude-opus-5-5", "high"))
         # The shared route table is unchanged: GPT-6 routes stay GPT-6, expert stays Opus/high.
-        self.assertEqual(config["routes"]["coding"]["model"], "openai-codex/gpt-6-sol")
-        self.assertEqual(config["routes"]["complex"]["model"], "openai-codex/gpt-6-sol")
+        self.assertEqual(config["routes"]["coding"]["model"], "openai/gpt-6-sol")
+        self.assertEqual(config["routes"]["complex"]["model"], "openai/gpt-6-sol")
         self.assertEqual(config["routes"]["expert"], {"model": "claude-opus-5-5", "thinking": "high"})
 
     def test_ordinary_claude_recommendation_prefers_sonnet(self):
@@ -114,7 +114,7 @@ class ClaudePreferenceTests(unittest.TestCase):
             decision, trace = self.run_dispatch(config, tools=tools, difficulty=3, risk=0.9, sensitive=0.9)
             self.assertEqual(decision["worker"], "pi")
             self.assertIsNone(trace["preference"])
-        self.assertEqual(decision["model"], "openai-codex/gpt-6-sol")
+        self.assertEqual(decision["model"], "openai/gpt-6-sol")
 
     def test_preference_changes_only_model_and_effort(self):
         with tempfile.TemporaryDirectory() as other:
@@ -131,15 +131,15 @@ class ClaudePreferenceTests(unittest.TestCase):
         reply = self.h.laya_reply(tools=0.9, difficulty=1, risk=0.1, sensitive=0.1)
         self.assertEqual(route_task(TASK, self.config, opener=opener_for(reply))["model"], "claude-sonnet-5-5")
         config = dict(self.config, local={"rules": [{"pattern": "payroll", "from": ["claude-sonnet-5-5"],
-                                                      "to": {"model": "openai-codex/gpt-6-sol", "thinking": "high"}}]})
+                                                      "to": {"model": "openai/gpt-6-sol", "thinking": "high"}}]})
         trace = {}
-        self.assertEqual(route_task(TASK, config, opener=opener_for(reply), trace=trace)["model"], "openai-codex/gpt-6-sol")
+        self.assertEqual(route_task(TASK, config, opener=opener_for(reply), trace=trace)["model"], "openai/gpt-6-sol")
         self.assertTrue(trace["rule_applied"])
 
     def test_invalid_preference_is_rejected(self):
         base = json.loads((ROOT / "config/router.json").read_text())
         bad = [
-            {"ordinary": {"model": "openai-codex/gpt-6-sol", "thinking": "high"}},
+            {"ordinary": {"model": "openai/gpt-6-sol", "thinking": "high"}},
             {"heavy": {"model": "claude-opus-5-5", "thinking": "max"}},
             {"ordinary": {"model": "claude-sonnet-9", "thinking": "medium"}},
             {"heavy_when": {"difficulty_at_least": 4, "high_risk_at_least": 0.5, "sensitive_at_least": 0.5, "scopes": []}},
@@ -159,7 +159,7 @@ class ClaudePreferenceTests(unittest.TestCase):
         chosen, record = claude_preference(target, answers, self.config)
         self.assertEqual(chosen["model"], "claude-sonnet-5-5")
         self.assertEqual(record["reasons"], [])
-        pi = {"worker": "pi", "model": "openai-codex/gpt-6-astra", "thinking": "high"}
+        pi = {"worker": "pi", "model": "openai/gpt-6-astra", "thinking": "high"}
         self.assertEqual(claude_preference(pi, answers, self.config), (pi, None))
 
 
@@ -429,7 +429,7 @@ class ExportTests(unittest.TestCase):
                   {"state": "waiting", "tokens": {"input": 100, "output": 40, "cacheRead": 0, "cacheWrite": 0},
                    "cost": 0.25, "updated": "2026-09-29T10:05:00Z"},
                   {"result.md": "done", "review-required.json": json.dumps({"required": True, "status": "pending_review"})})
-        self.task("review-auto-1", {"worker": "pi", "model": "openai-codex/gpt-6-sol", "thinking": "medium"},
+        self.task("review-auto-1", {"worker": "pi", "model": "openai/gpt-6-sol", "thinking": "medium"},
                   files={"result.md": "APPROVED\nlooks right\nCoverage\nreviewed the changed files."})
         self.task("auto-2", {"worker": "claude", "model": "claude-opus-5-5", "thinking": "high",
                              "escalated_from": {"id": "auto-1"}},

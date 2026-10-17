@@ -396,7 +396,7 @@ try {
     console.log(JSON.stringify({ queued, guards: await noHand() })); process.exitCode = 0;
   } else {
   const inputResult = await handlers.input({ text: original, source }, ctx);
-  const before = await handlers.before_agent_start({ type: 'before_agent_start', prompt: ['expanded', 'expanded-marker'].includes(scenario) ? 'Update password hashing in auth.py' : inputResult.text ?? original });
+  const before = await handlers.before_agent_start({ type: 'before_agent_start', messageType: 'user', prompt: ['expanded', 'expanded-marker'].includes(scenario) ? 'Update password hashing in auth.py' : inputResult.text ?? original });
   if (scenario === 'malformed-marker') {
     console.log(JSON.stringify({ inputResult, blocked: await noHand(), calls: calls.map(c => c.name) }));
     process.exitCode = 0;
@@ -520,14 +520,14 @@ try {
   if (scenario === 'goal') {
     const follow = `TP_GOAL_CONTINUATION goal ${'c'.repeat(32)} ${'b'.repeat(64)}\nVerify the parser acceptance evidence`;
     const next = await handlers.input({ text: follow, source: 'extension' }, ctx);
-    const hidden = await handlers.before_agent_start({ type: 'before_agent_start', prompt: next.text ?? follow });
+    const hidden = await handlers.before_agent_start({ type: 'before_agent_start', messageType: 'user', prompt: next.text ?? follow });
     globalThis.goalNextHandshake = hidden?.message?.content?.includes('Handshake:') || false;
   }
   let inheritedTaskReview = false;
   if (scenario === 'review-failed') {
     const next = await handlers.input({ text: '+here Explain tp-view', source: 'interactive' }, ctx);
     inheritedTaskReview = JSON.parse(calls.filter(c => c.name === 'tp-task' && c.args[0] === 'preflight').at(-1).args.at(-1)).review === 'required';
-    await handlers.before_agent_start({ type: 'before_agent_start', prompt: next.text ?? 'Explain tp-view' });
+    await handlers.before_agent_start({ type: 'before_agent_start', messageType: 'user', prompt: next.text ?? 'Explain tp-view' });
   }
   console.log(JSON.stringify({ guards, preContractTools, mismatch, inheritedTaskReview, staleHashRejected, wrongStop, duplicate, continuation, postContractResolve, postContractReviewResolve, afterEndBeforeSettle, stopCapturedBeforeSettle, committed: committed.details, terminate: committed.terminate ?? false, editAfter, afterEnd: await noHand(), capabilityResolution: scenario === 'capability-resolved' ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'checkpoints.json'))).events.some(e => e.action === 'capability-resolve') : undefined, calls: calls.map(c => ({ name: c.name, args: c.args })), messages: messages.map(m => ({ kind: m.details?.kind, content: m.content })), stopCaptured: fs.existsSync(path.join(dir('stop-1'), 'captured.md')), capturedOutput: fs.existsSync(path.join(dir('stop-1'), 'captured.md')) ? fs.readFileSync(path.join(dir('stop-1'), 'captured.md'), 'utf8') : undefined, reviewBlocker: fs.readdirSync(path.join(state, 'handoffs')).some(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), decisionAtContract: JSON.parse(calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args[calls.find(c => c.name === 'tp-task' && c.args[0] === 'main-contract').args.indexOf('--decision-json') + 1]), scaffold: fs.readFileSync(path.join(state, 'handoffs', match[1], 'scaffold.json'), 'utf8'), mainContract: JSON.parse(fs.readFileSync(path.join(state, 'handoffs', match[1], 'main-contract.json'))), handoffs: fs.readdirSync(path.join(state, 'handoffs')).length, newReviewMarkers: fs.readdirSync(path.join(state, 'handoffs')).filter(id => fs.existsSync(path.join(state, 'handoffs', id, 'review-required.json'))), taskReviewMarker: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')), taskReview: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).status : undefined, reviewReasons: fs.existsSync(path.join(dir('auto-1'), 'review-required.json')) ? JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json'))).reasons : undefined, reviewGate: globalThis.reviewGate, researchGate: globalThis.researchGate, goalNextHandshake: globalThis.goalNextHandshake, reviewRoundMarkers: globalThis.reviewRoundMarkers, upgradeAtSend: globalThis.upgradeAtSend, inheritedReview: JSON.parse((() => { const a = calls.find(c => c.name === 'tp-task' && c.args[0] === 'preflight').args; return a.includes('--decision-json') ? a[a.indexOf('--decision-json') + 1] : '{}'; })()).review }));
   }

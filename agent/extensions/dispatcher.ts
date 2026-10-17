@@ -2104,6 +2104,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
+		if (event.messageType !== "user") return undefined;
 		const hand = activeHandshake;
 		if (hand && event.prompt !== hand.effective) {
 			// Pi expands skills/templates after input; invalidate the old route/hash.

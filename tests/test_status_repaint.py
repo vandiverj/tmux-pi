@@ -113,7 +113,7 @@ esac
                     data += os.read(self.master, 65536)
                 except OSError:
                     break
-                if predicate(data.split(ESC)[-1]):
+                if predicate(data.split(ESC)[-1]) and data.endswith(b"\x1b[J"):
                     break
         return data
 
@@ -448,7 +448,14 @@ class StatusRepaintTest(StatusPaneFixture):
             # Start just after a load has finished, so the 1 s timer cannot fire during the keys.
             seen = count(loads)
             self.assertTrue(self.wait_for(lambda: count(loads) > seen, 3.0), "no timer load seen")
-            time.sleep(0.45)
+            time.sleep(0.2)
+            settle_by = time.monotonic() + 3.0
+            while True:     # the load logs its first call as it starts; let its later programs (cat, python3) finish too
+                before = count(calls)
+                time.sleep(0.15)
+                if count(calls) == before:
+                    break
+                self.assertLess(time.monotonic(), settle_by, "the call log never settled after a load")
             loads_before, calls_before = count(loads), count(calls)
             for _ in range(10):
                 for key in (b"k", b"k", b"j", b"s", b"s", b"j", b"k"):

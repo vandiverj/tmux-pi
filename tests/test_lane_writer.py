@@ -239,8 +239,15 @@ class RefusalTableTests(LaneCase):
         item, task = self.lane_ok()
         self.settle(task)
         self.cli("collect", item["id"])
-        for flags in (("--domain", "other"), ("--touches", "docs"), ("--repo", str(self.repo)), ("--base", "main")):
+        for flags in (("--domain", "other"), ("--touches", "docs"), ("--base", "main")):
             self.refused(self.lane_dispatch(step="s1", extra=flags), "already exists")
+
+    def test_10_an_existing_lane_can_be_located_with_repo(self):
+        item, task = self.lane_ok()
+        self.settle(task)
+        self.cli("collect", item["id"])
+        run = self.lane_dispatch(step="s1", extra=("--repo", str(self.repo)))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_11_a_lane_that_is_not_open_refuses(self):
         item, task = self.lane_ok()

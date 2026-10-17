@@ -779,8 +779,9 @@ def lane_plan(args, base, tests):
 
 
 def lane_declaration_check(record, args):
-    """Check 10: a lane that has a record takes no declaration flags."""
-    if any(getattr(args, attr, None) for attr in ("domain", "touches", "repo", "base")):
+    """Check 10: a lane that has a record takes no declaration flags. --repo is allowed: it only locates the lane (the
+    record was found in that repository), which a main pane in another repository needs."""
+    if any(getattr(args, attr, None) for attr in ("domain", "touches", "base")):
         raise ValueError(f"lane {record['name']} already exists (domain: {record['domain']}); its declaration is set when it is created")
 
 

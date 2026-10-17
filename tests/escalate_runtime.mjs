@@ -27,6 +27,7 @@ process.env.PI_CODING_AGENT_DIR = path.join(tmp, 'agent');
 process.env.TP_LOCAL_CONFIG = config;
 const calls = [];
 const source = fs.readFileSync(path.join(root, 'agent/extensions/escalate.ts'), 'utf8');
+fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(tmp, 'lib'), { recursive: true });
 fs.writeFileSync(path.join(tmp, 'escalate.ts'), source.replace('import { execFileSync } from "node:child_process";', 'const execFileSync = globalThis.__fakeExecFileSync;'));
 globalThis.__fakeExecFileSync = (cmd, args) => {
   calls.push({ cmd: path.basename(cmd), args });
@@ -89,16 +90,20 @@ assert.deepEqual([after('--lane'), after('--lane-step'), after('--lane-replaces'
 fs.writeFileSync(path.join(sourceDir, 'meta.json'), JSON.stringify(original));
 const targetBefore = JSON.stringify({ id: 'new', worker: 'claude', pane: '%1' });
 fs.writeFileSync(path.join(targetDir, 'meta.json'), targetBefore);
-fs.writeFileSync(path.join(tmp, 'escalate-fail.ts'), source
-  .replace('import { execFileSync } from "node:child_process";', 'const execFileSync = globalThis.__fakeExecFileSync;')
-  .replace('renameSync, unlinkSync', 'unlinkSync')
-  .replace('renameSync(temp, file);', 'globalThis.__failRename(temp, file);'));
+// The rename lives in the shared state-write helper, so the failing variant gets its own patched copy of it.
+const failDir = path.join(tmp, 'fail');
+fs.mkdirSync(path.join(failDir, 'lib'), { recursive: true });
+const helper = fs.readFileSync(path.join(root, 'agent/extensions/lib/state-write.ts'), 'utf8');
+assert(helper.includes('renameSync(temp, file);'), 'state-write rename call changed; update the failure harness');
+fs.writeFileSync(path.join(failDir, 'lib/state-write.ts'), helper.replace('renameSync(temp, file);', 'globalThis.__failRename(temp, file);'));
+fs.writeFileSync(path.join(failDir, 'escalate-fail.ts'), source
+  .replace('import { execFileSync } from "node:child_process";', 'const execFileSync = globalThis.__fakeExecFileSync;'));
 globalThis.__failRename = (temp, file) => {
   if (file.endsWith('/meta.json')) throw new Error('simulated metadata rename failure');
   fs.renameSync(temp, file);
 };
 const failed = {};
-(await import(pathToFileURL(path.join(tmp, 'escalate-fail.ts')).href)).default({ on(name, fn) { failed[name] = fn; } });
+(await import(pathToFileURL(path.join(failDir, 'escalate-fail.ts')).href)).default({ on(name, fn) { failed[name] = fn; } });
 failed.model_select({ model: { provider: 'local', id: 'qwen' } });
 failed.tool_execution_start({ toolCallId: '2', toolName: 'read', args: {} });
 failed.tool_execution_end({ toolCallId: '2', toolName: 'read', isError: true, result: 'failed' },

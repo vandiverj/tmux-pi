@@ -16,10 +16,10 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { refuseLinks, taskStateRoot, writeTaskFile } from "./lib/state-write.ts";
 
 type Policy = { models: string[]; after_consecutive_errors: number };
 type Call = { name: string; args: unknown; error: boolean; output: string };
@@ -32,16 +32,10 @@ function readJson(file: string): any {
 	}
 }
 
-// Replace metadata in the same directory: readers never see a truncated JSON file.
-function writeJsonAtomic(file: string, value: unknown): void {
-	const temp = join(dirname(file), `.meta-${randomUUID()}.tmp`);
-	try {
-		writeFileSync(temp, `${JSON.stringify(value)}\n`, { flag: "wx", mode: 0o600 });
-		renameSync(temp, file);
-	} catch (error) {
-		try { unlinkSync(temp); } catch { /* write may have failed before creating it */ }
-		throw error;
-	}
+// Replace metadata in the same directory: readers never see a truncated JSON file. A symlink from the
+// state dir down to the file (tasks/, the task dir) is refused; one at the file is replaced.
+function writeJsonAtomic(taskDir: string, name: string, value: unknown): void {
+	writeTaskFile(taskDir, name, `${JSON.stringify(value)}\n`, 0o600);
 }
 
 function textOf(value: any): string {
@@ -136,8 +130,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			escalate(ctx);
 		} catch (error) {
-			// Leave the worker running if the handoff fails; the error is in escalation.md.
-			writeFileSync(join(dir, "escalation-error.txt"), `${String(error)}\n`);
+			// Leave the worker running if the handoff fails; the error is in escalation-error.txt, unless the
+			// task dir is behind a symlink and there is nowhere safe to write it.
+			try { writeTaskFile(dir, "escalation-error.txt", `${String(error)}\n`); } catch { /* refused: a linked tasks/ or task dir */ }
 		}
 	});
 
@@ -174,7 +169,7 @@ export default function (pi: ExtensionAPI) {
 			lastReply ? clip(lastReply, 4000) : "(none)",
 			"",
 		].join("\n");
-		writeFileSync(join(dir, "escalation.md"), notes);
+		writeTaskFile(dir, "escalation.md", notes);
 
 		const evidence = calls.slice(-streak).map((c) => `${c.name}: ${clip(c.output, 300)}`).join("\n");
 		const plan = JSON.parse(
@@ -207,7 +202,7 @@ export default function (pi: ExtensionAPI) {
 		// Materialize that authoritative restriction before the target's contract is
 		// built; copying metadata after spawn cannot undo a newly granted edit right.
 		if (sourceMeta.preflight && typeof sourceMeta.preflight === "object" && !Array.isArray(sourceMeta.preflight)) {
-			writeJsonAtomic(join(dir, "preflight.json"), sourceMeta.preflight);
+			writeJsonAtomic(dir, "preflight.json", sourceMeta.preflight);
 		}
 		// tp-spawn owns the copies and builds a fresh target contract/budget. Never
 		// reuse the source contract's artifact path or elapsed-time checkpoints.
@@ -247,7 +242,11 @@ export default function (pi: ExtensionAPI) {
 				],
 				{ encoding: "utf8", timeout: 60_000 },
 			).trim().split("\n")[0];
-			const targetMetaPath = join(dirname(dir), newId, "meta.json");
+			// The sibling task lives under tasks/ beside this one. Trust only the state dir, so a linked tasks/ or
+			// tasks/<newId> is refused before it is read and again before it is written.
+			const targetDir = join(dirname(dir), newId);
+			const targetMetaPath = join(targetDir, "meta.json");
+			refuseLinks(taskStateRoot(targetDir), targetDir);
 			const targetMeta = readJson(targetMetaPath);
 			if (!targetMeta || typeof targetMeta !== "object" || Array.isArray(targetMeta) || targetMeta.id !== newId) {
 				throw new Error(`target task metadata unavailable for ${newId}`);
@@ -262,7 +261,7 @@ export default function (pi: ExtensionAPI) {
 			if (sourceMeta.decision?.review === "required") {
 				targetMeta.decision = { ...targetMeta.decision, review: "required" };
 			}
-			writeJsonAtomic(targetMetaPath, targetMeta);
+			writeJsonAtomic(targetDir, "meta.json", targetMeta);
 			execFileSync(
 				join(root, "bin", "tp-contract"),
 				["escalated", id, "--to", newId, "--outcome", "started", "--record-json", JSON.stringify(plan.record)],
@@ -281,7 +280,7 @@ export default function (pi: ExtensionAPI) {
 		const meta = readJson(sourceMetaPath);
 		if (!meta || typeof meta !== "object" || Array.isArray(meta)) throw new Error("source task metadata unavailable after escalation");
 		meta.escalated_to = { id: newId, model: target.model, after_errors: streak };
-		writeJsonAtomic(sourceMetaPath, meta);
+		writeJsonAtomic(dir, "meta.json", meta);
 		ctx.abort();
 		ctx.shutdown();
 	}

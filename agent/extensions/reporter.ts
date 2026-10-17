@@ -13,9 +13,10 @@
  * tp-spawn's run.sh records the process exit separately.
  */
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ensureDir, refuseLinks, taskStateRoot, writeFileAtomic } from "./lib/state-write.ts";
 
 type Tokens = { input: number; output: number; cacheRead: number; cacheWrite: number };
 
@@ -57,19 +58,28 @@ export default function (pi: ExtensionAPI) {
 	const taskDir = process.env.TP_TASK_DIR;
 	// Main runs have no TP_TASK_DIR; tp creates @tp_state_dir for the session.
 	let dir = taskDir;
+	// The trusted root for every write: the state dir that holds the task dir (state/tasks/<id>), so a link at
+	// tasks/ or at the task dir is refused, or the session state dir that holds main/.
+	let root = taskDir ? taskStateRoot(taskDir) : undefined;
+	// A symlink at main/ is refused: the reporter stays off rather than write through it.
+	const mainDir = (stateDir: string): string | undefined => {
+		const main = join(stateDir, "main");
+		try { ensureDir(stateDir, main); } catch { return undefined; }
+		return main;
+	};
 	if (!dir && process.env.TP_STATE_DIR) {
-		dir = join(process.env.TP_STATE_DIR, "main");
-		mkdirSync(dir, { recursive: true });
+		root = process.env.TP_STATE_DIR;
+		dir = mainDir(root);
 	}
 	if (!dir && process.env.TMUX && process.env.PI_CODING_AGENT_DIR) {
 		try {
 			const { execFileSync } = require("node:child_process");
 			const session = execFileSync("tmux", ["display-message", "-p", ...(process.env.TMUX_PANE ? ["-t", process.env.TMUX_PANE] : []), "#S"], { encoding: "utf8" }).trim();
 			const stateDir = execFileSync("tmux", ["show-options", "-qv", "-t", `=${session}:`, "@tp_state_dir"], { encoding: "utf8" }).trim();
-			if (stateDir) { dir = join(stateDir, "main"); mkdirSync(dir, { recursive: true }); }
+			if (stateDir) { root = stateDir; dir = mainDir(stateDir); }
 		} catch {}
 	}
-	if (!dir) return;
+	if (!dir || !root) return;
 
 	const s: State = {
 		id: process.env.TP_TASK_ID ?? "main",
@@ -90,9 +100,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Write via rename so the status pane never reads a half-written file.
 	const atomic = (name: string, body: string) => {
-		const file = join(dir, name);
-		writeFileSync(`${file}.tmp`, body);
-		renameSync(`${file}.tmp`, file);
+		writeFileAtomic(root, join(dir, name), body, 0o666);
 	};
 	const save = () => {
 		s.updated = new Date().toISOString();
@@ -132,7 +140,8 @@ export default function (pi: ExtensionAPI) {
 		s.state = "working";
 		s.error = "";
 		lastReply = "";
-		try { unlinkSync(join(dir, "result.md")); } catch {}
+		// A link at tasks/ or the task dir would make this delete a file outside the state dir.
+		try { refuseLinks(root, dir); unlinkSync(join(dir, "result.md")); } catch {}
 		save();
 	});
 	pi.on("tool_execution_start", (event) => {

@@ -20,11 +20,12 @@ cp "$root/agent/extensions/offload.ts" "$tmp/offload.ts"
 cp "$root/agent/extensions/subagents.ts" "$tmp/subagents.ts"
 cp "$root/agent/extensions/escalate.ts" "$tmp/escalate.ts"
 cp "$root/agent/extensions/reporter.ts" "$tmp/reporter.ts"
+cp -R "$root/agent/extensions/lib" "$tmp/lib"
 printf '{"type":"module"}\n' > "$tmp/package.json"
 ln -s "$pi_package" "$tmp/node_modules/@earendil-works/pi-coding-agent"
 ln -s "$pi_package/node_modules/@earendil-works/pi-ai" "$tmp/node_modules/@earendil-works/pi-ai"
 ln -s "$pi_package/node_modules/@types/node" "$tmp/node_modules/@types/node"
 tsc=(npm exec --yes --package=typescript@5.9.3 -- tsc)
 if [[ -n "${TP_TSC_BIN:-}" ]]; then tsc=("$TP_TSC_BIN"); fi
-"${tsc[@]}" --noEmit --skipLibCheck --module nodenext --target es2023 \
+"${tsc[@]}" --noEmit --skipLibCheck --allowImportingTsExtensions --module nodenext --target es2023 \
   --typeRoots "$tmp/node_modules/@types" --types node "$tmp/dispatcher.ts" "$tmp/catalogue.ts" "$tmp/goal.ts" "$tmp/subagents.ts" "$tmp/escalate.ts" "$tmp/assistant.ts" "$tmp/orchestration.ts" "$tmp/sensitive.ts" "$tmp/offload.ts" "$tmp/reporter.ts"

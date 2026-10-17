@@ -1,8 +1,8 @@
 /** Ask the human before a worker reads a credential-bearing path. */
 import { execFileSync, spawnSync } from "node:child_process";
-import { renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { writeTaskFile } from "./lib/state-write.ts";
 
 export default function (pi: ExtensionAPI) {
 	const taskDir = process.env.TP_TASK_DIR;
@@ -10,11 +10,9 @@ export default function (pi: ExtensionAPI) {
 	if (!agentDir) return;
 	const classifier = join(dirname(agentDir), "bin", "tp-sensitive-read");
 	const trustGuard = join(dirname(agentDir), "bin", "tp-trust-guard");
-	const request = taskDir ? join(taskDir, "permission-request.json") : "";
 	const save = (value: object) => {
-		if (!request) return;
-		writeFileSync(request + ".tmp", JSON.stringify(value) + "\n");
-		renameSync(request + ".tmp", request);
+		if (!taskDir) return;
+		writeTaskFile(taskDir, "permission-request.json", JSON.stringify(value) + "\n", 0o666);
 	};
 	// Redact secrets in every tool result before the model or the session sees it. Only in "on" mode; fail closed.
 	const redactor = join(dirname(agentDir), "bin", "tp-redact");

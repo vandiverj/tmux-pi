@@ -16,6 +16,7 @@ const root = path.resolve(import.meta.dirname, '..');
 const state = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-runtime-'));
 const moduleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-module-'));
 const source = fs.readFileSync(path.join(root, 'agent/extensions/dispatcher.ts'), 'utf8');
+fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(moduleDir, 'lib'), { recursive: true });
 // The production watcher/scanner poll every 3000ms; compress only that cadence so
 // settlement is noticed quickly. Other sleeps (2s, 15s contract scan) stay real.
 const POLL_MS = 3000, FAST_POLL_MS = Number(process.env.TP_TEST_POLL_MS || 150);
@@ -267,15 +268,34 @@ try {
       messages: messages.map(m => m.details?.kind), collected: calls.filter(c => c.name === 'tp-contract' && c.args[0] === 'collect').length }));
     process.exit(0);
   }
-  if (['rework-restart', 'rework-approved', 'resolved-restart', 'resolved-failed', 'resolved-changes', 'needs-human-followup'].includes(scenario)) {
+  if (['rework-restart', 'rework-approved', 'resolved-restart', 'resolved-failed', 'resolved-changes', 'needs-human-followup', 'followup-symlinks'].includes(scenario)) {
     task('auto-1', { decision: { review: 'required' }, review: 'review-1' });
     task('review-1', { worker: 'claude' });
     fs.writeFileSync(path.join(dir('review-1'), 'review-of'), 'auto-1');
     const verdict = 'APPROVED\nprevious round.' + COV;
     fs.writeFileSync(path.join(dir('review-1'), 'result.md'), verdict);
-    fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(scenario === 'needs-human-followup' ? { required: true, status: 'needs_human', task_id: 'auto-1', reasons: ['Earlier failure'] } : ['resolved-restart', 'resolved-failed', 'resolved-changes'].includes(scenario) ? { required: true, status: 'resolved', task_id: 'auto-1', resolution: { actor: 'human_cli', reason: 'Older work' } } : { required: true, status: 'approved', task_id: 'auto-1', approval: { reviewer_id: 'review-1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'), author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } }));
+    fs.writeFileSync(path.join(dir('auto-1'), 'review-required.json'), JSON.stringify(['needs-human-followup', 'followup-symlinks'].includes(scenario) ? { required: true, status: 'needs_human', task_id: 'auto-1', reasons: ['Earlier failure'] } : ['resolved-restart', 'resolved-failed', 'resolved-changes'].includes(scenario) ? { required: true, status: 'resolved', task_id: 'auto-1', resolution: { actor: 'human_cli', reason: 'Older work' } } : { required: true, status: 'approved', task_id: 'auto-1', approval: { reviewer_id: 'review-1', evidence_sha256: crypto.createHash('sha256').update(verdict).digest('hex'), author_sha256: crypto.createHash('sha256').update(DONE).digest('hex') } }));
     fs.writeFileSync(path.join(dir('auto-1'), 'completed'), '1\n');
     fs.writeFileSync(path.join(dir('auto-1'), 'state.json'), JSON.stringify({ state: 'starting' }));
+    if (scenario === 'followup-symlinks') {
+      // A link at followups.md and at meta.json: the append is refused and meta.json is replaced; nothing outside the state dir is written.
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-r5-outside-'));
+      const outFollow = path.join(outside, 'followups.md'), outMeta = path.join(outside, 'meta.json');
+      fs.writeFileSync(outFollow, 'OUTSIDE\n');
+      fs.copyFileSync(path.join(dir('auto-1'), 'meta.json'), outMeta);
+      const metaBefore = fs.readFileSync(outMeta, 'utf8');
+      fs.symlinkSync(outFollow, path.join(dir('auto-1'), 'followups.md'));
+      fs.rmSync(path.join(dir('auto-1'), 'meta.json'));
+      fs.symlinkSync(outMeta, path.join(dir('auto-1'), 'meta.json'));
+      // The input handler reports a failed send as a notice, not a throw.
+      const notices = [];
+      ctx.ui.notify = (message) => notices.push(message);
+      await handlers.input({ text: '+followup auto-1 Please rework this', source: 'interactive' }, ctx);
+      const refused = notices.splice(0).join('\n');
+      console.log(JSON.stringify({ refused, outFollow: fs.readFileSync(outFollow, 'utf8'), metaUnchanged: fs.readFileSync(outMeta, 'utf8') === metaBefore,
+        metaIsLink: fs.lstatSync(path.join(dir('auto-1'), 'meta.json')).isSymbolicLink(), outsideFiles: fs.readdirSync(outside).sort() }));
+      process.exit(0);
+    }
     await handlers.input({ text: '+followup auto-1 Please rework this', source: 'interactive' }, ctx);
     const pending = JSON.parse(fs.readFileSync(path.join(dir('auto-1'), 'review-required.json')));
     const staleCompleted = fs.existsSync(path.join(dir('auto-1'), 'completed'));

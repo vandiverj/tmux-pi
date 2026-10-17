@@ -9,6 +9,7 @@ const root = path.resolve(import.meta.dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-reporter-'));
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.copyFileSync(path.join(root, 'agent/extensions/reporter.ts'), path.join(tmp, 'reporter.ts'));
+fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(tmp, 'lib'), { recursive: true });
 const mod = await import(pathToFileURL(path.join(tmp, 'reporter.ts')).href);
 const task = path.join(tmp, 'task');
 fs.mkdirSync(task);

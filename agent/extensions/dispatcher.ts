@@ -42,10 +42,11 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { appendFileSafe, ensureDir, refuseLinks, writeFileAtomic } from "./lib/state-write.ts";
 
 type Decision = {
 	worker: "pi" | "claude";
@@ -404,16 +405,26 @@ export default function (pi: ExtensionAPI) {
 	// TP_STATE_DIR is authoritative, as in lib/tp.sh tp_session(): a pane whose session keeps
 	// its state elsewhere is refused, so the state dir and the main pane never come from
 	// two workspaces.
+	// The last state dir this pane accepted: the trusted root under which every state write below is checked for symlinks.
+	let stateRoot: string | undefined;
 	const stateDir = async () => {
 		const have = await sessionOpt("@tp_state_dir");
 		if (!have) throw new Error("tmux-pi state dir unavailable for this pane; no workspace guess");
 		const want = process.env.TP_STATE_DIR;
-		if (!want) return have;
+		if (!want) return (stateRoot = have);
 		if (canon(have) !== canon(want)) {
 			const session = await sessionOpt("session_name");
 			throw new Error(`session '${session}' keeps its state in '${have}', not TP_STATE_DIR '${want}'; refusing to act on another workspace`);
 		}
-		return want;
+		return (stateRoot = want);
+	};
+	// The state dir that `path` lies under (as given or resolved); a write outside it is refused.
+	const rootOf = (path: string): string => {
+		for (const root of stateRoot ? [stateRoot, canon(stateRoot)] : []) {
+			const rel = relative(resolve(root), resolve(path));
+			if (rel !== ".." && !rel.startsWith("../") && !rel.startsWith("/")) return root;
+		}
+		throw new Error(`refusing to write ${path}: not under the tmux-pi state dir`);
 	};
 	const mainWorkdir = async () => {
 		const pane = (await sessionOpt("@tp_main_pane")).trim();
@@ -544,6 +555,7 @@ export default function (pi: ExtensionAPI) {
 		// An approved round cannot authorize new work. Publish the gate before typing.
 		pendingDelegatedReview(dir, id);
 		// An earlier collection is not the completion of this new round.
+		refuseLinks(rootOf(dir), dir);
 		rmSync(join(dir, "completed"), { force: true });
 		// The record (task.md) must not keep saying "completed"; tp-contract status rewrites it (run never rejects).
 		void run(bin("tp-contract"), ["status", id]);
@@ -804,10 +816,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const writeJson = (file: string, value: any) => {
-		mkdirSync(dirname(file), { recursive: true });
-		const tmp = `${file}.${randomUUID()}.tmp`;
-		writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-		renameSync(tmp, file);
+		const root = rootOf(file);
+		ensureDir(root, dirname(file));
+		writeFileAtomic(root, file, `${JSON.stringify(value, null, 2)}\n`, 0o666);
 	};
 
 	const handoffDir = async (id: string) => join(await stateDir(), "handoffs", id);
@@ -839,7 +850,7 @@ export default function (pi: ExtensionAPI) {
 
 	const persistScaffold = async (hand: Handshake) => {
 		const dir = await handoffDir(hand.id);
-		mkdirSync(dir, { recursive: true });
+		ensureDir(rootOf(dir), dir);
 		const scaffold = {
 			schema: "tmux-pi-r5-scaffold:v1",
 			handshake_id: hand.id,
@@ -1391,7 +1402,10 @@ export default function (pi: ExtensionAPI) {
 		const q = readJson(await queueFile());
 		return Array.isArray(q) ? q : [];
 	};
-	const saveQueue = async (q: Queued[]) => writeFileSync(await queueFile(), `${JSON.stringify(q, null, 1)}\n`);
+	const saveQueue = async (q: Queued[]) => {
+		const file = await queueFile();
+		writeFileAtomic(rootOf(file), file, `${JSON.stringify(q, null, 1)}\n`);
+	};
 	let queueLock: Promise<unknown> = Promise.resolve();
 	const serial = <T>(f: () => Promise<T>): Promise<T> => {
 		const p = queueLock.then(f);
@@ -1948,7 +1962,8 @@ export default function (pi: ExtensionAPI) {
 			target.rounds = 0;
 			await typeInto(target.id, message);
 			// Reviewers read these with the original task (bin/tp-review).
-			appendFileSync(join(await taskDir(target.id), "followups.md"), `- ${message.replace(/\r?\n/g, " ")}\n`);
+			const followups = join(await taskDir(target.id), "followups.md");
+			appendFileSafe(rootOf(followups), followups, `- ${message.replace(/\r?\n/g, " ")}\n`);
 			post(`Sent to ${target.id}: ${message}`, { kind: "follow-up", id: target.id });
 			ctx.ui.setStatus("auto", `AUTO follow-up · ${target.id}`);
 			follow(target);

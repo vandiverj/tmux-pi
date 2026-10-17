@@ -7,7 +7,8 @@ A document that cannot be processed is skipped on its own and counted in `skippe
 file (a file name can hold anything, and this block reaches session-index.json and Pi): `work list`, `work decisions` and `find` name them.
 `checkpoint` (Phase C) is the status of the first attached workspace's newest valid checkpoint (ids, times and flags, and the two
 sentences the injection shows), None when nothing is attached; `recovery` appears only while a compaction marker is pending and a
-workspace is attached. Both are read-only.
+workspace is attached. Both are read-only. `autonomy` (Phase D1) appears only while autonomy is on: whether dispatch is blocked,
+since when, and the one line the injection shows (lib/autonomy.py).
 `decision_summary` is the bounded text form the Claude injection and Pi's task_index share (R3-F3).
 """
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 
+import autonomy
 import work
 import work_checkpoint
 from work import skipped_count
@@ -166,13 +168,17 @@ def _checkpoint_entry(state_dir, ids, opened, tasks):
 
 
 def _recovery(state_dir):
+    value = work_checkpoint.marker(state_dir)
+    if not value["pending"]:
+        return None
+    return {"pending": True, "since": _clip(value["since"], 40), "reason": _clip(value["problem"] or value["reason"], 80)}
+
+
+def _autonomy_entry(state_dir):
     try:
-        value = json.loads((Path(state_dir) / work_checkpoint.RECOVERY_FILE).read_text())
-    except (OSError, ValueError):
+        return autonomy.index_entry(state_dir)
+    except Exception:  # noqa: BLE001 - an extra line; a failure here must not hide the rest of the block
         return None
-    if not isinstance(value, dict) or value.get("pending") is not True:
-        return None
-    return {"pending": True, "since": _clip(value.get("since"), 40), "reason": _clip(value.get("reason"), 80)}
 
 
 def build(state_dir, workdir=None, tasks=None):
@@ -222,6 +228,9 @@ def build(state_dir, workdir=None, tasks=None):
     recovery = _recovery(state_dir) if ids else None  # a marker with nothing attached has nothing to recover
     if recovery:
         block["recovery"] = recovery
+    entry = _autonomy_entry(state_dir)
+    if entry:  # only while autonomy is on, so an interactive session's block is what it was
+        block["autonomy"] = entry
     if skipped_count(skipped):  # only when something could not be read, so a healthy store's block is what it was
         block["skipped"] = {"count": skipped_count(skipped)}
     return block

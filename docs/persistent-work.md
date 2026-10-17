@@ -54,7 +54,7 @@ A checkpoint is written:
 ```
 tp-agent work checkpoint [ID] [--auto] [--trigger manual|precompact|session-end]
 tp-agent work recover [ID]        # read-only: what is known now, from the workspace file or else the latest valid checkpoint
-tp-agent work compacted [--reason TEXT]   # marks this session's recovery pending (set-only, idempotent; for the hooks)
+tp-agent work compacted [--reason TEXT]   # marks this session's recovery pending (for the hooks; each call adds a recovery generation, so one landing during `work recovered` stays pending)
 ```
 
 `work recover` prints the live workspace state, the checkpoint (age, validity, truncation, agent summary), the tasks that
@@ -70,10 +70,14 @@ says how long ago the workspace was last updated and asks for re-confirmation wi
 
 After a compaction the injected task index (Claude: `SessionStart` with source `compact`; Pi: `task_index`) names the attached
 workspace, the checkpoint's age and validity, any task that changed since, and `tp-agent work recover`. Building that text reads
-files and writes none, so injecting twice gives the same text. `session-recovery.json` in the run's state directory is the
-recovery-pending marker; it is set by the `PreCompact` hook and by the `SessionStart(compact)` handler whether or not a
-checkpoint could be written, and by `work attach` in a run (a restart that attaches a workspace); nothing in this feature
-clears it yet. An attached workspace whose file is missing or corrupt is still named in the injected text, with
+files and writes none, so injecting twice gives the same text. The recovery-pending marker in the run's state directory is a
+generation: the `PreCompact` hook, the `SessionStart(compact)` handler (whether or not a checkpoint could be written), `work
+attach` in a run (a restart that attaches a workspace) and `autonomy on` each add one under `session-recovery/` without taking a
+lock. `tp-agent work recovered --evidence "..."` (after the same reconciliation `work recover` prints; `--accept T1,T2` for tasks
+that changed, `--no-checkpoint` when this run has none; it refuses when the live task records cannot be read) records in
+`session-recovery.json` the generation it validated, so a compaction during or after it stays pending. Nothing clears it by
+time. With `tp-agent autonomy on --workspace ID` (Claude orchestrator main only) a pending marker refuses every new worker start
+except a `tp-review` of a finished task; `autonomy off` is the user's way out. An attached workspace whose file is missing or corrupt is still named in the injected text, with
 `(file missing)` or `(corrupt: ...)`, and `work recover` prints the checkpoint's copy of it.
 
 Settings (`config/work.json`): `checkpoints_keep`, `checkpoint_max_bytes` (and the Phase A/B ones: `inject_*`, `recent_days`,

@@ -6,6 +6,7 @@ import re
 
 import sys
 
+import autonomy
 import work
 import work_checkpoint
 import work_find
@@ -129,7 +130,12 @@ def add_parsers(sub):
     p.add_argument("--summary-file", help="read that summary from a file")
     p = ws.add_parser("recover", help="print what is known about a workspace after a compaction or restart (reads only)")
     p.add_argument("id", nargs="?", help="workspace id (default: every workspace attached to this session)")
-    p = ws.add_parser("compacted", help="mark this session's recovery as pending (set-only, idempotent; for the compaction hooks)")
+    p = ws.add_parser("recovered", help="clear this session's recovery-pending marker after reconciling (the only way it is cleared)")
+    p.add_argument("id", nargs="?", help="one of this run's workspaces; the marker is run-wide, so every attached workspace is reconciled whatever is named")
+    p.add_argument("--evidence", required=True, help="what you checked: the live records, the open decisions, any 'done' claim you re-verified")
+    p.add_argument("--accept", default="", help="comma-separated task ids that differ from the checkpoint and that you have checked (T1,T2)")
+    p.add_argument("--no-checkpoint", action="store_true", help="there is no checkpoint of this run to compare with: the live records and the workspace are what you checked")
+    p = ws.add_parser("compacted", help="mark this session's recovery as pending by adding a recovery generation (for the compaction hooks)")
     p.add_argument("--reason", default="compaction")
 
 
@@ -199,7 +205,7 @@ def leaf(args):
 # Every `work` subcommand that changes nothing in the work store. Anything not listed here is a mutation: `run` calls
 # `post_mutation` after it, so a new mutating subcommand gets the stale-checkpoint trigger without anyone remembering to add it.
 READ_ONLY = frozenset({"show", "list", "decisions", "note show", "decision list"})
-NOT_MUTATIONS = READ_ONLY | {"recover", "compacted", "checkpoint"}
+NOT_MUTATIONS = READ_ONLY | {"recover", "compacted", "recovered", "checkpoint"}
 
 
 def mutating(args):
@@ -240,6 +246,8 @@ def run(args, session_dir=None, task_status=None, tasks=None):
         return work_checkpoint.compacted(session_dir, args.reason)
     if cmd == "recover":
         return _recover(args, session_dir, tasks)
+    if cmd == "recovered":  # touches the session's state directory only (it reads the work store and the task records)
+        return _recovered(args, session_dir, tasks)
     if leaf(args) in READ_ONLY:
         work.ensure_store()
         return _read_command(args)
@@ -309,6 +317,84 @@ def _recover(args, session_dir, tasks):
         raise WorkError("no workspace given and none attached to this session; pass a workspace id")
     live = _live(tasks)
     return "\n\n".join(work_checkpoint.format_recover(work_checkpoint.recover(i, live, _run_id(session_dir))) for i in ids)
+
+
+def _recovery_targets(args, session_dir):
+    """The workspaces whose reconciliation clears this run's marker: every one attached to the run, plus the one its autonomy record
+    names. The marker is run-wide, so a workspace id on the command line may select among them but never replaces them."""
+    required = list(dict.fromkeys(work_index.attached_ids(session_dir)))
+    try:
+        named = (autonomy.record(session_dir) or {}).get("workspace")
+    except ValueError:
+        named = None
+    if isinstance(named, str) and named and named not in required:
+        required.append(named)
+    if args.id and args.id not in required:
+        raise WorkError(f"{args.id} is not a workspace of this run (attached: {', '.join(required) or 'none'}); recovery clears the whole "
+                        "run's marker, so it can only be checked against this run's own workspaces")
+    return required
+
+
+def _recovered(args, session_dir, tasks):
+    """Clear the recovery marker, but only after the same reconciliation `work recover` prints: with a checkpoint of this run, the live
+    task diff against it must be empty or every task that differs named in --accept; with none (or none from this run), the caller
+    says so with --no-checkpoint. --evidence is required and recorded. Nothing is cleared when any workspace refuses."""
+    if session_dir is None:
+        raise WorkError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR")
+    evidence = (args.evidence or "").strip()
+    if not evidence:
+        raise WorkError("--evidence must say what you checked (the live records, the open decisions, any \"done\" claim you re-verified)")
+    accepted = {part for part in re.split(r"[,\s]+", args.accept or "") if part}
+    run, notes, ids = _run_id(session_dir), [], []
+
+    def check():  # the clear covers only the generations that existed before this ran (work_checkpoint.recovered)
+        # Select the workspaces only now, after that snapshot: an attach that published its workspace earlier is checked here, and
+        # one that publishes later also arms a newer generation, which this clear does not cover.
+        ids[:] = _recovery_targets(args, session_dir)
+        live, unreadable = None, None
+        try:
+            live = list(tasks()) if tasks else None
+        except (ValueError, OSError, KeyError) as error:
+            unreadable = error
+        if live is None and unreadable is None:
+            unreadable = "no task records were given"
+        problems = _recovery_problems(args, ids, run, live, unreadable, accepted, notes)
+        if problems:
+            raise WorkError("recovery is not complete, nothing was cleared: " + " | ".join(problems))
+
+    value = work_checkpoint.recovered(session_dir, evidence, accepted, check)
+    return {"recovered": True, "changed": value["changed"], "workspaces": ids, "accepted": sorted(accepted),
+            **({"notes": notes} if notes else {})}
+
+
+def _recovery_problems(args, ids, run, live, unreadable, accepted, notes):
+    """Why recovery is not complete (sentences; empty when it is), comparing each workspace's live tasks with this run's newest
+    valid checkpoint. Appends checkpoint labels worth printing to `notes`."""
+    problems = []
+    if unreadable is not None:
+        # Reconciliation is against the live records, with a checkpoint or (--no-checkpoint) without one: unread, nothing was checked.
+        return [f"the live task records cannot be read ({unreadable}), so recovery cannot be checked against them, with or without "
+                "a checkpoint; fix that, then run `work recover` and this again"]
+    if not ids and not args.no_checkpoint:
+        problems.append("no workspace is attached to this session, so there is nothing to compare; check `tp-agent list` and the live "
+                        "records, then pass --no-checkpoint")
+    for ws_id in ids:
+        info = work_checkpoint.recover(ws_id, live, run)
+        if info["state"] is None and not args.no_checkpoint:
+            problems.append(f"{ws_id}: its workspace file is unavailable ({info['file']}) and there is no valid checkpoint; "
+                            "pass --no-checkpoint to say you reconciled from the live records alone")
+        elif not info["tasks"]["known"]:
+            if not args.no_checkpoint:
+                problems.append(f"{ws_id}: no valid checkpoint of this run to compare the live tasks with; run `work recover {ws_id}`, "
+                                "check `tp-agent list`, then pass --no-checkpoint")
+        else:
+            unaccepted = sorted({line.split()[0] for line in info["tasks"]["changes"]} - accepted)
+            if unaccepted:
+                problems.append(f"{ws_id}: tasks changed since its checkpoint and not accepted: {', '.join(unaccepted)}; "
+                                f"check each (`tp-agent inspect ID`), then pass --accept {','.join(unaccepted)}")
+        if info["checkpoint"] and info["checkpoint"]["truncated"]:
+            notes.append(f"{ws_id}: the checkpoint is {work_checkpoint.TRUNCATED_LABEL}")
+    return problems
 
 
 def _read_command(args):
@@ -395,7 +481,7 @@ def _write_command(args, session_dir, task_status):
             current = []
         attached = list(dict.fromkeys([*current, doc.id]))
         work.atomic_write(path, json.dumps({"attached": attached}, indent=2) + "\n")
-        # A run that attaches a workspace is a restart that needs reconciling: recovery is pending (set-only, idempotent).
+        # A run that attaches a workspace is a restart that needs reconciling: recovery is pending (adds a recovery generation).
         work_checkpoint.compacted(session_dir, "attach")
         return {"attached": attached}
     if cmd == "decision":

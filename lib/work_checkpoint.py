@@ -10,8 +10,9 @@ left out is counted in `truncated` (and `counts` still says what the workspace h
 `truncated: workspace file is the authority` and never called a complete copy. Execution state is not checkpointed as truth: `tasks`
 is a snapshot kept only to diff against the live task records.
 
-`session-recovery.json` (the run's state directory) is the recovery-pending marker. `compacted` only ever sets it, and setting it
-twice changes nothing. It does not depend on a checkpoint having been written.
+The recovery-pending marker (the run's state directory) is a monotonic generation: `compacted`/`arm` add one, lock-free, under
+`session-recovery/`, and `recovered` records in `session-recovery.json` the generation it validated; pending = newer generations
+exist (see "the marker" below). Arming does not depend on a checkpoint having been written.
 
 Everything here that reads (status, latest, recover) creates and changes nothing. The writers are called by a command that already holds
 the work store lock (work.locked is not re-entrant), except `compacted`, which needs no work store at all.
@@ -307,14 +308,15 @@ def files(ws_id):
     return sorted(names, key=lambda p: (int(NAME_RE.fullmatch(p.name).group(2)), p.name), reverse=True)
 
 
-def latest(ws_id):
+def latest(ws_id, run=None):
     """{'valid': (path, checkpoint) | None, 'files': N, 'newest_failed': bool, 'problem': why the newest failed}: the newest valid
-    checkpoint, falling back past invalid ones. Reads only."""
+    checkpoint, falling back past invalid ones. With `run`, the newest valid one that run wrote (the store is shared, so another
+    run's newer checkpoint must not stand in for this run's). Reads only."""
     found = files(ws_id)
     result = {"valid": None, "files": len(found), "newest_failed": False, "problem": ""}
     for index, path in enumerate(found):
         value, problem = read_checkpoint(path)
-        if value is not None:
+        if value is not None and (run is None or value.get("run") == run):
             result["valid"] = (path, value)
             return result
         if index == 0:
@@ -551,9 +553,11 @@ def recover(ws_id, live_tasks=None, run=""):
                              "truncated": value["truncated"], "authored_by": value["summary"].get("authored_by"),
                              "summary": value["summary"].get("text", ""), "summary_from": value["summary"].get("carried_from"), "counts": value["counts"], "state": value["state"],
                              "stale": doc is not None and bool(value.get("workspace_sha256")) and _current_sha(doc) != value["workspace_sha256"]}
-        if live_tasks is not None and run and value.get("run") == run:
-            missing = tasks_not_checkpointed(value)
-            out["tasks"] = {"known": True, "changes": diff_tasks(value["tasks"], live_tasks, bool(missing)), "partial": missing}
+    own = (valid if valid is not None and valid[1].get("run") == run else latest(ws_id, run)["valid"]) if run else None
+    if live_tasks is not None and own is not None:  # the task diff is against this run's newest checkpoint, whatever is newer
+        missing = tasks_not_checkpointed(own[1])
+        out["tasks"] = {"known": True, "changes": diff_tasks(own[1]["tasks"], live_tasks, bool(missing)), "partial": missing}
+        out["tasks_against"] = {"path": own[0], "at": own[1]["at"]}
     if doc is not None:
         out["source"], out["state"] = "workspace", judgement_state(doc)
         out["workspace_age"] = age_text(work.updated_iso(doc))
@@ -604,6 +608,9 @@ def format_recover(info):
     tasks = info["tasks"]
     if tasks["known"]:
         out.append("tasks since the checkpoint: " + ("none changed" if not tasks["changes"] else ""))
+        against = info.get("tasks_against") or {}
+        if ckpt is None or against.get("path") != ckpt["path"]:
+            out.append(f"  compared with this run's newest checkpoint, taken at {against.get('at')} (the one above is another run's)")
         out += [f"  - {line}" for line in tasks["changes"]]
         if tasks.get("partial"):
             out.append(f"task diff partial: {tasks['partial']} task rows were not checkpointed")
@@ -645,9 +652,26 @@ def format_recover(info):
 
 
 # ------------------------------------------------------------------ the marker
+#
+# A monotonic generation. Every arming event (PreCompact and SessionStart(compact) through `work compacted`, `work attach`,
+# `autonomy on`) publishes the next number as a new file `session-recovery/<generation>.json` with os.link, which fails when the
+# number is taken; the arm then takes the next one. Arming takes no lock and never waits, so a compaction cannot time out behind a
+# slow `work recovered`. Numbers are only ever added, each one the maximum seen plus one, so a number an arm manages to publish is
+# above every number that existed before it: an arm that read a stale maximum merely retries. Concurrent arms can therefore only add
+# generations (over-arm), never reuse one that a clear has already covered (under-arm).
+# `session-recovery.json` is the clear record, written only by `recovered` under the state lock: `cleared_generation` is the newest
+# generation that existed BEFORE the reconciliation ran, and pending = current generation > cleared generation, so a compaction during
+# or after the reconciliation stays pending by construction. A Phase C record `{pending: true}` (no cleared_generation) reads as
+# pending until the next `recovered` replaces it.
+
+RECOVERY_DIR = "session-recovery"
+GENERATION_RE = re.compile(r"^(\d{12})\.json$")
+
 
 @contextlib.contextmanager
-def _state_lock(state_dir, seconds=5.0):
+def state_lock(state_dir, seconds=5.0):
+    """The lock `recovered` (validate and clear) and `autonomy on` (write its record and arm) take, so neither runs inside the other.
+    Arming alone takes no lock."""
     fd = os.open(Path(state_dir) / ".session-recovery.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         deadline = time.monotonic() + seconds
@@ -657,26 +681,154 @@ def _state_lock(state_dir, seconds=5.0):
                 break
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise WorkError("the recovery marker is locked by another tp-agent; try again")
+                    raise WorkError("the recovery state is locked by another tp-agent (work recovered or autonomy on); try again")
                 time.sleep(0.05)
         yield
     finally:
         os.close(fd)
 
 
-def compacted(state_dir, reason="compaction"):
-    """Set `session-recovery.json` {pending:true, since, reason}. Set-only and idempotent: an already-pending marker is left exactly
-    as it is (the first `since` and `reason` stay). Only a later `work recovered` (Phase D) clears it."""
+def _generations(state_dir):
+    """The published generation numbers, ascending; None when the directory does not exist. OSError when it cannot be read."""
+    folder = Path(state_dir) / RECOVERY_DIR
+    if folder.is_symlink():
+        raise OSError(f"{RECOVERY_DIR} is a symlink")
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return None
+    return sorted(int(m.group(1)) for m in map(GENERATION_RE.fullmatch, names) if m)
+
+
+def _event(state_dir, generation):
+    try:
+        value = json.loads((Path(state_dir) / RECOVERY_DIR / f"{generation:012d}.json").read_text())
+    except (OSError, ValueError):
+        value = None
+    if not isinstance(value, dict):
+        return {"since": "", "reason": "an unreadable recovery event"}
+    return {"since": str(value.get("since") or ""), "reason": str(value.get("reason") or "")}
+
+
+def marker(state_dir, missing_is_pending=False):
+    """{pending, generation, cleared_generation, since, reason, problem, evidence}. Reads only and never raises.
+
+    `since`/`reason` are those of the oldest event not yet cleared (so the first compaction's time stays while more happen), or of the
+    last cleared one. Whatever cannot be read is pending (`problem` says why): not knowing is not recovered. A missing generation
+    directory is clear for an interactive run, and pending with `missing_is_pending` (autonomy on armed it, so its absence means it
+    was removed)."""
+    out = {"pending": False, "generation": 0, "cleared_generation": 0, "since": "", "reason": "", "problem": "", "evidence": ""}
+    path = Path(state_dir) / RECOVERY_FILE
+    legacy = None
+    try:
+        if path.is_symlink():
+            raise ValueError("a symlink")
+        record = json.loads(path.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("not a JSON object")
+        if "cleared_generation" in record:
+            cleared = record["cleared_generation"]
+            if not isinstance(cleared, int) or isinstance(cleared, bool) or cleared < 0:
+                raise ValueError("a bad cleared_generation")
+            out["cleared_generation"], out["evidence"] = cleared, str(record.get("evidence") or "")
+            out["since"], out["reason"] = str(record.get("since") or ""), str(record.get("reason") or "")
+        elif record.get("pending") is True:  # a Phase C marker
+            legacy = {"since": str(record.get("since") or ""), "reason": str(record.get("reason") or "compaction")}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:
+        out["problem"] = f"the recovery record is unreadable ({type(error).__name__ if isinstance(error, OSError) else error})"
+    try:
+        found = _generations(state_dir)
+    except OSError as error:
+        out.update(pending=True, problem=f"the recovery generations are unreadable ({type(error).__name__})")
+        return out
+    if found is None and missing_is_pending:
+        out.update(pending=True, problem="the recovery generation state is missing")
+        return out
+    found = found or []
+    out["generation"] = found[-1] if found else 0
+    newer = [n for n in found if n > out["cleared_generation"]]
+    if out["generation"] < out["cleared_generation"]:
+        out["problem"] = out["problem"] or "the recovery generations are behind the clear record"
+    if newer:
+        out.update(_event(state_dir, newer[0]))
+    elif legacy:
+        out.update(legacy)
+    out["pending"] = bool(newer or legacy or out["problem"])
+    return out
+
+
+def _fsync_dir(folder):
+    try:
+        fd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def arm(state_dir, reason="compaction"):
+    """Publish the next recovery generation (lock-free; see above). Returns the marker as it now reads, plus `armed` (the generation
+    published) and `changed` (the run was not pending before this event)."""
     if state_dir is None or not Path(state_dir).is_dir():
         raise WorkError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR")
-    path = Path(state_dir) / RECOVERY_FILE
-    with _state_lock(state_dir):
+    before = marker(state_dir)["pending"]
+    folder = Path(state_dir) / RECOVERY_DIR
+    folder.mkdir(mode=0o700, exist_ok=True)
+    body = {"since": work.now(), "reason": re.sub(r"\s+", " ", str(reason or "compaction")).strip()[:MARKER_REASON_CHARS]}
+    fd, name = tempfile.mkstemp(prefix=".arm.", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps(body) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        while True:
+            generation = (_generations(state_dir) or [0])[-1] + 1
+            try:
+                os.link(name, folder / f"{generation:012d}.json")  # whole, ours, or taken by another arm (then the next one)
+                break
+            except FileExistsError:
+                continue
+    finally:
+        os.unlink(name)
+    _fsync_dir(folder)
+    return {**marker(state_dir), "armed": generation, "changed": not before}
+
+
+def compacted(state_dir, reason="compaction"):
+    """Arm recovery-pending for a compaction or an attach: a new generation every time, so a compaction that lands while
+    `work recovered` is checking is never covered by that clear. Repeating it only adds generations; `since` and `reason` stay those of
+    the first event not yet cleared. Only `work recovered` clears it."""
+    return arm(state_dir, reason)
+
+
+def recovered(state_dir, evidence, accepted=(), check=None):
+    """Clear the marker up to the generation that existed before `check()` (the reconciliation; it raises when recovery is not
+    complete) ran. The clear record keeps the time and reason of what was recovered from. Nothing clears it by time; clearing an already
+    clear marker changes nothing and says so. It holds `state_lock`, so `autonomy on` cannot write its record and arm in between;
+    compactions take no lock and, as newer generations, stay pending after this clear."""
+    if state_dir is None or not Path(state_dir).is_dir():
+        raise WorkError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR")
+    with state_lock(state_dir):
         try:
-            current = json.loads(path.read_text())
-        except (OSError, ValueError):
-            current = None
-        if isinstance(current, dict) and current.get("pending") is True:
-            return {**current, "changed": False}
-        value = {"pending": True, "since": work.now(), "reason": re.sub(r"\s+", " ", str(reason or "compaction")).strip()[:MARKER_REASON_CHARS]}
-        work.atomic_write(path, json.dumps(value, indent=2) + "\n")
-        return {**value, "changed": True}
+            found = _generations(state_dir)
+        except OSError as error:
+            raise WorkError(f"the recovery generations cannot be read ({type(error).__name__}); nothing was cleared") from error
+        validated = (found or [0])[-1]
+        before = marker(state_dir)
+        if check is not None:
+            check()
+        if found is None:  # never armed, or removed (which autonomy reads as pending): after the check it comes back empty, i.e. clear
+            (Path(state_dir) / RECOVERY_DIR).mkdir(mode=0o700, exist_ok=True)
+        if not before["pending"]:
+            return {"pending": False, "changed": found is None, "cleared_generation": before["cleared_generation"]}
+        value = {"cleared_generation": validated, "cleared": work.now(),
+                 "evidence": re.sub(r"\s+", " ", str(evidence)).strip()[:MARKER_REASON_CHARS * 2],
+                 "accepted": sorted(accepted), "since": before["since"], "reason": before["reason"]}
+        work.atomic_write(Path(state_dir) / RECOVERY_FILE, json.dumps(value, indent=2) + "\n")
+        return {**value, "pending": marker(state_dir)["pending"], "changed": True}

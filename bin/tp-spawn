@@ -58,6 +58,10 @@
 #                            and no --preamble-from, the lane repository's main working tree is used
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role
+#   --review-of <task>       this start is the independent review of that finished task (tp-review passes it, with --preamble-role
+#                            code-reviewer and the author's lane tags). Only while autonomy is on and recovery is pending does it
+#                            matter: lib/autonomy.py then admits no other start, and this one only when the task exists in this
+#                            run with a reply and a settled state and the call has no --role or --deliverable
 #
 # If <workdir>/.tmux-pi/worker-preamble.md exists, its text (and the section for the
 # worker's role) is appended to the worker's system prompt (not the packet; a copy is kept as system-prompt.md in the task dir); see lib/preamble.py. An unusable file refuses.
@@ -83,7 +87,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" check=0 lane="" lane_step="" preamble_from="" lane_replaces=""
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -115,6 +119,7 @@ while [[ $# -gt 0 ]]; do
     --tests)       tests="${2:?}"; shift 2 ;;
     --check)       check=1; shift ;;
     --preamble-role) preamble_role="${2:?}"; shift 2 ;;
+    --review-of)   review_of="${2:?}"; shift 2 ;;
     --lane)        lane="${2:?}"; shift 2 ;;
     --lane-step)   lane_step="${2:?}"; shift 2 ;;
     --lane-replaces) lane_replaces="${2:?}"; shift 2 ;;
@@ -147,6 +152,7 @@ fi
 case "$tests" in ""|affected|full|none) ;; *) die "--tests must be affected, full or none" ;; esac
 [[ -z "$reserved_id" || "$reserved_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad task id"
 [[ -z "$parent" || "$parent" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad parent id"
+[[ -z "$review_of" || "$review_of" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad --review-of id"
 jq -e 'type == "object" or . == null' <<<"$route_json" >/dev/null || die "bad route JSON"
 
 if [[ -n "$file" ]]; then
@@ -261,6 +267,12 @@ if [[ "$check" == 1 ]]; then
   printf '%s\n' "$workdir"
   exit 0
 fi
+
+# The autonomy gate (lib/autonomy.py): with autonomy on and this run's recovery pending, every start is refused here except the review
+# of a finished task, whoever asked (tp-agent, the dispatcher, a direct call), before any pane, lane reservation or directory exists.
+# With autonomy off it admits everything. It never stops a running worker. An error in the gate refuses too.
+python3 "$ROOT/lib/autonomy.py" gate --state-dir "$state_dir" --role "$role" --preamble-role "$preamble_role" --review-of "$review_of" \
+  --deliverable "$deliverable" --lane "$lane" --lane-step "$lane_step" || exit 1
 
 # LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
 if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then

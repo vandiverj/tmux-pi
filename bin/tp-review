@@ -236,7 +236,7 @@ if [[ "$force_alive" != 1 ]]; then
 fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
-if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer ${lane_args[@]+"${lane_args[@]}"} \
+if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer --review-of "$id" ${lane_args[@]+"${lane_args[@]}"} \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy ($independence)" \

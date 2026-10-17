@@ -15,6 +15,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import autonomy  # noqa: E402
 import lane_commands  # noqa: E402
 import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
@@ -428,6 +429,9 @@ def lane_refusal(name, holders):
 def capacity(base, item):
     """(ok, reason) for starting a queue item now. The item is validated here, so no caller can pass raw data."""
     item = queue_item(item)
+    refusal = autonomy.gate(base, role=item["role"], deliverable=item["deliverable"], lane=item.get("lane", ""), lane_step=item.get("lane_step", ""))
+    if refusal:  # the early look at tp-spawn's own gate: a queued item keeps waiting, with the reason, and starts once recovery is done
+        return False, refusal
     if "lane" in item:  # the one-writer rule again at start, for what was written around the tool
         holders = lane_holders(base, item["lane"], item["workdir"], item["role"], own=item["id"])
         if holders:
@@ -841,6 +845,11 @@ def lane_admit(base, plan, item):
 def dispatch(args, base):
     if not (ROLES / f"{args.role}.md").is_file():
         raise ValueError(f"unknown role: {args.role}")
+    # Autonomy's recovery gate comes before anything is written: a refused dispatch creates no lane, branch, worktree or queue entry.
+    # (A dispatch is never a review, so the lane and the deliverable change nothing: while recovery is pending all of them wait.)
+    refusal = autonomy.gate(base, role=args.role, deliverable=args.deliverable or "")
+    if refusal:
+        raise ValueError(refusal)
     tests = getattr(args, "tests", None)
     if tests is None:  # a caller that never sets the field (not a read value) gets the dispatch default
         tests = TESTS_DEFAULT
@@ -970,6 +979,11 @@ def investigate(base, args):
     """tp-agent dispatch --investigate-failure TASK_ID (T12): a tester on the failing tests a task reported as not its own,
     in a clean worktree at the commit the task started from, with the task's diff. Every refusal names a command that clears it."""
     ident = args.investigate_failure
+    # The recovery gate comes before the investigation folder, the diff and the clean worktree (git) are written: dispatch() below asks
+    # the same question, but only after those exist.
+    refusal = autonomy.gate(base, role="tester", deliverable=args.deliverable or "investigation.md")
+    if refusal:
+        raise ValueError(refusal)
     if not IDENT.fullmatch(ident) or not ((base / "tasks" / ident / "meta.json").is_file() or find_archived_task(base, ident)):
         raise ValueError(f"unknown task: {ident}; list the tasks with: tp-agent list")
     path = base / "tasks" / ident if (base / "tasks" / ident / "meta.json").is_file() else find_archived_task(base, ident)
@@ -1125,6 +1139,14 @@ def main():
     ls.add_argument("name", nargs="?")
     ls.add_argument("--repo", default=".")
     work_commands.add_parsers(sub)
+    au = sub.add_parser("autonomy", help="opt in to autonomous protection: while recovery is pending no new worker starts (Claude main only)").add_subparsers(
+        dest="autonomy_command", required=True)
+    on = au.add_parser("on", help="turn it on for this run and arm recovery-pending (clear it once with: work recovered)")
+    on.add_argument("--workspace", required=True, help="the workspace this run works in; it is attached to the run")
+    on.add_argument("--reason", default="")
+    off = au.add_parser("off", help="turn it off (a user action; running workers are not touched)")
+    off.add_argument("--reason", default="")
+    au.add_parser("status", help="on or off, the recovery state, and what is blocked since when")
     fd = sub.add_parser("find", help="search workspaces, notes, decisions and the archived tasks of earlier sessions (read-only; ~160-char snippets)")
     fd.add_argument("terms", nargs="*", help="all must match (case-insensitive substring); none means filters only")
     fd.add_argument("--kind", choices=list(work_find.KINDS), help="workspace|note|decision|task|session|shared (a read-only shared clone; only when shared.search is on in config/work.local.json); default: all of them")
@@ -1174,6 +1196,9 @@ def main():
         for warning in value["warnings"]:
             print(lane_commands.warning_text(warning), file=sys.stderr)
         print(json.dumps(value, indent=2))
+        return
+    if args.command == "autonomy":
+        print(json.dumps(run_autonomy(args), indent=2))
         return
     if args.command == "context":
         # Read-only suggestion: needs no session state and writes no manifest or log.
@@ -1354,6 +1379,33 @@ def run_find(args):
     return work_find.format_rows(rows, total, incomplete)
 
 
+def run_autonomy(args):
+    """`tp-agent autonomy on|off|status`. `on` checks the caller (a Claude orchestrator main) before it looks for any state, so a
+    refusal writes nothing; it then attaches the workspace, so the compaction hooks checkpoint it and the index shows it."""
+    cmd = args.autonomy_command
+    if cmd == "on":
+        problem = autonomy.env_problem(os.environ)
+        if problem:
+            raise ValueError(problem)
+    base = state_dir()
+    if cmd == "status":
+        return autonomy.status(base)
+    reason = args.reason.strip()
+    if cmd == "off":
+        value = autonomy.disable(base, reason)
+        note = autonomy.audit(value["workspace"], "autonomy off" + (f": {reason}" if reason else "")) if value["workspace"] else None
+    else:
+        value = autonomy.enable(base, os.environ, args.workspace, reason)
+        work_commands.run(argparse.Namespace(work_command="attach", id=args.workspace), base)
+        note = autonomy.audit(args.workspace, "autonomy on" + (f": {reason}" if reason else "") + "; recovery pending until `work recovered`")
+        value = {**autonomy.status(base), "attached": args.workspace}
+    if note:
+        print(f"tp-agent: warning: {note}", file=sys.stderr)
+        value["warning"] = note
+    write_index(base)
+    return value
+
+
 def run_work(args):
     """`tp-agent work ...`: returns what to print (text, or a JSON-able value); work_find.bounded prints it."""
     # The work store is user-level and needs no session, except `attach` and `compacted`, which write this run's own files.
@@ -1362,11 +1414,11 @@ def run_work(args):
     cmd = args.work_command
     session = None
     task_status = None
-    if cmd in {"attach", "compacted", "checkpoint", "recover"} or work_commands.mutating(args):
+    if cmd in {"attach", "compacted", "checkpoint", "recover", "recovered"} or work_commands.mutating(args):
         try:
             session = state_dir()
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
-            if cmd in {"attach", "compacted"}:
+            if cmd in {"attach", "compacted", "recovered"}:
                 raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
     tasks = None
     if session is not None:

@@ -30,7 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py"):   # the last two: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
@@ -745,6 +745,7 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"--workdir {self.work} --preamble-role code-reviewer", self.spawn_args())   # the author's tree, the reviewer's role
+        self.assertIn("--preamble-role code-reviewer --review-of w1 ", self.spawn_args())   # the autonomy gate admits a review by this flag
         preamble = (self.plan.parent / "preamble.out").read_text()
         self.assertIn("Repo-wide rule.", preamble)
         self.assertIn("REVIEWER-ONLY SECTION", preamble)

@@ -509,6 +509,9 @@ function workLines(index: Record<string, unknown>, room: number): string[] {
       reserve,
     )
   }
+  // Autonomy (Phase D1), only while it is on: what is blocked and since when, as the index words it.
+  const autonomy = typeof w.autonomy === 'object' && w.autonomy !== null ? (w.autonomy as Record<string, unknown>) : undefined
+  if (autonomy !== undefined && typeof autonomy.line === 'string' && autonomy.line !== '') append(plain(autonomy.line, 300), [], reserve)
   if (checkpoint !== undefined && typeof checkpoint.line === 'string' && checkpoint.line !== '') append(plain(checkpoint.line, 300), [], reserve)
   if (recovery !== undefined && recovery.pending === true && typeof checkpoint?.caution === 'string' && checkpoint.caution !== '') {
     append(plain(checkpoint.caution, 300), [], reserve)

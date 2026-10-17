@@ -676,14 +676,72 @@ class Replay(Base):
 
 
 class Marker(Base):
-    def test_compacted_sets_the_marker_once_and_never_changes_it(self):
+    def test_compacted_arms_a_new_generation_each_time_and_keeps_the_first_since_and_reason(self):
         first = cp.compacted(self.state, "precompact:auto")
         self.assertTrue(first["changed"])
-        stored = json.loads((self.state / cp.RECOVERY_FILE).read_text())
-        self.assertEqual((stored["pending"], stored["reason"]), (True, "precompact:auto"))
+        stored = cp.marker(self.state)
+        self.assertEqual((stored["pending"], stored["reason"], stored["generation"]), (True, "precompact:auto", 1))
         again = cp.compacted(self.state, "session-start:compact")
-        self.assertFalse(again["changed"])
-        self.assertEqual(json.loads((self.state / cp.RECOVERY_FILE).read_text()), stored)  # first since and reason stay
+        self.assertFalse(again["changed"])  # it was pending already
+        now = cp.marker(self.state)
+        self.assertEqual(now["generation"], 2)
+        self.assertEqual((now["since"], now["reason"]), (stored["since"], stored["reason"]))  # first since and reason stay
+
+    def test_recovered_clears_only_the_generations_that_existed_before_its_check(self):
+        cp.compacted(self.state, "precompact:auto")
+        value = cp.recovered(self.state, "checked", check=lambda: cp.compacted(self.state, "precompact:manual"))
+        self.assertEqual((value["cleared_generation"], value["changed"], value["pending"]), (1, True, True))
+        marker = cp.marker(self.state)
+        self.assertEqual((marker["pending"], marker["generation"], marker["reason"]), (True, 2, "precompact:manual"))
+        cp.recovered(self.state, "checked again")
+        self.assertEqual((cp.marker(self.state)["pending"], cp.marker(self.state)["evidence"]), (False, "checked again"))
+        self.assertFalse(cp.recovered(self.state, "nothing pending")["changed"])
+
+    def test_a_failed_check_clears_nothing(self):
+        cp.compacted(self.state)
+
+        def check():
+            raise work.WorkError("not reconciled")
+        with self.assertRaisesRegex(work.WorkError, "not reconciled"):
+            cp.recovered(self.state, "x", check=check)
+        self.assertTrue(cp.marker(self.state)["pending"])
+        self.assertFalse((self.state / cp.RECOVERY_FILE).exists())
+
+    def test_an_arm_that_read_a_stale_generation_takes_the_next_free_one_and_never_reuses_a_cleared_one(self):
+        cp.compacted(self.state, "first")
+        real = cp._generations
+        calls = []
+
+        def stale(state_dir):
+            calls.append(1)
+            return [] if len(calls) == 2 else real(state_dir)  # the arm's first look misses generation 1 (and the clear of it)
+        cp.recovered(self.state, "checked")
+        with mock.patch.object(cp, "_generations", stale):
+            armed = cp.arm(self.state, "late")
+        self.assertEqual(armed["armed"], 2)
+        self.assertTrue(cp.marker(self.state)["pending"])
+
+    def test_unreadable_or_odd_generation_state_reads_as_pending(self):
+        cp.compacted(self.state)
+        cp.recovered(self.state, "checked")
+        self.assertFalse(cp.marker(self.state)["pending"])
+        (self.state / cp.RECOVERY_FILE).write_text("{not json")
+        self.assertTrue(cp.marker(self.state)["pending"])
+        self.assertIn("unreadable", cp.marker(self.state)["problem"])
+        (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"cleared_generation": 5}))  # ahead of every generation
+        self.assertTrue(cp.marker(self.state)["pending"])
+        shutil.rmtree(self.state / cp.RECOVERY_DIR)
+        self.assertTrue(cp.marker(self.state, missing_is_pending=True)["pending"])
+        self.assertIn("missing", cp.marker(self.state, missing_is_pending=True)["problem"])
+
+    def test_a_phase_c_marker_reads_as_pending_until_recovered(self):
+        (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"pending": True, "since": "2026-10-01T00:00:00Z", "reason": "precompact:auto"}))
+        marker = cp.marker(self.state)
+        self.assertEqual((marker["pending"], marker["since"]), (True, "2026-10-01T00:00:00Z"))
+        self.assertTrue(cp.recovered(self.state, "checked")["changed"])
+        self.assertFalse(cp.marker(self.state)["pending"])
+        (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"pending": False, "since": "x", "reason": "old"}))
+        self.assertFalse(cp.marker(self.state)["pending"])
 
     def test_the_marker_needs_no_work_store(self):
         cp.compacted(self.state)
@@ -697,13 +755,15 @@ class Marker(Base):
 
     def test_a_long_reason_is_bounded_and_one_line(self):
         cp.compacted(self.state, "a\nb " + "x" * 1000)
-        reason = json.loads((self.state / cp.RECOVERY_FILE).read_text())["reason"]
+        reason = cp.marker(self.state)["reason"]
         self.assertNotIn("\n", reason)
         self.assertLessEqual(len(reason), cp.MARKER_REASON_CHARS)
 
     def test_a_marker_that_is_not_pending_is_set(self):
-        (self.state / cp.RECOVERY_FILE).write_text(json.dumps({"pending": False, "since": "x", "reason": "old"}))
+        cp.compacted(self.state, "first")
+        cp.recovered(self.state, "checked")
         self.assertTrue(cp.compacted(self.state, "again")["changed"])
+        self.assertEqual(cp.marker(self.state)["reason"], "again")
 
 
 class Cli(Base):
@@ -762,13 +822,14 @@ class Cli(Base):
 
     def test_work_attach_sets_recovery_pending_once_in_a_run_with_no_marker(self):
         self.cli("work", "new", "Demo", "--id", "demo")
-        self.assertFalse((self.state / cp.RECOVERY_FILE).exists())
+        self.assertFalse(cp.marker(self.state)["pending"])
         self.cli("work", "attach", "demo")
-        first = json.loads((self.state / cp.RECOVERY_FILE).read_text())
+        first = cp.marker(self.state)
         self.assertEqual((first["pending"], first["reason"]), (True, "attach"))
-        cp.compacted(self.state, "precompact:auto")  # already pending: nothing changes
+        cp.compacted(self.state, "precompact:auto")  # already pending: more generations, the first since and reason stay
         self.cli("work", "attach", "demo")
-        self.assertEqual(json.loads((self.state / cp.RECOVERY_FILE).read_text()), first)
+        now = cp.marker(self.state)
+        self.assertEqual((now["pending"], now["since"], now["reason"], now["generation"]), (True, first["since"], "attach", 3))
 
     def test_a_corrupt_workspace_pushes_no_good_checkpoint_out(self):
         self.prepared()
@@ -940,8 +1001,7 @@ class HookScript(Base):
         return subprocess.run([str(HOOK)], input=stdin, env=base, text=True, capture_output=True, timeout=60)
 
     def marker(self):
-        path = self.state / cp.RECOVERY_FILE
-        return json.loads(path.read_text()) if path.exists() else None
+        return cp.marker(self.state) if (self.state / cp.RECOVERY_DIR).exists() else None
 
     def test_the_orchestrator_main_gets_the_marker_and_a_checkpoint(self):
         self.cli("work", "new", "Demo", "--id", "demo")
@@ -954,7 +1014,7 @@ class HookScript(Base):
     def test_manual_and_unknown_triggers_are_named_in_the_reason(self):
         self.run_hook('{"trigger":"manual"}', TP_MODE="orchestrator")
         self.assertEqual(self.marker()["reason"], "precompact:manual")
-        (self.state / cp.RECOVERY_FILE).unlink()
+        shutil.rmtree(self.state / cp.RECOVERY_DIR)
         self.run_hook("not json at all", TP_MODE="orchestrator")
         self.assertEqual(self.marker()["reason"], "precompact:unknown")
 
@@ -1151,6 +1211,7 @@ LEAVES = {
     "decision withdraw": ("workspace", ["decision", "withdraw", "demo/D2"]),
     "decision list": ("read", ["decision", "list"]), "promote": ("other", ["promote", "demo"]), "decisions": ("read", ["decisions"]),
     "checkpoint": ("read", ["checkpoint"]), "recover": ("read", ["recover"]), "compacted": ("read", ["compacted"]),
+    "recovered": ("read", ["recovered", "--evidence", "checked"]),
 }
 
 

@@ -1273,6 +1273,22 @@ test('work block: a recovery pending because a workspace was attached says so, n
   expect(text).not.toContain('compaction at')
 })
 
+test('work block: the autonomy line says what is blocked and since when, and is absent while autonomy is off', async ($, on) => {
+  const w = world(on, MAIN)
+  const line = 'autonomy on: dispatch blocked since 2026-10-15T10:40:00Z by recovery; clear it with `tp-agent work recovered --evidence "what you checked"`'
+  w.work = workBlock({
+    attached: [summary('import-dmp')],
+    recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'autonomy on' },
+    autonomy: { on: true, workspace: 'import-dmp', blocked: true, blocked_since: '2026-10-15T10:40:00Z', line },
+  })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text).toContain(line)
+  expect(text.indexOf('recovery pending') < text.indexOf('autonomy on: dispatch blocked')).toBe(true)
+  w.work = workBlock({ attached: [summary('import-dmp')] })
+  expect(await injected($ as never)).not.toContain('autonomy')
+})
+
 test('work block: the recovery lines are short and do not push out paused workers', async ($, on) => {
   const w = world(on, MAIN)
   w.objective = 'o'.repeat(2000)

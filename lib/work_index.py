@@ -5,6 +5,9 @@ one made before this feature. Reading never creates the store. Per open decision
 `priority` and `blocking` (amendment R3-F1): question text stays in the workspace file and is shown by `tp-agent work decisions`.
 A document that cannot be processed is skipped on its own and counted in `skipped.count`; the rest still appears. The block never names a skipped
 file (a file name can hold anything, and this block reaches session-index.json and Pi): `work list`, `work decisions` and `find` name them.
+`checkpoint` (Phase C) is the status of the first attached workspace's newest valid checkpoint (ids, times and flags, and the two
+sentences the injection shows), None when nothing is attached; `recovery` appears only while a compaction marker is pending and a
+workspace is attached. Both are read-only.
 `decision_summary` is the bounded text form the Claude injection and Pi's task_index share (R3-F3).
 """
 from datetime import datetime, timedelta, timezone
@@ -14,6 +17,7 @@ from pathlib import Path
 import re
 
 import work
+import work_checkpoint
 from work import skipped_count
 
 CLIP = 120
@@ -120,16 +124,70 @@ def _rows(kind, build_row, skipped):
     return rows
 
 
-def build(state_dir, workdir=None):
+def _opened(ids):
+    """{id: workspace_health(id)} for the attached ids; an id whose check itself fails is reported corrupt, never raised."""
+    found = {}
+    for ws_id in ids:
+        try:
+            found[ws_id] = work_checkpoint.workspace_health(ws_id)
+        except Exception as error:  # noqa: BLE001 - one attached id must not hide the block
+            found[ws_id] = (None, f"corrupt: {type(error).__name__}")
+    return found
+
+
+def _attached_rows(ids, opened, by_id):
+    """The attached workspaces as rows. One that cannot be used (file missing or corrupt) is still named, with its health, so the
+    injected text can say so and `work recover` can be suggested."""
+    rows = []
+    for ws_id in ids:
+        doc, health = opened[ws_id]
+        if health == "ok" and ws_id in by_id:
+            rows.append(by_id[ws_id].summary)
+        elif health == "ok":  # an archived workspace is still attached
+            try:
+                rows.append(_summary(doc))
+                continue
+            except Exception:  # noqa: BLE001
+                health = "corrupt: unreadable"
+        if health != "ok":
+            rows.append({"id": ws_id, "title": "", "health": health})
+    return rows
+
+
+def _checkpoint_entry(state_dir, ids, opened, tasks):
+    """The checkpoint status of the first attached workspace (the one the injection speaks of), or None; it never raises."""
+    if not ids:
+        return None
+    ws_id = ids[0]
+    try:
+        return work_checkpoint.status(ws_id, Path(state_dir).name, tasks, opened[ws_id])
+    except Exception:  # noqa: BLE001 - the checkpoint line is an extra; a failure here must not hide the rest of the block
+        return None
+
+
+def _recovery(state_dir):
+    try:
+        value = json.loads((Path(state_dir) / work_checkpoint.RECOVERY_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("pending") is not True:
+        return None
+    return {"pending": True, "since": _clip(value.get("since"), 40), "reason": _clip(value.get("reason"), 80)}
+
+
+def build(state_dir, workdir=None, tasks=None):
+    """`tasks`: the live task records (for the checkpoint's task diff); None when the caller has none."""
     skipped = []
     workspaces, notes = _rows("workspace", _Workspace, skipped), _rows("note", _Note, skipped)
     items = decision_items(skipped)
-    if not workspaces and not notes and not skipped_count(skipped):
+    ids = list(dict.fromkeys(attached_ids(state_dir)))
+    if not workspaces and not notes and not skipped_count(skipped) and not ids:
         return None
     cap_candidates, cap_notes = work.setting("inject_candidates"), work.setting("inject_notes")
     recent_cutoff = datetime.now(timezone.utc) - timedelta(days=work.setting("recent_days"))
     by_id = {w.id: w for w in workspaces}
-    attached = [by_id[i] for i in dict.fromkeys(attached_ids(state_dir)) if i in by_id]
+    opened = _opened(ids)
+    attached = _attached_rows(ids, opened, by_id)
 
     candidates = []
     workdir = os.getenv("TP_WORKDIR") if workdir is None else workdir
@@ -144,7 +202,7 @@ def build(state_dir, workdir=None):
         if not candidates:  # a non-coding workspace: one line, only when it is recent and nothing else points at this session
             fresh = [w for w in active if not w.has_repos and w.updated >= recent_cutoff]
             candidates = fresh[:1]
-    shown = {w.id for w in attached} | {w.id for w in candidates}
+    shown = set(ids) | {w.id for w in candidates}
     others = sum(1 for w in workspaces if w.active and w.id not in shown)
 
     recent = sorted((n for n in notes if n.updated >= recent_cutoff), key=lambda n: n.updated, reverse=True)
@@ -152,15 +210,18 @@ def build(state_dir, workdir=None):
     recent.sort(key=lambda n: bool(n.links) and not n.links & shown)
     important = sorted((n for n in notes if n.important), key=lambda n: n.updated, reverse=True)
     block = {
-        "attached": [w.summary for w in attached],
+        "attached": attached,
         "candidates": [w.summary for w in candidates],
         "others": others,
         "decisions": {"open": len(items), "blocking": sum(1 for i in items if i["blocking"]), "chars": work.setting("inject_decisions_chars"),
                       "items": items},
         "notes": {"recent": [n.brief for n in recent[:cap_notes]],
                   "important": [n.brief for n in important[:cap_notes]]},
-        "checkpoint": None,
+        "checkpoint": _checkpoint_entry(state_dir, ids, opened, tasks),
     }
+    recovery = _recovery(state_dir) if ids else None  # a marker with nothing attached has nothing to recover
+    if recovery:
+        block["recovery"] = recovery
     if skipped_count(skipped):  # only when something could not be read, so a healthy store's block is what it was
         block["skipped"] = {"count": skipped_count(skipped)}
     return block

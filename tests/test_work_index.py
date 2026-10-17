@@ -114,7 +114,8 @@ class BuildTests(IndexBase):
         b = work.create("workspace", "Attached two")
         (self.state / "session-work.json").write_text(json.dumps({"attached": [a.id, b.id, "missing"]}))
         block = self.block()
-        self.assertEqual([x["id"] for x in block["attached"]], [a.id, b.id])
+        self.assertEqual([x["id"] for x in block["attached"]], [a.id, b.id, "missing"])
+        self.assertEqual(block["attached"][2], {"id": "missing", "title": "", "health": "file missing"})  # named, not dropped
         self.assertEqual(block["candidates"], [])
         self.assertEqual(block["others"], 1)
 

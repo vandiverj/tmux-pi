@@ -7,7 +7,9 @@ import re
 import sys
 
 import work
+import work_checkpoint
 import work_find
+import work_index
 import work_promote
 from work import WorkError, append_line, get_section, set_section
 
@@ -119,6 +121,16 @@ def add_parsers(sub):
     p = ws.add_parser("decisions", help="every open decision across all workspaces, blocking first")
     p.add_argument("--all", action="store_true", help="include answered and withdrawn")
     p.add_argument("--json", action="store_true")
+    p = ws.add_parser("checkpoint", help="write a validated checkpoint of a workspace's judgement state (default: the attached ones)")
+    p.add_argument("id", nargs="?", help="workspace id (default: every workspace attached to this session)")
+    p.add_argument("--trigger", choices=["manual", "precompact", "session-end"], default="manual")
+    p.add_argument("--auto", action="store_true", help="for hooks: a snapshot only (no --summary), and say nothing is attached instead of failing; a failed checkpoint still exits non-zero, which the hook and tp-exit ignore")
+    p.add_argument("--summary", help="your own short summary of where the work stands, stored with the checkpoint")
+    p.add_argument("--summary-file", help="read that summary from a file")
+    p = ws.add_parser("recover", help="print what is known about a workspace after a compaction or restart (reads only)")
+    p.add_argument("id", nargs="?", help="workspace id (default: every workspace attached to this session)")
+    p = ws.add_parser("compacted", help="mark this session's recovery as pending (set-only, idempotent; for the compaction hooks)")
+    p.add_argument("--reason", default="compaction")
 
 
 def _extend(meta, key, values):
@@ -177,14 +189,126 @@ def resume_targets(entry, task_status=None):
     return out
 
 
-def run(args, session_dir=None, task_status=None):
+def leaf(args):
+    """The subcommand as one word or two ('next', 'decision add', 'note show'), the key of the sets below."""
     cmd = args.work_command
-    if cmd in {"show", "list", "decisions"} or (cmd == "note" and args.note_command == "show") or \
-            (cmd == "decision" and args.decision_command == "list"):
+    sub = {"note": "note_command", "decision": "decision_command"}.get(cmd)
+    return f"{cmd} {getattr(args, sub)}" if sub else cmd
+
+
+# Every `work` subcommand that changes nothing in the work store. Anything not listed here is a mutation: `run` calls
+# `post_mutation` after it, so a new mutating subcommand gets the stale-checkpoint trigger without anyone remembering to add it.
+READ_ONLY = frozenset({"show", "list", "decisions", "note show", "decision list"})
+NOT_MUTATIONS = READ_ONLY | {"recover", "compacted", "checkpoint"}
+
+
+def mutating(args):
+    return leaf(args) not in NOT_MUTATIONS
+
+
+def workspace_written(args):
+    """The workspace a mutating command changed, else None (a note, a new workspace or an attach has no workspace to checkpoint)."""
+    cmd = args.work_command
+    if cmd in {"set", "next", "decide", "block", "link"}:
+        return args.id
+    if cmd == "archive":
+        return None if args.kind == "note" else args.id
+    if cmd == "decision":
+        if args.decision_command == "add":
+            return args.workspace
+        match = work.DECISION_RE.match(getattr(args, "id", "") or "")
+        return match.group(1) if match else None
+    return None
+
+
+def _live(tasks):
+    """The live task records (id, status, result_path) as a list, or None when there is no session to read them from."""
+    try:
+        return list(tasks()) if tasks else None
+    except (ValueError, OSError, KeyError):
+        return None
+
+
+def _run_id(session_dir):
+    return Path(session_dir).name if session_dir else ""
+
+
+def run(args, session_dir=None, task_status=None, tasks=None):
+    """`tasks`: a callable returning the live task records of this session (for the checkpoint diff), or None."""
+    cmd = args.work_command
+    if cmd == "compacted":  # touches the session's state directory only, never the work store
+        return work_checkpoint.compacted(session_dir, args.reason)
+    if cmd == "recover":
+        return _recover(args, session_dir, tasks)
+    if leaf(args) in READ_ONLY:
         work.ensure_store()
         return _read_command(args)
     with work.locked():
-        return _write_command(args, session_dir, task_status)
+        if cmd == "checkpoint":
+            return _checkpoint(args, session_dir, tasks)
+        value = _write_command(args, session_dir, task_status)
+        post_mutation(args, session_dir, tasks)
+        return value
+
+
+def _targets(args, session_dir):
+    if args.id:
+        return [args.id]
+    return list(dict.fromkeys(work_index.attached_ids(session_dir))) if session_dir else []
+
+
+def _checkpoint(args, session_dir, tasks):
+    """Write a checkpoint of each named (or attached) workspace and print `checkpoint written: <path>` for each one that was read back
+    and validated (and only for those). Any failure, `--auto` included, fails the command after the others were tried; the hooks that
+    call it ignore the exit code themselves, so a compaction or an exit is never blocked."""
+    if args.auto and (args.summary is not None or args.summary_file is not None):
+        raise WorkError("usage: --auto records a snapshot only and takes no --summary or --summary-file; "
+                        "run `work checkpoint --summary-file FILE` without --auto to store your own summary")
+    ids = _targets(args, session_dir)
+    if not ids:
+        if args.auto:
+            return "no workspace is attached to this session; no checkpoint written"
+        raise WorkError("no workspace given and none attached to this session; pass a workspace id")
+    live, failures = _live(tasks), []
+    summary = _text(args.summary, args.summary_file).strip() or None
+    for ws_id in ids:
+        try:
+            doc, health = work_checkpoint.workspace_health(ws_id)
+            if doc is None:  # nothing is written from a file that cannot be read: it would push a good checkpoint out
+                raise WorkError(f"workspace {health}; no checkpoint written (the earlier ones are kept)")
+            path, value = work_checkpoint.write(doc, _run_id(session_dir), args.trigger, live or [], summary)
+        except (WorkError, OSError) as error:
+            failures.append(f"{ws_id}: {error}")
+            continue
+        print(f"checkpoint written: {work_find.store_path(path)}")
+        if value["truncated"]:
+            print(f"  {work_checkpoint.TRUNCATED_LABEL} (left out: {json.dumps(value['truncated']['sections'], sort_keys=True)})")
+    if failures:
+        raise WorkError("checkpoint failed: " + "; ".join(failures))
+
+
+def post_mutation(args, session_dir, tasks):
+    """Runs after EVERY work mutation (see `NOT_MUTATIONS`), under the store lock, with the run's state directory as bin/tp-agent
+    resolved it (`state_dir()`: an exported TP_STATE_DIR or the one the session records). After a change to a workspace this run is
+    attached to: a checkpoint when the newest valid one is missing or old. Never fails the command (the change is already saved); a
+    problem is a warning."""
+    ws_id = workspace_written(args)
+    if not ws_id or session_dir is None or ws_id not in work_index.attached_ids(session_dir):
+        return
+    try:
+        doc = work_checkpoint.workspace_health(ws_id)[0]
+        if doc is not None and work_checkpoint.due(ws_id):
+            work_checkpoint.write(doc, _run_id(session_dir), "work-write", _live(tasks) or [])
+    except (WorkError, OSError) as error:
+        print(f"warning: checkpoint not written after the change: {error}", file=sys.stderr)
+
+
+def _recover(args, session_dir, tasks):
+    ids = _targets(args, session_dir)
+    if not ids:
+        raise WorkError("no workspace given and none attached to this session; pass a workspace id")
+    live = _live(tasks)
+    return "\n\n".join(work_checkpoint.format_recover(work_checkpoint.recover(i, live, _run_id(session_dir))) for i in ids)
 
 
 def _read_command(args):
@@ -271,6 +395,8 @@ def _write_command(args, session_dir, task_status):
             current = []
         attached = list(dict.fromkeys([*current, doc.id]))
         work.atomic_write(path, json.dumps({"attached": attached}, indent=2) + "\n")
+        # A run that attaches a workspace is a restart that needs reconciling: recovery is pending (set-only, idempotent).
+        work_checkpoint.compacted(session_dir, "attach")
         return {"attached": attached}
     if cmd == "decision":
         return _decision(args, task_status)

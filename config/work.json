@@ -5,6 +5,8 @@
   "recent_days": 14,
   "inject_decisions_chars": 1200,
   "find_line_max": 4000,
+  "checkpoints_keep": 5,
+  "checkpoint_max_bytes": 262144,
   "shared": {
     "path": "",
     "promote_dir": "",

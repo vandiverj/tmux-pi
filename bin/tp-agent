@@ -281,7 +281,7 @@ def build_index(base):
     if summary:
         value["lanes"] = summary
     try:
-        block = work_index.build(base)
+        block = work_index.build(base, tasks=[{"id": r.get("id"), "status": r.get("status"), "result_path": r.get("result_path")} for r in rows])
     except Exception as error:  # an unreadable or malformed work store never blocks the task index
         value["work_error"] = str(error)[:200]
     else:
@@ -1356,23 +1356,29 @@ def run_find(args):
 
 def run_work(args):
     """`tp-agent work ...`: returns what to print (text, or a JSON-able value); work_find.bounded prints it."""
-    # The work store is user-level and needs no session, except `attach`, which writes this run's session-work.json.
+    # The work store is user-level and needs no session, except `attach` and `compacted`, which write this run's own files.
+    # checkpoint and recover use a session when there is one, and so does every mutation (work_commands.post_mutation checkpoints an
+    # attached workspace): all of them resolve the run through state_dir(), an exported TP_STATE_DIR or the session's own alike.
+    cmd = args.work_command
     session = None
     task_status = None
-    if args.work_command == "attach" or (args.work_command == "decision" and args.decision_command == "answer"):
+    if cmd in {"attach", "compacted", "checkpoint", "recover"} or work_commands.mutating(args):
         try:
             session = state_dir()
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
-            if args.work_command == "attach":
+            if cmd in {"attach", "compacted"}:
                 raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
+    tasks = None
+    if session is not None:
+        def task_status(ident):
+            try:
+                return record(task_dir(session, ident))["status"]
+            except (ValueError, OSError, KeyError):
+                return "unknown"
 
-        if session is not None:
-            def task_status(ident):
-                try:
-                    return record(task_dir(session, ident))["status"]
-                except (ValueError, OSError, KeyError):
-                    return "unknown"
-    return work_commands.run(args, session, task_status)
+        def tasks():
+            return [{"id": r.get("id"), "status": r.get("status"), "result_path": r.get("result_path")} for r in all_records(session)]
+    return work_commands.run(args, session, task_status, tasks)
 
 
 if __name__ == "__main__":

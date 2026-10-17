@@ -4,7 +4,7 @@ Use `dispatch_role`, `task_index`, and `task_collect` for ordinary orchestration
 
 A failing test a worker reports as pre-existing or unrelated is a claim to check, not a reason to move on. Before you commit the slice that reported it, run `tp-agent dispatch --investigate-failure ID` (collect shows the worker's `FAILING_TESTS:` block) unless an investigation of that test is already open.
 
-Run `task_index` at session start and after compaction; nothing notifies you when a worker changes state, so check it before reporting on running work.
+Run `task_index` at session start and after compaction; nothing notifies you when a worker changes state, so check it before reporting on running work. After compaction, if a workspace is attached, run `tp-agent work recover` (through `bash`) whether or not `task_index` shows a pending recovery (Pi sets no marker), re-verify any "done" claim against live records, and tell the user each open decision it lists.
 
 `tp-agent context --task TEXT [--workdir DIR]` (through `bash`) suggests `context` specs for a task. They are suggestions: prefer a file you already know is right, and `tp-spawn` still caps and screens each one.
 

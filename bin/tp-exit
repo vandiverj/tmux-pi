@@ -21,6 +21,10 @@ session="$(tp_session)"
 # redisplayed as killed workers when the same workdir is opened again. Retain or
 # archive task records according to the retention policy; never delete blindly.
 state_dir="$(tp_opt "$session" @tp_state_dir)"
+# Checkpoint the attached workspaces first, while the task records still say what happened; it never blocks the exit.
+if [[ -n "$state_dir" ]]; then
+  TP_STATE_DIR="$state_dir" TP_WORK_LOCK_TIMEOUT=2 "$ROOT/bin/tp-agent" work checkpoint --auto --trigger session-end >/dev/null 2>&1 || true
+fi
 "$ROOT/bin/tp-reset" >/dev/null 2>&1 || true
 "$ROOT/bin/tp-task" --state-dir "$state_dir" end-session >/dev/null 2>&1 || true
 

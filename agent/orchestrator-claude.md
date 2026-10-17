@@ -9,4 +9,4 @@ The task index is injected at session start and after compaction; run `tp-agent 
 
 ## Compact Instructions
 
-When compacting, preserve active user instructions and corrections accurately, plus the current objective and unresolved decisions. Keep task IDs, status, and artifact paths as pointers, not their contents. Omit tool output and artifact text that can be re-fetched. After compaction the task index is injected again; retrieve only what the next step needs.
+When compacting, preserve active user instructions and corrections accurately, plus the current objective and unresolved decisions. Keep task IDs, status, and artifact paths as pointers, not their contents. Omit tool output and artifact text that can be re-fetched. After compaction the task index is injected again; retrieve only what the next step needs. If a workspace is attached, keep the attached workspace id and any open decision ids; before a manual /compact run `tp-agent work checkpoint --summary-file FILE` (FILE holds a short note of what you are in the middle of). After compaction run `tp-agent work recover`.

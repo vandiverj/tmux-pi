@@ -1173,3 +1173,122 @@ test('work block: paused workers keep their rows when the work block is large, a
   expect(w.paused.filter(row => text.includes(row.id)).length > 50).toBe(true)
   expect(text).toMatch(/… \d+ more workers waiting for you not shown/)
 })
+
+// ---- checkpoint and recovery lines (Phase C) ----
+const checkpoint = (extra: Record<string, unknown> = {}) => ({
+  workspace: 'import-dmp', state: 'valid', workspace_file: 'ok', at: '2026-10-15T10:00:00Z', age: '41 min', truncated: false, authored_by: null, stale: false, tasks_changed: 0,
+  line: 'checkpoint: valid snapshot, 41 min old (workspace updated 12 min ago; no task changed since)',
+  caution: 'workspace last updated 12 min ago: anything decided since then may exist only in the compaction summary; re-confirm with the user.',
+  ...extra,
+})
+
+test('a compaction marks recovery pending before the index is read, and a start does not', async ($, on) => {
+  const w = world(on, MAIN)
+  await $.session.start(start(true))
+  expect(w.ran.some(argv => argv[1] === 'work')).toBe(false)
+  await $.classic.SessionStart({ source: 'compact' } as never)
+  const verbsRan = w.ran.map(argv => argv.slice(1, 3).join(' '))
+  expect(verbsRan.indexOf('work compacted') >= 0).toBe(true)
+  expect(w.ran.find(argv => argv[1] === 'work')).toEqual([AGENT, 'work', 'compacted', '--reason', 'session-start:compact'])
+  expect(verbsRan.lastIndexOf('index --no-write') > verbsRan.indexOf('work compacted')).toBe(true)
+})
+
+test('a startup source never marks recovery', async ($, on) => {
+  const w = world(on, MAIN)
+  await $.session.start(start(true))
+  await $.classic.SessionStart({ source: 'startup' } as never)
+  expect(w.ran.some(argv => argv[1] === 'work')).toBe(false)
+})
+
+test('a worker never marks recovery after a compaction', async ($, on) => {
+  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1' })
+  await $.session.start(start(true))
+  await $.classic.SessionStart({ source: 'compact' } as never)
+  expect(w.ran).toEqual([])
+})
+
+test('work block: the checkpoint line, the recovery line and the caution follow the attached workspaces after a compaction', async ($, on) => {
+  const w = world(on, MAIN)
+  w.work = workBlock({
+    attached: [summary('import-dmp')],
+    checkpoint: checkpoint(),
+    recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'precompact:auto' },
+  })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  const at = (needle: string) => text.indexOf(needle)
+  expect(text).toContain('recovery pending (compaction at 2026-10-15T10:40:00Z): run tp-agent work recover; re-verify any "done" claim against live records first')
+  expect(text).toContain('checkpoint: valid snapshot, 41 min old (workspace updated 12 min ago; no task changed since)')
+  expect(text).toContain('anything decided since then may exist only in the compaction summary; re-confirm with the user.')
+  expect(at('work attached') >= 0 && at('work attached') < at('recovery pending')).toBe(true)
+  expect(at('recovery pending') < at('checkpoint: valid')).toBe(true)
+  expect(at('checkpoint: valid') < at('re-confirm with the user')).toBe(true)
+})
+
+test('work block: with no recovery pending the caution is left out, and no checkpoint adds nothing', async ($, on) => {
+  const w = world(on, MAIN)
+  w.work = workBlock({ attached: [summary('import-dmp')], checkpoint: checkpoint() })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text).toContain('checkpoint: valid snapshot')
+  expect(text).not.toContain('re-confirm with the user')
+  expect(text).not.toContain('recovery pending')
+  w.work = workBlock({ attached: [summary('import-dmp')] })
+  const plain = await injected($ as never)
+  expect(plain).not.toContain('checkpoint')
+  expect(plain).not.toContain('recovery')
+})
+
+test('work block: a missing workspace file and an older checkpoint are said as the index words them', async ($, on) => {
+  const w = world(on, MAIN)
+  w.work = workBlock({
+    checkpoint: checkpoint({ state: 'older-valid', workspace_file: 'file missing', line: 'checkpoint: last valid is older (3h old; newest failed validation) (workspace file missing; `tp-agent work recover` prints the checkpoint state)' }),
+    recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'precompact:manual' },
+  })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text).toContain('checkpoint: last valid is older (3h old; newest failed validation)')
+  expect(text).toContain('workspace file missing')
+})
+
+test('work block: an attached workspace whose file is missing or corrupt is still named, with why', async ($, on) => {
+  const w = world(on, MAIN)
+  w.work = workBlock({
+    attached: [{ id: 'gone-ws', title: '', health: 'file missing' }, { id: 'bad-ws', title: '', health: 'corrupt: no frontmatter' }, summary('fine-ws')],
+    checkpoint: checkpoint({ workspace_file: 'file missing', line: 'checkpoint: valid snapshot, 5 min old (workspace file missing; `tp-agent work recover` prints the checkpoint state)' }),
+  })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text).toContain('- gone-ws (file missing)')
+  expect(text).toContain('- bad-ws (corrupt: no frontmatter)')
+  expect(text).toContain('- fine-ws "Title of fine-ws"')
+})
+
+test('work block: a recovery pending because a workspace was attached says so, not "compaction"', async ($, on) => {
+  const w = world(on, MAIN)
+  w.work = workBlock({ attached: [summary('import-dmp')], recovery: { pending: true, since: '2026-10-15T10:40:00Z', reason: 'attach' } })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text).toContain('recovery pending (workspace attached at 2026-10-15T10:40:00Z): run tp-agent work recover')
+  expect(text).not.toContain('compaction at')
+})
+
+test('work block: the recovery lines are short and do not push out paused workers', async ($, on) => {
+  const w = world(on, MAIN)
+  w.objective = 'o'.repeat(2000)
+  w.paused = pausedRows(200, 'coder-p', 'blocked', '-0123456789abcdef')
+  w.work = workBlock({
+    attached: [summary('big', { next: 'n'.repeat(300) })],
+    checkpoint: checkpoint({ line: 'c'.repeat(2000), caution: 'x'.repeat(2000) }),
+    recovery: { pending: true, since: 's'.repeat(500), reason: 'r' },
+    decisions: { open: 300, blocking: 300, chars: 1200, items: decisionItems(300, 1) },
+  })
+  await $.session.start(start(true))
+  const text = await injected($ as never)
+  expect(text.length <= 6000).toBe(true)
+  expect(text).toContain('decisions: 300 open (300 blocking)')
+  const lines = text.split('\n').filter(line => line.startsWith('c') && line.length > 100)
+  expect(lines.every(line => line.length <= 301)).toBe(true)
+  expect(text.length - text.replace(/x{60,}/g, '').length <= 301).toBe(true)
+  expect(w.paused.filter(row => text.includes(row.id)).length > 20).toBe(true)
+})

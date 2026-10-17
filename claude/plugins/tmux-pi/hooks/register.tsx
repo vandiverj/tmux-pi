@@ -446,6 +446,8 @@ function workRow(row: unknown): string | undefined {
   if (typeof row !== 'object' || row === null) return undefined
   const r = row as Record<string, unknown>
   if (typeof r.id !== 'string') return undefined
+  // An attached workspace whose file cannot be used is still named, with why (the index carries its health).
+  if (typeof r.health === 'string' && r.health !== '' && r.health !== 'ok') return `- ${plain(r.id, 60)} (${plain(r.health, 60)})`
   const status = typeof r.status === 'string' && r.status !== '' && r.status !== 'active' ? ` [${plain(r.status, 12)}]` : ''
   const next = plain(r.next, 100)
   const sessions = (Array.isArray(r.sessions) ? r.sessions : []).filter((x): x is string => typeof x === 'string')
@@ -497,6 +499,20 @@ function workLines(index: Record<string, unknown>, room: number): string[] {
   const others = typeof w.others === 'number' && w.others > 0 ? w.others : 0
   const notes = (typeof w.notes === 'object' && w.notes !== null ? w.notes : {}) as Record<string, unknown>
   if (attached.length > 0) append('work attached to this session (tp-agent work show ID):', attached, reserve)
+  // Checkpoint and recovery (Phase C), only for an attached workspace: the index carries the exact sentences, read-only.
+  const checkpoint = typeof w.checkpoint === 'object' && w.checkpoint !== null ? (w.checkpoint as Record<string, unknown>) : undefined
+  const recovery = typeof w.recovery === 'object' && w.recovery !== null ? (w.recovery as Record<string, unknown>) : undefined
+  if (recovery !== undefined && recovery.pending === true) {
+    append(
+      `recovery pending (${recovery.reason === 'attach' ? 'workspace attached' : 'compaction'} at ${plain(recovery.since, 30)}): run tp-agent work recover; re-verify any "done" claim against live records first`,
+      [],
+      reserve,
+    )
+  }
+  if (checkpoint !== undefined && typeof checkpoint.line === 'string' && checkpoint.line !== '') append(plain(checkpoint.line, 300), [], reserve)
+  if (recovery !== undefined && recovery.pending === true && typeof checkpoint?.caution === 'string' && checkpoint.caution !== '') {
+    append(plain(checkpoint.caution, 300), [], reserve)
+  }
   if (candidates.length > 0) append('work in this directory, not attached (tp-agent work attach ID):', candidates, reserve)
   if (others > 0) append(`+${others} other active workspaces: tp-agent work list`, [], reserve)
   for (const line of [noteList('notes', notes.recent), noteList('important notes', notes.important)]) if (line !== undefined) append(line, [], reserve)
@@ -622,6 +638,8 @@ export const register: Register = on => {
   on('classic.SessionStart', async ($, e, next) => {
     const answer = await next(e)
     if (!isActive || e.source !== 'compact') return answer
+    // Mark recovery pending before the index is read (set-only and idempotent; the PreCompact hook has usually done it already).
+    await runTpAgent($, ['work', 'compacted', '--reason', 'session-start:compact'])
     const index = await readIndex($)
     if (index === undefined) return answer
     return { ...answer, additionalContext: [...(answer.additionalContext ?? []), index.text] }

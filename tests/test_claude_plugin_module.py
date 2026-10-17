@@ -38,6 +38,26 @@ class ClaudePluginModuleTests(unittest.TestCase):
         self.assertTrue(os.access(script, os.X_OK))
         self.assertTrue(os.access(ROOT / "bin" / "tp-trust-guard", os.X_OK))
 
+    def test_precompact_registers_for_manual_and_auto_and_fails_open(self):
+        # Phase C registration test: both matchers run precompact.sh (marker first, then checkpoint), with a timeout; the script
+        # is an executable file that never blocks a compaction.
+        hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
+        groups = hooks.get("PreCompact", [])
+        self.assertEqual(sorted(g["matcher"] for g in groups), ["auto", "manual"])
+        for group in groups:
+            self.assertEqual(len(group["hooks"]), 1)
+            entry = group["hooks"][0]
+            self.assertEqual(entry["type"], "command")
+            self.assertEqual(entry["command"], '"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.sh"')
+            self.assertLessEqual(entry["timeout"], 10)
+        script = PLUGIN / "hooks" / "precompact.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        text = script.read_text()
+        self.assertIn("work compacted", text)
+        self.assertIn("work checkpoint --auto --trigger precompact", text)
+        self.assertLess(text.index("work compacted"), text.index("work checkpoint"))
+        self.assertTrue(text.rstrip().endswith("exit 0"))
+
     def test_manifest_names_the_state_contract(self):
         manifest = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["types"], "./types/index.d.ts")

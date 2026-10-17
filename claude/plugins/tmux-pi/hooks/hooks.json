@@ -7,6 +7,7 @@
     "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
     "PermissionDenied": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sensitive-read.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
     "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 60}] }],
+    "PreCompact": [{ "matcher": "manual", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.sh\"", "timeout": 10}] }, { "matcher": "auto", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.sh\"", "timeout": 10}] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 10}] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/report.sh\"" }, { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/redact.sh\"", "timeout": 10}] }]

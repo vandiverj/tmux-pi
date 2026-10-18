@@ -14,6 +14,8 @@ const WAKE_TRIES = 3
 const UNREAD_EPOCH = 1e15
 // tp-agent's own id pattern (IDENT in bin/tp-agent): no leading dash, so never an option.
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+// tp-agent's MAIN_ID pattern.
+const MAIN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 // The one gate. Workers, headless runs, legacy mains and tp-claude-bootstrap load this
 // plugin too; every hook returns next(e) untouched while this is false.
@@ -60,6 +62,14 @@ async function readGate($: EngineInterface, e: SessionStartInput): Promise<boole
   return (await $.env.get('TP_MODE')) === 'orchestrator'
 }
 
+// The identity tp-agent records on every task this main dispatches (main_id in bin/tp-agent): the launcher's TP_MAIN_ID,
+// else the Claude session id. Read at each poll, because the main exports a different TP_STATE_DIR per command and this
+// is the one thing that follows its tasks into whichever state directory they live in.
+async function readMainId($: EngineInterface): Promise<string | undefined> {
+  const id = (await $.env.get('TP_MAIN_ID')) || (await $.env.get('CLAUDE_CODE_SESSION_ID'))
+  return id !== undefined && MAIN_ID.test(id) ? id : undefined
+}
+
 // Runs ${TP_ROOT}/bin/<tool> by argv (no shell). A timeout or a command that cannot
 // start rejects; that reads as undefined.
 async function runTool($: EngineInterface, tool: 'tp-agent' | 'tp-view', args: readonly string[]) {
@@ -84,9 +94,11 @@ async function runTpAgent($: EngineInterface, args: readonly string[]): Promise<
   }
 }
 
-// `tp-agent list` is read-only: no tick, no index write.
+// `tp-agent list` is read-only: no tick, no index write. `--main ID` adds this main's tasks in the other sessions of the
+// workspace and leaves out another main's tasks in this one; a main with no identity lists its own session as before.
 async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
-  const rows = await runTpAgent($, ['list'])
+  const main = await readMainId($)
+  const rows = await runTpAgent($, main === undefined ? ['list'] : ['list', '--main', main])
   if (!Array.isArray(rows)) return undefined
   const found: TaskRow[] = []
   for (const row of rows) {
@@ -100,6 +112,7 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
       capability_pending: row.capability_pending === true,
       reason: typeof row.reason === 'string' ? row.reason : null,
       result_status: typeof row.result_status === 'string' ? row.result_status : null,
+      ...(typeof row.state_dir === 'string' && row.state_dir.startsWith('/') ? { state_dir: row.state_dir } : {}),
       ...(typeof row.failing_tests === 'object' && row.failing_tests !== null ? { failing_tests: true as const } : {}),
     })
   }
@@ -148,24 +161,29 @@ function awaiting(row: { permission?: unknown; capability_request?: unknown; cap
   return [pending(row.capability_request) ? 'capability request pending' : '', row.capability_pending === true ? 'capability approval pending' : '', pending(row.permission) ? 'permission prompt pending' : ''].filter(Boolean).join(', ')
 }
 
+// A task in another session's state directory is reached with that directory exported, as the main dispatched it.
+function agent(row: TaskRow, verb: string): string {
+  return `${row.state_dir === undefined ? '' : `TP_STATE_DIR='${row.state_dir.replace(/'/g, `'\\''`)}' `}tp-agent ${verb} ${row.id}`
+}
+
 function hint(row: TaskRow): string {
-  if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or tp-agent stop ${row.id}`
+  if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or ${agent(row, 'stop')}`
   if (row.status === 'settled') {
     return row.failing_tests === true
-      ? `${row.id} settled and reports failing tests it does not own: tp-agent collect ${row.id}, then tp-agent dispatch --investigate-failure ${row.id}`
-      : `${row.id} settled: tp-agent collect ${row.id}`
+      ? `${row.id} settled and reports failing tests it does not own: ${agent(row, 'collect')}, then tp-agent dispatch --investigate-failure ${row.id}`
+      : `${row.id} settled: ${agent(row, 'collect')}`
   }
   if (row.status === 'paused') {
     const why = row.result_status === null ? 'replied without a result status' : 'is paused'
     const awaits = awaiting(row)
-    return `${row.id} ${why}${awaits === '' ? '' : ` (${awaits})`}: tp-agent inspect ${row.id}`
+    return `${row.id} ${why}${awaits === '' ? '' : ` (${awaits})`}: ${agent(row, 'inspect')}`
   }
-  if (row.status === 'failed') return `${row.id} failed: tp-agent inspect ${row.id}`
+  if (row.status === 'failed') return `${row.id} failed: ${agent(row, 'inspect')}`
   // tp-agent keeps returning a capability request after it is answered: only a pending
   // one is the reason the worker waits.
   const request = row.capability_request as { status?: unknown } | null
   const why = request?.status === 'pending' ? 'has a capability request' : 'is waiting at a permission prompt in its pane'
-  return `${row.id} needs input (${why}): tp-agent inspect ${row.id}`
+  return `${row.id} needs input (${why}): ${agent(row, 'inspect')}`
 }
 
 // The key a row is announced under, or undefined when it is not news: `id:status` for a notable status, and

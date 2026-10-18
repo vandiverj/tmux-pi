@@ -41,6 +41,7 @@ ROLES = ROOT / "agent" / "roles"
 TESTS_SCOPES = ("affected", "full", "none")
 TESTS_DEFAULT = "affected"
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MAIN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ACTIVE = {"starting", "working", "tool", "permission", "needs_input"}
 LOCAL = ("slotstream/", "lmstudio/", "mlx/", "ollama/")
 
@@ -159,6 +160,9 @@ def record(path, include_result=False):
     }
     if "lane" in meta and "lane_step" in meta:  # shown only; a task with no lane has neither key
         result.update(lane=meta["lane"], lane_step=meta["lane_step"])
+    main = read_json(path / "dispatch.json").get("main")  # the main that dispatched it (main_id), when it had an identity
+    if isinstance(main, str) and MAIN_ID.fullmatch(main):
+        result["main"] = main
     reported = failing_tests.read(path)
     if reported:  # a report without the block has no such key
         result["failing_tests"] = reported
@@ -242,7 +246,38 @@ def all_records(base):
                      "parent": item.get("parent"), "route": item.get("route_info"),
                      "reason": reason or item.get("queue_reason") or None,
                      "task_dir": None, "packet": None, "result_path": None, "updated": item.get("created"),
-                     **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item and "lane_step" in item else {})})
+                     **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item and "lane_step" in item else {}),
+                     **({"main": item["main"]} if "main" in item else {})})
+    return sorted(rows, key=lambda row: row.get("updated") or "")
+
+
+def main_id():
+    """The identity of the main agent that runs this command, or None: TP_MAIN_ID if the launcher set one, else the Claude
+    session id. A worker (TP_TASK_DIR set) has none: it never dispatches for a main. Recorded on each task it dispatches so
+    the main's notifier can tell its tasks from another main's, in whichever session state directory they live."""
+    if os.getenv("TP_TASK_DIR"):
+        return None
+    value = os.getenv("TP_MAIN_ID") or os.getenv("CLAUDE_CODE_SESSION_ID") or ""
+    return value if MAIN_ID.fullmatch(value) else None
+
+
+def main_rows(base, ident):
+    """`tp-agent list --main ID`: this session's rows except those another main dispatched (a row with no recorded main stays:
+    older tasks, and mains with no identity), plus the tasks `ident` dispatched into any other session of the same workspace
+    (<workdir>/.tmux-pi/sessions/*), each marked with its `state_dir`. A main that exports a different TP_STATE_DIR per command
+    still gets every one of its tasks. Other sessions are read only for tasks whose dispatch.json names `ident`."""
+    rows = [row for row in all_records(base) if row.get("main") in (None, ident)]
+    parent = base.parent
+    if parent.name != "sessions" or parent.parent.name != ".tmux-pi":
+        return rows
+    for other in sorted(parent.iterdir()):
+        tasks = other / "tasks"
+        if other == base or other.is_symlink() or not tasks.is_dir() or tasks.is_symlink():
+            continue
+        for path in sorted(tasks.iterdir()):
+            if path.is_symlink() or not (path / "meta.json").is_file() or read_json(path / "dispatch.json").get("main") != ident:
+                continue
+            rows.append(dict(record(path), state_dir=str(other)))
     return sorted(rows, key=lambda row: row.get("updated") or "")
 
 
@@ -524,7 +559,8 @@ def launch(base, item):
     admitted, omitted = admitted_context(path, item["context"])
     atomic_json(path / "dispatch.json",
                 {"context": admitted, "omitted_context": omitted, "notes": item["notes"], "tests": item["tests"], "base_commit": started_at,
-                 **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {})}, base)  # shown only; retry reads meta.json
+                 **({"lane": item["lane"], "lane_step": item["lane_step"]} if "lane" in item else {}),
+                 **({"main": item["main"]} if "main" in item else {})}, base)  # shown only; retry reads meta.json
     return record(task_dir(base, item["id"]))
 
 
@@ -610,6 +646,10 @@ def queue_item(value, name=None):
         if not isinstance(source, str) or not source.startswith("/") or "\n" in source:
             raise ValueError(f"the record has no usable preamble_from ({source!r}); a lane task reads its repository's preamble from there")
         clean.update(lane=value["lane"], lane_step=value["lane_step"], preamble_from=source)
+    if "main" in value:  # optional: the dispatching main's identity (main_id); a present value must have its shape
+        if not isinstance(value["main"], str) or not MAIN_ID.fullmatch(value["main"]):
+            raise ValueError("the record's main is not a valid main id")
+        clean["main"] = value["main"]
     if "queue_reason" in value:  # optional (tp-agent's own note, only displayed), but a present value must be text
         if not isinstance(value["queue_reason"], str):
             raise ValueError("the record's queue_reason is not text")
@@ -892,7 +932,7 @@ def dispatch(args, base):
             "task": args.task, "workdir": workdir, "worker": worker, "model": model,
             "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
-            "notes": args.note or [], "tests": tests})
+            "notes": args.note or [], "tests": tests, **({"main": main_id()} if main_id() else {})})
     if plan:
         with locked(base):
             value, _, warnings = lane_admit(base, plan, item)
@@ -1112,8 +1152,10 @@ def main():
     rp = sub.add_parser("reap", help="list finished tasks whose process is still alive; --yes ends them")
     rp.add_argument("ids", nargs="*")
     rp.add_argument("--yes", action="store_true", help="confirm: end the listed processes")
-    for name in ("list", "tick"):
-        sub.add_parser(name)
+    ls = sub.add_parser("list")
+    ls.add_argument("--main", help="list as the main with this id sees its tasks: this session's rows except another main's, plus this "
+                                   "main's tasks in the other sessions of the workspace (the Claude notifier uses this)")
+    sub.add_parser("tick")
     # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
     sub.add_parser("queue-view")
     # --no-tick: write and print the index without launching queued work.
@@ -1310,7 +1352,7 @@ def main():
         if args.bounded:
             value = work_index.bounded(value)
     elif args.command == "list":
-        value = all_records(base)
+        value = main_rows(base, args.main) if args.main else all_records(base)
     elif args.command == "objective":
         atomic_text(base / "session-objective.md", args.text.strip() + "\n", base)
         value = write_index(base)

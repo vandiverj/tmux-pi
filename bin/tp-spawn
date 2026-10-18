@@ -198,7 +198,7 @@ fi
 if [[ -z "$lane" ]]; then python3 "$ROOT/lib/lanes.py" check-tree "$workdir" || exit 1; fi
 
 # Limits keep packets to selected context rather than whole trees.
-max_file=60000 max_packet=200000
+max_file=60000 max_packet=300000
 
 # Never hand credentials to a worker (often a remote model).
 secret_file() {

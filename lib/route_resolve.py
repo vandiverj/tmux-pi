@@ -493,6 +493,15 @@ def pick_reviewer(author_provider, author_level_key, cat, health=None, review_le
     # lowers a role floor for an explicit --level; with no level, availability may not move a review below it.
     ctx["min_level_key"] = keys[floor]
     ctx["min_level_explicit"] = bool(ctx.get("level_key"))
+    if ctx.get("same_provider_approved"):
+        # The user approved a reviewer from the author's own provider: every other provider is excluded, so a healthy
+        # other provider is not picked and the usual level floor and effort rules still apply.
+        others = tuple(name for name in cat["providers"] if name not in excluded)
+        chosen = resolve(request, cat, health, dict(ctx, exclude_providers=others))
+        if chosen["source"] != "stop_and_ask":
+            chosen["independence"] = "same_provider_user_approved"
+            return chosen
+        return dict(chosen, reason="no same-provider reviewer available ({})".format(chosen.get("reason", "no reason recorded")))
     first = resolve(request, cat, health, dict(ctx, exclude_providers=excluded))
     if first["source"] != "stop_and_ask":
         first["independence"] = "different_provider"

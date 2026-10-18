@@ -19,6 +19,9 @@
 # tasks). It does NOT apply to a lane's working tree: a lane's one writer is enforced by the lane's lease, shared by every
 # session, and a reviewer is refused beside a live writer whatever flags are given. To review a lane task, end its writer:
 # `tp-agent stop <writer task id>` (the id and session are named in the refusal), then run tp-review again.
+# --same-provider --approved-by-user "QUOTE": a reviewer from the author's own provider, for when the user has approved that (for
+# example the other provider is out of credits). The quote is required and recorded; the plan, the author's record and the
+# reviewer's packet say `same_provider_user_approved`. The default is unchanged: no silent same-provider substitute.
 # Prints the review task id.
 set -euo pipefail
 
@@ -33,22 +36,31 @@ source "$ROOT/lib/tp.sh"
 
 usage() {
   echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2
+  echo "  --same-provider --approved-by-user QUOTE: review on the author's own provider, only with the user's approval (quoted, recorded)" >&2
   echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
   exit "${1:-1}"
 }
-force=0 force_alive=0 plan_opts=()
+force=0 force_alive=0 plan_opts=() same_provider=0 approval=""
 [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage 0
 while [[ $# -gt 1 ]]; do
   case "$1" in
     --force) force=1; shift ;;
     --force-alive) force_alive=1; shift ;;
     --approve-effort) plan_opts+=(--approve-effort); shift ;;
+    --same-provider) same_provider=1; shift ;;
+    --approved-by-user) [[ $# -gt 2 ]] || usage; approval="$2"; shift 2 ;;
     --level|--thinking) [[ $# -gt 2 ]] || usage; plan_opts+=("$1" "$2"); shift 2 ;;
     *) usage ;;
   esac
 done
 [[ $# -eq 1 ]] || usage
 id="$1"
+if [[ "$same_provider" == 1 ]]; then
+  [[ -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
+  plan_opts+=(--same-provider --approved-by-user "$approval")
+elif [[ -n "$approval" ]]; then
+  die "--approved-by-user applies only with --same-provider"
+fi
 [[ "$id" =~ ^[[:alnum:]_.-]+$ ]] || die "bad task id: $id"
 
 session="$(tp_session)"
@@ -108,6 +120,12 @@ reviewer="$(jq -r '.reviewer.worker' <<<"$plan")"
 model="$(jq -r '.reviewer.model' <<<"$plan")"
 thinking="$(jq -r '.reviewer.thinking' <<<"$plan")"
 independence="$(jq -r '.reviewer.independence' <<<"$plan")"
+approved_quote="$(jq -r '.reviewer.approved_by_user // empty' <<<"$plan")"
+same_provider_note=()
+if [[ "$independence" == same_provider_user_approved ]]; then
+  [[ -n "$approved_quote" ]] || die "the review plan for '$id' is same-provider without the user's approval quote; refused"
+  same_provider_note=(--note "This is a same-provider review approved by the user (\"$approved_quote\"): you share the author's provider and may share its blind spots. Check every claim yourself; do not accept assertions without checking.")
+fi
 worker="$(tp_meta "$dir" worker)"
 case "$worker" in
   pi|claude) ;;
@@ -153,7 +171,7 @@ if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md");
 # oversized author packet/result is never excerpted: it is split into ordered, labelled
 # segments that together hold every character. If all evidence cannot fit in one
 # packet, fail before spawning rather than drop any of it.
-max_file=60000 max_packet=200000 packet_reserve=20000 per_file_overhead=300
+max_file=60000 max_packet=300000 packet_reserve=20000 per_file_overhead=300
 excerpt_dir=""
 cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
 trap cleanup_excerpts EXIT
@@ -240,15 +258,15 @@ for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
 if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer --review-of "$id" ${lane_args[@]+"${lane_args[@]}"} \
   --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
-  --note "Review policy: $policy ($independence)" \
+  --note "Review policy: $policy ($independence)" ${same_provider_note[@]+"${same_provider_note[@]}"} \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
   -- "$review_task")"; then
   die "reviewer '$reviewer' ($model) could not start; ask the human (no silent skip or substitute)"
 fi
 
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
-  --arg policy "$policy" --arg independence "$independence" \
-  '. + {review:$review, reviews:((.reviews // (if .review then [.review] else [] end)) + [$review]), review_policy:$policy, reviewer:{worker:$reviewer, model:$model, thinking:$thinking, independence:$independence}}' \
+  --arg policy "$policy" --arg independence "$independence" --arg approved "$approved_quote" \
+  '. + {review:$review, reviews:((.reviews // (if .review then [.review] else [] end)) + [$review]), review_policy:$policy, reviewer:({worker:$reviewer, model:$model, thinking:$thinking, independence:$independence} + (if $approved != "" then {approved_by_user:$approved} else {} end))}' \
   "$dir/meta.json" | tp_write "$dir/meta.json" --root "$state_dir" --fresh
 review_dir="$(tp_task_dir "$session" "$review_id")"
 tp_not_link --root "$state_dir" "$review_dir"

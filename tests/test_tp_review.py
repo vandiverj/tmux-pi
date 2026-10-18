@@ -30,7 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py"):   # the last two: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
@@ -111,6 +111,31 @@ echo review-1
                 self.task = archive / "w1"
         r = subprocess.run([str(self.root / "bin/tp-review"), "nope"], env=self.env, capture_output=True, text=True)
         self.assertIn("no subagent 'nope'", r.stderr)
+
+    def test_same_provider_review_needs_the_users_quote_and_records_it(self):
+        for args in (("--same-provider",), ("--same-provider", "--approved-by-user", "  "), ("--approved-by-user", "x")):
+            r = self.review(*args)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("approv", r.stderr)
+            self.assertFalse((self.plan.parent / "route.args").exists())  # refused before any plan
+        quote = "use claude, gpt is out of credits"
+        self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high",
+                                "independence": "same_provider_user_approved", "approved_by_user": quote})
+        r = self.review("--same-provider", "--approved-by-user", quote)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"--same-provider --approved-by-user {quote}", (self.plan.parent / "route.args").read_text())
+        self.assertIn("(same_provider_user_approved)", self.spawn_args())
+        self.assertIn("same-provider review approved by the user", self.spawn_args())
+        self.assertIn("Check every claim yourself", self.spawn_args())
+        meta = json.loads((self.task / "meta.json").read_text())
+        self.assertEqual(meta["reviewer"]["independence"], "same_provider_user_approved")
+        self.assertEqual(meta["reviewer"]["approved_by_user"], quote)
+
+    def test_a_plan_marked_same_provider_without_the_quote_is_refused(self):
+        self.set_plan(reviewer={"worker": "claude", "model": "m", "thinking": "high", "independence": "same_provider_user_approved"})
+        r = self.review()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without the user's approval quote", r.stderr)
 
     def test_reviewer_comes_from_the_review_plan(self):
         self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})
@@ -681,8 +706,8 @@ echo review-1
         self.assertFalse(any(Path(p).exists() for p in segs))
 
     def test_aggregate_overflow_fails_before_spawn_and_cleans_up(self):
-        (self.task / "packet.md").write_text("p" * 150000)
-        (self.task / "result.md").write_text("RESULT_STATUS: complete\n" + "r" * 70000)
+        (self.task / "packet.md").write_text("p" * 230000)
+        (self.task / "result.md").write_text("RESULT_STATUS: complete\n" + "r" * 80000)
         r = self.review()
         self.assertEqual(r.returncode, 1)
         self.assertIn("without dropping author evidence", r.stderr)

@@ -973,6 +973,12 @@ def review(base, args):
             command += [flag, value]
     if args.approve_effort:
         command.append("--approve-effort")
+    if args.same_provider:
+        if not (args.approved_by_user or "").strip():
+            raise ValueError("--same-provider needs --approved-by-user with the user's approval quoted")
+        command += ["--same-provider", "--approved-by-user", args.approved_by_user]
+    elif args.approved_by_user is not None:
+        raise ValueError("--approved-by-user applies only with --same-provider")
     run = subprocess.run(command + [args.id], text=True, capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
     if run.returncode == 3:
         return {"id": args.id, "review": None, "status": "not_needed", "reason": run.stderr.strip()}
@@ -1097,13 +1103,15 @@ def main():
                        help="start the attempt although a process is still alive on the same working tree (skips only the retry guard; a lane's one writer is still enforced: stop the writer instead)")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
-    rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author)")
+    rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author unless --same-provider)")
     rv.add_argument("id")
     rv.add_argument("--force", action="store_true", help="review even when the policy says none")
     rv.add_argument("--level", help="explicit reviewer level key")
     rv.add_argument("--thinking", help="explicit reviewer effort")
     rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree (does not apply to a lane: stop its writer with tp-agent stop)")
+    rv.add_argument("--same-provider", action="store_true", help="review on the author's own provider; only with the user's approval, which --approved-by-user must quote")
+    rv.add_argument("--approved-by-user", metavar="QUOTE", help="the user's approval of a same-provider review, quoted (required with --same-provider)")
     ea = sub.add_parser("end-author", help="end a settled task's process before its review starts (bin/tp-review runs this)")
     ea.add_argument("id")
     gr = sub.add_parser("guard-review", help="refuse while a writer is alive on the task's working tree (bin/tp-review runs this)")

@@ -712,6 +712,29 @@ class ReviewPlanTests(Base):
         self.assertEqual(plan["reviewer"]["model"], SOL)
         self.assertEqual((plan["reviewer"]["worker"], plan["reviewer"]["level"], plan["reviewer"]["independence"]), ("pi", "mid", "different_provider"))
 
+    def test_same_provider_review_needs_a_quote(self):
+        path = self.author("claude", SONNET)
+        for quote in ("", "  "):
+            with self.assertRaises(ValueError):
+                self.plan(path, same_provider_approval=quote)
+
+    def test_same_provider_review_uses_the_authors_provider_and_records_the_quote(self):
+        # openai is healthy (the default), so the usual path would pick GPT; the approval keeps it on anthropic
+        plan = self.plan(self.author("claude", SONNET), same_provider_approval="  use claude, gpt is out of credits ")
+        self.assertEqual((plan["reviewer"]["worker"], plan["reviewer"]["provider"], plan["reviewer"]["level"]), ("claude", "anthropic", "mid"))
+        self.assertEqual(plan["reviewer"]["independence"], "same_provider_user_approved")
+        self.assertEqual(plan["reviewer"]["approved_by_user"], "use claude, gpt is out of credits")
+        # a required review too, and an author started without a model is placed by its harness
+        plan = self.plan(self.author("claude", ""), same_provider_approval="ok", force=True)
+        self.assertEqual((plan["reviewer"]["worker"], plan["reviewer"]["independence"]), ("claude", "same_provider_user_approved"))
+        plan = self.plan(self.author("pi", SOL), same_provider_approval="ok")
+        self.assertEqual(plan["reviewer"]["provider"], "openai")
+
+    def test_the_default_review_plan_is_unchanged_by_the_same_provider_option_existing(self):
+        plan = self.plan(self.author("claude", SONNET))
+        self.assertEqual((plan["reviewer"]["model"], plan["reviewer"]["independence"]), (SOL, "different_provider"))
+        self.assertNotIn("approved_by_user", plan["reviewer"])
+
     def test_gpt_authored_work_goes_to_claude(self):
         plan = self.plan(self.author("pi", SOL))
         self.assertEqual((plan["reviewer"]["worker"], plan["reviewer"]["model"]), ("claude", SONNET))

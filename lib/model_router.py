@@ -387,10 +387,14 @@ def git_files_touched(workdir, runner=subprocess.run):
 
 
 def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort=False, base=None, catalog_path=None,
-                runner=subprocess.run, files_touched=None, log=True):
+                runner=subprocess.run, files_touched=None, log=True, same_provider_approval=None):
     """Decide whether a review is needed and, if so, who reviews. Returns a dict with review (none|optional|required|
     forced) and, unless review is none, the reviewer's worker, model, thinking and independence. Raises RouteStop when
-    a required review has no independent provider, and ValueError for a bad request."""
+    a required review has no independent provider, and ValueError for a bad request. same_provider_approval is the user's
+    quoted approval of a reviewer from the author's own provider (independence same_provider_user_approved); None is the
+    default, and an empty quote is refused."""
+    if same_provider_approval is not None and not str(same_provider_approval).strip():
+        raise ValueError("a same-provider review needs the user's approval quote")
     started = time.monotonic()
     cat = rc.load_catalog(catalog_path)
     if base is None and Path(task_dir).resolve().parent.name == "tasks":
@@ -422,6 +426,10 @@ def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort
     effort = thinking or (cat["effort"]["ceiling"] if author_effort == cat["effort"]["ceiling"] else cat["reviewer"]["default_effort"])
     ctx = {"explicit_effort": effort, "approvals": {"effort_above_high": bool(approve_effort)},
            "local_only": bool(route.get("local_only"))}
+    if same_provider_approval is not None:
+        if ctx["local_only"]:
+            raise ValueError("local-only work is not reviewed by a cloud model")
+        ctx["same_provider_approved"] = True
     if level:
         if level not in rc.shown_keys(cat):
             raise ValueError("level {!r} is not offered; choose one of {}".format(level, ", ".join(rc.shown_keys(cat))))
@@ -434,6 +442,8 @@ def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort
     record["status"] = "stop_and_ask" if picked["source"] == "stop_and_ask" else "ok"
     record["author"] = plan["author"] | {"provider": author_provider if isinstance(author_provider, str) else list(author_provider)}
     record["independence"] = picked.get("independence")
+    if same_provider_approval is not None:
+        record["approved_by_user"] = same_provider_approval.strip()
     if log:
         write_selection(record, base)
     if picked["source"] == "stop_and_ask":
@@ -441,4 +451,6 @@ def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort
     plan["reviewer"] = {"worker": picked["worker"], "model": picked["model"], "thinking": picked["effort"],
                         "provider": picked["provider"], "independence": picked["independence"], "level": picked["level_key"],
                         "steps": picked["steps"]}
+    if same_provider_approval is not None:
+        plan["reviewer"]["approved_by_user"] = same_provider_approval.strip()
     return plan

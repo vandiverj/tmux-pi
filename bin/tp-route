@@ -81,6 +81,9 @@ def main():
     parser.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     parser.add_argument("--review-plan", metavar="TASK_DIR", help="decide whether a finished task needs review and who reviews")
     parser.add_argument("--force", action="store_true", help="with --review-plan: review regardless of need")
+    parser.add_argument("--same-provider", action="store_true",
+                        help="with --review-plan: a reviewer from the author's own provider, approved by the user (needs --approved-by-user)")
+    parser.add_argument("--approved-by-user", metavar="QUOTE", help="with --same-provider: the user's approval, quoted")
     parser.add_argument("--no-log", action="store_true", help="do not write a selection record")
     parser.add_argument("--base-url", default=os.environ.get("TP_ROUTER_BASE_URL"), help="legacy Laya endpoint (--dispatch, --follow-up)")
     parser.add_argument("--router-model", default=os.environ.get("TP_ROUTER_MODEL"), help="legacy Laya model (--dispatch)")
@@ -100,9 +103,11 @@ def main():
                 len(config["models"]), len(catalog["levels"]), len(router_catalog.shown_keys(catalog))))
             return 0
         if args.review_plan:
+            if args.same_provider != (args.approved_by_user is not None):
+                raise ValueError("--same-provider and --approved-by-user go together")
             plan = model_router.review_plan(args.review_plan, force=args.force, level=args.level, thinking=args.thinking,
                                             approve_effort=args.approve_effort, catalog_path=args.catalog,
-                                            log=not args.no_log)
+                                            log=not args.no_log, same_provider_approval=args.approved_by_user)
             print(json.dumps(plan, separators=(",", ":")))
             return 3 if plan["review"] == "none" else 0
         if args.dispatch or args.follow_up:

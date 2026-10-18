@@ -254,6 +254,10 @@ def gate(text, safe_paths, withheld_paths):
             raise Refused(f"the diff has a section for a flagged path: {line[4:]!r}")
 
 
+# Machine-generated files whose contents are named but left out of a review diff (drizzle-kit schema snapshots).
+GENERATED = re.compile(r"(^|/)drizzle/meta/[^/]+_snapshot\.json$")
+
+
 def safe_diff(top, old, new):
     """(text, withheld paths): git diff old..new without the contents of any path the sensitive-read rule flags.
 
@@ -276,7 +280,7 @@ def safe_diff(top, old, new):
         raise Refused("cannot work out the empty blob id")
     empty = empty.stdout.decode().strip()
     check = sensitive_checker()
-    safe, withheld = [], []
+    safe, withheld, generated = [], [], []
     for info, name in zip(fields[::2], fields[1::2]):
         try:
             path, meta = name.decode("utf-8"), info.decode("ascii")
@@ -288,11 +292,18 @@ def safe_diff(top, old, new):
         if not path or path.startswith("/") or "\0" in path:
             raise Refused(f"a changed path is not a repository-relative path: {path!r}")
         record = match.groups()
-        (withheld if check(top, path) else safe).append((path, record))
+        if check(top, path):
+            withheld.append((path, record))
+        elif GENERATED.search(path):
+            generated.append((path, record))
+        else:
+            safe.append((path, record))
     body = "".join(entry_patch(top, empty, entry) for entry in safe)
     labels = {"A": "added", "M": "modified", "D": "deleted", "T": "type changed"}
     notes = "".join(f"{json.dumps(p)} ({labels[r[4]]}): sensitive path, its contents were withheld from this diff\n"
                     for p, r in withheld)
+    notes += "".join(f"{json.dumps(p)} ({labels[r[4]]}): generated file, its contents were left out of this diff; open it if needed\n"
+                     for p, r in generated)
     gate(body, [p for p, _ in safe], [p for p, _ in withheld])
     return notes + body, [p for p, _ in withheld]
 

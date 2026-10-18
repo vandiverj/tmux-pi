@@ -311,6 +311,17 @@ class CloseAndNextStepTests(StepCase):
         self.assertEqual(json.loads((task / "meta.json").read_text())["lane_step"], "s2")
         self.assertEqual(self.lanes()["open_step"], "s2")
 
+    def test_row_6_a_completed_same_provider_user_approved_review_closes_like_any_other(self):
+        author, reviewer = self.approved_and_committed()
+        meta_path = self.state / "tasks" / reviewer / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["review_policy"] = "required"
+        meta["reviewer"] = {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high",
+                            "independence": "same_provider_user_approved", "approved_by_user": "use claude"}
+        meta_path.write_text(json.dumps(meta))
+        entry = self.closes()["closed"][0]
+        self.assertEqual((entry["review"], entry["verdict"]), (reviewer, "APPROVED"))
+
     def test_row_6_an_approval_with_notes_closes_and_is_recorded_as_such(self):
         _, reviewer = self.approved_and_committed(WITH_NOTES)
         self.assertEqual(self.closes()["closed"][0]["verdict"], "APPROVED_WITH_NOTES")

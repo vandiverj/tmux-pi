@@ -5,7 +5,8 @@
 lane lock file and the `tmux-pi/lanes` directory in the common git directory (empty bookkeeping that every later lane
 operation needs). It never touches the main checkout's files, HEAD, index or `info/exclude`, never reuses a path or a
 branch that exists, and on any failure undoes what it made (see `_roll_back`; what cannot be undone is named). Rollback
-never forces: a worktree a hook dirtied stays, with the command that discards it. The default base is the integration branch.
+never forces: a worktree a hook dirtied stays, with the command that discards it. The default base is the integration branch. After the worktree is added, main's node_modules are linked into it when the
+lockfiles agree with main's installed packages (lib/lane_deps.py; record `deps: shared|own`); the links are removed first when creation is rolled back.
 
 `list_lanes` is read-only: it takes no lock, runs git with `--no-optional-locks`, and writes nothing.
 
@@ -21,6 +22,7 @@ import os
 import subprocess
 from datetime import datetime, timezone
 
+import lane_deps
 import lanes
 
 DU_TIMEOUT = 5
@@ -117,6 +119,11 @@ def _roll_back(common, repo, name, slot, base_commit, made):
     """Undo what a failed creation made, newest first: record, worktree, branch. Returns the list of things that could not
     be undone, each with the command that does it. `made` says which of the three may exist."""
     left = []
+    if made["worktree"]:
+        try:
+            lane_deps.unlink_shared(repo, slot["worktree"])  # links only, before git removes the tree
+        except OSError as error:
+            left.append(f"the node_modules links in {slot['worktree']} ({error.__class__.__name__}); unlink them with: python3 lib/lane_deps.py unlink {slot['worktree']}")
     if made["record"]:
         try:
             lanes.discard_lane_record(common, name)
@@ -164,6 +171,8 @@ def warning_text(warning):
         return (f"tp-agent: warning: lanes {' and '.join(warning['lanes'])} overlap on {', '.join(warning['paths'])} "
                 f"({', '.join(warning['basis'])}). They were claimed independent ("
                 + "; ".join(f"{k}: {v!r}" for k, v in warning["claims"].items()) + ").")
+    if warning["kind"] == "deps":
+        return f"tp-agent: warning: dependencies: {warning['note']}"
     return f"tp-agent: warning: {warning['path']} is {warning['note']}"
 
 
@@ -199,12 +208,14 @@ def create_lane_locked(common, repo, name, domain, touches, base_ref, base_commi
             # The slot was proven free above, so whatever exists now was made by this command (even if git failed halfway).
             made["branch"] = lanes._branch_in_use(common, slot["branch"]) == slot["branch"]
             made["worktree"] = slot["worktree"] in lanes.registered_worktrees(common) or os.path.lexists(slot["worktree"])
+        deps = lane_deps.share(repo, slot["worktree"], base_commit)  # links only; never raises, a failure leaves the lane `own`
+        warnings = warnings + deps["warnings"]
         made["record"] = True
         record = lanes.write_lane(common, {
             "schema": lanes.SCHEMA, "name": name, "kind": "work", "state": "open", "repo": repo, "git_common_dir": common,
             "branch": slot["branch"], "worktree": slot["worktree"], "base": {"ref": base_ref, "commit": base_commit},
             "created": lanes.utc_now(), "domain": domain, "touches": touches, "closed": [], "integrated": None,
-            "defaulted": lanes.defaulted_values(machine, repo_config)})
+            "defaulted": lanes.defaulted_values(machine, repo_config), "deps": deps["deps"]})
         lanes.lane_reality(record)
     except BaseException as error:
         left = _roll_back(common, repo, name, slot, base_commit, made)

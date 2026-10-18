@@ -29,7 +29,7 @@ def good(**over):
     record = {"schema": "tp-lane:v1", "name": "alpha", "kind": "work", "state": "open", "repo": "/r/repo",
               "git_common_dir": "/r/repo/.git", "branch": "work/orch-alpha", "worktree": "/r/repo-wt-alpha",
               "base": {"ref": "work/orch-integrate", "commit": SHA}, "created": "2026-10-08T10:00:00+00:00",
-              "domain": "the parser", "touches": ["lib/a", "lib/b.py"], "closed": [], "integrated": None, "defaulted": []}
+              "domain": "the parser", "touches": ["lib/a", "lib/b.py"], "closed": [], "integrated": None, "defaulted": [], "deps": "own"}
     record.update(over)
     return record
 
@@ -614,8 +614,8 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             lanes.load_machine_config(self.dir / "absent.json")  # the machine file itself must exist
 
-    def test_the_shipped_config_has_no_lanes_block_so_it_takes_the_defaults(self):
-        self.assertEqual(lanes.load_machine_config(), {"max_active_lanes": 2, "defaulted": ["max_active_lanes"]})
+    def test_the_shipped_config_sets_max_active_lanes(self):
+        self.assertEqual(lanes.load_machine_config(), {"max_active_lanes": 5, "defaulted": []})
 
     def repo_config(self, value=None, raw=None, repo=None):
         repo = repo or self.dir

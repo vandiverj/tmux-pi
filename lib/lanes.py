@@ -43,6 +43,7 @@ REPO_CONFIG = Path(".tmux-pi/lanes.json")  # relative to the repository's main w
 SCHEMA = "tp-lane:v1"
 KINDS = ("work", "integration")
 STATES = ("open", "integrating", "integrated", "abandoned")
+DEPS = ("shared", "own")  # shared: node_modules are symlinks to the main checkout's (lib/lane_deps.py)
 VERDICTS = ("APPROVED", "APPROVED_WITH_NOTES")
 EMPTY = "EMPTY"  # the verdict of a step closed without a review because its work left the tree as the last closed commit had it
 LANE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
@@ -59,6 +60,7 @@ TEST_LEVEL = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
 MAX_DOMAIN = 200
 MAX_TOUCHES = 50
 GIT_TIMEOUT = 30
+REMOVE_TIMEOUT = 1800  # `git worktree remove` of a tree with node_modules is minutes of unlinking; the only git call given more than GIT_TIMEOUT
 LANES_SUBDIR = Path("tmux-pi/lanes")
 LOCK_NAME = ".lock"
 
@@ -74,12 +76,19 @@ DEFAULTABLE = tuple(sorted({*DEFAULT_MACHINE, *DEFAULT_REPO}))
 
 # ---------------------------------------------------------------- git
 
-def _git(args, cwd, ok=(0,)):
-    """(returncode, stdout) of `git -C cwd args`; a return code outside `ok`, a timeout or a missing git refuses."""
+class GitTimeout(ValueError):
+    """A git call that did not finish in time and was killed; whatever it was doing may be half done."""
+
+
+def _git(args, cwd, ok=(0,), timeout=None):
+    """(returncode, stdout) of `git -C cwd args`; a return code outside `ok`, a timeout (GIT_TIMEOUT unless `timeout` is
+    given) or a missing git refuses."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
     try:
-        run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, timeout=GIT_TIMEOUT, env=env)
-    except (OSError, subprocess.TimeoutExpired) as error:
+        run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, timeout=timeout or GIT_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired as error:
+        raise GitTimeout(f"git {' '.join(args)} could not run in {cwd} ({error.__class__.__name__})")
+    except OSError as error:
         raise ValueError(f"git {' '.join(args)} could not run in {cwd} ({error.__class__.__name__})")
     if run.returncode not in ok:
         raise ValueError(f"git {' '.join(args)} failed in {cwd}: {run.stderr.strip() or 'exit ' + str(run.returncode)}")
@@ -282,9 +291,12 @@ def lane_record(value, name=None):
     if not isinstance(defaulted, list) or not all(isinstance(k, str) and k in DEFAULTABLE for k in defaulted) \
             or defaulted != sorted(set(defaulted)):
         raise ValueError(f"defaulted must be a sorted list of distinct names from {', '.join(DEFAULTABLE)}")
+    deps = value.get("deps", "own")  # optional: a record from before shared dependencies has its own
+    if deps not in DEPS:
+        raise ValueError(f"deps {deps!r} is not one of {', '.join(DEPS)}")
     return {"schema": SCHEMA, "name": lane, "kind": value["kind"], "state": value["state"], "repo": repo, "git_common_dir": common,
             "branch": branch, "worktree": worktree, "base": base, "created": _timestamp(value["created"], "created"),
-            "domain": domain, "touches": touches, "closed": closed, "integrated": integrated, "defaulted": list(defaulted)}
+            "domain": domain, "touches": touches, "closed": closed, "integrated": integrated, "defaulted": list(defaulted), "deps": deps}
 
 
 # ---------------------------------------------------------------- the files
@@ -674,11 +686,13 @@ def worktree_identity(common_dir, worktree):
         raise ValueError(f"git run in {worktree} finds {actual.strip()}, not the repository's entry {entry}")
 
 
-def lane_reality(record):
+def lane_reality(record, history_only=False):
     """Check a validated record against the repository; every mismatch refuses naming the lane and the fact, nothing is
     repaired. Returns {"tip": commit of the branch}. Checks: the repository is the recorded one; the worktree is a directory
     git lists and is that registered worktree (worktree_identity); it is on the recorded branch (a symbolic ref, not detached); the branch exists; base and every closed
-    commit is an ancestor of the tip, in order; every closed tree is its commit's tree."""
+    commit is an ancestor of the tip, in order; every closed tree is its commit's tree. `history_only` skips the checks of the
+    worktree (a removal that was interrupted has left a tree that is not one any more; lane_remove checks what is left itself)
+    and asks only the repository: the branch, the base and the closed commits."""
     record = lane_record(record)
     name, repo, worktree, branch = record["name"], record["repo"], record["worktree"], record["branch"]
 
@@ -690,20 +704,21 @@ def lane_reality(record):
             fail(f"repository {repo} is not the recorded one ({record['git_common_dir']})")
         if main_worktree(record["git_common_dir"]) != repo:
             fail(f"{repo} is not the repository's main working tree")
-        if not os.path.isdir(worktree):
-            fail(f"worktree {worktree} does not exist; restore it, or retire the lane by hand (README.md, Lane recovery)")
-        if os.path.realpath(worktree) != worktree or worktree not in registered_worktrees(record["git_common_dir"]):
-            fail(f"worktree {worktree} is not registered with git")
         common = record["git_common_dir"]
-        try:
-            worktree_identity(common, worktree)
-        except ValueError as error:
-            fail(f"worktree {worktree} is not the worktree git registered ({error})")
-        _, head = _git(["symbolic-ref", "-q", "HEAD"], worktree, ok=(0, 1))
-        actual = head.strip()
-        if actual != f"refs/heads/{branch}":
-            fail(f"worktree {worktree} is on {actual[len('refs/heads/'):] if actual.startswith('refs/heads/') else 'a detached HEAD'}, "
-                 f"expected {branch}; check it out again, or retire the lane by hand (README.md, Lane recovery)")
+        if not history_only:
+            if not os.path.isdir(worktree):
+                fail(f"worktree {worktree} does not exist; restore it, or retire the lane by hand (README.md, Lane recovery)")
+            if os.path.realpath(worktree) != worktree or worktree not in registered_worktrees(common):
+                fail(f"worktree {worktree} is not registered with git")
+            try:
+                worktree_identity(common, worktree)
+            except ValueError as error:
+                fail(f"worktree {worktree} is not the worktree git registered ({error})")
+            _, head = _git(["symbolic-ref", "-q", "HEAD"], worktree, ok=(0, 1))
+            actual = head.strip()
+            if actual != f"refs/heads/{branch}":
+                fail(f"worktree {worktree} is on {actual[len('refs/heads/'):] if actual.startswith('refs/heads/') else 'a detached HEAD'}, "
+                     f"expected {branch}; check it out again, or retire the lane by hand (README.md, Lane recovery)")
         # From here on ask the repository itself (the common git dir), never the worktree directory.
         code, out = _git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}"], common, ok=(0, 1))
         if code:

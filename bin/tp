@@ -41,6 +41,7 @@ done
 case "$MAIN_HARNESS" in pi|claude) ;; *) echo "tp: --main must be pi or claude" >&2; exit 2 ;; esac
 # The older TP_MAIN entry point uses a different Claude prompt, but must still
 # identify its harness correctly for resume checks, status, and worker routing.
+[[ -z "${TP_MAIN:-}" ]] || echo "tp: warning: TP_MAIN is the legacy entry point (Claude gets the subagent MCP tools and no worker wake-ups); unset it and use --main to start the orchestrator main" >&2
 case "${TP_MAIN:-}" in
   "") ;;
   pi|claude)

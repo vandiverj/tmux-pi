@@ -8,6 +8,8 @@ export type TaskRow = {
   reason: string | null
   result_status: string | null
   failing_tests?: true
+  // Set for a task that lives in another session's state directory (tp-agent list --main).
+  state_dir?: string
 }
 
 export type TaskSummary = {

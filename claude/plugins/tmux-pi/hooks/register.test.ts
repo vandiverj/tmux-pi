@@ -8,7 +8,7 @@ const AGENT = `${ROOT}/bin/tp-agent`
 const MAIN = { TP_ROOT: ROOT, TP_MODE: 'orchestrator' }
 const BAND = { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 80 }
 
-type Row = { id: string; status: string; role?: string; capability_request?: unknown; result_status?: string | null }
+type Row = { id: string; status: string; role?: string; capability_request?: unknown; result_status?: string | null; state_dir?: string }
 
 // Stands for the engine beneath the plugin: answers the environment, the clock, the
 // session and every host command from memory, and records what the module did. A plugin's
@@ -34,6 +34,7 @@ function world(on: On, env: Record<string, string>) {
     acceptsAppend: false,
     appended: [] as string[], // the text of every row the module tried to append to the session
     listOut: undefined as string | undefined,
+    listFor: undefined as ((main: string | undefined) => Row[]) | undefined, // when set, `tp-agent list` answers per `--main`
     ran: [] as string[][],
     submitted: [] as string[],
     toasts: [] as string[],
@@ -71,7 +72,7 @@ function world(on: On, env: Record<string, string>) {
     let stdout = ''
     if (tool === AGENT && verb === 'index' && !e.argv.includes('--no-write')) w.indexWrites += 1
     if (tool !== AGENT) stdout = `viewing ${verb}`
-    else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.rows)
+    else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.listFor ? w.listFor(e.argv[2] === '--main' ? e.argv[3] : undefined) : w.rows)
     else if (verb === 'index' && w.indexJson !== undefined) stdout = JSON.stringify(w.indexJson)
     else if (verb === 'index') stdout = JSON.stringify({ objective: w.objective, active: w.rows, pending: [], paused: w.paused ?? [], unstatused: w.unstatused ?? [], recent: [], ...(w.work === undefined ? {} : { work: w.work }), ...(w.workError === undefined ? {} : { work_error: w.workError }) })
     else if (verb === 'collect') stdout = JSON.stringify({ id, status: w.collectStatus, result_status: w.collectResult, ...w.collectReport })
@@ -119,6 +120,16 @@ for (const [name, env, isInteractive] of [
     expect(await $.command.run(command('workers'))).toEqual({ text: 'engine' })
   })
 }
+
+test('a worker environment never notifies, even with a main identity and the orchestrator mode', async ($, on) => {
+  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1', CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_HARNESS: 'claude' })
+  w.rows = [{ id: 'coder-2', status: 'settled' }]
+  await $.session.start(start(true))
+  await w.clock.advance(30000)
+  expect(w.ran).toEqual([])
+  expect(w.submitted).toEqual([])
+  expect(w.toasts).toEqual([])
+})
 
 test('a failing tp-agent leaves the session start untouched', async ($, on) => {
   const w = world(on, MAIN)
@@ -1315,4 +1326,62 @@ test('work block: the recovery lines are short and do not push out paused worker
   expect(lines.every(line => line.length <= 301)).toBe(true)
   expect(text.length - text.replace(/x{60,}/g, '').length <= 301).toBe(true)
   expect(w.paused.filter(row => text.includes(row.id)).length > 20).toBe(true)
+})
+
+// ---- which tasks wake which main ----
+
+const OTHER_DIR = '/work/.tmux-pi/sessions/30e5e45f'
+
+test('the list is asked for this main by its session id, and by TP_MAIN_ID when the launcher set one', async ($, on) => {
+  const w = world(on, { ...MAIN, CLAUDE_CODE_SESSION_ID: 'sess-1' })
+  await $.session.start(start(true))
+  expect(w.ran.filter(argv => argv[1] === 'list').every(argv => argv.join(' ') === `${AGENT} list --main sess-1`)).toBe(true)
+  expect(w.ran.some(argv => argv[1] === 'list')).toBe(true)
+})
+
+test('TP_MAIN_ID wins over the Claude session id', async ($, on) => {
+  const w = world(on, { ...MAIN, CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_ID: 'main-a' })
+  await $.session.start(start(true))
+  expect(w.ran.some(argv => argv.join(' ') === `${AGENT} list --main main-a`)).toBe(true)
+})
+
+test('a main with no identity lists its own session as before', async ($, on) => {
+  const w = world(on, MAIN)
+  await $.session.start(start(true))
+  expect(w.ran.filter(argv => argv[1] === 'list')).toEqual([[AGENT, 'list']])
+})
+
+test('a task this main dispatched into a second state directory wakes it, with that directory in the hint', async ($, on) => {
+  const w = world(on, { ...MAIN, CLAUDE_CODE_SESSION_ID: 'sess-1' })
+  w.listFor = main => (main === 'sess-1' ? w.rows : [])
+  w.rows = [{ id: 'coder-1', status: 'working', role: 'coder', state_dir: OTHER_DIR }]
+  await $.session.start(start(true))
+  expect(w.submitted).toEqual([])
+  w.rows = [{ id: 'coder-1', status: 'settled', role: 'coder', state_dir: OTHER_DIR }]
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  expect(w.submitted[0]).toContain(`TP_STATE_DIR='${OTHER_DIR}' tp-agent collect coder-1`)
+  await w.clock.advance(15000)
+  expect(w.submitted.length).toBe(1)
+})
+
+test('a task another main dispatched never wakes this one', async ($, on) => {
+  const w = world(on, { ...MAIN, CLAUDE_CODE_SESSION_ID: 'sess-1' })
+  // tp-agent list --main leaves the other main's rows out; the module asks only for its own.
+  w.listFor = main => (main === 'sess-2' ? [{ id: 'coder-9', status: 'settled', state_dir: OTHER_DIR }] : [])
+  await $.session.start(start(true))
+  await w.clock.advance(15000)
+  expect(w.submitted).toEqual([])
+  expect(w.toasts).toEqual([])
+})
+
+test('a task already settled in a second state directory at start is the baseline once the index shows it', async ($, on) => {
+  const w = world(on, { ...MAIN, CLAUDE_CODE_SESSION_ID: 'sess-1' })
+  w.acceptsAppend = true
+  w.listFor = () => w.rows
+  w.rows = [{ id: 'coder-1', status: 'settled', role: 'coder', state_dir: OTHER_DIR }]
+  w.indexJson = { objective: '', active: [], pending: [{ id: 'coder-1', status: 'settled' }], paused: [], unstatused: [], recent: [] }
+  await $.session.start(start(true))
+  await w.clock.advance(15000)
+  expect(w.submitted).toEqual([])
 })

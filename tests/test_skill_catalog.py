@@ -101,6 +101,24 @@ class SkillCatalogTests(unittest.TestCase):
             with self.subTest(request=request, expected=expected):
                 self.assertEqual([s["id"] for s in run(request)], [expected], request)
 
+    def test_case_handoff_selected_only_for_deliberate_requests(self):
+        cases = {
+            "/case-handoff CASE-12 Person search": "case-handoff",
+            "Please run /case-handoff.": "case-handoff",
+            "Draft the MR description for this branch": "case-handoff",
+            "Draft the YouTrack handoff for CASE-40": "case-handoff",
+            "Write the handoff comments for the touched cases": "case-handoff",
+        }
+        for request, expected in cases.items():
+            with self.subTest(request=request, expected=expected):
+                self.assertEqual([s["id"] for s in run(request)], [expected], request)
+        for request in ("Fix the validation bug and open an MR for it",
+                        "Update the MR template wording",
+                        "Rename the handoff notes file",
+                        "Edit docs/case-handoff.md wording"):
+            with self.subTest(request=request):
+                self.assertEqual(run(request), [], request)
+
     def test_selection_never_exceeds_three_and_explicit_ranks_first(self):
         every = run("/make-qa, (/counterpoint) /product-fit. /threat-model: for report.pdf")
         self.assertEqual([s["id"] for s in every], ["make-qa", "counterpoint", "product-fit"])

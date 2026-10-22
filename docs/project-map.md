@@ -87,7 +87,7 @@ Design constants: state is plain files so any piece can be inspected or replaced
 | Retention | `/end` archives instead of deleting; `--delete-reviewed ... --confirm DELETE-ELIGIBLE-UNPINNED`; pins, ticket-linked, plan/prototype, and durable records are protected. |
 
 ### 4e. Skills and prompts
-- `skills/make-qa/` (tester-facing QA script drafting, invoked as `/make-qa`); `catalog/skills/{counterpoint, product-fit, threat-model, document-transform, test-skill-behavior}`; `config/skill-catalog.json` (private trigger profiles); `agent/prompts/*.md` (slash-prompt aliases); `bin/tp-skills` (deterministic selector).
+- `skills/make-qa/` (tester-facing QA script drafting, invoked as `/make-qa`); `catalog/skills/{counterpoint, product-fit, threat-model, document-transform, test-skill-behavior, case-handoff}`; `config/skill-catalog.json` (private trigger profiles); `agent/prompts/*.md` (slash-prompt aliases); `bin/tp-skills` (deterministic selector).
 - Design principle: skills are not globally advertised. A matched skill's body is injected for that turn only (max 3), so unrelated turns carry no skill descriptions.
 
 ### 4f. Claude worker config

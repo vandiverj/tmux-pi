@@ -56,6 +56,15 @@
       "authority": "instructions only; no automation qualification",
       "markers": [],
       "phrases": ["test skill behavior", "pressure-test the skill", "evaluate skill selection", "test catalogue trigger", "test skill selection"]
+    },
+    {
+      "id": "case-handoff",
+      "description": "Draft the merge request description and YouTrack done and handoff comments for a finished case, from facts checked at the branch tip.",
+      "path": "catalog/skills/case-handoff/SKILL.md",
+      "status": "pilot",
+      "authority": "instructions only; drafts files, no push, MR or post",
+      "markers": ["/case-handoff"],
+      "phrases": ["draft the mr description", "draft the youtrack handoff", "case handoff drafts", "write the handoff comments"]
     }
   ]
 }

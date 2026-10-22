@@ -252,6 +252,8 @@ echo review-1
             self.assertIn("Notes are returned in full but never justify another round", task)
             self.assertIn("REQUEST_CHANGES only when at least one finding is a defect", task)
             self.assertIn("name the family it belongs to", task)
+            # Both providers have the redacted tools; a prompt on a bash search outside the worktree stalls an unattended reviewer.
+            self.assertIn("Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash", task)
             self.assertNotIn("review round", task)  # a first review does not claim earlier rounds
             self.assertRegex(task, r"RESULT_STATUS: complete\|empty\|blocked\|incomplete on the second line")
         self.assertIn("report.md", research)

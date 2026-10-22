@@ -2,6 +2,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SAFE_TOOLS, redactionSession } from "./lib/redaction.ts";
 import { writeTaskFile } from "./lib/state-write.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -16,7 +17,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	// Redact secrets in every tool result before the model or the session sees it. Only in "on" mode; fail closed.
 	const redactor = join(dirname(agentDir), "bin", "tp-redact");
-	const session = process.env.TP_TASK_ID || process.env.TP_REDACTION_SESSION || `pi-${process.ppid}`;
+	const session = redactionSession();
 	let active: boolean | undefined;
 	const redactionOn = () => {
 		if (active !== undefined) return active;
@@ -71,6 +72,9 @@ export default function (pi: ExtensionAPI) {
 			save({ ...asked, status: allowed ? "authorized" : "denied", updated: new Date().toISOString() });
 			if (!allowed) return { block: true, reason: "User denied a call the trust-store guard could not fully check." };
 		}
+		// safe_read and safe_grep redact their own output in every mode and withhold it if the redactor fails (safe.ts), so the
+		// confirm has nothing to ask about. The guard above has already judged them; every other tool goes on to the classifier.
+		if (SAFE_TOOLS.includes(event.toolName)) return;
 		try {
 			// `--trusted`: this caller prompts the owner, so a name or directory guess in a tree the owner vouched for is lifted.
 			// offload.ts asks the same classifier whether to send text to a model and does not pass it.

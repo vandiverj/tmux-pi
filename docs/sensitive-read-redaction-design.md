@@ -418,6 +418,12 @@ Shapes are pinned by `tests/fixtures/tool_shapes/*.json` (captured in Phase 0). 
   - `structuredContent` is nulled, and a redactor failure or timeout withholds the output.
   - `tp-redact --mode` reports the mode. Qwen budget is 20 s per call with a 60 s hook timeout.
   - Test: `tests/test_pi_redaction.py`.
+- **pi `safe_read` / `safe_grep` (added later):** `agent/extensions/safe.ts` registers the two tools for every pi session that loads the normal extension set, and `MAIN_TOOLS` in `bin/tp-pi` lists them. `reveal` was not ported: a real value stays the user's decision.
+  - Same parameters, size limits, `rg` (then `grep`) search and fail-closed `bin/tp-redact --stdin` pipe as `claude/mcp/safe.mjs`. They always redact, in `shadow` and `off` as well as `on`, and use the session's placeholder store. The pi descriptions leave out the sentence about placeholders in commands and Write content, which only the Claude hooks implement.
+  - The trust-store guard runs first, as for every tool. `lib/trust_guard.py` knows `safe_read` as a file tool and `safe_grep` as a search that walks a tree (also under the `mcp__tmux-pi-safe__` prefix of the Claude server). A guard error blocks.
+  - The `Authorize sensitive read?` confirm is skipped for these two tools only (their output is redacted before it leaves the tool). `read`, `grep`, `bash` and every other tool keep it. This is what lets an unattended reviewer search a file outside its worktree.
+  - The `tool_result` handler still redacts their output a second time in `on` mode. Redacting redacted text changes nothing (placeholders stay, no double wrap; checked in `tests/safe_runtime.mjs`), so there is no skip: a tool that returned raw text would still be caught there.
+  - Tests: `tests/test_pi_safe_tools.py` (runs `tests/safe_runtime.mjs`) and `test_the_safe_tools_are_judged_like_read_and_grep` in `tests/test_trust_guard.py`.
 - **`offload.ts`:** in `on` mode the `tool_output` reread skips its sensitive confirm, because `sensitive.ts` redacts that result like any other. Any other mode, or a failed mode check, keeps the confirm. The mode is read once per session (`TP_REDACT_BIN` stubs it in `tests/offload_runtime.mjs`).
 - **Old gate kept (user decision 2026-10-06):** the `--claude-hook` path of `tp-sensitive-read` and `hooks/sensitive-read.sh` stay. They are the only protection in `shadow`/`off`, and they already no-op in `on`. Nothing was deleted.
 - **`tp-spawn` packets:** still omit sensitive `--context` files (user decision 2026-10-06, per decision 5). Revisit after more time in `on`.

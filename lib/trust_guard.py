@@ -301,10 +301,13 @@ _STAYS_PUT = {"cd", "pushd", "popd", "echo", "printf", "test", "[", "[[", "stat"
               "less", "more", "tee", "mktemp", "tp-trust"} | _PLACERS | _REMOVERS
 # Tools that search below a directory. Every one matches at any depth whatever its pattern looks like (Claude `Glob`
 # returns `a/b/x.json` for `*.json`), so no pattern is read as a limit.
-_TREE_TOOLS = {"Grep", "Glob", "grep", "glob", "find"}
+# `safe_grep` is the redacted search of the tmux-pi-safe tools (pi, and Claude's MCP server under its prefixed name); it walks like `grep`.
+_SAFE_PREFIX = "mcp__tmux-pi-safe__"
+_TREE_TOOLS = {"Grep", "Glob", "grep", "glob", "find", "safe_grep", _SAFE_PREFIX + "safe_grep"}
 # Parameters of the tools this guard knows that hold file contents, a search expression or a command: never a path.
 _CONTENT_KEYS = {"content", "new_string", "old_string", "new_source", "oldText", "newText", "pattern", "command"}
-_KNOWN_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read", "LS", "write", "edit", "read", "ls"} | _TREE_TOOLS
+_KNOWN_TOOLS = ({"Write", "Edit", "MultiEdit", "NotebookEdit", "Read", "LS", "write", "edit", "read", "ls",
+                 "safe_read", _SAFE_PREFIX + "safe_read"} | _TREE_TOOLS)
 _ROOT_KEYS = {"path", "directory", "dir", "folder", "root", "workdir", "cwd"}
 
 

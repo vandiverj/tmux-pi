@@ -494,7 +494,9 @@ class ToolTests(Fixture):
                    "{HOME}/.CONFIG/Tmux-Pi/TRUST/a.json", "{STATE}/skipped.jsonl", "{HOME}/.config/tmux-pi/state/../trust/a"]
         calls = [("Write", "file_path"), ("Edit", "file_path"), ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path"),
                  ("Read", "file_path"), ("Grep", "path"), ("Glob", "path"), ("write", "path"), ("edit", "path"),
-                 ("read", "path"), ("grep", "path"), ("find", "path"), ("ls", "path")]
+                 ("read", "path"), ("grep", "path"), ("find", "path"), ("ls", "path"),
+                 ("safe_read", "path"), ("safe_grep", "path"), ("mcp__tmux-pi-safe__safe_read", "path"),
+                 ("mcp__tmux-pi-safe__safe_grep", "path"), ("safe_grep", "glob")]
         for tool, key in calls:
             for target in targets:
                 for worker in (True, False):
@@ -509,6 +511,25 @@ class ToolTests(Fixture):
 
     def test_a_grep_pattern_is_a_regular_expression_not_a_path(self):
         self.assertIsNone(self.tool("Grep", {"pattern": "tmux-pi/trust", "path": "lib"}))
+
+    def test_the_safe_tools_are_judged_like_read_and_grep(self):
+        # safe_read and safe_grep (pi, and Claude's MCP server under its prefixed name) open what the plain tools refuse to,
+        # so the guard is the only check on them: a pattern is an expression, a search walks, a glob names files.
+        for prefix in ("", "mcp__tmux-pi-safe__"):
+            read, grep = prefix + "safe_read", prefix + "safe_grep"
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(self.tool(grep, {"pattern": "tmux-pi/trust", "path": "lib"}))
+                self.assertIsNone(self.tool(grep, {"pattern": "x", "path": "{HOME}/.config/nvim", "glob": "*.env*"}))
+                self.assertIsNone(self.tool(read, {"path": "README.md", "offset": 1, "limit": 20}))
+                for path in ("{HOME}", "~/.config", "{CONFIG}", "/"):
+                    self.assertTrue(self.tool(grep, {"pattern": "x", "path": path}), path)
+                self.assertTrue(self.tool(grep, {"pattern": "x", "glob": "{TRUST}/*.json"}))
+                self.assertTrue(self.tool(grep, {"pattern": "x", "path": "lib", "glob": "~/.config/tmux-pi/trust/*"}))
+                self.assertTrue(self.tool(read, {"path": "~/.config/tmux-pi/trust/a.json"}))
+                self.assertTrue(self.tool(read, {"path": "{LINK}/a.json"}))
+                for cwd in (self.home, self.config):
+                    self.assertTrue(trust_guard.check(grep, {"pattern": "x"}, cwd, home=self.home, worker=True), cwd)
+                self.assertIsNone(trust_guard.check(grep, {"pattern": "x"}, self.proj, home=self.home, worker=True))
 
     def test_file_contents_are_never_read_as_paths(self):
         self.assertIsNone(self.tool("Write", {"file_path": "notes.md", "content": "records live in {TRUST}/a.json"}))

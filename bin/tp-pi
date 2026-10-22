@@ -17,7 +17,7 @@
 # clears TP_MODE) get none of this.
 set -euo pipefail
 
-MAIN_TOOLS=read,bash,edit,write,grep,find,ls,codemode,dispatch_role,task_index,task_collect,tmux_pi_find_skill,ask_local,tool_output
+MAIN_TOOLS=read,bash,edit,write,grep,find,ls,codemode,dispatch_role,task_index,task_collect,tmux_pi_find_skill,ask_local,tool_output,safe_read,safe_grep
 
 src="${BASH_SOURCE[0]}"
 while [[ -L "$src" ]]; do
@@ -56,7 +56,7 @@ fi
 # Normal work loads only the orchestration extensions. Legacy goal, strict
 # dispatcher, generic subagent, and automatic escalation code remain available
 # for explicit legacy sessions but cannot quietly join this workflow.
-extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts")
+extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts" "$ROOT/agent/extensions/safe.ts")
 if [[ -z "${TP_TASK_DIR:-}" ]]; then
   extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts" "$ROOT/agent/extensions/offload.ts")
 fi

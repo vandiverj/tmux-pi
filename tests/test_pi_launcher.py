@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BUILTIN = {"read", "bash", "edit", "write", "grep", "find", "ls", "codemode"}
 EXPECTED = ("read,bash,edit,write,grep,find,ls,codemode,dispatch_role,task_index,task_collect,"
-            "tmux_pi_find_skill,ask_local,tool_output")
+            "tmux_pi_find_skill,ask_local,tool_output,safe_read,safe_grep")
 ASK_LOCAL = r'''
 import fs from 'node:fs';
 import path from 'node:path';
@@ -82,7 +82,7 @@ class PiLauncherTests(unittest.TestCase):
         self.assertIn("builtin:codemode", self.extensions(argv))
         self.assertNotIn("builtin:mcp", argv)
         self.assertEqual(self.value(argv, "--tools"), EXPECTED)
-        self.assertEqual(len(EXPECTED.split(",")), 14)
+        self.assertEqual(len(EXPECTED.split(",")), 16)
         self.assertEqual(argv[-2:], ["--extra", "value"])
 
     def test_worker_plain_and_legacy_launches_get_no_additions(self):
@@ -107,7 +107,7 @@ class PiLauncherTests(unittest.TestCase):
         argv = self.launched(TP_MODE="orchestrator")
         files = [Path(path) for path in self.extensions(argv) if not path.startswith("builtin:")]
         self.assertEqual({path.name for path in files}, {"reporter.ts", "sensitive.ts", "orchestration.ts",
-                                                         "assistant.ts", "catalogue.ts", "offload.ts"})
+                                                         "assistant.ts", "catalogue.ts", "offload.ts", "safe.ts"})
         registered = set()
         for path in files:
             source = path.read_text()

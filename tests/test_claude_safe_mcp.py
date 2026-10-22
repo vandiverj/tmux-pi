@@ -72,7 +72,9 @@ class SafeMcpTests(unittest.TestCase):
         self.assertRegex(limited, r"^\s+2\tCLERK_SECRET_KEY=<REDACTED:")
 
     def test_safe_read_handles_a_credential_store(self):
-        (text, error), = self.rpc(("safe_read", {"path": "~/.aws/credentials"}))
+        # The fixture's absolute path: `~` is the account's home, not $HOME, so it would open the real credential file.
+        # Tilde expansion is covered in tests/safe_runtime.mjs against a file that does not exist.
+        (text, error), = self.rpc(("safe_read", {"path": str(self.home / ".aws/credentials")}))
         self.assertFalse(error)
         self.assertNotIn(AWS, text)
         self.assertNotIn("AKIAABCDEFGHIJKLMNOP", text)

@@ -16,4 +16,6 @@ Workers may use `tp-agent request` to ask for a task-relevant skill, tool, or co
 
 Keep retries bounded. Distinguish tool trouble, misunderstanding, a verified empty finding, missing authority, and a boundary violation. Preserve partial work and state why a retry or reroute is better. If a worker needs a credential-bearing config file, route its specific permission request to the user; never grant it yourself. A denial or boundary violation is not a reason to seek another read path.
 
+End of a case: when the case's steps are reviewed and the pre-MR checks have reported, dispatch a researcher whose task starts with `/case-handoff` and gives the case ids and title, the branch, base and worktree, the output folder, the step report and review paths, the decisions record, and the touched cases. Check the drafts against the branch tip and show them to the user. Push, create the MR and post to YouTrack only after the user approves that text.
+
 The user may enter a worker's tmux pane to observe or answer a prompt. Material changes to the assignment go through you so the indexed task stays accurate. Report what changed, how it was checked, and what remains unresolved.

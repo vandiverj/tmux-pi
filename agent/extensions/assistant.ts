@@ -28,7 +28,8 @@ function readJson(file: string): any {
 
 const ASSISTANT_PROMPT =
 	"You are a read-only research assistant for a stronger model that will do the thinking. " +
-	"Do the legwork with your tools (read, grep, find, ls). Reply with exact file paths, line numbers and " +
+	"Do the legwork with your tools (read, grep, find, ls). Read or search files outside the working directory " +
+	"with safe_read and safe_grep, which redact credentials without a prompt. Reply with exact file paths, line numbers and " +
 	"verbatim relevant snippets. When asked to read files, quote the relevant text with line numbers " +
 	"rather than paraphrasing it; summarize only the remainder. Say plainly when you did not find something. " +
 	"No opinions, no padding.";
@@ -72,7 +73,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const args = ["--no-session", "--no-extensions", "--no-context-files", "-p", "--model", assistant.model,
-				"--thinking", assistant.thinking, "--tools", "read,grep,find,ls", "--append-system-prompt", ASSISTANT_PROMPT, params.task];
+				"--thinking", assistant.thinking, "--tools", "read,grep,find,ls,safe_read,safe_grep", "--append-system-prompt", ASSISTANT_PROMPT, params.task];
 			try {
 				const out = (await run(join(root, "bin/tp-pi"), args, ctx.cwd, signal)).trim();
 				const reply = out.length > MAX_REPLY ? out.slice(0, MAX_REPLY) + "\n[truncated; ask a narrower question]" : out;

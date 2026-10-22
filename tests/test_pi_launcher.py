@@ -143,7 +143,7 @@ class PiLauncherTests(unittest.TestCase):
         self.assertEqual(run.stdout.strip(), "stub reply")
         child = json.loads(self.record.read_text())
         self.assertIsNone(child["mode"])
-        self.assertEqual(self.value(child["argv"], "--tools"), "read,grep,find,ls")
+        self.assertEqual(self.value(child["argv"], "--tools"), "read,grep,find,ls,safe_read,safe_grep")
         for absent in ("builtin:codemode", "--no-mcp"):
             self.assertNotIn(absent, child["argv"])
 

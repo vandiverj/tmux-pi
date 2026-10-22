@@ -152,7 +152,7 @@ In `on` mode an agent can use a secret without seeing it:
 - A Bash command that contains a placeholder asks you once per placeholder per session. The real value is then filled in locally and never shown.
 - Write content, or an Edit `new_string`, can carry placeholders from the same file. They are filled in silently.
 - The `tmux-pi-safe` MCP server gives Claude `safe_read`/`safe_grep` (redacted, no prompt) for files the normal tools refuse. Its `reveal` tool asks every time before sending one real value to the model.
-- pi has `safe_read`/`safe_grep` too (`agent/extensions/safe.ts`, in every pi session; no `reveal`). They redact in every redaction mode, are checked by the trust-store guard like any tool, and skip the sensitive-read prompt, so an unattended worker or reviewer can read or search a file outside its worktree. The reviewer assignment tells reviewers to use them instead of `rg`/`grep` through bash on such paths.
+- pi has `safe_read`/`safe_grep` too (`agent/extensions/safe.ts`, in pi sessions that use the normal extension set; no `reveal`). They redact in every redaction mode, are checked by the trust-store guard like any tool, and skip the sensitive-read prompt, so an unattended worker or reviewer can read or search a file outside its worktree. The reviewer assignment tells reviewers to use them instead of `rg`/`grep` through bash on such paths.
 - pi's offloaded tool output can be reread without a prompt, because rereads are redacted too.
 - Pending placeholder requests show in the status pane, and the session's placeholder store is deleted when Claude exits.
 

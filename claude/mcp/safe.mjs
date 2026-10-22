@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
@@ -30,8 +30,10 @@ const redact = async (text, args) => {
   if (r.code !== 0) throw new Error("redaction failed; output withheld");
   return r.stdout;
 };
+// `~` is the account's home from the password database, never $HOME: the home the trust-store guard expands it to.
 const where = (p) => {
-  const expanded = p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+  const home = userInfo().homedir;
+  const expanded = p === "~" ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p;
   return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded);
 };
 const clip = (text) => (text.length > MAX_CHARS ? `${text.slice(0, MAX_CHARS)}\n…(truncated)` : text);
@@ -80,7 +82,7 @@ const TOOLS = {
       const target = where(String(p.path ?? "."));
       const have = await run("rg", ["--version"]);
       const args = have.code === 0
-        ? ["--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
+        ? ["--no-config", "--no-follow", "--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
            ...(p.include_ignored ? ["--no-ignore"] : []), ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? ["-g", String(p.glob)] : []),
            "-e", pattern, "--", target]
         : ["-rnIE", ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? [`--include=${p.glob}`] : []), "-e", pattern, "--", target];

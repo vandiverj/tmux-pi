@@ -1,5 +1,6 @@
 // pi safe_read / safe_grep (agent/extensions/safe.ts) and the sensitive.ts gate around them, against the real tp-redact,
 // tp-trust-guard (under a scratch home) and tp-sensitive-read. The key is built at runtime.
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -185,5 +186,49 @@ process.env.TP_REDACTION = 'on';
   fs.rmSync(guard);
   for (const toolName of ['safe_read', 'safe_grep'])
     assert.equal((await gate(handlers, toolName, { path: env, pattern: 'x' })).answer?.block, true, `${toolName}: a missing guard let the call through`);
+}
+
+// `~` is the account's home from the password database (as the guard expands it), never $HOME. HOME points into the scratch
+// trust store here, where a marker file exists; the tools must look for it under the account home, as the guard judged.
+{
+  const { tools } = load();
+  const realHome = os.userInfo().homedir;
+  const missing = `tp-safe-missing-${process.pid}`; // exists under HOME (scratch), not under the account home
+  fs.writeFileSync(path.join(store, missing), 'home-marker-text\n');
+  const savedHome = process.env.HOME;
+  process.env.HOME = store;
+  try {
+    await assert.rejects(read(tools, { path: `~/${missing}` }), (e) => e.message.includes(path.join(realHome, missing)) && !e.message.includes(store));
+    await assert.rejects(grep(tools, { pattern: 'home-marker-text', path: `~/${missing}` }), /search failed/);
+  } finally {
+    process.env.HOME = savedHome;
+  }
+}
+
+// ripgrep reads RIPGREP_CONFIG_PATH; a config that sets --follow must not make safe_grep walk a link out of the searched root.
+{
+  const { tools } = load();
+  const linked = path.join(tmp, 'linked');
+  const target = path.join(tmp, 'link-target');
+  fs.mkdirSync(linked);
+  fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'record.json'), '{"link-marker-text": 1}\n');
+  fs.symlinkSync(target, path.join(linked, 'inside-link'));
+  fs.writeFileSync(path.join(linked, 'plain.txt'), 'plain text\n');
+  const haveRg = await new Promise((done) => execFile('rg', ['--version'], (err) => done(!err)));
+  if (!haveRg) console.log('note: no rg on PATH; the --follow config case ran against the grep fallback');
+  const config = path.join(tmp, 'rg-config');
+  fs.writeFileSync(config, '--follow\n');
+  const saved = process.env.RIPGREP_CONFIG_PATH;
+  process.env.RIPGREP_CONFIG_PATH = config;
+  try {
+    for (const include_ignored of [false, true]) {
+      const out = await grep(tools, { pattern: 'link-marker-text', path: linked, include_ignored });
+      assert.equal(out, '(no matches)', `a link was followed (include_ignored ${include_ignored})`);
+    }
+    assert.match(await grep(tools, { pattern: 'plain', path: linked }), /\.txt:1:plain text/); // the search itself still works
+  } finally {
+    if (saved === undefined) delete process.env.RIPGREP_CONFIG_PATH; else process.env.RIPGREP_CONFIG_PATH = saved;
+  }
 }
 console.log('ok');

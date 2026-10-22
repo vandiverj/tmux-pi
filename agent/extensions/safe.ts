@@ -8,7 +8,7 @@
  */
 import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,8 +39,11 @@ export default function (pi: ExtensionAPI) {
 		if (r.code !== 0) throw new Error("redaction failed; output withheld");
 		return r.stdout;
 	};
+	// `~` is the account's home from the password database, never $HOME: the home the trust-store guard expands it to
+	// (lib/trust.py home_dir), so the guard judges the file the tool opens.
 	const where = (p: string, cwd: string) => {
-		const expanded = p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+		const home = userInfo().homedir;
+		const expanded = p === "~" ? home : p.startsWith("~/") ? join(home, p.slice(2)) : p;
 		return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
 	};
 	const clip = (text: string) => (text.length > MAX_CHARS ? `${text.slice(0, MAX_CHARS)}\n…(truncated)` : text);
@@ -97,8 +100,10 @@ export default function (pi: ExtensionAPI) {
 			const cwd = base(ctx);
 			const target = where(String(p.path ?? "."), cwd);
 			const have = await run("rg", ["--version"], cwd, signal);
+			// No ripgrep config (it could turn on --follow) and no symlink walking: the guard judges the search root, so a
+			// link inside it that leads into the trust store must stay unfollowed.
 			const args = have.code === 0
-				? ["--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
+				? ["--no-config", "--no-follow", "--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
 					...(p.include_ignored ? ["--no-ignore"] : []), ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? ["-g", String(p.glob)] : []),
 					"-e", pattern, "--", target]
 				: ["-rnIE", ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? [`--include=${p.glob}`] : []), "-e", pattern, "--", target];

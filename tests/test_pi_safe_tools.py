@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -26,6 +27,24 @@ class PiSafeToolsTests(unittest.TestCase):
         run = subprocess.run(["node", "--experimental-strip-types", str(ROOT / "tests/safe_runtime.mjs")],
                              cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_tilde_home_is_the_guards_account_home(self):
+        # `~` in the tools and in the trust-store guard must lead to one home: the password database's, whatever $HOME says.
+        env = dict(os.environ, HOME="/nonexistent-home-for-test")
+        run = subprocess.run(["node", "-e", "process.stdout.write(require('os').userInfo().homedir)"],
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        sys.path.insert(0, str(ROOT / "lib"))
+        try:
+            import trust
+        finally:
+            sys.path.remove(str(ROOT / "lib"))
+        self.assertEqual(run.stdout, trust.home_dir())
+        for source in ("agent/extensions/safe.ts", "claude/mcp/safe.mjs"):
+            text = (ROOT / source).read_text()
+            self.assertIn("userInfo().homedir", text)
+            self.assertNotIn("homedir()", text.replace("userInfo().homedir", ""), source)
+            self.assertIn('"--no-config", "--no-follow"', text, source)
 
     def test_tools_have_the_claude_servers_contract(self):
         # Same parameters as claude/mcp/safe.mjs, read from the two sources; `reveal` is not ported.

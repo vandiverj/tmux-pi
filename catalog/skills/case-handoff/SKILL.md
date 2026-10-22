@@ -69,6 +69,8 @@ detail to the case's done comment and point to the case.
      Failures: name each, and say whether it fails on the base (yes only if reproduced there).
    - *Manual check*: what was done in the running app, as which user, and the result; screenshots for UI changes.
      Otherwise `No UI change.` or `Not done: <reason>.`
+   - *Maintenance*: fixes the branch made to failures that also fail on the base, in files the branch touches
+     (formatting, a broken test, a shared skill), one line each with the commit. A failure left alone gets its case.
    - *Not done*: every skipped check, with the reason.
 9. **Config / Deployment Impact**: `No config, CI or deployment impact.`, or point to "Before merging".
 10. Keep `%{all_commits}` only for about five commits or fewer.

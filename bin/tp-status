@@ -107,7 +107,8 @@ color_for() {
 }
 
 # clip <width> <text> — cut to the pane width so rows never wrap.
-clip() { local w="$1"; shift; local t="$*"; if (( ${#t} > w )); then t="${t:0:w-1}…"; fi; R="$t"; }
+# A width of 0 or less (a long label in a narrow pane) gives nothing: bash 3.2 aborts the whole script on a negative ${t:0:-1}.
+clip() { local w="$1"; shift; local t="$*"; if (( w < 1 )); then t=""; elif (( ${#t} > w )); then t="${t:0:w-1}…"; fi; R="$t"; }
 
 # pad <width> <text> — left-align in characters (printf pads bytes, and ▸ ↑ ↓ are multibyte).
 pad() { local t="$2"; printf -v R '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )) ""; }

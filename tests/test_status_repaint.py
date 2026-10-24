@@ -310,6 +310,20 @@ class StatusRepaintTest(StatusPaneFixture):
         frame = self.first_frame(b"subagents 0", seconds=10).split(ESC)[-1]
         self.assertIn(b"subagents 0 \xc2\xb7 session fake", frame)
 
+    def test_a_session_name_wider_than_the_pane_does_not_stop_the_pane_and_enter_still_views(self):
+        # bash 3.2 aborts the whole script on a negative substring length, so a header label wider than the pane
+        # (a long session name in a narrow pane) used to end tp-status; the restart loop then lost every key.
+        self.make_jobs(2)
+        (self.base / "cols").write_text("20\n")   # the header label ("subagents 2 · session fake") is wider than this
+        first = self.first_frame(b"job1", b"job2")
+        order = [name.decode() for name in self.row_order(first)]
+        self.assertIsNone(self.proc.poll())
+        os.write(self.master, b"k")
+        self.output_until(lambda frame: f"── {order[0]} ".encode() in frame)
+        os.write(self.master, b"\r")
+        self.wait_viewing(order[0])
+        self.assertIsNone(self.proc.poll())
+
     def test_idle_no_workers_and_resize(self):
         first = self.first_frame(b"no subagents", settle=0.3)   # a duplicate initial repaint would show here
         self.assertIn(b"no subagents", first)

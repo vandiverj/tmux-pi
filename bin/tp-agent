@@ -568,12 +568,13 @@ def repeated_family(base, task_id):
     return None
 
 
-def park_retry(previous, task_id, family, earlier, latest):
-    """Write parked.md in the author task directory and return the record `retry --route park` prints: nothing is retried."""
+def park_retry(base, previous, task_id, family, earlier, latest):
+    """Write parked.md in the author task directory (a link already there is replaced, never written through) and return the
+    record `retry --route park` prints: nothing is retried."""
     path = previous / "parked.md"
-    path.write_text(f"# Parked: {task_id}\n\nThe finding family `{family}` was named by review {earlier} and again by review {latest}. "
-                    "Another retry on the same family would fix one more site; the owner decides what changes instead "
-                    "(the rule, the design, or whether to stop).\n")
+    atomic_text(path, f"# Parked: {task_id}\n\nThe finding family `{family}` was named by review {earlier} and again by review {latest}. "
+                      "Another retry on the same family would fix one more site; the owner decides what changes instead "
+                      "(the rule, the design, or whether to stop).\n", base)
     return {"id": task_id, "parked": str(path), "family": family, "reviews": [earlier, latest],
             "next": f"No attempt was started. The owner decides: {family} was named in {earlier} and {latest}."}
 
@@ -1408,13 +1409,16 @@ def main():
             wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
             raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
                              f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
-        if not args.force_alive:
-            guard_retry(previous)
         try:
             repeated = repeated_family(base, args.id)
         except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
             repeated = None
             print(f"tp-agent: the repeated-family gate was not checked: {error}", file=sys.stderr)
+        if repeated and args.route == "park":  # starts nothing, so a process alive on the tree does not stop it
+            print(json.dumps(park_retry(base, previous, args.id, *repeated), indent=2))
+            return
+        if not args.force_alive:
+            guard_retry(previous)
         if repeated and not args.route:
             family, earlier, latest = repeated
             raise ValueError(f"finding family {family} was named by review {earlier} and again by review {latest}: another retry would "
@@ -1423,9 +1427,6 @@ def main():
         if args.route and not repeated:
             raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named, "
                              "so there is nothing to route; retry without --route")
-        if args.route == "park":
-            print(json.dumps(park_retry(previous, args.id, *repeated), indent=2))
-            return
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).

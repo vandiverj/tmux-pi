@@ -61,7 +61,7 @@ $ tp-agent dispatch --lane api --step s1 --role coder --task "Add GET /health" -
 
 **One writer.** A lane takes one writer at a time; any number of reviewers may share it, but not with a writer. Starting anything in the lane's working tree without `--lane` is refused. Never start a worker by hand there.
 
-**Paths other lanes own.** When a task starts in a lane (a dispatch, a queued task when it comes off the queue, or a retry), the packet gets a section `Paths other lanes own` if another open lane overlaps this lane's declared `--touches`, by the same test as the lane-overlap warning (declared against declared, and declared against the other lane's measured changes). For each such lane it lists the name, the branch, the last closed step (or `no step closed yet`) and the overlapping paths (at most 20 per lane, then `and N more`), then says: "Do not edit these paths; if the task needs them, stop and send tp-agent request." It is advice, not a lock: nothing stops an edit, and `tp-agent lanes` still shows the overlap as a warning. No overlap, no section. A lane whose record cannot be read is left out, and the dispatch is not refused for it. Reviewers started by `tp-review` get no such section.
+**Paths other lanes own.** When a task starts in a lane (a dispatch, a queued task when it comes off the queue, or a retry), the packet gets a section `Paths other lanes own` if another open lane overlaps this lane's declared `--touches`, by the same test as the lane-overlap warning (declared against declared, and declared against the other lane's measured changes). For each such lane it lists the name, the branch, the last closed step (or `no step closed yet`) and the overlapping paths (every one, with no cap; a path with a backtick is shown in a longer code span, and a character that does not print is shown escaped, like `\n`), then says: "Do not edit these paths; if the task needs them, stop and send tp-agent request." It is advice, not a lock: nothing stops an edit, and `tp-agent lanes` still shows the overlap as a warning. No overlap, no section. A lane whose record cannot be read is left out, and the dispatch is not refused for it. Reviewers started by `tp-review` get no such section.
 
 **Steps.** The next step cannot start until the previous one is closed (below); a retry or a fix inside an open step is never held back.
 
@@ -128,7 +128,7 @@ tp-agent: step s1 is already closed at 5f7b64aca0f46d2585e35feda00b676a46252162;
 | --- | --- |
 | `rule-first` | retries; a Notes line records the route and the family and says the brief must change the rule or the design, not one more site. Name the rule in the brief |
 | `design` | the same, for a fix that changes the design |
-| `park` | no retry: `parked.md` in the author's task directory records the family and both reviews, and the command prints that the owner decides |
+| `park` | no retry: `parked.md` in the author's task directory records the family and both reviews, and the command prints that the owner decides. It starts nothing, so a process alive on the working tree does not stop it (the other routes are still stopped by that check); a link already at `parked.md` is replaced, not written through |
 
 `--route` with no repeated family is refused. A review that cannot be read names no family, and a retry lineage that cannot be walked (the limits the review rounds apply) prints that the gate was not checked and retries. The route Notes line is not carried into the next retry; the next review's own repeat decides again.
 

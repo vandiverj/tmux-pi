@@ -19,6 +19,7 @@ What later slices must not assume:
 - Creation holds the lane lock while it creates, so two creations in one repository queue; it does not hold git's own
   locks, so a hand-run `git worktree add` or `git branch` for the same name in between is caught by git, not by us."""
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -135,19 +136,28 @@ def paths_owned_elsewhere(repo_dir, name):
 
 
 OTHER_LANES_SENTENCE = "Do not edit these paths; if the task needs them, stop and send tp-agent request."
-OTHER_LANES_PATH_LIMIT = 20  # per lane: the packet has a size cap and a long list is not read
+
+
+def _code_span(path):
+    """`path` as one Markdown code span on one line. A character that does not print (a newline, an escape) is shown escaped, as
+    repr shows it. A backtick cannot close the span: the fence is longer than any run of backticks inside, padded with a space
+    on each side (CommonMark)."""
+    text = "".join(c if c.isprintable() else repr(c)[1:-1] for c in path)
+    if "`" not in text:
+        return f"`{text}`"
+    longest = max(len(run) for run in re.findall(r"`+", text))
+    fence = "`" * (longest + 1)
+    return f"{fence} {text} {fence}"
 
 
 def other_lanes_section(entries):
-    """The body of the packet section `Paths other lanes own` for `paths_owned_elsewhere` entries; "" for none. Advice, not a
-    lock: nothing stops a worker from editing a listed path."""
+    """The body of the packet section `Paths other lanes own` for `paths_owned_elsewhere` entries; "" for none. Every
+    overlapping path is named: the section is advice and the packet budget already counts it. Nothing stops a worker from
+    editing a listed path."""
     lines = []
     for entry in entries:
-        paths = [p for p in entry["paths"] if not any(ord(c) < 32 or c == "`" for c in p)]
-        shown = ", ".join(f"`{p}`" for p in paths[:OTHER_LANES_PATH_LIMIT])
-        more = len(entry["paths"]) - min(len(paths), OTHER_LANES_PATH_LIMIT)
         closed = f"last closed step {entry['last_closed']}" if entry["last_closed"] else "no step closed yet"
-        lines.append(f"- Lane {entry['name']} (branch {entry['branch']}, {closed}): {shown}" + (f" and {more} more" if more else ""))
+        lines.append(f"- Lane {entry['name']} (branch {entry['branch']}, {closed}): {', '.join(_code_span(p) for p in entry['paths'])}")
     return "\n".join(lines) + f"\n\n{OTHER_LANES_SENTENCE}" if lines else ""
 
 

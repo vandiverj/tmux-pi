@@ -90,14 +90,30 @@ class OtherLanePathsTests(LaneCase):
         (common / "tmux-pi/lanes/beta/lane.json").write_text("not json")
         self.assertEqual(lane_commands.paths_owned_elsewhere(str(self.repo), "alpha"), [])
 
-    def test_the_section_caps_the_paths_it_lists_per_lane(self):
-        entry = {"name": "beta", "branch": "lane/beta", "last_closed": None, "paths": [f"lib/f{n}.py" for n in range(25)] + ["lib/bad`name"]}
-        text = lane_commands.other_lanes_section([entry])
-        self.assertIn("`lib/f19.py`", text)
-        self.assertNotIn("lib/f20.py", text)
-        self.assertNotIn("bad`name", text)
-        self.assertIn("and 6 more", text)
+    def section(self, *paths):
+        return lane_commands.other_lanes_section([{"name": "beta", "branch": "lane/beta", "last_closed": None, "paths": list(paths)}])
+
+    def test_every_overlapping_path_is_named_with_no_cap(self):
+        paths = [f"lib/f{n}.py" for n in range(21)]
+        text = self.section(*paths)
+        for path in paths:
+            self.assertIn(f"`{path}`", text)
+        self.assertNotIn("more", text)
         self.assertEqual(lane_commands.other_lanes_section([]), "")
+
+    def test_a_path_with_a_backtick_is_named_in_a_span_it_cannot_close(self):
+        text = self.section("lib/a.py", "lib/`important.py", "lib/x``y.py")
+        self.assertIn("`` lib/`important.py ``", text)  # CommonMark: a longer fence, padded with a space each side
+        self.assertIn("``` lib/x``y.py ```", text)
+        self.assertIn("`lib/a.py`", text)
+
+    def test_a_path_with_a_control_character_is_named_escaped_on_one_line(self):
+        text = self.section("lib/a\nb.py", "lib/t\tab.py", "lib/e\x1b[0m.py")
+        for shown in (r"lib/a\nb.py", r"lib/t\tab.py", r"lib/e\x1b[0m.py"):
+            self.assertIn(shown, text)
+        body = text.split("\n\n", 1)[0]
+        self.assertEqual(len(body.splitlines()), 1)
+        self.assertFalse(any(ord(c) < 32 and c != "\n" for c in text))
 
 
 if __name__ == "__main__":

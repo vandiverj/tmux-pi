@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_orchestration  # noqa: E402  (the module, so its own tests are not collected twice)
+from lane_fixture import TMUX, TmuxCase  # noqa: E402
 
 MODEL = test_orchestration.MODEL
 OLD = "Make a focused change"
@@ -185,6 +186,19 @@ class RepeatedFamilyGateTests(RetryCase):
         self.assertIn("owner decides", run.stdout + run.stderr)
         self.assertEqual(Path(json.loads(run.stdout)["parked"]).resolve(), (self.task_dir(item) / "parked.md").resolve())
 
+    def test_route_park_replaces_a_link_at_parked_md_and_writes_nothing_through_it(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        target = self.root / "elsewhere.txt"
+        target.write_text("not the parked record\n")
+        parked = self.task_dir(item) / "parked.md"
+        parked.symlink_to(target)
+        run = self.plain_retry(item, "--route", "park")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(target.read_text(), "not the parked record\n")
+        self.assertFalse(parked.is_symlink())
+        self.assertTrue(parked.is_file())
+        self.assertIn("state-matrix", parked.read_text())
+
     def test_escalate_alone_does_not_pass_the_gate(self):
         item = self.chain(["state-matrix"], ["state-matrix"])
         before = self.tasks()
@@ -239,6 +253,49 @@ class RepeatedFamilyGateTests(RetryCase):
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("repeated-family gate was not checked", run.stderr)
+
+
+@unittest.skipUnless(TMUX, "tmux not installed")
+class ParkWithALiveProcessTests(TmuxCase):
+    """Parking starts no attempt, so a process alive on the working tree does not stop it; every other route still is stopped."""
+
+    def reviewed(self, task, review_id, family):
+        review = self.state / "tasks" / review_id
+        review.mkdir()
+        (review / "meta.json").write_text(json.dumps({"id": review_id, "role": "reviewer"}))
+        (review / "result.md").write_text(review_text(family))
+        meta = json.loads((task / "meta.json").read_text())
+        (task / "meta.json").write_text(json.dumps(dict(meta, reviews=meta.get("reviews", []) + [review_id])))
+
+    def repeated_family_with_a_live_process(self):
+        first, first_task = self.dispatch()
+        self.settle(first_task)
+        self.reviewed(first_task, "review-1", "state-matrix")
+        second = self.cli("retry", first["id"], "--reason", "again", "--worker", "pi", "--model", MODEL)
+        second_task = self.state / "tasks" / second["id"]
+        self.settle(second_task)
+        self.reviewed(second_task, "review-2", "state-matrix")
+        _, _, pane, _ = self.live_task()  # another task alive on the same working tree
+        self.assertTrue(self.alive(pane))
+        return second, second_task
+
+    def test_route_park_writes_parked_md_beside_a_live_process_and_design_is_still_refused(self):
+        second, task = self.repeated_family_with_a_live_process()
+        before = sorted(p.name for p in (self.state / "tasks").iterdir())
+        design = self.raw("retry", second["id"], "--reason", "again", "--worker", "pi", "--model", MODEL, "--route", "design")
+        self.assertEqual(design.returncode, 1, design.stdout)
+        self.assertIn("a process is alive on the same working tree", design.stderr)
+        self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), before)
+        park = self.raw("retry", second["id"], "--reason", "again", "--route", "park")
+        self.assertEqual(park.returncode, 0, park.stderr)
+        self.assertIn("state-matrix", (task / "parked.md").read_text())
+        self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), before)  # nothing was started
+
+    def test_a_plain_retry_beside_a_live_process_is_still_refused_by_the_guard(self):
+        second, _ = self.repeated_family_with_a_live_process()
+        run = self.raw("retry", second["id"], "--reason", "again", "--worker", "pi", "--model", MODEL)
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("a process is alive on the same working tree", run.stderr)
 
 
 if __name__ == "__main__":

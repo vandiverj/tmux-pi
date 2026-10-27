@@ -150,5 +150,126 @@ class ClosesByTests(unittest.TestCase):
             self.assertEqual(value["unusable_reason"], "REQUEST_CHANGES without a Closes by: code finding")
 
 
+BRIEF = "# Step\n\n## Done means\n1. First thing.\n   continued line\n2. Second thing.\n3. Third thing.\n\n## Tests\n9. not an item\n"
+COVERED = "\nCoverage\nI reviewed a.py and checked its callers and tests.\n"
+
+
+def reply(section):
+    return "APPROVED\nRESULT_STATUS: complete\n" + section + COVERED
+
+
+class AcceptanceCriteriaTests(unittest.TestCase):
+    """R7: a brief or contract with a numbered Done means / Acceptance criteria list makes the reply account for each item."""
+
+    def test_the_numbered_list_under_either_heading_is_read(self):
+        for name, text, want in (
+                ("heading", BRIEF, [1, 2, 3]),
+                ("acceptance heading, any level", "### Acceptance criteria\n\n1) a\n2) b\n", [1, 2]),
+                ("bold line", "**Done means**\n1. a\n2. b\n", [1, 2]),
+                ("bold line with colon", "**Acceptance criteria:**\n\n1. a\n", [1]),
+                ("plain line with colon", "Done means:\n1. a\n2. b\n", [1, 2]),
+                ("case", "## DONE MEANS\n1. a\n", [1]),
+                ("no list", "## Done means\n- a bullet\n- another\n", []),
+                ("no heading", "1. a\n2. b\n", []),
+                ("list under another heading", "## Why\n1. a\n2. b\n", []),
+                ("a sub-list is not an item", "## Done means\n1. a\n    1. nested\n    2. nested\n2. b\n", [1, 2]),
+                ("a list in a fence is not read", "## Done means\n```\n1. a\n```\n", [])):
+            with self.subTest(name):
+                self.assertEqual(review_verdict.acceptance_items(text), want)
+
+    def test_two_sources_are_joined(self):
+        self.assertEqual(review_verdict.acceptance_items(BRIEF, "## Acceptance criteria\n1. x\n4. y\n"), [1, 2, 3, 4])
+
+    def test_a_reply_naming_every_item_is_complete(self):
+        for section in ("## Acceptance criteria\n1. met - a.py:3\n2. not met - no test\n3. not checked - no tool\n",
+                        "**Acceptance criteria**\n- 1: met, test_a\n- 2: met, test_b\n- 3: met, test_c\n",
+                        "Acceptance criteria\n| 1 | met | a.py:1 |\n| 2 | met | a.py:2 |\n| 3 | met | a.py:3 |\n"):
+            with self.subTest(section=section):
+                text = review_verdict.ReviewText(reply(section), [1, 2, 3])
+                self.assertIsNone(review_verdict.assess(text)[2])
+                self.assertTrue(review_verdict.approves(text))
+
+    def test_a_reply_without_the_section_or_with_fewer_numbers_is_incomplete_and_the_reason_says_which(self):
+        for name, body, fragment in (
+                ("no section", "all fine\n", "no Acceptance criteria section"),
+                ("two of three", "## Acceptance criteria\n1. met - x\n2. met - y\n", "3"),
+                ("none named", "## Acceptance criteria\nall met\n", "1, 2, 3"),
+                ("the numbers sit in another section", "## Notes\n1. met\n2. met\n3. met\n", "no Acceptance criteria section")):
+            with self.subTest(name):
+                text = review_verdict.ReviewText(reply(body), [1, 2, 3])
+                verdict, _, problem = review_verdict.assess(text)
+                self.assertEqual(verdict, "APPROVED")  # the stated verdict is kept for the record
+                self.assertIn("Acceptance criteria", problem)
+                self.assertIn(fragment, problem)
+                self.assertFalse(review_verdict.approves(text))
+
+    def test_the_section_ends_at_the_next_heading_and_later_numbers_do_not_count(self):
+        for name, after in (("plain Coverage", "Coverage\n2. later row about a.py and its tests\n"),
+                            ("bold-only line", "**Notes**\n2. a note, not a row\n"),
+                            ("markdown heading", "## Notes\n2. a note, not a row\n")):
+            with self.subTest(name):
+                text = review_verdict.ReviewText(reply("## Acceptance criteria\n1. met - a.py:3\n" + after), [1, 2])
+                problem = review_verdict.assess(text)[2]
+                self.assertIn("item 2", problem or "")
+                self.assertFalse(review_verdict.approves(text))
+
+    def test_rows_before_the_ending_heading_still_count(self):
+        text = review_verdict.ReviewText(reply("## Acceptance criteria\n1. met - a\n2. met - b\n\n**Notes**\n3. other\n"), [1, 2])
+        self.assertIsNone(review_verdict.assess(text)[2])
+
+    def test_briefs_named_in_a_request_are_the_absolute_md_paths_in_it(self):
+        request = "Read and carry out the brief /x/dir/brief.md in full. Also `/y/other.md`, (/z/c.md) and /w/n.md. Not a.md, ./b.md or /x/dir/brief.md.txt or /q/r.mdx\n"
+        self.assertEqual(review_verdict.named_briefs(request), ["/x/dir/brief.md", "/y/other.md", "/z/c.md", "/w/n.md"])
+        self.assertEqual(review_verdict.named_briefs("/x/brief.md and /x/brief.md\n"), ["/x/brief.md"])
+        self.assertEqual(review_verdict.named_briefs("nothing here"), [])
+
+    def test_the_briefs_command_prints_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = Path(tmp, "request.md")
+            request.write_text("Read and carry out the brief /x/brief.md\n")
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), "briefs", str(request)], capture_output=True, text=True)
+            self.assertEqual(json.loads(out.stdout), {"briefs": ["/x/brief.md"]})
+
+    def test_a_missing_item_names_only_the_missing_numbers(self):
+        problem = review_verdict.assess(review_verdict.ReviewText(reply("## Acceptance criteria\n1. met\n3. met\n"), [1, 2, 3]))[2]
+        self.assertIn("item 2", problem)
+        self.assertNotIn("1, 2", problem)
+
+    def test_a_reply_that_is_also_missing_coverage_still_says_so_first(self):
+        text = review_verdict.ReviewText("APPROVED\n## Acceptance criteria\n1. met\n", [1])
+        self.assertEqual(review_verdict.assess(text)[2], "the review has no Coverage section")
+
+    def test_without_a_list_nothing_changes(self):
+        plain = reply("anything")
+        self.assertIsNone(review_verdict.assess(plain)[2])
+        self.assertIsNone(review_verdict.assess(review_verdict.ReviewText(plain, []))[2])
+        self.assertTrue(review_verdict.approves(plain))
+
+    def test_read_review_applies_the_items_recorded_beside_the_reply_to_every_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "result.md")
+            path.write_text(reply("## Acceptance criteria\n1. met\n"))
+            self.assertIsNone(review_verdict.assess(review_verdict.read_review(path))[2])  # no marker: the old rule
+            Path(tmp, "acceptance-items.json").write_text(json.dumps({"items": [1, 2]}))
+            self.assertIn("2", review_verdict.assess(review_verdict.read_review(path))[2])
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), str(path)], capture_output=True, text=True)
+            value = json.loads(out.stdout)
+            self.assertFalse(value["complete"])
+            self.assertIn("Acceptance criteria", value["incomplete_reason"])
+            Path(tmp, "acceptance-items.json").write_text("{not json")  # a marker that cannot be read refuses, never defaults
+            with self.assertRaises(ValueError):
+                review_verdict.read_review(path)
+
+    def test_the_acceptance_command_prints_the_numbers_of_the_files_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp, "a.md"), Path(tmp, "b.md")
+            a.write_text(BRIEF)
+            b.write_text("nothing here\n")
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), "acceptance", str(a), str(b)], capture_output=True, text=True)
+            self.assertEqual(json.loads(out.stdout), {"items": [1, 2, 3]})
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), "acceptance", str(b)], capture_output=True, text=True)
+            self.assertEqual(json.loads(out.stdout), {"items": []})
+
+
 if __name__ == "__main__":
     unittest.main()

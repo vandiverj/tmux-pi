@@ -365,5 +365,220 @@ class SecretsStayOutTests(RoundsTests):
             with self.assertRaises(review_rounds.Refused):
                 self.prepare("w1")
 
+
+def run_git(directory, *args):
+    return subprocess.run(["git", "-C", str(directory), "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class StepBaseTests(unittest.TestCase):
+    """R6: a lane task is scoped from the last closed step's commit when it is an ancestor of HEAD, else from the lane base."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        import lanes
+        self.lanes = lanes
+        base = Path(tmp.name)
+        self.main = base / "main"
+        self.main.mkdir()
+        run_git(self.main, "init", "-q", "-b", "main")
+        (self.main / "a.txt").write_text("one\n")
+        run_git(self.main, "add", "a.txt")
+        run_git(self.main, "commit", "-qm", "base")
+        self.base = run_git(self.main, "rev-parse", "HEAD")
+        self.wt = base / "lane-wt"
+        run_git(self.main, "worktree", "add", "-q", "-b", "lane-b", str(self.wt))
+        self.wt = Path(self.wt).resolve()
+        self.common = lanes.git_common_dir(str(self.main.resolve()))
+
+    def commit(self, name, text="x\n"):
+        (self.wt / name).write_text(text)
+        run_git(self.wt, "add", name)
+        run_git(self.wt, "commit", "-qm", f"add {name}")
+        return run_git(self.wt, "rev-parse", "HEAD")
+
+    def record(self, closed):
+        entries = [{"step": step, "commit": commit, "tree": run_git(self.wt, "rev-parse", commit + "^{tree}"), "review": "r-1",
+                    "verdict": "APPROVED", "closed_at": "2026-10-08T10:00:00+00:00"} for step, commit in closed]
+        record = {"schema": "tp-lane:v1", "name": "alpha", "kind": "work", "state": "open", "repo": str(self.main.resolve()),
+                  "git_common_dir": self.common, "branch": "lane-b", "worktree": str(self.wt), "base": {"ref": "main", "commit": self.base},
+                  "created": "2026-10-08T10:00:00+00:00", "domain": "d", "touches": ["lib"], "closed": entries, "integrated": None, "defaulted": []}
+        with self.lanes.lane_lock(self.common):
+            self.lanes.write_lane(self.common, record)
+
+    def scope(self):
+        return review_rounds.scope_text(str(self.wt), "alpha")[0]
+
+    def test_with_a_closed_step_the_base_is_its_commit_and_its_files_leave_the_list(self):
+        s1 = self.commit("s1.txt")
+        self.commit("n1.txt")
+        self.commit("n2.txt")
+        self.record([("s1", s1)])
+        text = self.scope()
+        self.assertIn(f"base: last closed step s1 at {s1[:12]}", text)
+        self.assertIn(f"relative to {s1[:12]}", text)
+        self.assertIn("- n1.txt\n", text)
+        self.assertIn("- n2.txt\n", text)
+        self.assertNotIn("s1.txt\n", text)
+        self.assertIn(f"diff {s1} -- <path>", text)
+        self.assertIn("closed steps are out of scope except where the new lines change or call them", text.lower().replace("steps closed earlier are", "closed steps are"))
+
+    def test_the_last_of_several_closed_steps_is_the_base(self):
+        s1 = self.commit("s1.txt")
+        s2 = self.commit("s2.txt")
+        self.commit("n1.txt")
+        self.record([("s1", s1), ("s2", s2)])
+        text = self.scope()
+        self.assertIn(f"base: last closed step s2 at {s2[:12]}", text)
+        self.assertNotIn("s2.txt\n", text)
+
+    def test_a_lane_with_no_closed_step_is_scoped_from_the_lane_base_as_before(self):
+        self.commit("n1.txt")
+        self.record([])
+        text = self.scope()
+        self.assertIn(f"Diff scope: 1 file(s) changed relative to {self.base[:12]} (committed on the lane since its base", text)
+        self.assertIn(f"base: lane base {self.base[:12]}", text)
+        self.assertNotIn("closed step", text)
+        self.assertIn(f"diff {self.base} -- <path>", text)
+
+    def test_a_closed_commit_that_is_not_an_ancestor_of_head_falls_back_to_the_lane_base_and_says_so(self):
+        run_git(self.main, "branch", "side", self.base)
+        side = Path(self.wt.parent / "side-wt")
+        run_git(self.main, "worktree", "add", "-q", str(side), "side")
+        (side / "other.txt").write_text("o\n")
+        run_git(side, "add", "other.txt")
+        run_git(side, "commit", "-qm", "elsewhere")
+        stray = run_git(side, "rev-parse", "HEAD")
+        self.commit("n1.txt")
+        self.record([("s1", stray)])
+        text = self.scope()
+        self.assertIn(f"base: lane base {self.base[:12]}", text)
+        self.assertIn(f"closed step s1 at {stray[:12]} is not an ancestor of HEAD", text)
+        self.assertIn(f"relative to {self.base[:12]}", text)
+        self.assertNotIn("base: last closed step", text)
+
+    def test_a_non_lane_scope_is_unchanged(self):
+        text = review_rounds.scope_text(str(self.main), "")[0]
+        self.assertIn("relative to HEAD (staged, unstaged and untracked)", text)
+        self.assertNotIn("base:", text)
+
+
+class TimerWaitsTests(unittest.TestCase):
+    """T2: added lines in test files that wait on a clock are listed as facts for the reviewer."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name).resolve()
+        run_git(self.work, "init", "-q", "-b", "main")
+        (self.work / "old_test.ts").write_text("await sleep(1)\nconst a = 1\n")
+        run_git(self.work, "add", "old_test.ts")
+        run_git(self.work, "commit", "-qm", "base")
+
+    def put(self, name, text):
+        path = self.work / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def waits(self):
+        return review_rounds.timer_waits(str(self.work), "")
+
+    def test_an_added_sleep_in_a_test_file_is_listed_with_path_and_line(self):
+        self.put("src/foo_test.ts", "const a = 1\nawait sleep(50)\n")
+        text = self.waits()
+        self.assertIn("Timer waits in added test lines", text)
+        self.assertIn("src/foo_test.ts:2: await sleep(50)", text)
+
+    def test_the_same_line_in_a_file_that_is_not_a_test_path_is_not_listed(self):
+        self.put("src/foo.ts", "await sleep(50)\n")
+        text = self.waits()
+        self.assertNotIn("src/foo.ts", text)
+        self.assertIn("none were found", text)
+
+    def test_every_test_path_pattern_and_every_timer_call_counts(self):
+        calls = ("setTimeout(r, 5)", "sleep(2)", "delay(3)", "Deno.sleep(4)", "waitForTimeout(5)")
+        for path in ("a/test_x.py", "a/x.spec.ts", "e2e/run.ts", "a/__tests__/x.ts", "lib/mytests/x.py"):
+            self.put(path, "\n".join(calls) + "\n")
+        text = self.waits()
+        for path in ("a/test_x.py", "a/x.spec.ts", "e2e/run.ts", "a/__tests__/x.ts", "lib/mytests/x.py"):
+            for number, call in enumerate(calls, 1):
+                self.assertIn(f"{path}:{number}: {call}", text)
+
+    def test_a_timer_ok_line_is_listed_and_marked_not_dropped(self):
+        self.put("src/foo_test.ts", "setTimeout(r, 10) // timer-ok: debounce\nsleep(3)\n")
+        text = self.waits()
+        self.assertIn("src/foo_test.ts:1: setTimeout(r, 10) // timer-ok: debounce (timer-ok)", text)
+        self.assertIn("src/foo_test.ts:2: sleep(3)\n", text + "\n")
+        self.assertNotIn("sleep(3) (timer-ok)", text)
+
+    def test_no_timer_lines_say_so_in_one_line(self):
+        self.put("src/foo_test.ts", "const a = 1\n")
+        lines = [line for line in self.waits().splitlines() if line.strip() and not line.startswith("#")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("none were found", lines[0])
+
+    def test_only_added_lines_count_and_a_modified_tracked_file_gets_its_new_line_numbers(self):
+        self.put("old_test.ts", "await sleep(1)\nconst a = 1\ndelay(7)\n")  # sleep(1) was already there
+        text = self.waits()
+        self.assertIn("old_test.ts:3: delay(7)", text)
+        self.assertNotIn("old_test.ts:1:", text)
+
+    def test_a_staged_new_file_and_a_committed_nothing_repository_are_read_too(self):
+        self.put("new_test.py", "time.sleep(2)\n")
+        run_git(self.work, "add", "new_test.py")
+        self.assertIn("new_test.py:1: time.sleep(2)", self.waits())
+
+    def test_a_withheld_path_is_never_read(self):
+        self.put(".env.test", "sleep(9) SECRET-VALUE\n")
+        text = self.waits()
+        self.assertNotIn("SECRET-VALUE", text)
+        self.assertNotIn(".env.test", text)
+
+    def test_a_secret_in_a_listed_line_is_redacted(self):
+        self.put("src/foo_test.ts", "sleep(1); const API_TOKEN = 'sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD'\n")
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", self.waits())
+
+    def test_outside_git_it_says_it_was_not_computed(self):
+        with tempfile.TemporaryDirectory() as plain:
+            text = review_rounds.timer_waits(plain, "")
+        self.assertIn("Timer waits in added test lines", text)
+        self.assertIn("not a git repository", text)
+
+    def test_past_the_cap_every_line_is_still_listed_as_path_and_line_and_the_header_counts(self):
+        cap = review_rounds.MAX_TIMER_LINES
+        self.put("src/foo_test.ts", "".join(f"sleep({n})\n" for n in range(cap + 1)))
+        text = self.waits()
+        entries = [line for line in text.splitlines() if line.startswith("src/foo_test.ts:")]
+        self.assertEqual(len(entries), cap + 1)
+        self.assertEqual(entries[-1], f"src/foo_test.ts:{cap + 1}")
+        self.assertEqual(entries[cap - 1], f"src/foo_test.ts:{cap}: sleep({cap - 1})")
+        self.assertEqual(text.splitlines()[0], f"# Timer waits in added test lines: {cap + 1} matching added line(s); 1 listed as path:line without their text")
+
+    def test_at_or_under_the_cap_the_first_line_says_none_lack_text(self):
+        self.put("src/foo_test.ts", "sleep(1)\n")
+        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text")
+
+    def test_with_no_match_the_first_line_says_none_found(self):
+        self.put("src/foo_test.ts", "const a = 1\n")
+        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: none found")
+
+    def test_when_it_cannot_be_computed_the_first_line_still_starts_with_the_title(self):
+        with tempfile.TemporaryDirectory() as plain:
+            first = review_rounds.timer_waits(plain, "").splitlines()[0]
+        self.assertTrue(first.startswith("# Timer waits in added test lines: "), first)
+
+    def test_a_long_matching_line_is_cut_at_400_with_the_mark(self):
+        self.put("src/foo_test.ts", "sleep(1) " + "x" * 491 + "\n")
+        text = self.waits()
+        self.assertIn("src/foo_test.ts:1: sleep(1) " + "x" * 391 + "… (truncated, 500 chars)", text)
+        self.assertNotIn("x" * 392, text)
+
+    def test_the_command_writes_the_file(self):
+        self.put("src/foo_test.ts", "await sleep(50)\n")
+        out = self.work.parent / "timers.md"
+        run = subprocess.run([sys.executable, str(ROOT / "lib/review_rounds.py"), "timers", str(self.work), "", str(out)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("src/foo_test.ts:1: await sleep(50)", out.read_text())
+
 if __name__ == "__main__":
     unittest.main()

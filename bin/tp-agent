@@ -1033,6 +1033,10 @@ def review(base, args):
         raise ValueError("--contract may be given only once")
     for path in args.contract:  # an empty value is passed on as well; bin/tp-review refuses it
         command += ["--contract", path]
+    if len(args.dispositions) > 1:  # refused here too, for the same reason
+        raise ValueError("--dispositions may be given only once")
+    for path in args.dispositions:  # what Main ruled on in earlier rounds; bin/tp-review refuses an unusable (or empty-named) file
+        command += ["--dispositions", path]
     if args.same_provider:
         if not (args.approved_by_user or "").strip():
             raise ValueError("--same-provider needs --approved-by-user with the user's approval quoted")
@@ -1172,6 +1176,7 @@ def main():
     rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree (does not apply to a lane: stop its writer with tp-agent stop)")
     rv.add_argument("--evidence", metavar="FILE", action="append", default=[], help="attach a check output Main produced (repeatable), under 'Evidence supplied by Main: <file name>'; the reviewer is told it is not the author's")
     rv.add_argument("--contract", metavar="FILE", action="append", default=[], help="attach the reviewer contract (once), under 'Reviewer contract (supplied by Main)'; the reviewer judges the work against it with the task")
+    rv.add_argument("--dispositions", metavar="FILE", action="append", default=[], help="attach what Main ruled on in earlier rounds (once, any round), under 'Dispositions of earlier findings (supplied by Main)'; a finding listed there is closed unless the tree changed in a way that reopens it")
     rv.add_argument("--same-provider", action="store_true", help="review on the author's own provider; only with the user's approval, which --approved-by-user must quote")
     rv.add_argument("--approved-by-user", metavar="QUOTE", help="the user's approval of a same-provider review, quoted (required with --same-provider)")
     ea = sub.add_parser("end-author", help="end a settled task's process before its review starts (bin/tp-review runs this)")

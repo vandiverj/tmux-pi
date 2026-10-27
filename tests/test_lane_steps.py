@@ -24,6 +24,20 @@ import lane_steps  # noqa: E402
 APPROVED = "APPROVED\n\nThe change does what the task asked.\n\n## Coverage\nI read lib/x.py and the callers it changes and ran the tests.\n\nRESULT_STATUS: complete\n"
 WITH_NOTES = "APPROVED_WITH_NOTES\n\nOne naming nit in lib/x.py, nothing blocking.\n\n## Coverage\nI read lib/x.py and the callers it changes.\n\nRESULT_STATUS: complete\n"
 CHANGES = "REQUEST_CHANGES: the helper returns the wrong value\n\n## Coverage\nI read lib/x.py and traced both of its callers.\n\nRESULT_STATUS: complete\n"
+COVERAGE = "\n## Coverage\nI read lib/x.py and traced both of its callers.\n\nRESULT_STATUS: complete\n"
+LABELLED = {  # REQUEST_CHANGES replies by what their findings say they close by (lib/review_verdict.py closes_by)
+    "code": "REQUEST_CHANGES\n\nF1 [defect] the helper returns the wrong value. Closes by: code\n" + COVERAGE,
+    "check and none": "REQUEST_CHANGES\n\nF1 [note] the report has no test count. Closes by: check\nF2 [note] wording. Closes by: none\n" + COVERAGE,
+    "Markdown check": "REQUEST_CHANGES\n\nF1 [note] the report shows no log. **Closes by:** `check`\n" + COVERAGE,
+    "no labels": "REQUEST_CHANGES\n\nF1 [defect] the helper returns the wrong value.\nF2 [note] wording.\n" + COVERAGE,
+    "check and code": "REQUEST_CHANGES\n\nF1 [note] no log. Closes by: check\nF2 [defect] wrong value. Closes by: code\n" + COVERAGE,
+    # a label counts only where it ends a finding (review_verdict.closes_by): a quotation of one is no label
+    "defect, Coverage quotes check": "REQUEST_CHANGES\n\nF1 [defect] the helper returns the wrong value.\n\n## Coverage\nI read lib/x.py, quoting `Closes by: check` from the rule.\n\nRESULT_STATUS: complete\n",
+    "check, prose quotes code": "REQUEST_CHANGES\n\nF1 [note] no log. Closes by: check\n\nThe rule says \"`Closes by: code`\" for a defect.\n" + COVERAGE,
+    "check, Verification holds code": "REQUEST_CHANGES\n\nF1 [note] no log. Closes by: check\n\n## Verification\nCloses by: code\n" + COVERAGE,
+    "bold code with a full stop": "REQUEST_CHANGES\n\nF1 [defect] wrong value. **Closes by: code.**\n" + COVERAGE,
+}
+CHECK_ONLY = LABELLED["check and none"]
 NO_COVERAGE = "APPROVED\n\nLooks fine to me.\n\nRESULT_STATUS: complete\n"
 NOT_A_VERDICT = "I think this is fine.\n\n## Coverage\nI read lib/x.py and the callers it changes.\n\nRESULT_STATUS: complete\n"
 DECORATED = "**APPROVED**\n\n## Coverage\nI read lib/x.py and the callers it changes.\n\nRESULT_STATUS: complete\n"
@@ -240,6 +254,50 @@ class GateRowsTests(StepCase):
         rejecting, _ = self.review(author, CHANGES)
         self.untouched(self.close, f"{rejecting} asked for changes to this tree")
         self.review(author, WITH_NOTES)  # a later approval of the same tree does not undo it
+        self.untouched(self.close, f"{rejecting} asked for changes to this tree")
+
+    def judge(self, text):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        _, task = self.review(author, text)
+        return lane_steps._judge({"path": task})  # the gate's one reader of a review reads nothing else of the task
+
+    def test_closes_by_a_request_changes_with_a_code_finding_or_no_labels_rejects(self):
+        for name in ("code", "no labels", "check and code", "defect, Coverage quotes check", "bold code with a full stop"):
+            with self.subTest(name):
+                self.reset()
+                self.assertEqual(self.judge(LABELLED[name]), ("rejects", "REQUEST_CHANGES"))
+
+    def test_closes_by_a_request_changes_with_labels_but_no_code_is_unusable_not_a_rejection(self):
+        for name in ("check and none", "Markdown check", "check, prose quotes code", "check, Verification holds code"):
+            with self.subTest(name):
+                self.reset()
+                self.assertEqual(self.judge(LABELLED[name]), ("unusable", "REQUEST_CHANGES without a Closes by: code finding"))
+
+    def test_closes_by_an_approval_with_check_labels_still_approves(self):
+        text = "APPROVED_WITH_NOTES\n\nN1 the report has no test count. Closes by: check\n" + COVERAGE
+        self.assertEqual(self.judge(text), ("approves", "APPROVED_WITH_NOTES"))
+
+    def test_closes_by_an_unusable_review_does_not_block_and_a_later_approval_closes_the_step(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        unusable, _ = self.review(author, CHECK_ONLY)
+        self.untouched(self.close, "cannot be closed", "is usable and complete", unusable, "REQUEST_CHANGES without a Closes by: code finding",
+                       f"tp-agent review {author} --force")
+        self.assertEqual(self.lanes()["waiting_on"], "review")  # the next move is a review, not a change to the work
+        good, _ = self.review(author)
+        entry = self.closes()["closed"][0]
+        self.assertEqual((entry["review"], entry["verdict"]), (good, "APPROVED"))
+
+    def test_closes_by_a_code_finding_still_blocks_after_an_unusable_review_and_a_later_approval(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(author, CHECK_ONLY)
+        rejecting, _ = self.review(author, LABELLED["code"])
+        self.review(author)
         self.untouched(self.close, f"{rejecting} asked for changes to this tree")
 
     def test_row_5_an_unreadable_verdict_never_approves(self):

@@ -165,6 +165,25 @@ class PaneTargetingTests(ExtensionSessionCase):
         self.assertNotIn("NOT AN APPROVAL", complete)
         self.assertNotIn("NOT AN APPROVAL", plain)
 
+    def test_collect_result_says_a_request_changes_with_no_code_finding_is_no_rejection(self):
+        (self.base / "root" / "lib").symlink_to(ROOT / "lib", target_is_directory=True)
+        coverage = "\nCoverage\nreviewed a.py and checked its callers"
+        for ident, reply in (("rv-check", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [note] no count. Closes by: check" + coverage),
+                             ("rv-code", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong. Closes by: code" + coverage)):
+            task = self.state / "tasks" / ident
+            task.mkdir()
+            (task / "meta.json").write_text(json.dumps({"id": ident, "worker": "pi", "pane": "%7"}))
+            (task / "state.json").write_text(json.dumps({"state": "waiting"}))
+            (task / "result.md").write_text(reply)
+            (task / "review-of").write_text("author")
+        run = subprocess.run(["node", "--experimental-strip-types", str(HARNESS), "subagents-collect", str(self.project), "rv-check", "rv-code"],
+                             cwd=ROOT, env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        unusable, rejecting = json.loads(run.stdout)["notices"]
+        for words in ("NOT A REJECTION AND NOT AN APPROVAL", "Closes by: code", "tp-agent review author"):
+            self.assertIn(words, unusable)
+        self.assertNotIn("NOT A REJECTION", rejecting)
+
     def assert_typed_into_own_task(self, scenario, **updates):
         self.log.write_text("")
         result = self.node(scenario, **updates)

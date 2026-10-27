@@ -414,12 +414,18 @@ def task_summary(d, dirs_by_id):
         review = {"id": meta["review"], "reviewer": _target(meta.get("reviewer")), "verdict": None}
         if reviewer_dir is not None:
             # review_verdict.assess decides on the whole reply; anything it refuses is "unparsed", a review without a usable
-            # Coverage section is "incomplete" and is never counted as the verdict it states
+            # Coverage section is "incomplete" and is never counted as the verdict it states; a REQUEST_CHANGES with no
+            # Closes by: code finding is "UNUSABLE", no rejection and no approval
             try:
-                stated, _, incomplete = review_verdict.assess(review_verdict.read_review(reviewer_dir / "result.md"))
+                text = review_verdict.read_review(reviewer_dir / "result.md")
+                stated, _, incomplete = review_verdict.assess(text)
                 review["verdict"] = stated
                 if incomplete:
                     review.update({"verdict": "incomplete", "stated_verdict": stated, "incomplete_reason": incomplete})
+                else:
+                    unusable = review_verdict.request_changes_problem(text)
+                    if unusable:
+                        review.update({"verdict": "UNUSABLE", "stated_verdict": stated, "unusable_reason": unusable})
             except review_verdict.ReviewMissing:
                 pass
             except ValueError as exc:

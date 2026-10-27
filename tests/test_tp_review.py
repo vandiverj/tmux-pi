@@ -30,7 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py"):   # the last two: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py"):   # the last two: the files contract.py's lifecycle and bin/tp-agent read: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
@@ -251,6 +251,11 @@ echo review-1
             self.assertIn("'note'", task)
             self.assertIn("Notes are returned in full but never justify another round", task)
             self.assertIn("REQUEST_CHANGES only when at least one finding is a defect", task)
+            self.assertIn("REQUEST_CHANGES only when at least one finding is a defect as defined above and ends 'Closes by: code'", task)
+            for label in ("code", "check", "decision", "none"):
+                self.assertIn(f"'Closes by: {label}'", task)
+            self.assertIn("A missing or wrong item in the author's report, or a command the author did not run, is never a defect: label it check "
+                          "and list it under 'Owed before close'. Run it yourself when you can and give the result.", task)
             self.assertIn("name the family it belongs to", task)
             # Both providers have the redacted tools; a prompt on a bash search outside the worktree stalls an unattended reviewer.
             self.assertIn("Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash", task)

@@ -884,6 +884,19 @@ test('the injected index marks an incomplete review and leaves a complete one pl
   expect(text).not.toContain('rv-ok code-reviewer settled result=complete verdict=APPROVED [')
 })
 
+test('the injected index marks a REQUEST_CHANGES with no Closes by: code finding as unusable', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [
+    { id: 'rv-check', role: 'code-reviewer', status: 'settled', verdict: 'REQUEST_CHANGES', review_complete: true, review_unusable: 'REQUEST_CHANGES without a Closes by: code finding' },
+    { id: 'rv-code', role: 'code-reviewer', status: 'settled', verdict: 'REQUEST_CHANGES', review_complete: true },
+  ]
+  await $.session.start(start(true))
+  const text = await injected($ as never, w)
+  expect(text).toContain('rv-check code-reviewer settled verdict=REQUEST_CHANGES [review unusable: neither a rejection nor an approval]')
+  expect(text).toContain('rv-code code-reviewer settled verdict=REQUEST_CHANGES')
+  expect(text).not.toContain('rv-code code-reviewer settled verdict=REQUEST_CHANGES [')
+})
+
 test('refused queue entries sit with paused and awaiting rows, ahead of the active rows', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [

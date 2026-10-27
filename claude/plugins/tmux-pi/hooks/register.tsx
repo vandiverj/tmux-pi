@@ -310,12 +310,17 @@ async function poll($: EngineInterface) {
 
 function indexLine(row: unknown): string | undefined {
   if (typeof row !== 'object' || row === null) return undefined
-  const { id, role, harness, status, result_status, result_path, reason, verdict, review_complete } = row as Record<string, unknown>
+  const { id, role, harness, status, result_status, result_path, reason, verdict, review_complete, review_unusable } = row as Record<string, unknown>
   if (typeof id !== 'string') return undefined
   const fields = [id, role, harness, status].filter(field => typeof field === 'string' && field !== '')
   if (typeof result_status === 'string') fields.push(`result=${result_status}`)
-  // a review's stated verdict never reads as an approval unless its Coverage section was there (tp-agent: review_complete)
-  if (typeof verdict === 'string') fields.push(review_complete === true ? `verdict=${verdict}` : `verdict=${verdict} [review incomplete: not an approval]`)
+  // a review's stated verdict never reads as an approval unless its Coverage section was there (tp-agent: review_complete),
+  // and a REQUEST_CHANGES with no Closes by: code finding (review_unusable) is neither a rejection nor an approval
+  if (typeof verdict === 'string') {
+    const note = review_complete !== true ? ' [review incomplete: not an approval]'
+      : typeof review_unusable === 'string' && review_unusable !== '' ? ' [review unusable: neither a rejection nor an approval]' : ''
+    fields.push(`verdict=${verdict}${note}`)
+  }
   if (typeof result_path === 'string') fields.push(result_path)
   if (typeof reason === 'string' && reason !== '') fields.push(`(${reason})`)
   const awaits = awaiting(row as Record<string, unknown>)

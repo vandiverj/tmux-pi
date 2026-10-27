@@ -12,7 +12,11 @@ record but is incomplete (assess): it never approves, whatever the verdict line 
 decides; every consumer of a verdict (tp-agent, task_record, routing_evals, the dispatcher, the collect tools) calls it
 or this command.
 
-usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null};
+A REQUEST_CHANGES whose findings are labelled `Closes by:` (code, check, decision or none) and none is `code` is unusable
+(request_changes_problem): neither an approval nor a rejection. One with a `code` label, or with no labels, rejects as before.
+
+usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null,
+       "closes_by": [label, ...], "unusable_reason": str|null};
        exits 1 and says why when the reply is not a verdict or the file cannot be read
 """
 import json
@@ -165,6 +169,59 @@ def assess(text):
     return verdict, notes, coverage_problem(text)
 
 
+# "Closes by: code|check|decision|none" ends each finding (bin/tp-review findings_rule). Case-insensitive; Markdown bold may surround
+# the label ("**Closes by:** `check`", "**Closes by: code.**"), the value may be in backticks, and a full stop may follow it. The
+# label must end its line: a value that is not one of the four, or text after the label, makes it no label.
+_VALUES = "code|check|decision|none"
+CLOSES_BY = re.compile(r"(?<!\w)closes[ \t]+by(?:[ \t]*(?:\*\*|__))?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*(?:`(" + _VALUES + r")`|(" + _VALUES +
+                       r"))[ \t]*\.?[ \t]*(?:\*\*|__)?[ \t]*$", re.I)
+# the lines a label never counts under: a Coverage or Verification heading (a Markdown heading, a bold line, or the bare word) to
+# the next Markdown heading
+QUOTING_SECTION = re.compile(r"(?i)^[ \t]{0,3}(?:#{1,6}[ \t]+)?(?:(?:\*\*|__)[ \t]*)?(?:coverage|verification)\b(?:[ \t]*[:*_#]|[ \t]*$)")
+MARKDOWN_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]")
+UNUSABLE_CHANGES = "REQUEST_CHANGES without a Closes by: code finding"
+
+
+def _quoted(prefix):
+    """True when the text before a label leaves a backtick or a double quote open, so the label is being quoted."""
+    return prefix.count("`") % 2 == 1 or prefix.count('"') % 2 == 1 or prefix.count("“") > prefix.count("”")
+
+
+def closes_by(text):
+    """The `Closes by:` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats kept); []
+    when it has none. This is the one rule for what counts. A label counts when it ends its line (optionally bold, in backticks
+    around the value, or followed by a full stop) and is none of: inside backticks or double quotes, in a fenced block or a `>`
+    blockquote, or under a Coverage or Verification heading (a Markdown heading or a line that starts with the bold word; it runs to
+    the next Markdown heading). A quoted label in the reviewer's prose is therefore no label. A reply that cannot be normalised (a
+    fence or comment never closed) has none: the safe reading is that nothing says the review asks for no change."""
+    try:
+        lines = normalise(text.strip()).split("\n")[1:]  # the first line is the verdict; normalise drops a leading BOM
+    except ValueError:
+        return []
+    found, quoting = [], False
+    for line in lines:
+        if MARKDOWN_HEADING.match(line):
+            quoting = False
+        if QUOTING_SECTION.match(line):
+            quoting = True
+        match = None if quoting else CLOSES_BY.search(line.rstrip())
+        if match and not _quoted(line[:match.start()]):
+            found.append((match.group(1) or match.group(2)).lower())
+    return found
+
+
+def request_changes_problem(text):
+    """Why a REQUEST_CHANGES reply is not a rejection, or None. It is not one when its findings are labelled and none is
+    `Closes by: code`: nothing in the tree has to change, so it asks for no work. A reply with a `code` label, with no labels
+    (an older reviewer, another template), or with any other verdict or none is not touched. It is no approval either."""
+    try:
+        verdict = parse(text)[0]
+    except ValueError:
+        return None
+    labels = closes_by(text)
+    return UNUSABLE_CHANGES if verdict == "REQUEST_CHANGES" and labels and "code" not in labels else None
+
+
 def approves(text):
     """True for a complete APPROVED or APPROVED_WITH_NOTES; False for REQUEST_CHANGES, an incomplete review, or anything refused."""
     try:
@@ -178,8 +235,10 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     try:
-        verdict, notes, incomplete = assess(read_review(sys.argv[1]))
+        text = read_review(sys.argv[1])
+        verdict, notes, incomplete = assess(text)
     except ValueError as exc:
         print(f"review_verdict: {exc}", file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"verdict": verdict, "notes": notes, "complete": incomplete is None, "incomplete_reason": incomplete}))
+    print(json.dumps({"verdict": verdict, "notes": notes, "complete": incomplete is None, "incomplete_reason": incomplete,
+                      "closes_by": closes_by(text), "unusable_reason": request_changes_problem(text)}))

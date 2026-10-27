@@ -467,6 +467,23 @@ class ExportTests(unittest.TestCase):
                          ("accepted_with_changes", "human", "oversized", "good"))
         self.assertEqual(labels["correction"]["model"], "claude-sonnet-5-5")
 
+    def test_export_classifies_a_request_changes_with_no_code_finding_as_unusable_not_as_a_rejection(self):
+        coverage = "\nCoverage\nreviewed the changed files."
+        replies = {"check": "REQUEST_CHANGES\nF1 [note] no count in the report. Closes by: check" + coverage,
+                   "code": "REQUEST_CHANGES\nF1 [defect] wrong value. Closes by: code" + coverage,
+                   "bare": "REQUEST_CHANGES\nF1 [defect] wrong value." + coverage,
+                   "quoted": "REQUEST_CHANGES\nF1 [defect] wrong value.\nCoverage\nreviewed the files, quoting `Closes by: check` from the rule."}
+        dirs = {}
+        for name, reply in replies.items():
+            dirs[f"review-{name}"] = self.task(f"review-{name}", {"worker": "pi"}, files={"result.md": reply})
+            dirs[f"auto-{name}"] = self.task(f"auto-{name}", {"worker": "pi", "review": f"review-{name}"})
+        review = {name: routing_evals.task_summary(dirs[f"auto-{name}"], dirs)["review"] for name in replies}
+        self.assertEqual(review["check"]["verdict"], "UNUSABLE")
+        self.assertEqual(review["check"]["stated_verdict"], "REQUEST_CHANGES")
+        self.assertIn("Closes by: code", review["check"]["unusable_reason"])
+        for name in ("code", "bare", "quoted"):
+            self.assertEqual(review[name]["verdict"], "REQUEST_CHANGES", name)
+
     def test_legacy_tasks_join_by_hash_only_when_unambiguous(self):
         decision, _ = self.select(tools=0.9)
         legacy = {k: v for k, v in decision.items() if k != "selection_id"}

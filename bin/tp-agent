@@ -170,8 +170,11 @@ def record(path, include_result=False):
     if (path / "review-of").is_file():
         # a reviewer's verdict; a reply that is not one is reported as such, never read as an approval. A review without a
         # Coverage section keeps its stated verdict but is incomplete: result_status says so and it approves nothing.
+        unusable = None
         try:
-            result["verdict"], result["verdict_notes"], incomplete = review_verdict.assess(review_verdict.read_review(result_path))
+            review_text = review_verdict.read_review(result_path)
+            result["verdict"], result["verdict_notes"], incomplete = review_verdict.assess(review_text)
+            unusable = review_verdict.request_changes_problem(review_text)
         except review_verdict.ReviewMissing:
             result["verdict"], result["verdict_notes"], incomplete = "unparseable", "the review has no result yet", "the review has no result yet"
         except ValueError as exc:
@@ -183,6 +186,12 @@ def record(path, include_result=False):
             result["review_notice"] = (f"{result['id']}'s review is incomplete: {incomplete}. Its verdict "
                                        f"({result['verdict']}) is kept for the record but does not count as an approval; "
                                        "ask for the review again.")
+        elif unusable:
+            author = (path / "review-of").read_text().strip()
+            result["review_unusable"] = unusable
+            result["review_notice"] = (f"{result['id']}'s verdict is REQUEST_CHANGES, but none of its findings is labelled `Closes by: code`, so it is "
+                                       "not a rejection and not an approval: it asks for no change to the work and blocks no lane step. Show what it "
+                                       f"lists as owed before close (a command, count or log); a new `tp-agent review {author}` of the same tree may run.")
     if include_result:
         result["result"] = result_text
     return result
@@ -289,8 +298,10 @@ def build_index(base):
         out = {key: row.get(key) for key in ("id", "role", "harness", "model", "status", "result_status",
                "deliverable", "task_dir", "result_path", "permission", "capability_request", "capability_pending",
                "reason", "updated")}
-        # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves
-        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "lane", "lane_step") if key in row})
+        # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves. A
+        # REQUEST_CHANGES with no Closes by: code finding keeps its verdict and says why it is neither a rejection nor an approval
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "lane", "lane_step")
+                    if key in row})
         if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
             out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1
         return out
@@ -374,8 +385,10 @@ def escalation_evidence(base, previous):
             try:
                 text = review_verdict.read_review(task_dir(base, meta["review"]) / "result.md")
                 # only a stated REQUEST_CHANGES counts toward escalation, complete or not (an incomplete review is never an
-                # approval); APPROVED, APPROVED_WITH_NOTES and incomplete approvals count as neither
-                changes += 1 if review_verdict.assess(text)[0] == "REQUEST_CHANGES" else 0
+                # approval); APPROVED, APPROVED_WITH_NOTES and incomplete approvals count as neither, nor does a REQUEST_CHANGES
+                # that asks for no code change (labelled, none `Closes by: code`): the author has nothing to fix
+                if review_verdict.assess(text)[0] == "REQUEST_CHANGES" and not review_verdict.request_changes_problem(text):
+                    changes += 1
             except (ValueError, OSError):
                 pass
         if not meta.get("parent"):

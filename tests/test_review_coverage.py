@@ -224,6 +224,22 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn("incomplete", out.stderr or subprocess.run([sys.executable, str(ROOT / "bin/tp-agent"), "collect", "rv"],
                                                                  capture_output=True, text=True, env=env).stderr)
 
+    def test_tp_agent_says_an_unusable_request_changes_is_no_rejection_and_a_new_review_may_run(self):
+        checks = "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [note] no test count in the report. Closes by: check\n" + COMPLETE
+        d = self.task("rv", checks, review_of="author")
+        rec = self.agent.record(d, include_result=True)
+        self.assertEqual((rec["verdict"], rec["review_complete"]), ("REQUEST_CHANGES", True))
+        for words in ("not a rejection", "not an approval", "Closes by: code", "tp-agent review author"):
+            self.assertIn(words, rec["review_notice"])
+        env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TMUX": "", "TMUX_PANE": ""}
+        out = subprocess.run([sys.executable, str(ROOT / "bin/tp-agent"), "collect", "rv"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("tp-agent review author", json.loads(out.stdout)["notice"])
+        self.assertIn("not a rejection", out.stderr)
+        for ident, reply in (("code", "REQUEST_CHANGES\nF1 Closes by: code\n" + COMPLETE), ("plain", "REQUEST_CHANGES\nF1 defect\n" + COMPLETE),
+                             ("quoted", "REQUEST_CHANGES\nF1 defect\nCoverage\nreviewed a.py, quoting `Closes by: check` from the rule\n")):
+            self.assertNotIn("review_notice", self.agent.record(self.task(f"rv-{ident}", reply, review_of="author")), ident)
+
     # the injected index
     def test_the_session_index_shows_an_incomplete_review_as_incomplete(self):
         self.task("rv", "APPROVED\nRESULT_STATUS: complete\nfine", review_of="author")
@@ -236,10 +252,30 @@ class ConsumerTests(unittest.TestCase):
         author = self.task("author", "done\nRESULT_STATUS: complete\n")
         self.assertNotIn("verdict", {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}["author"])
 
+    def test_the_session_index_shows_an_unusable_review_as_unusable_and_keeps_the_stated_verdict(self):
+        for ident, reply in (("check", "REQUEST_CHANGES\nF1 [note] no count. Closes by: check\n" + COMPLETE),
+                             ("code", "REQUEST_CHANGES\nF1 [defect] wrong. Closes by: code\n" + COMPLETE),
+                             ("bare", "REQUEST_CHANGES\nF1 [defect] wrong.\nCoverage\nreviewed a.py, quoting `Closes by: check` from the rule.\n"),
+                             ("ok", "APPROVED\n" + COMPLETE)):
+            self.task(f"rv-{ident}", reply, review_of="author")
+        rows = {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}
+        self.assertEqual((rows["rv-check"]["verdict"], rows["rv-check"]["review_complete"]), ("REQUEST_CHANGES", True))
+        self.assertIn("Closes by: code", rows["rv-check"]["review_unusable"])
+        for ident in ("code", "bare", "ok"):
+            self.assertNotIn("review_unusable", rows[f"rv-{ident}"], ident)
+
     # escalation evidence
     def test_escalation_counts_a_stated_request_changes_and_never_an_incomplete_approval(self):
         for ident, reply, expected in (("a", "REQUEST_CHANGES\nF1 defect", 1), ("b", "REQUEST_CHANGES\nF1\n" + COMPLETE, 1),
                                        ("c", "APPROVED\nfine", 0), ("d", "APPROVED_WITH_NOTES\nN1", 0), ("e", "APPROVED\n" + COMPLETE, 0)):
+            review = self.task(f"rv-{ident}", reply, review_of=ident)
+            author = self.task(ident, "x\nRESULT_STATUS: complete\n", meta={"review": review.name})
+            self.assertEqual(self.agent.escalation_evidence(self.state, author)[1], expected, ident)
+
+    def test_escalation_does_not_count_a_request_changes_that_has_no_code_finding(self):
+        for ident, reply, expected in (("a", "REQUEST_CHANGES\nF1 Closes by: check\nF2 Closes by: none\n", 0),
+                                       ("b", "REQUEST_CHANGES\nF1 Closes by: check\nF2 Closes by: code\n", 1),
+                                       ("c", "REQUEST_CHANGES\nF1 defect\n", 1)):
             review = self.task(f"rv-{ident}", reply, review_of=ident)
             author = self.task(ident, "x\nRESULT_STATUS: complete\n", meta={"review": review.name})
             self.assertEqual(self.agent.escalation_evidence(self.state, author)[1], expected, ident)
@@ -280,8 +316,10 @@ class ConsumerTests(unittest.TestCase):
         self.task("rv", "APPROVED\nRESULT_STATUS: complete\nfine", review_of="author")
         self.task("rv-ok", "APPROVED\nRESULT_STATUS: complete\n" + COMPLETE, review_of="author")
         self.task("plain", "APPROVED\nRESULT_STATUS: complete\nfine")
+        self.task("rv-check", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [note] no count. Closes by: check\n" + COMPLETE, review_of="author")
+        self.task("rv-code", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong. Closes by: code\n" + COMPLETE, review_of="author")
         requests = [{"id": 1, "method": "initialize", "params": {}}, {"method": "notifications/initialized"}]
-        for n, ident in enumerate(("rv", "rv-ok", "plain"), start=2):
+        for n, ident in enumerate(("rv", "rv-ok", "plain", "rv-check", "rv-code"), start=2):
             requests.append({"id": n, "method": "tools/call", "params": {"name": "collect_result", "arguments": {"id": ident}}})
         fake = Path(self.tmp.name, "fakebin")
         fake.mkdir()
@@ -297,6 +335,9 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn("no Coverage section", body(2))
         self.assertNotIn("NOT AN APPROVAL", body(3))
         self.assertNotIn("NOT AN APPROVAL", body(4))
+        for words in ("NOT A REJECTION AND NOT AN APPROVAL", "Closes by: code", "tp-agent review author"):
+            self.assertIn(words, body(5))
+        self.assertNotIn("NOT A REJECTION", body(6))  # a code finding is a rejection
 
     # the instruction to the reviewer
     def test_tp_review_still_tells_every_reviewer_to_end_with_coverage(self):

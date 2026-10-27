@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tp-review — spawn an independent reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>
+# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] <task-id>
 #
 # Asks the model router for a review plan (tp-route --review-plan): whether a review is needed
 # (the larger of a deterministic policy over role, files touched, level and effort and the
@@ -51,7 +51,7 @@ usage() {
   echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
   exit "${1:-1}"
 }
-force=0 force_alive=0 plan_opts=() same_provider=0 approval="" evidence=() contract=""
+force=0 force_alive=0 plan_opts=() same_provider=0 approval="" evidence=() contract="" have_contract=0   # have_contract, not -n "$contract": an empty value is a missing file, not no contract
 [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage 0
 while [[ $# -gt 1 ]]; do
   case "$1" in
@@ -64,8 +64,8 @@ while [[ $# -gt 1 ]]; do
     --evidence) [[ $# -gt 2 ]] || usage; evidence+=("$2"); shift 2 ;;
     --contract)
       [[ $# -gt 2 ]] || usage
-      [[ -z "$contract" ]] || { echo "tp-review: --contract may be given only once" >&2; usage; }
-      contract="$2"; shift 2 ;;
+      [[ "$have_contract" == 0 ]] || { echo "tp-review: --contract may be given only once" >&2; usage; }
+      have_contract=1; contract="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -106,8 +106,8 @@ if empty: refuse("is empty")
 PYEOF
 )" || die "$why"
 }
-for f in ${evidence[@]+"${evidence[@]}"}; do check_supplied --evidence "$f"; done
-if [[ -n "$contract" ]]; then check_supplied --contract "$contract"; fi
+for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
+if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi
 if [[ "$same_provider" == 1 ]]; then
   [[ -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
   plan_opts+=(--same-provider --approved-by-user "$approval")
@@ -220,7 +220,7 @@ fi
 if (( ${#evidence[@]} > 0 )); then
   review_task="$review_task Main (the orchestrator) attached ${#evidence[@]} evidence file(s) after the author's material, each under a heading that reads 'Evidence supplied by Main: <file name>'. That evidence was produced by the orchestrator, not the author, and tp-review has not checked it: it can be checked like any other claim, so check it where you can, and say which finding or Owed-before-close item it answers."
 fi
-if [[ -n "$contract" ]]; then
+if [[ "$have_contract" == 1 ]]; then
   review_task="$review_task Main attached a reviewer contract under the heading 'Reviewer contract (supplied by Main)'. Judge the work against that contract together with the task."
 fi
 
@@ -290,11 +290,12 @@ attach_supplied() {  # <file> <heading> <note, may be empty> <label>
   { printf '# %s\n\n' "$2"; [[ -z "$3" ]] || printf '%s\n\n' "$3"; cat -- "$1"; } > "$out" || die "cannot read '$1' to attach it to the review"
   add_segments "$out" "$4" "$1"
 }
-for f in ${evidence[@]+"${evidence[@]}"}; do
+for ((i = 0; i < ${#evidence[@]}; i++)); do
+  f="${evidence[$i]}"
   supplied_n=$(( supplied_n + 1 ))
   attach_supplied "$f" "Evidence supplied by Main: $(basename "$f")" "(Produced by the orchestrator, not the author. Check it like any other claim.)" "main-evidence-$(printf '%02d' "$supplied_n")"
 done
-if [[ -n "$contract" ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
+if [[ "$have_contract" == 1 ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
 # The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
 # The scope text is sized to the packet's remaining headroom. Any overflow list goes to $dir/review-changed-files.txt (named in the assignment, not attached, so it cannot exceed the packet budget).
 # Never fails the review: when the list cannot be made, the assignment says so in one line.

@@ -895,6 +895,15 @@ echo review-1
         self.assertIn("usage:", r.stderr)
         self.assertFalse((self.plan.parent / "spawn.args").exists())
 
+    def test_an_empty_flag_value_is_a_missing_file_for_both_flags(self):
+        for flag in ("--contract", "--evidence"):
+            with self.subTest(flag=flag):
+                r = self.review(flag, "")
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(flag, r.stderr)
+                self.assertFalse((self.plan.parent / "route.args").exists())
+                self.assertFalse((self.plan.parent / "spawn.args").exists())
+
     def test_a_large_file_is_split_into_labelled_segments_that_hold_every_character(self):
         text = "".join(chr(97 + i % 26) for i in range(100000)) + "EVIDENCE-TAIL"
         r = self.review("--evidence", self.supplied("big.txt", text))
@@ -943,6 +952,20 @@ echo review-1
         r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1"], text=True, capture_output=True, env=self.env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(record.read_text().splitlines(), ["w1"])  # no flags, none passed
+
+    def test_tp_agent_review_refuses_a_repeated_or_empty_contract_and_starts_no_reviewer(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        c1, c2 = self.supplied("c1.md"), self.supplied("c2.md")
+        for contracts in ((c1, c2), (str(self.work / "missing.md"), c2)):
+            with self.subTest(contracts=contracts):
+                r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", *[a for c in contracts for a in ("--contract", c)]],
+                                   text=True, capture_output=True, env=self.env)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("--contract may be given only once", r.stderr)
+                self.assertFalse(record.exists())
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--contract", ""], text=True, capture_output=True, env=self.env)
+        self.assertEqual(record.read_text().splitlines(), ["--contract", "", "w1"])  # an empty value reaches tp-review, which refuses it
 
 
 if __name__ == "__main__":

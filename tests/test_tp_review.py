@@ -1072,6 +1072,43 @@ echo review-1
         self.assertIn("section headed Acceptance criteria", self.task_text())
         self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2]})
 
+    def test_a_request_that_names_a_brief_gets_its_list_and_the_reply_is_held_to_it(self):
+        brief = self.supplied("brief.md", "# Brief\n\n## Done means\n1. a\n2. b\n3. c\n")
+        self.set_brief(f"Read and carry out the brief {brief} in full.\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("section headed Acceptance criteria", self.task_text())
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3]})
+        review = self.state / "tasks" / "review-1"
+        base = "APPROVED\nRESULT_STATUS: complete\n%sCoverage\nI reviewed a.py and checked its callers and tests.\n"
+        for section, complete in (("", False), ("## Acceptance criteria\n1. met\n2. met\n3. met\n\n", True)):
+            (review / "result.md").write_text(base % section)
+            out = subprocess.run([sys.executable, str(self.root / "lib/review_verdict.py"), str(review / "result.md")], text=True, capture_output=True)
+            self.assertEqual(json.loads(out.stdout)["complete"], complete, out.stdout)
+
+    def test_a_named_brief_that_is_missing_or_refused_is_noted_not_an_error(self):
+        env = self.work / ".env.md"
+        env.write_text("## Done means\n1. SECRET-LIST\n")
+        gone = str(self.work / "gone.md")
+        self.set_brief(f"Read the brief {gone} and {env}\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        self.assertIn(f"{gone}", task)
+        self.assertIn("does not exist", task)
+        self.assertIn(f"{env}", task)
+        self.assertIn("is a .env file", task)
+        self.assertNotIn("SECRET-LIST", task)
+        self.assertNotIn("section headed Acceptance criteria", task)
+        self.assertFalse(self.marker().exists())
+
+    def test_the_request_list_the_named_briefs_and_the_contract_are_merged(self):
+        brief = self.supplied("brief.md", "## Done means\n1. a\n2. b\n3. c\n4. d\n")
+        self.set_brief(f"## Done means\n1. a\n2. b\n\nRead the brief {brief}\n")
+        r = self.review("--contract", self.supplied("c.md", "**Acceptance criteria**\n1. x\n5. y\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3, 4, 5]})
+
     def test_without_a_numbered_list_the_rule_is_absent_and_no_marker_is_written(self):
         self.set_brief("Do it.\n\n## Done means\n- a bullet\n")
         r = self.review("--contract", self.supplied("c.md", "judge it well\n"))

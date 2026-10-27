@@ -23,6 +23,7 @@ section names fewer item numbers than the list has (acceptance_problem). With no
 usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null,
        "closes_by": [label, ...], "unusable_reason": str|null};
        exits 1 and says why when the reply is not a verdict or the file cannot be read
+       review_verdict.py briefs <request.md>   prints {"briefs": [path, ...]}: the absolute .md paths the request names (bin/tp-review)
        review_verdict.py acceptance <file>...   prints {"items": [n, ...]}: the acceptance criteria numbers in those files (bin/tp-review)
 """
 import json
@@ -234,6 +235,20 @@ def acceptance_items(*texts):
     return sorted(found)
 
 
+# An absolute path ending in .md in a request ("Read and carry out the brief /abs/path.md"): no space, quote, bracket or comma in it
+_NAMED_BRIEF = re.compile(r"(?<![\w.~/-])(/[^\s`'\"<>()\[\]|,;]+\.md)(?![\w/-]|\.\w)")
+
+
+def named_briefs(request):
+    """The absolute paths ending in .md that `request` names, in order of first appearance, each once. Only names: whether a
+    path may be read is bin/tp-review's check (the one --contract gets)."""
+    found = []
+    for match in _NAMED_BRIEF.finditer(request):
+        if match.group(1) not in found:
+            found.append(match.group(1))
+    return found
+
+
 def acceptance_problem(text, items):
     """Why `text` does not account for the acceptance criteria numbered `items`, or None. The reply needs a section that is only
     the words Acceptance criteria (as Coverage is found) whose lines name every item number. This counts numbers; it cannot tell
@@ -249,7 +264,7 @@ def acceptance_problem(text, items):
         return f"the review has no Acceptance criteria section (the task listed item(s) {', '.join(map(str, items))})"
     named = set()
     for line in lines[starts[-1] + 1:]:
-        if re.match(r"^[ \t]{0,3}#{1,6}[ \t]", line):
+        if _ANY_HEADING.match(line) or COVERAGE_HEADING.match(line):  # the lines coverage_problem and the list reader treat as a heading
             break
         if row := _REPLY_ROW.match(line):
             named.add(int(row.group(1)))
@@ -331,6 +346,13 @@ def approves(text):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "briefs":  # for bin/tp-review: the .md paths a request names
+        try:
+            print(json.dumps({"briefs": named_briefs(open(sys.argv[2], encoding="utf-8", errors="replace").read())}))
+        except OSError as exc:
+            print(f"review_verdict: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "acceptance":  # for bin/tp-review: the item numbers of the brief and contract files
         try:
             texts = [open(path, encoding="utf-8", errors="replace").read() for path in sys.argv[2:]]

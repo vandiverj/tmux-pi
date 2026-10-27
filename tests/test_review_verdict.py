@@ -203,6 +203,33 @@ class AcceptanceCriteriaTests(unittest.TestCase):
                 self.assertIn(fragment, problem)
                 self.assertFalse(review_verdict.approves(text))
 
+    def test_the_section_ends_at_the_next_heading_and_later_numbers_do_not_count(self):
+        for name, after in (("plain Coverage", "Coverage\n2. later row about a.py and its tests\n"),
+                            ("bold-only line", "**Notes**\n2. a note, not a row\n"),
+                            ("markdown heading", "## Notes\n2. a note, not a row\n")):
+            with self.subTest(name):
+                text = review_verdict.ReviewText(reply("## Acceptance criteria\n1. met - a.py:3\n" + after), [1, 2])
+                problem = review_verdict.assess(text)[2]
+                self.assertIn("item 2", problem or "")
+                self.assertFalse(review_verdict.approves(text))
+
+    def test_rows_before_the_ending_heading_still_count(self):
+        text = review_verdict.ReviewText(reply("## Acceptance criteria\n1. met - a\n2. met - b\n\n**Notes**\n3. other\n"), [1, 2])
+        self.assertIsNone(review_verdict.assess(text)[2])
+
+    def test_briefs_named_in_a_request_are_the_absolute_md_paths_in_it(self):
+        request = "Read and carry out the brief /x/dir/brief.md in full. Also `/y/other.md`, (/z/c.md) and /w/n.md. Not a.md, ./b.md or /x/dir/brief.md.txt or /q/r.mdx\n"
+        self.assertEqual(review_verdict.named_briefs(request), ["/x/dir/brief.md", "/y/other.md", "/z/c.md", "/w/n.md"])
+        self.assertEqual(review_verdict.named_briefs("/x/brief.md and /x/brief.md\n"), ["/x/brief.md"])
+        self.assertEqual(review_verdict.named_briefs("nothing here"), [])
+
+    def test_the_briefs_command_prints_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = Path(tmp, "request.md")
+            request.write_text("Read and carry out the brief /x/brief.md\n")
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), "briefs", str(request)], capture_output=True, text=True)
+            self.assertEqual(json.loads(out.stdout), {"briefs": ["/x/brief.md"]})
+
     def test_a_missing_item_names_only_the_missing_numbers(self):
         problem = review_verdict.assess(review_verdict.ReviewText(reply("## Acceptance criteria\n1. met\n3. met\n"), [1, 2, 3]))[2]
         self.assertIn("item 2", problem)

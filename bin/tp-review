@@ -35,8 +35,9 @@
 # cannot hold them is refused, never trimmed. A file that is missing, not a regular file, unreadable or empty, one named `.env*`,
 # and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules,
 # except the acceptance rule below.
-# Acceptance criteria: when the task's request, or the --contract file, has a numbered list under a heading `Done means` or `Acceptance
-# criteria`, the task text asks for a section headed `Acceptance criteria` with one line per item (number; met, not met or not
+# Acceptance criteria: when the task's request, a brief the request names (every absolute path ending in .md that passes the checks
+# --contract gets; one that does not is noted in the task text as not read, never an error), or the --contract file, has a numbered list
+# under a heading `Done means` or `Acceptance criteria` (the lists are merged; an item number counts once), the task text asks for a section headed `Acceptance criteria` with one line per item (number; met, not met or not
 # checked; evidence), and the item numbers are recorded beside the review's result (acceptance-items.json) so that
 # lib/review_verdict.py calls a reply without that section, or naming fewer item numbers, incomplete. Without such a list nothing changes.
 # A lane task's changed-file list and scoped commands start from the lane's last closed step (the lane base when it has none, or its
@@ -59,7 +60,7 @@ usage() {
   echo "  --evidence FILE (repeatable): attach a check output Main produced to the packet, under 'Evidence supplied by Main: <file name>'; the reviewer is told it is not the author's" >&2
   echo "  --contract FILE (once): attach the reviewer contract under 'Reviewer contract (supplied by Main)'; the reviewer judges the work against it with the task" >&2
   echo "  --dispositions FILE (once): attach what Main ruled on in earlier rounds under 'Dispositions of earlier findings (supplied by Main)'; a finding listed there is closed unless the tree changed in a way that reopens it" >&2
-  echo "  a numbered list under 'Done means' or 'Acceptance criteria' in the request or the contract makes the reviewer answer each item in an 'Acceptance criteria' section (a reply without it is incomplete)" >&2
+  echo "  a numbered list under 'Done means' or 'Acceptance criteria' in the request, a .md brief it names, or the contract makes the reviewer answer each item in an 'Acceptance criteria' section (a reply without it is incomplete)" >&2
   echo "  --same-provider --approved-by-user QUOTE: review on the author's own provider, only with the user's approval (quoted, recorded)" >&2
   echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
   exit "${1:-1}"
@@ -94,7 +95,12 @@ id="$1"
 # home in the password database (never $HOME); a link is judged by where it leads.
 check_supplied() {
   local why
-  why="$(python3 - "$1" "$2" <<'PYEOF'
+  why="$(supplied_problem "$1" "$2")" || die "$why"
+}
+# supplied_problem <flag> <file>: prints why the file is refused and returns 1, or prints nothing. A brief the request names is
+# judged by the same code but is only noted when refused (below).
+supplied_problem() {
+  python3 - "$1" "$2" <<'PYEOF'
 import os, pwd, sys, unicodedata
 flag, path = sys.argv[1], sys.argv[2]
 def fold(p): return unicodedata.normalize("NFC", p).casefold()
@@ -121,7 +127,6 @@ except OSError:
     refuse("cannot be read")
 if empty: refuse("is empty")
 PYEOF
-)" || die "$why"
 }
 for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
 if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi
@@ -247,10 +252,27 @@ fi
 # A numbered Done means / Acceptance criteria list in the request or the contract: the reply must account for each item, and
 # lib/review_verdict.py holds it to that through the item numbers recorded beside the review's result (below, after the start).
 acceptance='{"items":[]}' ac_sources=()
-if [[ -f "$dir/request.md" ]]; then ac_sources+=("$dir/request.md"); fi
+unread_briefs=""
+if [[ -f "$dir/request.md" ]]; then
+  ac_sources+=("$dir/request.md")
+  # A request usually says "Read and carry out the brief /abs/path.md": the list is in that brief. Each .md path it names is read
+  # when it passes the checks --contract gets; one that does not is not an error, the task text says it was not read and why.
+  named="$(python3 "$ROOT/lib/review_verdict.py" briefs "$dir/request.md")" || die "cannot read the request of '$id'"
+  while IFS= read -r brief; do
+    [[ -n "$brief" ]] || continue
+    if why="$(supplied_problem "A brief the request names:" "$brief")"; then
+      ac_sources+=("$brief")
+    else
+      unread_briefs="$unread_briefs ${why//$'\n'/ }"
+    fi
+  done < <(jq -r '.briefs[]' <<<"$named")
+fi
 if [[ "$have_contract" == 1 ]]; then ac_sources+=("$contract"); fi
 if (( ${#ac_sources[@]} > 0 )); then
   acceptance="$(python3 "$ROOT/lib/review_verdict.py" acceptance "${ac_sources[@]}")" || die "cannot read the acceptance criteria of '$id'"
+fi
+if [[ -n "$unread_briefs" ]]; then
+  review_task="$review_task Briefs the request names that tp-review did not read for the acceptance list:$unread_briefs."
 fi
 ac_count="$(jq -r '.items | length' <<<"$acceptance")"
 if (( ac_count > 0 )); then

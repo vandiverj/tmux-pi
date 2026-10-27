@@ -544,6 +544,26 @@ class TimerWaitsTests(unittest.TestCase):
         self.assertIn("Timer waits in added test lines", text)
         self.assertIn("not a git repository", text)
 
+    def test_past_the_cap_every_line_is_still_listed_as_path_and_line_and_the_header_counts(self):
+        cap = review_rounds.MAX_TIMER_LINES
+        self.put("src/foo_test.ts", "".join(f"sleep({n})\n" for n in range(cap + 1)))
+        text = self.waits()
+        entries = [line for line in text.splitlines() if line.startswith("src/foo_test.ts:")]
+        self.assertEqual(len(entries), cap + 1)
+        self.assertEqual(entries[-1], f"src/foo_test.ts:{cap + 1}")
+        self.assertEqual(entries[cap - 1], f"src/foo_test.ts:{cap}: sleep({cap - 1})")
+        self.assertIn(f"{cap + 1} matching added line(s); 1 listed as path:line without their text", text.splitlines()[2])
+
+    def test_at_or_under_the_cap_the_header_says_none_lack_text(self):
+        self.put("src/foo_test.ts", "sleep(1)\n")
+        self.assertIn("1 matching added line(s); 0 listed as path:line without their text", self.waits())
+
+    def test_a_long_matching_line_is_cut_at_400_with_the_mark(self):
+        self.put("src/foo_test.ts", "sleep(1) " + "x" * 491 + "\n")
+        text = self.waits()
+        self.assertIn("src/foo_test.ts:1: sleep(1) " + "x" * 391 + "… (truncated, 500 chars)", text)
+        self.assertNotIn("x" * 392, text)
+
     def test_the_command_writes_the_file(self):
         self.put("src/foo_test.ts", "await sleep(50)\n")
         out = self.work.parent / "timers.md"

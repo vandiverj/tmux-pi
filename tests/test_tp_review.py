@@ -798,6 +798,175 @@ echo review-1
         self.assertIn("could not start", r.stderr)
         self.assertFalse((self.plan.parent / "spawn.args").exists())
 
+    # --evidence / --contract: what Main hands the reviewer (P3, R8)
+    def supplied(self, name, text="line one\nline two\n"):
+        path = self.work / name
+        path.write_text(text)
+        return str(path)
+
+    def test_evidence_is_attached_under_its_heading_with_its_full_text_and_the_task_names_it(self):
+        a = self.supplied("a.txt", "COUNT: 42\nlog line\n")
+        r = self.review("--evidence", a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertIn("Evidence supplied by Main: a.txt", body)
+        self.assertIn("COUNT: 42\nlog line\n", body)
+        self.assertIn("produced by the orchestrator, not the author", self.task_text())
+        self.assertIn("checked like any other claim", self.task_text())
+        self.assertNotIn("Reviewer contract", self.task_text())
+
+    def test_two_evidence_files_are_attached_in_the_order_given(self):
+        b = self.supplied("b.txt", "BBB-TEXT\n")
+        a = self.supplied("a.txt", "AAA-TEXT\n")
+        r = self.review("--evidence", b, "--evidence", a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertLess(body.index("Evidence supplied by Main: b.txt"), body.index("BBB-TEXT"))
+        self.assertLess(body.index("BBB-TEXT"), body.index("Evidence supplied by Main: a.txt"))
+        self.assertLess(body.index("Evidence supplied by Main: a.txt"), body.index("AAA-TEXT"))
+        self.assertIn("2 evidence file(s)", self.task_text())
+
+    def test_a_contract_is_attached_and_the_task_says_to_judge_against_it(self):
+        c = self.supplied("c.md", "The reviewer must check X.\n")
+        r = self.review("--contract", c)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertIn("Reviewer contract (supplied by Main)", body)
+        self.assertIn("The reviewer must check X.\n", body)
+        self.assertIn("Judge the work against that contract together with the task", self.task_text())
+        self.assertNotIn("Evidence supplied by Main", self.task_text())
+
+    def test_a_missing_or_empty_file_is_refused_naming_it_and_no_reviewer_starts(self):
+        missing = str(self.work / "missing.txt")
+        empty = self.supplied("empty.txt", "")
+        folder = self.work / "dir.txt"
+        folder.mkdir()
+        for flag in ("--evidence", "--contract"):
+            for path, why in ((missing, "does not exist"), (empty, "is empty"), (str(folder), "not a regular file")):
+                with self.subTest(flag=flag, path=path):
+                    r = self.review(flag, path)
+                    self.assertEqual(r.returncode, 1)
+                    self.assertIn(f"'{path}'", r.stderr)
+                    self.assertIn(why, r.stderr)
+                    self.assertFalse((self.plan.parent / "route.args").exists())  # refused before any plan
+                    self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_an_unreadable_file_is_refused_naming_it(self):
+        locked = self.supplied("locked.txt")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        if os.access(locked, os.R_OK):
+            self.skipTest("running as a user that reads everything")
+        r = self.review("--evidence", locked)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"'{locked}'", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_a_dotenv_file_and_a_link_to_one_are_refused(self):
+        env_file = self.supplied(".env.local", "KEY=value\n")
+        link = self.work / "notes.txt"
+        link.symlink_to(env_file)
+        for path in (env_file, str(link)):
+            with self.subTest(path=path):
+                r = self.review("--evidence", path)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(f"'{path}'", r.stderr)
+                self.assertIn(".env", r.stderr)
+                self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_a_file_inside_the_trust_store_is_refused_even_when_it_is_named_by_a_link(self):
+        import pwd
+        store = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/tmux-pi/trust"
+        link = self.work / "t.txt"
+        link.symlink_to(store / "nothing-here.json")  # never created or read: the place alone refuses
+        for path in (str(store / "nothing-here.json"), str(link)):
+            with self.subTest(path=path):
+                r = self.review("--evidence", path)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(f"'{path}'", r.stderr)
+                self.assertIn("trust store", r.stderr)
+                self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_the_contract_may_be_given_only_once(self):
+        c1, c2 = self.supplied("c1.md"), self.supplied("c2.md")
+        r = self.review("--contract", c1, "--contract", c2)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--contract may be given only once", r.stderr)
+        self.assertIn("usage:", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_an_empty_flag_value_is_a_missing_file_for_both_flags(self):
+        for flag in ("--contract", "--evidence"):
+            with self.subTest(flag=flag):
+                r = self.review(flag, "")
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(flag, r.stderr)
+                self.assertFalse((self.plan.parent / "route.args").exists())
+                self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_a_large_file_is_split_into_labelled_segments_that_hold_every_character(self):
+        text = "".join(chr(97 + i % 26) for i in range(100000)) + "EVIDENCE-TAIL"
+        r = self.review("--evidence", self.supplied("big.txt", text))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        segs = [p for p in self.spawn_contexts() if "main-evidence" in Path(p).name]
+        self.assertEqual(len(segs), 2)
+        first = self.copy(segs[0]).read_text()
+        self.assertIn("Review segment 1 of 2 of main-evidence-01", first)
+        self.assertIn("big.txt", first)
+        pieces = [self.copy(p).read_text().split("]\n\n", 1)[1] for p in segs]
+        self.assertIn("Evidence supplied by Main: big.txt", pieces[0])
+        self.assertTrue(("".join(pieces)).endswith(text))
+        self.assertFalse(any(Path(p).exists() for p in segs))  # removed after the start
+
+    def test_evidence_that_overflows_the_packet_budget_is_refused_without_trimming(self):
+        (self.task / "packet.md").write_text("p" * 200000)
+        r = self.review("--evidence", self.supplied("big.txt", "e" * 150000))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without dropping author evidence", r.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertEqual(self.leftover(), [])
+        (self.task / "packet.md").write_text("p" * 20000)  # the same evidence fits beside a smaller packet
+        self.assertEqual(self.review("--evidence", str(self.work / "big.txt")).returncode, 0)
+
+    def test_a_contract_counts_against_the_budget_too(self):
+        (self.task / "packet.md").write_text("p" * 200000)
+        r = self.review("--contract", self.supplied("c.md", "c" * 150000))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without dropping author evidence", r.stderr)
+
+    def test_without_the_new_flags_the_packet_and_the_task_text_have_nothing_of_them(self):
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md"])
+        for word in ("Main", "evidence file", "Reviewer contract"):
+            self.assertNotIn(word, self.task_text())
+
+    def test_tp_agent_review_passes_both_flags_to_tp_review(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        a, b, c = self.supplied("a.txt"), self.supplied("b.txt"), self.supplied("c.md")
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--evidence", a, "--evidence", b, "--contract", c],
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text().splitlines(), ["--evidence", a, "--evidence", b, "--contract", c, "w1"])
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1"], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text().splitlines(), ["w1"])  # no flags, none passed
+
+    def test_tp_agent_review_refuses_a_repeated_or_empty_contract_and_starts_no_reviewer(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        c1, c2 = self.supplied("c1.md"), self.supplied("c2.md")
+        for contracts in ((c1, c2), (str(self.work / "missing.md"), c2)):
+            with self.subTest(contracts=contracts):
+                r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", *[a for c in contracts for a in ("--contract", c)]],
+                                   text=True, capture_output=True, env=self.env)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("--contract may be given only once", r.stderr)
+                self.assertFalse(record.exists())
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--contract", ""], text=True, capture_output=True, env=self.env)
+        self.assertEqual(record.read_text().splitlines(), ["--contract", "", "w1"])  # an empty value reaches tp-review, which refuses it
+
 
 if __name__ == "__main__":
     unittest.main()

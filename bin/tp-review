@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tp-review — spawn an independent reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>
+# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] <task-id>
 #
 # Asks the model router for a review plan (tp-route --review-plan): whether a review is needed
 # (the larger of a deterministic policy over role, files touched, level and effort and the
@@ -22,6 +22,15 @@
 # --same-provider --approved-by-user "QUOTE": a reviewer from the author's own provider, for when the user has approved that (for
 # example the other provider is out of credits). The quote is required and recorded; the plan, the author's record and the
 # reviewer's packet say `same_provider_user_approved`. The default is unchanged: no silent same-provider substitute.
+# --evidence FILE (repeatable): Main attaches a check output (a count, log or command output the author's report lacks, for
+# example what a `Closes by: check` note asked for) to the packet, in order, each under the heading `Evidence supplied by Main:
+# <file name>`. The task text tells the reviewer it was produced by the orchestrator, not the author, and can be checked like any
+# other claim. tp-review attaches it as it is and does not check that it is true.
+# --contract FILE (once): Main attaches the reviewer contract (for a review started without a brief) under `Reviewer contract
+# (supplied by Main)`; the task text says to judge the work against it together with the task.
+# Both count against the packet budget like the author's evidence and are split into labelled segments when large; a packet that
+# cannot hold them is refused, never trimmed. A file that is missing, not a regular file, unreadable or empty, one named `.env*`,
+# and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules.
 # Prints the review task id.
 set -euo pipefail
 
@@ -35,12 +44,14 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
 usage() {
-  echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] <task-id>" >&2
+  echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] <task-id>" >&2
+  echo "  --evidence FILE (repeatable): attach a check output Main produced to the packet, under 'Evidence supplied by Main: <file name>'; the reviewer is told it is not the author's" >&2
+  echo "  --contract FILE (once): attach the reviewer contract under 'Reviewer contract (supplied by Main)'; the reviewer judges the work against it with the task" >&2
   echo "  --same-provider --approved-by-user QUOTE: review on the author's own provider, only with the user's approval (quoted, recorded)" >&2
   echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
   exit "${1:-1}"
 }
-force=0 force_alive=0 plan_opts=() same_provider=0 approval=""
+force=0 force_alive=0 plan_opts=() same_provider=0 approval="" evidence=() contract="" have_contract=0   # have_contract, not -n "$contract": an empty value is a missing file, not no contract
 [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage 0
 while [[ $# -gt 1 ]]; do
   case "$1" in
@@ -50,11 +61,53 @@ while [[ $# -gt 1 ]]; do
     --same-provider) same_provider=1; shift ;;
     --approved-by-user) [[ $# -gt 2 ]] || usage; approval="$2"; shift 2 ;;
     --level|--thinking) [[ $# -gt 2 ]] || usage; plan_opts+=("$1" "$2"); shift 2 ;;
+    --evidence) [[ $# -gt 2 ]] || usage; evidence+=("$2"); shift 2 ;;
+    --contract)
+      [[ $# -gt 2 ]] || usage
+      [[ "$have_contract" == 0 ]] || { echo "tp-review: --contract may be given only once" >&2; usage; }
+      have_contract=1; contract="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 [[ $# -eq 1 ]] || usage
 id="$1"
+# Files Main supplies are checked before anything else happens, so a bad one starts no reviewer.
+# check_supplied <flag> <file>: refuses (naming the file) a file that is a secret or inside the trust store, missing, not a
+# regular file, unreadable or empty. The trust store is ~/.config/tmux-pi/trust and ~/.config/tmux-pi/state/trust under the
+# home in the password database (never $HOME); a link is judged by where it leads.
+check_supplied() {
+  local why
+  why="$(python3 - "$1" "$2" <<'PYEOF'
+import os, pwd, sys, unicodedata
+flag, path = sys.argv[1], sys.argv[2]
+def fold(p): return unicodedata.normalize("NFC", p).casefold()
+def refuse(reason):
+    print(f"{flag} file '{path}' {reason}; refused"); sys.exit(1)
+if not path.strip(): refuse("is not a file name")
+try:
+    real = os.path.realpath(path)
+except (OSError, ValueError):
+    refuse("cannot be resolved")
+home = pwd.getpwuid(os.getuid()).pw_dir
+for store in (".config/tmux-pi/trust", ".config/tmux-pi/state/trust"):
+    root = fold(os.path.realpath(os.path.join(home, store)))
+    for p in (fold(real), fold(os.path.abspath(path))):
+        if p == root or p.startswith(root + os.sep): refuse("is inside the trust store")
+for name in (os.path.basename(path), os.path.basename(real)):
+    if name.lower().startswith(".env"): refuse("is a .env file")
+if not os.path.exists(path): refuse("does not exist")
+if not os.path.isfile(path): refuse("is not a regular file")
+try:
+    with open(path, "rb") as f:
+        empty = not f.read(1)
+except OSError:
+    refuse("cannot be read")
+if empty: refuse("is empty")
+PYEOF
+)" || die "$why"
+}
+for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
+if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi
 if [[ "$same_provider" == 1 ]]; then
   [[ -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
   plan_opts+=(--same-provider --approved-by-user "$approval")
@@ -164,6 +217,12 @@ if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
   review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. $outside_rule $findings_rule $report_coverage_rule $verdict_rule a brief rationale or the findings (unsupported or wrong claims first)."
   extra=(--note "Research report: $report")
 fi
+if (( ${#evidence[@]} > 0 )); then
+  review_task="$review_task Main (the orchestrator) attached ${#evidence[@]} evidence file(s) after the author's material, each under a heading that reads 'Evidence supplied by Main: <file name>'. That evidence was produced by the orchestrator, not the author, and tp-review has not checked it: it can be checked like any other claim, so check it where you can, and say which finding or Owed-before-close item it answers."
+fi
+if [[ "$have_contract" == 1 ]]; then
+  review_task="$review_task Main attached a reviewer contract under the heading 'Reviewer contract (supplied by Main)'. Judge the work against that contract together with the task."
+fi
 
 # Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
 followups=()
@@ -178,14 +237,14 @@ cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
 trap cleanup_excerpts EXIT
 ctx_list=()
 excerpt_dir="$(mktemp -d)"
-# add_segments <file> <label>: appends context paths to ctx_list (runs in this shell,
-# so excerpt_dir and ctx_list survive for cleanup and spawning).
+# add_segments <file> <label> [origin]: appends context paths to ctx_list (runs in this shell,
+# so excerpt_dir and ctx_list survive for cleanup and spawning). origin is the path a segment label names (default: the file).
 add_segments() {
   local list line
   list="$excerpt_dir/$2.list"
-  python3 - "$1" "$excerpt_dir" "$2" "$max_file" > "$list" <<'PYEOF' || die "cannot split '$1' for review"
+  python3 - "$1" "$excerpt_dir" "$2" "$max_file" "${3:-$1}" > "$list" <<'PYEOF' || die "cannot split '$1' for review"
 import sys
-path, outdir, label, limit = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+path, outdir, label, limit, origin = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
 text = open(path, encoding="utf-8", errors="surrogateescape").read()
 def size(t): return len(t.encode("utf-8", "surrogateescape"))
 if size(text) <= limit:
@@ -198,7 +257,7 @@ while i < len(text):
     segs.append((i, j)); i = j
 for n, (a, b) in enumerate(segs, 1):
     out = f"{outdir}/{label}-{n:02d}-of-{len(segs):02d}.md"
-    head = (f"[Review segment {n} of {len(segs)} of {label}; original path: {path}; "
+    head = (f"[Review segment {n} of {len(segs)} of {label}; original path: {origin}; "
             f"characters {a}-{b} of {len(text)}. Segments are complete and in order; none omitted.]\n\n")
     with open(out, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(head + text[a:b])
     print(out)
@@ -223,6 +282,20 @@ done < <(jq -r '.withheld[]' <<<"$rounds")
 redactions="$(jq -r '.redactions' <<<"$rounds")"
 if (( redactions > 0 )); then echo "tp-review: $redactions secret-like value(s) in the earlier findings and diff were replaced with placeholders" >&2; fi
 while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -r '.contexts[]' <<<"$rounds")
+# What Main supplied: each file is copied under its heading, then split like the author's evidence when large. A segment's label
+# names the file Main gave. The evidence comes first, in the order given, then the contract.
+supplied_n=0
+attach_supplied() {  # <file> <heading> <note, may be empty> <label>
+  local out="$excerpt_dir/$4.md"
+  { printf '# %s\n\n' "$2"; [[ -z "$3" ]] || printf '%s\n\n' "$3"; cat -- "$1"; } > "$out" || die "cannot read '$1' to attach it to the review"
+  add_segments "$out" "$4" "$1"
+}
+for ((i = 0; i < ${#evidence[@]}; i++)); do
+  f="${evidence[$i]}"
+  supplied_n=$(( supplied_n + 1 ))
+  attach_supplied "$f" "Evidence supplied by Main: $(basename "$f")" "(Produced by the orchestrator, not the author. Check it like any other claim.)" "main-evidence-$(printf '%02d' "$supplied_n")"
+done
+if [[ "$have_contract" == 1 ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
 # The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
 # The scope text is sized to the packet's remaining headroom. Any overflow list goes to $dir/review-changed-files.txt (named in the assignment, not attached, so it cannot exceed the packet budget).
 # Never fails the review: when the list cannot be made, the assignment says so in one line.

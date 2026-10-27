@@ -45,6 +45,7 @@ KINDS = ("work", "integration")
 STATES = ("open", "integrating", "integrated", "abandoned")
 DEPS = ("shared", "own")  # shared: node_modules are symlinks to the main checkout's (lib/lane_deps.py)
 VERDICTS = ("APPROVED", "APPROVED_WITH_NOTES")
+OWNER_OVERRIDE = "OWNER_OVERRIDE"  # the verdict of a step the owner closed over a review that asked for changes (lane close --override-review)
 EMPTY = "EMPTY"  # the verdict of a step closed without a review because its work left the tree as the last closed commit had it
 LANE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 RESERVED_NAMES = ("archive",)  # lane_names skips this directory, so a lane called so would be invisible to the count
@@ -228,10 +229,17 @@ def _closed_entry(value, index):
             raise ValueError(f"{where}.review {value['review']!r} must be null for an {EMPTY} step")
     elif not isinstance(value["review"], str) or not TASK_ID.fullmatch(value["review"]):
         raise ValueError(f"{where}.review {value['review']!r} is not a task id")
-    if not empty and value["verdict"] not in VERDICTS:
-        raise ValueError(f"{where}.verdict {value['verdict']!r} is not one of {', '.join(VERDICTS)} (or {EMPTY})")
-    return {"step": value["step"], "commit": _hex(value["commit"], f"{where}.commit"), "tree": _hex(value["tree"], f"{where}.tree"),
-            "review": value["review"], "verdict": value["verdict"], "closed_at": _timestamp(value["closed_at"], f"{where}.closed_at")}
+    overridden = value["verdict"] == OWNER_OVERRIDE
+    if not empty and not overridden and value["verdict"] not in VERDICTS:
+        raise ValueError(f"{where}.verdict {value['verdict']!r} is not one of {', '.join(VERDICTS)} (or {EMPTY}, {OWNER_OVERRIDE})")
+    entry = {"step": value["step"], "commit": _hex(value["commit"], f"{where}.commit"), "tree": _hex(value["tree"], f"{where}.tree"),
+             "review": value["review"], "verdict": value["verdict"], "closed_at": _timestamp(value["closed_at"], f"{where}.closed_at")}
+    if overridden:
+        reason = value.get("override_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"{where}.override_reason must say why the owner closed over the review ({OWNER_OVERRIDE})")
+        entry["override_reason"] = reason
+    return entry
 
 
 def lane_record(value, name=None):

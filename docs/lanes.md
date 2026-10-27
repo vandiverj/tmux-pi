@@ -99,7 +99,7 @@ The same tags appear on each task: `lane` and `lane_step` in `tp-agent list`, in
 
 ### `tp-agent lane close NAME STEP [--repo DIR]`
 
-Records that a step is finished: its work is committed in the lane and a review of exactly that committed tree approved it. It appends (step, commit, tree, review, verdict) to the lane's `closed` list and prints the record. Nothing skips or overrides the gate. A step that left the tree as the last closed commit had it needs no review and is recorded with verdict `EMPTY`. Run it in the session that ran the step. The rules for what counts as a review are in the [README](../README.md#lanes).
+Records that a step is finished: its work is committed in the lane and a review of exactly that committed tree approved it. It appends (step, commit, tree, review, verdict) to the lane's `closed` list and prints the record. Nothing skips the gate, and an agent cannot override it. A step that left the tree as the last closed commit had it needs no review and is recorded with verdict `EMPTY`. Run it in the session that ran the step. The rules for what counts as a review are in the [README](../README.md#lanes).
 
 ```
 $ tp-agent lane close api s1
@@ -110,6 +110,8 @@ $ tp-agent lane close api s1
 $ tp-agent lane close api s1
 tp-agent: step s1 is already closed at 5f7b64aca0f46d2585e35feda00b676a46252162; it is recorded, so there is nothing to do. The next step takes a new id: `tp-agent dispatch --lane api --step NEW-ID --role ROLE --task "..."`
 ```
+
+**Owner override:** `tp-agent lane close NAME STEP --override-review --reason TEXT`. Run it yourself, in your own terminal. It closes a step over a review that asked for changes to this exact tree, for example when the only finding was already handled outside the tree, such as a test you ran. It lifts only that refusal: no writer may still be working, nothing may be queued, no review of the tree may still be running, and the work must be committed. It refuses when stdin and stdout are not a terminal, when `TP_TASK_ID`, `TP_TASK_DIR` or `TP_MODE` is set (an agent session), and when the random code it prints is not typed back from `/dev/tty`. A step that needs no override is refused too; close it normally. The entry is recorded with verdict `OWNER_OVERRIDE`, the newest review that asked for changes, and `override_reason`.
 
 Closing a step that is not finished says why and what to run:
 

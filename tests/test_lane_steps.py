@@ -705,5 +705,113 @@ class UnitTests(StepCase):
         self.assertIn("warning: no session state directory", run.stderr)
 
 
+class OwnerOverrideTests(StepCase):
+    """`lane close --override-review --reason TEXT`: the owner, at a terminal, closes over a review that asked for changes. The
+    terminal check is the CLI's; the gate is close_step's, driven here in-process as the CLI drives it after the code is typed."""
+
+    def rejected(self):
+        author, _ = self.writer()
+        self.edit()
+        self.commit()
+        rejecting, _ = self.review(author, CHANGES)
+        return author, rejecting
+
+    def override(self, reason="owner ran the tests the review asked for"):
+        common, _ = lane_steps.lane_commands._main_repo(str(self.repo))
+        return lane_steps.close_step(self.state, common, "alpha", "s1", override_reason=reason)
+
+    def close_over(self, *extra, env=None):
+        args = ("lane", "close", "alpha", "s1", "--repo", str(self.repo), *extra)
+        return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env or self.env, text=True, capture_output=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+
+    def test_an_agent_session_is_refused_before_it_is_asked(self):
+        self.rejected()
+        env = {**self.env, "TP_TASK_ID": "coder-0000000000"}
+        self.untouched(lambda: self.close_over("--override-review", "--reason", "x", env=env), "TP_TASK_ID is set")
+
+    def test_without_a_terminal_it_is_refused(self):
+        self.rejected()
+        env = {k: v for k, v in self.env.items() if k not in ("TP_TASK_ID", "TP_TASK_DIR", "TP_MODE")}
+        self.untouched(lambda: self.close_over("--override-review", "--reason", "x", env=env), "must be a terminal")
+
+    def test_a_reason_is_required_and_goes_only_with_the_override(self):
+        self.rejected()
+        self.untouched(lambda: self.close_over("--override-review"), "needs a --reason")
+        self.untouched(lambda: self.close_over("--override-review", "--reason", "  "), "needs a --reason")
+        self.untouched(lambda: self.close_over("--reason", "x"), "--reason goes with --override-review")
+        with self.assertRaisesRegex(ValueError, "needs a --reason"):
+            self.override("  ")
+
+    def test_the_owner_closes_over_a_rejecting_review_and_it_is_recorded_as_such(self):
+        _, rejecting = self.rejected()
+        committed = git(self.worktree, "rev-parse", "HEAD")
+        entry = self.override()["closed"][0]
+        self.assertEqual({k: entry[k] for k in ("step", "commit", "review", "verdict", "override_reason")},
+                         {"step": "s1", "commit": committed, "review": rejecting, "verdict": "OWNER_OVERRIDE",
+                          "override_reason": "owner ran the tests the review asked for"})
+        self.assertEqual(self.record()["closed"][0], entry)  # it survives the record's own check on read
+        self.assertEqual((self.lanes()["open_step"], self.lanes()["waiting_on"]), (None, "orchestrator-dispatch"))
+
+    def test_it_lifts_nothing_but_the_rejection(self):
+        author, _ = self.rejected()
+        self.review(author, life="running")
+        with self.assertRaisesRegex(ValueError, "is reviewing this tree"):
+            self.override()
+        self.reset()
+        author, _ = self.writer()
+        self.edit()
+        self.review(author, CHANGES)  # of the uncommitted tree
+        with self.assertRaisesRegex(ValueError, "not committed"):
+            self.override()
+        self.reset()
+        self.writer(settled=False)
+        with self.assertRaisesRegex(ValueError, "the step's work is not finished"):
+            self.override()
+        self.assertEqual(self.record()["closed"], [])
+
+    def at_terminal(self, answer):
+        """Run the override in a pseudo-terminal; `answer(code)` is what is typed back. Returns (exit status, all output)."""
+        import pty
+        import re
+        env = {k: v for k, v in self.env.items() if k not in ("TP_TASK_ID", "TP_TASK_DIR", "TP_MODE")}
+        argv = [str(ROOT / "bin/tp-agent"), "lane", "close", "alpha", "s1", "--repo", str(self.repo), "--override-review", "--reason", "owner says so"]
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve(argv[0], argv, env)
+        out = b""
+        while b"> " not in out:
+            out += os.read(fd, 1024)
+        code = re.search(rb"\n  ([a-z]+(?:-[a-z]+){3})\r?\n", out).group(1).decode()
+        os.write(fd, (answer(code) + "\n").encode())
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        _, status = os.waitpid(pid, 0)
+        os.close(fd)
+        return os.waitstatus_to_exitcode(status), out.decode("utf-8", "replace")
+
+    def test_at_a_terminal_the_typed_code_decides(self):
+        _, rejecting = self.rejected()
+        status, out = self.at_terminal(lambda code: "wrong-code")
+        self.assertEqual(status, 1, out)
+        self.assertIn("did not match", out)
+        self.assertEqual(self.record()["closed"], [])
+        status, out = self.at_terminal(lambda code: code)
+        self.assertEqual(status, 0, out)
+        self.assertEqual((self.record()["closed"][0]["verdict"], self.record()["closed"][0]["review"]), ("OWNER_OVERRIDE", rejecting))
+
+    def test_with_no_rejecting_review_there_is_nothing_to_override(self):
+        self.approved_and_committed()
+        with self.assertRaisesRegex(ValueError, "nothing to override"):
+            self.override()
+        self.assertEqual(self.record()["closed"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

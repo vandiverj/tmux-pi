@@ -28,7 +28,10 @@ Or it is EMPTY: after 1, the working tree is clean and HEAD's tree is the tree o
 step), so there is nothing to review. It is closed without a review and recorded with verdict EMPTY and review null. A review
 of that unchanged tree, whatever it said, is not read: it judged nothing that was changed.
 A review approves when its lifecycle is settled or completed and review_verdict.assess reads APPROVED or APPROVED_WITH_NOTES with
-a non-empty Coverage section. Reviews of another tree are stale and ignored. There is no skip and no override.
+a non-empty Coverage section. Reviews of another tree are stale and ignored. There is no skip. The one override is the owner's:
+`lane close --override-review --reason TEXT`, typed back at a terminal (owner_confirm), lifts only the refusal of a review that asked
+for changes to this tree. Every other part of 1 to 3 still holds (no running review, clean and committed), and the entry is recorded
+with verdict OWNER_OVERRIDE, the newest such review and the owner's reason.
 
 Reading chosen on purpose (it is the least strict one that keeps the rule): a review that FINISHED without a usable verdict
 (unreadable, unparseable, no Coverage section, or failed, killed or stopped) is not a vote. It never approves, and it is named
@@ -286,10 +289,11 @@ def _new_task(name, step, writers):
     return f"`tp-agent dispatch --lane {name} --step {step} --role {role} --task \"...\"`"
 
 
-def evaluate(session, record, step):
+def evaluate(session, record, step, override=False):
     """The facts of the review gate for `step` of `record`'s lane: {ok, why, wait, review, verdict, tree, dirty, head}.
     `wait` is who the step is waiting for (the `lanes` column waiting_on): worker | review | orchestrator-dispatch |
-    orchestrator-commit | orchestrator-close. `why` is empty when ok. Reads only; raises ValueError when git cannot say."""
+    orchestrator-commit | orchestrator-close. `why` is empty when ok. `override` is the owner's override of a review that asked
+    for changes (close_step checks who asked); it lifts that refusal and nothing else. Reads only; raises ValueError when git cannot say."""
     name, worktree = record["name"], record["worktree"]
     writers, queued = session.writers(name, step), session.queued_for(name, step)
     facts = {"ok": False, "why": "", "wait": None, "review": None, "verdict": None, "tree": None, "dirty": None, "head": None}
@@ -336,7 +340,7 @@ def evaluate(session, record, step):
                                 f"the step with {_new_task(name, step, writers)}, and review that one")
     owner = "review" if author else "orchestrator-dispatch"  # with no writer to review, the next move is a task
     rejecting = [j for j in judged if j[1] == "rejects"]
-    if rejecting:
+    if rejecting and not override:
         review = rejecting[0][0]
         fix = (f"Change the work, for example `tp-agent retry {author['id']} --reason \"address the findings of {review['id']}\"`, and review the new tree"
                if author else f"Change the work with a task in the step ({_new_task(name, step, writers)}) and review the new tree")
@@ -346,6 +350,12 @@ def evaluate(session, record, step):
         review, life = running[0][0], running[0][2]
         how = "Wait for it to finish, or end it" if finishes_alone(life) else _answer(review["id"]) + ", or end it"
         return refuse("review", f"{review['id']} is reviewing this tree and is {state_words(life)}. {how} with {_stop(review['id'])}")
+    if override:
+        if not rejecting:
+            return refuse(owner, f"no review of this tree ({where}) asked for changes, so there is nothing to override; "
+                                 f"close the step without --override-review once a review of it approves")
+        facts.update(review=max(rejecting, key=lambda j: j[0]["when"])[0]["id"], verdict=lanes.OWNER_OVERRIDE)
+        return _committed(facts, refuse, where, worktree, name, step)
     approving = [j for j in judged if j[1] == "approves"]
     if not approving:
         if judged:
@@ -358,7 +368,11 @@ def evaluate(session, record, step):
     chosen = next((j for j in sorted(approving, key=lambda j: j[0]["when"], reverse=True) if j[2] == "APPROVED_WITH_NOTES"),
                   max(approving, key=lambda j: j[0]["when"]))
     facts.update(review=chosen[0]["id"], verdict=chosen[2])
-    if dirty:
+    return _committed(facts, refuse, where, worktree, name, step)
+
+
+def _committed(facts, refuse, where, worktree, name, step):
+    if facts["dirty"]:
         return refuse("orchestrator-commit", f"the approved work is not committed: {where}. Commit it as reviewed with "
                                              f"`git -C {worktree} add -A && git -C {worktree} commit -m \"...\"`, then run `tp-agent lane close {name} {step}`")
     facts.update(ok=True, wait="orchestrator-close")
@@ -377,9 +391,12 @@ def _previous(record):
     return record["closed"][-1]["commit"] if record["closed"] else record["base"]["commit"]
 
 
-def close_step(state, common, name, step):
+def close_step(state, common, name, step, override_reason=None):
     """Record that `step` of lane `name` is finished and bound to the commit the reviewed work is committed as. Every refusal
-    is raised before anything is written; the one write is the new entry in `closed`, under the lane lock. Returns the record."""
+    is raised before anything is written; the one write is the new entry in `closed`, under the lane lock. Returns the record.
+    `override_reason` (the owner's, confirmed at a terminal by the caller) closes over a review that asked for changes."""
+    if override_reason is not None and not override_reason.strip():
+        raise ValueError("--override-review needs a --reason that says why the owner closes over the review")
     lane_commands.check_lane_name(name)
     if not lanes.STEP_ID.fullmatch(step):
         raise ValueError(f"invalid step id {step!r}: use up to 40 characters of letters, digits, . _ -")
@@ -402,12 +419,17 @@ def close_step(state, common, name, step):
         if current != step:
             raise ValueError(f"step {step} is not lane {name}'s open step ({current}, the oldest that is not closed); close that one first with "
                              f"`tp-agent lane close {name} {current}`")
-        facts = evaluate(session, record, step)
+        override = override_reason is not None
+        facts = evaluate(session, record, step, override=override)
         if not facts["ok"]:
             raise ValueError(f"step {step} of lane {name} cannot be closed: {facts['why']}")
+        if override and facts["verdict"] != lanes.OWNER_OVERRIDE:
+            raise ValueError(f"step {step} of lane {name} needs no override ({facts['verdict']}); close it without --override-review")
         head, head_tree = _head(record["worktree"])  # the clean tree evaluate judged: its commit is what the step is recorded as
-        updated = dict(record, closed=record["closed"] + [{"step": step, "commit": head, "tree": head_tree, "review": facts["review"],
-                                                            "verdict": facts["verdict"], "closed_at": lanes.utc_now()}])
+        entry = {"step": step, "commit": head, "tree": head_tree, "review": facts["review"], "verdict": facts["verdict"], "closed_at": lanes.utc_now()}
+        if override:
+            entry["override_reason"] = override_reason.strip()
+        updated = dict(record, closed=record["closed"] + [entry])
         lanes.lane_reality(updated)  # the new entry is checked against git before it is written, never after
         return lanes.write_lane(common, updated)
 

@@ -22,6 +22,7 @@ import lane_steps  # noqa: E402
 import failing_tests  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
+import owner_confirm  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
@@ -1206,6 +1207,9 @@ def main():
     lcl.add_argument("name")
     lcl.add_argument("step")
     lcl.add_argument("--repo", default=".", help="the repository (default: the current directory)")
+    lcl.add_argument("--override-review", action="store_true", help="owner only, at a terminal with a typed-back code: close over a review "
+                                                                     "that asked for changes to this tree; every other check still applies")
+    lcl.add_argument("--reason", help="why the owner closes over the review (required with --override-review; recorded in the entry)")
     lr = ln.add_parser("remove", help="remove an integrated lane (or, with --abandon, an open one): worktree, branch; the record is archived")
     lr.add_argument("name")
     lr.add_argument("--abandon", action="store_true", help="remove an open lane whose work is not integrated; its tip is printed first so the branch can be restored")
@@ -1258,7 +1262,14 @@ def main():
             except (OSError, subprocess.CalledProcessError) as error:
                 raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
             common, _ = lane_commands._main_repo(args.repo)
-            print(json.dumps(lane_steps.close_step(state, common, args.name, args.step), indent=2))
+            if args.reason is not None and not args.override_review:
+                raise ValueError("--reason goes with --override-review")
+            if args.override_review:
+                if not (args.reason or "").strip():
+                    raise ValueError("--override-review needs a --reason that says why the owner closes over the review")
+                owner_confirm.confirm(f"Close step {args.step} of lane {args.name} over the review that asked for changes.\nReason: {args.reason}")
+            print(json.dumps(lane_steps.close_step(state, common, args.name, args.step,
+                                                   override_reason=args.reason if args.override_review else None), indent=2))
             return
         if args.lane_command == "remove":
             try:

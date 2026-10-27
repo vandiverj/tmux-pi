@@ -251,6 +251,11 @@ echo review-1
             self.assertIn("'note'", task)
             self.assertIn("Notes are returned in full but never justify another round", task)
             self.assertIn("REQUEST_CHANGES only when at least one finding is a defect", task)
+            self.assertIn("REQUEST_CHANGES only when at least one finding is a defect as defined above and ends 'Closes by: code'", task)
+            for label in ("code", "check", "decision", "none"):
+                self.assertIn(f"'Closes by: {label}'", task)
+            self.assertIn("A missing or wrong item in the author's report, or a command the author did not run, is never a defect: label it check "
+                          "and list it under 'Owed before close'. Run it yourself when you can and give the result.", task)
             self.assertIn("name the family it belongs to", task)
             # Both providers have the redacted tools; a prompt on a bash search outside the worktree stalls an unattended reviewer.
             self.assertIn("Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash", task)

@@ -1027,6 +1027,10 @@ def review(base, args):
             command += [flag, value]
     if args.approve_effort:
         command.append("--approve-effort")
+    for path in args.evidence:  # check outputs Main attaches to the packet; bin/tp-review refuses an unusable file
+        command += ["--evidence", path]
+    if args.contract:
+        command += ["--contract", args.contract]
     if args.same_provider:
         if not (args.approved_by_user or "").strip():
             raise ValueError("--same-provider needs --approved-by-user with the user's approval quoted")
@@ -1164,6 +1168,8 @@ def main():
     rv.add_argument("--thinking", help="explicit reviewer effort")
     rv.add_argument("--approve-effort", action="store_true", help="record the user's approval of an effort above high")
     rv.add_argument("--force-alive", action="store_true", help="review although a writer is still alive on the same working tree (does not apply to a lane: stop its writer with tp-agent stop)")
+    rv.add_argument("--evidence", metavar="FILE", action="append", default=[], help="attach a check output Main produced (repeatable), under 'Evidence supplied by Main: <file name>'; the reviewer is told it is not the author's")
+    rv.add_argument("--contract", metavar="FILE", help="attach the reviewer contract (once), under 'Reviewer contract (supplied by Main)'; the reviewer judges the work against it with the task")
     rv.add_argument("--same-provider", action="store_true", help="review on the author's own provider; only with the user's approval, which --approved-by-user must quote")
     rv.add_argument("--approved-by-user", metavar="QUOTE", help="the user's approval of a same-provider review, quoted (required with --same-provider)")
     ea = sub.add_parser("end-author", help="end a settled task's process before its review starts (bin/tp-review runs this)")

@@ -1,5 +1,5 @@
 {
   "max_local_workers": 2,
   "max_active_workers": 10,
-  "lanes": { "max_active_lanes": 5 }
+  "lanes": { "max_active_lanes": 16 }
 }

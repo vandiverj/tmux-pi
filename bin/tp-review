@@ -100,33 +100,7 @@ check_supplied() {
 # supplied_problem <flag> <file>: prints why the file is refused and returns 1, or prints nothing. A brief the request names is
 # judged by the same code but is only noted when refused (below).
 supplied_problem() {
-  python3 - "$1" "$2" <<'PYEOF'
-import os, pwd, sys, unicodedata
-flag, path = sys.argv[1], sys.argv[2]
-def fold(p): return unicodedata.normalize("NFC", p).casefold()
-def refuse(reason):
-    print(f"{flag} file '{path}' {reason}; refused"); sys.exit(1)
-if not path.strip(): refuse("is not a file name")
-try:
-    real = os.path.realpath(path)
-except (OSError, ValueError):
-    refuse("cannot be resolved")
-home = pwd.getpwuid(os.getuid()).pw_dir
-for store in (".config/tmux-pi/trust", ".config/tmux-pi/state/trust"):
-    root = fold(os.path.realpath(os.path.join(home, store)))
-    for p in (fold(real), fold(os.path.abspath(path))):
-        if p == root or p.startswith(root + os.sep): refuse("is inside the trust store")
-for name in (os.path.basename(path), os.path.basename(real)):
-    if name.lower().startswith(".env"): refuse("is a .env file")
-if not os.path.exists(path): refuse("does not exist")
-if not os.path.isfile(path): refuse("is not a regular file")
-try:
-    with open(path, "rb") as f:
-        empty = not f.read(1)
-except OSError:
-    refuse("cannot be read")
-if empty: refuse("is empty")
-PYEOF
+  python3 "$ROOT/lib/review_verdict.py" supplied "$1" "$2"   # the one rule (lib/review_verdict.py supplied_problem); tp-agent retry's fix brief uses it too
 }
 for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
 if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi

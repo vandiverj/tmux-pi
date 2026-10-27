@@ -528,6 +528,20 @@ def admitted_context(path, specs):
     return admitted, omitted
 
 
+FIX_BRIEF_SENTENCE = "Read and carry out the fix brief {path} in full. It replaces the task below where they differ."
+
+
+def fix_brief(reason):
+    """(path, None) when `reason` is an absolute path to a .md file that passes the checks tp-review --contract makes (not .env*,
+    not in the trust store, a non-empty regular file); (None, why) when it is written like such a path but cannot be used;
+    (None, None) for any other reason, which is plain text."""
+    text = reason.strip()
+    if not (text.startswith("/") and text.endswith(".md")) or any(ord(c) < 32 for c in text):
+        return None, None
+    problem = review_verdict.supplied_problem("--reason", text)
+    return (None, problem) if problem else (text, None)
+
+
 def replay_inputs(previous, kept, problem=None):
     """Return (context, notes, remark) to replay from a prior attempt. `kept` is dispatch_record's return value, or
     None with its RecordError as `problem`; an unusable record replays nothing."""
@@ -1153,8 +1167,11 @@ def main():
                    help="with --investigate-failure: name the failing test and command yourself, when the report has no block")
     retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
     retry.add_argument("id")
-    retry.add_argument("--reason", required=True)
-    retry.add_argument("--task")
+    retry.add_argument("--reason", required=True,
+                       help="what changed (recorded in the Notes). An absolute path to a .md file (not .env*, not in the trust store) is a fix "
+                            "brief: without --task, the new request starts with 'Read and carry out the fix brief PATH in full. It replaces the "
+                            "task below where they differ.' and then the old request")
+    retry.add_argument("--task", help="the new request, instead of the old one (a --reason fix brief is then only recorded)")
     retry.add_argument("--role")
     retry.add_argument("--worker", choices=["pi", "claude"])
     retry.add_argument("--model")
@@ -1357,8 +1374,14 @@ def main():
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
             preroute = escalation_route(base, previous, args, contexts)
+        task, brief_note = args.task, ""
+        if not task:  # a --reason that names a usable .md file is the fix brief: the new attempt's request starts by saying to read it
+            brief, brief_problem = fix_brief(args.reason)
+            task = f"{FIX_BRIEF_SENTENCE.format(path=brief)}\n\n{original}" if brief else original
+            if brief_problem:
+                brief_note = f" The reason names a file that was not used as a fix brief: {brief_problem}."
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
-                                         task=args.task or original, worker=args.worker,
+                                         task=task, worker=args.worker,
                                          model=args.model, thinking=args.thinking, level=args.level,
                                          approve_effort=args.approve_effort, preroute=preroute,
                                          local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
@@ -1367,7 +1390,7 @@ def main():
                                          parent=args.id, after=[], context=contexts,
                                          tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
-                                                      + (f" {remark}; see the prior packet." if remark else "")])
+                                                      + brief_note + (f" {remark}; see the prior packet." if remark else "")])
         value = dispatch(replacement, base)
         if problem is not None:  # reachable only through an explicit --tests
             value = dict(value, prior_record=f"not used: {problem}")

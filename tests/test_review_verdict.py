@@ -150,6 +150,26 @@ class ClosesByTests(unittest.TestCase):
             self.assertEqual(value["unusable_reason"], "REQUEST_CHANGES without a Closes by: code finding")
 
 
+class SuppliedProblemTests(unittest.TestCase):
+    """The one rule for a file Main supplies, which tp-review and tp-agent retry share."""
+
+    def test_the_refusals_name_the_flag_the_file_and_why(self):
+        import os
+        import pwd
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, empty, env = Path(tmp, "ok.md"), Path(tmp, "empty.md"), Path(tmp, ".env.md")
+            ok.write_text("x\n")
+            empty.write_text("")
+            env.write_text("x\n")
+            self.assertIsNone(review_verdict.supplied_problem("--reason", str(ok)))
+            for path, why in ((empty, "is empty"), (env, "is a .env file"), (Path(tmp, "gone.md"), "does not exist"), (Path(tmp), "is not a regular file"),
+                              (home / ".config/tmux-pi/trust/never-written.md", "is inside the trust store")):
+                with self.subTest(why=why):
+                    self.assertEqual(review_verdict.supplied_problem("--reason", str(path)), f"--reason file '{path}' {why}; refused")
+            self.assertEqual(review_verdict.supplied_problem("--reason", "  "), "--reason file '  ' is not a file name; refused")
+
+
 BRIEF = "# Step\n\n## Done means\n1. First thing.\n   continued line\n2. Second thing.\n3. Third thing.\n\n## Tests\n9. not an item\n"
 COVERED = "\nCoverage\nI reviewed a.py and checked its callers and tests.\n"
 

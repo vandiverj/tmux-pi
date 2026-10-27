@@ -1102,6 +1102,24 @@ echo review-1
         self.assertNotIn("section headed Acceptance criteria", task)
         self.assertFalse(self.marker().exists())
 
+    def test_a_named_brief_inside_the_trust_store_gives_no_list_and_the_task_text_says_why(self):
+        import pwd
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for store in (".config/tmux-pi/trust", ".config/tmux-pi/state/trust"):
+            with self.subTest(store=store):
+                brief = str(home / store / "never-written-brief.md")  # not created or read: the refusal comes before any read
+                self.set_brief(f"Read and carry out the brief {brief} in full.\n")
+                if self.marker().exists():
+                    self.marker().unlink()
+                r = self.review()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                task = self.task_text()
+                self.assertIn("did not read for the acceptance list", task)
+                self.assertIn(brief, task)
+                self.assertIn("is inside the trust store", task)
+                self.assertNotIn("section headed Acceptance criteria", task)
+                self.assertFalse(self.marker().exists())
+
     def test_the_request_list_the_named_briefs_and_the_contract_are_merged(self):
         brief = self.supplied("brief.md", "## Done means\n1. a\n2. b\n3. c\n4. d\n")
         self.set_brief(f"## Done means\n1. a\n2. b\n\nRead the brief {brief}\n")

@@ -18,7 +18,8 @@ next round is the change from that tree to the tree now.
       writes the `Timer waits in added test lines` file: the added lines of that same diff, in files whose path matches
       test, spec, e2e or __tests__, that contain setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(, as path:line: text
       (a line carrying `timer-ok:` is marked `(timer-ok)`); facts only. Withheld paths are never read. Every match is kept: the
-      first line gives the total and how many carry no text; the first 300 carry text (cut at 400 characters with a mark), the rest
+      first line gives the title with the total and how many carry no text (`# Timer waits in added test lines: 301 matching added
+      line(s); 1 listed as path:line without their text`, or `...: none found`); the first 300 carry text (cut at 400 characters with a mark), the rest
       are path:line only.
 
   review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir>
@@ -575,7 +576,7 @@ def timer_waits(workdir, lane=""):
     path matches a test pattern, that contains one of TIMER_CALLS, as `path:line: text`, a line carrying `timer-ok:` marked
     `(timer-ok)`; one line saying none were found when there are none. Facts only. Withheld (sensitive) paths are never read, a
     listed line goes through the redaction pass, and the text is never an error: what cannot be computed is said in one line."""
-    head = f"# {TIMER_TITLE}\n\n"
+    head = f"# {TIMER_TITLE}: not computed\n\n"  # the first line carries the title and the counts together
     try:
         found = scope_lines(workdir, lane)
         if found is None:
@@ -593,17 +594,18 @@ def timer_waits(workdir, lane=""):
                     rows.append((path, number, f"{shown(path)}:{number}", f"{clipped}{' (timer-ok)' if 'timer-ok:' in text else ''}"))
         rows.sort(key=lambda row: row[:2])
         if not rows:
-            return head + "No added test line contains setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(; none were found.\n"
+            return (f"# {TIMER_TITLE}: none found\n\n"
+                    "No added test line contains setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(; none were found.\n")
         # every matching line is kept: the first MAX_TIMER_LINES with their text, the rest as path:line only
         body = "\n".join(f"{where}: {text}" if n < MAX_TIMER_LINES else where for n, (_, _, where, text) in enumerate(rows))
         body, _ = redact_text(redactor(), body, "timer waits in added test lines")
         bare = max(0, len(rows) - MAX_TIMER_LINES)
-        return (head + f"{len(rows)} matching added line(s); {bare} listed as path:line without their text.\n\n"
+        return (f"# {TIMER_TITLE}: {len(rows)} matching added line(s); {bare} listed as path:line without their text\n\n"
                 "Added lines in files whose path contains test, spec, e2e or __tests__ that contain setTimeout(, sleep(, delay(, "
                 "Deno.sleep( or waitForTimeout( (a plain match; the reviewer judges them; `(timer-ok)` marks a line carrying `timer-ok:`):\n\n"
                 + body + "\n")
     except (Refused, OSError) as exc:
-        return head + f"Not computed: {' '.join(str(exc).split())[:200]}.\n"
+        return head + f"Not computed: {' '.join(str(exc).split())[:200]}.\n"  # same first line as the git-less case
 
 
 def main(argv):

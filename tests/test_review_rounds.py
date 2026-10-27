@@ -552,11 +552,20 @@ class TimerWaitsTests(unittest.TestCase):
         self.assertEqual(len(entries), cap + 1)
         self.assertEqual(entries[-1], f"src/foo_test.ts:{cap + 1}")
         self.assertEqual(entries[cap - 1], f"src/foo_test.ts:{cap}: sleep({cap - 1})")
-        self.assertIn(f"{cap + 1} matching added line(s); 1 listed as path:line without their text", text.splitlines()[2])
+        self.assertEqual(text.splitlines()[0], f"# Timer waits in added test lines: {cap + 1} matching added line(s); 1 listed as path:line without their text")
 
-    def test_at_or_under_the_cap_the_header_says_none_lack_text(self):
+    def test_at_or_under_the_cap_the_first_line_says_none_lack_text(self):
         self.put("src/foo_test.ts", "sleep(1)\n")
-        self.assertIn("1 matching added line(s); 0 listed as path:line without their text", self.waits())
+        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text")
+
+    def test_with_no_match_the_first_line_says_none_found(self):
+        self.put("src/foo_test.ts", "const a = 1\n")
+        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: none found")
+
+    def test_when_it_cannot_be_computed_the_first_line_still_starts_with_the_title(self):
+        with tempfile.TemporaryDirectory() as plain:
+            first = review_rounds.timer_waits(plain, "").splitlines()[0]
+        self.assertTrue(first.startswith("# Timer waits in added test lines: "), first)
 
     def test_a_long_matching_line_is_cut_at_400_with_the_mark(self):
         self.put("src/foo_test.ts", "sleep(1) " + "x" * 491 + "\n")

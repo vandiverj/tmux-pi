@@ -528,6 +528,57 @@ def admitted_context(path, specs):
     return admitted, omitted
 
 
+FIX_BRIEF_SENTENCE = "Read and carry out the fix brief {path} in full. It replaces the task below where they differ."
+
+
+def fix_brief(reason):
+    """(path, None) when `reason` is an absolute path to a .md file that passes the checks tp-review --contract makes (not .env*,
+    not in the trust store, a non-empty regular file); (None, why) when it is written like such a path but cannot be used;
+    (None, None) for any other reason, which is plain text."""
+    text = reason.strip()
+    if not (text.startswith("/") and text.endswith(".md")) or any(ord(c) < 32 for c in text):
+        return None, None
+    problem = review_verdict.supplied_problem("--reason", text)
+    return (None, problem) if problem else (text, None)
+
+
+RETRY_ROUTES = ("rule-first", "design", "park")
+ROUTE_SENTENCE = "the brief must change the rule or the design, not one more site"
+
+
+def repeated_family(base, task_id):
+    """(family, earlier_review, latest_review) when the newest review of the author chain of `task_id` was written for `task_id`
+    itself and names a finding family an earlier review of the chain also named (names matched case-folded, see
+    review_verdict.families); None otherwise. A review whose reply cannot be read names no family. Raises review_rounds.Refused
+    when the chain cannot be walked (the same limits as the review rounds)."""
+    chain = review_rounds.earlier_reviews(base, task_id)
+    if not chain or chain[-1][0] != task_id:
+        return None
+    named = []
+    for _, review in chain:
+        try:
+            named.append((review, review_verdict.families((task_dir(base, review) / "result.md").read_text())))
+        except (OSError, ValueError):
+            named.append((review, []))
+    latest, latest_families = named[-1]
+    for family in latest_families:
+        for review, families in reversed(named[:-1]):
+            if family in families:
+                return family, review, latest
+    return None
+
+
+def park_retry(base, previous, task_id, family, earlier, latest):
+    """Write parked.md in the author task directory (a link already there is replaced, never written through) and return the
+    record `retry --route park` prints: nothing is retried."""
+    path = previous / "parked.md"
+    atomic_text(path, f"# Parked: {task_id}\n\nThe finding family `{family}` was named by review {earlier} and again by review {latest}. "
+                      "Another retry on the same family would fix one more site; the owner decides what changes instead "
+                      "(the rule, the design, or whether to stop).\n", base)
+    return {"id": task_id, "parked": str(path), "family": family, "reviews": [earlier, latest],
+            "next": f"No attempt was started. The owner decides: {family} was named in {earlier} and {latest}."}
+
+
 def replay_inputs(previous, kept, problem=None):
     """Return (context, notes, remark) to replay from a prior attempt. `kept` is dispatch_record's return value, or
     None with its RecordError as `problem`; an unusable record replays nothing."""
@@ -543,6 +594,16 @@ def replay_inputs(previous, kept, problem=None):
                              if omitted else "")
 
 
+def other_lane_paths(item):
+    """The packet text for the paths other open lanes own that overlap the lane `item` runs in ("" for none), worked out when the
+    task starts so a queued task and a retry see the lanes as they are then. A lane that cannot be read is no reason to refuse."""
+    try:
+        return lane_commands.other_lanes_section(lane_commands.paths_owned_elsewhere(item["workdir"], item["lane"]))
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"tp-agent: the paths other lanes own were not listed in the packet: {error}", file=sys.stderr)
+        return ""
+
+
 def launch(base, item):
     item = queue_item(item)  # every field below comes from the validator's return value
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
@@ -555,6 +616,9 @@ def launch(base, item):
         args += ["--parent", item["parent"]]
     if "lane" in item:
         args += ["--lane", item["lane"], "--lane-step", item["lane_step"], "--preamble-from", item["preamble_from"]]
+        owned = other_lane_paths(item)
+        if owned:
+            args += ["--other-lane-paths", owned]
     for spec in item["context"]:
         args += ["--context", spec]
     for note in item["notes"]:
@@ -1153,8 +1217,11 @@ def main():
                    help="with --investigate-failure: name the failing test and command yourself, when the report has no block")
     retry = sub.add_parser("retry", help="start a linked attempt with a recorded reason")
     retry.add_argument("id")
-    retry.add_argument("--reason", required=True)
-    retry.add_argument("--task")
+    retry.add_argument("--reason", required=True,
+                       help="what changed (recorded in the Notes). An absolute path to a .md file (not .env*, not in the trust store) is a fix "
+                            "brief: without --task, the new request starts with 'Read and carry out the fix brief PATH in full. It replaces the "
+                            "task below where they differ.' and then the old request")
+    retry.add_argument("--task", help="the new request, instead of the old one (a --reason fix brief is then only recorded)")
     retry.add_argument("--role")
     retry.add_argument("--worker", choices=["pi", "claude"])
     retry.add_argument("--model")
@@ -1167,6 +1234,10 @@ def main():
                        help="start the attempt although a process is still alive on the same working tree (skips only the retry guard; a lane's one writer is still enforced: stop the writer instead)")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
+    retry.add_argument("--route", choices=RETRY_ROUTES,
+                       help="when the latest review names a finding family (a 'Family: <name>' line) an earlier review of the chain also named, a "
+                            "plain retry is refused (--escalate does not pass it). rule-first / design: retry, with the brief changing the rule or "
+                            "the design, not one more site (recorded in the Notes); park: no retry, parked.md in the task directory, the owner decides")
     rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author unless --same-provider)")
     rv.add_argument("id")
     rv.add_argument("--force", action="store_true", help="review even when the policy says none")
@@ -1338,8 +1409,24 @@ def main():
             wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
             raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
                              f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
+        try:
+            repeated = repeated_family(base, args.id)
+        except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
+            repeated = None
+            print(f"tp-agent: the repeated-family gate was not checked: {error}", file=sys.stderr)
+        if repeated and args.route == "park":  # starts nothing, so a process alive on the tree does not stop it
+            print(json.dumps(park_retry(base, previous, args.id, *repeated), indent=2))
+            return
         if not args.force_alive:
             guard_retry(previous)
+        if repeated and not args.route:
+            family, earlier, latest = repeated
+            raise ValueError(f"finding family {family} was named by review {earlier} and again by review {latest}: another retry would "
+                             f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
+                             f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
+        if args.route and not repeated:
+            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named, "
+                             "so there is nothing to route; retry without --route")
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
@@ -1357,8 +1444,14 @@ def main():
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
             preroute = escalation_route(base, previous, args, contexts)
+        task, brief_note = args.task, ""
+        if not task:  # a --reason that names a usable .md file is the fix brief: the new attempt's request starts by saying to read it
+            brief, brief_problem = fix_brief(args.reason)
+            task = f"{FIX_BRIEF_SENTENCE.format(path=brief)}\n\n{original}" if brief else original
+            if brief_problem:
+                brief_note = f" The reason names a file that was not used as a fix brief: {brief_problem}."
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
-                                         task=args.task or original, worker=args.worker,
+                                         task=task, worker=args.worker,
                                          model=args.model, thinking=args.thinking, level=args.level,
                                          approve_effort=args.approve_effort, preroute=preroute,
                                          local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
@@ -1367,7 +1460,9 @@ def main():
                                          parent=args.id, after=[], context=contexts,
                                          tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
-                                                      + (f" {remark}; see the prior packet." if remark else "")])
+                                                      + brief_note + (f" {remark}; see the prior packet." if remark else "")]
+                                         + ([f"Retry of {args.id} by route {args.route}: finding family {repeated[0]} was named by review {repeated[1]} and again by review {repeated[2]}; {ROUTE_SENTENCE}."]
+                                            if args.route else []))
         value = dispatch(replacement, base)
         if problem is not None:  # reachable only through an explicit --tests
             value = dict(value, prior_record=f"not used: {problem}")

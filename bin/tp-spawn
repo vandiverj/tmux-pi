@@ -56,6 +56,8 @@
 #   --preamble-from <dir>    the main working tree to read .tmux-pi/worker-preamble.md from when the workdir has none
 #                            (a lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored); recorded in meta. With --lane
 #                            and no --preamble-from, the lane repository's main working tree is used
+#   --other-lane-paths <text> with --lane: the packet section `Paths other lanes own` (tp-agent works it out from the other open
+#                            lanes' declared and measured paths; advice, not a lock). Omitted when empty
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role
 #   --review-of <task>       this start is the independent review of that finished task (tp-review passes it, with --preamble-role
@@ -87,7 +89,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces=""
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths=""
 words=() contexts=() notes=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     --lane-step)   lane_step="${2:?}"; shift 2 ;;
     --lane-replaces) lane_replaces="${2:?}"; shift 2 ;;
     --preamble-from) preamble_from="${2:?}"; shift 2 ;;
+    --other-lane-paths) other_lane_paths="${2:?}"; shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
     -*)            die "unknown option: $1" ;;
@@ -143,6 +146,7 @@ fi
 [[ -z "$lane_step" || "$lane_step" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]] || die "bad --lane-step: $lane_step"
 [[ -n "$lane" || -z "$lane_step" ]] || die "--lane-step needs --lane"
 [[ -z "$lane" || -n "$lane_step" ]] || die "--lane needs --lane-step"
+[[ -n "$lane" || -z "$other_lane_paths" ]] || die "--other-lane-paths needs --lane"
 [[ -z "$lane_replaces" ]] || { [[ -n "$lane" && "${TP_TASK_ID:-}" == "$lane_replaces" ]] ||
   die "--lane-replaces is for a lane worker handing its own task over: it needs --lane and must be the caller's TP_TASK_ID"; }
 if [[ -n "$preamble_from" ]]; then
@@ -410,7 +414,7 @@ if [[ -n "$conversation" ]]; then
   packet+="What the user and the main agent said before this task, for intent and constraints. The task above is what to do."$'\n\n'
   packet+="$f"$'\n'"$body"$'\n'"$f"$'\n'
 fi
-if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file" ]]; then
+if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file" || -n "$other_lane_paths" ]]; then
   packet+=$'\n\n# Context\n\n'"Working directory: $workdir."
   if [[ ${#contexts[@]} -gt 0 ]]; then packet+=" The files below were chosen for this task; read others only if the task needs them."; fi
   packet+=$'\n'
@@ -444,6 +448,9 @@ if cm.get('events'):
     print('- Capability manifest events recorded: ' + str(len(cm.get('events', []))))
 EOF
 )"$'\n'
+fi
+if [[ -n "$other_lane_paths" ]]; then
+  packet+=$'\n## Paths other lanes own\n\n'"$other_lane_paths"$'\n'
 fi
 if [[ ${#notes[@]} -gt 0 ]]; then
   packet+=$'\n## Notes\n\n'

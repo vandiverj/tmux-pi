@@ -18,7 +18,9 @@ What later slices must not assume:
   (`git diff --name-only base..tip` plus uncommitted paths); it is a warning, never a refusal.
 - Creation holds the lane lock while it creates, so two creations in one repository queue; it does not hold git's own
   locks, so a hand-run `git worktree add` or `git branch` for the same name in between is caught by git, not by us."""
+import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -109,6 +111,56 @@ def _warnings(name, domain, touches, others):
             out.append({"kind": "lane-overlap", "lanes": sorted([name, other["name"]]), "paths": sorted(found),
                         "basis": sorted({b for bases in found.values() for b in bases}), "claims": {name: domain, other["name"]: other["domain"]}})
     return out
+
+
+def paths_owned_elsewhere(repo_dir, name):
+    """For lane `name`: one entry {name, branch, last_closed (a step id or None), paths} per other open lane whose declared or
+    measured paths overlap this lane's declared `touches` (the same test as the lane-overlap warning, `_warnings`); [] when
+    none do or the lane has no readable record. A record that cannot be read is left out: this is advice to a worker, never a
+    reason to refuse its dispatch."""
+    common, _ = _main_repo(repo_dir)
+    records = {}
+    for other in lanes.lane_names(common):
+        try:
+            records[other] = lanes.read_lane(common, other)
+        except ValueError:
+            continue
+    mine = records.get(name)
+    if mine is None:
+        return []
+    found = []
+    for warning in _warnings(name, mine["domain"], mine["touches"], list(records.values())):
+        other = records[next(n for n in warning["lanes"] if n != name)]
+        found.append({"name": other["name"], "branch": other["branch"],
+                      "last_closed": other["closed"][-1]["step"] if other["closed"] else None, "paths": warning["paths"]})
+    return found
+
+
+OTHER_LANES_SENTENCE = "Do not edit these paths; if the task needs them, stop and send tp-agent request."
+
+
+def _code_span(path):
+    """`path` as its JSON string (json.dumps, ASCII only) inside one Markdown code span on one line. The quotes keep leading and
+    trailing spaces visible, a backslash is shown as `\\\\`, and every non-ASCII or non-printing character is escaped, so two
+    different paths never look alike. A backtick cannot close the span: the fence is longer than any run of backticks inside,
+    padded with a space on each side (CommonMark)."""
+    text = json.dumps(path, ensure_ascii=True)
+    if "`" not in text:
+        return f"`{text}`"
+    longest = max(len(run) for run in re.findall(r"`+", text))
+    fence = "`" * (longest + 1)
+    return f"{fence} {text} {fence}"
+
+
+def other_lanes_section(entries):
+    """The body of the packet section `Paths other lanes own` for `paths_owned_elsewhere` entries; "" for none. Every
+    overlapping path is named: the section is advice and the packet budget already counts it. Nothing stops a worker from
+    editing a listed path."""
+    lines = []
+    for entry in entries:
+        closed = f"last closed step {entry['last_closed']}" if entry["last_closed"] else "no step closed yet"
+        lines.append(f"- Lane {entry['name']} (branch {entry['branch']}, {closed}): {', '.join(_code_span(p) for p in entry['paths'])}")
+    return "\n".join(lines) + f"\n\n{OTHER_LANES_SENTENCE}" if lines else ""
 
 
 def _all_records(common):

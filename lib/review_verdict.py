@@ -24,6 +24,7 @@ usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "co
        "closes_by": [label, ...], "unusable_reason": str|null};
        exits 1 and says why when the reply is not a verdict or the file cannot be read
        review_verdict.py briefs <request.md>   prints {"briefs": [path, ...]}: the absolute .md paths the request names (bin/tp-review)
+       review_verdict.py supplied <flag> <file>   prints why a file Main supplies is refused and exits 1, or prints nothing (bin/tp-review)
        review_verdict.py acceptance <file>...   prints {"items": [n, ...]}: the acceptance criteria numbers in those files (bin/tp-review)
 """
 import json
@@ -249,6 +250,47 @@ def named_briefs(request):
     return found
 
 
+def supplied_problem(flag, path):
+    """Why a file Main supplies (tp-review --evidence, --contract, --dispositions, a brief a request names; tp-agent retry's fix
+    brief) is refused, as one line that names the flag and the file, or None. Refused: a file inside the trust store
+    (~/.config/tmux-pi/trust, ~/.config/tmux-pi/state/trust under the home in the password database, never $HOME; a link is judged
+    by where it leads), a `.env*` file, and one that is missing, not a regular file, unreadable or empty. The trust store and a
+    .env file are refused by name before the file is looked at."""
+    import pwd
+    import unicodedata
+
+    def fold(p):
+        return unicodedata.normalize("NFC", p).casefold()
+
+    def refuse(reason):
+        return f"{flag} file '{path}' {reason}; refused"
+    if not path.strip():
+        return refuse("is not a file name")
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return refuse("cannot be resolved")
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    for store in (".config/tmux-pi/trust", ".config/tmux-pi/state/trust"):
+        root = fold(os.path.realpath(os.path.join(home, store)))
+        for p in (fold(real), fold(os.path.abspath(path))):
+            if p == root or p.startswith(root + os.sep):
+                return refuse("is inside the trust store")
+    for name in (os.path.basename(path), os.path.basename(real)):
+        if name.lower().startswith(".env"):
+            return refuse("is a .env file")
+    if not os.path.exists(path):
+        return refuse("does not exist")
+    if not os.path.isfile(path):
+        return refuse("is not a regular file")
+    try:
+        with open(path, "rb") as handle:
+            empty = not handle.read(1)
+    except OSError:
+        return refuse("cannot be read")
+    return refuse("is empty") if empty else None
+
+
 def acceptance_problem(text, items):
     """Why `text` does not account for the acceptance criteria numbered `items`, or None. The reply needs a section that is only
     the words Acceptance criteria (as Coverage is found) whose lines name every item number. This counts numbers; it cannot tell
@@ -287,8 +329,18 @@ def assess(text):
 # the label ("**Closes by:** `check`", "**Closes by: code.**"), the value may be in backticks, and a full stop may follow it. The
 # label must end its line: a value that is not one of the four, or text after the label, makes it no label.
 _VALUES = "code|check|decision|none"
-CLOSES_BY = re.compile(r"(?<!\w)closes[ \t]+by(?:[ \t]*(?:\*\*|__))?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*(?:`(" + _VALUES + r")`|(" + _VALUES +
-                       r"))[ \t]*\.?[ \t]*(?:\*\*|__)?[ \t]*$", re.I)
+
+
+def _label(words, values):
+    """The pattern for a `<words>: <value>` label on a line of its own; `values` is a regex with no groups."""
+    return re.compile(r"(?<!\w)" + words + r"(?:[ \t]*(?:\*\*|__))?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*(?:`(" + values + r")`|(" + values +
+                      r"))[ \t]*\.?[ \t]*(?:\*\*|__)?[ \t]*$", re.I)
+
+
+CLOSES_BY = _label(r"closes[ \t]+by", _VALUES)
+# "Family: <short-kebab-name>" before the Closes by: line of a finding that repeats an earlier one (a new finding may name one too);
+# read by the same rule as Closes by:, with the name folded to lower case.
+FAMILY = _label("family", r"[a-z0-9][a-z0-9_-]*")
 # the lines a label never counts under: a Coverage or Verification heading (a Markdown heading, a bold line, or the bare word) to
 # the next Markdown heading
 QUOTING_SECTION = re.compile(r"(?i)^[ \t]{0,3}(?:#{1,6}[ \t]+)?(?:(?:\*\*|__)[ \t]*)?(?:coverage|verification)\b(?:[ \t]*[:*_#]|[ \t]*$)")
@@ -301,13 +353,12 @@ def _quoted(prefix):
     return prefix.count("`") % 2 == 1 or prefix.count('"') % 2 == 1 or prefix.count("“") > prefix.count("”")
 
 
-def closes_by(text):
-    """The `Closes by:` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats kept); []
-    when it has none. This is the one rule for what counts. A label counts when it ends its line (optionally bold, in backticks
-    around the value, or followed by a full stop) and is none of: inside backticks or double quotes, in a fenced block or a `>`
-    blockquote, or under a Coverage or Verification heading (a Markdown heading or a line that starts with the bold word; it runs to
-    the next Markdown heading). A quoted label in the reviewer's prose is therefore no label. A reply that cannot be normalised (a
-    fence or comment never closed) has none: the safe reading is that nothing says the review asks for no change."""
+def _labels(text, pattern):
+    """The values of `pattern` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats
+    kept). A label counts when it ends its line (optionally bold, in backticks around the value, or followed by a full stop) and is
+    none of: inside backticks or double quotes, in a fenced block or a `>` blockquote, or under a Coverage or Verification heading
+    (a Markdown heading or a line that starts with the bold word; it runs to the next Markdown heading). A quoted label in the
+    reviewer's prose is therefore no label. A reply that cannot be normalised (a fence or comment never closed) has none."""
     try:
         lines = normalise(text.strip()).split("\n")[1:]  # the first line is the verdict; normalise drops a leading BOM
     except ValueError:
@@ -318,10 +369,23 @@ def closes_by(text):
             quoting = False
         if QUOTING_SECTION.match(line):
             quoting = True
-        match = None if quoting else CLOSES_BY.search(line.rstrip())
+        match = None if quoting else pattern.search(line.rstrip())
         if match and not _quoted(line[:match.start()]):
             found.append((match.group(1) or match.group(2)).lower())
     return found
+
+
+def closes_by(text):
+    """The `Closes by:` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats kept); []
+    when it has none. This is the one rule for what counts (see _labels). A reply that cannot be normalised has none: the safe
+    reading is that nothing says the review asks for no change."""
+    return _labels(text, CLOSES_BY)
+
+
+def families(text):
+    """The distinct `Family:` names a reviewer's reply gives its findings, lower-case, in order of first appearance; [] when it names
+    none or cannot be normalised. Counted by the rule for `Closes by:` labels."""
+    return list(dict.fromkeys(_labels(text, FAMILY)))
 
 
 def request_changes_problem(text):
@@ -351,6 +415,12 @@ if __name__ == "__main__":
             print(json.dumps({"briefs": named_briefs(open(sys.argv[2], encoding="utf-8", errors="replace").read())}))
         except OSError as exc:
             print(f"review_verdict: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == "supplied":  # for bin/tp-review: prints why FILE is refused and exits 1, or prints nothing
+        problem = supplied_problem(sys.argv[2], sys.argv[3])
+        if problem:
+            print(problem)
             sys.exit(1)
         sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "acceptance":  # for bin/tp-review: the item numbers of the brief and contract files

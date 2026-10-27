@@ -150,6 +150,58 @@ class ClosesByTests(unittest.TestCase):
             self.assertEqual(value["unusable_reason"], "REQUEST_CHANGES without a Closes by: code finding")
 
 
+FAMILY_ROWS = (
+    ("a plain label", "REQUEST_CHANGES\nF1 [defect] wrong.\nFamily: state-matrix\nCloses by: code\n", ["state-matrix"]),
+    ("bold around the label and its colon", "REQUEST_CHANGES\nF1 wrong.\n**Family:** state-matrix\n**Closes by:** code\n", ["state-matrix"]),
+    ("bold around the label, colon and value", "REQUEST_CHANGES\nF1 wrong.\n**Family: state-matrix**\n", ["state-matrix"]),
+    ("any case, the name folded", "REQUEST_CHANGES\nF1 wrong.\nFAMILY: State-Matrix\n", ["state-matrix"]),
+    ("the value in backticks, a full stop after it", "REQUEST_CHANGES\nF1 wrong.\n**Family:** `state-matrix`.\n", ["state-matrix"]),
+    ("a finding after a finding, the same name once", "REQUEST_CHANGES\nF1 a\nFamily: one\nF2 b\nFamily: two\nF3 c\nFamily: one\n", ["one", "two"]),
+    ("no label", "REQUEST_CHANGES\nF1 wrong. Closes by: code\n", []),
+    ("a label with text after it", "REQUEST_CHANGES\nF1 wrong.\nFamily: state-matrix is what I would call it\n", []),
+    ("a label with no name", "REQUEST_CHANGES\nF1 wrong.\nFamily:\n", []),
+    ("a label wrapped whole in backticks", "REQUEST_CHANGES\nF1 wrong.\n`Family: state-matrix`\n", []),
+    ("a label in a fenced block", "REQUEST_CHANGES\nF1 wrong.\n```\nFamily: state-matrix\n```\n", []),
+    ("a label in a blockquote", "REQUEST_CHANGES\nF1 wrong.\n> Family: state-matrix\n", []),
+    ("a label under the Coverage heading", "REQUEST_CHANGES\nF1 wrong.\n\nCoverage\nFamily: state-matrix\n", []),
+    ("a label in the first line is the verdict's, not a finding's", "REQUEST_CHANGES: Family: x\nF1 wrong.\n", []),
+)
+
+
+class FamilyTests(unittest.TestCase):
+    def test_the_families_a_review_names(self):
+        for name, text, families in FAMILY_ROWS:
+            with self.subTest(name):
+                self.assertEqual(review_verdict.families(text), families)
+
+    def test_a_reply_that_cannot_be_normalised_names_no_family(self):
+        self.assertEqual(review_verdict.families("REQUEST_CHANGES\nF1 wrong.\nFamily: state-matrix\n```\nnever closed\n"), [])
+
+    def test_a_family_label_does_not_change_the_closes_by_labels(self):
+        text = "REQUEST_CHANGES\nF1 wrong.\nFamily: state-matrix\nCloses by: code\n"
+        self.assertEqual(review_verdict.closes_by(text), ["code"])
+
+
+class SuppliedProblemTests(unittest.TestCase):
+    """The one rule for a file Main supplies, which tp-review and tp-agent retry share."""
+
+    def test_the_refusals_name_the_flag_the_file_and_why(self):
+        import os
+        import pwd
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, empty, env = Path(tmp, "ok.md"), Path(tmp, "empty.md"), Path(tmp, ".env.md")
+            ok.write_text("x\n")
+            empty.write_text("")
+            env.write_text("x\n")
+            self.assertIsNone(review_verdict.supplied_problem("--reason", str(ok)))
+            for path, why in ((empty, "is empty"), (env, "is a .env file"), (Path(tmp, "gone.md"), "does not exist"), (Path(tmp), "is not a regular file"),
+                              (home / ".config/tmux-pi/trust/never-written.md", "is inside the trust store")):
+                with self.subTest(why=why):
+                    self.assertEqual(review_verdict.supplied_problem("--reason", str(path)), f"--reason file '{path}' {why}; refused")
+            self.assertEqual(review_verdict.supplied_problem("--reason", "  "), "--reason file '  ' is not a file name; refused")
+
+
 BRIEF = "# Step\n\n## Done means\n1. First thing.\n   continued line\n2. Second thing.\n3. Third thing.\n\n## Tests\n9. not an item\n"
 COVERED = "\nCoverage\nI reviewed a.py and checked its callers and tests.\n"
 

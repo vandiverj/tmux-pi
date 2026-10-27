@@ -593,6 +593,16 @@ def replay_inputs(previous, kept, problem=None):
                              if omitted else "")
 
 
+def other_lane_paths(item):
+    """The packet text for the paths other open lanes own that overlap the lane `item` runs in ("" for none), worked out when the
+    task starts so a queued task and a retry see the lanes as they are then. A lane that cannot be read is no reason to refuse."""
+    try:
+        return lane_commands.other_lanes_section(lane_commands.paths_owned_elsewhere(item["workdir"], item["lane"]))
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"tp-agent: the paths other lanes own were not listed in the packet: {error}", file=sys.stderr)
+        return ""
+
+
 def launch(base, item):
     item = queue_item(item)  # every field below comes from the validator's return value
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
@@ -605,6 +615,9 @@ def launch(base, item):
         args += ["--parent", item["parent"]]
     if "lane" in item:
         args += ["--lane", item["lane"], "--lane-step", item["lane_step"], "--preamble-from", item["preamble_from"]]
+        owned = other_lane_paths(item)
+        if owned:
+            args += ["--other-lane-paths", owned]
     for spec in item["context"]:
         args += ["--context", spec]
     for note in item["notes"]:

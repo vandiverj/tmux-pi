@@ -111,6 +111,46 @@ def _warnings(name, domain, touches, others):
     return out
 
 
+def paths_owned_elsewhere(repo_dir, name):
+    """For lane `name`: one entry {name, branch, last_closed (a step id or None), paths} per other open lane whose declared or
+    measured paths overlap this lane's declared `touches` (the same test as the lane-overlap warning, `_warnings`); [] when
+    none do or the lane has no readable record. A record that cannot be read is left out: this is advice to a worker, never a
+    reason to refuse its dispatch."""
+    common, _ = _main_repo(repo_dir)
+    records = {}
+    for other in lanes.lane_names(common):
+        try:
+            records[other] = lanes.read_lane(common, other)
+        except ValueError:
+            continue
+    mine = records.get(name)
+    if mine is None:
+        return []
+    found = []
+    for warning in _warnings(name, mine["domain"], mine["touches"], list(records.values())):
+        other = records[next(n for n in warning["lanes"] if n != name)]
+        found.append({"name": other["name"], "branch": other["branch"],
+                      "last_closed": other["closed"][-1]["step"] if other["closed"] else None, "paths": warning["paths"]})
+    return found
+
+
+OTHER_LANES_SENTENCE = "Do not edit these paths; if the task needs them, stop and send tp-agent request."
+OTHER_LANES_PATH_LIMIT = 20  # per lane: the packet has a size cap and a long list is not read
+
+
+def other_lanes_section(entries):
+    """The body of the packet section `Paths other lanes own` for `paths_owned_elsewhere` entries; "" for none. Advice, not a
+    lock: nothing stops a worker from editing a listed path."""
+    lines = []
+    for entry in entries:
+        paths = [p for p in entry["paths"] if not any(ord(c) < 32 or c == "`" for c in p)]
+        shown = ", ".join(f"`{p}`" for p in paths[:OTHER_LANES_PATH_LIMIT])
+        more = len(entry["paths"]) - min(len(paths), OTHER_LANES_PATH_LIMIT)
+        closed = f"last closed step {entry['last_closed']}" if entry["last_closed"] else "no step closed yet"
+        lines.append(f"- Lane {entry['name']} (branch {entry['branch']}, {closed}): {shown}" + (f" and {more} more" if more else ""))
+    return "\n".join(lines) + f"\n\n{OTHER_LANES_SENTENCE}" if lines else ""
+
+
 def _all_records(common):
     return [lanes.read_lane(common, n) for n in lanes.lane_names(common)]
 

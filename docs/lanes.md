@@ -61,6 +61,8 @@ $ tp-agent dispatch --lane api --step s1 --role coder --task "Add GET /health" -
 
 **One writer.** A lane takes one writer at a time; any number of reviewers may share it, but not with a writer. Starting anything in the lane's working tree without `--lane` is refused. Never start a worker by hand there.
 
+**Paths other lanes own.** When a task starts in a lane (a dispatch, a queued task when it comes off the queue, or a retry), the packet gets a section `Paths other lanes own` if another open lane overlaps this lane's declared `--touches`, by the same test as the lane-overlap warning (declared against declared, and declared against the other lane's measured changes). For each such lane it lists the name, the branch, the last closed step (or `no step closed yet`) and the overlapping paths (at most 20 per lane, then `and N more`), then says: "Do not edit these paths; if the task needs them, stop and send tp-agent request." It is advice, not a lock: nothing stops an edit, and `tp-agent lanes` still shows the overlap as a warning. No overlap, no section. A lane whose record cannot be read is left out, and the dispatch is not refused for it. Reviewers started by `tp-review` get no such section.
+
 **Steps.** The next step cannot start until the previous one is closed (below); a retry or a fix inside an open step is never held back.
 
 ```
@@ -119,6 +121,18 @@ tp-agent: step s1 is already closed at 5f7b64aca0f46d2585e35feda00b676a46252162;
 | `REQUEST_CHANGES` with at least one `Closes by: code` finding | rejects: blocks this tree, even if a later review of it approves |
 | `REQUEST_CHANGES` with no `Closes by:` label at all (an older reviewer, another template) | rejects, as it always did |
 | `REQUEST_CHANGES` with labels, none of them `code` | unusable (`REQUEST_CHANGES without a Closes by: code finding`): not a rejection and not an approval. It blocks nothing; a new `tp-agent review AUTHOR --force` of the same tree can approve it |
+
+**Families, and a retry that keeps meeting the same finding.** A finding that repeats an earlier one ends with `Family: <short-kebab-name>` on its own line, before its `Closes by:` line, using the name the earlier finding used (a new finding may name a family too). `review_verdict.families` reads the marker by the rule for `Closes by:` labels above (optionally bold, name in backticks or a full stop after it, not quoted, fenced, blockquoted or under Coverage), and names are matched with the case folded. `tp-agent retry ID` looks at the reviews of the author chain (the task and its retry ancestors, as the review rounds do). When the latest review, written for `ID` itself, names a family an earlier review of the chain also named, a retry without `--route` is refused; the message names the family, both reviews and the three routes. `--escalate` alone does not pass it.
+
+| `--route` | What happens |
+| --- | --- |
+| `rule-first` | retries; a Notes line records the route and the family and says the brief must change the rule or the design, not one more site. Name the rule in the brief |
+| `design` | the same, for a fix that changes the design |
+| `park` | no retry: `parked.md` in the author's task directory records the family and both reviews, and the command prints that the owner decides |
+
+`--route` with no repeated family is refused. A review that cannot be read names no family, and a retry lineage that cannot be walked (the limits the review rounds apply) prints that the gate was not checked and retries. The route Notes line is not carried into the next retry; the next review's own repeat decides again.
+
+**A retry's fix brief.** `tp-agent retry ID --reason /abs/fix.md`, with no `--task`, starts the new request with `Read and carry out the fix brief /abs/fix.md in full. It replaces the task below where they differ.` and then the old request. The file must exist, be a non-empty regular file, not be named `.env*` and not be in the trust store (the `--contract` checks); otherwise the request is unchanged and the Notes say the reason named a file that was not used and why. With `--task` the request is that text only, and a plain-text reason is only recorded. A review of the retry reads the brief as it does any brief its request names.
 
 **Re-review after a `check` note.** When Main runs the check itself (the count, log or command output the note asked for), it hands the output to the next review instead of having the author rewrite the report: `tp-agent review AUTHOR --force --evidence FILE` (repeatable; `tp-review` takes the same flags). Each file is attached to the packet in order under `Evidence supplied by Main: <file name>`, and the reviewer is told it was produced by the orchestrator, not the author, and can be checked like any other claim; `tp-review` attaches it as it is and does not check that it is true. `--contract FILE` (once) attaches the reviewer contract under `Reviewer contract (supplied by Main)` for a review started without a brief, and the reviewer judges the work against it together with the task. Both count against the packet budget like the author's evidence and are split into labelled segments when large; a packet that cannot hold them is refused, never trimmed. A file that is missing, empty, unreadable, not a regular file, named `.env*` or inside the trust store is refused, naming the file, before any reviewer starts. The flags change nothing in the verdict rules above.
 

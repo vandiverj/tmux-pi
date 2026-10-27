@@ -90,7 +90,7 @@ $ tp-agent lanes api
 | --- | --- | --- |
 | `worker` | a task of the open step is queued or running | wait, answer it (`tp-agent message ID --text "..."`), or `tp-agent stop ID` |
 | `review` | the step has no usable review of its current tree, or one is running | wait for the running one, or `tp-agent review AUTHOR --force` |
-| `orchestrator-dispatch` | no open step, a review asked for changes, or no writer is left to review | `tp-agent dispatch --lane NAME --step ID ...` (a new step, or a task in the open step), or `tp-agent retry AUTHOR --reason "..."` |
+| `orchestrator-dispatch` | no open step, a review asked for changes (a `Closes by: code` finding, or no labels), or no writer is left to review | `tp-agent dispatch --lane NAME --step ID ...` (a new step, or a task in the open step), or `tp-agent retry AUTHOR --reason "..."` |
 | `orchestrator-commit` | the review approved work that is not committed | `git -C WORKTREE add -A && git -C WORKTREE commit -m "..."` |
 | `orchestrator-close` | the step is committed and approved (or changed nothing) | `tp-agent lane close NAME STEP` |
 | `none` | the lane is not open | nothing; start a new lane |
@@ -110,6 +110,15 @@ $ tp-agent lane close api s1
 $ tp-agent lane close api s1
 tp-agent: step s1 is already closed at 5f7b64aca0f46d2585e35feda00b676a46252162; it is recorded, so there is nothing to do. The next step takes a new id: `tp-agent dispatch --lane api --step NEW-ID --role ROLE --task "..."`
 ```
+
+**What a review can say.** Reviewers end every finding with `Closes by: code` (the tree must change), `check` (a command, count or log the author must show), `decision` (the owner or orchestrator must rule) or `none` (a note); a missing or wrong item in the author's report, or a command the author did not run, is a `check`, not a defect, and is listed under "Owed before close". The gate reads the labels (`review_verdict.closes_by`):
+
+| Review | The gate reads it as |
+| --- | --- |
+| `APPROVED`, or `APPROVED_WITH_NOTES` (labels or not) with a Coverage section | approves |
+| `REQUEST_CHANGES` with at least one `Closes by: code` finding | rejects: blocks this tree, even if a later review of it approves |
+| `REQUEST_CHANGES` with no `Closes by:` label at all (an older reviewer, another template) | rejects, as it always did |
+| `REQUEST_CHANGES` with labels, none of them `code` | unusable (`REQUEST_CHANGES without a Closes by: code finding`): not a rejection and not an approval. It blocks nothing; a new `tp-agent review AUTHOR --force` of the same tree can approve it |
 
 **Owner override:** `tp-agent lane close NAME STEP --override-review --reason TEXT`. Run it yourself, in your own terminal. It closes a step over a review that asked for changes to this exact tree, for example when the only finding was already handled outside the tree, such as a test you ran. It lifts only that refusal: no writer may still be working, nothing may be queued, no review of the tree may still be running, and the work must be committed. It refuses when stdin and stdout are not a terminal, when `TP_TASK_ID`, `TP_TASK_DIR` or `TP_MODE` is set (an agent session), and when the random code it prints is not typed back from `/dev/tty`. A step that needs no override is refused too; close it normally. The entry is recorded with verdict `OWNER_OVERRIDE`, the newest review that asked for changes, and `override_reason`.
 

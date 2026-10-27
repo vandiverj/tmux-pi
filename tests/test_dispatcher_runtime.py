@@ -202,6 +202,27 @@ class DispatcherRuntime(unittest.TestCase):
         self.assertEqual(d["taskReview"], "needs_human")
         self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]))
 
+    def test_a_request_changes_with_no_code_finding_is_neither_approval_nor_rejection(self):
+        # the same scenario with a reviewer whose findings are labelled Closes by: and none is code: the author is not sent back
+        replies = {"check": ("REQUEST_CHANGES: F1\nF1 [note] the report has no count. Closes by: check\nCoverage\nreviewed every changed file.", False),
+                   "code": ("REQUEST_CHANGES: F1\nF1 [defect] wrong value. Closes by: code\nCoverage\nreviewed every changed file.", True)}
+        for name, (reply, sent_back) in replies.items():
+            with self.subTest(name):
+                run = subprocess.run(["node", "--experimental-strip-types", str(HARNESS), "review-changes"], cwd=ROOT, text=True,
+                                     capture_output=True, check=True, timeout=15, env={**os.environ, "REVIEW_CHANGES_REPLY": reply})
+                d = json.loads(run.stdout)
+                self.assertEqual(d["taskReview"], "needs_human")
+                self.assertEqual(len([c for c in d["calls"] if c["name"] == "tp-review"]), 2 if sent_back else 1)
+                self.assertFalse(any(c["name"] == "tp-contract" and c["args"][0] == "collect" for c in d["calls"]))
+                said = "\n".join(str(m["content"]) for m in d["messages"])
+                if sent_back:
+                    self.assertNotIn("neither an approval nor a rejection", said)
+                else:
+                    self.assertIn("neither an approval nor a rejection", said)
+                    self.assertIn("the author was not sent back", said)
+                    self.assertIn("tp-agent review auto-1", said)
+                    self.assertIn("Closes by: code", d["reviewReasons"][-1])
+
     def test_malformed_and_forged_resolved_markers_never_unblock(self):
         malformed = scenario("malformed-marker")
         self.assertEqual(malformed["inputResult"]["action"], "handled")

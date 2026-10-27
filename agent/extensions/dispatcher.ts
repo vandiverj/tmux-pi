@@ -18,7 +18,8 @@
  *                      Models in local packet_files also get up to 3 files a Claude
  *                      model picked (`tp-route --pick-files`).
  *   review required    when the author settles, a cross-provider reviewer starts; one
- *                      REQUEST_CHANGES round goes back to the author automatically.
+ *                      REQUEST_CHANGES round goes back to the author automatically,
+ *                      unless no finding is labelled Closes by: code (human gate).
  *   Laya unavailable   do not authorize dispatch or edits; main may answer read-only.
  *
  * Leading +here, +delegate and +review markers override placement or review; +followup
@@ -387,6 +388,16 @@ export default function (pi: ExtensionAPI) {
 			return "review_verdict output unreadable";
 		}
 	};
+	// Why a REQUEST_CHANGES review is no rejection (its findings are labelled Closes by: and none is code), or "" when it is one
+	// or the reply is another verdict; lib/review_verdict.py decides.
+	const reviewUnusable = async (resultFile: string): Promise<string> => {
+		const r = await run("python3", [join(root, "lib", "review_verdict.py"), resultFile]);
+		try {
+			return r.code === 0 ? String(JSON.parse(r.stdout).unusable_reason || "") : "";
+		} catch {
+			return "";
+		}
+	};
 	let enabled = true;
 	let active = true;
 	let lastCtx: any;
@@ -719,6 +730,8 @@ export default function (pi: ExtensionAPI) {
 			// A review without a Coverage section is incomplete whatever its first line says; lib/review_verdict.py decides, and
 			// a refusal or unreadable answer from it counts as incomplete too.
 			const incomplete = parsed.verdict ? await reviewIncomplete(join(reviewDir, "result.md")) : undefined;
+			// A REQUEST_CHANGES with labelled findings and no Closes by: code asks for no change: neither an approval nor a rejection.
+			const unusable = parsed.verdict === "REQUEST_CHANGES" ? await reviewUnusable(join(reviewDir, "result.md")) : "";
 				const verdictApproved = reviewed.ok && !incomplete && (parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES");
 			const changed = reviewMarker(dir).round_nonce !== nonce || authorHash(dir) !== snapshot;
 			if (changed && reviewed.ok && reviewMarker(dir).status !== "needs_human") {
@@ -751,13 +764,16 @@ export default function (pi: ExtensionAPI) {
 					post(`${task.id} finished and ${reviewer} approved it${withNotes ? " with notes" : ""}.\n\n${summary(reply, join(dir, "result.md"))}\n\n${withNotes ? `Notes (${reviewer}'s verdict is APPROVED_WITH_NOTES; handle them or say why not):\n${clip(parsed.notes, REPLY_LIMIT)}\n\nFull review:\n` : "Review:\n"}${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "result", id: task.id, review: reviewer, ...(withNotes ? { notes: parsed.notes } : {}) });
 				break;
 			}
-			if (!reviewed.ok || verdictApproved || parsed.verdict !== "REQUEST_CHANGES") {
-				const reason = !reviewed.ok ? "Required review failed before approval" : incomplete ?
+			if (!reviewed.ok || verdictApproved || parsed.verdict !== "REQUEST_CHANGES" || unusable) {
+				const reason = !reviewed.ok ? "Required review failed before approval" : unusable ?
+					`${unusable}; it is neither an approval nor a rejection` : incomplete ?
 					`Review incomplete (${incomplete}); its stated verdict ${parsed.verdict} does not count as an approval` : verdictApproved ?
 					"Approval cannot clear an existing human gate or lacks independent evidence" :
 					`Reviewer verdict unparseable: ${parsed.error ?? "whole first line must be APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES without formatting"}`;
 				requireDelegatedReview(dir, task.id, reason, reviewer);
-				post(`${task.id} still needs human review resolution; ${reviewer} did not clear the durable gate.\n\n${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "review-needs-human", id: task.id, review: reviewer });
+				const why = reviewed.ok && unusable ? `${task.id}: ${reviewer} answered REQUEST_CHANGES, but none of its findings is labelled Closes by: code, so it is neither an approval nor a rejection and the author was not sent back. Show what it lists as owed before close (a command, count or log); a new \`tp-agent review ${task.id}\` of the same result may run.` :
+					`${task.id} still needs human review resolution; ${reviewer} did not clear the durable gate.`;
+				post(`${why}\n\n${summary(verdict, join(reviewDir, "result.md"))}`, { kind: "review-needs-human", id: task.id, review: reviewer });
 				break;
 			}
 			if (task.rounds >= MAX_REVIEW_ROUNDS) {

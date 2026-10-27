@@ -12,7 +12,11 @@ record but is incomplete (assess): it never approves, whatever the verdict line 
 decides; every consumer of a verdict (tp-agent, task_record, routing_evals, the dispatcher, the collect tools) calls it
 or this command.
 
-usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null};
+A REQUEST_CHANGES whose findings are labelled `Closes by:` (code, check, decision or none) and none is `code` is unusable
+(request_changes_problem): neither an approval nor a rejection. One with a `code` label, or with no labels, rejects as before.
+
+usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null,
+       "closes_by": [label, ...], "unusable_reason": str|null};
        exits 1 and says why when the reply is not a verdict or the file cannot be read
 """
 import json
@@ -165,6 +169,29 @@ def assess(text):
     return verdict, notes, coverage_problem(text)
 
 
+# "Closes by: code|check|decision|none" ends each finding (bin/tp-review findings_rule). Case-insensitive; Markdown bold or backticks
+# may surround the label and the value ("**Closes by:** `check`"). A value that is not one of the four is not a label.
+CLOSES_BY = re.compile(r"closes[ \t]+by[ \t*_`]*:[ \t*_`]*(code|check|decision|none)\b", re.I)
+UNUSABLE_CHANGES = "REQUEST_CHANGES without a Closes by: code finding"
+
+
+def closes_by(text):
+    """The `Closes by:` labels in a reviewer's reply, lower-case, in order of appearance (repeats kept); [] when it has none."""
+    return [match.group(1).lower() for match in CLOSES_BY.finditer(text)]
+
+
+def request_changes_problem(text):
+    """Why a REQUEST_CHANGES reply is not a rejection, or None. It is not one when its findings are labelled and none is
+    `Closes by: code`: nothing in the tree has to change, so it asks for no work. A reply with a `code` label, with no labels
+    (an older reviewer, another template), or with any other verdict or none is not touched. It is no approval either."""
+    try:
+        verdict = parse(text)[0]
+    except ValueError:
+        return None
+    labels = closes_by(text)
+    return UNUSABLE_CHANGES if verdict == "REQUEST_CHANGES" and labels and "code" not in labels else None
+
+
 def approves(text):
     """True for a complete APPROVED or APPROVED_WITH_NOTES; False for REQUEST_CHANGES, an incomplete review, or anything refused."""
     try:
@@ -178,8 +205,10 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     try:
-        verdict, notes, incomplete = assess(read_review(sys.argv[1]))
+        text = read_review(sys.argv[1])
+        verdict, notes, incomplete = assess(text)
     except ValueError as exc:
         print(f"review_verdict: {exc}", file=sys.stderr)
         sys.exit(1)
-    print(json.dumps({"verdict": verdict, "notes": notes, "complete": incomplete is None, "incomplete_reason": incomplete}))
+    print(json.dumps({"verdict": verdict, "notes": notes, "complete": incomplete is None, "incomplete_reason": incomplete,
+                      "closes_by": closes_by(text), "unusable_reason": request_changes_problem(text)}))

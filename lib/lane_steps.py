@@ -28,7 +28,10 @@ Or it is EMPTY: after 1, the working tree is clean and HEAD's tree is the tree o
 step), so there is nothing to review. It is closed without a review and recorded with verdict EMPTY and review null. A review
 of that unchanged tree, whatever it said, is not read: it judged nothing that was changed.
 A review approves when its lifecycle is settled or completed and review_verdict.assess reads APPROVED or APPROVED_WITH_NOTES with
-a non-empty Coverage section. Reviews of another tree are stale and ignored. There is no skip. The one override is the owner's:
+a non-empty Coverage section. A REQUEST_CHANGES rejects, unless every finding is labelled `Closes by:` and none is `code`
+(a missing report item or an unrun command, which no change to the tree closes): that review is unusable, a second review of
+the same tree may approve, and it is named in `why` like the other unusable ones. A REQUEST_CHANGES with a `code` label, or with
+no labels at all (older reviewers, other templates), rejects as before. Reviews of another tree are stale and ignored. There is no skip. The one override is the owner's:
 `lane close --override-review --reason TEXT`, typed back at a terminal (owner_confirm), lifts only the refusal of a review that asked
 for changes to this tree. Every other part of 1 to 3 still holds (no running review, clean and committed), and the entry is recorded
 with verdict OWNER_OVERRIDE, the newest such review and the owner's reason.
@@ -229,20 +232,24 @@ def _reviewed_state(task):
 
 def _judge(task):
     """('approves' | 'rejects' | 'running' | 'unusable', detail) for a review task. Settled or completed ones are read through
-    review_verdict.assess (the one reader); a REQUEST_CHANGES verdict rejects even when its Coverage section is missing."""
+    review_verdict.assess (the one reader); a REQUEST_CHANGES verdict rejects even when its Coverage section is missing, unless its
+    findings are labelled `Closes by:` and none is `code` (review_verdict.request_changes_problem): that asks for no change to the
+    tree, so it is unusable like any review that is not a vote."""
     life = life_of(task)
     if life in AT_WORK:
         return "running", life
     if life not in FINISHED_REVIEW:
         return "unusable", f"it ended {life}"
     try:
-        verdict, _, incomplete = review_verdict.assess(review_verdict.read_review(task["path"] / "result.md"))
+        text = review_verdict.read_review(task["path"] / "result.md")
+        verdict, _, incomplete = review_verdict.assess(text)
     except review_verdict.ReviewMissing:
         return "unusable", "it has no result"
     except ValueError as error:
         return "unusable", str(error)
     if verdict == "REQUEST_CHANGES":
-        return "rejects", verdict
+        problem = review_verdict.request_changes_problem(text)
+        return ("unusable", problem) if problem else ("rejects", verdict)
     if incomplete:
         return "unusable", incomplete
     return "approves", verdict

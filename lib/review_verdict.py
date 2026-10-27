@@ -329,8 +329,18 @@ def assess(text):
 # the label ("**Closes by:** `check`", "**Closes by: code.**"), the value may be in backticks, and a full stop may follow it. The
 # label must end its line: a value that is not one of the four, or text after the label, makes it no label.
 _VALUES = "code|check|decision|none"
-CLOSES_BY = re.compile(r"(?<!\w)closes[ \t]+by(?:[ \t]*(?:\*\*|__))?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*(?:`(" + _VALUES + r")`|(" + _VALUES +
-                       r"))[ \t]*\.?[ \t]*(?:\*\*|__)?[ \t]*$", re.I)
+
+
+def _label(words, values):
+    """The pattern for a `<words>: <value>` label on a line of its own; `values` is a regex with no groups."""
+    return re.compile(r"(?<!\w)" + words + r"(?:[ \t]*(?:\*\*|__))?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*(?:`(" + values + r")`|(" + values +
+                      r"))[ \t]*\.?[ \t]*(?:\*\*|__)?[ \t]*$", re.I)
+
+
+CLOSES_BY = _label(r"closes[ \t]+by", _VALUES)
+# "Family: <short-kebab-name>" before the Closes by: line of a finding that repeats an earlier one (a new finding may name one too);
+# read by the same rule as Closes by:, with the name folded to lower case.
+FAMILY = _label("family", r"[a-z0-9][a-z0-9_-]*")
 # the lines a label never counts under: a Coverage or Verification heading (a Markdown heading, a bold line, or the bare word) to
 # the next Markdown heading
 QUOTING_SECTION = re.compile(r"(?i)^[ \t]{0,3}(?:#{1,6}[ \t]+)?(?:(?:\*\*|__)[ \t]*)?(?:coverage|verification)\b(?:[ \t]*[:*_#]|[ \t]*$)")
@@ -343,13 +353,12 @@ def _quoted(prefix):
     return prefix.count("`") % 2 == 1 or prefix.count('"') % 2 == 1 or prefix.count("“") > prefix.count("”")
 
 
-def closes_by(text):
-    """The `Closes by:` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats kept); []
-    when it has none. This is the one rule for what counts. A label counts when it ends its line (optionally bold, in backticks
-    around the value, or followed by a full stop) and is none of: inside backticks or double quotes, in a fenced block or a `>`
-    blockquote, or under a Coverage or Verification heading (a Markdown heading or a line that starts with the bold word; it runs to
-    the next Markdown heading). A quoted label in the reviewer's prose is therefore no label. A reply that cannot be normalised (a
-    fence or comment never closed) has none: the safe reading is that nothing says the review asks for no change."""
+def _labels(text, pattern):
+    """The values of `pattern` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats
+    kept). A label counts when it ends its line (optionally bold, in backticks around the value, or followed by a full stop) and is
+    none of: inside backticks or double quotes, in a fenced block or a `>` blockquote, or under a Coverage or Verification heading
+    (a Markdown heading or a line that starts with the bold word; it runs to the next Markdown heading). A quoted label in the
+    reviewer's prose is therefore no label. A reply that cannot be normalised (a fence or comment never closed) has none."""
     try:
         lines = normalise(text.strip()).split("\n")[1:]  # the first line is the verdict; normalise drops a leading BOM
     except ValueError:
@@ -360,10 +369,23 @@ def closes_by(text):
             quoting = False
         if QUOTING_SECTION.match(line):
             quoting = True
-        match = None if quoting else CLOSES_BY.search(line.rstrip())
+        match = None if quoting else pattern.search(line.rstrip())
         if match and not _quoted(line[:match.start()]):
             found.append((match.group(1) or match.group(2)).lower())
     return found
+
+
+def closes_by(text):
+    """The `Closes by:` labels that sit on a finding in a reviewer's reply, lower-case, in order of appearance (repeats kept); []
+    when it has none. This is the one rule for what counts (see _labels). A reply that cannot be normalised has none: the safe
+    reading is that nothing says the review asks for no change."""
+    return _labels(text, CLOSES_BY)
+
+
+def families(text):
+    """The distinct `Family:` names a reviewer's reply gives its findings, lower-case, in order of first appearance; [] when it names
+    none or cannot be normalised. Counted by the rule for `Closes by:` labels."""
+    return list(dict.fromkeys(_labels(text, FAMILY)))
 
 
 def request_changes_problem(text):

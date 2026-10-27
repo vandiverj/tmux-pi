@@ -103,5 +103,143 @@ class FixBriefTests(RetryCase):
         self.assertEqual(review_verdict.named_briefs(self.request(again)), [brief])
 
 
+def review_text(*families):
+    labels = "".join(f"F{n} [defect] one cell of the matrix is wrong.\nFamily: {name}\nCloses by: code\n\n" for n, name in enumerate(families, 1))
+    return (f"REQUEST_CHANGES\nRESULT_STATUS: complete\n{labels or 'F1 [defect] wrong.\nCloses by: code\n'}\n"
+            "Coverage\nI read the changed files and their callers.\n")
+
+
+class RepeatedFamilyGateTests(RetryCase):
+    def attach_review(self, item, review_id, *families):
+        """A review task `review_id` with a reply naming `families`, recorded on the author `item` (reviews, as tp-review writes them)."""
+        task = self.state / "tasks" / review_id
+        task.mkdir(exist_ok=True)  # a test that chains twice (subTests) reuses the ids
+        (task / "meta.json").write_text(json.dumps({"id": review_id, "role": "reviewer"}))
+        (task / "result.md").write_text(review_text(*families))
+        path = self.task_dir(item) / "meta.json"
+        meta = json.loads(path.read_text())
+        meta["reviews"] = meta.get("reviews", []) + [review_id]
+        path.write_text(json.dumps(meta))
+
+    def chain(self, *rounds):
+        """The author reviewed once per round (each round is the families its review names), each retried from the last (plainly, or
+        with --route design where the gate asks for a route); the newest author is returned. Every review is `review-N`."""
+        item = self.settled()
+        self.attach_review(item, "review-1", *rounds[0])
+        for number, families in enumerate(rounds[1:], 2):
+            run = self.plain_retry(item)
+            if run.returncode:
+                run = self.plain_retry(item, "--route", "design")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            item = json.loads(run.stdout)
+            self.settle(item, "RESULT_STATUS: complete\nDone.\n")
+            self.attach_review(item, f"review-{number}", *families)
+        return item
+
+    def tasks(self):
+        return sorted(p.name for p in (self.state / "tasks").iterdir())
+
+    def plain_retry(self, item, *extra):
+        return self.raw("retry", item["id"], "--reason", "again", "--worker", "pi", "--model", MODEL, *extra)
+
+    def test_a_family_named_in_two_rounds_refuses_a_plain_retry(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        before = self.tasks()
+        run = self.plain_retry(item)
+        self.assertEqual(run.returncode, 1, run.stdout)
+        for word in ("state-matrix", "review-1", "review-2", "--route rule-first", "--route design", "--route park"):
+            self.assertIn(word, run.stderr)
+        self.assertEqual(self.tasks(), before)  # no task was spawned
+
+    def test_the_families_are_matched_by_name_with_the_case_folded(self):
+        item = self.chain(["State-Matrix"], ["state-matrix"])
+        self.assertEqual(self.plain_retry(item).returncode, 1)
+
+    def test_route_design_and_rule_first_retry_and_the_notes_say_which_route(self):
+        for route in ("design", "rule-first"):
+            with self.subTest(route=route):
+                item = self.chain(["state-matrix"], ["state-matrix"])
+                run = self.plain_retry(item, "--route", route)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                packet = self.packet(json.loads(run.stdout))
+                self.assertIn(f"route {route}", packet)
+                self.assertIn("state-matrix", packet)
+                self.assertIn("the brief must change the rule or the design, not one more site", packet)
+                self.assertTrue(any(line.startswith(f"- Retry of {item['id']}") and f"route {route}" in line for line in packet.splitlines()))
+
+    def test_the_route_note_is_not_replayed_into_the_next_retry(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        again = json.loads(self.plain_retry(item, "--route", "design").stdout)
+        self.settle(again, "RESULT_STATUS: complete\nDone.\n")
+        self.assertNotIn("route design", self.packet(self.retry(again, "later")))
+
+    def test_route_park_does_not_retry_and_writes_parked_md(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        before = self.tasks()
+        run = self.plain_retry(item, "--route", "park")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.tasks(), before)
+        parked = (self.task_dir(item) / "parked.md").read_text()
+        for word in ("state-matrix", "review-1", "review-2"):
+            self.assertIn(word, parked)
+        self.assertIn("owner decides", run.stdout + run.stderr)
+        self.assertEqual(Path(json.loads(run.stdout)["parked"]).resolve(), (self.task_dir(item) / "parked.md").resolve())
+
+    def test_escalate_alone_does_not_pass_the_gate(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        before = self.tasks()
+        run = self.raw("retry", item["id"], "--reason", "again", "--escalate")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("state-matrix", run.stderr)
+        self.assertIn("--route", run.stderr)
+        self.assertEqual(self.tasks(), before)
+
+    def test_a_family_round_one_did_not_name_allows_a_plain_retry(self):
+        item = self.chain(["state-matrix"], ["error-path"])
+        run = self.plain_retry(item)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_a_latest_review_naming_no_family_allows_a_plain_retry(self):
+        item = self.chain(["state-matrix"], [])
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_only_the_latest_review_is_judged_against_the_earlier_ones(self):
+        item = self.chain(["state-matrix", "error-path"], ["state-matrix"], ["error-path"])  # round 3 repeats a family of round 1 only
+        run = self.plain_retry(item)
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("error-path", run.stderr)
+        self.assertNotIn("family state-matrix", run.stderr)
+
+    def test_an_attempt_not_yet_reviewed_after_a_routed_retry_retries_plainly(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        again = json.loads(self.plain_retry(item, "--route", "design").stdout)
+        self.settle(again, "RESULT_STATUS: complete\nDone.\n")
+        self.assertEqual(self.plain_retry(again).returncode, 0)
+
+    def test_a_route_without_a_repeated_family_is_refused(self):
+        item = self.chain(["state-matrix"], ["error-path"])
+        before = self.tasks()
+        run = self.plain_retry(item, "--route", "park")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("repeats no family", run.stderr)
+        self.assertEqual(self.tasks(), before)
+        self.assertFalse((self.task_dir(item) / "parked.md").exists())
+
+    def test_a_review_that_cannot_be_read_is_skipped(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        (self.state / "tasks" / "review-1" / "result.md").unlink()
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_a_retry_lineage_that_cannot_be_read_says_the_gate_was_not_checked(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        meta = self.task_dir(item) / "meta.json"
+        value = json.loads(meta.read_text())
+        parent = value["parent"]
+        (self.state / "tasks" / parent / "meta.json").write_text("not json")
+        run = self.plain_retry(item)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("repeated-family gate was not checked", run.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -542,6 +542,42 @@ def fix_brief(reason):
     return (None, problem) if problem else (text, None)
 
 
+RETRY_ROUTES = ("rule-first", "design", "park")
+ROUTE_SENTENCE = "the brief must change the rule or the design, not one more site"
+
+
+def repeated_family(base, task_id):
+    """(family, earlier_review, latest_review) when the newest review of the author chain of `task_id` was written for `task_id`
+    itself and names a finding family an earlier review of the chain also named (names matched case-folded, see
+    review_verdict.families); None otherwise. A review whose reply cannot be read names no family. Raises review_rounds.Refused
+    when the chain cannot be walked (the same limits as the review rounds)."""
+    chain = review_rounds.earlier_reviews(base, task_id)
+    if not chain or chain[-1][0] != task_id:
+        return None
+    named = []
+    for _, review in chain:
+        try:
+            named.append((review, review_verdict.families((task_dir(base, review) / "result.md").read_text())))
+        except (OSError, ValueError):
+            named.append((review, []))
+    latest, latest_families = named[-1]
+    for family in latest_families:
+        for review, families in reversed(named[:-1]):
+            if family in families:
+                return family, review, latest
+    return None
+
+
+def park_retry(previous, task_id, family, earlier, latest):
+    """Write parked.md in the author task directory and return the record `retry --route park` prints: nothing is retried."""
+    path = previous / "parked.md"
+    path.write_text(f"# Parked: {task_id}\n\nThe finding family `{family}` was named by review {earlier} and again by review {latest}. "
+                    "Another retry on the same family would fix one more site; the owner decides what changes instead "
+                    "(the rule, the design, or whether to stop).\n")
+    return {"id": task_id, "parked": str(path), "family": family, "reviews": [earlier, latest],
+            "next": f"No attempt was started. The owner decides: {family} was named in {earlier} and {latest}."}
+
+
 def replay_inputs(previous, kept, problem=None):
     """Return (context, notes, remark) to replay from a prior attempt. `kept` is dispatch_record's return value, or
     None with its RecordError as `problem`; an unusable record replays nothing."""
@@ -1184,6 +1220,10 @@ def main():
                        help="start the attempt although a process is still alive on the same working tree (skips only the retry guard; a lane's one writer is still enforced: stop the writer instead)")
     retry.add_argument("--escalate", action="store_true",
                        help="after two failed attempts or two REQUEST_CHANGES: effort up, then level up (never above high unapproved)")
+    retry.add_argument("--route", choices=RETRY_ROUTES,
+                       help="when the latest review names a finding family (a 'Family: <name>' line) an earlier review of the chain also named, a "
+                            "plain retry is refused (--escalate does not pass it). rule-first / design: retry, with the brief changing the rule or "
+                            "the design, not one more site (recorded in the Notes); park: no retry, parked.md in the task directory, the owner decides")
     rv = sub.add_parser("review", help="start an independent reviewer for a finished task (a different provider from the author unless --same-provider)")
     rv.add_argument("id")
     rv.add_argument("--force", action="store_true", help="review even when the policy says none")
@@ -1357,6 +1397,22 @@ def main():
                              f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
         if not args.force_alive:
             guard_retry(previous)
+        try:
+            repeated = repeated_family(base, args.id)
+        except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
+            repeated = None
+            print(f"tp-agent: the repeated-family gate was not checked: {error}", file=sys.stderr)
+        if repeated and not args.route:
+            family, earlier, latest = repeated
+            raise ValueError(f"finding family {family} was named by review {earlier} and again by review {latest}: another retry would "
+                             f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
+                             f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
+        if args.route and not repeated:
+            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named, "
+                             "so there is nothing to route; retry without --route")
+        if args.route == "park":
+            print(json.dumps(park_retry(previous, args.id, *repeated), indent=2))
+            return
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
@@ -1390,7 +1446,9 @@ def main():
                                          parent=args.id, after=[], context=contexts,
                                          tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
-                                                      + brief_note + (f" {remark}; see the prior packet." if remark else "")])
+                                                      + brief_note + (f" {remark}; see the prior packet." if remark else "")]
+                                         + ([f"Retry of {args.id} by route {args.route}: finding family {repeated[0]} was named by review {repeated[1]} and again by review {repeated[2]}; {ROUTE_SENTENCE}."]
+                                            if args.route else []))
         value = dispatch(replacement, base)
         if problem is not None:  # reachable only through an explicit --tests
             value = dict(value, prior_record=f"not used: {problem}")

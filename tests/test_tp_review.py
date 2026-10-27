@@ -257,6 +257,8 @@ echo review-1
             self.assertIn("A missing or wrong item in the author's report, or a command the author did not run, is never a defect: label it check "
                           "and list it under 'Owed before close'. Run it yourself when you can and give the result.", task)
             self.assertIn("name the family it belongs to", task)
+            self.assertIn("end it with 'Family: <short-kebab-name>' on its own line, before its 'Closes by:' line, and use the name the earlier "
+                          "finding used; a new finding may name a family too", task)
             # Both providers have the redacted tools; a prompt on a bash search outside the worktree stalls an unattended reviewer.
             self.assertIn("Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash", task)
             self.assertNotIn("review round", task)  # a first review does not claim earlier rounds

@@ -18,6 +18,7 @@ What later slices must not assume:
   (`git diff --name-only base..tip` plus uncommitted paths); it is a warning, never a refusal.
 - Creation holds the lane lock while it creates, so two creations in one repository queue; it does not hold git's own
   locks, so a hand-run `git worktree add` or `git branch` for the same name in between is caught by git, not by us."""
+import json
 import os
 import re
 import subprocess
@@ -139,10 +140,11 @@ OTHER_LANES_SENTENCE = "Do not edit these paths; if the task needs them, stop an
 
 
 def _code_span(path):
-    """`path` as one Markdown code span on one line. A character that does not print (a newline, an escape) is shown escaped, as
-    repr shows it. A backtick cannot close the span: the fence is longer than any run of backticks inside, padded with a space
-    on each side (CommonMark)."""
-    text = "".join(c if c.isprintable() else repr(c)[1:-1] for c in path)
+    """`path` as its JSON string (json.dumps, ASCII only) inside one Markdown code span on one line. The quotes keep leading and
+    trailing spaces visible, a backslash is shown as `\\\\`, and every non-ASCII or non-printing character is escaped, so two
+    different paths never look alike. A backtick cannot close the span: the fence is longer than any run of backticks inside,
+    padded with a space on each side (CommonMark)."""
+    text = json.dumps(path, ensure_ascii=True)
     if "`" not in text:
         return f"`{text}`"
     longest = max(len(run) for run in re.findall(r"`+", text))

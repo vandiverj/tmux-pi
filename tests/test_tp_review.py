@@ -279,7 +279,7 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         names = [Path(p).name for p in self.spawn_contexts()]
-        self.assertEqual(names, ["task.md", "packet.md", "result.md"])
+        self.assertEqual(names, ["task.md", "packet.md", "result.md", "timer-waits.md"])  # the computed timer file is the only addition
         self.assertFalse((self.state / "tasks" / "review-1" / "reviewed-state.json").exists())
         meta = json.loads((self.task / "meta.json").read_text())
         self.assertEqual(meta["reviews"], ["review-1"])
@@ -540,7 +540,7 @@ echo review-1
         (self.work / "a.txt").write_text("one\n")
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md"])
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md", "timer-waits.md"])
         state = json.loads((self.state / "tasks" / "review-1" / "reviewed-state.json").read_text())
         self.assertRegex(state["tree"], r"^[0-9a-f]{40,64}$")
         self.assertEqual(Path(state["workdir"]).resolve(), self.work.resolve())
@@ -937,8 +937,8 @@ echo review-1
     def test_without_the_new_flags_the_packet_and_the_task_text_have_nothing_of_them(self):
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md"])
-        for word in ("Main", "evidence file", "Reviewer contract"):
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md", "timer-waits.md"])
+        for word in ("Main", "evidence file", "Reviewer contract", "Dispositions", "Acceptance criteria"):
             self.assertNotIn(word, self.task_text())
 
     def test_tp_agent_review_passes_both_flags_to_tp_review(self):
@@ -966,6 +966,150 @@ echo review-1
                 self.assertFalse(record.exists())
         r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--contract", ""], text=True, capture_output=True, env=self.env)
         self.assertEqual(record.read_text().splitlines(), ["--contract", "", "w1"])  # an empty value reaches tp-review, which refuses it
+
+    # --dispositions (R5)
+    def test_dispositions_are_attached_under_their_heading_and_the_task_says_a_listed_finding_is_closed(self):
+        d = self.supplied("d.md", "round 1 F2: closed by decision (Main): out of scope\n")
+        r = self.review("--dispositions", d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertIn("Dispositions of earlier findings (supplied by Main)", body)
+        self.assertIn("round 1 F2: closed by decision (Main): out of scope\n", body)
+        task = self.task_text()
+        self.assertIn("Dispositions of earlier findings (supplied by Main)", task)
+        self.assertIn("A finding listed there is closed", task)
+        self.assertIn("raise it again only if the tree changed in a way that reopens it", task)
+        self.assertIn("cite the disposition and the change", task)
+        self.assertNotIn("Reviewer contract", task)
+
+    def test_dispositions_come_after_the_contract_and_are_allowed_beside_it_and_evidence(self):
+        r = self.review("--evidence", self.supplied("e.txt", "EVID\n"), "--contract", self.supplied("c.md", "CONTRACT-TEXT\n"),
+                        "--dispositions", self.supplied("d.md", "DISPOSITION-TEXT\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertLess(body.index("CONTRACT-TEXT"), body.index("DISPOSITION-TEXT"))
+
+    def test_a_bad_dispositions_file_is_refused_naming_it_and_no_reviewer_starts(self):
+        folder = self.work / "dir.txt"
+        folder.mkdir()
+        env_file = self.supplied(".env.local", "K=v\n")
+        for path, why in ((str(self.work / "missing.md"), "does not exist"), ("", "--dispositions"), (self.supplied("empty.md", ""), "is empty"),
+                          (str(folder), "not a regular file"), (env_file, ".env")):
+            with self.subTest(path=path):
+                r = self.review("--dispositions", path)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("--dispositions", r.stderr)
+                self.assertIn(why, r.stderr)
+                if path:
+                    self.assertIn(f"'{path}'", r.stderr)
+                self.assertFalse((self.plan.parent / "route.args").exists())
+                self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_a_dispositions_file_inside_the_trust_store_is_refused(self):
+        import pwd
+        store = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/tmux-pi/trust/nothing-here.json"
+        r = self.review("--dispositions", str(store))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("trust store", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_dispositions_may_be_given_only_once(self):
+        r = self.review("--dispositions", self.supplied("d1.md"), "--dispositions", self.supplied("d2.md"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--dispositions may be given only once", r.stderr)
+        self.assertIn("usage:", r.stderr)
+        self.assertFalse((self.plan.parent / "spawn.args").exists())
+
+    def test_dispositions_count_against_the_budget_and_are_never_trimmed(self):
+        (self.task / "packet.md").write_text("p" * 200000)
+        r = self.review("--dispositions", self.supplied("d.md", "d" * 150000))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("without dropping author evidence", r.stderr)
+
+    def test_a_large_dispositions_file_is_split_into_labelled_segments(self):
+        r = self.review("--dispositions", self.supplied("big.md", "x" * 100000 + "DISPOSITION-TAIL"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        segs = [p for p in self.spawn_contexts() if "main-dispositions" in Path(p).name]
+        self.assertEqual(len(segs), 2)
+        self.assertIn("big.md", self.copy(segs[0]).read_text())
+
+    def test_tp_agent_review_passes_dispositions_through_and_refuses_a_repeat(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        d1, d2 = self.supplied("d1.md"), self.supplied("d2.md")
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--dispositions", d1], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text().splitlines(), ["--dispositions", d1, "w1"])
+        record.unlink()
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--dispositions", d1, "--dispositions", d2], text=True, capture_output=True, env=self.env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--dispositions may be given only once", r.stderr)
+        self.assertFalse(record.exists())
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1", "--dispositions", ""], text=True, capture_output=True, env=self.env)
+        self.assertEqual(record.read_text().splitlines(), ["--dispositions", "", "w1"])  # an empty value reaches tp-review, which refuses it
+
+    # the acceptance list (R7)
+    def set_brief(self, text):
+        (self.task / "request.md").write_text(text)
+
+    def marker(self):
+        return self.state / "tasks" / "review-1" / "acceptance-items.json"
+
+    def test_a_brief_with_a_numbered_done_means_list_tells_the_reviewer_to_account_for_each_item_and_records_the_count(self):
+        self.set_brief("Do it.\n\n## Done means\n1. one\n2. two\n3. three\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        task = self.task_text()
+        self.assertIn("section headed Acceptance criteria", task)
+        self.assertIn("one line per item", task)
+        self.assertIn("not checked", task)
+        self.assertIn("3 item(s)", task)
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3]})
+
+    def test_the_contract_files_list_counts_too(self):
+        r = self.review("--contract", self.supplied("c.md", "**Acceptance criteria**\n1. a\n2. b\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("section headed Acceptance criteria", self.task_text())
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2]})
+
+    def test_without_a_numbered_list_the_rule_is_absent_and_no_marker_is_written(self):
+        self.set_brief("Do it.\n\n## Done means\n- a bullet\n")
+        r = self.review("--contract", self.supplied("c.md", "judge it well\n"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Acceptance criteria", self.task_text())
+        self.assertFalse(self.marker().exists())
+
+    def test_a_reply_missing_the_section_is_incomplete_through_tp_agent_once_the_marker_is_written(self):
+        self.set_brief("## Done means\n1. a\n2. b\n")
+        self.assertEqual(self.review().returncode, 0)
+        review = self.state / "tasks" / "review-1"
+        text = "APPROVED\nRESULT_STATUS: complete\nCoverage\nI reviewed a.py and checked its callers and tests.\n"
+        (review / "result.md").write_text(text)
+        out = subprocess.run([sys.executable, str(self.root / "lib/review_verdict.py"), str(review / "result.md")], text=True, capture_output=True)
+        self.assertFalse(json.loads(out.stdout)["complete"])
+        (review / "result.md").write_text(text.replace("Coverage", "## Acceptance criteria\n1. met - a.py:1\n2. met - t\n\nCoverage"))
+        out = subprocess.run([sys.executable, str(self.root / "lib/review_verdict.py"), str(review / "result.md")], text=True, capture_output=True)
+        self.assertTrue(json.loads(out.stdout)["complete"], out.stdout)
+
+    # timer waits in added test lines (T2)
+    def test_the_packet_carries_the_timer_file_and_with_no_new_flags_nothing_else_changes(self):
+        self.git("init", "-q")
+        (self.work / "x_test.ts").write_text("await sleep(50)\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertEqual(names, ["task.md", "packet.md", "result.md", "timer-waits.md"])
+        timer = self.copy(self.spawn_contexts()[-1]).read_text()
+        self.assertIn("Timer waits in added test lines", timer)
+        self.assertIn("x_test.ts:1: await sleep(50)", timer)
+        for word in ("Main", "Reviewer contract", "Dispositions", "Acceptance criteria"):
+            self.assertNotIn(word, self.task_text())
+
+    def test_with_no_timer_lines_the_file_says_none_were_found(self):
+        self.git("init", "-q")
+        (self.work / "x.ts").write_text("await sleep(50)\n")
+        self.assertEqual(self.review().returncode, 0)
+        self.assertIn("none were found", self.copy(self.spawn_contexts()[-1]).read_text())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,14 @@ next round is the change from that tree to the tree now.
       (<budget>: most characters the text may have; the inline list shrinks to fit. <lane> may be "" for a non-lane task; the full changed-file list is written to <list-file> (atomically, replacing a link there), which the assignment names, when it is longer than the assignment lists (200 paths or 16 KB); it is not attached to the packet)
       prints {"text": the changed-file list and scoped git commands for the reviewer's assignment, "withheld": [paths]};
       always exits 0 (a workdir that is not a git repository, or a list that cannot be made, is said in one line)
+      For a lane task the list and the commands start from the lane's last closed step (the commit lane_steps._previous names)
+      when that commit is an ancestor of HEAD, else from the lane base; the text names which ("base: last closed step S at SHA"
+      or "base: lane base SHA") and says closed steps are out of scope except where the new lines change or call them.
+
+  review_rounds.py timers <workdir> <lane> <out-file>
+      writes the `Timer waits in added test lines` file: the added lines of that same diff, in files whose path matches
+      test, spec, e2e or __tests__, that contain setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(, as path:line: text
+      (a line carrying `timer-ok:` is marked `(timer-ok)`); facts only. Withheld paths are never read.
 
   review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir>
       writes the earlier findings files and the diff into out-dir and prints
@@ -369,22 +377,33 @@ MAX_SCOPE_BYTES = 16384  # and at most this many bytes of them, so long names ca
 
 
 def scope_lines(workdir, lane=""):
-    """(base, top, safe paths [(path, untracked)], withheld paths) for the author's change, or None outside git; raises Refused."""
+    """(base, top, safe paths [(path, untracked)], withheld paths, basis) for the author's change, or None outside git; raises
+    Refused. basis says which base a lane review diffs from and why ("" for a task outside a lane): the last closed step's
+    commit when the lane has closed steps and that commit is an ancestor of HEAD, else the lane base."""
     top = git(workdir, "rev-parse", "--show-toplevel")
     if top.returncode:
         return None
     top = top.stdout.strip()
+    basis = ""
     if git(top, "rev-parse", "--verify", "-q", "HEAD").returncode:
         base = git(top, "hash-object", "-t", "tree", "/dev/null").stdout.strip()  # no commit yet: everything is new
     elif lane:
         try:
             import lanes
+            import lane_steps
             record = lanes.read_lane(lanes.git_common_dir(top), lane)
             base = record["base"]["commit"]
+            closed = record["closed"][-1]["step"] if record["closed"] else None
+            last = lane_steps._previous(record) if closed else None
         except Exception as exc:
             raise Refused(f"cannot read the base of lane {lane}: {exc}")
         merged = git(top, "merge-base", base, "HEAD")
         base = merged.stdout.strip() if merged.returncode == 0 and merged.stdout.strip() else base
+        basis = f"base: lane base {base[:12]}"
+        if closed and git(top, "merge-base", "--is-ancestor", last, "HEAD").returncode == 0:
+            base, basis = last, f"base: last closed step {closed} at {last[:12]}"
+        elif closed:
+            basis += f" (closed step {closed} at {last[:12]} is not an ancestor of HEAD)"
     else:
         base = "HEAD"
     # The working tree and the index each against the base: a staged change that the working tree undoes (MM) is in the
@@ -403,7 +422,7 @@ def scope_lines(workdir, lane=""):
     withheld = [path for path in paths if path in flagged or any(f.startswith(path + "/") for f in flagged)]
     held = set(withheld)
     safe = [(path, path in new) for path in paths if path not in held]
-    return base, top, safe, withheld
+    return base, top, safe, withheld, basis
 
 
 def literal(text):
@@ -457,9 +476,13 @@ def scope_text(workdir, lane="", list_file=None, budget=None):
 
 def render_scope(found, lane, list_file, max_bytes):
     """(text, bytes of path lines used, False when the text is the unavailable line) for found = scope_lines(...) with at most max_bytes of path lines inline."""
-    base, top, safe, withheld = found
-    kinds = "committed on the lane since its base, staged, unstaged and untracked" if lane else "staged, unstaged and untracked"
+    base, top, safe, withheld, basis = found
+    since = "since its last closed step" if basis.startswith("base: last closed step") else "since its base"
+    kinds = f"committed on the lane {since}, staged, unstaged and untracked" if lane else "staged, unstaged and untracked"
     out = [f"Diff scope: {len(safe)} file(s) changed relative to {base[:12] if lane else 'HEAD'} ({kinds}) in the repository at {literal(top)}:"]
+    if basis:  # a lane task: which base the list and the commands below use, and what that leaves out of scope
+        closed = " Closed steps are out of scope except where the new lines change or call them." if "closed step" in basis else ""
+        out.insert(0, f"{basis}.{closed}")
     count, size = 0, 0
 
     def room(line):
@@ -511,7 +534,81 @@ def render_scope(found, lane, list_file, max_bytes):
     return "\n".join(out), size, True
 
 
+TIMER_CALLS = ("setTimeout(", "sleep(", "delay(", "Deno.sleep(", "waitForTimeout(")  # a plain substring match; the reviewer judges
+TEST_PATH = re.compile(r"test|spec|e2e|__tests__", re.I)
+TIMER_TITLE = "Timer waits in added test lines"
+MAX_TIMER_LINES = 300  # listed lines; the rest are counted, so a huge list cannot crowd out the packet's author evidence
+MAX_TIMER_TEXT = 400
+
+
+def added_lines(top, base, path, untracked):
+    """[(line number, text)]: the lines of `path` that are added relative to `base` (the working tree and the index each; a
+    path that is untracked is all added). The path is given to git as a literal name."""
+    if untracked:
+        target = Path(top) / path
+        if target.is_symlink() or not target.is_file():
+            return []
+        data = target.read_bytes()
+        return [] if b"\0" in data else list(enumerate(data.decode("utf-8", "replace").splitlines(), 1))
+    env = {**os.environ, "GIT_LITERAL_PATHSPECS": "1"}
+    found = []
+    for flags in ((), ("--cached",)):
+        run = subprocess.run(["git", "-C", top, "-c", "core.quotepath=false", "diff", *flags, "--unified=0", "--no-color", "--no-ext-diff",
+                              "--no-textconv", "--no-renames", base, "--", path], capture_output=True, env=env)
+        if run.returncode:
+            raise Refused(f"cannot read the added lines of {shown(path)}: {run.stderr.decode('utf-8', 'replace').strip()}")
+        number = None
+        for line in run.stdout.decode("utf-8", "replace").split("\n"):
+            hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if hunk:
+                number = int(hunk.group(1))
+            elif number is not None and line.startswith("+"):
+                found.append((number, line[1:]))
+                number += 1
+    return found
+
+
+def timer_waits(workdir, lane=""):
+    """The text of the packet's `Timer waits in added test lines` file: every added line of the review diff, in a file whose
+    path matches a test pattern, that contains one of TIMER_CALLS, as `path:line: text`, a line carrying `timer-ok:` marked
+    `(timer-ok)`; one line saying none were found when there are none. Facts only. Withheld (sensitive) paths are never read, a
+    listed line goes through the redaction pass, and the text is never an error: what cannot be computed is said in one line."""
+    head = f"# {TIMER_TITLE}\n\n"
+    try:
+        found = scope_lines(workdir, lane)
+        if found is None:
+            return head + "Not computed: the working directory is not a git repository.\n"
+        base, top, safe, _, _ = found
+        rows, seen = [], set()
+        for path, untracked in safe:
+            if not TEST_PATH.search(path):
+                continue
+            for number, text in added_lines(top, base, path, untracked):
+                if any(call in text for call in TIMER_CALLS) and (path, number, text) not in seen:
+                    seen.add((path, number, text))
+                    clipped = text.strip()[:MAX_TIMER_TEXT] + ("…" if len(text.strip()) > MAX_TIMER_TEXT else "")
+                    rows.append((path, number, f"{shown(path)}:{number}: {clipped}{' (timer-ok)' if 'timer-ok:' in text else ''}"))
+        rows.sort(key=lambda row: row[:2])
+        if not rows:
+            return head + "No added test line contains setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(; none were found.\n"
+        body = "\n".join(row[2] for row in rows[:MAX_TIMER_LINES])
+        body, _ = redact_text(redactor(), body, "timer waits in added test lines")
+        more = len(rows) - MAX_TIMER_LINES
+        return (head + "Added lines in files whose path contains test, spec, e2e or __tests__ that contain setTimeout(, sleep(, delay(, "
+                "Deno.sleep( or waitForTimeout( (a plain match; the reviewer judges them; `(timer-ok)` marks a line carrying `timer-ok:`):\n\n"
+                + body + "\n" + (f"\nand {more} more such line(s) not listed here.\n" if more > 0 else ""))
+    except (Refused, OSError) as exc:
+        return head + f"Not computed: {' '.join(str(exc).split())[:200]}.\n"
+
+
 def main(argv):
+    if len(argv) == 5 and argv[1] == "timers":  # timers <workdir> <lane> <out-file>
+        try:
+            write_list_file(argv[4], timer_waits(argv[2], argv[3]))
+        except OSError as exc:
+            print(f"review_rounds: cannot write {argv[4]}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
     if len(argv) in (3, 4, 5, 6) and argv[1] == "scope":
         text, withheld = scope_text(*argv[2:5], budget=int(argv[5]) if len(argv) == 6 else None)
         print(json.dumps({"text": text, "withheld": withheld}))

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tp-review — spawn an independent reviewer for a completed tmux-pi task.
 #
-# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] <task-id>
+# Usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] [--dispositions FILE] <task-id>
 #
 # Asks the model router for a review plan (tp-route --review-plan): whether a review is needed
 # (the larger of a deterministic policy over role, files touched, level and effort and the
@@ -28,9 +28,20 @@
 # other claim. tp-review attaches it as it is and does not check that it is true.
 # --contract FILE (once): Main attaches the reviewer contract (for a review started without a brief) under `Reviewer contract
 # (supplied by Main)`; the task text says to judge the work against it together with the task.
-# Both count against the packet budget like the author's evidence and are split into labelled segments when large; a packet that
+# --dispositions FILE (once, any round): Main attaches what it has ruled on in earlier rounds under `Dispositions of earlier findings
+# (supplied by Main)`; the task text says a finding listed there is closed, to be raised again only if the tree changed in a way that
+# reopens it, citing the disposition and the change. tp-review does not check the file against the earlier findings.
+# All three count against the packet budget like the author's evidence and are split into labelled segments when large; a packet that
 # cannot hold them is refused, never trimmed. A file that is missing, not a regular file, unreadable or empty, one named `.env*`,
-# and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules.
+# and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules,
+# except the acceptance rule below.
+# Acceptance criteria: when the task's request, or the --contract file, has a numbered list under a heading `Done means` or `Acceptance
+# criteria`, the task text asks for a section headed `Acceptance criteria` with one line per item (number; met, not met or not
+# checked; evidence), and the item numbers are recorded beside the review's result (acceptance-items.json) so that
+# lib/review_verdict.py calls a reply without that section, or naming fewer item numbers, incomplete. Without such a list nothing changes.
+# A lane task's changed-file list and scoped commands start from the lane's last closed step (the lane base when it has none, or its
+# commit is not an ancestor of HEAD), and the text names the base used (lib/review_rounds.py scope). The packet also carries a file
+# `Timer waits in added test lines` (lib/review_rounds.py timers): the added test lines that call setTimeout(, sleep(, delay(, ...).
 # Prints the review task id.
 set -euo pipefail
 
@@ -44,14 +55,16 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
 
 usage() {
-  echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] <task-id>" >&2
+  echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] [--dispositions FILE] <task-id>" >&2
   echo "  --evidence FILE (repeatable): attach a check output Main produced to the packet, under 'Evidence supplied by Main: <file name>'; the reviewer is told it is not the author's" >&2
   echo "  --contract FILE (once): attach the reviewer contract under 'Reviewer contract (supplied by Main)'; the reviewer judges the work against it with the task" >&2
+  echo "  --dispositions FILE (once): attach what Main ruled on in earlier rounds under 'Dispositions of earlier findings (supplied by Main)'; a finding listed there is closed unless the tree changed in a way that reopens it" >&2
+  echo "  a numbered list under 'Done means' or 'Acceptance criteria' in the request or the contract makes the reviewer answer each item in an 'Acceptance criteria' section (a reply without it is incomplete)" >&2
   echo "  --same-provider --approved-by-user QUOTE: review on the author's own provider, only with the user's approval (quoted, recorded)" >&2
   echo "  --force-alive skips ending the author and the session's writer check; it does not apply to a lane's tree (end the writer: tp-agent stop ID)" >&2
   exit "${1:-1}"
 }
-force=0 force_alive=0 plan_opts=() same_provider=0 approval="" evidence=() contract="" have_contract=0   # have_contract, not -n "$contract": an empty value is a missing file, not no contract
+force=0 force_alive=0 plan_opts=() same_provider=0 approval="" evidence=() contract="" have_contract=0 dispositions="" have_dispositions=0   # have_*, not -n "$contract": an empty value is a missing file, not no file
 [[ "${1:-}" != -h && "${1:-}" != --help ]] || usage 0
 while [[ $# -gt 1 ]]; do
   case "$1" in
@@ -66,6 +79,10 @@ while [[ $# -gt 1 ]]; do
       [[ $# -gt 2 ]] || usage
       [[ "$have_contract" == 0 ]] || { echo "tp-review: --contract may be given only once" >&2; usage; }
       have_contract=1; contract="$2"; shift 2 ;;
+    --dispositions)
+      [[ $# -gt 2 ]] || usage
+      [[ "$have_dispositions" == 0 ]] || { echo "tp-review: --dispositions may be given only once" >&2; usage; }
+      have_dispositions=1; dispositions="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -108,6 +125,7 @@ PYEOF
 }
 for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
 if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi
+if [[ "$have_dispositions" == 1 ]]; then check_supplied --dispositions "$dispositions"; fi
 if [[ "$same_provider" == 1 ]]; then
   [[ -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
   plan_opts+=(--same-provider --approved-by-user "$approval")
@@ -223,6 +241,21 @@ fi
 if [[ "$have_contract" == 1 ]]; then
   review_task="$review_task Main attached a reviewer contract under the heading 'Reviewer contract (supplied by Main)'. Judge the work against that contract together with the task."
 fi
+if [[ "$have_dispositions" == 1 ]]; then
+  review_task="$review_task Main attached the dispositions of earlier findings under the heading 'Dispositions of earlier findings (supplied by Main)'. A finding listed there is closed: raise it again only if the tree changed in a way that reopens it, and then cite the disposition and the change."
+fi
+# A numbered Done means / Acceptance criteria list in the request or the contract: the reply must account for each item, and
+# lib/review_verdict.py holds it to that through the item numbers recorded beside the review's result (below, after the start).
+acceptance='{"items":[]}' ac_sources=()
+if [[ -f "$dir/request.md" ]]; then ac_sources+=("$dir/request.md"); fi
+if [[ "$have_contract" == 1 ]]; then ac_sources+=("$contract"); fi
+if (( ${#ac_sources[@]} > 0 )); then
+  acceptance="$(python3 "$ROOT/lib/review_verdict.py" acceptance "${ac_sources[@]}")" || die "cannot read the acceptance criteria of '$id'"
+fi
+ac_count="$(jq -r '.items | length' <<<"$acceptance")"
+if (( ac_count > 0 )); then
+  review_task="$review_task The task (or the reviewer contract) has a numbered list of $ac_count item(s), numbers $(jq -r '.items | map(tostring) | join(", ")' <<<"$acceptance"), under a heading 'Done means' or 'Acceptance criteria'. Include in your final reply a section headed Acceptance criteria with one line per item: its number, then met, not met or not checked, then the evidence (file:line, a test, or a command). A reply without that section, or one that names fewer of the item numbers than the list has, is incomplete."
+fi
 
 # Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
 followups=()
@@ -296,6 +329,13 @@ for ((i = 0; i < ${#evidence[@]}; i++)); do
   attach_supplied "$f" "Evidence supplied by Main: $(basename "$f")" "(Produced by the orchestrator, not the author. Check it like any other claim.)" "main-evidence-$(printf '%02d' "$supplied_n")"
 done
 if [[ "$have_contract" == 1 ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
+if [[ "$have_dispositions" == 1 ]]; then attach_supplied "$dispositions" "Dispositions of earlier findings (supplied by Main)" "" main-dispositions; fi
+# The added test lines that wait on a clock (a research report has no diff). Computed here, never by the reviewer; facts only.
+if [[ -z "${extra[*]+x}" ]]; then
+  python3 "$ROOT/lib/review_rounds.py" timers "$author_workdir" "$author_lane" "$excerpt_dir/timer-waits.md" || die "cannot compute the timer waits for '$id'"
+  add_segments "$excerpt_dir/timer-waits.md" timer-waits
+  review_task="$review_task The context file headed 'Timer waits in added test lines' lists the added test lines that wait on a clock, as path:line: text; they are facts only, and you judge whether each is a defect."
+fi
 # The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
 # The scope text is sized to the packet's remaining headroom. Any overflow list goes to $dir/review-changed-files.txt (named in the assignment, not attached, so it cannot exceed the packet budget).
 # Never fails the review: when the list cannot be made, the assignment says so in one line.
@@ -347,4 +387,6 @@ tp_not_link --root "$state_dir" "$review_dir"
 printf '%s\n' "$id" | tp_write "$review_dir/review-of" --root "$state_dir"
 # The working tree this reviewer saw; the next round's diff starts here. Absent when the workdir is not a git repository.
 if [[ "$snapshot" != null ]]; then printf '%s\n' "$snapshot" | tp_write "$review_dir/reviewed-state.json" --root "$state_dir"; fi
+# The acceptance items the reply must account for; lib/review_verdict.py read_review applies them for every reader of the reply.
+if (( ac_count > 0 )); then printf '%s\n' "$acceptance" | tp_write "$review_dir/acceptance-items.json" --root "$state_dir"; fi
 printf '%s\n' "$review_id"

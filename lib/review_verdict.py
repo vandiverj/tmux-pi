@@ -15,11 +15,18 @@ or this command.
 A REQUEST_CHANGES whose findings are labelled `Closes by:` (code, check, decision or none) and none is `code` is unusable
 (request_changes_problem): neither an approval nor a rejection. One with a `code` label, or with no labels, rejects as before.
 
+When a task's brief or reviewer contract has a numbered list under `Done means` or `Acceptance criteria`, bin/tp-review records
+its item numbers beside the review's result.md (acceptance-items.json); read_review then returns a ReviewText that carries them,
+and assess calls the reply incomplete, like a missing Coverage section, when it has no `Acceptance criteria` section or that
+section names fewer item numbers than the list has (acceptance_problem). With no list nothing changes.
+
 usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "complete": bool, "incomplete_reason": str|null,
        "closes_by": [label, ...], "unusable_reason": str|null};
        exits 1 and says why when the reply is not a verdict or the file cannot be read
+       review_verdict.py acceptance <file>...   prints {"items": [n, ...]}: the acceptance criteria numbers in those files (bin/tp-review)
 """
 import json
+import os
 import re
 import sys
 
@@ -100,7 +107,41 @@ def read_review(path):
         raise ValueError(f"the review result {path} is not valid UTF-8: {exc}") from None
     if not text.strip():
         raise ValueError(f"the review result {path} is empty")
-    return text
+    return ReviewText(text, recorded_items(path))
+
+
+class ReviewText(str):
+    """A review reply read from a file, with the numbers of the acceptance criteria its task listed (None: no list), so
+    that assess() applies the Acceptance criteria rule for every consumer that reads a reply through read_review. strip()
+    keeps them: tp-agent, lane_steps, routing_evals and task_record all pass the text on after it."""
+
+    def __new__(cls, text, items=None):
+        self = super().__new__(cls, text)
+        self.acceptance_items = list(items) if items else None
+        return self
+
+    def strip(self, *chars):
+        return ReviewText(super().strip(*chars), self.acceptance_items)
+
+
+ITEMS_FILE = "acceptance-items.json"  # beside a review's result.md; bin/tp-review writes it when the task listed numbered criteria
+
+
+def recorded_items(result_path):
+    """The item numbers bin/tp-review recorded beside `result_path`, or None when it recorded none. A record that exists
+    but cannot be read refuses: a review is never judged against a guess."""
+    path = os.path.join(os.path.dirname(os.fspath(result_path)), ITEMS_FILE)
+    try:
+        with open(path, "rb") as handle:
+            value = json.loads(handle.read(MAX_REVIEW_BYTES).decode("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"the acceptance items recorded in {path} are unreadable: {exc}") from None
+    items = value.get("items") if isinstance(value, dict) else None
+    if not isinstance(items, list) or not all(isinstance(i, int) and not isinstance(i, bool) and i > 0 for i in items):
+        raise ValueError(f"the acceptance items recorded in {path} are not a list of item numbers")
+    return items or None
 
 
 def normalise(text):
@@ -162,11 +203,69 @@ def coverage_problem(text):
     return None
 
 
+# The acceptance list of a brief or contract: a line that is only `Done means` or `Acceptance criteria` (Markdown heading of any
+# level, bold, or plain, with an optional colon), then the numbered items before the next heading. A reply to a task that had one
+# must carry an `Acceptance criteria` section that names every item number (bin/tp-review tells the reviewer so).
+_LIST_HEADING = re.compile(r"(?i)^[ \t]{0,3}(?:#{1,6}[ \t]+)?(?:\*\*|__)?[ \t]*(done means|acceptance criteria)[ \t]*:?[ \t]*(?:\*\*|__)?[ \t]*:?[ \t]*#*[ \t]*$")
+_ANY_HEADING = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]|(?:\*\*|__)[^*_\n]+(?:\*\*|__)[ \t]*:?[ \t]*$)")
+_ITEM = re.compile(r"^ {0,3}(\d+)[.)][ \t]+")
+_REPLY_ROW = re.compile(r"(?i)^[|\s]*(?:[-*+][ \t]+)?(?:\*\*|__)?[ \t]*(?:ac|item|criterion|#)?[ \t]*(\d+)\b")
+
+
+def acceptance_items(*texts):
+    """The item numbers, sorted, of the numbered lists that follow a `Done means` or `Acceptance criteria` heading in each of
+    `texts` (a list in a fenced block is not read; only top-level items count). [] when there is no such list."""
+    found = set()
+    for text in texts:
+        inside, fence = False, None
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            match = FENCE.match(line)
+            if fence is not None:
+                if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
+                    fence = None
+            elif match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
+            elif _LIST_HEADING.match(line):
+                inside = True
+            elif _ANY_HEADING.match(line):
+                inside = False
+            elif inside and (item := _ITEM.match(line)):
+                found.add(int(item.group(1)))
+    return sorted(found)
+
+
+def acceptance_problem(text, items):
+    """Why `text` does not account for the acceptance criteria numbered `items`, or None. The reply needs a section that is only
+    the words Acceptance criteria (as Coverage is found) whose lines name every item number. This counts numbers; it cannot tell
+    a true row from a false one. No items: nothing is asked."""
+    if not items:
+        return None
+    try:
+        lines = normalise(text.strip().strip("﻿")).split("\n")[1:]  # the first line is the verdict
+    except ValueError as exc:
+        return f"the review cannot be checked for an Acceptance criteria section: {exc}"
+    starts = [n for n, line in enumerate(lines) if (m := _LIST_HEADING.match(line)) and m.group(1).lower() == "acceptance criteria"]
+    if not starts:
+        return f"the review has no Acceptance criteria section (the task listed item(s) {', '.join(map(str, items))})"
+    named = set()
+    for line in lines[starts[-1] + 1:]:
+        if re.match(r"^[ \t]{0,3}#{1,6}[ \t]", line):
+            break
+        if row := _REPLY_ROW.match(line):
+            named.add(int(row.group(1)))
+    missing = [i for i in items if i not in named]
+    if missing:
+        return f"the review's Acceptance criteria section does not account for item{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))}"
+    return None
+
+
 def assess(text):
     """(verdict, notes, incomplete_reason) for a reviewer's reply; ValueError when the reply is not a verdict. The stated
-    verdict is always kept for the record; incomplete_reason is None only for a review with a non-empty Coverage section."""
+    verdict is always kept for the record; incomplete_reason is None only for a review with a non-empty Coverage section and,
+    when its task listed numbered acceptance criteria (a ReviewText from read_review carries them), an Acceptance criteria
+    section that names every item."""
     verdict, notes = parse(text)
-    return verdict, notes, coverage_problem(text)
+    return verdict, notes, coverage_problem(text) or acceptance_problem(text, getattr(text, "acceptance_items", None))
 
 
 # "Closes by: code|check|decision|none" ends each finding (bin/tp-review findings_rule). Case-insensitive; Markdown bold may surround
@@ -232,6 +331,14 @@ def approves(text):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "acceptance":  # for bin/tp-review: the item numbers of the brief and contract files
+        try:
+            texts = [open(path, encoding="utf-8", errors="replace").read() for path in sys.argv[2:]]
+        except OSError as exc:
+            print(f"review_verdict: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps({"items": acceptance_items(*texts)}))
+        sys.exit(0)
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     try:

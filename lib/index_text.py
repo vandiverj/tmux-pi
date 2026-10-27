@@ -96,9 +96,15 @@ def _index_line(row):
     if _is_text(row.get("result_status")):
         fields.append(f"result={row['result_status']}")
     # a review's stated verdict never reads as an approval unless its Coverage section was there
+    # and a REQUEST_CHANGES whose findings are labelled Closes by: with none `code` is neither a rejection nor an approval
     if _is_text(row.get("verdict")):
-        fields.append(f"verdict={row['verdict']}" if row.get("review_complete") is True
-                      else f"verdict={row['verdict']} [review incomplete: not an approval]")
+        if row.get("review_complete") is not True:
+            note = " [review incomplete: not an approval]"
+        elif _is_text(row.get("review_unusable")) and row["review_unusable"] != "":
+            note = " [review unusable: neither a rejection nor an approval]"
+        else:
+            note = ""
+        fields.append(f"verdict={row['verdict']}{note}")
     if _is_text(row.get("result_path")):
         fields.append(row["result_path"])
     if _is_text(row.get("reason")) and row["reason"] != "":

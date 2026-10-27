@@ -75,14 +75,18 @@ export default function (pi: ExtensionAPI) {
 	const root = dirname(process.env.PI_CODING_AGENT_DIR);
 	const bin = (name: string) => join(root, "bin", name);
 	// A reviewer's reply without a Coverage section (or that cannot be checked, or is missing) is announced in words before the reply;
-	// lib/review_verdict.py decides. Empty for a task that is not a review or a complete review.
+	// lib/review_verdict.py decides. A REQUEST_CHANGES with labelled findings and none `Closes by: code` is announced as no rejection too.
+	// Empty for a task that is not a review or a complete, usable review.
 	const reviewNotice = async (dir: string, reply: string): Promise<string> => {
 		if (!existsSync(join(dir, "review-of"))) return "";
 		const r = await run("python3", [join(root, "lib", "review_verdict.py"), join(dir, "result.md")]);
 		let out: any = null;
 		try { out = JSON.parse(r.stdout); } catch { /* refused below */ }
 		if (r.code !== 0 || !out) return `NOT AN APPROVAL: this review is incomplete (${(r.stderr || r.stdout).trim() || "no answer"}).\n\n`;
-		return out.complete ? "" : `NOT AN APPROVAL: this review is incomplete (${out.incomplete_reason}). Its stated verdict ${out.verdict} is kept for the record but does not count; ask for the review again.\n\n`;
+		if (!out.complete) return `NOT AN APPROVAL: this review is incomplete (${out.incomplete_reason}). Its stated verdict ${out.verdict} is kept for the record but does not count; ask for the review again.\n\n`;
+		if (!out.unusable_reason) return "";
+		const author = readFileSync(join(dir, "review-of"), "utf8").trim();
+		return `NOT A REJECTION AND NOT AN APPROVAL: this review answered ${out.verdict}, but ${out.unusable_reason}. It asks for no change to the work and blocks no lane step; show what it lists as owed before close (a command, count or log), then a new \`tp-agent review ${author}\` of the same work may run.\n\n`;
 	};
 
 	// When each subagent was last given input; collect_result waits for a report newer than this.

@@ -236,7 +236,8 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("tp-agent review author", json.loads(out.stdout)["notice"])
         self.assertIn("not a rejection", out.stderr)
-        for ident, reply in (("code", "REQUEST_CHANGES\nF1 Closes by: code\n" + COMPLETE), ("plain", "REQUEST_CHANGES\nF1 defect\n" + COMPLETE)):
+        for ident, reply in (("code", "REQUEST_CHANGES\nF1 Closes by: code\n" + COMPLETE), ("plain", "REQUEST_CHANGES\nF1 defect\n" + COMPLETE),
+                             ("quoted", "REQUEST_CHANGES\nF1 defect\nCoverage\nreviewed a.py, quoting `Closes by: check` from the rule\n")):
             self.assertNotIn("review_notice", self.agent.record(self.task(f"rv-{ident}", reply, review_of="author")), ident)
 
     # the injected index
@@ -250,6 +251,18 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual((rows["rv-ok"]["verdict"], rows["rv-ok"]["review_complete"]), ("APPROVED", True))
         author = self.task("author", "done\nRESULT_STATUS: complete\n")
         self.assertNotIn("verdict", {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}["author"])
+
+    def test_the_session_index_shows_an_unusable_review_as_unusable_and_keeps_the_stated_verdict(self):
+        for ident, reply in (("check", "REQUEST_CHANGES\nF1 [note] no count. Closes by: check\n" + COMPLETE),
+                             ("code", "REQUEST_CHANGES\nF1 [defect] wrong. Closes by: code\n" + COMPLETE),
+                             ("bare", "REQUEST_CHANGES\nF1 [defect] wrong.\nCoverage\nreviewed a.py, quoting `Closes by: check` from the rule.\n"),
+                             ("ok", "APPROVED\n" + COMPLETE)):
+            self.task(f"rv-{ident}", reply, review_of="author")
+        rows = {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}
+        self.assertEqual((rows["rv-check"]["verdict"], rows["rv-check"]["review_complete"]), ("REQUEST_CHANGES", True))
+        self.assertIn("Closes by: code", rows["rv-check"]["review_unusable"])
+        for ident in ("code", "bare", "ok"):
+            self.assertNotIn("review_unusable", rows[f"rv-{ident}"], ident)
 
     # escalation evidence
     def test_escalation_counts_a_stated_request_changes_and_never_an_incomplete_approval(self):
@@ -303,8 +316,10 @@ class ConsumerTests(unittest.TestCase):
         self.task("rv", "APPROVED\nRESULT_STATUS: complete\nfine", review_of="author")
         self.task("rv-ok", "APPROVED\nRESULT_STATUS: complete\n" + COMPLETE, review_of="author")
         self.task("plain", "APPROVED\nRESULT_STATUS: complete\nfine")
+        self.task("rv-check", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [note] no count. Closes by: check\n" + COMPLETE, review_of="author")
+        self.task("rv-code", "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong. Closes by: code\n" + COMPLETE, review_of="author")
         requests = [{"id": 1, "method": "initialize", "params": {}}, {"method": "notifications/initialized"}]
-        for n, ident in enumerate(("rv", "rv-ok", "plain"), start=2):
+        for n, ident in enumerate(("rv", "rv-ok", "plain", "rv-check", "rv-code"), start=2):
             requests.append({"id": n, "method": "tools/call", "params": {"name": "collect_result", "arguments": {"id": ident}}})
         fake = Path(self.tmp.name, "fakebin")
         fake.mkdir()
@@ -320,6 +335,9 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn("no Coverage section", body(2))
         self.assertNotIn("NOT AN APPROVAL", body(3))
         self.assertNotIn("NOT AN APPROVAL", body(4))
+        for words in ("NOT A REJECTION AND NOT AN APPROVAL", "Closes by: code", "tp-agent review author"):
+            self.assertIn(words, body(5))
+        self.assertNotIn("NOT A REJECTION", body(6))  # a code finding is a rejection
 
     # the instruction to the reviewer
     def test_tp_review_still_tells_every_reviewer_to_end_with_coverage(self):

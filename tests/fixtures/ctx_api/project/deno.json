@@ -1,0 +1,9 @@
+{
+    "imports": {
+        "@/": "./src/",
+        "@shared/": "./shared/",
+        "@util": "./src/util/index.ts",
+        "@host": "./src/real_host.ts"
+    },
+    "exclude": ["skipped/"]
+}

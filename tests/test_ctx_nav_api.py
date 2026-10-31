@@ -273,7 +273,7 @@ class IndexCase(Tree):
         index.refresh()
         self.assertFalse(index.indexed("src/linked.ts"))
         self.assertFalse(any(rel.startswith("src/linked_dir") for rel in index.entries))
-        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("./linked.ts", "outside")])
+        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("", "outside")])  # the specifier leads out through a link: blanked
 
     def test_a_relative_import_that_leaves_the_project_is_unresolved_not_returned(self):
         project = self.project()
@@ -612,12 +612,12 @@ class ReviewFixesCase(Tree):
         nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
         answer = nav.imports("src/viaparent.ts")
         self.assertEqual(answer["files"], [])
-        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("./linked_dir/secret.ts", "outside")])
+        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "outside")])
         self.assertEqual(nav.importers("src/linked_dir/secret.ts")["status"], "refused")
         self.assertEqual(nav._get_index().importers("src/linked_dir/secret.ts"), [])
         for call in (nav.symbols, nav.forward_graph):
             refused = call("src/viaparent.ts")
-            self.assertEqual((refused["status"], refused["reason"]), ("refused", "reaches_refused_path"), call.__name__)
+            self.assertEqual((refused["status"], refused["reason"]), ("refused", "outside_project"), call.__name__)
         self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])  # Deno was not run
 
     def test_deno_is_not_run_on_a_file_that_reaches_a_refused_file(self):
@@ -658,14 +658,15 @@ class ReviewFixesCase(Tree):
     def test_a_cached_symbol_of_a_file_that_is_refused_now_is_not_returned(self):
         project = self.project()
         write(project / "src" / "credentials.ts", "export const k = 1;\n")
+        write(project / "src" / "gate.ts", "import './credentials.ts';\nexport { c } from './config.ts';\n")
         doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
         doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/credentials.ts", "secretive", "x")["nodes"]["n"]["symbols"]
         exe = self.scripted_deno(doc=doc)
         permissive = self.nav(project, deno=exe, check_path=lambda root, path: path)
-        self.assertEqual([s["name"] for s in permissive.symbols("src/main.ts")["symbols"]], ["kept", "secretive"])
-        again = self.nav(project, deno=exe).symbols("src/main.ts")
-        self.assertTrue(again["cached"])
-        self.assertEqual([s["name"] for s in again["symbols"]], ["kept"])
+        self.assertEqual([s["name"] for s in permissive.symbols("src/gate.ts")["symbols"]], ["kept", "secretive"])
+        again = self.nav(project, deno=exe).symbols("src/gate.ts")  # the cache holds the symbol; the walk now refuses the target
+        self.assertEqual((again["status"], again["reason"]), ("refused", "reaches_refused_path"))
+        self.assertNotIn("secretive", json.dumps(again))
 
     # --- F4
 
@@ -739,7 +740,8 @@ class ReviewFixesCase(Tree):
         names = [f"src/a{n:03d}.ts" for n in range(250)]
         for name in names:
             write(project / name, "export const a = 1;\n")
-        write(project / "src" / "zz_entry.ts", "import './a249.ts';\nimport './a248.ts';\nexport const z = 1;\n")
+        write(project / "src" / "zz_entry.ts", "import './a249.ts';\nimport './a248.ts';\n"
+              + "".join(f"import './a{n:03d}.ts';\n" for n in range(248)) + "export const z = 1;\n")  # Deno's graph is what the walk reached
         url = lambda rel: f"file://{project.resolve() / rel}"
         modules = [{"specifier": url(name), "dependencies": []} for name in names]
         modules.append({"specifier": url("src/zz_entry.ts"), "dependencies": [
@@ -753,6 +755,298 @@ class ReviewFixesCase(Tree):
         self.assertEqual([m["path"] for m in answer["modules"]], sorted(listed))
         self.assertIn("src/a000.ts", listed)
         self.assertNotIn("src/a199.ts", listed)
+
+
+class AllowListCase(Tree):
+    """Round 3. Deno runs on a target only after a walk of every module reachable from it has shown each one allowed (family
+    path-boundary, found in reviews 1 and 2). The walk reads the files itself: it does not depend on the index, so a file the index
+    does not hold (excluded by deno.json) is followed like any other. Each refusal cause has its own test."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+
+    def deno_nav(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), **kw)
+
+    def assert_refused(self, project, target, reason, nav=None):
+        """Both Deno operations refuse `target` for `reason`, and Deno is not started for either."""
+        nav = nav or self.deno_nav(project)
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call(target)
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", reason), call.__name__)
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+        return nav
+
+    # --- the reviewer's repro
+
+    def test_a_refused_file_behind_an_excluded_file_is_reached_and_refuses(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "import x from './ghost_SECRETNAME.ts';\nexport const KEY = x;\n")
+        write(project / "skipped" / "mid.ts", "export { KEY } from '../src/.env.ts';\n")  # skipped/ is in deno.json "exclude"
+        write(project / "src" / "top.ts", "export { KEY } from '../skipped/mid.ts';\n")
+        self.assertFalse(self.nav(project)._get_index().indexed("skipped/mid.ts"))  # the index does not hold the middle file
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+
+    @NEEDS_DENO
+    def test_the_repro_with_the_real_deno_names_nothing(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "import x from './ghost_SECRETNAME.ts';\nexport const KEY = x;\n")
+        write(project / "skipped" / "mid.ts", "export { KEY } from '../src/.env.ts';\n")
+        write(project / "src" / "top.ts", "export { KEY } from '../skipped/mid.ts';\n")
+        nav = self.nav(project)
+        for answer in (nav.symbols("src/top.ts"), nav.forward_graph("src/top.ts"), nav.imports("src/top.ts", source="deno")):
+            self.assertEqual(answer["status"], "refused")
+            self.assertNotIn("SECRETNAME", json.dumps(answer))
+
+    @NEEDS_DENO
+    def test_an_excluded_file_that_reaches_nothing_refused_is_followed_and_listed(self):
+        project = self.project()
+        write(project / "skipped" / "mid.ts", "import { c } from '../src/config.ts';\nexport const m = c;\n")
+        write(project / "src" / "top.ts", "export { m } from '../skipped/mid.ts';\n")
+        answer = self.nav(project).forward_graph("src/top.ts")
+        self.assertEqual(answer["status"], "ok")
+        self.assertTrue({m["path"] for m in answer["modules"]} >= {"skipped/mid.ts", "src/config.ts"})
+
+    # --- one test per refusal cause
+
+    def test_cause_a_reached_file_that_leaves_the_project(self):
+        project = self.project()
+        write(self.dir / "outside.ts", "export const o = 1;\n")
+        write(project / "skipped" / "mid.ts", "export { o } from '../../outside.ts';\n")
+        write(project / "src" / "top.ts", "export { o } from '../skipped/mid.ts';\n")
+        self.assert_refused(project, "src/top.ts", "outside_project")
+
+    def test_cause_a_reached_symlink_that_leads_out(self):
+        project = self.project()
+        outside = write(self.dir / "outside" / "secret.ts", "export const s = 1;\n")
+        (project / "skipped" / "link.ts").symlink_to(outside)
+        write(project / "skipped" / "mid.ts", "export { s } from './link.ts';\n")
+        write(project / "src" / "top.ts", "export { s } from '../skipped/mid.ts';\n")
+        self.assert_refused(project, "src/top.ts", "outside_project")
+
+    def test_cause_a_percent_encoded_dot_dot_that_the_url_parser_turns_into_a_parent_directory(self):
+        project = self.project()
+        write(self.dir / "outside.ts", "export const o = 1;\n")
+        write(project / "src" / "top.ts", "export { o } from './%2e%2e/%2e%2e/outside.ts';\n")  # Deno reads ../../outside.ts
+        self.assert_refused(project, "src/top.ts", "outside_project")
+
+    def test_cause_a_percent_encoded_name_of_a_refused_file(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        write(project / "src" / "top.ts", "export { KEY } from './%2eenv.ts';\n")
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+
+    def test_cause_an_import_map_entry_that_points_at_a_refused_file(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@secret"] = "./src/.env.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        write(project / "skipped" / "mid.ts", "export { KEY } from '@secret';\n")
+        write(project / "src" / "top.ts", "export { KEY } from '../skipped/mid.ts';\n")
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+
+    def test_cause_a_scope_of_the_import_map_that_points_at_a_refused_file(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        config = json.loads((project / "deno.json").read_text())
+        config["scopes"] = {"./skipped/": {"@util": "./src/.env.ts"}}  # inside skipped/, "@util" is the refused file
+        (project / "deno.json").write_text(json.dumps(config))
+        write(project / "skipped" / "mid.ts", "export { KEY } from '@util';\n")
+        write(project / "src" / "top.ts", "export { KEY } from '../skipped/mid.ts';\n")
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+        write(project / "src" / "other.ts", "export { slug } from '@util';\n")  # outside the scope "@util" is the util module
+        self.assertEqual(self.deno_nav(project).symbols("src/other.ts")["status"], "ok")
+
+    def test_cause_a_scope_that_cannot_be_modelled(self):
+        project = self.project()
+        for scopes in ({"./skipped/": "not a table"}, ["list"], {"./skipped/": {"@util": 5}}):
+            config = json.loads((project / "deno.json").read_text())
+            config["scopes"] = scopes
+            (project / "deno.json").write_text(json.dumps(config))
+            self.assert_refused(project, "src/main.ts", "unmodelled_config", self.deno_nav(project))
+
+    def test_cause_a_config_that_changes_resolution_in_a_way_the_walk_does_not_model(self):
+        project = self.project()
+        original = (project / "deno.json").read_text()
+        for key, value in (("importMap", "./map.json"), ("workspace", ["./a"]), ("links", ["../x"]), ("patch", ["../x"]),
+                           ("unstable", ["sloppy-imports"])):
+            config = json.loads(original)
+            config[key] = value
+            (project / "deno.json").write_text(json.dumps(config))
+            self.assert_refused(project, "src/main.ts", "unmodelled_config", self.deno_nav(project))
+        (project / "deno.json").write_text("{ not json")
+        self.assert_refused(project, "src/main.ts", "unmodelled_config", self.deno_nav(project))
+        (project / "deno.json").write_text(original)
+        self.assertEqual(self.deno_nav(project).symbols("src/main.ts")["status"], "ok")
+
+    def test_cause_a_package_json_dependency_that_is_a_local_path(self):
+        project = self.project()
+        write(project / "package.json", json.dumps({"dependencies": {"leaked": "file:../outside"}}))
+        self.assert_refused(project, "src/main.ts", "unmodelled_config")
+
+    def test_cause_a_compiler_option_that_loads_a_refused_file(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        config = json.loads((project / "deno.json").read_text())
+        config["compilerOptions"] = {"types": ["./src/.env.ts"]}
+        (project / "deno.json").write_text(json.dumps(config))
+        self.assert_refused(project, "src/main.ts", "reaches_refused_path")
+
+    def test_cause_a_dynamic_import_with_an_argument_that_is_not_a_literal(self):
+        project = self.project()
+        write(project / "skipped" / "mid.ts", "export const load = (n: string) => import(`./${n}.ts`);\n")
+        write(project / "src" / "top.ts", "export { load } from '../skipped/mid.ts';\n")
+        self.assert_refused(project, "src/top.ts", "unmodelled_import")
+        write(project / "src" / "meta.ts", "export const u = import.meta.resolve('./x.ts');\n")
+        self.assert_refused(project, "src/meta.ts", "unmodelled_import")
+        self.assertEqual(self.deno_nav(project).symbols("src/main.ts")["status"], "ok")  # literal dynamic imports are followed
+
+    def test_cause_a_pragma_that_names_a_module(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        for pragma in ('// @ts-types="./.env.ts"\nimport "./config.ts";\n', '// @deno-types="./.env.ts"\nimport "./config.ts";\n',
+                       '/// <reference types="./.env.ts" />\n', '/// <reference path="./.env.ts" />\n',
+                       '/** @jsxImportSource ./.env.ts */\n'):
+            write(project / "skipped" / "mid.ts", pragma)
+            write(project / "src" / "top.ts", "import '../skipped/mid.ts';\n")
+            self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+
+    def test_cause_a_reached_file_the_walk_cannot_read(self):
+        project = self.project()
+        write(project / "skipped" / "big.ts", "export const big = 1;\n" + "// " + "x" * (graph.MAX_BYTES + 10) + "\n")
+        write(project / "src" / "top.ts", "export { big } from '../skipped/big.ts';\n")
+        self.assert_refused(project, "src/top.ts", "unreadable_file")
+
+    def test_cause_a_graph_longer_than_the_walk_will_follow(self):
+        project = self.project()
+        write(project / "src" / "top.ts", "".join(f"import './g{n}.ts';\n" for n in range(6)))
+        for n in range(6):
+            write(project / "src" / f"g{n}.ts", "export {};\n")
+        with mock.patch.object(graph, "MAX_REACH_FILES", 4):
+            self.assert_refused(project, "src/top.ts", "too_many_files")
+
+    def test_cause_a_walk_that_fails_unexpectedly(self):
+        project = self.project()
+        nav = self.deno_nav(project)
+        with mock.patch.object(graph, "prove_reach", side_effect=RuntimeError("boom")):
+            self.assert_refused(project, "src/main.ts", "precheck_failed", nav)
+
+    def test_the_walk_does_not_depend_on_the_index(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        write(project / "skipped" / "mid.ts", "export { KEY } from '../src/.env.ts';\n")
+        write(project / "src" / "top.ts", "export { KEY } from '../skipped/mid.ts';\n")
+        nav = self.deno_nav(project)
+        with mock.patch.object(graph.ImportIndex, "refresh", side_effect=OSError("disk")):
+            self.assert_refused(project, "src/top.ts", "reaches_refused_path", nav)
+            self.assertEqual(nav.symbols("src/main.ts")["status"], "ok")  # a clean target does not need the index
+
+    # --- what Deno says is held to the same list
+
+    def test_a_module_deno_lists_that_the_walk_did_not_reach_refuses_the_answer(self):
+        project = self.project()
+        write(project / "src" / "stray.ts", "export const s = 1;\n")
+        url = lambda rel: f"file://{project.resolve() / rel}"
+        info = {"modules": [{"specifier": url("src/config.ts"), "dependencies": []},
+                            {"specifier": url("src/stray.ts"), "dependencies": []}]}
+        nav = self.nav(project, deno=self.scripted_deno(info=info))
+        answer = nav.forward_graph("src/config.ts")
+        self.assertEqual((answer["status"], answer["reason"]), ("refused", "unproven_module"))
+        self.assertNotIn("stray", json.dumps(answer))
+
+    def test_a_file_that_changes_while_deno_runs_gives_no_answer(self):
+        project = self.project()
+        target = project / "src" / "config.ts"
+        exe = self.fake_deno('case "$1" in\n --version) echo "deno 9.9.9";;\n *) echo "// changed" >> ' + str(target)
+                             + '; echo \'{"modules": []}\';;\nesac')
+        answer = self.nav(project, deno=exe).forward_graph("src/config.ts")
+        self.assertEqual(answer["status"], "stale_index")
+        self.assertNotIn("modules", answer)
+
+    def test_the_doc_cache_key_covers_an_excluded_file_the_target_reaches(self):
+        project = self.project()
+        write(project / "skipped" / "mid.ts", "export const m = 1;\n")
+        write(project / "src" / "top.ts", "export { m } from '../skipped/mid.ts';\n")
+        exe = self.scripted_deno(doc=self.doc_payload(project, "skipped/mid.ts", "m", "x"))
+        self.nav(project, deno=exe).symbols("src/top.ts")
+        self.assertTrue(self.nav(project, deno=exe).symbols("src/top.ts")["cached"])
+        write(project / "skipped" / "mid.ts", "export const m = 2;\n")
+        self.assertFalse(self.nav(project, deno=exe).symbols("src/top.ts")["cached"])
+
+    def test_a_symbol_from_a_file_outside_the_walk_is_not_returned(self):
+        project = self.project()
+        write(project / "src" / "stray.ts", "export const s = 1;\n")
+        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/stray.ts", "stray", "x")["nodes"]["n"]["symbols"]
+        shown = self.nav(project, deno=self.scripted_deno(doc=doc)).symbols("src/config.ts")
+        self.assertEqual([s["name"] for s in shown["symbols"]], ["kept"])
+
+    def test_deno_is_told_not_to_look_for_a_config_when_there_is_none(self):
+        write(self.dir / "plain" / "a.ts", "export const a = 1;\n")
+        nav = self.nav(self.dir / "plain", deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        nav.symbols("a.ts")
+        self.assertIn("--no-config", self.deno_calls("doc")[0].split())
+        proj = self.project()
+        self.nav(proj, deno=self.scripted_deno(doc={"nodes": {}})).symbols("src/main.ts")
+        self.assertNotIn("--no-config", self.deno_calls("doc")[-1].split())
+
+    # --- specifier strings in answers
+
+    def test_a_specifier_that_names_a_path_outside_or_refused_is_blanked_whether_or_not_the_file_exists(self):
+        project = self.project()
+        write(self.dir / "outside.ts", "export const o = 1;\n")
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        write(project / "src" / "named.ts", "\n".join([
+            "import '../../outside.ts';", "import '../../../.env';", "import './.env.local';", "import './%2e%2e/%2e%2e/outside.ts';",
+            "import './.env.ts';", "import './nope.ts';", "import 'left-pad';", ""]))
+        nav = self.nav(project)
+        answer = nav.imports("src/named.ts")
+        by_line = {u["line"]: u for u in answer["unresolved"]}
+        for line in (1, 2, 3, 4, 5):
+            self.assertEqual(by_line[line]["spec"], "", line)
+        self.assertEqual((by_line[6]["spec"], by_line[6]["reason"]), ("./nope.ts", "missing"))  # allowed, so named as written
+        self.assertEqual((by_line[7]["spec"], by_line[7]["reason"]), ("left-pad", "bare"))
+        text = json.dumps([answer, nav._get_index().unresolved()])
+        for needle in ("outside.ts", ".env", "%2e"):
+            self.assertNotIn(needle, text)
+
+    def test_a_specifier_reached_through_the_import_map_to_a_refused_path_is_blanked(self):
+        project = self.project()
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@gone"] = "../../elsewhere.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        write(project / "src" / "named.ts", "import '@gone';\n")
+        answer = self.nav(project).imports("src/named.ts")
+        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "missing")])  # no such file, and the path is outside the project
+
+    # --- scopes in the index
+
+    def test_scopes_resolve_longest_scope_first_then_fall_back_to_the_top_level_map(self):
+        write(self.dir / "a.ts")
+        write(self.dir / "scoped" / "a.ts")
+        write(self.dir / "scoped" / "deep" / "a.ts")
+        imap = graph.ImportMap({"@a": "./a.ts"}, str(self.dir), scopes={
+            "./scoped/": {"@a": "./scoped/a.ts"}, "./scoped/deep/": {"@a": "./scoped/deep/a.ts"}, "./scoped/x/": {"@other": "./a.ts"}})
+
+        def res(spec, referrer):
+            return graph.resolve(spec, str(self.dir / referrer), imap)[1]
+        self.assertEqual(res("@a", "main.ts"), str(self.dir / "a.ts"))
+        self.assertEqual(res("@a", "scoped/m.ts"), str(self.dir / "scoped" / "a.ts"))
+        self.assertEqual(res("@a", "scoped/deep/m.ts"), str(self.dir / "scoped" / "deep" / "a.ts"))
+        self.assertEqual(res("@a", "scoped/x/m.ts"), str(self.dir / "scoped" / "a.ts"))  # x/ has no "@a": the next scope up
+        self.assertFalse(imap.unmodelled)
+
+    def test_the_index_follows_scopes_and_no_longer_reports_them_as_ignored(self):
+        project = self.project()
+        config = json.loads((project / "deno.json").read_text())
+        config["scopes"] = {"./src/app/": {"@util": "./src/config.ts"}}
+        (project / "deno.json").write_text(json.dumps(config))
+        write(project / "src" / "app" / "scoped.ts", "import { c } from '@util';\nexport { c };\n")
+        nav = self.nav(project)
+        self.assertEqual([f["path"] for f in nav.imports("src/app/scoped.ts")["files"]], ["src/config.ts"])
+        self.assertNotIn("ignored_config", nav.importers("src/config.ts"))
 
 
 if __name__ == "__main__":

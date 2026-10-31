@@ -6,19 +6,25 @@ subprocess), resolves them the way Deno does (relative paths with their extensio
 `jsr:` `node:` and URL specifiers as external), and keeps `file -> imports` per file, keyed by `(mtime_ns, size)`, so a later call
 re-reads only the files that changed. The reverse map is derived from it.
 
-What it does not do: type-check, follow a specifier it cannot resolve (those are listed in `unresolved`, never guessed), read a
-`scopes` table (reported in `meta["ignored"]`), or open a file larger than MAX_BYTES. Paths in an index are posix paths relative to
-`base` (the project root); a path outside `base` is never indexed or returned.
+What it does not do: type-check, follow a specifier it cannot resolve (those are listed in `unresolved`, never guessed), or open a
+file larger than MAX_BYTES. `scopes` of the config are followed (a malformed table is reported in `meta["ignored"]`). Paths in an
+index are posix paths relative to `base` (the project root); a path outside `base` is never indexed or returned, and a specifier
+that names one (or a path the caller's guard refuses) is blanked in the edge.
+
+`prove_reach` is separate from the index: the allow-list walk that must succeed before Deno is run (see nav_api.py). It reads the
+files itself and shares only the scanner, the import map and the path helpers with the index.
 
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
 from concurrent.futures import ThreadPoolExecutor
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import stat
 import time
+from urllib.parse import unquote
 
 INDEX_VERSION = 1
 SOURCE_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
@@ -164,9 +170,23 @@ def scan_specifiers(text):
 
     Forms: `import "x"`, `import a, { b } from "x"`, `import * as a from "x"`, `import type ... from "x"`, `import a = require("x")`,
     `import("x")` with a literal, `export ... from "x"`, `export type ... from "x"` and `/// <reference path="x" />`. An `import(...)`
-    whose argument is not a string literal is not an edge (it cannot be resolved without running the code)."""
+    whose argument is not a string literal is not an edge (it cannot be resolved without running the code); `scan_module` reports it."""
+    return scan_module(text)["specs"]
+
+
+_PRAGMA = re.compile(r"""(?:@deno-types|@ts-types)\s*=\s*["']([^"']+)["']|<reference\s+(?:path|types)\s*=\s*["']([^"']+)["']"""
+                     r"""|@jsxImportSource(?:Types)?\s+([^\s*"']+)""")
+
+
+def scan_module(text):
+    """What `text` makes Deno load: {"specs": as `scan_specifiers`, "pragmas": [specifier], "unmodelled": [str]}.
+
+    `pragmas` are the specifiers named in comments that Deno reads (`// @ts-types="x"`, `// @deno-types="x"`,
+    `/// <reference types="x" />`, `/** @jsxImportSource x */`), found on the raw text, so a match inside a string is a false
+    positive that can only make a check stricter. `unmodelled` names a construct that loads a module the scanner cannot name:
+    `dynamic_import` (`import(expr)` with an argument that is not a string literal) and `import_meta_resolve`."""
     tokens = tokenize(text)
-    found = []
+    found, unmodelled = [], []
 
     def add(spec, line, type_only=False, dynamic=False):
         found.append({"spec": spec, "line": line, "type_only": type_only, "dynamic": dynamic})
@@ -190,13 +210,19 @@ def scan_specifiers(text):
                 if at + 1 < len(tokens) and tokens[at + 1][0] == "str" and (_is(tokens, at + 2, ")", "punct")
                                                                            or _is(tokens, at + 2, ",", "punct")):
                     add(tokens[at + 1][1], tokens[at + 1][2], dynamic=True)
+                elif "dynamic_import" not in unmodelled:
+                    unmodelled.append("dynamic_import")
             elif nxt[0] == "punct" and nxt[1] == ".":
+                if _is(tokens, at + 1, "meta") and _is(tokens, at + 2, ".", "punct") and _is(tokens, at + 3, "resolve") \
+                        and "import_meta_resolve" not in unmodelled:
+                    unmodelled.append("import_meta_resolve")
                 continue  # import.meta
             else:
                 _import_clause(tokens, at, add)
         else:
             _export_clause(tokens, at, add)
-    return found
+    pragmas = [next(group for group in match.groups() if group) for match in _PRAGMA.finditer(text)]
+    return {"specs": found, "pragmas": pragmas, "unmodelled": unmodelled}
 
 
 def _named_specifiers(tokens, at):
@@ -269,31 +295,85 @@ def _export_clause(tokens, at, add):
 
 
 class ImportMap:
-    """The `imports` table of a Deno config: exact keys and `prefix/` keys, longest key first. Targets that start with `./`, `../` or
-    `/` are paths relative to the config's directory; every other target (`npm:`, `jsr:`, `https:`, ...) is external."""
+    """The `imports` and `scopes` tables of a Deno config. Exact keys and `prefix/` keys, longest key first. Targets that start with
+    `./`, `../` or `/` are paths relative to the config's directory (also inside a scope); every other target (`npm:`, `jsr:`,
+    `https:`, ...) is external.
 
-    def __init__(self, imports, config_dir):
+    Scopes follow the import-map rule: for a referrer (the importing file), the scopes whose key is that file or a directory above it
+    are tried longest first, each as its own table; a scope that has no key for the specifier gives way to the next, and the
+    top-level table is last. A table that is not what Deno reads (a scope that is not a table of strings, an `imports` that is not
+    a table) sets `unmodelled`; the walk that guards Deno refuses on it, because it cannot say what Deno would load."""
+
+    def __init__(self, imports, config_dir, scopes=None):
         self.config_dir = config_dir
-        self.entries = sorted(((str(k), str(v)) for k, v in (imports or {}).items()), key=lambda kv: -len(kv[0]))
+        self.unmodelled = False
+        self.entries = self._table(imports)
+        self.scopes = []
+        if scopes:
+            if not isinstance(scopes, dict):
+                self.unmodelled = True
+            else:
+                for key, table in scopes.items():
+                    prefix = self._scope_prefix(str(key))
+                    if not isinstance(table, dict):
+                        self.unmodelled = True
+                    elif prefix is not None:  # a scope for a URL no local file has as its address cannot apply here
+                        self.scopes.append((prefix, self._table(table)))
+                self.scopes.sort(key=lambda item: -len(item[0]))
 
-    def lookup(self, spec):
-        """(target, matched) for `spec`: target is an absolute path, an external specifier, or None when no key matches."""
-        for key, target in self.entries:
+    def _table(self, table):
+        if table is None:
+            return []
+        if not isinstance(table, dict):
+            self.unmodelled = True
+            return []
+        if not all(isinstance(v, str) for v in table.values()):
+            self.unmodelled = True
+        return sorted(((str(k), v) for k, v in table.items() if isinstance(v, str)), key=lambda kv: -len(kv[0]))
+
+    def _scope_prefix(self, key):
+        if key.startswith("file://"):
+            key = key[len("file://"):]
+        if not key.startswith(("./", "../", "/")):
+            return None
+        full = os.path.normpath(key if os.path.isabs(key) else os.path.join(self.config_dir, key))
+        return full + "/" if key.endswith("/") else full
+
+    def _match(self, entries, spec):
+        for key, target in entries:
             if spec == key or (key.endswith("/") and spec.startswith(key)):
                 full = target + (spec[len(key):] if key.endswith("/") else "")
                 if full.startswith(("./", "../", "/")):
                     return os.path.normpath(full if os.path.isabs(full) else os.path.join(self.config_dir, full)), key
                 return full, key
         package = "/".join(spec.split("/")[: 2 if spec.startswith("@") else 1])
-        for key, target in self.entries:  # a package key also covers its subpaths: "drizzle-orm/pg-core" under "drizzle-orm"
+        for key, target in entries:  # a package key also covers its subpaths: "drizzle-orm/pg-core" under "drizzle-orm"
             if key == package and spec != package and target.startswith(("npm:", "jsr:")):
                 return target + spec[len(package):], key
         return None, None
 
+    def lookup(self, spec, referrer=None):
+        """(target, matched) for `spec` written in the file `referrer` (an absolute path; None skips the scopes): target is an
+        absolute path, an external specifier, or None when no key matches."""
+        if referrer:
+            for prefix, entries in self.scopes:
+                if referrer == prefix or (prefix.endswith("/") and referrer.startswith(prefix)):
+                    got = self._match(entries, spec)
+                    if got[0] is not None:
+                        return got
+        return self._match(self.entries, spec)
+
+
+# A key of the config that changes how Deno resolves a module, which the walk does not follow: Deno would read files it never saw.
+_UNMODELLED_KEYS = ("importMap", "workspace", "links", "patch")
+
 
 def load_config(path):
-    """(ImportMap, details) from a Deno config file; a missing or unreadable file gives an empty map and says why in `details`."""
-    details = {"path": path, "exclude": [], "ignored": []}
+    """(ImportMap, details) from a Deno config file; a missing or unreadable file gives an empty map and says why in `details`.
+
+    `details`: `exclude`, `ignored` (what the index does not follow), `unmodelled` (why the walk that guards Deno cannot trust the
+    map: a list of short reasons, empty when it can), `data` (the parsed config, {} when unreadable) and `error`."""
+    details = {"path": path, "exclude": [], "ignored": [], "unmodelled": [], "data": {}}
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -303,13 +383,22 @@ def load_config(path):
     if not isinstance(data, dict):
         details["error"] = "not an object"
         return ImportMap({}, os.path.dirname(path)), details
-    imports = data.get("imports") if isinstance(data.get("imports"), dict) else {}
+    details["data"] = data
+    imap = ImportMap(data.get("imports"), os.path.dirname(path), data.get("scopes"))
     details["exclude"] = [e for e in data.get("exclude", []) if isinstance(e, str)] if isinstance(data.get("exclude"), list) else []
-    if data.get("scopes"):
-        details["ignored"].append("scopes")
+    if imap.unmodelled:
+        details["unmodelled"].append("import_map")
+        if data.get("scopes"):
+            details["ignored"].append("scopes")
+    for key in _UNMODELLED_KEYS:
+        if data.get(key):
+            details["unmodelled"].append(key)
     if data.get("workspace"):
         details["ignored"].append("workspace")
-    return ImportMap(imports, os.path.dirname(path)), details
+    unstable = data.get("unstable")
+    if "sloppy-imports" in (unstable if isinstance(unstable, list) else [unstable]):
+        details["unmodelled"].append("sloppy-imports")  # Deno would try extensions and index files the walk does not
+    return imap, details
 
 
 def resolve(spec, importer, import_map, isfile=os.path.isfile):
@@ -326,7 +415,7 @@ def resolve(spec, importer, import_map, isfile=os.path.isfile):
     if spec.startswith(("./", "../", "/")):
         path = os.path.normpath(spec if os.path.isabs(spec) else os.path.join(os.path.dirname(importer), spec))
         return ("file", path, "") if isfile(path) else ("unresolved", None, "missing")
-    target, _ = import_map.lookup(spec)
+    target, _ = import_map.lookup(spec, importer)
     if target is None:
         return "unresolved", None, "bare"
     if os.path.isabs(target):
@@ -370,6 +459,238 @@ def read_sources(paths, workers=8):
     paths = list(paths)
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(paths) or 1))) as pool:
         return dict(zip(paths, pool.map(read_source, paths)))
+
+
+# ------------------------------------------------------------------------------------------------------- the allow-list walk
+
+MAX_REACH_FILES = 3000
+_PACKAGE_LOCAL = ("file:", "link:", "portal:", "workspace:")
+_SCAN_MEMO = {}
+
+
+class Unproven(Exception):
+    """The walk cannot show that Deno would load only allowed files. `reason` is one of `outside_project`, `reaches_refused_path`,
+    `unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def spec_variants(spec):
+    """The spellings of `spec` that Deno's URL parser may read as different paths: as written, percent-decoded (`%2e%2e` is `..`),
+    and with backslashes as slashes. A check applies to every one of them: the file Deno reads is whichever it is, and a check on
+    the spelling alone would pass a `./%2e%2e/.env`."""
+    out = [spec]
+    for variant in (unquote(spec), spec.replace("\\", "/"), unquote(spec).replace("\\", "/")):
+        if variant not in out:
+            out.append(variant)
+    return out
+
+
+def named_paths(spec, importer, import_map):
+    """Every absolute path `spec`, written in the file `importer`, may name once the URL parser and the import map have had their
+    say: [] for a package, a builtin, a URL or a bare specifier no key matches. It names a path whether or not a file is there."""
+    found = []
+    for variant in spec_variants(spec):
+        variant = re.split(r"[?#]", variant, maxsplit=1)[0]
+        if variant.startswith(EXTERNAL_SCHEMES):
+            continue
+        if variant.startswith("file://"):
+            found.append(os.path.normpath(variant[len("file://"):]))
+        elif variant.startswith(("./", "../", "/")):
+            found.append(os.path.normpath(variant if os.path.isabs(variant) else os.path.join(os.path.dirname(importer), variant)))
+        else:
+            target, _ = import_map.lookup(variant, importer)
+            if target is not None and os.path.isabs(target):
+                found.append(target)
+                twin = os.path.normpath(unquote(target).replace("\\", "/"))  # a map target is parsed as a URL as well
+                if twin != target:
+                    found.append(twin)
+    return list(dict.fromkeys(found))
+
+
+def admit(base, path, allow):
+    """(lexical, real) project-relative names of `path` when Deno may read it, else raises Unproven: `outside_project` when it, or a
+    directory on its way, is not inside `base`; `reaches_refused_path` when `allow(rel)` refuses either name (a guard that raises
+    refuses). Judged by name whether or not a file is there."""
+    lexical = lexical_path(base, path)
+    inside = lexical_path(base, os.path.realpath(path))
+    if lexical is None or inside is None:
+        raise Unproven("outside_project")
+    for rel in dict.fromkeys((lexical, inside)):
+        try:
+            allowed = bool(allow(rel))
+        except Exception:
+            allowed = False
+        if not allowed:
+            raise Unproven("reaches_refused_path")
+    return lexical, inside
+
+
+def _fingerprint(path, is_source, text=None):
+    if is_source:
+        return hashlib.sha256(text if text is not None else b"").hexdigest()
+    try:
+        info = os.stat(path)
+    except OSError:
+        return "-"
+    return f"{info.st_mtime_ns}:{info.st_size}"
+
+
+def _scan_cached(data):
+    key = hashlib.sha256(data).hexdigest()
+    got = _SCAN_MEMO.get(key)
+    if got is None:
+        if len(_SCAN_MEMO) >= 4096:
+            _SCAN_MEMO.clear()
+        got = _SCAN_MEMO[key] = scan_module(data.decode("utf-8", "replace"))
+    return got
+
+
+class Reach:
+    """What `prove_reach` proved: every file Deno would load from the entry, as {rel: (real rel, fingerprint)}. `names` holds both
+    spellings of each (a symlink inside the project is a file under two names); `digest()` stands for their content; `holds()` is
+    False once any of them has changed, or points somewhere else, since the proof."""
+
+    def __init__(self, base):
+        self.base = base
+        self.files = {}
+
+    @property
+    def names(self):
+        return {name for rel, (real, _) in self.files.items() for name in (rel, real)}
+
+    def digest(self):
+        h = hashlib.sha256()
+        for rel in sorted(self.files):
+            h.update(f"{rel}\0{self.files[rel][1]}\0".encode("utf-8"))
+        return h.hexdigest()
+
+    def holds(self):
+        for rel, (real, fingerprint) in self.files.items():
+            path = os.path.join(self.base, rel)
+            if lexical_path(self.base, os.path.realpath(path)) != real:
+                return False
+            if rel.endswith(SOURCE_EXTENSIONS):
+                data = _read_capped(path)
+                if data is None or _fingerprint(path, True, data) != fingerprint:
+                    return False
+            elif _fingerprint(path, False) != fingerprint:
+                return False
+        return True
+
+
+def _read_capped(path):
+    """The bytes of `path` when it can be read and is not larger than MAX_BYTES, else None."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_BYTES + 1)
+    except OSError:
+        return None
+    return None if len(data) > MAX_BYTES else data
+
+
+def _check_package_json(base, directory):
+    """Deno reads the `package.json` next to its config. A dependency that is a local path (`file:`, `link:`, a workspace) loads
+    code from somewhere the walk does not look: refused. A `package.json` that is not JSON is refused too."""
+    for folder in dict.fromkeys((directory, base)):
+        path = os.path.join(folder, "package.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            raise Unproven("unmodelled_config")
+        if not isinstance(data, dict) or data.get("workspaces"):
+            raise Unproven("unmodelled_config")
+        for field in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            table = data.get(field)
+            if table is None:
+                continue
+            if not isinstance(table, dict) or any(not isinstance(v, str) or v.startswith(_PACKAGE_LOCAL) for v in table.values()):
+                raise Unproven("unmodelled_config")
+
+
+def prove_reach(base, entry, config, allow):
+    """Walk every module Deno would load from `entry` (an absolute path), following the imports of each local file whether or not
+    an index holds it, and return a `Reach`; raise `Unproven` when that cannot be shown. Deno is to be run only after this returns.
+
+    Allowed means: inside `base` (by name and with symlinks followed), `allow(rel)` true for both names, readable, and small enough
+    to scan. Followed: static imports and re-exports, `import("literal")`, `require` in `import x = require("y")`, the pragmas of
+    `scan_module`, the `types` and `jsxImportSource` of the config's `compilerOptions`, the import map and its scopes, every
+    spelling of a specifier (`spec_variants`). A specifier that names a refused or outside path is refused even when no file is
+    there. Refused outright, because the walk cannot say what Deno would load: a config with `importMap`, `workspace`, `links`,
+    `patch`, `sloppy-imports`, or a map it cannot read (`unmodelled_config`); a local `package.json` dependency
+    (`unmodelled_config`); an `import(expr)` or `import.meta.resolve` anywhere in the graph (`unmodelled_import`); a source file
+    that cannot be read or is over MAX_BYTES (`unreadable_file`); a graph over MAX_REACH_FILES files (`too_many_files`).
+    The index is not used: nothing here depends on it being built."""
+    base = os.path.realpath(base)
+    reach = Reach(base)
+    roots = []  # (specifier, referrer) pairs the config itself makes Deno load
+    if os.path.isfile(config):
+        if lexical_path(base, os.path.realpath(config)) is None:
+            raise Unproven("unmodelled_config")
+        imap, details = load_config(config)
+        if details.get("error") or details["unmodelled"]:
+            raise Unproven("unmodelled_config")
+        _check_package_json(base, os.path.dirname(config))
+        options = details["data"].get("compilerOptions")
+        if options is not None and not isinstance(options, dict):
+            raise Unproven("unmodelled_config")
+        options = options or {}
+        types = options.get("types", [])
+        if not isinstance(types, list) or not all(isinstance(item, str) for item in types):
+            raise Unproven("unmodelled_config")
+        roots += [(item, config) for item in types]
+        for field in ("jsxImportSource", "jsxImportSourceTypes"):
+            source = options.get(field)
+            if source is not None and not isinstance(source, str):
+                raise Unproven("unmodelled_config")
+            if source:
+                roots += [(source + suffix, config) for suffix in ("", "/jsx-runtime", "/jsx-dev-runtime")]
+    else:
+        imap = ImportMap({}, os.path.dirname(config))  # the caller runs Deno with --no-config
+    queue, seen = [os.path.normpath(entry)], set()
+    for spec, referrer in roots:
+        queue += _local_targets(spec, referrer, imap, base, allow)
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        lexical, real = admit(base, path, allow)
+        if not os.path.isfile(path):
+            continue
+        if len(reach.files) >= MAX_REACH_FILES:
+            raise Unproven("too_many_files")
+        is_source = lexical.endswith(SOURCE_EXTENSIONS)
+        data = None
+        if is_source:
+            data = _read_capped(path)
+            if data is None:
+                raise Unproven("unreadable_file")
+        reach.files[lexical] = (real, _fingerprint(path, is_source, data))
+        if not is_source:
+            continue
+        scanned = _scan_cached(data)
+        if scanned["unmodelled"]:
+            raise Unproven("unmodelled_import")
+        specs = [item["spec"] for item in scanned["specs"]]
+        for pragma in scanned["pragmas"]:
+            specs += [pragma, pragma + "/jsx-runtime", pragma + "/jsx-dev-runtime"]
+        for spec in specs:
+            queue += _local_targets(spec, path, imap, base, allow)
+    return reach
+
+
+def _local_targets(spec, importer, imap, base, allow):
+    """The paths `spec` may name, each shown allowed (raises Unproven otherwise), for the walk to follow."""
+    out = named_paths(spec, importer, imap)
+    for path in out:
+        admit(base, path, allow)
+    return out
 
 
 # ------------------------------------------------------------------------------------------------------------ the index
@@ -572,11 +893,11 @@ class ImportIndex:
             out = []
             for spec, line, type_only, dynamic in self.entries[rel]["specs"]:
                 base = resolve(spec, importer, imap, isfile)
-                out.append(self._edge(rel, spec, line, type_only, dynamic, base, None))
+                out.append(self._edge(rel, spec, line, type_only, dynamic, base, None, imap))
                 for name, omap in overlay_maps:
                     alt = resolve(spec, importer, omap, isfile)
                     if alt[:2] != base[:2]:
-                        out.append(self._edge(rel, spec, line, type_only, dynamic, alt, name))
+                        out.append(self._edge(rel, spec, line, type_only, dynamic, alt, name, omap))
             edges[rel] = out
             for edge in out:
                 if edge["kind"] == "file":
@@ -585,18 +906,28 @@ class ImportIndex:
             items.sort(key=lambda e: (e["from"], e["line"], e["config"] or ""))
         self.edges, self._reverse = edges, reverse
 
-    def _edge(self, rel, spec, line, type_only, dynamic, resolved, config):
+    def _edge(self, rel, spec, line, type_only, dynamic, resolved, config, imap):
         kind, target, reason = resolved
         if kind == "file":
             inside, why = self._judge(target)
             if inside is None:
                 kind, target, reason = "unresolved", None, why
-                if why == "refused":
-                    spec = ""
             else:
                 target = inside
+        if kind == "unresolved" and self._names_forbidden(spec, self._abs(rel), imap):
+            spec = ""  # the specifier is a path the guard refuses (or one outside the project): the answer must not say which
         return {"from": rel, "line": line, "spec": spec, "kind": kind, "to": target, "reason": reason, "type_only": bool(type_only),
                 "dynamic": bool(dynamic), "config": config}
+
+    def _names_forbidden(self, spec, importer, imap):
+        """True when `spec` names, in any spelling Deno's URL parser accepts, a path outside the project or one `allow` refuses,
+        whether or not a file is there."""
+        for path in named_paths(spec, importer, imap):
+            try:
+                admit(self.base, path, self._allowed)
+            except Unproven:
+                return True
+        return False
 
     # --- questions
 

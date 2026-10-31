@@ -119,6 +119,16 @@ def lead_shape(cmd):
     return ""
 
 
+def is_env_path(path):
+    """True when the path, or the file it really is (symlinks in any component followed), is `.env*`."""
+    try:
+        path = os.fspath(path)
+        real = os.path.realpath(path)
+    except (OSError, ValueError, TypeError):
+        return True  # cannot say where it leads, so do not open it
+    return bool(ENV_FILE.search(path) or ENV_FILE.search(real))
+
+
 def has_credential(text):
     """True when any line of the text looks like a credential (SECRET has no pattern that spans lines)."""
     return bool(SECRET.search(text))
@@ -139,6 +149,8 @@ def parse_transcript(path):
     pi: assistant `toolCall` parts (id, name, arguments), answered by `toolResult` messages (toolCallId).
     Lines that are not JSON are skipped. Result text is measured, not kept.
     """
+    if is_env_path(path):
+        raise PermissionError("refusing to open a .env file: {}".format(path))
     calls = []
     pending = {}
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -204,7 +216,7 @@ def find_tasks(sessions_dir, since="", role=None):
     """[(meta, transcript path)] for every task with a readable meta.json and an existing transcript.
 
     `since` (YYYY-MM-DD) keeps tasks whose meta `created` date is on or after it. A transcript whose
-    file name is `.env*` is never opened.
+    path (or the file a symlink leads to) names `.env*` is never opened.
     """
     tasks = []
     for task_dir in sorted(_task_dirs(sessions_dir)):
@@ -215,7 +227,7 @@ def find_tasks(sessions_dir, since="", role=None):
                 tpath = fh.read().strip()
         except (OSError, ValueError):
             continue
-        if not isinstance(meta, dict) or not meta.get("id") or not tpath or ENV_FILE.search(tpath) or not os.path.isfile(tpath):
+        if not isinstance(meta, dict) or not meta.get("id") or not tpath or is_env_path(tpath) or not os.path.isfile(tpath):
             continue
         if since and (meta.get("created") or "")[:10] < since:
             continue
@@ -292,41 +304,52 @@ def counts_of(roles, min_tasks):
             for role, r in roles.items()}
 
 
-def merged_state(previous, roles, min_tasks, now):
-    """New state: the roles analysed now replace their old counts; roles not analysed this run keep theirs."""
-    kept = dict(previous["roles"]) if previous else {}
-    kept.update(counts_of(roles, min_tasks))
+def merged_state(previous, roles, min_tasks, now, role=""):
+    """New state. An unscoped run replaces every role (a role that no longer has tasks is gone, so its probes
+    drop to 0 once and are not kept). A run limited to `role` replaces only that role and keeps the others."""
+    counts = counts_of(roles, min_tasks)
+    if role:
+        kept = dict(previous["roles"]) if previous else {}
+        kept.pop(role, None)
+        kept.update({k: v for k, v in counts.items() if k == role})
+    else:
+        kept = counts
     return {"version": STATE_VERSION, "generated": now, "min_tasks": min_tasks, "roles": kept}
 
 
-def compare(previous, roles, min_tasks):
-    """The three lists. Only roles analysed this run are compared; with no previous run every count starts at 0.
+EMPTY_ROLE = {"tasks": 0, "calls": 0, "probes": {}, "leads": {}}
+
+
+def compare(previous, roles, min_tasks, role=""):
+    """The three lists. An unscoped run compares every role in either run (a role with no tasks now counts 0);
+    a run limited to `role` compares only that role. With no previous run every count starts at 0.
 
     grew      probes whose task count is above the previous run's
-    new_leads Bash lead commands in >= min_tasks tasks that match no probe and were not already at min_tasks before
-              (the saved counts hold only leads at min_tasks or more, so a lead below it counts as 0 before)
+    new_leads Bash lead commands in >= min_tasks tasks that match no probe and were not reported before
+              (the saved counts hold the leads that were at their run's min_tasks or more, so a lead that is
+              saved was already reported, whatever threshold this run uses)
     dropped   probes whose task count is below the previous run's (including to 0)
     """
     before = (previous or {}).get("roles", {})
+    names = [role] if role else sorted(set(roles) | set(before))
     grew, new_leads, dropped = [], [], []
-    for role in sorted(roles):
-        old = before.get(role, {})
+    for name_role in names:
+        old = before.get(name_role, {})
         old_probes, old_leads = old.get("probes", {}), old.get("leads", {})
-        now_probes = roles[role]["probes"]
+        now = roles.get(name_role, EMPTY_ROLE)
+        now_probes = now["probes"]
         for name, stat in now_probes.items():
             prev = int(old_probes.get(name, 0))
             if stat["tasks"] > prev:
-                grew.append({"role": role, "probe": name, "previous": prev, "tasks": stat["tasks"],
+                grew.append({"role": name_role, "probe": name, "previous": prev, "tasks": stat["tasks"],
                              "calls": stat["calls"], "result_tokens": stat["result_tokens"]})
         for name, prev in old_probes.items():
-            if name not in now_probes and prev > 0:
-                dropped.append({"role": role, "probe": name, "previous": int(prev), "tasks": 0})
-            elif name in now_probes and now_probes[name]["tasks"] < prev:
-                dropped.append({"role": role, "probe": name, "previous": int(prev), "tasks": now_probes[name]["tasks"]})
-        for name, stat in roles[role]["leads"].items():
-            prev = int(old_leads.get(name, 0))
-            if stat["tasks"] >= min_tasks and prev < min_tasks:
-                new_leads.append({"role": role, "lead": name, "tasks": stat["tasks"],
+            now_tasks = now_probes[name]["tasks"] if name in now_probes else 0
+            if now_tasks < int(prev):
+                dropped.append({"role": name_role, "probe": name, "previous": int(prev), "tasks": now_tasks})
+        for name, stat in now["leads"].items():
+            if stat["tasks"] >= min_tasks and name not in old_leads:
+                new_leads.append({"role": name_role, "lead": name, "tasks": stat["tasks"],
                                   "calls": stat["calls"], "result_tokens": stat["result_tokens"]})
     grew.sort(key=lambda e: (-(e["tasks"] - e["previous"]), e["role"], e["probe"]))
     new_leads.sort(key=lambda e: (-e["tasks"], e["role"], e["lead"]))
@@ -335,7 +358,7 @@ def compare(previous, roles, min_tasks):
 
 
 def build_report(roles, previous, min_tasks, since="", role="", project="", now=None):
-    lists = compare(previous, roles, min_tasks)
+    lists = compare(previous, roles, min_tasks, role=role)
     return {
         "generated": now or utc_now(), "project": project, "since": since, "role": role, "min_tasks": min_tasks,
         "baseline": previous is None,
@@ -398,5 +421,5 @@ def run(project, role="", since="", min_tasks=3, as_json=False, out=""):
         return body, warnings
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     write_atomic(out, body)
-    write_atomic(counts_path(out), json.dumps(merged_state(previous, roles, min_tasks, report["generated"]), indent=2) + "\n")
+    write_atomic(counts_path(out), json.dumps(merged_state(previous, roles, min_tasks, report["generated"], role=role), indent=2) + "\n")
     return "wrote {} (counts in {})\n".format(out, counts_path(out)), warnings

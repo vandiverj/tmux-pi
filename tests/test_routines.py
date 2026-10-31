@@ -161,6 +161,38 @@ class Safety(unittest.TestCase):
         self.assertEqual(roles["coder"]["tasks"], 1)  # only t1
         self.assertFalse([p for p in opened if os.path.basename(p).startswith(".env")], opened)
 
+    def test_a_symlink_to_a_dotenv_file_is_never_opened(self):
+        opened = []
+        real_open = builtins.open
+
+        def spy(file, *a, **k):
+            opened.append(os.path.realpath(str(file)))
+            return real_open(file, *a, **k)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / (".en" + "v.production")
+            target.write_text((FIX / GATE).read_text())
+            link = Path(tmp) / "worker.jsonl"
+            link.symlink_to(target)
+            hidden = Path(tmp) / (".en" + "v.d")  # a symlinked directory component
+            hidden.mkdir()
+            (hidden / "t.jsonl").write_text((FIX / GATE).read_text())
+            via_dir = Path(tmp) / "plain"
+            via_dir.symlink_to(hidden)
+            for name, tpath in (("t1", link), ("t2", via_dir / "t.jsonl")):
+                d = Path(tmp) / ".tmux-pi" / "sessions" / "s1" / "tasks" / name
+                d.mkdir(parents=True)
+                (d / "meta.json").write_text(json.dumps({"id": name, "role": "coder", "created": "2026-10-01T00:00:00Z"}))
+                (d / "transcript-path").write_text(str(tpath))
+            sessions = str(Path(tmp) / ".tmux-pi" / "sessions")
+            with mock.patch("builtins.open", spy):
+                self.assertEqual(routines.find_tasks(sessions), [])
+                # a caller that skips find_tasks is refused too
+                self.assertEqual(routines.mine([({"id": "t1", "role": "coder"}, str(link))])["coder"]["tasks"], 0)
+                with self.assertRaises(OSError):
+                    routines.parse_transcript(str(link))
+            self.assertFalse([p for p in opened if any(part.startswith(".en" + "v") for part in Path(p).parts)], opened)
+
     def test_env_file_targets_never_match_a_probe(self):
         for tool, arg in (("Read", "file_path"), ("Edit", "path")):
             call = {"name": tool, "bytes": 0, "input": {arg: "/work/app/.env.lane-common"}}
@@ -241,6 +273,56 @@ class Report(unittest.TestCase):
             second = json.loads(counts.read_text())
         self.assertEqual(second["roles"]["coder"]["probes"][GITLEAKS], 5)
         self.assertEqual(second["roles"]["review"], first["roles"]["review"])  # not analysed, so kept
+
+    def test_a_role_that_vanishes_from_an_unscoped_scan_drops_to_zero(self):
+        review_only = [t for t in self.RUN1 if t[1] == "review"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.json"
+            self.report(self.RUN1, out)
+            second = self.report(review_only, out)
+            saved = json.loads(Path(str(out) + ".counts.json").read_text())
+            third = self.report(review_only, out)
+        dropped = by(second["dropped"], "probe")
+        self.assertEqual((dropped[("coder", GITLEAKS)]["previous"], dropped[("coder", GITLEAKS)]["tasks"]), (3, 0))
+        self.assertEqual(dropped[("coder", COMMIT)]["tasks"], 0)
+        self.assertNotIn("coder", saved["roles"])  # the stale counts do not linger
+        self.assertEqual(third["dropped"], [])  # and are not reported a second time
+
+    def test_a_role_filter_with_no_matching_tasks_drops_that_role_and_keeps_the_others(self):
+        review_only = [t for t in self.RUN1 if t[1] == "review"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.json"
+            first = self.report(self.RUN1, out)
+            saved_first = json.loads(Path(str(out) + ".counts.json").read_text())
+            second = self.report(review_only, out, "--role", "coder")
+            saved = json.loads(Path(str(out) + ".counts.json").read_text())
+        self.assertEqual(by(second["dropped"], "probe")[("coder", GITLEAKS)]["tasks"], 0)
+        self.assertEqual({e["role"] for e in second["dropped"]}, {"coder"})
+        self.assertNotIn("coder", saved["roles"])
+        self.assertEqual(saved["roles"]["review"], saved_first["roles"]["review"])
+
+    def test_a_lead_reported_at_the_old_threshold_is_not_new_under_a_higher_one(self):
+        three = [("d1", "coder", "2026-10-01T00:00:00Z", DOCKER), ("d2", "coder", "2026-10-01T00:00:00Z", DOCKER),
+                 ("d3", "coder", "2026-10-01T00:00:00Z", DOCKER)]
+        four = three + [("d4", "coder", "2026-10-02T00:00:00Z", DOCKER)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.json"
+            first = self.report(three, out, "--min-tasks", "3")
+            second = self.report(four, out, "--min-tasks", "4")
+            lower = self.report(four, Path(tmp) / "other.json", "--min-tasks", "2")
+        self.assertEqual({e["lead"] for e in first["new_leads"]}, {"docker compose"})
+        self.assertEqual(second["new_leads"], [])  # already reported once, at 3
+        self.assertEqual({e["lead"] for e in lower["new_leads"]}, {"docker compose"})
+
+    def test_a_lead_never_reported_before_is_new_when_the_threshold_drops(self):
+        three = [("d1", "coder", "2026-10-01T00:00:00Z", DOCKER), ("d2", "coder", "2026-10-01T00:00:00Z", DOCKER),
+                 ("d3", "coder", "2026-10-01T00:00:00Z", DOCKER)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.json"
+            first = self.report(three, out, "--min-tasks", "4")
+            second = self.report(three, out, "--min-tasks", "3")
+        self.assertEqual(first["new_leads"], [])
+        self.assertEqual({e["lead"] for e in second["new_leads"]}, {"docker compose"})
 
     def test_role_filter_limits_every_list(self):
         with tempfile.TemporaryDirectory() as tmp:

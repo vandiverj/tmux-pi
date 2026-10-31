@@ -496,6 +496,98 @@ class RemoteTests(ProjectCase):
                 self.assertNotIn("CODE", text, src)
                 self.assertNotIn("BODY", text, src)
 
+    def test_a_nested_template_literal_with_a_paren_does_not_move_the_end_of_the_parameter_list(self):
+        # review 4 F1: `${`)`}` ended the template at the inner backtick, and the stray ) was taken as the list's own
+        shapes = (
+            ("export function f(a = `${`)`}` || (() => { CODE })): void { BODY }", "f"),
+            ("export function f(a = `${`)`}` || (() => { CODE })) { BODY }", "f"),
+            ("export class C { m(a = `${`)`}` || (() => { CODE })): void { BODY } }", "C.m"),
+            ("export const k = (a = `${`)`}` || (() => { CODE })): void => { BODY };", "k"),
+            ("export function f(a = `${`${`)`}`}` || (() => { CODE }), b = 1): void { BODY }", "f"),
+            ("export function f(a = `${ {x: `)`}.x }` || (() => { CODE })): void { BODY }", "f"),
+            ("export function f(a = `${'`'}` || (() => { CODE })): void { BODY }", "f"),
+            ("export function f(a = `${/* ` */ 1}` || (() => { CODE })): void { BODY }", "f"),
+        )
+        for src, symbol in shapes:
+            found = "\n".join(signature.find_declarations(src, symbol, source=True))
+            self.assertTrue(found, src)
+            for code in ("CODE", "BODY", "`"):
+                self.assertNotIn(code, found, src)
+        self.assertEqual(signature.find_declarations("export function f(a = `${`)`}` || (() => { CODE })): void { BODY }", "f", source=True),
+                         ["export function f(a = /* defaults omitted */): void;"])
+
+    def test_template_nesting_is_skipped_without_recursion_errors(self):
+        deep = "`${" * 2000 + "1" + "}`" * 2000
+        src = f"export function f(a = {deep}): void {{ BODY }}\nexport const z = 1;\n"
+        signature.find_declarations(src, "z", source=True)  # must not raise RecursionError
+        signature.find_declarations(src, "f", source=True)
+
+    def test_a_template_expression_that_never_closes_ends_the_file_and_leaks_nothing(self):
+        out = signature.find_declarations("export function f(a = `${ (() => { CODE })): void { BODY }\nexport const z = 1;\n", "f", source=True)
+        self.assertNotIn("CODE", "\n".join(out))
+
+    def test_what_follows_a_cut_is_kept_only_when_it_is_a_plain_return_type(self):
+        keep = ("", " ", ": void", ": Promise<void>", ": Map<string, number>", ": A | B", ": T[]", ": this is Foo", ": asserts x is string",
+                ": { ok: boolean }", ": { a: Map<string, number>, b?: T[] }", ": {}", ": (A | B)[]", " =>", ": number =>")
+        for tail in keep:
+            self.assertEqual(signature._safe_tail(tail), tail, repr(tail))
+        omit = ("`}` || (() => { CODE })): void", ": void { CODE }", ": { f(): void }", ": { a: number; b: string }", ": (() => { CODE })",
+                ": x => y", ": () => void", ": await x", ": function", ": return x", ": 'a'", ": \"a\"", ": `a`", ": { CODE }",
+                ": void; CODE", ") || (() => CODE", ": a || b", ": a && b", ": a ?? b", ": a?.b", ": a / b", ": a + b", ": a = b",
+                ": { a: () => 1 }", ": (CODE", ": CODE }", ": { a: [ }", ": new X", ": class {}", ": void } {", "CODE", ": throw x", ": yield x")
+        for tail in omit:
+            self.assertEqual(signature._safe_tail(tail), ": /* type omitted */", repr(tail))
+        self.assertEqual(signature._safe_tail(": () => void =>"), ": /* type omitted */ =>")
+
+    def test_a_scanner_misread_cannot_put_code_after_the_cut(self):
+        # a regex literal right after `)` is read as division (Known limits); the text after the wrong `)` must still be refused
+        src = ("export function f(a = (x) /'/.test(y) || (() => {\n CODE1 })): void { BODY }\n"
+               "export function g(a = (x) /'/.test(y) || (() => {\n CODE2 })) { BODY }\n"
+               "export const h = (a = (x) /'/.test(y) || (() => {\n CODE3 })): void => { BODY };\n")
+        for symbol in ("f", "g", "h"):
+            found = "\n".join(signature.find_declarations(src, symbol, source=True))
+            self.assertNotIn("CODE", found, symbol)
+            self.assertNotIn("BODY", found, symbol)
+
+    def test_decorator_arguments_are_cut_on_parameters_and_members(self):
+        src = ("export class C {\n"
+               "  @Inject(() => { CODE1 }) readonly dep: Dep;\n"
+               "  @Input() name: string;\n"
+               "  @Dec.of({ a: () => { CODE2 } }) @Other(`x`) tagged(): void { BODY }\n"
+               "  @Secret(() => { CODE3 }) private hidden: number;\n"
+               "  @Secret(() => { CODE4 })\n  private hiddenNextLine(): void { BODY }\n"
+               "  constructor(@Inject(() => { CODE5 }) private a: A, @Optional() b?: B, @Self() c = 1) { BODY }\n"
+               "  m(@Arg('x', () => { CODE6 }) v: string): void { BODY }\n"
+               "}\n")
+        whole = "\n".join(signature.find_declarations(src, "C", source=True))
+        for part in ("CODE", "BODY", "hidden", "Hidden"):
+            self.assertNotIn(part, whole, part)
+        self.assertIn("@Inject(/* args omitted */) readonly dep: Dep;", whole)
+        self.assertIn("@Input(/* args omitted */) name: string;", whole)
+        self.assertIn("@Dec.of(/* args omitted */) @Other(/* args omitted */) tagged(): void;", whole)
+        self.assertIn("constructor(@Inject(/* args omitted */) private a: A, @Optional(/* args omitted */) b?: B, @Self(/* args omitted */) c = 1);", whole)
+        self.assertIn("m(@Arg(/* args omitted */) v: string): void;", whole)
+        for member, expect in (("C.dep", "@Inject(/* args omitted */) readonly dep: Dep;"), ("C.tagged", "tagged(): void;"),
+                               ("C.constructor", "@Inject(/* args omitted */)"), ("C.m", "@Arg(/* args omitted */)")):
+            found = "\n".join(signature.find_declarations(src, member, source=True))
+            self.assertIn(expect, found, member)
+            self.assertNotIn("CODE", found, member)
+            self.assertNotIn("BODY", found, member)
+        for private in ("C.hidden", "C.hiddenNextLine"):
+            self.assertEqual(signature.find_declarations(src, private, source=True), [], private)
+
+    def test_decorators_in_unreadable_shapes_withhold_the_declaration(self):
+        for text in ("export class C { @Dec<T>(() => { CODE }) x: T; }", "export class C { @a.b(() => { CODE })(() => { CODE }) x: T; }",
+                     "export class C { @(foo()) x: T; }", "export class C { @Dec(() => { CODE ) x: T; }",
+                     "export class C { @Dec(`${`)`}`) || (() => { CODE })) x: T; }"):
+            found = "\n".join(signature.find_declarations(text, "C", source=True))
+            self.assertNotIn("CODE", found, text)
+
+    def test_empty_object_and_array_defaults_are_plain_literals(self):
+        src = "export function f(a = {}, b = [], c = { }, d = [ ], e = () => { CODE }, g = 1): void { BODY }"
+        self.assertEqual(signature.find_declarations(src, "f", source=True),
+                         ["export function f(a = {}, b = [], c = { }, d = [ ], e = /* defaults omitted */): void;"])
+
     def test_a_regex_literal_with_a_quote_does_not_hide_later_exports(self):
         for literal in ("/'/", '/"/', "/[/']/g", r"/\//", "/`/"):
             src = (f"export function first(s: string): boolean {{ return {literal}.test(s); }}\n"

@@ -6,7 +6,7 @@ package only deno.lock pins) in Deno's npm cache. Its entry declaration file com
 guard.py (allowlisted extensions, links resolved, nothing outside the package directory, never .env*).
 
 `jsr:@scope/name` and `https://` specifiers are read from Deno's remote cache (remote.py), pinned by deno.lock. Those files
-may be TypeScript source; declaration_view() then returns only exported declarations, with bodies, initializers and code in
+may be TypeScript source; declaration_view() then returns only exported declarations, with bodies, initializers, decorator arguments and code in
 parameter defaults cut (see Known limits). jsr files are checked against deno.lock's integrity when it records one (remote.py).
 
 The declaration scanner is a text scanner, not a TypeScript parser: it splits a declaration file into top-level
@@ -18,6 +18,12 @@ Known limits (TypeScript source files only; .d.ts files carry no code and are re
   `/* defaults omitted */)`, then the declared return type. The scanner never tries to find where such a default ends.
   The same happens for an `=` that is not a default, such as a type parameter default in a callback type
   (`cb: <T = string>(x: T) => void`). Less is shown, never code.
+- What follows the cut is shown only if it passes an allow-list (empty, or `: <type>` made of type words, `<>`, `[]`, `|`, `&`,
+  `,`, `?`, grouping parens and `{ name: type, ... }`). A return type with a quote, a `=>` (a function type), a `;` or `(` in
+  braces, or a statement word is replaced by `: /* type omitted */`; the scanner may also have misread the list.
+- Decorator arguments are cut everywhere in a declaration (`@Inject(/* args omitted */)`). A decorator the scanner cannot read
+  (type arguments, `@(expr)`, a second call, arguments that do not close) withholds the declaration or member, so does a
+  stray `@` outside strings and comments in a body. A template literal nested more than 24 levels ends the scan of the file.
 - A regex literal right after `)` on a line (`if (a) /'/.test(a); }`) is read as division, so a quote in it opens a string that
   runs to the end of the line and can swallow a closing `}`; later exports in that file may then report "not found". No code is
   returned for it.
@@ -40,8 +46,9 @@ CONTAINER_HEAD = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:ab
 DECL = re.compile(
     r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const\s+)?(?:async\s+)?"
     r"(?P<kind>function|class|interface|type|enum|namespace|module|const|let|var)(?:\s*\*\s*|\s+)(?P<name>[A-Za-z_$][\w$]*)")
+DECORATOR_PREFIX = r"(?:@[A-Za-z_$][\w$.]*(?:\(/\* args omitted \*/\))?\s*)*"  # decorators as _cut_decorators leaves them
 MEMBER = re.compile(
-    r"^(?:(?:public|protected|private|static|readonly|abstract|declare|async|override|export)\s+)*"
+    r"^" + DECORATOR_PREFIX + r"(?:(?:public|protected|private|static|readonly|abstract|declare|async|override|export)\s+)*"
     r"(?:(?:get|set)\s+(?=[A-Za-z_$]))?(?P<name>[A-Za-z_$][\w$]*|'[^']+'|\"[^\"]+\")\s*[?!]?\s*(?:[(<:=;,]|$)")
 OPEN_ENDED = ("=", "|", "&", ",", ":", "<", "(", "?", "{", "[")
 OPEN_WORDS = re.compile(r"\b(?:extends|implements|keyof|typeof|in|is|as|infer|readonly|new|unique)$")
@@ -64,15 +71,57 @@ class Found:
 
 # ---- statement scanner ---------------------------------------------------------------------------------------------
 
-def _skip_string(text, i):
+MAX_TEMPLATE_NEST = 24
+
+
+def _skip_string(text, i, _nest=0):
     """End of the string that starts at `i`. A ' or " string ends at its line: a quote that opens no string (one a scanner
-    misread) then costs one line and not the rest of the file. A template literal may span lines."""
+    misread) then costs one line and not the rest of the file. A template literal may span lines, and its `${ ... }` holds an
+    expression that can hold strings and templates of its own. Nesting deeper than MAX_TEMPLATE_NEST ends the text."""
     quote, i = text[i], i + 1
     while i < len(text) and text[i] != quote:
-        if text[i] == "\n" and quote != "`":
+        c = text[i]
+        if c == "\n" and quote != "`":
             return i
-        i += 2 if text[i] == "\\" else 1
+        if c == "$" and quote == "`" and text.startswith("${", i):
+            i = _skip_template_expression(text, i + 2, _nest + 1)
+            continue
+        i += 2 if c == "\\" else 1
     return i + 1
+
+
+def _skip_template_expression(text, i, nest):
+    """Index after the `}` that closes a `${` whose expression starts at `i`."""
+    n = len(text)
+    if nest > MAX_TEMPLATE_NEST:
+        return n
+    depth = 1
+    while i < n:
+        c = text[i]
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if c in "'\"`":
+            i = _skip_string(text, i, nest)
+            continue
+        if c == "/":
+            end = _skip_regex(text, i)
+            if end >= 0:
+                i = end
+                continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
 
 
 REGEX_AFTER = "(,=:[!&|?{};+-*%<>~^"
@@ -247,11 +296,50 @@ def _body(statement):
 
 # ---- source files: exported declarations without code --------------------------------------------------------------
 
-PRIVATE_MEMBER = re.compile(r"^(?:(?:public|protected|static|readonly|abstract|declare|async|override|export)\s+)*(?:private\b|#)")
+PRIVATE_MEMBER = re.compile(r"^" + DECORATOR_PREFIX + r"(?:(?:public|protected|static|readonly|abstract|declare|async|override|export)\s+)*(?:private\b|#)")
 LITERAL = re.compile(r"""^(?:"[^"\n]{0,80}"|'[^'\n]{0,80}'|-?\d[\w.]{0,30}|true|false|null)$""")
 KEEP_WHOLE = ("interface", "type", "enum")
 BLOCKS = ("class", "namespace", "module")
 OMITTED = "/* body omitted */"
+
+
+DECORATOR_ARGS = "/* args omitted */"
+DECORATOR_NAME = re.compile(r"@\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)")
+AFTER_DECORATOR = re.compile(r"(?:\s|/\*.*?\*/|//[^\n]*)*([A-Za-z_$@#\[*'\"])", re.S)
+WITHHELD = "/* declaration omitted */"
+
+
+def _cut_decorators(text):
+    """`text` with the arguments of every decorator replaced (`@Inject(() => { CODE })` -> `@Inject(/* args omitted */)`),
+    on members and on parameters alike. None when a decorator has a shape this does not read: type arguments, a call
+    after the call, `@(expression)`, an argument list that does not close, or something after it that no declaration starts
+    with (a sign that the scanner misread the arguments). The caller then withholds the declaration."""
+    out, pos = [], 0
+    for at in [i for i, c, *_ in _scan(text) if c == "@"]:
+        if at < pos:
+            continue  # inside arguments already cut
+        match = DECORATOR_NAME.match(text, at)
+        if not match:
+            return None
+        name_end = j = match.end()
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        if text[j:j + 1] == "<":
+            return None
+        if text[j:j + 1] == "(":
+            close = next((k for k, d, depth, _, _ in _scan(text[j:]) if d == ")" and depth == 1), None)
+            if close is None:
+                return None
+            out.append(text[pos:name_end] + "(" + DECORATOR_ARGS + ")")
+            pos = j + close + 1
+            if text[pos:pos + 1] in ("(", ".", "[", "`", "<", "!", "?"):
+                return None
+        else:
+            out.append(text[pos:name_end])
+            pos = name_end
+        if not AFTER_DECORATOR.match(text, pos):
+            return None
+    return "".join(out) + text[pos:]
 
 
 def _function_body_open(text):
@@ -284,22 +372,109 @@ def _arrow_at(text):
 
 
 PLAIN_DEFAULT = re.compile(r"""\s*(?:"(?:[^"\\\n]|\\.){0,80}"|'(?:[^'\\\n]|\\.){0,80}'|-?\d[\w.]{0,30}"""
-                           r"""|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?=[,)\]}])""")
+                           r"""|\{\s*\}|\[\s*\]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?=[,)\]}])""")
 DEFAULTS_OMITTED = "/* defaults omitted */"
+
+
+TYPE_OMITTED = ": /* type omitted */"
+TAIL_CHARS = re.compile(r"[\w$\s.<>\[\]|&,?:(){}-]*")
+TAIL_REFUSED = re.compile(
+    r"\b(?:return|await|yield|throw|function|class|var|let|const|if|else|for|while|do|switch|case|break|continue|try|catch|finally|"
+    r"delete|new|import|export|async|with|debugger|instanceof|super|arguments|enum|default)\b|\|\||&&|\?\?|\?\.|\.\.\.")
+MEMBER_OF_TYPE = re.compile(r"(?:readonly\s+)?[\w$]+\??\s*:(?P<type>.+)", re.S)
+INDEX_OF_TYPE = re.compile(r"\[\s*[\w$]+\s*:\s*[\w$]+\s*\]\s*:(?P<type>.+)", re.S)
+MAX_TYPE_NEST = 8
+
+
+def _split_top(text):
+    """`text` split at the commas that are not inside (), [], {} or <>; None when the brackets do not balance."""
+    pieces, depth, start = [], 0, 0
+    for i, c in enumerate(text):
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == "," and depth == 0:
+            pieces.append(text[start:i])
+            start = i + 1
+    pieces.append(text[start:])
+    return pieces if depth == 0 else None
+
+
+def _safe_type(text, nest=0):
+    """True when `text` is made only of what a plain type is made of. The test is an allow-list: type words, `.`, `<>`, `[]`,
+    `|`, `&`, `,`, `?`, `:`, `()` for grouping, and `{ name: type, ... }` with no `;`, no `(` and no `=>` in it. A quote, a
+    backtick, `=`, `/`, `+`, `;`, an operator, a statement word or a brace group that is not made of `name: type` members
+    fails it. It decides what is shown, not what is valid TypeScript: a refusal costs the type, a pass shows only type-shaped text."""
+    text = text.strip()
+    if nest > MAX_TYPE_NEST or not text or not TAIL_CHARS.fullmatch(text) or TAIL_REFUSED.search(text):
+        return False
+    flat, stack, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            depth, j = 1, i + 1
+            while j < len(text) and depth:
+                depth += (text[j] == "{") - (text[j] == "}")
+                j += 1
+            if depth:
+                return False
+            inner = text[i + 1:j - 1]
+            if "(" in inner or ")" in inner:
+                return False
+            members = _split_top(inner)
+            if members is None:
+                return False
+            for member in members:
+                member = member.strip()
+                if not member:
+                    continue
+                match = MEMBER_OF_TYPE.fullmatch(member) or INDEX_OF_TYPE.fullmatch(member)
+                if not match or not _safe_type(match["type"], nest + 1):
+                    return False
+            flat.append("X")
+            i = j
+            continue
+        if c == "}":
+            return False
+        if c in "([":
+            stack.append(")" if c == "(" else "]")
+        elif c in ")]" and (not stack or stack.pop() != c):
+            return False
+        flat.append(c)
+        i += 1
+    return not stack and "".join(flat).count("<") == "".join(flat).count(">")
+
+
+def _safe_tail(tail):
+    """What follows a parameter list the scanner cut (its return type, and the `=>` of an arrow). The tail is returned as it is
+    only when it is empty or `: <plain type>` (see _safe_type); anything else, which is how a misread parameter list shows
+    itself, is replaced by `: /* type omitted */`. A `=>` inside the type is refused: a function type cannot be told from code."""
+    core = tail.rstrip()
+    arrow = core.endswith("=>")
+    if arrow:
+        core = core[:-2].rstrip()
+    if not core.strip() or (core.lstrip().startswith(":") and _safe_type(core.lstrip()[1:])):
+        return tail
+    return TYPE_OMITTED + (" =>" if arrow else "")
 
 
 def _drop_defaults(header):
     """A parameter list without the code in its default values. A default that is a plain literal (number, short string,
-    true/false/null/undefined, an identifier or a dotted name, followed at once by `,` or a closing bracket) stays. From the
-    first default that is anything else (`cb = () => { ... }`, `x = f(...)`, `a = x < y`) the rest of the parameter list is
-    withheld: the output has `/* defaults omitted */)` and then whatever follows the list's own `)` (the declared return type).
-    Nothing tries to find where such a default ends, since type arguments (`<T, U>`) make a comma ambiguous; so no code in
-    a default can come back. Inside a parameter list an `=` is a default (`==`, `<=`, `!=` can only occur inside a default)."""
+    true/false/null/undefined, `{}`, `[]`, an identifier or a dotted name, followed at once by `,` or a closing bracket) stays.
+    From the first default that is anything else (`cb = () => { ... }`, `x = f(...)`, `a = x < y`) the rest of the parameter
+    list is withheld: the output has `/* defaults omitted */)` and then what follows the list's own `)`, the declared return
+    type. Nothing tries to find where such a default ends, since type arguments (`<T, U>`) make a comma ambiguous. The list's
+    own `)` is found by the same scanner that can misread a string or a regex, so what follows it is kept only if _safe_tail
+    accepts it, and is otherwise replaced; no code in or after a default can come back. Inside a parameter list an `=` is a
+    default (`==`, `<=`, `!=` can only occur inside a default)."""
     for i, c, paren, _, _ in _scan(header):
         if c != "=" or paren < 1 or header[i + 1:i + 2] in ("=", ">") or PLAIN_DEFAULT.match(header, i + 1):
             continue
         close = next((j for j, d, depth, _, _ in _scan(header) if j > i and d == ")" and depth == 1), None)
-        return header[:i + 1] + " " + DEFAULTS_OMITTED + ")" + ("" if close is None else header[close + 1:])
+        return header[:i + 1] + " " + DEFAULTS_OMITTED + ")" + ("" if close is None else _safe_tail(header[close + 1:]))
     return header
 
 
@@ -320,7 +495,9 @@ def _value_view(header, initializer):
 def declaration_view(statement):
     """A statement of a TypeScript *source* file as its declaration: function and method bodies, variable and property
     initializers (short literals aside) and private members are left out. Types (interface, type, enum) are kept as written."""
-    statement = statement.strip().rstrip(";").rstrip()
+    statement = _cut_decorators(statement.strip().rstrip(";").rstrip())
+    if statement is None:
+        return WITHHELD
     decl = DECL.match(statement)
     kind = decl["kind"] if decl else None
     if kind in KEEP_WHOLE:
@@ -341,9 +518,9 @@ def _block_view(statement, kind):
     body = statement[open_at + 1:close_at]
     lines = []
     for start, end, doc in split_statements(body, members=True):
-        member = body[start:end].strip().rstrip(",;")
-        if PRIVATE_MEMBER.match(member) or (kind != "class" and not member.startswith("export")):
-            continue
+        member = _cut_decorators(body[start:end].strip().rstrip(",;"))
+        if member is None or PRIVATE_MEMBER.match(member) or (kind != "class" and not member.startswith("export")):
+            continue  # a member whose decorators cannot be read is left out, as a private one is
         lines.append("  " + _with_doc(body, doc, declaration_view(member)).replace("\n", "\n  "))
     return statement[:open_at].rstrip() + (" {\n" + "\n".join(lines) + "\n}" if lines else " {}")
 
@@ -374,6 +551,10 @@ def find_members(body, path, _nest=0, source=False, parent="interface"):
     out = []
     for start, end, doc in split_statements(body, members=True):
         statement = body[start:end].strip().rstrip(",;")
+        if source:
+            statement = _cut_decorators(statement)
+            if statement is None:
+                continue
         if source and (PRIVATE_MEMBER.match(statement) or (parent in ("namespace", "module") and not statement.startswith("export"))):
             continue
         decl, member = DECL.match(statement), MEMBER.match(statement)

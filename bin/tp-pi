@@ -56,7 +56,7 @@ fi
 # Normal work loads only the orchestration extensions. Legacy goal, strict
 # dispatcher, generic subagent, and automatic escalation code remain available
 # for explicit legacy sessions but cannot quietly join this workflow.
-extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts" "$ROOT/agent/extensions/safe.ts")
+extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensitive.ts" "$ROOT/agent/extensions/safe.ts" "$ROOT/agent/extensions/kill-guard.ts")
 if [[ -z "${TP_TASK_DIR:-}" ]]; then
   extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts" "$ROOT/agent/extensions/offload.ts")
 fi

@@ -151,6 +151,27 @@ class ValidationTests(unittest.TestCase):
             rc.load_catalog(fx.ROOT / "config" / "nonexistent.json")
 
 
+class QwenReasoningConfigTests(unittest.TestCase):
+    QWEN_ID = "qwen/qwen3.6-35b-a3b"
+
+    def entry(self):
+        cat = fx.shipped_catalog()
+        return next(m for lv in cat["levels"] for m in lv["models"] if m["model"] == fx.QWEN)
+
+    def test_catalog_and_router_roster_agree_on_qwen_efforts(self):
+        roster = json.loads((fx.ROOT / "config" / "router.json").read_text())["models"]
+        row = next(m for m in roster if m["model"] == fx.QWEN)
+        self.assertEqual(row["thinking"], self.entry()["efforts"])
+        self.assertEqual(self.entry()["efforts"], ["off", "low", "medium", "high"])
+
+    def test_max_output_covers_the_pi_max_tokens(self):
+        models = json.loads((fx.ROOT / "agent" / "models.json").read_text())["providers"]["lmstudio"]["models"]
+        pi = next(m for m in models if m["id"] == self.QWEN_ID)
+        self.assertEqual(pi["maxTokens"], 32768)
+        self.assertGreaterEqual(self.entry()["max_output"], pi["maxTokens"])
+        self.assertLess(pi["maxTokens"], pi["contextWindow"])
+
+
 class PromptTests(unittest.TestCase):
     FORBIDDEN = ("haiku", "sonnet", "opus", "gpt", "qwen", "luna", "astra", "anthropic", "openai", "openrouter", "slotstream", "lmstudio")
     LEVEL_KEYS = ("small", "mid", "strong", "top")

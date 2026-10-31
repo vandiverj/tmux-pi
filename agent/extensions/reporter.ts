@@ -54,6 +54,12 @@ function textOf(message: any): string {
 		.join("\n");
 }
 
+// A local model may inline its reasoning as a leading <think>...</think> block in the reply text. Drop that block (and
+// the whitespace after it); a <think> later in the text is part of the answer and stays.
+export function stripLeadingThink(text: string): string {
+	return text.replace(/^\s*<think>[\s\S]*?<\/think>\s*/, "");
+}
+
 export default function (pi: ExtensionAPI) {
 	const taskDir = process.env.TP_TASK_DIR;
 	// Main runs have no TP_TASK_DIR; tp creates @tp_state_dir for the session.
@@ -180,7 +186,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (m.stopReason === "error" || m.errorMessage) s.error = String(m.errorMessage ?? "error");
-		const text = textOf(m).trim();
+		const text = stripLeadingThink(textOf(m)).trim();
 		if (text) lastReply = text;
 		save();
 	});

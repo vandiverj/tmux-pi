@@ -345,6 +345,35 @@ def X(model, worker=None, thinking=None, **ctx):
     return rr.resolve(None, CAT, health, dict(ctx, explicit={"model": model, "worker": worker, "thinking": thinking}))
 
 
+class QwenReasoningTests(unittest.TestCase):
+    """Lane qwen-reasoning: an explicit Qwen run may reason; a router-chosen one and the coder floor are unchanged."""
+
+    def test_explicit_low_medium_high_resolve(self):
+        for effort in ("low", "medium", "high"):
+            with self.subTest(effort=effort):
+                r = X(QWEN, "pi", effort)
+                self.assertEqual((r["model"], r["source"], r["effort"]), (QWEN, "explicit", effort))
+
+    def test_explicit_max_is_still_rejected(self):
+        with self.assertRaises(rr.ExplicitError) as caught:
+            X(QWEN, "pi", "max")
+        self.assertIn("does not allow effort 'max'", str(caught.exception))
+
+    def test_router_chosen_local_work_still_resolves_to_off(self):
+        for effort in ("low", "medium", "high"):
+            with self.subTest(effort=effort):
+                r = R(D("local", effort, "none", "locate_quote"), role="scribe")
+                self.assertEqual((r["provider"], r["model"], r["effort"]), ("local", QWEN, "off"))
+
+    def test_a_coder_without_a_model_never_lands_on_local(self):
+        for key in ("local", "small", "mid"):
+            for effort in ("low", "medium", "high"):
+                with self.subTest(level=key, effort=effort):
+                    r = R(D(key, effort), role="coder")
+                    self.assertNotEqual(r["level_key"], "local")
+                    self.assertNotEqual(r["provider"], "local")
+
+
 class ExplicitValidationTests(unittest.TestCase):
     def rejected(self, needle, *args, **kw):
         with self.assertRaises(rr.ExplicitError) as caught:
@@ -374,7 +403,7 @@ class ExplicitValidationTests(unittest.TestCase):
 
     def test_effort_the_model_does_not_allow_is_rejected(self):
         self.rejected("does not allow effort 'off'", HAIKU, None, "off")
-        self.rejected("does not allow effort 'high'", QWEN, "pi", "high")
+        self.rejected("does not allow effort 'max'", QWEN, "pi", "max")
         self.rejected("does not allow effort 'minimal'", SONNET, "claude", "minimal")
         self.assertEqual(X(SOL, "pi", "off")["effort"], "off")
         self.assertEqual(X(QWEN, "pi", "off")["effort"], "off")
@@ -446,7 +475,7 @@ class RedirectTests(unittest.TestCase):
             ("openai/gpt-6.1-sol", "pi", "high", {}, "not offered"),
             (SONNET, "claude", "medium", {"health": {"anthropic": {"status": "exhausted"}}}, "marked unavailable"),
             (HAIKU, "claude", "high", {"est_tokens": 700000}, "does not fit"),
-            (QWEN, "pi", "high", {}, "not allowed"),
+            (HAIKU, "claude", "off", {}, "not allowed"),
         ]
         for model, worker, thinking, ctx, needle in cases:
             with self.subTest(model=model):

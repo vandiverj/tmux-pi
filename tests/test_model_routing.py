@@ -425,7 +425,7 @@ class ExplicitValidationCommandTests(Base):
                  (("--model", "openai/gpt-6.1-sol"), "not offered"),
                  (("--model", "claude-opus-9"), "not in the model catalog"),
                  (("--model", HAIKU, "--thinking", "off"), "does not allow effort"),
-                 (("--model", QWEN, "--thinking", "high"), "does not allow effort"),
+                 (("--model", QWEN, "--thinking", "max"), "does not allow effort"),
                  (("--model", SONNET, "--thinking", "nonsense"), "not one of"),
                  (("--model", slot, "--workdir", str(self.project), "--context", "big.txt"), "over")]
         for args, needle in cases:

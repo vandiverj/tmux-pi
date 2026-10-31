@@ -1,0 +1,28 @@
+{
+  "tools": [
+    {
+      "name": "lane-info",
+      "path": "$TP_ROOT/tools/agent/lane-info.sh",
+      "roles": ["coder", "researcher", "tester"],
+      "use": "orient in a lane",
+      "usage": "WORKTREE [BASE_REF] [--fetch]",
+      "output": "branch, base, diff, dirty files; last line exit=N log=PATH"
+    },
+    {
+      "name": "pre-commit-gate",
+      "path": "$TP_ROOT/tools/agent/pre-commit-gate.sh",
+      "roles": ["coder", "tester"],
+      "use": "prettier, eslint, typecheck, gitleaks",
+      "usage": "WORKTREE [BASE_REF]",
+      "output": "one 'name exit' line per check; last line exit=N log=PATH"
+    },
+    {
+      "name": "web-jest",
+      "path": "$TP_ROOT/tools/agent/web-jest.sh",
+      "roles": ["coder", "tester"],
+      "use": "run web jest tests",
+      "usage": "WORKTREE [--repeat N] TEST_PATH...",
+      "output": "per-file counts; last line exit=N log=PATH"
+    }
+  ]
+}

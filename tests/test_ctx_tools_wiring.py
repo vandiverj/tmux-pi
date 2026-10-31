@@ -174,6 +174,16 @@ class McpServer(Workspace):
             self.assertEqual(self.tp_ctx(tool, args), text, tool)
         self.assertIn("apps/launchpad/api/src/routes/r01.ts:3 -> " + ORDERS, texts[1])
 
+    def test_a_note_answers_with_its_id_and_status_as_structured_content(self):
+        """Review 1 F6: the candidate's id is data in the reply, not only prose."""
+        note = {"kind": "lesson", "scope": ["apps/**"], "text": "Parse before use.", "evidence": [f"{ORDERS}:6"]}
+        run, replies = self.rpc([("ctx_note", note), ("ctx_knowledge", {})], TP_TASK_ID="coder-x")
+        written = replies[3]["result"]
+        self.assertEqual(written["structuredContent"]["status"], "candidate")
+        self.assertRegex(written["structuredContent"]["id"], r"^kn-\d{4}-\d\d-\d\d-")
+        self.assertIn(written["structuredContent"]["id"], written["content"][0]["text"])
+        self.assertNotIn("structuredContent", replies[4]["result"])
+
     def test_a_bad_argument_is_an_answer_with_a_next_step_not_an_error(self):
         run, replies = self.rpc([("ctx_relations", {"target": ORDERS, "direction": "sideways"})])
         result = replies[3]["result"]
@@ -216,7 +226,7 @@ class McpServer(Workspace):
 
 @unittest.skipUnless(NODE and pi_package() and (pi_package() / "dist/index.js").exists(), "node or the installed pi package is not available")
 class PiExtension(Workspace):
-    def run_extension(self, calls, task=True):
+    def run_extension(self, calls, task=True, **extra):
         agent = self.tmp / "agent"
         (self.tmp / "bin").mkdir(exist_ok=True)
         agent.mkdir(exist_ok=True)
@@ -224,7 +234,7 @@ class PiExtension(Workspace):
         if not link.exists():
             link.symlink_to(ROOT / "bin" / "tp-ctx")
         spec = {"pkg": str(pi_package()), "root": str(ROOT), "project": str(self.project), "calls": [{"tool": t, "input": a} for t, a in calls]}
-        env = self.env(task=task, tools=False, PI_CODING_AGENT_DIR=str(agent), CTX_RUNTIME_SPEC=json.dumps(spec))
+        env = self.env(task=task, tools=False, PI_CODING_AGENT_DIR=str(agent), CTX_RUNTIME_SPEC=json.dumps(spec), **extra)
         run = subprocess.run(["node", "--experimental-strip-types", str(FIX / "ctx_runtime.mjs")], cwd=ROOT, env=env, capture_output=True, text=True,
                              timeout=120)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -253,6 +263,14 @@ class PiExtension(Workspace):
             self.assertEqual(answer["text"], self.tp_ctx(tool, args), tool)
         self.assertIn("Next: ", answers[3]["text"])
         self.assertEqual([entry["tool"] for entry in self.log()][:5], [c[0] for c in calls])
+
+    def test_a_note_returns_its_id_and_status_as_the_tool_details(self):
+        """Review 1 F6, pi side."""
+        note = {"kind": "lesson", "scope": ["apps/**"], "text": "Parse before use.", "evidence": [f"{ORDERS}:6"]}
+        answers = self.run_extension([("ctx_note", note), ("ctx_knowledge", {})], TP_TASK_ID="coder-x")["answers"]
+        self.assertEqual(answers[0]["details"]["status"], "candidate")
+        self.assertRegex(answers[0]["details"]["id"], r"^kn-\d{4}-\d\d-\d\d-")
+        self.assertIsNone(answers[1]["details"])
 
     def test_with_no_task_directory_the_tool_call_fails(self):
         out = self.run_extension([("ctx_knowledge", {})], task=False)

@@ -224,7 +224,8 @@ const run = (args) =>
     execFile(TP_CTX, args, { timeout: 90000, maxBuffer: 1024 * 1024, cwd: process.cwd(), env: process.env }, (err, stdout, stderr) =>
       done({ code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) })));
 
-// `tp-ctx --json` prints {status,text,truncated,left_out}. A refusal or a bad argument is an answer (exit 1 or 2, with text);
+// `tp-ctx --json` prints {status,text,truncated,left_out} and, for ctx_note, `result` ({id,status:'candidate',path}), which goes
+// out as the tool's structuredContent, so the candidate's id is data and not something to scrape from prose. A refusal or a bad argument is an answer (exit 1 or 2, with text);
 // no stdout at all (exit 3: it could not log, or no project) means no answer, and the tool call fails.
 const ask = async (tool, input) => {
   const r = await run(["--json", tool, "--input", JSON.stringify(input ?? {})]);
@@ -235,7 +236,7 @@ const ask = async (tool, input) => {
     reply = null;
   }
   if (!reply || typeof reply.text !== "string") throw new Error(r.stderr.trim() || `tp-ctx exited ${r.code}`);
-  return reply.text;
+  return { text: reply.text, result: reply.result && typeof reply.result === "object" ? reply.result : undefined };
 };
 
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
@@ -251,7 +252,10 @@ async function handle(msg) {
     const tool = TOOLS[params?.name];
     if (!tool) return send({ id, result: { isError: true, content: [{ type: "text", text: `unknown tool ${params?.name}` }] } });
     try {
-      return send({ id, result: { content: [{ type: "text", text: await ask(params.name, params.arguments ?? {}) }] } });
+      const answer = await ask(params.name, params.arguments ?? {});
+      const out = { content: [{ type: "text", text: answer.text }] };
+      if (answer.result) out.structuredContent = answer.result;
+      return send({ id, result: out });
     } catch (e) {
       return send({ id, result: { isError: true, content: [{ type: "text", text: String(e.message ?? e) }] } });
     }

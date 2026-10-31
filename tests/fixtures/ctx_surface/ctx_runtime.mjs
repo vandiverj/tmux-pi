@@ -30,7 +30,7 @@ for (const call of spec.calls) {
   const tool = tools.find((t) => t.name === call.tool);
   try {
     const result = await tool.execute('call-1', call.input, undefined, undefined, { cwd: spec.project });
-    answers.push({ text: result.content[0].text, type: result.content[0].type });
+    answers.push({ text: result.content[0].text, type: result.content[0].type, details: result.details ?? null });
   } catch (error) {
     answers.push({ error: String(error.message ?? error) });
   }

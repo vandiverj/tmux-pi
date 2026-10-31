@@ -32,20 +32,20 @@ imports (1):
 == contracts
 lib/launchpad/types/order.ts — imported at apps/launchpad/api/src/orders.ts:2, apps/launchpad/web/src/cart.ts:1
   consumers (10):
-  apps/launchpad/web/src/p01.ts:1
-  apps/launchpad/web/src/p02.ts:1
-  apps/launchpad/web/src/p03.ts:1
-  apps/launchpad/web/src/p04.ts:1
-  apps/launchpad/web/src/p05.ts:1
-  apps/launchpad/web/src/p06.ts:1
-  apps/launchpad/web/src/p07.ts:1
-  apps/launchpad/web/src/p08.ts:1
+  apps/launchpad/web/src/p01.ts:1 [unread]
+  apps/launchpad/web/src/p02.ts:1 [unread]
+  apps/launchpad/web/src/p03.ts:1 [unread]
+  apps/launchpad/web/src/p04.ts:1 [unread]
+  apps/launchpad/web/src/p05.ts:1 [unread]
+  apps/launchpad/web/src/p06.ts:1 [unread]
+  apps/launchpad/web/src/p07.ts:1 [unread]
+  apps/launchpad/web/src/p08.ts:1 [unread]
 == knowledge
-  kn-2026-10-01-parse (convention) — Parse input before use: Always parse. ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp…
+  kn-2026-10-01-parse (convention) — Parse input before use: Always parse. pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp…
   kn-2026-10-02-routes (convention) — Routes are thin: Keep routes thin.
   kn-2026-10-04-elsewhere (convention) — Not for orders: Web only.
   kn-2026-10-03-repo (convention) — Repo-wide habit: Use strict mode.
 == libraries
   react (version not read: not in the lockfile)
   zod 4.6.7 — use api_signature(zod, <symbol>) for exact signatures
-(left out: importers of apps/launchpad/api/src/orders.ts: 4 more (14 total); contract consumers of lib/launchpad/types/order.ts: 2 more)
+(left out: importers of apps/launchpad/api/src/orders.ts: 4 more (14 total); contract consumers of lib/launchpad/types/order.ts: 2 more; note text cut at 300 characters (ctx_knowledge shows it whole): kn-2026-10-01-parse)

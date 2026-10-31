@@ -201,19 +201,21 @@ export default function (pi: ExtensionAPI) {
 			execFile(tpCtx, args, { timeout: 90000, maxBuffer: 1024 * 1024, cwd, encoding: "utf8", env: process.env, signal }, (err, stdout, stderr) =>
 				done({ code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) }));
 		});
-	// `tp-ctx --json` prints {status,text,truncated,left_out}. A refusal or a bad argument is an answer (exit 1 or 2, with text);
+	// `tp-ctx --json` prints {status,text,truncated,left_out} and, for ctx_note, `result` ({id,status:'candidate',path}), which goes
+	// out as the tool's `details`, so the candidate's id is data and not something to scrape from prose. A refusal or a bad argument is an answer (exit 1 or 2, with text);
 	// no stdout at all (exit 3: it could not log, or no project) means no answer, and the tool call fails.
 	const ask = async (tool: string, input: unknown, ctx: { cwd?: unknown } | undefined, signal?: AbortSignal) => {
 		const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
 		const r = await run(["--json", tool, "--input", JSON.stringify(input ?? {})], cwd, signal);
-		let reply: { text?: unknown } | null = null;
+		let reply: { text?: unknown; result?: unknown } | null = null;
 		try {
 			reply = JSON.parse(r.stdout);
 		} catch {
 			reply = null;
 		}
 		if (!reply || typeof reply.text !== "string") throw new Error(r.stderr.trim() || `tp-ctx exited ${r.code}`);
-		return { content: [{ type: "text" as const, text: reply.text }], details: undefined };
+		const result = reply.result && typeof reply.result === "object" ? reply.result : undefined;
+		return { content: [{ type: "text" as const, text: reply.text }], details: result };
 	};
 
 	for (const [name, tool] of Object.entries(SCHEMA.tools)) {

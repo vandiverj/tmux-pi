@@ -1,6 +1,7 @@
 """CX4 ctx-tools: the folded-in CX1 review notes (N1-N8), the surface (argument checks, the 6 KB answer, the status vocabulary),
 the deterministic brief, the five operations on stubbed and on fake-real navigators, and the call log. No model, no network,
 no real navigator: the stubs and small fakes that copy the real answer shapes stand in."""
+import fcntl
 import inspect
 import json
 import os
@@ -454,12 +455,14 @@ class Brief(SurfaceCase):
             add_approved(self.layout, f"kn-2026-10-1{ident}-more", f"More {ident}", ["apps/launchpad/api/**"], "More.")
         self.assertEqual(len(self.brief(paths=(ORDERS,)).notes_returned), 5)
 
-    def test_notes_are_ranked_by_specificity_and_cut_at_300_characters_with_their_titles(self):
+    def test_notes_are_ranked_by_specificity_and_the_body_is_cut_at_300_characters_after_the_title(self):
         answer = self.brief(paths=(ORDERS,))
         self.assertEqual(answer.notes_returned, ["kn-2026-10-01-parse", "kn-2026-10-02-routes", "kn-2026-10-03-repo"])
         line = [row for row in answer.text.splitlines() if "kn-2026-10-01-parse" in row][0]
         self.assertIn("Parse input before use", line)
-        self.assertLessEqual(len(line.split(" — ", 1)[1]), 300 + 3)
+        title, body = line.split(" — ", 1)[1].split(": ", 1)
+        self.assertEqual(title, "Parse input before use")
+        self.assertEqual(body, "Always parse. " + "p" * 286 + "…")  # the first 300 characters of the body, whatever the title's length
         self.assertNotIn("kn-2026-10-04-elsewhere", answer.text)
 
     def test_library_hints_name_the_pinned_version_or_say_it_could_not_be_read(self):
@@ -575,8 +578,8 @@ class Operations(SurfaceCase):
         engine = self.engine(env={"TP_TASK_ID": "coder-x"})
         answer = engine.run("ctx_note", VALID["ctx_note"])
         self.assertEqual(answer.status, "ok", answer.text)
-        self.assertEqual(answer.data["status"], "candidate")
-        ident = answer.data["id"]
+        self.assertEqual(answer.data["result"]["status"], "candidate")
+        ident = answer.data["result"]["id"]
         written = self.layout.path("candidate", ident)
         self.assertTrue(written.is_file())
         self.assertFalse(self.layout.path("approved", ident).exists())
@@ -586,7 +589,7 @@ class Operations(SurfaceCase):
         self.assertEqual(answer.notes_returned, [ident])
         again = engine.run("ctx_note", VALID["ctx_note"])  # the same text never overwrites
         self.assertEqual(again.status, "ok")
-        self.assertNotEqual(again.data["id"], ident)
+        self.assertNotEqual(again.data["result"]["id"], ident)
         self.assertEqual(written.read_text(), text)
 
     def test_note_refuses_a_secret_and_rejects_bad_evidence_and_scope(self):
@@ -740,6 +743,564 @@ class CommandLine(SurfaceCase):
         schema = json.loads(json.loads(done.stdout)["text"])
         self.assertEqual(sorted(schema["tools"]), sorted(surface.TOOLS))
         self.assertEqual(schema["cap"], 6144)
+
+
+# ------------------------------------------------------------------------------------------------------- Review 1 (F1-F11)
+
+API_SRC = "apps/launchpad/api/src"
+WEB_SRC = "apps/launchpad/web/src"
+SPEC = f"{WEB_SRC}/cart.spec.ts"
+GOOD = f"{API_SRC}/routes/r01.ts"
+REFUSED_PATHS = ["config/local.json", "../outside.ts", ".env", "apps/link.ts"]  # sensitive, outside, sensitive, a link out of the project
+LEAKS = ("local.json", "outside.ts", ".env", "do-not-read", "apps/link.ts")
+
+
+def put(project, rel, text):
+    path = project / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return rel
+
+
+def api_importers(paths, target=ORDERS, **extra):
+    rows = [{"path": p, "line": 1, "spec": "../orders.ts"} for p in paths]
+    return {"status": "ok", "target": target, "total": len(rows), "truncated": False, "importers": rows, "index_age_s": 3, "unresolved_total": 0,
+            "files_indexed": 40, "scanned": 0, **extra}
+
+
+def web_edges(file, direction, others, **extra):
+    """A web `imports` answer: `others` import `file` (importers), or `file` imports `others` (imports)."""
+    edges = [{"from": o, "line": 1, "specifier": "x", "to": file, "depth": 1} if direction == "importers"
+             else {"from": file, "line": n, "specifier": "x", "to": o, "depth": 1} for n, o in enumerate(others, 1)]
+    return {"status": "ok", "direction": direction, "target": file, "edges": edges, "total": len(edges), "truncated": False, "unresolved": 0, **extra}
+
+
+class ReviewOne(SurfaceCase):
+    def put(self, rel, text):
+        return put(self.project, rel, text)
+
+
+class NavigatorPaths(ReviewOne):
+    """F1: every path a navigator returns passes the path policy before it is shown; a refused one is counted, never named."""
+
+    def setUp(self):
+        super().setUp()
+        outside = self.tmp / "outside.ts"
+        outside.write_text("export const x = 1;\n")
+        (self.project / "apps" / "link.ts").symlink_to(outside)
+
+    def assertClean(self, answer, counted=None):
+        self.assertEqual(answer.status, "ok", answer.text)
+        for word in LEAKS:
+            self.assertNotIn(word, answer.text, word)
+            self.assertNotIn(word, json.dumps(answer.data), word)
+        if counted is not None:
+            self.assertTrue(any(f"{counted} withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_api_importers_are_screened_in_relations_and_in_the_brief(self):
+        fake_navs.BEHAVIOUR[("api", "importers")] = lambda a: api_importers([GOOD, *REFUSED_PATHS])
+        relations = self.run_tool("ctx_relations", {"target": ORDERS, "direction": "importers"})
+        self.assertClean(relations, counted=4)
+        self.assertIn(f"{GOOD}:1 -> {ORDERS}", relations.text)
+        brief = self.run_tool("ctx_brief", {"paths": [ORDERS]})
+        self.assertClean(brief, counted=4)
+        self.assertIn(GOOD, brief.text)
+
+    def test_web_importers_and_imports_are_screened_in_relations_and_in_the_brief(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], a["direction"],
+                                                                      [SPEC if a["direction"] == "importers" else ORDER, *REFUSED_PATHS])
+        for direction in ("importers", "imports", "contracts"):
+            self.assertClean(self.run_tool("ctx_relations", {"target": CART, "direction": direction}), counted=4 if direction != "contracts" else None)
+        self.assertClean(self.run_tool("ctx_brief", {"paths": [CART]}), counted=4)
+
+    def test_api_imports_are_screened(self):
+        files = [{"path": p, "line": n, "spec": "x"} for n, p in enumerate([ORDER, *REFUSED_PATHS], 1)]
+        fake_navs.BEHAVIOUR[("api", "imports")] = {"status": "ok", "target": ORDERS, "source": "index", "files": files, "external": [], "unresolved": [],
+                                                   "index_age_s": 3, "unresolved_total": 0, "files_indexed": 40, "scanned": 0}
+        self.assertClean(self.run_tool("ctx_relations", {"target": ORDERS, "direction": "imports"}), counted=4)
+        self.assertClean(self.run_tool("ctx_brief", {"paths": [ORDERS]}), counted=4)
+
+    def test_contract_consumers_are_screened(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], a["direction"], [CART, *REFUSED_PATHS])
+        self.assertClean(self.run_tool("ctx_relations", {"target": ORDERS, "direction": "contracts"}))
+
+    def test_a_placeholder_and_the_navigators_own_withheld_count_are_counted_not_shown(self):
+        fake_navs.BEHAVIOUR[("api", "importers")] = lambda a: api_importers([GOOD, "<withheld>"])
+        answer = self.run_tool("ctx_relations", {"target": ORDERS, "direction": "importers"})
+        self.assertNotIn("<withheld>", answer.text)
+        self.assertTrue(any("1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], "importers", [SPEC], withheld=3)
+        answer = self.run_tool("ctx_relations", {"target": CART, "direction": "importers"})
+        self.assertTrue(any("3 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        self.assertIn(SPEC, answer.text)
+
+    def test_definitions_and_references_of_a_symbol_are_screened(self):
+        rows = [{"path": p, "line": 5, "column": 1, "name": "addToCart", "kind": "function", "container": "", "text": f"function addToCart() // {p}"}
+                for p in (CART, *REFUSED_PATHS)]
+        fake_navs.BEHAVIOUR[("web", "definition")] = {"status": "ok", "definitions": rows, "signature": "function addToCart()", "doc": ""}
+        refs = [{"path": p, "line": 2, "column": 1, "text": "addToCart(x)", "is_definition": False, "is_write": False} for p in (SPEC, *REFUSED_PATHS)]
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "ok", "definitions": [], "references": refs, "total": len(refs), "truncated": False}
+        answer = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART})
+        self.assertEqual(answer.status, "ok", answer.text)
+        for word in ("local.json", "outside.ts", ".env", "apps/link.ts"):
+            self.assertNotIn(word, answer.text, word)
+        self.assertIn(f"{CART}:5", answer.text)
+        self.assertIn(SPEC, answer.text)
+        self.assertTrue(any("withheld" in item and "definitions" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        self.assertTrue(any("withheld" in item and "references" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_an_api_symbol_listed_at_a_refused_path_is_not_named(self):
+        symbols = [{"name": "createOrder", "kind": "function", "path": p, "line": 5, "signature": "export function createOrder()", "doc": ""}
+                   for p in (ORDERS, *REFUSED_PATHS)]
+        fake_navs.BEHAVIOUR[("api", "symbols")] = {"status": "ok", "path": ORDERS, "source": "deno_doc", "total": 5, "truncated": False, "symbols": symbols}
+        answer = self.run_tool("ctx_symbol", {"name": "createOrder", "path": ORDERS})
+        self.assertClean(answer)
+        self.assertIn(f"{ORDERS}:5", answer.text)
+
+
+class ContractMarks(ReviewOne):
+    """F2: contract consumers say whether they read or write the contract."""
+
+    def setUp(self):
+        super().setUp()
+        imp = 'import { OrderSchema } from "../../../../lib/launchpad/types/order";\n'
+        self.files = {
+            "reader": self.put(f"{WEB_SRC}/reader.ts", imp + "export const read = (x: unknown) => OrderSchema.parse(x);\n"),
+            "writer": self.put(f"{WEB_SRC}/writer.ts", imp + "export const Draft = OrderSchema.extend({ note: z.string() });\n"),
+            "both": self.put(f"{WEB_SRC}/both.ts", imp + "export const A = OrderSchema.pick({ id: true });\nexport const f = (x: unknown) => OrderSchema.safeParse(x);\n"),
+            "uses": self.put(f"{WEB_SRC}/uses.ts", imp + "console.log(OrderSchema);\n"),
+            "types": self.put(f"{WEB_SRC}/types.ts", 'import type { Order } from "../../../../lib/launchpad/types/order";\nexport type O = Order;\n'),
+            "reexport": self.put(f"{WEB_SRC}/reexport.ts", 'export * from "../../../../lib/launchpad/types/order";\n'),
+            "alias": self.put(f"{WEB_SRC}/alias.ts", 'import { OrderSchema as S } from "../../../../lib/launchpad/types/order";\nexport const x = S.omit({ id: true });\n'),
+            "namespace": self.put(f"{WEB_SRC}/ns.ts", 'import * as O from "../../../../lib/launchpad/types/order";\nexport const x = O.OrderSchema.parse(1);\n'),
+        }
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], a["direction"], list(self.files.values()) if a["direction"] == "importers"
+                                                                      else [ORDER])
+
+    def marks(self, text):
+        found = {}
+        for name, rel in self.files.items():
+            hit = re.search(rf"^  {re.escape(rel)}:\d+(?: -> \S+)? \[([^\]]+)\]$", text, re.M)
+            found[name] = hit.group(1) if hit else "absent"
+        return found
+
+    def test_each_consumer_of_a_contract_is_marked_reader_writer_both_or_uses(self):
+        text = self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"}).text
+        self.assertEqual(self.marks(text), {"reader": "reader", "writer": "writer", "both": "reader, writer", "uses": "uses", "types": "reader",
+                                            "reexport": "writer", "alias": "writer", "namespace": "reader"}, text)
+
+    def test_importers_of_a_lib_contract_are_marked_and_a_file_that_cannot_be_read_says_so(self):
+        text = self.run_tool("ctx_relations", {"target": ORDER, "direction": "importers"}).text
+        self.assertEqual(self.marks(text)["writer"], "writer", text)
+        (self.project / self.files["writer"]).unlink()
+        self.assertEqual(self.marks(self.run_tool("ctx_relations", {"target": ORDER, "direction": "importers"}).text)["writer"], "unread")
+
+    def test_the_brief_marks_its_contract_consumers_too(self):
+        text = self.run_tool("ctx_brief", {"paths": [CART]}).text
+        contracts = text.split("== contracts")[1].split("== knowledge")[0]
+        self.assertEqual(self.marks(contracts)["reader"], "reader", contracts)
+        self.assertIn("[", contracts)
+
+
+def web_listing(total, contract_at, cap):
+    """A web navigator that has `total` imports of the file, returns at most `cap` of them and reports `total` and `truncated`."""
+    def answer(args):
+        everything = [ORDER if n == contract_at else f"{WEB_SRC}/p{n:03d}.ts" for n in range(1, total + 1)]
+        shown = web_edges(args["file"], "imports", everything)
+        wanted = min(args["limit"], cap)
+        shown["edges"] = shown["edges"][:wanted]
+        shown["truncated"] = total > wanted
+        return shown
+    return answer
+
+
+def importing(total, contract_at, cap):
+    listing = web_listing(total, contract_at, cap)
+    return lambda a: listing(a) if a["direction"] == "imports" else web_edges(a["file"], "importers", [SPEC])
+
+
+class TruncatedImports(ReviewOne):
+    """F3: an imports list the navigator cut is reported as cut, and never as the whole picture of the file's contracts."""
+
+    def test_a_26th_import_is_not_hidden_behind_a_25_of_25_claim(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = importing(26, 26, 200)
+        answer = self.run_tool("ctx_relations", {"target": CART, "direction": "imports", "limit": 25})
+        self.assertNotIn("25 of 25", answer.text)
+        self.assertIn("25 of 26", answer.text)
+        self.assertTrue(any("imports" in item and "1 more" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_the_contract_that_is_import_26_is_found_in_the_brief_and_in_relations(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = importing(26, 26, 200)
+        brief = self.run_tool("ctx_brief", {"paths": [CART]})
+        self.assertNotIn("no shared contracts", brief.text)
+        self.assertIn(ORDER, brief.text.split("== contracts")[1].split("== knowledge")[0])
+        self.assertIn(ORDER, self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"}).text)
+
+    def test_when_the_navigator_itself_cuts_the_list_the_contracts_view_says_it_may_be_incomplete(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = importing(250, 250, 200)
+        for answer in (self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"}), self.run_tool("ctx_brief", {"paths": [CART]})):
+            self.assertNotIn("no shared contracts", answer.text)
+            self.assertIn("only 200 of 250 imports were read", answer.text)
+            self.assertTrue(any("imports" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_a_complete_list_makes_no_such_claim(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = importing(5, 3, 200)
+        answer = self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"})
+        self.assertNotIn("were read", answer.text)
+        self.assertIn(ORDER, answer.text)
+
+
+def symbol_listing(total, cap, path=MANY):
+    def answer(args):
+        found = [{"name": f"e{n:03d}", "kind": "variable", "path": path, "line": n, "signature": f"export const e{n:03d} = {n};", "doc": ""}
+                 for n in range(1, total + 1)]
+        wanted = min(args["limit"], cap)
+        return {"status": "ok", "path": path, "source": "deno_doc", "cached": False, "total": total, "truncated": total > wanted, "symbols": found[:wanted]}
+    return answer
+
+
+class PartialSymbolListing(ReviewOne):
+    """F4: ctx_symbol does not conclude that an api symbol is absent from a listing the navigator cut."""
+
+    def test_a_name_beyond_the_listing_is_not_declared_absent(self):
+        fake_navs.BEHAVIOUR[("api", "symbols")] = symbol_listing(120, 100)
+        answer = self.run_tool("ctx_symbol", {"name": "e110", "path": MANY})
+        self.assertNotIn("lists none", answer.text)
+        self.assertNotIn("no definition", answer.text)
+        self.assertIn("does not show that it is not defined", answer.text)
+        self.assertRegex(answer.text, r"Next: \S")
+        self.assertTrue(any("not listed" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_a_name_in_the_first_hundred_is_found_where_fifty_used_to_be_the_limit(self):
+        fake_navs.BEHAVIOUR[("api", "symbols")] = symbol_listing(120, 100)
+        answer = self.run_tool("ctx_symbol", {"name": "e060", "path": MANY})
+        self.assertIn(f"{MANY}:60", answer.text)
+        self.assertEqual(max(c[2]["limit"] for c in fake_navs.CALLS if c[1] == "symbols"), 100)
+
+    def test_a_name_missing_from_a_complete_listing_is_still_said_to_be_absent(self):
+        fake_navs.BEHAVIOUR[("api", "symbols")] = symbol_listing(30, 100)
+        answer = self.run_tool("ctx_symbol", {"name": "nothere", "path": MANY})
+        self.assertIn("no definition of nothere", answer.text)
+        self.assertNotIn("does not show", answer.text)
+
+
+def letters(count):
+    return "".join(chr(97 + n % 26) for n in range(count))
+
+
+class NoteBodies(ReviewOne):
+    """F5: ctx_knowledge returns the whole note body; the brief returns the first 300 characters of it whatever the title's length."""
+
+    def test_knowledge_returns_an_800_character_body_whole(self):
+        add_approved(self.layout, "kn-2026-10-01-long", "T" * 100, ["apps/**"], letters(800))
+        answer = self.run_tool("ctx_knowledge", {})
+        self.assertIn(letters(800), answer.text)
+        self.assertEqual((answer.status, answer.data["truncated"], answer.data["left_out"]), ("ok", False, []))
+
+    def test_a_body_of_the_longest_size_a_note_can_have_is_shown_whole(self):
+        add_approved(self.layout, "kn-2026-10-01-huge", "Huge", ["apps/**"], letters(store.BODY_MAX))
+        answer = self.run_tool("ctx_knowledge", {})
+        self.assertIn(": " + letters(store.BODY_MAX), answer.text)
+        self.assertNotIn("…", answer.text)
+        self.assertEqual((answer.data["truncated"], answer.data["left_out"]), (False, []))
+
+    def test_the_brief_gives_300_characters_of_body_after_a_100_character_title(self):
+        add_approved(self.layout, "kn-2026-10-01-titled", "H" * 100, [ORDERS], letters(500))
+        answer = self.run_tool("ctx_brief", {"paths": [ORDERS]})
+        line = [row for row in answer.text.splitlines() if "kn-2026-10-01-titled" in row][0]
+        self.assertTrue(line.endswith(": " + letters(300) + "…"), line)
+        self.assertTrue(any("kn-2026-10-01-titled" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_a_short_body_is_shown_whole_in_both_views(self):
+        add_approved(self.layout, "kn-2026-10-01-short", "Short", [ORDERS], "Just this.")
+        for answer in (self.run_tool("ctx_brief", {"paths": [ORDERS]}), self.run_tool("ctx_knowledge", {})):
+            self.assertIn("Short: Just this.", answer.text)
+            self.assertFalse(any("kn-2026-10-01-short" in item for item in answer.data["left_out"]))
+
+
+class NoteResult(SurfaceCase):
+    """F6: the candidate's id and status are structured output, not prose to scrape."""
+
+    def test_the_json_answer_carries_the_id_and_status_for_a_note_and_nothing_extra_for_other_tools(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        env = {"TP_TASK_DIR": str(task), "TP_TASK_ID": "coder-x"}
+        done = run_cli(self.project, "ctx_note", VALID["ctx_note"], env)
+        payload = json.loads(done.stdout)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(payload["result"]["status"], "candidate")
+        self.assertRegex(payload["result"]["id"], r"^kn-\d{4}-\d\d-\d\d-")
+        self.assertIn(payload["result"]["id"], payload["text"])
+        self.assertTrue(self.layout.path("candidate", payload["result"]["id"]).is_file())
+        for tool in ("ctx_knowledge", "ctx_brief"):
+            self.assertNotIn("result", json.loads(run_cli(self.project, tool, VALID[tool], env).stdout), tool)
+        refused = json.loads(run_cli(self.project, "ctx_note", {**VALID["ctx_note"], "text": f"Use {AWS}."}, env).stdout)
+        self.assertNotIn("result", refused)
+
+
+class NoteLimitIsAtomic(SurfaceCase):
+    """F7: the five-notes-per-task limit holds when callers arrive together."""
+
+    GATE = ("import os, runpy, sys\n"
+            "os.read(int(sys.argv[1]), 1)  # wait for the parent to close its end: every caller starts together\n"
+            "sys.argv = ['tp-ctx'] + sys.argv[2:]\n"
+            "runpy.run_path(%r, run_name='__main__')\n")
+
+    def test_six_callers_released_together_write_five_candidates_and_log_six_lines(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        env = clean_env({"TP_CTX_TODAY": "2026-10-31", "TP_TASK_DIR": str(task), "TP_TASK_ID": "coder-x"})
+        gate_in, gate_out = os.pipe()
+        procs = []
+        for number in range(6):
+            args = {**VALID["ctx_note"], "text": f"Rule number {number}."}
+            procs.append(subprocess.Popen([sys.executable, "-c", self.GATE % str(TP_CTX), str(gate_in), "--project", str(self.project), "--json",
+                                           "ctx_note", "--input", json.dumps(args)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                                          pass_fds=(gate_in,), stdin=subprocess.DEVNULL))
+        os.close(gate_in)
+        os.close(gate_out)  # EOF on the gate: all six go
+        results = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=120)
+            results.append((proc.returncode, json.loads(out)["status"] if out else err))
+        self.assertEqual(sorted(results), [(0, "ok")] * 5 + [(2, "refused")], results)
+        self.assertEqual(len(list(self.layout.directory("candidate").glob("*.md"))), 5)
+        logged = [json.loads(line) for line in (task / "ctx-calls.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(line["status"] for line in logged), ["ok"] * 5 + ["refused"])
+
+    def test_the_task_lock_is_held_for_the_whole_of_a_note_call(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        held = []
+        engine = self.engine(env={"TP_TASK_ID": "coder-x", "TP_TASK_DIR": str(task)})
+        real = engine.op_ctx_note
+
+        def probe(args):
+            fd = os.open(task / calls.LOCK_NAME, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                os.close(fd)
+            return real(args)
+
+        engine.op_ctx_note = probe
+        calls.call("ctx_note", VALID["ctx_note"], lambda: engine.run("ctx_note", VALID["ctx_note"]), env={"TP_TASK_DIR": str(task)}, exclusive=True)
+        self.assertEqual(held, [True])
+
+
+class UnloggedNotes(SurfaceCase):
+    """F8: a ctx_note whose log line cannot be written leaves no candidate."""
+
+    def run_note(self, task):
+        return run_cli(self.project, "ctx_note", VALID["ctx_note"], {"TP_TASK_DIR": str(task), "TP_TASK_ID": "coder-x"})
+
+    def candidates(self):
+        directory = self.layout.directory("candidate")
+        return list(directory.glob("*.md")) if directory.exists() else []
+
+    def test_a_log_that_is_a_directory_or_a_link_means_no_answer_and_no_candidate(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        log = task / "ctx-calls.jsonl"
+        for make in (log.mkdir, lambda: log.symlink_to(self.tmp / "elsewhere.jsonl")):
+            make()
+            done = self.run_note(task)
+            self.assertEqual((done.returncode, done.stdout), (3, ""), done.stderr)
+            self.assertEqual(self.candidates(), [])
+            log.rmdir() if log.is_dir() and not log.is_symlink() else log.unlink()
+        self.assertFalse((self.tmp / "elsewhere.jsonl").exists())
+        self.assertEqual(self.run_note(task).returncode, 0)  # the retry writes exactly one
+        self.assertEqual(len(self.candidates()), 1)
+
+    def test_a_line_that_fails_after_the_write_takes_the_candidate_back(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        engine = self.engine(env={"TP_TASK_ID": "coder-x", "TP_TASK_DIR": str(task)})
+        with mock.patch.object(calls, "record", side_effect=calls.LogUnavailable("disk full")):
+            with self.assertRaises(calls.LogUnavailable):
+                calls.call("ctx_note", VALID["ctx_note"], lambda: engine.run("ctx_note", VALID["ctx_note"]), env={"TP_TASK_DIR": str(task)},
+                           exclusive=True)
+        self.assertEqual(self.candidates(), [])
+
+
+class WritingCallsShareTheLock(unittest.TestCase):
+    """F7/F8 at their shared cause (calls.call, used by the surface and by CX1's `knowledge add`): a call that writes holds the task's
+    lock from before it runs until its line is written, checks the log can be appended first, and takes its write back if the line
+    still cannot be written."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name).resolve()
+        self.task = self.tmp / "task"
+        self.task.mkdir()
+        self.env = {"TP_TASK_DIR": str(self.task)}
+
+    def lock_is_free(self):
+        fd = os.open(self.task / calls.LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_an_exclusive_call_holds_the_task_lock_while_it_runs_and_releases_it_after(self):
+        seen = []
+        calls.call("t", {}, lambda: seen.append(self.lock_is_free()) or calls.Answer("ok", "x"), env=self.env, exclusive=True)
+        calls.call("t", {}, lambda: seen.append(self.lock_is_free()) or calls.Answer("ok", "x"), env=self.env)
+        self.assertEqual(seen, [False, True])  # held during the exclusive run, not taken by an ordinary one
+        self.assertTrue(self.lock_is_free())
+        self.assertEqual(len((self.task / calls.LOG_NAME).read_text().splitlines()), 2)
+
+    def test_the_lock_is_released_when_the_call_cannot_be_logged(self):
+        with mock.patch.object(calls, "record", side_effect=calls.LogUnavailable("no")):
+            with self.assertRaises(calls.LogUnavailable):
+                calls.call("t", {}, lambda: calls.Answer("ok", "x"), env=self.env, exclusive=True)
+        self.assertTrue(self.lock_is_free())
+
+    def test_a_write_is_taken_back_when_its_line_cannot_be_written(self):
+        written = self.tmp / "candidate.md"
+
+        def run():
+            written.write_text("a candidate")
+            return calls.Answer("ok", "written", undo=written.unlink)
+
+        with mock.patch.object(calls, "record", side_effect=calls.LogUnavailable("disk full")):
+            with self.assertRaises(calls.LogUnavailable):
+                calls.call("t", {}, run, env=self.env, exclusive=True)
+        self.assertFalse(written.exists())
+
+    def test_a_log_that_cannot_be_appended_stops_an_exclusive_call_before_it_runs(self):
+        ran = []
+        log = self.task / calls.LOG_NAME
+        for make in (log.mkdir, lambda: log.symlink_to(self.tmp / "elsewhere.jsonl")):
+            make()
+            with self.assertRaises(calls.LogUnavailable):
+                calls.call("t", {}, lambda: ran.append(1) or calls.Answer("ok", "x"), env=self.env, exclusive=True)
+            self.assertEqual(ran, [])
+            log.rmdir() if log.is_dir() and not log.is_symlink() else log.unlink()
+        self.assertFalse((self.tmp / "elsewhere.jsonl").exists())
+
+    def test_cx1_knowledge_add_leaves_no_candidate_when_its_log_cannot_be_written(self):
+        project = self.tmp / "project"
+        (project / ".tmux-pi").mkdir(parents=True)
+        put(project, "apps/a.test.ts", "one\ntwo\n")
+        notes = project / ".tmux-pi" / "knowledge"
+        log = self.task / calls.LOG_NAME
+
+        def add():
+            return subprocess.run([sys.executable, str(TP_CTX), "--project", str(project), "knowledge", "add", "--kind", "convention", "--scope",
+                                   "apps/**/*.test.ts", "--evidence", "apps/a.test.ts:2", "--text", "Clean up only the rows a test created."],
+                                  capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                                  env=clean_env({"TP_TASK_DIR": str(self.task), "TP_TASK_ID": "coder-x", "TP_CTX_TODAY": "2026-10-31"}))
+
+        for make in (log.mkdir, lambda: log.symlink_to(self.tmp / "elsewhere.jsonl")):
+            make()
+            done = add()
+            self.assertEqual((done.returncode, done.stdout), (3, ""), done.stderr)
+            self.assertEqual(list(notes.glob("**/*.md")), [], done.stderr)
+            log.rmdir() if log.is_dir() and not log.is_symlink() else log.unlink()
+        self.assertEqual(add().returncode, 0)
+        self.assertEqual(len(list(notes.glob("candidates/*.md"))), 1)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+
+class EveryDefinition(ReviewOne):
+    """F9: each matching definition gets its own detail, not only the first."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = self.put(f"{API_SRC}/other.ts", "export function createOrder(count: number) {\n  return count;\n}\n")
+
+        def symbols(args):
+            if args["path"] != self.other:
+                return None
+            return {"status": "ok", "path": self.other, "source": "deno_doc", "total": 1, "truncated": False,
+                    "symbols": [{"name": "createOrder", "kind": "function", "path": self.other, "line": 1,
+                                 "signature": "export function createOrder(count: number) {", "doc": "The other one."}]}
+        fake_navs.BEHAVIOUR[("api", "symbols")] = symbols
+
+    def test_two_files_that_export_the_name_each_get_signature_and_doc(self):
+        answer = self.run_tool("ctx_symbol", {"name": "createOrder"})
+        self.assertEqual(answer.status, "ok", answer.text)
+        self.assertIn(f"== {ORDERS}", answer.text)
+        self.assertIn(f"== {self.other}", answer.text)
+        self.assertIn("export function createOrder(input: unknown) {", answer.text)
+        self.assertIn("export function createOrder(count: number) {", answer.text)
+        self.assertIn("Creates an order.", answer.text)
+        self.assertIn("The other one.", answer.text)
+
+    def test_details_are_given_for_at_most_five_files_and_the_rest_are_named(self):
+        for n in range(6):
+            self.put(f"{API_SRC}/extra{n}.ts", "export function createOrder() {}\n")
+        answer = self.run_tool("ctx_symbol", {"name": "createOrder"})
+        self.assertEqual(len(re.findall(r"^== ", answer.text, re.M)), 5)
+        self.assertTrue(any("details for 3 more file(s)" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_a_path_narrows_it_back_to_one_file(self):
+        answer = self.run_tool("ctx_symbol", {"name": "createOrder", "path": self.other})
+        self.assertNotIn("== ", answer.text)
+        self.assertNotIn("input: unknown", answer.text)
+
+
+class NothingToBrief(ReviewOne):
+    """F10: a brief where no requested path exists is a bad argument with a next step, not a success."""
+
+    GHOST = f"{API_SRC}/ghost.ts"
+
+    def test_every_path_missing_is_invalid_with_a_next_step(self):
+        answer = self.run_tool("ctx_brief", {"paths": [self.GHOST, f"{API_SRC}/phantom.ts"]})
+        self.assertEqual(answer.status, "invalid", answer.text)
+        for path in (self.GHOST, f"{API_SRC}/phantom.ts"):
+            self.assertIn(f"== {path}\nno such file", answer.text)
+        self.assertRegex(answer.text, r"Next: \S")
+
+    def test_some_paths_missing_is_still_a_brief_with_a_next_step_for_the_missing_ones(self):
+        answer = self.run_tool("ctx_brief", {"paths": [ORDERS, self.GHOST]})
+        self.assertEqual(answer.status, "ok", answer.text)
+        self.assertIn(f"== {ORDERS}", answer.text)
+        self.assertRegex(answer.text, rf"Next: [^\n]*{re.escape(self.GHOST)}")
+
+    def test_the_logged_status_is_invalid(self):
+        task = self.tmp / "task"
+        task.mkdir()
+        done = run_cli(self.project, "ctx_brief", {"paths": [self.GHOST]}, {"TP_TASK_DIR": str(task)})
+        self.assertEqual((done.returncode, json.loads(done.stdout)["status"]), (1, "invalid"))
+        self.assertEqual(json.loads((task / "ctx-calls.jsonl").read_text())["status"], "invalid")
+
+
+class AmbiguousSymbols(ReviewOne):
+    """F11: ctx_relations does not pick one of several same-named symbols."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.put(f"{API_SRC}/handlers/a.ts", "export function handler() {}\n")
+        self.b = self.put(f"{API_SRC}/handlers/b.ts", "export const handler = () => 1;\n")
+
+    def test_a_symbol_declared_in_two_files_is_rejected_with_the_files_and_a_next_step(self):
+        for direction in ("importers", "imports", "contracts"):
+            answer = self.run_tool("ctx_relations", {"target": "handler", "direction": direction})
+            self.assertEqual(answer.status, "invalid", (direction, answer.text))
+            self.assertIn(self.a, answer.text)
+            self.assertIn(self.b, answer.text)
+            self.assertRegex(answer.text, r"Next: [^\n]*path")
+        self.assertEqual(fake_navs.CALLS, [])
+
+    def test_a_symbol_declared_once_still_resolves_and_a_path_still_works(self):
+        answer = self.run_tool("ctx_relations", {"target": "addToCart", "direction": "importers"})
+        self.assertEqual(answer.status, "ok", answer.text)
+        self.assertIn(f"target resolved to {CART}", answer.text)
+        self.assertEqual(self.run_tool("ctx_relations", {"target": self.a, "direction": "importers"}).status, "ok")
+
+    def test_two_declarations_in_the_same_file_are_still_one_file(self):
+        self.put(f"{API_SRC}/handlers/c.ts", "export function twice() {}\nexport type twice = number;\n")
+        answer = self.run_tool("ctx_relations", {"target": "twice", "direction": "importers"})
+        self.assertEqual(answer.status, "ok", answer.text)
 
 
 if __name__ == "__main__":

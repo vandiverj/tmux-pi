@@ -24,6 +24,7 @@ A line: {ts, tool, args_hash, args, status, bytes, ms, notes_returned, index_age
 Statuses: ok, invalid (bad arguments), refused (a screen said no), no_project, stale_index, unavailable (a navigator or
 reader is missing), error (a bug; the text says so without a traceback).
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ import safe_write
 from . import redact
 
 LOG_NAME = "ctx-calls.jsonl"
+LOCK_NAME = "ctx-calls.lock"
 ARG_LIMIT = 500
 NOTES_LIMIT = 50
 STATUSES = ("ok", "invalid", "refused", "no_project", "stale_index", "unavailable", "error")
@@ -53,6 +55,7 @@ class Answer:
     index_age_s: int | None = None
     reason: str | None = None
     data: object = None  # whatever structured result the caller wants back; not logged
+    undo: object = None  # for a call that wrote something: takes the write back when the call cannot be logged
 
 
 WORKER_ENV = ("TP_TASK_DIR", "TP_TASK_ID")
@@ -151,13 +154,59 @@ def record(path, tool, args, answer, ms=0, task_dir=None):
         raise LogUnavailable(f"cannot write {path}: {exc}; refusing to answer without a log") from exc
 
 
-def call(tool, args, run, *, log_file=None, env=None, operator=False):
+class _Lock:
+    """An exclusive lock on <task dir>/ctx-calls.lock for a call that counts, writes and logs as one step."""
+
+    def __init__(self, task_dir):
+        self.task_dir, self.fd = task_dir, None
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(os.path.join(self.task_dir, LOCK_NAME), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) |
+                              getattr(os, "O_CLOEXEC", 0), 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            if self.fd is not None:
+                os.close(self.fd)
+            raise LogUnavailable(f"cannot lock the call log ({exc.strerror or type(exc).__name__}); refusing to answer without a log") from exc
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)  # closing the descriptor releases the lock
+
+
+def check_writable(path, task_dir=None):
+    """LogUnavailable unless a line could be appended to `path` now (nothing is written). A link, a directory or a refused parent is
+    found here, before a write that could not be logged is made."""
+    try:
+        root = check_task_dir(task_dir) if task_dir else None
+        safe_write.open_append(path, root=root or Path(path).parent).close()
+    except OSError as exc:
+        raise LogUnavailable(f"cannot write {path}: {exc}; refusing to answer without a log") from exc
+
+
+def call(tool, args, run, *, log_file=None, env=None, operator=False, exclusive=False):
     """One logged engine call: resolve the log first (LogUnavailable before anything is read), run `run()` -> Answer, log the
     line, then hand the answer back. A raised exception becomes status `error` with a text that carries no traceback.
-    `operator` marks a person's command (see the module note): the only kind that may run unlogged or use `log_file`."""
+    `operator` marks a person's command (see the module note): the only kind that may run unlogged or use `log_file`.
+
+    `exclusive` is for a call that writes (a candidate note) or counts earlier calls (the per-task note limit): the task's lock is
+    held from before `run()` until the line is written, so two such calls never interleave, and the log is checked to be writable
+    first. If the line still cannot be written, the answer's `undo` takes the write back before LogUnavailable goes up: a write
+    is never left behind without its line."""
     environ = os.environ if env is None else env
     path = log_path(log_file, environ, operator)
     task_dir = environ.get("TP_TASK_DIR") if path is not None and not log_file else None
+    if exclusive and path is not None and task_dir:
+        with _Lock(task_dir):
+            check_writable(path, task_dir)
+            return _run_logged(tool, args, run, path, task_dir)
+    if exclusive and path is not None:
+        check_writable(path)
+    return _run_logged(tool, args, run, path, task_dir)
+
+
+def _run_logged(tool, args, run, path, task_dir):
     started = time.monotonic()
     try:
         answer = run()
@@ -170,5 +219,13 @@ def call(tool, args, run, *, log_file=None, env=None, operator=False):
     except Exception as exc:  # a bug must not escape as a traceback into a worker's context, nor go unlogged
         answer = Answer("error", f"internal error ({type(exc).__name__}); see the call log", reason=repr(exc))
     if path is not None:
-        record(path, tool, args, answer, int((time.monotonic() - started) * 1000), task_dir=task_dir)
+        try:
+            record(path, tool, args, answer, int((time.monotonic() - started) * 1000), task_dir=task_dir)
+        except LogUnavailable:
+            if callable(answer.undo):
+                try:
+                    answer.undo()
+                except Exception:
+                    pass
+            raise
     return answer

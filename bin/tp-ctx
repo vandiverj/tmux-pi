@@ -40,6 +40,7 @@ ENGINE_VERSION = 1
 PLUGINS = ("ctxengine.surface",)
 VALUE_FLAGS = {"--project", "--log"}
 WORKER_ENV = calls.WORKER_ENV
+WRITE_COMMANDS = ("add", "import")  # write a candidate: the write and its log line are one step (calls.call exclusive)
 OPERATOR_COMMANDS = ("audit", "show", "list", "status")  # a person's commands (approve has its own gates): see calls.py for what that allows
 
 
@@ -175,6 +176,14 @@ def _candidate_from(args, layout, text, source):
     return note
 
 
+def _unlink(path):
+    """Take back a candidate whose call could not be logged (calls.call runs this before it gives up)."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _write_candidate(layout, note):
     try:
         path = store.add_candidate(layout, note, screen=redact.screen_note)
@@ -186,7 +195,7 @@ def _write_candidate(layout, note):
         return calls.Answer("refused", str(refusal), reason=str(refusal))
     rel = os.path.relpath(path, layout.project)
     return calls.Answer("ok", f"{note.id} written as a candidate ({rel}); it is not approved", [note.id],
-                        data={"id": note.id, "status": "candidate", "path": rel})
+                        data={"id": note.id, "status": "candidate", "path": rel}, undo=lambda: _unlink(path))
 
 
 def cmd_add(args, layout):
@@ -344,7 +353,7 @@ def main(argv=None):
 
     params = {k: v for k, v in vars(args).items() if k not in ("command", "action", "json", "log", "project") and v is not None}
     try:
-        answer = calls.call(tool, params, run, log_file=args.log, operator=name in OPERATOR_COMMANDS)
+        answer = calls.call(tool, params, run, log_file=args.log, operator=name in OPERATOR_COMMANDS, exclusive=name in WRITE_COMMANDS)
     except calls.LogUnavailable as exc:
         print(f"tp-ctx: {redact.guard(str(exc))}", file=sys.stderr)
         return 3

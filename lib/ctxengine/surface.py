@@ -36,9 +36,16 @@ PACKAGES = ("web", "api", "mc", "lib")
 DIRECTIONS = ("importers", "imports", "contracts")
 NAV_MODULES = {"web": "ctxengine.nav_web", "api": "ctxengine.nav_api"}
 NOTES_PER_TASK = 5
+NOTE_BODY_FULL = store.BODY_MAX   # ctx_knowledge: a note's body, whole (the store accepts no longer one)
+NOTE_BODY_BRIEF = 300   # ctx_brief: the first characters of a note's body
 EXIT = {"ok": 0, "invalid": 1, "error": 1, "stale_index": 1, "unavailable": 1, "refused": 2, "no_project": 2}
 CODE_EXT = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
 LABEL_ORDER = ("web", "api", "mc", "lib", "other")
+WITHHELD = "<withheld>"
+WEB_EDGES = 200   # the most import edges CX2 returns for one file
+API_SYMBOLS = 100  # the most symbols CX3 lists for one file
+SYMBOL_PLACES = 20   # declarations of one name that are listed
+SYMBOL_FILES = 5     # files whose details ctx_symbol gives for one name
 SCAN_FILES = 20000
 SCAN_BYTES = 1_000_000
 
@@ -249,6 +256,18 @@ class Got:
     unresolved: int = 0
     age: int | None = None
     raw: dict = field(default_factory=dict)
+    seen: int = 0            # rows the navigator handed over, refused ones included: what `total` is compared with
+    refused: int = 0         # rows left out because their path fails the path policy (counted, never named)
+    cut: bool = False        # the navigator said its list was cut (`truncated`), whatever its `total` says
+
+    @property
+    def beyond(self):
+        """Rows of the navigator's full answer that are not in `rows` and were not refused: the part not read."""
+        return max(self.total - self.seen, 0)
+
+    @property
+    def incomplete(self):
+        return self.beyond > 0 or self.cut
 
 
 def label_for(path):
@@ -424,8 +443,7 @@ class NoteWriter:
         rel = os.path.relpath(path, self.project)
         return self.finish("ok", [f"{note.id} written as a candidate ({rel}); it is not approved and a person must review it",
                                   f"{taken + 1} of {NOTES_PER_TASK} notes used in this task"], notes=[note.id],
-                           data={"id": note.id, "status": "candidate", "path": rel})
-
+                           data={"result": {"id": note.id, "status": "candidate", "path": rel}}, undo=lambda: _remove(path))
 
     def notes_this_task(self):
         """How many ctx_note calls this task's call log already shows as ok (0 when there is no task directory)."""
@@ -508,10 +526,10 @@ class Engine(NoteWriter):
         except Exception:
             return None
 
-    def finish(self, status, lines, left_out=(), notes=(), age=None, data=None, reason=None):
+    def finish(self, status, lines, left_out=(), notes=(), age=None, data=None, reason=None, undo=None):
         text, left = fit([redact.guard(line) for line in lines], left_out)
         info = {"truncated": bool(left), "left_out": left, **(data or {})}
-        return calls.Answer(status, redact.guard(text), list(notes), age, reason, info)
+        return calls.Answer(status, redact.guard(text), list(notes), age, reason, info, undo)
 
     def invalid(self, tool, problems):
         lines = ["invalid arguments: " + "; ".join(problems), f"Usage: {usage(tool)}" if tool in SPECS else f"Tools: {', '.join(TOOLS)}",
@@ -559,6 +577,38 @@ class Engine(NoteWriter):
         word = str(raw.get("status", "error"))
         return None if MAP_STATUS.get(word, "error") == "ok" else self.failed(kind, raw)
 
+    def allowed(self, value):
+        """The project-relative path of a path a navigator returned, or None when it fails the path policy (outside the project,
+        a link out of it, sensitive, empty, or a placeholder a navigator left for a path it withheld)."""
+        if not isinstance(value, str) or value.strip() in ("", WITHHELD):
+            return None
+        try:
+            return self.path(value)
+        except redact.Refused:
+            return None
+
+    def screen_rows(self, rows, index):
+        """(rows whose path at position `index` passes the path policy, with that path normalized; number refused)."""
+        kept, refused = [], 0
+        for row in rows:
+            rel = self.allowed(row[index])
+            if rel is None:
+                refused += 1
+            else:
+                kept.append(row[:index] + (rel,) + row[index + 1:])
+        return kept, refused
+
+    def screen_dicts(self, rows, key="path"):
+        """The same for navigator rows that are dicts: (rows with a normalized `key`, number refused). Non-dict rows count as refused."""
+        kept, refused = [], 0
+        for row in rows:
+            rel = self.allowed(row.get(key)) if isinstance(row, dict) else None
+            if rel is None:
+                refused += 1
+            else:
+                kept.append({**row, key: rel})
+        return kept, refused
+
     def exports(self, rel, limit=200):
         """Got whose rows are (name, kind, line) for the names `rel` defines or exports."""
         kind, made, failure = self._ask(rel, "exports")
@@ -569,14 +619,23 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            rows = [(str(e.get("name", "")), str(e.get("kind", "")), int(e.get("line") or 0)) for e in raw.get("exports") or []]
-            return Got(rows=rows, total=int(raw.get("total", len(rows))), raw=raw)
-        raw = self.call(kind, made, "symbols", rel, limit=50)
+            listed = raw.get("exports") or []
+            rows = [(str(e.get("name", "")), str(e.get("kind", "")), _int(e.get("line"))) for e in listed if isinstance(e, dict)]
+            return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=bool(raw.get("truncated")), raw=raw)
+        raw = self.call(kind, made, "symbols", rel, limit=API_SYMBOLS)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        rows = [(str(s.get("name", "")), str(s.get("kind", "")), int(s.get("line") or 0)) for s in raw.get("symbols") or []]
-        return Got(rows=rows, total=int(raw.get("total", len(rows))), raw=raw)
+        listed = raw.get("symbols") or []
+        rows = [(str(s.get("name", "")), str(s.get("kind", "")), _int(s.get("line"))) for s in listed if isinstance(s, dict)]
+        return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=bool(raw.get("truncated")), raw=raw)
+
+    def _edges(self, raw, rows, index, listed, **more):
+        """A Got from navigator rows: refused paths dropped and counted, and the navigator's own truncation kept."""
+        kept, refused = self.screen_rows(rows, index)
+        withheld = _int(raw.get("withheld"))
+        return Got(rows=kept, total=_int(raw.get("total", len(rows))), seen=listed + withheld, refused=refused + withheld,
+                   cut=bool(raw.get("truncated")), raw=raw, **more)
 
     def importers(self, rel, limit=10):
         """Got whose rows are (importing file, line, rel)."""
@@ -588,16 +647,18 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            rows = [(str(e.get("from", "")), int(e.get("line") or 0), rel) for e in raw.get("edges") or []]
-            return Got(rows=rows, total=int(raw.get("total", len(rows))), unresolved=_count(raw.get("unresolved")), raw=raw)
+            listed = [e for e in raw.get("edges") or [] if isinstance(e, dict)]
+            rows = [(str(e.get("from", "")), _int(e.get("line")), rel) for e in listed]
+            return self._edges(raw, rows, 0, len(listed), unresolved=_count(raw.get("unresolved")))
         raw = self.call(kind, made, "importers", rel, limit=limit)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        rows = [(str(e.get("path", "")), int(e.get("line") or 0), rel) for e in raw.get("importers") or []]
-        return Got(rows=rows, total=int(raw.get("total", len(rows))), age=raw.get("index_age_s"), raw=raw)
+        listed = [e for e in raw.get("importers") or [] if isinstance(e, dict)]
+        rows = [(str(e.get("path", "")), _int(e.get("line")), rel) for e in listed]
+        return self._edges(raw, rows, 0, len(listed), age=raw.get("index_age_s"))
 
-    def imports(self, rel, limit=25):
+    def imports(self, rel, limit=WEB_EDGES):
         """Got whose rows are (rel, line in rel, imported file); `external` names the libraries it imports."""
         kind, made, failure = self._ask(rel, "imports")
         if failure:
@@ -607,15 +668,18 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            rows = [(rel, int(e.get("line") or 0), str(e.get("to", ""))) for e in raw.get("edges") or []]
-            return Got(rows=rows, total=int(raw.get("total", len(rows))), unresolved=_count(raw.get("unresolved")), raw=raw)
+            listed = [e for e in raw.get("edges") or [] if isinstance(e, dict)]
+            rows = [(rel, _int(e.get("line")), str(e.get("to", ""))) for e in listed]
+            return self._edges(raw, rows, 2, len(listed), unresolved=_count(raw.get("unresolved")))
         raw = self.call(kind, made, "imports", rel)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        rows = [(rel, int(e.get("line") or 0), str(e.get("path", ""))) for e in raw.get("files") or []]
-        return Got(rows=rows, total=len(rows), external=[str(x) for x in raw.get("external") or []], unresolved=_count(raw.get("unresolved")),
-                   age=raw.get("index_age_s"), raw=raw)
+        listed = [e for e in raw.get("files") or [] if isinstance(e, dict)]
+        rows = [(rel, _int(e.get("line")), str(e.get("path", ""))) for e in listed]
+        kept, refused = self.screen_rows(rows, 2)
+        return Got(rows=kept, total=len(listed), seen=len(listed), refused=refused, external=[str(x) for x in raw.get("external") or []],
+                   unresolved=_count(raw.get("unresolved")), age=raw.get("index_age_s"), raw=raw)
 
     # ----------------------------------------------------------------------------------------------- text-scan locator
 
@@ -645,7 +709,9 @@ class Engine(NoteWriter):
     def flags_of(self, notes):
         return {n.id: freshness.assess(n, self.project, self.tree, self.pin, search.glob_matches, self.today) for n in notes}
 
-    def note_line(self, note, verdict):
+    def note_line(self, note, verdict, body_limit):
+        """One note on one line: id, kind, marks, title, then the body cut at `body_limit` characters (never less of the body because
+        the title is long). Returns (line, whether the body was cut)."""
         marks = ["candidate"] if note.status != "approved" else []
         marks += verdict.get("flags", [])
         if verdict.get("age_days"):
@@ -653,23 +719,33 @@ class Engine(NoteWriter):
         head = f"  {note.id} ({note.kind})" + (f" [{', '.join(marks)}]" if marks else "")
         if verdict.get("version_unchecked"):
             head += f" (version not checked: {', '.join(verdict['version_unchecked'])})"
-        title = note.headline
+        title = " ".join(note.headline.split())
         body = " ".join(note.body.split())
-        text = title if not body or body == title else f"{title}: {body}"
-        return f"{head} — {short(text, 300)}"
+        if not body or body == title:
+            return f"{head} — {title}", False
+        cut = len(body) > body_limit
+        shown = body[:body_limit].rstrip() + "…" if cut else body
+        return f"{head} — {title}: {shown}", cut
 
-    def find_notes(self, paths=(), query=None, tags=(), include_candidates=False, limit=5):
+    def find_notes(self, paths=(), query=None, tags=(), include_candidates=False, limit=5, body_limit=NOTE_BODY_BRIEF):
+        """(search result, note lines, ids of the notes whose body was cut)."""
         result = search.query(self.layout, query=query, paths=list(paths), tags=list(tags), include_candidates=include_candidates, limit=limit)
         verdicts = self.flags_of([h.note for h in result.hits])
-        lines = [self.note_line(h.note, verdicts[h.note.id]) for h in result.hits]
-        return result, lines
+        lines, cut = [], []
+        for hit in result.hits:
+            line, was_cut = self.note_line(hit.note, verdicts[hit.note.id], body_limit)
+            lines.append(line)
+            if was_cut:
+                cut.append(hit.note.id)
+        return result, lines, cut
 
     # -------------------------------------------------------------------------------------------------------- tools
 
     def op_ctx_knowledge(self, args):
         paths = [self.path(p) for p in args.get("paths", [])]
         limit = args.get("limit", 5)
-        result, lines = self.find_notes(paths, args.get("query"), args.get("tags", []), args.get("include_candidates", False), limit)
+        result, lines, _ = self.find_notes(paths, args.get("query"), args.get("tags", []), args.get("include_candidates", False), limit,
+                                           NOTE_BODY_FULL)
         left = []
         if not lines:
             hidden = f" {result.candidates_counted} candidate(s) matched but are not shown; include_candidates=true shows them, marked." \
@@ -695,22 +771,41 @@ class Engine(NoteWriter):
             rel = self.path(args["path"])
             if not (self.project / rel).is_file():
                 return self.finish("invalid", [f"no such file: {rel}", "Next: check the path, or leave path out to search by name."])
-            where = [(rel, 0, True)]
+            files = [rel]
         else:
-            where = self.locate(name, package)
+            where = self.locate(name, package, SYMBOL_PLACES + 1)
             if not where:
                 scope = f" in the {package} package" if package else ""
                 return self.finish("ok", [f"no definition of {name} found{scope} (text scan of the project's code files)",
                                           "Next: check the spelling, or pass path if you know the file."])
+            if len(where) > SYMBOL_PLACES:
+                left.append(f"definitions: more than {SYMBOL_PLACES} places declare {name}; pass package or path to narrow it")
+                where = where[:SYMBOL_PLACES]
+            files = list(dict.fromkeys(place[0] for place in where))
             if len(where) > 1:
-                lines.append(f"{name} is declared in {len(where)} places (details for the first):")
+                lines.append(f"{name} is declared in {len(where)} places:")
                 lines += [f"  {p}:{n}" for p, n, _ in where[:5]]
                 if len(where) > 5:
                     left.append(f"definitions: {len(where) - 5} more places")
-        rel = where[0][0]
+            if len(files) > SYMBOL_FILES:
+                left.append(f"details for {len(files) - SYMBOL_FILES} more file(s) not shown: {', '.join(files[SYMBOL_FILES:SYMBOL_FILES + 3])}"
+                            + (" and others" if len(files) > SYMBOL_FILES + 3 else "") + " (pass path to see one)")
+        results = []
+        for rel in files[:SYMBOL_FILES]:
+            if len(files) > 1:
+                lines.append(f"== {rel}")
+            results.append(self._symbol_in(rel, name, lines, left))
+        good = [r for r in results if r[0] == "ok"]
+        if good:
+            return self.finish("ok", lines, left)
+        return self.finish(results[0][0], lines, left, reason=results[0][1])
+
+    def _symbol_in(self, rel, name, lines, left):
+        """Add the details of `name` in the file `rel` to `lines`. Returns (status, reason) of that file's lookup."""
         kind, made, failure = self._ask(rel, "definition")
         if failure:
-            return self.finish(failure.status, lines + [failure.text], left, reason=failure.text.splitlines()[0])
+            lines.append(failure.text)
+            return failure.status, failure.text.splitlines()[0]
         if kind == "web":
             return self._symbol_web(kind, made, rel, name, lines, left)
         return self._symbol_api(kind, made, rel, name, lines, left)
@@ -718,19 +813,27 @@ class Engine(NoteWriter):
     def _definition_lines(self, rows, left, total_noun="definitions"):
         lines = []
         for row in rows[:5]:
-            lines.append(f"{row['path']}:{row['line']} {row.get('kind', '')} {short(row.get('text', ''), 160)}".rstrip())
+            lines.append(f"{row['path']}:{row.get('line', 0)} {row.get('kind', '')} {short(row.get('text', ''), 160)}".rstrip())
         if len(rows) > 5:
             left.append(f"{total_noun}: {len(rows) - 5} more")
         return lines
+
+    def _withheld_note(self, count, left, what):
+        if count:
+            left.append(f"{what}: {count} withheld (a refused path)")
 
     def _symbol_web(self, kind, made, rel, name, lines, left):
         raw = self.call(kind, made, "definition", rel, name=name)
         bad = self._status(kind, raw)
         if bad:
-            return self.finish(bad.status, lines + [bad.text], left, reason=bad.text.splitlines()[0])
-        rows = [r for r in raw.get("definitions") or [] if isinstance(r, dict)]
+            lines.append(bad.text)
+            return bad.status, bad.text.splitlines()[0]
+        rows, refused = self.screen_dicts([r for r in raw.get("definitions") or []])
+        self._withheld_note(refused + _int(raw.get("withheld")), left, f"definitions of {name} in {rel}")
         if not rows:
-            return self.finish("ok", lines + [f"no definition of {name} in {rel} (the web navigator found none)"], left)
+            lines.append(f"no definition of {name} in {rel} (the web navigator found none)" if not refused
+                         else f"{name} in {rel}: every definition the navigator found is at a refused path")
+            return "ok", None
         lines.append(f"{name} — {len(rows)} definition(s):")
         lines += self._definition_lines(rows, left)
         if raw.get("signature"):
@@ -741,34 +844,50 @@ class Engine(NoteWriter):
         bad = self._status(kind, refs)
         if bad:
             lines.append("references unavailable — " + bad.text.replace("\n", " "))
-            return self.finish("ok", lines, left)
-        shown = [r for r in refs.get("references") or [] if isinstance(r, dict)]
-        total = int(refs.get("total", len(shown)))
+            return "ok", None
+        shown, refused = self.screen_dicts([r for r in refs.get("references") or []])
+        refused += _int(refs.get("withheld"))
+        total = _int(refs.get("total", len(shown) + refused))
         lines.append(f"{total} references ({min(5, len(shown))} shown):")
-        lines += [f"  {r.get('path', '')}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
-        if total > 5:
-            left.append(f"references: {total - 5} more")
-        return self.finish("ok", lines, left)
+        lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
+        more = total - min(5, len(shown)) - refused
+        if more > 0:
+            left.append(f"references of {name}: {more} more")
+        self._withheld_note(refused, left, f"references of {name}")
+        return "ok", None
 
     def _symbol_api(self, kind, made, rel, name, lines, left):
-        raw = self.call(kind, made, "symbols", rel, limit=50)
+        raw = self.call(kind, made, "symbols", rel, limit=API_SYMBOLS)
         bad = self._status(kind, raw)
         if bad:
-            return self.finish(bad.status, lines + [bad.text], left, reason=bad.text.splitlines()[0])
-        rows = [s for s in raw.get("symbols") or [] if isinstance(s, dict) and s.get("name") == name]
-        if not rows:
-            return self.finish("ok", lines + [f"no definition of {name} in {rel} (the api navigator lists none by that name)"], left)
-        lines.append(f"{name} — {len(rows)} definition(s):")
-        lines += [f"{s.get('path', rel)}:{s.get('line', 0)} {s.get('kind', '')}" for s in rows[:5]]
-        if len(rows) > 5:
-            left.append(f"definitions: {len(rows) - 5} more")
-        first = rows[0]
+            lines.append(bad.text)
+            return bad.status, bad.text.splitlines()[0]
+        listed = [s for s in raw.get("symbols") or [] if isinstance(s, dict)]
+        total = _int(raw.get("total", len(listed)))
+        partial = bool(raw.get("truncated")) or total > len(listed)
+        named, refused = self.screen_dicts([s for s in listed if s.get("name") == name])
+        self._withheld_note(refused, left, f"definitions of {name} in {rel}")
+        if not named:
+            if partial:
+                lines.append(f"{name} is not among the first {len(listed)} of {total} exports of {rel} that the api navigator listed; "
+                             "the listing was cut, so this does not show that it is not defined there")
+                lines.append("Next: read the file directly, or ask ctx_relations for its importers.")
+                left.append(f"symbols of {rel}: {max(total - len(listed), 1)} not listed")
+            else:
+                lines.append(f"no definition of {name} in {rel} (the api navigator lists none by that name)"
+                             if not refused else f"{name} in {rel}: every definition the navigator found is at a refused path")
+            return "ok", None
+        lines.append(f"{name} — {len(named)} definition(s):")
+        lines += [f"{s['path']}:{s.get('line', 0)} {s.get('kind', '')}" for s in named[:5]]
+        if len(named) > 5:
+            left.append(f"definitions: {len(named) - 5} more")
+        first = named[0]
         if first.get("signature"):
             lines.append(f"  signature: {short(first['signature'], 300)}")
         if first.get("doc"):
             lines.append(f"  doc: {short(first['doc'], 400)}")
         lines.append(f"references: api files have none here; ctx_relations(target={rel!r}, direction='importers') lists who imports this file")
-        return self.finish("ok", lines, left)
+        return "ok", None
 
     def op_ctx_relations(self, args):
         from . import brief
@@ -779,20 +898,44 @@ class Engine(NoteWriter):
             if not (self.project / rel).is_file():
                 return self.finish("invalid", [f"no such file: {rel}", "Next: check the path, or name a symbol defined once in the project."])
         else:
-            where = self.locate(target)
+            where = self.locate(target, limit=SYMBOL_PLACES + 1)
             if not where:
                 return self.finish("invalid", [f"{target} is not a file path and no declaration of that name was found",
                                                "Next: pass a project file path, or check the symbol's spelling."])
-            rel = where[0][0]
-            lines.append(f"target resolved to {rel} (declared at line {where[0][1]})" +
-                         (f"; {len(where) - 1} other place(s) declare the name" if len(where) > 1 else ""))
+            files = list(dict.fromkeys(place[0] for place in where))
+            if len(files) > 1:
+                shown = ", ".join(files[:5])
+                return self.finish("invalid", [f"{target} is declared in {len(files)}{'+' if len(where) > SYMBOL_PLACES else ''} files ({shown}"
+                                               f"{', ...' if len(files) > 5 else ''}), so the relations of {target} are not one answer",
+                                               "Next: call ctx_relations again with target set to the path of the file you mean."],
+                                   reason=f"{target} is declared in more than one file")
+            rel = files[0]
+            lines.append(f"target resolved to {rel} (declared at line {where[0][1]})")
         return brief.relations(self, rel, direction, limit, lines)
+
+
+def _remove(path):
+    """Take back a candidate that was written but whose call could not be logged."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _count(value):
     if isinstance(value, list):
         return len(value)
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _int(value):
+    """A whole number from a navigator field (0 when it is anything else)."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 # ----------------------------------------------------------------------------------------------------------- command line
@@ -834,7 +977,7 @@ def main(argv):
             engine.close()
 
     try:
-        answer = calls.call(args.tool, logged, run, log_file=args.log, operator=False)
+        answer = calls.call(args.tool, logged, run, log_file=args.log, operator=False, exclusive=args.tool == "ctx_note")
     except calls.LogUnavailable as exc:
         print(f"tp-ctx: {redact.guard(str(exc))}", file=sys.stderr)
         return 3
@@ -843,6 +986,8 @@ def main(argv):
     data = answer.data if isinstance(answer.data, dict) else {}
     if args.json:
         payload = {"status": answer.status, "text": answer.text, "truncated": bool(data.get("truncated")), "left_out": data.get("left_out", [])}
+        if isinstance(data.get("result"), dict):
+            payload["result"] = data["result"]  # ctx_note: {id, status: "candidate", path}
         print(json.dumps(redact.guard_json(payload), ensure_ascii=False))
     elif answer.status != "ok":
         print(redact.guard(answer.text), file=sys.stderr)

@@ -113,6 +113,31 @@ terminal. It re-screens the file, prints the diff, and moves the candidate only 
 `supersedes` move to `superseded/` in the same step; if any step fails, every step already taken is undone and the
 store is as it was.
 
+## The context tools (`ctx_brief`, `ctx_symbol`, `ctx_relations`, `ctx_knowledge`, `ctx_note`)
+
+`tp-ctx --json <tool> --input <json>` answers `{status, text, truncated, left_out}` in at most 6144 bytes; `agent/extensions/ctx.ts` (pi) and
+`claude/mcp/ctx.mjs` (Claude) are thin wrappers over it, loaded only when `TP_CTX_TOOLS=1`. What a worker can rely on:
+
+- **Paths.** Every path a navigator returns (importers, imports, contract consumers, definitions, references, listed symbols) goes through
+  the same path policy as the arguments before it is shown. One that is sensitive, outside the project, a link out of it, or a `<withheld>`
+  placeholder is never named: it is counted in `left_out` (`N withheld`).
+- **Truncation.** A navigator list that was cut is reported as cut (`left_out`, and "25 of 26" rather than "25 of 25"); the contracts view
+  says "only N of M imports were read" instead of "no shared contracts". `ctx_symbol` never concludes that an api symbol is absent from a
+  listing the navigator cut: it says so and gives a next step. `ctx_symbol` with no `path` gives the details of each file that declares the
+  name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is `invalid` with a next step (pass a path).
+- **Contract consumers** are marked `[reader]`, `[writer]`, `[reader, writer]`, `[uses]` (imports it, does neither) or `[unread]` (the file
+  could not be read). A text scan of the consumer's own import statements (calls such as `.parse(`, `.extend(`, `import type`, `export * from`), not
+  type analysis.
+- **Notes.** `ctx_knowledge` shows each note's whole body (up to `store.BODY_MAX`, 1200); `ctx_brief` shows the first 300 characters of the body
+  after the title, and names the notes it cut in `left_out`.
+- **`ctx_note`** writes a candidate and answers `result: {id, status: "candidate", path}` in the `--json` payload (pi: the tool's `details`; MCP:
+  `structuredContent`). The five-per-task limit, the write and the log line are one step under an exclusive lock on
+  `$TP_TASK_DIR/ctx-calls.lock` (`calls.call(..., exclusive=True)`; `knowledge add` and `import` use it too). The log is checked to be appendable
+  before the write, and a line that still cannot be written takes the candidate back (`Answer.undo`), so a candidate never exists without its
+  line. A crash between the write and the line can still leave a candidate that is not logged; `knowledge list --status candidate` shows what is waiting.
+- **`ctx_brief`** with no requested path present is `invalid` with a next step; with some missing it still briefs the rest and ends with a
+  `Next:` line naming the missing ones.
+
 ## For other lanes
 
 `ctxengine.search.query(layout, query=, paths=, tags=, include_candidates=, limit=)` returns `Result.hits`; `Result.candidates_counted` is the number of candidates that passed every selector (path, tag, text) but were not asked for. Calls go through

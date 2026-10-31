@@ -137,10 +137,20 @@ def family_record(root, members, owner, session=None):
     for n in authors:
         entry = dict(_entry(n), kind=_kind(n))
         attempts.append(entry)
+    # Rounds come from the review ids the authors name (meta.reviews), not from the review dirs that survive: a pruned
+    # review still was a round, and when the first one is gone the first verdict is unknown, not the next one's.
+    declared = []
+    for n in authors:
+        declared += [r for r in n["review_ids"] if r not in declared]
+    present = {n["id"]: n for n in reviewers}
+    extra = [n["id"] for n in reviewers if n["id"] not in declared]
+    sequence = declared + extra
+    missing_reviews = [r for r in sequence if r not in present]
+    reviewers = [present[r] for r in sequence if r in present]
     reviews, latest = [], {}
     for rn in reviewers:
         outcome = re_.review_outcome(rn["dir"])
-        entry = {"id": rn["id"], "of": owner[rn["id"]], "round": len(reviews) + 1, "verdict": outcome["verdict"],
+        entry = {"id": rn["id"], "of": owner[rn["id"]], "round": sequence.index(rn["id"]) + 1, "verdict": outcome["verdict"],
                  "model": rn["state"].get("model") or rn["meta"].get("model"), "created": rn["meta"].get("created")}
         for key in ("stated_verdict", "incomplete_reason", "unusable_reason"):
             if key in outcome:
@@ -148,7 +158,7 @@ def family_record(root, members, owner, session=None):
         reviews.append(entry)
         latest[owner[rn["id"]]] = entry["verdict"]
     accepted = next((a["id"] for a in reversed(attempts) if a["kind"] == "attempt" and latest.get(a["id"]) in APPROVING), None)
-    status = "accepted" if accepted else ("open" if reviews else "unreviewed")
+    status = "accepted" if accepted else ("open" if sequence else "unreviewed")
     timeline = [{"id": n["id"], "kind": "review" if n["id"] in owner else _kind(n)} for n in members]
     created = [n["created"] for n in members if n["created"]]
     updated = [n["updated"] for n in members if n["updated"]]
@@ -163,7 +173,9 @@ def family_record(root, members, owner, session=None):
         "schema": FAMILY_SCHEMA, "family_id": "fam-" + root, "root": root, "root_missing": root_node is None,
         "session": session, "lane": lane_meta.get("lane"), "lane_step": lane_meta.get("lane_step"),
         "attempts": attempts, "reviews": reviews, "timeline": timeline,
-        "first_review_verdict": reviews[0]["verdict"] if reviews else None, "review_rounds": len(reviews),
+        "first_review_verdict": reviews[0]["verdict"] if reviews and sequence[0] in present else None,
+        "first_review_known": bool(sequence) and sequence[0] in present, "review_rounds": len(sequence),
+        "missing_reviews": missing_reviews,
         "accepted": accepted, "status": status,
         "tokens": {"frontier": _tokens([n for n in members if not _local(n)]), "local": _tokens([n for n in members if _local(n)])},
         "wall_seconds": wall, "task_seconds": task_seconds, "task_seconds_unknown_tasks": task_seconds_missing,
@@ -216,11 +228,11 @@ def render(records):
     """One line per family, then its attempts and reviews in order."""
     lines = []
     for r in records:
-        tok = r["tokens"]["frontier"]
-        lines.append("{}  {}  lane={}/{}  rounds={} first={} accepted={}  wall={}s  frontier in/out/cache={}/{}/{}  local out={}".format(
+        tok, loc = r["tokens"]["frontier"], r["tokens"]["local"]
+        lines.append("{}  {}  lane={}/{}  rounds={} first={} accepted={}  wall={}s  frontier in/out/cache={}/{}/{}  local in/out/cache={}/{}/{}".format(
             r["family_id"], r["status"], r["lane"] or "-", r["lane_step"] or "-", r["review_rounds"],
             r["first_review_verdict"] or "-", r["accepted"] or "-", _count(r["wall_seconds"]), _count(tok["input"]),
-            _count(tok["output"]), _count(tok["cache"]), _count(r["tokens"]["local"]["output"])))
+            _count(tok["output"]), _count(tok["cache"]), _count(loc["input"]), _count(loc["output"]), _count(loc["cache"])))
         by_id = {a["id"]: a for a in r["attempts"]}
         by_id.update({v["id"]: v for v in r["reviews"]})
         for item in r["timeline"]:

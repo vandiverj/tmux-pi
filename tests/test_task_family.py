@@ -87,6 +87,34 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(sorted(a["id"] for a in got[0]["attempts"]), ["a", "b"])
 
 
+class PrunedReviewTests(unittest.TestCase):
+    def families(self, tasks):
+        with tempfile.TemporaryDirectory() as tmp:
+            materialize(tmp, tasks)
+            return task_family.families(tmp)
+
+    def test_a_missing_first_review_still_counts_and_the_first_verdict_is_unknown(self):
+        got = self.families({
+            "coder-a": {"meta": {"role": "coder", "created": "2026-10-01T10:00:00Z", "reviews": ["review-a1", "review-a2"]}},
+            "review-a2": {"meta": {"role": "code-reviewer", "created": "2026-10-01T10:20:00Z"}, "files": {"result.md": OK}}})
+        family = got[0]
+        self.assertEqual((family["review_rounds"], family["first_review_verdict"], family["first_review_known"]),
+                         (2, None, False))
+        self.assertEqual(([r["id"] for r in family["reviews"]], [r["round"] for r in family["reviews"]]), (["review-a2"], [2]))
+        self.assertEqual(family["missing_reviews"], ["review-a1"])
+
+    def test_a_missing_later_review_counts_and_the_first_verdict_is_kept(self):
+        family = self.families({
+            "coder-a": {"meta": {"role": "coder", "created": "2026-10-01T10:00:00Z", "reviews": ["review-a1", "review-a2"]}},
+            "review-a1": {"meta": {"role": "code-reviewer", "created": "2026-10-01T10:10:00Z"}, "files": {"result.md": OK}}})[0]
+        self.assertEqual((family["review_rounds"], family["first_review_verdict"], family["first_review_known"]),
+                         (2, "APPROVED", True))
+
+    def test_a_review_named_but_never_present_is_a_round_and_the_family_is_open(self):
+        family = self.families({"coder-a": {"meta": {"role": "coder", "created": "2026-10-01T10:00:00Z", "review": "review-gone"}}})[0]
+        self.assertEqual((family["review_rounds"], family["status"], family["first_review_verdict"]), (1, "open", None))
+
+
 class TokenTests(unittest.TestCase):
     def families(self, tasks):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,6 +161,14 @@ class CommandTests(unittest.TestCase):
             buf = io.StringIO()
             task_family.run(tmp, out=buf)
             self.assertIn("fam-coder-a  accepted", buf.getvalue())
+
+    def test_text_shows_local_input_output_and_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            materialize(tmp, {"coder-a": {"meta": {"role": "coder", "created": "2026-10-01T10:00:00Z"},
+                                          "state": {"model": "lmstudio/qwen", "tokens": {"input": 1000, "output": 300, "cacheRead": 7, "cacheWrite": 3}}}})
+            buf = io.StringIO()
+            task_family.run(tmp, out=buf)
+        self.assertIn("local in/out/cache=1000/300/10", buf.getvalue())
 
     def test_add_subcommand_parses_project_and_json(self):
         parser = argparse.ArgumentParser()

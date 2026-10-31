@@ -165,7 +165,7 @@
       "models": [
         {
           "provider": "local", "worker": "pi", "model": "lmstudio/qwen/qwen3.6-35b-a3b",
-          "efforts": ["off"], "context_window": 131072, "max_output": 8192, "in_roster": true
+          "efforts": ["off", "low", "medium", "high"], "context_window": 131072, "max_output": 32768, "in_roster": true
         },
         {
           "provider": "local", "worker": "pi", "model": "slotstream/qwen3.8-flash-next:4bit",

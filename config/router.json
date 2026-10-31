@@ -18,7 +18,7 @@
     {
       "worker": "pi",
       "model": "lmstudio/qwen/qwen3.6-35b-a3b",
-      "thinking": ["off"]
+      "thinking": ["off", "low", "medium", "high"]
     },
     {
       "worker": "pi",

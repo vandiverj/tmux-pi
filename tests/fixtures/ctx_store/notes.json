@@ -1,0 +1,294 @@
+[
+ {
+  "slug": "test-truncate",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/**/*.test.ts"
+  ],
+  "tags": [
+   "test-isolation",
+   "drizzle"
+  ],
+  "title": "Tests must not truncate shared tables",
+  "body": "Cleanup in API tests must not truncate shared tables. Create a per-test schema with the schema helper and drop it afterwards.",
+  "status": "approved",
+  "id": "kn-2026-10-01-test-truncate"
+ },
+ {
+  "slug": "orders-test-truncate",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/orders/orders.test.ts"
+  ],
+  "tags": [
+   "test-isolation"
+  ],
+  "title": "Orders tests truncate only the fixture table",
+  "body": "In orders.test.ts truncate only orders_fixture, never orders itself.",
+  "status": "approved",
+  "id": "kn-2026-10-01-orders-test-truncate"
+ },
+ {
+  "slug": "api-src-layering",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/**"
+  ],
+  "tags": [
+   "api"
+  ],
+  "title": "API source layering",
+  "body": "Routes call services; services call repositories. A route never imports a repository.",
+  "status": "approved",
+  "id": "kn-2026-10-01-api-src-layering"
+ },
+ {
+  "slug": "repo-test-isolation",
+  "kind": "convention",
+  "scope": [
+   "**/*.test.ts"
+  ],
+  "tags": [
+   "test-isolation"
+  ],
+  "title": "Tests isolate their data",
+  "body": "Every test creates the rows it reads and removes only those rows.",
+  "status": "approved",
+  "id": "kn-2026-10-01-repo-test-isolation"
+ },
+ {
+  "slug": "identity-scoped-cache",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/web/src/**"
+  ],
+  "tags": [
+   "cache",
+   "identity"
+  ],
+  "title": "Scope cached state to the signed-in identity",
+  "body": "Query keys and stores include the organisation id and user id so a second sign-in never sees the first user's data.",
+  "status": "approved",
+  "id": "kn-2026-10-01-identity-scoped-cache"
+ },
+ {
+  "slug": "query-freshness",
+  "kind": "framework",
+  "scope": [
+   "apps/launchpad/web/src/**/*.tsx"
+  ],
+  "tags": [
+   "tanstack-query"
+  ],
+  "title": "Set staleTime on queries that feed forms",
+  "body": "A form seeded from a query needs staleTime so a background refetch does not overwrite what the user typed.",
+  "status": "approved",
+  "versions": {
+   "@tanstack/react-query": ">=5 <6"
+  },
+  "id": "kn-2026-10-01-query-freshness"
+ },
+ {
+  "slug": "mutation-cache-pii",
+  "kind": "framework",
+  "scope": [
+   "apps/launchpad/web/src/**"
+  ],
+  "tags": [
+   "tanstack-query",
+   "pii"
+  ],
+  "title": "Do not keep personal data in mutation state",
+  "body": "Mutation variables stay in the mutation cache. Reset the mutation after success so a social security number is not retained.",
+  "status": "approved",
+  "id": "kn-2026-10-01-mutation-cache-pii"
+ },
+ {
+  "slug": "effect-timing",
+  "kind": "framework",
+  "scope": [
+   "apps/launchpad/web/src/hooks/**"
+  ],
+  "tags": [
+   "react"
+  ],
+  "title": "Effects run after paint",
+  "body": "Read layout in useLayoutEffect; useEffect runs after paint and can flash stale layout.",
+  "status": "approved",
+  "id": "kn-2026-10-01-effect-timing"
+ },
+ {
+  "slug": "drizzle-columns",
+  "kind": "framework",
+  "scope": [
+   "apps/launchpad/api/src/db/**"
+  ],
+  "tags": [
+   "drizzle"
+  ],
+  "title": "Drizzle column names are snake_case in SQL",
+  "body": "Declare the SQL name as the first argument of the column helper; the property name is only the TypeScript key.",
+  "status": "approved",
+  "versions": {
+   "drizzle-orm": ">=0.45 <0.46"
+  },
+  "id": "kn-2026-10-01-drizzle-columns"
+ },
+ {
+  "slug": "zod-contract-readers",
+  "kind": "relation",
+  "scope": [
+   "lib/launchpad/types/**"
+  ],
+  "tags": [
+   "contract",
+   "zod"
+  ],
+  "title": "Contract changes touch three packages",
+  "body": "A change to a zod contract needs the web query hooks, the mission-control readers and the API handlers updated together.",
+  "status": "approved",
+  "id": "kn-2026-10-01-zod-contract-readers"
+ },
+ {
+  "slug": "mc-contract-reader",
+  "kind": "relation",
+  "scope": [
+   "apps/mission-control/src/**"
+  ],
+  "tags": [
+   "contract"
+  ],
+  "title": "Mission control reads the order contract",
+  "body": "mission-control parses orders with the shared contract; a renamed field breaks its dashboard.",
+  "status": "approved",
+  "id": "kn-2026-10-01-mc-contract-reader"
+ },
+ {
+  "slug": "auth-decision",
+  "kind": "decision",
+  "scope": [
+   "apps/launchpad/api/src/auth/**"
+  ],
+  "tags": [
+   "auth"
+  ],
+  "title": "Sessions are server side",
+  "body": "Decision: sessions live in the database, not in signed cookies, so they can be revoked.",
+  "status": "approved",
+  "id": "kn-2026-10-01-auth-decision"
+ },
+ {
+  "slug": "business-day-zone",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/**/*.ts"
+  ],
+  "tags": [
+   "time"
+  ],
+  "title": "Business days use the facility time zone",
+  "body": "Compute business days in the facility time zone, never in UTC or the server zone.",
+  "status": "approved",
+  "id": "kn-2026-10-01-business-day-zone"
+ },
+ {
+  "slug": "existing-allowlist",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/http/**"
+  ],
+  "tags": [
+   "limits"
+  ],
+  "title": "Use the existing request limits",
+  "body": "Reuse the request limit wrapper in http/limits; do not add a second allowlist.",
+  "status": "approved",
+  "id": "kn-2026-10-01-existing-allowlist"
+ },
+ {
+  "slug": "fixture-pii",
+  "kind": "lesson",
+  "scope": [
+   "**/*.test.ts",
+   "**/*.fixture.ts"
+  ],
+  "tags": [
+   "pii"
+  ],
+  "title": "Fixtures use obviously fake personal data",
+  "body": "Fixture names and numbers must be plainly fake, never copied from a real record.",
+  "status": "approved",
+  "id": "kn-2026-10-01-fixture-pii"
+ },
+ {
+  "slug": "poisoned-truncate",
+  "kind": "lesson",
+  "scope": [
+   "apps/launchpad/api/src/**/*.test.ts"
+  ],
+  "tags": [
+   "test-isolation"
+  ],
+  "title": "Truncate everything for speed",
+  "body": "Truncate all tables between tests to run faster. Truncate truncate truncate.",
+  "status": "candidate",
+  "id": "kn-2026-10-01-poisoned-truncate"
+ },
+ {
+  "slug": "unreviewed-limits",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/http/**"
+  ],
+  "tags": [
+   "limits"
+  ],
+  "title": "A guess about limits",
+  "body": "The limits wrapper may be bypassed in tests.",
+  "status": "candidate",
+  "id": "kn-2026-10-01-unreviewed-limits"
+ },
+ {
+  "slug": "orders-directory",
+  "kind": "convention",
+  "scope": [
+   "apps/launchpad/api/src/orders/**"
+  ],
+  "tags": [
+   "orders"
+  ],
+  "title": "Orders module notes",
+  "body": "The orders module owns order state transitions; other modules call its service.",
+  "status": "approved",
+  "id": "kn-2026-10-01-orders-directory"
+ },
+ {
+  "slug": "order-contract-file",
+  "kind": "relation",
+  "scope": [
+   "lib/launchpad/types/order.ts"
+  ],
+  "tags": [
+   "contract",
+   "orders"
+  ],
+  "title": "The order contract file",
+  "body": "order.ts is the single definition of the order shape; both web and mission-control import it.",
+  "status": "approved",
+  "id": "kn-2026-10-01-order-contract-file"
+ },
+ {
+  "slug": "readme-lesson",
+  "kind": "lesson",
+  "scope": [
+   "README.md"
+  ],
+  "tags": [
+   "docs"
+  ],
+  "title": "Keep the README command list short",
+  "body": "List commands, not explanations; link the guide for the rest.",
+  "status": "approved",
+  "id": "kn-2026-10-01-readme-lesson"
+ }
+]

@@ -349,7 +349,8 @@ class RemoteTests(ProjectCase):
         self.write_deno_lock()
 
     def write_deno_lock(self, **over):
-        data = {"version": "4", "specifiers": {"jsr:@fx/strs@1": "1.4.0"}, "jsr": {"@fx/strs@1.4.0": {"integrity": "abc"}}, "remote": self.remote}
+        meta = self.hashes["https://jsr.io/@fx/strs/1.4.0_meta.json"]  # deno.lock's jsr integrity is the sha256 of the version's meta file
+        data = {"version": "4", "specifiers": {"jsr:@fx/strs@1": "1.4.0"}, "jsr": {"@fx/strs@1.4.0": {"integrity": meta}}, "remote": self.remote}
         data.update(over)
         self.write_lock(data, "deno.lock")
 
@@ -414,6 +415,77 @@ class RemoteTests(ProjectCase):
         self.assertIn("export async function* gen<T>(x: T): AsyncGenerator<T>;", "\n".join(signature.find_declarations(src, "gen", source=True)))
         for hidden in ("Box.p", "N.hidden", "helper"):  # private, not exported from the namespace, not exported at all
             self.assertEqual(signature.find_declarations(src, hidden, source=True), [], hidden)
+
+    def test_default_parameter_initializers_never_leak_code(self):
+        src = ("export function i(cb: (a: number) => void = () => { CODE1 }): void { BODY }\n"
+               "export function g(a = f(() => { CODE2 }), b = 2): void { BODY }\n"
+               "export function h({ x = () => { CODE3 }, y }: { x?: () => void; y: number } = {} as never, z: Map<string, number> = new Map<string, number>(() => { CODE4 })): void { BODY }\n"
+               "export const k = (cb = () => { CODE5 }, n = 3) => { BODY };\n"
+               "export const m = function (cb = () => { CODE6 }) { BODY };\n"
+               "export class C {\n  constructor(readonly cb = () => { CODE7 }) { BODY }\n  run(cb = function () { CODE8 }, tail = 1): void { BODY }\n}\n"
+               "export function t(a = tag<A, B>(() => { CODE9 }), after = 1): void { BODY }\n")
+        for symbol in ("i", "g", "h", "k", "m", "C", "C.run", "C.constructor", "t"):
+            found = "\n".join(signature.find_declarations(src, symbol, source=True))
+            self.assertTrue(found, symbol)
+            self.assertNotIn("CODE", found, symbol)
+            self.assertNotIn("BODY", found, symbol)
+        self.assertIn("export function i(cb: (a: number) => void", signature.find_declarations(src, "i", source=True)[0])
+        self.assertIn("b = 2): void;", signature.find_declarations(src, "g", source=True)[0])  # a literal default stays
+        self.assertIn("tail = 1): void;", signature.find_declarations(src, "C.run", source=True)[0])  # later parameters stay
+
+    def test_a_regex_literal_with_a_quote_does_not_hide_later_exports(self):
+        for literal in ("/'/", '/"/', "/[/']/g", r"/\//", "/`/"):
+            src = (f"export function first(s: string): boolean {{ return {literal}.test(s); }}\n"
+                   "export const half = (n: number): number => n / 2 / 1;\n"
+                   "export function later(x: number): number { return x; }\n"
+                   "export const also = 1;\n")
+            for symbol in ("first", "half", "later", "also"):
+                self.assertTrue(signature.find_declarations(src, symbol, source=True), (literal, symbol))
+            self.assertNotIn("test(", "\n".join(signature.find_declarations(src, "first", source=True)))
+        # a quote that opens no string on its own line ends at the line, so a stray one costs one line and not the file
+        stray = "export function a(): void { const s = 'oops;\n}\nexport function b(): void { }\n"
+        self.assertTrue(signature.find_declarations(stray, "b", source=True))
+        # and in a type body, where the other scanner (_scan) runs
+        body = "export class K {\n  m(): void { return /'/.test(x); }\n  n(): number { return 1; }\n}\n"
+        self.assertTrue(signature.find_declarations(body, "K.n", source=True))
+
+    def test_jsr_files_are_checked_against_the_hashes_deno_lock_records(self):
+        found = self.get(self.JSR, "joinAll")
+        self.assertTrue(found.provenance["exact"])
+        self.assertIn("pad", self.get(self.JSR, "pad").text)  # a file reached through a re-export is checked too
+
+    def test_jsr_meta_file_that_differs_from_the_lock_integrity_is_not_served(self):
+        self.write_deno_lock(jsr={"@fx/strs@1.4.0": {"integrity": "0" * 64}})
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.JSR, "joinAll")
+        self.assertIn("deno.lock", str(ctx.exception))
+        self.assertNotIn("BODY_MARKER", str(ctx.exception))
+
+    def test_jsr_file_whose_content_differs_from_the_manifest_is_not_served(self):
+        directory = self.deno / "remote" / "https" / "jsr.io"
+        entry = directory / hashlib.sha256(b"/@fx/strs/1.4.0/mod.ts").hexdigest()
+        entry.write_text(entry.read_text().replace("Join strings.", "Join strings, tampered."))
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.JSR, "joinAll")
+        self.assertIn("deno.lock", str(ctx.exception))
+
+    def test_jsr_file_the_manifest_does_not_list_is_not_served(self):
+        directory = self.deno / "remote" / "https" / "jsr.io"
+        meta_path = directory / hashlib.sha256(b"/@fx/strs/1.4.0_meta.json").hexdigest()
+        meta = json.loads(meta_path.read_text())
+        del meta["manifest"]["/util.ts"]
+        meta_path.write_text(json.dumps(meta))
+        self.write_deno_lock(jsr={"@fx/strs@1.4.0": {"integrity": hashlib.sha256(meta_path.read_bytes()).hexdigest()}})
+        self.assertIn("joinAll", self.get(self.JSR, "joinAll").text)
+        with self.assertRaises(signature.Miss):
+            self.get(self.JSR, "pad")
+
+    def test_jsr_without_a_lock_integrity_is_served_but_not_marked_exact(self):
+        self.write_deno_lock(jsr={"@fx/strs@1.4.0": {}})
+        found = self.get(self.JSR, "joinAll")
+        self.assertIn("joinAll", found.text)
+        self.assertFalse(found.provenance["exact"])
+        self.assertIn("exact=no", calls.header(found.provenance))
 
     def test_jsr_needs_a_pin_in_deno_lock_and_the_pinned_version(self):
         with self.assertRaises(signature.Miss) as ctx:

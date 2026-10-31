@@ -11,7 +11,16 @@ function and method bodies and initializers before anything is returned.
 
 `https:` modules are pinned by deno.lock's "remote" section (URL -> sha256 of the content); a module the lock does not list is
 unpinned, and cached content that does not hash to the lock's value is not served. `jsr:` packages are pinned by deno.lock's
-specifiers; their files live under `https://jsr.io/<@scope/name>/<version>/`.
+specifiers; their files live under `https://jsr.io/<@scope/name>/<version>/`. When deno.lock records an `integrity` for the
+jsr package (the sha256 of the version's `<version>_meta.json`), that meta file must hash to it and every file read must match
+the checksum its `manifest` lists; a mismatch or an unlisted file is not served, and the answer is marked `exact`.
+
+Known limits:
+- A jsr entry whose deno.lock record has no `integrity` (older or hand-edited locks) cannot be checked. Its cached files are
+  still read, the version still comes from the lock, and the answer says `exact=no` so a caller knows the content was not
+  vouched for by the lockfile.
+- The cache layout (sha256 of the URL path, a `.metadata.json` beside it) and the meta/manifest/integrity formats are those of
+  Deno 1.4x/2.x as documented; they were checked against fixtures, not against a live Deno cache (no network here).
 """
 import hashlib
 import json
@@ -99,11 +108,20 @@ class RemoteSource:
 
     def read_json(self, path):
         """A registry metadata file (jsr's `<version>_meta.json`) from the cache, as an object or None."""
+        return self._json(self._raw(path))
+
+    def _raw(self, path):
+        """The bytes of a cached registry metadata file, or None. The file is resolved through links like any cache file."""
         if not self.directory.is_dir():
             return None
         target = guard.resolve_inside(self.directory, hashlib.sha256(path.encode()).hexdigest(), suffix=False)
+        text = guard.read_text(target, limit=1_000_000)
+        return None if text is None else Path(target).read_bytes()
+
+    @staticmethod
+    def _json(raw):
         try:
-            value = json.loads(guard.read_text(target, limit=1_000_000) or "null")
+            value = json.loads(raw.decode("utf-8", "replace") or "null") if raw is not None else None
         except ValueError:
             return None
         return value if isinstance(value, dict) else None
@@ -157,9 +175,45 @@ class RemoteSource:
 class JsrSource(RemoteSource):
     """`jsr:@scope/name` at a pinned version: files under https://jsr.io/@scope/name/<version>/. Keys are relative to that."""
 
-    def __init__(self, deno, name, version):
+    def __init__(self, deno, name, version, integrity=None):
         super().__init__(deno, JSR_HOST, f"/{name}/{version}/")
         self.name, self.version = name, version
+        self.integrity = integrity.lower() if isinstance(integrity, str) and integrity else None
+        self._manifest = None
+
+    @property
+    def meta_path(self):
+        return f"/{self.name}/{self.version}_meta.json"
+
+    def vouch(self):
+        """Check the cached meta file against deno.lock's integrity (when it records one); the manifest it lists is then what each
+        file is checked against. Raises Unavailable when the cache does not match the lock. True when verified."""
+        if self.integrity is None:
+            return False
+        raw = self._raw(self.meta_path)
+        if raw is None:
+            raise Unavailable(f"jsr:{self.name}@{self.version}: its meta file is not in Deno's cache, so the files cannot be checked "
+                              f"against deno.lock; run `deno cache jsr:{self.name}@{self.version}` (this tool never fetches)")
+        if hashlib.sha256(raw).hexdigest() != self.integrity:
+            raise Unavailable(f"the cached meta file of jsr:{self.name}@{self.version} does not match the integrity deno.lock records; "
+                              "run `deno cache --reload` (nothing is read from content the lockfile does not vouch for)")
+        manifest = (self._json(raw) or {}).get("manifest")
+        self._manifest = manifest if isinstance(manifest, dict) else {}
+        return True
+
+    def verify(self, path, target):
+        if self.integrity is None:
+            return
+        if self._manifest is None:
+            self.vouch()
+        key = "/" + path[len(self.prefix):]
+        entry = self._manifest.get(key)
+        checksum = entry.get("checksum") if isinstance(entry, dict) else None
+        if not isinstance(checksum, str) or not checksum.startswith("sha256-"):
+            raise Unavailable(f"jsr:{self.name}@{self.version}: {key} is not listed in the package manifest that deno.lock vouches for")
+        if hashlib.sha256(Path(target).read_bytes()).hexdigest() != checksum[len("sha256-"):].lower():
+            raise Unavailable(f"the cached {key} of jsr:{self.name}@{self.version} does not match the checksum in its manifest "
+                              "(deno.lock vouches for that manifest); run `deno cache --reload`")
 
     def _path(self, key):
         return self.prefix + key
@@ -171,7 +225,7 @@ class JsrSource(RemoteSource):
         return self.directory.is_dir()
 
     def entry_candidates(self):
-        meta = self.read_json(f"/{self.name}/{self.version}_meta.json")
+        meta = self.read_json(self.meta_path)
         out = []
         exports = meta.get("exports") if meta else None
         entry = exports.get(".") if isinstance(exports, dict) else exports

@@ -1,1 +1,15 @@
-{"exports":{".":"./mod.ts"}}
+{
+  "manifest": {
+    "/mod.ts": {
+      "size": 810,
+      "checksum": "sha256-f178de1e7099313f56c435adc77a1af2bfe5afaaa4bb26e37bfe569b20014bfd"
+    },
+    "/util.ts": {
+      "size": 97,
+      "checksum": "sha256-63cb3627eb767331af498e65cd02f869559318939172c9beb8bc45c147d7b762"
+    }
+  },
+  "exports": {
+    ".": "./mod.ts"
+  }
+}

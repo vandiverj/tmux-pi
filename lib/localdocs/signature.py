@@ -6,10 +6,11 @@ package only deno.lock pins) in Deno's npm cache. Its entry declaration file com
 guard.py (allowlisted extensions, links resolved, nothing outside the package directory, never .env*).
 
 `jsr:@scope/name` and `https://` specifiers are read from Deno's remote cache (remote.py), pinned by deno.lock. Those files
-may be TypeScript source; declaration_view() then returns only exported declarations, with bodies and initializers cut.
+may be TypeScript source; declaration_view() then returns only exported declarations, with bodies, initializers and code in
+parameter defaults cut. jsr files are checked against deno.lock's integrity when it records one (remote.py).
 
 The declaration scanner is a text scanner, not a TypeScript parser: it splits a declaration file into top-level
-statements (comments, strings and brackets skipped) and matches the name. It returns the statement with the
+statements (comments, strings, regex literals and brackets skipped) and matches the name. It returns the statement with the
 JSDoc comment just above it. `Ns.member` finds a member of a namespace, class, interface or enum.
 """
 import json
@@ -55,10 +56,47 @@ class Found:
 # ---- statement scanner ---------------------------------------------------------------------------------------------
 
 def _skip_string(text, i):
+    """End of the string that starts at `i`. A ' or " string ends at its line: a quote that opens no string (one a scanner
+    misread) then costs one line and not the rest of the file. A template literal may span lines."""
     quote, i = text[i], i + 1
     while i < len(text) and text[i] != quote:
+        if text[i] == "\n" and quote != "`":
+            return i
         i += 2 if text[i] == "\\" else 1
     return i + 1
+
+
+REGEX_AFTER = "(,=:[!&|?{};+-*%<>~^"
+REGEX_KEYWORD = re.compile(r"(?:^|[^\w$.])(?:return|typeof|case|in|of|delete|void|throw|new|else|do|yield|await|instanceof)$")
+
+
+def _skip_regex(text, i):
+    """End of the regular-expression literal that starts at `i` (a `/` after an operator or keyword and closed on the same
+    line), else -1. Division, a comment or an unclosed `/` is not one; a quote inside a regex must not open a string."""
+    if text[i + 1:i + 2] in ("/", "*", ""):
+        return -1
+    j = i - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j >= 0 and text[j] not in REGEX_AFTER and not REGEX_KEYWORD.search(text[max(0, j - 12):j + 1]):
+        return -1
+    k, in_class = i + 1, False
+    while k < len(text) and text[k] != "\n":
+        c = text[k]
+        if c == "\\":
+            k += 2
+            continue
+        if c == "[":
+            in_class = True
+        elif c == "]":
+            in_class = False
+        elif c == "/" and not in_class:
+            k += 1
+            while k < len(text) and (text[k].isalnum() or text[k] in "_$"):
+                k += 1
+            return k
+        k += 1
+    return -1
 
 
 def _newline_ends(text, start, i, members):
@@ -114,6 +152,11 @@ def split_statements(text, members=False):
         if c in "'\"`":
             i = _skip_string(text, i)
             continue
+        if c == "/":
+            end = _skip_regex(text, i)
+            if end >= 0:
+                i = end
+                continue
         if c in "([{":
             depth += 1
         elif c in ")]}":
@@ -158,6 +201,11 @@ def _scan(text):
         if c in "'\"`":
             i = _skip_string(text, i)
             continue
+        if c == "/":
+            end = _skip_regex(text, i)
+            if end >= 0:
+                i = end
+                continue
         yield i, c, paren, angle, brace
         if c in "([":
             paren += 1
@@ -226,6 +274,41 @@ def _arrow_at(text):
     return -1
 
 
+def _drop_defaults(header):
+    """A parameter list without the code in its default values. A default that is a short literal stays (`sep = ","`); any
+    other (`cb = () => { ... }`, `x = f(...)`) becomes a comment. A default ends at the `,` or closing bracket of its own level;
+    where `<` may open type arguments the comma is not trusted, so an unsure scan drops more and never keeps code. Inside a
+    parameter list an `=` is a default (`==`, `<=`, `!=` can only occur inside a default, which is skipped as a whole)."""
+    out, last, resume = [], 0, 0
+    for i, c, paren, _, brace in _scan(header):
+        if i < resume or c != "=" or paren < 1 or header[i + 1:i + 2] in ("=", ">"):
+            continue
+        end = _default_end(header, i + 1, paren + brace)
+        if not LITERAL.match(header[i + 1:end].strip()):
+            out.append(header[last:i + 1] + " /* default omitted */")
+            last = resume = end
+    out.append(header[last:])
+    return "".join(out)
+
+
+def _default_end(text, start, base):
+    """Index where the default value that begins at `start` ends: the first `,` or closing bracket at nesting `base`."""
+    angle = 0
+    previous = ""
+    for i, c, paren, _, brace in _scan(text):
+        if i < start:
+            continue
+        depth = paren + brace
+        if depth <= base and angle <= 0 and c in ",)]}":
+            return i
+        if c == "<" and (previous.isalnum() or previous in "_$>"):
+            angle += 1
+        elif c == ">" and angle > 0 and text[i - 1] != "=":
+            angle -= 1
+        previous = c
+    return len(text)
+
+
 def _value_view(header, initializer):
     """`header = initializer` reduced to what a caller needs: a function's parameters and result, a short literal, else nothing."""
     initializer = initializer.strip().rstrip(";").strip()
@@ -233,10 +316,10 @@ def _value_view(header, initializer):
         return f"{header} = {initializer};"
     arrow = _arrow_at(initializer)
     if arrow >= 0:
-        return f"{header} = {initializer[:arrow + 2]} {OMITTED};"
+        return f"{header} = {_drop_defaults(initializer[:arrow + 2])} {OMITTED};"
     if re.match(r"(?:async\s+)?function\b", initializer):
         body = _function_body_open(initializer)
-        return f"{header} = {initializer[:body].rstrip() if body >= 0 else initializer} {OMITTED};"
+        return f"{header} = {_drop_defaults(initializer[:body].rstrip() if body >= 0 else initializer)} {OMITTED};"
     return f"{header}; /* initializer omitted */"
 
 
@@ -254,7 +337,7 @@ def declaration_view(statement):
     if equals >= 0:
         return _value_view(statement[:equals].rstrip(), statement[equals + 1:])
     body = _function_body_open(statement)
-    return (statement[:body].rstrip() if body >= 0 else statement) + ";"
+    return _drop_defaults(statement[:body].rstrip() if body >= 0 else statement) + ";"
 
 
 def _block_view(statement, kind):
@@ -570,11 +653,15 @@ def _lookup_jsr(project, name, wanted, symbol, deno):
         raise Miss(pinned.reason)
     if wanted and wanted != pinned.version:
         raise Miss(f"jsr:{name}@{wanted} was asked for but {pinned.lockfile} pins {pinned.version}; no result for other versions", pinned.version)
-    source = remote.JsrSource(deno_dir(deno), name, pinned.version)
+    source = remote.JsrSource(deno_dir(deno), name, pinned.version, pinned.integrity)
+    try:
+        verified = source.vouch()
+    except remote.Unavailable as unavailable:
+        raise Miss(str(unavailable), pinned.version) from None
     if not source.cached() or not any(source.existing(c, []) for c in source.entry_candidates()):
         raise Miss(f"jsr:{name}@{pinned.version} is pinned but not in Deno's cache; run `deno cache jsr:{name}@{pinned.version}` first "
                    "(this tool never fetches)", pinned.version)
-    return _answer(f"jsr:{name}", pinned, source, symbol, f"deno-cache:{source.directory}", True)
+    return _answer(f"jsr:{name}", pinned, source, symbol, f"deno-cache:{source.directory}", verified)
 
 
 def _lookup_https(project, url, symbol, deno):

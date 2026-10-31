@@ -91,7 +91,20 @@
   "kill -- -123",
   "kill -9 -123",
   "kill -TERM -- -5",
-  "cat <<EOF | bash\npkill x\nEOF"
+  "cat <<EOF | bash\npkill x\nEOF",
+  "env -S 'bash -s' <<'EOF'\npkill -f foo\nEOF",
+  "env -S 'bash -s' <<< 'pkill -f foo'",
+  "cat <<'EOF' | env -S 'bash -s'\npkill -f foo\nEOF",
+  "cat <<'EOF' | env bash\npkill x\nEOF",
+  "cat <<'EOF' | sudo -n bash\nkillall x\nEOF",
+  "exec bash <<'EOF'\npkill x\nEOF",
+  "nohup sh <<< 'pkill x'",
+  "command bash <<'EOF'\npkill x\nEOF",
+  "FOO=1 env -i bash -s <<'EOF'\npkill x\nEOF",
+  "cat <<< 'pkill x' | bash",
+  "cat <<'EOF' | cat | sh\npkill x\nEOF",
+  "cat <<'EOF' | env -S 'cat' | zsh\npkill x\nEOF",
+  "cat <<'EOF'; bash <<'EOF2'\ndata\nEOF\npkill x\nEOF2"
  ],
  "allow": [
   "kill 123",
@@ -159,6 +172,16 @@
   "cat <<'EOF'\npkill -f foo\nEOF",
   "bash <<'EOF'\necho hi\nkill 123\nEOF",
   "env -S 'echo hi'",
-  "env FOO=1 echo pkill"
+  "env FOO=1 echo pkill",
+  "cat <<'EOF' | grep bash\npkill x\nEOF",
+  "cat <<'EOF'; echo bash\npkill x\nEOF",
+  "cat <<< 'pkill x' | grep bash",
+  "cat <<< 'pkill x'; echo sh",
+  "grep bash <<'EOF'\npkill x\nEOF",
+  "env -S 'cat' <<'EOF'\npkill x\nEOF",
+  "sudo -n cat <<'EOF'\npkill x\nEOF",
+  "cat <<'EOF' | env tee out.txt\npkill x\nEOF",
+  "echo bash && cat <<'EOF'\npkill x\nEOF",
+  "python3 -c 'print(1)' bash <<'EOF'\npkill x\nEOF"
  ]
 }

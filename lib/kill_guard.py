@@ -19,8 +19,18 @@ Allowed: `kill 123`, `kill -TERM 123`, `kill -s TERM 123`, `kill %1`, `kill -0 1
 `echo "pkill"`, `grep -n pkill file`, `pgrep -f x` (only the name in command position counts).
 
 A command that cannot be parsed (unbalanced quote, unterminated `$(`, nesting too deep, not text) is refused: fail closed.
-Not covered (a pattern check, not a sandbox): `python -c 'os.kill'`, `tmux kill-server`, `fuser -k`, a PID taken from a
-variable set in an earlier tool call, scripts run from a file.
+
+Here-documents and here-strings: the body is parsed as commands only when the command that reads it is a shell (bash, sh,
+zsh, dash, ksh, ash). That reader is the command word of the segment the `<<` / `<<<` attaches to, after env (also
+`env -S 'bash -s'`), exec, nohup, command, sudo -n ... are unwrapped; when it is `cat`, the next pipe stage is the reader.
+A shell name elsewhere on the line (`cat <<EOF | grep bash`, `cat <<EOF; echo bash`) is ignored, and the body is data.
+
+Known limits (this guard stops accidents, it is not a sandbox). Not covered: `python -c 'os.kill'`, killing through a
+terminal multiplexer, `fuser -k`, a PID taken from a variable set in an earlier tool call, scripts written to a file and
+run later, and ambiguous input forms that hide the script from the segment: `echo '...' | bash`, `printf ... | sh`, any
+filter between a here-document and a shell other than `cat` (tee, sed, tr, ...), `bash < file`, text built at run time
+and fed to `bash <(...)`, a here-document whose `|` ends the line (`cat <<EOF |` with the shell on a later line),
+`source` / `.` of a file.
 
 Applies to worker sessions only, decided by `trust_guard.is_worker` (TP_TASK_DIR / TP_TASK_ID set, or TP_MODE=strict), the
 same test the trust-store guard uses. Main is supervised by the owner and the refusal tells a worker to "ask Main"; a
@@ -90,12 +100,13 @@ class Parser:
         if depth > MAX_DEPTH:
             raise Unparseable("commands nested too deeply")
         s, n = self.s, self.n
-        out, words, pending = [], [], []   # pending: heredocs to read at next newline: (delimiter, expands, strip_tabs)
+        out, words, pending = [], [], []   # pending: here-documents to read at next newline (dicts, see `<<` below)
+        records = []                     # the simple commands of the current line, to find which one reads a here-document
+        cmd_docs = []                    # here-documents attached to the command being read
         cur, have = [], False            # current word pieces, whether a word has started
         flags = {"subst": False, "dynamic": False}
         redirect_next = False
         herestring = False
-        line_start = 0                   # first command of the current line, for here-documents
         strings = []                     # here-string texts of the current command
 
         def end_word():
@@ -112,15 +123,27 @@ class Parser:
             flags["subst"] = flags["dynamic"] = False
 
         def end_cmd():
-            nonlocal words
+            nonlocal words, cmd_docs
             end_word()
+            rec = None
             if words:
                 out.append(words)
-                if strings and _feeds_shell(words):
-                    for text in strings:
-                        out.extend(Parser(text).parse_nested(depth + 1))
+                rec = {"words": words, "piped": False, "strings": list(strings)}
+                records.append(rec)
+                for d in cmd_docs:
+                    d["rec"] = rec
             strings.clear()
+            cmd_docs = []
             words = []
+            return rec
+
+        def flush():
+            # here-strings go to the command they attach to; they are a script only when a shell reads them
+            for k, rec in enumerate(records):
+                if rec["strings"] and _reads_shell(records, k):
+                    for text in rec["strings"]:
+                        out.extend(Parser(text).parse_nested(depth + 1))
+            records.clear()
 
         def add_inner(cmds):
             # commands inside a substitution run before the word's command
@@ -131,11 +154,11 @@ class Parser:
             if c == "\n":
                 end_cmd()
                 i += 1
-                shell = any(_feeds_shell(c) for c in out[line_start:])   # `cat <<EOF | bash` counts too
-                for delim, expands, strip, owner in pending:
-                    i = self._heredoc(i, delim, expands, strip, out, depth, shell)
+                for d in pending:
+                    shell = d["rec"] is not None and _reads_shell(records, records.index(d["rec"]))
+                    i = self._heredoc(i, d["delim"], d["expands"], d["strip"], out, depth, shell)
                 pending = []
-                line_start = len(out)
+                flush()
                 continue
             if c == "\\":
                 if i + 1 < n and s[i + 1] == "\n":
@@ -225,6 +248,7 @@ class Parser:
             if c == ")":
                 if closer == ")":
                     end_cmd()
+                    flush()
                     return out, i + 1
                 end_cmd()          # a stray ) (case pattern, subshell end): a separator
                 i += 1
@@ -240,7 +264,9 @@ class Parser:
                     i += 2 + (1 if s[i + 2:i + 3] == ">" else 0)
                     redirect_next = True
                     continue
-                end_cmd()
+                rec = end_cmd()
+                if rec and c == "|" and s[i + 1:i + 2] != "|":
+                    rec["piped"] = True        # its output is the next command's input
                 i += 1
                 while i < n and s[i] in ";|&":
                     i += 1
@@ -266,7 +292,9 @@ class Parser:
                     while i < n and s[i] in " \t":
                         i += 1
                     delim, quoted, i = self._heredoc_word(i)
-                    pending.append((delim, not quoted, strip, None))
+                    d = {"delim": delim, "expands": not quoted, "strip": strip, "rec": None}
+                    pending.append(d)
+                    cmd_docs.append(d)
                     continue
                 i += 1
                 while i < n and s[i] in "<>&|":
@@ -279,6 +307,7 @@ class Parser:
         if closer is not None:
             raise Unparseable("unterminated $(")
         end_cmd()
+        flush()
         return out, i
 
     def parse_nested(self, depth):
@@ -389,9 +418,79 @@ class Parser:
         return i
 
 
-def _feeds_shell(words):
-    """True when a simple command (its words so far) runs a shell, which reads its script from stdin."""
-    return any(_base(w.text) in SHELLS for w in words)
+def _reads_shell(records, k):
+    """True when the command that reads standard input for records[k] is a shell. That is the command word of the
+    segment (after env, env -S, exec, nohup, command, sudo ... are unwrapped); `cat` passes its input on, so the next
+    pipe stage is the reader then. A shell name anywhere else on the line does not count."""
+    while k < len(records):
+        rec = records[k]
+        name = _effective(rec["words"], 0)
+        if name in SHELLS:
+            return True
+        if name == "cat" and rec["piped"]:
+            k += 1
+            continue
+        return False
+    return False
+
+
+def _effective(words, depth):
+    """Base name of the program a simple command finally runs, or None when it is not clear."""
+    if depth > MAX_DEPTH:
+        raise Unparseable("commands nested too deeply")
+    i = 0
+    while i < len(words) and ((ASSIGN.match(words[i].text) and not words[i].text.startswith("$"))
+                              or words[i].text in KEYWORDS):
+        i += 1
+    rest = words[i:]
+    if not rest or rest[0].dynamic:
+        return None
+    name = _base(rest[0].text)
+    if name not in WRAPPERS:
+        return name
+    if name == "command" and any(w.text in ("-v", "-V") for w in rest[1:2]):
+        return None
+    target = _wrapper_target(name, rest[1:])
+    if target is None:
+        return None
+    if isinstance(target, str):
+        cmds = Parser(target).parse_nested(depth + 1)
+        return _effective(cmds[-1], depth + 1) if cmds else None
+    return _effective(target, depth + 1)
+
+
+def _wrapper_target(name, args):
+    """What a wrapper (sudo, env, nohup, ...) runs: a list of Words, a command-line string (env -S), or None."""
+    values = WRAPPERS[name]
+    i = 0
+    if name == "timeout":
+        while i < len(args) and args[i].text.startswith("-"):
+            i += 2 if args[i].text in values else 1
+        i += 1     # the duration
+    else:
+        while i < len(args) and (args[i].text.startswith("-") or ASSIGN.match(args[i].text)
+                                 or (name == "nice" and PID.match(args[i].text))):
+            if name == "env":
+                split = _env_split(args, i)
+                if split is not None:
+                    return split
+            i += 2 if args[i].text in values else 1
+    return args[i:] if i < len(args) else None
+
+
+def _env_split(args, i):
+    """`env -S STRING` / `--split-string=STRING` runs STRING (then the rest of the arguments) as a command line.
+    Returns that text when args[i] is such an option, else None."""
+    t = args[i].text
+    m = re.match(r"^--split-string(?:=(.*))?$", t, re.S) or re.match(r"^-[A-Za-z]*S(.*)$", t, re.S) if t.startswith("-") else None
+    if not m:
+        return None
+    if t.startswith("--"):
+        value, used = (m.group(1), 1) if m.group(1) is not None else (args[i + 1].text if i + 1 < len(args) else "", 2)
+    else:
+        value, used = (m.group(1), 1) if m.group(1) else (args[i + 1].text if i + 1 < len(args) else "", 2)
+    rest = " ".join(shlex.quote(w.text) for w in args[i + used:])
+    return value + " " + rest
 
 
 def _scan_expansions(text, depth):
@@ -505,38 +604,12 @@ class Judge:
         return None
 
     def _wrapped(self, name, args, xargs, depth):
-        values = WRAPPERS[name]
-        i = 0
-        if name == "timeout":
-            while i < len(args) and args[i].text.startswith("-"):
-                i += 2 if args[i].text in values else 1
-            i += 1     # the duration
-        else:
-            while i < len(args) and (args[i].text.startswith("-") or ASSIGN.match(args[i].text)
-                                     or (name == "nice" and PID.match(args[i].text))):
-                if name == "env":
-                    split = self._env_split(args, i)
-                    if split is not None:
-                        return self._text(split, xargs, depth)
-                i += 2 if args[i].text in values else 1
-        if i >= len(args):
+        target = _wrapper_target(name, args)
+        if target is None:
             return None
-        return self.command(args[i:], xargs, depth + 1)
-
-    @staticmethod
-    def _env_split(args, i):
-        """`env -S STRING` / `--split-string=STRING` runs STRING (then the rest of the arguments) as a command line.
-        Returns that text when args[i] is such an option, else None."""
-        t = args[i].text
-        m = re.match(r"^--split-string(?:=(.*))?$", t, re.S) or re.match(r"^-[A-Za-z]*S(.*)$", t, re.S) if t.startswith("-") else None
-        if not m:
-            return None
-        if t.startswith("--"):
-            value, used = (m.group(1), 1) if m.group(1) is not None else (args[i + 1].text if i + 1 < len(args) else "", 2)
-        else:
-            value, used = (m.group(1), 1) if m.group(1) else (args[i + 1].text if i + 1 < len(args) else "", 2)
-        rest = " ".join(shlex.quote(w.text) for w in args[i + used:])
-        return value + " " + rest
+        if isinstance(target, str):
+            return self._text(target, xargs, depth)
+        return self.command(target, xargs, depth + 1)
 
     def _text(self, text, xargs, depth):
         commands = Parser(text).parse_nested(depth + 1)

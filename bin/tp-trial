@@ -11,7 +11,8 @@ and its own tmux session, reviews the diff and writes a trial record. It never t
     tp-trial run --run-dir DIR   the run itself (started by `shadow`; not for direct use)
     tp-trial X ...               any other X runs bin/tp-trial-X with the remaining arguments, when that file exists
 
-The main state dir is TP_STATE_DIR, else the session's @tp_state_dir (the same lookup as tp-agent). A run's own files are under
+The main state dir is TP_STATE_DIR, else the session's @tp_state_dir (the same lookup as tp-agent); `status`, `stop` and `normal`
+need it only when --project is not given. A run's own files are under
 <project>/.tmux-pi/trial/<run>/; the records are <project>/.tmux-pi/trial/records.jsonl."""
 
 import argparse
@@ -44,11 +45,39 @@ def main_state(explicit=None):
     return Path(found.stdout.strip()).resolve()
 
 
-def project_dir(explicit, state):
-    """The repository the trial's directory lives in: --project, else the main state dir's own project (<project>/.tmux-pi)."""
+def project_dir(explicit, state_arg=None):
+    """The repository the trial's directory lives in: --project, else found from the main state dir. A state dir is
+    <project>/.tmux-pi/sessions/<id> (what tp makes) or <project>/.tmux-pi itself (a state dir that holds its tasks directly);
+    any other shape cannot be traced to a project, so the caller is asked for --project. With --project the state dir is never
+    looked up."""
     if explicit:
         return os.path.realpath(explicit)
-    return os.path.realpath(str(Path(state).parent))
+    state = main_state(state_arg)
+    if state.parent.name == "sessions" and state.parent.parent.name == ".tmux-pi":
+        return os.path.realpath(str(state.parent.parent.parent))
+    if state.name == ".tmux-pi":
+        return os.path.realpath(str(state.parent))
+    raise trial_shadow.ShadowError("cannot tell the project from the state dir {}; give --project".format(state))
+
+
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a whole number of at least 1: {!r}".format(text))
+    return value
+
+
+def positive_float(text):
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if not value > 0:
+        raise argparse.ArgumentTypeError("must be a number above 0: {!r}".format(text))
+    return value
 
 
 def find_run(project, name):
@@ -88,8 +117,7 @@ def cmd_run(args):
 
 
 def cmd_status(args):
-    state = main_state(args.state_dir)
-    project = project_dir(args.project, state)
+    project = project_dir(args.project, args.state_dir)
     if args.run:
         show(trial_shadow.read_run(find_run(project, args.run)), args.json)
         return 0
@@ -99,16 +127,14 @@ def cmd_status(args):
 
 
 def cmd_stop(args):
-    state = main_state(args.state_dir)
-    project = project_dir(args.project, state)
+    project = project_dir(args.project, args.state_dir)
     show(trial_shadow.stop(find_run(project, args.run)), args.json)
     return 0
 
 
 def cmd_normal(args):
-    state = main_state(args.state_dir)
-    project = project_dir(args.project, state)
-    record = trial_shadow.record_normal(find_run(project, args.run))
+    project = project_dir(args.project, args.state_dir)
+    record =trial_shadow.record_normal(find_run(project, args.run))
     if record is None:
         raise trial_shadow.ShadowError("the source task of run '{}' is gone; no normal record written".format(args.run))
     print(json.dumps({"run": args.run, "arm": "normal", "pair_id": record.get("pair_id")}, sort_keys=True))
@@ -130,9 +156,9 @@ def parser():
     p.add_argument("--pair", help="pair id shared by both arms' records (default: shadow-<task-id>)")
     p.add_argument("--model")
     p.add_argument("--thinking")
-    p.add_argument("--timeout-s", type=int, help="attempt timeout in seconds (default: trial.attempt_timeout_s)")
-    p.add_argument("--review-timeout-s", type=int)
-    p.add_argument("--poll-s", type=float, default=2.0)
+    p.add_argument("--timeout-s", type=positive_int, help="attempt timeout in seconds (default: trial.attempt_timeout_s)")
+    p.add_argument("--review-timeout-s", type=positive_int)
+    p.add_argument("--poll-s", type=positive_float, default=2.0)
     p.add_argument("--foreground", action="store_true", help="run to the end in this process")
     common(p)
     p.set_defaults(fn=cmd_shadow)

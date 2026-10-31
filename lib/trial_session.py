@@ -10,7 +10,8 @@ TP_SESSION name the trial's state and session, TMUX and TMUX_PANE are removed (i
 the caller's own session), and nothing that points at Main's state survives.
 
 The guard (`guard`) is §8/§10.7: a trial local run starts only while Main holds fewer than its `max_local_workers` local pi
-tasks, and while the trial's own local runs are under `trial.max_local_workers`. Main's count is read with `tp-agent list`, the
+tasks, and while the trial's own local runs (running tasks, and runs that are queued or starting) are under
+`trial.max_local_workers`. Main's count is read with `tp-agent list`, the
 same classifier Main's own capacity check uses; nothing in Main's state dir is written.
 """
 
@@ -183,25 +184,73 @@ def local_active(state, env=None):
             if isinstance(r, dict) and r.get("status") in ACTIVE and r.get("harness") == "pi" and str(r.get("model") or "").startswith(LOCAL)]
 
 
-def trial_states(project):
-    """The state dirs of every trial run under the project (each run has its own)."""
+def _run_info(directory):
+    try:
+        value = json.loads((directory / "run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: the process exists and is somebody else's
+        return True
+    return True
+
+
+def trial_runs(project):
+    """[(run name, directory)] of every run under the project, oldest name first."""
     root = trial_root(project)
     try:
-        return sorted(p / "state" for p in root.iterdir() if p.is_dir() and RUN.fullmatch(p.name) and (p / "state" / "tasks").is_dir())
+        return sorted((p.name, p) for p in root.iterdir() if p.is_dir() and RUN.fullmatch(p.name))
     except OSError:
         return []
 
 
-def guard(main_state, project, trial, main_max, model, env=None):
+def trial_local(project, exclude_run=None, ahead_of=None, env=None):
+    """What the trial's own local runs hold now, as a list of names. A run counts by its running local pi tasks, and, when it has
+    none yet, once by itself while its run.json says it is not done: a run that is queued or starting holds a slot before tp-spawn
+    has made its task (without this, two quick starts both pass the guard). A run whose runner has died does not hold one (`tp-trial
+    stop` also ends it); a run not yet launched has no pid and does.
+
+    `exclude_run` leaves one run out (the caller itself). `ahead_of` = (created, run name) is the recheck at spawn time: a run that
+    is only queued counts only when it was created before the caller (or ties and sorts first), so of two runs that were prepared
+    together exactly one goes on; a run that already has a running task always counts."""
+    out = []
+    for name, directory in trial_runs(project):
+        if name == exclude_run:
+            continue
+        info = _run_info(directory)
+        tasks = local_active(directory / "state", env) if (directory / "state" / "tasks").is_dir() else []
+        if tasks:
+            out.extend(tasks)
+            continue
+        if info.get("phase") in (None, "done") or not str(info.get("model") or "").startswith(LOCAL):
+            continue
+        if info.get("pid") is not None and not _alive(info.get("pid")):
+            continue
+        if ahead_of is not None and (str(info.get("created") or ""), name) >= tuple(ahead_of):
+            continue
+        out.append("run " + name)
+    return out
+
+
+def guard(main_state, project, trial, main_max, model, env=None, exclude_run=None, ahead_of=None):
     """(ok, reason): may a trial run of `model` start now? A model that does not run on this machine is not limited by the local
     slots. Otherwise Main must hold fewer than `main_max` local workers (a trial yields to Main, §10.7) and the trial's own local
-    runs, in every run's state dir, must be fewer than `trial["max_local_workers"]`."""
+    runs (`trial_local`) must be fewer than `trial["max_local_workers"]`."""
     if not model.startswith(LOCAL):
         return True, ""
     main = local_active(main_state, env)
     if len(main) >= main_max:
         return False, "Main holds {} of its {} local worker slots ({}); a trial run waits for Main".format(len(main), main_max, ", ".join(main))
-    own = [i for state in trial_states(project) for i in local_active(state, env)]
+    own = trial_local(project, exclude_run, ahead_of, env)
     if len(own) >= trial["max_local_workers"]:
         return False, "the trial already runs {} local worker(s) ({}); its limit is {}".format(len(own), ", ".join(own), trial["max_local_workers"])
     return True, ""

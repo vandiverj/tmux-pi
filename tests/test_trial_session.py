@@ -207,7 +207,7 @@ class GuardCase(TmuxCase):
 class GuardTests(GuardCase):
     def trial_state(self, run):
         state = trial_session.state_dir(self.project, run)
-        (state / "tasks").mkdir(parents=True)
+        (state / "tasks").mkdir(parents=True, exist_ok=True)
         return state
 
     def test_local_active_counts_running_local_pi_tasks_only(self):
@@ -245,6 +245,50 @@ class GuardTests(GuardCase):
         self.assertFalse(ok)
         self.assertIn("trial already runs 1 local worker", reason)
         self.assertEqual(self.guard(trial_max=2), (True, ""))
+
+    def make_run(self, name, phase="queued", model=LOCAL_MODEL, pid=None, created="2026-10-31T10:00:00Z"):
+        state = self.trial_state(name)
+        (state.parent / "run.json").write_text(json.dumps({"run": name, "phase": phase, "model": model, "pid": pid, "created": created}))
+        return state
+
+    def test_f2_a_run_that_is_queued_or_starting_holds_a_slot_before_it_has_a_task(self):
+        for phase in ("queued", "starting", "worktree", "spawn"):
+            with self.subTest(phase=phase):
+                self.make_run("sh-q", phase=phase)
+                ok, reason = self.guard()
+                self.assertFalse(ok)
+                self.assertIn("trial already runs 1 local worker(s) (run sh-q)", reason)
+
+    def test_f2_a_run_that_is_done_or_not_local_or_has_no_runner_left_holds_no_slot(self):
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        cases = {"done": dict(phase="done"), "not local": dict(model=MODEL), "runner dead": dict(phase="wait", pid=gone.pid)}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.make_run("sh-q", **kw)
+                self.assertEqual(self.guard(), (True, ""))
+
+    def test_f2_a_run_with_a_live_runner_holds_a_slot(self):
+        self.make_run("sh-q", phase="wait", pid=os.getpid())
+        self.assertFalse(self.guard()[0])
+
+    def test_f2_a_run_with_a_task_and_a_run_file_counts_once(self):
+        state = self.make_run("sh-q")
+        self.local_task(state, name="T-1")
+        ok, reason = self.guard(trial_max=2)
+        self.assertEqual(ok, True, reason)
+        ok, reason = self.guard(trial_max=1)
+        self.assertEqual((ok, "T-1" in reason, "run sh-q" in reason), (False, True, False))
+
+    def test_f2_ahead_of_counts_only_queued_runs_that_came_first_and_always_a_running_worker(self):
+        self.make_run("sh-a", created="2026-10-31T10:00:00Z")
+        self.make_run("sh-b", created="2026-10-31T10:00:05Z")
+        project, env = self.project, self.env
+        names = lambda **kw: trial_session.trial_local(project, env=env, **kw)  # noqa: E731
+        self.assertEqual(names(exclude_run="sh-b", ahead_of=("2026-10-31T10:00:05Z", "sh-b")), ["run sh-a"])
+        self.assertEqual(names(exclude_run="sh-a", ahead_of=("2026-10-31T10:00:00Z", "sh-a")), [], "sh-b came later: it does not hold sh-a back")
+        self.local_task(trial_session.state_dir(project, "sh-b"), name="T-9")
+        self.assertEqual(names(exclude_run="sh-a", ahead_of=("2026-10-31T10:00:00Z", "sh-a")), ["T-9"], "but its running worker does")
 
     def test_a_non_local_model_is_not_limited_by_the_local_slots(self):
         self.main_with(2)

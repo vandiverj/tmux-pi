@@ -255,6 +255,13 @@ def project_of(main_state, source):
         raise ShadowError(str(error))
 
 
+def _positive(value, shown, number=False):
+    kinds = (int, float) if number else (int,)
+    if isinstance(value, bool) or not isinstance(value, kinds) or not value > 0:
+        raise ShadowError("{} must be a positive number: {!r}".format(shown, value))
+    return value
+
+
 def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=None, main_max=None, model=None, thinking=None, env=None,
             config_path=None, timeout_s=None, poll_s=2.0, review_timeout_s=None):
     """Check everything that can be checked before anything is made, then create the run directory, run.json and the session.
@@ -263,7 +270,13 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
         loaded = trial_session.load_config(config_path)
         trial, main_max = trial or loaded[0], main_max or loaded[1]
     trial = dict(trial, **{k: v for k, v in (("model", model), ("thinking", thinking), ("attempt_timeout_s", timeout_s),
-                                             ("review_timeout_s", review_timeout_s)) if v})
+                                             ("review_timeout_s", review_timeout_s)) if v is not None})
+    for key, shown in (("attempt_timeout_s", "--timeout-s"), ("review_timeout_s", "--review-timeout-s")):
+        if key in trial:  # a zero or negative limit would end the wait at once (or never); refuse it before anything is made
+            _positive(trial[key], shown)
+    _positive(poll_s, "poll_s", number=True)
+    if not isinstance(trial["model"], str) or not trial["model"]:
+        raise ShadowError("model must be a model name: {!r}".format(trial["model"]))
     if trial["thinking"] not in trial_session.THINKING:
         raise ShadowError("thinking must be one of {}: {!r}".format(", ".join(trial_session.THINKING), trial["thinking"]))
     source = read_source(main_state, task_id)
@@ -283,7 +296,8 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
     return update_run(rdir, run=run, session=name, state=str(state), main_state=str(Path(main_state).resolve()), project=project,
                       source_task=task_id, pair_id=pair_id or "shadow-" + task_id, base_commit=source["base_commit"], model=trial["model"],
                       thinking=trial["thinking"], workdir=str(worktree), timeout_s=trial["attempt_timeout_s"], review_timeout_s=trial.get("review_timeout_s", 1800),
-                      poll_s=poll_s, worktree=str(worktree), task_id="trial-" + run, mode="shadow", phase="queued", outcome=None,
+                      poll_s=poll_s, max_local_workers=trial["max_local_workers"], main_max_local_workers=main_max,
+                      worktree=str(worktree), task_id="trial-" + run, mode="shadow", phase="queued", outcome=None,
                       created=now(), pid=None)
 
 
@@ -357,8 +371,18 @@ class Run:
     def source(self):
         return read_source(self.main_state, self.info["source_task"])
 
+    def recheck_capacity(self):
+        """The guard again, just before tp-spawn: between `prepare` and here another run may have been prepared, or Main may have
+        filled its slots. This run is left out of the count, and a run that is only queued counts only when it came first."""
+        ok, reason = trial_session.guard(self.main_state, self.project, {"max_local_workers": self.info.get("max_local_workers", 1)},
+                                         self.info.get("main_max_local_workers", 2), self.info["model"], self.env, exclude_run=self.run,
+                                         ahead_of=(self.info.get("created") or "", self.run))
+        if not ok:
+            raise ShadowError("not started: " + reason)
+
     def spawn(self):
         self.note(phase="spawn")
+        self.recheck_capacity()
         source = self.source()
         trial = {"model": self.info["model"], "thinking": self.info["thinking"]}
         args = spawn_args(source, self.run, self.worktree, self.project, trial, self.rdir / "request.md", self.task_id)
@@ -447,11 +471,30 @@ class Run:
         reviewer = meta.get("reviewer")
         return reviewer.get("model") if isinstance(reviewer, dict) and isinstance(reviewer.get("model"), str) else None
 
+    def spawn_failed_record(self):
+        """A failed spawn may leave no task dir, so the builder has nothing to read. The record still says what was tried and that it
+        failed (a spawn failure is data too), with the keys the builder's records share and `no_task` set."""
+        return {"schema": getattr(self.records, "SCHEMA", None), "created": now(), "pair_id": self.info["pair_id"], "arm": "qwen", "mode": "shadow",
+                "task_id": self.task_id, "role": self.source_role() or self.info.get("source_role"), "diff": None, "model": self.info["model"],
+                "effort": self.info["thinking"], "first_review_verdict": None, "review_rounds": 0, "reviewer_model": None,
+                "commit_messages": None, "base_commit": self.info["base_commit"], "brief_drift": None, "no_task": True,
+                "error": self.info.get("error")}
+
     def write_record(self):
-        if self.recorded or not (self.task_path() / "meta.json").is_file():
+        if self.recorded:
+            return
+        has_task = (self.task_path() / "meta.json").is_file()
+        if not has_task and self.outcome != "spawn_failed":
             return
         self.recorded = True
         self.note(phase="record")
+        if not has_task:
+            record = self.spawn_failed_record()
+            record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
+                           "normal_reviewer_model": self.info.get("normal_reviewer_model"), "reviewer_mismatch": None})
+            self.records.append(self.project, record)
+            self.note(recorded=now())
+            return
         record = self.records.build(self.task_path(), "qwen", "shadow", self.info["pair_id"], state_dir=self.state, role=self.source_role(),
                                     diff_files=self.diff[0], diff_lines=self.diff[1], commit_messages=self.commit_messages)
         normal = self.info.get("normal_reviewer_model")
@@ -475,7 +518,8 @@ class Run:
         error = None
         try:
             try:
-                self.note(normal_reviewer_model=self.source()["reviewer_model"])
+                source = self.source()
+                self.note(normal_reviewer_model=source["reviewer_model"], source_role=source["role"] or None)
                 self.make_worktree()
                 try:
                     self.spawn()

@@ -7,7 +7,8 @@ real task dir with a real pane, written by hand) and steps an injected clock; on
 tp-agent and tp-review, with `new-window` stubbed, so nothing starts a model. No test waits a fixed time: every wait is a poll
 callback that settles the task, or a clock that jumps.
 
-The full run takes minutes (tp-spawn is slow here); run it apart: `-k FullRun`, and the rest with `-k 'not FullRun'`."""
+The full run takes minutes (tp-spawn is slow here); run it apart: `python3 -m unittest test_trial_shadow.FullRunTests` from tests/, and
+the other classes by name (unittest's -k has no "not")."""
 import http.server
 import json
 import os
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_lane_writer as lw  # noqa: E402
@@ -320,6 +322,76 @@ class PrepareTests(ShadowCase):
         self.assertIn("trial already runs 1 local worker", str(caught.exception))
         self.assertFalse(trial_session.run_dir(self.repo, "sh-two").exists())
 
+    def test_f2_a_second_local_shadow_is_refused_while_the_first_is_only_queued(self):
+        """No task exists yet for a run that is prepared or starting; the run itself holds the slot."""
+        rdir, first = self.prepare(model=LOCAL, run="sh-one")
+        self.assertEqual(first["phase"], "queued")
+        with self.assertRaises(ts.ShadowError) as caught:
+            ts.prepare(self.state, "src-1", model=LOCAL, thinking="medium", env=self.env, run="sh-two")
+        self.assertIn("run sh-one", str(caught.exception))
+        self.assertFalse(trial_session.run_dir(self.repo, "sh-two").exists())
+        ts.update_run(rdir, phase="done", outcome="completed")  # a finished run frees the slot
+        ts.prepare(self.state, "src-1", model=LOCAL, thinking="medium", env=self.env, run="sh-two")
+
+    def test_f2_a_queued_run_of_a_model_that_is_not_local_holds_no_local_slot(self):
+        self.prepare(model=MODEL, run="sh-one")
+        ts.prepare(self.state, "src-1", model=LOCAL, thinking="medium", env=self.env, run="sh-two")
+
+    def test_f2_the_recheck_before_spawn_lets_only_the_run_that_came_first_go_on(self):
+        """Two runs prepared together (the guard in `prepare` patched to pass, as in a race): at spawn time the earlier one goes on,
+        the later one is refused and never calls tp-spawn."""
+        calls = []
+
+        class Counting(ts.Run):
+            def command(self, args, timeout=ts.CMD_TIMEOUT):
+                calls.append(self.run)
+                return subprocess.CompletedProcess(args, 1, "", "stop here")
+
+        with mock.patch.object(trial_session, "guard", return_value=(True, "")):
+            rdir_a, a = self.prepare(model=LOCAL, run="sh-a")
+            rdir_b, b = self.prepare(model=LOCAL, run="sh-b")
+        ts.update_run(rdir_a, created="2026-10-31T10:00:00Z")
+        ts.update_run(rdir_b, created="2026-10-31T10:00:01Z")
+        first = Counting(rdir_a, self.env, sleep=lambda s: None, clock=Clock())
+        first.note(phase="spawn")
+        first.recheck_capacity()  # nothing ahead of it
+        second = Counting(rdir_b, self.env, sleep=lambda s: None, clock=Clock())
+        with self.assertRaises(ts.ShadowError) as caught:
+            second.recheck_capacity()
+        self.assertIn("not started: the trial already runs 1 local worker", str(caught.exception))
+        self.assertIn("run sh-a", str(caught.exception))
+        done = second.execute()
+        self.assertEqual((done["outcome"], calls), ("spawn_failed", []), "tp-spawn was never called for the run that came second")
+        self.assertIn("not started", done["error"])
+
+    def test_f2_the_recheck_counts_a_worker_that_already_runs_whatever_the_order(self):
+        rdir_a, _ = self.prepare(model=LOCAL, run="sh-a")
+        ts.update_run(rdir_a, created="2026-10-31T10:00:09Z")
+        with mock.patch.object(trial_session, "guard", return_value=(True, "")):
+            rdir_b, _ = self.prepare(model=LOCAL, run="sh-b")
+        ts.update_run(rdir_b, created="2026-10-31T10:00:00Z")
+        self.local_task(trial_session.state_dir(self.repo, "sh-a"), name="T-1")
+        with self.assertRaises(ts.ShadowError):
+            ts.Run(rdir_b, self.env).recheck_capacity()
+
+    def test_f2_the_recheck_yields_to_main_filling_its_slots(self):
+        rdir, _ = self.prepare(model=LOCAL, run="sh-a")
+        self.local_task(self.state)
+        self.local_task(self.state)
+        with self.assertRaises(ts.ShadowError) as caught:
+            ts.Run(rdir, self.env).recheck_capacity()
+        self.assertIn("Main holds 2 of its 2 local worker slots", str(caught.exception))
+
+    def test_f5_a_zero_or_negative_limit_is_refused_before_anything_is_made(self):
+        sessions = self.session_names()
+        for kw in ({"timeout_s": 0}, {"timeout_s": -5}, {"review_timeout_s": 0}, {"review_timeout_s": -1}, {"poll_s": 0}, {"poll_s": -2.0}):
+            with self.subTest(kw=kw):
+                with self.assertRaises(ts.ShadowError) as caught:
+                    ts.prepare(self.state, "src-1", model=MODEL, thinking="medium", env=self.env, run="sh-bad", **kw)
+                self.assertIn("must be a positive number", str(caught.exception))
+        self.assertFalse(trial_session.run_dir(self.repo, "sh-bad").exists())
+        self.assertEqual(self.session_names(), sessions)
+
     def test_the_other_refusals_create_nothing(self):
         self.prepare(run="sh-dup")
         sessions = self.session_names()
@@ -490,8 +562,35 @@ class RunStepTests(ShadowCase):
         self.assertEqual(self.worktrees().count("worktree "), 1)
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
         self.assertEqual(self.refs("refs/tmux-pi"), "")
-        self.assertEqual([r["arm"] for r in self.records()], ["normal"], "no task, so no qwen record")
         self.assertEqual(self.worktrees(), before)
+
+    def test_f7_a_spawn_failure_with_no_task_still_writes_a_qwen_record_saying_so(self):
+        rdir, info = self.prepare()
+        _, done = self.run_stub(rdir, spawn_error="tp-spawn refused: nope")
+        by_arm = {r["arm"]: r for r in self.records()}
+        self.assertEqual(sorted(by_arm), ["normal", "qwen"])
+        qwen = by_arm["qwen"]
+        self.assertEqual((qwen["outcome"], qwen["run"], qwen["source_task"], qwen["mode"]), ("spawn_failed", info["run"], "src-1", "shadow"))
+        self.assertEqual((qwen["pair_id"], qwen["model"], qwen["effort"], qwen["base_commit"]), (by_arm["normal"]["pair_id"], MODEL, "medium", self.base))
+        self.assertIn("tp-spawn refused", qwen["error"])
+        self.assertTrue(qwen["no_task"])
+        self.assertEqual(qwen["role"], "coder")
+        self.assertEqual(done["outcome"], "spawn_failed")
+
+    def test_f7_a_spawn_that_failed_after_making_its_task_is_recorded_from_that_task(self):
+        rdir, info = self.prepare()
+
+        class Late(StubSpawnRun):
+            def spawn(self):
+                super().spawn()
+                raise ts.ShadowError("tp-spawn refused: late")
+
+        self.spawn_error = None
+        done = Late(rdir, self.env, sleep=lambda s: None, clock=Clock()).execute()
+        qwen, = [r for r in self.records() if r["arm"] == "qwen"]
+        self.assertEqual((done["outcome"], qwen["outcome"]), ("spawn_failed", "spawn_failed"))
+        self.assertNotIn("no_task", qwen)
+        self.assertEqual(qwen["task_id"], info["task_id"])
 
     def test_g_an_interrupt_during_the_review_still_records_ends_the_worker_and_cleans_up(self):
         rdir, info = self.prepare()
@@ -574,11 +673,19 @@ class CleanupTests(ShadowCase):
 
 
 class StopTests(ShadowCase):
+    def runner(self, rdir):
+        """A stand-in for a run's runner: its command line names tp-trial and the run directory, and it lives until its stdin closes
+        (or it is signalled), so it never outlives the test. Cleanups run last-in first-out: kill, reap, then close the pipe."""
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "tp-trial", "run", "--run-dir", str(rdir)],
+                                 stdin=subprocess.PIPE)
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
     def test_pid_is_run_requires_the_runner_command_line_and_the_run(self):
         rdir, info = self.prepare()
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", "tp-trial", "run", "--run-dir", str(rdir)])
-        self.addCleanup(child.kill)
-        self.addCleanup(child.wait)
+        child = self.runner(rdir)
         self.assertTrue(ts.pid_is_run(child.pid, info["run"]))
         self.assertFalse(ts.pid_is_run(child.pid, "sh-other"))
         for pid in (None, 0, 1, -5, "12", os.getpid()):
@@ -588,17 +695,14 @@ class StopTests(ShadowCase):
         rdir, info = self.prepare()
         run = ts.Run(rdir, self.env)
         run.make_worktree()
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", "tp-trial", "run", "--run-dir", str(rdir)])
-        self.addCleanup(child.kill)
-        reaped = []
+        child = self.runner(rdir)
 
         def sleep(_):
-            reaped.append(child.poll())  # the poll is the wait: the runner's exit is the event
+            child.poll()  # the poll is the wait (and reaps the child): the runner's exit is the event
 
         ts.update_run(rdir, pid=child.pid, phase="wait")
         done = ts.stop(rdir, self.env, sleep=sleep)
-        child.wait(timeout=30)
-        self.assertNotEqual(child.returncode, None)
+        self.assertIsNotNone(child.poll(), "the runner was signalled and has gone")
         self.assertEqual((done["phase"], done["outcome"]), ("done", "stopped"))
         self.assertFalse((rdir / "worktree").exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
@@ -644,6 +748,62 @@ class CommandLineTests(ShadowCase):
         stopped = self.tp_trial("stop", info["run"], "--project", str(self.repo), "--json")
         self.assertEqual(json.loads(stopped.stdout)["phase"], "done", stopped.stderr)
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+
+    def without_main_state(self, **extra):
+        """An environment in which Main's state dir cannot be found: no TP_STATE_DIR, not in tmux, and a tmux that fails if asked."""
+        broken = self.root / "no-tmux-bin"
+        broken.mkdir(exist_ok=True)
+        (broken / "tmux").write_text("#!/bin/sh\nexit 1\n")
+        (broken / "tmux").chmod(0o755)
+        env = {k: v for k, v in self.env.items() if k not in ("TP_STATE_DIR", "TMUX", "TMUX_PANE")}
+        env["PATH"] = str(broken) + os.pathsep + env["PATH"]
+        return {**env, **extra}
+
+    def test_f1_the_project_is_found_from_a_state_dir_that_is_under_sessions(self):
+        """tp makes <project>/.tmux-pi/sessions/<id>: the project is three levels up, not the directory above."""
+        sessions = self.repo / ".tmux-pi" / "sessions" / "0123abcd"
+        sessions.mkdir(parents=True)
+        rdir, info = self.prepare()
+        for layout in (sessions, self.repo / ".tmux-pi"):  # the session-id layout and the flat .tmux-pi layout
+            with self.subTest(state=str(layout)):
+                env = self.without_main_state()
+                listed = self.tp_trial("status", "--state-dir", str(layout), env=env)
+                self.assertIn("run=" + info["run"], listed.stdout, listed.stderr)
+                one = json.loads(self.tp_trial("status", info["run"], "--state-dir", str(layout), "--json", env=env).stdout)
+                self.assertEqual(one["source_task"], "src-1")
+        env = self.without_main_state(TP_STATE_DIR=str(sessions))
+        self.assertIn("run=" + info["run"], self.tp_trial("status", env=env).stdout, "TP_STATE_DIR alone is enough")
+        stopped = self.tp_trial("stop", info["run"], "--state-dir", str(sessions), "--json", env=self.without_main_state())
+        self.assertEqual(json.loads(stopped.stdout)["phase"], "done", stopped.stderr)
+        self.assertEqual(self.tp_trial("normal", info["run"], "--state-dir", str(sessions), env=self.without_main_state()).returncode, 0)
+        self.assertTrue(any(r["arm"] == "normal" for r in self.records()))
+
+    def test_f1_a_state_dir_of_another_shape_asks_for_the_project(self):
+        odd = self.root / "elsewhere" / "state"
+        odd.mkdir(parents=True)
+        run = self.tp_trial("status", "--state-dir", str(odd), env=self.without_main_state())
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("give --project", run.stderr)
+
+    def test_f5_status_stop_and_normal_work_with_the_project_alone(self):
+        rdir, info = self.prepare()
+        env = self.without_main_state()
+        self.assertIn("run=" + info["run"], self.tp_trial("status", "--project", str(self.repo), env=env).stdout)
+        no_project = self.tp_trial("status", env=env)
+        self.assertEqual(no_project.returncode, 1)
+        self.assertIn("no tmux-pi state directory", no_project.stderr)
+        self.assertEqual(self.tp_trial("normal", info["run"], "--project", str(self.repo), env=env).returncode, 0)
+        stopped = self.tp_trial("stop", info["run"], "--project", str(self.repo), "--json", env=env)
+        self.assertEqual(json.loads(stopped.stdout)["phase"], "done", stopped.stderr)
+
+    def test_f5_shadow_refuses_a_timeout_that_is_not_positive(self):
+        for flag in ("--timeout-s", "--review-timeout-s", "--poll-s"):
+            for value in ("0", "-3", "abc"):
+                with self.subTest(flag=flag, value=value):
+                    run = self.tp_trial("shadow", "src-1", flag, value)
+                    self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                    self.assertIn(flag, run.stderr)
+        self.assertFalse((self.repo / ".tmux-pi" / "trial").exists())
 
     def test_an_unknown_subcommand_runs_bin_tp_trial_x_when_that_file_exists(self):
         tree = self.root / "tree"
@@ -739,6 +899,13 @@ class ExplicitQwenRequestTests(unittest.TestCase):
 class FullRunTests(ShadowCase):
     """The real tp-spawn, tp-agent and tp-review against a real lane; only `new-window` (the worker launch) is stubbed."""
 
+    def lanes_listing(self):
+        """`tp-agent lanes` of the fixture repository. It lists the lanes of the repository it runs in, so it runs there; run from
+        the test process's own directory it would compare the real repository's lanes, which other work changes at any time."""
+        run = subprocess.run([str(ROOT / "bin" / "tp-agent"), "lanes"], env=self.env, cwd=str(self.repo), text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return [{k: v for k, v in row.items() if k != "age"} for row in json.loads(run.stdout)]  # "age" is the clock, not the lane
+
     def test_a_full_shadow_run_changes_nothing_of_the_real_lane_and_cleans_up(self):
         item, source = self.lane_ok(name="alpha", tests="affected")
         self.settle(source)
@@ -747,7 +914,8 @@ class FullRunTests(ShadowCase):
         lane_tree = Path(json.loads((source / "meta.json").read_text())["workdir"])
         (lane_tree / "lib" / "x.py").write_text("changed by the normal coder\n")
         branch_before = self.refs("refs/heads")
-        lane_before = self.raw("lanes")
+        lane_before = self.lanes_listing()
+        self.assertEqual([row["name"] for row in lane_before], ["alpha"], "the listing is the fixture repository's own, with the lane under test")
         main_before = self.snapshot(self.state)
         sessions_before = self.session_names()
         worktrees_before = self.worktrees()
@@ -798,7 +966,7 @@ class FullRunTests(ShadowCase):
         self.assertEqual(self.snapshot(self.state), main_before)
         self.assertEqual(self.refs("refs/heads"), branch_before)
         self.assertEqual(git(self.repo, "rev-parse", "lane/alpha"), tip_before)
-        self.assertEqual(self.raw("lanes").stdout, lane_before.stdout)
+        self.assertEqual(self.lanes_listing(), lane_before)
         # (g) the worktree and shadow refs are gone, the session ended
         self.assertFalse((rdir / "worktree").exists())
         self.assertEqual(self.worktrees(), worktrees_before)

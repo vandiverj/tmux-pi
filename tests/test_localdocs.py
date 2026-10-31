@@ -737,6 +737,193 @@ class RemoteTests(ProjectCase):
         self.assertEqual(rows[0]["tool"], "api_signature")
 
 
+class OutputGateTests(unittest.TestCase):
+    """Review 5 F1: text from a TypeScript source file leaves signature.py only through one allow-list of declaration shapes."""
+    LEAKS = ("CODE", "BODY", "SECRET", "mix(", "Mixin(")
+
+    def found(self, src, symbol):
+        return "\n".join(signature.find_declarations(src, symbol, source=True))
+
+    def assertNoCode(self, text, label):
+        for word in self.LEAKS:
+            self.assertNotIn(word, text, (label, word))
+
+    def test_a_class_heritage_clause_is_kept_only_when_it_is_type_shaped(self):
+        for src, head in (("export class C extends mix(() => { CODE }) { m(): void { BODY } }", "export class C /* heritage omitted */ {"),
+                          ("export class C extends Mixin(class { x = SECRET }) implements I { m(): void { BODY } }", "export class C /* heritage omitted */ {"),
+                          ("export abstract class C<T> implements I, J<CODE()> { m(): void { BODY } }", "export abstract class C<T> /* heritage omitted */ {"),
+                          ("export class C extends Base.make(CODE) { m(): void { BODY } }", "export class C /* heritage omitted */ {")):
+            text = self.found(src, "C")
+            self.assertNoCode(text, src)
+            self.assertIn(head, text, src)
+            self.assertIn("m(): void;", text, src)
+        kept = "export class C<T extends { a: string }> extends Base<{ b: number }> implements I, ns.J<T> {"
+        self.assertIn(kept, self.found(kept + " m(): void { BODY } }", "C"))
+        nested = self.found("export namespace N { export class C extends mix(() => { CODE }) { m(): void { BODY } } }", "N")
+        self.assertNoCode(nested, "namespace")
+        self.assertIn("export class C /* heritage omitted */ {", nested)
+
+    def test_an_initializer_is_shown_as_a_function_only_when_it_starts_with_an_arrow_head(self):
+        for src in ("export const k = cond ? initSecret(CODE) : (x) => { BODY };",
+                    "export const k = (cond) ? initSecret(CODE) : (x) => { BODY };",
+                    "export const k = SECRET(CODE) ? 1 : (x) => { BODY };",
+                    "export const k = DEV && (x) => { BODY };",
+                    "export const k = <T,>(x: T) ? CODE(x) : (y) => { BODY };",
+                    "export const k = x as unknown as (a: number) => void;"):
+            self.assertEqual(self.found(src, "k"), "export const k; /* initializer omitted */", src)
+        self.assertEqual(self.found("export class C { p = cond ? initSecret(CODE) : (x) => { BODY }; }", "C.p"), "p; /* initializer omitted */")
+        for src, expected in (("export const a = async (n: number): Promise<number> => { BODY };", "export const a = async (n: number): Promise<number> => /* body omitted */;"),
+                              ("export const b = <T,>(x: T): T => { BODY };", "export const b = <T,>(x: T): T => /* body omitted */;"),
+                              ("export const c = x => { BODY };", "export const c = x => /* body omitted */;"),
+                              ("export const d = async x => x + BODY;", "export const d = async x => /* body omitted */;")):
+            self.assertEqual(self.found(src, src.split()[2]), expected, src)
+
+    def test_enum_members_keep_only_literal_initializers(self):
+        src = ('export enum E { A = (() => { CODE })(), B = 2, /** See C. */ C = "c", D, F = A | B, G = -1, H = SECRET.length }')
+        text = self.found(src, "E")
+        self.assertNoCode(text, "E")
+        for part in ("export enum E {\n", "A /* initializer omitted */,", "B = 2,", '/** See C. */\n  C = "c",', "D,", "F /* initializer omitted */,",
+                     "G = -1,", "H /* initializer omitted */,"):
+            self.assertIn(part, text)
+        self.assertEqual(self.found(src, "E.A"), "A; /* initializer omitted */")
+        self.assertEqual(self.found(src, "E.B"), "B = 2;")
+        self.assertEqual(self.found("export const enum M { Fast = 1, Slow = 2 }", "M"), "export const enum M {\n  Fast = 1,\n  Slow = 2,\n}")
+
+    def test_the_gate_withholds_code_that_no_per_site_cut_removes(self):
+        # review 5 N1: a header is kept as written up to the body, so a call on the line after the return type came back with it.
+        # No per-site cut removes it; the gate does. The first shape needs no scanner misread at all.
+        for src in ("export function f(x: number): void\n CODE1(x) { BODY }",
+                    "export function f(a = (x) /'/.test(y) || (\n z): void\n CODE1(x) { BODY }",
+                    "export function f(a = (x) /'/.test(y) || (\n z): void\n CODE1(x)\n { BODY }"):
+            self.assertEqual(self.found(src, "f"), "export function f /* declaration omitted */", src)
+        documented = "/** Doc. */\nexport function f(x: number): void\n CODE1(x) { BODY }"
+        self.assertEqual(self.found(documented, "f"), "/** Doc. */\nexport function f /* declaration omitted */")
+
+    def test_the_gate_holds_when_a_view_returns_code(self):
+        # every per-site cut switched off: what reaches the caller is still only declaration shapes
+        src = ("export function f(a = g(CODE1)): void { BODY }\n"
+               "export const k = initSecret(CODE2);\n"
+               "export class C extends mix(CODE3) { m(a = g(CODE4)): void { BODY } }\n"
+               "export namespace N { export const n = CODE5(); }\n")
+        with mock.patch.object(signature, "_drop_defaults", lambda header: header), \
+                mock.patch.object(signature, "_value_view", lambda header, initializer: f"{header} = {initializer.strip()}"), \
+                mock.patch.object(signature, "_block_view", lambda statement, kind: statement):
+            for symbol in ("f", "k", "C", "C.m", "N", "N.n"):
+                text = self.found(src, symbol)
+                self.assertTrue(text, symbol)
+                self.assertNoCode(text, symbol)
+                self.assertIn("/* declaration omitted */", text, symbol)
+
+    def test_declarations_inside_an_exported_declare_module_are_cut_like_the_rest(self):
+        text = self.found("export declare module 'x' { function f(): void { CODE } }", "f")
+        self.assertEqual(text, "function f(): void;")
+
+    def test_the_gate_keeps_declaration_shapes_and_replaces_anything_else(self):
+        keep = {
+            "decl": (
+                "export function f<T extends keyof U = never>(this: Window, a?: string, ...rest: Array<[k: string, v?: number]>): asserts a is string;",
+                "export declare const x: { readonly [K in keyof T]-?: T[K] extends infer U ? U : never };",
+                "export type Fn = new (...args: any[]) => typeof import(\"x\").Y<string>;",
+                "export type L = `prefix-${string}`;",
+                "export type S = 'a' | \"b\" | 1 | -2 | true | null;",
+                "export interface I extends A<B>, C {\n  a: string\n  b?(x: number): void;\n  readonly [k: string]: unknown,\n  new (x: T): I;\n"
+                "  <U>(u: U): U\n  'quoted-name': 1\n  delete(key: string): boolean;\n}",
+                "export const k = (cb = /* defaults omitted */): /* type omitted */ => /* body omitted */;",
+                "export const fn = async function (a: number) /* body omitted */;",
+                "export const obj; /* initializer omitted */",
+                "export function g({ a, b: [c, d] }: P, sep = \",\", mode = Mode.Fast, e = {}, z = /* defaults omitted */): void;",
+                "export async function* gen<T>(x: T): AsyncGenerator<T>;",
+                "export class C<T> /* heritage omitted */ {\n  @Dec.of(/* args omitted */) static readonly x?: Map<string, T[]>;\n  get size(): number;\n"
+                "  constructor(@Inject(/* args omitted */) private readonly a: A, b = 1);\n  [Symbol.iterator](): Iterator<T>;\n  *gen(): Generator<T>;\n"
+                "  tick = () => /* body omitted */;\n  p; /* initializer omitted */\n  q /* declaration omitted */;\n}",
+                "export namespace N {\n  export function f(a: number): { r: 1 };\n  export type T = string\n  export class D {}\n}",
+                "export enum E {\n  A /* initializer omitted */,\n  B = 2,\n  C = \"c\",\n}",
+                "/** Doc with code: f(x) => { y() } */\nexport function f(): void;",
+                "/* declaration omitted */",
+                "export class C /* declaration omitted */",
+            ),
+            "class": ("run(cb = /* defaults omitted */): void;", "count = 0;", "p; /* initializer omitted */", "delete(key: K): boolean;",
+                      "@Input(/* args omitted */) name: string;"),
+            "interface": ("a?: string;", "m<T>(x: T): T;"),
+            "enum": ("A = 1;", "A; /* initializer omitted */"),
+        }
+        for context, shapes in keep.items():
+            for shape in shapes:
+                self.assertEqual(signature._gate(shape, context), shape, (context, shape))
+        refuse = {
+            "decl": (
+                "export function f(): void\n CODE1(x);",
+                "export const k = cond ? init(CODE) : (x) => /* body omitted */;",
+                "export class C extends mix(() => { CODE }) {\n  m(): void;\n}",
+                "export enum E { A = (() => { CODE })(), B = 2 }",
+                "export function f(a = g(CODE)): void;",
+                "export type T = ReturnType<typeof f>; CODE();",
+                "export const x = 1; CODE();",
+                "export const k = \"a\" + CODE;",
+                "export function f(): foo CODE(x);",
+                "export interface I { a: string; m(): void { CODE } }",
+                "export function f(): void { return CODE; }",
+                "export const x = `${CODE()}`;",
+                "export type T = `${CODE()}`;",
+                "export const r = /CODE/;",
+                "export function f(a: number = x || CODE): void;",
+                "export class C {\n  if(CODE);\n}",
+                "export class C {\n  return(CODE);\n}",
+                "export class C {\n  m(): void\n  CODE(x);\n}",
+                "export namespace N {\n  export type T = string\n  CODE(x)\n}",
+                "export const k = 0..CODE.constructor;",
+                "export function f(): void; /* x */ CODE();",
+                "export type T = { [K in keyof T]: CODE() };",
+                "export const f = (a) => CODE(a);",
+                "export class C { p = CODE(); }",
+                "export class C { @Dec(CODE) p: T; }",
+                "export function f(): void /* never closed",
+            ),
+            "class": ("CODE1(x) || y;", "p = CODE();", "m() { CODE }"),
+            "interface": ("a: CODE();",),
+            "enum": ("A = CODE();", "A = B | CODE"),
+        }
+        for context, shapes in refuse.items():
+            for shape in shapes:
+                out = signature._gate(shape, context)
+                self.assertNotIn("CODE", out, (context, shape))
+                self.assertIn("/* declaration omitted */", out, (context, shape))
+                self.assertEqual(signature._gate(out, context), out, (context, shape))  # the replacement passes the gate itself
+        self.assertEqual(signature._gate("export const k = cond ? init(CODE) : 1;", "decl"), "export const k /* declaration omitted */")
+        self.assertEqual(signature._gate("p = CODE();", "class"), "p /* declaration omitted */;")
+
+    POSITIONS = {
+        "function default": ("export function f(a = {X}): void { BODY }", ("f",)),
+        "function return": ("export function f(a: number): {X} { BODY }", ("f",)),
+        "type parameter default": ("export function f<T = {X}>(a: T): void { BODY }", ("f",)),
+        "class heritage": ("export class f extends {X} { m(): void { BODY } }", ("f", "f.m")),
+        "class implements": ("export class f implements {X} { m(): void { BODY } }", ("f", "f.m")),
+        "class property": ("export class f { p = {X}; m(): void { BODY } }", ("f", "f.p")),
+        "class method default": ("export class f { m(a = {X}): void { BODY } }", ("f", "f.m")),
+        "member decorator": ("export class f { @Dec({X}) m(): void { BODY } }", ("f", "f.m")),
+        "const": ("export const f = {X};", ("f",)),
+        "typed const": ("export const f: T = {X};", ("f",)),
+        "arrow prefix": ("export const f = {X} ? 1 : (x) => { BODY };", ("f",)),
+        "arrow return": ("export const f = (a: number): {X} => { BODY };", ("f",)),
+        "enum": ("export enum f { A = {X}, B = 1 }", ("f", "f.A", "f.B")),
+        "namespace const": ("export namespace f { export const m = {X}; }", ("f", "f.m")),
+        "namespace heritage": ("export namespace f { export class m extends {X} { n(): void { BODY } } }", ("f", "f.m", "f.m.n")),
+        "declare module": ("export declare module 'x' { export const f = {X}; }", ("f",)),
+        "after the header": ("export function f(a: number): void\n {X} { BODY }", ("f",)),
+    }
+    CODES = ("CODE()", "(() => { CODE })()", "mix(CODE)", "cond ? CODE(1) : 2", "`${CODE()}`", "new CODE()", "CODE as never", "x || CODE",
+             "class { CODE = 1 }", "{ a: CODE() }", "[CODE()]", "await CODE", "/CODE/.test(x)", "'a' + CODE", "CODE!.x", "a?.CODE", "-CODE")
+
+    def test_no_emitting_path_returns_code(self):
+        for label, (template, symbols) in self.POSITIONS.items():
+            for code in self.CODES:
+                src = template.replace("{X}", code)
+                for symbol in symbols:
+                    text = self.found(src, symbol)
+                    self.assertNotIn("CODE", text, (label, code, symbol))
+                    self.assertNotIn("BODY", text, (label, code, symbol))
+
+
 class IndexTests(ProjectCase):
     def setUp(self):
         super().setUp()

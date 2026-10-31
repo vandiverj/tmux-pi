@@ -7,13 +7,25 @@ guard.py (allowlisted extensions, links resolved, nothing outside the package di
 
 `jsr:@scope/name` and `https://` specifiers are read from Deno's remote cache (remote.py), pinned by deno.lock. Those files
 may be TypeScript source; declaration_view() then returns only exported declarations, with bodies, initializers, decorator arguments and code in
-parameter defaults cut (see Known limits). jsr files are checked against deno.lock's integrity when it records one (remote.py).
+parameter defaults, heritage clauses and enum initializers cut (see Known limits). jsr files are checked against deno.lock's integrity when it
+records one (remote.py).
+
+Every text taken from a source file leaves this module through one gate, _gate(), which find_declarations, find_members and declaration_view
+apply to what they return: an allow-list of declaration shapes (shape.py). A text that is not only declaration words, names, types, literal
+defaults and omission markers is replaced by its name and `/* declaration omitted */`, or by the marker alone. The per-site cuts keep the output
+useful; the gate is what guarantees that no code is returned when the scanner or a cut gets a shape wrong.
 
 The declaration scanner is a text scanner, not a TypeScript parser: it splits a declaration file into top-level
 statements (comments, strings, regex literals and brackets skipped) and matches the name. It returns the statement with the
 JSDoc comment just above it. `Ns.member` finds a member of a namespace, class, interface or enum.
 
-Known limits (TypeScript source files only; .d.ts files carry no code and are returned as written):
+Known limits (TypeScript source files only; .d.ts files carry no code and are returned as written, without the gate):
+- The gate is a recogniser, not a parser: a declaration it does not know (an unusual type form, a class member not ended by `;`,
+  a member named by a statement word without full types, a non-ASCII name) is withheld although it holds no code. Comments are
+  documentation and pass it as written; an unclosed one does not.
+- A class or namespace header that is not type-shaped keeps its name and type parameters and shows `/* heritage omitted */`; when the
+  clause opens a block of its own (`extends class {`, `extends function () {`) the whole declaration is withheld. Enum members keep only
+  string and number initializers. An initializer is shown as a function only when it starts with an arrow head or `function`.
 - A parameter list is shown only up to its first default that is not a plain literal; the rest of the list is withheld as
   `/* defaults omitted */)`, then the declared return type. The scanner never tries to find where such a default ends.
   The same happens for an `=` that is not a default, such as a type parameter default in a callback type
@@ -33,7 +45,7 @@ import os
 import re
 from pathlib import Path
 
-from . import guard, lock, remote
+from . import guard, lock, remote, shape
 
 NAME_RE = re.compile(r"^(@[A-Za-z0-9][A-Za-z0-9~._-]*/)?[A-Za-z0-9][A-Za-z0-9~._-]*$")
 SYMBOL_RE = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$")
@@ -289,9 +301,20 @@ def _body_open(statement):
     return -1
 
 
-def _body(statement):
+def _body_span(statement):
+    """(open, close) of a container's body: the `{` _body_open finds and the `}` that closes it, which must be the statement's
+    last one. None otherwise: a `{` in the header that is not in brackets (`extends class { ... } { ... }`) was taken for the
+    body, and what follows it is not the container's members."""
     open_at, close_at = _body_open(statement), statement.rfind("}")
-    return statement[open_at + 1:close_at] if 0 <= open_at < close_at else ""
+    if not 0 <= open_at < close_at:
+        return None
+    match = next((i for i, c, _, _, brace in _scan(statement) if i > open_at and c == "}" and brace == 1), None)
+    return (open_at, close_at) if match == close_at else None
+
+
+def _body(statement):
+    span = _body_span(statement)
+    return statement[span[0] + 1:span[1]] if span else ""
 
 
 # ---- source files: exported declarations without code --------------------------------------------------------------
@@ -300,13 +323,15 @@ PRIVATE_MEMBER = re.compile(r"^" + DECORATOR_PREFIX + r"(?:(?:public|protected|s
 LITERAL = re.compile(r"""^(?:"[^"\n]{0,80}"|'[^'\n]{0,80}'|-?\d[\w.]{0,30}|true|false|null)$""")
 KEEP_WHOLE = ("interface", "type", "enum")
 BLOCKS = ("class", "namespace", "module")
-OMITTED = "/* body omitted */"
+OMITTED = shape.BODY
+INIT_OMITTED = shape.INIT
+HERITAGE_OMITTED = shape.HERITAGE
 
 
-DECORATOR_ARGS = "/* args omitted */"
+DECORATOR_ARGS = shape.ARGS
 DECORATOR_NAME = re.compile(r"@\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)")
 AFTER_DECORATOR = re.compile(r"(?:\s|/\*.*?\*/|//[^\n]*)*([A-Za-z_$@#\[*'\"])", re.S)
-WITHHELD = "/* declaration omitted */"
+WITHHELD = shape.WITHHELD
 
 
 def _cut_decorators(text):
@@ -373,10 +398,10 @@ def _arrow_at(text):
 
 PLAIN_DEFAULT = re.compile(r"""\s*(?:"(?:[^"\\\n]|\\.){0,80}"|'(?:[^'\\\n]|\\.){0,80}'|-?\d[\w.]{0,30}"""
                            r"""|\{\s*\}|\[\s*\]|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?=[,)\]}])""")
-DEFAULTS_OMITTED = "/* defaults omitted */"
+DEFAULTS_OMITTED = shape.DEFAULTS
 
 
-TYPE_OMITTED = ": /* type omitted */"
+TYPE_OMITTED = ": " + shape.TYPE
 TAIL_CHARS = re.compile(r"[\w$\s.<>\[\]|&,?:(){}-]*")
 TAIL_REFUSED = re.compile(
     r"\b(?:return|await|yield|throw|function|class|var|let|const|if|else|for|while|do|switch|case|break|continue|try|catch|finally|"
@@ -478,28 +503,94 @@ def _drop_defaults(header):
     return header
 
 
+def _is_arrow_head(head):
+    """True when `head`, the text before an initializer's first top-level `=>`, is an arrow function's head: `x`, `async x`, or
+    `[async] [<T>](params)` followed by nothing or `: <type>`. Anything else (`cond ? init(x) : (y)`, `a && (y)`, `x as (a: T)`) is
+    code that happens to end in an arrow, and the initializer is omitted."""
+    head = re.sub(r"^async\b\s*(?=[(<A-Za-z_$])", "", head.strip())
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", head):
+        return True
+    rest = head
+    if rest.startswith("<"):
+        close = next((i for i, c, _, angle, _ in _scan(rest) if c == ">" and angle == 1 and rest[i - 1] != "="), None)
+        if close is None:
+            return False
+        rest = rest[close + 1:].lstrip()
+    if not rest.startswith("("):
+        return False
+    close = next((i for i, c, depth, _, _ in _scan(rest) if c == ")" and depth == 1), None)
+    if close is None:
+        return True  # the list does not close for the scanner: _drop_defaults withholds it and the gate checks what is left
+    tail = rest[close + 1:]
+    return not tail.strip() or shape.return_type_ok(tail)
+
+
 def _value_view(header, initializer):
     """`header = initializer` reduced to what a caller needs: a function's parameters and result, a short literal, else nothing."""
     initializer = initializer.strip().rstrip(";").strip()
     if LITERAL.match(initializer):
         return f"{header} = {initializer};"
     arrow = _arrow_at(initializer)
-    if arrow >= 0:
+    if arrow >= 0 and _is_arrow_head(initializer[:arrow]):
         return f"{header} = {_drop_defaults(initializer[:arrow + 2])} {OMITTED};"
     if re.match(r"(?:async\s+)?function\b", initializer):
         body = _function_body_open(initializer)
         return f"{header} = {_drop_defaults(initializer[:body].rstrip() if body >= 0 else initializer)} {OMITTED};"
-    return f"{header}; /* initializer omitted */"
+    return f"{header}; {INIT_OMITTED}"
 
 
-def declaration_view(statement):
-    """A statement of a TypeScript *source* file as its declaration: function and method bodies, variable and property
-    initializers (short literals aside) and private members are left out. Types (interface, type, enum) are kept as written."""
+# ---- the output gate -----------------------------------------------------------------------------------------------
+
+MEMBER_CONTEXT = {"class": "class", "interface": "interface", "enum": "enum"}  # a namespace or module member is a declaration
+
+
+def _leading_doc(text):
+    """(doc, rest): the comment that opens `text`, kept as documentation, and what follows it."""
+    stripped = text.lstrip()
+    if stripped.startswith("/*"):
+        end = stripped.find("*/", 2)
+        if end >= 0:
+            return stripped[:end + 2] + "\n", stripped[end + 2:].lstrip()
+    return "", stripped
+
+
+def _replacement(rest, context):
+    """What is shown for a declaration the gate refused: its name and the withheld marker, or the marker alone."""
+    name = None
+    if context == "decl":
+        decl = DECL.match(_cut_decorators(rest) or "")
+        candidate = decl.group(0) + " " + WITHHELD if decl else None
+    else:
+        member = MEMBER.match(rest)
+        after = rest[member.end("name"):].lstrip(" \t?!") if member else ""
+        name = member["name"] if member and not after.startswith(("(", "<")) else None  # a method-shaped refusal keeps no name
+        candidate = name + " " + WITHHELD if name else None
+    end = ";" if context == "class" else ""
+    if candidate and shape.accepts(candidate + end, context):
+        return candidate + end
+    return WITHHELD + end
+
+
+def _gate(text, context):
+    """The single gate every text taken from a TypeScript source file passes before it leaves this module. `text` comes back
+    as it is when it is only declaration shapes (shape.accepts); otherwise its leading doc comment is kept and the rest is
+    replaced by the declaration's name and `/* declaration omitted */`, or by the marker alone. The per-site cuts above keep the
+    output useful; this is what guarantees no code is returned when one of them, or the scanner, gets a shape wrong."""
+    if shape.accepts(text, context):
+        return text
+    doc, rest = _leading_doc(text)
+    return doc + _replacement(rest, context)
+
+
+def _view(statement):
+    """declaration_view() before the gate."""
     statement = _cut_decorators(statement.strip().rstrip(";").rstrip())
     if statement is None:
         return WITHHELD
     decl = DECL.match(statement)
     kind = decl["kind"] if decl else None
+    if kind == "enum":
+        return _enum_view(statement)
     if kind in KEEP_WHOLE:
         return statement
     if kind in BLOCKS:
@@ -511,23 +602,99 @@ def declaration_view(statement):
     return _drop_defaults(statement[:body].rstrip() if body >= 0 else statement) + ";"
 
 
-def _block_view(statement, kind):
-    open_at, close_at = _body_open(statement), statement.rfind("}")
-    if open_at < 0 or close_at < open_at:
-        return statement + ";"
+def declaration_view(statement):
+    """A statement of a TypeScript *source* file as its declaration: function and method bodies, variable and property
+    initializers (short literals aside), code in heritage clauses and enum initializers, and private members are left out.
+    Interfaces and type aliases are kept as written. What is returned has passed _gate()."""
+    return _gate(_view(statement), "decl")
+
+
+ENUM_MEMBER = re.compile(r"""^(?P<name>[A-Za-z_$][\w$]*|'[^'\\\n]*'|"[^"\\\n]*")\s*(?:=\s*(?P<init>.*))?$""", re.S)
+ENUM_LITERAL = re.compile(r"""(?:"[^"\\\n]{0,80}"|'[^'\\\n]{0,80}'|-?(?:0[xXoObB][0-9a-fA-F_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?))""")
+
+
+def _enum_view(statement):
+    """An enum with each member's initializer kept only when it is a string or number literal."""
+    span = _body_span(statement)
+    if span is None:
+        return _gate(statement, "decl")
+    open_at, close_at = span
     body = statement[open_at + 1:close_at]
+    lines = []
+    for start, end, doc in split_statements(body, members=True):
+        member = ENUM_MEMBER.match(body[start:end].strip().rstrip(",;").strip())
+        if not member:
+            line = WITHHELD
+        elif member["init"] is None:
+            line = member["name"]
+        elif ENUM_LITERAL.fullmatch(member["init"].strip()):
+            line = f"{member['name']} = {member['init'].strip()}"
+        else:
+            line = f"{member['name']} {INIT_OMITTED}"
+        lines.append("  " + _with_doc(body, doc, line + ",").replace("\n", "\n  "))
+    return statement[:open_at].rstrip() + (" {\n" + "\n".join(lines) + "\n}" if lines else " {}")
+
+
+HERITAGE_OPENS_BLOCK = re.compile(r"(?<![\w$.])(?:class|function)(?![\w$])")
+HERITAGE_OPEN_END = re.compile(r"(?:(?<![\w$.])(?:extends|implements|new|typeof|void|await|yield|in|instanceof)|[^\w$)\]>\s])\s*$")
+
+
+def _top_level(text):
+    """`text` without what is inside (), [], {} and <> (the brackets kept), strings and comments."""
+    out = []
+    for _, c, paren, angle, brace in _scan(text):
+        depth = max(paren, 0) + max(angle, 0) + max(brace, 0)
+        if depth == 0 or (depth == 1 and c in ")]}>"):
+            out.append(c)
+    return "".join(out)
+
+
+def _heritage_cut(head):
+    """A class or namespace header with what follows its name and type parameters replaced by `/* heritage omitted */`, when
+    the header as written is not type-shaped (`extends mix(() => { ... })`). None when even the cut header is not."""
+    if shape.accepts(head + " {}", "decl"):
+        return head
+    decl = DECL.match(head)
+    if not decl:
+        return None
+    rest, cut = head[decl.end():], head[:decl.end()]
+    flat = _top_level(rest)
+    if HERITAGE_OPENS_BLOCK.search(flat) or HERITAGE_OPEN_END.search(flat):
+        return None  # `extends class {`, `extends function () {`: the `{` taken for the body may be the expression's own
+    if rest.lstrip().startswith("<"):
+        offset = len(rest) - len(rest.lstrip())
+        rest = rest.lstrip()
+        close = next((i for i, c, _, angle, _ in _scan(rest) if c == ">" and angle == 1 and rest[i - 1] != "="), None)
+        if close is None:
+            return None
+        cut = head[:decl.end() + offset + close + 1]
+    cut = f"{cut} {HERITAGE_OMITTED}"
+    return cut if shape.accepts(cut + " {}", "decl") else None
+
+
+def _block_view(statement, kind):
+    span = _body_span(statement)
+    if span is None:
+        return _gate(statement + ";", "decl")
+    open_at, close_at = span
+    head = _heritage_cut(statement[:open_at].rstrip())
+    if head is None:
+        return _gate(statement, "decl")
+    body = statement[open_at + 1:close_at]
+    context = "class" if kind == "class" else "decl"
     lines = []
     for start, end, doc in split_statements(body, members=True):
         member = _cut_decorators(body[start:end].strip().rstrip(",;"))
         if member is None or PRIVATE_MEMBER.match(member) or (kind != "class" and not member.startswith("export")):
             continue  # a member whose decorators cannot be read is left out, as a private one is
-        lines.append("  " + _with_doc(body, doc, declaration_view(member)).replace("\n", "\n  "))
-    return statement[:open_at].rstrip() + (" {\n" + "\n".join(lines) + "\n}" if lines else " {}")
+        shown = _gate(_with_doc(body, doc, _view(member)), context)
+        lines.append("  " + shown.replace("\n", "\n  "))
+    return head + (" {\n" + "\n".join(lines) + "\n}" if lines else " {}")
 
 
 def find_declarations(text, symbol, _nest=0, source=False, exported_only=True):
     """Declaration texts (doc comment included) for `symbol` in one declaration file's text. With `source`, `text` is TypeScript
-    source: only exported declarations count and each is returned as declaration_view() shows it."""
+    source: only exported declarations count and each is returned as declaration_view() shows it, through _gate()."""
     head, _, rest = symbol.partition(".")
     out = []
     for start, end, doc in split_statements(text):
@@ -537,16 +704,16 @@ def find_declarations(text, symbol, _nest=0, source=False, exported_only=True):
         match = DECL.match(statement)
         if match and match["name"] == head:
             if not rest:
-                out.append(_with_doc(text, doc, declaration_view(statement) if source else statement))
+                out.append(_gate(_with_doc(text, doc, _view(statement)), "decl") if source else _with_doc(text, doc, statement))
             elif _nest < MAX_NEST and match["kind"] in ("namespace", "module", "class", "interface", "enum"):
                 out.extend(find_members(_body(statement), rest, _nest + 1, source, match["kind"]))
         elif _nest < MAX_NEST and re.match(r"^(?:export\s+)?declare\s+(?:module\s+['\"]|global\b)", statement):
-            out.extend(find_declarations(_body(statement), symbol, _nest + 1))
+            out.extend(find_declarations(_body(statement), symbol, _nest + 1, source=source, exported_only=False))
     return out
 
 
 def find_members(body, path, _nest=0, source=False, parent="interface"):
-    """Members of a container body named by the dotted `path`."""
+    """Members of a container body named by the dotted `path`. With `source`, each passes _gate() as a member of `parent`."""
     head, _, rest = path.partition(".")
     out = []
     for start, end, doc in split_statements(body, members=True):
@@ -562,7 +729,10 @@ def find_members(body, path, _nest=0, source=False, parent="interface"):
         if name != head:
             continue
         if not rest:
-            out.append(_with_doc(body, doc, declaration_view(statement) if source else statement))
+            if source:
+                out.append(_gate(_with_doc(body, doc, _view(statement)), MEMBER_CONTEXT.get(parent, "decl")))
+            else:
+                out.append(_with_doc(body, doc, statement))
         elif _nest < MAX_NEST and decl and decl["kind"] in ("namespace", "module", "class", "interface", "enum"):
             out.extend(find_members(_body(statement), rest, _nest + 1, source, decl["kind"]))
     return out

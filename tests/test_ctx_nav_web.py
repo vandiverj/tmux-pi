@@ -62,6 +62,22 @@ class TempCase(unittest.TestCase):
         return nav
 
 
+class RecordingGuard(nav_web.StubGuard):
+    """The real guard plus a recording of every path the helper asked about, a folder it refuses (`hide`), and a failing mode."""
+
+    def __init__(self, hide=None, fail=False):
+        super().__init__()
+        self.hide, self.fail, self.asked = hide, fail, []
+
+    def check_path(self, path, root):
+        self.asked.append(path)
+        if self.hide and self.hide in path.replace(os.sep, "/"):
+            if self.fail:
+                raise RuntimeError("guard broke")
+            return "test_hidden"
+        return super().check_path(path, root)
+
+
 def spots(rows, key="path"):
     return [f"{r[key]}:{r['line']}" for r in rows]
 
@@ -242,6 +258,48 @@ class Freshness(TempCase):
         (proj / "src" / "format.ts").unlink()
         self.assertEqual(nav.imports("src/barrel.ts")["unresolved"], 1)
 
+    def test_a_file_that_appears_where_an_earlier_candidate_won_changes_the_edge(self):
+        proj = make_project(self.tmp)
+        nav = self.nav(proj)
+        (proj / "src" / "format.ts").rename(proj / "src" / "format.tsx")
+        got = nav.imports("src/barrel.ts")
+        self.assertEqual([e["resolved"] for e in got["edges"]][:1], ["src/format.tsx"])
+        write(proj / "src" / "format.ts", "export function fmt(value: number): string { return String(value); }\n")
+        got = nav.imports("src/barrel.ts")
+        self.assertEqual([e["resolved"] for e in got["edges"]][:1], ["src/format.ts"])
+        got = nav.imports("src/format.ts", direction="importers")
+        self.assertEqual([(e["from"], e["line"]) for e in got["edges"]], [("src/barrel.ts", 1), ("src/main.ts", 10)])
+
+    def test_a_package_that_appears_nearer_than_the_one_in_use_takes_over_the_edge(self):
+        proj = make_project(self.tmp)
+        write(proj / "node_modules" / "dup" / "package.json", '{"name": "dup", "version": "1.0.0", "types": "index.d.ts"}\n')
+        write(proj / "node_modules" / "dup" / "index.d.ts", "export declare const twin: number;\n")
+        write(proj / "src" / "uses.ts", 'import { twin } from "dup";\nexport const t = twin;\n')
+        nav = self.nav(proj)
+        self.assertEqual([(e["resolved"], e["external"]) for e in nav.imports("src/uses.ts")["edges"]], [("node_modules/dup/index.d.ts", True)])
+        write(proj / "src" / "node_modules" / "dup" / "package.json", '{"name": "dup", "version": "2.0.0", "types": "index.d.ts"}\n')
+        write(proj / "src" / "node_modules" / "dup" / "index.d.ts", "export declare const twin: string;\n")
+        got = nav.imports("src/uses.ts")
+        self.assertEqual([(e["resolved"], e["external"]) for e in got["edges"]], [("src/node_modules/dup/index.d.ts", True)])
+
+    def test_a_missing_package_that_gets_installed_resolves_and_one_that_is_removed_does_not(self):
+        proj = make_project(self.tmp)
+        nav = self.nav(proj)
+        self.assertEqual(nav.imports("src/main.ts")["unresolved"], 1)
+        write(proj / "node_modules" / "missing-package" / "package.json", '{"name": "missing-package", "version": "1.0.0", "types": "index.d.ts"}\n')
+        write(proj / "node_modules" / "missing-package" / "index.d.ts", "export {};\n")
+        got = nav.imports("src/main.ts")
+        self.assertEqual(got["unresolved"], 0)
+        shutil.rmtree(proj / "node_modules" / "missing-package")
+        self.assertEqual(nav.imports("src/main.ts")["unresolved"], 1)
+
+    def test_an_edge_does_not_change_when_nothing_it_looked_at_changed(self):
+        proj = make_project(self.tmp)
+        nav = self.nav(proj)
+        first = nav.imports("src/main.ts")["edges"]
+        write(proj / "src" / "unrelated.ts", "export const z = 1;\n")
+        self.assertEqual(nav.imports("src/main.ts")["edges"], first)
+
     def test_an_edited_tsconfig_is_reread(self):
         proj = make_project(self.tmp)
         nav = self.nav(proj)
@@ -288,30 +346,73 @@ class Boundaries(TempCase):
             self.assertEqual(got["status"], "refused", name)
             self.assertIn("sensitive_path", got["message"])
 
-    def test_a_credential_file_reached_through_an_import_is_withheld_from_the_answer(self):
+    def test_a_credential_file_reached_through_an_import_is_never_read_and_counts_as_absent(self):
         proj = make_project(self.tmp)
         config = json.loads((proj / "tsconfig.json").read_text())
         config["compilerOptions"]["resolveJsonModule"] = True
         (proj / "tsconfig.json").write_text(json.dumps(config))
         write(proj / "config" / "local.json", '{"token": "x"}\n')
         write(proj / "src" / "cfg.ts", 'import local from "../config/local.json";\nexport const token = local.token;\n')
-        nav = self.nav(proj)
+        guard = RecordingGuard()
+        nav = self.nav(proj, guard=guard)
         got = nav.imports("src/cfg.ts")
-        self.assertEqual([(e["specifier"], e["resolved"]) for e in got["edges"]], [("../config/local.json", nav_web.WITHHELD)])
-        self.assertEqual(got["withheld"], 1)
+        self.assertEqual([(e["specifier"], e["resolved"]) for e in got["edges"]], [("../config/local.json", None)])
+        self.assertEqual((got["unresolved"], "withheld" in got), (1, False))
+        got = nav.definition("src/cfg.ts", name="token", line=2)
+        self.assertNotIn("string", got["signature"])  # the JSON was not read, so `local.token` has no type from it
+        self.assertEqual({d["path"] for d in got["definitions"]}, {"src/cfg.ts"})  # nothing points into the JSON file
         got = nav.references("src/cfg.ts", name="local", line=1)
         self.assertEqual({r["path"] for r in got["references"]}, {"src/cfg.ts"})
         self.assertNotIn('"token": "x"', json.dumps(got))
+        self.assertTrue(any(p.endswith("config/local.json") for p in guard.asked), guard.asked)
 
-    def test_locations_outside_the_root_are_dropped_and_counted(self):
+    def test_a_source_the_guard_refuses_is_treated_as_absent_by_the_helper(self):
+        proj = make_project(self.tmp)
+        write(proj / "src" / "hidden" / "h.ts", "export const hidden: number = 1;\n")
+        write(proj / "src" / "uses_hidden.ts", 'import { hidden } from "./hidden/h";\nexport const v = hidden;\n')
+        guard = RecordingGuard(hide="/src/hidden/")
+        nav = self.nav(proj, guard=guard)
+        got = nav.imports("src/uses_hidden.ts")
+        self.assertEqual([(e["resolved"], e["external"]) for e in got["edges"]], [(None, False)])
+        self.assertNotIn("withheld", got)
+        got = nav.definition("src/uses_hidden.ts", name="hidden", line=2)
+        self.assertEqual({d["path"] for d in got["definitions"]}, {"src/uses_hidden.ts"})  # only the import itself; the source is unknown
+        self.assertNotIn("number", got["signature"])
+        self.assertEqual(nav.stats()["root_files"], 5)  # the 4 fixture files and uses_hidden.ts; the refused file is not listed
+        self.assertTrue(any("/src/hidden/h.ts" in p for p in guard.asked), guard.asked)
+
+    def test_a_guard_that_fails_while_the_helper_asks_refuses_the_path(self):
+        proj = make_project(self.tmp)
+        write(proj / "src" / "hidden" / "h.ts", "export const hidden: number = 1;\n")
+        write(proj / "src" / "uses_hidden.ts", 'import { hidden } from "./hidden/h";\nexport const v = hidden;\n')
+        nav = self.nav(proj, guard=RecordingGuard(hide="/src/hidden/", fail=True))
+        self.assertEqual([e["resolved"] for e in nav.imports("src/uses_hidden.ts")["edges"]], [None])
+
+    def test_a_source_reached_through_an_alias_or_symlink_outside_the_root_is_never_loaded(self):
         proj = make_project(self.tmp)
         write(self.tmp / "shared" / "x.ts", "export function outside(): number { return 1; }\n")
         config = json.loads((proj / "tsconfig.json").read_text())
         config["compilerOptions"]["paths"]["@out/*"] = ["../shared/*"]
         (proj / "tsconfig.json").write_text(json.dumps(config))
         write(proj / "src" / "uses.ts", 'import { outside } from "@out/x";\nexport const n = outside();\n')
-        got = self.nav(proj).definition("src/uses.ts", name="outside", line=2)
-        self.assertEqual((got["status"], got["definitions"], got["omitted_outside_root"]), ("not_found", [], 1))
+        os.symlink(self.tmp / "shared" / "x.ts", proj / "src" / "linked.ts")
+        write(proj / "src" / "uses_link.ts", 'import { outside as o2 } from "./linked";\nexport const m = o2();\n')
+        nav = self.nav(proj)
+        got = nav.definition("src/uses.ts", name="outside", line=2)
+        self.assertEqual({d["path"] for d in got["definitions"]}, {"src/uses.ts"})
+        self.assertNotIn("number", got["signature"])  # the file was not read, so TypeScript knows nothing about it
+        got = nav.definition("src/uses_link.ts", name="o2", line=2)
+        self.assertEqual({d["path"] for d in got["definitions"]}, {"src/uses_link.ts"})
+        self.assertNotIn("number", got["signature"])
+        self.assertEqual([e["resolved"] for e in nav.imports("src/uses.ts")["edges"]], [None])
+
+    def test_typescripts_own_library_files_stay_readable_even_when_they_sit_outside_the_root(self):
+        proj = make_project(self.tmp)
+        write(proj / "src" / "lib_use.ts", "export const xs: Array<number> = [];\n")
+        got = self.nav(proj).definition("src/lib_use.ts", name="Array", line=1)
+        self.assertIn("interface Array", got["signature"])
+        self.assertEqual((got["status"], got["definitions"]), ("not_found", []))
+        self.assertGreaterEqual(got["omitted_outside_root"], 1)  # the declaration is in the typescript package: dropped and counted
 
     def test_free_text_is_screened(self):
         proj = make_project(self.tmp)
@@ -321,6 +422,30 @@ class Boundaries(TempCase):
         self.assertEqual(spots(got["definitions"]), ["src/key.ts:1"])
         self.assertNotIn(AWS, json.dumps(got))
         self.assertIn("REDACTED", got["definitions"][0]["text"])
+
+    def test_every_string_in_an_answer_is_screened_not_only_chosen_keys(self):
+        nav = self.nav(self.tmp)
+        got = nav._finish({"status": "ok", "edges": [{"specifier": AWS, "resolved": None, "line": 1}], "other": [AWS, {"deep": {"name": AWS}}],
+                           "kind": AWS})
+        self.assertNotIn(AWS, json.dumps(got))
+        self.assertEqual(got["edges"][0]["line"], 1)
+        self.assertIsNone(got["edges"][0]["resolved"])
+        self.assertEqual(got["status"], "ok")
+
+    def test_an_import_specifier_that_holds_a_secret_is_screened_in_a_real_answer(self):
+        proj = make_project(self.tmp)
+        write(proj / "src" / "odd.ts", f'import "{AWS}";\nexport const odd = 1;\n')
+        got = self.nav(proj).imports("src/odd.ts")
+        self.assertEqual(got["status"], "ok")
+        self.assertEqual(len(got["edges"]), 1)
+        self.assertNotIn(AWS, json.dumps(got))
+
+    def test_screening_everything_leaves_paths_and_names_of_an_ordinary_answer_unchanged(self):
+        proj = make_project(self.tmp)
+        got = self.nav(proj).imports("src/format.ts", direction="importers", depth=2)
+        self.assertEqual([(e["from"], e["to"], e["specifier"]) for e in got["edges"]],
+                         [("src/barrel.ts", "src/format.ts", "./format"), ("src/main.ts", "src/format.ts", "./format"),
+                          ("src/main.ts", "src/barrel.ts", "@/barrel")])
 
     def test_the_helper_gets_only_allowlisted_environment(self):
         root = self.tmp / "fake"
@@ -450,7 +575,7 @@ class Failures(TempCase):
         _, nav = self.fake("ok")
         nav.guard = mock.Mock(wraps=nav.guard)
         nav.guard.screen.side_effect = RuntimeError("boom")
-        self.assertEqual(nav.exports("a.ts")["status"], "ok")  # the fake's answer has no free text to screen
+        self.assertEqual(nav.exports("a.ts")["status"], "unavailable")  # every string is screened, so even the status needs the screen
         self.assertEqual(nav._finish({"status": "ok", "text": "x"})["status"], "unavailable")
 
 

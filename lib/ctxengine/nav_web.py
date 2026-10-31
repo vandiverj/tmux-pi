@@ -24,6 +24,11 @@ locations in `node_modules` carry `external: true` (definitions) or are dropped 
 Guard: `StubGuard` below stands in for CX1's `lib/ctxengine/redact.py` until that merges. It has the two entry points the engine
 needs, `check_path(path, root)` -> reason or None and `screen(text)` -> text, and is built from the existing `sensitive_read` and
 `redact` modules (no new patterns). When CX1 lands, pass its guard as `NavWeb(..., guard=...)` or replace `StubGuard`.
+
+The guard is applied twice. Before the helper reads: it asks this process (two inherited pipes, see `_serve_guard`) about every file, folder
+and listing entry TypeScript touches, module resolution included, and a refused path is treated as absent (an import of it is unresolved
+and its text is never loaded); anything outside the root is absent too, except TypeScript's own `lib` folder. Before an answer leaves: the
+whole answer is walked, rows and path values the guard refuses are withheld, and every other string is screened.
 """
 from collections import deque
 import json
@@ -45,7 +50,8 @@ WARM_LIMIT = 300.0
 NODE_FLAGS = ("--max-old-space-size=2048",)
 CHILD_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")  # nothing else (tokens, keys) reaches the child
 SERVER = Path(__file__).resolve().parent / "nav_web" / "server.mjs"
-TEXT_KEYS = frozenset({"text", "signature", "doc", "message"})  # free text: screened before it leaves
+PATH_KEYS = frozenset({"resolved", "defined_at", "to", "target"})  # values that name a file: withheld when the guard refuses it
+# Every other string in an answer is screened before it leaves, whatever its key.
 OPS = ("definition", "references", "exports", "imports", "stats")
 WITHHELD = "<withheld>"
 STDERR_TAIL = 8
@@ -197,15 +203,24 @@ class NavWeb:
         node = self.node or shutil.which("node")
         if not node:
             return _result("unavailable", "node is not installed or not on PATH", "install node (outside this tool)")
-        argv = [node, *NODE_FLAGS, self.server, "--root", self.root, "--tsconfig", self.tsconfig]
+        # Two pipes carry the guard to the helper: it asks (a path out), this process answers from `self.guard` (1 = may read, 0 = refused).
+        ask_r, ask_w = os.pipe()
+        answer_r, answer_w = os.pipe()
+        argv = [node, *NODE_FLAGS, self.server, "--root", self.root, "--tsconfig", self.tsconfig, "--guard-fds", f"{ask_w},{answer_r}"]
         if self.typescript:
             argv += ["--typescript", str(self.typescript)]
         env = {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                                    cwd=self.root, start_new_session=True, close_fds=True)
+                                    cwd=self.root, start_new_session=True, close_fds=True, pass_fds=(ask_w, answer_r))
         except OSError as error:
+            for fd in (ask_r, answer_w):
+                os.close(fd)
             return _result("unavailable", f"cannot start node: {error.strerror or error}", "check the node install")
+        finally:
+            for fd in (ask_w, answer_r):  # the helper holds its own copies now
+                os.close(fd)
+        threading.Thread(target=self._serve_guard, args=(ask_r, answer_w), daemon=True).start()
         lines = queue.Queue()
         threading.Thread(target=self._pump, args=(proc.stdout, lines.put), daemon=True).start()
         threading.Thread(target=self._pump, args=(proc.stderr, lambda l: l is not None and self._stderr.append(l)), daemon=True).start()
@@ -224,6 +239,20 @@ class NavWeb:
             return {k: v for k, v in first.items() if k in ("status", "message", "next")}
         self.ready = first
         return None
+
+    def _serve_guard(self, ask_r, answer_w):
+        """Answer the helper's path questions until it goes away. Any doubt (an error in the guard, a bad line) is a refusal."""
+        try:
+            with os.fdopen(ask_r, "rb") as asks, os.fdopen(answer_w, "wb", buffering=0) as answers:
+                for raw in asks:
+                    try:
+                        asked = json.loads(raw)
+                        allowed = isinstance(asked, str) and bool(asked) and not self.guard.check_path(asked, self.root)
+                    except Exception:  # noqa: BLE001 - a guard that fails refuses
+                        allowed = False
+                    answers.write(b"1\n" if allowed else b"0\n")
+        except (OSError, ValueError):
+            pass
 
     def _stderr_note(self):
         tail = " ".join(l.decode("utf-8", "replace").strip() for l in self._stderr)[:300]
@@ -323,6 +352,7 @@ class NavWeb:
         return isinstance(path, str) and bool(self.guard.check_path(os.path.join(self.root, path.split(":", 1)[0]), self.root))
 
     def _clean(self, value, withheld, key=""):
+        """Walk the whole answer: drop rows about hidden paths, withhold hidden path values, and screen every other string."""
         if isinstance(value, list):
             rows = []
             for item in value:
@@ -334,11 +364,10 @@ class NavWeb:
         if isinstance(value, dict):
             return {k: self._clean(v, withheld, k) for k, v in value.items()}
         if isinstance(value, str):
-            if key in ("resolved", "defined_at", "to", "target") and self._hidden(value):
+            if key in PATH_KEYS and self._hidden(value):
                 withheld[0] += 1
                 return WITHHELD
-            if key in TEXT_KEYS:
-                return self.guard.screen(value)
+            return self.guard.screen(value)
         return value
 
     # ---- the operations --------------------------------------------------------------------------------------------

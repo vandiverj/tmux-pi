@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "esnext",
+        "moduleResolution": "bundler",
+        "strict": true,
+        "noEmit": true,
+        "baseUrl": ".",
+        "paths": { "@/*": ["./src/*"], "@lib/*": ["./lib/*"] }
+    },
+    "include": ["src/**/*.ts"],
+    "references": [{ "path": "./lib" }]
+}

@@ -19,6 +19,7 @@ only there, so a file the walk missed is a file Deno cannot open.
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -477,14 +478,50 @@ def project_path(base, path):
     return lexical_path(base, full) or lexical_path(base, real)
 
 
-def read_source(path):
-    """The text of `path`, or None when it cannot be read or is larger than MAX_BYTES."""
+def _opened_path(fd):
+    """The path of the file open on `fd` as the kernel names it (macOS `F_GETPATH`, Linux `/proc/self/fd`), or None when that cannot
+    be asked: then no read is taken to be of a checked file."""
     try:
-        with open(path, "rb") as handle:
-            data = handle.read(MAX_BYTES + 1)
+        if hasattr(fcntl, "F_GETPATH"):
+            return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0]) or None
+        return os.readlink(f"/proc/self/fd/{fd}")
     except OSError:
         return None
-    return None if len(data) > MAX_BYTES else data.decode("utf-8", "replace")
+
+
+def read_checked(path):
+    """(bytes, opened) from one open of `path`: what was read (None when it cannot be read, is not a regular file or is larger than
+    MAX_BYTES) and the resolved path of the file that was open while it was read (None when it cannot be known). A path is judged
+    on its name before it is opened (`admit`, the walk); comparing `opened` with that judgement is what ties the bytes to it, since
+    a link swapped in between is followed by the open and shows in `opened`. No second resolution of `path` is made."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except (OSError, ValueError):
+        return None, None
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        regular = False
+    if not regular:
+        os.close(fd)
+        return None, None
+    with open(fd, "rb") as handle:  # closes `fd`
+        try:
+            opened = _opened_path(fd)
+            data = handle.read(MAX_BYTES + 1)
+        except OSError:
+            return None, None
+    return (None if len(data) > MAX_BYTES else data), opened
+
+
+def read_source(path):
+    """The text of `path` (a resolved path with no link on the way: the index's walk does not follow links), or None when it cannot
+    be read, is larger than MAX_BYTES, or the file that was opened is not the one at that name (a link swapped in after the walk
+    checked it)."""
+    data, opened = read_checked(path)
+    if data is None or opened != os.path.normpath(path):
+        return None
+    return data.decode("utf-8", "replace")
 
 
 def read_sources(paths, workers=8):
@@ -504,7 +541,8 @@ _SCAN_MEMO = {}
 
 class Unproven(Exception):
     """The walk cannot show that Deno would load only allowed files. `reason` is one of `outside_project`, `reaches_refused_path`,
-    `unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`."""
+    `unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`, `changed_during_walk` (the file opened was not
+    the one the walk had checked: a link moved in between)."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -571,13 +609,12 @@ CONFIG_UNREADABLE = ("unreadable",)
 
 
 def _config_read(path):
-    """(state, bytes or None): the state of a config file (see `_config_state`) and the bytes it was made from, from one read."""
-    if not os.path.lexists(path):
-        return CONFIG_ABSENT, None
-    data = _read_capped(path) if os.path.isfile(path) else None
-    if data is None:
-        return CONFIG_UNREADABLE, None
-    return ("content", os.path.realpath(path), _fingerprint(data)), data
+    """(state, bytes or None): the state of a config file (see `_config_state`) and the bytes it was made from, from one open. The
+    resolved path in the state is the path of the file that was open while it was read, not a second resolution of `path`."""
+    data, opened = read_checked(path)
+    if data is None or opened is None:
+        return (CONFIG_UNREADABLE if os.path.lexists(path) else CONFIG_ABSENT), None
+    return ("content", opened, _fingerprint(data)), data
 
 
 def _config_state(path):
@@ -635,11 +672,8 @@ class Reach:
 
     def holds(self):
         for rel, (real, fingerprint) in self.files.items():
-            path = os.path.join(self.base, rel)
-            if lexical_path(self.base, os.path.realpath(path)) != real:
-                return False
-            data = _read_capped(path)
-            if data is None or _fingerprint(data) != fingerprint:
+            data, opened = read_checked(os.path.join(self.base, rel))  # where it leads and what it holds, from the same open
+            if data is None or opened is None or lexical_path(self.base, opened) != real or _fingerprint(data) != fingerprint:
                 return False
         return all(_config_state(path) == state for path, state in self.configs.items())
 
@@ -708,16 +742,6 @@ class Mirror:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def _read_capped(path):
-    """The bytes of `path` when it can be read and is not larger than MAX_BYTES, else None."""
-    try:
-        with open(path, "rb") as handle:
-            data = handle.read(MAX_BYTES + 1)
-    except OSError:
-        return None
-    return None if len(data) > MAX_BYTES else data
-
-
 _PACKAGE_KEEP = ("name", "version", "type")
 _PACKAGE_DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
@@ -768,7 +792,8 @@ def prove_reach(base, entry, config, allow):
     `patch`, `vendor`, `sloppy-imports`, a `nodeModulesDir` of `manual`, or a map it cannot read or whose keys are paths or
     whose targets are `file:` URLs (`unmodelled_config`); a local `package.json` dependency (`unmodelled_config`); an `import(expr)`
     or `import.meta.resolve` anywhere in the graph (`unmodelled_import`); a source file that cannot be read or is over MAX_BYTES
-    (`unreadable_file`); a graph over MAX_REACH_FILES files (`too_many_files`).
+    (`unreadable_file`); a graph over MAX_REACH_FILES files (`too_many_files`); a file whose open leads somewhere other than the
+    path that was judged, because a link moved in between (`changed_during_walk`).
     The walk is a first check, not the only one: a file it misses is not in the mirror, so Deno cannot read it.
     The index is not used: nothing here depends on it being built."""
     base = os.path.realpath(base)
@@ -785,6 +810,8 @@ def prove_reach(base, entry, config, allow):
         reach.configs[config], raw = _config_read(config)
         if raw is None:
             raise Unproven("unreadable_file")
+        if lexical_path(base, reach.configs[config][1]) is None:
+            raise Unproven("changed_during_walk")  # the file that was read is outside the project: a link moved after the check above
         imap, details = load_config(config, raw)
         if details.get("error") or details["unmodelled"]:
             raise Unproven("unmodelled_config")
@@ -823,9 +850,11 @@ def prove_reach(base, entry, config, allow):
             continue
         if len(reach.files) >= MAX_REACH_FILES:
             raise Unproven("too_many_files")
-        data = _read_capped(path)
+        data, opened = read_checked(path)
         if data is None:
             raise Unproven("unreadable_file")
+        if opened is None or lexical_path(base, opened) != real:
+            raise Unproven("changed_during_walk")  # the bytes are of another file than the one `admit` judged
         reach.files[lexical] = (real, _fingerprint(data))
         reach.contents[lexical] = data
         if not lexical.endswith(SOURCE_EXTENSIONS):

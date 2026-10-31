@@ -1549,7 +1549,7 @@ class SandboxCase(Tree):
     def plain_modules(self, project, rel):
         """The same Deno on the project itself, without the sandbox (the control: it shows the file can be opened)."""
         run = subprocess.run([shutil.which("deno"), "info", "--json", "--no-remote", "--no-lock", "--config", str(project / "deno.json"),
-                              str(project / rel)], cwd=project, capture_output=True, env=nav_api.NavApi(str(project))._env())
+                              str(project / rel)], cwd=project, capture_output=True, env=nav_api.NavApi(str(project))._base_env())
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)["modules"]
 
@@ -1628,12 +1628,13 @@ class SandboxCase(Tree):
         exe = nav._deno_exe()
         for label, (code, works) in probes.items():
             argv = [exe, "eval", "--allow-all", "--no-lock", f"try {{ {code} }} catch (e) {{ console.log('denied ' + e.name) }}"]
-            plain = subprocess.run(argv, cwd=mirror, capture_output=True, env=nav._env()).stdout.decode()
+            plain = subprocess.run(argv, cwd=mirror, capture_output=True, env=nav._base_env()).stdout.decode()
             if works is not None:
                 self.assertEqual(plain.strip(), works, f"{label}: the control must succeed without the sandbox")
             for leftover in (secret.parent / "new.txt", mirror / "a.txt"):
                 leftover.unlink(missing_ok=True)  # what the control run wrote
-            boxed = subprocess.run(nav._sandboxed(exe, argv[1:], str(mirror)), cwd=mirror, capture_output=True, env=nav._env())
+            boxed_argv, boxed_env = nav._sandboxed(exe, argv[1:], str(mirror))
+            boxed = subprocess.run(boxed_argv, cwd=mirror, capture_output=True, env=boxed_env)
             self.assertEqual(boxed.stdout.decode().strip(), "denied PermissionDenied", (label, boxed.stderr))
             self.assertFalse((secret.parent / "new.txt").exists() or (mirror / "a.txt").exists(), label)
 
@@ -1793,10 +1794,15 @@ class SandboxGrantCase(Tree):
         link = self.dir / "cache-link"
         cache.mkdir()
         link.symlink_to(cache)
-        with self.aimed(project, DENO_DIR=link):
+        started = []
+        real = subprocess.run
+        with self.aimed(project, DENO_DIR=link), \
+                mock.patch.object(nav_api.subprocess, "run", lambda argv, *a, **k: (started.append(k["env"]), real(argv, *a, **k))[1]):
             nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
             self.assertEqual([nav.symbols("src/main.ts")["status"], nav.forward_graph("src/main.ts")["status"]], ["ok", "ok"])
-            self.assertEqual(nav._env()["DENO_DIR"], str(cache.resolve()), "Deno must get the directory that was checked, not the link")
+        self.assertTrue(started)
+        for env in started:
+            self.assertEqual(env["DENO_DIR"], str(cache.resolve()), "Deno must get the directory that was checked, not the link")
 
     def test_f1_the_production_profile_grants_the_cache_read_only(self):
         write_rules = [line for line in SANDBOX_PRODUCTION.splitlines() if line.startswith("(allow file-write*")]
@@ -1969,6 +1975,224 @@ class ProbeDirectoryCase(Tree):
         self.assertEqual(nav.symbols("src/main.ts")["status"], "error")
         parent.mkdir()
         self.assertIsNone(nav._check_sandbox())
+
+
+class CheckedValueCase(Tree):
+    """Round 7 (review 6 F1 path-boundary, F2 config-freshness, and the audit for the same pattern): every check uses the exact value
+    it hands on, and nothing runs between the final `holds()` and the return. Each test failed against f24ba54."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+
+    def spied_launches(self):
+        """Patch `subprocess.run` in nav_api to record (argv, env) of every process started; returns the list."""
+        started = []
+        real = subprocess.run
+
+        def spy(argv, *args, **kwargs):
+            started.append((list(argv), dict(kwargs.get("env") or {})))
+            return real(argv, *args, **kwargs)
+        patch = mock.patch.object(nav_api.subprocess, "run", spy)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return started
+
+    @staticmethod
+    def params(argv):
+        return dict(argv[i + 1].split("=", 1) for i, word in enumerate(argv[:-1]) if word == "-D")
+
+    def assert_launch_uses_the_checked_grants(self, argv, env, project):
+        params = self.params(argv)
+        self.assertEqual(env["DENO_DIR"], params["DENODIR"], "the cache Deno is told about must be the one the profile grants")
+        self.assertEqual(argv[argv.index("-p") + 2], params["DENOBIN"], "the program run must be the checked executable path")
+        for grant in (params["DENODIR"], params["DENOBIN"]):
+            self.assertNotEqual(os.path.commonpath([grant, str(project)]), str(project), (grant, argv))
+            self.assertFalse(str(project).startswith(grant + os.sep), (grant, argv))
+
+    @NEEDS_SANDBOX
+    def test_f1_a_cache_link_moved_into_the_project_after_the_check_is_never_granted(self):
+        """The review repro: DENO_DIR is a link to a safe directory while the grant is checked and points into the project when the
+        command and environment are made. The move is made right after each check in turn (the k-th time the guarded folders are
+        computed); whatever k, no process is started with the project granted or named as its cache."""
+        project = self.project()
+        safe = self.dir / "safe-cache"
+        safe.mkdir()
+        link = self.dir / "cache-link"
+        started = self.spied_launches()
+        for k in range(1, 12):
+            if link.is_symlink():
+                link.unlink()
+            link.symlink_to(safe)
+            with mock.patch.dict(os.environ, {"DENO_DIR": str(link)}):
+                nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+                real_roots, calls = nav._guarded_roots, []
+
+                def roots(real_roots=real_roots, calls=calls, k=k):
+                    out = real_roots()
+                    calls.append(1)
+                    if len(calls) == k:
+                        link.unlink()
+                        link.symlink_to(project)
+                    return out
+                nav._guarded_roots = roots
+                for call in (nav.symbols, nav.forward_graph):
+                    call("src/main.ts")
+        self.assertTrue(started)
+        for argv, env in started:
+            self.assert_launch_uses_the_checked_grants(argv, env, project.resolve())
+
+    @NEEDS_SANDBOX
+    def test_f1_audit_the_program_started_is_the_executable_that_was_checked(self):
+        """`deno` named through a link: the command runs the resolved, checked file, not the link (which could be moved later)."""
+        project = self.project()
+        target = self.scripted_deno(doc={"nodes": {}}, info={"modules": []})
+        link = self.dir / "deno-link"
+        link.symlink_to(target)
+        started = self.spied_launches()
+        nav = self.nav(project, deno=str(link))
+        self.assertEqual([nav.symbols("src/main.ts")["status"], nav.forward_graph("src/main.ts")["status"]], ["ok", "ok"])
+        self.assertTrue(started)
+        for argv, env in started:
+            self.assert_launch_uses_the_checked_grants(argv, env, project.resolve())
+            self.assertEqual(argv[argv.index("-p") + 2], str(Path(target).resolve()))
+
+    def config_changing_guard(self, project):
+        """A guard that rewrites the import map the first time it screens anything: a config edit while the answer is screened."""
+        state = []
+
+        def guard(text):
+            if not state:
+                state.append(1)
+                FinalHoldsCase.rewrite_import_map(project)
+            return text
+        return guard
+
+    def test_f2_a_config_change_while_the_answer_is_screened_withholds_it(self):
+        """The review repro, for every answer that rests on a proof: fresh and cached `symbols`, `forward_graph` and `imports` from
+        `deno info`."""
+        info = {"modules": [{"specifier": f"file://{MIRROR}/src/main.ts", "dependencies": []}]}
+        doc = ReviewFixesCase.doc_payload(MIRROR, "src/main.ts", "main", "d")
+        cases = {"symbols": lambda nav: nav.symbols("src/main.ts"), "forward_graph": lambda nav: nav.forward_graph("src/main.ts"),
+                 "imports via deno": lambda nav: nav.imports("src/main.ts", source="deno")}
+        for label, call in cases.items():
+            for cached in ((False, True) if label == "symbols" else (False,)):  # only `deno doc` answers are cached
+                project = self.project(f"{label}-{cached}".replace(" ", "_"))
+                deno = self.scripted_deno(doc=doc, info=info)
+                if cached:
+                    self.assertEqual(call(self.nav(project, deno=deno))["status"], "ok", label)  # fills the doc cache
+                nav = self.nav(project, deno=deno, guard=self.config_changing_guard(project))
+                answer = call(nav)
+                self.assertEqual(answer["status"], "stale_index", (label, cached, answer))
+                self.assertNotIn("symbols", answer)
+                self.assertNotIn("modules", answer)
+
+    def test_f2_an_answer_screened_without_a_change_is_still_given(self):
+        project = self.project()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), guard=lambda text: text)
+        self.assertEqual([nav.symbols("src/main.ts")["status"], nav.symbols("src/main.ts")["cached"],
+                          nav.forward_graph("src/main.ts")["status"]], ["ok", True, "ok"])
+
+    # --- the audit: a name checked, then the file read by resolving the name again
+
+    def swap_after_admit(self, project, rel, target):
+        """Patch `graph.admit` so that right after it judges `rel` the second time (the walk judges a specifier's path when it
+        queues it and again just before it reads it), the file there is replaced by a link to `target`."""
+        real = graph.admit
+        seen = []
+
+        def admit(base, path, allow):
+            out = real(base, path, allow)
+            if os.path.normpath(path) == str(project / rel):
+                seen.append(1)
+                if len(seen) == 2:
+                    os.unlink(path)
+                    os.symlink(target, path)
+            return out
+        return mock.patch.object(graph, "admit", admit)
+
+    def solo(self):
+        """A project with an entry whose one import (`src/leaf.ts`) is reached once, and a refused file to swap in for it."""
+        project = self.project().resolve()
+        write(project / "src" / "solo.ts", "import { LEAF } from './leaf.ts';\nexport const SOLO = LEAF;\n")
+        write(project / "src" / "leaf.ts", "export const LEAF = 1;\n")
+        return project, write(project / "secrets.ts", "export const LEAKED_CANARY = 1;\n")
+
+    def test_audit_the_walk_never_takes_the_bytes_of_a_file_it_did_not_check(self):
+        """`prove_reach` judged `src/leaf.ts`, then read whatever the name led to by then: a link to a refused file put its
+        bytes in the proof (and so in the mirror Deno is given, and in signature lines)."""
+        project, secret = self.solo()
+        with self.swap_after_admit(project, "src/leaf.ts", secret):
+            try:
+                reach = graph.prove_reach(str(project), str(project / "src/solo.ts"), str(project / "deno.json"),
+                                          lambda rel: nav_api.stub_check_path(project, rel) is not None)
+            except graph.Unproven as error:
+                self.assertEqual(error.reason, "changed_during_walk")
+            else:
+                self.fail(f"the walk returned a proof holding: {[r for r, d in reach.contents.items() if b'LEAKED' in d]}")
+
+    def test_audit_a_link_swapped_in_during_the_walk_gives_stale_index_from_the_answer(self):
+        project, secret = self.solo()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        with self.swap_after_admit(project, "src/leaf.ts", secret):
+            answer = nav.forward_graph("src/solo.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertNotIn("LEAKED", json.dumps(answer))
+
+    def test_audit_the_index_never_scans_a_file_swapped_for_a_link_after_the_walk(self):
+        """The index's walk saw a regular file; before it was read the name became a link to a refused file. Its specifiers must
+        not become edges."""
+        project = self.project().resolve()
+        secret = write(project / "secrets.ts", "import './LEAKED_CANARY.ts';\n")
+        real = graph.read_sources
+
+        def racing(paths, *a, **k):
+            paths = list(paths)
+            victim = str(project / "src" / "config.ts")
+            if victim in paths:
+                os.unlink(victim)
+                os.symlink(secret, victim)
+            return real(paths, *a, **k)
+        nav = self.nav(project)
+        with mock.patch.object(graph, "read_sources", racing):
+            answer = nav.imports("src/config.ts", source="index")
+        self.assertNotIn("LEAKED", json.dumps(answer))
+        self.assertNotIn("LEAKED", json.dumps(nav.importers("src/main.ts")))
+
+    def test_audit_the_config_read_is_judged_by_the_file_that_was_opened(self):
+        """The config was checked inside the project, then swapped for a link to a config outside it before it was read."""
+        project = self.project().resolve()
+        outside = write(self.dir / "elsewhere" / "deno.json", json.dumps({"imports": {"@host": "./LEAKED.ts"}}))
+        real = graph._config_read
+        done = []
+
+        def config_read(path):
+            if not done and path == str(project / "deno.json"):
+                done.append(1)
+                os.unlink(path)
+                os.symlink(outside, path)
+            return real(path)
+        with mock.patch.object(graph, "_config_read", config_read):
+            with self.assertRaises(graph.Unproven) as raised:
+                graph.prove_reach(str(project), str(project / "src/main.ts"), str(project / "deno.json"), lambda rel: True)
+        self.assertEqual(raised.exception.reason, "changed_during_walk")
+
+    def test_audit_holds_judges_where_a_file_leads_by_the_file_it_read(self):
+        project = self.project().resolve()
+        reach = graph.prove_reach(str(project), str(project / "src/config.ts"), str(project / "deno.json"), lambda rel: True)
+        self.assertTrue(reach.holds())
+        copy = write(self.dir / "elsewhere" / "config.ts", (project / "src" / "config.ts").read_text())
+        (project / "src" / "config.ts").unlink()
+        (project / "src" / "config.ts").symlink_to(copy)
+        self.assertFalse(reach.holds(), "the same bytes behind a link that leaves the project are not the proven file")
+
+    def test_audit_read_checked_names_the_opened_file(self):
+        folder = self.dir / "rc"
+        real_file = write(folder / "a.txt", "x")
+        (folder / "link").symlink_to(real_file)
+        self.assertEqual(graph.read_checked(str(folder / "link")), (b"x", str(real_file)))
+        self.assertEqual(graph.read_checked(str(folder / "missing")), (None, None))
+        self.assertEqual(graph.read_checked(str(folder)), (None, None))
+        write(folder / "big", " " * (graph.MAX_BYTES + 1))
+        self.assertIsNone(graph.read_checked(str(folder / "big"))[0])
 
 
 if __name__ == "__main__":

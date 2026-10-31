@@ -39,8 +39,9 @@ Deno is also run inside an operating-system sandbox, always (`sandbox-exec` with
 executable and cache and the system libraries, may write nothing (its cache is read only), and has no network and cannot start
 another program. So a path the mirror does not hold and the walk never saw (an absolute `file:///...` the scanner missed) cannot
 be opened either. Every path the profile grants other than the mirror (Deno's cache directory, which the worker's environment names
-with `DENO_DIR` or `XDG_CACHE_HOME`, and the Deno executable) is resolved with `realpath`, and Deno is given that resolved cache path
-in `DENO_DIR`. If it equals, contains or sits inside the project, the Deno root, the config's folder, a monorepo root (the nearest
+with `DENO_DIR` or `XDG_CACHE_HOME`, and the Deno executable) is resolved with `realpath` once per launch, and those resolved
+strings are what is checked and what is handed on: the profile's parameters, `DENO_DIR` and the program that is run. Nothing is
+resolved again after the check. If it equals, contains or sits inside the project, the Deno root, the config's folder, a monorepo root (the nearest
 folder above the project with a `.git`, any with a workspace marker) or the mirror, the call is refused with `sandbox_grant_overlap`,
 on every call, before Deno starts. If the sandbox cannot be applied (not macOS, no `sandbox-exec`, this process already in a
 sandbox) the call is refused with the reason `sandbox_unavailable` or `sandbox_failed` and Deno is not started: there is no unsandboxed path, and a cached `deno doc`
@@ -48,7 +49,8 @@ answer is not served either. Importers and imports (the index) need no Deno and 
 Afterwards the answer is held to the same list: a module Deno lists that the walk did not reach refuses the answer
 (`unproven_module`), and if any proven file, or the config or `package.json` the mirror's were made from (each one absent, unreadable or a content hash;
 a change between any two of the three counts), changed while Deno ran there is no answer (`stale_index`). That check is also the
-last step of every `ok` answer of `symbols` and `forward_graph`, one served from the cache included. A message of Deno's names
+last step of every `ok` answer of `symbols`, `forward_graph` and `imports` from `deno info`, one served from the cache included:
+it runs after the output screen, in the public method, and nothing runs between it and the return. A message of Deno's names
 only files the walk proved (any other path is `<file>`).
 
 Known limits (what is not proven):
@@ -69,6 +71,11 @@ Known limits (what is not proven):
     call, though Deno would not follow it either: the walk cannot tell. A source file over 2 MB refuses the call.
   - Modules named only by `new URL(..., import.meta.url)`, `Worker`, `require()` in CommonJS, or runtime reads are not followed; Deno
     does not load them for `info` or `doc` either, but that is Deno's behaviour, not something proven here.
+  - Every file the walk, `Reach.holds()` and the index read is judged by the file that was open while it was read (its kernel
+    path, `graph.read_checked`), not by resolving the name a second time: a link swapped in between the check of a name and its
+    read gives `stale_index` (the walk) or no edges (the index), never the bytes of another file. Where the kernel cannot name
+    an open file (not macOS or Linux), nothing is read as checked. A hard link is one file under two names; the kernel may name
+    either, so a hard-linked source file can be taken as changed (a refusal, never a wrong answer).
   - The mirror holds the bytes the walk read, so a file swapped for a link after the walk cannot reach Deno; a change to a file the
     walk read is still noticed afterwards (`stale_index`), so an answer is never given for a tree that moved.
   - Case-insensitive file systems: a name that differs from a refused one only by case is the guard's to refuse.
@@ -151,7 +158,7 @@ class Refused(Exception):
 
 
 class GrantOverlap(Exception):
-    """A path the sandbox profile would grant overlaps the project or a monorepo root (see `NavApi._grant_overlap`)."""
+    """A path the sandbox profile would grant overlaps the project or a monorepo root (see `NavApi._grants`)."""
 
 
 def stub_check_path(project, value):
@@ -332,28 +339,29 @@ class NavApi:
     def imports(self, target, source="auto"):
         """What `target` imports directly: `files` (project paths), `external` (packages, builtins, URLs) and `unresolved`.
         `source` is `auto` (the index, and `deno info` when no index can be built), `index` or `deno`."""
-        return self._out(self._imports(target, source))
+        return self._final(*self._imports(target, source))
 
     def _imports(self, target, source):
+        """(answer, reach): `reach` is the proof an answer from `deno info` rests on (None for the index)."""
         rel, error = self._target(target)
         if error:
-            return error
+            return error, None
         if source not in ("auto", "index", "deno"):
-            return _answer("bad_argument", detail="source must be auto, index or deno")
+            return _answer("bad_argument", detail="source must be auto, index or deno"), None
         if source != "deno":
             index, stats, error = self._fresh()
             if error is None:
                 edges = index.imports(rel)
                 if edges is None:
-                    return _answer("not_found", detail="the file is not an indexed source file")
+                    return _answer("not_found", detail="the file is not an indexed source file"), None
                 return _answer("stale_index" if stats["stale"] else "ok", target=rel, source="index",
                                files=[self._slim(e, "to") for e in edges if e["kind"] == "file"],
                                external=sorted({e["spec"] for e in edges if e["kind"] == "external"}),
                                unresolved=[{"line": e["line"], "spec": e["spec"], "reason": e["reason"]}
                                            for e in edges if e["kind"] == "unresolved"],
-                               **self._meta(index, stats))
+                               **self._meta(index, stats)), None
             if source == "index":
-                return error
+                return error, None
         return self._forward_graph(target)
 
     # --- deno
@@ -364,13 +372,6 @@ class NavApi:
     def _base_env(self):
         env = {key: os.environ[key] for key in DENO_ENV_KEEP if key in os.environ}
         env.update(OFFLINE_ENV)
-        return env
-
-    def _env(self):
-        """The environment Deno gets. `DENO_DIR` is always set, to the resolved directory the sandbox is told about (`_deno_dir`), so
-        a link that is moved after the check leads Deno to the checked directory or nowhere."""
-        env = self._base_env()
-        env["DENO_DIR"] = self._deno_dir()
         return env
 
     def _deno_dir(self):
@@ -402,25 +403,34 @@ class NavApi:
     def _overlaps(a, b):
         return os.path.commonpath([a, b]) in (a, b)
 
-    def _grant_overlap(self, exe, mirror=None):
-        """True when a path the profile grants (Deno's cache, the executable, each resolved with `realpath`) equals, contains or sits
-        inside the project, the Deno root, the config's folder or a monorepo root, or contains or sits inside the mirror `mirror`.
-        The mirror is the one grant that is meant to be a folder of files; every other grant is Deno's own, and a worker's
-        environment can name them."""
-        grants = [self._deno_dir()] + ([os.path.realpath(exe)] if exe else [])
-        guarded = self._guarded_roots() | ({os.path.realpath(mirror)} if mirror else set())
-        return any(self._overlaps(grant, root) for grant in grants for root in guarded)
+    def _grants(self, exe, mirror=None):
+        """{"DENODIR": Deno's cache, "DENOBIN": the executable}, each resolved with `realpath` exactly once, here, and checked as
+        those strings; raises GrantOverlap when one equals, contains or sits inside the project, the Deno root, the config's folder
+        or a monorepo root, or contains or sits inside `mirror` (the resolved mirror, checked as the string given). The mirror is
+        the one grant that is meant to be a folder of files; every other grant is Deno's own, and a worker's environment can name
+        them. The caller hands on these strings and never resolves the paths again (`_sandboxed`), so a link moved after the check
+        cannot change what is granted: the profile and `DENO_DIR` name the checked directory, and the sandbox matches the paths Deno
+        opens after their links are followed, so a link inside it that is moved later leads to a path that is not granted."""
+        grants = {"DENODIR": self._deno_dir(), "DENOBIN": os.path.realpath(exe)}
+        guarded = self._guarded_roots() | ({mirror} if mirror else set())
+        if any(self._overlaps(grant, root) for grant in grants.values() for root in guarded):
+            raise GrantOverlap()
+        return grants
 
     def _sandboxed(self, exe, args, root):
-        """The command line that runs `exe args` under `SANDBOX_PROFILE`, allowed to read `root` (a resolved directory) and Deno's own
-        files and nothing else, or None when there is no sandbox to run it in; raises GrantOverlap when a grant other than `root`
-        overlaps a guarded folder (`_grant_overlap`). Never a command line without the sandbox, and none with such a grant."""
+        """(argv, env) that run `exe args` under `SANDBOX_PROFILE`, allowed to read `root` (a resolved directory, the mirror) and
+        Deno's own files and nothing else, or None when there is no sandbox to run it in; raises GrantOverlap (`_grants`). The
+        command runs the checked executable path (`DENOBIN`), and `DENO_DIR` in `env` is the checked cache path (`DENODIR`): every
+        value in the command line and the environment is the very string that was checked. Never a command line without the
+        sandbox, and none with an overlapping grant."""
         if sys.platform != "darwin" or not os.access(SANDBOX_EXEC, os.X_OK):
             return None
-        if self._grant_overlap(exe, root):
-            raise GrantOverlap()
-        return [SANDBOX_EXEC, "-D", f"ROOT={root}", "-D", f"DENODIR={self._deno_dir()}", "-D", f"DENOBIN={os.path.realpath(exe)}",
-                "-p", SANDBOX_PROFILE, exe, *args]
+        grants = self._grants(exe, root)
+        env = self._base_env()
+        env["DENO_DIR"] = grants["DENODIR"]
+        argv = [SANDBOX_EXEC, "-D", f"ROOT={root}", "-D", f"DENODIR={grants['DENODIR']}", "-D", f"DENOBIN={grants['DENOBIN']}",
+                "-p", SANDBOX_PROFILE, grants["DENOBIN"], *args]
+        return argv, env
 
     def _check_sandbox(self):
         """None when a process can be started under the sandbox on this machine, else the reason code of the refusal. Tried once:
@@ -431,8 +441,11 @@ class NavApi:
         directory, or the executable is somewhere, that a grant must not be; checked on every call) and `SCRATCH_REASON` (no
         directory for the probe)."""
         exe = self._deno_exe()
-        if exe and self._grant_overlap(exe):
-            return "sandbox_grant_overlap"
+        if exe:
+            try:
+                self._grants(exe)  # a gate only: nothing is handed on from this check (each launch checks its own grants)
+            except GrantOverlap:
+                return "sandbox_grant_overlap"
         if self._sandbox is False:
             try:
                 scratch = tempfile.mkdtemp(prefix="tp-ctx-probe-", dir=self.mirror_parent)
@@ -441,14 +454,15 @@ class NavApi:
             try:
                 root = os.path.realpath(scratch)
                 try:
-                    argv = self._sandboxed(exe, ["--version"], root) if exe else None
+                    launch = self._sandboxed(exe, ["--version"], root) if exe else None
                 except GrantOverlap:
                     return "sandbox_grant_overlap"
-                self._sandbox = "sandbox_unavailable" if argv is None else None
+                self._sandbox = "sandbox_unavailable" if launch is None else None
                 self._version = ""
-                if argv is not None:
+                if launch is not None:
+                    argv, env = launch
                     try:
-                        run = subprocess.run(argv, cwd=root, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True,
+                        run = subprocess.run(argv, cwd=root, env=env, stdin=subprocess.DEVNULL, capture_output=True,
                                              timeout=self.timeout)
                     except subprocess.TimeoutExpired:
                         run = None  # it ran, so the sandbox was applied
@@ -471,7 +485,8 @@ class NavApi:
         return _answer("refused", reason=reason, next_step=GRANT_NEXT_STEP if reason == "sandbox_grant_overlap" else SANDBOX_NEXT_STEP)
 
     def _run_deno(self, args, cwd, root):
-        """(status, stdout, detail): runs `deno` with `args` in `cwd`, under the sandbox, which lets it read `root` (a mirror) and Deno's own
+        """(status, stdout, detail): runs `deno` with `args` in `cwd`, under the sandbox, which lets it read `root` (a mirror, as the
+        resolved path `graph.Mirror.root`; it is checked and granted as given, never resolved again) and Deno's own
         files and nothing else, never longer than the timeout. When the sandbox cannot be applied nothing is run: the status is `refused` and
         the detail the reason code. The detail is not screened here; `_out` screens the answer it ends up in."""
         exe = self._deno_exe()
@@ -481,13 +496,14 @@ class NavApi:
         if reason:
             return "refused", "", reason
         try:
-            argv = self._sandboxed(exe, args, os.path.realpath(root))
+            launch = self._sandboxed(exe, args, root)
         except GrantOverlap:
             return "refused", "", "sandbox_grant_overlap"
-        if argv is None:
+        if launch is None:
             return "refused", "", "sandbox_unavailable"
+        argv, env = launch
         try:
-            run = subprocess.run(argv, cwd=cwd, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True, timeout=self.timeout)
+            run = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return "timeout", "", f"deno took longer than {self.timeout} s"
         except OSError as error:
@@ -519,6 +535,8 @@ class NavApi:
         try:
             return graph.prove_reach(self.project_root, os.path.join(self.project_root, rel), self.config, self._permits), None
         except graph.Unproven as error:
+            if error.reason == "changed_during_walk":  # a link moved while the walk read: ask again
+                return None, _answer("stale_index", detail="a file changed while it was being read")
             return None, _answer("refused", reason=error.reason)
         except Exception:
             return None, _answer("refused", reason="precheck_failed")
@@ -548,13 +566,17 @@ class NavApi:
             return _answer("stale_index", detail="a file changed while Deno was reading it"), None, None
         return None, out, mirror
 
-    @staticmethod
-    def _held(reach, answer):
-        """`answer`, unless it is an answer for a tree that has moved: the last step before any `ok` answer that rests on a proof
-        (cached or fresh) is `reach.holds()`, so no later step can leave a stale answer behind. Config files count (`Reach.configs`)."""
-        if answer["status"] == "ok" and not reach.holds():
-            return _answer("stale_index", detail="a file changed while the answer was being made")
-        return answer
+    def _final(self, answer, reach):
+        """What a public operation returns: `answer` screened (`_out`), and then, when it is an `ok` answer that rests on a proof
+        (`reach`, cached or fresh), `reach.holds()` as the very last step: the screen runs before it, so nothing (the guard
+        included) runs between the check and the return of an `ok` answer. Config files count (`Reach.configs`). A tree that moved
+        gives `stale_index`, which carries nothing from the answer."""
+        out = self._out(answer)
+        if reach is None or out["status"] != "ok":
+            return out
+        if reach.holds():
+            return out
+        return self._out(_answer("stale_index", detail="a file changed while the answer was being made"))
 
     @staticmethod
     def _scrub(text, mirror, names):
@@ -572,28 +594,29 @@ class NavApi:
         """The local modules `target` reaches, from `deno info --json` (30 s cap): {"modules": [{"path", "imports": [paths]}]}.
         Only files inside the project are listed; packages and URLs are counted in `external`. When the graph is longer than
         MAX_MODULES, `target` and its direct imports are kept and the rest is cut in path order."""
-        return self._out(self._forward_graph(target))
+        return self._final(*self._forward_graph(target))
 
     def _forward_graph(self, target):
+        """(answer, reach); the public wrapper makes the final check (`_final`)."""
         rel, error = self._target(target)
         if error:
-            return error
+            return error, None
         full = os.path.join(self.project_root, rel)
         if not os.path.isfile(full):
-            return _answer("not_found", detail="no such file in the project")
+            return _answer("not_found", detail="no such file in the project"), None
         reach, refusal = self._prove(rel)
         if refusal:
-            return refusal
+            return refusal, None
         refusal, out, mirror = self._run_mirrored(["info", "--json", "--no-remote", "--no-lock"], reach)
         if refusal:
-            return refusal
+            return refusal, None
         try:
             data = json.loads(out)
             modules = data["modules"]
         except (ValueError, KeyError, TypeError):
-            return _answer("error", detail="deno info gave output that is not a module graph")
+            return _answer("error", detail="deno info gave output that is not a module graph"), None
         if not isinstance(modules, list):
-            return _answer("error", detail="deno info gave output that is not a module graph")
+            return _answer("error", detail="deno info gave output that is not a module graph"), None
         names = reach.names
         local, external = {}, 0
         for module in modules:
@@ -607,7 +630,7 @@ class NavApi:
             if inside is None or inside not in names:
                 if module.get("error") and inside is not None:
                     continue  # a module Deno could not load (not in the mirror): nothing was read, nothing to list
-                return _answer("refused", reason="unproven_module")  # Deno loaded a file the walk did not show allowed
+                return _answer("refused", reason="unproven_module"), None  # Deno loaded a file the walk did not show allowed
             deps = set()
             for dep in module.get("dependencies") or []:
                 if not isinstance(dep, dict):
@@ -625,31 +648,32 @@ class NavApi:
                 break
             chosen.add(path)
         listed = [{"path": path, "imports": local[path]} for path in sorted(chosen)]
-        return self._held(reach, _answer("ok", target=rel, source="deno_info", modules=listed, truncated=len(local) > len(listed),
-                                         total=len(local), external=external))
+        return _answer("ok", target=rel, source="deno_info", modules=listed, truncated=len(local) > len(listed), total=len(local),
+                       external=external), reach
 
     def symbols(self, path, limit=MAX_SYMBOLS):
         """The exported symbols of `path` from `deno doc --json`: name, kind, definition path and line, the definition's source
         line as `signature`, and the first doc-comment lines. A re-export is listed at the file that defines it."""
-        return self._out(self._symbols(path, limit))
+        return self._final(*self._symbols(path, limit))
 
     def _symbols(self, path, limit):
+        """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one."""
         rel, error = self._target(path)
         if error:
-            return error
+            return error, None
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-            return _answer("bad_argument", detail="limit must be a whole number from 1 to 100")
+            return _answer("bad_argument", detail="limit must be a whole number from 1 to 100"), None
         full = os.path.join(self.project_root, rel)
         if not os.path.isfile(full):
-            return _answer("not_found", detail="no such file in the project")
+            return _answer("not_found", detail="no such file in the project"), None
         if self._deno_exe() is None:
-            return _answer("unavailable", detail="deno was not found on PATH")
+            return _answer("unavailable", detail="deno was not found on PATH"), None
         reach, refusal = self._prove(rel)
         if refusal:
-            return refusal
+            return refusal, None
         reason = self._check_sandbox()
         if reason:  # not even a cached answer: with no sandbox Deno is not run, so nothing is answered from what it said
-            return self._sandbox_refusal(reason)
+            return self._sandbox_refusal(reason), None
         names = reach.names
         key = self._doc_key(rel, reach)
         cached = self._read_cache("doc", key)
@@ -658,15 +682,15 @@ class NavApi:
         else:
             refusal, out, mirror = self._run_mirrored(["doc", "--json", "--no-remote", "--no-lock"], reach)
             if refusal:
-                return refusal
+                return refusal, None
             found = self._parse_doc(out, names, mirror, reach)
             if found is None:
-                return _answer("error", detail="deno doc gave output that is not a symbol list")
+                return _answer("error", detail="deno doc gave output that is not a symbol list"), None
             self._write_cache("doc", key, found)
             hit = False
         shown = [item for item in (self._present(entry, names) for entry in found) if item]
-        return self._held(reach, _answer("ok", path=rel, source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
-                                         symbols=shown[:limit]))
+        return _answer("ok", path=rel, source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
+                       symbols=shown[:limit]), reach
 
     def _present(self, entry, names):
         """One cached or fresh symbol as it may leave the process: None when its path is refused now, or is not one of the files

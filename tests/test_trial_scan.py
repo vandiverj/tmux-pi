@@ -130,9 +130,10 @@ class WriteRuleTests(unittest.TestCase):
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "echo a#b; sleep 2\n"), ["fixed_wait"])
 
     def test_deeply_nested_interpolations_do_not_crash_and_still_count_a_wait(self):
-        for path, unit in (("tests/test_a.py", 'f"{'), ("src/a.test.ts", "`${"), ("tests/run.sh", '"$(')):
+        for path, unit, wait in (("tests/test_a.py", 'f"{', "time.sleep(1)"), ("src/a.test.ts", "`${", "time.sleep(1)"),
+                                 ("tests/run.sh", '"$(', "sleep 1")):
             with self.subTest(path=path):
-                self.assertEqual(trial_scan.write_slips(path, unit * 5000 + "time.sleep(1)\n"), ["fixed_wait"])
+                self.assertEqual(trial_scan.write_slips(path, unit * 5000 + wait + "\n"), ["fixed_wait"])
                 self.assertEqual(trial_scan.write_slips(path, unit * 5000 + "\n"), [])
 
     def test_code_keeps_its_lines(self):
@@ -143,6 +144,68 @@ class WriteRuleTests(unittest.TestCase):
 
     def test_the_code_after_a_block_comment_is_scanned(self):
         self.assertEqual(trial_scan.write_slips("src/a.test.ts", "/* x */ setTimeout(r, 5)\n"), ["fixed_wait"])
+
+    # Rule: a wait is flagged only when it is positively a call token in code that runs.
+    def test_a_regex_literal_is_not_code_that_waits(self):
+        for text in ("const matcher = /setTimeout(done, 50)/;\n", "if (/sleep\\(/.test(src)) run()\n",
+                     "const r = /[/]setTimeout(/g;\n", "return /setTimeout(/.test(s)\n", "x = s.split(/a\\/setTimeout(/)\n",
+                     "const m = cond ? /setTimeout(/ : null\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("src/a.test.ts", text), [])
+
+    def test_a_wait_beside_a_regex_or_a_division_is_still_a_wait(self):
+        for text in ("const m = /x/g; setTimeout(r, 5)\n", "const u = /https?:\\/\\//; setTimeout(r, 5)\n",
+                     "const q = a / b; setTimeout(r, 5)\n", "x = total / 2 / 3; setTimeout(r, 5)\n",
+                     "const q = arr[0] / 2; setTimeout(r, 5)\n", "const c = /[//]/; setTimeout(r, 5)\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("src/a.test.ts", text), ["fixed_wait"])
+
+    def test_a_slash_that_may_be_a_division_or_a_regex_flags_nothing_on_its_line_only(self):
+        for text in ("f(a) / 2; setTimeout(r, 5)\n", "x = /abc setTimeout(r, 5)\n", "const q = (a) /b/ 2; setTimeout(r, 5)\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("src/a.test.ts", text), [])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "f(a) / 2\nsetTimeout(r, 5)\n"), ["fixed_wait"])
+
+    def test_timer_ok_counts_only_in_a_comment(self):
+        for path, text in (("tests/test_a.py", 'marker = "timer-ok"; time.sleep(2)\n'),
+                           ("src/a.test.ts", "const m = 'timer-ok'; setTimeout(r, 5)\n"),
+                           ("src/a.test.ts", "const m = `timer-ok`; setTimeout(r, 5)\n"),
+                           ("src/a.test.ts", "const m = /timer-ok/; setTimeout(r, 5)\n"),
+                           ("tests/run.sh", "echo 'timer-ok'; sleep 2\n"),
+                           ("tests/test_a.py", "# timer-ok\ntime.sleep(2)\n"),
+                           ("src/a.test.ts", "/* timer-ok */\nsetTimeout(r, 5)\n")):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), ["fixed_wait"])
+
+    def test_a_timer_ok_comment_on_the_line_of_the_wait_clears_it(self):
+        for path, text in (("tests/test_a.py", "time.sleep(2)  # timer-ok: fake clock\n"),
+                           ("src/a.test.ts", "setTimeout(r, 5) // timer-ok\n"),
+                           ("src/a.test.ts", "setTimeout(r, 5) /* timer-ok */\n"),
+                           ("src/a.test.ts", "/* why:\n timer-ok */ setTimeout(r, 5)\n"),
+                           ("tests/run.sh", "sleep 2  # timer-ok\n"),
+                           ("tests/test_a.py", 'x = "a"; time.sleep(2)  # timer-ok\n')):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), [])
+
+    def test_a_definition_or_a_file_of_unknown_kind_is_not_a_wait_call(self):
+        self.assertEqual(trial_scan.write_slips("tests/test_a.py", "async def sleep(n):\n    pass\n"), [])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "function sleep(ms) { return ms }\n"), [])
+        self.assertEqual(trial_scan.write_slips("tests/test_a.py", "await sleep(1)\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "await sleep(100)\n"), ["fixed_wait"])
+        for path in ("tests/notes.md", "tests/fixtures/a.json", "tests/page.html", "tests/a.rb"):
+            self.assertEqual(trial_scan.write_slips(path, "setTimeout(done, 5)\ntime.sleep(2)\nsleep 2\n"), [], path)
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "sleep 2\n"), [])
+        self.assertEqual(trial_scan.write_slips("tests/test_a.py", "sleep 2\n"), [])
+
+    def test_a_shell_wait_is_only_a_command(self):
+        for text in ("echo sleep 5\n", "cat <<EOF\nsleep 2\nEOF\n", "cat <<-'EOF' > t.sh\n\tsleep 2\n\tEOF\n",
+                     "rsync a b \\\n  sleep 2\n", "grep sleep 2 file\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("tests/run.sh", text), [])
+        for text in ("if x; then sleep 2; fi\n", "while true; do\n  sleep 1\ndone\n", "make && sleep 2\n", "sleep 2 &\n",
+                     "cat <<EOF >x\nbody\nEOF\nsleep 2\n", "echo $((1<<3)); sleep 2\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("tests/run.sh", text), ["fixed_wait"])
 
 
 class MessageRuleTests(unittest.TestCase):
@@ -202,6 +265,46 @@ class GateKindTests(unittest.TestCase):
 
     def test_a_redirect_ampersand_does_not_split(self):
         self.assertEqual(trial_scan.gate_kinds("npm test 2>&1 | tail -3"), ["test"])
+
+    def test_a_gate_inside_a_command_substitution_is_found_with_no_exit(self):
+        ran = [{"kind": "test", "exit": None}]
+        for command in ('echo "$(npm test)"', "echo `npm test`", "x=$(npm test)", "diff <(npm test) b", 'echo "$(echo "$(npm test)")"',
+                        "echo $(npm test | tail -3)", 'echo "$(echo \\"x\\"; npm test)"'):
+            with self.subTest(command=command):
+                self.assertEqual(trial_scan.gate_kinds(command), ["test"])
+                self.assertEqual(trial_scan.gate_runs(command, 0), ran)
+                self.assertEqual(trial_scan.gate_runs(command, 1)[0]["exit"], None)  # the substitution's own status is not shown
+
+    def test_a_substitution_that_does_not_run_is_not_a_gate_run(self):
+        for command in ("echo '$(npm test)'", "echo \\$(npm test)", "echo $((1+2))", "echo '`npm test`'"):
+            with self.subTest(command=command):
+                self.assertEqual(trial_scan.gate_kinds(command), [])
+                self.assertEqual(trial_scan.gate_runs(command, 0), [])
+
+    def test_a_gate_in_a_substitution_follows_its_units_run_or_skip(self):
+        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", 1), [])
+        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", None), [{"kind": "test", "exit": None, "uncertain": True}])
+        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", 0), [{"kind": "test", "exit": None}])
+        self.assertEqual(trial_scan.gate_runs("echo $(npm test) || npx tsc", 0), [{"kind": "test", "exit": None}])
+
+    def test_gates_in_a_substitution_and_around_it_keep_their_order_and_the_outer_exit(self):
+        self.assertEqual(trial_scan.gate_runs("npm run lint && echo $(npm test) && npx tsc --noEmit", 0),
+                         [{"kind": "lint", "exit": 0}, {"kind": "test", "exit": None}, {"kind": "tsc", "exit": 0}])
+        self.assertEqual(trial_scan.gate_runs("FOO=$(cat a) npm test", 1), [{"kind": "test", "exit": 1}])
+        self.assertEqual(trial_scan.gate_kinds("x=$(cd a && npm test) && npx tsc"), ["test", "tsc"])
+        self.assertEqual(trial_scan.gate_runs("x=$(cd a && npm test) && npx tsc", 0),
+                         [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "tsc", "exit": 0}])
+
+    def test_a_heredoc_body_is_data_not_commands(self):
+        message = 'git commit -m "$(cat <<\'EOF\'\nnpm test\nEOF\n)"'
+        self.assertEqual(trial_scan.gate_kinds(message), [])
+        self.assertEqual(trial_scan.gate_runs("cat <<EOF\nnpm test\nEOF\nnpm run lint", 0), [{"kind": "lint", "exit": 0}])
+        self.assertEqual(trial_scan.gate_kinds("echo $((1<<3)) && npm test"), ["test"])
+        self.assertEqual(trial_scan.gate_kinds("cat <<EOF\nnpm test\n"), ["test"])  # no end line: not read as a heredoc
+
+    def test_deeply_nested_substitutions_do_not_crash(self):
+        self.assertEqual(trial_scan.gate_runs("echo " + "$(" * 5000 + "npm test", 0), [])
+        self.assertEqual(trial_scan.gate_runs("echo " + '"$(' * 5000 + "npm test", 0), [])
 
     def test_repeated_gates_are_kept(self):
         self.assertEqual(trial_scan.gate_kinds("npm test; npm test"), ["test", "test"])
@@ -370,6 +473,13 @@ class ClaudeScanTests(unittest.TestCase):
 
     def test_no_result_leaves_later_branches_uncertain_and_exits_unknown(self):
         self.assertEqual(self.gates("npm test && npm run lint"), [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}])
+
+    def test_a_gate_in_a_substitution_is_counted_and_denied_with_its_call(self):
+        self.assertEqual(self.gates('echo "$(npm test)"', "done"), [{"kind": "test", "exit": None}])
+        self.assertEqual(self.gates('echo "$(npm test)" > /no/dir/f', "Exit code 1\nboom", error=True), [{"kind": "test", "exit": None}])
+        self.assertEqual(self.gates('echo "$(npm test)"', "The user denied this tool call", error=True),
+                         [{"kind": "test", "exit": None, "denied": True}])
+        self.assertEqual(trial_scan.gate_totals(self.gates('echo "$(npm test)"', "done"))["total"], 1)
 
     def test_denied_chain_counts_no_run(self):
         out = self.scan(use("a", "Bash", command="npm test && npm run lint"),

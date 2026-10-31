@@ -25,6 +25,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -44,6 +45,9 @@ MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_TEXT = 2000
 MAX_NOTE = 1000
 LOCK_SECONDS = 2.0
+# Threads of one process queue here (blocking, bounded) instead of all polling flock: polling is unfair
+# and starved a thread past LOCK_SECONDS under load. flock still serialises separate processes.
+_THREAD_LOCK = threading.Lock()
 SELECTION_ID = re.compile(r"^sel-[0-9a-f]{32}$")
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RATINGS = ("good", "acceptable", "poor", "wrong")
@@ -242,6 +246,15 @@ def append_jsonl(directory, name, record):
     if len(line) > MAX_RECORD_BYTES + 1:
         raise EvalLogError("record is larger than {} bytes".format(MAX_RECORD_BYTES))
     directory = Path(directory)
+    if not _THREAD_LOCK.acquire(timeout=LOCK_SECONDS * 4):
+        raise EvalLogError("eval log is locked")
+    try:
+        _append_locked(directory, name, line)
+    finally:
+        _THREAD_LOCK.release()
+
+
+def _append_locked(directory, name, line):
     try:
         if directory.is_symlink():
             raise EvalLogError("eval dir is a symlink: {}".format(directory))

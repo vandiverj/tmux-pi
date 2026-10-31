@@ -57,7 +57,7 @@ class LauncherCase(unittest.TestCase):
 def with_docs_pi(golden):
     """What tp-pi should launch with TP_DOCS_TOOLS=1: docs.ts after the last file extension, and the tool names on --tools."""
     argv = list(golden)
-    if argv[:2] == ["--no-skills", "--extra"]:  # strict mode hands pi over untouched
+    if "--no-context-files" not in argv:  # strict mode hands pi over with only --no-skills and the kill guard
         return argv
     last = max(i for i, a in enumerate(argv) if a == "--extension" and argv[i + 1].endswith(".ts"))
     argv[last + 2:last + 2] = ["--extension", "{ROOT}/agent/extensions/docs.ts"]

@@ -95,9 +95,10 @@ class PiLauncherTests(unittest.TestCase):
             self.assertEqual(argv[:3], ["--no-skills", "--no-context-files", "--no-extensions"], extra)
             self.assertTrue(all(Path(path).is_file() for path in self.extensions(argv)), extra)
 
-    def test_strict_launch_is_unchanged(self):
-        self.assertEqual(self.launched("--extra", TP_MODE="strict"), ["--no-skills", "--extra"])
-        self.assertEqual(self.launched(TP_MODE="strict", TP_TASK_DIR=str(self.base / "task")), ["--no-skills"])
+    def test_strict_launch_adds_only_the_kill_guard(self):
+        guard = ["--extension", str(ROOT / "agent/extensions/kill-guard.ts")]
+        self.assertEqual(self.launched("--extra", TP_MODE="strict"), ["--no-skills", *guard, "--extra"])
+        self.assertEqual(self.launched(TP_MODE="strict", TP_TASK_DIR=str(self.base / "task")), ["--no-skills", *guard])
 
     def test_caller_tools_flag_is_the_only_one_outside_the_orchestrator_main(self):
         argv = self.launched("--tools", "read,grep,find,ls")
@@ -107,7 +108,8 @@ class PiLauncherTests(unittest.TestCase):
         argv = self.launched(TP_MODE="orchestrator")
         files = [Path(path) for path in self.extensions(argv) if not path.startswith("builtin:")]
         self.assertEqual({path.name for path in files}, {"reporter.ts", "sensitive.ts", "orchestration.ts",
-                                                         "assistant.ts", "catalogue.ts", "offload.ts", "safe.ts"})
+                                                         "assistant.ts", "catalogue.ts", "offload.ts", "safe.ts",
+                                                         "kill-guard.ts"})
         registered = set()
         for path in files:
             source = path.read_text()

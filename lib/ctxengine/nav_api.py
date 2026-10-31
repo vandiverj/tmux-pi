@@ -71,9 +71,11 @@ Known limits (what is not proven):
     call, though Deno would not follow it either: the walk cannot tell. A source file over 2 MB refuses the call.
   - Modules named only by `new URL(..., import.meta.url)`, `Worker`, `require()` in CommonJS, or runtime reads are not followed; Deno
     does not load them for `info` or `doc` either, but that is Deno's behaviour, not something proven here.
-  - Every file the walk, `Reach.holds()` and the index read is judged by the file that was open while it was read (its kernel
-    path, `graph.read_checked`), not by resolving the name a second time: a link swapped in between the check of a name and its
-    read gives `stale_index` (the walk) or no edges (the index), never the bytes of another file. Where the kernel cannot name
+  - There is one way to read a file's bytes in this module and in `graph`: `graph.read_bounded`. It opens the file, asks the
+    kernel which file is open, checks that it is the path the caller judged, inside the project (or the cache directory) and
+    allowed by the guard, and only then reads; a file that fails a check is never read. That covers sources, the Deno config,
+    overlays, `package.json` files and both caches. A link swapped in between the check of a name and its read gives
+    `stale_index` (the walk) or no edges (the index), and its bytes are not read. Where the kernel cannot name
     an open file (not macOS or Linux), nothing is read as checked. A hard link is one file under two names; the kernel may name
     either, so a hard-linked source file can be taken as changed (a refusal, never a wrong answer).
   - The mirror holds the bytes the walk read, so a file swapped for a link after the walk cannot reach Deno; a change to a file the
@@ -747,14 +749,7 @@ class NavApi:
         return _digest(rel, reach.digest(), self.deno_version() or "")[:40]
 
     def _read_cache(self, kind, key):
-        path = self._cache_file(kind, key)
-        if os.path.islink(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            return None
+        data = graph.read_cache_json(self._cache_file(kind, key))  # not through a link, and only a file directly in the cache dir
         return data if isinstance(data, list) else None
 
     def _write_cache(self, kind, key, value):
@@ -764,8 +759,9 @@ class NavApi:
         temp = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
-            with open(temp, "w", encoding="utf-8") as handle:
-                json.dump(value, handle, separators=(",", ":"))
+            if os.path.lexists(temp):
+                os.unlink(temp)  # left by a crashed run of this process id
+            graph.write_new(temp, json.dumps(value, separators=(",", ":")).encode("utf-8"))
             os.replace(temp, path)
         except OSError:
             try:

@@ -306,8 +306,8 @@ class IndexCase(Tree):
         target.write_text("export const lazy = 1; // first edit\n")
         real = graph.read_sources
 
-        def racing(paths, workers=8):
-            out = real(paths, workers)
+        def racing(paths, *a, **k):
+            out = real(paths, *a, **k)
             target.write_text("import './config.ts'; // second edit, a different size\n")
             return out
 
@@ -561,7 +561,7 @@ class ReviewFixesCase(Tree):
                                            "export { KEY, c };\n")
         opened = []
         real = graph.read_source
-        with mock.patch.object(graph, "read_source", lambda path: opened.append(path) or real(path)):
+        with mock.patch.object(graph, "read_source", lambda path, *a: opened.append(path) or real(path, *a)):
             answer = self.nav(project).imports("src/gate.ts")
         self.assertFalse([p for p in opened if p.endswith((".env.ts", "credentials.ts"))], opened)
         self.assertEqual(answer["status"], "ok")
@@ -1899,18 +1899,19 @@ class FinalHoldsCase(Tree):
     def test_f3_the_state_of_a_config_file_has_three_values(self):
         folder = self.dir / "states"
         folder.mkdir()
-        absent = graph._config_state(str(folder / "a.json"))
-        content = graph._config_state(str(write(folder / "b.json", "{}")))
+        state = lambda path: graph._config_state(path, str(folder), lambda rel: True)  # noqa: E731
+        absent = state(str(folder / "a.json"))
+        content = state(str(write(folder / "b.json", "{}")))
         big = write(folder / "c.json", " " * (graph.MAX_BYTES + 1))
-        unreadable = graph._config_state(str(big))
+        unreadable = state(str(big))
         self.assertEqual(len({absent, content, unreadable}), 3, (absent, content, unreadable))
-        self.assertEqual(graph._config_state(str(folder / "a.json")), absent)
-        self.assertEqual(graph._config_state(str(folder / "b.json")), content)
+        self.assertEqual(state(str(folder / "a.json")), absent)
+        self.assertEqual(state(str(folder / "b.json")), content)
         (folder / "d.json").mkdir()
-        self.assertNotEqual(graph._config_state(str(folder / "d.json")), absent)  # something is there, and it is not a readable file
+        self.assertNotEqual(state(str(folder / "d.json")), absent)  # something is there, and it is not a readable file
         os.chmod(folder / "b.json", 0)
         self.addCleanup(os.chmod, folder / "b.json", 0o644)
-        self.assertEqual(graph._config_state(str(folder / "b.json")), unreadable) if os.geteuid() else None
+        self.assertEqual(state(str(folder / "b.json")), unreadable) if os.geteuid() else None
 
     def assert_stale_when(self, make, change, files_present=True):
         for call in ("symbols", "forward_graph"):
@@ -2164,12 +2165,12 @@ class CheckedValueCase(Tree):
         real = graph._config_read
         done = []
 
-        def config_read(path):
+        def config_read(path, *a):
             if not done and path == str(project / "deno.json"):
                 done.append(1)
                 os.unlink(path)
                 os.symlink(outside, path)
-            return real(path)
+            return real(path, *a)
         with mock.patch.object(graph, "_config_read", config_read):
             with self.assertRaises(graph.Unproven) as raised:
                 graph.prove_reach(str(project), str(project / "src/main.ts"), str(project / "deno.json"), lambda rel: True)
@@ -2184,15 +2185,247 @@ class CheckedValueCase(Tree):
         (project / "src" / "config.ts").symlink_to(copy)
         self.assertFalse(reach.holds(), "the same bytes behind a link that leaves the project are not the proven file")
 
-    def test_audit_read_checked_names_the_opened_file(self):
+    def test_audit_read_bounded_names_the_opened_file(self):
         folder = self.dir / "rc"
         real_file = write(folder / "a.txt", "x")
         (folder / "link").symlink_to(real_file)
-        self.assertEqual(graph.read_checked(str(folder / "link")), (b"x", str(real_file)))
-        self.assertEqual(graph.read_checked(str(folder / "missing")), (None, None))
-        self.assertEqual(graph.read_checked(str(folder)), (None, None))
+        yes = lambda rel: True  # noqa: E731
+        self.assertEqual(graph.read_bounded(str(folder / "link"), str(real_file), str(folder), yes), ("ok", b"x", str(real_file)))
+        self.assertEqual(graph.read_bounded(str(folder / "missing"), str(folder / "missing"), str(folder), yes), ("absent", None, None))
+        self.assertEqual(graph.read_bounded(str(folder), str(folder), str(self.dir), yes)[:2], ("unreadable", None))
         write(folder / "big", " " * (graph.MAX_BYTES + 1))
-        self.assertIsNone(graph.read_checked(str(folder / "big"))[0])
+        self.assertIsNone(graph.read_bounded(str(folder / "big"), str(folder / "big"), str(folder), yes)[1])
+
+class ReadRecorder:
+    """Records the path (as the kernel names it) of every file whose bytes graph.py reads: through `os.read` (the bounded reader) or
+    through a handle `open()` makes in graph.py (any other way). Opening a file is not recorded; reading from it is."""
+
+    def __init__(self, test):
+        self.paths = []
+        real_read = os.read
+        real_open = open
+
+        def os_read(fd, n):
+            self.paths.append(graph._opened_path(fd))
+            return real_read(fd, n)
+
+        def graph_open(file, mode="r", *args, **kwargs):
+            handle = real_open(file, mode, *args, **kwargs)
+            if not any(flag in mode for flag in "wxa"):
+                self.paths.append(graph._opened_path(handle.fileno()))
+            return handle
+        for patch in (mock.patch.object(os, "read", os_read), mock.patch.object(graph, "open", graph_open, create=True)):
+            patch.start()
+            test.addCleanup(patch.stop)
+
+    def read(self, path):
+        return str(Path(path).resolve()) in self.paths
+
+
+class BoundedReadCase(Tree):
+    """Round 8 (review 7 F1-F2, path-boundary): there is one way to read file bytes in graph.py and nav_api.py, `read_bounded`,
+    which checks the opened file (admitted, inside the boundary, allowed) before it reads. Each repro failed against d977e72."""
+
+    solo = CheckedValueCase.solo
+    swap_after_admit = CheckedValueCase.swap_after_admit
+
+    def outside(self, name="outside.json", text=None):
+        return write(self.dir / "elsewhere" / name, text if text is not None else json.dumps({"name": "outside-name", "type": "module"}))
+
+    # --- review 7 F1: package.json
+
+    def test_r7_f1_a_root_package_json_linked_outside_is_refused_and_not_read(self):
+        project = self.project().resolve()
+        outside = self.outside()
+        (project / "package.json").symlink_to(outside)
+        recorder = ReadRecorder(self)
+        with self.assertRaises(graph.Unproven) as raised:
+            graph.prove_reach(str(project), str(project / "src/config.ts"), str(project / "deno.json"), lambda rel: True)
+        self.assertEqual(raised.exception.reason, "outside_project")
+        self.assertFalse(recorder.read(outside), "the outside package.json was read")
+
+    def test_r7_f1_a_config_folder_package_json_linked_outside_is_refused_and_not_read(self):
+        project = self.project().resolve()
+        write(project / "api" / "deno.json", "{}")
+        outside = self.outside()
+        (project / "api" / "package.json").symlink_to(outside)
+        recorder = ReadRecorder(self)
+        with self.assertRaises(graph.Unproven) as raised:
+            graph.prove_reach(str(project), str(project / "src/config.ts"), str(project / "api" / "deno.json"), lambda rel: True)
+        self.assertEqual(raised.exception.reason, "outside_project")
+        self.assertFalse(recorder.read(outside))
+
+    def test_r7_f1_a_refused_package_json_is_not_read(self):
+        project = self.project().resolve()
+        write(project / "package.json", json.dumps({"name": "x"}))
+        recorder = ReadRecorder(self)
+        with self.assertRaises(graph.Unproven) as raised:
+            graph.prove_reach(str(project), str(project / "src/config.ts"), str(project / "deno.json"),
+                              lambda rel: rel != "package.json")
+        self.assertEqual(raised.exception.reason, "reaches_refused_path")
+        self.assertFalse(recorder.read(project / "package.json"))
+
+    def test_r7_f1_an_absent_config_that_becomes_a_link_outside_is_never_read(self):
+        project = self.project().resolve()
+        outside = self.outside("deno.json", json.dumps({"imports": {"@x": "./LEAKED.ts"}}))
+        config = project / "conf" / "deno.json"
+        config.parent.mkdir()
+        recorder = ReadRecorder(self)
+        real_isfile = os.path.isfile
+
+        def isfile(path):  # the walk sees no config, then a link to an outside one appears before its state is taken
+            got = real_isfile(path)
+            if path == str(config) and not os.path.lexists(config):
+                config.symlink_to(outside)
+            return got
+        with mock.patch.object(graph.os.path, "isfile", isfile):
+            reach = graph.prove_reach(str(project), str(project / "src/config.ts"), str(config), lambda rel: True)
+        self.assertEqual(reach.configs[str(config)], graph.CONFIG_OUTSIDE)
+        self.assertFalse(recorder.read(outside))
+        self.assertTrue(reach.holds())  # still a link outside: the state has not changed, and holds() reads it no more than the walk
+
+    # --- review 7 F2: a swapped refused file is checked before it is read
+
+    def test_r7_f2_a_refused_file_swapped_in_after_admit_is_never_read(self):
+        project, secret = self.solo()
+        recorder = ReadRecorder(self)
+        with self.swap_after_admit(project, "src/leaf.ts", secret):
+            with self.assertRaises(graph.Unproven) as raised:
+                graph.prove_reach(str(project), str(project / "src/solo.ts"), str(project / "deno.json"),
+                                  lambda rel: nav_api.stub_check_path(project, rel) is not None)
+        self.assertEqual(raised.exception.reason, "changed_during_walk")
+        self.assertFalse(recorder.read(secret), "the refused file's bytes were read before the swap was noticed")
+
+    def test_r7_f2_holds_does_not_read_a_refused_file_swapped_in(self):
+        project, secret = self.solo()
+        allow = lambda rel: nav_api.stub_check_path(project, rel) is not None  # noqa: E731
+        reach = graph.prove_reach(str(project), str(project / "src/solo.ts"), str(project / "deno.json"), allow)
+        os.unlink(project / "src" / "leaf.ts")
+        os.symlink(secret, project / "src" / "leaf.ts")
+        recorder = ReadRecorder(self)
+        self.assertFalse(reach.holds())
+        self.assertFalse(recorder.read(secret))
+
+    def test_r7_f2_the_index_does_not_read_a_file_swapped_for_a_link_after_its_walk(self):
+        project = self.project().resolve()
+        secret = write(project / "secrets.ts", "import './LEAKED_CANARY.ts';\n")
+        real = graph.read_sources
+
+        def racing(paths, *a, **k):
+            paths = list(paths)
+            victim = str(project / "src" / "config.ts")
+            if victim in paths:
+                os.unlink(victim)
+                os.symlink(secret, victim)
+            return real(paths, *a, **k)
+        recorder = ReadRecorder(self)
+        with mock.patch.object(graph, "read_sources", racing):
+            self.nav(project).imports("src/config.ts", source="index")
+        self.assertFalse(recorder.read(secret))
+
+    # --- the same rule at the other reads
+
+    def test_r7_an_index_config_or_overlay_linked_outside_is_not_read(self):
+        for which in ("config", "overlay"):
+            project = self.project(which).resolve()
+            outside = self.outside(f"{which}.json", json.dumps({"imports": {"@host": "./src/mock_host.ts"}}))
+            target = project / ("deno.json" if which == "config" else "deno.test.json")
+            target.unlink()
+            target.symlink_to(outside)
+            recorder = ReadRecorder(self)
+            index = graph.ImportIndex(str(project), overlays=[str(project / "deno.test.json")],
+                                      cache_path=str(self.dir / f"cache-{which}" / "index.json"))
+            index.refresh()
+            self.assertFalse(recorder.read(outside), which)
+            if which == "config":
+                self.assertEqual(index.meta["config_error"], "outside")
+
+    def test_r7_a_cache_file_that_is_a_link_is_not_read(self):
+        project = self.project().resolve()
+        cache = self.dir / "cache" / "index.json"
+        outside = self.outside("index.json", json.dumps({"version": graph.INDEX_VERSION}))
+        cache.parent.mkdir()
+        cache.symlink_to(outside)
+        recorder = ReadRecorder(self)
+        graph.ImportIndex(str(project), cache_path=str(cache))
+        self.assertFalse(recorder.read(outside))
+        nav = self.nav(project)
+        os.makedirs(nav.cache_dir, exist_ok=True)
+        doc = Path(nav._cache_file("doc", "k"))
+        doc.symlink_to(outside)
+        self.assertIsNone(nav._read_cache("doc", "k"))
+        self.assertFalse(recorder.read(outside))
+
+    def test_r7_read_bounded_reads_only_after_every_check(self):
+        folder = (self.dir / "rb").resolve()
+        good = write(folder / "a.txt", "x")
+        refused = write(folder / "secret.txt", "LEAKED")
+        outside = self.outside("o.txt", "LEAKED")
+        (folder / "link").symlink_to(refused)
+        (folder / "out").symlink_to(outside)
+        recorder = ReadRecorder(self)
+        yes = lambda rel: True  # noqa: E731
+        self.assertEqual(graph.read_bounded(str(good), str(good), str(folder), yes), ("ok", b"x", str(good)))
+        self.assertEqual(graph.read_bounded(str(refused), str(refused), str(folder), lambda rel: rel != "secret.txt")[:2],
+                         ("refused", None))
+        self.assertEqual(graph.read_bounded(str(folder / "link"), str(folder / "link"), str(folder), yes)[:2], ("changed", None))
+        self.assertEqual(graph.read_bounded(str(folder / "out"), str(outside), str(folder), yes)[:2], ("outside", None))
+        self.assertEqual(graph.read_bounded(str(folder / "missing"), str(folder / "missing"), str(folder), yes)[:2], ("absent", None))
+        self.assertEqual(graph.read_bounded(str(folder), str(folder), str(self.dir), yes)[:2], ("unreadable", None))
+        big = write(folder / "big", " " * (graph.MAX_BYTES + 1))
+        self.assertEqual(graph.read_bounded(str(big), str(big), str(folder), yes)[:2], ("unreadable", None))
+        self.assertFalse(recorder.read(refused) or recorder.read(outside) or recorder.read(big))
+        self.assertEqual(graph.read_bounded(str(good), str(good), str(folder), lambda rel: 1 / 0)[0], "refused")  # a guard that fails
+
+    # --- the rule, by scan
+
+    def test_r7_graph_and_nav_api_read_bytes_only_through_read_bounded(self):
+        """Any call that opens or reads a file (open, io.open, Path.open, read_text, read_bytes, os.read, os.fdopen, FileIO, json.load,
+        a handle's .read) outside `graph.read_bounded` fails; `os.open` is allowed in `read_bounded` and, write-only and exclusive,
+        in `graph.write_new`."""
+        import ast
+        reading = {"open", "fdopen", "FileIO", "read_text", "read_bytes", "read", "readline", "readlines", "readinto", "load",
+                   "mmap", "sendfile", "copyfile", "copy", "copy2", "copyfileobj"}
+        found = []
+        for name in ("graph.py", "nav_api.py"):
+            path = ROOT / "lib" / "ctxengine" / name
+            tree = ast.parse(path.read_text(), str(path))
+            for func in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))] + [tree]:
+                body = func.body if func is not tree else [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+                for node in (n for stmt in body for n in ast.walk(stmt)):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    callee = node.func
+                    called = callee.id if isinstance(callee, ast.Name) else callee.attr if isinstance(callee, ast.Attribute) else ""
+                    owner = getattr(func, "name", "<module>")
+                    if called not in reading:
+                        continue
+                    if owner == "read_bounded" and called == "open":
+                        continue  # os.open, checked by the next test
+                    if owner == "read_bounded" and called == "read" and isinstance(callee, ast.Attribute) \
+                            and isinstance(callee.value, ast.Name) and callee.value.id == "os":
+                        continue
+                    if owner == "write_new" and called == "open" and isinstance(callee, ast.Attribute) \
+                            and ast.unparse(callee.value) == "os":
+                        flags = ast.unparse(node.args[1])
+                        if "O_WRONLY" in flags and "O_EXCL" in flags and "O_RDONLY" not in flags and "O_RDWR" not in flags:
+                            continue
+                    found.append(f"{name}:{node.lineno} {owner}: {ast.unparse(callee)}")
+        self.assertEqual(found, [], "file bytes read other than through graph.read_bounded")
+
+    def test_r7_read_bounded_opens_read_only_and_reads_after_its_checks(self):
+        import ast
+        import inspect
+        source = inspect.getsource(graph.read_bounded)
+        func = ast.parse(source).body[0]
+        calls = [(n.lineno, ast.unparse(n.func)) for n in ast.walk(func) if isinstance(n, ast.Call)]
+        opens = [line for line, name in calls if name == "os.open"]
+        reads = [line for line, name in calls if name == "os.read"]
+        checks = [line for line, name in calls if name in ("_opened_path", "lexical_path", "allow", "os.fstat")]
+        self.assertEqual(len(opens), 1)
+        self.assertIn("O_RDONLY", ast.unparse([n for n in ast.walk(func) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.open"][0]))
+        self.assertTrue(reads and checks)
+        self.assertLess(max(checks), min(reads), "a check comes after the read")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ INDEX_VERSION = 1
 SOURCE_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
 SKIP_DIRS = frozenset({"node_modules", ".git", ".tmux-pi", ".deno"})
 MAX_BYTES = 2_000_000
+MAX_CACHE_BYTES = 64_000_000  # an index or doc cache file; larger is taken as no cache
 EXTERNAL_SCHEMES = ("npm:", "jsr:", "node:", "http:", "https:", "data:", "blob:")
 _REGEX_AFTER_WORDS = frozenset({"return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else",
                                 "yield", "await"})
@@ -399,21 +400,21 @@ class ImportMap:
 _UNMODELLED_KEYS = ("importMap", "workspace", "links", "patch", "vendor")
 
 
-def load_config(path, raw=None):
-    """(ImportMap, details) from a Deno config file; a missing or unreadable file gives an empty map and says why in `details`.
+def load_config(path, raw, error=""):
+    """(ImportMap, details) from the bytes `raw` of the Deno config file `path` (read by the caller with `read_bounded`; this
+    function reads nothing); `raw` None gives an empty map and says why in `details` (`error`, or "unreadable").
 
     `details`: `exclude`, `ignored` (what the index does not follow), `unmodelled` (why the walk that guards Deno cannot trust the
     map: a list of short reasons, empty when it can), `data` (the parsed config, {} when unreadable) and `error`. `raw` is the
-    file's bytes when the caller has read them already (the parse is then of those bytes, not of a second read)."""
+    file's bytes."""
     details = {"path": path, "exclude": [], "ignored": [], "unmodelled": [], "data": {}}
+    if raw is None:
+        details["error"] = error or "unreadable"
+        return ImportMap({}, os.path.dirname(path)), details
     try:
-        if raw is None:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        else:
-            data = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError) as error:
-        details["error"] = type(error).__name__
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as failure:
+        details["error"] = type(failure).__name__
         return ImportMap({}, os.path.dirname(path)), details
     if not isinstance(data, dict):
         details["error"] = "not an object"
@@ -489,47 +490,109 @@ def _opened_path(fd):
         return None
 
 
-def read_checked(path):
-    """(bytes, opened) from one open of `path`: what was read (None when it cannot be read, is not a regular file or is larger than
-    MAX_BYTES) and the resolved path of the file that was open while it was read (None when it cannot be known). A path is judged
-    on its name before it is opened (`admit`, the walk); comparing `opened` with that judgement is what ties the bytes to it, since
-    a link swapped in between is followed by the open and shows in `opened`. No second resolution of `path` is made."""
+READ_OK = "ok"
+
+
+def read_bounded(path, admitted, boundary, allow, limit=None):
+    """(status, bytes or None, opened): THE ONE WAY this module and `nav_api` read the bytes of a file (a test scans both files
+    for any other). In this order: (a) open `path`; (b) ask the kernel which file is open (`_opened_path`); (c) check that it is
+    `admitted` (the path the caller judged), that it is inside `boundary` (a resolved directory) by its name and by `path`'s
+    name, that `allow(rel)` is true for both names relative to `boundary` (a guard that raises refuses), and that it is a regular
+    file of at most `limit` bytes (default MAX_BYTES); (d) only then read. Nothing of a file that fails a check is read.
+
+    status: `ok`; `absent` (nothing at `path`); `unreadable` (cannot be opened, or is not a regular file, or the kernel cannot name
+    it, or is over `limit`); `changed` (the file open is not `admitted`: a link moved after the caller judged the name);
+    `outside` (not inside `boundary`); `refused` (the guard refuses it). `opened` is the kernel's path, None when not known."""
+    admitted = os.path.normpath(admitted)
+    limit = MAX_BYTES if limit is None else limit
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except (OSError, ValueError):
-        return None, None
+        return ("unreadable" if os.path.lexists(path) else "absent"), None, None
     try:
-        regular = stat.S_ISREG(os.fstat(fd).st_mode)
-    except OSError:
-        regular = False
-    if not regular:
-        os.close(fd)
-        return None, None
-    with open(fd, "rb") as handle:  # closes `fd`
+        opened = _opened_path(fd)
+        if opened is None:
+            return "unreadable", None, None
+        if opened != admitted:
+            return "changed", None, opened
+        names = [lexical_path(boundary, opened), lexical_path(boundary, os.path.normpath(path))]
+        if None in names:
+            return "outside", None, opened
+        for rel in dict.fromkeys(names):
+            try:
+                allowed = bool(allow(rel))
+            except Exception:
+                allowed = False
+            if not allowed:
+                return "refused", None, opened
         try:
-            opened = _opened_path(fd)
-            data = handle.read(MAX_BYTES + 1)
+            info = os.fstat(fd)
         except OSError:
-            return None, None
-    return (None if len(data) > MAX_BYTES else data), opened
+            return "unreadable", None, opened
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return "unreadable", None, opened
+        chunks, left = [], limit + 1
+        try:
+            while left > 0:  # (d): every check above has passed
+                chunk = os.read(fd, min(left, 1 << 20))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                left -= len(chunk)
+        except OSError:
+            return "unreadable", None, opened
+        data = b"".join(chunks)
+        if len(data) > limit:
+            return "unreadable", None, opened
+        return READ_OK, data, opened
+    finally:
+        os.close(fd)
 
 
-def read_source(path):
-    """The text of `path` (a resolved path with no link on the way: the index's walk does not follow links), or None when it cannot
-    be read, is larger than MAX_BYTES, or the file that was opened is not the one at that name (a link swapped in after the walk
-    checked it)."""
-    data, opened = read_checked(path)
-    if data is None or opened != os.path.normpath(path):
+def write_new(path, data):
+    """Write `data` to `path` as a new regular file (never through a link, never over an existing file): the one way this module
+    and `nav_api` write a file. Raises OSError when `path` exists."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
+def cache_allow(rel):
+    """The guard for a cache directory: a plain file directly in it, no folder and no hidden name."""
+    return "/" not in rel and not rel.startswith(".") and rel.endswith(".json")
+
+
+def read_cache_json(path):
+    """The JSON value in the cache file `path`, or None: read with `read_bounded`, the boundary being the cache directory (resolved
+    now) and the admitted path the file's name in it, so a link at that name, or a link moved in, is not followed."""
+    folder = os.path.realpath(os.path.dirname(path) or ".")
+    admitted = os.path.join(folder, os.path.basename(path))
+    status, data, _ = read_bounded(admitted, admitted, folder, cache_allow, limit=MAX_CACHE_BYTES)
+    if status != READ_OK:
         return None
-    return data.decode("utf-8", "replace")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
 
 
-def read_sources(paths, workers=8):
+def read_source(path, base, allow):
+    """The text of `path` (a resolved path with no link on the way: the index's walk does not follow links), or None when
+    `read_bounded` does not give it (refused, outside `base`, a link swapped in after the walk, over MAX_BYTES)."""
+    status, data, _ = read_bounded(path, path, base, allow)
+    return data.decode("utf-8", "replace") if status == READ_OK else None
+
+
+def read_sources(paths, base, allow, workers=8):
     """{path: text or None} for each path. Reading is the slow part of a build (many small files, and a cold disk); it is done in
     threads, and the CPU work of scanning stays in the caller."""
     paths = list(paths)
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(paths) or 1))) as pool:
-        return dict(zip(paths, pool.map(read_source, paths)))
+        return dict(zip(paths, pool.map(lambda path: read_source(path, base, allow), paths)))
 
 
 # ------------------------------------------------------------------------------------------------------- the allow-list walk
@@ -606,22 +669,28 @@ def _fingerprint(data):
 
 CONFIG_ABSENT = ("absent",)
 CONFIG_UNREADABLE = ("unreadable",)
+CONFIG_OUTSIDE = ("outside",)
+CONFIG_REFUSED = ("refused",)
+CONFIG_CHANGED = ("changed",)
 
 
-def _config_read(path):
-    """(state, bytes or None): the state of a config file (see `_config_state`) and the bytes it was made from, from one open. The
-    resolved path in the state is the path of the file that was open while it was read, not a second resolution of `path`."""
-    data, opened = read_checked(path)
-    if data is None or opened is None:
-        return (CONFIG_UNREADABLE if os.path.lexists(path) else CONFIG_ABSENT), None
+def _config_read(path, base, allow):
+    """(state, bytes or None): the state of the config file `path` (see `_config_state`) and the bytes it was made from, from one
+    `read_bounded`: admitted is where `path` leads when it is judged (now), the boundary is the project `base` and the guard is
+    `allow`. A config that leads outside the project, or that the guard refuses, is never read."""
+    status, data, opened = read_bounded(path, os.path.realpath(path), base, allow)
+    if status != READ_OK:
+        return (status,), None
     return ("content", opened, _fingerprint(data)), data
 
 
-def _config_state(path):
-    """What a config file is now, one of three states: `CONFIG_ABSENT` (nothing is there), `CONFIG_UNREADABLE` (something is there
-    and it cannot be read as a file, or is over MAX_BYTES) or `("content", resolved path, fingerprint)`. Every writer and reader of
-    a config state goes through here, so "there was none" and "there is one I cannot read" are never the same value."""
-    return _config_read(path)[0]
+def _config_state(path, base, allow):
+    """What a config file is now: `CONFIG_ABSENT` (nothing is there), `CONFIG_UNREADABLE` (something is there and it cannot be read
+    as a file, or is over MAX_BYTES), `CONFIG_OUTSIDE` (it leads out of `base`), `CONFIG_REFUSED` (the guard refuses it),
+    `CONFIG_CHANGED` (a link moved while it was opened) or `("content", resolved path, fingerprint)`. Only `content` was read.
+    Every writer and reader of a config state goes through here, so "there was none" and "there is one I cannot read" are never
+    the same value."""
+    return _config_read(path, base, allow)[0]
 
 
 def _state_token(state):
@@ -648,8 +717,9 @@ class Reach:
     or content). `holds()` checks them as well, since an answer made with an old config is an answer for a tree that has moved,
     and a change between any two of the three states counts."""
 
-    def __init__(self, base):
+    def __init__(self, base, allow):
         self.base = base
+        self.allow = allow
         self.files = {}
         self.contents = {}
         self.entry = None
@@ -672,10 +742,10 @@ class Reach:
 
     def holds(self):
         for rel, (real, fingerprint) in self.files.items():
-            data, opened = read_checked(os.path.join(self.base, rel))  # where it leads and what it holds, from the same open
-            if data is None or opened is None or lexical_path(self.base, opened) != real or _fingerprint(data) != fingerprint:
+            status, data, _ = read_bounded(os.path.join(self.base, rel), os.path.join(self.base, real), self.base, self.allow)
+            if status != READ_OK or _fingerprint(data) != fingerprint:
                 return False
-        return all(_config_state(path) == state for path, state in self.configs.items())
+        return all(_config_state(path, self.base, self.allow) == state for path, state in self.configs.items())
 
     def materialize(self, parent=None):
         """A `Mirror` holding a copy of each proved file and nothing else, under the same relative paths, with a config made from
@@ -725,8 +795,7 @@ class Mirror:
     def write(self, rel, data):
         target = self.path(rel)
         os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-        with open(target, "xb") as handle:
-            handle.write(data)
+        write_new(target, data)
 
     def write_json(self, rel, value):
         self.write(rel, json.dumps(value, sort_keys=True).encode("utf-8"))
@@ -746,17 +815,23 @@ _PACKAGE_KEEP = ("name", "version", "type")
 _PACKAGE_DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
 
-def _check_package_json(base, directory, configs):
+_CONFIG_REFUSAL = {"outside": "outside_project", "refused": "reaches_refused_path", "changed": "changed_during_walk"}
+
+
+def _check_package_json(base, directory, configs, allow):
     """Deno reads the `package.json` next to its config. A dependency that is a local path (`file:`, `link:`, a workspace) loads
     code from somewhere the walk does not look: refused. A `package.json` that is not JSON is refused too. Returns {folder: what
     the mirror gets} for the folders that have one (`""` is the project root, others are project-relative posix paths): the
     package's `name`, `version`, `type` and dependency tables, and nothing else (its `imports` and `exports` name paths). Each
-    file is read once; what was read is recorded in `configs` (see `Reach`), absent files too."""
+    file is read once, with `read_bounded` (one that leads outside the project or that `allow` refuses is never read, and refuses
+    the call); what was read is recorded in `configs` (see `Reach`), absent files too."""
     out = {}
     for folder in dict.fromkeys((directory, base)):
         path = os.path.join(folder, "package.json")
-        configs[path], raw = _config_read(path)
+        configs[path], raw = _config_read(path, base, allow)
         if raw is None:
+            if configs[path][0] in _CONFIG_REFUSAL:
+                raise Unproven(_CONFIG_REFUSAL[configs[path][0]])
             if configs[path] == CONFIG_UNREADABLE and os.path.isfile(path):
                 raise Unproven("unreadable_file")
             continue
@@ -797,21 +872,23 @@ def prove_reach(base, entry, config, allow):
     The walk is a first check, not the only one: a file it misses is not in the mirror, so Deno cannot read it.
     The index is not used: nothing here depends on it being built."""
     base = os.path.realpath(base)
-    reach = Reach(base)
-    config_dir = os.path.dirname(config)
+    reach = Reach(base, allow)
+    config_dir = os.path.realpath(os.path.dirname(config))
+    config = os.path.join(config_dir, os.path.basename(config))  # one spelling: the configs are read and recorded under it
     roots = []  # (specifier, referrer) pairs the config itself makes Deno load
-    config_rel = lexical_path(base, os.path.realpath(config_dir))
-    if config_rel is None and os.path.realpath(config_dir) != base:
+    config_rel = lexical_path(base, config_dir)
+    if config_rel is None and config_dir != base:
         raise Unproven("unmodelled_config")  # a config directory outside the project
     reach.config_rel = posixpath.join(config_rel or "", os.path.basename(config))
     if os.path.isfile(config):
         if lexical_path(base, os.path.realpath(config)) is None:
             raise Unproven("unmodelled_config")
-        reach.configs[config], raw = _config_read(config)
+        reach.configs[config], raw = _config_read(config, base, allow)
         if raw is None:
-            raise Unproven("unreadable_file")
-        if lexical_path(base, reach.configs[config][1]) is None:
-            raise Unproven("changed_during_walk")  # the file that was read is outside the project: a link moved after the check above
+            state = reach.configs[config][0]
+            if state == "outside":
+                raise Unproven("changed_during_walk")  # it was inside when checked above: a link moved in between
+            raise Unproven(_CONFIG_REFUSAL.get(state, "unreadable_file"))
         imap, details = load_config(config, raw)
         if details.get("error") or details["unmodelled"]:
             raise Unproven("unmodelled_config")
@@ -833,9 +910,11 @@ def prove_reach(base, entry, config, allow):
             if source:
                 roots += [(source + suffix, config) for suffix in ("", "/jsx-runtime", "/jsx-dev-runtime")]
     else:
-        reach.configs[config] = _config_state(config)
+        reach.configs[config] = _config_state(config, base, allow)
+        if reach.configs[config][0] == "content":
+            raise Unproven("changed_during_walk")  # none was there when checked above, and one is now
         imap = ImportMap({}, config_dir)  # the mirror gets a config of its own, so Deno looks for none above it
-    reach.packages = _check_package_json(base, config_dir, reach.configs)
+    reach.packages = _check_package_json(base, config_dir, reach.configs, allow)
     reach.entry = lexical_path(base, os.path.normpath(entry))
     queue, seen = [os.path.normpath(entry)], set()
     for spec, referrer in roots:
@@ -850,11 +929,11 @@ def prove_reach(base, entry, config, allow):
             continue
         if len(reach.files) >= MAX_REACH_FILES:
             raise Unproven("too_many_files")
-        data, opened = read_checked(path)
-        if data is None:
+        status, data, _ = read_bounded(path, os.path.join(base, real), base, allow)
+        if status in ("changed", "outside", "refused"):
+            raise Unproven("changed_during_walk")  # the file open is not the one `admit` judged; nothing of it was read
+        if status != READ_OK:
             raise Unproven("unreadable_file")
-        if opened is None or lexical_path(base, opened) != real:
-            raise Unproven("changed_during_walk")  # the bytes are of another file than the one `admit` judged
         reach.files[lexical] = (real, _fingerprint(data))
         reach.contents[lexical] = data
         if not lexical.endswith(SOURCE_EXTENSIONS):
@@ -943,13 +1022,9 @@ class ImportIndex:
     # --- persistence
 
     def _load(self):
-        if not self.cache_path or os.path.islink(self.cache_path):
+        if not self.cache_path:
             return
-        try:
-            with open(self.cache_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            return
+        data = read_cache_json(self.cache_path)
         if not isinstance(data, dict) or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
                 or data.get("root") != self.root or not isinstance(data.get("entries"), dict):
             return
@@ -966,8 +1041,9 @@ class ImportIndex:
         temp = f"{self.cache_path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
-            with open(temp, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, separators=(",", ":"), sort_keys=True)
+            if os.path.lexists(temp):
+                os.unlink(temp)  # left by a crashed run of this process id
+            write_new(temp, json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8"))
             os.replace(temp, self.cache_path)
         except OSError:
             try:
@@ -1006,11 +1082,11 @@ class ImportIndex:
         "ms"}: `scanned` is how many files were read this time; `stale` lists files that changed again while they were being read
         (the next call picks them up; the answer should say so)."""
         started = time.perf_counter()
-        imap, details = load_config(self.config)
+        imap, details = self._load_config(self.config)
         self.meta = {"ignored": list(details["ignored"]), "config_error": details.get("error", "")}
         overlay_maps = []
         for path in self.overlays:
-            omap, odetails = load_config(path)
+            omap, odetails = self._load_config(path)
             overlay_maps.append((os.path.basename(path), omap))
             self.meta["ignored"] += [f"{os.path.basename(path)}:{item}" for item in odetails["ignored"]]
         current = self._walk(details["exclude"])
@@ -1018,7 +1094,7 @@ class ImportIndex:
         removed = [rel for rel in self.entries if rel not in current]
         for rel in removed:
             del self.entries[rel]
-        texts = read_sources([self._abs(rel) for rel in changed])
+        texts = read_sources([self._abs(rel) for rel in changed], self.base, self._allowed)
         stale = []
         for rel in changed:
             text = texts[self._abs(rel)]
@@ -1033,6 +1109,12 @@ class ImportIndex:
             self.save()
         return {"files": len(current), "scanned": len(changed), "removed": len(removed), "unchanged": len(current) - len(changed),
                 "stale": stale, "ms": round((time.perf_counter() - started) * 1000)}
+
+    def _load_config(self, path):
+        """`load_config` of the bytes `_config_read` gives (inside the project, allowed): a config that leads out of the project or
+        that the guard refuses is not read, and is reported in `config_error` by its state (`outside`, `refused`)."""
+        state, raw = _config_read(path, self.base, self._allowed)
+        return load_config(path, raw, error=state[0])
 
     def _allowed(self, rel):
         if self.allow is None:

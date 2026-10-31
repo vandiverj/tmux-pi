@@ -18,8 +18,9 @@ Known limits (TypeScript source files only; .d.ts files carry no code and are re
   `/* defaults omitted */)`, then the declared return type. The scanner never tries to find where such a default ends.
   The same happens for an `=` that is not a default, such as a type parameter default in a callback type
   (`cb: <T = string>(x: T) => void`). Less is shown, never code.
-- A regex literal right after `)` on a line (`if (a) /'/.test(a); }`) is read as division, so a quote in it can end the scan
-  of that line early and hide a later export on the same line. No code is returned for it.
+- A regex literal right after `)` on a line (`if (a) /'/.test(a); }`) is read as division, so a quote in it opens a string that
+  runs to the end of the line and can swallow a closing `}`; later exports in that file may then report "not found". No code is
+  returned for it.
 """
 import json
 import os

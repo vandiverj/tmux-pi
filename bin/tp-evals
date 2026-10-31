@@ -8,6 +8,9 @@
                 [--sizing right_sized|oversized|undersized|unknown]
                 [--correct-model M --correct-thinking T] [--note TEXT] [--rater NAME]
   tp-evals export [--out FILE]        one JSON row per selection joined to tasks and outcomes
+  tp-evals trial [--project DIR | --file FILE] [--json]
+                                      Qwen-trial report from <project>/.tmux-pi/trial/records.jsonl (default project: cwd);
+                                      needs no tmux session and ignores --dir/--state-dir
 
 The eval dir is <state dir>/evals (see lib/routing_evals.py); pass --dir or --state-dir to
 read another. Records are evidence only and never grant dispatch, edit or review authority.
@@ -22,6 +25,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import routing_evals  # noqa: E402
+import trial_record  # noqa: E402
+import trial_report  # noqa: E402
 from router import RouterError, load_config  # noqa: E402
 
 
@@ -46,8 +51,16 @@ def main():
     rate.add_argument("--rater", default="human")
     export = sub.add_parser("export")
     export.add_argument("--out", help="write JSONL here instead of stdout")
+    report = sub.add_parser("trial")
+    report.add_argument("--project", help="project dir holding .tmux-pi/trial/records.jsonl (default: current dir)")
+    report.add_argument("--file", help="read this records.jsonl instead")
+    report.add_argument("--json", action="store_true", help="print the report as JSON")
     args = parser.parse_args()
     try:
+        if args.command == "trial":  # reads a file in the project, so it needs no session state dir
+            path = Path(args.file) if args.file else trial_record.trial_dir(args.project or os.getcwd()) / trial_record.RECORDS
+            print(trial_report.report(path, as_json=args.json))
+            return 0
         if args.dir:
             directory = Path(args.dir)
         elif args.state_dir:

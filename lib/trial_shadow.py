@@ -326,6 +326,7 @@ class Run:
         self.task_id = self.info["task_id"]
         self.env = trial_session.env_for(self.state, self.info["session"], env)
         self.sleep, self.clock = sleep, clock
+        self.started_at = clock() - self.prepared_ago()
         self.records = record_module or load_record_module()
         self.outcome = None
         self.recorded = False
@@ -336,6 +337,15 @@ class Run:
         self.wait_result = None
 
     # -- helpers
+    def prepared_ago(self):
+        """Seconds since `prepare` wrote the run (run.json `created`, whole seconds, wall clock), never negative: the part of the attempt's
+        clock spent before the runner began."""
+        try:
+            made = datetime.datetime.strptime(self.info.get("created") or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return 0.0
+        return max(0.0, (datetime.datetime.now(datetime.timezone.utc) - made).total_seconds())
+
     def note(self, **fields):
         self.info = update_run(self.rdir, **fields)
 
@@ -394,20 +404,38 @@ class Run:
             raise ShadowError("tp-spawn printed {!r}, not the task id {}".format(spawned[-1:] or "nothing", self.task_id))
         self.note(spawned=now())
 
-    def wait(self, task_id, seconds, phase):
-        """Wait for `task_id` to settle. Returns settled, failed, stopped, paused or timeout. The poll sleeps `poll_s` and re-reads the
-        task's own record; `seconds` is the limit, not a wait."""
+    def wait(self, task_id, deadline, phase, yield_to_main=False):
+        """Wait for `task_id` to settle. Returns settled, failed, stopped, paused, preempted or timeout. The poll sleeps `poll_s` and
+        re-reads the task's own record; `deadline` is a time on this run's clock, a limit and not a wait. With `yield_to_main` each poll
+        also reads Main's local workers: when Main holds all its slots the wait ends `preempted` (§10.7: a trial does not continue a
+        local run then). A task that has settled is taken as it is, whatever Main holds."""
         self.note(phase=phase)
-        deadline = self.clock() + seconds
         while True:
             status = self.status_of(task_id)
             if status in SETTLED:
                 return "settled"
             if status in ("failed", "stopped", "paused"):
                 return status
+            if yield_to_main and self.main_is_full():
+                return "preempted"
             if self.clock() >= deadline:
                 return "timeout"
             self.sleep(self.info.get("poll_s", 2.0))
+
+    def main_is_full(self):
+        """Whether Main now holds all its local worker slots, for a run of a local model. An unreadable count stops the run: it is never read as zero."""
+        if not self.info["model"].startswith(trial_session.LOCAL):
+            return False
+        try:
+            main = trial_session.local_active(self.main_state, self.env)
+        except trial_session.SessionError as problem:
+            raise ShadowError(str(problem))
+        return len(main) >= self.info.get("main_max_local_workers", 2)
+
+    def attempt_deadline(self):
+        """The end of the attempt's wall clock (§8): `timeout_s` after the run was prepared, so the time `tp-spawn` and the worktree took
+        is spent from it and the worker has what remains."""
+        return self.started_at + self.info["timeout_s"]
 
     def end_worker(self, outcome):
         """End the worker's process: `end-author` for a task that settled (its pane and scrollback are kept), `stop` for any other."""
@@ -460,7 +488,7 @@ class Run:
             self.note(review_error=value.get("reason") or "no review was started")
             return None
         self.note(review_id=self.review_id)
-        result = self.wait(self.review_id, self.info.get("review_timeout_s", 1800), "review-wait")
+        result = self.wait(self.review_id, self.clock() + self.info.get("review_timeout_s", 1800), "review-wait")
         self.note(review_wait=result)
         if result == "timeout":
             self.agent("stop", self.review_id)
@@ -518,6 +546,7 @@ class Run:
         error = None
         try:
             try:
+                check_ownership(self.rdir, self.info)  # the worktree is made, reset and read below: only at the run's own path
                 source = self.source()
                 self.note(normal_reviewer_model=source["reviewer_model"], source_role=source["role"] or None)
                 self.make_worktree()
@@ -526,18 +555,16 @@ class Run:
                 except ShadowError as problem:
                     self.outcome, error = "spawn_failed", str(problem)
                     raise
-                result = self.wait(self.task_id, self.info["timeout_s"], "wait")
+                result = self.wait(self.task_id, self.attempt_deadline(), "wait", yield_to_main=True)
                 self.note(wait_result=result)
-                if result == "timeout":
-                    self.outcome = "timeout"
-                    self.end_worker("timeout")
-                else:
-                    self.end_worker(result)
+                if result in ("timeout", "preempted"):
+                    self.outcome = result
+                self.end_worker(result)
                 self.collect_work()
                 if result == "settled":
                     self.review()
                     self.outcome = "completed"
-                elif result != "timeout":
+                elif result not in ("timeout", "preempted"):
                     self.outcome = {"failed": "worker_failed", "stopped": "stopped", "paused": "paused"}[result]
                 self.write_record()
             except Interrupted:
@@ -621,12 +648,35 @@ def record_normal(rdir, env=None, record_module=None):
 
 # ------------------------------------------------------------------------------------------------------------------ cleanup
 
+def check_ownership(rdir, info):
+    """Raise unless run.json names this run's own things: the run directory is `<project>/.tmux-pi/trial/<run>`, and the state dir and
+    the worktree are `state` and `worktree` directly under it, not links to another place. Cleanup checks this before it touches
+    anything: run.json is a file the worker can reach, and `git worktree remove --force` on a path out of an altered one would
+    delete another lane's tree."""
+    here = Path(os.path.realpath(str(rdir)))
+    try:
+        expected = Path(os.path.realpath(str(trial_session.run_dir(info["project"], info["run"]))))
+    except (trial_session.SessionError, TypeError, KeyError) as problem:
+        raise ShadowError("run.json names no valid run or project ({})".format(problem))
+    if expected != here:
+        raise ShadowError("run.json puts the run at {} but it is at {}".format(expected, here))
+    for key in ("worktree", "state"):
+        path = Path(str(info.get(key) or ""))
+        if path.name != key or not path.is_absolute() or Path(os.path.realpath(str(path))) != here / key:
+            raise ShadowError("{} {} is not the run's own {}/{} (it resolves to {})".format(
+                key, path, here, key, os.path.realpath(str(path)) if str(path) else "nothing"))
+
+
 def cleanup(rdir, env=None):
     """End what the run left: trial tasks that still run, the worktree (and its shared node_modules links), the shadow refs, the
     session. Idempotent and total: every step is attempted whatever the others did. Returns the list of what could not be done."""
     info = read_run(rdir)
     project, worktree, state = info["project"], Path(info["worktree"]), Path(info["state"])
     leftovers = []
+    try:
+        check_ownership(rdir, info)
+    except ShadowError as problem:
+        return ["not cleaned: {}".format(problem)]
     run_env = trial_session.env_for(state, info["session"], env)
 
     def attempt(label, fn):
@@ -656,8 +706,6 @@ def cleanup(rdir, env=None):
             lane_deps.unlink_shared(project, str(worktree))
             git(project, "worktree", "remove", "--force", str(worktree), check=False)
             if worktree.exists():  # a worktree git no longer knows (its admin entry was pruned): still ours, under the run dir
-                if Path(os.path.realpath(str(worktree))).parent != Path(os.path.realpath(str(rdir))):
-                    raise ShadowError("{} is not directly under the run directory; left alone".format(worktree))
                 shutil.rmtree(str(worktree))
         git(project, "worktree", "prune", check=False)
 

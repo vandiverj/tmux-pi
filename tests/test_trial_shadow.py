@@ -147,7 +147,7 @@ class ShadowCase(lw.LaneCase):
                 out[str(path.relative_to(root))] = (st.st_size, st.st_mtime_ns)
         return out
 
-    def run_stub(self, rdir, on_poll=None, clock=None, record_module=None, spawn_error=None):
+    def run_stub(self, rdir, on_poll=None, clock=None, record_module=None, spawn_error=None, run_class=StubSpawnRun):
         """Execute the run with the stub spawn. `on_poll(n, run)` is called at each poll (the event that settles a task)."""
         self.spawn_error = spawn_error
         clock = clock or Clock()
@@ -160,7 +160,7 @@ class ShadowCase(lw.LaneCase):
                 on_poll(count[0], holder["run"])
             clock.sleep(seconds)
 
-        run = StubSpawnRun(rdir, self.env, sleep=sleep, clock=clock, record_module=record_module)
+        run = run_class(rdir, self.env, sleep=sleep, clock=clock, record_module=record_module)
         holder["run"] = run
         return run, run.execute()
 
@@ -504,6 +504,83 @@ class RunStepTests(ShadowCase):
         self.assertFalse((rdir / "worktree").exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
 
+    def test_f2_a_local_run_stops_as_preempted_when_main_fills_its_slots_while_it_waits(self):
+        self.local_task(self.state)  # Main holds one of its two slots when the shadow starts
+        rdir, info = self.prepare(model=LOCAL, timeout_s=300)
+        seen = {}
+
+        def poll(n, run):
+            seen["polls"] = n
+            if n == 3:
+                self.local_task(self.state)  # Main starts another local worker: both slots are held
+        clock = Clock(step=10.0)
+        run, done = self.run_stub(rdir, on_poll=poll, clock=clock)
+        self.assertEqual((done["outcome"], done["wait_result"], done["phase"]), ("preempted", "preempted", "done"))
+        self.assertEqual(seen["polls"], 3,"it stopped at the first poll that saw Main full, not at the deadline")
+        self.assertLess(clock.now, 100, "the 300 s limit was never reached")
+        self.assertFalse(self.alive(self.worker_pane), "the worker's window is killed")
+        record, = [r for r in self.records() if r["arm"] == "qwen"]
+        self.assertEqual(record["outcome"], "preempted")
+        self.assertFalse([p for p in (rdir / "state" / "tasks").iterdir() if p.name.startswith("review-")], "a preempted run is not reviewed")
+        self.assertEqual(done["cleanup_errors"], [])
+        self.assertFalse((rdir / "worktree").exists())
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+
+    def test_f2_main_below_its_limit_does_not_stop_the_run_and_a_worker_that_settled_is_kept(self):
+        self.local_task(self.state)
+        rdir, info = self.prepare(model=LOCAL)
+
+        def poll(n, run):
+            if n == 1:
+                self.edit(run)
+                self.local_task(self.state)  # Main is full by the time the worker is read as settled
+                self.settle_worker(run)
+            elif n == 2:
+                for p in (run.state / "tasks").iterdir():
+                    if (p / "review-of").exists():
+                        self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+        run, done = self.run_stub(rdir, on_poll=poll)
+        self.assertEqual(done["outcome"], "completed", "a settled worker is taken whatever Main holds")
+
+    def test_f2_a_model_that_is_not_local_never_yields_to_main(self):
+        self.local_task(self.state)
+        self.local_task(self.state)
+        rdir, info = self.prepare(timeout_s=300)
+        run, done = self.run_stub(rdir, clock=Clock(step=100.0))
+        self.assertEqual(done["outcome"], "timeout")
+
+    def test_f2_an_unreadable_count_ends_the_run_with_an_error_not_a_zero(self):
+        rdir, info = self.prepare(model=LOCAL)
+        with mock.patch.object(trial_session, "local_active", side_effect=trial_session.SessionError("cannot count")):
+            run, done = self.run_stub(rdir)
+        self.assertEqual(done["outcome"], "error")
+        self.assertIn("cannot count", done["error"])
+        self.assertFalse(self.alive(self.worker_pane))
+
+    def test_f3_the_attempt_limit_includes_the_time_tp_spawn_took(self):
+        rdir, info = self.prepare(timeout_s=300)
+        clock = Clock(step=100.0)
+        polls = []
+
+        class SlowSpawn(StubSpawnRun):
+            def spawn(self):
+                clock.now += 250.0  # the worktree and tp-spawn took 250 s of the 300
+                super().spawn()
+        run, done = self.run_stub(rdir, clock=clock, on_poll=lambda n, r: polls.append(n), run_class=SlowSpawn)
+        self.assertEqual((done["outcome"], done["wait_result"]), ("timeout", "timeout"))
+        self.assertEqual(polls, [1], "the worker had the 50 s that were left: one poll, not the whole 300 again")
+        self.assertLess(clock.now, 400)
+        self.assertFalse(self.alive(self.worker_pane))
+
+    def test_f3_the_limit_counts_from_prepare_not_from_the_runner_starting(self):
+        rdir, info = self.prepare(timeout_s=300)
+        clock = Clock(step=100.0)
+        ts.update_run(rdir, created=(ts.datetime.datetime.now(ts.datetime.timezone.utc) - ts.datetime.timedelta(seconds=290)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        run = StubSpawnRun(rdir, self.env, sleep=clock.sleep, clock=clock)
+        self.assertAlmostEqual(run.attempt_deadline() - clock.now, 10.0, delta=3.0, msg="290 s of the 300 had passed before the runner began")
+        ts.update_run(rdir, created="not a time")
+        self.assertEqual(StubSpawnRun(rdir, self.env, sleep=clock.sleep, clock=clock).attempt_deadline(), 300.0)
+
     def test_a_worker_that_settles_is_reviewed_and_ended_without_losing_its_pane_text(self):
         rdir, info = self.prepare()
         seen = {}
@@ -669,7 +746,56 @@ class CleanupTests(ShadowCase):
         ts.update_run(rdir, worktree=str(outside))
         leftovers = ts.cleanup(rdir, self.env)
         self.assertTrue((outside / "keep").exists())
-        self.assertTrue(any("not directly under the run directory" in l for l in leftovers), leftovers)
+        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
+
+    def other_worktree(self):
+        """A second, registered, dirty worktree of the same repository: another lane's tree, which no shadow may touch."""
+        other = self.root / "other-lane"
+        git(self.repo, "worktree", "add", "--detach", str(other), self.base)
+        (other / "lib" / "x.py").write_text("another lane's uncommitted work\n")
+        return other
+
+    def assert_other_untouched(self, other):
+        self.assertEqual((other / "lib" / "x.py").read_text(), "another lane's uncommitted work\n")
+        self.assertIn(str(other.resolve()), self.worktrees().replace("\\", ""), "git still has the other worktree registered")
+
+    def test_f1_a_run_record_pointing_at_another_registered_dirty_worktree_removes_nothing(self):
+        rdir, info = self.prepare()
+        other = self.other_worktree()
+        ts.update_run(rdir, worktree=str(other))
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
+        self.assert_other_untouched(other)
+
+    def test_f1_a_link_in_the_runs_worktree_place_to_another_worktree_removes_nothing(self):
+        rdir, info = self.prepare()
+        other = self.other_worktree()
+        os.symlink(str(other), str(rdir / "worktree"))
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
+        self.assert_other_untouched(other)
+
+    def test_f1_a_record_that_puts_the_run_in_another_project_or_name_cleans_nothing(self):
+        rdir, info = self.prepare()
+        other = self.other_worktree()
+        for fields in ({"project": str(other)}, {"run": "sh-elsewhere"}):
+            with self.subTest(fields=fields):
+                ts.update_run(rdir, **fields)
+                leftovers = ts.cleanup(rdir, self.env)
+                self.assertTrue(any("not cleaned" in l for l in leftovers), leftovers)
+                self.assertIn("tp-trial-" + info["run"], self.session_names(), "the session was not ended on a record that is not the run's")
+                self.assert_other_untouched(other)
+                ts.update_run(rdir, project=info["project"], run=info["run"])
+
+    def test_f1_a_run_that_starts_from_such_a_record_does_not_touch_that_tree(self):
+        rdir, info = self.prepare()
+        other = self.other_worktree()
+        ts.update_run(rdir, worktree=str(other))
+        run, done = self.run_stub(rdir)
+        self.assertEqual(done["outcome"], "error")
+        self.assertIn("not the run's own", done["error"])
+        self.assert_other_untouched(other)
+        self.assertEqual(git(other, "status", "--porcelain"), "M lib/x.py", "nothing was staged or reset there")
 
 
 class StopTests(ShadowCase):

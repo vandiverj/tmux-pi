@@ -67,22 +67,55 @@ class CategoryAndMedianTests(unittest.TestCase):
 
     def test_medians_skip_unknowns_and_report_how_many_were_known(self):
         rows = [rec("1", "qwen", "approved", wall_time_s=100, tokens={"input": 10, "output": 5}, review_rounds=1,
-                    rule_slips={"complete": True, "total": 2}, gate_runs={"total": 3}, docs_calls={"count": 4}),
+                    rule_slips={"complete": True, "total": 2}, gate_runs={"complete": True, "total": 3}, docs_calls={"count": 4}),
                 rec("2", "qwen", "approved", wall_time_s=300, tokens={"input": 30, "output": 5, "cacheRead": 999}, review_rounds=3,
-                    rule_slips={"complete": True, "total": 4}, gate_runs={"total": 5}, docs_calls={"count": 0}),
+                    rule_slips={"complete": True, "total": 4}, gate_runs={"complete": True, "total": 5}, docs_calls={"count": 0}),
                 rec("3", "qwen", "approved", wall_time_s=None, tokens=None, rule_slips={"complete": False, "total": 9},
-                    gate_runs=None, docs_calls=None)]
+                    gate_runs=None, docs_calls=None),
+                rec("4", "qwen", "approved", gate_runs={"complete": False, "total": 99})]
         med = trial_report.summarize(rows)["medians"]["qwen"]
         self.assertEqual(med["wall_time_s"], {"n": 2, "median": 200})
         self.assertEqual(med["tokens"], {"n": 2, "median": 25})  # (15 + 35) / 2: cache tokens are left out
         self.assertEqual(med["review_rounds"], {"n": 2, "median": 2})
         self.assertEqual(med["rule_slips"], {"n": 2, "median": 3})  # the incomplete record is not counted
-        self.assertEqual(med["gate_runs"], {"n": 2, "median": 4})
+        self.assertEqual(med["gate_runs"], {"n": 2, "median": 4})  # the incomplete scan is not counted
         self.assertEqual(med["docs_calls"], {"n": 2, "median": 2})
 
     def test_a_median_with_nothing_known_is_none(self):
         med = trial_report.summarize([rec("1", "qwen", "approved")])["medians"]["normal"]
         self.assertEqual(med["wall_time_s"], {"n": 0, "median": None})
+
+
+class LatestRecordTests(unittest.TestCase):
+    """One policy for every aggregate: the last record of a (pair_id, arm) replaces the earlier tries."""
+    ROWS = [rec("a", "qwen", "request_changes", finding_categories=["old"], wall_time_s=100, review_rounds=1),
+            rec("a", "qwen", "approved", finding_categories=["new"], wall_time_s=300, review_rounds=3),
+            rec("a", "normal", "approved")]
+
+    def test_rates_and_cells_use_the_last_record_so_they_agree_with_the_paired_view(self):
+        out = trial_report.summarize(self.ROWS)
+        self.assertEqual((out["by_arm"]["qwen"]["n"], out["by_arm"]["qwen"]["rate"]), (1, 1.0))
+        self.assertEqual(out["cells"][0]["qwen"]["request_changes"], 0)
+        self.assertEqual(out["paired"]["table"]["qwen_approved"]["normal_approved"], 1)
+
+    def test_categories_and_medians_use_the_last_record(self):
+        out = trial_report.summarize(self.ROWS)
+        self.assertEqual(out["categories"]["qwen"], [{"family": "new", "count": 1}])
+        self.assertEqual(out["medians"]["qwen"]["wall_time_s"], {"n": 1, "median": 300})
+        self.assertEqual(out["medians"]["qwen"]["review_rounds"], {"n": 1, "median": 3})
+
+    def test_the_count_says_how_many_records_were_replaced(self):
+        out = trial_report.summarize(self.ROWS)
+        self.assertEqual((out["records"], out["superseded"]), (2, 1))
+        self.assertIn("1 superseded", trial_report.render(out))
+
+    def test_the_same_pair_id_on_the_two_arms_is_two_attempts(self):
+        self.assertEqual(trial_report.summarize([rec("a", "qwen", "approved"), rec("a", "normal", "approved")])["superseded"], 0)
+
+    def test_a_record_without_a_pair_id_is_its_own_attempt_and_never_paired(self):
+        rows = [rec(None, "qwen", "approved"), rec(None, "qwen", "request_changes")]
+        out = trial_report.summarize(rows)
+        self.assertEqual((out["by_arm"]["qwen"]["n"], out["superseded"], out["paired"]["pairs"]), (2, 0, 0))
 
 
 class PairedTests(unittest.TestCase):
@@ -127,6 +160,15 @@ class RenderTests(unittest.TestCase):
         self.assertIn("1/1 100% noise", text)
         self.assertIn("0/1 0% noise", text)
         self.assertIn("Paired (1 pair(s)", text)
+
+    def test_a_cell_with_no_conclusive_review_still_shows_n_and_the_noise_flag(self):
+        rows = [rec("1", "qwen", "approved", role="coder", size="small")]
+        text = trial_report.render(trial_report.summarize(rows))
+        row = next(line for line in text.splitlines() if line.strip().startswith("coder"))
+        self.assertIn("1/1 100% noise", row)
+        self.assertIn("0/0 noise", row)
+        by_arm = next(line for line in text.splitlines() if line.strip().startswith("normal"))
+        self.assertIn("0/0 noise", by_arm)
 
     def test_no_pairs_prints_no_table(self):
         text = trial_report.render(trial_report.summarize([rec("1", "qwen", "approved")]))

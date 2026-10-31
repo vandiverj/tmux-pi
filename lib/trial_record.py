@@ -156,13 +156,22 @@ def _count(path):
 
 
 def _slips(scan, extra):
-    """{"complete", "total", "by_rule"}. `complete` is False when the transcript could not be scanned (a pi transcript until its
-    schema is pinned, a missing file): the total then counts only what commit messages and replies showed, and the report
-    leaves it out of medians."""
+    """{"complete", "total", "by_rule"}. `complete` is False when the transcript could not be scanned (a pi transcript until
+    its schema is pinned, a missing file) or was scanned with lines skipped: the total is then a lower bound (what the lines
+    read, the commit messages and the replies showed), and the report leaves it out of medians."""
     by_rule = dict(scan["rule_slips"]) if scan.get("rule_slips") is not None else {}
     for rule in extra:
         by_rule[rule] = by_rule.get(rule, 0) + 1
-    return {"complete": scan.get("rule_slips") is not None, "total": sum(by_rule.values()), "by_rule": dict(sorted(by_rule.items()))}
+    return {"complete": bool(scan.get("complete")), "total": sum(by_rule.values()), "by_rule": dict(sorted(by_rule.items()))}
+
+
+def _gates(scan):
+    """None when there is no transcript scan; else {"complete", "total", "uncertain", "denied", "runs"}. `total` counts gate
+    runs known to have happened (not denied, not behind an unresolved `&&` / `||`); a scan with skipped lines is incomplete,
+    so its total is a lower bound and the report leaves it out."""
+    if scan.get("gate_runs") is None:
+        return None
+    return {"complete": bool(scan.get("complete")), **trial_scan.gate_totals(scan["gate_runs"]), "runs": scan["gate_runs"]}
 
 
 def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files=None, diff_lines=None,
@@ -224,7 +233,7 @@ def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files
         "transcript": {"harness": scan["harness"], "status": scan["status"], "commands": scan["commands"],
                        "bad_lines": scan["bad_lines"]},
         "rule_slips": _slips(scan, extra + leaks),
-        "gate_runs": {"total": len(scan["gate_runs"]), "runs": scan["gate_runs"]} if scan["gate_runs"] is not None else None,
+        "gate_runs": _gates(scan),
         "tokens": summary["tokens"],
         "wall_time_s": summary["duration_seconds"],
         "turns": summary["turns"],

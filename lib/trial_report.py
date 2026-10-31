@@ -6,8 +6,11 @@ Counting rules, all stated in the output where a reader needs them:
 - The first-pass rate is approved / (approved + request_changes). A first review that is incomplete, unparsed or label-only
   (`inconclusive`) is neither, and is counted on its own; an attempt with no first review is counted as `no_review`.
 - A cell with fewer than NOISE_BELOW conclusive attempts is flagged `noise`.
-- If a pair_id has more than one record for an arm, the last one in the file is the one used (a rerun replaces an earlier try).
-- Medians skip unknown values. `rule_slips` skips records whose transcript could not be scanned (`complete` false).
+- If a pair_id has more than one record for an arm, the last one in the file is the one used everywhere (rates, cells,
+  categories, medians and the paired view): a rerun replaces an earlier try, it does not add a second attempt. The report
+  says how many records were superseded. A record with no pair_id is its own attempt and is never paired.
+- Medians skip unknown values. `rule_slips` and `gate_runs` skip records whose transcript was not fully scanned
+  (`complete` false: no transcript, an unpinned pi transcript, or skipped lines).
 - Tokens are input + output; cache tokens are left out.
 """
 
@@ -30,13 +33,28 @@ def load(path):
     return trial_record.read_records(path)
 
 
-def _latest(records):
-    """One record per (pair_id, arm): the last in file order. Records without a pair_id or a known arm are dropped."""
-    latest = {}
+def _effective(records):
+    """(records to count, how many were superseded). The last record of a (pair_id, arm) replaces the earlier ones, in the
+    place of the first; records without a pair_id are each kept. Records with an unknown arm are dropped."""
+    slots, order, superseded = {}, [], 0
     for record in records:
-        if record.get("arm") in ARMS and isinstance(record.get("pair_id"), str):
-            latest[(record["pair_id"], record["arm"])] = record
-    return latest
+        if record.get("arm") not in ARMS:
+            continue
+        key = (record["pair_id"], record["arm"]) if isinstance(record.get("pair_id"), str) else None
+        if key is None:
+            order.append(record)
+            continue
+        if key in slots:
+            superseded += 1
+        else:
+            order.append(key)
+        slots[key] = record
+    return [slots[item] if isinstance(item, tuple) else item for item in order], superseded
+
+
+def _latest(records):
+    """{(pair_id, arm): record} over already-effective records that have a pair_id."""
+    return {(r["pair_id"], r["arm"]): r for r in records if isinstance(r.get("pair_id"), str)}
 
 
 def _outcome(record):
@@ -78,7 +96,7 @@ def _slips(record):
 
 def _gates(record):
     gates = record.get("gate_runs")
-    return _number(gates.get("total")) if isinstance(gates, dict) else None
+    return _number(gates.get("total")) if isinstance(gates, dict) and gates.get("complete") else None
 
 
 def _docs(record):
@@ -113,9 +131,9 @@ def _paired(latest):
 
 
 def summarize(records, malformed=0):
-    """The report as data. Counts every record for the cells, medians and categories; pairs use the last record per arm."""
-    records = [r for r in records if r.get("arm") in ARMS]
-    out = {"records": len(records), "malformed": malformed, "noise_below": NOISE_BELOW,
+    """The report as data. Every figure is over the effective records: the last one per (pair_id, arm)."""
+    records, superseded = _effective(records)
+    out = {"records": len(records), "superseded": superseded, "malformed": malformed, "noise_below": NOISE_BELOW,
            "by_arm": {}, "cells": [], "categories": {}, "medians": {}, "paired": _paired(_latest(records))}
     for arm in ARMS:
         mine = [r for r in records if r["arm"] == arm]
@@ -139,9 +157,9 @@ def summarize(records, malformed=0):
 
 
 def _rate(cell):
-    if not cell["n"]:
-        return "-"
-    return "{}/{} {:.0f}%{}".format(cell["approved"], cell["n"], cell["rate"] * 100, " noise" if cell["noise"] else "")
+    """approved/n with the rate and the noise flag. A cell with no conclusive review still prints its n (0/0) and the flag."""
+    pct = " {:.0f}%".format(cell["rate"] * 100) if cell["n"] else ""
+    return "{}/{}{}{}".format(cell["approved"], cell["n"], pct, " noise" if cell["noise"] else "")
 
 
 def _num(value):
@@ -156,7 +174,8 @@ def render(summary, source=None):
         where = " in {}".format(source) if source else ""
         extra = " ({} malformed line(s) skipped)".format(summary["malformed"]) if summary["malformed"] else ""
         return "No trial records{}{}. Nothing to report yet.".format(where, extra)
-    lines = ["Trial records: {} ({} malformed line(s) skipped)".format(summary["records"], summary["malformed"]),
+    lines = ["Trial records: {} ({} superseded by a later record of the same pair and arm, {} malformed line(s) skipped)".format(
+                 summary["records"], summary["superseded"], summary["malformed"]),
              "First-pass approval = approved / (approved + request_changes); cells under {} are noise.".format(summary["noise_below"]),
              "", "By arm:"]
     for arm in ARMS:

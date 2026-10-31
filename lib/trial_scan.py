@@ -8,7 +8,6 @@ transcripts (`transcript.jsonl` in the task dir) have no pinned schema yet: the 
 `scan_pi` returns `status: "unknown"` with null `rule_slips` and `gate_runs` instead of guessing.
 """
 
-import itertools
 import json
 import re
 from pathlib import Path
@@ -39,11 +38,11 @@ COMMAND_RULES = (
 # Rules that read a file write, not a command: the content a Write/Edit puts in a test file.
 FIXED_WAIT = re.compile(r"\bsetTimeout\s*\(|\bwaitForTimeout\s*\(|\btime\.sleep\s*\(|(?<![\w.])sleep\s+\d|\bsleep\s*\(")
 TIMER_OK = "timer-ok"
-# A quoted literal is a value, not code that runs: a fixture that spells `time.sleep(2)` in a string does not wait. Triple
-# quotes and backticks may span lines; plain quotes stop at the end of the line so a stray apostrophe in a comment is harmless.
-STRING_LITERAL = re.compile("|".join((
-    r'"""[\s\S]*?"""', r"'''[\s\S]*?'''", r"`(?:[^`\\]|\\[\s\S])*`",
-    r'"(?:[^"\\\n]|\\.)*"', r"'(?:[^'\\\n]|\\.)*'")))
+# A wait only counts in code that runs: comments are dropped and the literal text of a string is blanked, but an
+# interpolation (`f"{...}"`, `${...}` in a template, `$(...)` or backticks in shell) is code and is kept.
+_HASH_LANGS = {".py": "py", ".pyi": "py", ".sh": "sh", ".bash": "sh", ".zsh": "sh", ".bats": "sh"}  # anything else: JS-like
+MAX_NESTING = 32  # interpolations inside interpolations; past this the rest of the text is read as written
+_PY_STRING = re.compile(r"(?:(?<!\w)([rRbBuUfF]{1,2}))?('''|\"\"\"|'|\")")
 TEST_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|e2e)/|(?:^|/)test_[^/]*$|[._-]test\.\w+$|\.spec\.\w+$")
 ENV_PATH = re.compile(r"(?:^|/)\.env(?!\.(?:example|sample|template)$)(?:\.[\w.-]+)?$")
 # airtera-monorepo commit subjects are "DMP-NN: <imperative>" and end with a Co-Authored-By trailer
@@ -66,26 +65,56 @@ GATES = (
                         r"deno\s+test\b|node\s+--test\b|vitest\b|jest\b|(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b)")),
 )
 _PREFIX = re.compile(r"^\s*(?:(?:\w+=\S*|env|npx|timeout\s+\d+\S*|time|command)\s+)*")
-# Units that practically never fail: a failed exit after `cd x && npm test` is the gate's, not the cd's.
-_RELIABLE = re.compile(r"\s*(?:cd|echo|export|printf|pwd|true|set|unset|:)(?:\s|$)")
-MAX_FLEXIBLE_UNITS = 12
+# Builtins that do not fail in practice. `cd` is not one: a missing dir fails it and the gate behind `&&` never runs.
+_RELIABLE = re.compile(r"\s*(?:echo|export|printf|pwd|true|set|unset|:)(?:\s|$)")
+# `set -o pipefail`, `set -euo pipefail` turn pipefail on; `set +o pipefail` turns it off.
+_PIPEFAIL = re.compile(r"^\s*set\s+(?:[-+]\w*\s+)*([-+])\w*o\s+pipefail\b")
 ARITHMETIC = re.compile(r"\$\(\(.*?\)\)", re.S)
 _EXIT = re.compile(r"^\s*Exit code[: ]+(-?\d+)")
 
 
+def strip_shell_comments(command):
+    """`command` without its shell comments: a `#` that starts a word, outside quotes, up to the end of its line. A `#`
+    inside a word (`a#b`, `$#`, `${#a}`) or a quote is not a comment."""
+    out, quote, i, n = [], None, 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def command_slips(command):
-    """Rule ids a single Bash command breaks, in rule order, each once."""
+    """Rule ids a single Bash command breaks, in rule order, each once. Shell comments do not run and break nothing."""
     if not isinstance(command, str):
         return []
-    command = ARITHMETIC.sub(" ", command)  # $((1<<3)) is arithmetic, not a heredoc
+    command = ARITHMETIC.sub(" ", strip_shell_comments(command))  # $((1<<3)) is arithmetic, not a heredoc
     return [rule for rule, _, pattern in COMMAND_RULES if pattern.search(command)]
 
 
 def _units(command):
     """[(connector, [pipeline stage text, ...])] for a shell command. The connector is what precedes the unit: None for the
     first, then `&&`, `||` or `;` (a newline or a lone `&` counts as `;`). Quotes and backslashes hide operators, and `>&`,
-    `&>` redirects are not a connector. Empty units are dropped."""
-    units, stages, buf, op, pending = [], [], [], None, None
+    `&>` redirects are not a connector. Shell comments are dropped first. Empty units are dropped."""
+    command = strip_shell_comments(command)
+    units, stages, buf, op = [], [], [], None
     quote = None
     i, n = 0, len(command)
 
@@ -141,12 +170,15 @@ def _stage_kind(stage):
 
 
 def _plan(command):
-    """[{"op", "gates": [kind...], "reliable"}] per shell unit. A pipeline is one unit, and its exit is attributed to every
-    gate in it (the usual `... 2>&1 | tail` assumes pipefail or a gate in last place)."""
+    """[{"op", "gates": [(kind, last_stage)...], "reliable", "pipefail"}] per shell unit. A pipeline is one unit; its status
+    is its last stage's, or with pipefail the last failing stage's. `pipefail` is True/False when the unit sets it, else None."""
     plan = []
     for op, stages in _units(command):
-        gates = [k for k in (_stage_kind(st) for st in stages) if k]
-        plan.append({"op": op, "gates": gates, "reliable": len(stages) == 1 and bool(_RELIABLE.match(stages[0]))})
+        gates = [(k, j == len(stages) - 1) for j, k in enumerate(_stage_kind(st) for st in stages) if k]
+        single = len(stages) == 1
+        switch = _PIPEFAIL.match(stages[0]) if single else None
+        plan.append({"op": op, "gates": gates, "stages": len(stages), "reliable": single and bool(_RELIABLE.match(stages[0])),
+                     "pipefail": (switch.group(1) == "-") if switch else None})
     return plan
 
 
@@ -155,46 +187,82 @@ def gate_kinds(command):
     message or an echo that mentions pytest is not a gate run. It does not say which ones ran; `gate_runs` does."""
     if not isinstance(command, str):
         return []
-    return [kind for unit in _plan(command) for kind in unit["gates"]]
+    return [kind for unit in _plan(command) for kind, _ in unit["gates"]]
+
+
+def _runs(unit, i, status):
+    return i == 0 or unit["op"] == ";" or (unit["op"] == "&&" and status == 0) or (unit["op"] == "||" and status != 0)
+
+
+def _after(unit, state, outcome):
+    pipefail = state[1] if unit["pipefail"] is None else unit["pipefail"]
+    return (outcome, pipefail)
+
+
+def _gate_exit(outcome, ended, last_stage, single, pipefail, exit_code):
+    """What one gate's exit is, given its unit's status (0 or 1 = failed) in one surviving case: a number, "fail" (failed,
+    code not shown) or "unknown" (the unit's status does not say)."""
+    if not (single or (last_stage and not pipefail) or (pipefail and outcome == 0)):
+        return "unknown"  # an earlier stage without pipefail, or a failed pipefail pipe whose failing stage is not shown
+    if outcome == 0:
+        return 0
+    return exit_code if ended and exit_code else "fail"
 
 
 def gate_runs(command, exit_code=None):
     """[{"kind", "exit"} | + "uncertain": True] for one Bash command whose whole exit status is `exit_code` (None when
-    not shown). Gates behind `&&` / `||` are run only if the earlier units' status allowed it, so each possible pass/fail
-    of every unit is tried against bash's list rules and kept when it ends in the shown status (0 or nonzero).
-    A gate that ran in every surviving case has no mark; one that ran in some has `uncertain: True`; one that ran in none
-    is left out. `exit` is a number only for a certain run when every surviving case agrees: 0, or the shown code for the unit whose status
-    ended the list. Failures of cd / echo / true and the like are not tried."""
+    not shown). Each unit of the list passes or fails (echo / true / set and the like only pass), and bash's `&&` / `||`
+    / `;` rules decide which units run. A case is one pass/fail choice per unit that ends in the shown status (0 or
+    nonzero). A gate that ran in every case has no mark; one that ran in some has `uncertain: True`; one that ran in none
+    is left out. `exit` is a number only for a certain run when every case agrees on it: 0, or the shown code for the
+    gate whose status ended the list. A gate that is not the last stage of a pipe has no exit unless pipefail is set
+    and the pipe passed.
+
+    The cases are not listed one by one: what decides the rest of the list is only (status, pipefail) after a unit, so a
+    forward pass finds the states each unit can start in and a backward pass which states can still end in the shown
+    status. A long list costs a few steps per unit, with no cap."""
     plan = _plan(command) if isinstance(command, str) else []
     if not any(unit["gates"] for unit in plan):
         return []
-    flexible = [i for i, unit in enumerate(plan) if not unit["reliable"]]
-    cases = []
-    if len(flexible) <= MAX_FLEXIBLE_UNITS:
-        for bits in itertools.product((0, 1), repeat=len(flexible)):
-            fails = dict(zip(flexible, bits))
-            status, ran, last = 0, {}, None
-            for i, unit in enumerate(plan):
-                op = unit["op"]
-                if i == 0 or op == ";" or (op == "&&" and status == 0) or (op == "||" and status != 0):
-                    status = fails.get(i, 0)
-                    ran[i], last = status, i
-            if exit_code is None or (status == 0) == (exit_code == 0):
-                cases.append((ran, last))
+    n = len(plan)
+
+    def outcomes(unit):
+        return (0,) if unit["reliable"] else (0, 1)
+
+    states = [(s, p) for s in (0, 1) for p in (False, True)]
+    # tail[i][state] = set of "did a later unit run" over continuations of units i.. that end in the shown status
+    tail = [None] * (n + 1)
+    tail[n] = {st: ({False} if exit_code is None or (st[0] == 0) == (exit_code == 0) else set()) for st in states}
+    for i in range(n - 1, -1, -1):
+        unit, row = plan[i], {}
+        for st in states:
+            if _runs(unit, i, st[0]):
+                row[st] = {True} if any(tail[i + 1][_after(unit, st, o)] for o in outcomes(unit)) else set()
+            else:
+                row[st] = set(tail[i + 1][st])
+        tail[i] = row
+    # head[i] = states the shell can be in just before unit i
+    head = [{(0, False)}]
+    for i, unit in enumerate(plan):
+        nxt = set()
+        for st in head[i]:
+            nxt.update(_after(unit, st, o) for o in outcomes(unit)) if _runs(unit, i, st[0]) else nxt.add(st)
+        head.append(nxt)
+
     out = []
     for i, unit in enumerate(plan):
-        if cases:
-            seen = [(ran[i], last == i) for ran, last in cases if i in ran]
-            if not seen:
-                continue
-            certain = len(seen) == len(cases)
-            values = {0 if code == 0 else (exit_code if ended and exit_code else "fail") for code, ended in seen}
-            value = next(iter(values)) if len(values) == 1 and isinstance(next(iter(values)), int) else None
-        else:  # nothing fits the shown status: only the first unit and `;` units are known to have run
-            certain, value = unit["op"] in (None, ";"), None
-        for kind in unit["gates"]:
-            run = {"kind": kind, "exit": value}
-            if not certain:  # its status only counts if it ran, so none is claimed
+        ran = [(st, o) for st in head[i] if _runs(unit, i, st[0]) for o in outcomes(unit) if tail[i + 1][_after(unit, st, o)]]
+        if not ran:
+            continue
+        skipped = any(tail[i + 1][st] for st in head[i] if not _runs(unit, i, st[0]))
+        for kind, last_stage in unit["gates"]:
+            values = set()
+            for st, o in ran:
+                for later in tail[i + 1][_after(unit, st, o)]:  # pipefail as it was while the pipe ran
+                    values.add(_gate_exit(o, not later, last_stage, unit["stages"] == 1, st[1], exit_code))
+            value = next(iter(values)) if len(values) == 1 else None
+            run = {"kind": kind, "exit": value if isinstance(value, int) else None}
+            if skipped:  # its status only counts if it ran, so none is claimed
                 run["exit"], run["uncertain"] = None, True
             out.append(run)
     return out
@@ -208,16 +276,109 @@ def gate_totals(runs):
     return {"total": len(runs) - denied - uncertain, "uncertain": uncertain, "denied": denied}
 
 
-def _blank_literal(match):
-    return '""' + "\n" * match.group(0).count("\n")  # keep line numbers
+def _source_lang(path):
+    name = path.rsplit("/", 1)[-1]
+    return _HASH_LANGS.get(name[name.rfind("."):].lower() if "." in name else "", "js")
+
+
+def _code_from(text, i, lang, close, out, level=0):
+    """Copy the code in text[i:] to `out` until an unmatched `close` or the end, and return the index after it. A comment
+    becomes nothing, a string becomes `""` with its newlines kept (so lines still line up), an interpolation is code."""
+    opener = {"}": "{", ")": "("}.get(close)
+    depth, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if close and c == close and depth == 0:
+            return i + 1
+        if lang == "js" and text.startswith("//", i) or c == "#" and (
+                lang == "py" or lang == "sh" and (i == 0 or text[i - 1] in " \t\n;&|()")):
+            j = text.find("\n", i)
+            i = n if j < 0 else j  # the newline itself is code
+            continue
+        if lang == "js" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("\n" * text.count("\n", i, j))
+            i = j
+            continue
+        string = _PY_STRING.match(text, i) if lang == "py" else None
+        if string:
+            i = _string(text, string.end(), lang, string.group(2), "f" in (string.group(1) or "").lower(), out, level)
+            continue
+        if lang != "py" and (c in "'\"" or c == "`" and lang == "js"):
+            i = _string(text, i + 1, lang, c, c == "`" or (lang == "sh" and c == '"'), out, level)
+            continue
+        if opener and c == opener:
+            depth += 1
+        elif close and c == close:
+            depth -= 1
+        out.append(c)
+        i += 1
+    return i
+
+
+def _string(text, i, lang, quote, interpolates, out, level):
+    """Blank a string body that starts at text[i] and return the index after its closing quote. A one-line quote (`'`
+    or `"` outside shell, not tripled) also ends at a newline, so a stray apostrophe cannot swallow the next line."""
+    one_line = len(quote) == 1 and quote != "`" and lang != "sh"
+    raw_shell = lang == "sh" and quote == "'"
+    out.append('"')
+    n = len(text)
+    if level >= MAX_NESTING:  # too deep to follow: keep the rest as code, so a wait in it still counts
+        out.append(text[i:])
+        return n
+    while i < n:
+        if text.startswith(quote, i):
+            i += len(quote)
+            break
+        c = text[i]
+        if c == "\n":
+            if one_line:
+                break
+            out.append(c)
+        elif c == "\\" and not raw_shell and i + 1 < n:
+            if text[i + 1] == "\n":
+                out.append("\n")
+            i += 2
+            continue
+        elif interpolates and lang == "py" and c == "{":
+            if text.startswith("{{", i):
+                i += 2
+                continue
+            out.append(" ")
+            i = _code_from(text, i + 1, lang, "}", out, level + 1)
+            out.append(" ")
+            continue
+        elif interpolates and lang == "js" and text.startswith("${", i):
+            out.append(" ")
+            i = _code_from(text, i + 2, lang, "}", out, level + 1)
+            out.append(" ")
+            continue
+        elif interpolates and lang == "sh" and (text.startswith("$(", i) or c == "`"):
+            out.append(" ")
+            i = _code_from(text, i + (2 if c == "$" else 1), lang, ")" if c == "$" else "`", out, level + 1)
+            out.append(" ")
+            continue
+        i += 1
+    out.append('"')
+    return i
+
+
+def executable_code(path, text):
+    """`text` as the code that runs, for a file at `path`: comments dropped, literal text of strings blanked, the code
+    inside interpolations kept. Lines line up with `text`."""
+    out = []
+    _code_from(text, 0, _source_lang(path), None, out)
+    return "".join(out)
 
 
 def write_slips(path, text):
-    """Rule ids a Write/Edit of `text` to `path` breaks: a fixed wait in a test file that carries no `timer-ok` mark."""
+    """Rule ids a Write/Edit of `text` to `path` breaks: a fixed wait in the code of a test file whose line carries no
+    `timer-ok` mark (the mark is usually a comment, so it is looked for in the line as written)."""
     if not isinstance(path, str) or not isinstance(text, str) or not TEST_PATH.search(path):
         return []
-    for line in STRING_LITERAL.sub(_blank_literal, text).splitlines():
-        if FIXED_WAIT.search(line) and TIMER_OK not in line:
+    for code, written in zip(executable_code(path, text).split("\n"), text.split("\n")):
+        if FIXED_WAIT.search(code) and TIMER_OK not in written:
             return ["fixed_wait"]
     return []
 

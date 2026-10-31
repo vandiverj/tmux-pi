@@ -134,6 +134,16 @@ class GoldenArgvTests(LauncherCase):
         self.assertEqual([a for a in allow if "tmux-pi-docs" in a], [f"mcp__tmux-pi-docs__{t}" for t in TOOLS])
 
 
+    def test_the_readme_names_what_the_shared_allowlist_pre_allows(self):
+        readme = (ROOT / "README.md").read_text()
+        line = next(l for l in readme.splitlines() if "are pre-allowed" in l or "is pre-allowed" in l)
+        for tool in TOOLS:
+            self.assertIn(f"`{tool}`", line)
+        self.assertIn("tmux-pi-docs", line)
+        self.assertIn("tmux-pi-safe", line)
+        self.assertNotIn("Only the legacy subagent MCP tools are pre-allowed", readme)
+
+
 @unittest.skipUnless(NODE, "node is not installed")
 class McpServerTests(ProjectCase):
     SERVER = ROOT / "claude" / "mcp" / "docs.mjs"
@@ -267,6 +277,35 @@ class ExtensionContractTests(unittest.TestCase):
         script = (ROOT / "bin/tp-pi").read_text()
         self.assertEqual(script.count("docs.ts"), 1)
         self.assertRegex(script, r'if \[\[ "\$\{TP_DOCS_TOOLS:-\}" == 1 \]\]; then\n\s+extensions\+=\("\$ROOT/agent/extensions/docs\.ts"\)')
+
+
+class ExtensionRuntimeTests(ProjectCase):
+    """agent/extensions/docs.ts loaded as pi loads an extension (the installed pi packages, real bin/tp-docs), no model."""
+
+    def test_both_tools_answer_against_fixtures_with_logging_and_fail_closed_without_a_task_dir(self):
+        package = os.environ.get("PI_CODING_AGENT_PACKAGE")
+        if not package:
+            pi = shutil.which("pi")
+            package = str(Path(pi).resolve().parents[2]) if pi else ""
+        if not package or not (Path(package) / "dist/index.js").exists() or not NODE:
+            self.skipTest("installed pi package or node not found")
+        sys.path.insert(0, str(ROOT / "lib"))
+        from localdocs import index  # noqa: E402
+        from project import install_deno_remote  # noqa: E402
+        shutil.copytree(FIXTURES / "docs", self.base / "docs")
+        index.build_for(self.project, "plainpkg", source=self.base / "docs")
+        jsr = self.base / "jsr-project"
+        jsr.mkdir()
+        deno = self.base / "deno"
+        install_deno_remote(deno)
+        (jsr / "deno.lock").write_text(json.dumps({"version": "4", "specifiers": {"jsr:@fx/strs@1": "1.4.0"}, "jsr": {"@fx/strs@1.4.0": {}}}))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TP_")}
+        env.update(PI_CODING_AGENT_PACKAGE=package, DOCS_ROOT=str(ROOT), DOCS_PROJECT=str(self.project), DOCS_JSR_PROJECT=str(jsr),
+                   DOCS_TASK_DIR=str(self.task), DENO_DIR=str(deno))
+        run = subprocess.run([NODE, "--experimental-strip-types", str(FIXTURES / "docs_runtime.mjs")], cwd=ROOT, env=env,
+                             capture_output=True, text=True, timeout=240)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("docs extension runtime ok", run.stdout)
 
 
 if __name__ == "__main__":

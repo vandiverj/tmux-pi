@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """tp-docs — offline, read-only library docs for workers, matched to the project's lockfile.
 
-  tp-docs signature PACKAGE SYMBOL   the declaration of SYMBOL (docs comment included) from PACKAGE's own .d.ts
+  tp-docs signature PACKAGE SYMBOL   the declaration of SYMBOL (docs comment included) from PACKAGE's own .d.ts; PACKAGE is an npm
+                                     name, npm:name, jsr:@scope/name or an https:// URL, the last two from Deno's cache
   tp-docs search LIB QUERY           top matches from LIB's docs index
   tp-docs status                     indexes built, and whether the lockfile moved since
   tp-docs build LIB [--from DIR]     index LIB's docs at the version the lockfile pins (offline)
@@ -10,7 +11,8 @@
 
 signature and search log every call as one JSON line to $TP_TASK_DIR/docs-calls.jsonl (or --log FILE) and answer nothing
 when they cannot (exit 3). They open no sockets and read only .d.ts/.d.mts/.d.cts/.md files under the package, the index
-or Deno's npm cache. The project is --project, $TP_DOCS_PROJECT, or found from the working directory by its lockfile.
+or Deno's npm cache; jsr:/https: modules in Deno's remote cache may also be .ts/.mts/.cts source, from which only exported
+declarations are returned (bodies and initializers are cut). The project is --project, $TP_DOCS_PROJECT, or found from the working directory by its lockfile.
 Every answer starts with a [provenance] line (source, version, exact yes/no, retrieved time); search answers are cached beside
 the log, keyed by lib, pinned version, index build and query. Answers are capped at 8 KB. Exit: 0 an answer, 1 no answer (--json: 0), 2 usage or refusal at the CLI, 3 not logged.
 """

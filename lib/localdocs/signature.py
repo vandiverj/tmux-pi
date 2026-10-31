@@ -5,6 +5,9 @@ package only deno.lock pins) in Deno's npm cache. Its entry declaration file com
 `typings` / `exports["."]` / `main`; relative re-exports are followed inside the package. Every read goes through
 guard.py (allowlisted extensions, links resolved, nothing outside the package directory, never .env*).
 
+`jsr:@scope/name` and `https://` specifiers are read from Deno's remote cache (remote.py), pinned by deno.lock. Those files
+may be TypeScript source; declaration_view() then returns only exported declarations, with bodies and initializers cut.
+
 The declaration scanner is a text scanner, not a TypeScript parser: it splits a declaration file into top-level
 statements (comments, strings and brackets skipped) and matches the name. It returns the statement with the
 JSDoc comment just above it. `Ns.member` finds a member of a namespace, class, interface or enum.
@@ -14,7 +17,7 @@ import os
 import re
 from pathlib import Path
 
-from . import guard, lock
+from . import guard, lock, remote
 
 NAME_RE = re.compile(r"^(@[A-Za-z0-9][A-Za-z0-9~._-]*/)?[A-Za-z0-9][A-Za-z0-9~._-]*$")
 SYMBOL_RE = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$")
@@ -25,8 +28,8 @@ KEYWORDS = ("export", "declare", "import", "interface", "type", "function", "cla
 CONTAINERS = ("interface", "class", "enum", "namespace", "module", "global")
 CONTAINER_HEAD = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const\s+)?(?:%s)\b" % "|".join(CONTAINERS))
 DECL = re.compile(
-    r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const\s+)?"
-    r"(?P<kind>function|class|interface|type|enum|namespace|module|const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)")
+    r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const\s+)?(?:async\s+)?"
+    r"(?P<kind>function|class|interface|type|enum|namespace|module|const|let|var)(?:\s*\*\s*|\s+)(?P<name>[A-Za-z_$][\w$]*)")
 MEMBER = re.compile(
     r"^(?:(?:public|protected|private|static|readonly|abstract|declare|async|override|export)\s+)*"
     r"(?:(?:get|set)\s+(?=[A-Za-z_$]))?(?P<name>[A-Za-z_$][\w$]*|'[^']+'|\"[^\"]+\")\s*[?!]?\s*(?:[(<:=;,]|$)")
@@ -138,42 +141,172 @@ def _with_doc(text, doc, statement):
     return (text[doc[0]:doc[1]] + "\n" if doc else "") + statement
 
 
+def _scan(text):
+    """(index, char, parens, angles, braces) for each character outside strings and comments, counted before the character."""
+    paren = angle = brace = 0
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if c in "'\"`":
+            i = _skip_string(text, i)
+            continue
+        yield i, c, paren, angle, brace
+        if c in "([":
+            paren += 1
+        elif c in ")]":
+            paren -= 1
+        elif c == "{":
+            brace += 1
+        elif c == "}":
+            brace -= 1
+        elif c == "<" and paren <= 0:
+            angle += 1
+        elif c == ">" and paren <= 0 and angle > 0 and text[i - 1] != "=":
+            angle -= 1
+        i += 1
+
+
+def _body_open(statement):
+    """Index of the `{` that opens a container's body: the first one outside (), [] and <>, strings and comments. A `{` in
+    the header, such as `<T extends { id: string }>` or `extends Base<{ a: 1 }>`, is a type and not the body."""
+    for i, c, paren, angle, brace in _scan(statement):
+        if c == "{" and paren <= 0 and angle <= 0 and brace <= 0:
+            return i
+    return -1
+
+
 def _body(statement):
-    open_at, close_at = statement.find("{"), statement.rfind("}")
+    open_at, close_at = _body_open(statement), statement.rfind("}")
     return statement[open_at + 1:close_at] if 0 <= open_at < close_at else ""
 
 
-def find_declarations(text, symbol, _nest=0):
-    """Declaration texts (doc comment included) for `symbol` in one declaration file's text."""
+# ---- source files: exported declarations without code --------------------------------------------------------------
+
+PRIVATE_MEMBER = re.compile(r"^(?:(?:public|protected|static|readonly|abstract|declare|async|override|export)\s+)*(?:private\b|#)")
+LITERAL = re.compile(r"""^(?:"[^"\n]{0,80}"|'[^'\n]{0,80}'|-?\d[\w.]{0,30}|true|false|null)$""")
+KEEP_WHOLE = ("interface", "type", "enum")
+BLOCKS = ("class", "namespace", "module")
+OMITTED = "/* body omitted */"
+
+
+def _function_body_open(text):
+    """Index of the `{` that opens a function or method body: a top-level `{` that follows a finished type, not an operator
+    (`): { a: 1 } {` is a return type and then the body)."""
+    for i, c, paren, angle, brace in _scan(text):
+        if c == "{" and paren <= 0 and angle <= 0 and brace <= 0:
+            before = text[:i].rstrip()
+            if before and before[-1] not in ":|&<,(=" and not before.endswith("=>") and not OPEN_WORDS.search(before):
+                return i
+    return -1
+
+
+def _initializer_at(text):
+    """Index of the `=` that starts an initializer (not `=>`, `==`, `<=`, `>=`, `!=`, and not inside (), [], <> or {})."""
+    for i, c, paren, angle, brace in _scan(text):
+        if c == "=" and paren <= 0 and angle <= 0 and brace <= 0:
+            following, previous = text[i + 1:i + 2], text[i - 1:i] if i else ""
+            if (following and following in "=>") or (previous and previous in "=!<>"):
+                continue
+            return i
+    return -1
+
+
+def _arrow_at(text):
+    for i, c, paren, angle, brace in _scan(text):
+        if c == "=" and text[i + 1:i + 2] == ">" and paren <= 0 and angle <= 0 and brace <= 0:
+            return i
+    return -1
+
+
+def _value_view(header, initializer):
+    """`header = initializer` reduced to what a caller needs: a function's parameters and result, a short literal, else nothing."""
+    initializer = initializer.strip().rstrip(";").strip()
+    if LITERAL.match(initializer):
+        return f"{header} = {initializer};"
+    arrow = _arrow_at(initializer)
+    if arrow >= 0:
+        return f"{header} = {initializer[:arrow + 2]} {OMITTED};"
+    if re.match(r"(?:async\s+)?function\b", initializer):
+        body = _function_body_open(initializer)
+        return f"{header} = {initializer[:body].rstrip() if body >= 0 else initializer} {OMITTED};"
+    return f"{header}; /* initializer omitted */"
+
+
+def declaration_view(statement):
+    """A statement of a TypeScript *source* file as its declaration: function and method bodies, variable and property
+    initializers (short literals aside) and private members are left out. Types (interface, type, enum) are kept as written."""
+    statement = statement.strip().rstrip(";").rstrip()
+    decl = DECL.match(statement)
+    kind = decl["kind"] if decl else None
+    if kind in KEEP_WHOLE:
+        return statement
+    if kind in BLOCKS:
+        return _block_view(statement, kind)
+    equals = _initializer_at(statement)
+    if equals >= 0:
+        return _value_view(statement[:equals].rstrip(), statement[equals + 1:])
+    body = _function_body_open(statement)
+    return (statement[:body].rstrip() if body >= 0 else statement) + ";"
+
+
+def _block_view(statement, kind):
+    open_at, close_at = _body_open(statement), statement.rfind("}")
+    if open_at < 0 or close_at < open_at:
+        return statement + ";"
+    body = statement[open_at + 1:close_at]
+    lines = []
+    for start, end, doc in split_statements(body, members=True):
+        member = body[start:end].strip().rstrip(",;")
+        if PRIVATE_MEMBER.match(member) or (kind != "class" and not member.startswith("export")):
+            continue
+        lines.append("  " + _with_doc(body, doc, declaration_view(member)).replace("\n", "\n  "))
+    return statement[:open_at].rstrip() + (" {\n" + "\n".join(lines) + "\n}" if lines else " {}")
+
+
+def find_declarations(text, symbol, _nest=0, source=False, exported_only=True):
+    """Declaration texts (doc comment included) for `symbol` in one declaration file's text. With `source`, `text` is TypeScript
+    source: only exported declarations count and each is returned as declaration_view() shows it."""
     head, _, rest = symbol.partition(".")
     out = []
     for start, end, doc in split_statements(text):
         statement = text[start:end].strip()
+        if source and exported_only and not statement.startswith("export"):
+            continue
         match = DECL.match(statement)
         if match and match["name"] == head:
             if not rest:
-                out.append(_with_doc(text, doc, statement))
+                out.append(_with_doc(text, doc, declaration_view(statement) if source else statement))
             elif _nest < MAX_NEST and match["kind"] in ("namespace", "module", "class", "interface", "enum"):
-                out.extend(find_members(_body(statement), rest, _nest + 1))
+                out.extend(find_members(_body(statement), rest, _nest + 1, source, match["kind"]))
         elif _nest < MAX_NEST and re.match(r"^(?:export\s+)?declare\s+(?:module\s+['\"]|global\b)", statement):
             out.extend(find_declarations(_body(statement), symbol, _nest + 1))
     return out
 
 
-def find_members(body, path, _nest=0):
+def find_members(body, path, _nest=0, source=False, parent="interface"):
     """Members of a container body named by the dotted `path`."""
     head, _, rest = path.partition(".")
     out = []
     for start, end, doc in split_statements(body, members=True):
         statement = body[start:end].strip().rstrip(",;")
+        if source and (PRIVATE_MEMBER.match(statement) or (parent in ("namespace", "module") and not statement.startswith("export"))):
+            continue
         decl, member = DECL.match(statement), MEMBER.match(statement)
         name = decl["name"] if decl else member["name"].strip("'\"") if member else None
         if name != head:
             continue
         if not rest:
-            out.append(_with_doc(body, doc, statement))
+            out.append(_with_doc(body, doc, declaration_view(statement) if source else statement))
         elif _nest < MAX_NEST and decl and decl["kind"] in ("namespace", "module", "class", "interface", "enum"):
-            out.extend(find_members(_body(statement), rest, _nest + 1))
+            out.extend(find_members(_body(statement), rest, _nest + 1, source, decl["kind"]))
     return out
 
 
@@ -189,11 +322,12 @@ def _export_items(clause):
     return items
 
 
-def local_aliases(text, head):
-    """Originals that a local `export { Original as head }` (no `from`) exports as `head`."""
+def local_aliases(text, head, include_same=False):
+    """Originals that a local `export { Original as head }` (no `from`) exports as `head`. With `include_same`, also `head`
+    itself when it is exported that way (a source file declares it without `export`)."""
     found = []
     for match in re.finditer(r"export\s+(?:type\s+)?\{([^}]*)\}(?!\s*from\b)", text):
-        found.extend(orig for orig, exported in _export_items(match.group(1)) if exported == head and orig != head)
+        found.extend(orig for orig, exported in _export_items(match.group(1)) if exported == head and (include_same or orig != head))
     return found
 
 
@@ -225,24 +359,32 @@ def deno_dir(explicit=None):
 
 
 def parse_package(spec):
-    """(name, wanted_version, via_deno) from `name`, `@scope/name` or `npm:name[@version]`."""
+    """(name, wanted_version, kind) from `name`, `@scope/name`, `npm:name[@version]`, `jsr:@scope/name[@version]` or an
+    `https://host/path` URL. kind is "npm", "deno-npm", "jsr" or "https" (for https, name is the URL)."""
     spec = str(spec or "").strip()
-    if not spec or len(spec) > 214:
+    if not spec or len(spec) > 500 or (len(spec) > 214 and not spec.startswith("https://")):
         raise guard.Rejected("refused: package name is empty or too long")
-    if re.match(r"^(jsr|https?|file|node|data):", spec) or spec.startswith(("/", ".", "~", "\\")):
+    if spec.startswith("https://"):
+        remote.parse_https(spec)
+        return spec, None, "https"
+    if re.match(r"^(http|file|node|data):", spec) or spec.startswith(("/", ".", "~", "\\")):
         raise guard.Rejected(
-            f"refused: {spec.split(':', 1)[0]!r} specifiers and paths are not supported; only npm packages are read, "
-            "from node_modules or Deno's npm cache")
-    via_deno = spec.startswith("npm:")
-    if via_deno:
-        spec = spec[4:]
+            f"refused: {spec.split(':', 1)[0]!r} specifiers and paths are not supported; npm, jsr: and https: modules are read, "
+            "from node_modules or Deno's cache")
+    kind = "npm"
+    for prefix, found in (("npm:", "deno-npm"), ("jsr:", "jsr")):
+        if spec.startswith(prefix):
+            spec, kind = spec[len(prefix):], found
     wanted = None
     at = spec.rfind("@")
     if at > 0:
         spec, wanted = spec[:at], spec[at + 1:] or None
-    if not NAME_RE.match(spec):
+    if kind == "jsr":
+        if not remote.JSR_RE.match(spec):
+            raise guard.Rejected(f"refused: {spec!r} is not a jsr package name (@scope/name)")
+    elif not NAME_RE.match(spec):
         raise guard.Rejected(f"refused: {spec!r} is not an npm package name")
-    return spec, wanted, via_deno
+    return spec, wanted, kind
 
 
 def types_package(name):
@@ -343,10 +485,33 @@ def _module_file(package_dir, base, specifier, refusals):
     return None
 
 
-def search_package(package_dir, symbol):
-    """(hits, files_read, entry, refusals): hits are (file, declaration text); relative re-exports are followed."""
+class DirSource:
+    """A package directory (node_modules or Deno's npm cache): the strict allowlist, declaration files only."""
+
+    def __init__(self, package_dir):
+        self.package_dir = package_dir
+
+    def entry_candidates(self):
+        return entry_candidates(self.package_dir)
+
+    def existing(self, key, refusals):
+        return _existing(self.package_dir, key, refusals)
+
+    def read(self, key):
+        return guard.read_text(guard.resolve_inside(self.package_dir, key))
+
+    def module(self, base, specifier, refusals):
+        return _module_file(self.package_dir, base, specifier, refusals)
+
+    def is_source(self, key):
+        return False
+
+
+def search_package(source, symbol):
+    """(hits, files_read, entry, refusals): hits are (file, declaration text); relative re-exports are followed.
+    `source` is a DirSource or one of remote.py's sources."""
     refusals = []
-    entry = next(filter(None, (_existing(package_dir, c, refusals) for c in entry_candidates(package_dir))), None)
+    entry = next(filter(None, (source.existing(c, refusals) for c in source.entry_candidates())), None)
     if entry is None:
         if refusals:
             raise guard.Rejected("refused: " + "; ".join(refusals))
@@ -357,26 +522,70 @@ def search_package(package_dir, symbol):
         if (current, wanted) in seen:
             continue
         seen.add((current, wanted))
-        text = guard.read_text(guard.resolve_inside(package_dir, current))
+        text = source.read(current)
         if text is None:
             continue
+        code = source.is_source(current)
         head, _, rest = wanted.partition(".")
-        found = find_declarations(text, wanted)
-        for original in local_aliases(text, head):
-            found += find_declarations(text, original + ("." + rest if rest else ""))
+        found = find_declarations(text, wanted, source=code)
+        for original in local_aliases(text, head, include_same=code):
+            found += find_declarations(text, original + ("." + rest if rest else ""), source=code, exported_only=False)
         equals = re.search(r"^\s*export\s*=\s*([A-Za-z_$][\w$]*)\s*;?", text, re.M)
         if not found and equals and not rest:
-            found = find_declarations(text, f"{equals.group(1)}.{wanted}")
+            found = find_declarations(text, f"{equals.group(1)}.{wanted}", source=code)
         if found:
             hits.extend((current, hit) for hit in found)
             continue
         if depth < MAX_NEST:
             for specifier, name in reexports(text, head):
-                module = _module_file(package_dir, current, specifier, refusals)
+                module = source.module(current, specifier, refusals)
                 if module:
                     queue.append((module, name + ("." + rest if rest else ""), depth + 1))
     files = sorted({f for f, _ in seen})
     return hits, files, entry, refusals
+
+
+def _answer(name, pinned, source, symbol, where, exact):
+    """The Found for `symbol` read from `source`, or Miss."""
+    try:
+        hits, files, entry, refusals = search_package(source, symbol)
+    except remote.Unavailable as unavailable:
+        raise Miss(str(unavailable), pinned.version) from None
+    except Miss as miss:
+        miss.version = pinned.version
+        raise
+    if not hits:
+        note = f"; refused: {'; '.join(refusals)}" if refusals else ""
+        raise Miss(f"{symbol} not found in the {name}@{pinned.version} declarations (entry {entry}, {len(files)} file(s) read){note}",
+                   pinned.version)
+    member = f" (member {symbol})" if "." in symbol else ""
+    text = "\n\n".join(f"// {name}@{pinned.version} — {file}{member}\n{hit}" for file, hit in hits)
+    provenance = {"source": where, "version": pinned.version, "exact": exact, "retrieved": guard.now()}
+    return Found(text, pinned.version, name, files, provenance)
+
+
+def _lookup_jsr(project, name, wanted, symbol, deno):
+    pinned = lock.pin(project, name, scheme="jsr")
+    if not pinned:
+        raise Miss(pinned.reason)
+    if wanted and wanted != pinned.version:
+        raise Miss(f"jsr:{name}@{wanted} was asked for but {pinned.lockfile} pins {pinned.version}; no result for other versions", pinned.version)
+    source = remote.JsrSource(deno_dir(deno), name, pinned.version)
+    if not source.cached() or not any(source.existing(c, []) for c in source.entry_candidates()):
+        raise Miss(f"jsr:{name}@{pinned.version} is pinned but not in Deno's cache; run `deno cache jsr:{name}@{pinned.version}` first "
+                   "(this tool never fetches)", pinned.version)
+    return _answer(f"jsr:{name}", pinned, source, symbol, f"deno-cache:{source.directory}", True)
+
+
+def _lookup_https(project, url, symbol, deno):
+    host, path = remote.parse_https(url)
+    source = remote.HttpsSource(deno_dir(deno), project, host, path)
+    if not source.locked(path):
+        raise Miss(f"no pinned version: {url} has no entry in deno.lock (its \"remote\" section)")
+    pinned = lock.Pin(source.version(), "deno.lock")
+    if not source.existing(path, []):
+        raise Miss(f"{url} is pinned but not in Deno's cache; run `deno cache {url}` first (this tool never fetches)", pinned.version)
+    return _answer(url, pinned, source, symbol, f"deno-cache:{source.directory}", True)
 
 
 def _lookup(project, name, wanted, via_deno, symbol, deno):
@@ -397,20 +606,8 @@ def _lookup(project, name, wanted, via_deno, symbol, deno):
     if installed != pinned.version:
         raise Miss(f"{name} on disk is {installed or 'of unknown version'} but {pinned.lockfile} pins {pinned.version}; "
                    "reinstall to match the lockfile", pinned.version)
-    try:
-        hits, files, entry, refusals = search_package(package_dir, symbol)
-    except Miss as miss:
-        miss.version = pinned.version
-        raise
-    if not hits:
-        note = f"; refused: {'; '.join(refusals)}" if refusals else ""
-        raise Miss(f"{symbol} not found in the {name}@{pinned.version} declarations (entry {entry}, {len(files)} file(s) read){note}",
-                   pinned.version)
-    member = f" (member {symbol})" if "." in symbol else ""
-    text = "\n\n".join(f"// {name}@{pinned.version} — {file}{member}\n{hit}" for file, hit in hits)
-    provenance = {"source": f"{'node_modules' if package_dir is node_dir else 'deno-cache'}:{package_dir}", "version": pinned.version,
-                  "exact": installed == pinned.version, "retrieved": guard.now()}
-    return Found(text, pinned.version, name, files, provenance)
+    where = f"{'node_modules' if package_dir is node_dir else 'deno-cache'}:{package_dir}"
+    return _answer(name, pinned, DirSource(package_dir), symbol, where, installed == pinned.version)
 
 
 def api_signature(project, package, symbol, *, deno=None):
@@ -418,7 +615,12 @@ def api_signature(project, package, symbol, *, deno=None):
     symbol = str(symbol or "").strip()
     if not SYMBOL_RE.match(symbol) or len(symbol) > 200:
         raise guard.Rejected(f"refused: {symbol!r} is not an identifier (use Name or Namespace.member)")
-    name, wanted, via_deno = parse_package(package)
+    name, wanted, kind = parse_package(package)
+    if kind == "jsr":
+        return _lookup_jsr(project, name, wanted, symbol, deno)
+    if kind == "https":
+        return _lookup_https(project, name, symbol, deno)
+    via_deno = kind == "deno-npm"
     try:
         return _lookup(project, name, wanted, via_deno, symbol, deno)
     except Miss as first:

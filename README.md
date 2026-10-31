@@ -245,7 +245,7 @@ The plugin in `claude/plugins/tmux-pi` also loads a main-only module, `hooks/reg
 
 Sensitive-read enforcement, `report.sh`, the status pane and `tp-agent` are unchanged and stay the shared contract for both harnesses; the Pi main has no equivalent notifier and polls with `task_index`. Check the module with `claude plugin validate claude/plugins/tmux-pi` and `claude plugin test claude/plugins/tmux-pi`.
 
-`claude/mcp.json` also defines YouTrack, airteracode, and optional database integrations; `agent/mcp.json` defines Pi integrations. Availability depends on installed services and local configuration. HTTP auth headers come from the git-ignored `claude/mcp.local.env`, sourced by the launchers when present. Only the legacy subagent MCP tools are pre-allowed; other Claude MCP calls still prompt for permission.
+`claude/mcp.json` also defines YouTrack, airteracode, and optional database integrations; `agent/mcp.json` defines Pi integrations. Availability depends on installed services and local configuration. HTTP auth headers come from the git-ignored `claude/mcp.local.env`, sourced by the launchers when present. Only the legacy subagent MCP tools, the `tmux-pi-safe` read tools and the two read-only `tmux-pi-docs` calls (`api_signature` and `docs_search`, present only when `TP_DOCS_TOOLS=1`) are pre-allowed; other Claude MCP calls still prompt for permission.
 
 ## Validation and legacy path
 

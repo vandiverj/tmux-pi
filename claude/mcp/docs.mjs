@@ -34,7 +34,7 @@ const TOOLS = {
       "`symbol` may be dotted (Namespace.member, Class.method). No lockfile entry means no answer.",
     schema: {
       type: "object", required: ["package", "symbol"],
-      properties: { package: str("npm package name, e.g. zod or @scope/name (or npm:name)"), symbol: str("Exported name, e.g. z.object or Client.connect") },
+      properties: { package: str("npm package, e.g. zod, @scope/name, npm:name, jsr:@scope/name, or an https:// module URL that deno.lock pins"), symbol: str("Exported name, e.g. z.object or Client.connect") },
     },
     run: (p) => ask(["signature", String(p.package ?? ""), String(p.symbol ?? "")]),
   },

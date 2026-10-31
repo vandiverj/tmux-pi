@@ -174,8 +174,17 @@ def build(project, lib, version, source, lock_hash, lock_name, source_kind):
     return meta
 
 
+def read_in_index(directory, name, limit):
+    """The text of `name` (index.json or meta.json) inside an index directory. The file is resolved through links first and
+    must be that very file under the directory: a link out of it, or to another name inside it, is refused."""
+    target = guard.resolve_inside(directory, name, suffix=False)
+    if target.name != name:
+        raise guard.Rejected(f"refused: {name!r} in the docs index is a link to {target.name!r}")
+    return guard.read_text(target, limit=limit)
+
+
 def read_meta(directory):
-    text = guard.read_text(Path(directory) / "meta.json", limit=1_000_000)
+    text = read_in_index(directory, "meta.json", 1_000_000)
     meta = json.loads(text) if text else None
     return meta if isinstance(meta, dict) else None
 
@@ -210,11 +219,7 @@ def build_for(project, lib, *, source=None, version=None, deno=None):
     """`tp-docs build`: index lib at the lockfile's pin from `source` (a directory) or the default source."""
     if not signature.NAME_RE.match(str(lib or "")):
         raise guard.Rejected(f"refused: {lib!r} is not an npm package name")
-    installed = None
-    node_dir = signature.node_package_dir(project, lib)
-    if node_dir:
-        installed = signature.installed_version(node_dir)
-    pinned = lock.pin(project, lib, installed)
+    pinned = _pin_of(project, lib)
     if not pinned and pinned.candidates and version in pinned.candidates:
         pinned = lock.Pin(version, "lockfile")
     if not pinned:
@@ -231,8 +236,17 @@ def build_for(project, lib, *, source=None, version=None, deno=None):
     return build(project, lib, pinned.version, chosen[1], lock.lock_hash(project), pinned.lockfile, chosen[0])
 
 
+def _pin_of(project, lib):
+    node_dir = signature.node_package_dir(project, lib)
+    return lock.pin(project, lib, signature.installed_version(node_dir) if node_dir else None)
+
+
 def refresh(project, deno=None):
-    """`tp-docs refresh`: rebuild every index whose lockfile hash changed. [(lib, action, detail)]."""
+    """`tp-docs refresh`: rebuild every index whose lockfile hash changed. [(lib, action, detail)].
+
+    A `--from DIR` source is for the version it was built for: it is reused only while the pin is still that version. When
+    the pin moved it is dropped and the docs are sourced again for the new pin (fetched docs, else the installed package);
+    with none to be had the old index is kept untouched and reported `stale` rather than relabelled as the new version."""
     current = lock.lock_hash(project)
     done = []
     for directory, meta in list_indexes(project):
@@ -242,12 +256,23 @@ def refresh(project, deno=None):
         elif meta.get("lock_hash") == current:
             done.append((lib, "unchanged", meta.get("version", "")))
         else:
+            recorded = meta.get("source") or {}
+            moved = None
+            source = None
+            if recorded.get("kind") == "dir":
+                pinned = _pin_of(project, lib)
+                if pinned and pinned.version == meta.get("version"):
+                    source = recorded.get("path") if os.path.isdir(recorded.get("path", "")) else None
+                else:
+                    moved = pinned.version or "no version"
             try:
-                recorded = meta.get("source") or {}
-                source = recorded.get("path") if recorded.get("kind") == "dir" and os.path.isdir(recorded.get("path", "")) else None
                 fresh = build_for(project, lib, source=source, deno=deno)
             except (Miss, guard.Rejected) as exc:
-                done.append((lib, "failed", str(exc)))
+                if moved is not None:
+                    done.append((lib, "stale", f"the lockfile now pins {moved} but the index is {meta.get('version')} from a --from "
+                                 f"directory, which is not reused for another version ({exc}); the {meta.get('version')} index is kept"))
+                else:
+                    done.append((lib, "failed", str(exc)))
                 continue
             if fresh["version"] != meta.get("version") and directory.exists():
                 shutil.rmtree(directory, ignore_errors=True)
@@ -267,8 +292,7 @@ def status(project):
 
 
 def _load(directory):
-    path = Path(directory) / "index.json"
-    text = guard.read_text(path, limit=MAX_INDEX)
+    text = read_in_index(directory, "index.json", MAX_INDEX)
     return json.loads(text) if text else None
 
 
@@ -305,11 +329,7 @@ def docs_search(project, lib, query, limit=None, cache_dir=None):
         limit = max(1, min(10, int(limit))) if limit not in (None, "") else 5
     except (TypeError, ValueError):
         raise guard.Rejected("refused: limit must be a number") from None
-    installed = None
-    node_dir = signature.node_package_dir(project, lib)
-    if node_dir:
-        installed = signature.installed_version(node_dir)
-    pinned = lock.pin(project, lib, installed)
+    pinned = _pin_of(project, lib)
     if not pinned:
         raise Miss(pinned.reason)
     directory = index_root(project) / key(lib, pinned.version)

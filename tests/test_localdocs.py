@@ -1,5 +1,6 @@
 """lib/localdocs: lockfile pins, allowlisted reads, api_signature, the docs index, call logging. No network, no models."""
 import ast
+import hashlib
 import io
 import json
 import os
@@ -14,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures" / "localdocs"))
-from project import FIXTURES, ROOT, ProjectCase, make_project  # noqa: E402
+from project import FIXTURES, ROOT, ProjectCase, install_deno_remote, make_project  # noqa: E402
 
 from localdocs import calls, fetch, guard, index, lock, log, signature  # noqa: E402
 
@@ -151,6 +152,21 @@ class SignatureTests(ProjectCase):
         self.assertNotIn("Mode", sig(self.project, "plainpkg", "DEFAULT_TIMEOUT").text)
         self.assertIn("export declare const enum Mode { Fast = 1, Slow = 2 }", sig(self.project, "plainpkg", "Mode").text)
 
+    def test_a_generic_constraint_brace_is_not_the_body_so_its_keys_are_not_members(self):
+        # `ConnectOptions<T extends { id: string }>`: the first `{` is a constraint, not the interface body
+        with self.assertRaises(signature.Miss):
+            sig(self.project, "plainpkg", "ConnectOptions.id")
+        self.assertIn("timeout?: number", sig(self.project, "plainpkg", "ConnectOptions.timeout").text)
+        self.assertIn("onError(error: Error): void", sig(self.project, "plainpkg", "ConnectOptions.onError").text)
+
+    def test_generic_classes_with_extends_and_object_defaults_find_members_in_the_real_body(self):
+        text = ("export declare class Box<T extends { a: string } = { a: string }> extends Base<{ b: number }> implements Thing<{ c: 1 }> {\n"
+                "  /** Put it. */\n  put(value: T): void;\n  readonly size: number;\n}\n")
+        self.assertIn("put(value: T): void", "\n".join(signature.find_declarations(text, "Box.put")))
+        self.assertIn("readonly size: number", "\n".join(signature.find_declarations(text, "Box.size")))
+        for phantom in ("Box.a", "Box.b", "Box.c"):
+            self.assertEqual(signature.find_declarations(text, phantom), [], phantom)
+
     def test_dotted_symbols_find_members_of_namespaces_and_classes(self):
         self.assertIn("/** Join with a slash. */\nfunction join(...parts: string[]): string", sig(self.project, "plainpkg", "util.join").text)
         member = sig(self.project, "plainpkg", "Connection.close").text
@@ -185,7 +201,7 @@ class SignatureTests(ProjectCase):
         for symbol in ("", "a b", "a;b", "../x", "x.", "1abc", "a" * 201):
             with self.assertRaises(guard.Rejected, msg=symbol):
                 sig(self.project, "plainpkg", symbol)
-        for package in ("", "../../etc", "a/../b", "/etc", ".", "..", "@scope", "a b", "~root", "jsr:@std/path", "https://x.test/a.ts", "file:///etc"):
+        for package in ("", "../../etc", "a/../b", "/etc", ".", "..", "@scope", "a b", "~root", "http://x.test/a.ts", "file:///etc", "jsr:std/path", "jsr:@std", "https://u:p@x.test/a.d.ts", "https://x.test/a.d.ts?q=1", "https://x.test/a.d.ts#f", "https://x.test:8080/a.d.ts"):
             with self.assertRaises(guard.Rejected, msg=package):
                 sig(self.project, package, "x")
 
@@ -301,8 +317,8 @@ class SignatureTests(ProjectCase):
         with self.assertRaises(signature.Miss):
             sig(self.project, "npm:denopkg", "fromDeno", deno=FIXTURES / "deno")
 
-    def test_jsr_and_https_specifiers_are_refused_with_the_reason(self):
-        for spec in ("jsr:@std/path", "https://deno.land/x/mod.ts", "npm:../../x"):
+    def test_unsupported_and_malformed_specifiers_are_refused_with_the_reason(self):
+        for spec in ("npm:../../x", "http://deno.land/x/mod.d.ts", "file:///etc/passwd", "data:text/plain,x", "node:fs"):
             with self.assertRaises(guard.Rejected, msg=spec):
                 sig(self.project, spec, "join", deno=FIXTURES / "deno")
 
@@ -316,6 +332,182 @@ class SignatureTests(ProjectCase):
         self.assertIn("function inner", signature.find_declarations(text, "inner")[0])
         self.assertTrue(signature.find_declarations(text, "U")[0].endswith("| 'b'"))
         self.assertTrue(signature.find_declarations(text, "I")[0].endswith("a: 1\n}"))
+
+
+class RemoteTests(ProjectCase):
+    """jsr: and https: specifiers, read from Deno's remote cache only, and only what deno.lock pins."""
+    JSR = "jsr:@fx/strs"
+    TYPED = "https://deno.land/x/typed@2.0.1/types.d.ts"
+    LIB = "https://deno.land/x/lib@1.0.0/mod.ts"
+
+    def setUp(self):
+        super().setUp()
+        self.deno = self.base / "deno"
+        self.hashes = install_deno_remote(self.deno)
+        (self.project / "package-lock.json").unlink()
+        self.remote = {url: digest for url, digest in self.hashes.items() if "deno.land" in url}
+        self.write_deno_lock()
+
+    def write_deno_lock(self, **over):
+        data = {"version": "4", "specifiers": {"jsr:@fx/strs@1": "1.4.0"}, "jsr": {"@fx/strs@1.4.0": {"integrity": "abc"}}, "remote": self.remote}
+        data.update(over)
+        self.write_lock(data, "deno.lock")
+
+    def get(self, spec, symbol, **kw):
+        kw.setdefault("deno", self.deno)
+        return sig(self.project, spec, symbol, **kw)
+
+    def test_jsr_function_is_returned_as_a_signature_with_its_doc_and_no_body(self):
+        found = self.get(self.JSR, "joinAll")
+        self.assertEqual(found.version, "1.4.0")
+        self.assertIn('/** Join strings. */\nexport function joinAll(parts: string[], sep = ","): string;', found.text)
+        self.assertNotIn("BODY_MARKER", found.text)
+        self.assertEqual(found.provenance["source"].split(":")[0], "deno-cache")
+        self.assertTrue(found.provenance["exact"])
+
+    def test_no_body_marker_is_returned_for_any_exported_symbol_or_member(self):
+        for symbol in ("joinAll", "pad", "Counter", "Counter.increment", "Counter.count", "Counter.constructor", "VERSION", "double", "config"):
+            self.assertNotIn("BODY_MARKER", self.get(self.JSR, symbol).text, symbol)
+
+    def test_class_members_are_signatures_and_private_ones_are_not_api(self):
+        whole = self.get(self.JSR, "Counter").text
+        self.assertIn("increment(by: number = 1): number;", whole)
+        self.assertIn("/** Add one. */", whole)
+        self.assertIn("count = 0", whole)
+        for hidden in ("secret", "hide", "#hidden"):
+            self.assertNotIn(hidden, whole)
+        self.assertIn("increment(by: number = 1): number;", self.get(self.JSR, "Counter.increment").text)
+        for hidden in ("Counter.secret", "Counter.hide"):
+            with self.assertRaises(signature.Miss, msg=hidden):
+                self.get(self.JSR, hidden)
+
+    def test_generic_constraint_in_source_does_not_leak_members(self):
+        with self.assertRaises(signature.Miss):
+            self.get(self.JSR, "Counter.id")
+
+    def test_constants_keep_literals_and_drop_other_initializers(self):
+        self.assertIn('export const VERSION = "1.4.0";', self.get(self.JSR, "VERSION").text)
+        self.assertIn("export const double = (n: number): number =>", self.get(self.JSR, "double").text)
+        config = self.get(self.JSR, "config").text
+        self.assertIn("export const config", config)
+        self.assertNotIn("token", config)
+
+    def test_only_exports_are_returned_and_relative_ts_reexports_are_followed(self):
+        with self.assertRaises(signature.Miss):
+            self.get(self.JSR, "notExported")
+        self.assertIn("export function pad(s: string, n: number): string;", self.get(self.JSR, "pad").text)
+
+    def test_source_view_never_returns_code_for_the_usual_ts_shapes(self):
+        src = ("export class Box<T extends { a: string } = { a: string }> extends Base<{ b: number }> {\n"
+               "  static count: number = compute(BODY1);\n  private p = BODY2;\n  get size(): { n: number } { return BODY3; }\n"
+               "  async load(id: string): Promise<{ ok: boolean }> { return BODY4; }\n  protected tick = () => { BODY5 };\n}\n"
+               "export namespace N {\n  export function f(a: number): { r: 1 } { return BODY6; }\n  function hidden() { BODY7 }\n}\n"
+               "export default function main(a: string) { BODY8 }\n"
+               "export async function* gen<T>(x: T): AsyncGenerator<T> { yield BODY9; }\n"
+               "export const fn = async function (a: number) { BODY10 };\nexport const obj = { a: BODY11 };\n"
+               "function helper() { BODY12 }\nexport { helper as pub };\n")
+        for symbol in ("Box", "Box.size", "Box.load", "Box.tick", "Box.count", "N", "N.f", "main", "gen", "fn", "obj"):
+            found = "\n".join(signature.find_declarations(src, symbol, source=True))
+            self.assertTrue(found, symbol)
+            self.assertNotIn("BODY", found, symbol)
+        self.assertIn("async load(id: string): Promise<{ ok: boolean }>;", "\n".join(signature.find_declarations(src, "Box.load", source=True)))
+        self.assertIn("export async function* gen<T>(x: T): AsyncGenerator<T>;", "\n".join(signature.find_declarations(src, "gen", source=True)))
+        for hidden in ("Box.p", "N.hidden", "helper"):  # private, not exported from the namespace, not exported at all
+            self.assertEqual(signature.find_declarations(src, hidden, source=True), [], hidden)
+
+    def test_jsr_needs_a_pin_in_deno_lock_and_the_pinned_version(self):
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get("jsr:@fx/other", "x")
+        self.assertIn("no pinned version", str(ctx.exception))
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get("jsr:@fx/strs@9.9.9", "joinAll")
+        self.assertIn("pins 1.4.0", str(ctx.exception))
+        self.assertIn("joinAll", self.get("jsr:@fx/strs@1.4.0", "joinAll").text)
+        self.write_deno_lock(specifiers={"jsr:@fx/strs@1": "1.5.0"}, jsr={"@fx/strs@1.5.0": {}})
+        with self.assertRaises(signature.Miss) as ctx:  # pinned, but only 1.4.0 is cached: no fallback to it
+            self.get(self.JSR, "joinAll")
+        self.assertIn("1.5.0", str(ctx.exception))
+        self.assertIn("cache", str(ctx.exception))
+
+    def test_jsr_with_an_empty_cache_says_it_is_not_cached(self):
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.JSR, "joinAll", deno=self.base / "empty")
+        self.assertIn("not in Deno's cache", str(ctx.exception))
+
+    def test_https_declaration_file_is_read_when_the_lock_lists_it(self):
+        found = self.get(self.TYPED, "typed")
+        self.assertIn("/** Typed thing. */\nexport declare function typed(x: number): string;", found.text)
+        self.assertEqual(found.version, "2.0.1")
+
+    def test_https_ts_source_gives_a_signature_without_its_body(self):
+        found = self.get(self.LIB, "libFn")
+        self.assertIn("export function libFn(a: number): number;", found.text)
+        self.assertNotIn("BODY_MARKER", found.text)
+
+    def test_https_url_missing_from_the_lock_has_no_pinned_version(self):
+        self.write_deno_lock(remote={})
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.TYPED, "typed")
+        self.assertIn("no pinned version", str(ctx.exception))
+
+    def test_https_content_that_differs_from_the_lock_hash_is_not_served(self):
+        self.write_deno_lock(remote={**self.remote, self.TYPED: "0" * 64})
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.TYPED, "typed")
+        self.assertIn("deno.lock", str(ctx.exception))
+
+    def test_https_cache_entry_whose_metadata_names_another_url_is_refused(self):
+        entry = self.deno / "remote" / "https" / "deno.land"
+        digest = hashlib.sha256(b"/x/typed@2.0.1/types.d.ts").hexdigest()
+        (entry / (digest + ".metadata.json")).write_text(json.dumps({"url": "https://other.test/x.d.ts"}))
+        with self.assertRaises((guard.Rejected, signature.Miss)):
+            self.get(self.TYPED, "typed")
+
+    def test_https_paths_with_dot_env_components_or_other_extensions_are_refused(self):
+        for url in ("https://deno.land/x/" + ".en" + "v.d.ts", "https://deno.land/x/" + ".en" + "v/a.d.ts", "https://deno.land/x/data.json",
+                    "https://deno.land/x/run.js", "https://deno.land/x/../../a.d.ts", "https://deno.land/x/a b.d.ts"):
+            self.write_deno_lock(remote={**self.remote, url: "0" * 64})
+            with self.assertRaises(guard.Rejected, msg=url):
+                self.get(url, "x")
+
+    def test_a_cache_entry_that_is_a_link_leaving_the_remote_cache_is_refused(self):
+        outside = self.base / "outside.d.ts"
+        outside.write_text("export declare function stolen(): void;\n")
+        entry = self.deno / "remote" / "https" / "deno.land" / hashlib.sha256(b"/x/typed@2.0.1/types.d.ts").hexdigest()
+        entry.unlink()
+        entry.symlink_to(outside)
+        self.write_deno_lock(remote={**self.remote, self.TYPED: hashlib.sha256(outside.read_bytes()).hexdigest()})
+        with self.assertRaises((guard.Rejected, signature.Miss)):
+            self.get(self.TYPED, "stolen")
+
+    def test_node_modules_keeps_the_strict_allowlist_and_never_reads_ts_source(self):
+        package = self.project / "node_modules" / "plainpkg"
+        (package / "src.ts").write_text("export function sneaky(): void { BODY_MARKER }\n")
+        data = json.loads((package / "package.json").read_text())
+        data["types"] = "src.ts"
+        (package / "package.json").write_text(json.dumps(data))
+        (self.project / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {"node_modules/plainpkg": {"version": data["version"]}}}))
+        with self.assertRaises(signature.Miss) as ctx:  # the .ts entry is refused, index.d.ts is used instead and has no `sneaky`
+            sig(self.project, "plainpkg", "sneaky")
+        self.assertNotIn("BODY_MARKER", str(ctx.exception))
+        self.assertIn("refused", str(ctx.exception))
+        with self.assertRaises(guard.Rejected):
+            guard.resolve_inside(package, "src.ts")
+
+    def test_the_call_layer_logs_caps_and_works_offline_for_remote_answers(self):
+        def blocked(*args, **kwargs):
+            raise AssertionError("network used")
+
+        env = {"TP_TASK_DIR": str(self.task)}
+        with mock.patch.object(socket.socket, "connect", blocked), mock.patch.object(socket, "create_connection", blocked), \
+                mock.patch.object(socket, "getaddrinfo", blocked):
+            reply = calls.call("api_signature", {"package": self.JSR, "symbol": "Counter"}, project=self.project, deno=self.deno, env=env)
+        self.assertEqual(reply.status, "hit")
+        self.assertLessEqual(len(reply.text.encode()), calls.MAX_RESPONSE)
+        self.assertNotIn("BODY_MARKER", reply.text)
+        rows = [json.loads(line) for line in (self.task / "docs-calls.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tool"], "api_signature")
 
 
 class IndexTests(ProjectCase):
@@ -395,18 +587,46 @@ class IndexTests(ProjectCase):
         self.assertEqual(after["lock_hash"], lock.lock_hash(self.project))
         self.assertEqual([a for _, a, _ in index.refresh(self.project)], ["unchanged"])
 
-    def test_refresh_follows_a_moved_pin_to_the_new_version_and_drops_the_old_index(self):
-        self.build()
+    def move_pin(self, version="1.3.0"):
         data = json.loads((self.project / "package-lock.json").read_text())
-        data["packages"]["node_modules/plainpkg"]["version"] = "1.3.0"
+        data["packages"]["node_modules/plainpkg"]["version"] = version
         self.write_lock(data)
         pkg = self.project / "node_modules" / "plainpkg" / "package.json"
-        pkg.write_text(pkg.read_text().replace("1.2.3", "1.3.0"))
-        (self.project / "node_modules" / "plainpkg" / "README.md").write_text("# plainpkg 1.3\n\nNew `timeout` docs.\n")
-        # the recorded source was an explicit directory, which still exists and is reused; it indexes the old docs for the new pin
+        pkg.write_text(pkg.read_text().replace("1.2.3", version))
+
+    def test_refresh_does_not_reuse_a_from_directory_after_the_pin_moves(self):
+        self.build()
+        self.move_pin()
+        result = index.refresh(self.project)
+        self.assertEqual(result[0][:2], ("plainpkg", "stale"))
+        self.assertIn("1.2.3", result[0][2])
+        self.assertIn("1.3.0", result[0][2])
+        # nothing relabelled: no 1.3.0 index made from the 1.2.3 docs; the old index is kept as it was
+        self.assertFalse((index.index_root(self.project) / "plainpkg@1.3.0").exists())
+        self.assertTrue((index.index_root(self.project) / "plainpkg@1.2.3").is_dir())
+        with self.assertRaises(index.Miss):
+            index.docs_search(self.project, "plainpkg", "timeout")
+
+    def test_refresh_follows_a_moved_pin_by_re_sourcing_from_the_installed_package(self):
+        self.build()
+        self.move_pin()
+        (self.project / "node_modules" / "plainpkg" / "README.md").write_text("# plainpkg 1.3\n\nNew `frobnicate` docs.\n")
+        # a --from directory is not trusted for the new version; the installed package at the pin is
+        meta = json.loads((index.index_root(self.project) / "plainpkg@1.2.3" / "meta.json").read_text())
+        self.assertEqual(meta["source"]["kind"], "dir")
         self.assertEqual(index.refresh(self.project)[0][:2], ("plainpkg", "rebuilt"))
+        self.assertIn("frobnicate", index.docs_search(self.project, "plainpkg", "frobnicate").text)
         self.assertFalse((index.index_root(self.project) / "plainpkg@1.2.3").exists())
-        self.assertTrue((index.index_root(self.project) / "plainpkg@1.3.0").is_dir())
+
+    def test_refresh_reuses_a_from_directory_when_the_pin_did_not_move(self):
+        before = self.build()
+        data = json.loads((self.project / "package-lock.json").read_text())
+        data["packages"]["node_modules/esmpkg"]["version"] = "2.0.1"
+        self.write_lock(data)
+        self.assertEqual(index.refresh(self.project)[0][:2], ("plainpkg", "rebuilt"))
+        meta = json.loads((index.index_root(self.project) / "plainpkg@1.2.3" / "meta.json").read_text())
+        self.assertEqual(meta["source"]["kind"], "dir")
+        self.assertNotEqual(meta["build_id"], before["build_id"])
 
     def test_default_source_is_the_installed_package_only_when_it_is_the_pinned_version(self):
         (self.project / "node_modules" / "plainpkg" / "README.md").write_text("# plainpkg\n\nInstalled docs about retries.\n")
@@ -451,6 +671,36 @@ class IndexTests(ProjectCase):
         directory.symlink_to(moved)
         with self.assertRaises(index.Miss):
             index.docs_search(self.project, "plainpkg", "timeout")
+
+    def test_index_and_meta_files_that_link_outside_the_index_directory_are_not_read(self):
+        self.build()
+        directory = index.index_root(self.project) / "plainpkg@1.2.3"
+        outside = self.base / "outside.json"
+        for name, body in (("index.json", {"chunks": [{"f": "x.md", "h": "h", "l": 1, "t": "SECRET_OUTSIDE_ROOT"}],
+                                           "postings": {"secret": [[0, 1]]}, "lengths": [1]}),
+                           ("meta.json", {"lib": "plainpkg", "version": "1.2.3", "build_id": "x"})):
+            kept = directory / name
+            data = kept.read_text()
+            outside.write_text(json.dumps(body))
+            kept.unlink()
+            kept.symlink_to(outside)
+            try:
+                for query in ("secret", "timeout"):
+                    with self.assertRaises((guard.Rejected, index.Miss), msg=f"{name} {query}"):
+                        index.docs_search(self.project, "plainpkg", query)
+            finally:
+                kept.unlink()
+                kept.write_text(data)
+        self.assertIn("timeout", index.docs_search(self.project, "plainpkg", "timeout").text)
+
+    def test_the_index_listing_skips_a_directory_whose_meta_links_outside(self):
+        self.build()
+        meta = index.index_root(self.project) / "plainpkg@1.2.3" / "meta.json"
+        outside = self.base / "outside.json"
+        outside.write_text(json.dumps({"lib": "plainpkg", "version": "1.2.3"}))
+        meta.unlink()
+        meta.symlink_to(outside)
+        self.assertEqual(index.list_indexes(self.project), [])
 
     def test_scoped_library_names_get_a_flat_directory(self):
         self.assertEqual(index.key("@scope/scoped", "4.0.0"), "@scope__scoped@4.0.0")

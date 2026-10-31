@@ -189,15 +189,24 @@ def _pnpm_lock(text, name):
 
 # ---- deno.lock ---------------------------------------------------------------------------------------------------
 
-def _deno_lock(data, name):
+def _deno_sections(data):
+    """(specifiers, {scheme: packages}, remote) from a deno.lock of version 4 (top level) or 3 (under "packages")."""
+    inner = data.get("packages") if isinstance(data.get("packages"), dict) else {}
+    pick = lambda key: data.get(key) if isinstance(data.get(key), dict) else inner.get(key) if isinstance(inner.get(key), dict) else {}
+    return pick("specifiers"), {"npm": pick("npm"), "jsr": pick("jsr")}, pick("remote")
+
+
+def _deno_lock(data, name, scheme="npm"):
+    """Pins for `name` from deno.lock under `scheme` ("npm" or "jsr"). Version 3 values read "npm:name@1.2.3"."""
     direct, other = {}, {}
-    specifiers = data.get("specifiers") if isinstance(data.get("specifiers"), dict) else {}
-    wanted = f"npm:{name}@"
+    specifiers, packages, _ = _deno_sections(data)
+    wanted = f"{scheme}:{name}@"
     for spec, resolved in specifiers.items():
-        if isinstance(spec, str) and spec.startswith(wanted) and _clean(resolved):
-            direct[_clean(resolved)] = None
-    npm = data.get("npm") if isinstance(data.get("npm"), dict) else {}
-    for key, entry in npm.items():
+        if isinstance(spec, str) and spec.startswith(wanted) and isinstance(resolved, str):
+            version = _clean(resolved[len(wanted):] if resolved.startswith(wanted) else resolved)
+            if version:
+                direct[version] = None
+    for key, entry in packages[scheme].items():
         if not isinstance(key, str) or not key.startswith(name + "@"):
             continue
         version = _clean(key[len(name) + 1:])
@@ -206,20 +215,34 @@ def _deno_lock(data, name):
     return direct, other
 
 
-def _per_file(project, name):
+def remote_hash(project, url):
+    """The sha256 deno.lock records for the remote module `url`, or None when the lockfile does not list it."""
+    path = Path(project) / "deno.lock"
+    if not path.is_file():
+        return None
+    try:
+        value = _deno_sections(json.loads(_read(path)))[2].get(url)
+    except (ValueError, OSError, AttributeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _per_file(project, name, scheme="npm"):
     for path in lockfiles(project):
+        if scheme != "npm" and path.name != "deno.lock":  # only deno.lock knows jsr packages
+            continue
         try:
             if path.name == "package-lock.json":
                 yield path.name, _npm_lock(json.loads(_read(path)), name)
             elif path.name == "pnpm-lock.yaml":
                 yield path.name, _pnpm_lock(_read(path).decode("utf-8", "replace"), name)
             else:
-                yield path.name, _deno_lock(json.loads(_read(path)), name)
+                yield path.name, _deno_lock(json.loads(_read(path)), name, scheme)
         except (ValueError, OSError):
             yield path.name, None
 
 
-def pin(project, name, installed=None):
+def pin(project, name, installed=None, scheme="npm"):
     """The version the project's lockfiles pin for `name`.
 
     The project's own entry wins (the root node_modules entry, an importer dependency, a deno specifier). With none,
@@ -229,7 +252,7 @@ def pin(project, name, installed=None):
     if not files:
         return Pin(reason=f"no lockfile ({', '.join(LOCKFILES)}) in {project}")
     direct, other, broken = {}, {}, []
-    for lockname, found in _per_file(project, name):
+    for lockname, found in _per_file(project, name, scheme):
         if found is None:
             broken.append(lockname)
             continue
@@ -248,7 +271,8 @@ def pin(project, name, installed=None):
             if installed in pool:
                 return Pin(installed, pool[installed][0], pool[installed][1], sorted(pool))
             return Pin(candidates=sorted(pool), reason=f"{name} is pinned at more than one version: {', '.join(sorted(pool))}")
-    why = f"no pinned version: {name} has no entry in the lockfile"
+    where = "deno.lock" if scheme != "npm" else "the lockfile"
+    why = f"no pinned version: {name} has no {scheme + ' ' if scheme != 'npm' else ''}entry in {where}"
     if broken:
         why += f" (could not read {', '.join(broken)})"
     return Pin(reason=why)

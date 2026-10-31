@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 			"package's own .d.ts files at the version the project's lockfile pins. Use it instead of guessing an API from memory. " +
 			"`symbol` may be dotted (Namespace.member, Class.method). No lockfile entry means no answer.",
 		parameters: Type.Object({
-			package: Type.String({ description: "npm package name, e.g. zod or @scope/name (or npm:name)" }),
+			package: Type.String({ description: "npm package, e.g. zod, @scope/name, npm:name, jsr:@scope/name, or an https:// module URL that deno.lock pins" }),
 			symbol: Type.String({ description: "Exported name, e.g. z.object or Client.connect" }),
 		}),
 		async execute(_id, p, signal, _onUpdate, ctx) {

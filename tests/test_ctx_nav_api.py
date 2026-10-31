@@ -778,6 +778,15 @@ class AllowListCase(Tree):
         self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
         return nav
 
+    def test_a_spread_before_a_dynamic_import_is_still_a_real_import(self):
+        """`...import('./x.ts')` is the spread of a real import, not a property named import, so the walk follows it."""
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        write(project / "src" / "top.ts", "export const all = [...await import('./.env.ts')];\n")
+        self.assertEqual([s["spec"] for s in graph.scan_specifiers("f(...import('./y.ts'))")], ["./y.ts"])
+        self.assertEqual(graph.scan_specifiers("a.import('./z.ts'); a?.import('./z.ts')"), [])  # a property named import
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")
+
     # --- the reviewer's repro
 
     def test_a_refused_file_behind_an_excluded_file_is_reached_and_refuses(self):

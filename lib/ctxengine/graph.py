@@ -197,8 +197,9 @@ def scan_module(text):
             continue
         if kind != "id" or value not in ("import", "export"):
             continue
-        if at and tokens[at - 1][0] == "punct" and tokens[at - 1][1] == ".":
-            continue  # a property named import/export
+        if (at and tokens[at - 1][0] == "punct" and tokens[at - 1][1] == "."
+                and not (at > 1 and tokens[at - 2][0] == "punct" and tokens[at - 2][1] == ".")):
+            continue  # a property named import/export; `...import(x)` is a spread of a real import, so it is kept
         nxt = tokens[at + 1] if at + 1 < len(tokens) else ("", "", 0)
         if nxt[0] == "punct" and nxt[1] == ":":
             continue  # an object key

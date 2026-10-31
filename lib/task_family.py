@@ -15,8 +15,8 @@ and wall time. A token or time that was not recorded is None, never 0, and `*_un
 
 Facts only: a verdict here is read from the reviewer's reply the way `tp-evals export` reads it (routing_evals.review_outcome).
 
-Wiring for `tp-evals families [--project DIR] [--json]` (bin/tp-evals belongs to lane trial-records): call
-`task_family.add_subcommand(sub)` on the subparsers and, for that command, `args.func(args)` or `task_family.run(args.project, args.json)`.
+Wired into `tp-evals families [--project DIR] [--json]`: bin/tp-evals calls `task_family.add_subcommand(sub)` and, for that
+command, `args.func(args)`.
 """
 
 import json

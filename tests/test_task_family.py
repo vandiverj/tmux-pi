@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -175,6 +176,30 @@ class CommandTests(unittest.TestCase):
         task_family.add_subcommand(parser.add_subparsers(dest="command"))
         args = parser.parse_args(["families", "--project", "/x", "--json"])
         self.assertEqual((args.command, args.project, args.json, callable(args.func)), ("families", "/x", True, True))
+
+
+class TpEvalsFamiliesTests(unittest.TestCase):
+    """`bin/tp-evals families` reaches task_family.run and needs no routing eval dir."""
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(ROOT / "bin" / "tp-evals"), "families", *args], capture_output=True, text=True,
+                              timeout=60, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"})
+
+    def test_prints_text_and_json_for_a_project(self):
+        case = json.loads((FIXTURES / "single_attempt.json").read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            materialize(Path(tmp) / ".tmux-pi" / "sessions" / "s1", case["tasks"])
+            text = self.run_cli("--project", tmp)
+            self.assertEqual(text.returncode, 0, text.stderr)
+            self.assertIn("fam-coder-a  accepted", text.stdout)
+            data = self.run_cli("--project", tmp, "--json")
+            self.assertEqual(data.returncode, 0, data.stderr)
+            self.assertEqual([r["family_id"] for r in json.loads(data.stdout)], ["fam-coder-a"])
+
+    def test_a_project_with_no_tasks_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.run_cli("--project", tmp)
+            self.assertEqual((out.returncode, out.stdout), (0, ""), out.stderr)
 
 
 if __name__ == "__main__":

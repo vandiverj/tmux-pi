@@ -1,0 +1,12 @@
+# Standing rules
+
+Every Bash call is one plain command: no heredocs, no `$(...)`, no shell arrays or loops.
+Commit with the exact line from the brief.
+
+## Role: coder
+
+Run the tests that cover your change and no others.
+
+## Role: tester
+
+Report counts exactly as the log shows them.

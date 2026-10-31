@@ -1,0 +1,4 @@
+# Standing rules
+
+Every Bash call is one plain command: no heredocs, no `$(...)`, no shell arrays or loops.
+Commit with the exact line from the brief.

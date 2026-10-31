@@ -17,10 +17,14 @@ ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable unt
 the end, on success and on failure. A branch the worker made in the worktree (`git checkout -b`) is detached and deleted; no
 other branch is ever deleted.
 
-Ownership: `make_worktree` records what it created (real path, git admin directory, branches that existed) in run.json and in memory;
-before every git command in the worktree and every removal of it, `worktree_proof` checks the place against that record (no link,
-same real path, same admin directory, listed by git, not on a pre-existing branch). A tree the run did not create, or one swapped
-in since, is left as it is and the step fails. The attempt clock (§8) is checked before the worktree and before tp-spawn.
+Ownership (the worker can write run.json and everything beside its tree, so nothing there proves anything): `prepare` chooses an
+attempt-unique place `<run dir>/wt-<id>` that must not exist when the tree is made and is never reused. `make_worktree` then holds
+open descriptors on the tree's root directory and on its git admin directory (while they are open no other directory can have the
+same device and inode) and keeps the record in memory and in `<project>/.tmux-pi/trial-owner/<run>.json`, a file outside the run
+dir that only a stop of a dead runner reads. `Owner.prove` checks the place against that identity before every git command and
+every removal there. Project, state dir, session and task id come from where the run dir is, never from run.json. Whatever is not
+provably this attempt's tree is left as it is; the worker's tasks and the session are ended whether or not the proof holds.
+The attempt clock (§8) is checked before the worktree and before tp-spawn.
 
 The record comes from lib/trial_record.py (lane L2). Until it exists, lib/trial_record_stub.py (same call shape) is used.
 `gate_runs` is L2's field and is never read here.
@@ -32,8 +36,10 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +56,9 @@ COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 TESTS = ("affected", "full", "none")
 SPEC = re.compile(r"^(.+):([0-9]+)-([0-9]+)$")
 REF_PREFIX = "refs/tmux-pi/shadow/"
+PLACE = re.compile(r"^wt-[0-9a-f]{12}$")  # the attempt-unique name of a run's worktree
+OWNER_DIR = "trial-owner"
+NOT_OURS = "not the tree this run created"
 SETTLED = ("settled", "completed")
 OTHER_LANES = "## Paths other lanes own"
 GIT_TIMEOUT = 120
@@ -300,7 +309,11 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
     if not ok:
         raise ShadowError("not started: " + reason)
     name, state = trial_session.ensure(project, run, env)
-    worktree = rdir / "worktree"
+    worktree = rdir / ("wt-" + secrets.token_hex(6))  # this attempt's own place: never the same name twice, so a path is never reused
+    try:
+        owner_file(project, run).unlink()  # a record left by an earlier run of the same name is not this attempt's
+    except FileNotFoundError:
+        pass
     (rdir / "request.md").write_text(workdir_text(worktree, project) + "\n\n" + source["request"].rstrip("\n") + "\n", encoding="utf-8")
     return update_run(rdir, run=run, session=name, state=str(state), main_state=str(Path(main_state).resolve()), project=project,
                       source_task=task_id, pair_id=pair_id or "shadow-" + task_id, base_commit=source["base_commit"], model=trial["model"],
@@ -327,13 +340,15 @@ class Run:
     def __init__(self, rdir, env=None, sleep=time.sleep, clock=time.monotonic, record_module=None):
         self.rdir = Path(rdir)
         self.info = read_run(self.rdir)
-        self.run = self.info["run"]
-        self.project = self.info["project"]
+        # Where the run is decides what it is: project, run id, state dir, session and task id come from the run dir's own place and
+        # name (the worker can edit run.json, so none of them is read from it). run.json supplies the settings and the chosen place.
+        self.owner = Owner(self.rdir)
+        self.run, self.project = self.owner.run, self.owner.project
         self.worktree = Path(self.info["worktree"])
-        self.state = Path(self.info["state"])
+        self.state = self.owner.state
         self.main_state = Path(self.info["main_state"])
-        self.task_id = self.info["task_id"]
-        self.env = trial_session.env_for(self.state, self.info["session"], env)
+        self.task_id = self.owner.task_id
+        self.env = trial_session.env_for(self.state, self.owner.session, env)
         self.sleep, self.clock = sleep, clock
         self.started_at = clock() - self.prepared_ago()
         self.records = record_module or load_record_module()
@@ -344,7 +359,6 @@ class Run:
         self.commit_messages = None
         self.review_id = None
         self.wait_result = None
-        self.owned = None
 
     # -- helpers
     def prepared_ago(self):
@@ -383,27 +397,31 @@ class Run:
     # -- steps
     def make_worktree(self):
         self.note(phase="worktree")
+        self.owner.check_place(self.worktree)
+        if os.path.lexists(str(self.worktree)):
+            raise ShadowError("{} already exists; a run makes its tree at a new place of its own and never reuses one".format(self.worktree))
         self.heads_before = heads(self.project)
         git(self.project, "worktree", "add", "--detach", str(self.worktree), self.info["base_commit"])
-        self.owned = ownership_record(self.worktree, self.heads_before)  # what this run created: every later git command proves it first
-        self.note(owned_worktree=self.owned, worktree_removed=None)
-        shared = lane_deps.share(self.project, self.owned["path"], self.info["base_commit"])
+        self.owner.create(self.worktree, self.heads_before)  # what this run created: every later git command proves it first
+        self.note(worktree_removed=None)
+        shared = lane_deps.share(self.project, self.owner.record["path"], self.info["base_commit"])
         self.note(deps=shared["deps"], deps_warnings=[w if isinstance(w, str) else json.dumps(w, sort_keys=True) for w in shared["warnings"]])
 
     def source(self):
         return read_source(self.main_state, self.info["source_task"])
 
     def prove_worktree(self):
-        """(state, realpath) of the run's worktree, proven again now against the record made when this run created it (not run.json:
-        the worker can reach that file). Raises when the place holds anything else."""
-        return worktree_proof(self.rdir, self.info, self.owned)
+        """(state, realpath) of the run's worktree, proven again now against the identity this run recorded when it created the tree
+        (`Owner.prove`; run.json is not consulted: the worker can reach it). Raises when the place holds anything else."""
+        return self.owner.prove(self.worktree)
 
     def wt_git(self, *args, check=True):
         """git in the run's worktree, run on the proven real path and only after proving it, every time: the worker has write access
         to its tree and the directory around it and can swap the tree for a link to another one while it runs."""
         state, real = self.prove_worktree()
         if state != "owned":
-            raise ShadowError("the run's worktree {} is {}; no git command was run there".format(self.worktree, "not there" if state == "absent" else state))
+            raise ShadowError("the run's worktree {} is {}; no git command was run there".format(
+                self.worktree, "not there" if state == "absent" else "damaged ({})".format(self.owner.why)))
         return git(real, *args, check=check)
 
     def require_time(self, step):
@@ -570,7 +588,7 @@ class Run:
         return meta.get("role") if isinstance(meta.get("role"), str) else None
 
     def cleanup(self):
-        return cleanup(self.rdir, self.env)
+        return cleanup(self.rdir, self.env, self.owner)
 
     # -- the whole run
     def execute(self):
@@ -578,7 +596,7 @@ class Run:
         error = None
         try:
             try:
-                check_ownership(self.rdir, self.info)  # the worktree is made, reset and read below: only at the run's own path
+                self.owner.check_place(self.worktree)  # the worktree is made, reset and read below: only at the run's own place
                 source = self.source()
                 self.note(normal_reviewer_model=source["reviewer_model"], source_role=source["role"] or None)
                 self.require_time("the worktree was made")
@@ -631,6 +649,7 @@ class Run:
                     leftovers = ["cleanup: {}".format(problem)]
                 self.note(cleanup_errors=leftovers)
             finally:
+                self.owner.close()
                 self.note(outcome=self.outcome, phase="done", finished=now())
         try:
             record_normal(self.rdir, self.env, self.records)
@@ -670,6 +689,7 @@ def record_normal(rdir, env=None, record_module=None):
     builder. Safe to repeat: L2's report keeps the last record of a pair and arm, so a later call, once the normal task's review
     has landed, supersedes an earlier one. Returns the record or None when the source task is gone."""
     info = read_run(rdir)
+    project, run = locate(rdir)
     records = record_module or load_record_module()
     main_state = Path(info["main_state"])
     path = find_task(main_state, info["source_task"])
@@ -677,13 +697,31 @@ def record_normal(rdir, env=None, record_module=None):
         return None
     files, lines = _diff_counts(_json(path / "meta.json").get("workdir"), info["base_commit"])
     record = records.build(path, "normal", "shadow", info["pair_id"], state_dir=main_state, diff_files=files, diff_lines=lines)
-    record.update({"run": info["run"], "source_task": info["source_task"], "outcome": "completed"})
-    records.append(info["project"], record)
+    record.update({"run": run, "source_task": info["source_task"], "outcome": "completed"})
+    records.append(project, record)
     update_run(rdir, normal_recorded=now())
     return record
 
 
-# ------------------------------------------------------------------------------------------------------------------ cleanup
+# ------------------------------------------------------------------------------------------------------------------ ownership
+
+def owner_file(project, run):
+    """The ownership record of a run: outside its run dir (and so outside the worktree's parent), `<project>/.tmux-pi/trial-owner/<run>.json`."""
+    return Path(project) / ".tmux-pi" / OWNER_DIR / (trial_session.valid_run(run) + ".json")
+
+
+def locate(rdir):
+    """(project, run) from where the run dir is, `<project>/.tmux-pi/trial/<run>`: the caller names the directory, so these cannot
+    be changed from inside the run. Raises when the directory is not in that shape."""
+    path = Path(os.path.abspath(str(rdir)))
+    if path.parent.name != "trial" or path.parent.parent.name != ".tmux-pi":
+        raise ShadowError("{} is not a trial run directory (<project>/.tmux-pi/trial/<run>)".format(path))
+    try:
+        run = trial_session.valid_run(path.name)
+    except trial_session.SessionError as problem:
+        raise ShadowError(str(problem))
+    return os.path.realpath(str(path.parent.parent.parent)), run
+
 
 def _gitfile_target(path):
     """Where the `.git` file of the worktree at `path` points (the admin directory), as a real path, or None."""
@@ -692,17 +730,6 @@ def _gitfile_target(path):
     except (OSError, UnicodeDecodeError):
         return None
     return os.path.realpath(text[len("gitdir:"):].strip()) if text.startswith("gitdir:") else None
-
-
-def ownership_record(worktree, heads_before):
-    """What proves a worktree is the one this run created: written right after `git worktree add` succeeded, so it exists only for
-    a tree the run made. The real path, git's admin directory for it, and the branches that existed before (a branch of those is
-    never the run's own)."""
-    real = os.path.realpath(str(worktree))
-    admin = _gitfile_target(real)
-    if admin is None:
-        raise ShadowError("{} is not a git worktree after `git worktree add`".format(worktree))
-    return {"path": real, "gitdir": admin, "heads_before": sorted(heads_before), "created": now()}
 
 
 def registered_worktrees(project):
@@ -718,81 +745,196 @@ def registered_worktrees(project):
     return found
 
 
-def worktree_proof(rdir, info, owned=None):
-    """Prove, now, that the worktree of the run at `rdir` is the one the run created. Returns (state, real path):
+class Owner:
+    """What one attempt created, and the proof that a directory is that. Built from where the run dir is (`locate`), never from run.json.
 
-      owned     a real directory (no link) at the recorded real path, whose `.git` names the recorded admin directory, that git lists
-                at that path, on a detached HEAD or a branch the run made, and whose admin directory points back at it
-      absent    the run created none, or created one that is gone; nothing is there
-      gone      a directory is there but git no longer knows it (its admin entry was pruned): the run's own leftovers
-      unowned   something is at the place that the run did not create (a worktree that existed first, or one made since)
+    The proof is object identity: (device, inode) of the tree's root directory and of its git admin directory. The runner that made
+    them keeps a descriptor open on each (`create`), and while a descriptor is open the inode cannot be given to another directory,
+    so nothing the worker does (remove and re-add a tree at the same path, git reusing the admin name, `git worktree move`, a link,
+    a rewritten `.git` file) can produce a directory with the same identity. A stop of a runner that has died has no descriptors and
+    uses the identity written to the owner file; it stays honest about what that is worth (see the report).
 
-    and raises ShadowError when the run did create a tree and what is there now is not it (a link, another place, another worktree).
-    `owned` is the record the runner kept in memory; without it the one in run.json is used (a stop from another process)."""
-    check_ownership(rdir, info)
-    path = Path(str(info["worktree"]))
-    record = owned if owned is not None else info.get("owned_worktree")
-    if not isinstance(record, dict) or info.get("worktree_removed") and owned is None:
-        return ("unowned", None) if os.path.lexists(str(path)) else ("absent", None)
-    if path.is_symlink():
-        raise ShadowError("{} is a link now; the run created a directory there".format(path))
-    real = os.path.realpath(str(path))
-    if real != record.get("path"):
-        raise ShadowError("{} resolves to {} and not to the worktree the run created ({})".format(path, real, record.get("path")))
-    if not os.path.lexists(real):
-        return "absent", real
-    if not os.path.isdir(real):
-        raise ShadowError("{} is not a directory".format(path))
-    admin = record.get("gitdir")
-    listed = registered_worktrees(info["project"])
-    if real not in listed:
-        if admin and not os.path.exists(admin):
-            return "gone", real
-        raise ShadowError("git does not list {} though the run's admin directory {} still exists".format(real, admin))
-    if _gitfile_target(real) != admin:
-        raise ShadowError("{} names another git directory ({}) than the run's ({})".format(real, _gitfile_target(real), admin))
+    `prove` returns ("owned", path) when every check holds now, ("damaged", path) when the directory is the one the run made but git's
+    link to it is broken (git no longer knows it, its `.git` was rewritten, it is on a pre-existing branch: the run may delete the
+    directory but runs no git command in it), ("absent", path) when nothing is there, and raises ShadowError for anything else:
+    a link, another directory, a tree made after the run's own was removed, a record that cannot be read."""
+
+    def __init__(self, rdir):
+        self.fds = {}
+        self.rdir = Path(os.path.abspath(str(rdir)))
+        self.project, self.run = locate(self.rdir)
+        self.state = self.rdir / "state"
+        self.session = trial_session.session_name(self.run)
+        self.task_id = "trial-" + self.run
+        self.file = owner_file(self.project, self.run)
+        self.record = None
+        self.problem = None
+        self.why = ""
+        self.load()
+
+    def __del__(self):
+        self.close()
+
+    # -- the record
+    def load(self):
+        """Read the owner file (a runner that created the tree has its record in memory and does not use it)."""
+        try:
+            value = json.loads(self.file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            self.problem = "the owner record {} cannot be read ({}); no tree is touched".format(self.file, error)
+            return
+        try:
+            ok = (isinstance(value, dict) and value["run"] == self.run and value["project"] == self.project
+                  and value["run_dir"] == os.path.realpath(str(self.rdir)) and PLACE.fullmatch(Path(value["path"]).name)
+                  and all(isinstance(value[k][f], int) for k in ("tree", "admin") for f in ("dev", "ino")) and isinstance(value["admin"]["path"], str)
+                  and isinstance(value["heads_before"], list))
+        except (KeyError, TypeError):
+            ok = False
+        if not ok:
+            self.problem = "the owner record {} does not describe this run; no tree is touched".format(self.file)
+            return
+        self.record = value
+
+    def _write(self):
+        self.file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.file.with_name(self.file.name + ".tmp.{}".format(os.getpid()))
+        tmp.write_text(json.dumps(self.record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(self.file))
+
+    def check_place(self, place):
+        """Raise unless `place` is `wt-<id>` directly under this run's directory: the one shape of place a run ever makes a tree at."""
+        place = Path(os.path.abspath(str(place)))
+        if not PLACE.fullmatch(place.name) or os.path.realpath(str(place.parent)) != os.path.realpath(str(self.rdir)):
+            raise ShadowError("{} is not this run's own place ({}/wt-<id>); nothing is made or changed there".format(place, self.rdir))
+
+    def create(self, place, heads_before):
+        """Take the identity of the tree `git worktree add` just made at `place` (before any worker exists) and record it."""
+        self.check_place(place)
+        real = os.path.realpath(str(place))
+        admin = _gitfile_target(real)
+        if admin is None:
+            raise ShadowError("{} is not a git worktree after `git worktree add`".format(place))
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fds = {"tree": os.open(real, flags)}
+        try:
+            fds["admin"] = os.open(admin, flags)
+        except OSError:
+            os.close(fds["tree"])
+            raise ShadowError("the git directory {} of {} cannot be opened".format(admin, place))
+        self.close()
+        self.fds = fds
+        ident = {k: {"dev": os.fstat(fd).st_dev, "ino": os.fstat(fd).st_ino} for k, fd in fds.items()}
+        self.record = {"schema": 1, "run": self.run, "project": self.project, "run_dir": os.path.realpath(str(self.rdir)), "path": real,
+                       "tree": ident["tree"], "admin": dict(ident["admin"], path=admin), "heads_before": sorted(heads_before),
+                       "created": now(), "removed": None}
+        self.problem = None
+        self._write()
+
+    def close(self):
+        for fd in list(getattr(self, "fds", {}).values()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds = {}
+
+    def mark_removed(self):
+        """The run's tree is gone: from now on anything at the place is not it, whatever its inode."""
+        if self.record is not None and not self.record.get("removed"):
+            self.record["removed"] = now()
+            try:
+                self._write()
+            except OSError:
+                pass
+
+    # -- the proof
+    def identity(self, kind):
+        fd = self.fds.get(kind)
+        if fd is not None:
+            st = os.fstat(fd)
+            return st.st_dev, st.st_ino
+        return self.record[kind]["dev"], self.record[kind]["ino"]
+
+    def foreign(self, path, what):
+        return ShadowError("{} is {} ({}); left as it is".format(path, NOT_OURS, what))
+
+    def prove(self, hint=None):
+        """See the class. `hint` is where run.json says the tree is, used only to name a tree found there when this run made none."""
+        self.why = ""
+        if self.record is None:
+            if self.problem:
+                raise ShadowError(self.problem)
+            if hint is not None and os.path.lexists(str(hint)):
+                raise self.foreign(hint, "this run made no tree")
+            return "absent", None
+        path = self.record["path"]
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return "absent", path
+        if self.record.get("removed"):
+            raise self.foreign(path, "something was made at the place after the run removed its own")
+        if stat.S_ISLNK(st.st_mode):
+            raise self.foreign(path, "a link now; the run made a directory")
+        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != self.identity("tree"):
+            raise self.foreign(path, "a different directory than the one the run made")
+        admin = self.record["admin"]["path"]
+        try:
+            ast = os.lstat(admin)
+        except FileNotFoundError:
+            self.why = "git no longer knows it: its admin entry is gone"
+            return "damaged", path
+        if stat.S_ISLNK(ast.st_mode) or (ast.st_dev, ast.st_ino) != self.identity("admin"):
+            self.why = "its git directory {} is not the one the run's tree had".format(admin)
+            return "damaged", path
+        if _gitfile_target(path) != admin:
+            self.why = "its .git names {} and not the run's git directory".format(_gitfile_target(path))
+            return "damaged", path
+        try:
+            back = os.path.realpath(os.path.dirname((Path(admin) / "gitdir").read_text(encoding="utf-8").strip()))
+        except (OSError, UnicodeDecodeError):
+            back = None
+        listed = registered_worktrees(self.project)
+        if back != path or path not in listed:
+            self.why = "git's own entry for it does not point back at it"
+            return "damaged", path
+        branch = listed[path]
+        if branch and branch in self.record["heads_before"]:
+            self.why = "it is on {}, a branch that was there before the run and is not the run's".format(branch)
+            return "damaged", path
+        return "owned", path
+
+    def remove_admin(self):
+        """Remove the run's own git admin directory when it is still there and is the very one recorded (not `git worktree prune`,
+        which would also drop entries that belong to other lanes)."""
+        if self.record is None:
+            return
+        admin = self.record["admin"]["path"]
+        try:
+            st = os.lstat(admin)
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and (st.st_dev, st.st_ino) == self.identity("admin"):
+            shutil.rmtree(admin)
+
+
+def cleanup(rdir, env=None, owner=None):
+    """End what the run left: its tasks and its session first, whatever the worktree proof says (nothing here depends on run.json or on
+    the tree), then the worktree (only a tree proven to be this attempt's, and only once the worker cannot be running), the shadow refs.
+    Idempotent and total: every step is attempted whatever the others did. Returns the list of what could not be done."""
     try:
-        back = os.path.realpath(os.path.dirname((Path(admin) / "gitdir").read_text(encoding="utf-8").strip()))
-    except (OSError, UnicodeDecodeError):
-        back = None
-    if back != real:
-        raise ShadowError("the run's git directory {} points at {} and not at {}".format(admin, back, real))
-    branch = listed[real]
-    if branch and branch[len("refs/heads/"):] in [h[len("refs/heads/"):] for h in record.get("heads_before", ())]:
-        raise ShadowError("{} is on {}, a branch that was there before the run and is not the run's".format(real, branch))
-    return "owned", real
-
-
-def check_ownership(rdir, info):
-    """Raise unless run.json names this run's own things: the run directory is `<project>/.tmux-pi/trial/<run>`, and the state dir and
-    the worktree are `state` and `worktree` directly under it, not links to another place. Cleanup checks this before it touches
-    anything: run.json is a file the worker can reach, and `git worktree remove --force` on a path out of an altered one would
-    delete another lane's tree."""
-    here = Path(os.path.realpath(str(rdir)))
-    try:
-        expected = Path(os.path.realpath(str(trial_session.run_dir(info["project"], info["run"]))))
-    except (trial_session.SessionError, TypeError, KeyError) as problem:
-        raise ShadowError("run.json names no valid run or project ({})".format(problem))
-    if expected != here:
-        raise ShadowError("run.json puts the run at {} but it is at {}".format(expected, here))
-    for key in ("worktree", "state"):
-        path = Path(str(info.get(key) or ""))
-        if path.name != key or not path.is_absolute() or Path(os.path.realpath(str(path))) != here / key:
-            raise ShadowError("{} {} is not the run's own {}/{} (it resolves to {})".format(
-                key, path, here, key, os.path.realpath(str(path)) if str(path) else "nothing"))
-
-
-def cleanup(rdir, env=None):
-    """End what the run left: trial tasks that still run, the worktree (and its shared node_modules links), the shadow refs, the
-    session. Idempotent and total: every step is attempted whatever the others did. Returns the list of what could not be done."""
-    info = read_run(rdir)
-    project, worktree, state = info["project"], Path(info["worktree"]), Path(info["state"])
-    leftovers = []
-    try:
-        check_ownership(rdir, info)
+        owner = owner or Owner(rdir)
     except ShadowError as problem:
         return ["not cleaned: {}".format(problem)]
-    run_env = trial_session.env_for(state, info["session"], env)
+    rdir, project, run = Path(owner.rdir), owner.project, owner.run
+    try:
+        hint = Path(read_run(rdir).get("worktree") or "")
+    except ShadowError:
+        hint = None
+    leftovers = []
+    run_env = trial_session.env_for(owner.state, owner.session, env)
 
     def attempt(label, fn):
         try:
@@ -801,6 +943,9 @@ def cleanup(rdir, env=None):
             leftovers.append("{}: {}".format(label, problem))
 
     def end_tasks():
+        state = owner.state
+        if os.path.islink(str(state)) or os.path.realpath(str(state)) != os.path.join(os.path.realpath(str(rdir)), "state"):
+            raise ShadowError("the state dir {} is not the run's own directory; its tasks were not stopped (the session is ended instead)".format(state))
         tasks = state / "tasks"
         for path in sorted(tasks.iterdir()) if tasks.is_dir() else []:
             if not (path / "meta.json").is_file() or (path / "stopped.json").exists() or (path / "exit").exists():
@@ -816,65 +961,59 @@ def cleanup(rdir, env=None):
                 if stop.returncode:
                     raise ShadowError("task {} could not be stopped: {}".format(task, stop.stderr.strip()))
 
-    def drop_worktree():
-        proven = [None]
+    def end_session():
+        trial_session.end(run, run_env)
 
-        def prove():
-            state, real = worktree_proof(rdir, info, None)
-            if state == "unowned":
-                raise ShadowError("{} was not created by this run; left as it is".format(worktree))
-            proven[0] = state
-            return state, real
-        state, real = prove()
-        if state in ("owned", "gone"):
-            if state == "owned":
-                lane_deps.unlink_shared(project, real)
-                state, real = prove()  # before the removal itself: the tree can be swapped between two steps
+    def drop_worktree():
+        if trial_session.has_session(owner.session, run_env):
+            raise ShadowError("the session {} is still there, so the worker may still be running; the tree was not removed".format(owner.session))
+        state, real = owner.prove(hint)  # raises for anything that is not this attempt's tree
+        if state == "owned":
+            lane_deps.unlink_shared(project, real)
+            state, real = owner.prove(hint)  # before the removal itself
             if state == "owned":
                 git(project, "worktree", "remove", "--force", real, check=False)
-            if os.path.lexists(real):  # a tree git no longer knows, or would not remove: the run's own, under the run dir
-                state, real = prove()
-                if state in ("owned", "gone") and os.path.lexists(real):
-                    shutil.rmtree(real)
-            update_run(rdir, worktree_removed=now())
-        if proven[0] is not None:
-            git(project, "worktree", "prune", check=False)
+        if real is not None and os.path.lexists(real):  # damaged, or git would not remove it: the directory is the run's by identity
+            state, real = owner.prove(hint)
+            if state in ("owned", "damaged") and os.path.lexists(real):
+                shutil.rmtree(real)
+        owner.remove_admin()
+        owner.mark_removed()
+        update_run(rdir, worktree_removed=now())
 
     def drop_refs():
-        listing = git(project, "for-each-ref", "--format=%(refname)", "{}{}/".format(REF_PREFIX, info["run"]), check=False).stdout.split()
+        listing = git(project, "for-each-ref", "--format=%(refname)", "{}{}/".format(REF_PREFIX, run), check=False).stdout.split()
         for ref in listing:
             git(project, "update-ref", "-d", ref)
 
-    def end_session():
-        trial_session.end(info["run"], run_env)
-
     attempt("tasks", end_tasks)
+    attempt("session", end_session)
     attempt("worktree", drop_worktree)
     attempt("refs", drop_refs)
-    attempt("session", end_session)
     return leftovers
 
 
 # ---------------------------------------------------------------------------------------------------------------------- stop
 
 def pid_is_run(pid, run):
-    """Whether `pid` is this run's runner: its command line names bin/tp-trial and the run's directory. Never signals a pid on a
-    guess, since a recorded pid may have been reused."""
+    """Whether `pid` is this run's runner: its command line names bin/tp-trial and ends in this run's directory. Never signals a pid
+    on a guess, since a recorded pid may have been reused (or edited)."""
     if not isinstance(pid, int) or pid <= 1:
         return False
     out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], text=True, capture_output=True)
-    return out.returncode == 0 and "tp-trial" in out.stdout and "/{}".format(run) in out.stdout.replace("\\", "")
+    return out.returncode == 0 and "tp-trial" in out.stdout and re.search(r"/trial/{}\s*$".format(re.escape(run)), out.stdout.replace("\\", "")) is not None
 
 
 def stop(rdir, env=None, wait_s=120.0, sleep=time.sleep, clock=time.monotonic):
     """End a run early: signal its runner (its own cleanup then runs), wait for it to go, then run the idempotent cleanup anyway.
     A run that already finished is only cleaned. Returns the run.json content."""
     info = read_run(rdir)
+    _, run = locate(rdir)
     pid = info.get("pid")
-    if info.get("phase") != "done" and pid_is_run(pid, info["run"]):
+    if info.get("phase") != "done" and pid_is_run(pid, run):
         os.kill(pid, signal.SIGTERM)
         deadline = clock() + wait_s
-        while pid_is_run(pid, info["run"]) and clock() < deadline:  # the runner exiting is the event; the deadline only bounds it
+        while pid_is_run(pid, run) and clock() < deadline:  # the runner exiting is the event; the deadline only bounds it
             sleep(0.2)
     leftovers = cleanup(rdir, env)
     info = read_run(rdir)

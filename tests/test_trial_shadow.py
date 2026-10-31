@@ -34,6 +34,7 @@ import trial_shadow as ts  # noqa: E402
 git = lw.git
 LOCAL = tts.LOCAL_MODEL
 SECTION = "## Paths other lanes own"
+NOT_OURS = "not the tree this run created"  # what a refusal to act on a tree says
 OTHERS = "- lane beta (lane/beta) owns \"lib/x.py\"\nDo not edit these paths; if the task needs them, stop and send tp-agent request."
 
 
@@ -124,6 +125,10 @@ class ShadowCase(lw.LaneCase):
         rdir = trial_session.run_dir(info["project"], info["run"])
         (rdir / "state" / "live-window").write_text("")  # tp-spawn and tp-review in the trial's state get a real pane
         return rdir, info
+
+    def tree(self, rdir):
+        """The place of the run's worktree: chosen by `prepare`, unique to the run (`wt-<id>` under its directory)."""
+        return Path(ts.read_run(rdir)["worktree"])
 
     def session_names(self):
         run = subprocess.run([TMUX, "-L", self.sock, "list-sessions", "-F", "#{session_name}"], text=True, capture_output=True)
@@ -313,9 +318,9 @@ class PrepareTests(ShadowCase):
         self.assertIn("tp-trial-" + info["run"], self.session_names())
         self.assertEqual(info["base_commit"], self.base)
         text = (rdir / "request.md").read_text()
-        self.assertTrue(text.startswith(ts.workdir_text(rdir / "worktree", self.repo)), "the first request names the absolute working tree first")
+        self.assertTrue(text.startswith(ts.workdir_text(self.tree(rdir), self.repo)), "the first request names the absolute working tree first")
         self.assertTrue(text.endswith("\n\nMake a focused change in lib/x.py\n"), "then the request the normal coder got")
-        self.assertEqual(info["workdir"], str(rdir / "worktree"))
+        self.assertEqual(info["workdir"], str(self.tree(rdir)))
         trial_shadow_cleanup = ts.cleanup(rdir, self.env)
         self.assertEqual(trial_shadow_cleanup, [])
 
@@ -506,7 +511,7 @@ class RunStepTests(ShadowCase):
         self.assertEqual((record["outcome"], record["mode"], record["pair_id"]), ("timeout", "shadow", info["pair_id"]))
         self.assertFalse([p for p in (rdir / "state" / "tasks").iterdir() if p.name.startswith("review-")], "a timed out run is not reviewed")
         self.assertEqual(done["cleanup_errors"], [])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
 
     def test_f2_a_local_run_stops_as_preempted_when_main_fills_its_slots_while_it_waits(self):
@@ -528,7 +533,7 @@ class RunStepTests(ShadowCase):
         self.assertEqual(record["outcome"], "preempted")
         self.assertFalse([p for p in (rdir / "state" / "tasks").iterdir() if p.name.startswith("review-")], "a preempted run is not reviewed")
         self.assertEqual(done["cleanup_errors"], [])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
 
     def test_f2_main_below_its_limit_does_not_stop_the_run_and_a_worker_that_settled_is_kept(self):
@@ -613,7 +618,7 @@ class RunStepTests(ShadowCase):
 
     def test_the_run_and_its_record_say_where_the_worker_worked(self):
         rdir, info = self.prepare()
-        worktree = str(rdir / "worktree")
+        worktree = str(self.tree(rdir))
         self.assertEqual(ts.read_run(rdir)["workdir"], worktree)
         _, done = self.run_stub(rdir, lambda n, run: self.settle_worker(run) if n == 1 else None)
         self.assertEqual(done["workdir"], worktree)
@@ -632,7 +637,7 @@ class RunStepTests(ShadowCase):
         self.assertEqual(done["outcome"], "worker_failed", done)
         self.assertIsNone(done.get("review_id"))
         self.assertEqual([r["outcome"] for r in self.records() if r["arm"] == "qwen"], ["worker_failed"])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
 
     def test_g_a_failed_spawn_cleans_up_the_worktree_the_session_and_the_refs(self):
         rdir, info = self.prepare()
@@ -640,7 +645,7 @@ class RunStepTests(ShadowCase):
         _, done = self.run_stub(rdir, spawn_error="tp-spawn refused: nope")
         self.assertEqual(done["outcome"], "spawn_failed")
         self.assertIn("tp-spawn refused", done["error"])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertEqual(self.worktrees().count("worktree "), 1)
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
         self.assertEqual(self.refs("refs/tmux-pi"), "")
@@ -687,7 +692,7 @@ class RunStepTests(ShadowCase):
         _, done = self.run_stub(rdir, poll)
         self.assertEqual(done["outcome"], "stopped")
         self.assertTrue(done.get("interrupted"))
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertEqual(self.refs("refs/tmux-pi"), "")
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
         self.assertEqual([r["outcome"] for r in self.records() if r["arm"] == "qwen"], ["stopped"])
@@ -701,7 +706,7 @@ class RunStepTests(ShadowCase):
         _, done = self.run_stub(rdir, poll)
         self.assertEqual(done["outcome"], "error")
         self.assertIn("RuntimeError: boom", done["error"])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
         self.assertFalse(self.alive(self.worker_pane), "the worker is ended too")
 
@@ -720,18 +725,17 @@ class CleanupTests(ShadowCase):
         git(self.repo, "update-ref", "refs/tmux-pi/shadow/{}/head".format(info["run"]), self.base)
         self.assertEqual(ts.cleanup(rdir, self.env), [])
         self.assertEqual(ts.cleanup(rdir, self.env), [])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertEqual(self.refs("refs/tmux-pi"), "")
 
     def test_cleanup_removes_a_worktree_git_no_longer_knows(self):
         rdir, info = self.prepare()
         run = ts.Run(rdir, self.env)
         run.make_worktree()
-        git(self.repo, "worktree", "remove", "--force", str(run.worktree))
-        (rdir / "worktree").mkdir()
-        (rdir / "worktree" / "stale").write_text("x")
+        shutil.rmtree(ts._gitfile_target(run.worktree))  # git's entry for the tree is gone; the directory (ours by identity) stays
+        (self.tree(rdir) / "stale").write_text("x")
         self.assertEqual(ts.cleanup(rdir, self.env), [])
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse(self.tree(rdir).exists())
 
     def test_cleanup_ends_a_task_that_still_runs(self):
         rdir, info = self.prepare()
@@ -744,14 +748,14 @@ class CleanupTests(ShadowCase):
         self.assertFalse(self.alive(pane))
 
     def test_cleanup_never_removes_a_worktree_path_outside_the_run_directory(self):
+        """run.json is a file the worker can edit: what it says about the worktree decides nothing."""
         rdir, info = self.prepare()
         outside = self.root / "precious"
         outside.mkdir()
         (outside / "keep").write_text("x")
         ts.update_run(rdir, worktree=str(outside))
-        leftovers = ts.cleanup(rdir, self.env)
+        ts.cleanup(rdir, self.env)
         self.assertTrue((outside / "keep").exists())
-        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
 
     def other_worktree(self):
         """A second, registered, dirty worktree of the same repository: another lane's tree, which no shadow may touch."""
@@ -768,29 +772,25 @@ class CleanupTests(ShadowCase):
         rdir, info = self.prepare()
         other = self.other_worktree()
         ts.update_run(rdir, worktree=str(other))
-        leftovers = ts.cleanup(rdir, self.env)
-        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
+        ts.cleanup(rdir, self.env)
         self.assert_other_untouched(other)
 
     def test_f1_a_link_in_the_runs_worktree_place_to_another_worktree_removes_nothing(self):
         rdir, info = self.prepare()
         other = self.other_worktree()
-        os.symlink(str(other), str(rdir / "worktree"))
+        os.symlink(str(other), str(self.tree(rdir)))
         leftovers = ts.cleanup(rdir, self.env)
-        self.assertTrue(any("not the run's own" in l for l in leftovers), leftovers)
+        self.assertTrue(any(NOT_OURS in l for l in leftovers), leftovers)
         self.assert_other_untouched(other)
 
-    def test_f1_a_record_that_puts_the_run_in_another_project_or_name_cleans_nothing(self):
+    def test_f1_a_record_that_names_another_project_or_run_moves_nothing_cleanup_does(self):
+        """Project, run, state dir and session come from where the run directory is, not from run.json."""
         rdir, info = self.prepare()
         other = self.other_worktree()
-        for fields in ({"project": str(other)}, {"run": "sh-elsewhere"}):
-            with self.subTest(fields=fields):
-                ts.update_run(rdir, **fields)
-                leftovers = ts.cleanup(rdir, self.env)
-                self.assertTrue(any("not cleaned" in l for l in leftovers), leftovers)
-                self.assertIn("tp-trial-" + info["run"], self.session_names(), "the session was not ended on a record that is not the run's")
-                self.assert_other_untouched(other)
-                ts.update_run(rdir, project=info["project"], run=info["run"])
+        ts.update_run(rdir, project=str(other), run="sh-elsewhere", state=str(other), session="tp-trial-sh-elsewhere")
+        ts.cleanup(rdir, self.env)
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names(), "the run's own session, derived from its directory, was ended")
+        self.assert_other_untouched(other)
 
     def test_f1_a_run_that_starts_from_such_a_record_does_not_touch_that_tree(self):
         rdir, info = self.prepare()
@@ -798,7 +798,7 @@ class CleanupTests(ShadowCase):
         ts.update_run(rdir, worktree=str(other))
         run, done = self.run_stub(rdir)
         self.assertEqual(done["outcome"], "error")
-        self.assertIn("not the run's own", done["error"])
+        self.assertIn("not this run's own place", done["error"])
         self.assert_other_untouched(other)
         self.assertEqual(git(other, "status", "--porcelain"), "M lib/x.py", "nothing was staged or reset there")
 
@@ -845,23 +845,23 @@ class WorktreeOwnershipTests(ShadowCase):
 
     def test_f1_a_worktree_that_was_there_before_the_run_is_left_untouched_by_cleanup(self):
         rdir, info = self.prepare()
-        other = self.other_tree(rdir / "worktree")  # registered, dirty, and not made by this run (the run never reached make_worktree)
+        other = self.other_tree(self.tree(rdir))  # registered, dirty, and not made by this run (the run never reached make_worktree)
         before = self.fingerprint(other)
         leftovers = ts.cleanup(rdir, self.env)
-        self.assertTrue(any("not created by this run" in l for l in leftovers), leftovers)
+        self.assertTrue(any(NOT_OURS in l for l in leftovers), leftovers)
         self.assertEqual(self.fingerprint(other), before)
 
     def test_f1_stop_of_a_queued_run_leaves_a_worktree_it_did_not_create(self):
         rdir, info = self.prepare()
-        other = self.other_tree(rdir / "worktree")
+        other = self.other_tree(self.tree(rdir))
         before = self.fingerprint(other)
         done = ts.stop(rdir, self.env)
         self.assertEqual(self.fingerprint(other), before)
-        self.assertTrue(any("not created by this run" in l for l in done["cleanup_errors"]), done["cleanup_errors"])
+        self.assertTrue(any(NOT_OURS in l for l in done["cleanup_errors"]), done["cleanup_errors"])
 
     def test_f1_a_run_that_finds_a_worktree_at_its_place_makes_none_and_removes_none(self):
         rdir, info = self.prepare()
-        other = self.other_tree(rdir / "worktree")
+        other = self.other_tree(self.tree(rdir))
         before = self.fingerprint(other)
         run, done = self.run_stub(rdir)
         self.assertEqual(done["outcome"], "error")
@@ -872,7 +872,8 @@ class WorktreeOwnershipTests(ShadowCase):
         rdir, info = self.prepare()
         run = ts.Run(rdir, self.env)
         run.make_worktree()
-        self.assertEqual(run.info["owned_worktree"]["path"], os.path.realpath(str(run.worktree)))
+        self.assertEqual(run.owner.record["path"], os.path.realpath(str(run.worktree)))
+        self.assertNotIn("owned_worktree", ts.read_run(rdir), "the ownership record is not kept in run.json, which the worker can reach")
         self.assertEqual(ts.cleanup(rdir, self.env), [])
         self.assertFalse(run.worktree.exists())
         self.assertEqual(ts.cleanup(rdir, self.env), [], "a second cleanup finds nothing and does nothing")
@@ -882,18 +883,18 @@ class WorktreeOwnershipTests(ShadowCase):
         run = ts.Run(rdir, self.env)
         run.make_worktree()
         self.assertEqual(ts.cleanup(rdir, self.env), [])
-        other = self.other_tree(rdir / "worktree")  # git may reuse the admin name of the removed one
+        other = self.other_tree(self.tree(rdir))  # git may reuse the admin name of the removed one
         before = self.fingerprint(other)
         leftovers = ts.cleanup(rdir, self.env)
         self.assertEqual(self.fingerprint(other), before)
-        self.assertTrue(any("not created by this run" in l for l in leftovers), leftovers)
+        self.assertTrue(any(NOT_OURS in l for l in leftovers), leftovers)
 
     def test_f2_a_link_swapped_in_before_the_reset_is_caught_before_any_git_command_there(self):
         run, other = self.swapped_run("link")
         before = self.fingerprint(other)
         with self.assertRaises(ts.ShadowError) as caught:
             run.collect_work()
-        self.assertIn("not the run's own", str(caught.exception))
+        self.assertIn(NOT_OURS, str(caught.exception))
         self.assertEqual(self.fingerprint(other), before, "no reset, no add in the other tree")
         leftovers = ts.cleanup(run.rdir, self.env)
         self.assertEqual(self.fingerprint(other), before)
@@ -928,7 +929,162 @@ class WorktreeOwnershipTests(ShadowCase):
         run, done = self.run_stub(rdir, on_poll=swap)
         self.assertEqual(done["outcome"], "error")
         self.assertEqual(self.fingerprint(other), before)
-        self.assertTrue(os.path.islink(str(rdir / "worktree")), "the link is left, not followed")
+        self.assertTrue(os.path.islink(str(self.tree(rdir))), "the link is left, not followed")
+
+    # -- review 4: the model changed, not a site (see the report's design)
+
+    def worker_replaces_tree(self, run):
+        """What a worker can do with git alone: remove the run's tree and make another registered, detached, dirty one at the same place."""
+        old_admin = ts._gitfile_target(run.worktree)
+        git(self.repo, "worktree", "remove", "--force", str(run.worktree))
+        other = self.other_tree(run.worktree)
+        self.assertEqual(ts._gitfile_target(other), old_admin, "git reused the admin directory name: no name tells the two trees apart")
+        return other
+
+    def made_run(self):
+        rdir, info = self.prepare()
+        run = ts.Run(rdir, self.env)
+        run.make_worktree()
+        return run
+
+    def test_r4_f1_a_tree_made_at_the_place_after_the_runs_own_was_removed_is_left_by_the_runners_cleanup(self):
+        run = self.made_run()
+        other = self.worker_replaces_tree(run)
+        before = self.fingerprint(other)
+        leftovers = run.cleanup()
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(any(NOT_OURS in l for l in leftovers), leftovers)
+
+    def test_r4_f1_the_same_replacement_is_left_by_an_external_stop_and_cleanup(self):
+        run = self.made_run()
+        other = self.worker_replaces_tree(run)
+        before = self.fingerprint(other)
+        done = ts.stop(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(any(NOT_OURS in l for l in done["cleanup_errors"]), done["cleanup_errors"])
+        ts.cleanup(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+
+    def forge_and_swap(self):
+        """The worker moves another registered tree into the place and rewrites every field of run.json that could name it."""
+        run, other = self.swapped_run("moved-worktree")
+        real = os.path.realpath(str(run.worktree))
+        ts.update_run(run.rdir, owned_worktree={"path": real, "gitdir": ts._gitfile_target(run.worktree), "heads_before": [], "created": ts.now()},
+                      worktree_removed=None, worktree=str(run.worktree), project=run.info["project"])
+        return run, other
+
+    def test_r4_f2_a_forged_run_json_cannot_make_another_tree_the_runs_for_the_runner_or_for_a_stop(self):
+        run, other = self.forge_and_swap()
+        before = self.fingerprint(other)
+        run.cleanup()
+        self.assertEqual(self.fingerprint(other), before, "the runner's cleanup")
+        ts.cleanup(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before, "an external cleanup")
+        ts.stop(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before, "an external stop")
+
+    def test_r4_f2_a_state_dir_the_worker_points_at_mains_stops_none_of_mains_tasks(self):
+        main_task = self.local_task(self.state)  # made first: a bare `new-window` of the fixture lands in the newest session, and a trial's is killed
+        rdir, info = self.prepare()
+        pane = json.loads((self.state / "tasks" / main_task / "meta.json").read_text())["pane"]
+        ts.update_run(rdir, state=str(self.state))
+        ts.cleanup(rdir, self.env)
+        self.assertTrue(self.alive(pane), "Main's worker is still running")
+
+    def test_r4_f3_a_state_dir_replaced_by_a_link_to_mains_stops_none_of_mains_tasks_and_the_session_still_ends(self):
+        main_task = self.local_task(self.state)
+        rdir, info = self.prepare()
+        pane = json.loads((self.state / "tasks" / main_task / "meta.json").read_text())["pane"]
+        shutil.move(str(rdir / "state"), str(self.root / "aside-state"))
+        os.symlink(str(self.state), str(rdir / "state"))
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(self.alive(pane), "Main's worker is still running")
+        self.assertTrue(any("not the run's own directory" in l for l in leftovers), leftovers)
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names(), "the session is the backstop that needs no state dir")
+
+    def test_r4_the_place_is_unique_to_the_attempt_and_the_record_is_outside_the_run_dir(self):
+        first, _ = self.prepare(run="sh-one")
+        second, _ = self.prepare(run="sh-two")
+        names = [self.tree(first), self.tree(second)]
+        self.assertNotEqual(names[0].name, names[1].name)
+        for rdir, place in zip((first, second), names):
+            self.assertRegex(place.name, r"^wt-[0-9a-f]{12}$")
+            self.assertEqual(place.parent, rdir)
+        run = ts.Run(first, self.env)
+        run.make_worktree()
+        record = ts.owner_file(run.project, run.run)
+        self.assertTrue(record.is_file())
+        self.assertNotIn(os.path.realpath(str(first)), os.path.realpath(str(record)), "outside the run dir (and so outside the worktree's parent)")
+        self.assertEqual(json.loads(record.read_text())["path"], os.path.realpath(str(run.worktree)))
+
+    def test_r4_a_place_that_exists_is_never_reused_even_an_empty_directory(self):
+        rdir, info = self.prepare()
+        place = self.tree(rdir)
+        place.mkdir()
+        run, done = self.run_stub(rdir)
+        self.assertEqual(done["outcome"], "error")
+        self.assertTrue(place.is_dir() and not list(place.iterdir()), "left exactly as found")
+        self.assertFalse((rdir / "state" / "tasks" / run.task_id).exists(), "no worker was started")
+
+    def test_r4_cleanup_does_not_prune_the_repository_and_so_leaves_other_lanes_entries(self):
+        run = self.made_run()
+        gone = self.root / "lane-on-an-unmounted-volume"
+        git(self.repo, "worktree", "add", "--detach", str(gone), self.base)
+        shutil.move(str(gone), str(self.root / "moved-off"))  # git would call this entry prunable
+        entry = str(gone.resolve())
+        self.assertIn(entry, self.worktrees().replace("\\", ""))
+        self.assertEqual(run.cleanup(), [])
+        self.assertIn(entry, self.worktrees().replace("\\", ""), "another lane's entry is not ours to prune")
+
+    def test_r4_the_tree_is_not_removed_while_the_worker_may_still_run(self):
+        run = self.made_run()
+        with mock.patch.object(ts.trial_session, "end", return_value=False):  # the session cannot be ended
+            leftovers = run.cleanup()
+        self.assertTrue(run.worktree.is_dir(), "no removal is raced against a worker that may still be running")
+        self.assertTrue(any("may still be running" in l for l in leftovers), leftovers)
+        self.assertEqual(run.cleanup(), [], "once the session is gone the tree goes")
+        self.assertFalse(run.worktree.exists())
+
+    def test_r4_an_unreadable_owner_record_leaves_the_tree_but_still_ends_the_session(self):
+        run = self.made_run()
+        ts.owner_file(run.project, run.run).write_text("{not json")
+        leftovers = ts.cleanup(run.rdir, self.env)
+        self.assertTrue(run.worktree.is_dir())
+        self.assertTrue(any("owner record" in l for l in leftovers), leftovers)
+        self.assertNotIn("tp-trial-" + run.run, self.session_names())
+
+    def test_r4_f3_a_link_swapped_in_while_the_worker_runs_still_ends_the_worker_and_the_session(self):
+        rdir, info = self.prepare()
+        other = self.other_tree(self.root / "other-lane")
+        before = self.fingerprint(other)
+
+        def swap_then_fail(n, run):
+            shutil.move(str(run.worktree), str(self.root / "aside"))
+            os.symlink(str(other), str(run.worktree))
+            raise ts.Interrupted()  # or a failed Main-slot count: any way the runner ends
+        run, done = self.run_stub(rdir, on_poll=swap_then_fail)
+        self.assertEqual(done["outcome"], "stopped")
+        self.assertFalse(self.alive(self.worker_pane), "the worker was ended whatever the worktree proof said")
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(os.path.islink(str(run.worktree)), "the link is left, not followed")
+        self.assertTrue(any(NOT_OURS in l for l in done["cleanup_errors"]), done["cleanup_errors"])
+
+    def test_r4_f3_stop_ends_the_worker_and_the_session_though_the_tree_is_no_longer_the_runs(self):
+        rdir, info = self.prepare()
+        run = StubSpawnRun(rdir, self.env)
+        run.make_worktree()
+        run.spawn()
+        other = self.other_tree(self.root / "other-lane")
+        before = self.fingerprint(other)
+        shutil.move(str(run.worktree), str(self.root / "aside"))
+        os.symlink(str(other), str(run.worktree))
+        self.assertTrue(self.alive(self.worker_pane))
+        done = ts.stop(rdir, self.env)
+        self.assertFalse(self.alive(self.worker_pane))
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertEqual(done["phase"], "done")
 
     def test_f3_an_attempt_spent_before_the_runner_began_starts_no_worker_and_makes_no_worktree(self):
         rdir, info = self.prepare(timeout_s=300)
@@ -939,7 +1095,7 @@ class WorktreeOwnershipTests(ShadowCase):
         self.assertIn("worker was not started", done["error"])
         self.assertFalse((rdir / "state" / "tasks" / run.task_id).exists(), "tp-spawn (here its stand-in) was never reached")
         self.assertEqual(len(self.worktrees().split("\n\n")), trees)
-        self.assertNotIn("owned_worktree", done)
+        self.assertFalse(ts.owner_file(info["project"], info["run"]).exists(), "nothing was created, so nothing is recorded")
 
     def test_f3_time_spent_on_the_worktree_is_checked_again_just_before_tp_spawn(self):
         rdir, info = self.prepare(timeout_s=300)
@@ -957,7 +1113,7 @@ class WorktreeOwnershipTests(ShadowCase):
         run, done = self.run_stub(rdir, clock=clock, run_class=SlowTree)
         self.assertEqual((done["outcome"], calls), ("timeout", []), "tp-spawn was not called")
         self.assertIn("before tp-spawn", done["error"])
-        self.assertFalse((rdir / "worktree").exists(), "the worktree made is cleaned up")
+        self.assertFalse((self.tree(rdir)).exists(), "the worktree made is cleaned up")
 
     def test_f3_an_attempt_with_time_left_still_spawns(self):
         rdir, info = self.prepare(timeout_s=300)
@@ -998,7 +1154,7 @@ class StopTests(ShadowCase):
         done = ts.stop(rdir, self.env, sleep=sleep)
         self.assertIsNotNone(child.poll(), "the runner was signalled and has gone")
         self.assertEqual((done["phase"], done["outcome"]), ("done", "stopped"))
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertNotIn("tp-trial-" + info["run"], self.session_names())
 
     def test_stop_of_a_finished_run_only_cleans(self):
@@ -1242,14 +1398,14 @@ class FullRunTests(ShadowCase):
         meta = seen["spawned_meta"]
         self.assertEqual((meta["model"], meta["thinking"], meta["worker"]), (MODEL, "medium", "pi"))
         self.assertNotIn("route_info", meta, "an explicit model is never routed or escalated")
-        self.assertEqual(os.path.realpath(meta["workdir"]), os.path.realpath(rdir / "worktree"))
+        self.assertEqual(os.path.realpath(meta["workdir"]), os.path.realpath(self.tree(rdir)))
         self.assertNotIn("lane", meta)
         self.assertIn("export TP_TRIAL_ID={}".format(info["run"]), seen["run_sh"])
         self.assertIn("export TP_DOCS_TOOLS=1", seen["run_sh"])
         self.assertIn("Make a focused change", seen["packet"])
         self.assertIn(ts.TRIAL_NOTE, seen["packet"])
         # Phase 0: the worker is told, in the request and in the packet, which tree is its own
-        told = ts.workdir_text(os.path.realpath(rdir / "worktree"), os.path.realpath(self.repo))
+        told = ts.workdir_text(os.path.realpath(self.tree(rdir)), os.path.realpath(self.repo))
         self.assertIn(told, seen["packet"])
         self.assertTrue(seen["request_md"].startswith(told))
         # (c) the review saw the diff of the soft-reset worktree
@@ -1262,7 +1418,7 @@ class FullRunTests(ShadowCase):
         self.assertEqual(git(self.repo, "rev-parse", "lane/alpha"), tip_before)
         self.assertEqual(self.lanes_listing(), lane_before)
         # (g) the worktree and shadow refs are gone, the session ended
-        self.assertFalse((rdir / "worktree").exists())
+        self.assertFalse((self.tree(rdir)).exists())
         self.assertEqual(self.worktrees(), worktrees_before)
         self.assertEqual(self.refs("refs/tmux-pi"), "")
         self.assertEqual(self.session_names(), sessions_before)

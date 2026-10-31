@@ -30,7 +30,8 @@ terminal multiplexer, `fuser -k`, a PID taken from a variable set in an earlier 
 run later, and ambiguous input forms that hide the script from the segment: `echo '...' | bash`, `printf ... | sh`, any
 filter between a here-document and a shell other than `cat` (tee, sed, tr, ...), `bash < file`, text built at run time
 and fed to `bash <(...)`, a here-document whose `|` ends the line (`cat <<EOF |` with the shell on a later line),
-`source` / `.` of a file.
+`source` / `.` of a file, and a shell reached through a subshell, a brace group or `xargs` after a here-document:
+`cat <<EOF | (bash)`, `{ cat <<EOF; } | bash`, `... | xargs bash`.
 
 Applies to worker sessions only, decided by `trust_guard.is_worker` (TP_TASK_DIR / TP_TASK_ID set, or TP_MODE=strict), the
 same test the trust-store guard uses. Main is supervised by the owner and the refusal tells a worker to "ask Main"; a

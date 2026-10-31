@@ -326,6 +326,103 @@ class GateTests(ScriptCase):
         self.assertIn("prettier skipped (no files)", body)
         self.assertIn("typecheck skipped (no ts files)", body)
 
+    # --- deletions: a deleted file can break its app's importers, so it touches the app
+    def lane_deleting(self, files, delete, commit=True):
+        """`files` committed on main; then on the lane `delete` is removed (committed, or only removed from the worktree)."""
+        repo = self.repo()
+        self.commit(repo, files)
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        for rel in delete:
+            if commit:
+                self.git(repo, "rm", "-q", rel)
+            else:
+                (repo / rel).unlink()
+        if commit:
+            self.git(repo, "commit", "-q", "-m", "delete")
+        return repo
+
+    def test_deleting_a_ts_file_of_a_deno_app_checks_the_remaining_ts_files(self):
+        repo = self.lane_deleting({"api/deno.json": "{}\n", "api/main.ts": "x\n", "api/gone.ts": "x\n", "api/sub/util.ts": "x\n"}, ["api/gone.ts"])
+        self.stub("deno")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:api 0", body)
+        deno = self.calls_of("deno")
+        self.assertIn("arg: main.ts\n", deno)
+        self.assertIn("arg: sub/util.ts\n", deno)
+        self.assertNotIn("gone.ts", deno)
+        self.assertNotIn("typecheck skipped", "\n".join(body))
+
+    def test_deleting_a_ts_file_of_a_web_app_runs_tsc(self):
+        repo = self.lane_deleting({"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n", "web/gone.ts": "x\n"}, ["web/gone.ts"])
+        self.stub("tsc", exit_code=2, output="error TS2307: Cannot find module './gone'")
+        code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))
+        self.assertEqual(code, 1)
+        self.assertIn("typecheck:web 2", body)
+        self.assertEqual(self.calls_of("tsc").count("--- call"), 1)
+
+    def test_an_uncommitted_deletion_also_typechecks_the_app(self):
+        repo = self.lane_deleting({"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n", "web/gone.ts": "x\n"}, ["web/gone.ts"], commit=False)
+        self.stub("tsc")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:web 0", body)
+
+    def test_deleting_a_non_ts_file_of_a_typed_app_also_typechecks_it(self):
+        repo = self.lane_deleting({"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n", "web/data.json": "{}\n"}, ["web/data.json"])
+        self.stub("tsc")
+        self.assertIn("typecheck:web 0", self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2])
+
+    def test_a_ts_file_moved_out_of_an_app_typechecks_the_app_it_left(self):
+        repo = self.repo()
+        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/moved.ts": "export const m = 1\n",
+                           "other/package.json": "{}\n", "other/tsconfig.json": "{}\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.git(repo, "mv", "web/moved.ts", "other/moved.ts")
+        self.git(repo, "commit", "-q", "-m", "move")
+        self.stub("tsc")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:web 0", body)
+        self.assertIn("typecheck:other 0", body)
+
+    def test_deleting_the_last_ts_file_of_a_deno_app_does_not_claim_there_were_no_ts_files(self):
+        repo = self.lane_deleting({"api/deno.json": "{}\n", "api/gone.ts": "x\n"}, ["api/gone.ts"])
+        self.stub("deno")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        skipped = [line for line in body if line.startswith("typecheck:api skipped")]
+        self.assertEqual(len(skipped), 1, body)
+        self.assertNotIn("no ts files", skipped[0])
+        self.assertEqual(self.calls_of("deno"), "")
+
+    def test_deleting_a_ts_file_in_an_app_without_a_typecheck_config_is_reported(self):
+        repo = self.lane_deleting({"docs/package.json": "{}\n", "docs/gone.ts": "x\n"}, ["docs/gone.ts"])
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:docs skipped (no deno.json or tsconfig.json)", body)
+
+    def test_a_deletion_that_no_typecheck_cares_about_leaves_the_summary_alone(self):
+        repo = self.lane_deleting({"docs/package.json": "{}\n", "docs/gone.md": "x\n"}, ["docs/gone.md"])
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertNotIn("typecheck:docs", "\n".join(body))
+        self.assertIn("typecheck skipped (no ts files)", body)
+
+    def test_the_ts_listing_of_a_deno_app_survives_literal_pathspecs(self):
+        repo = self.repo()
+        self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n", "api/sub/util.tsx": "x\n", "api/readme.txt": "x\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.commit(repo, {"api/deno.json": '{"a":1}\n'})
+        self.stub("deno")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane", env={"GIT_LITERAL_PATHSPECS": "1"}))[2]
+        self.assertIn("typecheck:api 0", body)
+        deno = self.calls_of("deno")
+        self.assertIn("arg: main.ts\n", deno)
+        self.assertIn("arg: sub/util.tsx\n", deno)
+        self.assertNotIn("readme.txt", deno)
+
+    def test_literal_pathspecs_do_not_change_the_changed_file_list(self):
+        repo = self.lane_with_web_app()
+        for tool in ("prettier", "eslint", "tsc", "gitleaks"):
+            self.stub(tool)
+        self.run_script("pre-commit-gate.sh", repo, "main", env={"GIT_LITERAL_PATHSPECS": "1"})
+        self.assertIn("arg: app/(protected)/page.ts", self.calls_of("prettier"))
+
 
 class LaneInfoTests(ScriptCase):
     def with_remote(self):

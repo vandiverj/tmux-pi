@@ -193,6 +193,54 @@ class Safety(unittest.TestCase):
                     routines.parse_transcript(str(link))
             self.assertFalse([p for p in opened if any(part.startswith(".en" + "v") for part in Path(p).parts)], opened)
 
+    def test_every_reader_refuses_a_symlink_that_leads_to_a_dotenv_file(self):
+        """meta.json, transcript-path and the previous counts file are checked like a transcript."""
+        opened = []
+        real_open = builtins.open
+        hidden = ".en" + "v.production"
+
+        def spy(file, *a, **k):
+            opened.append(os.path.realpath(str(file)))
+            return real_open(file, *a, **k)
+
+        def leaked():
+            return [p for p in opened if any(part.startswith(".en" + "v") for part in Path(p).parts)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            sessions = tmp / ".tmux-pi" / "sessions"
+            good = {"id": "t1", "role": "coder", "created": "2026-10-01T00:00:00Z"}
+            # t1: meta.json is a link to a hidden file holding valid-looking meta
+            d1 = sessions / "s1" / "tasks" / "t1"
+            d1.mkdir(parents=True)
+            (tmp / hidden).write_text(json.dumps(good))
+            (d1 / "meta.json").symlink_to(tmp / hidden)
+            (d1 / "transcript-path").write_text(str(FIX / GATE))
+            # t2: transcript-path is a link to a hidden file holding a valid transcript path
+            d2 = sessions / "s1" / "tasks" / "t2"
+            d2.mkdir(parents=True)
+            (d2 / "meta.json").write_text(json.dumps(dict(good, id="t2")))
+            (tmp / (hidden + ".path")).write_text(str(FIX / GATE))
+            (d2 / "transcript-path").symlink_to(tmp / (hidden + ".path"))
+            # the previous counts file is a link to a hidden file holding valid counts
+            (tmp / (hidden + ".counts")).write_text(json.dumps({"version": routines.STATE_VERSION, "roles": {}}))
+            counts = tmp / "report.json.counts.json"
+            counts.symlink_to(tmp / (hidden + ".counts"))
+            with mock.patch("builtins.open", spy):
+                self.assertEqual(routines.find_tasks(str(sessions)), [])
+                state, why = routines.load_state(str(counts))
+            self.assertIsNone(state)
+            self.assertTrue(why)  # the caller is told the counts could not be used
+            self.assertEqual(leaked(), [])
+
+    def test_an_ordinary_task_dir_and_counts_file_are_still_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build_project(tmp, [("t1", "coder", "2026-10-01T00:00:00Z", GATE)])
+            self.assertEqual(len(routines.find_tasks(str(Path(tmp) / ".tmux-pi" / "sessions"))), 1)
+            counts = Path(tmp) / "c.json"
+            counts.write_text(json.dumps({"version": routines.STATE_VERSION, "roles": {}}))
+            self.assertEqual(routines.load_state(str(counts))[0]["roles"], {})
+
     def test_env_file_targets_never_match_a_probe(self):
         for tool, arg in (("Read", "file_path"), ("Edit", "path")):
             call = {"name": tool, "bytes": 0, "input": {arg: "/work/app/.env.lane-common"}}
@@ -313,6 +361,21 @@ class Report(unittest.TestCase):
         self.assertEqual({e["lead"] for e in first["new_leads"]}, {"docker compose"})
         self.assertEqual(second["new_leads"], [])  # already reported once, at 3
         self.assertEqual({e["lead"] for e in lower["new_leads"]}, {"docker compose"})
+
+    def test_a_reported_lead_stays_reported_across_a_raise_then_a_rise(self):
+        """run 1: 3 tasks at --min-tasks 3 (reported); run 2: same tasks at 4; run 3: 4 tasks at 4."""
+        three = [("d%d" % i, "coder", "2026-10-01T00:00:00Z", DOCKER) for i in (1, 2, 3)]
+        four = three + [("d4", "coder", "2026-10-02T00:00:00Z", DOCKER)]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.json"
+            first = self.report(three, out, "--min-tasks", "3")
+            second = self.report(three, out, "--min-tasks", "4")
+            saved = json.loads(Path(str(out) + ".counts.json").read_text())
+            third = self.report(four, out, "--min-tasks", "4")
+        self.assertEqual({e["lead"] for e in first["new_leads"]}, {"docker compose"})
+        self.assertEqual(second["new_leads"], [])
+        self.assertIn("docker compose", saved["roles"]["coder"]["leads"])  # kept although below 4
+        self.assertEqual(third["new_leads"], [])
 
     def test_a_lead_never_reported_before_is_new_when_the_threshold_drops(self):
         three = [("d1", "coder", "2026-10-01T00:00:00Z", DOCKER), ("d2", "coder", "2026-10-01T00:00:00Z", DOCKER),

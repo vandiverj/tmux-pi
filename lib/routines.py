@@ -129,6 +129,14 @@ def is_env_path(path):
     return bool(ENV_FILE.search(path) or ENV_FILE.search(real))
 
 
+def open_text(path):
+    """The one way this module opens a file it reads: text mode, refused (PermissionError) for `.env*`,
+    whether named directly or reached through a symlink."""
+    if is_env_path(path):
+        raise PermissionError("refusing to open a .env file: {}".format(path))
+    return open(path, encoding="utf-8", errors="replace")
+
+
 def has_credential(text):
     """True when any line of the text looks like a credential (SECRET has no pattern that spans lines)."""
     return bool(SECRET.search(text))
@@ -149,11 +157,9 @@ def parse_transcript(path):
     pi: assistant `toolCall` parts (id, name, arguments), answered by `toolResult` messages (toolCallId).
     Lines that are not JSON are skipped. Result text is measured, not kept.
     """
-    if is_env_path(path):
-        raise PermissionError("refusing to open a .env file: {}".format(path))
     calls = []
     pending = {}
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with open_text(path) as fh:
         for line in fh:
             try:
                 rec = json.loads(line)
@@ -221,9 +227,9 @@ def find_tasks(sessions_dir, since="", role=None):
     tasks = []
     for task_dir in sorted(_task_dirs(sessions_dir)):
         try:
-            with open(os.path.join(task_dir, "meta.json"), encoding="utf-8") as fh:
+            with open_text(os.path.join(task_dir, "meta.json")) as fh:
                 meta = json.load(fh)
-            with open(os.path.join(task_dir, "transcript-path"), encoding="utf-8") as fh:
+            with open_text(os.path.join(task_dir, "transcript-path")) as fh:
                 tpath = fh.read().strip()
         except (OSError, ValueError):
             continue
@@ -286,7 +292,7 @@ def mine(tasks):
 def load_state(path):
     """The previous run's counts, or None when there is none or it cannot be used (second value says why)."""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open_text(path) as fh:
             state = json.load(fh)
     except FileNotFoundError:
         return None, ""
@@ -297,17 +303,25 @@ def load_state(path):
     return state, ""
 
 
-def counts_of(roles, min_tasks):
-    """The part of a mine() result worth keeping for the next run: task counts per probe, and per lead seen min_tasks+ times."""
-    return {role: {"probes": {k: s["tasks"] for k, s in r["probes"].items()},
-                   "leads": {k: s["tasks"] for k, s in r["leads"].items() if s["tasks"] >= min_tasks}}
-            for role, r in roles.items()}
+def counts_of(roles, min_tasks, previous=None):
+    """The part of a mine() result worth keeping for the next run: task counts per probe, and per lead.
+
+    A lead is kept when it is in min_tasks+ tasks now, or was saved by an earlier run: a lead once reported
+    stays reported, so a raised --min-tasks cannot make it new again later. A saved lead that this run did not
+    see keeps its saved count. (`previous` is the saved roles; a role that is gone from `roles` keeps nothing.)"""
+    out = {}
+    for role, r in roles.items():
+        saved = ((previous or {}).get(role) or {}).get("leads") or {}
+        leads = {k: v for k, v in saved.items() if isinstance(v, int)}
+        leads.update({k: s["tasks"] for k, s in r["leads"].items() if s["tasks"] >= min_tasks or k in leads})
+        out[role] = {"probes": {k: s["tasks"] for k, s in r["probes"].items()}, "leads": leads}
+    return out
 
 
 def merged_state(previous, roles, min_tasks, now, role=""):
     """New state. An unscoped run replaces every role (a role that no longer has tasks is gone, so its probes
     drop to 0 once and are not kept). A run limited to `role` replaces only that role and keeps the others."""
-    counts = counts_of(roles, min_tasks)
+    counts = counts_of(roles, min_tasks, previous["roles"] if previous else None)
     if role:
         kept = dict(previous["roles"]) if previous else {}
         kept.pop(role, None)

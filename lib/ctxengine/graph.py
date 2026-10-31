@@ -566,10 +566,29 @@ def _fingerprint(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _config_state(path):
-    """(resolved path, fingerprint) of a config file as it is now, (None, None) when there is none, or it cannot be read."""
+CONFIG_ABSENT = ("absent",)
+CONFIG_UNREADABLE = ("unreadable",)
+
+
+def _config_read(path):
+    """(state, bytes or None): the state of a config file (see `_config_state`) and the bytes it was made from, from one read."""
+    if not os.path.lexists(path):
+        return CONFIG_ABSENT, None
     data = _read_capped(path) if os.path.isfile(path) else None
-    return (os.path.realpath(path), _fingerprint(data)) if data is not None else (None, None)
+    if data is None:
+        return CONFIG_UNREADABLE, None
+    return ("content", os.path.realpath(path), _fingerprint(data)), data
+
+
+def _config_state(path):
+    """What a config file is now, one of three states: `CONFIG_ABSENT` (nothing is there), `CONFIG_UNREADABLE` (something is there
+    and it cannot be read as a file, or is over MAX_BYTES) or `("content", resolved path, fingerprint)`. Every writer and reader of
+    a config state goes through here, so "there was none" and "there is one I cannot read" are never the same value."""
+    return _config_read(path)[0]
+
+
+def _state_token(state):
+    return state[0] if len(state) == 1 else f"{state[0]}:{state[2]}"
 
 
 def _scan_cached(data):
@@ -588,9 +607,9 @@ class Reach:
     is a file under two names); `digest()` stands for their content; `holds()` is False once any of them has changed, or points
     somewhere else, since the proof. `config_rel` is the config's project-relative path, `config_data` what the mirror's config
     is made from and `packages` the sanitised `package.json` files (`rel -> dict`). `configs` is every file those two were made
-    from, the config and the `package.json` of each folder Deno looks in, as {absolute path: (resolved path or None, fingerprint
-    or None)}; None is "there was no such file". `holds()` checks them as well, since an answer made with an old config is an
-    answer for a tree that has moved."""
+    from, the config and the `package.json` of each folder Deno looks in, as {absolute path: `_config_state`} (absent, unreadable
+    or content). `holds()` checks them as well, since an answer made with an old config is an answer for a tree that has moved,
+    and a change between any two of the three states counts."""
 
     def __init__(self, base):
         self.base = base
@@ -611,7 +630,7 @@ class Reach:
         for rel in sorted(self.files):
             h.update(f"{rel}\0{self.files[rel][1]}\0".encode("utf-8"))
         for path in sorted(self.configs):
-            h.update(f"config\0{lexical_path(self.base, path)}\0{self.configs[path][1]}\0".encode("utf-8"))
+            h.update(f"config\0{lexical_path(self.base, path)}\0{_state_token(self.configs[path])}\0".encode("utf-8"))
         return h.hexdigest()
 
     def holds(self):
@@ -712,10 +731,9 @@ def _check_package_json(base, directory, configs):
     out = {}
     for folder in dict.fromkeys((directory, base)):
         path = os.path.join(folder, "package.json")
-        raw = _read_capped(path) if os.path.isfile(path) else None
-        configs[path] = (os.path.realpath(path), _fingerprint(raw)) if raw is not None else (None, None)
+        configs[path], raw = _config_read(path)
         if raw is None:
-            if os.path.isfile(path):
+            if configs[path] == CONFIG_UNREADABLE and os.path.isfile(path):
                 raise Unproven("unreadable_file")
             continue
         try:
@@ -764,10 +782,9 @@ def prove_reach(base, entry, config, allow):
     if os.path.isfile(config):
         if lexical_path(base, os.path.realpath(config)) is None:
             raise Unproven("unmodelled_config")
-        raw = _read_capped(config)
+        reach.configs[config], raw = _config_read(config)
         if raw is None:
             raise Unproven("unreadable_file")
-        reach.configs[config] = (os.path.realpath(config), _fingerprint(raw))
         imap, details = load_config(config, raw)
         if details.get("error") or details["unmodelled"]:
             raise Unproven("unmodelled_config")
@@ -789,7 +806,7 @@ def prove_reach(base, entry, config, allow):
             if source:
                 roots += [(source + suffix, config) for suffix in ("", "/jsx-runtime", "/jsx-dev-runtime")]
     else:
-        reach.configs[config] = (None, None)
+        reach.configs[config] = _config_state(config)
         imap = ImportMap({}, config_dir)  # the mirror gets a config of its own, so Deno looks for none above it
     reach.packages = _check_package_json(base, config_dir, reach.configs)
     reach.entry = lexical_path(base, os.path.normpath(entry))

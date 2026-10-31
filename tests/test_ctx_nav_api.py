@@ -30,6 +30,7 @@ NEEDS_DENO = unittest.skipUnless(HAVE_DENO, "deno is not on PATH")
 # what the production profile (nav_api.SANDBOX_PROFILE) denies. They still run under sandbox-exec, with network denied; only the
 # file rules are lifted. `SandboxCase` runs the real Deno under the production profile.
 LOOSE_PROFILE = "(version 1)\n(allow default)\n(deny network*)\n"
+SANDBOX_PRODUCTION = nav_api.SANDBOX_PROFILE  # captured before any test patches it
 
 
 def write(path, text=""):
@@ -1716,6 +1717,258 @@ class SandboxRefusalCase(Tree):
         for argv in started:
             self.assertEqual(argv[0], nav_api.SANDBOX_EXEC, argv)
             self.assertIn("-p", argv)
+
+
+class SandboxGrantCase(Tree):
+    """Round 6 F1 (path-boundary, the rule and not one more site): every path the sandbox profile grants, other than the per-call
+    mirror, is resolved with `realpath` and must not equal, contain or sit inside the project, the Deno root or a monorepo root; the
+    call is refused with `sandbox_grant_overlap` before Deno starts. Deno's cache is granted read-only. The cache directory is
+    chosen by the worker's environment, so it is the grant that a worker can aim."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_that_marks = SandboxRefusalCase.deno_that_marks
+
+    def assert_overlap(self, nav, label=""):
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call("src/main.ts")
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_grant_overlap"), (label, call.__name__, answer))
+            self.assertTrue(answer["next_step"])
+        self.assertFalse((self.dir / "marker").exists(), f"Deno ran with an overlapping grant: {label}")
+        self.assertIsNone(nav.deno_version(), label)
+
+    def aimed(self, project, **env):
+        return mock.patch.dict(os.environ, {key: str(value) for key, value in env.items()})
+
+    def test_f1_deno_dir_naming_the_project_a_part_of_it_or_a_parent_is_refused(self):
+        project = self.project()
+        (project / "src" / "cache").mkdir()
+        link = self.dir / "link-into-project"
+        link.symlink_to(project / "src")
+        for label, target in {"the project": project, "inside the project": project / "src" / "cache", "a parent": self.dir,
+                              "the filesystem root": "/", "a symlink into the project": link}.items():
+            with self.aimed(project, DENO_DIR=target):
+                self.assert_overlap(self.nav(project, deno=self.deno_that_marks()), label)
+
+    def test_f1_the_derived_cache_directory_is_judged_the_same_way(self):
+        project = self.project()
+        with self.aimed(project, XDG_CACHE_HOME=project.parent):  # Deno would use <parent>/deno, a sibling: allowed
+            os.environ.pop("DENO_DIR", None)
+            nav = self.nav(project, deno=self.deno_that_marks())
+            self.assertEqual(nav.symbols("src/main.ts").get("reason"), None)
+        (project / "deno").mkdir()
+        (self.dir / "marker").unlink()
+        with self.aimed(project, XDG_CACHE_HOME=project):  # <project>/deno
+            os.environ.pop("DENO_DIR", None)
+            self.assert_overlap(self.nav(project, deno=self.deno_that_marks()), "derived from XDG_CACHE_HOME")
+
+    def test_f1_a_cache_directory_inside_a_monorepo_root_is_refused(self):
+        mono = self.dir / "mono"
+        (mono / ".git").mkdir(parents=True)
+        project = mono / "apps" / "api"
+        shutil.copytree(FIXTURE, project)
+        for label, target in {"a sibling package": mono / "apps" / "web", "the monorepo": mono, "its root folder": mono / ".deno"}.items():
+            with self.aimed(project, DENO_DIR=target):
+                self.assert_overlap(self.nav(project, deno=self.deno_that_marks()), label)
+        with self.aimed(project, DENO_DIR=self.dir / "elsewhere"):  # outside the monorepo
+            self.assertIsNone(self.nav(project, deno=self.deno_that_marks()).symbols("src/main.ts").get("reason"))
+
+    def test_f1_the_deno_executable_inside_the_project_is_refused(self):
+        project = self.project()
+        marker = self.dir / "marker"
+        inside = write(project / "bin" / "deno", f'#!/bin/sh\necho ran >> {marker}; echo "deno 9.9.9"\n')
+        inside.chmod(inside.stat().st_mode | stat.S_IXUSR)
+        self.assert_overlap(self.nav(project, deno=str(inside)), "the executable")
+
+    def test_f1_the_mirror_is_not_inside_a_cache_directory_either(self):
+        """A cache directory that contains the mirror's parent would hand Deno every mirror made next to it."""
+        project = self.project()
+        parent = self.dir / "mirrors"
+        parent.mkdir()
+        with self.aimed(project, DENO_DIR=parent):
+            self.assert_overlap(self.nav(project, deno=self.deno_that_marks(), mirror_parent=str(parent)), "contains the mirror")
+
+    def test_f1_an_unrelated_cache_directory_is_fine_and_is_what_deno_is_told(self):
+        project = self.project()
+        cache = self.dir / "cache-elsewhere"
+        link = self.dir / "cache-link"
+        cache.mkdir()
+        link.symlink_to(cache)
+        with self.aimed(project, DENO_DIR=link):
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            self.assertEqual([nav.symbols("src/main.ts")["status"], nav.forward_graph("src/main.ts")["status"]], ["ok", "ok"])
+            self.assertEqual(nav._env()["DENO_DIR"], str(cache.resolve()), "Deno must get the directory that was checked, not the link")
+
+    def test_f1_the_production_profile_grants_the_cache_read_only(self):
+        write_rules = [line for line in SANDBOX_PRODUCTION.splitlines() if line.startswith("(allow file-write*")]
+        self.assertTrue(write_rules)
+        for rule in write_rules:
+            self.assertNotIn("DENODIR", rule)
+
+    @NEEDS_SANDBOX
+    def test_f1_the_review_repro_deno_dir_naming_the_project_does_not_open_an_unproven_file(self):
+        project = self.project()
+        inside = write(project / "inside.ts", "export const CANARY = 1;\n").resolve()
+        write(project / "src" / "blind.ts", f"export const later = import('file://{inside}');\n")
+        self.profile = None
+        with mock.patch.object(nav_api, "SANDBOX_PROFILE", SANDBOX_PRODUCTION), self.aimed(project, DENO_DIR=project), \
+                SandboxCase.blind_scanner():
+            nav = self.nav(project)
+            answers = [nav.forward_graph("src/blind.ts"), nav.symbols("src/blind.ts")]
+        for answer in answers:
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_grant_overlap"), answer)
+            self.assertNotIn("CANARY", json.dumps(answer))
+
+    @NEEDS_SANDBOX
+    def test_f1_the_real_deno_still_answers_with_the_cache_read_only(self):
+        project = self.project()
+        cache = self.dir / "fresh-deno-dir"  # does not exist yet: nothing can be written to it
+        with mock.patch.object(nav_api, "SANDBOX_PROFILE", SANDBOX_PRODUCTION), self.aimed(project, DENO_DIR=cache):
+            nav = self.nav(project)
+            answers = [nav.symbols("src/main.ts"), nav.forward_graph("src/main.ts")]
+        for answer in answers:
+            self.assertEqual(answer["status"], "ok", answer)
+        self.assertFalse(cache.exists(), "the sandbox let Deno create its cache directory")
+
+
+class FinalHoldsCase(Tree):
+    """Round 6 F2/F3: every answer, cached or fresh, is held to `Reach.holds()` once more immediately before it is returned, and a
+    config file has three states (absent, unreadable, content), any change between which is a change."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+
+    def nav_for(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), **kw)
+
+    @staticmethod
+    def rewrite_import_map(project):
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@host"] = "./src/mock_host.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+
+    def test_f2_a_cached_symbols_answer_is_withheld_when_the_config_changes_during_the_call(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        self.assertEqual(nav.symbols("src/main.ts")["cached"], False)  # fills the cache
+        real = nav._read_cache
+
+        def read(kind, key):
+            got = real(kind, key)
+            self.rewrite_import_map(project)
+            return got
+        nav._read_cache = read
+        answer = nav.symbols("src/main.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertNotIn("symbols", answer)
+
+    def test_f2_the_last_step_of_every_answer_is_the_check(self):
+        """A change after Deno answered and after the module check, while the answer is being put together."""
+        for call in ("symbols", "forward_graph"):
+            project = self.project(call)
+            nav = self.nav(project, deno=self.scripted_deno(
+                doc=ReviewFixesCase.doc_payload(MIRROR, "src/main.ts", "main", "d"),
+                info={"modules": [{"specifier": f"file://{MIRROR}/src/main.ts",
+                                   "dependencies": [{"code": {"specifier": f"file://{MIRROR}/src/config.ts"}}]}]}))
+            armed = []
+            real_run = nav._run_deno
+            nav._run_deno = lambda *a, **k: (armed.append(1), real_run(*a, **k))[1]
+            real_allowed = nav._allowed
+
+            def allowed(rel, real_allowed=real_allowed, project=project):
+                if armed and not (project / "moved").exists():
+                    write(project / "moved", "")
+                    self.rewrite_import_map(project)
+                return real_allowed(rel)
+            nav._allowed = allowed
+            answer = getattr(nav, call)("src/main.ts")
+            self.assertEqual(answer["status"], "stale_index", (call, answer))
+
+    def test_f2_an_unchanged_tree_still_gives_cached_and_fresh_answers(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        self.assertEqual([nav.symbols("src/main.ts")["cached"], nav.symbols("src/main.ts")["cached"], nav.forward_graph("src/main.ts")["status"]],
+                         [False, True, "ok"])
+
+    # --- three states
+
+    def test_f3_the_state_of_a_config_file_has_three_values(self):
+        folder = self.dir / "states"
+        folder.mkdir()
+        absent = graph._config_state(str(folder / "a.json"))
+        content = graph._config_state(str(write(folder / "b.json", "{}")))
+        big = write(folder / "c.json", " " * (graph.MAX_BYTES + 1))
+        unreadable = graph._config_state(str(big))
+        self.assertEqual(len({absent, content, unreadable}), 3, (absent, content, unreadable))
+        self.assertEqual(graph._config_state(str(folder / "a.json")), absent)
+        self.assertEqual(graph._config_state(str(folder / "b.json")), content)
+        (folder / "d.json").mkdir()
+        self.assertNotEqual(graph._config_state(str(folder / "d.json")), absent)  # something is there, and it is not a readable file
+        os.chmod(folder / "b.json", 0)
+        self.addCleanup(os.chmod, folder / "b.json", 0o644)
+        self.assertEqual(graph._config_state(str(folder / "b.json")), unreadable) if os.geteuid() else None
+
+    def assert_stale_when(self, make, change, files_present=True):
+        for call in ("symbols", "forward_graph"):
+            project = self.project(call)
+            make(project)
+            nav = self.nav_for(project)
+            real = nav._run_deno
+
+            def run(*a, project=project, real=real, **k):
+                change(project)
+                return real(*a, **k)
+            nav._run_deno = run
+            answer = getattr(nav, call)("src/main.ts")
+            self.assertEqual(answer["status"], "stale_index", (call, answer))
+
+    def test_f3_a_config_that_was_absent_and_is_now_too_large_to_read_is_a_change(self):
+        self.assert_stale_when(lambda project: (project / "deno.json").unlink(),
+                               lambda project: write(project / "deno.json", " " * (graph.MAX_BYTES + 1)))
+
+    def test_f3_a_package_json_that_was_absent_and_is_now_too_large_to_read_is_a_change(self):
+        self.assert_stale_when(lambda project: None,
+                               lambda project: write(project / "package.json", " " * (graph.MAX_BYTES + 1)))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read any file")
+    def test_f3_a_package_json_that_appears_unreadable_is_a_change(self):
+        def change(project):
+            write(project / "package.json", "{}")
+            os.chmod(project / "package.json", 0)
+        self.assert_stale_when(lambda project: None, change)
+
+    def test_f3_a_config_that_becomes_too_large_to_read_is_a_change(self):
+        self.assert_stale_when(lambda project: None, lambda project: write(project / "deno.json", " " * (graph.MAX_BYTES + 1)))
+
+    def test_f3_a_config_that_stays_absent_is_not_a_change(self):
+        project = self.project()
+        (project / "deno.json").unlink()
+        nav = self.nav_for(project)
+        self.assertEqual([nav.symbols("src/main.ts")["status"], nav.forward_graph("src/main.ts")["status"]], ["ok", "ok"])
+
+
+class ProbeDirectoryCase(Tree):
+    """Round 6 F4: an unusable directory for the sandbox probe or the mirror is a status with a next step, from every operation."""
+
+    def test_f4_a_missing_mirror_parent_is_a_status_for_every_operation(self):
+        project = self.project()
+        marker = self.dir / "marker"
+        deno = self.fake_deno(f'echo ran >> {marker}; echo "deno 9.9.9"')
+        nav = self.nav(project, deno=deno, mirror_parent=str(self.dir / "does" / "not" / "exist"))
+        for label, call in (("symbols", lambda: nav.symbols("src/main.ts")), ("forward_graph", lambda: nav.forward_graph("src/main.ts")),
+                            ("imports via deno", lambda: nav.imports("src/main.ts", source="deno"))):
+            answer = call()
+            self.assertEqual(answer["status"], "error", (label, answer))
+            self.assertTrue(answer["next_step"], label)
+        self.assertIsNone(nav.deno_version())
+        self.assertEqual(nav.status()["status"], "ok")
+        self.assertFalse(marker.exists(), "Deno ran with nowhere to put its files")
+
+    def test_f4_the_probe_is_tried_again_once_the_directory_exists(self):
+        project = self.project()
+        parent = self.dir / "later"
+        nav = self.nav(project, deno=self.fake_deno('echo "deno 9.9.9"'), mirror_parent=str(parent))
+        self.assertEqual(nav.symbols("src/main.ts")["status"], "error")
+        parent.mkdir()
+        self.assertIsNone(nav._check_sandbox())
 
 
 if __name__ == "__main__":

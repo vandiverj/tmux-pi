@@ -226,7 +226,7 @@ class Result:
     index_age_s: int = 0
     cache: str = ""
     invalid: list = field(default_factory=list)
-    candidates_counted: int = 0  # candidates that qualified but were not asked for (never counted in a brief)
+    candidates_counted: int = 0  # candidates that passed every selector (path, tag, text) but were not asked for (never counted in a brief)
 
 
 def query(layout, *, query=None, paths=(), tags=(), include_candidates=False, limit=5, use_cache=True):
@@ -250,7 +250,8 @@ def query(layout, *, query=None, paths=(), tags=(), include_candidates=False, li
         if tags and not overlap:
             continue
         if entry["status"] != "approved" and not include_candidates:
-            result.candidates_counted += 1
+            if not terms or any(entry["tf"].get(term) for term in terms):  # counted only when it passes the text selector too
+                result.candidates_counted += 1
             continue
         pool.append((entry, special, overlap))
     corpus = [e for e in index.entries.values() if include_candidates or e["status"] == "approved"]

@@ -213,6 +213,27 @@ class Ranking(Hermetic):
         self.assertIn("poisoned-truncate", self.ids(asked))
         self.assertEqual([h.note.status for h in asked.hits if "poisoned" in h.note.id], ["candidate"])
 
+    def test_candidates_counted_only_includes_candidates_that_match_every_selector_including_the_text(self):
+        self.corpus()
+        orders, http = f"{API}/orders/orders.test.ts", f"{API}/http/limits.ts"
+        cases = [  # (selectors, candidates that qualify but were not asked for)
+            (dict(query="kubernetes"), 0),
+            (dict(query="truncate"), 1),  # only the poisoned candidate says it
+            (dict(query="limits"), 1),  # only the unreviewed-limits candidate
+            (dict(query="truncate limits"), 2),
+            (dict(query="truncate", paths=[orders]), 1),
+            (dict(query="truncate", paths=[http]), 0),  # its scope matches the path but its text does not match
+            (dict(query="limits", paths=[orders]), 0),  # its text matches but its scope does not match the path
+            (dict(paths=[orders]), 1),  # no query: the scope alone qualifies it
+            (dict(), 2),
+            (dict(query="truncate", tags=["limits"]), 0),
+        ]
+        for selectors, expected in cases:
+            got = search.query(self.layout, limit=10, **selectors)
+            self.assertEqual(got.candidates_counted, expected, selectors)
+            self.assertNotIn("poisoned-truncate", self.ids(got), selectors)
+            self.assertNotIn("unreviewed-limits", self.ids(got), selectors)
+
     def test_a_candidate_does_not_change_the_score_of_an_approved_note(self):
         self.corpus()
         before = search.query(self.layout, query="truncate tables", limit=10)
@@ -391,6 +412,35 @@ class PathFlags(Hermetic):
         got = self.reasons(self.note(evidence=[f"{API}/foo.test.ts:4", f"{API}/missing.ts:1", "review:r-1#F2", f"{API}/foo.test.ts:3"]))
         self.assertEqual(got, [f"evidence_moved:{API}/foo.test.ts:4", f"evidence_missing:{API}/missing.ts"])
 
+    def hashed(self, **kw):
+        note = self.note(**kw)
+        note.evidence_hashes = freshness.hash_evidence(self.project, note.evidence)
+        return note
+
+    def test_evidence_whose_cited_line_moved_is_flagged_even_when_the_file_is_long_enough(self):
+        note = self.hashed()
+        self.assertEqual(list(note.evidence_hashes), [f"{API}/foo.test.ts:3"])
+        self.assertEqual(self.reasons(note), [])
+        (self.project / API / "foo.test.ts").write_text("x\ny\na\nb\nc\n")  # the cited code is now on line 5
+        self.assertEqual(self.reasons(note), [f"evidence_changed:{API}/foo.test.ts:3"])
+
+    def test_edits_that_leave_the_cited_line_alone_do_not_flag_it(self):
+        note = self.hashed()
+        (self.project / API / "foo.test.ts").write_text("a\nb\n  c  \nd\ne\n")  # indentation and later lines changed
+        self.assertEqual(self.reasons(note), [])
+
+    def test_a_note_written_before_hashes_existed_is_only_checked_for_the_file_and_its_length(self):
+        note = self.note()
+        (self.project / API / "foo.test.ts").write_text("x\ny\na\nb\nc\n")
+        self.assertEqual(self.reasons(note), [])
+
+    def test_no_hash_is_taken_for_a_sensitive_outside_missing_or_non_file_evidence(self):
+        (self.project / ".env.local").write_text("SECRET=1\n")
+        got = freshness.hash_evidence(self.project, [".env.local:1", "../outside.ts:1", f"{API}/missing.ts:1", f"{API}/foo.test.ts:9",
+                                                     "review:r-1#F2", f"{API}/foo.test.ts:2"])
+        self.assertEqual(list(got), [f"{API}/foo.test.ts:2"])
+        self.assertRegex(got[f"{API}/foo.test.ts:2"], r"^[0-9a-f]{16}$")
+
     def test_evidence_naming_a_sensitive_or_outside_path_is_neither_read_nor_flagged(self):
         (self.project / ".env.local").write_text("SECRET=1\n")
         self.assertEqual(self.reasons(self.note(evidence=[".env.local:1", "../outside.ts:1"])), [])
@@ -486,6 +536,23 @@ class Writing(Hermetic):
         self.assertEqual(Path(path).read_text(), before)
         self.assertEqual([p.name for p in self.layout.directory("candidate").iterdir()], ["kn-2026-10-31-first.md"])  # no temp left
 
+    def test_add_records_a_hash_of_each_cited_line_and_it_survives_approval(self):
+        (self.project / API).mkdir(parents=True)
+        (self.project / API / "a.test.ts").write_text("one\ntwo\n")
+        forged = {f"{API}/a.test.ts:1": "0" * 16}
+        path = store.add_candidate(self.layout, self.candidate(evidence=[f"{API}/a.test.ts:2", "review:r-1#F2", f"{API}/gone.ts:1"],
+                                                               evidence_hashes=forged))
+        written = store.parse(Path(path).read_text())
+        self.assertEqual(list(written.evidence_hashes), [f"{API}/a.test.ts:2"])  # taken from the tree, not from the caller
+        self.assertEqual(written.evidence_hashes, freshness.hash_evidence(self.project, [f"{API}/a.test.ts:2"]))
+        store.approve_apply(self.layout, store.approve_plan(self.layout, "kn-2026-10-31-first"))
+        self.assertEqual(store.load(self.layout, "approved", "kn-2026-10-31-first").evidence_hashes, written.evidence_hashes)
+
+    def test_evidence_hashes_must_name_listed_evidence_and_look_like_hashes(self):
+        for hashes in ({f"{API}/b.ts:1": "a" * 16}, {f"{API}/a.test.ts:1": "xyz"}, {f"{API}/a.test.ts:1": "A" * 16}):
+            with self.assertRaisesRegex(store.NoteError, "evidence_hashes"):
+                store.validate(self.candidate(evidence_hashes=hashes, created="2026-10-31"))
+
     def test_add_refuses_an_id_that_exists_in_another_directory(self):
         self.corpus()
         taken = self.candidate(ident="kn-2026-10-01-test-truncate")
@@ -532,6 +599,87 @@ class Writing(Hermetic):
         self.assertFalse(self.layout.path("approved", old).exists())
         self.assertEqual(store.get(self.layout, old).where, "superseded")
         self.assertNotIn("test-truncate", self.ids(search.query(self.layout, paths=[f"{API}/orders/orders.test.ts"], limit=10)))
+
+    def knowledge_files(self):
+        return {str(p.relative_to(self.layout.knowledge)): p.read_bytes() for p in sorted(self.layout.knowledge.rglob("*")) if p.is_file()}
+
+    def two_replacements(self):
+        self.corpus()
+        old = ["kn-2026-10-01-test-truncate", "kn-2026-10-01-orders-test-truncate"]
+        store.add_candidate(self.layout, self.candidate(supersedes=old))
+        return old, self.knowledge_files()
+
+    def test_a_note_cannot_list_the_same_superseded_id_twice(self):
+        for ids in (["kn-2026-10-01-a", "kn-2026-10-01-a"], ["kn-2026-10-01-a", "kn-2026-10-01-b", "kn-2026-10-01-a"]):
+            with self.assertRaisesRegex(store.NoteError, "supersedes lists each id once"):
+                store.validate(self.candidate(supersedes=ids, created="2026-10-31"))
+        with self.assertRaisesRegex(store.NoteError, "supersedes lists each id once"):
+            store.add_candidate(self.layout, self.candidate(supersedes=["kn-2026-10-01-a"] * 2))
+        self.assertFalse(self.layout.directory("candidate").exists())
+
+    def test_a_hand_edited_candidate_with_a_repeated_supersedes_id_is_not_approved_and_nothing_moves(self):
+        self.corpus()
+        old = "kn-2026-10-01-test-truncate"
+        store.add_candidate(self.layout, self.candidate(supersedes=[old]))
+        path = self.layout.path("candidate", "kn-2026-10-31-first")
+        path.write_text(path.read_text().replace(f'["{old}"]', f'["{old}", "{old}"]'))
+        before = self.knowledge_files()
+        with self.assertRaises((store.StoreError, store.NoteError)):
+            store.approve_plan(self.layout, "kn-2026-10-31-first")
+        self.assertEqual(self.knowledge_files(), before)
+
+    def test_a_failure_while_moving_a_replaced_note_leaves_the_store_as_it_was(self):
+        old, before = self.two_replacements()
+        plan = store.approve_plan(self.layout, "kn-2026-10-31-first")
+        real_link = os.link
+
+        def failing_link(source, target, *a, **kw):
+            if str(target).endswith(f"superseded/{old[1]}.md"):
+                raise OSError(5, "injected")
+            return real_link(source, target, *a, **kw)
+
+        with mock.patch.object(store.os, "link", failing_link):
+            with self.assertRaisesRegex(store.StoreError, "nothing was changed"):
+                store.approve_apply(self.layout, plan)
+        self.assertEqual(self.knowledge_files(), before)
+        self.assertEqual(store.get(self.layout, old[0]).where, "approved")
+        self.assertEqual(store.get(self.layout, "kn-2026-10-31-first").where, "candidate")
+        self.assertEqual([p.name for p in self.layout.directory("candidate").glob(".*")], [])
+
+    def test_a_failure_while_retiring_a_replaced_note_puts_back_every_step(self):
+        old, before = self.two_replacements()
+        plan = store.approve_plan(self.layout, "kn-2026-10-31-first")
+        real_unlink = os.unlink
+
+        def failing_unlink(path, *a, **kw):
+            if str(path).endswith(f"approved/{old[1]}.md"):
+                raise OSError(5, "injected")
+            return real_unlink(path, *a, **kw)
+
+        with mock.patch.object(store.os, "unlink", failing_unlink):
+            with self.assertRaisesRegex(store.StoreError, "nothing was changed"):
+                store.approve_apply(self.layout, plan)
+        self.assertEqual(self.knowledge_files(), before)
+        self.assertEqual([p.name for p in self.layout.directory("candidate").glob(".*")], [])
+
+    def test_a_retried_approval_after_a_failed_one_succeeds(self):
+        old, before = self.two_replacements()
+        real_link = os.link
+        calls = []
+
+        def flaky_link(source, target, *a, **kw):
+            if str(target).endswith(f"superseded/{old[1]}.md") and not calls:
+                calls.append(1)
+                raise OSError(5, "injected")
+            return real_link(source, target, *a, **kw)
+
+        with mock.patch.object(store.os, "link", flaky_link):
+            with self.assertRaises(store.StoreError):
+                store.approve_apply(self.layout, store.approve_plan(self.layout, "kn-2026-10-31-first"))
+            store.approve_apply(self.layout, store.approve_plan(self.layout, "kn-2026-10-31-first"))
+        self.assertEqual([store.get(self.layout, i).where for i in old], ["superseded", "superseded"])
+        self.assertEqual(store.get(self.layout, "kn-2026-10-31-first").where, "approved")
+        self.assertFalse(self.layout.path("candidate", "kn-2026-10-31-first").exists())
 
     def test_approve_with_a_missing_supersedes_target_changes_nothing(self):
         store.add_candidate(self.layout, self.candidate(supersedes=["kn-2026-10-01-nothing"]))

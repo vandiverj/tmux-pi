@@ -57,16 +57,24 @@ Computed on every read and never stored. A flag does not hide a note; it tells t
 |---|---|
 | `stale_by_version` | a `versions` range does not hold for the version the lockfile pins |
 | `version_unchecked` | no pin was available (the lockfile reader is L5's `localdocs`; without it versions are not checked) |
-| `stale_by_path` | a scope glob matches no file, or evidence names a file that is gone or a line past its end |
+| `stale_by_path` | a scope glob matches no file, or evidence names a file that is gone (`evidence_missing`), a line past its end (`evidence_moved`), or a line whose text is no longer the cited text (`evidence_changed`) |
 | `age_days` | more than 180 days since `last_reviewed` |
 
 ## Call log
 
-When `TP_TASK_DIR` is set (a worker) or `--log FILE` is given, every `tp-ctx` command except `approve` appends one JSON line to
-`ctx-calls.jsonl`: `ts, tool, args_hash, args, status, bytes, ms, notes_returned, index_age_s` and, when there is one,
-`reason`. It fails closed: with no usable task directory (unset, relative, not a directory, a symlink), or a log that cannot be
-written (including a symlinked `ctx-calls.jsonl`), the command prints nothing from the store and exits 3. Arguments are
-redacted before they are logged and before they are hashed. Run by a person with neither set, a command is unlogged.
+Every `tp-ctx` command except `approve` appends one JSON line to `$TP_TASK_DIR/ctx-calls.jsonl`: `ts, tool, args_hash, args,
+status, bytes, ms, notes_returned, index_age_s` and, when there is one, `reason`. It fails closed: with no usable task
+directory, or a log that cannot be written, the command prints nothing from the store and exits 3. Unusable means: unset,
+relative, not a directory, or a symlink; or a symlink anywhere in its path (for `<state>/tasks/<id>`, the state directory, `tasks`
+and `<id>` must be real directories; for any other spelling, no ancestor may be a symlink owned by the calling user). The path
+is examined again when the line is written. A symlinked `ctx-calls.jsonl` is refused. Arguments are redacted before they are
+logged and before they are hashed.
+
+Only a person's commands may do otherwise: `list`, `show` and `audit` (and `approve`, which logs nothing). With neither
+`TP_TASK_DIR` nor `TP_TASK_ID` set they may run unlogged, and `--log FILE` writes their line to a file of the person's choice,
+but only on a terminal. `status`, `add`, `import` and the query operations other lanes add (brief, symbol, relations,
+knowledge search, note) always need a usable `TP_TASK_DIR`. With either variable set the shell is a worker's: `--log` is refused
+and the call is logged in the task directory like any other.
 
 ## Screens
 
@@ -88,20 +96,24 @@ tp-ctx knowledge audit
 tp-ctx knowledge approve ID
 ```
 
-`--project DIR`, `--log FILE` and `--json` work anywhere on the line. The project is `--project`, `$TP_CTX_PROJECT`, or found
+`--project DIR`, `--log FILE` (operator commands on a terminal only, see above) and `--json` work anywhere on the line. The project is `--project`, `$TP_CTX_PROJECT`, or found
 from the working directory (`.tmux-pi` or `.git`). Exit codes: 0 answered, 1 no answer (not found, invalid), 2 usage or
 refusal, 3 not logged.
 
-`add` and `import` only write candidates. A new file is created without overwriting, so an existing id is an error. `import`
+`add` and `import` only write candidates. A new file is created without overwriting, so an existing id is an error. Each
+`file:line` evidence entry is stored with `evidence_hashes`, a hash of the cited line taken from the tree when the candidate is
+written (not taken from the caller); later reads flag the note `stale_by_path` when that line's text changes. A note without
+hashes (written by hand or before this field) is checked for the file and line count only. `supersedes` lists each id once. `import`
 accepts a work-store note tagged `lesson` that is not tagged or fenced private.
 
 `approve` is for a person. It refuses when `TP_TASK_DIR` or `TP_TASK_ID` is set, and refuses unless stdin and stdout are a
 terminal. It re-screens the file, prints the diff, and moves the candidate only after the note id is typed. Notes listed in
-`supersedes` move to `superseded/` in the same step; if any is missing, nothing changes.
+`supersedes` move to `superseded/` in the same step; if any step fails, every step already taken is undone and the
+store is as it was.
 
 ## For other lanes
 
-`ctxengine.search.query(layout, query=, paths=, tags=, include_candidates=, limit=)` returns `Result.hits`. Calls go through
-`ctxengine.calls.call(tool, args, run)`. Path arguments go through `redact.check_path(project, path)` and output through
+`ctxengine.search.query(layout, query=, paths=, tags=, include_candidates=, limit=)` returns `Result.hits`; `Result.candidates_counted` is the number of candidates that passed every selector (path, tag, text) but were not asked for. Calls go through
+`ctxengine.calls.call(tool, args, run)`, which needs a usable `TP_TASK_DIR` (pass `operator=True` only for a person's command). Path arguments go through `redact.check_path(project, path)` and output through
 `redact.guard`. A new `tp-ctx` command lives in a module named in `PLUGINS` in `bin/tp-ctx` that exposes `COMMANDS` (the first
 words it handles) and `main(argv)`.

@@ -2,14 +2,16 @@
 
   stale_by_version   a note's `versions` range no longer matches what the lockfile pins (the note is flagged, never dropped)
   version_unchecked  packages whose pin could not be read (no lockfile reader, or the lockfile does not name the package)
-  stale_by_path      a scope glob matches no file in the tree, or an evidence `file:line` names a missing file or a line past
-                     its end
+  stale_by_path      a scope glob matches no file in the tree, or an evidence `file:line` names a missing file, a line past its
+                     end, or a line whose text is no longer the text that was cited (a hash of the line is taken when a
+                     candidate is written, and compared on every read; a note without one is checked for file and length only)
   age_days           present when `last_reviewed` is more than AGE_LIMIT_DAYS old
 
 Lockfile versions come from a `pin(name) -> version | None` callable the caller supplies (the CLI wires L5's
 `localdocs.lock` when it is merged); this module has no lockfile reader of its own. Nothing here edits a note.
 """
 import datetime as _dt
+import hashlib
 import os
 import re
 import subprocess
@@ -24,6 +26,7 @@ EVIDENCE_LINE = re.compile(r"^(?P<path>[^:\s]+):(?P<line>[1-9]\d*)$")
 _VERSION = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 _COMPARATOR = re.compile(r"^(>=|<=|>|<|=|\^|~)?v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?$")
 _ANY = ("x", "X", "*")
+HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 # ------------------------------------------------------------------------------------------------------------ versions
@@ -178,41 +181,75 @@ class Tree:
 
 # -------------------------------------------------------------------------------------------------------------- paths
 
+def _evidence_target(project, item):
+    """(project-relative path, line number, full path) for a `file:line` evidence entry that names a readable place, else None:
+    not that shape, a review/doc/work/http reference, or a refused (sensitive or outside) path, which is never read."""
+    match = EVIDENCE_LINE.match(item)
+    if not match or item.startswith(("review:", "doc:", "work:", "http")):
+        return None
+    try:
+        rel = redact.check_path(project, match.group("path"))
+    except redact.Refused:
+        return None
+    return rel, int(match.group("line")), os.path.join(str(project), rel)
+
+
+def line_hash(text):
+    """A short hash of one source line, ignoring the whitespace around it (a re-indented line is the same line)."""
+    return hashlib.sha256(text.strip().encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def hash_evidence(project, evidence):
+    """{evidence entry: line_hash} for the `file:line` entries that name a line that exists now, in a path the engine may read."""
+    out = {}
+    for item in evidence:
+        target = _evidence_target(project, item)
+        if target and not os.path.islink(target[2]):
+            text = _line_text(target[2], target[1])
+            if text is not None:
+                out[item] = line_hash(text)
+    return out
+
+
 def path_reasons(note, project, tree, glob_matches):
     """Why a note is stale by path, as short codes: `scope_no_match:<glob>` for each scope glob matching no file,
-    `evidence_missing:<path>` and `evidence_moved:<path>:<line>`. `glob_matches(glob, path)` is search.glob_matches.
-    Evidence for a refused (sensitive or outside) path is not read and not flagged."""
+    `evidence_missing:<path>`, `evidence_moved:<path>:<line>` (the file no longer has that line) and
+    `evidence_changed:<path>:<line>` (the line is there but is not the text that was cited). `glob_matches(glob, path)` is
+    search.glob_matches. Evidence for a refused (sensitive or outside) path is not read and not flagged."""
     reasons = []
     files = tree.files
     for glob in note.scope:
         if not any(glob_matches(glob, path) for path in files):
             reasons.append(f"scope_no_match:{glob}")
     for item in note.evidence:
-        match = EVIDENCE_LINE.match(item)
-        if not match or item.startswith(("review:", "doc:", "work:", "http")):
+        target = _evidence_target(project, item)
+        if not target:
             continue
-        try:
-            rel = redact.check_path(project, match.group("path"))
-        except redact.Refused:
-            continue
-        full = os.path.join(str(project), rel)
+        rel, line, full = target
         if os.path.islink(full) or not os.path.isfile(full):
             reasons.append(f"evidence_missing:{rel}")
             continue
-        if _lines(full) < int(match.group("line")):
-            reasons.append(f"evidence_moved:{rel}:{match.group('line')}")
+        text = _line_text(full, line)
+        if text is None:
+            reasons.append(f"evidence_moved:{rel}:{line}")
+        elif item in note.evidence_hashes and line_hash(text) != note.evidence_hashes[item]:
+            reasons.append(f"evidence_changed:{rel}:{line}")
     return reasons
 
 
-def _lines(path):
-    count = 0
+def _line_text(path, number):
+    """The text of line `number` (1-based) of the file, or None when the file cannot be read or has fewer lines."""
     try:
         with open(path, "rb") as handle:
             chunk = handle.read(EVIDENCE_READ_MAX)
     except OSError:
-        return 0
-    count = chunk.count(b"\n") + (1 if chunk and not chunk.endswith(b"\n") else 0)
-    return count
+        return None
+    lines = chunk.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()  # a final newline ends the last line; it does not start another
+    if number > len(lines):
+        return None
+    return lines[number - 1].decode("utf-8", "replace").rstrip("\r")
 
 
 # --------------------------------------------------------------------------------------------------------------- age

@@ -13,10 +13,11 @@
                                          offer a work-store note tagged `lesson` as a candidate (same screens)
 
 The project is --project, $TP_CTX_PROJECT, or found from the working directory (a .tmux-pi directory or a .git); notes live in
-<project>/.tmux-pi/knowledge/. When $TP_TASK_DIR is set (or --log FILE is given) every command except `approve` is logged as one
-JSON line in ctx-calls.jsonl and answers nothing if it cannot be (exit 3); with neither set the command is an operator's and
-runs unlogged. All output passes the redaction boundary. Exit: 0 answered, 1 no answer (not found, invalid), 2 usage or
-refusal, 3 not logged.
+<project>/.tmux-pi/knowledge/. Every command except `approve` is logged as one JSON line in $TP_TASK_DIR/ctx-calls.jsonl and
+answers nothing if it cannot be (exit 3): status, add and import need a usable $TP_TASK_DIR, as do the query operations the
+other lanes add. Only the operator commands list, show and audit may run unlogged, and only with neither TP_TASK_DIR nor
+TP_TASK_ID set; --log FILE is accepted only for those, at a terminal, with neither set. All output passes the redaction
+boundary. Exit: 0 answered, 1 no answer (not found, invalid), 2 usage or refusal, 3 not logged.
 
 Commands the other CX lanes add live in modules named in PLUGINS; a module exposes COMMANDS (the first words it handles,
 e.g. ctx_brief) and main(argv) -> int, and is called with the whole argument list.
@@ -38,7 +39,8 @@ from ctxengine import calls, freshness, redact, search, store  # noqa: E402
 ENGINE_VERSION = 1
 PLUGINS = ("ctxengine.surface",)
 VALUE_FLAGS = {"--project", "--log"}
-WORKER_ENV = ("TP_TASK_DIR", "TP_TASK_ID")
+WORKER_ENV = calls.WORKER_ENV
+OPERATOR_COMMANDS = ("audit", "show", "list")  # a person's commands (approve has its own gates): see calls.py for what that allows
 
 
 class Usage(Exception):
@@ -339,10 +341,9 @@ def main(argv=None):
             return calls.Answer("no_project", str(exc), reason=str(exc))
         return COMMANDS[name](args, layout)
 
-    logged = bool(args.log or os.environ.get("TP_TASK_DIR"))
     params = {k: v for k, v in vars(args).items() if k not in ("command", "action", "json", "log", "project") and v is not None}
     try:
-        answer = calls.call(tool, params, run, log_file=args.log) if logged else run()
+        answer = calls.call(tool, params, run, log_file=args.log, operator=name in OPERATOR_COMMANDS)
     except calls.LogUnavailable as exc:
         print(f"tp-ctx: {redact.guard(str(exc))}", file=sys.stderr)
         return 3

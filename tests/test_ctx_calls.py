@@ -138,11 +138,89 @@ class CallLog(unittest.TestCase):
             calls.record(self.log, "t", {}, calls.Answer("fine", "x"))
         self.assertFalse(self.log.exists())
 
-    def test_an_explicit_log_file_overrides_the_task_dir(self):
+    def test_an_explicit_log_file_is_for_an_operator_at_a_terminal_with_no_task_dir(self):
         other = self.tmp / "own.jsonl"
-        calls.call("t", {}, self.ok(), log_file=other)
+        with mock.patch.object(calls, "on_terminal", return_value=True):
+            calls.call("t", {}, self.ok(), log_file=other, operator=True)
         self.assertTrue(other.is_file())
         self.assertFalse(self.log.exists())
+
+    def test_an_explicit_log_file_is_refused_everywhere_else_and_the_call_is_never_run(self):
+        other = self.tmp / "own.jsonl"
+        cases = {
+            "a query operation": dict(operator=False, env={}, tty=True),
+            "no terminal": dict(operator=True, env={}, tty=False),
+            "a task dir in the environment": dict(operator=True, env={"TP_TASK_DIR": str(self.task)}, tty=True),
+            "a task id in the environment": dict(operator=True, env={"TP_TASK_ID": "coder-x"}, tty=True),
+        }
+        for label, case in cases.items():
+            ran = []
+            with mock.patch.object(calls, "on_terminal", return_value=case["tty"]):
+                with self.assertRaises(calls.LogUnavailable, msg=label):
+                    calls.call("t", {}, lambda: ran.append(1) or calls.Answer("ok", "x"), log_file=other,
+                               operator=case["operator"], env=case["env"])
+            self.assertEqual(ran, [], label)
+            self.assertFalse(other.exists(), label)
+            self.assertFalse(self.log.exists(), label)
+
+    def test_an_operator_command_may_run_unlogged_only_with_no_worker_variables(self):
+        ran = []
+        answer = calls.call("t", {}, lambda: ran.append(1) or calls.Answer("ok", "x"), operator=True, env={})
+        self.assertEqual((answer.status, ran), ("ok", [1]))
+        self.assertFalse(self.log.exists())
+        for env in ({"TP_TASK_ID": "coder-x"}, {"TP_TASK_DIR": str(self.tmp / "missing")}):
+            with self.assertRaises(calls.LogUnavailable, msg=str(env)):
+                calls.call("t", {}, lambda: ran.append(2), operator=True, env=env)
+        self.assertEqual(ran, [1])
+
+    def test_a_query_operation_never_runs_unlogged(self):
+        ran = []
+        with self.assertRaises(calls.LogUnavailable):
+            calls.call("t", {}, lambda: ran.append(1), operator=False, env={})
+        self.assertEqual(ran, [])
+
+    def test_an_operator_command_with_a_task_dir_is_logged_there(self):
+        calls.call("t", {}, self.ok(), operator=True, env={"TP_TASK_DIR": str(self.task)})
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_symlinked_ancestor_of_the_task_dir_is_refused_and_nothing_is_written_through_it(self):
+        real = self.tmp / "real"
+        (real / "task").mkdir(parents=True)
+        (self.tmp / "alias").symlink_to(real)
+        ran = []
+        with self.assertRaisesRegex(calls.LogUnavailable, "symlink"):
+            calls.call("t", {}, lambda: ran.append(1), env={"TP_TASK_DIR": str(self.tmp / "alias" / "task")})
+        self.assertEqual((ran, list((real / "task").iterdir())), ([], []))
+
+    def test_a_symlinked_part_of_a_session_task_path_is_refused(self):
+        other = self.tmp / "other"
+        (other / "tasks" / "t1").mkdir(parents=True)
+        (self.tmp / "sessions").mkdir()
+        (self.tmp / "sessions" / "sid").symlink_to(other)  # <sessions>/<sid> is a link
+        with self.assertRaisesRegex(calls.LogUnavailable, "symlink"):
+            calls.call("t", {}, self.ok(), env={"TP_TASK_DIR": str(self.tmp / "sessions" / "sid" / "tasks" / "t1")})
+        self.assertEqual(list((other / "tasks" / "t1").iterdir()), [])
+        state = self.tmp / "sessions" / "sid2"
+        state.mkdir()
+        (state / "tasks").symlink_to(other / "tasks")  # <sid>/tasks is a link
+        with self.assertRaisesRegex(calls.LogUnavailable, "symlink"):
+            calls.call("t", {}, self.ok(), env={"TP_TASK_DIR": str(state / "tasks" / "t1")})
+        self.assertEqual(list((other / "tasks" / "t1").iterdir()), [])
+
+    def test_a_real_session_task_path_is_logged(self):
+        task = self.tmp / "sessions" / "sid" / "tasks" / "t1"
+        task.mkdir(parents=True)
+        calls.call("t", {}, self.ok(), env={"TP_TASK_DIR": str(task)})
+        self.assertEqual(len((task / calls.LOG_NAME).read_text().splitlines()), 1)
+
+    def test_a_link_that_appears_after_the_check_is_refused_at_write_time(self):
+        real = self.tmp / "real"
+        (real / "task").mkdir(parents=True)
+        (self.tmp / "alias").symlink_to(real)
+        with self.assertRaises(calls.LogUnavailable):
+            calls.record(self.tmp / "alias" / "task" / calls.LOG_NAME, "t", {}, calls.Answer("ok", "x"),
+                         task_dir=self.tmp / "alias" / "task")
+        self.assertEqual(list((real / "task").iterdir()), [])
 
     def test_notes_returned_is_capped(self):
         calls.call("t", {}, self.ok(notes=[f"kn-{i}" for i in range(80)]), env={"TP_TASK_DIR": str(self.task)})

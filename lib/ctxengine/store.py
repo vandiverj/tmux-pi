@@ -18,6 +18,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import safe_write
@@ -34,8 +35,8 @@ SCOPE_MAX, TAGS_MAX, EVIDENCE_MAX, VERSIONS_MAX, SUPERSEDES_MAX = 10, 10, 10, 10
 GLOB_MAX = 200
 EVIDENCE_ITEM_MAX = 300
 SOURCE_PREFIXES = ("review:", "doc:", "work:", "worker:")
-FIELD_ORDER = ("id", "kind", "title", "scope", "tags", "versions", "source", "evidence", "supersedes", "status", "created",
-               "last_reviewed")
+FIELD_ORDER = ("id", "kind", "title", "scope", "tags", "versions", "source", "evidence", "evidence_hashes", "supersedes", "status",
+               "created", "last_reviewed")
 ID_RE = re.compile(r"^kn-[a-z0-9]+(?:-[a-z0-9]+)*$")
 TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,39}$")
 PACKAGE_RE = re.compile(r"^[@a-z0-9][@a-z0-9._/-]{0,99}$")
@@ -236,6 +237,7 @@ class Note:
     tags: list = field(default_factory=list)
     versions: dict = field(default_factory=dict)
     evidence: list = field(default_factory=list)
+    evidence_hashes: dict = field(default_factory=dict)  # {evidence entry: hash of the cited line}, taken from the tree when a candidate is written
     supersedes: list = field(default_factory=list)
     created: str = ""
     last_reviewed: str = ""
@@ -289,10 +291,16 @@ def from_meta(meta, body, where=""):
     if not isinstance(versions, dict) or not all(isinstance(v, str) for v in versions.values()):
         problems.append("versions must be a map of package to range text")
         versions = {}
+    hashes = meta.get("evidence_hashes", {})
+    if hashes == "":
+        hashes = {}
+    if not isinstance(hashes, dict) or not all(isinstance(v, str) for v in hashes.values()):
+        problems.append("evidence_hashes must be a map of evidence entry to hash text")
+        hashes = {}
     if problems:
         raise NoteError(problems)
     return Note(id=text("id"), kind=text("kind"), scope=list(scope), source=text("source"), body=body, status=text("status"),
-                title=text("title"), tags=list(tags), versions=dict(versions), evidence=list(evidence),
+                title=text("title"), tags=list(tags), versions=dict(versions), evidence=list(evidence), evidence_hashes=dict(hashes),
                 supersedes=list(supersedes), created=text("created"), last_reviewed=text("last_reviewed"), where=where)
 
 
@@ -339,12 +347,17 @@ def validate(note, require_evidence=None):
         if not item.strip() or len(item) > EVIDENCE_ITEM_MAX or CONTROL.search(item):
             problems.append(f"each evidence entry is 1 to {EVIDENCE_ITEM_MAX} characters, one line")
             break
+    if len(note.evidence_hashes) > EVIDENCE_MAX or any(key not in note.evidence or not freshness.HASH_RE.match(value)
+                                                        for key, value in note.evidence_hashes.items()):
+        problems.append("evidence_hashes names listed evidence entries, each with a 16 character lower case hex hash")
     for other in note.supersedes:
         if not ID_RE.match(other):
             problems.append("supersedes lists note ids")
             break
     if note.id in note.supersedes:
         problems.append("a note cannot supersede itself")
+    if len(set(note.supersedes)) != len(note.supersedes):
+        problems.append("supersedes lists each id once")
     for name in ("created", "last_reviewed"):
         value = getattr(note, name)
         if value and not _real_date(value):
@@ -587,6 +600,7 @@ def add_candidate(layout, note, screen=None):
     note.where = "candidate"
     note.created = note.created or today()
     note.last_reviewed = ""
+    note.evidence_hashes = freshness.hash_evidence(layout.project, note.evidence)  # what the cited lines say now, from the tree
     validate(note, require_evidence=True)
     for where in DIRS:
         if os.path.lexists(layout.path(where, note.id)):
@@ -620,17 +634,50 @@ def approve_plan(layout, ident, screen=None):
 
 
 def approve_apply(layout, plan):
-    """Carry out `approve_plan`: place the approved note, retire the candidate, move each replaced note to superseded/. A step
-    that fails stops there; the order leaves a note in at least one place at every step."""
+    """Carry out `approve_plan` as one step: either the approved note is in place, the candidate retired and every replaced note
+    moved to superseded/, or the store is exactly as it was and StoreError says so.
+
+    Stage: place the approved note and link each replaced note into superseded/ (only new names; nothing is removed). Commit:
+    move the candidate aside (a hidden name no scan reads) and remove each replaced note from approved/. Each step that
+    succeeded registers its undo, and a failure at any step runs them in reverse. The one step after the last undo point, the
+    removal of the hidden candidate copy, cannot undo anything: a failure there leaves a stray hidden file and no other change."""
     candidate, approved, text, replaced = plan
-    _place(layout, "approved", approved, text)
-    os.unlink(layout.path("candidate", candidate.id))
-    for old in replaced:
-        source, target = layout.path("approved", old.id), layout.path("superseded", old.id)
-        safe_write.ensure_dir(target.parent, root=layout.project, what="knowledge directory")
-        os.link(source, target)  # fails if the name exists; the old note is then still approved
-        os.unlink(source)
-    return layout.path("approved", approved.id)
+    new_path = layout.path("approved", approved.id)
+    candidate_path = layout.path("candidate", candidate.id)
+    aside = layout.directory("candidate") / f".retiring-{candidate.id}.md"
+    undo = []
+    try:
+        _place(layout, "approved", approved, text)
+        undo.append(partial(os.unlink, new_path))
+        if replaced:
+            safe_write.ensure_dir(layout.directory("superseded"), root=layout.project, what="knowledge directory")
+        for old in replaced:
+            source, target = layout.path("approved", old.id), layout.path("superseded", old.id)
+            os.link(source, target)  # fails if the name exists; the old note is then still approved
+            undo.append(partial(os.unlink, target))
+        os.rename(candidate_path, aside)
+        undo.append(partial(os.rename, aside, candidate_path))
+        for old in replaced:
+            source, target = layout.path("approved", old.id), layout.path("superseded", old.id)
+            os.unlink(source)
+            undo.append(partial(os.link, target, source))
+    except (OSError, StoreError) as exc:
+        stuck = 0
+        for step in reversed(undo):
+            try:
+                step()
+            except OSError:
+                stuck += 1
+        reason = exc.strerror or type(exc).__name__ if isinstance(exc, OSError) else str(exc)
+        if stuck:
+            raise StoreError(f"approval failed ({reason}) and {stuck} step(s) could not be put back; check {layout.knowledge.name}/ "
+                             "before trying again") from None
+        raise StoreError(f"approval failed ({reason}); nothing was changed") from None
+    try:
+        os.unlink(aside)
+    except OSError:
+        pass
+    return new_path
 
 
 def get(layout, ident, wheres=("approved", "candidate", "superseded")):

@@ -33,6 +33,7 @@ class Cli(unittest.TestCase):
         self.env.update({"TP_WORK_DIR": str(self.tmp / "work"), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
                          "TP_CTX_TODAY": "2026-10-31"})
         self.base = [sys.executable, str(TP_CTX), "--project", str(self.project)]
+        self.task_env = {"TP_TASK_DIR": str(self.task)}  # a logged run that is not a worker's shell (no TP_TASK_ID)
 
     def run_cli(self, *args, worker=False, env=None, stdin=None):
         full = dict(self.env, **(env or {}))
@@ -42,8 +43,38 @@ class Cli(unittest.TestCase):
                               cwd=str(self.tmp))
 
     def add(self, *extra, text="Clean up only the rows a test created.", **kw):
+        if not kw.get("worker"):
+            kw["env"] = {**self.task_env, **kw.get("env", {})}
         return self.run_cli("knowledge", "add", "--kind", "convention", "--scope", f"{API}/**/*.test.ts", "--evidence",
                             f"{API}/a.test.ts:2", "--title", "Clean up own rows", "--tag", "test-isolation", "--text", text, *extra, **kw)
+
+    def run_tty(self, *args, env=None):
+        """Run tp-ctx with a pseudo-terminal as stdin and stdout (stderr captured). Reads until the process closes the terminal.
+        Returns (exit code, terminal output, stderr)."""
+        master, slave = pty.openpty()
+        errors = tempfile.TemporaryFile()
+        self.addCleanup(errors.close)
+        proc = subprocess.Popen(self.base + list(args), stdin=slave, stdout=slave, stderr=errors, env=dict(self.env, **(env or {})),
+                                cwd=str(self.tmp), close_fds=True)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        seen = b""
+        while True:
+            ready, _, _ = select.select([master], [], [], 30)  # a bound, not a wait: the loop ends when the terminal closes
+            if not ready:
+                proc.kill()
+                self.fail(f"tp-ctx did not finish; saw {seen!r}")
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+        os.close(master)
+        code = proc.wait(timeout=30)
+        errors.seek(0)
+        return code, seen.decode(errors="replace"), errors.read().decode(errors="replace")
 
     def log_lines(self):
         path = self.task / "ctx-calls.jsonl"
@@ -90,12 +121,19 @@ class Knowledge(Cli):
         for label, (opts, expected) in cases.items():
             text = opts.get("text", "A body.")
             done = self.run_cli("knowledge", "add", "--kind", "lesson", "--scope", opts.get("scope", f"{API}/**"), "--evidence",
-                                opts.get("evidence", f"{API}/a.test.ts:1"), "--title", label, "--text", text, "--id", f"kn-2026-10-31-case-{label.split()[-1]}")
+                                opts.get("evidence", f"{API}/a.test.ts:1"), "--title", label, "--text", text, "--id", f"kn-2026-10-31-case-{label.split()[-1]}",
+                                env=self.task_env)
             if expected:
                 self.assertEqual(done.returncode, 1, label)
                 self.assertIn(expected, done.stderr, label)
             else:
                 self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_add_refuses_a_supersedes_id_given_twice(self):
+        done = self.add("--supersedes", "kn-2026-10-01-a", "--supersedes", "kn-2026-10-01-a")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("supersedes lists each id once", done.stderr)
+        self.assertFalse(self.candidate_path().exists())
 
     def test_list_show_and_the_candidate_status_filter(self):
         self.add()
@@ -118,6 +156,15 @@ class Knowledge(Cli):
         self.assertIn("stale_by_path", audit.stdout)
         self.assertIn("scope_no_match:gone/**", audit.stdout)
 
+    def test_moved_evidence_is_flagged_by_show_and_audit(self):
+        self.add("--id", "kn-2026-10-31-moved")  # cites a.test.ts:2, which says "two"
+        self.assertNotIn("stale_by_path", self.run_cli("knowledge", "show", "kn-2026-10-31-moved").stdout)
+        (self.project / API / "a.test.ts").write_text("zero\nzero too\none\ntwo\n")  # still long enough; "two" is now on line 4
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-moved", "--json").stdout)
+        self.assertIn("stale_by_path", shown["note"]["flags"])
+        self.assertEqual(shown["note"]["path_reasons"], [f"evidence_changed:{API}/a.test.ts:2"])
+        self.assertIn(f"evidence_changed:{API}/a.test.ts:2", self.run_cli("knowledge", "audit").stdout)
+
     def test_a_non_matching_versions_range_is_flagged_through_a_lockfile_pin(self):
         # the lockfile reader is L5's (not in this lane); the library hook is covered in test_ctx_store. Here the CLI reports
         # the check as unavailable rather than silently passing.
@@ -136,13 +183,14 @@ class Knowledge(Cli):
         self.assertIn("evidence is required", audit.stdout)
 
     def test_import_from_work_refuses_an_unknown_or_non_lesson_note(self):
-        done = self.run_cli("knowledge", "import", "--from-work", "note-nope", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1")
+        done = self.run_cli("knowledge", "import", "--from-work", "note-nope", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1",
+                            env=self.task_env)
         self.assertIn(done.returncode, (1, 2))
         self.assertFalse((self.project / ".tmux-pi" / "knowledge").exists())
 
     def test_status_reports_counts_and_the_lockfile_reader(self):
         self.add()
-        out = self.run_cli("status", "--json")
+        out = self.run_cli("status", "--json", env=self.task_env)
         data = json.loads(out.stdout)
         self.assertEqual(data["counts"]["candidate"], 1)
         self.assertIn("lockfile_reader", data)
@@ -150,7 +198,8 @@ class Knowledge(Cli):
     def test_no_project_is_a_usage_error(self):
         empty = self.tmp / "empty"
         empty.mkdir()
-        done = subprocess.run([sys.executable, str(TP_CTX), "status"], env=self.env, capture_output=True, text=True, cwd=str(empty), timeout=60)
+        done = subprocess.run([sys.executable, str(TP_CTX), "status"], env=dict(self.env, **self.task_env), capture_output=True, text=True,
+                              cwd=str(empty), timeout=60)
         self.assertEqual(done.returncode, 2)
         self.assertIn("no project", done.stderr)
 
@@ -194,12 +243,62 @@ class Logging(Cli):
         self.assertNotIn(AWS, raw)
         self.assertEqual(self.log_lines()[-1]["status"], "refused")
 
-    def test_an_operator_call_is_not_logged_and_an_explicit_log_is(self):
-        self.run_cli("knowledge", "list")
-        self.assertEqual(self.log_lines(), [])
+    def test_operator_commands_may_run_unlogged_with_no_worker_variable(self):
+        self.add()
+        for words in (("knowledge", "list", "--status", "all"), ("knowledge", "show", "kn-2026-10-31-clean-up-own-rows"), ("knowledge", "audit")):
+            done = self.run_cli(*words)
+            self.assertEqual(done.returncode, 0, (words, done.stderr))
+        self.assertEqual([line["tool"] for line in self.log_lines()], ["knowledge.add"])
+
+    def test_every_other_command_gets_no_answer_without_a_task_dir(self):
+        cases = [("status",), ("knowledge", "add", "--kind", "lesson", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1", "--text", "A rule."),
+                 ("knowledge", "import", "--from-work", "note-nope", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1")]
+        for words in cases:
+            done = self.run_cli(*words)
+            self.assertEqual(done.returncode, 3, (words, done.stdout, done.stderr))
+            self.assertEqual(done.stdout, "", words)
+            self.assertIn("TP_TASK_DIR is not set", done.stderr)
+        self.assertFalse((self.project / ".tmux-pi" / "knowledge").exists())
+
+    def test_an_operator_command_with_only_a_task_id_is_a_worker_and_gets_no_answer(self):
+        self.add()
+        done = self.run_cli("knowledge", "list", env={"TP_TASK_ID": "coder-test"})
+        self.assertEqual((done.returncode, done.stdout), (3, ""))
+
+    def test_a_worker_cannot_redirect_or_skip_its_log_with_log(self):
         own = self.tmp / "own.jsonl"
-        self.run_cli("--log", str(own), "knowledge", "list")
-        self.assertEqual(len(own.read_text().splitlines()), 1)
+        self.add()
+        for words, kw in ((("--log", str(own), "knowledge", "list"), dict(worker=True)),
+                          (("--log", str(own), "knowledge", "list"), dict(env=self.task_env)),
+                          (("--log", str(own), "knowledge", "list"), {}),  # no terminal
+                          (("--log", str(own), "status"), {}),
+                          (("--log", str(own), "knowledge", "add", "--kind", "lesson", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1",
+                            "--text", "A rule."), {})):
+            done = self.run_cli(*words, **kw)
+            self.assertEqual((done.returncode, done.stdout), (3, ""), (words, kw, done.stderr))
+            self.assertIn("--log is for a person", done.stderr)
+            self.assertFalse(own.exists())
+        self.assertEqual(len(list((self.project / ".tmux-pi" / "knowledge" / "candidates").iterdir())), 1)  # the setup add only
+
+    def test_a_person_at_a_terminal_may_log_an_operator_command_to_a_file(self):
+        self.add()
+        own = self.tmp / "own.jsonl"
+        code, shown, errors = self.run_tty("--log", str(own), "knowledge", "list", "--status", "all")
+        self.assertEqual(code, 0, errors)
+        self.assertIn("kn-2026-10-31-clean-up-own-rows", shown)
+        self.assertEqual([json.loads(line)["tool"] for line in own.read_text().splitlines()], ["knowledge.list"])
+        code, shown, errors = self.run_tty("--log", str(own), "knowledge", "list", env={"TP_TASK_DIR": str(self.task)})
+        self.assertEqual(code, 3, shown)
+
+    def test_a_symlinked_ancestor_of_the_task_dir_is_refused(self):
+        real = self.tmp / "real"
+        (real / "task").mkdir(parents=True)
+        (self.tmp / "alias").symlink_to(real)
+        for words in (("knowledge", "list"), ("status",)):
+            done = self.run_cli(*words, env={"TP_TASK_DIR": str(self.tmp / "alias" / "task")})
+            self.assertEqual((done.returncode, done.stdout), (3, ""), words)
+            self.assertIn("symlink", done.stderr)
+        self.assertEqual(list((real / "task").iterdir()), [])
 
     def test_a_no_project_call_is_logged_as_no_project(self):
         empty = self.tmp / "empty"
@@ -223,7 +322,7 @@ class Approve(Cli):
             self.assertIn("marks a worker's shell", done.stderr)
             self.assertTrue(self.candidate_path().exists())
             self.assertFalse(self.approved_path().exists())
-        self.assertEqual(self.log_lines(), [])
+        self.assertEqual([line["tool"] for line in self.log_lines()], ["knowledge.add"])  # the add; approve logged nothing
 
     def test_approve_refuses_without_a_terminal(self):
         self.candidate()

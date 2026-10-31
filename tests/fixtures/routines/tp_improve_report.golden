@@ -1,0 +1,9 @@
+
+tests/fixtures/routines/pi_session.jsonl
+  tools: read 2, bash 2, edit 1
+  - model edited guard/state files itself (1): /work/app/.tmux-pi/tasks/x/state.json
+  - 1 repeat reads; most repeated: 2x lane-common.md
+  - 1 guard blocks: 1x blocked: not authorized to edit
+
+Tokens by model across 1 session(s):
+  lmstudio/qwen3                                          600 tokens  $0.00

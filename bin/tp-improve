@@ -3,12 +3,18 @@
 
 Usage:
   tp-improve report [--last N] [--since YYYY-MM-DD] [--json] [session.jsonl ...]
+  tp-improve routines --project DIR [--role R] [--since YYYY-MM-DD] [--min-tasks 3] [--json] [--out PATH]
 
 Reads agent/sessions/*/*.jsonl (newest N, default 5, or the files you name) and reports
 measurable friction, ranked by cost: compaction storms, files re-read, main-model work
 the local assistant could have done, guard blocks, repeated tool errors, guard or state
 files edited by the model itself, and tokens/cost per model. Findings cite the session
 and message index so they can be checked.
+
+`routines` mines DIR/.tmux-pi/sessions task transcripts (Claude and pi) for repeated worker
+routines, per role: probes in more tasks than in the previous report, new Bash lead commands in
+--min-tasks or more tasks that match no probe, and probes in fewer tasks. With --out it writes the
+report there and keeps this run's counts in PATH.counts.json for the next run. See lib/routines.py.
 """
 import argparse
 import collections
@@ -19,6 +25,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+import routines  # noqa: E402
 SEARCH_BASH = re.compile(r"^\s*(?:cd [^;&]+(?:&&|;)\s*)?(?:grep|rg|find|ls|cat|head|tail|sed -n|wc)\b")
 BLOCK_TEXT = re.compile(r"blocked|not authorized|permits only|needs an authorized|policy did not authorize|outside the working", re.I)
 GUARD_PATHS = re.compile(r"/\.tmux-pi/(?:tasks|handoffs)/|review-required|config/local\.json")
@@ -124,7 +132,25 @@ def main():
     rp.add_argument("--last", type=int, default=5)
     rp.add_argument("--since")
     rp.add_argument("--json", action="store_true")
+    rt = sub.add_parser("routines", help="repeated worker routines across task transcripts")
+    rt.add_argument("--project", required=True, help="project directory that holds .tmux-pi/sessions")
+    rt.add_argument("--role")
+    rt.add_argument("--since", default="", help="only tasks created on or after YYYY-MM-DD")
+    rt.add_argument("--min-tasks", type=int, default=3)
+    rt.add_argument("--json", action="store_true")
+    rt.add_argument("--out", default="", help="write the report here; previous counts are kept in PATH.counts.json")
     args = ap.parse_args()
+    if args.cmd == "routines":
+        try:
+            text, warnings = routines.run(args.project, role=args.role or "", since=args.since, min_tasks=args.min_tasks,
+                                          as_json=args.json, out=args.out)
+        except (ValueError, OSError) as exc:
+            print("tp-improve routines: {}".format(exc), file=sys.stderr)
+            return 2
+        for w in warnings:
+            print("tp-improve routines: {}".format(w), file=sys.stderr)
+        sys.stdout.write(text)
+        return 0
     files = args.sessions or sorted(glob.glob(os.path.join(ROOT, "agent/sessions/*/*.jsonl")), key=os.path.getmtime)
     if args.since:
         files = [f for f in files if os.path.basename(f) >= args.since]

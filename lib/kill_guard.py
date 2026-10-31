@@ -13,8 +13,8 @@ bodies that expand, `bash -c '...'`, `sh -c`, `eval`, `find -exec`):
   * `kill` given anything but literal numeric PIDs, `%job` specs, or a plain variable such as `$PID` / `$!`.
     A command substitution (`kill $(pgrep ...)`), a variable assigned from one in the same command, or a loop variable over
     one, is refused. So is a variable `kill` uses in a command that also looks processes up (`pgrep`, `pidof`, `ps`, `lsof`,
-    `fuser`, `pstree`): `pgrep -f x | while read p; do kill $p; done`. PID `0` and `-1` (a whole group / every process) are
-    refused too.
+    `fuser`, `pstree`): `pgrep -f x | while read p; do kill $p; done`. PID `0` and any negative PID such as `-1` or
+    `-- -123` (a whole process group / every process) are refused too.
 Allowed: `kill 123`, `kill -TERM 123`, `kill -s TERM 123`, `kill %1`, `kill -0 123`, `kill $PID`, `kill $!`, `kill -l`;
 `echo "pkill"`, `grep -n pkill file`, `pgrep -f x` (only the name in command position counts).
 
@@ -30,6 +30,7 @@ every session.
 import json
 import os
 import re
+import shlex
 import sys
 
 MAX_DEPTH = 12
@@ -93,13 +94,18 @@ class Parser:
         cur, have = [], False            # current word pieces, whether a word has started
         flags = {"subst": False, "dynamic": False}
         redirect_next = False
+        herestring = False
+        line_start = 0                   # first command of the current line, for here-documents
+        strings = []                     # here-string texts of the current command
 
         def end_word():
-            nonlocal cur, have, redirect_next
+            nonlocal cur, have, redirect_next, herestring
             if have:
                 w = Word("".join(cur), flags["subst"], flags["dynamic"])
                 if redirect_next:
-                    redirect_next = False
+                    if herestring:
+                        strings.append(w.text)
+                    redirect_next = herestring = False
                 else:
                     words.append(w)
             cur, have = [], False
@@ -110,6 +116,10 @@ class Parser:
             end_word()
             if words:
                 out.append(words)
+                if strings and _feeds_shell(words):
+                    for text in strings:
+                        out.extend(Parser(text).parse_nested(depth + 1))
+            strings.clear()
             words = []
 
         def add_inner(cmds):
@@ -121,9 +131,11 @@ class Parser:
             if c == "\n":
                 end_cmd()
                 i += 1
-                for delim, expands, strip in pending:
-                    i = self._heredoc(i, delim, expands, strip, out, depth)
+                shell = any(_feeds_shell(c) for c in out[line_start:])   # `cat <<EOF | bash` counts too
+                for delim, expands, strip, owner in pending:
+                    i = self._heredoc(i, delim, expands, strip, out, depth, shell)
                 pending = []
+                line_start = len(out)
                 continue
             if c == "\\":
                 if i + 1 < n and s[i + 1] == "\n":
@@ -244,7 +256,7 @@ class Parser:
                     continue
                 if s.startswith("<<<", i):
                     i += 3
-                    redirect_next = True
+                    redirect_next = herestring = True
                     continue
                 if s.startswith("<<", i):
                     i += 2
@@ -254,7 +266,7 @@ class Parser:
                     while i < n and s[i] in " \t":
                         i += 1
                     delim, quoted, i = self._heredoc_word(i)
-                    pending.append((delim, not quoted, strip))
+                    pending.append((delim, not quoted, strip, None))
                     continue
                 i += 1
                 while i < n and s[i] in "<>&|":
@@ -356,8 +368,9 @@ class Parser:
             raise Unparseable("here-document without a delimiter")
         return "".join(out), quoted, i
 
-    def _heredoc(self, i, delim, expands, strip, out, depth):
-        """Skip a here-document body starting at i; its `$( )` and backticks run when the delimiter is unquoted."""
+    def _heredoc(self, i, delim, expands, strip, out, depth, shell=False):
+        """Read a here-document body starting at i. A body fed to a shell is a script and is parsed as commands; else it
+        is data, except that its `$( )` and backticks run when the delimiter is unquoted."""
         s, n = self.s, self.n
         body = []
         while i < n:
@@ -367,11 +380,18 @@ class Parser:
             if (line.lstrip("\t") if strip else line) == delim:
                 break
             body.append(line)
-        if expands and body:
+        if shell and body:
+            out.extend(Parser("\n".join(body)).parse_nested(depth + 1))
+        elif expands and body:
             text = "\n".join(body)
             if "$(" in text or "`" in text:
                 out.extend(_scan_expansions(text, depth + 1))
         return i
+
+
+def _feeds_shell(words):
+    """True when a simple command (its words so far) runs a shell, which reads its script from stdin."""
+    return any(_base(w.text) in SHELLS for w in words)
 
 
 def _scan_expansions(text, depth):
@@ -494,10 +514,29 @@ class Judge:
         else:
             while i < len(args) and (args[i].text.startswith("-") or ASSIGN.match(args[i].text)
                                      or (name == "nice" and PID.match(args[i].text))):
+                if name == "env":
+                    split = self._env_split(args, i)
+                    if split is not None:
+                        return self._text(split, xargs, depth)
                 i += 2 if args[i].text in values else 1
         if i >= len(args):
             return None
         return self.command(args[i:], xargs, depth + 1)
+
+    @staticmethod
+    def _env_split(args, i):
+        """`env -S STRING` / `--split-string=STRING` runs STRING (then the rest of the arguments) as a command line.
+        Returns that text when args[i] is such an option, else None."""
+        t = args[i].text
+        m = re.match(r"^--split-string(?:=(.*))?$", t, re.S) or re.match(r"^-[A-Za-z]*S(.*)$", t, re.S) if t.startswith("-") else None
+        if not m:
+            return None
+        if t.startswith("--"):
+            value, used = (m.group(1), 1) if m.group(1) is not None else (args[i + 1].text if i + 1 < len(args) else "", 2)
+        else:
+            value, used = (m.group(1), 1) if m.group(1) else (args[i + 1].text if i + 1 < len(args) else "", 2)
+        rest = " ".join(shlex.quote(w.text) for w in args[i + used:])
+        return value + " " + rest
 
     def _text(self, text, xargs, depth):
         commands = Parser(text).parse_nested(depth + 1)
@@ -561,7 +600,7 @@ class Judge:
             if w.subst:
                 return _refusal(f"`kill {t}` takes its PIDs from a command, which can match processes that are not yours")
             if PID.match(t):
-                if t in ("0", "-1"):
+                if t == "0" or t.startswith("-"):
                     return _refusal(f"`kill {t}` signals a whole process group or every process, not a PID you started")
                 continue
             if JOB.match(t):

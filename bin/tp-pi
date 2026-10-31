@@ -50,7 +50,8 @@ export PI_CODING_AGENT_DIR="$ROOT/agent"
 # Auth for the MCP servers in agent/mcp.json (git-ignored; shared with tp-claude).
 [[ ! -f "$ROOT/claude/mcp.local.env" ]] || source "$ROOT/claude/mcp.local.env"
 if [[ "${TP_MODE:-}" == strict ]]; then
-  pi --no-skills "$@"
+  # Strict sessions count as workers for the kill guard (lib/trust_guard.py), so they load it too.
+  pi --no-skills --extension "$ROOT/agent/extensions/kill-guard.ts" "$@"
 fi
 
 # Normal work loads only the orchestration extensions. Legacy goal, strict

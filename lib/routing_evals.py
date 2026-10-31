@@ -45,9 +45,20 @@ MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_TEXT = 2000
 MAX_NOTE = 1000
 LOCK_SECONDS = 2.0
-# Threads of one process queue here (blocking, bounded) instead of all polling flock: polling is unfair
-# and starved a thread past LOCK_SECONDS under load. flock still serialises separate processes.
-_THREAD_LOCK = threading.Lock()
+# Threads of one process queue on a per-log lock (blocking, bounded) instead of all polling flock: polling is
+# unfair and starved a thread past LOCK_SECONDS under load. Locks are per resolved log path so a stalled log
+# never blocks writers to another. flock still serialises separate processes.
+_PATH_LOCKS = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(directory, name):
+    try:
+        key = os.path.join(os.path.realpath(directory), name)
+    except (OSError, ValueError):
+        key = os.path.join(os.path.abspath(str(directory)), name)
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
 SELECTION_ID = re.compile(r"^sel-[0-9a-f]{32}$")
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RATINGS = ("good", "acceptable", "poor", "wrong")
@@ -246,12 +257,13 @@ def append_jsonl(directory, name, record):
     if len(line) > MAX_RECORD_BYTES + 1:
         raise EvalLogError("record is larger than {} bytes".format(MAX_RECORD_BYTES))
     directory = Path(directory)
-    if not _THREAD_LOCK.acquire(timeout=LOCK_SECONDS * 4):
+    thread_lock = _path_lock(directory, name)
+    if not thread_lock.acquire(timeout=LOCK_SECONDS * 4):
         raise EvalLogError("eval log is locked")
     try:
         _append_locked(directory, name, line)
     finally:
-        _THREAD_LOCK.release()
+        thread_lock.release()
 
 
 def _append_locked(directory, name, line):

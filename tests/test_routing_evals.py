@@ -250,6 +250,40 @@ class AppendTests(unittest.TestCase):
         self.assertEqual((len(rows), bad), (160, 0))
         self.assertEqual(oct((self.dir / "t.jsonl").stat().st_mode & 0o777), "0o600")
 
+    def test_stalled_append_to_one_log_does_not_block_another(self):
+        import fcntl
+        from unittest import mock
+        other = Path(self.tmp.name) / "other"
+        self.dir.mkdir(parents=True)
+        held = os.open(self.dir / "t.jsonl.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(os.close, held)
+        stalled, release = threading.Event(), threading.Event()
+
+        def fake_sleep(_):
+            stalled.set()
+            release.wait(10)
+
+        errors = []
+
+        def stuck():
+            try:
+                routing_evals.append_jsonl(self.dir, "t.jsonl", {"a": 1})
+            except routing_evals.EvalLogError as exc:
+                errors.append(exc)
+
+        with mock.patch.object(routing_evals, "LOCK_SECONDS", 0.2), \
+                mock.patch.object(routing_evals.time, "sleep", fake_sleep):
+            thread = threading.Thread(target=stuck)
+            thread.start()
+            try:
+                self.assertTrue(stalled.wait(10))
+                routing_evals.append_jsonl(other, "t.jsonl", {"b": 2})
+            finally:
+                release.set()
+                thread.join()
+        self.assertEqual(routing_evals.read_jsonl(other / "t.jsonl")[0], [{"b": 2}])
+
     def test_failures_raise_eval_log_error(self):
         target = Path(self.tmp.name) / "elsewhere"
         target.mkdir()

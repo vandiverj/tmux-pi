@@ -1,8 +1,6 @@
 """Qwen-trial transcript scanners: one positive and one negative case per slip rule, gate runs, Claude and pi transcripts."""
 
-import itertools
 import json
-import random
 import sys
 import tempfile
 import unittest
@@ -76,7 +74,8 @@ class CommandRuleTests(unittest.TestCase):
 class WriteRuleTests(unittest.TestCase):
     def test_fixed_wait_in_a_test_file_is_a_slip(self):
         self.assertEqual(trial_scan.write_slips("tests/test_a.py", "import time\ntime.sleep(2)\n"), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "await new Promise(r => setTimeout(r, 50))\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "setTimeout(r, 50)\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "await sleep(50)\n"), ["fixed_wait"])
 
     def test_fixed_wait_with_a_timer_ok_mark_or_outside_a_test_file_is_not(self):
         self.assertEqual(trial_scan.write_slips("src/a.test.ts", "setTimeout(done, 5) // timer-ok: fake clock\n"), [])
@@ -99,15 +98,16 @@ class WriteRuleTests(unittest.TestCase):
         self.assertEqual(trial_scan.write_slips("tests/test_a.py", 'print("start"); time.sleep(2)\n'), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/test_a.py", "# don't wait\ntime.sleep(2)\n"), ["fixed_wait"])
 
-    def test_a_wait_inside_an_interpolation_runs_and_is_a_wait(self):
-        self.assertEqual(trial_scan.write_slips("tests/test_wait.py", 'f"{time.sleep(2)}"\n'), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("tests/test_wait.py", "x = rf'a {time.sleep(2)!r} b'\n"), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("tests/test_wait.py", "x = f\"{f'{time.sleep(1)}'}\"\n"), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("tests/test_wait.py", 'x = f"""\n{\n time.sleep(1)}"""\n'), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "const s = `x ${setTimeout(done, 50)} y`\n"), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "const s = `${ {a: setTimeout(done, 5)}.a }`\n"), ["fixed_wait"])
+    def test_a_shell_wait_inside_an_interpolation_runs_and_is_a_wait(self):
         self.assertEqual(trial_scan.write_slips("tests/run.sh", 'echo "$(sleep 2)"\n'), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "x=`sleep 2`\n"), ["fixed_wait"])
+
+    def test_a_py_or_js_call_inside_an_interpolation_does_not_start_its_statement(self):
+        for path, text in (("tests/test_wait.py", 'f"{time.sleep(2)}"\n'), ("tests/test_wait.py", "x = rf'a {time.sleep(2)!r} b'\n"),
+                           ("tests/test_wait.py", "x = f\"{f'{time.sleep(1)}'}\"\n"),
+                           ("src/a.test.ts", "const s = `x ${setTimeout(done, 50)} y`\n")):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), [])
 
     def test_literal_text_around_an_interpolation_is_still_not_a_wait(self):
         self.assertEqual(trial_scan.write_slips("tests/test_wait.py", 'f"time.sleep(2) {x}"\n'), [])
@@ -126,14 +126,14 @@ class WriteRuleTests(unittest.TestCase):
     def test_a_comment_marker_inside_a_string_does_not_hide_the_wait_after_it(self):
         self.assertEqual(trial_scan.write_slips("tests/test_wait.py", 'x = "#"; time.sleep(1)\n'), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("src/a.test.ts", 'const u = "http://x"; setTimeout(r, 5)\n'), ["fixed_wait"])
-        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "this.#t = setTimeout(r, 5)\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "this.#t; setTimeout(r, 5)\n"), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "echo a#b; sleep 2\n"), ["fixed_wait"])
 
-    def test_deeply_nested_interpolations_do_not_crash_and_still_count_a_wait(self):
-        for path, unit, wait in (("tests/test_a.py", 'f"{', "time.sleep(1)"), ("src/a.test.ts", "`${", "time.sleep(1)"),
-                                 ("tests/run.sh", '"$(', "sleep 1")):
-            with self.subTest(path=path):
-                self.assertEqual(trial_scan.write_slips(path, unit * 5000 + wait + "\n"), ["fixed_wait"])
+    def test_deeply_nested_interpolations_do_not_crash(self):
+        for path, unit, wait, flagged in (("tests/test_a.py", 'f"{', "time.sleep(1)", []), ("src/a.test.ts", "`${", "time.sleep(1)", []),
+                                          ("tests/run.sh", '"$(', "sleep 1", ["fixed_wait"])):
+            with self.subTest(path=path):  # past MAX_NESTING the text is read as written: a py/js call there starts no statement
+                self.assertEqual(trial_scan.write_slips(path, unit * 5000 + wait + "\n"), flagged)
                 self.assertEqual(trial_scan.write_slips(path, unit * 5000 + "\n"), [])
 
     def test_code_keeps_its_lines(self):
@@ -196,6 +196,46 @@ class WriteRuleTests(unittest.TestCase):
             self.assertEqual(trial_scan.write_slips(path, "setTimeout(done, 5)\ntime.sleep(2)\nsleep 2\n"), [], path)
         self.assertEqual(trial_scan.write_slips("src/a.test.ts", "sleep 2\n"), [])
         self.assertEqual(trial_scan.write_slips("tests/test_a.py", "sleep 2\n"), [])
+
+    def test_a_declaration_is_never_a_wait_whatever_its_whitespace(self):
+        for path, text in (("tests/test_a.py", "def   sleep(n):\n    pass\n"), ("tests/test_a.py", "def\tsleep(n):\n    pass\n"),
+                           ("tests/test_a.py", "async  def  sleep(n):\n    pass\n"),
+                           ("src/a.test.ts", "function  sleep(ms) { return ms }\n"), ("src/a.test.ts", "function\tsleep(ms) { return ms }\n"),
+                           ("src/a.test.ts", "async function   sleep(ms) {\n  return ms\n}\n"),
+                           ("src/a.test.ts", "export const sleep = (ms) => ms\n"),
+                           ("src/a.test.ts", "class T {\n  sleep(ms) {\n    return ms\n  }\n}\n")):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), [])
+
+    def test_only_a_call_statement_starting_with_a_wait_token_is_flagged(self):
+        flagged = (("tests/test_a.py", "sleep(1)\n"), ("tests/test_a.py", "    time.sleep(0.5)\n"), ("tests/test_a.py", "await asyncio.sleep(1)\n"),
+                   ("tests/test_a.py", "x = 1; asyncio.sleep(1)\n"), ("src/a.test.ts", "  setTimeout(() => done(), 5);\n"),
+                   ("src/a.test.ts", "await sleep(5)\n"), ("src/a.test.ts", "a(); setTimeout(\n  r,\n  5)\n"),
+                   ("tests/test_a.py", "time.sleep(1).x\n"))
+        for path, text in flagged:
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), ["fixed_wait"])
+        not_flagged = (("src/a.test.ts", "await new Promise(r => setTimeout(r, 50))\n"), ("tests/test_a.py", "x = time.sleep(1)\n"),
+                       ("tests/test_a.py", "if ready: time.sleep(1)\n"), ("tests/test_a.py", "run(sleep(1), 2)\n"),
+                       ("src/a.test.ts", "const w = () => sleep(1)\n"), ("src/a.test.ts", "page.waitForTimeout(500)\n"),
+                       ("tests/test_a.py", "page.wait_for_timeout(500)\n"), ("src/a.test.ts", "window.setTimeout(r, 5)\n"),
+                       ("tests/test_a.py", "helper.sleep(1)\n"), ("tests/test_a.py", "setTimeout(r, 5)\n"),
+                       ("src/a.test.ts", "time.sleep(5)\n"), ("src/a.test.ts", "class T {\n  sleep(ms) { return ms }\n}\n"),
+                       ("tests/test_a.py", "x = \\\n    time.sleep(1)\n"), ("tests/test_a.py", "time.sleep(\n"))
+        for path, text in not_flagged:
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips(path, text), [])
+
+    def test_a_shell_wait_after_a_quoted_heredoc_marker_is_still_a_wait(self):
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "echo '<<EOF'\nsleep 2\nEOF\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", 'echo "<<EOF" # x\nsleep 2\n'), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<EOF\nsleep 2\nEOF\n"), [])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<EOF\nsleep 2\n"), [])  # no end line: the body runs to the end
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "x=$(cat <<EOF\nsleep 2\nEOF\n)\nsleep 3\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<-EOF\n\tsleep 2\n\tEOF\nsleep 3\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<A <<B\nsleep 1\nA\nsleep 2\nB\n"), [])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<<sleep\nsleep 2\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "echo $((1<<3))\nsleep 2\n"), ["fixed_wait"])
 
     def test_a_shell_wait_is_only_a_command(self):
         for text in ("echo sleep 5\n", "cat <<EOF\nsleep 2\nEOF\n", "cat <<-'EOF' > t.sh\n\tsleep 2\n\tEOF\n",
@@ -266,41 +306,46 @@ class GateKindTests(unittest.TestCase):
     def test_a_redirect_ampersand_does_not_split(self):
         self.assertEqual(trial_scan.gate_kinds("npm test 2>&1 | tail -3"), ["test"])
 
-    def test_a_gate_inside_a_command_substitution_is_found_with_no_exit(self):
-        ran = [{"kind": "test", "exit": None}]
+    def test_a_gate_only_inside_a_substitution_a_group_or_a_string_is_not_found(self):
         for command in ('echo "$(npm test)"', "echo `npm test`", "x=$(npm test)", "diff <(npm test) b", 'echo "$(echo "$(npm test)")"',
-                        "echo $(npm test | tail -3)", 'echo "$(echo \\"x\\"; npm test)"'):
-            with self.subTest(command=command):
-                self.assertEqual(trial_scan.gate_kinds(command), ["test"])
-                self.assertEqual(trial_scan.gate_runs(command, 0), ran)
-                self.assertEqual(trial_scan.gate_runs(command, 1)[0]["exit"], None)  # the substitution's own status is not shown
-
-    def test_a_substitution_that_does_not_run_is_not_a_gate_run(self):
-        for command in ("echo '$(npm test)'", "echo \\$(npm test)", "echo $((1+2))", "echo '`npm test`'"):
+                        "echo $(npm test | tail -3)", "x=$(cd a && npm test)", "echo '$(npm test)'", "echo \\$(npm test)",
+                        "echo $((1+2))", "echo '`npm test`'", 'bash -c "npm test"', "sh -c 'npm run lint'", "echo \"x\"; echo 'npm test'"):
             with self.subTest(command=command):
                 self.assertEqual(trial_scan.gate_kinds(command), [])
-                self.assertEqual(trial_scan.gate_runs(command, 0), [])
+                for code in (0, 1, None):
+                    self.assertEqual(trial_scan.gate_runs(command, code), [])
 
-    def test_a_gate_in_a_substitution_follows_its_units_run_or_skip(self):
-        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", 1), [])
-        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", None), [{"kind": "test", "exit": None, "uncertain": True}])
-        self.assertEqual(trial_scan.gate_runs("git status && echo $(npm test)", 0), [{"kind": "test", "exit": None}])
-        self.assertEqual(trial_scan.gate_runs("echo $(npm test) || npx tsc", 0), [{"kind": "test", "exit": None}])
-
-    def test_gates_in_a_substitution_and_around_it_keep_their_order_and_the_outer_exit(self):
-        self.assertEqual(trial_scan.gate_runs("npm run lint && echo $(npm test) && npx tsc --noEmit", 0),
-                         [{"kind": "lint", "exit": 0}, {"kind": "test", "exit": None}, {"kind": "tsc", "exit": 0}])
+    def test_a_gate_beside_a_substitution_is_found_and_the_substitution_is_not(self):
         self.assertEqual(trial_scan.gate_runs("FOO=$(cat a) npm test", 1), [{"kind": "test", "exit": 1}])
-        self.assertEqual(trial_scan.gate_kinds("x=$(cd a && npm test) && npx tsc"), ["test", "tsc"])
-        self.assertEqual(trial_scan.gate_runs("x=$(cd a && npm test) && npx tsc", 0),
-                         [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "tsc", "exit": 0}])
+        self.assertEqual(trial_scan.gate_runs("npm run lint && echo $(npm test) && npx tsc --noEmit", 0),
+                         [{"kind": "lint", "exit": None}, {"kind": "tsc", "exit": 0}])
+        self.assertEqual(trial_scan.gate_kinds("x=$(cd a && npm test) && npx tsc"), ["tsc"])
+
+    def test_an_outer_redirection_failure_is_not_given_to_an_unrun_gate(self):  # review F1
+        self.assertEqual(trial_scan.gate_runs("echo $(npm test) > /no/dir/f && npm run lint", 1),
+                         [{"kind": "lint", "exit": None, "uncertain": True}])
+        self.assertEqual(trial_scan.gate_runs("echo $(npm test) > /no/dir/f && npm run lint", 0),
+                         [{"kind": "lint", "exit": 0}])
 
     def test_a_heredoc_body_is_data_not_commands(self):
         message = 'git commit -m "$(cat <<\'EOF\'\nnpm test\nEOF\n)"'
         self.assertEqual(trial_scan.gate_kinds(message), [])
         self.assertEqual(trial_scan.gate_runs("cat <<EOF\nnpm test\nEOF\nnpm run lint", 0), [{"kind": "lint", "exit": 0}])
+        self.assertEqual(trial_scan.gate_runs("cat <<-EOF\n\tnpm test\n\tEOF\nnpm run lint", 0), [{"kind": "lint", "exit": 0}])
+        self.assertEqual(trial_scan.gate_runs("cat <<A <<'B'\nnpm test\nA\nnpm run lint\nB\nnpx tsc", 0), [{"kind": "tsc", "exit": 0}])
         self.assertEqual(trial_scan.gate_kinds("echo $((1<<3)) && npm test"), ["test"])
-        self.assertEqual(trial_scan.gate_kinds("cat <<EOF\nnpm test\n"), ["test"])  # no end line: not read as a heredoc
+        self.assertEqual(trial_scan.gate_kinds("cat <<<npm\nnpm test"), ["test"])  # a here-string has no body
+        self.assertEqual(trial_scan.gate_kinds("cat <<EOF\nnpm test\n"), [])  # no end line: the body runs to the end
+
+    def test_a_heredoc_marker_inside_quotes_is_not_a_heredoc(self):  # review F2
+        for command in ("echo '<<EOF'\nnpm test\nEOF\ntrue", 'echo "<<EOF"\nnpm test\nEOF\ntrue', "echo \\<<EOF\nnpm test\nEOF\ntrue",
+                        "echo '<<EOF' # x\nnpm test\nEOF\ntrue"):
+            with self.subTest(command=command):
+                self.assertEqual(trial_scan.gate_kinds(command), ["test"])
+                self.assertEqual(trial_scan.gate_runs(command, 0), [{"kind": "test", "exit": None}])
+
+    def test_a_heredoc_body_with_a_quote_or_hash_does_not_hide_what_follows(self):
+        self.assertEqual(trial_scan.gate_runs("cat <<EOF\nit's # no\nEOF\nnpm test # then ; npm run lint", 1), [{"kind": "test", "exit": 1}])
 
     def test_deeply_nested_substitutions_do_not_crash(self):
         self.assertEqual(trial_scan.gate_runs("echo " + "$(" * 5000 + "npm test", 0), [])
@@ -314,68 +359,86 @@ class GateKindTests(unittest.TestCase):
         self.assertEqual(trial_scan.gate_kinds("cd /w && npx tsc --noEmit && FOO=1 python3 -m unittest x | tail -5"), ["tsc", "test"])
 
 
-def brute_force_gate_runs(command, exit_code):
-    """Every pass/fail choice per unit, one by one: the slow, plain statement of what gate_runs must return."""
-    plan = trial_scan._plan(command)
-    flexible = [i for i, unit in enumerate(plan) if not unit["reliable"]]
-    cases = []
-    for bits in itertools.product((0, 1), repeat=len(flexible)):
-        fails = dict(zip(flexible, bits))
-        status, pipefail, ran, last = 0, False, {}, None
-        for i, unit in enumerate(plan):
-            op = unit["op"]
-            if i == 0 or op == ";" or (op == "&&" and status == 0) or (op == "||" and status != 0):
-                status = fails.get(i, 0)
-                ran[i], last = (status, pipefail), i
-                if unit["pipefail"] is not None:
-                    pipefail = unit["pipefail"]
-        if exit_code is None or (status == 0) == (exit_code == 0):
-            cases.append((ran, last))
-    out = []
-    for i, unit in enumerate(plan):
-        seen = [(ran[i], last == i) for ran, last in cases if i in ran]
-        if not seen:
-            continue
-        for kind, last_stage in unit["gates"]:
-            values = set()
-            for (status, pipefail), ended in seen:
-                if unit["stages"] > 1 and not (last_stage and not pipefail) and not (pipefail and status == 0):
-                    values.add("unknown")
-                elif status == 0:
-                    values.add(0)
-                else:
-                    values.add(exit_code if ended and exit_code else "fail")
-            value = values.pop() if len(values) == 1 else None
-            run = {"kind": kind, "exit": value if isinstance(value, int) else None}
-            if len(seen) != len(cases):
-                run["exit"], run["uncertain"] = None, True
-            out.append(run)
-    return out
+class GateRunsTests(unittest.TestCase):
+    """The exit is the call's status for the last command run only; every other gate has none, and nothing is inferred."""
 
+    def check(self, table):
+        for command, code, expected in table:
+            with self.subTest(command=command, code=code):
+                self.assertEqual(trial_scan.gate_runs(command, code), expected)
 
-class GateRunsAgreeWithEveryCaseTests(unittest.TestCase):
-    UNITS = ("npm test", "npm test | tail -5", "cat x | npm run lint", "cd /w", "true", "git status", "set -o pipefail",
-             "set +o pipefail", "npx tsc --noEmit")
+    def test_a_simple_command_owns_the_exit(self):
+        self.check([("npm test", 0, [{"kind": "test", "exit": 0}]), ("npm test", 1, [{"kind": "test", "exit": 1}]),
+                    ("npm test", 2, [{"kind": "test", "exit": 2}]), ("npm test", None, [{"kind": "test", "exit": None}]),
+                    ("FOO=1 npx tsc --noEmit", 0, [{"kind": "tsc", "exit": 0}])])
 
-    def check(self, command):
-        for code in (None, 0, 1, 2):
-            with self.subTest(command=command, exit=code):
-                self.assertEqual(trial_scan.gate_runs(command, code), brute_force_gate_runs(command, code))
+    def test_only_the_last_command_run_gets_the_exit(self):
+        self.check([
+            ("npm test && npm run lint", 0, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 0}]),
+            ("npm test; npm run lint", 1, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 1}]),
+            ("npm test\nnpm run lint", 0, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 0}]),
+            ("npm test; npm test", 1, [{"kind": "test", "exit": None}, {"kind": "test", "exit": 1}]),
+            ("npm test; echo done", 0, [{"kind": "test", "exit": None}]),
+            ("npm test || true", 0, [{"kind": "test", "exit": None}]),
+        ])
 
-    def test_every_list_of_up_to_three_units(self):
-        for size in (1, 2, 3):
-            for units in itertools.product(self.UNITS, repeat=size):
-                for ops in itertools.product(("&&", "||", ";"), repeat=size - 1):
-                    self.check(units[0] + "".join(" {} {}".format(op, u) for op, u in zip(ops, units[1:])))
+    def test_a_failed_chain_does_not_say_which_gate_failed_or_that_the_second_ran(self):
+        failed = [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}]
+        self.check([("npm test && npm run lint", 1, failed), ("npm test && npm run lint", None, failed),
+                    ("echo start && npm test", 2, [{"kind": "test", "exit": None, "uncertain": True}]),
+                    ("cd /does-not-exist && npm test", 1, [{"kind": "test", "exit": None, "uncertain": True}]),
+                    ("cd /w && npm test", 0, [{"kind": "test", "exit": 0}])])
 
-    def test_sampled_longer_lists(self):
-        rng = random.Random(7)
-        for _ in range(300):
-            size = rng.randint(4, 10)
-            command = rng.choice(self.UNITS)
-            for _ in range(size - 1):
-                command += " {} {}".format(rng.choice(("&&", "||", ";")), rng.choice(self.UNITS))
-            self.check(command)
+    def test_an_or_branch_is_never_known_to_have_run(self):
+        both = [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}]
+        self.check([("npm test || npm run lint", 0, both), ("npm test || npm run lint", 1, both), ("true || npm test", 0, [{"kind": "test", "exit": None, "uncertain": True}])])
+
+    def test_a_semicolon_list_after_a_chain_does_not_prove_the_chain_ran(self):
+        self.check([("git status && npm test; npm run lint", 0, [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "lint", "exit": 0}]),
+                    ("npm test; git status && npm run lint", 0, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 0}]),
+                    ("npm test; git status && npm run lint", 1, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}]),
+                    ("git status && npm test || npm run lint", 0, [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "lint", "exit": None, "uncertain": True}])])
+
+    def test_pipes(self):
+        self.check([("npm test | tail -5", 1, [{"kind": "test", "exit": None}]), ("npm test 2>&1 | tail -5", 0, [{"kind": "test", "exit": None}]),
+                    ("cat x | npm test", 3, [{"kind": "test", "exit": 3}]),
+                    ("set -o pipefail; cat x | npm test", 1, [{"kind": "test", "exit": None}]),
+                    ("set -o pipefail; npm test | tail -5", 0, [{"kind": "test", "exit": None}])])
+
+    def test_a_background_job_has_no_exit(self):
+        self.check([("npm test &", 0, [{"kind": "test", "exit": None}]),
+                    ("npm test & npm run lint", 1, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 1}]),
+                    ("npm test 2>&1 >/dev/null", 1, [{"kind": "test", "exit": 1}])])
+
+    def test_exit_return_and_set_e_make_later_gates_uncertain(self):
+        self.check([("npm test; exit 0", 0, [{"kind": "test", "exit": None}]),
+                    ("exit 0; npm test", 0, [{"kind": "test", "exit": None, "uncertain": True}]),
+                    ("return 1; npm test", 1, [{"kind": "test", "exit": None, "uncertain": True}]),
+                    ("set -euo pipefail\nnpm test", 0, [{"kind": "test", "exit": 0}]),
+                    ("set -e; npm test", 1, [{"kind": "test", "exit": None, "uncertain": True}]),
+                    ("set -o errexit; npm run lint; npm test", 3, [{"kind": "lint", "exit": None, "uncertain": True}, {"kind": "test", "exit": None, "uncertain": True}]),
+                    ("set -x\nnpm test", 1, [{"kind": "test", "exit": 1}])])
+
+    def test_a_gate_inside_a_compound_command_is_uncertain(self):
+        maybe = [{"kind": "test", "exit": None, "uncertain": True}]
+        self.check([("if x; then npm test; fi", 0, []), ("for f in a; do\n  npm test\ndone", 0, maybe),
+                    ("if [ -f x ]; then\n  npm test\nfi", 0, maybe), ("f() {\n  npm test\n}", 0, maybe),
+                    ("(cd x && npm test)", 0, maybe), ("{ npm test; }", 0, []), ("while x; do\n npm test\ndone\nnpm run lint", 1,
+                     [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "lint", "exit": None, "uncertain": True}]),
+                    ("docker run x && npm test", 0, [{"kind": "test", "exit": 0}])])
+
+    def test_a_long_list_has_no_cap_and_no_guess(self):
+        command = "; ".join(["git status"] * 40) + "; npm test"
+        self.check([(command, 0, [{"kind": "test", "exit": 0}]), (command, 1, [{"kind": "test", "exit": 1}])])
+        chain = " && ".join(["git status"] * 60 + ["npm test", "npm run lint"])
+        self.check([(chain, 0, [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 0}]),
+                    (chain, 1, [{"kind": "test", "exit": None, "uncertain": True}, {"kind": "lint", "exit": None, "uncertain": True}])])
+
+    def test_totals_split_attributed_unattributed_uncertain_and_denied(self):
+        runs = trial_scan.gate_runs("npm test && npm run lint && npx tsc --noEmit", 1) + trial_scan.gate_runs("npm test; npm run lint", 0)
+        runs.append({"kind": "test", "exit": None, "denied": True})
+        self.assertEqual(trial_scan.gate_totals(runs), {"total": 3, "uncertain": 2, "denied": 1, "unattributed": 2})
+        self.assertEqual(trial_scan.gate_totals(None), {"total": 0, "uncertain": 0, "denied": 0, "unattributed": 0})
 
 
 class ClaudeScanTests(unittest.TestCase):
@@ -409,77 +472,32 @@ class ClaudeScanTests(unittest.TestCase):
         self.assertEqual(self.gates("npm test && npm run lint", "Exit code 1\nFAIL", True),
                          [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}])
 
-    def test_and_chain_that_passed_ran_every_gate(self):
-        self.assertEqual(self.gates("npm test && npm run lint", "ok"), [{"kind": "test", "exit": 0}, {"kind": "lint", "exit": 0}])
+    def test_and_chain_that_passed_gives_the_exit_to_the_last_gate_only(self):
+        self.assertEqual(self.gates("npm test && npm run lint", "ok"), [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 0}])
 
-    def test_the_gate_that_ended_the_chain_gets_the_exit_code(self):
-        self.assertEqual(self.gates("echo start && npm test", "Exit code 2\nFAIL", True), [{"kind": "test", "exit": 2}])
+    def test_a_failure_behind_an_unproven_prefix_is_not_given_to_the_gate(self):
+        self.assertEqual(self.gates("echo start && npm test", "Exit code 2\nFAIL", True),
+                         [{"kind": "test", "exit": None, "uncertain": True}])
 
-    def test_a_cd_may_fail_so_a_gate_behind_it_is_uncertain_after_a_failure(self):
-        self.assertEqual(trial_scan.gate_runs("cd /does-not-exist && npm test", 1), [{"kind": "test", "exit": None, "uncertain": True}])
-        self.assertEqual(trial_scan.gate_totals(trial_scan.gate_runs("cd /does-not-exist && npm test", 1))["total"], 0)
-
-    def test_a_cd_that_led_to_a_zero_exit_ran_the_gate(self):
-        self.assertEqual(trial_scan.gate_runs("cd /w && npm test", 0), [{"kind": "test", "exit": 0}])
-
-    def test_a_pipeline_status_is_not_the_status_of_an_earlier_stage(self):
-        for code in (0, 1):
-            with self.subTest(code=code):
-                self.assertEqual(trial_scan.gate_runs("npm test | tail -5", code), [{"kind": "test", "exit": None}])
-                self.assertEqual(trial_scan.gate_runs("npm test 2>&1 | tail -5", code), [{"kind": "test", "exit": None}])
-
-    def test_the_last_stage_of_a_pipeline_owns_the_pipeline_status(self):
-        self.assertEqual(trial_scan.gate_runs("cat x | npm test", 3), [{"kind": "test", "exit": 3}])
-
-    def test_visible_pipefail_and_a_zero_exit_mean_every_stage_passed(self):
-        self.assertEqual(trial_scan.gate_runs("set -o pipefail; npm test | tail -5", 0), [{"kind": "test", "exit": 0}])
-        self.assertEqual(trial_scan.gate_runs("set -euo pipefail\nnpm test | tail -5", 0), [{"kind": "test", "exit": 0}])
-
-    def test_pipefail_with_a_failure_does_not_say_which_stage_failed(self):
-        self.assertEqual(trial_scan.gate_runs("set -o pipefail; npm test | tail -5", 1), [{"kind": "test", "exit": None}])
-
-    def test_pipefail_switched_off_again_is_not_visible(self):
-        self.assertEqual(trial_scan.gate_runs("set -o pipefail; set +o pipefail; npm test | tail -5", 0), [{"kind": "test", "exit": None}])
-
-    def test_pipefail_only_in_a_branch_that_may_not_run_is_not_visible(self):
-        self.assertEqual(trial_scan.gate_runs("git diff --quiet && set -o pipefail; npm test | tail -5", 0),
-                         [{"kind": "test", "exit": None}])
-
-    def test_a_semicolon_runs_the_next_unit_however_long_the_chain(self):
-        command = "; ".join(["git status"] * 13) + "; true && npm test"
-        self.assertEqual(trial_scan.gate_runs(command, 0), [{"kind": "test", "exit": 0}])
-        self.assertEqual(trial_scan.gate_totals(trial_scan.gate_runs(command, 0))["total"], 1)
-        self.assertEqual(trial_scan.gate_runs("; ".join(["git status"] * 40) + "; npm test", 1), [{"kind": "test", "exit": 1}])
-
-    def test_a_long_and_chain_that_passed_ran_every_gate(self):
-        command = " && ".join(["git status"] * 40 + ["npm test", "npm run lint"])
-        self.assertEqual(trial_scan.gate_runs(command, 0), [{"kind": "test", "exit": 0}, {"kind": "lint", "exit": 0}])
-        self.assertEqual(trial_scan.gate_runs(command, 1), [{"kind": "test", "exit": None, "uncertain": True},
-                                                            {"kind": "lint", "exit": None, "uncertain": True}])
-
-    def test_an_or_branch_may_or_may_not_have_run_when_the_exit_was_zero(self):
-        self.assertEqual(self.gates("npm test || npm run lint", "ok"),
-                         [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}])
-
-    def test_an_or_branch_never_runs_after_a_pass_that_is_known(self):
-        self.assertEqual(self.gates("true || npm test", "ok"), [])
-
-    def test_an_or_branch_after_a_failed_gate_is_known_to_have_run_when_the_exit_was_nonzero(self):
-        self.assertEqual(self.gates("npm test || npm run lint", "Exit code 1\nx", True), [{"kind": "test", "exit": None}, {"kind": "lint", "exit": 1}])
+    def test_an_or_branch_may_or_may_not_have_run(self):
+        both = [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}]
+        self.assertEqual(self.gates("npm test || npm run lint", "ok"), both)
+        self.assertEqual(self.gates("npm test || npm run lint", "Exit code 1\nx", True), both)
 
     def test_semicolon_runs_both_and_keeps_repeats(self):
         self.assertEqual(self.gates("npm test; npm test", "Exit code 1\nx", True), [{"kind": "test", "exit": None}, {"kind": "test", "exit": 1}])
-        self.assertEqual(self.gates("npm test; npm test", "ok"), [{"kind": "test", "exit": None}, {"kind": "test", "exit": 0}])  # `;` shows only the last status
+        self.assertEqual(self.gates("npm test; npm test", "ok"), [{"kind": "test", "exit": None}, {"kind": "test", "exit": 0}])
+
+    def test_a_failure_with_no_code_in_the_result_gives_no_exit(self):
+        self.assertEqual(self.gates("npm test", "boom", True), [{"kind": "test", "exit": None}])
 
     def test_no_result_leaves_later_branches_uncertain_and_exits_unknown(self):
         self.assertEqual(self.gates("npm test && npm run lint"), [{"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True}])
 
-    def test_a_gate_in_a_substitution_is_counted_and_denied_with_its_call(self):
-        self.assertEqual(self.gates('echo "$(npm test)"', "done"), [{"kind": "test", "exit": None}])
-        self.assertEqual(self.gates('echo "$(npm test)" > /no/dir/f', "Exit code 1\nboom", error=True), [{"kind": "test", "exit": None}])
-        self.assertEqual(self.gates('echo "$(npm test)"', "The user denied this tool call", error=True),
-                         [{"kind": "test", "exit": None, "denied": True}])
-        self.assertEqual(trial_scan.gate_totals(self.gates('echo "$(npm test)"', "done"))["total"], 1)
+    def test_a_gate_only_in_a_substitution_is_not_counted_even_when_the_call_is_denied(self):
+        self.assertEqual(self.gates('echo "$(npm test)"', "done"), [])
+        self.assertEqual(self.gates('echo "$(npm test)" > /no/dir/f', "Exit code 1\nboom", error=True), [])
+        self.assertEqual(self.gates('echo "$(npm test)"', "The user denied this tool call", error=True), [])
 
     def test_denied_chain_counts_no_run(self):
         out = self.scan(use("a", "Bash", command="npm test && npm run lint"),
@@ -490,7 +508,7 @@ class ClaudeScanTests(unittest.TestCase):
         out = self.scan(use("a", "Bash", command="npm test && npm run lint"), result("a", "Exit code 1\nx", True),
                         use("b", "Bash", command="npm test"),
                         result("b", "PreToolUse:Bash hook error: guard denied this tool call: x", error=True))
-        self.assertEqual(trial_scan.gate_totals(out["gate_runs"]), {"total": 1, "uncertain": 1, "denied": 1})
+        self.assertEqual(trial_scan.gate_totals(out["gate_runs"]), {"total": 1, "uncertain": 1, "denied": 1, "unattributed": 1})
 
     def test_a_malformed_line_makes_the_scan_incomplete_not_ok(self):
         out = self.scan("not json\n", use("a", "Bash", command="git push"))

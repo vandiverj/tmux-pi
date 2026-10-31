@@ -166,9 +166,10 @@ def _slips(scan, extra):
 
 
 def _gates(scan):
-    """None when there is no transcript scan; else {"complete", "total", "uncertain", "denied", "runs"}. `total` counts gate
-    runs known to have happened (not denied, not behind an unresolved `&&` / `||`); a scan with skipped lines is incomplete,
-    so its total is a lower bound and the report leaves it out."""
+    """None when there is no transcript scan; else {"complete", "total", "uncertain", "denied", "unattributed", "runs"}. `total`
+    counts gate runs known to have happened (not denied, not behind an unresolved `&&` / `||`); `unattributed` is how many of
+    those have no exit status, because only the last command a call ran can claim the call's status. A scan with skipped
+    lines is incomplete, so its total is a lower bound and the report leaves it out."""
     if scan.get("gate_runs") is None:
         return None
     return {"complete": bool(scan.get("complete")), **trial_scan.gate_totals(scan["gate_runs"]), "runs": scan["gate_runs"]}

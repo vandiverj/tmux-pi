@@ -203,7 +203,7 @@ class SlipFieldTests(unittest.TestCase):
         self.assertEqual(r["rule_slips"], {"complete": True, "total": 3,
                                            "by_rule": {"commit_subject": 1, "commit_trailer": 1, "git_push": 1}})
         self.assertEqual(r["gate_runs"], {"complete": True, "total": 1, "uncertain": 0, "denied": 0,
-                                          "runs": [{"kind": "test", "exit": None}]})
+                                          "unattributed": 1, "runs": [{"kind": "test", "exit": None}]})
 
     def test_a_transcript_with_a_skipped_line_is_incomplete_for_slips_and_gates(self):
         fx = Fixture(self)
@@ -215,7 +215,8 @@ class SlipFieldTests(unittest.TestCase):
         (d / "transcript-path").write_text(str(transcript), encoding="utf-8")
         r = fx.build()
         self.assertEqual(r["rule_slips"], {"complete": False, "total": 1, "by_rule": {"git_push": 1}})
-        self.assertEqual((r["gate_runs"]["complete"], r["gate_runs"]["total"], r["gate_runs"]["uncertain"]), (False, 1, 1))
+        self.assertEqual((r["gate_runs"]["complete"], r["gate_runs"]["total"], r["gate_runs"]["uncertain"], r["gate_runs"]["unattributed"]),
+                         (False, 1, 1, 1))
         self.assertEqual((r["transcript"]["status"], r["transcript"]["bad_lines"]), ("incomplete", 1))
 
     def test_no_transcript_means_unknown_slips(self):

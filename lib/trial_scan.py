@@ -7,28 +7,52 @@ Claude transcripts are JSONL: assistant lines hold `tool_use` blocks, user lines
 transcripts (`transcript.jsonl` in the task dir) have no pinned schema yet: the design waits for a Phase-0 sample, so
 `scan_pi` returns `status: "unknown"` with null `rule_slips` and `gate_runs` instead of guessing.
 
-Fixed waits (`write_slips`) follow one rule: a wait is flagged only when the scanner can positively identify it as a call
-token in code that runs. Anything it cannot read with confidence is not flagged. A `timer-ok` mark clears a wait only when
-it sits in a comment on the same line. Known limits, all of them in the "not flagged" direction unless noted:
+Known limits. Every limit below is in the "not counted" direction unless it says otherwise: the scanner reports what it can
+read with confidence and leaves the rest out, and no value it reports is inferred from a guess.
 
-- Only py (.py .pyi), shell (.sh .bash .zsh .bats) and js/ts (.js .mjs .cjs .jsx .ts .mts .cts .tsx) files are read. Any other
-  file (.md, .json, .html, .vue, .rb, ...) has no code to the scanner, so a wait in it is not flagged.
+Fixed waits (`write_slips`), only in a test file of a known language (py .py .pyi; shell .sh .bash .zsh .bats; js/ts .js .mjs
+.cjs .jsx .ts .mts .cts .tsx; any other file is not read, so a wait in a .md, .json, .html, .vue or .rb is not flagged):
+
+- A wait is flagged only when it is a call statement: its first token is `sleep`, `time.sleep` or `asyncio.sleep` (py) or
+  `sleep` or `setTimeout` (js/ts), after an optional `await`, and the `)` that closes the call is followed by the end of the
+  line, `;` or `.`. A statement starts at the start of a line (not after a trailing backslash, py or shell) or after `;`.
+  A definition (`def sleep(`, `async def   sleep(`, `function  sleep(`, `export const sleep = ...`) starts with another
+  token and is never flagged, whatever the whitespace.
+- NOT flagged, though they wait: a wait that does not start its statement (`await new Promise(r => setTimeout(r, 50))`,
+  `x = time.sleep(1)`, `if x: time.sleep(1)`, `foo(sleep(1), 2)`, `cb = () => sleep(1)`, `{ sleep(1) }`), `waitForTimeout(`,
+  `wait_for_timeout(`, `window.setTimeout(`, `x.sleep(`, and `time.sleep` in js or `setTimeout` in py. A JS method written `sleep(ms) {` is a definition and is not flagged;
+  a call of a user helper named `sleep(` IS flagged (names decide, types do not; the other direction).
+- `timer-ok` clears a wait only when it sits in a comment on the line the wait starts on.
 - Comments, string text and JavaScript regular-expression literals are blanked; interpolations (`f"{...}"`, `${...}`,
-  `$(...)`, backticks in shell strings) are code. A wait inside a string that another interpreter runs (`exec("sleep 2")`,
-  `page.evaluate("setTimeout(...)")`, `bash -c '...'`) is therefore not seen.
-- A JavaScript `/` after `)`, `}`, `+`, `-` or `.` could be a division or the start of a regex, and a
-  regex that does not end on its line cannot be read: the whole line is left unflagged (`UNSURE`). JSX text is not parsed.
-- Names decide, types do not: `sleep(`, `x.sleep(`, `setTimeout(` and `waitForTimeout(`/`wait_for_timeout(` are waits on any
-  object, so a call to a user helper of that name is flagged (the other direction). `def sleep(` and `function sleep(`
-  are definitions and are not; a JS method written `sleep(ms) {` is not told from a call and is flagged.
-- A shell wait is `sleep N` (a digit) where a command starts: at the start of a line (not after a trailing backslash), after
-  `; & | ( { ` ` ` or `then`/`do`/`else`/`elif`. `sleep $n`, `env X=1 sleep 2`, `timeout 5 sleep 2` and case patterns are not
-  flagged. Heredoc bodies are data, so `$(...)` that an unquoted heredoc would expand is not seen either.
-- Nesting deeper than MAX_NESTING levels is read as written (still flagged); `UNSURE` only ever clears a line.
+  `$(...)`, backticks in shell strings) are code, so a statement start inside one counts. A wait inside a string another
+  interpreter runs (`exec("sleep 2")`, `page.evaluate("setTimeout(...)")`, `bash -c '...'`) is not seen.
+- A JavaScript `/` after `)`, `}`, `+`, `-` or `.` could be a division or the start of a regex, and a regex that does not
+  end on its line cannot be read: the whole line is left unflagged (`UNSURE`). JSX text is not parsed.
+- A shell wait is `sleep N` (a digit) where a command starts: at the start of a line, after `; & | ( { ` ` ` or
+  `then`/`do`/`else`/`elif`. `sleep $n`, `env X=1 sleep 2`, `timeout 5 sleep 2` and case patterns are not flagged.
+- Shell heredocs: a body is data, from the line after its `<<WORD` opener to the line that is WORD (to the end of the text
+  when there is none, as the shell does). `<<` in quotes, in `<<<`, or in `$((...))` is not an opener. `<<` in a `(( ))`
+  command or `[[ ]]` IS read as an opener, which drops the rest of that text (not counted).
+- Nesting deeper than MAX_NESTING levels is read as written: a shell `sleep N` after `(` or `;` there is still flagged (the
+  other direction), a py/js call is not (it no longer starts its statement). `UNSURE` only ever clears a line.
 
-Gate runs (`gate_runs`, `gate_kinds`): a gate inside a command substitution (`$(...)`, backticks, `<(...)`) is recorded with
-a null exit, since the status the transcript shows is the status of the command around it. A gate nested more than
-MAX_NESTING substitutions deep is not seen, and heredoc bodies are data, not commands.
+Gate runs (`gate_runs`, `gate_kinds`), over one Bash call:
+
+- A gate (test, lint, tsc, prettier, gitleaks) is found only where a pipeline stage starts, in a simple command or in a plain
+  `&&` / `||` / `;` / newline chain, after env assignments, `env`, `npx`, `timeout N`, `time`, `command`. A gate that appears
+  only inside a heredoc body, a `$(...)` or backtick or `<(...)` body, arithmetic or a quoted string (`bash -c "npm test"`,
+  `echo "$(npm test)"`) is not found, so it is not counted. `xargs`, `find -exec`, `sudo`, `!` and aliases hide a gate too.
+- `exit` is the call's exit status for one gate only: the last command the call ran, i.e. the last stage of the last unit,
+  when that unit is certain to have run, is not a background job (`&`), and, as one stage of a pipe, the text never says
+  `pipefail`. Every other gate has `exit: None`. The status is never used to say which gate failed, so a call that failed
+  after `npm test && npm run lint` says nothing about either. The call's status is taken as the gate's even when the shell
+  failed around it (a redirection like `npm test > /no/dir/f`).
+- `uncertain: True` marks a gate that may not have run, and it has `exit: None`: it follows `&&` or `||` and the call did
+  not pass as a plain `&&` list, or it sits in a call that has an `if`/`for`/`while`/`case`, a function, a `( )` or `{ }`
+  group, or after `exit`/`return`, or after `set -e` in a call that failed. `trap`, `bash -e -c`, and a shell started
+  with errexit are not seen.
+- `gate_totals` counts `total` (known to have run), `uncertain`, `denied` and `unattributed` (gates in `total` that have no
+  exit). A call the guard refused has all its gates `denied`.
 """
 
 import bisect
@@ -59,14 +83,16 @@ COMMAND_RULES = (
     ("git_reset", "git reset", re.compile(_GIT + r"reset\b")),
     ("git_cherry_pick", "git cherry-pick", re.compile(_GIT + r"cherry-pick\b")),
 )
-# Rules that read a file write, not a command: the content a Write/Edit puts in a test file. A wait is flagged only when
-# it is a call token in code that runs (not in a comment, a string or a regex literal) in a file of a known language.
-# A Python or JS call is `sleep(`, `setTimeout(`, `waitForTimeout(`, `wait_for_timeout(`; a definition (`def sleep(`,
-# `function sleep(`) is not a call. A shell wait is `sleep N` where a command starts.
-_CALL = r"(?<!def )(?<!function )\bsleep\s*\("
+# Rules that read a file write, not a command: the content a Write/Edit puts in a test file. A wait is flagged only when it is
+# a call statement in code that runs (not in a comment, a string or a regex literal) in a file of a known language: the
+# first token of the statement is `sleep`, `time.sleep`, `asyncio.sleep` (py) or `sleep`, `setTimeout` (js/ts), after an
+# optional `await`, and it is followed by a call whose `)` ends the statement. A statement starts at the start of a line
+# (after its indentation) or after `;`. A definition (`def sleep(`, `function sleep(`) starts with another token, so it is
+# not a call. A shell wait is `sleep N` where a command starts.
+_STATEMENT = r"(?:^|;)[ \t]*(?:await[ \t]+)?"
 FIXED_WAIT = {
-    "py": re.compile(_CALL + r"|\bwait_for_timeout\s*\("),
-    "js": re.compile(_CALL + r"|\b(?:setTimeout|waitForTimeout)\s*\("),
+    "py": re.compile(_STATEMENT + r"(?:time\.sleep|asyncio\.sleep|sleep)[ \t]*\("),
+    "js": re.compile(_STATEMENT + r"(?:sleep|setTimeout)[ \t]*\("),
     "sh": re.compile(r"(?:^|[;&|(){`\n]|\b(?:then|do|else|elif))\s*sleep\s+\d"),
 }
 TIMER_OK = "timer-ok"
@@ -98,10 +124,12 @@ GATES = (
                         r"deno\s+test\b|node\s+--test\b|vitest\b|jest\b|(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b)")),
 )
 _PREFIX = re.compile(r"^\s*(?:(?:\w+=\S*|env|npx|timeout\s+\d+\S*|time|command)\s+)*")
-# Builtins that do not fail in practice. `cd` is not one: a missing dir fails it and the gate behind `&&` never runs.
-_RELIABLE = re.compile(r"\s*(?:echo|export|printf|pwd|true|set|unset|:)(?:\s|$)")
-# `set -o pipefail`, `set -euo pipefail` turn pipefail on; `set +o pipefail` turns it off.
-_PIPEFAIL = re.compile(r"^\s*set\s+(?:[-+]\w*\s+)*([-+])\w*o\s+pipefail\b")
+# A unit that starts a compound command (if/for/while/case, a function, a group): what is inside may run once, many times or
+# never, so the scanner does not say a gate in the call ran.
+_COMPOUND = re.compile(r"\s*(?:[({]|(?:if|for|while|until|case|select|function|then|do|else|elif|fi|done|esac)\b|[\w.-]+\s*\(\s*\))")
+_HALTS = re.compile(r"\s*(?:exit|return)\b")  # nothing after it is known to run
+_ERREXIT = re.compile(r"\s*set\s+(?:-\w+\s+)*-(?:\w*e|o\s+errexit)")  # a later failure may end the shell
+_PIPEFAIL = re.compile(r"\bpipefail\b")
 ARITHMETIC = re.compile(r"\$\(\(.*?\)\)", re.S)
 _EXIT = re.compile(r"^\s*Exit code[: ]+(-?\d+)")
 
@@ -142,42 +170,33 @@ def command_slips(command):
     return [rule for rule, _, pattern in COMMAND_RULES if pattern.search(command)]
 
 
-HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?(\w+))")
+HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?(\w+))")
 
 
-def _blank_heredocs(command):
-    """`command` with each heredoc body (and its end line) turned to spaces, same length and same newlines. A body is data,
-    not commands, so a line of it that reads `npm test` or `sleep 2` is not a run. A heredoc whose end line is never found
-    is left as written, and `<<` inside `$(( ))` is arithmetic."""
-    masked = ARITHMETIC.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), command)
-    out, pos, done = [], 0, 0
-    while True:
-        m = HEREDOC.search(masked, pos)
-        if not m:
-            break
-        delimiter = next(g for g in m.groups()[1:] if g is not None)
-        start = masked.find("\n", m.end())
-        if start < 0:
-            break
-        i = start + 1
-        end = None
-        while i <= len(masked):
-            j = masked.find("\n", i)
-            j = len(masked) if j < 0 else j
-            if (masked[i:j].lstrip("\t") if m.group(1) else masked[i:j]) == delimiter:
-                end = j
+def _heredoc_at(text, i):
+    """(delimiter, strip_tabs, index after the opener) when a heredoc opener (`<<WORD`, `<<-'WORD'`) starts at text[i], else
+    None. `<<<` is a here-string, not a heredoc. The caller decides that text[i] is outside quotes and arithmetic."""
+    if not text.startswith("<<", i) or text.startswith("<<<", i) or text[i - 1:i] == "<":
+        return None
+    m = HEREDOC_OPEN.match(text, i)
+    if not m:
+        return None
+    return next(g for g in m.groups()[1:] if g is not None), bool(m.group(1)), m.end()
+
+
+def _skip_heredoc_bodies(text, i, pending):
+    """Index after the bodies of the heredocs in `pending` [(delimiter, strip_tabs)], whose first body line starts at
+    text[i]. A body ends after the line that is its delimiter; with no such line the shell reads to the end of the text."""
+    n = len(text)
+    for delimiter, tabs in pending:
+        while i < n:
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            line = text[i:j]
+            i = min(j + 1, n)
+            if (line.lstrip("\t") if tabs else line) == delimiter:
                 break
-            if j == len(masked):
-                break
-            i = j + 1
-        if end is None:
-            pos = m.end()
-            continue
-        out.append(command[done:start + 1])
-        out.append(re.sub(r"[^\n]", " ", command[start + 1:end]))
-        done = pos = end
-    out.append(command[done:])
-    return "".join(out)
+    return i
 
 
 def _group_end(text, i, level=0):
@@ -233,24 +252,25 @@ def _dq_end(text, i, level):
 
 
 def _units(command):
-    """[(connector, [pipeline stage text, ...])] for a shell command. The connector is what precedes the unit: None for the
-    first, then `&&`, `||` or `;` (a newline or a lone `&` counts as `;`). Quotes and backslashes hide operators, and so
-    does a command substitution (`$(a && b)`, backticks, `<(...)`), and `>&`, `&>` redirects are not a connector. Shell
-    comments are dropped first. Empty units are dropped."""
-    command = strip_shell_comments(command)
+    """[(connector, [pipeline stage text, ...], background)] for a shell command. The connector is what precedes the unit:
+    None for the first, then `&&`, `||` or `;` (a newline or a lone `&` counts as `;`); `background` is True for a unit a
+    lone `&` ends. Quotes and backslashes hide operators, and so do command substitutions (`$(a && b)`, backticks,
+    `<(...)`) and arithmetic (`$((1<<3))`); `>&`, `&>` redirects are not a connector. Comments are dropped. A heredoc body
+    (from the line after its opener to its end line) is skipped: it is data, and `<<` inside quotes is not an opener.
+    Empty units are dropped."""
     units, stages, buf, op = [], [], [], None
-    quote = None
+    quote, pending = None, []
     i, n = 0, len(command)
 
     def end_stage():
         stages.append("".join(buf))
         buf.clear()
 
-    def end_unit(connector):
+    def end_unit(connector, background=False):
         nonlocal stages, op
         end_stage()
         if any(t.strip() for t in stages):
-            units.append((op, stages))
+            units.append((op, stages, background))
             op = connector
         elif connector != ";":
             op = connector
@@ -280,8 +300,18 @@ def _units(command):
         elif c in "'\"":
             quote = c
             buf.append(c)
-        elif _starts_group(command, i):
+        elif c == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif _starts_group(command, i) or command.startswith("$((", i):
             end = _group_end(command, i)[0]
+            buf.append(command[i:end])
+            i = end
+            continue
+        elif c == "<" and _heredoc_at(command, i):
+            delimiter, tabs, end = _heredoc_at(command, i)
+            pending.append((delimiter, tabs))
             buf.append(command[i:end])
             i = end
             continue
@@ -290,8 +320,14 @@ def _units(command):
             i += 1
         elif c == "|":
             end_stage()
-        elif c in ";\n" or (c == "&" and not (buf and buf[-1] in "<>") and command[i + 1:i + 2] != ">"):
+        elif c == "\n":
             end_unit(";")
+            if pending:
+                i = _skip_heredoc_bodies(command, i + 1, pending)
+                pending = []
+                continue
+        elif c == ";" or (c == "&" and not (buf and buf[-1] in "<>") and command[i + 1:i + 2] != ">"):
+            end_unit(";", background=(c == "&"))
         else:
             buf.append(c)
         i += 1
@@ -305,10 +341,11 @@ def _starts_group(text, i):
         text[i] in "<>" and text.startswith("(", i + 1))
 
 
-def _stage_groups(stage):
-    """(stage with each command substitution replaced by `_`, [body text of each]) for one pipeline stage. Single quotes
-    and backslashes hide a substitution; double quotes do not (the shell still runs `"$(cmd)"`)."""
-    out, bodies, quote, i, n = [], [], None, 0, len(stage)
+def _mask_groups(stage):
+    """`stage` with each command substitution replaced by `_`, so the head of the stage can be read. Single quotes and
+    backslashes hide a substitution; double quotes do not (the shell still runs `"$(cmd)"`). Nothing in a substitution is
+    read as a gate."""
+    out, quote, i, n = [], None, 0, len(stage)
     while i < n:
         c = stage[i]
         if quote == "'":
@@ -320,12 +357,8 @@ def _stage_groups(stage):
             continue
         elif (c == "`" or (c == "$" and stage.startswith("$(", i) and not stage.startswith("$((", i))
               or (quote is None and c in "<>" and stage.startswith("(", i + 1))):
-            end, closed = _group_end(stage, i)
-            start = i + 1 if c == "`" else i + 2
-            body = stage[start:end - 1 if closed else end]
-            bodies.append(body.replace("\\`", "`") if c == "`" else body)
             out.append("_")
-            i = end
+            i = _group_end(stage, i)[0]
             continue
         else:
             if c == "'" and quote is None:
@@ -334,7 +367,7 @@ def _stage_groups(stage):
                 quote = None if quote else '"'
             out.append(c)
         i += 1
-    return "".join(out), bodies
+    return "".join(out)
 
 
 def _stage_kind(stage):
@@ -345,144 +378,74 @@ def _stage_kind(stage):
     return None
 
 
-def _plan(command, level=0):
-    """[{"op", "gates": [(kind, last_stage)...], "gate_stages", "nested": [(stage, kind, uncertain)...], "stages",
-    "reliable", "pipefail"}] per shell unit. A pipeline is one unit; its status is its last stage's, or with pipefail the
-    last failing stage's. `pipefail` is True/False when the unit sets it, else None. `nested` are the gates a command
-    substitution in the unit runs (`echo "$(npm test)"`): they run when the unit runs, and their status is not the unit's."""
-    plan = []
-    for op, stages in _units(_blank_heredocs(command)):
-        gates, gate_stages, nested = [], [], []
-        for j, stage in enumerate(stages):
-            masked, bodies = _stage_groups(stage) if level < MAX_NESTING else (stage, [])
-            for body in bodies:
-                nested += [(j, run["kind"], bool(run.get("uncertain"))) for run in _gate_runs(body, None, level + 1)]
-            kind = _stage_kind(masked)
-            if kind:
-                gates.append((kind, j == len(stages) - 1))
-                gate_stages.append(j)
-        single = len(stages) == 1
-        switch = _PIPEFAIL.match(stages[0]) if single else None
-        plan.append({"op": op, "gates": gates, "gate_stages": gate_stages, "nested": nested, "stages": len(stages),
-                     "reliable": single and bool(_RELIABLE.match(stages[0])),
-                     "pipefail": (switch.group(1) == "-") if switch else None})
-    return plan
-
-
-def _slots(unit):
-    """[(kind, last_stage, inner_uncertain)] for a unit in the order the shell reaches them: by stage, a stage's command
-    substitutions before its own command. `last_stage` is None for a gate inside a substitution."""
-    slots = [(j, 0, kind, None, unc) for j, kind, unc in unit["nested"]]
-    slots += [(j, 1, kind, last, False) for j, (kind, last) in zip(unit["gate_stages"], unit["gates"])]
-    return [slot[2:] for slot in sorted(slots, key=lambda slot: slot[:2])]
+def _gates_in(units):
+    """[(unit index, stage index, kind)] for the gates that head a pipeline stage, in the order they stand."""
+    return [(u, j, kind) for u, (_, stages, _) in enumerate(units) for j, stage in enumerate(stages)
+            for kind in [_stage_kind(_mask_groups(stage))] if kind]
 
 
 def gate_kinds(command):
-    """Gate kinds a Bash command names, in order, repeats kept. Only the head of a shell segment counts, so a commit
+    """Gate kinds a Bash command names, in order, repeats kept. Only the head of a pipeline stage counts, so a commit
     message or an echo that mentions pytest is not a gate run. It does not say which ones ran; `gate_runs` does."""
     if not isinstance(command, str):
         return []
-    return [kind for unit in _plan(command) for kind, _, _ in _slots(unit)]
-
-
-def _runs(unit, i, status):
-    return i == 0 or unit["op"] == ";" or (unit["op"] == "&&" and status == 0) or (unit["op"] == "||" and status != 0)
-
-
-def _after(unit, state, outcome):
-    pipefail = state[1] if unit["pipefail"] is None else unit["pipefail"]
-    return (outcome, pipefail)
-
-
-def _gate_exit(outcome, ended, last_stage, single, pipefail, exit_code):
-    """What one gate's exit is, given its unit's status (0 or 1 = failed) in one surviving case: a number, "fail" (failed,
-    code not shown) or "unknown" (the unit's status does not say)."""
-    if not (single or (last_stage and not pipefail) or (pipefail and outcome == 0)):
-        return "unknown"  # an earlier stage without pipefail, or a failed pipefail pipe whose failing stage is not shown
-    if outcome == 0:
-        return 0
-    return exit_code if ended and exit_code else "fail"
+    return [kind for _, _, kind in _gates_in(_units(command))]
 
 
 def gate_runs(command, exit_code=None):
-    """[{"kind", "exit"} | + "uncertain": True] for one Bash command whose whole exit status is `exit_code` (None when
-    not shown). A gate inside a command substitution (`$(...)`, backticks, `<(...)`) is recorded with a null exit: it runs
-    whenever its unit does, but the status of the substitution is not the status of the command around it. Each unit of the list passes or fails (echo / true / set and the like only pass), and bash's `&&` / `||`
-    / `;` rules decide which units run. A case is one pass/fail choice per unit that ends in the shown status (0 or
-    nonzero). A gate that ran in every case has no mark; one that ran in some has `uncertain: True`; one that ran in none
-    is left out. `exit` is a number only for a certain run when every case agrees on it: 0, or the shown code for the
-    gate whose status ended the list. A gate that is not the last stage of a pipe has no exit unless pipefail is set
-    and the pipe passed.
+    """[{"kind", "exit"} | + "uncertain": True] for the gates one Bash command names, in the order they stand. `exit_code`
+    is the whole command's exit status (None when the transcript does not show it).
 
-    The cases are not listed one by one: what decides the rest of the list is only (status, pipefail) after a unit, so a
-    forward pass finds the states each unit can start in and a backward pass which states can still end in the shown
-    status. A long list costs a few steps per unit, with no cap."""
-    return _gate_runs(command, exit_code, 0)
-
-
-def _gate_runs(command, exit_code, level, nested_only=False):
-    plan = _plan(command, level) if isinstance(command, str) else []
-    if not any(unit["gates"] or unit["nested"] for unit in plan):
+    `exit` is a number only for a gate that is the last command the call ran: the last stage of the last unit, which is
+    not a background job, is certain to have run, and (when it is one stage of a pipe) the text never mentions pipefail. It
+    then is the call's exit status. Every other gate has `exit: None`, and the status of the call is not used to say which
+    gate failed. A gate is certain to have run when every connector before it is `;` (or a newline), or when the call
+    passed and the last `;`-list is only `&&` links; otherwise (`a && gate` that failed, `a || gate`, anything inside an
+    `if`/loop/function/group, anything after `exit`, `return`, or `set -e` that may have stopped) it carries
+    `uncertain: True`. A gate that appears only inside a heredoc, a command substitution, arithmetic or a quoted string is
+    not found at all."""
+    if not isinstance(command, str):
         return []
-    n = len(plan)
-
-    def outcomes(unit):
-        return (0,) if unit["reliable"] else (0, 1)
-
-    states = [(s, p) for s in (0, 1) for p in (False, True)]
-    # tail[i][state] = set of "did a later unit run" over continuations of units i.. that end in the shown status
-    tail = [None] * (n + 1)
-    tail[n] = {st: ({False} if exit_code is None or (st[0] == 0) == (exit_code == 0) else set()) for st in states}
-    for i in range(n - 1, -1, -1):
-        unit, row = plan[i], {}
-        for st in states:
-            if _runs(unit, i, st[0]):
-                row[st] = {True} if any(tail[i + 1][_after(unit, st, o)] for o in outcomes(unit)) else set()
-            else:
-                row[st] = set(tail[i + 1][st])
-        tail[i] = row
-    if exit_code is not None and not tail[0][(0, False)]:
-        # The shown status fits no way this list could run (`echo "$(npm test)" > /no/dir` fails though echo "cannot").
-        # A substitution ran with its unit anyway, so it is still counted; the direct gates have nothing to say.
-        return _gate_runs(command, None, level, nested_only=True)
-    # head[i] = states the shell can be in just before unit i
-    head = [{(0, False)}]
-    for i, unit in enumerate(plan):
-        nxt = set()
-        for st in head[i]:
-            nxt.update(_after(unit, st, o) for o in outcomes(unit)) if _runs(unit, i, st[0]) else nxt.add(st)
-        head.append(nxt)
-
+    units = _units(command)
+    n = len(units)
+    last_list = max(i for i in range(n) if i == 0 or units[i][0] == ";") if n else 0
+    and_tail = all(units[i][0] == "&&" for i in range(last_list + 1, n))
+    passed = exit_code == 0
+    compound = any(_COMPOUND.match(stages[0]) for _, stages, _ in units)
+    halted = errexit = False
+    certain = []
+    for i, (op, stages, _) in enumerate(units):
+        if compound or halted:
+            certain.append(False)
+        elif op in (None, ";"):
+            certain.append(passed or not errexit)  # with errexit a failure may have ended the shell before this unit
+        else:
+            certain.append(i > last_list and passed and and_tail)
+        head = stages[0]
+        halted = halted or bool(_HALTS.match(head))
+        errexit = errexit or bool(_ERREXIT.match(head))
+    pipefail = bool(_PIPEFAIL.search(command))
     out = []
-    for i, unit in enumerate(plan):
-        ran = [(st, o) for st in head[i] if _runs(unit, i, st[0]) for o in outcomes(unit) if tail[i + 1][_after(unit, st, o)]]
-        if not ran:
-            continue
-        skipped = any(tail[i + 1][st] for st in head[i] if not _runs(unit, i, st[0]))
-        for kind, last_stage, inner_uncertain in _slots(unit):
-            if last_stage is None:  # inside a command substitution: ran with its unit, status not shown
-                out.append(dict({"kind": kind, "exit": None}, **({"uncertain": True} if skipped or inner_uncertain else {})))
-                continue
-            if nested_only:
-                continue
-            values = set()
-            for st, o in ran:
-                for later in tail[i + 1][_after(unit, st, o)]:  # pipefail as it was while the pipe ran
-                    values.add(_gate_exit(o, not later, last_stage, unit["stages"] == 1, st[1], exit_code))
-            value = next(iter(values)) if len(values) == 1 else None
-            run = {"kind": kind, "exit": value if isinstance(value, int) else None}
-            if skipped:  # its status only counts if it ran, so none is claimed
-                run["exit"], run["uncertain"] = None, True
-            out.append(run)
+    for u, j, kind in _gates_in(units):
+        _, stages, background = units[u]
+        run = {"kind": kind, "exit": None}
+        if not certain[u]:
+            run["uncertain"] = True
+        elif u == n - 1 and not background and j == len(stages) - 1 and (len(stages) == 1 or not pipefail):
+            run["exit"] = exit_code
+        out.append(run)
     return out
 
 
 def gate_totals(runs):
-    """{"total", "uncertain", "denied"} over gate_runs entries: `total` counts runs known to have happened."""
+    """{"total", "uncertain", "denied", "unattributed"} over gate_runs entries. `total` counts runs known to have happened;
+    `unattributed` is how many of those have no exit status (the call's status was not theirs to claim). `uncertain` runs
+    may not have happened, `denied` ones were refused."""
     runs = runs or []
     denied = sum(1 for r in runs if r.get("denied"))
     uncertain = sum(1 for r in runs if r.get("uncertain") and not r.get("denied"))
-    return {"total": len(runs) - denied - uncertain, "uncertain": uncertain, "denied": denied}
+    unattributed = sum(1 for r in runs if r.get("exit") is None and not r.get("uncertain") and not r.get("denied"))
+    return {"total": len(runs) - denied - uncertain, "uncertain": uncertain, "denied": denied, "unattributed": unattributed}
 
 
 def _source_lang(path):
@@ -539,10 +502,28 @@ def _code_from(text, i, lang, close, out, marks, level=0):
     opener = {"}": "{", ")": "("}.get(close)
     depth, n = 0, len(text)
     prev, word, gap = "", "", False  # last significant code char, the word it ends, whether a space came after it
+    pending = []  # shell heredocs opened on this line: their bodies start after its newline
     while i < n:
         c = text[i]
         if close and c == close and depth == 0:
             return i + 1
+        if lang == "sh":
+            if c == "\n" and pending:  # the bodies are data; their lines stay, empty
+                j = _skip_heredoc_bodies(text, i + 1, pending)
+                out.append("\n" * text.count("\n", i, j))
+                i, pending = j, []
+                continue
+            if text.startswith("$((", i):  # arithmetic: its `<<` is a shift, not a heredoc
+                j = _group_end(text, i)[0]
+                out.append("\n" * text.count("\n", i, j))
+                i = j
+                continue
+            if c == "<" and _heredoc_at(text, i):
+                delimiter, tabs, j = _heredoc_at(text, i)
+                pending.append((delimiter, tabs))
+                out.append("<<" + "\n" * text.count("\n", i, j))
+                i = j
+                continue
         if lang == "js" and text.startswith("//", i) or c == "#" and (
                 lang == "py" or lang == "sh" and (i == 0 or text[i - 1] in " \t\n;&|()")):
             j = text.find("\n", i)
@@ -643,6 +624,11 @@ def _string(text, i, lang, quote, interpolates, out, marks, level):
             i = _code_from(text, i + 2, lang, "}", out, marks, level + 1)
             out.append(" ")
             continue
+        elif interpolates and lang == "sh" and text.startswith("$((", i):
+            j = _group_end(text, i)[0]
+            out.append("\n" * text.count("\n", i, j))
+            i = j
+            continue
         elif interpolates and lang == "sh" and (text.startswith("$(", i) or c == "`"):
             out.append(";")  # the start of a command, so `sleep 2` in it is found where a command begins
             i = _code_from(text, i + (2 if c == "$" else 1), lang, ")" if c == "$" else "`", out, marks, level + 1)
@@ -656,13 +642,11 @@ def _string(text, i, lang, quote, interpolates, out, marks, level):
 def _scan_source(path, text):
     """(code, lines that carry a `timer-ok` mark in a comment) for `text` written to `path`. The code is what runs:
     comments dropped, literal text of strings and regular-expression literals blanked, the code inside interpolations
-    kept, shell heredoc bodies blanked. Its lines line up with `text`. A file that is not py, sh or js/ts has no code."""
+    kept, shell heredoc bodies and arithmetic dropped. Its lines line up with `text`. A file that is not py, sh or js/ts has no code."""
     lang = _source_lang(path)
     if lang is None:
         return "\n" * text.count("\n"), set()
     out, marks = [], []
-    if lang == "sh":
-        text = _blank_heredocs(text)
     _code_from(text, 0, lang, None, out, marks)
     starts = [0] + [m.end() for m in re.finditer("\n", text)]
     return "".join(out), {bisect.bisect_right(starts, k) - 1 for k in marks}
@@ -671,6 +655,30 @@ def _scan_source(path, text):
 def executable_code(path, text):
     """`text` as the code that runs, for a file at `path` (see `_scan_source`). Lines line up with `text`."""
     return _scan_source(path, text)[0]
+
+
+def _paren_pairs(code):
+    """{index of "(": index of its ")"} over `code`, in one pass. Strings are already blanked, so parentheses in them are not
+    counted; a "(" that never closes has no entry."""
+    pairs, stack = {}, []
+    for i, c in enumerate(code):
+        if c == "(":
+            stack.append(i)
+        elif c == ")" and stack:
+            pairs[stack.pop()] = i
+    return pairs
+
+
+def _call_ends_statement(code, pairs, opened):
+    """True when the "(" at code[opened] closes and what follows its ")" ends the statement: the end of the line or text, `;`,
+    or `.` (a chained call)."""
+    i = pairs.get(opened)
+    if i is None:
+        return False
+    i += 1
+    while i < len(code) and code[i] in " \t":
+        i += 1
+    return i >= len(code) or code[i] in ";.\n"
 
 
 def write_slips(path, text):
@@ -682,12 +690,19 @@ def write_slips(path, text):
     if lang is None:
         return []
     code, marked = _scan_source(path, text)
-    pattern, continued = FIXED_WAIT[lang], False
+    pattern, continued, offset, pairs = FIXED_WAIT[lang], False, 0, None
     for n, line in enumerate(code.split("\n")):
-        read = ("\\ " + line) if continued else line  # the line after a trailing backslash continues a command
-        continued = lang == "sh" and line.rstrip().endswith("\\")
-        if UNSURE not in line and n not in marked and pattern.search(read):
-            return ["fixed_wait"]
+        # a line after a trailing backslash continues a command or statement: it does not start one
+        prefix = "\\ " if continued else ""
+        continued = lang != "js" and line.rstrip().endswith("\\")
+        if UNSURE not in line and n not in marked:
+            for m in pattern.finditer(prefix + line):
+                if lang == "sh":
+                    return ["fixed_wait"]
+                pairs = _paren_pairs(code) if pairs is None else pairs
+                if _call_ends_statement(code, pairs, offset + m.end() - len(prefix) - 1):
+                    return ["fixed_wait"]
+        offset += len(line) + 1
     return []
 
 

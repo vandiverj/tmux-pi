@@ -56,8 +56,12 @@
 #   --preamble-from <dir>    the main working tree to read .tmux-pi/worker-preamble.md from when the workdir has none
 #                            (a lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored); recorded in meta. With --lane
 #                            and no --preamble-from, the lane repository's main working tree is used
-#   --other-lane-paths <text> with --lane: the packet section `Paths other lanes own` (tp-agent works it out from the other open
-#                            lanes' declared and measured paths; advice, not a lock). Omitted when empty
+#   --other-lane-paths <text> the packet section `Paths other lanes own` (tp-agent works it out from the other open
+#                            lanes' declared and measured paths; advice, not a lock). Omitted when empty. A shadow trial run
+#                            (bin/tp-trial) has no lane and passes the section the task it copies was given
+#   --worker-env KEY=VAL     export KEY=VAL in the worker's run.sh (the worker's window does not inherit the caller's
+#                            environment); repeatable. Only TP_DOCS_TOOLS and TP_TRIAL_ID are accepted, once each, and a value
+#                            has no line break. Without the flag run.sh is exactly what it was before the flag existed
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role
 #   --review-of <task>       this start is the independent review of that finished task (tp-review passes it, with --preamble-role
@@ -90,7 +94,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
 kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths=""
-words=() contexts=() notes=()
+words=() contexts=() notes=() worker_env=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -127,6 +131,7 @@ while [[ $# -gt 0 ]]; do
     --lane-replaces) lane_replaces="${2:?}"; shift 2 ;;
     --preamble-from) preamble_from="${2:?}"; shift 2 ;;
     --other-lane-paths) other_lane_paths="${2:?}"; shift 2 ;;
+    --worker-env)  worker_env+=("${2:?}"); shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
     -*)            die "unknown option: $1" ;;
@@ -146,7 +151,18 @@ fi
 [[ -z "$lane_step" || "$lane_step" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]] || die "bad --lane-step: $lane_step"
 [[ -n "$lane" || -z "$lane_step" ]] || die "--lane-step needs --lane"
 [[ -z "$lane" || -n "$lane_step" ]] || die "--lane needs --lane-step"
-[[ -n "$lane" || -z "$other_lane_paths" ]] || die "--other-lane-paths needs --lane"
+# --worker-env: a KEY=VAL pair from a short allowlist (a task's environment is not a way to set anything else), each key once.
+seen_env=" "
+for pair in ${worker_env[@]+"${worker_env[@]}"}; do
+  [[ "$pair" == *=* ]] || die "bad --worker-env (want KEY=VAL): $pair"
+  case "${pair%%=*}" in
+    TP_DOCS_TOOLS|TP_TRIAL_ID) ;;
+    *) die "--worker-env key not allowed: ${pair%%=*} (allowed: TP_DOCS_TOOLS, TP_TRIAL_ID)" ;;
+  esac
+  [[ "$seen_env" != *" ${pair%%=*} "* ]] || die "--worker-env ${pair%%=*} given twice"
+  seen_env+="${pair%%=*} "
+  [[ "${pair#*=}" != *$'\n'* && "${pair#*=}" != *$'\r'* ]] || die "--worker-env ${pair%%=*}: the value has a line break"
+done
 [[ -z "$lane_replaces" ]] || { [[ -n "$lane" && "${TP_TASK_ID:-}" == "$lane_replaces" ]] ||
   die "--lane-replaces is for a lane worker handing its own task over: it needs --lane and must be the caller's TP_TASK_ID"; }
 if [[ -n "$preamble_from" ]]; then
@@ -368,7 +384,13 @@ if [[ -n "$tests" ]]; then
 fi
 # The repository preamble goes to the worker's system prompt, not the packet (see below), so it sits ahead of
 # everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
-preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from")" || exit 1
+# With a parent task, lib/preamble.py (when this checkout's copy takes --state-dir and --parent) adds the prior task's result and
+# review line to the Tools block. A checkout whose preamble.py does not take the options is called exactly as before.
+preamble_args=()
+if [[ -n "$parent" ]] && grep -q -e '--state-dir' "$ROOT/lib/preamble.py" 2>/dev/null; then
+  preamble_args=(--state-dir "$state_dir" --parent "$parent")
+fi
+preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" ${preamble_args[@]+"${preamble_args[@]}"})" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
 packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
 packet+=$'\n'
@@ -572,6 +594,7 @@ fi
   printf 'cd %q\n' "$workdir"
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
+  for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
   # The packet text is the first message (not @packet.md: pi would present it as
   # a file in the task dir, and models then resolve relative paths against that).
   printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""tp-trial: the Qwen trial's shadow runs (design §3). A shadow runs Qwen on the brief a normal coder got, in a throwaway worktree
+and its own tmux session, reviews the diff and writes a trial record. It never touches the real lane, step or branch.
+
+    tp-trial shadow <task-id> [--run ID] [--pair ID] [--model M] [--thinking T] [--timeout-s N] [--project DIR]
+                              [--state-dir DIR] [--foreground]
+        start a shadow of coder task <task-id> (a task in the main state dir). Detached by default: prints the run id at once.
+    tp-trial status [run]        one line per run (JSON with --json)
+    tp-trial stop <run>          end a run early; its cleanup still runs
+    tp-trial normal <run>        write (again) the normal arm's record of a run's pair, e.g. after the normal task's review landed
+    tp-trial run --run-dir DIR   the run itself (started by `shadow`; not for direct use)
+    tp-trial X ...               any other X runs bin/tp-trial-X with the remaining arguments, when that file exists
+
+The main state dir is TP_STATE_DIR, else the session's @tp_state_dir (the same lookup as tp-agent). A run's own files are under
+<project>/.tmux-pi/trial/<run>/; the records are <project>/.tmux-pi/trial/records.jsonl."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+import trial_session  # noqa: E402
+import trial_shadow  # noqa: E402
+
+SUBCOMMANDS = ("shadow", "status", "stop", "normal", "run")
+FIELDS = ("run", "phase", "outcome", "source_task", "model", "session")
+
+
+def main_state(explicit=None):
+    value = explicit or os.getenv("TP_STATE_DIR")
+    if value:
+        return Path(value).resolve()
+    session = os.getenv("TP_SESSION", "tmux-pi")
+    if os.getenv("TMUX"):
+        target = ["-t", os.environ["TMUX_PANE"]] if os.getenv("TMUX_PANE") else []
+        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True).strip()
+    found = subprocess.run(["tmux", "show-options", "-qv", "-t", "={}:".format(session), "@tp_state_dir"], text=True, capture_output=True)
+    if found.returncode or not found.stdout.strip():
+        raise trial_shadow.ShadowError("no tmux-pi state directory; run this from the workspace (tp), or with TP_STATE_DIR or --state-dir set")
+    return Path(found.stdout.strip()).resolve()
+
+
+def project_dir(explicit, state):
+    """The repository the trial's directory lives in: --project, else the main state dir's own project (<project>/.tmux-pi)."""
+    if explicit:
+        return os.path.realpath(explicit)
+    return os.path.realpath(str(Path(state).parent))
+
+
+def find_run(project, name):
+    rdir = trial_session.run_dir(project, name)
+    if not trial_shadow.run_file(rdir).is_file():
+        raise trial_shadow.ShadowError("no trial run '{}' under {}".format(name, trial_session.trial_root(project)))
+    return rdir
+
+
+def show(info, as_json):
+    if as_json:
+        print(json.dumps(info, sort_keys=True))
+    else:
+        print("  ".join("{}={}".format(k, info.get(k) if info.get(k) is not None else "-") for k in FIELDS))
+
+
+def cmd_shadow(args):
+    state = main_state(args.state_dir)
+    info = trial_shadow.prepare(state, args.task_id, project=args.project or None, run=args.run, pair_id=args.pair, model=args.model,
+                                thinking=args.thinking, timeout_s=args.timeout_s, review_timeout_s=args.review_timeout_s,
+                                poll_s=args.poll_s)
+    rdir = trial_session.run_dir(info["project"], info["run"])
+    if args.foreground:
+        done = trial_shadow.execute(rdir, install_signals=True)
+        show(done, args.json)
+        return 0 if done.get("outcome") == "completed" else 1
+    pid = trial_shadow.launch(rdir, info["project"])
+    trial_shadow.update_run(rdir, pid=pid)
+    show(trial_shadow.read_run(rdir), args.json)
+    return 0
+
+
+def cmd_run(args):
+    done = trial_shadow.execute(Path(args.run_dir), install_signals=True)
+    show(done, False)
+    return 0 if done.get("outcome") == "completed" else 1
+
+
+def cmd_status(args):
+    state = main_state(args.state_dir)
+    project = project_dir(args.project, state)
+    if args.run:
+        show(trial_shadow.read_run(find_run(project, args.run)), args.json)
+        return 0
+    for info in trial_shadow.list_runs(project):
+        show(info, args.json)
+    return 0
+
+
+def cmd_stop(args):
+    state = main_state(args.state_dir)
+    project = project_dir(args.project, state)
+    show(trial_shadow.stop(find_run(project, args.run)), args.json)
+    return 0
+
+
+def cmd_normal(args):
+    state = main_state(args.state_dir)
+    project = project_dir(args.project, state)
+    record = trial_shadow.record_normal(find_run(project, args.run))
+    if record is None:
+        raise trial_shadow.ShadowError("the source task of run '{}' is gone; no normal record written".format(args.run))
+    print(json.dumps({"run": args.run, "arm": "normal", "pair_id": record.get("pair_id")}, sort_keys=True))
+    return 0
+
+
+def parser():
+    top = argparse.ArgumentParser(prog="tp-trial", description=__doc__.split("\n\n")[0])
+    sub = top.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--state-dir", help="the main tmux-pi state dir (default: TP_STATE_DIR, else the session's)")
+        p.add_argument("--project", help="the repository's main checkout (default: the one above the state dir)")
+        p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("shadow", help="start a shadow of a coder task")
+    p.add_argument("task_id")
+    p.add_argument("--run")
+    p.add_argument("--pair", help="pair id shared by both arms' records (default: shadow-<task-id>)")
+    p.add_argument("--model")
+    p.add_argument("--thinking")
+    p.add_argument("--timeout-s", type=int, help="attempt timeout in seconds (default: trial.attempt_timeout_s)")
+    p.add_argument("--review-timeout-s", type=int)
+    p.add_argument("--poll-s", type=float, default=2.0)
+    p.add_argument("--foreground", action="store_true", help="run to the end in this process")
+    common(p)
+    p.set_defaults(fn=cmd_shadow)
+    p = sub.add_parser("status")
+    p.add_argument("run", nargs="?")
+    common(p)
+    p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("stop")
+    p.add_argument("run")
+    common(p)
+    p.set_defaults(fn=cmd_stop)
+    p = sub.add_parser("normal")
+    p.add_argument("run")
+    common(p)
+    p.set_defaults(fn=cmd_normal)
+    p = sub.add_parser("run")
+    p.add_argument("--run-dir", required=True)
+    p.set_defaults(fn=cmd_run)
+    return top
+
+
+def main(argv):
+    if argv and argv[0] not in SUBCOMMANDS and not argv[0].startswith("-"):
+        name = argv[0]
+        plugin = Path(__file__).resolve().parent / "tp-trial-{}".format(name)
+        if "/" not in name and plugin.is_file() and os.access(str(plugin), os.X_OK):  # the L4 hook: tp-trial replay -> bin/tp-trial-replay
+            os.execv(str(plugin), [str(plugin)] + argv[1:])
+    args = parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except (trial_shadow.ShadowError, trial_session.SessionError) as error:
+        print("tp-trial: {}".format(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

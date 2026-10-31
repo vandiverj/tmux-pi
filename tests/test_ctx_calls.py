@@ -165,12 +165,13 @@ class CallLog(unittest.TestCase):
 
     def test_an_operator_command_may_run_unlogged_only_with_no_worker_variables(self):
         ran = []
-        answer = calls.call("t", {}, lambda: ran.append(1) or calls.Answer("ok", "x"), operator=True, env={})
-        self.assertEqual((answer.status, ran), ("ok", [1]))
-        self.assertFalse(self.log.exists())
-        for env in ({"TP_TASK_ID": "coder-x"}, {"TP_TASK_DIR": str(self.tmp / "missing")}):
-            with self.assertRaises(calls.LogUnavailable, msg=str(env)):
-                calls.call("t", {}, lambda: ran.append(2), operator=True, env=env)
+        with mock.patch.object(calls, "on_terminal", return_value=True):  # a person at a terminal (CX4 N2: without one it is refused)
+            answer = calls.call("t", {}, lambda: ran.append(1) or calls.Answer("ok", "x"), operator=True, env={})
+            self.assertEqual((answer.status, ran), ("ok", [1]))
+            self.assertFalse(self.log.exists())
+            for env in ({"TP_TASK_ID": "coder-x"}, {"TP_TASK_DIR": str(self.tmp / "missing")}):
+                with self.assertRaises(calls.LogUnavailable, msg=str(env)):
+                    calls.call("t", {}, lambda: ran.append(2), operator=True, env=env)
         self.assertEqual(ran, [1])
 
     def test_a_query_operation_never_runs_unlogged(self):

@@ -14,9 +14,9 @@
 
 The project is --project, $TP_CTX_PROJECT, or found from the working directory (a .tmux-pi directory or a .git); notes live in
 <project>/.tmux-pi/knowledge/. Every command except `approve` is logged as one JSON line in $TP_TASK_DIR/ctx-calls.jsonl and
-answers nothing if it cannot be (exit 3): status, add and import need a usable $TP_TASK_DIR, as do the query operations the
-other lanes add. Only the operator commands list, show and audit may run unlogged, and only with neither TP_TASK_DIR nor
-TP_TASK_ID set; --log FILE is accepted only for those, at a terminal, with neither set. All output passes the redaction
+answers nothing if it cannot be (exit 3): add and import need a usable $TP_TASK_DIR, as do the query operations the
+other lanes add. Only the operator commands list, show, audit and status may run unlogged, and only at a terminal with neither
+TP_TASK_DIR nor TP_TASK_ID set; --log FILE is accepted only for those, at a terminal, with neither set. All output passes the redaction
 boundary. Exit: 0 answered, 1 no answer (not found, invalid), 2 usage or refusal, 3 not logged.
 
 Commands the other CX lanes add live in modules named in PLUGINS; a module exposes COMMANDS (the first words it handles,
@@ -40,7 +40,7 @@ ENGINE_VERSION = 1
 PLUGINS = ("ctxengine.surface",)
 VALUE_FLAGS = {"--project", "--log"}
 WORKER_ENV = calls.WORKER_ENV
-OPERATOR_COMMANDS = ("audit", "show", "list")  # a person's commands (approve has its own gates): see calls.py for what that allows
+OPERATOR_COMMANDS = ("audit", "show", "list", "status")  # a person's commands (approve has its own gates): see calls.py for what that allows
 
 
 class Usage(Exception):
@@ -257,7 +257,8 @@ COMMANDS = {"status": cmd_status, "list": cmd_list, "show": cmd_show, "add": cmd
 def build_parser():
     parser = argparse.ArgumentParser(prog="tp-ctx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", help="project directory (default: $TP_CTX_PROJECT, else found from the working directory)")
-    parser.add_argument("--log", help="call log file (default: $TP_TASK_DIR/ctx-calls.jsonl)")
+    parser.add_argument("--log", help="call log file (default: $TP_TASK_DIR/ctx-calls.jsonl); only for an operator command (list, show, audit, "
+                                      "status) run by a person at a terminal with no TP_TASK_DIR or TP_TASK_ID")
     parser.add_argument("--json", action="store_true", help="print {status, text, ...data} as JSON")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")

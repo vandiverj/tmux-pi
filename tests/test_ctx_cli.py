@@ -137,39 +137,39 @@ class Knowledge(Cli):
 
     def test_list_show_and_the_candidate_status_filter(self):
         self.add()
-        self.assertEqual(self.run_cli("knowledge", "list").stdout.strip(), "no notes")  # approved only by default
-        listed = self.run_cli("knowledge", "list", "--status", "candidate")
+        self.assertEqual(self.run_cli("knowledge", "list", env=self.task_env).stdout.strip(), "no notes")  # approved only by default
+        listed = self.run_cli("knowledge", "list", "--status", "candidate", env=self.task_env)
         self.assertIn("kn-2026-10-31-clean-up-own-rows", listed.stdout)
-        shown = self.run_cli("knowledge", "show", "kn-2026-10-31-clean-up-own-rows", "--json")
+        shown = self.run_cli("knowledge", "show", "kn-2026-10-31-clean-up-own-rows", "--json", env=self.task_env)
         data = json.loads(shown.stdout)
         self.assertEqual((data["status"], data["note"]["status"]), ("ok", "candidate"))
-        missing = self.run_cli("knowledge", "show", "kn-2026-10-31-nope")
+        missing = self.run_cli("knowledge", "show", "kn-2026-10-31-nope", env=self.task_env)
         self.assertEqual(missing.returncode, 1)
 
     def test_show_flags_a_stale_by_path_note_and_audit_lists_it(self):
         self.add("--id", "kn-2026-10-31-dead-scope")
         text = self.candidate_path("kn-2026-10-31-dead-scope").read_text().replace(f"{API}/**/*.test.ts", "gone/**")
         self.candidate_path("kn-2026-10-31-dead-scope").write_text(text)
-        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-dead-scope", "--json").stdout)
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-dead-scope", "--json", env=self.task_env).stdout)
         self.assertIn("stale_by_path", shown["note"]["flags"])
-        audit = self.run_cli("knowledge", "audit")
+        audit = self.run_cli("knowledge", "audit", env=self.task_env)
         self.assertIn("stale_by_path", audit.stdout)
         self.assertIn("scope_no_match:gone/**", audit.stdout)
 
     def test_moved_evidence_is_flagged_by_show_and_audit(self):
         self.add("--id", "kn-2026-10-31-moved")  # cites a.test.ts:2, which says "two"
-        self.assertNotIn("stale_by_path", self.run_cli("knowledge", "show", "kn-2026-10-31-moved").stdout)
+        self.assertNotIn("stale_by_path", self.run_cli("knowledge", "show", "kn-2026-10-31-moved", env=self.task_env).stdout)
         (self.project / API / "a.test.ts").write_text("zero\nzero too\none\ntwo\n")  # still long enough; "two" is now on line 4
-        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-moved", "--json").stdout)
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-moved", "--json", env=self.task_env).stdout)
         self.assertIn("stale_by_path", shown["note"]["flags"])
         self.assertEqual(shown["note"]["path_reasons"], [f"evidence_changed:{API}/a.test.ts:2"])
-        self.assertIn(f"evidence_changed:{API}/a.test.ts:2", self.run_cli("knowledge", "audit").stdout)
+        self.assertIn(f"evidence_changed:{API}/a.test.ts:2", self.run_cli("knowledge", "audit", env=self.task_env).stdout)
 
     def test_a_non_matching_versions_range_is_flagged_through_a_lockfile_pin(self):
         # the lockfile reader is L5's (not in this lane); the library hook is covered in test_ctx_store. Here the CLI reports
         # the check as unavailable rather than silently passing.
         self.add("--version", "drizzle-orm=>=0.45 <0.46", "--id", "kn-2026-10-31-versioned")
-        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-versioned", "--json").stdout)
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-versioned", "--json", env=self.task_env).stdout)
         note = shown["note"]
         self.assertEqual(note["versions"], {"drizzle-orm": ">=0.45 <0.46"})
         self.assertTrue(note.get("version_unchecked") or "stale_by_version" in note.get("flags", []))
@@ -178,7 +178,7 @@ class Knowledge(Cli):
         directory = self.project / ".tmux-pi" / "knowledge" / "approved"
         directory.mkdir(parents=True)
         (directory / "kn-2026-10-31-broken.md").write_text((FIXTURES / "missing-evidence-approved.md").read_text())
-        audit = self.run_cli("knowledge", "audit")
+        audit = self.run_cli("knowledge", "audit", env=self.task_env)
         self.assertIn("invalid", audit.stdout)
         self.assertIn("evidence is required", audit.stdout)
 
@@ -245,13 +245,14 @@ class Logging(Cli):
 
     def test_operator_commands_may_run_unlogged_with_no_worker_variable(self):
         self.add()
-        for words in (("knowledge", "list", "--status", "all"), ("knowledge", "show", "kn-2026-10-31-clean-up-own-rows"), ("knowledge", "audit")):
-            done = self.run_cli(*words)
-            self.assertEqual(done.returncode, 0, (words, done.stderr))
+        for words in (("knowledge", "list", "--status", "all"), ("knowledge", "show", "kn-2026-10-31-clean-up-own-rows"), ("knowledge", "audit"),
+                      ("status",)):
+            code, _, errors = self.run_tty(*words)  # a person at a terminal (CX4 N2/N3: without one these are refused)
+            self.assertEqual(code, 0, (words, errors))
         self.assertEqual([line["tool"] for line in self.log_lines()], ["knowledge.add"])
 
     def test_every_other_command_gets_no_answer_without_a_task_dir(self):
-        cases = [("status",), ("knowledge", "add", "--kind", "lesson", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1", "--text", "A rule."),
+        cases = [("knowledge", "add", "--kind", "lesson", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1", "--text", "A rule."),
                  ("knowledge", "import", "--from-work", "note-nope", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1")]
         for words in cases:
             done = self.run_cli(*words)

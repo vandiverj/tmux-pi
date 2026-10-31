@@ -34,6 +34,7 @@ and never repeats the value.
 | `versions` | optional `{package: range}`; a range such as `>=0.45 <0.46`, `^1.2`, `~1.2.3`, `1.x`, `a \|\| b` |
 | `source` | `human`, or starts with `review:`, `doc:`, `work:` or `worker:` |
 | `evidence` | required for an approved note and for every new candidate; up to 10 entries such as `path:line` or `review:<id>#<finding>` |
+| `evidence_hashes` | optional `{entry: hash}`: a hash of the cited line for each `path:line` entry, taken by the tool when a candidate is written; never set by the caller (see `add` under `tp-ctx`) |
 | `supersedes` | optional ids of approved notes this one replaces |
 | `status`, `created`, `last_reviewed` | set by the tool |
 
@@ -65,15 +66,16 @@ Computed on every read and never stored. A flag does not hide a note; it tells t
 Every `tp-ctx` command except `approve` appends one JSON line to `$TP_TASK_DIR/ctx-calls.jsonl`: `ts, tool, args_hash, args,
 status, bytes, ms, notes_returned, index_age_s` and, when there is one, `reason`. It fails closed: with no usable task
 directory, or a log that cannot be written, the command prints nothing from the store and exits 3. Unusable means: unset,
-relative, not a directory, or a symlink; or a symlink anywhere in its path (for `<state>/tasks/<id>`, the state directory, `tasks`
+relative, not spelled as its own normalized path (`..`, `.`, a repeated or trailing slash), not a directory, or a symlink; or a symlink anywhere in its path (for `<state>/tasks/<id>`, the state directory, `tasks`
 and `<id>` must be real directories; for any other spelling, no ancestor may be a symlink owned by the calling user). The path
 is examined again when the line is written. A symlinked `ctx-calls.jsonl` is refused. Arguments are redacted before they are
 logged and before they are hashed.
 
-Only a person's commands may do otherwise: `list`, `show` and `audit` (and `approve`, which logs nothing). With neither
-`TP_TASK_DIR` nor `TP_TASK_ID` set they may run unlogged, and `--log FILE` writes their line to a file of the person's choice,
-but only on a terminal. `status`, `add`, `import` and the query operations other lanes add (brief, symbol, relations,
-knowledge search, note) always need a usable `TP_TASK_DIR`. With either variable set the shell is a worker's: `--log` is refused
+Only a person's commands may do otherwise: `list`, `show`, `audit` and `status` (and `approve`, which logs nothing). With
+neither `TP_TASK_DIR` nor `TP_TASK_ID` set, and only when stdin and stdout are a terminal, they may run unlogged, and `--log
+FILE` writes their line to a file of the person's choice. With no terminal they need a usable `TP_TASK_DIR` like every other
+command. `add`, `import` and the query operations (brief, symbol, relations, knowledge search, note) always need a usable
+`TP_TASK_DIR`. With either variable set the shell is a worker's: `--log` is refused
 and the call is logged in the task directory like any other.
 
 ## Screens

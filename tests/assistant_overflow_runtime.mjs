@@ -26,7 +26,7 @@ script('tp-pi', '#!/bin/sh\ncat "$ASK_FIXTURE"\n');
 const classifier = script('classifier', `#!/usr/bin/env node
 let d = ''; process.stdin.on('data', (c) => d += c).on('end', () => {
   const p = String(JSON.parse(d).tool_input?.path ?? '');
-  console.log(JSON.stringify(p.includes('dummy-secret') || p.endsWith('/.env') ? { sensitive: true, target: p } : { sensitive: false }));
+  console.log(JSON.stringify(p.includes('dummy-secret') || p.includes('secret files') || p.endsWith('/.env') ? { sensitive: true, target: p } : { sensitive: false }));
 });
 `);
 const work = path.join(tmp, 'work');
@@ -152,6 +152,67 @@ const oneLine = await overflow('y'.repeat(30_000), '');
 assert(oneLine.text.includes('truncated, cut mid-line'));
 assert(!oneLine.text.includes('line boundary'));
 assert(oneLine.text.startsWith('y'.repeat(24_000) + '\n['));
+
+// Retry cases. Each is recorded so one run shows every failure, not just the first.
+const failures = [];
+const check = async (name, fn) => { try { await fn(); console.log('pass', name); } catch (e) { failures.push(name); console.log('FAIL', name, '-', String(e.message).split('\n')[0]); } };
+const withEnv = async (vars, fn) => {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+  try { return await fn(); } finally { for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v); }
+};
+const secretHead = 'Token is in dummy-secret/token.txt:1 and nothing else.';
+const stateFile = path.join(tmp, 'state-is-a-file');
+fs.writeFileSync(stateFile, 'not a directory');
+const fallbackRoot = path.join(tmp, 'fallback-tmp');
+fs.mkdirSync(fallbackRoot);
+
+// F1/F3: the state dir cannot be used (unset, or unwritable): the reply is saved under the OS temp dir, masked like any other.
+for (const [label, vars] of [['unset', { TP_STATE_DIR: undefined }], ['unwritable', { TP_STATE_DIR: path.join(stateFile, 'x') }]]) {
+  await check(`F1/F3 state dir ${label}: fallback artifact, masked`, () => withEnv({ ...vars, TMPDIR: fallbackRoot }, async () => {
+    const r = await overflow(secretHead);
+    assert(r.m, 'a manifest comes back');
+    assert(!r.text.includes('dummy-secret'), 'withheld path masked');
+    assert.equal(r.m.withheld, 1);
+    assert(r.m.artifact.startsWith(fallbackRoot + path.sep), 'artifact is under the OS temp dir');
+    assert.equal(fs.readFileSync(r.m.artifact, 'utf8').startsWith(secretHead), true, 'full reply saved');
+    assert.equal(fs.statSync(r.m.artifact).mode & 0o777, 0o600);
+    assert.equal(r.m.error, undefined);
+    assert(r.text.includes(r.m.artifact));
+  }));
+}
+// F1/F3: nothing can be written: masked excerpt, and an explicit error that the full reply is not saved.
+await check('F1/F3 nothing writable: masked excerpt, explicit not-saved error', () => withEnv({ TP_STATE_DIR: undefined, TMPDIR: path.join(tmp, 'no-such-tmp') }, async () => {
+  const r = await overflow(secretHead);
+  assert(!r.text.includes('dummy-secret'), 'withheld path masked');
+  assert(r.text.includes('[withheld path]'));
+  assert(r.m, 'manifest still returned');
+  assert.equal(r.m.artifact, undefined);
+  assert.equal(r.m.error, 'full reply not saved');
+  assert.equal(r.m.withheld, 1);
+  assert(r.text.includes('full reply not saved'));
+}));
+
+// F2: a quoted name with a trailing :line or :line:col is classified as the full path, whether or not it exists.
+for (const [label, head] of [
+  ['double quotes :line', 'Look at "secret files/data.txt:8" now.'],
+  ['backticks :line:col', 'Look at `secret files/data.txt:8:3` now.'],
+  ['single quotes :line-line', "Look at 'secret files/data.txt:8-9' now."],
+  ['no line number', 'Look at "secret files/data.txt" now.'],
+]) {
+  await check(`F2 ${label}: withheld, not spelled in the excerpt`, async () => {
+    const r = await overflow(head);
+    assert.equal(r.m.withheld, 1);
+    assert(!r.text.includes('secret files'), 'full spelling absent');
+    assert(!r.text.includes('files/data.txt'), 'tail spelling absent');
+    assert.deepEqual(r.m.paths, []);
+  });
+}
+await check('F2 quoted existing path keeps its line range', async () => {
+  const r = await overflow('Quoted: "my dir/b c.py:3:5" here.');
+  assert.deepEqual(r.m.paths, [{ path: 'my dir/b c.py', lines: ['3'], content_hash: sha(path.join(work, 'my dir/b c.py')) }]);
+});
+if (failures.length) { console.log('FAILED:', failures.join(' | ')); process.exit(1); }
 
 // A classifier that cannot answer fails closed: everything cited is withheld.
 process.env.TP_SENSITIVE_READ_BIN = path.join(tmp, 'no-such-classifier');

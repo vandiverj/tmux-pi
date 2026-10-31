@@ -14,7 +14,8 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -40,6 +41,7 @@ const MAX_CITED = 50; // paths hashed and listed in one manifest; the rest are c
 const MAX_CLASSIFIED = 200; // cited names run through the sensitive classifier; one past this is masked, never named
 const MAX_BACK_WORDS = 8; // words an unquoted citation may reach back over to find a path with spaces
 const WITHHELD_MARK = "[withheld path]";
+const NOT_SAVED = "full reply not saved";
 
 /** Cut `text` to at most `max` characters, at a line boundary when the cut has one; `midLine` says it did not. */
 export function cutAtLine(text: string, max: number): { text: string; midLine: boolean } {
@@ -74,12 +76,14 @@ export function citedPaths(reply: string, exists?: (path: string) => boolean): C
 	};
 	const quoted: Span[] = [];
 	for (const m of reply.matchAll(QUOTED_RE)) {
-		const inner = m[2].trim();
+		// The :line, :line:col or :line-line may sit inside the quotes; take it off before the name is judged.
+		const tail = m[2].trim().match(/^(.*?)(?::(\d+)(?:(?:[-–](\d+))|(?::\d+))?)?$/)!;
+		const inner = tail[1];
 		const looksLikePath = inner.includes("/") || /\.[A-Za-z0-9]{1,8}$/.test(inner);
 		if (!looksLikePath || !/^[\w@.+\-/ ()]+$/.test(inner)) continue;
-		const span = { start: m.index! + 1, end: m.index! + m[0].length };
-		quoted.push({ start: m.index!, end: span.end });
-		events.push({ at: m.index!, run: () => add(inner, m[3] ?? m[5], m[4] ?? m[6], span, true) });
+		const span = { start: m.index! + 1, end: m.index! + 1 + m[2].length };
+		quoted.push({ start: m.index!, end: m.index! + m[0].length });
+		events.push({ at: m.index!, run: () => add(inner, tail[2] ?? m[3] ?? m[5], tail[3] ?? m[4] ?? m[6], span, true) });
 	}
 	const plain: { span: Span; run: () => void }[] = [];
 	for (const m of reply.matchAll(PATH_RE)) {
@@ -119,7 +123,8 @@ export type Manifest = {
 	unresolved: number;
 	truncated: true;
 	bytes_total: number;
-	artifact: string;
+	artifact?: string; // absent when the full reply could not be saved
+	error?: string; // set exactly then
 };
 
 /** SHA-256 of a file's current content, read in chunks so its size does not matter. */
@@ -140,7 +145,7 @@ function hashFile(file: string): string {
  * Nothing is dropped silently: past the cap, `omitted` counts the readable files left out and `unresolved` the
  * citations that could not be read or found.
  */
-export function buildManifest(reply: string, cwd: string, artifact: string, sensitive: (path: string) => boolean):
+export function buildManifest(reply: string, cwd: string, artifact: string | undefined, sensitive: (path: string) => boolean):
 	{ manifest: Manifest; withheldSpans: Span[] } {
 	const resolveIn = (p: string) => (isAbsolute(p) ? p : resolve(cwd, p));
 	const isThere = (p: string) => { try { lstatSync(resolveIn(p)); return true; } catch { return false; } };
@@ -170,7 +175,7 @@ export function buildManifest(reply: string, cwd: string, artifact: string, sens
 		} catch { unresolved++; continue; }
 		paths.push({ path: cite.path, ...(cite.lines.length ? { lines: cite.lines } : {}), content_hash });
 	}
-	return { manifest: { paths, withheld, omitted, unresolved, truncated: true, bytes_total: Buffer.byteLength(reply), artifact }, withheldSpans };
+	return { manifest: { paths, withheld, omitted, unresolved, truncated: true, bytes_total: Buffer.byteLength(reply), ...(artifact ? { artifact } : { error: NOT_SAVED }) }, withheldSpans };
 }
 
 /** Replace each span of `text` (offsets into the full reply) with a fixed placeholder; spans past its end are ignored. */
@@ -186,6 +191,30 @@ export function maskSpans(text: string, spans: Span[]): string {
 const GUIDANCE =
     "\n\nFor a small read or search, ask_local can return paths, line numbers and snippets without growing your context. " +
     "Dispatch substantial investigation, edits, testing, review, or design with dispatch_role and collect with task_collect.";
+
+/**
+ * Write an over-cap reply to disk, mode 0600: under the session state dir's evidence/ folder, else in a private
+ * per-call folder under the OS temp dir. Returns the path, or undefined when neither place takes it.
+ */
+async function saveReply(reply: string, state: string | undefined): Promise<string | undefined> {
+	const name = `ask-local-${Date.now()}-${randomUUID().slice(0, 8)}.md`;
+	if (state) {
+		try {
+			// Loaded here so a reply under the cap needs nothing beyond this file.
+			const { ensureDir, writeFileAtomic } = await import("./lib/state-write.ts");
+			const evidence = join(state, "evidence");
+			ensureDir(state, evidence);
+			const file = join(evidence, name);
+			writeFileAtomic(state, file, reply, 0o600);
+			return file;
+		} catch { /* fall through to the temp dir */ }
+	}
+	try {
+		const file = join(mkdtempSync(join(tmpdir(), "tp-ask-local-")), name); // mkdtemp makes the folder 0700
+		writeFileSync(file, reply, { mode: 0o600, flag: "wx" });
+		return file;
+	} catch { return undefined; }
+}
 
 function run(cmd: string, args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
 	// The child is not the orchestrator main: without TP_MODE, bin/tp-pi adds neither codemode nor a second --tools.
@@ -245,28 +274,14 @@ export default function (pi: ExtensionAPI) {
 				if (out.length <= MAX_REPLY) {
 					return { content: [{ type: "text" as const, text: out || "(the local assistant returned nothing)" }], details: { model: assistant.model } };
 				}
-				// Over the cap: keep the whole reply on disk and return an excerpt plus a manifest of what it cites.
-				const state = stateDir();
-				let artifact: string | undefined;
-				if (state) {
-					try {
-						// Loaded here so a reply under the cap needs nothing beyond this file.
-						const { ensureDir, writeFileAtomic } = await import("./lib/state-write.ts");
-						const evidence = join(state, "evidence");
-						ensureDir(state, evidence);
-						artifact = join(evidence, `ask-local-${Date.now()}-${randomUUID().slice(0, 8)}.md`);
-						writeFileAtomic(state, artifact, out, 0o600);
-					} catch { artifact = undefined; }
-				}
+				// Over the cap: one path. Save the full reply, then mask what the guard refuses, then return.
+				const artifact = await saveReply(out, stateDir());
 				const cut = cutAtLine(out, MAX_REPLY);
-				if (!artifact) {
-					return { content: [{ type: "text" as const, text: cut.text + "\n[truncated; ask a narrower question]" }], details: { model: assistant.model } };
-				}
 				const { manifest, withheldSpans } = buildManifest(out, ctx.cwd, artifact, isSensitive(ctx.cwd));
 				// A path the guard refuses is not advertised in the excerpt; the saved reply keeps it on disk.
-				const label = cut.midLine ? "truncated, cut mid-line" : "truncated at a line boundary";
-				const text = `${maskSpans(cut.text, withheldSpans)}\n[${label}; the full reply is saved at ${artifact}]\n` +
-					`evidence manifest: ${JSON.stringify(manifest)}`;
+				const how = cut.midLine ? "truncated, cut mid-line" : "truncated at a line boundary";
+				const label = artifact ? `${how}; the full reply is saved at ${artifact}` : `${how}; ${NOT_SAVED}, ask a narrower question`;
+				const text = `${maskSpans(cut.text, withheldSpans)}\n[${label}]\nevidence manifest: ${JSON.stringify(manifest)}`;
 				return { content: [{ type: "text" as const, text }], details: { model: assistant.model, manifest } };
 			} catch (error) {
 				throw new Error(`local assistant unavailable (${(error as Error).message}); do this yourself with read/grep/find`);

@@ -226,12 +226,34 @@ class WriteRuleTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(trial_scan.write_slips(path, text), [])
 
+    def test_a_declaration_with_the_brace_on_the_next_line_or_in_an_interface_is_not_a_wait(self):  # review 5 N2
+        for text in ("class T {\n  sleep(ms)\n  {\n    return ms\n  }\n}\n", "const o = {\n  sleep(ms)\n  {\n    return ms\n  }\n}\n",
+                     "interface Clock {\n  sleep(ms: number);\n}\n", "interface Clock {\n  sleep(ms: number): Promise<void>;\n}\n",
+                     "interface Clock {\n  sleep(ms: number)\n}\n", "export interface Clock extends Base {\n  sleep(ms: number);\n  now();\n}\n",
+                     "abstract class C {\n  sleep(ms: number);\n  sleep(ms: any) { return ms }\n}\n",
+                     "declare class C {\n  sleep(ms: number);\n}\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("src/a.test.ts", text), [])
+
+    def test_a_call_after_or_beside_an_interface_or_class_is_still_a_wait(self):
+        for text in ("interface A {\n  sleep(ms: number);\n}\nsleep(5);\n", "class T {\n  run() {\n    sleep(5);\n  }\n}\n",
+                     "class T {\n  static {\n    sleep(5);\n  }\n}\n", "interface A { b: { c: 1 } }\nsleep(1)\n",
+                     "describe('x', () => {\n  sleep(5);\n})\n", "class T {\n  sleep(ms) { return ms }\n  run() {\n    sleep(5);\n  }\n}\n"):
+            with self.subTest(text=text):
+                self.assertEqual(trial_scan.write_slips("src/a.test.ts", text), ["fixed_wait"])
+
+    def test_declaration_limits_a_call_followed_by_a_block_on_the_next_line_is_not_a_wait(self):
+        self.assertEqual(trial_scan.write_slips("src/a.test.ts", "sleep(5)\n{\n  x()\n}\n"), [])  # the other direction
+        self.assertEqual(trial_scan.write_slips("tests/test_a.py", "sleep(5)\n{1: 2}\n"), ["fixed_wait"])  # py is not read this way
+
     def test_a_shell_wait_after_a_quoted_heredoc_marker_is_still_a_wait(self):
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "echo '<<EOF'\nsleep 2\nEOF\n"), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", 'echo "<<EOF" # x\nsleep 2\n'), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<EOF\nsleep 2\nEOF\n"), [])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<EOF\nsleep 2\n"), [])  # no end line: the body runs to the end
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "x=$(cat <<EOF\nsleep 2\nEOF\n)\nsleep 3\n"), ["fixed_wait"])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "git commit -m \"$(cat <<'EOF'\nit's\nsleep 2\nEOF\n)\"\n"), [])
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"\nsleep 3\n"), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<-EOF\n\tsleep 2\n\tEOF\nsleep 3\n"), ["fixed_wait"])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<A <<B\nsleep 1\nA\nsleep 2\nB\n"), [])
         self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<<sleep\nsleep 2\n"), ["fixed_wait"])
@@ -348,8 +370,9 @@ class GateKindTests(unittest.TestCase):
         self.assertEqual(trial_scan.gate_runs("cat <<EOF\nit's # no\nEOF\nnpm test # then ; npm run lint", 1), [{"kind": "test", "exit": 1}])
 
     def test_deeply_nested_substitutions_do_not_crash(self):
-        self.assertEqual(trial_scan.gate_runs("echo " + "$(" * 5000 + "npm test", 0), [])
-        self.assertEqual(trial_scan.gate_runs("echo " + '"$(' * 5000 + "npm test", 0), [])
+        self.assertEqual(trial_scan.gate_runs("echo " + "$(" * 5000 + "npm test", 0), PARSE_FAILED)  # too deep to read: visible
+        self.assertEqual(trial_scan.gate_runs("echo " + '"$(' * 5000 + "npm test", 0), PARSE_FAILED)
+        self.assertEqual(trial_scan.gate_runs("echo " + "$(" * 5000 + "npm test" + ")" * 5000, 0), PARSE_FAILED)
 
     def test_repeated_gates_are_kept(self):
         self.assertEqual(trial_scan.gate_kinds("npm test; npm test"), ["test", "test"])
@@ -437,8 +460,165 @@ class GateRunsTests(unittest.TestCase):
     def test_totals_split_attributed_unattributed_uncertain_and_denied(self):
         runs = trial_scan.gate_runs("npm test && npm run lint && npx tsc --noEmit", 1) + trial_scan.gate_runs("npm test; npm run lint", 0)
         runs.append({"kind": "test", "exit": None, "denied": True})
-        self.assertEqual(trial_scan.gate_totals(runs), {"total": 3, "uncertain": 2, "denied": 1, "unattributed": 2})
-        self.assertEqual(trial_scan.gate_totals(None), {"total": 0, "uncertain": 0, "denied": 0, "unattributed": 0})
+        self.assertEqual(trial_scan.gate_totals(runs), {"total": 3, "uncertain": 2, "denied": 1, "unattributed": 2, "parse_failed": 0})
+        self.assertEqual(trial_scan.gate_totals(None), {"total": 0, "uncertain": 0, "denied": 0, "unattributed": 0, "parse_failed": 0})
+
+
+PARSE_FAILED = [{"kind": None, "exit": None, "parse_failed": True}]
+
+
+class ShellTokenizerTests(unittest.TestCase):
+    """Review 5 F1: one pass skips a heredoc body as data wherever it opens, so an apostrophe in it opens no quote."""
+
+    def check_found(self, command, code, expected):
+        with self.subTest(command=command, code=code):
+            self.assertEqual(trial_scan.gate_runs(command, code), expected)
+
+    def test_a_heredoc_in_a_substitution_with_an_apostrophe_does_not_hide_the_gate_after_it(self):  # review 5 F1
+        commit = 'git commit -m "$(cat <<\'EOF\'\nfix: don\'t crash\nEOF\n)"'
+        self.check_found(commit + " && npm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found(commit + "; npm test", 1, [{"kind": "test", "exit": 1}])
+        self.check_found(commit + "\nnpm test", 1, [{"kind": "test", "exit": 1}])
+        self.check_found("x=\"$(cat <<'EOF'\nit's\nEOF\n)\"\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found("x=$(cat <<'EOF'\nit's\nEOF\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found("x=`cat <<'EOF'\nit's\nEOF\n`\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found("x=$(cat <<-'EOF'\n\tit's\n\tEOF\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.assertEqual(trial_scan.gate_kinds(commit + " && npm test"), ["test"])
+
+    def test_a_heredoc_body_in_a_group_is_data_whatever_it_holds(self):
+        for body in ("it's", 'say "hi', "a ) b", "a ( b", "`tick", "$(unclosed", "npm test", "# it's"):
+            self.check_found('x="$(cat <<\'EOF\'\n%s\nEOF\n)"\nnpm run lint' % body, 0, [{"kind": "lint", "exit": 0}])
+        self.check_found("x=$(cat <<A <<'B'\nit's\nA\nthat's\nB\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found('echo "$(echo "$(cat <<\'EOF\'\nit\'s\nEOF\n)")" && npm test', 0, [{"kind": "test", "exit": 0}])
+        self.check_found("x=$(cat <<EOF\nit's\nEOF\n); y=$(cat <<EOF\nthat's\nEOF\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])
+
+    def test_a_marker_that_is_not_an_opener_in_a_group_opens_no_body(self):
+        for command in ("x=$(echo '<<EOF')\nnpm test", 'x=$(echo "<<EOF")\nnpm test', "x=$(echo $((1<<3)))\nnpm test",
+                        'x="$((1<<3))"\nnpm test', "x=$(cat <<<npm)\nnpm test", "x=$(echo \\<<EOF)\nnpm test"):
+            self.check_found(command, 0, [{"kind": "test", "exit": 0}])
+
+    def test_tab_stripping_and_a_delimiter_line_with_other_text(self):
+        self.check_found("x=$(cat <<-EOF\n\tit's\n\tEOF\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])
+        self.check_found("x=$(cat <<EOF\nit's\n EOF\nEOF\n)\nnpm test", 0, [{"kind": "test", "exit": 0}])  # ' EOF' is body
+
+    def test_ordinary_calls_are_not_parse_failed(self):
+        for command in ("npm test", "echo \"it's\"", "echo it\\'s", "echo 'say \"hi'", 'echo "$(date)"', "echo `date`", "cat <<EOF\nx\nEOF",
+                        "cat <<EOF\nx\nEOF\n", "echo $((1<<3))", "echo '<<EOF'", "", "   ", "# only a comment's apostrophe", "ls | wc",
+                        "a && b || c; d &"):
+            with self.subTest(command=command):
+                self.assertFalse(any(r.get("parse_failed") for r in trial_scan.gate_runs(command, 0)))
+
+    def test_an_unclosed_quote_group_or_heredoc_is_parse_failed_not_empty(self):  # review 5: fail visible
+        unreadable = ("echo 'abc\nnpm test", 'echo "abc\nnpm test', "echo $(npm test", "echo `npm test", 'echo "$(npm test',
+                      "cat <<EOF\nnpm test\n", "cat <<EOF", "cat <<EOF\n", "cat <<'EOF'\nit's\nnpm test",
+                      'x="$(cat <<\'EOF\'\nit\'s\nnpm test\n)"', "x=$(cat <<EOF)\nnpm test", "echo $(echo 'a)\nnpm test",
+                      "echo $(echo \"a)\nnpm test", "echo `echo 'a`\nnpm test", "cat <<A <<B\nx\nA\n", "echo $((1+2)",
+                      "echo " + "$(" * 5000 + "npm test", "echo " + '"$(' * 5000 + "npm test")
+        for command in unreadable:
+            for code in (0, 1, None):
+                with self.subTest(command=command[:40], code=code):
+                    self.assertEqual(trial_scan.gate_runs(command, code), PARSE_FAILED)
+            self.assertEqual(trial_scan.gate_kinds(command), [])
+
+    def test_parse_failed_is_counted_by_gate_totals_and_not_as_a_gate(self):
+        runs = trial_scan.gate_runs("echo 'x\nnpm test", 0) + trial_scan.gate_runs("npm test", 0) + trial_scan.gate_runs("cat <<EOF", 1)
+        self.assertEqual(trial_scan.gate_totals(runs), {"total": 1, "uncertain": 0, "denied": 0, "unattributed": 0, "parse_failed": 2})
+        self.assertEqual(trial_scan.gate_totals(None), {"total": 0, "uncertain": 0, "denied": 0, "unattributed": 0, "parse_failed": 0})
+        self.assertEqual(trial_scan.gate_totals(PARSE_FAILED), {"total": 0, "uncertain": 0, "denied": 0, "unattributed": 0, "parse_failed": 1})
+
+    def test_a_parse_failed_call_in_a_transcript_shows_in_the_totals(self):
+        lines = (use("a", "Bash", command="git commit -m 'don't' && npm test") + result("a", "Exit code 1\nx", True)
+                 + use("b", "Bash", command="npm test") + result("b", "ok"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text(lines, encoding="utf-8")
+            out = trial_scan.scan_claude(path)
+        self.assertEqual(out["gate_runs"], PARSE_FAILED + [{"kind": "test", "exit": 0}])
+        self.assertEqual(trial_scan.gate_totals(out["gate_runs"])["parse_failed"], 1)
+
+
+class KnownLimitsTests(unittest.TestCase):
+    """One test per bullet of the Known limits in lib/trial_scan.py, written against what the code does."""
+
+    def kinds(self, commands):
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(trial_scan.gate_runs(command, 0), [], command)
+
+    def test_gate_bullet_a_gate_is_found_only_where_a_pipeline_stage_starts(self):
+        for command in ("npm test", "cd w && FOO=1 npx tsc --noEmit", "env X=1 timeout 60 npm run lint", "time command pytest -q",
+                        "a | npm test", "a; b\nnpm test"):
+            with self.subTest(command=command):
+                self.assertTrue(trial_scan.gate_kinds(command), command)
+        self.kinds(['bash -c "npm test"', "echo \"$(npm test)\"", "cat <<EOF\nnpm test\nEOF", "echo $((1+2))", "xargs npm test",
+                    "echo a | xargs npm test", "find . -exec npm test {} +", "sudo npm test", "! npm test", "nice npm test"])
+
+    def test_gate_bullet_groups_and_branch_keywords_head_a_stage_and_hide_the_gate(self):  # review 5 F2
+        self.kinds(["(npm test)", "{ npm test; }", "cd a && (npm test)", "x && { npm test; }", "if x; then npm test; fi",
+                    "if x; then npm test; else npm run lint; fi", "for f in a; do npm test; done", "while x; do npm test; done",
+                    "case x in a) npm test;; esac", "if x; then :; elif y; then npm test; fi"])
+
+    def test_gate_bullet_a_gate_on_its_own_line_in_a_compound_is_found_and_uncertain(self):  # review 5 F2
+        maybe = [{"kind": "test", "exit": None, "uncertain": True}]
+        for command in ("for f in a; do\n  npm test\ndone", "if x; then\n  npm test\nfi", "f() {\n  npm test\n}",
+                        "(cd x && npm test)", "(cd x; npm test)", "while x; do\n npm test\ndone"):
+            with self.subTest(command=command):
+                self.assertEqual(trial_scan.gate_runs(command, 0), maybe)
+
+    def test_uncertain_bullet_exactly_when(self):
+        un = {"kind": "test", "exit": None, "uncertain": True}
+        table = [
+            # follows && or || and the call did not pass as a plain && list
+            ("x && npm test", 0, [{"kind": "test", "exit": 0}]), ("x && npm test", 1, [un]), ("x && npm test", None, [un]),
+            ("x || npm test", 0, [un]), ("x && y; z && npm test", 0, [{"kind": "test", "exit": 0}]),
+            ("x && npm test; z", 0, [un]),
+            # a compound command anywhere in the call
+            ("if x; then :; fi\nnpm test", 0, [un]), ("npm test\nfor f in a; do :; done", 0, [un]), ("f() { :; }\nnpm test", 0, [un]),
+            ("(cd x)\nnpm test", 0, [un]), ("{ :; }\nnpm test", 0, [un]),
+            # exit / return, and set -e in a call that did not pass
+            ("exit 0; npm test", 0, [un]), ("return 1; npm test", 1, [un]), ("set -e; npm test", 1, [un]),
+            ("set -e; npm test", None, [un]), ("set -e; npm test", 0, [{"kind": "test", "exit": 0}]),
+            ("set -e\nnpm test", 2, [un]),
+            # not triggers: trap, bash -e -c, set +e, a plain list
+            ("trap 'x' ERR; npm test", 1, [{"kind": "test", "exit": 1}]), ("set +e; npm test", 1, [{"kind": "test", "exit": 1}]),
+            ("bash -e -c 'x'; npm test", 1, [{"kind": "test", "exit": 1}]),
+            ("a; b; npm test", 3, [{"kind": "test", "exit": 3}])]
+        for command, code, expected in table:
+            with self.subTest(command=command, code=code):
+                self.assertEqual(trial_scan.gate_runs(command, code), expected)
+
+    def test_totals_bullet(self):
+        runs = [{"kind": "test", "exit": 0}, {"kind": "test", "exit": None}, {"kind": "lint", "exit": None, "uncertain": True},
+                {"kind": "tsc", "exit": None, "denied": True}] + PARSE_FAILED
+        self.assertEqual(trial_scan.gate_totals(runs), {"total": 2, "uncertain": 1, "denied": 1, "unattributed": 1, "parse_failed": 1})
+
+    def test_parse_failed_bullet_a_call_the_tokenizer_cannot_close(self):
+        for command in ("echo 'x", 'echo "x', "echo $(x", "echo `x", "cat <<EOF\nx"):
+            self.assertEqual(trial_scan.gate_runs(command, 0), PARSE_FAILED, command)
+        # an apostrophe in a `#` comment inside $( ) is not recognised as a comment: it opens a quote and the call fails
+        self.assertEqual(trial_scan.gate_runs("x=$(echo a # it's\n)\nnpm test", 0), PARSE_FAILED)
+        self.assertEqual(trial_scan.gate_runs("x=$(echo a # its\n)\nnpm test", 0), [{"kind": "test", "exit": 0}])
+        # outside a substitution the comment is dropped, so the apostrophe is harmless
+        self.assertEqual(trial_scan.gate_runs("echo a # it's\nnpm test", 0), [{"kind": "test", "exit": 0}])
+
+    def test_heredoc_bullet_shell_heredocs_in_a_command_and_in_a_written_file(self):
+        # a command: a heredoc with no end line is parse_failed; in a written shell file the body runs to the end of the text
+        self.assertEqual(trial_scan.gate_runs("cat <<EOF\nnpm test\n", 0), PARSE_FAILED)
+        self.assertEqual(trial_scan.write_slips("tests/run.sh", "cat <<EOF\nsleep 2\n"), [])
+        # `<<` in a (( )) command is read as an opener: with no matching line the call is parse_failed (not counted)
+        self.assertEqual(trial_scan.gate_runs("(( x = 1 << 2 ))\nnpm test", 0), PARSE_FAILED)
+        self.assertEqual(trial_scan.gate_runs("[[ a << b ]]\nnpm test", 0), PARSE_FAILED)
+        self.assertEqual(trial_scan.gate_runs("(( x = 1 << 2 ))\n2\nnpm test", 0), [dict(kind="test", exit=None, uncertain=True)])  # "2" ends the body
+
+    def test_pipe_ampersand_bullet(self):  # review 5 N1: |& is read as a pipe then a background &
+        self.assertEqual(trial_scan.gate_runs("false && echo |& npm test", 1), [{"kind": "test", "exit": 1}])
+        self.assertEqual(trial_scan.gate_runs("npm test |& tail -3", 0), [{"kind": "test", "exit": None}])
+
+    def test_command_slips_heredoc_bullet(self):  # review 5 N3: the rule is a text match, a quoted << still counts
+        self.assertEqual(trial_scan.command_slips("echo '<<EOF'"), ["heredoc"])
+        self.assertEqual(trial_scan.command_slips('echo "<<EOF"'), ["heredoc"])
+        self.assertEqual(trial_scan.command_slips('echo "git push"'), ["git_push"])  # every rule is a text match
+        self.assertEqual(trial_scan.command_slips("echo $((1<<3))"), [])
 
 
 class ClaudeScanTests(unittest.TestCase):
@@ -508,7 +688,7 @@ class ClaudeScanTests(unittest.TestCase):
         out = self.scan(use("a", "Bash", command="npm test && npm run lint"), result("a", "Exit code 1\nx", True),
                         use("b", "Bash", command="npm test"),
                         result("b", "PreToolUse:Bash hook error: guard denied this tool call: x", error=True))
-        self.assertEqual(trial_scan.gate_totals(out["gate_runs"]), {"total": 1, "uncertain": 1, "denied": 1, "unattributed": 1})
+        self.assertEqual(trial_scan.gate_totals(out["gate_runs"]), {"total": 1, "uncertain": 1, "denied": 1, "unattributed": 1, "parse_failed": 0})
 
     def test_a_malformed_line_makes_the_scan_incomplete_not_ok(self):
         out = self.scan("not json\n", use("a", "Bash", command="git push"))

@@ -20,8 +20,12 @@ Fixed waits (`write_slips`), only in a test file of a known language (py .py .py
   token and is never flagged, whatever the whitespace.
 - NOT flagged, though they wait: a wait that does not start its statement (`await new Promise(r => setTimeout(r, 50))`,
   `x = time.sleep(1)`, `if x: time.sleep(1)`, `foo(sleep(1), 2)`, `cb = () => sleep(1)`, `{ sleep(1) }`), `waitForTimeout(`,
-  `wait_for_timeout(`, `window.setTimeout(`, `x.sleep(`, and `time.sleep` in js or `setTimeout` in py. A JS method written `sleep(ms) {` is a definition and is not flagged;
-  a call of a user helper named `sleep(` IS flagged (names decide, types do not; the other direction).
+  `wait_for_timeout(`, `window.setTimeout(`, `x.sleep(`, and `time.sleep` in js or `setTimeout` in py. A js `sleep(` is a
+  declaration and is not flagged when its `)` is followed by `{` (same line, or the next line: Allman style), or when it
+  stands directly in an `interface` or `class` body (`sleep(ms: number);`, `sleep(ms: number): Promise<void>;`, a bare
+  `sleep(ms)`). A body counts as one when the text from the last `;`, `{` or `}` to its `{` has the word `interface` or
+  `class`. A real call followed by a `{` block on the next line is not flagged either (the other direction), and a call
+  of a user helper named `sleep(` IS flagged (names decide, types do not; the other direction).
 - `timer-ok` clears a wait only when it sits in a comment on the line the wait starts on.
 - Comments, string text and JavaScript regular-expression literals are blanked; interpolations (`f"{...}"`, `${...}`,
   `$(...)`, backticks in shell strings) are code, so a statement start inside one counts. A wait inside a string another
@@ -30,9 +34,10 @@ Fixed waits (`write_slips`), only in a test file of a known language (py .py .py
   end on its line cannot be read: the whole line is left unflagged (`UNSURE`). JSX text is not parsed.
 - A shell wait is `sleep N` (a digit) where a command starts: at the start of a line, after `; & | ( { ` ` ` or
   `then`/`do`/`else`/`elif`. `sleep $n`, `env X=1 sleep 2`, `timeout 5 sleep 2` and case patterns are not flagged.
-- Shell heredocs: a body is data, from the line after its `<<WORD` opener to the line that is WORD (to the end of the text
-  when there is none, as the shell does). `<<` in quotes, in `<<<`, or in `$((...))` is not an opener. `<<` in a `(( ))`
-  command or `[[ ]]` IS read as an opener, which drops the rest of that text (not counted).
+- Shell heredocs: a body is data, from the line after its `<<WORD` opener to the line that is WORD. In a written shell
+  file, a body with no WORD line runs to the end of the text, as the shell reads it. (In a Bash command that is a
+  `parse_failed` call; see the gate bullets.) `<<` in quotes, in `<<<`, or in `$((...))` is not an opener. `<<` in a `(( ))`
+  command or `[[ ]]` IS read as an opener, which drops the text up to a line equal to the word after it (not counted).
 - Nesting deeper than MAX_NESTING levels is read as written: a shell `sleep N` after `(` or `;` there is still flagged (the
   other direction), a py/js call is not (it no longer starts its statement). `UNSURE` only ever clears a line.
 
@@ -42,17 +47,39 @@ Gate runs (`gate_runs`, `gate_kinds`), over one Bash call:
   `&&` / `||` / `;` / newline chain, after env assignments, `env`, `npx`, `timeout N`, `time`, `command`. A gate that appears
   only inside a heredoc body, a `$(...)` or backtick or `<(...)` body, arithmetic or a quoted string (`bash -c "npm test"`,
   `echo "$(npm test)"`) is not found, so it is not counted. `xargs`, `find -exec`, `sudo`, `!` and aliases hide a gate too.
+- A stage headed by `(`, `{`, `then`, `do`, `else` or `elif` is not read, so its gate is NOT FOUND (neither counted nor
+  `uncertain`): `(npm test)`, `{ npm test; }`, `cd a && (npm test)`, `x && { npm test; }`, `if x; then npm test; fi`,
+  `for f in a; do npm test; done`. A gate that heads its own stage inside such a body is found and is `uncertain`: on its own
+  line (`for f in a; do` newline `npm test` newline `done`), after `;` or `&&` inside a group (`(cd x && npm test)`).
 - `exit` is the call's exit status for one gate only: the last command the call ran, i.e. the last stage of the last unit,
   when that unit is certain to have run, is not a background job (`&`), and, as one stage of a pipe, the text never says
   `pipefail`. Every other gate has `exit: None`. The status is never used to say which gate failed, so a call that failed
   after `npm test && npm run lint` says nothing about either. The call's status is taken as the gate's even when the shell
   failed around it (a redirection like `npm test > /no/dir/f`).
-- `uncertain: True` marks a gate that may not have run, and it has `exit: None`: it follows `&&` or `||` and the call did
-  not pass as a plain `&&` list, or it sits in a call that has an `if`/`for`/`while`/`case`, a function, a `( )` or `{ }`
-  group, or after `exit`/`return`, or after `set -e` in a call that failed. `trap`, `bash -e -c`, and a shell started
-  with errexit are not seen.
-- `gate_totals` counts `total` (known to have run), `uncertain`, `denied` and `unattributed` (gates in `total` that have no
-  exit). A call the guard refused has all its gates `denied`.
+- `uncertain: True` marks a gate that was found but may not have run, and it has `exit: None`. It is set when any of these
+  holds, and not otherwise: (1) the gate follows `&&` or `||`, unless the call passed (exit 0) and the gate is in the last
+  `;`-list of the call and every link after that list's first command is `&&`; (2) the call has a compound command anywhere
+  (a command that starts with `(`, `{`, `if`, `for`, `while`, `until`, `case`, `select`, `function`, `then`, `do`, `else`,
+  `elif`, `fi`, `done`, `esac`, or is `name()`): then every gate found in the call is uncertain; (3) the gate follows `exit`
+  or `return`; (4) the gate follows `set -e` (or `-o errexit`) in a call that did not pass (a non-zero or unknown status).
+  `trap`, `bash -e -c`, `set +e` and a shell started with errexit are not seen.
+- `gate_totals` counts `total` (known to have run), `uncertain`, `denied`, `unattributed` (gates in `total` that have no
+  exit) and `parse_failed`. A call the guard refused has all its gates `denied`.
+- `parse_failed`: a call whose text ends inside a quote, a `$(...)` / backtick / `<(...)` group or a heredoc with no end line,
+  or nests deeper than MAX_NESTING, is not read. It is one entry `{"kind": None, "exit": None, "parse_failed": True}` and no
+  gate (`gate_kinds` gives []), counted in `gate_totals` as `parse_failed` and not in `total`. A `total` above a
+  `parse_failed` of 0 is exact for what was read; with `parse_failed` above 0 it is a lower bound, and the report says so.
+  This is how a heredoc is read anywhere in a call (top level, `"$(...)"`, `$(...)`, backticks): an unquoted `<<WORD` opener
+  makes everything up to the WORD line data, before quotes are followed again, so an apostrophe in a commit message heredoc
+  opens no quote. A call that is wrong shell is parse_failed too (`git commit -m 'don't'`).
+- A `#` comment inside `$(...)` is not recognised (outside one it is): an apostrophe in it opens a quote and the call is
+  parse_failed. `<<` in a `(( ))` command or `[[ ]]` is read as an opener (see the heredoc bullet above).
+- `|&` is read as `|` and a background `&`: a gate left of it is a background job (no exit) and a gate right of it is read as
+  a separate command that certainly ran (the other direction: a gate that may not have run is counted).
+
+Commands (`command_slips`): every rule is a text match over the command with comments and `$((...))` removed, so the words of
+a rule inside a quote or a message count: `echo '<<EOF'` is a `heredoc` slip and `echo "git push"` is a `git_push` slip (the
+other direction).
 """
 
 import bisect
@@ -130,6 +157,7 @@ _COMPOUND = re.compile(r"\s*(?:[({]|(?:if|for|while|until|case|select|function|t
 _HALTS = re.compile(r"\s*(?:exit|return)\b")  # nothing after it is known to run
 _ERREXIT = re.compile(r"\s*set\s+(?:-\w+\s+)*-(?:\w*e|o\s+errexit)")  # a later failure may end the shell
 _PIPEFAIL = re.compile(r"\bpipefail\b")
+PARSE_FAILED = {"kind": None, "exit": None, "parse_failed": True}  # the one entry gate_runs gives a call it could not read
 ARITHMETIC = re.compile(r"\$\(\(.*?\)\)", re.S)
 _EXIT = re.compile(r"^\s*Exit code[: ]+(-?\d+)")
 
@@ -185,70 +213,92 @@ def _heredoc_at(text, i):
 
 
 def _skip_heredoc_bodies(text, i, pending):
-    """Index after the bodies of the heredocs in `pending` [(delimiter, strip_tabs)], whose first body line starts at
-    text[i]. A body ends after the line that is its delimiter; with no such line the shell reads to the end of the text."""
+    """(index after the bodies, closed) of the heredocs in `pending` [(delimiter, strip_tabs)], whose first body line starts
+    at text[i]. A body ends after the line that is its delimiter. `closed` is False when a body has no such line: the shell
+    reads to the end of the text then, and the caller decides what that means."""
     n = len(text)
+    closed = True
     for delimiter, tabs in pending:
-        while i < n:
+        found = False
+        while i < n and not found:
             j = text.find("\n", i)
             j = n if j < 0 else j
             line = text[i:j]
             i = min(j + 1, n)
-            if (line.lstrip("\t") if tabs else line) == delimiter:
-                break
-    return i
+            found = (line.lstrip("\t") if tabs else line) == delimiter
+        closed = closed and found
+    return i, closed
 
 
 def _group_end(text, i, level=0):
-    """(index after, closed) for the command substitution (`$(...)`, `<(...)`, `>(...)`) or backtick pair that starts at
-    text[i]. Quotes and nested groups inside it are followed. Past MAX_NESTING levels the rest of the text is the group."""
+    """(index after, closed) for the command substitution (`$(...)`, `<(...)`, `>(...)`), arithmetic (`$((...))`) or backtick
+    pair that starts at text[i]. Quotes, nested groups and heredocs inside it are followed: the body of an unquoted
+    `<<WORD` heredoc is data up to its end line, so an apostrophe in it opens no quote. `closed` is False when the text
+    ends first (an open quote, group or heredoc inside it), and past MAX_NESTING levels, where the rest of the text is the group."""
     n = len(text)
     if level >= MAX_NESTING:
         return n, False
-    if text[i] == "`":
-        j = i + 1
-        while j < n:
-            if text[j] == "\\":
-                j += 2
-            elif text[j] == "`":
-                return j + 1, True
-            else:
-                j += 1
-        return n, False
-    depth, j = 1, i + 2
+    backtick = text[i] == "`"
+    arithmetic = text.startswith("$((", i)  # its `<<` is a shift, not a heredoc
+    depth, j, pending, quote = 1, i + (1 if backtick else 2), [], None
     while j < n:
         c = text[j]
-        if c == "\\":
+        if backtick and c == "`":  # a backtick ends the group wherever it stands, even inside a quote
+            return j + 1, quote is None and not pending
+        if c == "\\" and quote != "'":
             j += 2
-        elif c == "'":
+        elif backtick and quote:
+            quote = None if c == quote else quote
+            j += 1
+        elif backtick and c in "'\"":
+            quote = c
+            j += 1
+        elif not backtick and c == "'":
             k = text.find("'", j + 1)
-            j = n if k < 0 else k + 1
-        elif c == '"':
-            j = _dq_end(text, j + 1, level + 1)
-        elif c == "`" or text.startswith("$(", j):
-            j = _group_end(text, j, level + 1)[0]
+            if k < 0:
+                return n, False
+            j = k + 1
+        elif not backtick and c == '"':
+            j, closed = _dq_end(text, j + 1, level + 1)
+            if not closed:
+                return n, False
+        elif not backtick and (c == "`" or text.startswith("$(", j)):
+            j, closed = _group_end(text, j, level + 1)
+            if not closed:
+                return n, False
+        elif c == "\n" and pending:
+            j, closed = _skip_heredoc_bodies(text, j + 1, pending)
+            pending = []
+            if not closed:
+                return n, False
+        elif c == "<" and not arithmetic and _heredoc_at(text, j):
+            delimiter, tabs, j = _heredoc_at(text, j)
+            pending.append((delimiter, tabs))
         else:
-            depth += (c == "(") - (c == ")")
+            depth += (c == "(") - (c == ")") if not backtick else 0
             j += 1
             if depth == 0:
-                return j, True
+                return j, not pending
     return n, False
 
 
 def _dq_end(text, i, level):
-    """Index after the double quote that closes the string whose body starts at text[i]; groups in it are followed."""
+    """(index after, closed) for the double quote whose body starts at text[i]; groups in it are followed. A heredoc marker in
+    a double quote is text, not an opener."""
     n = len(text)
     while i < n:
         c = text[i]
         if c == "\\":
             i += 2
         elif c == '"':
-            return i + 1
+            return i + 1, True
         elif c == "`" or text.startswith("$(", i):
-            i = _group_end(text, i, level)[0]
+            i, closed = _group_end(text, i, level)
+            if not closed:
+                return n, False
         else:
             i += 1
-    return n
+    return n, False
 
 
 def _units(command):
@@ -257,9 +307,10 @@ def _units(command):
     lone `&` ends. Quotes and backslashes hide operators, and so do command substitutions (`$(a && b)`, backticks,
     `<(...)`) and arithmetic (`$((1<<3))`); `>&`, `&>` redirects are not a connector. Comments are dropped. A heredoc body
     (from the line after its opener to its end line) is skipped: it is data, and `<<` inside quotes is not an opener.
-    Empty units are dropped."""
+    Empty units are dropped. Returns (units, failed): `failed` is True when the text ends inside a quote, a group or a heredoc
+    (or nests deeper than MAX_NESTING), so what the units show is not the whole call."""
     units, stages, buf, op = [], [], [], None
-    quote, pending = None, []
+    quote, pending, failed = None, [], False
     i, n = 0, len(command)
 
     def end_stage():
@@ -287,7 +338,8 @@ def _units(command):
                 i += 2
                 continue
             if c == "`" or command.startswith("$(", i):
-                end = _group_end(command, i)[0]
+                end, closed = _group_end(command, i)
+                failed = failed or not closed
                 buf.append(command[i:end])
                 i = end
                 continue
@@ -305,7 +357,8 @@ def _units(command):
             i = n if j < 0 else j
             continue
         elif _starts_group(command, i) or command.startswith("$((", i):
-            end = _group_end(command, i)[0]
+            end, closed = _group_end(command, i)
+            failed = failed or not closed
             buf.append(command[i:end])
             i = end
             continue
@@ -323,7 +376,8 @@ def _units(command):
         elif c == "\n":
             end_unit(";")
             if pending:
-                i = _skip_heredoc_bodies(command, i + 1, pending)
+                i, closed = _skip_heredoc_bodies(command, i + 1, pending)
+                failed = failed or not closed
                 pending = []
                 continue
         elif c == ";" or (c == "&" and not (buf and buf[-1] in "<>") and command[i + 1:i + 2] != ">"):
@@ -332,7 +386,7 @@ def _units(command):
             buf.append(c)
         i += 1
     end_unit(";")
-    return units
+    return units, failed or quote is not None or bool(pending)
 
 
 def _starts_group(text, i):
@@ -389,7 +443,8 @@ def gate_kinds(command):
     message or an echo that mentions pytest is not a gate run. It does not say which ones ran; `gate_runs` does."""
     if not isinstance(command, str):
         return []
-    return [kind for _, _, kind in _gates_in(_units(command))]
+    units, failed = _units(command)
+    return [] if failed else [kind for _, _, kind in _gates_in(units)]
 
 
 def gate_runs(command, exit_code=None):
@@ -403,10 +458,13 @@ def gate_runs(command, exit_code=None):
     passed and the last `;`-list is only `&&` links; otherwise (`a && gate` that failed, `a || gate`, anything inside an
     `if`/loop/function/group, anything after `exit`, `return`, or `set -e` that may have stopped) it carries
     `uncertain: True`. A gate that appears only inside a heredoc, a command substitution, arithmetic or a quoted string is
-    not found at all."""
+    not found at all. A call the tokenizer cannot close (an open quote, group or heredoc) is one entry `PARSE_FAILED` and no
+    gate, so the loss shows in `gate_totals` instead of the call reading as empty."""
     if not isinstance(command, str):
         return []
-    units = _units(command)
+    units, failed = _units(command)
+    if failed:
+        return [dict(PARSE_FAILED)]
     n = len(units)
     last_list = max(i for i in range(n) if i == 0 or units[i][0] == ";") if n else 0
     and_tail = all(units[i][0] == "&&" for i in range(last_list + 1, n))
@@ -438,14 +496,18 @@ def gate_runs(command, exit_code=None):
 
 
 def gate_totals(runs):
-    """{"total", "uncertain", "denied", "unattributed"} over gate_runs entries. `total` counts runs known to have happened;
-    `unattributed` is how many of those have no exit status (the call's status was not theirs to claim). `uncertain` runs
-    may not have happened, `denied` ones were refused."""
+    """{"total", "uncertain", "denied", "unattributed", "parse_failed"} over gate_runs entries. `total` counts runs known to
+    have happened; `unattributed` is how many of those have no exit status (the call's status was not theirs to claim).
+    `uncertain` runs may not have happened, `denied` ones were refused. `parse_failed` counts calls the tokenizer could not
+    close: each is one entry, not a gate, so `total` is a lower bound when it is above 0."""
     runs = runs or []
+    failed = sum(1 for r in runs if r.get("parse_failed"))
+    runs = [r for r in runs if not r.get("parse_failed")]
     denied = sum(1 for r in runs if r.get("denied"))
     uncertain = sum(1 for r in runs if r.get("uncertain") and not r.get("denied"))
     unattributed = sum(1 for r in runs if r.get("exit") is None and not r.get("uncertain") and not r.get("denied"))
-    return {"total": len(runs) - denied - uncertain, "uncertain": uncertain, "denied": denied, "unattributed": unattributed}
+    return {"total": len(runs) - denied - uncertain, "uncertain": uncertain, "denied": denied, "unattributed": unattributed,
+            "parse_failed": failed}
 
 
 def _source_lang(path):
@@ -509,7 +571,7 @@ def _code_from(text, i, lang, close, out, marks, level=0):
             return i + 1
         if lang == "sh":
             if c == "\n" and pending:  # the bodies are data; their lines stay, empty
-                j = _skip_heredoc_bodies(text, i + 1, pending)
+                j = _skip_heredoc_bodies(text, i + 1, pending)[0]  # no end line: the body runs to the end, as the shell reads it
                 out.append("\n" * text.count("\n", i, j))
                 i, pending = j, []
                 continue
@@ -669,16 +731,49 @@ def _paren_pairs(code):
     return pairs
 
 
-def _call_ends_statement(code, pairs, opened):
+def _call_ends_statement(code, pairs, opened, lang="py"):
     """True when the "(" at code[opened] closes and what follows its ")" ends the statement: the end of the line or text, `;`,
-    or `.` (a chained call)."""
+    or `.` (a chained call). In js a `{` on the next line after the `)` is a method body (Allman style), so the call is a
+    declaration and does not end a statement."""
     i = pairs.get(opened)
     if i is None:
         return False
     i += 1
     while i < len(code) and code[i] in " \t":
         i += 1
+    if lang == "js" and i < len(code) and code[i] == "\n":
+        k = i
+        while k < len(code) and code[k].isspace():
+            k += 1
+        if k < len(code) and code[k] == "{":
+            return False
     return i >= len(code) or code[i] in ";.\n"
+
+
+_MEMBER_HEADER = re.compile(r"\b(?:interface|class)\b")
+
+
+def _member_bodies(code):
+    """([index of each `{` or `}` in code], [True when the innermost braces after it are an interface or class body]). A body
+    is a class or interface one when the text between the last `;`, `{` or `}` and its `{` has the word interface or class."""
+    places, flags, stack, start = [], [], [], 0
+    for m in re.finditer(r"[{};]", code):
+        if m.group() == "{":
+            stack.append(bool(_MEMBER_HEADER.search(code, start, m.start())))
+        elif m.group() == "}" and stack:
+            stack.pop()
+        if m.group() != ";":
+            places.append(m.start())
+            flags.append(bool(stack) and stack[-1])
+        start = m.end()
+    return places, flags
+
+
+def _in_member_body(bodies, at):
+    """True when code[at] stands directly in an interface or class body, where `sleep(ms: number);` declares a member."""
+    places, flags = bodies
+    k = bisect.bisect_right(places, at) - 1
+    return k >= 0 and flags[k]
 
 
 def write_slips(path, text):
@@ -690,7 +785,7 @@ def write_slips(path, text):
     if lang is None:
         return []
     code, marked = _scan_source(path, text)
-    pattern, continued, offset, pairs = FIXED_WAIT[lang], False, 0, None
+    pattern, continued, offset, pairs, bodies = FIXED_WAIT[lang], False, 0, None, None
     for n, line in enumerate(code.split("\n")):
         # a line after a trailing backslash continues a command or statement: it does not start one
         prefix = "\\ " if continued else ""
@@ -700,7 +795,12 @@ def write_slips(path, text):
                 if lang == "sh":
                     return ["fixed_wait"]
                 pairs = _paren_pairs(code) if pairs is None else pairs
-                if _call_ends_statement(code, pairs, offset + m.end() - len(prefix) - 1):
+                opened = offset + m.end() - len(prefix) - 1
+                if _call_ends_statement(code, pairs, opened, lang):
+                    if lang == "js":  # `sleep(ms: number);` directly in an interface or class body declares a member
+                        bodies = _member_bodies(code) if bodies is None else bodies
+                        if _in_member_body(bodies, opened):
+                            continue
                     return ["fixed_wait"]
         offset += len(line) + 1
     return []

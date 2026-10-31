@@ -203,7 +203,7 @@ class SlipFieldTests(unittest.TestCase):
         self.assertEqual(r["rule_slips"], {"complete": True, "total": 3,
                                            "by_rule": {"commit_subject": 1, "commit_trailer": 1, "git_push": 1}})
         self.assertEqual(r["gate_runs"], {"complete": True, "total": 1, "uncertain": 0, "denied": 0,
-                                          "unattributed": 1, "runs": [{"kind": "test", "exit": None}]})
+                                          "unattributed": 1, "parse_failed": 0, "runs": [{"kind": "test", "exit": None}]})
 
     def test_a_transcript_with_a_skipped_line_is_incomplete_for_slips_and_gates(self):
         fx = Fixture(self)
@@ -218,6 +218,18 @@ class SlipFieldTests(unittest.TestCase):
         self.assertEqual((r["gate_runs"]["complete"], r["gate_runs"]["total"], r["gate_runs"]["uncertain"], r["gate_runs"]["unattributed"]),
                          (False, 1, 1, 1))
         self.assertEqual((r["transcript"]["status"], r["transcript"]["bad_lines"]), ("incomplete", 1))
+
+    def test_an_unreadable_bash_call_is_counted_in_the_record_not_dropped(self):  # review 5: fail visible
+        fx = Fixture(self)
+        d = fx.author([])
+        transcript = Path(fx.tmp.name) / "t.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "git commit -m 'don't' && npm test"}},
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "npm run lint"}}]}}) + "\n", encoding="utf-8")
+        (d / "transcript-path").write_text(str(transcript), encoding="utf-8")
+        gates = fx.build()["gate_runs"]
+        self.assertEqual((gates["total"], gates["parse_failed"], gates["complete"]), (1, 1, True))
+        self.assertEqual(gates["runs"][0], {"kind": None, "exit": None, "parse_failed": True})
 
     def test_no_transcript_means_unknown_slips(self):
         fx = Fixture(self)

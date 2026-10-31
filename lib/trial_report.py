@@ -11,6 +11,8 @@ Counting rules, all stated in the output where a reader needs them:
   says how many records were superseded. A record with no pair_id is its own attempt and is never paired.
 - Medians skip unknown values. `rule_slips` and `gate_runs` skip records whose transcript was not fully scanned
   (`complete` false: no transcript, an unpinned pi transcript, or skipped lines).
+  `gate_runs` also skips a record with `parse_failed` calls (Bash calls the scanner could not read: its total is a lower
+  bound); the count of those calls per arm is printed and is in the JSON as `gate_parse_failed`.
 - Tokens are input + output; cache tokens are left out.
 """
 
@@ -94,9 +96,15 @@ def _slips(record):
     return _number(slips.get("total")) if isinstance(slips, dict) and slips.get("complete") else None
 
 
+def _parse_failed(record):
+    gates = record.get("gate_runs")
+    return _number(gates.get("parse_failed")) or 0 if isinstance(gates, dict) else 0  # records from before the key have none
+
+
 def _gates(record):
     gates = record.get("gate_runs")
-    return _number(gates.get("total")) if isinstance(gates, dict) and gates.get("complete") else None
+    ok = isinstance(gates, dict) and gates.get("complete") and not _parse_failed(record)
+    return _number(gates.get("total")) if ok else None
 
 
 def _docs(record):
@@ -134,7 +142,7 @@ def summarize(records, malformed=0):
     """The report as data. Every figure is over the effective records: the last one per (pair_id, arm)."""
     records, superseded = _effective(records)
     out = {"records": len(records), "superseded": superseded, "malformed": malformed, "noise_below": NOISE_BELOW,
-           "by_arm": {}, "cells": [], "categories": {}, "medians": {}, "paired": _paired(_latest(records))}
+           "by_arm": {}, "cells": [], "categories": {}, "medians": {}, "gate_parse_failed": {}, "paired": _paired(_latest(records))}
     for arm in ARMS:
         mine = [r for r in records if r["arm"] == arm]
         out["by_arm"][arm] = _cell(mine)
@@ -146,6 +154,7 @@ def summarize(records, malformed=0):
         ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_CATEGORIES]
         out["categories"][arm] = [{"family": name, "count": count} for name, count in ranked]
         out["medians"][arm] = {key: _median([fn(r) for r in mine]) for key, fn in MEDIANS}
+        out["gate_parse_failed"][arm] = sum(_parse_failed(r) for r in mine)
     keys = sorted({(r.get("role") or UNKNOWN, r.get("size") or UNKNOWN) for r in records})
     for role, size in keys:
         cell = {"role": role, "size": size}
@@ -192,6 +201,9 @@ def render(summary, source=None):
     for key, _ in MEDIANS:
         cells = ["{} ({})".format(_num(summary["medians"][arm][key]["median"]), summary["medians"][arm][key]["n"]) for arm in ARMS]
         lines.append("  {:<14} {:<14} {:<14}".format(key, *cells))
+    unread = {arm: summary["gate_parse_failed"].get(arm, 0) for arm in ARMS}
+    lines.append("  Bash calls not read (parse_failed): " + ", ".join("{} {}".format(arm, n) for arm, n in unread.items())
+                 + ("; their gate runs are a lower bound, so those records skip the gate_runs median" if any(unread.values()) else ""))
     paired = summary["paired"]
     lines += ["", "Paired ({} pair(s) with a first review on both arms):".format(paired["pairs"])]
     if paired["pairs"]:

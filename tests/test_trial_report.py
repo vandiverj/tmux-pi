@@ -81,6 +81,23 @@ class CategoryAndMedianTests(unittest.TestCase):
         self.assertEqual(med["gate_runs"], {"n": 2, "median": 4})  # the incomplete scan is not counted
         self.assertEqual(med["docs_calls"], {"n": 2, "median": 2})
 
+    def test_unread_bash_calls_are_counted_per_arm_and_their_records_skip_the_gate_median(self):  # review 5: fail visible
+        rows = [rec("1", "qwen", "approved", gate_runs={"complete": True, "total": 3, "parse_failed": 0}),
+                rec("2", "qwen", "approved", gate_runs={"complete": True, "total": 9, "parse_failed": 2}),
+                rec("3", "normal", "approved", gate_runs={"complete": True, "total": 4}),  # a record from before the key
+                rec("4", "normal", "approved", gate_runs={"complete": True, "total": 6, "parse_failed": 1})]
+        out = trial_report.summarize(rows)
+        self.assertEqual(out["gate_parse_failed"], {"qwen": 2, "normal": 1})
+        self.assertEqual(out["medians"]["qwen"]["gate_runs"], {"n": 1, "median": 3})
+        self.assertEqual(out["medians"]["normal"]["gate_runs"], {"n": 1, "median": 4})
+        text = trial_report.render(out)
+        self.assertIn("Bash calls not read (parse_failed): qwen 2, normal 1", text)
+        self.assertIn("lower bound", text)
+        clean = trial_report.render(trial_report.summarize([rec("1", "qwen", "approved", gate_runs={"complete": True, "total": 1})]))
+        self.assertIn("Bash calls not read (parse_failed): qwen 0, normal 0", clean)
+        self.assertNotIn("lower bound", clean)
+        self.assertEqual(json.loads(json.dumps(out))["gate_parse_failed"], {"qwen": 2, "normal": 1})
+
     def test_a_median_with_nothing_known_is_none(self):
         med = trial_report.summarize([rec("1", "qwen", "approved")])["medians"]["normal"]
         self.assertEqual(med["wall_time_s"], {"n": 0, "median": None})

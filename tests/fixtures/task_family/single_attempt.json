@@ -1,0 +1,46 @@
+{
+ "tasks": {
+  "coder-a": {
+   "meta": {
+    "role": "coder",
+    "worker": "claude",
+    "model": "claude-sonnet-5-5",
+    "lane": "L",
+    "lane_step": "s1",
+    "created": "2026-10-01T10:00:00Z",
+    "review": "review-a"
+   },
+   "state": {
+    "updated": "2026-10-01T10:05:00Z"
+   }
+  },
+  "review-a": {
+   "meta": {
+    "role": "code-reviewer",
+    "created": "2026-10-01T10:06:00Z"
+   },
+   "state": {
+    "updated": "2026-10-01T10:08:00Z"
+   },
+   "files": {
+    "result.md": "APPROVED\nlooks right\nCoverage\nreviewed the changed files."
+   }
+  }
+ },
+ "expect": [
+  {
+   "family_id": "fam-coder-a",
+   "attempts": [
+    "coder-a"
+   ],
+   "reviews": [
+    "review-a"
+   ],
+   "first_review_verdict": "APPROVED",
+   "review_rounds": 1,
+   "accepted": "coder-a",
+   "status": "accepted",
+   "wall_seconds": 480
+  }
+ ]
+}

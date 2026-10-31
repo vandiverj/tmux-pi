@@ -1,0 +1,56 @@
+{
+ "tasks": {
+  "researcher-a": {
+   "meta": {
+    "role": "researcher",
+    "worker": "claude",
+    "model": "claude-sonnet-5-5",
+    "lane": "L",
+    "lane_step": "s1",
+    "created": "2026-10-01T09:00:00Z"
+   },
+   "state": {
+    "updated": "2026-10-01T09:10:00Z"
+   }
+  },
+  "coder-a": {
+   "meta": {
+    "role": "coder",
+    "worker": "claude",
+    "model": "claude-sonnet-5-5",
+    "lane": "L",
+    "lane_step": "s1",
+    "created": "2026-10-01T10:00:00Z"
+   },
+   "state": {
+    "updated": "2026-10-01T10:05:00Z"
+   }
+  }
+ },
+ "expect": [
+  {
+   "family_id": "fam-researcher-a",
+   "attempts": [
+    "researcher-a"
+   ],
+   "reviews": [],
+   "first_review_verdict": null,
+   "review_rounds": 0,
+   "accepted": null,
+   "status": "unreviewed",
+   "wall_seconds": 600
+  },
+  {
+   "family_id": "fam-coder-a",
+   "attempts": [
+    "coder-a"
+   ],
+   "reviews": [],
+   "first_review_verdict": null,
+   "review_rounds": 0,
+   "accepted": null,
+   "status": "unreviewed",
+   "wall_seconds": 300
+  }
+ ]
+}

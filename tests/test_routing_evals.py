@@ -250,6 +250,40 @@ class AppendTests(unittest.TestCase):
         self.assertEqual((len(rows), bad), (160, 0))
         self.assertEqual(oct((self.dir / "t.jsonl").stat().st_mode & 0o777), "0o600")
 
+    def test_stalled_append_to_one_log_does_not_block_another(self):
+        import fcntl
+        from unittest import mock
+        other = Path(self.tmp.name) / "other"
+        self.dir.mkdir(parents=True)
+        held = os.open(self.dir / "t.jsonl.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(os.close, held)
+        stalled, release = threading.Event(), threading.Event()
+
+        def fake_sleep(_):
+            stalled.set()
+            release.wait(10)
+
+        errors = []
+
+        def stuck():
+            try:
+                routing_evals.append_jsonl(self.dir, "t.jsonl", {"a": 1})
+            except routing_evals.EvalLogError as exc:
+                errors.append(exc)
+
+        with mock.patch.object(routing_evals, "LOCK_SECONDS", 0.2), \
+                mock.patch.object(routing_evals.time, "sleep", fake_sleep):
+            thread = threading.Thread(target=stuck)
+            thread.start()
+            try:
+                self.assertTrue(stalled.wait(10))
+                routing_evals.append_jsonl(other, "t.jsonl", {"b": 2})
+            finally:
+                release.set()
+                thread.join()
+        self.assertEqual(routing_evals.read_jsonl(other / "t.jsonl")[0], [{"b": 2}])
+
     def test_failures_raise_eval_log_error(self):
         target = Path(self.tmp.name) / "elsewhere"
         target.mkdir()
@@ -493,6 +527,51 @@ class ExportTests(unittest.TestCase):
         self.select(tools=0.9)
         rows, _ = routing_evals.export_rows(self.evals, self.state)
         self.assertTrue(all(r["tasks"] == [] for r in rows))
+
+    def model_selection(self, task=TASK, **over):
+        """A record shaped like lib/model_router.py writes today (flat; no request/recommendation blocks)."""
+        sid = routing_evals.new_selection_id()
+        rec = {"schema": "tmux-pi-model-selection:v1", "selection_id": sid, "created": "2026-10-01T09:00:00Z", "kind": "dispatch",
+               "role": "coder", "task_sha256": routing_evals.sha256_text(task), "card_sha256": "c" * 64, "catalog_version": 3,
+               "catalog_sha": "d" * 64, "prompt_sha256": None, "constraints": {"local_only": False, "approve_effort": False},
+               "source": "router", "level": "standard", "effort": "medium", "effort_abstract": "medium",
+               "decided_by": "claude-haiku-5-5", "router": "r1", "reason": "x", "review": "optional", "router_review": None,
+               "router_level": "standard", "resolved": {"worker": "claude", "model": "claude-sonnet-5-5", "provider": "anthropic",
+                                                         "effort": "medium"},
+               "substitution": [], "degraded": None, "attempts": [], "confirmation": None, "config_error": None, "seconds": 0.4}
+        rec.update(over)
+        return rec
+
+    def test_export_reads_model_selections_and_joins_by_route_info_selection_id(self):
+        rec = self.model_selection()
+        routing_evals.append_jsonl(self.evals, "model-selections.jsonl", rec)
+        self.task("auto-m", {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium",
+                             "route_info": {"selection_id": rec["selection_id"]}}, {"state": "waiting"})
+        rows, summary = routing_evals.export_rows(self.evals, self.state)
+        self.assertEqual((summary["selections"], summary["linked"]), (1, 1))
+        row = rows[0]
+        self.assertEqual((row["selection_id"], row["source_file"], row["link"]),
+                         (rec["selection_id"], "model-selections.jsonl", "selection_id"))
+        self.assertEqual(row["recommendation"]["final"],
+                         {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"})
+        self.assertTrue(row["actual"]["matches_recommendation"])
+        self.assertEqual(row["request"]["task_sha256"], rec["task_sha256"])
+
+    def test_export_still_reads_the_old_routing_selections_and_marks_each_row(self):
+        _, old = self.select(tools=0.9)
+        new = self.model_selection(task="another task")
+        routing_evals.append_jsonl(self.evals, "model-selections.jsonl", new)
+        rows, summary = routing_evals.export_rows(self.evals, self.state)
+        self.assertEqual(summary["selections"], 2)
+        self.assertEqual({r["selection_id"]: r["source_file"] for r in rows},
+                         {old["selection_id"]: "routing-selections.jsonl", new["selection_id"]: "model-selections.jsonl"})
+
+    def test_export_counts_malformed_lines_of_both_files(self):
+        self.evals.mkdir(parents=True)
+        (self.evals / "model-selections.jsonl").write_text("{torn\n")
+        (self.evals / "routing-selections.jsonl").write_text("[1]\n")
+        _, summary = routing_evals.export_rows(self.evals, self.state)
+        self.assertEqual((summary["selections"], summary["malformed_selections"]), (0, 2))
 
     def test_outcome_validation(self):
         good = dict(selection_id="sel-" + "a" * 32, rating="good")

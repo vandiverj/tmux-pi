@@ -1,0 +1,63 @@
+{
+ "tasks": {
+  "coder-b": {
+   "meta": {
+    "role": "coder",
+    "worker": "claude",
+    "model": "claude-sonnet-5-5",
+    "lane": "L",
+    "lane_step": "s1",
+    "created": "2026-10-01T10:10:00Z",
+    "parent": "coder-gone",
+    "review": "review-b"
+   },
+   "state": {
+    "updated": "2026-10-01T10:20:00Z"
+   }
+  },
+  "coder-c": {
+   "meta": {
+    "role": "coder",
+    "worker": "claude",
+    "model": "claude-sonnet-5-5",
+    "lane": "L",
+    "lane_step": "s1",
+    "created": "2026-10-01T10:30:00Z",
+    "parent": "coder-gone"
+   },
+   "state": {
+    "updated": "2026-10-01T10:40:00Z"
+   }
+  },
+  "review-b": {
+   "meta": {
+    "role": "code-reviewer",
+    "created": "2026-10-01T10:21:00Z"
+   },
+   "state": {
+    "updated": "2026-10-01T10:25:00Z"
+   },
+   "files": {
+    "result.md": "REQUEST_CHANGES\nF1 [defect] wrong value. Closes by: code\nCoverage\nreviewed the changed files."
+   }
+  }
+ },
+ "expect": [
+  {
+   "family_id": "fam-coder-gone",
+   "attempts": [
+    "coder-b",
+    "coder-c"
+   ],
+   "reviews": [
+    "review-b"
+   ],
+   "first_review_verdict": "REQUEST_CHANGES",
+   "review_rounds": 1,
+   "accepted": null,
+   "status": "open",
+   "wall_seconds": 1800,
+   "root_missing": true
+  }
+ ]
+}

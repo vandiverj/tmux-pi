@@ -1,7 +1,7 @@
 """Experimental routing evaluation log: per-selection records, human outcomes and a joined export.
 
 Every `tp-route --dispatch` (and plain `tp-route`) appends one bounded selection record to
-the session's project-local state dir, `<.tmux-pi>/evals/routing-selections.jsonl`:
+the session's project-local state dir, `<.tmux-pi>/evals/routing-selections.jsonl` (lib/model_router.py writes `model-selections.jsonl` beside it, and the export reads both):
 sanitized request traits and hashes (no raw request text unless TP_ROUTING_EVALS_TEXT=1),
 Laya's bounded answer scores, the learned heads' probabilities, version hashes of the
 questions, config, heads and code, and the recommended route/model/effort before and after
@@ -25,6 +25,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -35,13 +36,29 @@ import router
 SELECTION_SCHEMA = "tmux-pi-routing-selection:v1"
 OUTCOME_SCHEMA = "tmux-pi-routing-outcome:v1"
 EXPORT_SCHEMA = "tmux-pi-routing-eval-row:v1"
-SELECTIONS = "routing-selections.jsonl"
+SELECTIONS = "routing-selections.jsonl"  # the old selection log; log_selection still writes it
+MODEL_SELECTIONS = "model-selections.jsonl"  # what lib/model_router.py writes today; the export reads it first
+SELECTION_FILES = (MODEL_SELECTIONS, SELECTIONS)
 OUTCOMES = "routing-outcomes.jsonl"
 MAX_RECORD_BYTES = 16 * 1024
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_TEXT = 2000
 MAX_NOTE = 1000
 LOCK_SECONDS = 2.0
+# Threads of one process queue on a per-log lock (blocking, bounded) instead of all polling flock: polling is
+# unfair and starved a thread past LOCK_SECONDS under load. Locks are per resolved log path so a stalled log
+# never blocks writers to another. flock still serialises separate processes.
+_PATH_LOCKS = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(directory, name):
+    try:
+        key = os.path.join(os.path.realpath(directory), name)
+    except (OSError, ValueError):
+        key = os.path.join(os.path.abspath(str(directory)), name)
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
 SELECTION_ID = re.compile(r"^sel-[0-9a-f]{32}$")
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RATINGS = ("good", "acceptable", "poor", "wrong")
@@ -240,6 +257,16 @@ def append_jsonl(directory, name, record):
     if len(line) > MAX_RECORD_BYTES + 1:
         raise EvalLogError("record is larger than {} bytes".format(MAX_RECORD_BYTES))
     directory = Path(directory)
+    thread_lock = _path_lock(directory, name)
+    if not thread_lock.acquire(timeout=LOCK_SECONDS * 4):
+        raise EvalLogError("eval log is locked")
+    try:
+        _append_locked(directory, name, line)
+    finally:
+        thread_lock.release()
+
+
+def _append_locked(directory, name, line):
     try:
         if directory.is_symlink():
             raise EvalLogError("eval dir is a symlink: {}".format(directory))
@@ -306,6 +333,42 @@ def read_jsonl(path):
             rows.append(value)
         else:
             bad += 1
+    return rows, bad
+
+
+def adapt_model_selection(rec):
+    """A lib/model_router.py record (flat) in the shape of a routing selection, so the export reads both the same way.
+
+    Only fields the record carries are mapped; nothing is invented (no classifier scores, no versions)."""
+    resolved = rec.get("resolved") if isinstance(rec.get("resolved"), dict) else {}
+    final = {"worker": resolved.get("worker"), "model": resolved.get("model"), "thinking": resolved.get("effort")}
+    ok = bool(resolved.get("model")) and not rec.get("config_error")
+    return {
+        "schema": rec.get("schema"),
+        "selection_id": rec.get("selection_id"),
+        "created": rec.get("created"),
+        "kind": rec.get("kind"),
+        "status": "ok" if ok else "router_error",
+        "request": {k: rec[k] for k in ("task_sha256", "role", "constraints") if k in rec},
+        "versions": {k: rec.get(k) for k in ("catalog_version", "catalog_sha", "card_sha256", "prompt_sha256")},
+        "classifier": {"backend": "model_router", "router": rec.get("router"), "decided_by": rec.get("decided_by")},
+        "recommendation": {"route": rec.get("source"), "level": rec.get("level"), "review": rec.get("review"),
+                           "reason": rec.get("reason"), "degraded": rec.get("degraded"),
+                           "final": final if ok else None},
+    }
+
+
+def read_selections(directory):
+    """(selections, malformed): the rows of model-selections.jsonl then routing-selections.jsonl, each marked with
+    "source_file" and the old ones left as written; model_router rows pass through adapt_model_selection."""
+    rows, bad = [], 0
+    for name in SELECTION_FILES:
+        found, torn = read_jsonl(Path(directory) / name)
+        bad += torn
+        for rec in found:
+            row = adapt_model_selection(rec) if name == MODEL_SELECTIONS else dict(rec)
+            row["source_file"] = name
+            rows.append(row)
     return rows, bad
 
 
@@ -401,6 +464,30 @@ def totals(tasks):
             "output_tokens_partial": bool(output_missing and output is not None)}
 
 
+def review_outcome(reviewer_dir):
+    """{"verdict": ...} (plus the reason fields) for the review in a reviewer's task dir; verdict None when it has no reply yet.
+
+    review_verdict.assess decides on the whole reply; anything it refuses is "unparsed", a review without a usable
+    Coverage section is "incomplete" and is never counted as the verdict it states; a REQUEST_CHANGES with no
+    Closes by: code finding is "UNUSABLE", no rejection and no approval."""
+    out = {"verdict": None}
+    try:
+        text = review_verdict.read_review(Path(reviewer_dir) / "result.md")
+        stated, _, incomplete = review_verdict.assess(text)
+        out["verdict"] = stated
+        if incomplete:
+            out.update({"verdict": "incomplete", "stated_verdict": stated, "incomplete_reason": incomplete})
+        else:
+            unusable = review_verdict.request_changes_problem(text)
+            if unusable:
+                out.update({"verdict": "UNUSABLE", "stated_verdict": stated, "unusable_reason": unusable})
+    except review_verdict.ReviewMissing:
+        pass
+    except ValueError as exc:
+        out.update({"verdict": "unparsed", "incomplete_reason": str(exc)})
+    return out
+
+
 def task_summary(d, dirs_by_id):
     """Joinable, text-free facts about one task dir: actual model, state, review, escalation, usage."""
     meta = _read_json(d / "meta.json") or {}
@@ -413,23 +500,7 @@ def task_summary(d, dirs_by_id):
         reviewer_dir = dirs_by_id.get(meta["review"])
         review = {"id": meta["review"], "reviewer": _target(meta.get("reviewer")), "verdict": None}
         if reviewer_dir is not None:
-            # review_verdict.assess decides on the whole reply; anything it refuses is "unparsed", a review without a usable
-            # Coverage section is "incomplete" and is never counted as the verdict it states; a REQUEST_CHANGES with no
-            # Closes by: code finding is "UNUSABLE", no rejection and no approval
-            try:
-                text = review_verdict.read_review(reviewer_dir / "result.md")
-                stated, _, incomplete = review_verdict.assess(text)
-                review["verdict"] = stated
-                if incomplete:
-                    review.update({"verdict": "incomplete", "stated_verdict": stated, "incomplete_reason": incomplete})
-                else:
-                    unusable = review_verdict.request_changes_problem(text)
-                    if unusable:
-                        review.update({"verdict": "UNUSABLE", "stated_verdict": stated, "unusable_reason": unusable})
-            except review_verdict.ReviewMissing:
-                pass
-            except ValueError as exc:
-                review.update({"verdict": "unparsed", "incomplete_reason": str(exc)})
+            review.update(review_outcome(reviewer_dir))
     marker = _read_json(d / "review-required.json")
     escalated_to = meta.get("escalated_to") if isinstance(meta.get("escalated_to"), dict) else None
     return {
@@ -456,7 +527,7 @@ def task_summary(d, dirs_by_id):
 
 def export_rows(directory, state_dir):
     """One eval row per selection, joined to its tasks, handoff and human outcomes."""
-    selections, bad_selections = read_jsonl(Path(directory) / SELECTIONS)
+    selections, bad_selections = read_selections(directory)
     outcomes, bad_outcomes = read_jsonl(Path(directory) / OUTCOMES)
     dirs = list(_task_dirs(state_dir)) if state_dir else []
     dirs_by_id = {d.name: d for d in dirs}
@@ -464,7 +535,8 @@ def export_rows(directory, state_dir):
     by_selection, by_task_hash = {}, {}
     for d, meta in metas.items():
         decision = meta.get("decision") if isinstance(meta.get("decision"), dict) else {}
-        sid = decision.get("selection_id")
+        info = meta.get("route_info") if isinstance(meta.get("route_info"), dict) else {}  # tp-agent keeps model_router's id here
+        sid = decision.get("selection_id") or info.get("selection_id")
         if isinstance(sid, str) and SELECTION_ID.match(sid):
             by_selection.setdefault(sid, []).append(d)
         elif isinstance(decision.get("task"), str):
@@ -503,6 +575,7 @@ def export_rows(directory, state_dir):
         rows.append({
             "schema": EXPORT_SCHEMA,
             "selection_id": sid,
+            "source_file": sel.get("source_file"),
             "created": sel.get("created"),
             "status": sel.get("status"),
             "request": {k: v for k, v in (sel.get("request") or {}).items() if k != "text"},

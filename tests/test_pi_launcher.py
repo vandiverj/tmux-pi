@@ -107,7 +107,8 @@ class PiLauncherTests(unittest.TestCase):
         argv = self.launched(TP_MODE="orchestrator")
         files = [Path(path) for path in self.extensions(argv) if not path.startswith("builtin:")]
         self.assertEqual({path.name for path in files}, {"reporter.ts", "sensitive.ts", "orchestration.ts",
-                                                         "assistant.ts", "catalogue.ts", "offload.ts", "safe.ts"})
+                                                         "assistant.ts", "catalogue.ts", "offload.ts", "safe.ts",
+                                                         "kill-guard.ts"})
         registered = set()
         for path in files:
             source = path.read_text()

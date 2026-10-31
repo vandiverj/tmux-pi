@@ -24,8 +24,11 @@ class ClaudePluginModuleTests(unittest.TestCase):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
         names = lambda group: [Path(h["command"].strip('"')).name for h in group["hooks"]]
         pre = hooks["PreToolUse"]
-        self.assertEqual(len(pre), 1)
+        # The trust guard's group comes first; the only other group is the Bash-only kill guard after it.
+        self.assertEqual(len(pre), 2)
         self.assertEqual(pre[0]["matcher"], "*")
+        self.assertEqual(pre[1]["matcher"], "Bash")
+        self.assertEqual(names(pre[1]), ["kill-guard.sh"])
         order = names(pre[0])
         self.assertEqual(order[0], "trust-guard.sh")
         self.assertLess(order.index("trust-guard.sh"), order.index("sensitive-read.sh"))

@@ -430,8 +430,71 @@ class RemoteTests(ProjectCase):
             self.assertNotIn("CODE", found, symbol)
             self.assertNotIn("BODY", found, symbol)
         self.assertIn("export function i(cb: (a: number) => void", signature.find_declarations(src, "i", source=True)[0])
-        self.assertIn("b = 2): void;", signature.find_declarations(src, "g", source=True)[0])  # a literal default stays
-        self.assertIn("tail = 1): void;", signature.find_declarations(src, "C.run", source=True)[0])  # later parameters stay
+        # from the first default that is not a plain literal the rest of the list is withheld, the return type stays
+        self.assertIn("export function g(a = /* defaults omitted */): void;", signature.find_declarations(src, "g", source=True)[0])
+        self.assertIn("run(cb = /* defaults omitted */): void;", signature.find_declarations(src, "C.run", source=True)[0])
+
+    def test_plain_literal_defaults_stay_until_the_first_default_that_is_not_one(self):
+        src = ("export function a(sep = \",\", n = 3, on = true, off = false, none = null, u = undefined, k = Mode.Fast, z = f(1), after = 2): string { BODY }\n"
+               "export function b(x = y < z, w = 1): void { BODY }\n"
+               "export function c(x = a ? b : d, w = 1): void { BODY }\n"
+               "export function d(x = new Foo(), w = 1): void { BODY }\n"
+               "export function e(x = 1, y = 2): void { BODY }\n")
+        found = lambda name: signature.find_declarations(src, name, source=True)[0]
+        self.assertEqual(found("a"), 'export function a(sep = ",", n = 3, on = true, off = false, none = null, u = undefined, k = Mode.Fast, z = /* defaults omitted */): string;')
+        self.assertEqual(found("b"), "export function b(x = /* defaults omitted */): void;")
+        self.assertEqual(found("c"), "export function c(x = /* defaults omitted */): void;")
+        self.assertEqual(found("d"), "export function d(x = /* defaults omitted */): void;")
+        self.assertEqual(found("e"), "export function e(x = 1, y = 2): void;")
+
+    def test_a_generic_arrow_default_with_several_type_parameters_leaks_no_code(self):
+        # review 3 F1: `<T, U>` in a default ended the default at its comma and returned the arrow body
+        shapes = {
+            "function": ("export function f(cb = <T, U>(x: T, y: U) => { CODE }, z = 1): void { BODY }", "f",
+                         "export function f(cb = /* defaults omitted */): void;"),
+            "async": ("export function f(cb = async <T, U>(x: T, y: U) => { CODE }, z = 1): Promise<void> { BODY }", "f",
+                      "export function f(cb = /* defaults omitted */): Promise<void>;"),
+            "arrow initializer": ("export const k = (a = <T, U>(x: T) => { CODE }, n = 1): number => { BODY };", "k",
+                                  "export const k = (a = /* defaults omitted */): number => /* body omitted */;"),
+            "class method": ("export class C { m(a = <T, U>(x: T) => { CODE }, n = 1): void { BODY } }", "C.m",
+                             "m(a = /* defaults omitted */): void;"),
+        }
+        for label, (src, symbol, expected) in shapes.items():
+            found = "\n".join(signature.find_declarations(src, symbol, source=True))
+            self.assertIn(expected, found, label)
+            for code in ("CODE", "BODY", "=>  {", "x: T"):
+                self.assertNotIn(code, found, (label, code))
+
+    def test_a_default_parameter_list_that_cannot_be_closed_ends_the_declaration(self):
+        out = signature.declaration_view("export function f(a: number, cb = () => { CODE }")
+        self.assertEqual(out, "export function f(a: number, cb = /* defaults omitted */);")
+
+    PROBE_SHAPES = (
+        "export function f(cb = <T, U>(x: T, y: U) => { CODE }, z = 1): void { BODY }",
+        "export function f(cb = <T>(x: T) => { CODE }, z = 1): void { BODY }",
+        "export function f(cb = async <T, U>(x: T) => { CODE }): void { BODY }",
+        "export function f(o = { a: () => { CODE }, b: 2 }, z = 1): void { BODY }",
+        "export function f(a = x < y, b = () => { CODE }): void { BODY }",
+        "export function f(a = x<y, b = () => { CODE }): void { BODY }",
+        "export function f(a = `${() => { CODE }}`, b = 2): void { BODY }",
+        "export function f(a = \"x,)\", b = () => { CODE }): void { BODY }",
+        "export function f(a = /[,)]/g, b = () => { CODE }): void { BODY }",
+        "export function f(a = c ? () => { CODE } : null, b = 1): void { BODY }",
+        "export function f(a = new Foo<A, B>(), b = () => { CODE }): void { BODY }",
+        "export const f = (a = <T, U>(x: T) => { CODE }) => { BODY };",
+        "export class f { m(a = <T, U>(x: T) => { CODE }): void { BODY } }",
+        "export function f(a = `${`x`}`, b = () => { CODE }): void { BODY }",
+        "export function f<T = { a: 1 }>(a: T = {} as T, b = () => { CODE }): void { BODY }",
+    )
+
+    def test_no_default_parameter_shape_returns_code_or_body_text(self):
+        for src in self.PROBE_SHAPES:
+            symbols = ("f", "f.m")
+            found = [d for symbol in symbols for d in signature.find_declarations(src, symbol, source=True)]
+            self.assertTrue(found, src)
+            for text in found:
+                self.assertNotIn("CODE", text, src)
+                self.assertNotIn("BODY", text, src)
 
     def test_a_regex_literal_with_a_quote_does_not_hide_later_exports(self):
         for literal in ("/'/", '/"/', "/[/']/g", r"/\//", "/`/"):

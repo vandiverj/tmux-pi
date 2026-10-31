@@ -7,11 +7,19 @@ guard.py (allowlisted extensions, links resolved, nothing outside the package di
 
 `jsr:@scope/name` and `https://` specifiers are read from Deno's remote cache (remote.py), pinned by deno.lock. Those files
 may be TypeScript source; declaration_view() then returns only exported declarations, with bodies, initializers and code in
-parameter defaults cut. jsr files are checked against deno.lock's integrity when it records one (remote.py).
+parameter defaults cut (see Known limits). jsr files are checked against deno.lock's integrity when it records one (remote.py).
 
 The declaration scanner is a text scanner, not a TypeScript parser: it splits a declaration file into top-level
 statements (comments, strings, regex literals and brackets skipped) and matches the name. It returns the statement with the
 JSDoc comment just above it. `Ns.member` finds a member of a namespace, class, interface or enum.
+
+Known limits (TypeScript source files only; .d.ts files carry no code and are returned as written):
+- A parameter list is shown only up to its first default that is not a plain literal; the rest of the list is withheld as
+  `/* defaults omitted */)`, then the declared return type. The scanner never tries to find where such a default ends.
+  The same happens for an `=` that is not a default, such as a type parameter default in a callback type
+  (`cb: <T = string>(x: T) => void`). Less is shown, never code.
+- A regex literal right after `)` on a line (`if (a) /'/.test(a); }`) is read as division, so a quote in it can end the scan
+  of that line early and hide a later export on the same line. No code is returned for it.
 """
 import json
 import os
@@ -274,39 +282,24 @@ def _arrow_at(text):
     return -1
 
 
+PLAIN_DEFAULT = re.compile(r"""\s*(?:"(?:[^"\\\n]|\\.){0,80}"|'(?:[^'\\\n]|\\.){0,80}'|-?\d[\w.]{0,30}"""
+                           r"""|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?=[,)\]}])""")
+DEFAULTS_OMITTED = "/* defaults omitted */"
+
+
 def _drop_defaults(header):
-    """A parameter list without the code in its default values. A default that is a short literal stays (`sep = ","`); any
-    other (`cb = () => { ... }`, `x = f(...)`) becomes a comment. A default ends at the `,` or closing bracket of its own level;
-    where `<` may open type arguments the comma is not trusted, so an unsure scan drops more and never keeps code. Inside a
-    parameter list an `=` is a default (`==`, `<=`, `!=` can only occur inside a default, which is skipped as a whole)."""
-    out, last, resume = [], 0, 0
-    for i, c, paren, _, brace in _scan(header):
-        if i < resume or c != "=" or paren < 1 or header[i + 1:i + 2] in ("=", ">"):
+    """A parameter list without the code in its default values. A default that is a plain literal (number, short string,
+    true/false/null/undefined, an identifier or a dotted name, followed at once by `,` or a closing bracket) stays. From the
+    first default that is anything else (`cb = () => { ... }`, `x = f(...)`, `a = x < y`) the rest of the parameter list is
+    withheld: the output has `/* defaults omitted */)` and then whatever follows the list's own `)` (the declared return type).
+    Nothing tries to find where such a default ends, since type arguments (`<T, U>`) make a comma ambiguous; so no code in
+    a default can come back. Inside a parameter list an `=` is a default (`==`, `<=`, `!=` can only occur inside a default)."""
+    for i, c, paren, _, _ in _scan(header):
+        if c != "=" or paren < 1 or header[i + 1:i + 2] in ("=", ">") or PLAIN_DEFAULT.match(header, i + 1):
             continue
-        end = _default_end(header, i + 1, paren + brace)
-        if not LITERAL.match(header[i + 1:end].strip()):
-            out.append(header[last:i + 1] + " /* default omitted */")
-            last = resume = end
-    out.append(header[last:])
-    return "".join(out)
-
-
-def _default_end(text, start, base):
-    """Index where the default value that begins at `start` ends: the first `,` or closing bracket at nesting `base`."""
-    angle = 0
-    previous = ""
-    for i, c, paren, _, brace in _scan(text):
-        if i < start:
-            continue
-        depth = paren + brace
-        if depth <= base and angle <= 0 and c in ",)]}":
-            return i
-        if c == "<" and (previous.isalnum() or previous in "_$>"):
-            angle += 1
-        elif c == ">" and angle > 0 and text[i - 1] != "=":
-            angle -= 1
-        previous = c
-    return len(text)
+        close = next((j for j, d, depth, _, _ in _scan(header) if j > i and d == ")" and depth == 1), None)
+        return header[:i + 1] + " " + DEFAULTS_OMITTED + ")" + ("" if close is None else header[close + 1:])
+    return header
 
 
 def _value_view(header, initializer):

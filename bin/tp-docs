@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""tp-docs — offline, read-only library docs for workers, matched to the project's lockfile.
+
+  tp-docs signature PACKAGE SYMBOL   the declaration of SYMBOL (docs comment included) from PACKAGE's own .d.ts
+  tp-docs search LIB QUERY           top matches from LIB's docs index
+  tp-docs status                     indexes built, and whether the lockfile moved since
+  tp-docs build LIB [--from DIR]     index LIB's docs at the version the lockfile pins (offline)
+  tp-docs refresh                    rebuild the indexes whose lockfile hash changed (offline)
+  tp-docs fetch LIB                  download LIB's docs for the pinned version (the only command that uses the network)
+
+signature and search log every call as one JSON line to $TP_TASK_DIR/docs-calls.jsonl (or --log FILE) and answer nothing
+when they cannot (exit 3). They open no sockets and read only .d.ts/.d.mts/.d.cts/.md files under the package, the index
+or Deno's npm cache. The project is --project, $TP_DOCS_PROJECT, or found from the working directory by its lockfile.
+Every answer starts with a [provenance] line (source, version, exact yes/no, retrieved time); search answers are cached beside
+the log, keyed by lib, pinned version, index build and query. Answers are capped at 8 KB. Exit: 0 an answer, 1 no answer (--json: 0), 2 usage or refusal at the CLI, 3 not logged.
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+from localdocs import calls, guard, index, lock, log  # noqa: E402
+
+
+def project_dir(args):
+    chosen = args.project or os.environ.get("TP_DOCS_PROJECT")
+    return Path(chosen).resolve() if chosen else lock.find_project(os.getcwd())
+
+
+def answer(args, tool, params):
+    try:
+        reply = calls.call(tool, params, project=project_dir(args), deno=args.deno_dir, log_file=args.log)
+    except log.LogUnavailable as exc:
+        print(f"tp-docs: {exc}", file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps({"status": reply.status, "text": reply.text, "version": reply.version, "provenance": reply.provenance}))
+        return 0
+    print(reply.text)
+    return 0 if reply.status == "hit" else 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--project", help="project directory (default: $TP_DOCS_PROJECT, else found from the working directory)")
+    parser.add_argument("--deno-dir", help="Deno cache directory (default: $DENO_DIR, else the platform default)")
+    parser.add_argument("--log", help="call log file (default: $TP_TASK_DIR/docs-calls.jsonl)")
+    parser.add_argument("--json", action="store_true", help="signature/search: print {status,text,version,provenance}; exit 0 for any answer")
+    sub = parser.add_subparsers(dest="command", required=True)
+    one = sub.add_parser("signature")
+    one.add_argument("package")
+    one.add_argument("symbol")
+    two = sub.add_parser("search")
+    two.add_argument("lib")
+    two.add_argument("query")
+    two.add_argument("--limit", type=int)
+    sub.add_parser("status")
+    build = sub.add_parser("build")
+    build.add_argument("lib")
+    build.add_argument("--from", dest="source", help="directory of markdown to index instead of the installed package")
+    build.add_argument("--version")
+    sub.add_parser("refresh")
+    fetch = sub.add_parser("fetch")
+    fetch.add_argument("lib")
+    fetch.add_argument("--version")
+    fetch.add_argument("--registry", default=None)
+    args = parser.parse_args(argv)
+    project = project_dir(args)
+    if args.command == "signature":
+        return answer(args, "api_signature", {"package": args.package, "symbol": args.symbol})
+    if args.command == "search":
+        params = {"lib": args.lib, "query": args.query}
+        if args.limit is not None:
+            params["limit"] = args.limit
+        return answer(args, "docs_search", params)
+    try:
+        if args.command == "status":
+            print(json.dumps(index.status(project), indent=1))
+        elif args.command == "build":
+            meta = index.build_for(project, args.lib, source=args.source, version=args.version, deno=args.deno_dir)
+            print(json.dumps(meta, indent=1))
+        elif args.command == "refresh":
+            print(json.dumps([{"lib": l, "action": a, "detail": d} for l, a, d in index.refresh(project, args.deno_dir)], indent=1))
+        elif args.command == "fetch":
+            from localdocs import fetch as fetcher  # the only import of the network module
+            kwargs = {"registry": args.registry} if args.registry else {}
+            print(json.dumps(fetcher.fetch(project, args.lib, version=args.version, **kwargs), indent=1))
+    except (index.Miss, guard.Rejected) as exc:
+        print(f"tp-docs: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # FetchError and OS errors: a message, no traceback
+        print(f"tp-docs: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

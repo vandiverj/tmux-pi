@@ -40,9 +40,14 @@ fi
 # Auth headers for the HTTP MCP servers in mcp.json (git-ignored; see README).
 [[ ! -f "$CLAUDE_DIR/mcp.local.env" ]] || source "$CLAUDE_DIR/mcp.local.env"
 
+# Offline docs server (api_signature, docs_search) only when TP_DOCS_TOOLS=1: a second --mcp-config beside mcp.json,
+# which stays under --strict-mcp-config. Unset, the argument list is exactly the one below without the extra pair.
+mcp_args=(--mcp-config "$CLAUDE_DIR/mcp.json")
+[[ "${TP_DOCS_TOOLS:-}" != 1 ]] || mcp_args+=(--mcp-config "$CLAUDE_DIR/mcp.docs.json")
+
 exec claude \
   --setting-sources "" \
   --settings "$settings" \
-  --strict-mcp-config --mcp-config "$CLAUDE_DIR/mcp.json" \
+  --strict-mcp-config "${mcp_args[@]}" \
   --plugin-dir "$CLAUDE_DIR/plugins" \
   "$@"

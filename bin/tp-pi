@@ -60,9 +60,15 @@ extensions=("$ROOT/agent/extensions/reporter.ts" "$ROOT/agent/extensions/sensiti
 if [[ -z "${TP_TASK_DIR:-}" ]]; then
   extensions+=("$ROOT/agent/extensions/orchestration.ts" "$ROOT/agent/extensions/assistant.ts" "$ROOT/agent/extensions/catalogue.ts" "$ROOT/agent/extensions/offload.ts")
 fi
+# Offline docs tools (api_signature, docs_search) only when TP_DOCS_TOOLS=1; unset, nothing below changes.
+main_tools="$MAIN_TOOLS"
+if [[ "${TP_DOCS_TOOLS:-}" == 1 ]]; then
+  extensions+=("$ROOT/agent/extensions/docs.ts")
+  main_tools+=,api_signature,docs_search
+fi
 args=(--no-skills --no-context-files --no-extensions)
 for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done
 if [[ -z "${TP_TASK_DIR:-}" && "${TP_MODE:-}" == orchestrator ]]; then
-  args+=(--extension builtin:codemode --no-mcp --tools "$MAIN_TOOLS")
+  args+=(--extension builtin:codemode --no-mcp --tools "$main_tools")
 fi
 pi "${args[@]}" "$@"

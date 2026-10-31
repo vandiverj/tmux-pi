@@ -1,0 +1,5 @@
+{
+  "version": "4",
+  "specifiers": { "npm:denopkg@1": "1.2.0" },
+  "npm": { "denopkg@1.2.0": { "integrity": "sha512-DDDD" } }
+}

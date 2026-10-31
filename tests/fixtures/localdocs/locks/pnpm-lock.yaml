@@ -1,0 +1,27 @@
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      plainpkg:
+        specifier: ^1.0.0
+        version: 1.2.3
+      '@scope/scoped':
+        specifier: ^4.0.0
+        version: 4.0.0(react@18.2.0)
+
+packages:
+
+  plainpkg@1.2.3:
+    resolution: {integrity: sha512-AAAA}
+
+  '@scope/scoped@4.0.0':
+    resolution: {integrity: sha512-BBBB}
+
+  other@5.0.0:
+    resolution: {integrity: sha512-CCCC}
+
+snapshots:
+
+  plainpkg@1.2.3: {}

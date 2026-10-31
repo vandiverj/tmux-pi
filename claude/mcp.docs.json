@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tmux-pi-docs": {
+      "command": "node",
+      "args": [
+        "${TP_ROOT}/claude/mcp/docs.mjs"
+      ]
+    }
+  }
+}

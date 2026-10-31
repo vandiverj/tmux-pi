@@ -28,6 +28,8 @@ EXTERNAL_SCHEMES = ("npm:", "jsr:", "node:", "http:", "https:", "data:", "blob:"
 _REGEX_AFTER_WORDS = frozenset({"return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else",
                                 "yield", "await"})
 
+_PAREN_KEYWORDS = frozenset({"if", "while", "for", "with"})
+
 _TOKEN = re.compile(r"""
     (?P<ws>\s+)
   | (?P<line>//[^\n]*)
@@ -49,6 +51,7 @@ def tokenize(text):
     out, pos, line, size = [], 0, 1, len(text)
     depth, templates = 0, []  # brace depth, and the depth at which each open `${` began
     in_template = False
+    parens, kw_close = [], -1  # open `(`: True when it follows if/while/for/with; index of the last `)` that closed such a one
     while pos < size:
         if in_template:
             body = _TEMPLATE_BODY.match(text, pos)
@@ -85,13 +88,23 @@ def tokenize(text):
         elif kind == "tpl":
             in_template = True
         elif kind == "punct" and value == "/":
-            if _regex_allowed(out):
+            if _regex_allowed(out, kw_close):
                 rx = _REGEX_BODY.match(text, pos - 1)
                 if rx:
                     pos = rx.end()
                     out.append(("val", "", line))
                     continue
             out.append(("punct", "/", line))
+        elif kind == "punct" and value == "(":
+            before = out[-1] if out else ("", "", 0)
+            parens.append(before[0] == "id" and (before[1] in _PAREN_KEYWORDS or (
+                before[1] == "await" and len(out) > 1 and out[-2][0] == "id" and out[-2][1] == "for")))
+            out.append(("punct", "(", line))
+        elif kind == "punct" and value == ")":
+            closes_condition = parens.pop() if parens else False
+            out.append(("punct", ")", line))
+            if closes_condition:
+                kw_close = len(out) - 1
         elif kind == "punct" and value == "{":
             depth += 1
             out.append(("punct", "{", line))
@@ -107,8 +120,9 @@ def tokenize(text):
     return out
 
 
-def _regex_allowed(tokens):
-    """A `/` starts a regular expression unless the token before it ends an expression."""
+def _regex_allowed(tokens, condition_close=-1):
+    """A `/` starts a regular expression unless the token before it ends an expression. A `)` ends an expression, except the one
+    that closes the condition of `if`/`while`/`for`/`with` (`condition_close` is its index): a statement follows it."""
     if not tokens:
         return True
     kind, value, _ = tokens[-1]
@@ -116,7 +130,9 @@ def _regex_allowed(tokens):
         return False
     if kind == "id":
         return value in _REGEX_AFTER_WORDS
-    return value not in (")", "]", "}")
+    if value == ")":
+        return len(tokens) - 1 == condition_close
+    return value not in ("]", "}")
 
 
 def _skip_braces(tokens, at):
@@ -183,6 +199,28 @@ def scan_specifiers(text):
     return found
 
 
+def _named_specifiers(tokens, at):
+    """For the `{` at `at`: (index after its `}`, True when it lists at least one specifier and every one is `type`-marked, as in
+    `{ type A, type B as C }`). A lone `type`, or `type as name`, names a value called `type`."""
+    end = _skip_braces(tokens, at)
+    inner, groups, current = tokens[at + 1:end - 1], [], []
+    for token in inner:
+        if token[0] == "punct" and token[1] == ",":
+            groups.append(current)
+            current = []
+        else:
+            current.append(token)
+    groups.append(current)
+    groups = [g for g in groups if g]
+
+    def marked(group):
+        if len(group) < 2 or group[0][0] != "id" or group[0][1] != "type":
+            return False
+        return group[1][1] != "as" or group[1][0] != "id" or len(group) in (2, 4)
+
+    return end, bool(groups) and all(marked(g) for g in groups)
+
+
 def _import_clause(tokens, at, add):
     """`import <clause> from "x"` / `import a = require("x")` with `at` just past `import`."""
     type_only = False
@@ -190,7 +228,9 @@ def _import_clause(tokens, at, add):
             tokens[at + 1][1] in ("{", "*") and tokens[at + 1][0] == "punct"
             or (tokens[at + 1][0] == "id" and tokens[at + 1][1] != "from")):
         type_only, at = True, at + 1
+    has_value = False  # a default or namespace binding is a value, whatever the named ones are
     if at < len(tokens) and tokens[at][0] == "id":
+        has_value = True
         at += 1  # the default binding
         if _is(tokens, at, "=", "punct") and _is(tokens, at + 1, "require") and _is(tokens, at + 2, "(", "punct") \
                 and at + 3 < len(tokens) and tokens[at + 3][0] == "str":
@@ -199,9 +239,11 @@ def _import_clause(tokens, at, add):
         if _is(tokens, at, ",", "punct"):
             at += 1
     if _is(tokens, at, "*", "punct"):
+        has_value = True
         at += 3  # * as name
     elif _is(tokens, at, "{", "punct"):
-        at = _skip_braces(tokens, at)
+        at, all_marked = _named_specifiers(tokens, at)
+        type_only = type_only or (all_marked and not has_value)
     clause = _from_clause(tokens, at)
     if clause:
         add(clause[0], clause[1], type_only=type_only)
@@ -213,7 +255,8 @@ def _export_clause(tokens, at, add):
     if _is(tokens, at, "type") and at + 1 < len(tokens) and tokens[at + 1][0] == "punct" and tokens[at + 1][1] in ("{", "*"):
         type_only, at = True, at + 1
     if _is(tokens, at, "{", "punct"):
-        at = _skip_braces(tokens, at)
+        at, all_marked = _named_specifiers(tokens, at)
+        type_only = type_only or all_marked
     elif _is(tokens, at, "*", "punct"):
         at += 1
         if _is(tokens, at, "as"):
@@ -355,7 +398,9 @@ class ImportIndex:
     """`file -> imports` for the source files below `root`, and the reverse map derived from it.
 
     `base` is the project root: every path in and out is a posix path relative to it, and nothing outside it is read, indexed or
-    returned. `config` is the Deno config whose `imports` table resolves bare specifiers (default `root/deno.json`); `overlays` are
+    returned. `allow` is the caller's path guard: a file it refuses is never read or indexed, and an import that resolves to one is
+    an `unresolved` edge with reason `refused` whose specifier is blanked (the edge must not name the path); a path that leaves the
+    project, by its name or through a symlinked directory, is `unresolved` with reason `outside`. `config` is the Deno config whose `imports` table resolves bare specifiers (default `root/deno.json`); `overlays` are
     further configs (for the API, `deno.test.json`, which swaps the Temporal packages for mocks): where one resolves a specifier
     differently from `config`, the extra edge is recorded with `config` set to that file's name, so the importers of a mock module
     are answerable.
@@ -365,8 +410,9 @@ class ImportIndex:
     importer of a file that did not exist yet becomes an edge without the importer changing). `refresh()` re-reads only the files
     whose key changed, forgets deleted ones, and returns what it did."""
 
-    def __init__(self, base, root=None, config=None, overlays=(), cache_path=None):
+    def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None):
         self.base = os.path.realpath(base)
+        self.allow = allow  # allow(rel) -> bool: may this project file be read? None allows every file inside the project
         self.root = os.path.realpath(root or base)
         self.config = os.path.join(self.root, "deno.json") if config is None else os.path.realpath(config)
         self.overlays = [os.path.realpath(p) for p in overlays]
@@ -444,7 +490,9 @@ class ImportIndex:
                 if not stat.S_ISREG(info.st_mode):
                     continue  # a symlink is skipped: it could lead out of the project
                 if not _excluded(os.path.relpath(full, config_dir).replace(os.sep, "/"), patterns):
-                    found[os.path.relpath(full, self.base).replace(os.sep, "/")] = [info.st_mtime_ns, info.st_size]
+                    rel = os.path.relpath(full, self.base).replace(os.sep, "/")
+                    if self._allowed(rel):
+                        found[rel] = [info.st_mtime_ns, info.st_size]
         return found
 
     def refresh(self):
@@ -480,16 +528,41 @@ class ImportIndex:
         return {"files": len(current), "scanned": len(changed), "removed": len(removed), "unchanged": len(current) - len(changed),
                 "stale": stale, "ms": round((time.perf_counter() - started) * 1000)}
 
+    def _allowed(self, rel):
+        if self.allow is None:
+            return True
+        try:
+            return bool(self.allow(rel))
+        except Exception:  # a guard that fails refuses
+            return False
+
     def _is_file(self):
         cache = {}
 
         def check(path):
-            if os.path.relpath(path, self.base).replace(os.sep, "/") in self._known:
-                return True
             if path not in cache:
-                cache[path] = os.path.isfile(path) and not os.path.islink(path)
+                cache[path] = os.path.isfile(path)
             return cache[path]
         return check
+
+    def _judge(self, target):
+        """(rel, "") for an existing file an import may point at, else (None, reason): `outside` when it, or a directory on its way,
+        leads out of the project; `refused` when the guard refuses it (by its name or by where it really is); `missing` when
+        a symlink is on the way inside the project (the walk does not follow links, so neither does an edge)."""
+        lexical = lexical_path(self.base, target)
+        if lexical is None:
+            return None, "outside"
+        if lexical in self._known:
+            return lexical, ""  # walked, so allowed and free of symlinks
+        real = os.path.realpath(target)
+        inside = lexical_path(self.base, real)
+        if inside is None:
+            return None, "outside"
+        if not (self._allowed(lexical) and self._allowed(inside)):
+            return None, "refused"
+        if real != target:
+            return None, "missing"
+        return lexical, ""
 
     def _resolve_all(self, imap, overlay_maps):
         isfile = self._is_file()
@@ -515,9 +588,11 @@ class ImportIndex:
     def _edge(self, rel, spec, line, type_only, dynamic, resolved, config):
         kind, target, reason = resolved
         if kind == "file":
-            inside = lexical_path(self.base, target)
+            inside, why = self._judge(target)
             if inside is None:
-                kind, target, reason = "unresolved", None, "outside"
+                kind, target, reason = "unresolved", None, why
+                if why == "refused":
+                    spec = ""
             else:
                 target = inside
         return {"from": rel, "line": line, "spec": spec, "kind": kind, "to": target, "reason": reason, "type_only": bool(type_only),

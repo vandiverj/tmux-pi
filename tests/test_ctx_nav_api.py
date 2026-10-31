@@ -273,7 +273,7 @@ class IndexCase(Tree):
         index.refresh()
         self.assertFalse(index.indexed("src/linked.ts"))
         self.assertFalse(any(rel.startswith("src/linked_dir") for rel in index.entries))
-        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("./linked.ts", "missing")])
+        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("./linked.ts", "outside")])
 
     def test_a_relative_import_that_leaves_the_project_is_unresolved_not_returned(self):
         project = self.project()
@@ -376,18 +376,20 @@ class NavCase(Tree):
                 self.assertEqual((answer["status"], answer.get("reason")), ("refused", reason), (call.__name__, path))
         self.assertNotIn("TOKEN", json.dumps(nav.importers(".env")))
 
-    def test_an_injected_guard_and_screen_replace_the_stubs(self):
+    def test_an_injected_path_check_and_guard_replace_the_stubs(self):
         project = self.project()
         seen = []
 
-        def guard(path, root):
-            seen.append((path, root))
-            return "blocked_by_test" if path.endswith("main.ts") else None
+        def check_path(root, path):
+            seen.append((root, path))
+            if path.endswith("main.ts"):
+                raise nav_api.Refused("blocked_by_test")
+            return path
 
-        nav = self.nav(project, guard=guard)
+        nav = self.nav(project, check_path=check_path)
         self.assertEqual(nav.importers("src/main.ts")["reason"], "blocked_by_test")
         self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
-        self.assertEqual(seen[0], ("src/main.ts", str(project.resolve())))
+        self.assertEqual(seen[0], (str(project.resolve()), "src/main.ts"))
 
     def test_imports_split_files_packages_and_unresolved(self):
         project = self.project()
@@ -435,7 +437,7 @@ class NavCase(Tree):
     @NEEDS_DENO
     def test_a_screen_is_applied_to_text_taken_from_comments(self):
         project = self.project()
-        nav = self.nav(project, screen=lambda text: text.replace("Run the app", "[screened]"))
+        nav = self.nav(project, guard=lambda text: text.replace("Run the app", "[screened]"))
         run = next(s for s in nav.symbols("src/app/run.ts")["symbols"] if s["name"] == "run")
         self.assertEqual(run["doc"], "[screened] for one config.")
 
@@ -458,7 +460,7 @@ class NavCase(Tree):
             answer = self.nav(project, deno=exe).symbols("src/main.ts")
         self.assertEqual(answer["status"], "ok")
         text = log.read_text()
-        self.assertIn("doc --json --no-lock", text)
+        self.assertIn("doc --json --no-remote --no-lock", text)
         self.assertIn("NPM_CONFIG_REGISTRY=http://127.0.0.1:1/", text)
         self.assertIn("DENO_NO_UPDATE_CHECK=1", text)
         self.assertNotIn("do-not-pass", text)
@@ -475,7 +477,7 @@ class NavCase(Tree):
 
     def test_a_deno_failure_is_an_error_with_one_screened_line(self):
         exe = self.fake_deno("echo 'Download http://x' >&2; echo 'error: Module not found \"file:///x.ts\"' >&2; echo more >&2; exit 1")
-        nav = self.nav(self.project(), deno=exe, screen=lambda t: t.replace("x.ts", "[path]"))
+        nav = self.nav(self.project(), deno=exe, guard=lambda t: t.replace("x.ts", "[path]"))
         answer = nav.symbols("src/main.ts")
         self.assertEqual((answer["status"], answer["detail"]), ("error", 'error: Module not found "file:///[path]"'))
 
@@ -509,6 +511,248 @@ class NavCase(Tree):
         nav = self.nav(self.dir / "plain")
         self.assertEqual([i["path"] for i in nav.importers("b.ts")["importers"]], ["a.ts"])
         self.assertEqual([u["reason"] for u in nav.imports("a.ts")["unresolved"]], ["bare"])
+
+
+class ReviewFixesCase(Tree):
+    """Findings F1-F8 of the review of the first CX3 attempt. Each test failed against that attempt."""
+
+    def scripted_deno(self, doc=None, info=None):
+        """A fake `deno` that logs every call to self.dir/deno.log and answers `doc` / `info` with the given JSON."""
+        for name, payload in (("doc", doc), ("info", info)):
+            if payload is not None:
+                write(self.dir / f"{name}.json", json.dumps(payload))
+        log = self.dir / "deno.log"
+        return self.fake_deno(
+            f'echo "$@" >> {log}\ncase "$1" in\n --version) echo "deno 9.9.9";;\n doc) cat {self.dir / "doc.json"};;\n'
+            f' info) cat {self.dir / "info.json"};;\nesac')
+
+    def deno_calls(self, verb):
+        log = self.dir / "deno.log"
+        return [line for line in (log.read_text().splitlines() if log.exists() else []) if line.startswith(verb + " ")]
+
+    @staticmethod
+    def doc_payload(project, rel, name, doc, line=0):
+        return {"version": 2, "nodes": {"n": {"symbols": [{"name": name, "declarations": [
+            {"declarationKind": "export", "kind": "function", "jsDoc": {"doc": doc},
+             "location": {"filename": f"file://{Path(project).resolve() / rel}", "line": line}}]}]}}}
+
+    # --- F1
+
+    def test_a_refused_file_is_never_read_indexed_or_named(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "import './hidden_marker.ts';\nexport const KEY = 'x';\n")
+        write(project / "src" / "credentials.ts", "import './hidden_marker2.ts';\n")
+        write(project / "src" / "gate.ts", "import { KEY } from './.env.ts';\nimport './credentials.ts';\nimport { c } from './config.ts';\n"
+                                           "export { KEY, c };\n")
+        opened = []
+        real = graph.read_source
+        with mock.patch.object(graph, "read_source", lambda path: opened.append(path) or real(path)):
+            answer = self.nav(project).imports("src/gate.ts")
+        self.assertFalse([p for p in opened if p.endswith((".env.ts", "credentials.ts"))], opened)
+        self.assertEqual(answer["status"], "ok")
+        self.assertEqual([f["path"] for f in answer["files"]], ["src/config.ts"])
+        self.assertEqual(sorted((u["reason"], u["spec"]) for u in answer["unresolved"]), [("refused", ""), ("refused", "")])
+        text = json.dumps(answer)
+        for secret in (".env.ts", "credentials", "hidden_marker"):
+            self.assertNotIn(secret, text)
+        for cached in (self.dir / "cache").iterdir():
+            self.assertNotIn("hidden_marker", cached.read_text())  # the refused files were not read, so their imports are not kept
+            self.assertNotIn("\"src/.env.ts\"", cached.read_text())  # no entry of its own
+        self.assertIn("src/gate.ts", [i["path"] for i in self.nav(project).importers("src/config.ts")["importers"]])
+
+    def test_a_refused_file_that_is_already_in_the_cache_is_dropped(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "import './hidden_marker.ts';\n")
+        permissive = self.nav(project, check_path=lambda root, path: path)
+        self.assertIn("src/.env.ts", [i["path"] for i in permissive.importers("src/config.ts")["importers"]] + ["src/.env.ts"])
+        permissive.imports("src/.env.ts")  # indexed and cached under the permissive guard
+        strict = self.nav(project)
+        self.assertEqual(strict.imports("src/.env.ts")["status"], "refused")
+        strict.importers("src/main.ts")
+        self.assertFalse(strict._get_index().indexed("src/.env.ts"))
+        self.assertNotIn("hidden_marker", json.dumps(strict.importers("src/main.ts")))
+
+    def test_every_string_in_an_answer_passes_the_guard(self):
+        project = self.project()
+        write(project / "src" / "tok.ts", "import z from 'https://example.test/a.ts?token=SECRETTOKEN';\n"
+                                          "import { c } from './config.ts?x=SECRETTOKEN';\nexport { z, c };\n")
+        nav = self.nav(project, guard=lambda text: text.replace("SECRETTOKEN", "[redacted]"))
+        imports = nav.imports("src/tok.ts")
+        importers = nav.importers("src/config.ts")
+        self.assertEqual(imports["external"], ["https://example.test/a.ts?token=[redacted]"])
+        self.assertIn("./config.ts?x=[redacted]", [i["spec"] for i in importers["importers"]])
+        for answer in (imports, importers, nav.status()):
+            self.assertNotIn("SECRETTOKEN", json.dumps(answer))
+
+    def test_a_guard_that_raises_returns_an_error_and_no_content(self):
+        def broken(text):
+            raise RuntimeError("screen down")
+
+        nav = self.nav(self.project(), guard=broken)
+        for answer in (nav.importers("src/main.ts"), nav.imports("src/main.ts"), nav.status()):
+            self.assertEqual(answer["status"], "error")
+            self.assertNotIn("main.ts", json.dumps(answer))
+
+    def test_the_stub_has_the_signatures_of_cx1_redact(self):
+        project = self.project()
+        self.assertEqual(nav_api.stub_check_path(str(project), "src/main.ts"), "src/main.ts")
+        self.assertEqual(nav_api.stub_check_path(str(project), str(project / "src" / "main.ts")), "src/main.ts")
+        for bad in ("../x.ts", ".env", "src/.env.local", ""):
+            with self.assertRaises(nav_api.Refused):
+                nav_api.stub_check_path(str(project), bad)
+        self.assertEqual(nav_api.stub_guard("text"), "text")
+
+    # --- F2
+
+    def test_a_symlinked_directory_inside_the_project_does_not_lead_out(self):
+        project = self.project()
+        outside = write(self.dir / "outside" / "secret.ts", "import './deeper.ts';\nexport const s = 1;\n")
+        (project / "src" / "linked_dir").symlink_to(outside.parent)
+        write(project / "src" / "viaparent.ts", "import { s } from './linked_dir/secret.ts';\nexport { s };\n")
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        answer = nav.imports("src/viaparent.ts")
+        self.assertEqual(answer["files"], [])
+        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("./linked_dir/secret.ts", "outside")])
+        self.assertEqual(nav.importers("src/linked_dir/secret.ts")["status"], "refused")
+        self.assertEqual(nav._get_index().importers("src/linked_dir/secret.ts"), [])
+        for call in (nav.symbols, nav.forward_graph):
+            refused = call("src/viaparent.ts")
+            self.assertEqual((refused["status"], refused["reason"]), ("refused", "reaches_refused_path"), call.__name__)
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])  # Deno was not run
+
+    def test_deno_is_not_run_on_a_file_that_reaches_a_refused_file(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        write(project / "src" / "mid.ts", "import { KEY } from './.env.ts';\nexport { KEY };\n")
+        write(project / "src" / "top.ts", "export { KEY } from './mid.ts';\n")
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        self.assertEqual(nav.symbols("src/top.ts")["reason"], "reaches_refused_path")
+        self.assertEqual(self.deno_calls("doc"), [])
+        self.assertEqual(nav.symbols("src/main.ts")["status"], "ok")
+
+    def test_deno_output_naming_a_refused_or_outside_file_is_dropped(self):
+        project = self.project()
+        write(project / "src" / ".env.ts", "export const KEY = 1;\n")
+        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/.env.ts", "leak", "x")["nodes"]["n"]["symbols"]
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(self.dir, "outside.ts", "away", "x")["nodes"]["n"]["symbols"]
+        shown = self.nav(project, deno=self.scripted_deno(doc=doc)).symbols("src/main.ts")
+        self.assertEqual([s["name"] for s in shown["symbols"]], ["kept"])
+
+    # --- F3
+
+    def test_cached_symbols_are_screened_with_the_guard_of_the_reader(self):
+        project = self.project()
+        exe = self.scripted_deno(doc=self.doc_payload(project, "src/app/run.ts", "run", "uses SECRETTOKEN here", line=4))
+        first = self.nav(project, deno=exe).symbols("src/app/run.ts")  # the stub guard: nothing screened
+        self.assertEqual((first["cached"], first["symbols"][0]["doc"]), (False, "uses SECRETTOKEN here"))
+        strict = self.nav(project, deno=exe, guard=lambda text: text.replace("SECRETTOKEN", "[redacted]"))
+        second = strict.symbols("src/app/run.ts")
+        self.assertTrue(second["cached"])
+        self.assertNotIn("SECRETTOKEN", json.dumps(second))
+        self.assertIn("uses [redacted] here", second["symbols"][0]["doc"])
+        stricter = self.nav(project, deno=exe, guard=lambda text: text.replace("run", "[r]"))
+        for field in ("name", "path", "signature", "doc"):  # names and paths are screened as well as the text
+            self.assertNotIn("run", stricter.symbols("src/app/run.ts")["symbols"][0][field].replace("[r]", ""), field)
+
+    def test_a_cached_symbol_of_a_file_that_is_refused_now_is_not_returned(self):
+        project = self.project()
+        write(project / "src" / "credentials.ts", "export const k = 1;\n")
+        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/credentials.ts", "secretive", "x")["nodes"]["n"]["symbols"]
+        exe = self.scripted_deno(doc=doc)
+        permissive = self.nav(project, deno=exe, check_path=lambda root, path: path)
+        self.assertEqual([s["name"] for s in permissive.symbols("src/main.ts")["symbols"]], ["kept", "secretive"])
+        again = self.nav(project, deno=exe).symbols("src/main.ts")
+        self.assertTrue(again["cached"])
+        self.assertEqual([s["name"] for s in again["symbols"]], ["kept"])
+
+    # --- F4
+
+    def test_deno_doc_and_deno_info_both_run_with_no_remote(self):
+        project = self.project()
+        exe = self.scripted_deno(doc={"nodes": {}}, info={"modules": []})
+        nav = self.nav(project, deno=exe)
+        nav.symbols("src/main.ts")
+        nav.forward_graph("src/main.ts")
+        self.assertIn("--no-remote", self.deno_calls("doc")[0].split())
+        self.assertIn("--no-remote", self.deno_calls("info")[0].split())
+
+    # --- F5
+
+    def test_a_slash_after_the_condition_of_if_while_for_starts_a_regex(self):
+        for src in ('if (ok) /import("ghost.ts")/.test(value);', 'while (x) /import "ghost.ts"/.test(y);',
+                    'for (const a of b) /import("ghost.ts")/.test(a);', 'for await (const a of b) /import("ghost.ts")/.test(a);',
+                    'with (o) /import("ghost.ts")/.test(a);', 'if (a) { b(); } else if (c(d)) /import("ghost.ts")/.test(e);'):
+            self.assertEqual(graph.scan_specifiers(src), [], src)
+
+    def test_a_slash_after_a_call_or_a_parenthesised_value_is_still_a_division(self):
+        src = "const r = f(a) / 2; const q = (a + b) / c; import './one.ts'\nif (x) y(z) / 2; import './two.ts'\n"
+        self.assertEqual([s["spec"] for s in graph.scan_specifiers(src)], ["./one.ts", "./two.ts"])
+
+    # --- F6
+
+    def test_inline_type_specifiers_make_an_import_type_only_when_every_name_is_a_type(self):
+        def flags(src):
+            return [s["type_only"] for s in graph.scan_specifiers(src)]
+
+        self.assertEqual(flags("import { type Thing } from './t.ts';"), [True])
+        self.assertEqual(flags("import { type A, type B as C } from './t.ts';"), [True])
+        self.assertEqual(flags("import { type A, b } from './t.ts';"), [False])
+        self.assertEqual(flags("import d, { type A } from './t.ts';"), [False])
+        self.assertEqual(flags("import { type } from './t.ts';"), [False])  # a value called `type`
+        self.assertEqual(flags("import { type as other } from './t.ts';"), [False])
+        self.assertEqual(flags("import { type as } from './t.ts';"), [True])  # a type called `as`
+        self.assertEqual(flags("import {} from './t.ts';"), [False])
+        self.assertEqual(flags("import type { A } from './t.ts';"), [True])
+        self.assertEqual(flags("export { type Thing } from './t.ts';"), [True])
+        self.assertEqual(flags("export { type A, type B } from './t.ts';"), [True])
+        self.assertEqual(flags("export { type A, b } from './t.ts';"), [False])
+        self.assertEqual(flags("export type { A } from './t.ts';"), [True])
+        self.assertEqual(flags("export * from './t.ts';"), [False])
+        self.assertEqual(flags("import * as ns from './t.ts';"), [False])
+
+    # --- F7
+
+    def test_the_doc_cache_follows_content_not_size_and_modification_time(self):
+        project = self.project()
+        exe = self.scripted_deno(doc=self.doc_payload(project, "src/app/run.ts", "run", "x"))
+        run_ts = project / "src" / "app" / "run.ts"
+        self.nav(project, deno=exe).symbols("src/main.ts")
+        self.assertEqual(len(self.deno_calls("doc")), 1)
+        self.assertTrue(self.nav(project, deno=exe).symbols("src/main.ts")["cached"])
+        before = run_ts.stat()
+        text = run_ts.read_text()
+        self.assertIn("Run the app", text)
+        run_ts.write_text(text.replace("Run the app", "Run THE app"))  # same length
+        os.utime(run_ts, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = run_ts.stat()
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        answer = self.nav(project, deno=exe).symbols("src/main.ts")
+        self.assertFalse(answer["cached"])
+        self.assertEqual(len(self.deno_calls("doc")), 2)
+
+    # --- F8
+
+    def test_the_forward_graph_keeps_the_target_and_its_direct_imports_when_it_cuts(self):
+        project = self.project()
+        names = [f"src/a{n:03d}.ts" for n in range(250)]
+        for name in names:
+            write(project / name, "export const a = 1;\n")
+        write(project / "src" / "zz_entry.ts", "import './a249.ts';\nimport './a248.ts';\nexport const z = 1;\n")
+        url = lambda rel: f"file://{project.resolve() / rel}"
+        modules = [{"specifier": url(name), "dependencies": []} for name in names]
+        modules.append({"specifier": url("src/zz_entry.ts"), "dependencies": [
+            {"specifier": "./a249.ts", "code": {"specifier": url("src/a249.ts")}},
+            {"specifier": "./a248.ts", "code": {"specifier": url("src/a248.ts")}}]})
+        answer = self.nav(project, deno=self.scripted_deno(info={"modules": modules})).forward_graph("src/zz_entry.ts")
+        listed = {m["path"]: m["imports"] for m in answer["modules"]}
+        self.assertEqual((answer["status"], answer["total"], len(listed), answer["truncated"]), ("ok", 251, 200, True))
+        self.assertEqual(listed["src/zz_entry.ts"], ["src/a248.ts", "src/a249.ts"])
+        self.assertIn("src/a249.ts", listed)
+        self.assertEqual([m["path"] for m in answer["modules"]], sorted(listed))
+        self.assertIn("src/a000.ts", listed)
+        self.assertNotIn("src/a199.ts", listed)
 
 
 if __name__ == "__main__":

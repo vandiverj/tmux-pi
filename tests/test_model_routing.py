@@ -524,6 +524,28 @@ class LocalRuleConstraintTests(Base):
         out = self.route(self.rule(SONNET, SOL, "max"), "--approve-effort")
         self.assertEqual(out["thinking"], "max")
 
+    def test_a_redirect_to_qwen_never_carries_a_reasoning_effort(self):
+        # Qwen accepts low/medium/high only on an explicit --model; a machine-local rule must not reach them.
+        for thinking in ("low", "medium", "high"):
+            with self.subTest(thinking=thinking):
+                env = self.rule(SONNET, QWEN, thinking, pattern=".")
+                run = self.run_cmd("tp-route", "--no-log", "--role", "scribe", stdin=TASK, env=env)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                out = json.loads(run.stdout)
+                self.assertEqual(out["model"], SONNET)
+                self.assertTrue(any("dropped" in s and "not allowed" in s for s in out["steps"]), out["steps"])
+
+    def test_an_explicit_qwen_run_ignores_the_follow_up_judge_settings(self):
+        # design section 8: the follow-up judge's extra_body reasoning_effort "none" belongs to the judge call only.
+        path = self.root / "local.json"
+        path.write_text(json.dumps({"followup": {"base_url": "http://127.0.0.1:1/v1", "model": "judge", "ask_between": [0.3, 0.7],
+                                                 "extra_body": {"reasoning_effort": "none"}}}))
+        env = {**self.env, "TP_LOCAL_CONFIG": str(path)}
+        run = self.run_cmd("tp-route", "--no-log", "--role", "coder", "--model", QWEN, "--thinking", "medium", stdin=TASK, env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        out = json.loads(run.stdout)
+        self.assertEqual((out["model"], out["thinking"]), (QWEN, "medium"))
+
     def test_a_coder_redirect_below_the_floor_is_dropped(self):
         for target in (HAIKU, QWEN, LUNA):
             with self.subTest(target=target):

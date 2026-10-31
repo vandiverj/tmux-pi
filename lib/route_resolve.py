@@ -181,7 +181,9 @@ def redirect_problems(cat, target, ctx, health, may_enter_restricted, bound=None
     if reason:
         problems.append(reason)
     effort, note = clamp_effort(cat, target["thinking"], bool(ctx.get("approvals", {}).get("effort_above_high")))
-    if effort not in entry["efforts"]:
+    # A redirect is a machine choice, not an explicit one: the effort must be one the level's own map would give, so
+    # efforts a model accepts only on an explicit request (those its effort_map folds away) are never reached this way.
+    if effort not in entry["efforts"] or level["effort_map"].get(effort, effort) != effort:
         problems.append("effort {} is not allowed on {}".format(effort, target["model"]))
     return problems, effort
 

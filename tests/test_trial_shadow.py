@@ -139,6 +139,11 @@ class ShadowCase(lw.LaneCase):
         path = Path(project or self.repo) / ".tmux-pi" / "trial" / "records.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def ago(self, seconds):
+        """A run.json `created` time `seconds` before now."""
+        then = ts.datetime.datetime.now(ts.datetime.timezone.utc) - ts.datetime.timedelta(seconds=seconds)
+        return then.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def snapshot(self, root):
         out = {}
         for path in sorted(Path(root).rglob("*")):
@@ -350,8 +355,8 @@ class PrepareTests(ShadowCase):
         with mock.patch.object(trial_session, "guard", return_value=(True, "")):
             rdir_a, a = self.prepare(model=LOCAL, run="sh-a")
             rdir_b, b = self.prepare(model=LOCAL, run="sh-b")
-        ts.update_run(rdir_a, created="2026-10-31T10:00:00Z")
-        ts.update_run(rdir_b, created="2026-10-31T10:00:01Z")
+        ts.update_run(rdir_a, created=self.ago(2))  # prepared moments ago: the attempt's clock is not spent
+        ts.update_run(rdir_b, created=self.ago(1))
         first = Counting(rdir_a, self.env, sleep=lambda s: None, clock=Clock())
         first.note(phase="spawn")
         first.recheck_capacity()  # nothing ahead of it
@@ -796,6 +801,169 @@ class CleanupTests(ShadowCase):
         self.assertIn("not the run's own", done["error"])
         self.assert_other_untouched(other)
         self.assertEqual(git(other, "status", "--porcelain"), "M lib/x.py", "nothing was staged or reset there")
+
+
+class WorktreeOwnershipTests(ShadowCase):
+    """Review 3: ownership is proven by what the run itself recorded when it created the worktree, and proven again before every git
+    command or removal there. A tree the run did not create, or one swapped in while it ran, is left exactly as it was."""
+
+    def other_tree(self, at, commit=True):
+        """Another lane's registered worktree (dirty, and with a commit of its own past the base) that no shadow may touch."""
+        git(self.repo, "worktree", "add", "--detach", str(at), self.base)
+        if commit:
+            (Path(at) / "lib" / "x.py").write_text("another lane's commit\n")
+            git(at, "commit", "-q", "-am", "other lane commit")
+        (Path(at) / "lib" / "x.py").write_text("another lane's uncommitted work\n")
+        (Path(at) / "lib" / "theirs.py").write_text("untracked\n")
+        return Path(at)
+
+    def fingerprint(self, tree):
+        return (git(tree, "rev-parse", "HEAD"), git(tree, "status", "--porcelain"), (Path(tree) / "lib" / "x.py").read_text(),
+                git(tree, "diff", "--cached", "--stat"), os.path.realpath(str(tree)) in self.worktrees().replace("\\", ""))
+
+    def swapped_run(self, how):
+        """A run with its own worktree made; then `how` replaces what is at the worktree place, as a worker could. Returns the run and
+        the other tree."""
+        rdir, _ = self.prepare()
+        run = ts.Run(rdir, self.env)
+        run.make_worktree()
+        self.addCleanup(lambda: shutil.rmtree(str(run.worktree), ignore_errors=True))
+        self.edit(run)
+        other = self.other_tree(self.root / "other-lane")
+        aside = self.root / "aside"
+        if how == "link":
+            shutil.move(str(run.worktree), str(aside))
+            os.symlink(str(other), str(run.worktree))
+        elif how == "moved-worktree":
+            shutil.move(str(run.worktree), str(aside))
+            git(self.repo, "worktree", "move", "-f", str(other), str(run.worktree))
+            other = run.worktree
+        elif how == "dotgit":
+            admin = ts._gitfile_target(other)
+            (run.worktree / ".git").write_text("gitdir: {}\n".format(admin))
+        return run, other
+
+    def test_f1_a_worktree_that_was_there_before_the_run_is_left_untouched_by_cleanup(self):
+        rdir, info = self.prepare()
+        other = self.other_tree(rdir / "worktree")  # registered, dirty, and not made by this run (the run never reached make_worktree)
+        before = self.fingerprint(other)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("not created by this run" in l for l in leftovers), leftovers)
+        self.assertEqual(self.fingerprint(other), before)
+
+    def test_f1_stop_of_a_queued_run_leaves_a_worktree_it_did_not_create(self):
+        rdir, info = self.prepare()
+        other = self.other_tree(rdir / "worktree")
+        before = self.fingerprint(other)
+        done = ts.stop(rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(any("not created by this run" in l for l in done["cleanup_errors"]), done["cleanup_errors"])
+
+    def test_f1_a_run_that_finds_a_worktree_at_its_place_makes_none_and_removes_none(self):
+        rdir, info = self.prepare()
+        other = self.other_tree(rdir / "worktree")
+        before = self.fingerprint(other)
+        run, done = self.run_stub(rdir)
+        self.assertEqual(done["outcome"], "error")
+        self.assertFalse((rdir / "state" / "tasks" / run.task_id).exists(), "no worker was started")
+        self.assertEqual(self.fingerprint(other), before)
+
+    def test_f1_the_runs_own_worktree_is_still_removed(self):
+        rdir, info = self.prepare()
+        run = ts.Run(rdir, self.env)
+        run.make_worktree()
+        self.assertEqual(run.info["owned_worktree"]["path"], os.path.realpath(str(run.worktree)))
+        self.assertEqual(ts.cleanup(rdir, self.env), [])
+        self.assertFalse(run.worktree.exists())
+        self.assertEqual(ts.cleanup(rdir, self.env), [], "a second cleanup finds nothing and does nothing")
+
+    def test_f1_a_worktree_made_at_the_place_after_the_runs_own_was_removed_is_not_the_runs(self):
+        rdir, info = self.prepare()
+        run = ts.Run(rdir, self.env)
+        run.make_worktree()
+        self.assertEqual(ts.cleanup(rdir, self.env), [])
+        other = self.other_tree(rdir / "worktree")  # git may reuse the admin name of the removed one
+        before = self.fingerprint(other)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(any("not created by this run" in l for l in leftovers), leftovers)
+
+    def test_f2_a_link_swapped_in_before_the_reset_is_caught_before_any_git_command_there(self):
+        run, other = self.swapped_run("link")
+        before = self.fingerprint(other)
+        with self.assertRaises(ts.ShadowError) as caught:
+            run.collect_work()
+        self.assertIn("not the run's own", str(caught.exception))
+        self.assertEqual(self.fingerprint(other), before, "no reset, no add in the other tree")
+        leftovers = ts.cleanup(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(leftovers)
+
+    def test_f2_another_registered_worktree_moved_into_the_place_is_caught_too(self):
+        run, other = self.swapped_run("moved-worktree")
+        before = self.fingerprint(other)
+        with self.assertRaises(ts.ShadowError):
+            run.collect_work()
+        self.assertEqual(self.fingerprint(other), before)
+        ts.cleanup(run.rdir, self.env)
+        self.assertEqual(self.fingerprint(other), before)
+
+    def test_f2_a_dot_git_file_rewritten_to_another_tree_is_caught_too(self):
+        run, other = self.swapped_run("dotgit")
+        before = self.fingerprint(other)
+        with self.assertRaises(ts.ShadowError):
+            run.collect_work()
+        self.assertEqual(self.fingerprint(other), before)
+
+    def test_f2_the_swap_while_the_worker_runs_ends_the_run_in_error_and_leaves_the_other_tree(self):
+        rdir, info = self.prepare()
+        other = self.other_tree(self.root / "other-lane")
+        before = self.fingerprint(other)
+
+        def swap(n, run):
+            if n == 1:
+                shutil.move(str(run.worktree), str(self.root / "aside"))
+                os.symlink(str(other), str(run.worktree))
+                self.settle_worker(run)
+        run, done = self.run_stub(rdir, on_poll=swap)
+        self.assertEqual(done["outcome"], "error")
+        self.assertEqual(self.fingerprint(other), before)
+        self.assertTrue(os.path.islink(str(rdir / "worktree")), "the link is left, not followed")
+
+    def test_f3_an_attempt_spent_before_the_runner_began_starts_no_worker_and_makes_no_worktree(self):
+        rdir, info = self.prepare(timeout_s=300)
+        ts.update_run(rdir, created=self.ago(301))
+        trees = len(self.worktrees().split("\n\n"))
+        run, done = self.run_stub(rdir)
+        self.assertEqual(done["outcome"], "timeout")
+        self.assertIn("worker was not started", done["error"])
+        self.assertFalse((rdir / "state" / "tasks" / run.task_id).exists(), "tp-spawn (here its stand-in) was never reached")
+        self.assertEqual(len(self.worktrees().split("\n\n")), trees)
+        self.assertNotIn("owned_worktree", done)
+
+    def test_f3_time_spent_on_the_worktree_is_checked_again_just_before_tp_spawn(self):
+        rdir, info = self.prepare(timeout_s=300)
+        clock = Clock(step=100.0)
+        calls = []
+
+        class SlowTree(ts.Run):
+            def make_worktree(self):
+                super().make_worktree()
+                clock.now += 301.0  # the worktree and the shared deps took the whole attempt
+
+            def command(self, args, timeout=ts.CMD_TIMEOUT):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 1, "", "tp-spawn must not run")
+        run, done = self.run_stub(rdir, clock=clock, run_class=SlowTree)
+        self.assertEqual((done["outcome"], calls), ("timeout", []), "tp-spawn was not called")
+        self.assertIn("before tp-spawn", done["error"])
+        self.assertFalse((rdir / "worktree").exists(), "the worktree made is cleaned up")
+
+    def test_f3_an_attempt_with_time_left_still_spawns(self):
+        rdir, info = self.prepare(timeout_s=300)
+        ts.update_run(rdir, created=self.ago(250))
+        run, done = self.run_stub(rdir, on_poll=lambda n, r: self.settle_worker(r))
+        self.assertEqual(done["outcome"], "completed")
 
 
 class StopTests(ShadowCase):

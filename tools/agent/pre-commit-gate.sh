@@ -71,6 +71,16 @@ files_of() {
   done
 }
 
+# count_in APP — how many changed files are in APP.
+count_in() {
+  local i=0 n=0 f
+  for f in ${FILES[@]+"${FILES[@]}"}; do
+    [ "${FILE_APP[$i]}" = "$1" ] && n=$((n + 1))
+    i=$((i + 1))
+  done
+  printf '%s\n' "$n"
+}
+
 # run_in APP NAME CMD... — run in APP's directory, output appended to the log under a heading. Sets RC and, when it
 # failed, a few lines of the failure for the summary.
 run_in() {
@@ -163,17 +173,27 @@ has_eslint_config() {
 tool_check prettier prettier 'js|jsx|ts|tsx|mjs|cjs|mts|cts|json|css|scss|md|yml|yaml' --check --ignore-unknown
 tool_check eslint eslint 'js|jsx|ts|tsx|mjs|cjs|mts|cts'
 
-# Typecheck, one line per touched app that has changed TypeScript.
+# Typecheck, one line per touched app that has a typecheck config (deno.json(c) or tsconfig.json). Any changed file in
+# the app counts: a package.json, tsconfig, deno.json or .js change can break the typecheck as well as a .ts one.
+# `tsc --noEmit` checks the whole app. `deno check` needs files: the changed TS files when only TS changed, else every
+# TS file of the app (tracked or untracked, not ignored). An app without a config is reported only when TS changed in it.
 TS_EXT='ts|tsx|mts|cts'
 typed=0
 for app in ${APPS[@]+"${APPS[@]}"}; do
   rels=()
   while IFS= read -r line; do [ -z "$line" ] || rels+=("$line"); done < <(files_of "$app" "$TS_EXT")
-  [ "${#rels[@]}" -gt 0 ] || continue
-  typed=1
   label="typecheck:$app"
   if [ -e "$WT/$app/deno.json" ] || [ -e "$WT/$app/deno.jsonc" ]; then
-    if bin="$(tp_find_deno "$WT")"; then
+    typed=1
+    if [ "$(count_in "$app")" -gt "${#rels[@]}" ]; then
+      rels=()
+      while IFS= read -r -d '' line; do
+        [ -f "$WT/$app/$line" ] && rels+=("$line")
+      done < <(git -C "$WT/$app" ls-files -z --cached --others --exclude-standard -- '*.ts' '*.tsx' '*.mts' '*.cts')
+    fi
+    if [ "${#rels[@]}" = 0 ]; then
+      printf '%s skipped (no ts files)\n' "$label"
+    elif bin="$(tp_find_deno "$WT")"; then
       run_in "$app" "$label" "$bin" check "${rels[@]}"
       printf '%s %s\n' "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
@@ -181,6 +201,7 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
       printf '%s skipped (not found)\n' "$label"
     fi
   elif [ -e "$WT/$app/tsconfig.json" ]; then
+    typed=1
     if bin="$(tp_find_tool tsc "$WT/$app" "$WT")"; then
       run_in "$app" "$label" "$bin" --noEmit
       printf '%s %s\n' "$label" "$RC"
@@ -188,7 +209,8 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
     else
       printf '%s skipped (not found)\n' "$label"
     fi
-  else
+  elif [ "${#rels[@]}" -gt 0 ]; then
+    typed=1
     printf '%s skipped (no deno.json or tsconfig.json)\n' "$label"
   fi
 done

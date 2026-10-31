@@ -227,6 +227,65 @@ class GateTests(ScriptCase):
         self.assertIn("arg: check\narg: main.ts", deno)
         self.assertEqual(self.calls_of("tsc").count("--- call"), 1)
 
+    def test_a_change_to_a_web_apps_config_or_js_still_typechecks_the_app(self):
+        repo = self.repo()
+        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.commit(repo, {"web/package.json": '{"a":1}\n', "web/tsconfig.json": '{"a":1}\n', "web/a.js": "x\n"})
+        self.stub("tsc")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:web 0", body)
+        self.assertEqual(self.calls_of("tsc").count("--- call"), 1)
+        self.assertNotIn("typecheck skipped", "\n".join(body))
+
+    def test_a_package_json_alone_typechecks_a_web_app(self):
+        repo = self.repo()
+        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": "{}\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.commit(repo, {"web/package.json": '{"a":1}\n'})
+        self.stub("tsc")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:web 0", body)
+
+    def test_a_failing_tsc_after_a_config_only_change_fails_the_gate(self):
+        repo = self.repo()
+        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": "{}\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.commit(repo, {"web/tsconfig.json": '{"a":1}\n'})
+        self.stub("tsc", exit_code=2, output="error TS1: broke")
+        code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))
+        self.assertEqual(code, 1)
+        self.assertIn("typecheck:web 2", body)
+
+    def test_a_deno_app_with_only_config_or_js_changes_checks_all_its_ts_files(self):
+        repo = self.repo()
+        self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n", "api/sub/util.ts": "x\n", "api/readme.txt": "x\n"})
+        self.git(repo, "checkout", "-q", "-b", "lane2")
+        self.commit(repo, {"api/deno.json": '{"a":1}\n', "api/script.js": "x\n"})
+        self.stub("deno")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "lane"))[2]
+        self.assertIn("typecheck:api 0", body)
+        deno = self.calls_of("deno")
+        self.assertIn(f"cwd={repo}/api", deno)
+        self.assertIn("arg: check\n", deno)
+        self.assertIn("arg: main.ts\n", deno)
+        self.assertIn("arg: sub/util.ts\n", deno)
+
+    def test_a_deno_app_with_no_ts_files_is_skipped_with_a_reason(self):
+        repo = self.repo()
+        self.commit(repo, {"api/deno.json": "{}\n"})
+        self.stub("deno")
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
+        self.assertIn("typecheck:api skipped (no ts files)", body)
+        self.assertEqual(self.calls_of("deno"), "")
+
+    def test_an_app_with_no_typecheck_config_and_no_ts_changes_prints_no_typecheck_line_for_it(self):
+        repo = self.repo()
+        self.commit(repo, {"docs/package.json": "{}\n", "docs/a.js": "x\n"})
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
+        self.assertNotIn("typecheck:docs", "\n".join(body))
+        self.assertIn("typecheck skipped (no ts files)", body)
+
     def test_deno_is_found_with_mise_when_it_is_not_on_path(self):
         repo = self.repo()
         self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n"})
@@ -439,13 +498,25 @@ class WebJestTests(ScriptCase):
         self.assertEqual([line for line in body if line.startswith("run ")], ["run 1 0", "run 2 0", "run 3 0"])
         self.assertEqual(self.calls_of("jest").count("--- call"), 3)
 
+    def test_repeat_prints_per_file_counts_for_runs_that_all_pass(self):
+        repo = self.web_repo()
+        self.stub("jest", output=self.PASS)
+        code, log, body = self.last_line(self.run_script("web-jest.sh", repo, "--repeat", "3", "apps/web/app/(protected)/page.test.ts"))
+        self.assertEqual(code, 0)
+        self.assertEqual(sum("PASS app/(protected)/page.test.ts passed=2 failed=0 skipped=1" in line for line in body), 3)
+        # each run's counts sit right under its own run line
+        runs = [i for i, line in enumerate(body) if line.startswith("run ")]
+        for i in runs:
+            self.assertIn("PASS app/(protected)/page.test.ts", body[i + 1])
+
     def test_a_failing_run_is_shown_with_its_counts_and_fails_the_script(self):
         repo = self.web_repo()
         self.stub("jest", output="FAIL app/plain.test.ts\n    ✓ a\n    ✕ b\n\nTests:       1 failed, 1 passed, 2 total", fail_on_call=2)
         code, log, body = self.last_line(self.run_script("web-jest.sh", repo, "--repeat", "3", "apps/web/app/plain.test.ts"))
         self.assertEqual(code, 1)
         self.assertEqual([line for line in body if line.startswith("run ")], ["run 1 0", "run 2 1", "run 3 0"])
-        self.assertEqual(sum("FAIL app/plain.test.ts passed=1 failed=1 skipped=0" in line for line in body), 1)
+        # the stub prints the same FAIL output on every call, so each run shows its counts
+        self.assertEqual(sum("FAIL app/plain.test.ts passed=1 failed=1 skipped=0" in line for line in body), 3)
 
     def test_jest_missing_is_reported_and_fails(self):
         repo = self.web_repo()

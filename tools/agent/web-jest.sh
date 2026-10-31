@@ -7,7 +7,7 @@
 # "/wt/apps/web/app/(protected)/page.test.ts": the script passes every path on to jest as one argument, and it
 # prints the command it ran with such paths quoted.
 # Prints per-file counts (`PASS path passed=P failed=F skipped=S`, from jest's --verbose list) and jest's `Tests:` line.
-# With --repeat N it runs the whole thing N times and prints one `run I EXIT` line per run (counts only for runs that failed).
+# With --repeat N it runs the whole thing N times and prints one `run I EXIT` line per run with its per-file counts under it.
 # --config-hook PATH: a JS file of the project (absolute, kept outside the tracked tree, e.g. in .tmux-pi/) that exports
 #   function (config, { worktree, packageDir }) returning the jest config to use. The script wraps the package's own
 #   jest config (jest.config.js|cjs|mjs, or the "jest" key of package.json; an async config function is awaited) in a scratch
@@ -176,18 +176,10 @@ while [ "$run" -le "$REPEAT" ]; do
     rm -f "$RUN_OUT.jest"
     if [ "$rc" != 0 ] && [ "$RUN_RC" = 0 ]; then RUN_RC="$rc"; fi
   done
-  if [ "$REPEAT" -gt 1 ]; then
-    printf 'run %s %s\n' "$run" "$RUN_RC"
-    show=0
-    [ "$RUN_RC" = 0 ] || show=1
-  else
-    show=1
-  fi
-  if [ "$show" = 1 ]; then
-    summarize <"$RUN_OUT" | sed 's/^/  /'
-    grep -E '^Tests:' "$RUN_OUT" | sed 's/^/  /'
-    grep -E '^(jest not found|cannot wrap)' "$RUN_OUT" | sed 's/^/  /'
-  fi
+  [ "$REPEAT" -le 1 ] || printf 'run %s %s\n' "$run" "$RUN_RC"
+  summarize <"$RUN_OUT" | sed 's/^/  /'
+  grep -E '^Tests:' "$RUN_OUT" | sed 's/^/  /'
+  grep -E '^(jest not found|cannot wrap)' "$RUN_OUT" | sed 's/^/  /'
   rm -f "$RUN_OUT"
   if [ "$FINAL" = 0 ] && [ "$RUN_RC" != 0 ]; then FINAL="$RUN_RC"; fi
   run=$((run + 1))

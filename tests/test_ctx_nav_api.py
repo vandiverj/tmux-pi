@@ -21,6 +21,7 @@ from ctxengine import graph  # noqa: E402
 from ctxengine import nav_api  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "ctx_api" / "project"
+MIRROR = "@ROOT@"  # in a fake deno's canned output: the directory the fake runs in, which is the mirror Deno was given
 HAVE_DENO = shutil.which("deno") is not None
 NEEDS_DENO = unittest.skipUnless(HAVE_DENO, "deno is not on PATH")
 
@@ -479,7 +480,7 @@ class NavCase(Tree):
         exe = self.fake_deno("echo 'Download http://x' >&2; echo 'error: Module not found \"file:///x.ts\"' >&2; echo more >&2; exit 1")
         nav = self.nav(self.project(), deno=exe, guard=lambda t: t.replace("x.ts", "[path]"))
         answer = nav.symbols("src/main.ts")
-        self.assertEqual((answer["status"], answer["detail"]), ("error", 'error: Module not found "file:///[path]"'))
+        self.assertEqual((answer["status"], answer["detail"]), ("error", 'error: Module not found "<file>"'))  # a path Deno quotes is not shown
 
     def test_output_that_is_not_what_deno_prints_is_an_error_not_a_crash(self):
         project = self.project()
@@ -523,18 +524,19 @@ class ReviewFixesCase(Tree):
                 write(self.dir / f"{name}.json", json.dumps(payload))
         log = self.dir / "deno.log"
         return self.fake_deno(
-            f'echo "$@" >> {log}\ncase "$1" in\n --version) echo "deno 9.9.9";;\n doc) cat {self.dir / "doc.json"};;\n'
-            f' info) cat {self.dir / "info.json"};;\nesac')
+            f'echo "$@" >> {log}\ncase "$1" in\n --version) echo "deno 9.9.9";;\n'
+            f' doc) sed "s|{MIRROR}|$PWD|g" {self.dir / "doc.json"};;\n info) sed "s|{MIRROR}|$PWD|g" {self.dir / "info.json"};;\nesac')
 
     def deno_calls(self, verb):
         log = self.dir / "deno.log"
         return [line for line in (log.read_text().splitlines() if log.exists() else []) if line.startswith(verb + " ")]
 
     @staticmethod
-    def doc_payload(project, rel, name, doc, line=0):
+    def doc_payload(root, rel, name, doc, line=0):
+        """A canned `deno doc` answer with one export at `rel` below `root` (MIRROR, or another directory for a file outside)."""
         return {"version": 2, "nodes": {"n": {"symbols": [{"name": name, "declarations": [
             {"declarationKind": "export", "kind": "function", "jsDoc": {"doc": doc},
-             "location": {"filename": f"file://{Path(project).resolve() / rel}", "line": line}}]}]}}}
+             "location": {"filename": f"file://{root}/{rel}", "line": line}}]}]}}}
 
     # --- F1
 
@@ -633,9 +635,9 @@ class ReviewFixesCase(Tree):
     def test_deno_output_naming_a_refused_or_outside_file_is_dropped(self):
         project = self.project()
         write(project / "src" / ".env.ts", "export const KEY = 1;\n")
-        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
-        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/.env.ts", "leak", "x")["nodes"]["n"]["symbols"]
-        doc["nodes"]["n"]["symbols"] += self.doc_payload(self.dir, "outside.ts", "away", "x")["nodes"]["n"]["symbols"]
+        doc = self.doc_payload(MIRROR, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(MIRROR, "src/.env.ts", "leak", "x")["nodes"]["n"]["symbols"]
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(str(self.dir), "outside.ts", "away", "x")["nodes"]["n"]["symbols"]
         shown = self.nav(project, deno=self.scripted_deno(doc=doc)).symbols("src/main.ts")
         self.assertEqual([s["name"] for s in shown["symbols"]], ["kept"])
 
@@ -643,7 +645,7 @@ class ReviewFixesCase(Tree):
 
     def test_cached_symbols_are_screened_with_the_guard_of_the_reader(self):
         project = self.project()
-        exe = self.scripted_deno(doc=self.doc_payload(project, "src/app/run.ts", "run", "uses SECRETTOKEN here", line=4))
+        exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "src/app/run.ts", "run", "uses SECRETTOKEN here", line=4))
         first = self.nav(project, deno=exe).symbols("src/app/run.ts")  # the stub guard: nothing screened
         self.assertEqual((first["cached"], first["symbols"][0]["doc"]), (False, "uses SECRETTOKEN here"))
         strict = self.nav(project, deno=exe, guard=lambda text: text.replace("SECRETTOKEN", "[redacted]"))
@@ -659,8 +661,8 @@ class ReviewFixesCase(Tree):
         project = self.project()
         write(project / "src" / "credentials.ts", "export const k = 1;\n")
         write(project / "src" / "gate.ts", "import './credentials.ts';\nexport { c } from './config.ts';\n")
-        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
-        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/credentials.ts", "secretive", "x")["nodes"]["n"]["symbols"]
+        doc = self.doc_payload(MIRROR, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(MIRROR, "src/credentials.ts", "secretive", "x")["nodes"]["n"]["symbols"]
         exe = self.scripted_deno(doc=doc)
         permissive = self.nav(project, deno=exe, check_path=lambda root, path: path)
         self.assertEqual([s["name"] for s in permissive.symbols("src/gate.ts")["symbols"]], ["kept", "secretive"])
@@ -717,7 +719,7 @@ class ReviewFixesCase(Tree):
 
     def test_the_doc_cache_follows_content_not_size_and_modification_time(self):
         project = self.project()
-        exe = self.scripted_deno(doc=self.doc_payload(project, "src/app/run.ts", "run", "x"))
+        exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "src/app/run.ts", "run", "x"))
         run_ts = project / "src" / "app" / "run.ts"
         self.nav(project, deno=exe).symbols("src/main.ts")
         self.assertEqual(len(self.deno_calls("doc")), 1)
@@ -742,7 +744,7 @@ class ReviewFixesCase(Tree):
             write(project / name, "export const a = 1;\n")
         write(project / "src" / "zz_entry.ts", "import './a249.ts';\nimport './a248.ts';\n"
               + "".join(f"import './a{n:03d}.ts';\n" for n in range(248)) + "export const z = 1;\n")  # Deno's graph is what the walk reached
-        url = lambda rel: f"file://{project.resolve() / rel}"
+        url = lambda rel: f"file://{MIRROR}/{rel}"
         modules = [{"specifier": url(name), "dependencies": []} for name in names]
         modules.append({"specifier": url("src/zz_entry.ts"), "dependencies": [
             {"specifier": "./a249.ts", "code": {"specifier": url("src/a249.ts")}},
@@ -957,7 +959,7 @@ class AllowListCase(Tree):
     def test_a_module_deno_lists_that_the_walk_did_not_reach_refuses_the_answer(self):
         project = self.project()
         write(project / "src" / "stray.ts", "export const s = 1;\n")
-        url = lambda rel: f"file://{project.resolve() / rel}"
+        url = lambda rel: f"file://{MIRROR}/{rel}"
         info = {"modules": [{"specifier": url("src/config.ts"), "dependencies": []},
                             {"specifier": url("src/stray.ts"), "dependencies": []}]}
         nav = self.nav(project, deno=self.scripted_deno(info=info))
@@ -978,7 +980,7 @@ class AllowListCase(Tree):
         project = self.project()
         write(project / "skipped" / "mid.ts", "export const m = 1;\n")
         write(project / "src" / "top.ts", "export { m } from '../skipped/mid.ts';\n")
-        exe = self.scripted_deno(doc=self.doc_payload(project, "skipped/mid.ts", "m", "x"))
+        exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "skipped/mid.ts", "m", "x"))
         self.nav(project, deno=exe).symbols("src/top.ts")
         self.assertTrue(self.nav(project, deno=exe).symbols("src/top.ts")["cached"])
         write(project / "skipped" / "mid.ts", "export const m = 2;\n")
@@ -987,19 +989,24 @@ class AllowListCase(Tree):
     def test_a_symbol_from_a_file_outside_the_walk_is_not_returned(self):
         project = self.project()
         write(project / "src" / "stray.ts", "export const s = 1;\n")
-        doc = self.doc_payload(project, "src/config.ts", "kept", "fine")
-        doc["nodes"]["n"]["symbols"] += self.doc_payload(project, "src/stray.ts", "stray", "x")["nodes"]["n"]["symbols"]
+        doc = self.doc_payload(MIRROR, "src/config.ts", "kept", "fine")
+        doc["nodes"]["n"]["symbols"] += self.doc_payload(MIRROR, "src/stray.ts", "stray", "x")["nodes"]["n"]["symbols"]
         shown = self.nav(project, deno=self.scripted_deno(doc=doc)).symbols("src/config.ts")
         self.assertEqual([s["name"] for s in shown["symbols"]], ["kept"])
 
-    def test_deno_is_told_not_to_look_for_a_config_when_there_is_none(self):
+    def test_deno_is_always_given_a_config_of_the_mirror_and_never_looks_for_one(self):
+        """With a config and without one, Deno gets `--config` naming the mirror's own config, so it finds none above the mirror."""
         write(self.dir / "plain" / "a.ts", "export const a = 1;\n")
         nav = self.nav(self.dir / "plain", deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
         nav.symbols("a.ts")
-        self.assertIn("--no-config", self.deno_calls("doc")[0].split())
         proj = self.project()
         self.nav(proj, deno=self.scripted_deno(doc={"nodes": {}})).symbols("src/main.ts")
-        self.assertNotIn("--no-config", self.deno_calls("doc")[-1].split())
+        for line in self.deno_calls("doc"):
+            words = line.split()
+            self.assertIn("--config", words)
+            self.assertTrue(words[words.index("--config") + 1].endswith("deno.json"), line)
+            self.assertNotIn("--no-config", words)
+            self.assertIn("--no-remote", words)
 
     # --- specifier strings in answers
 
@@ -1056,6 +1063,297 @@ class AllowListCase(Tree):
         nav = self.nav(project)
         self.assertEqual([f["path"] for f in nav.imports("src/app/scoped.ts")["files"]], ["src/config.ts"])
         self.assertNotIn("ignored_config", nav.importers("src/config.ts"))
+
+
+class MirrorCase(Tree):
+    """Round 4. Deno is run on a temporary mirror of the files the walk proved, not on the project: whatever the walk misses or
+    misreads is not in the mirror, so Deno cannot open it (family path-boundary, found in reviews 1, 2 and 3). The `recording_deno`
+    wrapper writes what the directory Deno starts in holds, then runs the real Deno."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+
+    def recording_deno(self):
+        """The real `deno`, behind a script that first lists every entry of the mirror it is started in (tree.log) and what it
+        is given as arguments (args.log). Anything Deno could open below its working directory is in tree.log."""
+        real = shutil.which("deno")
+        return self.fake_deno(f'echo "$@" >> {self.dir / "args.log"}\n'
+                              f'case "$1" in --version) ;; *) find . | sort >> {self.dir / "tree.log"}\n'
+                              f'find . ! -type f ! -type d >> {self.dir / "special.log"};; esac\nexec {real} "$@"')
+
+    def tree_seen_by_deno(self):
+        log = self.dir / "tree.log"
+        return log.read_text() if log.exists() else ""
+
+    def refused_project(self):
+        project = self.project()
+        write(project / ".env.dev", "SECRET_CANARY=1\n")
+        write(project / "src" / ".env.ts", "export const KEY = 'CANARY_VALUE';\n")
+        return project
+
+    def assert_deno_never_could_see(self, answers, canary=".env"):
+        self.assertTrue(self.tree_seen_by_deno(), "Deno was not started, so the repro proves nothing")
+        self.assertNotIn(canary, self.tree_seen_by_deno())
+        for answer in answers:
+            self.assertNotIn("CANARY", json.dumps(answer))
+
+    # --- F1 of review 3: import-map entries the walk does not model
+
+    def test_f1_an_import_map_key_that_is_a_path_or_a_file_url_is_not_modelled(self):
+        project = self.refused_project()
+        write(project / "src" / "real.ts", "export const KEY = 1;\n")
+        write(project / "src" / "t2.ts", "export { KEY } from './real.ts';\n")
+        original = json.loads((project / "deno.json").read_text())
+        for key in ("./src/real.ts", "../proj/src/real.ts", "/src/real.ts", f"file://{project}/src/real.ts", ".\\src\\real.ts"):
+            config = json.loads(json.dumps(original))
+            config["imports"][key] = "./src/.env.ts"
+            (project / "deno.json").write_text(json.dumps(config))
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            for call in (nav.symbols, nav.forward_graph):
+                answer = call("src/t2.ts")
+                self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), (key, call.__name__))
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    def test_f1_an_import_map_target_that_is_a_file_url_or_an_absolute_path_is_not_modelled(self):
+        project = self.refused_project()
+        write(project / "src" / "t2.ts", "export { KEY } from '@s';\n")
+        original = json.loads((project / "deno.json").read_text())
+        for target in (f"file://{project}/src/.env.ts", f"FILE:///{project}/src/.env.ts", f"{project}/src/.env.ts", ".\\src\\.env.ts"):
+            config = json.loads(json.dumps(original))
+            config["imports"]["@s"] = target
+            (project / "deno.json").write_text(json.dumps(config))
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            for call in (nav.symbols, nav.forward_graph):
+                answer = call("src/t2.ts")
+                self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), (target, call.__name__))
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    def test_f1_the_same_rules_hold_inside_a_scope(self):
+        project = self.refused_project()
+        original = json.loads((project / "deno.json").read_text())
+        for table in ({"./src/real.ts": "./src/.env.ts"}, {"@s": f"file://{project}/src/.env.ts"}):
+            config = json.loads(json.dumps(original))
+            config["scopes"] = {"./src/": table}
+            (project / "deno.json").write_text(json.dumps(config))
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            self.assertEqual(nav.symbols("src/main.ts")["reason"], "unmodelled_config", table)
+
+    def test_f1_an_ordinary_relative_target_and_a_scope_key_are_still_modelled(self):
+        imap = graph.ImportMap({"@/": "./src/", "@up": "../lib/x.ts", "zod": "npm:zod@4"}, str(self.dir),
+                               scopes={"./vendor/": {"@/": "./other/"}})
+        self.assertFalse(imap.unmodelled)
+
+    @NEEDS_DENO
+    def test_f1_the_repro_with_the_real_deno_is_refused_before_deno_starts(self):
+        project = self.refused_project()
+        write(project / "src" / "real.ts", "export const KEY = 1;\n")
+        write(project / "src" / "t2.ts", "export { KEY } from './real.ts';\n")
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["./src/real.ts"] = "./src/.env.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        nav = self.nav(project, deno=self.recording_deno())
+        answers = [nav.symbols("src/t2.ts"), nav.forward_graph("src/t2.ts")]
+        self.assertEqual([a["status"] for a in answers], ["refused", "refused"])
+        self.assertEqual(self.tree_seen_by_deno(), "")  # refused before Deno was started
+        config["imports"].pop("./src/real.ts")
+        config["imports"]["@s"] = f"file://{project}/src/.env.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        self.assertEqual(nav.symbols("src/t2.ts")["reason"], "unmodelled_config")
+        self.assertEqual(self.tree_seen_by_deno(), "")
+
+    # --- F2 of review 3: a construct the scanner misreads
+
+    @NEEDS_DENO
+    def test_f2_a_scanner_that_sees_no_import_at_all_still_leaves_the_refused_file_out_of_denos_reach(self):
+        """The scanner now reads `a++ / 2` as a division. This test keeps the scanner out of it: with the scanner made blind to every
+        import, Deno is started on the target and still cannot open the refused file, because it is not in the mirror."""
+        project = self.refused_project()
+        write(project / "src" / "t3.ts", "let a = 1;\na++ / 2; export const y = import('./.env.ts');\n")
+        blind = {"specs": [], "pragmas": [], "unmodelled": []}
+        nav = self.nav(project, deno=self.recording_deno())
+        with mock.patch.object(graph, "scan_module", lambda text: blind):
+            graph._SCAN_MEMO.clear()
+            try:
+                answers = [nav.symbols("src/t3.ts"), nav.forward_graph("src/t3.ts")]
+            finally:
+                graph._SCAN_MEMO.clear()
+        self.assertEqual([a["status"] for a in answers], ["ok", "ok"])
+        self.assert_deno_never_could_see(answers)
+        self.assertEqual([m["path"] for m in answers[1]["modules"]], ["src/t3.ts"])  # the refused module is neither listed nor named
+        self.assertNotIn(".env.ts", json.dumps(answers[1]))
+
+    @NEEDS_DENO
+    def test_f2_with_the_scanner_as_it_is_the_repros_refuse_before_deno_starts(self):
+        project = self.refused_project()
+        write(project / "src" / "t3.ts", "let a = 1;\na++ / 2; export const y = import('./.env.ts');\n")
+        write(project / "src" / "t4.tsx", "const a = <div>x</div>; const b = await import('./.env.ts');\n")
+        write(project / "src" / "t5.ts", "const a = 2; a-- / 2; const t = x.if(1) / 2; const u = import('./.env.ts');\n")
+        nav = self.nav(project, deno=self.recording_deno())
+        for target in ("src/t3.ts", "src/t4.tsx", "src/t5.ts"):
+            for call in (nav.symbols, nav.forward_graph):
+                answer = call(target)
+                self.assertEqual((answer["status"], answer.get("reason")), ("refused", "reaches_refused_path"), (target, call.__name__))
+        self.assertEqual(self.tree_seen_by_deno(), "")
+
+    def test_f2_the_scanner_reads_a_slash_after_postfix_operators_member_keywords_and_closing_tags_as_it_should(self):
+        def specs(src):
+            return [s["spec"] for s in graph.scan_specifiers(src)]
+
+        self.assertEqual(specs("let a = 1;\na++ / 2; export const y = import('./a.ts');"), ["./a.ts"])
+        self.assertEqual(specs("a-- / 2; import('./a.ts')"), ["./a.ts"])
+        self.assertEqual(specs("y.if(1) /2; import('./a.ts')"), ["./a.ts"])
+        self.assertEqual(specs("z.while(1) / 2; import('./a.ts')"), ["./a.ts"])
+        self.assertEqual(specs("a.in / 2; b.return / 3; import('./a.ts')"), ["./a.ts"])
+        self.assertEqual(specs("const a = <div>x</div>; const b = await import('./a.ts');"), ["./a.ts"])
+        for still_a_regex in ("if (a) /import('g.ts')/.test(b);", "const r = 1 + /import('g.ts')/.test(x)", "return /import('g.ts')/",
+                              "x = a ? /import('g.ts')/ : 1"):
+            self.assertEqual(specs(still_a_regex), [], still_a_regex)
+
+    # --- the mirror itself
+
+    def proved(self, project, target="src/main.ts", **config):
+        nav = self.nav(project, **config)
+        return graph.prove_reach(nav.project_root, os.path.join(nav.project_root, target), nav.config, nav._permits)
+
+    def test_the_mirror_holds_the_proved_files_a_rewritten_config_and_nothing_else(self):
+        project = self.refused_project()
+        write(project / "package.json", json.dumps({"name": "p", "type": "module", "dependencies": {"zod": "^4"},
+                                                  "imports": {"#k": "./src/.env.ts"}, "exports": "./src/.env.ts"}))
+        config = json.loads((project / "deno.json").read_text())
+        config["tasks"] = {"x": "echo"}
+        config["lock"] = "../outside.lock"
+        config["nodeModulesDir"] = "auto"
+        (project / "deno.json").write_text(json.dumps(config))
+        reach = self.proved(project)
+        mirror = reach.materialize(str(self.dir))
+        try:
+            entries = [os.path.join(d, n) for d, ds, names in os.walk(mirror.root, followlinks=False) for n in ds + names]
+            files = sorted(os.path.relpath(p, mirror.root) for p in entries if os.path.isfile(p))
+            self.assertEqual(files, sorted(set(reach.files) | {"deno.json", "package.json"}))
+            self.assertNotIn(".env", " ".join(files))
+            self.assertFalse([p for p in entries if os.path.islink(p)])
+            self.assertFalse(mirror.root.startswith(str(project) + os.sep))
+            rewritten = json.loads(Path(mirror.path("deno.json")).read_text())
+            self.assertEqual(rewritten["imports"], config["imports"])
+            self.assertEqual((rewritten["lock"], rewritten["nodeModulesDir"]), (False, "none"))
+            for gone in ("tasks", "exclude"):
+                self.assertNotIn(gone, rewritten)
+            package = json.loads(Path(mirror.path("package.json")).read_text())
+            self.assertEqual(package, {"name": "p", "type": "module", "dependencies": {"zod": "^4"}})  # no `imports`, no `exports`
+            for rel in reach.files:  # copies, equal in content, not the same file
+                self.assertEqual(Path(mirror.path(rel)).read_bytes(), (project / rel).read_bytes())
+                self.assertNotEqual(os.stat(mirror.path(rel)).st_ino, os.stat(project / rel).st_ino)
+        finally:
+            mirror.cleanup()
+        self.assertFalse(os.path.exists(mirror.root))
+
+    def test_a_project_without_a_config_gets_a_config_and_a_package_json_of_the_mirror_too(self):
+        write(self.dir / "plain" / "a.ts", "export const a = 1;\n")
+        reach = self.proved(self.dir / "plain", "a.ts")
+        mirror = reach.materialize(str(self.dir))
+        try:
+            self.assertEqual(json.loads(Path(mirror.path("deno.json")).read_text()), {"lock": False, "nodeModulesDir": "none"})
+            self.assertEqual(json.loads(Path(mirror.path("package.json")).read_text()), {})
+        finally:
+            mirror.cleanup()
+
+    def test_a_config_below_the_project_root_is_mirrored_at_the_same_relative_place(self):
+        project = self.dir / "mono"
+        write(project / "lib" / "shared.ts", "export const s = 1;\n")
+        write(project / "api" / "deno.json", json.dumps({"imports": {"@lib/": "../lib/"}}))
+        write(project / "api" / "main.ts", "import { s } from '@lib/shared.ts';\nexport { s };\n")
+        nav = self.nav(project, root=str(project / "api"))
+        reach = graph.prove_reach(nav.project_root, str(project / "api" / "main.ts"), nav.config, nav._permits)
+        mirror = reach.materialize(str(self.dir))
+        try:
+            self.assertEqual(sorted(reach.files), ["api/main.ts", "lib/shared.ts"])
+            self.assertTrue(os.path.isfile(mirror.path("api/deno.json")) and os.path.isfile(mirror.path("lib/shared.ts")))
+        finally:
+            mirror.cleanup()
+
+    @NEEDS_DENO
+    def test_a_config_below_the_project_root_works_with_the_real_deno(self):
+        project = self.dir / "mono"
+        write(project / "lib" / "shared.ts", "/** The shared one. */\nexport const s = 1;\n")
+        write(project / "api" / "deno.json", json.dumps({"imports": {"@lib/": "../lib/"}}))
+        write(project / "api" / "main.ts", "import { s } from '@lib/shared.ts';\nexport { s };\n")
+        nav = self.nav(project, root=str(project / "api"))
+        answer = nav.symbols("api/main.ts")
+        self.assertEqual((answer["status"], [(s["name"], s["path"]) for s in answer["symbols"]]), ("ok", [("s", "lib/shared.ts")]))
+        info = nav.forward_graph("api/main.ts")
+        self.assertEqual([m["path"] for m in info["modules"]], ["api/main.ts", "lib/shared.ts"])
+
+    @NEEDS_DENO
+    def test_a_package_json_subpath_import_cannot_reach_a_refused_file(self):
+        """`#k` is a `package.json` `imports` entry the walk does not follow; Deno would resolve it to the refused file in the
+        project. The mirror's package.json has no `imports`, so there is nothing for Deno to resolve it to."""
+        project = self.refused_project()
+        write(project / "package.json", json.dumps({"name": "p", "imports": {"#k": "./src/.env.ts"}}))
+        write(project / "src" / "t4.ts", "import { KEY } from '#k';\nexport { KEY };\n")
+        nav = self.nav(project, deno=self.recording_deno())
+        answers = [nav.symbols("src/t4.ts"), nav.forward_graph("src/t4.ts")]
+        self.assert_deno_never_could_see(answers)
+        self.assertNotIn("KEY", [s["name"] for s in answers[0].get("symbols", [])])
+
+    def test_config_keys_that_make_deno_read_directories_the_mirror_does_not_have_are_refused(self):
+        project = self.project()
+        original = (project / "deno.json").read_text()
+        for key, value in (("vendor", True), ("nodeModulesDir", "manual")):
+            config = json.loads(original)
+            config[key] = value
+            (project / "deno.json").write_text(json.dumps(config))
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            self.assertEqual((nav.symbols("src/main.ts")["reason"], nav.forward_graph("src/main.ts")["reason"]),
+                             ("unmodelled_config",) * 2, key)
+        for value in ("auto", "none", True, False):
+            config = json.loads(original)
+            config["nodeModulesDir"] = value
+            (project / "deno.json").write_text(json.dumps(config))
+            self.assertEqual(self.nav(project, deno=self.scripted_deno(doc={"nodes": {}})).symbols("src/main.ts")["status"], "ok", value)
+
+    def test_a_mirror_that_would_sit_inside_the_project_is_refused(self):
+        project = self.project()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), mirror_parent=str(project))
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call("src/main.ts")
+            self.assertEqual((answer["status"], answer["reason"]), ("refused", "unmodelled_config"))
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+        self.assertEqual([p.name for p in project.iterdir() if p.name.startswith("tp-ctx-mirror")], [])  # and nothing was left behind
+
+    def test_the_mirror_is_removed_after_every_outcome(self):
+        project = self.project()
+        parent = self.dir / "mirrors"
+        parent.mkdir()
+        for deno in (self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), self.fake_deno("exit 3"), self.fake_deno("exec sleep 30")):
+            nav = self.nav(project, deno=deno, mirror_parent=str(parent), timeout=0.5)
+            nav.symbols("src/main.ts")
+            nav.forward_graph("src/main.ts")
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_a_module_outside_the_mirror_in_deno_output_is_an_unproven_module(self):
+        """Deno listing a path of the project itself (not of the mirror) read something it was not given: no answer."""
+        project = self.project()
+        info = {"modules": [{"specifier": f"file://{MIRROR}/src/config.ts", "dependencies": []},
+                            {"specifier": f"file://{project.resolve()}/src/config.ts", "dependencies": []}]}
+        answer = self.nav(project, deno=self.scripted_deno(info=info)).forward_graph("src/config.ts")
+        self.assertEqual((answer["status"], answer["reason"]), ("refused", "unproven_module"))
+
+    def test_a_deno_failure_names_only_files_the_walk_proved(self):
+        project = self.project()
+        exe = self.fake_deno('echo "error: Module not found \\"file://$PWD/src/.env.ts\\" imported from \\"file://$PWD/src/main.ts\\"" >&2; exit 1')
+        answer = self.nav(project, deno=exe).symbols("src/main.ts")
+        self.assertEqual((answer["status"], answer["detail"]),
+                         ("error", 'error: Module not found "<file>" imported from "src/main.ts"'))
+        text = json.dumps(answer)
+        self.assertNotIn("tp-ctx-mirror", text)
+        self.assertNotIn(".env", text)
+
+    def test_the_signature_line_is_read_from_the_files_deno_was_given(self):
+        project = self.project()
+        exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "src/app/run.ts", "run", "x", line=4))
+        shown = self.nav(project, deno=exe).symbols("src/app/run.ts")
+        self.assertEqual(shown["symbols"][0]["signature"], "export function run(config: Config): string {")
 
 
 if __name__ == "__main__":

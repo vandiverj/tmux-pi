@@ -21,28 +21,39 @@ project or one the guard refuses, in any spelling Deno's URL parser accepts (`%2
 be shown, whether or not a file is there. Every string in an answer, including one read back from the cache, passes through
 `guard(text)` on its way out; a guard that raises gives an `error` answer.
 
-Deno is run on an allow-list, not on a filter. `deno info` and `deno doc` start only after `graph.prove_reach` has walked every
-module Deno would load from the target and shown each one allowed: the walk reads the files itself (so a file the index does not
-hold, such as one under the config's `exclude`, is followed like any other), resolves each specifier through the config's import
-map and scopes, and checks every path a specifier may name. If one is outside the project or refused, or the walk meets something
-it cannot model, the call is refused with a `reason` (`outside_project`, `reaches_refused_path`, `unmodelled_config`,
-`unmodelled_import`, `unreadable_file`, `too_many_files`, `precheck_failed`) and Deno is not started. Nothing depends on the index
-being built. Afterwards the answer is held to the same list: a module Deno lists that the walk did not reach refuses the answer
-(`unproven_module`), and if any proven file changed while Deno ran there is no answer (`stale_index`). With no config file Deno runs
-with `--no-config`, so it cannot find one above the project.
+Deno is run on a mirror of an allow-list, not on the project. `deno info` and `deno doc` start only after `graph.prove_reach` has
+walked every module Deno would load from the target and shown each one allowed: the walk reads the files itself (so a file the
+index does not hold, such as one under the config's `exclude`, is followed like any other), resolves each specifier through the
+config's import map and scopes, and checks every path a specifier may name. If one is outside the project or refused, or the walk
+meets something it cannot model, the call is refused with a `reason` (`outside_project`, `reaches_refused_path`,
+`unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`, `precheck_failed`) and Deno is not started. Then
+the walk's files are copied (the bytes the walk read, as regular files) into a temporary directory laid out like the project, with
+a rewritten config (`imports`, `scopes`, `compilerOptions`, `unstable`; no `exclude`, `lock`, `tasks`, `vendor`) and a `package.json`
+cut down to name, version, type and dependency tables, and Deno is run there with `--config` naming that config; the directory is
+removed afterwards and the paths in Deno's answer are mapped back. So whatever the walk misses or misreads (a scanner that
+misreads a `/`, an import-map entry of a shape it does not model) names a file that is not there: Deno cannot open a refused file
+it was not given. The walk stays as the first check, so a refused file is reported by name-free `reason` before Deno starts.
+Afterwards the answer is held to the same list: a module Deno lists that the walk did not reach refuses the answer
+(`unproven_module`), and if any proven file changed while Deno ran there is no answer (`stale_index`). A message of Deno's names
+only files the walk proved (any other path is `<file>`).
 
 Known limits (what is not proven):
+  - The mirror keeps Deno from opening a project file it was not given, not from opening a path given as an absolute path or one
+    that leaves the project (`/etc/x`, `../../x`) when the scanner misses that import: a copy of the project cannot stop that. The
+    walk refuses such a specifier when it sees it; a missed one is only stopped by an operating-system sandbox of the Deno process
+    (not built here: it is platform-specific and a decision for the host).
   - `npm:`, `jsr:` and `node:` packages, and `http(s):` modules, are external: they are not followed, and Deno reads them from its
-    own cache or `node_modules`, which are not checked. A `package.json` dependency that is a local path (`file:`, `link:`,
-    `workspace:`) is refused; one in a directory above the config or the project root is not looked at.
-  - A config with comments (JSONC), `importMap`, `workspace`, `links`, `patch`, an unreadable map or `sloppy-imports` is refused;
+    own cache, which is not checked (the mirror has no `node_modules`). A `package.json` dependency that is a local path (`file:`,
+    `link:`, `workspace:`) is refused; one in a directory above the config or the project root is not looked at.
+  - A config with comments (JSONC), `importMap`, `workspace`, `links`, `patch`, `vendor`, a `nodeModulesDir` of `manual`, an unreadable
+    map, an import map whose keys are paths (`./x`, `/x`, `file:`) or whose targets are `file:` URLs, or `sloppy-imports` is refused;
     nothing is guessed. Import-map matching is the specifier-prefix rule as implemented in `graph.ImportMap`, not Deno's own code.
   - Any `import(expr)` with an argument that is not a string literal, or `import.meta.resolve`, anywhere in the graph refuses the
     call, though Deno would not follow it either: the walk cannot tell. A source file over 2 MB refuses the call.
   - Modules named only by `new URL(..., import.meta.url)`, `Worker`, `require()` in CommonJS, or runtime reads are not followed; Deno
     does not load them for `info` or `doc` either, but that is Deno's behaviour, not something proven here.
-  - Between the walk and Deno's read a file can be swapped for a symlink or a file created where there was none; a change to a file
-    the walk read is caught afterwards, one to a path it found empty is not.
+  - The mirror holds the bytes the walk read, so a file swapped for a link after the walk cannot reach Deno; a change to a file the
+    walk read is still noticed afterwards (`stale_index`), so an answer is never given for a tree that moved.
   - Case-insensitive file systems: a name that differs from a refused one only by case is the guard's to refuse.
   - The index (importers/imports) is not part of the proof; its edges ignore `@deno-types`/`@ts-types` pragmas and percent-encoded
     spellings, so an importer list can miss an edge Deno would see.
@@ -53,6 +64,7 @@ by passing `check_path=redact.check_path, guard=redact.guard` to `NavApi`. Any e
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from urllib.parse import unquote
@@ -160,7 +172,7 @@ class NavApi:
     what Deno said, and both run again on every read of it."""
 
     def __init__(self, project_root, root=None, config=None, overlays=(), cache_dir=None, deno="deno", timeout=DEFAULT_TIMEOUT,
-                 check_path=stub_check_path, guard=stub_guard):
+                 check_path=stub_check_path, guard=stub_guard, mirror_parent=None):
         self.project_root = os.path.realpath(project_root)
         self.root = os.path.realpath(root or project_root)
         self.config = os.path.join(self.root, "deno.json") if config is None else os.path.realpath(config)
@@ -170,6 +182,7 @@ class NavApi:
         self.timeout = timeout
         self.check_path = check_path
         self.guard = guard
+        self.mirror_parent = mirror_parent  # where each call's temporary mirror is made (default: the system's temporary directory)
         self._index = None
         self._version = None
 
@@ -315,13 +328,14 @@ class NavApi:
         env.update(OFFLINE_ENV)
         return env
 
-    def _run_deno(self, args):
-        """(status, stdout, detail): runs `deno` with `args` in the config's directory, never longer than the timeout. The detail
-        is not screened here; `_out` screens the answer it ends up in."""
+    def _run_deno(self, args, cwd=None):
+        """(status, stdout, detail): runs `deno` with `args` in `cwd` (default: the config's directory), never longer than the
+        timeout. The detail is not screened here; `_out` screens the answer it ends up in."""
         exe = self._deno_exe()
         if exe is None:
             return "unavailable", "", "deno was not found on PATH"
-        cwd = os.path.dirname(self.config) if os.path.isdir(os.path.dirname(self.config)) else self.root
+        if cwd is None:
+            cwd = os.path.dirname(self.config) if os.path.isdir(os.path.dirname(self.config)) else self.root
         try:
             run = subprocess.run([exe, *args], cwd=cwd, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True,
                                  timeout=self.timeout)
@@ -334,13 +348,8 @@ class NavApi:
         if run.returncode != 0:
             lines = run.stderr.decode("utf-8", "replace").strip().splitlines()
             first = next((line for line in lines if line.strip() and not line.startswith(("Download", "Warning"))), "")
-            return "error", "", first.strip()[:200] or "deno failed"
+            return "error", "", first.strip()[:1000] or "deno failed"  # cut to 200 after `_scrub`, which needs whole paths
         return "ok", run.stdout.decode("utf-8", "replace"), ""
-
-    def _config_args(self):
-        """`--config` for the config the walk read, else `--no-config`: Deno looks for a config in the directories above, and
-        would load a map the walk never saw."""
-        return ["--config", self.config] if os.path.isfile(self.config) else ["--no-config"]
 
     def deno_version(self):
         """First line of `deno --version`, or None when Deno cannot be run."""
@@ -354,15 +363,50 @@ class NavApi:
 
     def _prove(self, rel):
         """(reach, None) when every module Deno would load from `rel` has been shown allowed (`graph.prove_reach`), else
-        (None, the refusing answer). Deno is run only on a `reach`. The walk reads the files itself and does not use the index,
-        so what the index leaves out (an excluded file) and whether the index could be built make no difference. A walk that
-        fails for any other reason is a refusal as well."""
+        (None, the refusing answer). The walk reads the files itself and does not use the index, so what the index leaves out (an
+        excluded file) and whether the index could be built make no difference. A walk that fails for any other reason is a
+        refusal as well."""
         try:
             return graph.prove_reach(self.project_root, os.path.join(self.project_root, rel), self.config, self._permits), None
         except graph.Unproven as error:
             return None, _answer("refused", reason=error.reason)
         except Exception:
             return None, _answer("refused", reason="precheck_failed")
+
+    def _run_mirrored(self, verb_args, reach):
+        """Runs `deno <verb_args> --config <mirror config> <mirror entry>` on a mirror of what the walk proved, never on the project
+        (see `graph.Mirror`), and removes the mirror. Returns (None, stdout, mirror) when Deno answered and the proven files are
+        unchanged, else (the answer to give, None, None). The detail of a Deno failure is rewritten so it names no file the walk did
+        not prove."""
+        try:
+            mirror = reach.materialize(self.mirror_parent)
+        except graph.Unproven as error:
+            return _answer("refused", reason=error.reason), None, None
+        except Exception:
+            return _answer("error", detail="the temporary copy for Deno could not be made"), None, None
+        try:
+            config = mirror.path(reach.config_rel)
+            status, out, detail = self._run_deno([*verb_args, "--config", config, mirror.path(reach.entry)],
+                                                 cwd=os.path.dirname(config))
+        finally:
+            mirror.cleanup()
+        if status != "ok":
+            return _answer(status, detail=self._scrub(detail, mirror, reach.names)[:200]), None, None
+        if not reach.holds():
+            return _answer("stale_index", detail="a file changed while Deno was reading it"), None, None
+        return None, out, mirror
+
+    @staticmethod
+    def _scrub(text, mirror, names):
+        """`text` with each path in the mirror shown as its project-relative name when the walk proved that file, else `<file>`:
+        Deno's messages quote what the files said, which can be a refused or outside path that is not there."""
+        def swap(match):
+            raw = match.group()
+            path = unquote(raw[len("file://"):]) if raw.startswith("file://") else raw
+            rel = mirror.to_real(path)
+            return rel if rel in names else "<file>"
+        text = re.sub(r"file://[^\s\"'<>)\]]+", swap, text)
+        return re.sub(re.escape(mirror.root) + r"[^\s\"'<>)\]]*", swap, text)
 
     def forward_graph(self, target):
         """The local modules `target` reaches, from `deno info --json` (30 s cap): {"modules": [{"path", "imports": [paths]}]}.
@@ -380,11 +424,9 @@ class NavApi:
         reach, refusal = self._prove(rel)
         if refusal:
             return refusal
-        status, out, detail = self._run_deno(["info", "--json", "--no-remote", "--no-lock", *self._config_args(), full])
-        if status != "ok":
-            return _answer(status, detail=detail)
-        if not reach.holds():
-            return _answer("stale_index", detail="a file changed while Deno was reading it")
+        refusal, out, mirror = self._run_mirrored(["info", "--json", "--no-remote", "--no-lock"], reach)
+        if refusal:
+            return refusal
         try:
             data = json.loads(out)
             modules = data["modules"]
@@ -401,10 +443,10 @@ class NavApi:
             if path is None:
                 external += 1
                 continue
-            inside = graph.project_path(self.project_root, path)
+            inside = mirror.to_real(path)  # None: a path outside the mirror, so Deno read something that was not given to it
             if inside is None or inside not in names:
                 if module.get("error") and inside is not None:
-                    continue  # a module Deno could not load (no such file): nothing was read, nothing to list
+                    continue  # a module Deno could not load (not in the mirror): nothing was read, nothing to list
                 return _answer("refused", reason="unproven_module")  # Deno loaded a file the walk did not show allowed
             deps = set()
             for dep in module.get("dependencies") or []:
@@ -412,7 +454,7 @@ class NavApi:
                     continue
                 for key in ("code", "type"):
                     dest = _file_url_path(dep.get(key, {}).get("specifier")) if isinstance(dep.get(key), dict) else None
-                    dest = graph.project_path(self.project_root, dest) if dest else None
+                    dest = mirror.to_real(dest) if dest else None
                     if dest and dest in names and self._allowed(dest) is not None:
                         deps.add(dest)
             local[inside] = sorted(deps)
@@ -451,12 +493,10 @@ class NavApi:
         if cached is not None:
             found, hit = cached, True
         else:
-            status, out, detail = self._run_deno(["doc", "--json", "--no-remote", "--no-lock", *self._config_args(), full])
-            if status != "ok":
-                return _answer(status, detail=detail)
-            if not reach.holds():
-                return _answer("stale_index", detail="a file changed while Deno was reading it")
-            found = self._parse_doc(out, names)
+            refusal, out, mirror = self._run_mirrored(["doc", "--json", "--no-remote", "--no-lock"], reach)
+            if refusal:
+                return refusal
+            found = self._parse_doc(out, names, mirror, reach)
             if found is None:
                 return _answer("error", detail="deno doc gave output that is not a symbol list")
             self._write_cache("doc", key, found)
@@ -474,9 +514,10 @@ class NavApi:
             return None
         return {key: entry.get(key, "") for key in ("name", "kind", "path", "line", "signature", "doc")}
 
-    def _parse_doc(self, text, names):
+    def _parse_doc(self, text, names, mirror, reach):
         """The symbol list for the cache: raw as Deno gave it (cut to length), for files the guard allows now and the walk reached
-        (`names`). It is screened when it is read, never trusted as already screened."""
+        (`names`), named by their project paths (Deno saw the mirror's). The signature line is read from what the walk read, the
+        files Deno was given. It is screened when it is read, never trusted as already screened."""
         try:
             data = json.loads(text)
             nodes = data["nodes"]
@@ -491,16 +532,12 @@ class NavApi:
                     if decl.get("declarationKind") != "export":
                         continue
                     where = _file_url_path(decl.get("location", {}).get("filename"))
-                    rel = graph.project_path(self.project_root, where) if where else None
+                    rel = mirror.to_real(where) if where else None
                     if rel is None or rel not in names or self._allowed(rel) is None:
                         continue  # defined outside the project (a package), or a file the guard refuses: not navigable here
                     line = int(decl["location"].get("line", 0)) + 1  # deno doc counts lines from 0
                     if rel not in lines_of:
-                        try:
-                            with open(os.path.join(self.project_root, rel), "r", encoding="utf-8", errors="replace") as handle:
-                                lines_of[rel] = handle.read().splitlines()
-                        except OSError:
-                            lines_of[rel] = []
+                        lines_of[rel] = reach.contents.get(rel, b"").decode("utf-8", "replace").splitlines()
                     source = lines_of[rel]
                     signature = ""
                     for at in range(line - 1, min(len(source), line + 10)):  # the location can point at the doc comment

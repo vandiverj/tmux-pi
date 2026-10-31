@@ -41,6 +41,8 @@ fs.mkdirSync(state);
 for (const key of ['TP_TASK_DIR', 'TP_MODE']) delete process.env[key];
 Object.assign(process.env, {
   TMUX: '/tmp/stub,1,0', PI_CODING_AGENT_DIR: path.join(home, 'agent'), TP_STATE_DIR: state, TP_SENSITIVE_READ_BIN: classifier,
+  // The classifier stub is a node process; on a loaded machine its start-up can pass the 5 s default, and the guard then fails closed and masks every citation.
+  TP_SENSITIVE_READ_TIMEOUT_MS: '60000',
 });
 const tools = {};
 (await import(pathToFileURL(path.join(tmp, 'ext/assistant.ts')).href)).default({ on() {}, registerTool(t) { tools[t.name] = t; } });
@@ -212,6 +214,31 @@ await check('F2 quoted existing path keeps its line range', async () => {
   const r = await overflow('Quoted: "my dir/b c.py:3:5" here.');
   assert.deepEqual(r.m.paths, [{ path: 'my dir/b c.py', lines: ['3'], content_hash: sha(path.join(work, 'my dir/b c.py')) }]);
 });
+// Classifier stall: the first call outlasts the 5 s default. Without the override the guard fails closed and masks the citation; with it the path is classified and hashed.
+const stallMarker = path.join(tmp, 'stall-marker');
+const stallBin = script('stall-classifier', `#!/usr/bin/env node
+const fs = require('node:fs');
+let d = ''; process.stdin.on('data', (c) => d += c).on('end', () => {
+  const first = !fs.existsSync(${JSON.stringify(stallMarker)});
+  fs.writeFileSync(${JSON.stringify(stallMarker)}, '1');
+  setTimeout(() => console.log(JSON.stringify({ sensitive: false })), first ? 6000 : 0);
+});
+`);
+for (const [label, timeout, held] of [['default timeout fails closed', undefined, true], ['override waits for the stall', '60000', false]]) {
+  await check(`classifier stall: ${label}`, () => withEnv({ TP_SENSITIVE_READ_BIN: stallBin, TP_SENSITIVE_READ_TIMEOUT_MS: timeout }, async () => {
+    fs.rmSync(stallMarker, { force: true });
+    const r = await overflow('Only src/alpha.py:3 matters.');
+    if (held) {
+      assert.equal(r.m.withheld, 1);
+      assert(!r.text.includes('src/alpha.py'), 'masked in the excerpt');
+      assert.deepEqual(r.m.paths, []);
+    } else {
+      assert.equal(r.m.withheld, 0);
+      assert.deepEqual(r.m.paths.map((p) => p.path), ['src/alpha.py']);
+      assert(r.text.includes('src/alpha.py:3'));
+    }
+  }));
+}
 if (failures.length) { console.log('FAILED:', failures.join(' | ')); process.exit(1); }
 
 // A classifier that cannot answer fails closed: everything cited is withheld.

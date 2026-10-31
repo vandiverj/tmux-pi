@@ -9,6 +9,12 @@
  *                paths, line numbers and verbatim snippets. Main keeps the thinking and
  *                the knowledge; the local model's context never accumulates, so its
  *                window never compacts mid-task.
+ *
+ * Settings (environment):
+ *   TP_SENSITIVE_READ_BIN         classifier used to decide which cited paths are withheld (default bin/tp-sensitive-read).
+ *   TP_SENSITIVE_READ_TIMEOUT_MS  milliseconds the classifier gets per path (default 5000). On timeout or any
+ *                                 error the path is treated as sensitive: withheld and masked, never hashed.
+ *
  * Substantial work is dispatched through orchestration.ts and tp-agent.
  */
 
@@ -233,11 +239,11 @@ export default function (pi: ExtensionAPI) {
 	const local = readJson(join(root, "config/local.json"));
 	if (process.env.TP_MODE === "strict") return;
 
-	// Same classifier as the worker gate; TP_SENSITIVE_READ_BIN lets tests stub it. Fails closed.
+	// Same classifier as the worker gate; TP_SENSITIVE_READ_BIN lets tests stub it, TP_SENSITIVE_READ_TIMEOUT_MS sets its time limit. Fails closed.
 	const isSensitive = (cwd: string) => (path: string): boolean => {
 		try {
 			const answer = JSON.parse(execFileSync(process.env.TP_SENSITIVE_READ_BIN || join(root, "bin/tp-sensitive-read"), [], {
-				input: JSON.stringify({ tool_name: "read", tool_input: { path }, cwd }), encoding: "utf8", timeout: 5000,
+				input: JSON.stringify({ tool_name: "read", tool_input: { path }, cwd }), encoding: "utf8", timeout: Number(process.env.TP_SENSITIVE_READ_TIMEOUT_MS) || 5000,
 			}));
 			return answer.sensitive !== false;
 		} catch { return true; }

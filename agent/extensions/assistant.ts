@@ -14,7 +14,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -36,70 +36,151 @@ const ASSISTANT_PROMPT =
 	"No opinions, no padding.";
 const MAX_REPLY = 24_000;
 
-const MAX_CITED = 50; // paths examined and listed in one manifest
-const MAX_HASH_BYTES = 64 * 1024 * 1024;
+const MAX_CITED = 50; // paths hashed and listed in one manifest; the rest are counted in `omitted`
+const MAX_CLASSIFIED = 200; // cited names run through the sensitive classifier; one past this is masked, never named
+const MAX_BACK_WORDS = 8; // words an unquoted citation may reach back over to find a path with spaces
+const WITHHELD_MARK = "[withheld path]";
 
-/** Cut `text` to at most `max` characters, at a line boundary when the cut has one. */
-export function cutAtLine(text: string, max: number): string {
-	if (text.length <= max) return text;
+/** Cut `text` to at most `max` characters, at a line boundary when the cut has one; `midLine` says it did not. */
+export function cutAtLine(text: string, max: number): { text: string; midLine: boolean } {
+	if (text.length <= max) return { text, midLine: false };
 	const head = text.slice(0, max);
 	const nl = head.lastIndexOf("\n");
-	return nl > 0 ? head.slice(0, nl) : head;
+	return nl > 0 ? { text: head.slice(0, nl), midLine: false } : { text: head, midLine: true };
 }
 
-export type Cited = { path: string; lines: string[] };
+export type Span = { start: number; end: number };
+export type Cite = { path: string; lines: string[]; spans: Span[]; spaced: boolean };
 
-const PATH_RE = /(?<=^|[\s`'"(\[<])(\/?(?:[\w@.+-]+\/)+[\w@.+-]+|[\w@.+-]*\.[A-Za-z0-9]{1,8})(?::(\d+)(?:[-–:](\d+))?|#L(\d+)(?:-L?(\d+))?)?/gm;
+const LINES = String.raw`(?::(\d+)(?:[-–:](\d+))?|#L(\d+)(?:-L?(\d+))?)?`;
+const PATH_RE = new RegExp(String.raw`(?<=^|[\s` + "`" + String.raw`'"(\[<])(\/?(?:[\w@.+-]+\/)+[\w@.+-]+|[\w@.+-]*\.[A-Za-z0-9]{1,8})` + LINES, "gm");
+// A quoted name with a space in it: "src/my file.py:8", `my dir/a.py`.
+const QUOTED_RE = new RegExp("([\"`'])([^\"`'\\n]* [^\"`'\\n]*)\\1" + LINES, "g");
 
-/** The file paths a reply cites, with the line ranges it gives for each, in first-seen order. */
-export function citedPaths(reply: string): Cited[] {
-	const found = new Map<string, Set<string>>();
-	for (const m of reply.matchAll(PATH_RE)) {
-		const path = m[1].replace(/[.,;:]+$/, "");
-		if (!path || path === "." || path === "..") continue;
-		const first = m[2] ?? m[4], last = m[3] ?? m[5];
-		const lines = found.get(path) ?? new Set<string>();
-		if (first) lines.add(last && last !== first ? `${first}-${last}` : first);
-		found.set(path, lines);
+/**
+ * The file paths a reply cites, with the line ranges it gives for each, in first-seen order, and where each
+ * citation sits in the reply. A path with spaces is taken when the reply quotes it, or (given `exists`) when
+ * it names a file that is there; a quoted one is returned with `spaced` set whether or not it is there.
+ */
+export function citedPaths(reply: string, exists?: (path: string) => boolean): Cite[] {
+	const found = new Map<string, Cite>();
+	const events: { at: number; run: () => void }[] = [];
+	const add = (path: string, first: string | undefined, last: string | undefined, span: Span, spaced: boolean) => {
+		const cite = found.get(path) ?? { path, lines: [], spans: [], spaced };
+		const range = first ? (last && last !== first ? `${first}-${last}` : first) : undefined;
+		if (range && !cite.lines.includes(range)) cite.lines.push(range);
+		cite.spans.push(span);
+		found.set(path, cite);
+	};
+	const quoted: Span[] = [];
+	for (const m of reply.matchAll(QUOTED_RE)) {
+		const inner = m[2].trim();
+		const looksLikePath = inner.includes("/") || /\.[A-Za-z0-9]{1,8}$/.test(inner);
+		if (!looksLikePath || !/^[\w@.+\-/ ()]+$/.test(inner)) continue;
+		const span = { start: m.index! + 1, end: m.index! + m[0].length };
+		quoted.push({ start: m.index!, end: span.end });
+		events.push({ at: m.index!, run: () => add(inner, m[3] ?? m[5], m[4] ?? m[6], span, true) });
 	}
-	return [...found].map(([path, lines]) => ({ path, lines: [...lines] }));
+	const plain: { span: Span; run: () => void }[] = [];
+	for (const m of reply.matchAll(PATH_RE)) {
+		if (quoted.some((q) => m.index! >= q.start && m.index! < q.end)) continue;
+		let path = m[1].replace(/[.,;:]+$/, "");
+		if (!path || path === "." || path === "..") continue;
+		let start = m.index!;
+		const end = m.index! + m[0].length;
+		if (exists) {
+			// Reach back over earlier words on the line; the longest stretch that names a file here is the citation.
+			const lineStart = reply.lastIndexOf("\n", start - 1) + 1;
+			const words = [...reply.slice(lineStart, start).matchAll(/\S+/g)].slice(-MAX_BACK_WORDS);
+			for (let k = words.length; k >= 1; k--) {
+				const from = lineStart + words[words.length - k].index!;
+				const raw = reply.slice(from, start + path.length);
+				const text = raw.replace(/^[`'"(\[<]+/, "");
+				if (exists(text)) { start = from + raw.length - text.length; path = text; break; }
+			}
+		}
+		const span = { start, end };
+		plain.push({ span, run: () => add(path, m[2] ?? m[4], m[3] ?? m[5], span, false) });
+	}
+	// "src/my file.py" is one citation: drop the pieces ("src/my") that the longer match swallowed.
+	for (const p of plain) {
+		if (!plain.some((o) => o !== p && o.span.start <= p.span.start && o.span.end >= p.span.end && o.span.end - o.span.start > p.span.end - p.span.start)) {
+			events.push({ at: p.span.start, run: p.run });
+		}
+	}
+	for (const e of events.sort((x, y) => x.at - y.at)) e.run();
+	return [...found.values()];
 }
 
 export type Manifest = {
-	paths: { path: string; lines?: string[]; content_hash: string | null }[];
+	paths: { path: string; lines?: string[]; content_hash: string }[];
 	withheld: number;
+	omitted: number;
+	unresolved: number;
 	truncated: true;
 	bytes_total: number;
 	artifact: string;
 };
 
+/** SHA-256 of a file's current content, read in chunks so its size does not matter. */
+function hashFile(file: string): string {
+	const hash = createHash("sha256");
+	const buf = Buffer.allocUnsafe(1 << 20);
+	const fd = openSync(file, "r");
+	try {
+		for (let n; (n = readSync(fd, buf, 0, buf.length, null)) > 0;) hash.update(buf.subarray(0, n));
+	} finally { closeSync(fd); }
+	return "sha256:" + hash.digest("hex");
+}
+
 /**
- * Build the manifest for an over-cap reply. A cited path the sensitive classifier flags, or cannot classify,
- * is counted in `withheld` and never read, hashed or named. Hashes come from the working tree now.
+ * Build the manifest for an over-cap reply. Every cited name is classified, including one that is not on disk.
+ * One the sensitive classifier flags, or cannot classify, is counted in `withheld` and never read, hashed or named;
+ * `withheldSpans` says where it sits in the reply so the excerpt can mask it. Hashes come from the working tree now.
+ * Nothing is dropped silently: past the cap, `omitted` counts the readable files left out and `unresolved` the
+ * citations that could not be read or found.
  */
-export function buildManifest(reply: string, cwd: string, artifact: string, sensitive: (path: string) => boolean): Manifest {
+export function buildManifest(reply: string, cwd: string, artifact: string, sensitive: (path: string) => boolean):
+	{ manifest: Manifest; withheldSpans: Span[] } {
+	const resolveIn = (p: string) => (isAbsolute(p) ? p : resolve(cwd, p));
+	const isThere = (p: string) => { try { lstatSync(resolveIn(p)); return true; } catch { return false; } };
 	const paths: Manifest["paths"] = [];
-	let withheld = 0;
-	for (const cite of citedPaths(reply).slice(0, MAX_CITED)) {
-		const abs = isAbsolute(cite.path) ? cite.path : resolve(cwd, cite.path);
-		let exists = true;
-		try { lstatSync(abs); } catch { exists = false; }
-		// A name with no directory part that is not here is prose ("e.g.", "v1.2"), not a citation.
-		if (!exists && !cite.path.includes("/")) continue;
-		if (sensitive(abs)) { withheld++; continue; }
-		if (!exists) continue;
-		let real: string;
-		try { real = realpathSync(abs); } catch { continue; }
-		if (real !== abs && sensitive(real)) { withheld++; continue; }
-		let content_hash: string | null = null;
+	const withheldSpans: Span[] = [];
+	let withheld = 0, omitted = 0, unresolved = 0, classified = 0;
+	for (const cite of citedPaths(reply, isThere)) {
+		const abs = resolveIn(cite.path);
+		const exists = isThere(cite.path);
+		let flagged = ++classified > MAX_CLASSIFIED || sensitive(abs);
+		let real = abs;
+		if (!flagged && exists) {
+			try { real = realpathSync(abs); } catch { unresolved++; continue; }
+			flagged = real !== abs && sensitive(real);
+		}
+		if (flagged) { withheld++; withheldSpans.push(...cite.spans); continue; }
+		if (!exists) {
+			// A bare name that is not here is prose ("e.g.", "v1.2"); a quoted or directory-qualified one is a citation we could not find.
+			if (cite.spaced || cite.path.includes("/")) unresolved++;
+			continue;
+		}
+		let content_hash: string;
 		try {
-			const stat = lstatSync(real);
-			if (!stat.isFile()) continue;
-			if (stat.size <= MAX_HASH_BYTES) content_hash = "sha256:" + createHash("sha256").update(readFileSync(real)).digest("hex");
-		} catch { continue; }
+			if (!lstatSync(real).isFile()) continue;
+			if (paths.length >= MAX_CITED) { omitted++; continue; }
+			content_hash = hashFile(real);
+		} catch { unresolved++; continue; }
 		paths.push({ path: cite.path, ...(cite.lines.length ? { lines: cite.lines } : {}), content_hash });
 	}
-	return { paths, withheld, truncated: true, bytes_total: Buffer.byteLength(reply), artifact };
+	return { manifest: { paths, withheld, omitted, unresolved, truncated: true, bytes_total: Buffer.byteLength(reply), artifact }, withheldSpans };
+}
+
+/** Replace each span of `text` (offsets into the full reply) with a fixed placeholder; spans past its end are ignored. */
+export function maskSpans(text: string, spans: Span[]): string {
+	let out = text;
+	for (const { start, end } of [...spans].sort((a, b) => b.start - a.start)) {
+		if (start >= out.length) continue;
+		out = out.slice(0, start) + WITHHELD_MARK + out.slice(Math.min(end, out.length));
+	}
+	return out;
 }
 
 const GUIDANCE =
@@ -177,12 +258,14 @@ export default function (pi: ExtensionAPI) {
 						writeFileAtomic(state, artifact, out, 0o600);
 					} catch { artifact = undefined; }
 				}
-				const head = cutAtLine(out, MAX_REPLY);
+				const cut = cutAtLine(out, MAX_REPLY);
 				if (!artifact) {
-					return { content: [{ type: "text" as const, text: head + "\n[truncated; ask a narrower question]" }], details: { model: assistant.model } };
+					return { content: [{ type: "text" as const, text: cut.text + "\n[truncated; ask a narrower question]" }], details: { model: assistant.model } };
 				}
-				const manifest = buildManifest(out, ctx.cwd, artifact, isSensitive(ctx.cwd));
-				const text = `${head}\n[truncated at a line boundary; the full reply is saved at ${artifact}]\n` +
+				const { manifest, withheldSpans } = buildManifest(out, ctx.cwd, artifact, isSensitive(ctx.cwd));
+				// A path the guard refuses is not advertised in the excerpt; the saved reply keeps it on disk.
+				const label = cut.midLine ? "truncated, cut mid-line" : "truncated at a line boundary";
+				const text = `${maskSpans(cut.text, withheldSpans)}\n[${label}; the full reply is saved at ${artifact}]\n` +
 					`evidence manifest: ${JSON.stringify(manifest)}`;
 				return { content: [{ type: "text" as const, text }], details: { model: assistant.model, manifest } };
 			} catch (error) {

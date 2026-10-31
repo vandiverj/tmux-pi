@@ -26,7 +26,7 @@ script('tp-pi', '#!/bin/sh\ncat "$ASK_FIXTURE"\n');
 const classifier = script('classifier', `#!/usr/bin/env node
 let d = ''; process.stdin.on('data', (c) => d += c).on('end', () => {
   const p = String(JSON.parse(d).tool_input?.path ?? '');
-  console.log(JSON.stringify(p.includes('dummy-secret') ? { sensitive: true, target: p } : { sensitive: false }));
+  console.log(JSON.stringify(p.includes('dummy-secret') || p.endsWith('/.env') ? { sensitive: true, target: p } : { sensitive: false }));
 });
 `);
 const work = path.join(tmp, 'work');
@@ -82,8 +82,9 @@ assert.equal(m.truncated, true);
 assert.equal(m.bytes_total, Buffer.byteLength(reply));
 // The returned text is bounded, cut at a line boundary, and names the artifact and the manifest.
 const excerpt = big.text.slice(0, big.text.indexOf('\n[truncated at a line boundary'));
-assert(excerpt.length <= 24_000 && reply.startsWith(excerpt));
-assert(reply[excerpt.length] === '\n', 'cut at a line boundary');
+const cutAt = reply.lastIndexOf('\n', 24_000);
+assert(reply[cutAt] === '\n' && cutAt <= 24_000 && cutAt > 20_000, 'cut at a line boundary');
+assert.equal(excerpt, reply.slice(0, cutAt).replace('dummy-secret/token.txt:1', '[withheld path]'));
 assert(big.text.length < 24_000 + 2000);
 assert(big.text.includes(saved));
 assert(big.text.includes('evidence manifest: ' + JSON.stringify(m)));
@@ -95,6 +96,9 @@ assert.deepEqual(m.paths, [
 // A sensitive path is counted as withheld: not hashed, not named anywhere in the manifest.
 assert.equal(m.withheld, 1);
 assert(!JSON.stringify(m).includes('dummy-secret'));
+// ...and not in the returned excerpt either: masked with a fixed placeholder (the saved file keeps the original).
+assert(!big.text.includes('dummy-secret'), 'withheld path is masked in the excerpt');
+assert(big.text.includes('[withheld path]:1 holds a credential.'.replace(':1', '')), 'placeholder stands in');
 
 // A hash reflects an uncommitted edit.
 fs.appendFileSync(path.join(work, 'src/alpha.py'), '# edited, not committed\n');
@@ -104,9 +108,55 @@ assert.equal(alpha.content_hash, sha(path.join(work, 'src/alpha.py')));
 assert.notEqual(alpha.content_hash, m.paths[0].content_hash);
 assert.equal(evidence().length, 2, 'each overflow gets its own file');
 
+// More over-cap replies, each with its own head; the filler pushes the reply past the cap.
+const overflow = async (head, tail = lines) => {
+  const f = path.join(tmp, `case-${Math.random().toString(16).slice(2)}.md`);
+  fs.writeFileSync(f, (head + '\n' + tail).trim());
+  const r = await ask(f);
+  return { text: r.text, m: r.details.manifest };
+};
+// F2: a cited name that is not on disk is still classified before it is skipped.
+const noEnv = await overflow('Config lives in .env:1 and nothing else.');
+assert.equal(noEnv.m.withheld, 1);
+assert(!noEnv.text.includes('.env:1'), 'nonexistent sensitive name is masked');
+assert.deepEqual(noEnv.m.paths, []);
+// F3: the cap on listed paths stays, and what it leaves out is counted.
+fs.mkdirSync(path.join(work, 'many'));
+const names = Array.from({ length: 55 }, (_, i) => `many/f${i}.txt`);
+for (const n of names) fs.writeFileSync(path.join(work, n), n);
+const many = await overflow(names.join('\n'));
+assert.equal(many.m.paths.length, 50);
+assert.equal(many.m.omitted, 5);
+assert.equal(many.m.withheld, 0);
+// F4: a file past 64 MiB is hashed by streaming, not given a null hash.
+const hugeFile = path.join(work, 'src/huge.bin');
+fs.writeFileSync(hugeFile, '');
+fs.truncateSync(hugeFile, 65 * 1024 * 1024);
+fs.appendFileSync(hugeFile, 'tail');
+const huge = await overflow('See src/huge.bin:1 for the blob.');
+assert.deepEqual(huge.m.paths, [{ path: 'src/huge.bin', lines: ['1'], content_hash: sha(hugeFile) }]);
+assert.equal(huge.m.omitted, 0);
+fs.rmSync(hugeFile);
+// F5: a path with spaces is taken when quoted or backticked, or when it exists; a quoted one that is not there is unresolved.
+fs.writeFileSync(path.join(work, 'src/my file.py'), 'x = 1\n');
+fs.mkdirSync(path.join(work, 'my dir'));
+fs.writeFileSync(path.join(work, 'my dir/b c.py'), 'y = 2\n');
+const spaced = await overflow('Bare: see src/my file.py:8 here.\nQuoted: "my dir/b c.py:3-4" and `src/gone file.py:2`.');
+assert.deepEqual(spaced.m.paths, [
+  { path: 'src/my file.py', lines: ['8'], content_hash: sha(path.join(work, 'src/my file.py')) },
+  { path: 'my dir/b c.py', lines: ['3-4'], content_hash: sha(path.join(work, 'my dir/b c.py')) },
+]);
+assert.equal(spaced.m.unresolved, 1);
+// F6: one line longer than the cap is cut at the cap and labelled so.
+const oneLine = await overflow('y'.repeat(30_000), '');
+assert(oneLine.text.includes('truncated, cut mid-line'));
+assert(!oneLine.text.includes('line boundary'));
+assert(oneLine.text.startsWith('y'.repeat(24_000) + '\n['));
+
 // A classifier that cannot answer fails closed: everything cited is withheld.
 process.env.TP_SENSITIVE_READ_BIN = path.join(tmp, 'no-such-classifier');
 const closed = await ask(long);
 assert.deepEqual(closed.details.manifest.paths, []);
-assert.equal(closed.details.manifest.withheld, 4);
+// Every cited name is classified, prose-like ones ("e.g", "v1.2") and a missing file included, so all six are held back.
+assert.equal(closed.details.manifest.withheld, 6);
 console.log('ok');

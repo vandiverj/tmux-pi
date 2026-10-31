@@ -1,7 +1,10 @@
 """Deno's remote module cache as a source of declarations: `jsr:` packages and `https:` modules, offline.
 
-Deno keeps a fetched module at `<DENO_DIR>/remote/https/<host>/<sha256 of the URL path>` with a `.metadata.json` beside it
-naming the URL. Nothing here fetches: a module that is not in the cache is a miss that says to cache it.
+Deno keeps a fetched module at `<DENO_DIR>/remote/https/<host>/<sha256 of the URL path>`. Deno 2.x appends its metadata to that
+file as a last line, `\n// denoCacheMetadata={"headers":...,"url":...,"time":...}` (no newline after it); older Deno wrote the
+metadata to a `.metadata.json` beside it. Both are read: the trailer is cut off before the content is parsed or hashed (deno.lock's
+hashes are of the content without it), and either record, when present, must name the URL asked for. Nothing here fetches: a module
+that is not in the cache is a miss that says to cache it.
 
 What is read is bounded the way package files are (guard.py): the cache file is resolved through links and must stay under
 the host's cache directory, a URL path with a `.env*` component is refused, and the extension is judged on the URL path (the
@@ -19,8 +22,8 @@ Known limits:
 - A jsr entry whose deno.lock record has no `integrity` (older or hand-edited locks) cannot be checked. Its cached files are
   still read, the version still comes from the lock, and the answer says `exact=no` so a caller knows the content was not
   vouched for by the lockfile.
-- The cache layout (sha256 of the URL path, a `.metadata.json` beside it) and the meta/manifest/integrity formats are those of
-  Deno 1.4x/2.x as documented; they were checked against fixtures, not against a live Deno cache (no network here).
+- The cache layout and the meta/manifest/integrity formats were checked offline against a real Deno 2.9.7 cache (a jsr meta file
+  hashes to deno.lock's integrity once the trailer is cut) and against fixtures in both layouts. Other Deno versions are untested.
 """
 import hashlib
 import json
@@ -38,6 +41,22 @@ JSR_RE = re.compile(r"^@[A-Za-z0-9][A-Za-z0-9~._-]*/[A-Za-z0-9][A-Za-z0-9~._-]*$
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.@~+%=,-]+$")
 VERSION_IN_URL = re.compile(r"@(\d[0-9A-Za-z.+-]*)(?=/|$)")
+
+
+TRAILER = b"\n// denoCacheMetadata="
+
+
+def split_trailer(raw):
+    """(content, record) of a cache file's bytes. Deno 2.x ends the file with TRAILER and a JSON object; that last line is cut off
+    and its object returned. Without a well-formed trailer the bytes are the content and the record is None."""
+    at = raw.rfind(TRAILER)
+    if at < 0:
+        return raw, None
+    try:
+        record = json.loads(raw[at + len(TRAILER):].decode("utf-8"))
+    except ValueError:
+        return raw, None
+    return (raw[:at], record) if isinstance(record, dict) else (raw, None)
 
 
 class Unavailable(Exception):
@@ -106,17 +125,29 @@ class RemoteSource:
                 raise guard.Rejected(f"refused: the cache entry for {path} is recorded for another URL")
         return target
 
+    def _content(self, path, target, *, limit=guard.MAX_FILE):
+        """(text, bytes) of a cache file without Deno's trailer, or None when the file is missing. The same checks as guard.read_text
+        (regular file, size, not binary); an embedded record that names another URL is refused."""
+        text = guard.read_text(target, limit=limit)
+        if text is None:
+            return None
+        body, record = split_trailer(Path(target).read_bytes())
+        url = record.get("url") if record else None
+        if url is not None and url != f"https://{self.host}{path}":
+            raise guard.Rejected(f"refused: the cache entry for {path} is recorded for another URL")
+        return body.decode("utf-8", "replace"), body
+
     def read_json(self, path):
         """A registry metadata file (jsr's `<version>_meta.json`) from the cache, as an object or None."""
         return self._json(self._raw(path))
 
     def _raw(self, path):
-        """The bytes of a cached registry metadata file, or None. The file is resolved through links like any cache file."""
+        """The content bytes of a cached registry metadata file, or None. The file is resolved through links like any cache file."""
         if not self.directory.is_dir():
             return None
         target = guard.resolve_inside(self.directory, hashlib.sha256(path.encode()).hexdigest(), suffix=False)
-        text = guard.read_text(target, limit=1_000_000)
-        return None if text is None else Path(target).read_bytes()
+        found = self._content(path, target, limit=1_000_000)
+        return None if found is None else found[1]
 
     @staticmethod
     def _json(raw):
@@ -139,13 +170,14 @@ class RemoteSource:
     def read(self, key):
         path = self._path(key)
         target = self._file(path)
-        text = guard.read_text(target) if target else None
-        if text is not None:
-            self.verify(path, target)
-        return text
+        found = self._content(path, target) if target else None
+        if found is None:
+            return None
+        self.verify(path, found[1])
+        return found[0]
 
-    def verify(self, path, target):
-        """Hook: check the cached bytes against the lockfile."""
+    def verify(self, path, content):
+        """Hook: check the cached content bytes (Deno's trailer already cut off) against the lockfile."""
 
     def is_source(self, key):
         return is_source(key)
@@ -201,7 +233,7 @@ class JsrSource(RemoteSource):
         self._manifest = manifest if isinstance(manifest, dict) else {}
         return True
 
-    def verify(self, path, target):
+    def verify(self, path, content):
         if self.integrity is None:
             return
         if self._manifest is None:
@@ -211,7 +243,7 @@ class JsrSource(RemoteSource):
         checksum = entry.get("checksum") if isinstance(entry, dict) else None
         if not isinstance(checksum, str) or not checksum.startswith("sha256-"):
             raise Unavailable(f"jsr:{self.name}@{self.version}: {key} is not listed in the package manifest that deno.lock vouches for")
-        if hashlib.sha256(Path(target).read_bytes()).hexdigest() != checksum[len("sha256-"):].lower():
+        if hashlib.sha256(content).hexdigest() != checksum[len("sha256-"):].lower():
             raise Unavailable(f"the cached {key} of jsr:{self.name}@{self.version} does not match the checksum in its manifest "
                               "(deno.lock vouches for that manifest); run `deno cache --reload`")
 
@@ -251,9 +283,9 @@ class HttpsSource(RemoteSource):
             return None
         return super().existing(key, refusals)
 
-    def verify(self, path, target):
+    def verify(self, path, content):
         wanted = self.locked(path)
-        if wanted and hashlib.sha256(Path(target).read_bytes()).hexdigest() != wanted:
+        if wanted and hashlib.sha256(content).hexdigest() != wanted:
             raise Unavailable(f"the cached https://{self.host}{path} does not match the hash deno.lock records; run `deno cache --reload` "
                               "(nothing is read from content the lockfile does not vouch for)")
 

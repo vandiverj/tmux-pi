@@ -17,7 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures" / "localdocs"))
 from project import FIXTURES, ROOT, ProjectCase, install_deno_remote, make_project  # noqa: E402
 
-from localdocs import calls, fetch, guard, index, lock, log, signature  # noqa: E402
+from localdocs import calls, fetch, guard, index, lock, log, remote, signature  # noqa: E402
 
 PKG_ONLY = ("plainpkg",)
 
@@ -339,11 +339,12 @@ class RemoteTests(ProjectCase):
     JSR = "jsr:@fx/strs"
     TYPED = "https://deno.land/x/typed@2.0.1/types.d.ts"
     LIB = "https://deno.land/x/lib@1.0.0/mod.ts"
+    layout = "sidecar"  # how the cache records each URL; RemoteEmbeddedTests repeats every test with Deno 2.x's trailer
 
     def setUp(self):
         super().setUp()
         self.deno = self.base / "deno"
-        self.hashes = install_deno_remote(self.deno)
+        self.hashes = install_deno_remote(self.deno, layout=self.layout)
         (self.project / "package-lock.json").unlink()
         self.remote = {url: digest for url, digest in self.hashes.items() if "deno.land" in url}
         self.write_deno_lock()
@@ -627,10 +628,13 @@ class RemoteTests(ProjectCase):
     def test_jsr_file_the_manifest_does_not_list_is_not_served(self):
         directory = self.deno / "remote" / "https" / "jsr.io"
         meta_path = directory / hashlib.sha256(b"/@fx/strs/1.4.0_meta.json").hexdigest()
-        meta = json.loads(meta_path.read_text())
+        raw = meta_path.read_bytes()
+        content, _ = remote.split_trailer(raw)  # the trailer (embedded layout) is not part of the content deno.lock hashes
+        meta = json.loads(content)
         del meta["manifest"]["/util.ts"]
-        meta_path.write_text(json.dumps(meta))
-        self.write_deno_lock(jsr={"@fx/strs@1.4.0": {"integrity": hashlib.sha256(meta_path.read_bytes()).hexdigest()}})
+        changed = json.dumps(meta).encode()
+        meta_path.write_bytes(changed + raw[len(content):])
+        self.write_deno_lock(jsr={"@fx/strs@1.4.0": {"integrity": hashlib.sha256(changed).hexdigest()}})
         self.assertIn("joinAll", self.get(self.JSR, "joinAll").text)
         with self.assertRaises(signature.Miss):
             self.get(self.JSR, "pad")
@@ -735,6 +739,56 @@ class RemoteTests(ProjectCase):
         rows = [json.loads(line) for line in (self.task / "docs-calls.jsonl").read_text().splitlines()]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["tool"], "api_signature")
+
+
+class RemoteEmbeddedTests(RemoteTests):
+    """Every RemoteTests case again against Deno 2.x's layout: the metadata is the last line of the cache file, not a sidecar."""
+    layout = "embedded"
+
+    def test_the_trailer_is_not_part_of_the_content_that_deno_lock_hashes(self):
+        digest = hashlib.sha256(b"/x/typed@2.0.1/types.d.ts").hexdigest()
+        raw = (self.deno / "remote" / "https" / "deno.land" / digest).read_bytes()
+        content, record = remote.split_trailer(raw)
+        self.assertEqual(hashlib.sha256(content).hexdigest(), self.hashes[self.TYPED])
+        self.assertEqual(record["url"], self.TYPED)
+        self.assertIn("typed", self.get(self.TYPED, "typed").text)
+        self.assertNotIn("denoCacheMetadata", self.get(self.TYPED, "typed").text)
+
+    def test_an_embedded_record_that_names_another_url_is_refused(self):
+        digest = hashlib.sha256(b"/x/typed@2.0.1/types.d.ts").hexdigest()
+        target = self.deno / "remote" / "https" / "deno.land" / digest
+        content, _ = remote.split_trailer(target.read_bytes())
+        target.write_bytes(content + remote.TRAILER + b'{"headers":{},"url":"https://other.test/x.d.ts","time":1}')
+        with self.assertRaises((guard.Rejected, signature.Miss)):
+            self.get(self.TYPED, "typed")
+
+    def test_a_jsr_file_changed_after_the_manifest_was_made_is_still_refused(self):
+        digest = hashlib.sha256(b"/@fx/strs/1.4.0/util.ts").hexdigest()
+        target = self.deno / "remote" / "https" / "jsr.io" / digest
+        target.write_bytes(target.read_bytes().replace(b"export", b"export // changed\nexport", 1))
+        with self.assertRaises(signature.Miss) as ctx:
+            self.get(self.JSR, "pad")
+        self.assertIn("checksum", str(ctx.exception))
+
+
+class TrailerTests(unittest.TestCase):
+    def test_a_file_without_a_trailer_is_all_content(self):
+        self.assertEqual(remote.split_trailer(b"export const a = 1;\n"), (b"export const a = 1;\n", None))
+
+    def test_the_last_line_is_cut_off_and_parsed(self):
+        raw = b'export const a = 1;\n// denoCacheMetadata={"headers":{},"url":"https://h.test/a.ts","time":2}'
+        self.assertEqual(remote.split_trailer(raw), (b"export const a = 1;", {"headers": {}, "url": "https://h.test/a.ts", "time": 2}))
+
+    def test_a_trailer_that_is_not_a_json_object_stays_content(self):
+        for tail in (b"{not json", b"[1, 2]", b"", b'"text"'):
+            raw = b"export const a = 1;" + remote.TRAILER + tail
+            self.assertEqual(remote.split_trailer(raw), (raw, None), tail)
+
+    def test_the_marker_inside_the_content_does_not_hide_the_real_trailer(self):
+        raw = b'// see\n// denoCacheMetadata=docs\nexport const a = 1;\n// denoCacheMetadata={"url":"https://h.test/a.ts"}'
+        content, record = remote.split_trailer(raw)
+        self.assertEqual(content, b"// see\n// denoCacheMetadata=docs\nexport const a = 1;")
+        self.assertEqual(record, {"url": "https://h.test/a.ts"})
 
 
 class OutputGateTests(unittest.TestCase):

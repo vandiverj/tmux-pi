@@ -24,9 +24,11 @@ def make_project(base, packages=("plainpkg", "esmpkg", "reexp", "untyped", "@typ
     return project
 
 
-def install_deno_remote(deno_dir, hosts=("jsr.io", "deno.land")):
-    """Fill `<deno_dir>/remote/https/<host>/<sha256 of the URL path>` (with the .metadata.json Deno writes) from the fixture
-    tree `remote/<host>/<path>`. Returns {url: sha256 of the content}, the shape of a deno.lock "remote" section."""
+def install_deno_remote(deno_dir, hosts=("jsr.io", "deno.land"), layout="sidecar"):
+    """Fill `<deno_dir>/remote/https/<host>/<sha256 of the URL path>` from the fixture tree `remote/<host>/<path>`. `layout` is how
+    Deno records the URL: "sidecar" writes a `.metadata.json` beside the file (older Deno); "embedded" appends
+    `\\n// denoCacheMetadata={json}` to the file (Deno 2.x, as seen in a real cache). Returns {url: sha256 of the content without
+    any trailer}, the shape of a deno.lock "remote" section."""
     hashes = {}
     for host in hosts:
         base = FIXTURES / "remote" / host
@@ -35,8 +37,12 @@ def install_deno_remote(deno_dir, hosts=("jsr.io", "deno.land")):
             target = Path(deno_dir) / "remote" / "https" / host
             target.mkdir(parents=True, exist_ok=True)
             name = hashlib.sha256(path.encode()).hexdigest()
-            shutil.copy(file, target / name)
-            (target / (name + ".metadata.json")).write_text(json.dumps({"url": f"https://{host}{path}", "headers": {}}))
+            record = {"headers": {}, "url": f"https://{host}{path}", "time": 1786123343}
+            if layout == "embedded":
+                (target / name).write_bytes(file.read_bytes() + b"\n// denoCacheMetadata=" + json.dumps(record, separators=(",", ":")).encode())
+            else:
+                shutil.copy(file, target / name)
+                (target / (name + ".metadata.json")).write_text(json.dumps(record))
             hashes[f"https://{host}{path}"] = hashlib.sha256(file.read_bytes()).hexdigest()
     return hashes
 

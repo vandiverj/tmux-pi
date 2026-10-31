@@ -398,15 +398,19 @@ class ImportMap:
 _UNMODELLED_KEYS = ("importMap", "workspace", "links", "patch", "vendor")
 
 
-def load_config(path):
+def load_config(path, raw=None):
     """(ImportMap, details) from a Deno config file; a missing or unreadable file gives an empty map and says why in `details`.
 
     `details`: `exclude`, `ignored` (what the index does not follow), `unmodelled` (why the walk that guards Deno cannot trust the
-    map: a list of short reasons, empty when it can), `data` (the parsed config, {} when unreadable) and `error`."""
+    map: a list of short reasons, empty when it can), `data` (the parsed config, {} when unreadable) and `error`. `raw` is the
+    file's bytes when the caller has read them already (the parse is then of those bytes, not of a second read)."""
     details = {"path": path, "exclude": [], "ignored": [], "unmodelled": [], "data": {}}
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        if raw is None:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        else:
+            data = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError) as error:
         details["error"] = type(error).__name__
         return ImportMap({}, os.path.dirname(path)), details
@@ -562,6 +566,12 @@ def _fingerprint(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _config_state(path):
+    """(resolved path, fingerprint) of a config file as it is now, (None, None) when there is none, or it cannot be read."""
+    data = _read_capped(path) if os.path.isfile(path) else None
+    return (os.path.realpath(path), _fingerprint(data)) if data is not None else (None, None)
+
+
 def _scan_cached(data):
     key = hashlib.sha256(data).hexdigest()
     got = _SCAN_MEMO.get(key)
@@ -577,7 +587,10 @@ class Reach:
     were read (`contents`: the snapshot a mirror is built from). `names` holds both spellings of each (a symlink inside the project
     is a file under two names); `digest()` stands for their content; `holds()` is False once any of them has changed, or points
     somewhere else, since the proof. `config_rel` is the config's project-relative path, `config_data` what the mirror's config
-    is made from and `packages` the sanitised `package.json` files (`rel -> dict`)."""
+    is made from and `packages` the sanitised `package.json` files (`rel -> dict`). `configs` is every file those two were made
+    from, the config and the `package.json` of each folder Deno looks in, as {absolute path: (resolved path or None, fingerprint
+    or None)}; None is "there was no such file". `holds()` checks them as well, since an answer made with an old config is an
+    answer for a tree that has moved."""
 
     def __init__(self, base):
         self.base = base
@@ -587,6 +600,7 @@ class Reach:
         self.config_rel = None
         self.config_data = {}
         self.packages = {}
+        self.configs = {}
 
     @property
     def names(self):
@@ -596,6 +610,8 @@ class Reach:
         h = hashlib.sha256()
         for rel in sorted(self.files):
             h.update(f"{rel}\0{self.files[rel][1]}\0".encode("utf-8"))
+        for path in sorted(self.configs):
+            h.update(f"config\0{lexical_path(self.base, path)}\0{self.configs[path][1]}\0".encode("utf-8"))
         return h.hexdigest()
 
     def holds(self):
@@ -606,19 +622,20 @@ class Reach:
             data = _read_capped(path)
             if data is None or _fingerprint(data) != fingerprint:
                 return False
-        return True
+        return all(_config_state(path) == state for path, state in self.configs.items())
 
     def materialize(self, parent=None):
         """A `Mirror` holding a copy of each proved file and nothing else, under the same relative paths, with a config made from
         `config_data`: the only tree Deno is given."""
         mirror = Mirror(self.base, parent)
         try:
+            package_files = {posixpath.join(folder, "package.json") for folder in (posixpath.dirname(self.config_rel), "")}
             for rel in sorted(self.files):
-                mirror.write(rel, self.contents[rel])
+                if rel not in package_files and rel != self.config_rel:  # those are written once, below, in their cut-down form
+                    mirror.write(rel, self.contents[rel])
             mirror.write_json(self.config_rel, self._mirror_config())
-            package_dirs = {os.path.dirname(self.config_rel), ""}
-            for folder in sorted(package_dirs):
-                mirror.write_json(posixpath.join(folder, "package.json"), self.packages.get(folder, {}))
+            for rel in sorted(package_files):
+                mirror.write_json(rel, self.packages.get(posixpath.dirname(rel), {}))
         except BaseException:
             mirror.cleanup()
             raise
@@ -686,20 +703,24 @@ _PACKAGE_KEEP = ("name", "version", "type")
 _PACKAGE_DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 
 
-def _check_package_json(base, directory):
+def _check_package_json(base, directory, configs):
     """Deno reads the `package.json` next to its config. A dependency that is a local path (`file:`, `link:`, a workspace) loads
     code from somewhere the walk does not look: refused. A `package.json` that is not JSON is refused too. Returns {folder: what
     the mirror gets} for the folders that have one (`""` is the project root, others are project-relative posix paths): the
-    package's `name`, `version`, `type` and dependency tables, and nothing else (its `imports` and `exports` name paths)."""
+    package's `name`, `version`, `type` and dependency tables, and nothing else (its `imports` and `exports` name paths). Each
+    file is read once; what was read is recorded in `configs` (see `Reach`), absent files too."""
     out = {}
     for folder in dict.fromkeys((directory, base)):
         path = os.path.join(folder, "package.json")
-        if not os.path.isfile(path):
+        raw = _read_capped(path) if os.path.isfile(path) else None
+        configs[path] = (os.path.realpath(path), _fingerprint(raw)) if raw is not None else (None, None)
+        if raw is None:
+            if os.path.isfile(path):
+                raise Unproven("unreadable_file")
             continue
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError:
             raise Unproven("unmodelled_config")
         if not isinstance(data, dict) or data.get("workspaces"):
             raise Unproven("unmodelled_config")
@@ -743,7 +764,11 @@ def prove_reach(base, entry, config, allow):
     if os.path.isfile(config):
         if lexical_path(base, os.path.realpath(config)) is None:
             raise Unproven("unmodelled_config")
-        imap, details = load_config(config)
+        raw = _read_capped(config)
+        if raw is None:
+            raise Unproven("unreadable_file")
+        reach.configs[config] = (os.path.realpath(config), _fingerprint(raw))
+        imap, details = load_config(config, raw)
         if details.get("error") or details["unmodelled"]:
             raise Unproven("unmodelled_config")
         reach.config_data = details["data"]
@@ -764,8 +789,9 @@ def prove_reach(base, entry, config, allow):
             if source:
                 roots += [(source + suffix, config) for suffix in ("", "/jsx-runtime", "/jsx-dev-runtime")]
     else:
+        reach.configs[config] = (None, None)
         imap = ImportMap({}, config_dir)  # the mirror gets a config of its own, so Deno looks for none above it
-    reach.packages = _check_package_json(base, config_dir)
+    reach.packages = _check_package_json(base, config_dir, reach.configs)
     reach.entry = lexical_path(base, os.path.normpath(entry))
     queue, seen = [os.path.normpath(entry)], set()
     for spec, referrer in roots:

@@ -26,22 +26,34 @@ walked every module Deno would load from the target and shown each one allowed: 
 index does not hold, such as one under the config's `exclude`, is followed like any other), resolves each specifier through the
 config's import map and scopes, and checks every path a specifier may name. If one is outside the project or refused, or the walk
 meets something it cannot model, the call is refused with a `reason` (`outside_project`, `reaches_refused_path`,
-`unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`, `precheck_failed`) and Deno is not started. Then
+`unmodelled_config`, `unmodelled_import`, `unreadable_file`, `too_many_files`, `precheck_failed`, and `sandbox_unavailable`,
+`sandbox_failed`) and Deno is not started. Then
 the walk's files are copied (the bytes the walk read, as regular files) into a temporary directory laid out like the project, with
 a rewritten config (`imports`, `scopes`, `compilerOptions`, `unstable`; no `exclude`, `lock`, `tasks`, `vendor`) and a `package.json`
 cut down to name, version, type and dependency tables, and Deno is run there with `--config` naming that config; the directory is
 removed afterwards and the paths in Deno's answer are mapped back. So whatever the walk misses or misreads (a scanner that
 misreads a `/`, an import-map entry of a shape it does not model) names a file that is not there: Deno cannot open a refused file
 it was not given. The walk stays as the first check, so a refused file is reported by name-free `reason` before Deno starts.
+
+Deno is also run inside an operating-system sandbox, always (`sandbox-exec` with `SANDBOX_PROFILE`): it may read the mirror, its own
+executable and cache and the system libraries, may write only to its cache, and has no network and cannot start another program.
+So a path the mirror does not hold and the walk never saw (an absolute `file:///...` the scanner missed) cannot be opened either.
+If the sandbox cannot be applied (not macOS, no `sandbox-exec`, this process already in a sandbox) the call is refused with the
+reason `sandbox_unavailable` or `sandbox_failed` and Deno is not started: there is no unsandboxed path, and a cached `deno doc`
+answer is not served either. Importers and imports (the index) need no Deno and are unaffected.
 Afterwards the answer is held to the same list: a module Deno lists that the walk did not reach refuses the answer
-(`unproven_module`), and if any proven file changed while Deno ran there is no answer (`stale_index`). A message of Deno's names
+(`unproven_module`), and if any proven file, or the config or `package.json` the mirror's were made from, changed while Deno ran
+there is no answer (`stale_index`). A message of Deno's names
 only files the walk proved (any other path is `<file>`).
 
 Known limits (what is not proven):
-  - The mirror keeps Deno from opening a project file it was not given, not from opening a path given as an absolute path or one
-    that leaves the project (`/etc/x`, `../../x`) when the scanner misses that import: a copy of the project cannot stop that. The
-    walk refuses such a specifier when it sees it; a missed one is only stopped by an operating-system sandbox of the Deno process
-    (not built here: it is platform-specific and a decision for the host).
+  - The mirror keeps Deno from opening a project file it was not given; the sandbox keeps it from opening anything else. An import
+    the scanner missed, whatever it names (`/etc/x`, `../../x`, `file:///abs/x`), is a path the process is not allowed to open: Deno
+    lists the module with an `error` and no content, and the answer is refused (`unproven_module`). The sandbox is not proven
+    beyond that: it is `sandbox-exec` (macOS Seatbelt, deprecated by Apple but present), so it exists only on macOS, and its profile
+    is `SANDBOX_PROFILE`.
+  - A `package.json` below the config's folder that the code imports as data is copied as it is (only the two Deno looks in
+    beside the config and at the project root are cut down); the sandbox is what holds if one of its fields names a path.
   - `npm:`, `jsr:` and `node:` packages, and `http(s):` modules, are external: they are not followed, and Deno reads them from its
     own cache, which is not checked (the mirror has no `node_modules`). A `package.json` dependency that is a local path (`file:`,
     `link:`, `workspace:`) is refused; one in a directory above the config or the project root is not looked at.
@@ -67,6 +79,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 from urllib.parse import unquote
 
 try:
@@ -85,6 +99,24 @@ CACHE_RELATIVE = os.path.join(".tmux-pi", "ctx-cache")
 DENO_ENV_KEEP = ("PATH", "HOME", "DENO_DIR", "TMPDIR", "LANG", "LC_ALL", "XDG_CACHE_HOME", "USER")
 OFFLINE_ENV = {"DENO_NO_UPDATE_CHECK": "1", "NO_COLOR": "1", "NPM_CONFIG_REGISTRY": "http://127.0.0.1:1/",
                "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# The profile every Deno process runs under (macOS Seatbelt). Everything not named is allowed except what the first lines deny; the
+# reads and writes are denied and then allowed again by name, so a path that is not listed cannot be opened, and nothing can be
+# reached over the network. ROOT is the mirror, DENODIR Deno's cache, DENOBIN the Deno executable; they are passed as parameters
+# (`-D`), never spliced into the text.
+SANDBOX_PROFILE = """(version 1)
+(allow default)
+(deny network*)
+(deny process-exec*)
+(allow process-exec* (literal (param "DENOBIN")))
+(deny file-read*)
+(deny file-write*)
+(allow file-read* (literal "/") (subpath (param "ROOT")) (subpath (param "DENODIR")) (literal (param "DENOBIN"))
+    (subpath "/usr/lib") (subpath "/System") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/tty"))
+(allow file-write* (subpath (param "DENODIR")) (literal "/dev/null"))
+"""
+SANDBOX_APPLY_FAILED = 71  # sandbox-exec's exit status when the profile could not be applied
+SANDBOX_NEXT_STEP = "Deno is only run inside an operating-system sandbox (macOS sandbox-exec); importers and imports still work without it"
 NEXT_STEP = {
     "unavailable": "install Deno 2 and put it on PATH; importers and imports still work without it",
     "no_project": "pass the directory that holds the Deno project (the one with deno.json)",
@@ -150,15 +182,6 @@ def _digest(*parts):
     return h.hexdigest()
 
 
-def _read_bytes(path):
-    """The bytes of `path` (at most graph.MAX_BYTES + 1), or None when it cannot be read."""
-    try:
-        with open(path, "rb") as handle:
-            return handle.read(graph.MAX_BYTES + 1)
-    except OSError:
-        return None
-
-
 def _file_url_path(url):
     return os.path.normpath(unquote(url[len("file://"):])) if isinstance(url, str) and url.startswith("file://") else None
 
@@ -185,6 +208,7 @@ class NavApi:
         self.mirror_parent = mirror_parent  # where each call's temporary mirror is made (default: the system's temporary directory)
         self._index = None
         self._version = None
+        self._sandbox = False  # False: not tried yet; None: Deno starts under the sandbox; else the reason code (see `_check_sandbox`)
 
     # --- plumbing
 
@@ -328,21 +352,74 @@ class NavApi:
         env.update(OFFLINE_ENV)
         return env
 
-    def _run_deno(self, args, cwd=None):
-        """(status, stdout, detail): runs `deno` with `args` in `cwd` (default: the config's directory), never longer than the
-        timeout. The detail is not screened here; `_out` screens the answer it ends up in."""
+    def _deno_dir(self):
+        """Deno's cache directory as Deno finds it (`DENO_DIR`, else `XDG_CACHE_HOME`, else the platform's cache folder)."""
+        env = self._env()
+        if env.get("DENO_DIR"):
+            return os.path.realpath(env["DENO_DIR"])
+        if env.get("XDG_CACHE_HOME"):
+            return os.path.realpath(os.path.join(env["XDG_CACHE_HOME"], "deno"))
+        return os.path.realpath(os.path.join(env.get("HOME") or os.path.expanduser("~"), "Library", "Caches", "deno"))
+
+    def _sandboxed(self, exe, args, root):
+        """The command line that runs `exe args` under `SANDBOX_PROFILE`, allowed to read `root` (a resolved directory) and Deno's own
+        files and nothing else, or None when there is no sandbox to run it in. Never a command line without the sandbox."""
+        if sys.platform != "darwin" or not os.access(SANDBOX_EXEC, os.X_OK):
+            return None
+        return [SANDBOX_EXEC, "-D", f"ROOT={root}", "-D", f"DENODIR={self._deno_dir()}", "-D", f"DENOBIN={os.path.realpath(exe)}",
+                "-p", SANDBOX_PROFILE, exe, *args]
+
+    def _check_sandbox(self):
+        """None when a process can be started under the sandbox on this machine, else the reason code of the refusal. Tried once:
+        `deno --version` in an empty directory (which also gives the version). Only a failure of the sandbox itself counts: no
+        `sandbox-exec`, a profile it cannot apply (it exits 71, as it does when this process already runs in a sandbox), or no
+        way to start it. What Deno does inside is judged on each call. Every later Deno process is started the same way."""
+        if self._sandbox is False:
+            exe = self._deno_exe()
+            scratch = tempfile.mkdtemp(prefix="tp-ctx-probe-", dir=self.mirror_parent)
+            try:
+                root = os.path.realpath(scratch)
+                argv = self._sandboxed(exe, ["--version"], root) if exe else None
+                self._sandbox = "sandbox_unavailable" if argv is None else None
+                self._version = ""
+                if argv is not None:
+                    try:
+                        run = subprocess.run(argv, cwd=root, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True,
+                                             timeout=self.timeout)
+                    except subprocess.TimeoutExpired:
+                        run = None  # it ran, so the sandbox was applied
+                    except OSError:
+                        self._sandbox = "sandbox_failed"
+                    else:
+                        if run.returncode == SANDBOX_APPLY_FAILED and run.stderr.startswith(b"sandbox-exec:"):
+                            self._sandbox = "sandbox_failed"
+                        elif run.returncode == 0 and run.stdout.strip():
+                            self._version = run.stdout.decode("utf-8", "replace").splitlines()[0].strip()
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+        return self._sandbox
+
+    def _run_deno(self, args, cwd, root):
+        """(status, stdout, detail): runs `deno` with `args` in `cwd`, under the sandbox, which lets it read `root` (a mirror) and Deno's own
+        files and nothing else, never longer than the timeout. When the sandbox cannot be applied nothing is run: the status is `refused` and
+        the detail the reason code. The detail is not screened here; `_out` screens the answer it ends up in."""
         exe = self._deno_exe()
         if exe is None:
             return "unavailable", "", "deno was not found on PATH"
-        if cwd is None:
-            cwd = os.path.dirname(self.config) if os.path.isdir(os.path.dirname(self.config)) else self.root
+        reason = self._check_sandbox()
+        if reason:
+            return "refused", "", reason
+        argv = self._sandboxed(exe, args, os.path.realpath(root))
+        if argv is None:
+            return "refused", "", "sandbox_unavailable"
         try:
-            run = subprocess.run([exe, *args], cwd=cwd, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True,
-                                 timeout=self.timeout)
+            run = subprocess.run(argv, cwd=cwd, env=self._env(), stdin=subprocess.DEVNULL, capture_output=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return "timeout", "", f"deno took longer than {self.timeout} s"
         except OSError as error:
             return "unavailable", "", f"deno could not be started: {type(error).__name__}"
+        if run.returncode == SANDBOX_APPLY_FAILED and run.stderr.startswith(b"sandbox-exec:"):
+            return "refused", "", "sandbox_failed"
         if len(run.stdout) > MAX_DENO_OUTPUT:
             return "error", "", "deno output was too large"
         if run.returncode != 0:
@@ -352,10 +429,9 @@ class NavApi:
         return "ok", run.stdout.decode("utf-8", "replace"), ""
 
     def deno_version(self):
-        """First line of `deno --version`, or None when Deno cannot be run."""
-        if self._version is None:
-            status, out, _ = self._run_deno(["--version"])
-            self._version = out.splitlines()[0].strip() if status == "ok" and out.strip() else ""
+        """First line of `deno --version`, or None when Deno cannot be run (or not under the sandbox)."""
+        if self._deno_exe() is None or self._check_sandbox():
+            return None
         return self._version or None
 
     def _permits(self, rel):
@@ -387,9 +463,11 @@ class NavApi:
         try:
             config = mirror.path(reach.config_rel)
             status, out, detail = self._run_deno([*verb_args, "--config", config, mirror.path(reach.entry)],
-                                                 cwd=os.path.dirname(config))
+                                                 cwd=os.path.dirname(config), root=mirror.root)
         finally:
             mirror.cleanup()
+        if status == "refused":  # the sandbox could not be applied: Deno was not run
+            return _answer("refused", reason=detail, next_step=SANDBOX_NEXT_STEP), None, None
         if status != "ok":
             return _answer(status, detail=self._scrub(detail, mirror, reach.names)[:200]), None, None
         if not reach.holds():
@@ -487,6 +565,9 @@ class NavApi:
         reach, refusal = self._prove(rel)
         if refusal:
             return refusal
+        reason = self._check_sandbox()
+        if reason:  # not even a cached answer: with no sandbox Deno is not run, so nothing is answered from what it said
+            return _answer("refused", reason=reason, next_step=SANDBOX_NEXT_STEP)
         names = reach.names
         key = self._doc_key(rel, reach)
         cached = self._read_cache("doc", key)
@@ -555,9 +636,9 @@ class NavApi:
 
     def _doc_key(self, rel, reach):
         """Cache key for `deno doc` of one file: a hash of the content of every file the walk reached (the target, and whatever a
-        re-export is resolved from, an excluded file included), of the config, and the Deno version. A size and a modification time
+        re-export is resolved from, an excluded file included), of the config and package files Deno was given, and the Deno version. A size and a modification time
         do not stand for content (a checkout can restore both), so none is used."""
-        return _digest(rel, reach.digest(), _read_bytes(self.config) or b"", self.deno_version() or "")[:40]
+        return _digest(rel, reach.digest(), self.deno_version() or "")[:40]
 
     def _read_cache(self, kind, key):
         path = self._cache_file(kind, key)

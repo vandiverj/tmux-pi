@@ -26,6 +26,12 @@ HAVE_DENO = shutil.which("deno") is not None
 NEEDS_DENO = unittest.skipUnless(HAVE_DENO, "deno is not on PATH")
 
 
+# The fake `deno` scripts of these tests are shell scripts that run `sed`, `find` and write their logs next to the test: they need
+# what the production profile (nav_api.SANDBOX_PROFILE) denies. They still run under sandbox-exec, with network denied; only the
+# file rules are lifted. `SandboxCase` runs the real Deno under the production profile.
+LOOSE_PROFILE = "(version 1)\n(allow default)\n(deny network*)\n"
+
+
 def write(path, text=""):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,10 +42,16 @@ def write(path, text=""):
 class Tree(unittest.TestCase):
     """A temporary directory per test, with helpers to copy the fixture project into it or to write a fake `deno`."""
 
+    profile = LOOSE_PROFILE  # None: the production profile
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name).resolve()
+        if self.profile is not None:
+            patch = mock.patch.object(nav_api, "SANDBOX_PROFILE", self.profile)
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def project(self, name="proj"):
         target = self.dir / name
@@ -1354,6 +1366,356 @@ class MirrorCase(Tree):
         exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "src/app/run.ts", "run", "x", line=4))
         shown = self.nav(project, deno=exe).symbols("src/app/run.ts")
         self.assertEqual(shown["symbols"][0]["signature"], "export function run(config: Config): string {")
+
+
+
+class ConfigFreshnessCase(Tree):
+    """Round 5 F2: the files the mirror's config and `package.json` are made from are part of what an answer is held to. A change to
+    one during the call is a `stale_index`, as a change to a module is."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+
+    def nav_that_changes(self, project, change):
+        """A NavApi on a scripted Deno whose every run is preceded by `change()`: the file moves while Deno is reading."""
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        real = nav._run_deno
+
+        def run(*args, **kwargs):
+            change()
+            return real(*args, **kwargs)
+        nav._run_deno = run
+        return nav
+
+    def assert_stale(self, setup, change):
+        """For each operation, on a project of its own: `setup(project)` before the call, `change(project)` while Deno runs."""
+        for call in ("symbols", "forward_graph"):
+            project = self.project(call)
+            setup(project)
+            nav = self.nav_that_changes(project, lambda: change(project))
+            answer = getattr(nav, call)("src/main.ts")
+            self.assertEqual(answer["status"], "stale_index", (call, answer))
+
+    def test_f2_the_import_map_changing_during_the_call_withholds_the_answer(self):
+        def change(project):
+            config = json.loads((project / "deno.json").read_text())
+            config["imports"]["@host"] = "./src/mock_host.ts"
+            (project / "deno.json").write_text(json.dumps(config))
+        self.assert_stale(lambda project: None, change)
+
+    def test_f2_the_config_being_removed_during_the_call_withholds_the_answer(self):
+        self.assert_stale(lambda project: None, lambda project: (project / "deno.json").unlink())
+
+    def test_f2_the_package_json_changing_during_the_call_withholds_the_answer(self):
+        self.assert_stale(lambda project: write(project / "package.json", json.dumps({"name": "p", "dependencies": {"left-pad": "1.0.0"}})),
+                          lambda project: write(project / "package.json", json.dumps({"name": "p", "type": "module"})))
+
+    def test_f2_a_package_json_appearing_during_the_call_withholds_the_answer(self):
+        self.assert_stale(lambda project: None, lambda project: write(project / "package.json", json.dumps({"name": "late"})))
+
+    def test_f2_a_package_json_in_the_config_folder_is_watched_too(self):
+        project = self.project()
+        write(project / "api" / "deno.json", json.dumps({"imports": {}}))
+        write(project / "api" / "main.ts", "export const a = 1;\n")
+        nav = self.nav(project, root=str(project / "api"), deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        real = nav._run_deno
+        nav._run_deno = lambda *a, **k: (write(project / "api" / "package.json", "{}"), real(*a, **k))[1]
+        self.assertEqual(nav.symbols("api/main.ts")["status"], "stale_index")
+
+    def test_f2_nothing_changing_gives_an_answer(self):
+        project = self.project()
+        write(project / "package.json", json.dumps({"name": "p"}))
+        nav = self.nav_that_changes(project, lambda: None)
+        self.assertEqual([nav.symbols("src/main.ts")["status"], nav.forward_graph("src/main.ts")["status"]], ["ok", "ok"])
+
+    def test_f2_reach_holds_follows_the_config_and_package_files(self):
+        project = self.project().resolve()
+        write(project / "package.json", json.dumps({"name": "p"}))
+        allow = lambda rel: True  # noqa: E731
+        edits = {"config": lambda: write(project / "deno.json", "{}"), "package": lambda: write(project / "package.json", '{"name":"q"}'),
+                 "package removed": lambda: (project / "package.json").unlink()}
+        for label, edit in edits.items():
+            reach = graph.prove_reach(str(project), str(project / "src" / "config.ts"), str(project / "deno.json"), allow)
+            self.assertTrue(reach.holds(), label)
+            edit()
+            self.assertFalse(reach.holds(), label)
+            shutil.rmtree(project)
+            shutil.copytree(FIXTURE, project)
+            write(project / "package.json", json.dumps({"name": "p"}))
+
+    def test_f2_the_doc_cache_follows_the_config(self):
+        """A cached `deno doc` answer made with one import map is not served for another."""
+        project = self.project()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        self.assertFalse(nav.symbols("src/main.ts")["cached"])
+        self.assertTrue(nav.symbols("src/main.ts")["cached"])
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@host"] = "./src/mock_host.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        self.assertFalse(nav.symbols("src/main.ts")["cached"])
+        write(project / "package.json", json.dumps({"name": "p"}))
+        self.assertFalse(nav.symbols("src/main.ts")["cached"])
+
+
+class PackageJsonImportCase(Tree):
+    """Round 5 F3: a reached `package.json` (or `deno.json`) is the file the mirror also needs in its cut-down form. One file is
+    written, in that form, and used for both."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+
+    def project_importing(self, target):
+        project = self.project()
+        write(project / "package.json", json.dumps({"name": "p", "version": "1.0.0", "type": "module", "scripts": {"x": "y"},
+                                                    "exports": {".": "./src/main.ts"}, "dependencies": {"left-pad": "1.0.0"}}))
+        write(project / "src" / "meta.ts", f"import data from '{target}' with {{ type: 'json' }};\nexport {{ data }};\n")
+        return project
+
+    def test_f3_a_reached_package_json_does_not_stop_the_mirror(self):
+        project = self.project_importing("../package.json")
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call("src/meta.ts")
+            self.assertEqual(answer["status"], "ok", (call.__name__, answer))
+
+    def test_f3_the_mirror_holds_one_package_json_and_it_is_the_cut_down_one(self):
+        project = self.project_importing("../package.json")
+        reach = graph.prove_reach(str(project.resolve()), str(project.resolve() / "src" / "meta.ts"), str(project.resolve() / "deno.json"),
+                                  lambda rel: True)
+        self.assertIn("package.json", reach.files)  # it was reached as data
+        mirror = reach.materialize(str(self.dir))
+        self.addCleanup(mirror.cleanup)
+        self.assertEqual(json.loads(Path(mirror.path("package.json")).read_text()),
+                         {"name": "p", "version": "1.0.0", "type": "module", "dependencies": {"left-pad": "1.0.0"}})
+        self.assertTrue(Path(mirror.path("src/meta.ts")).is_file())
+
+    def test_f3_a_reached_deno_json_does_not_stop_the_mirror_either(self):
+        project = self.project_importing("../deno.json")
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        self.assertEqual([nav.symbols("src/meta.ts")["status"], nav.forward_graph("src/meta.ts")["status"]], ["ok", "ok"])
+        reach = graph.prove_reach(str(project.resolve()), str(project.resolve() / "src" / "meta.ts"), str(project.resolve() / "deno.json"),
+                                  lambda rel: True)
+        mirror = reach.materialize(str(self.dir))
+        self.addCleanup(mirror.cleanup)
+        self.assertNotIn("exclude", json.loads(Path(mirror.path("deno.json")).read_text()))  # the rewritten config, not the project's
+
+    @NEEDS_DENO
+    def test_f3_the_real_deno_reads_the_cut_down_package_json(self):
+        project = self.project_importing("../package.json")
+        self.profile = None
+        with mock.patch.object(nav_api, "SANDBOX_PROFILE", nav_api.SANDBOX_PROFILE):
+            answer = self.nav(project).symbols("src/meta.ts")
+        if answer.get("reason") in ("sandbox_unavailable", "sandbox_failed"):
+            self.skipTest("the sandbox cannot be applied here")
+        self.assertEqual(answer["status"], "ok", answer)
+
+
+def sandbox_works():
+    """True when sandbox-exec can run the real Deno here (it cannot inside another sandbox)."""
+    if not HAVE_DENO:
+        return False
+    probe = nav_api.NavApi(str(ROOT))
+    probe.mirror_parent = None
+    return probe._check_sandbox() is None and bool(probe.deno_version())
+
+
+NEEDS_SANDBOX = unittest.skipUnless(sandbox_works(), "deno or a usable sandbox-exec is missing")
+
+
+class SandboxCase(Tree):
+    """Round 5 F1: Deno runs under an operating-system sandbox that lets it read the mirror and Deno's own files and nothing else,
+    so an import the walk missed cannot be opened whatever its spelling (path-boundary: reviews 1 to 4). These tests run the real
+    Deno under the production profile (`profile = None`)."""
+
+    profile = None
+
+    def outside_file(self, name="outside.ts"):
+        folder = self.dir / "elsewhere"
+        return write(folder / name, "export const CANARY = 1;\n").resolve()
+
+    @staticmethod
+    def blind_scanner():
+        """A scanner that sees no import at all: whatever the walk misses, Deno is still to be kept from it."""
+        return mock.patch.object(graph, "_scan_cached", lambda data: {"specs": [], "pragmas": [], "unmodelled": []})
+
+    def raw_modules(self, nav, rel):
+        """The module list Deno itself printed when run by `nav` on the mirror of `rel` (unfiltered)."""
+        reach, refusal = nav._prove(rel)
+        self.assertIsNone(refusal)
+        refusal, out, _ = nav._run_mirrored(["info", "--json", "--no-remote", "--no-lock"], reach)
+        self.assertIsNone(refusal)
+        return json.loads(out)["modules"]
+
+    def plain_modules(self, project, rel):
+        """The same Deno on the project itself, without the sandbox (the control: it shows the file can be opened)."""
+        run = subprocess.run([shutil.which("deno"), "info", "--json", "--no-remote", "--no-lock", "--config", str(project / "deno.json"),
+                              str(project / rel)], cwd=project, capture_output=True, env=nav_api.NavApi(str(project))._env())
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout)["modules"]
+
+    @staticmethod
+    def entry(modules, name):
+        return next((m for m in modules if m.get("specifier", "").endswith("/" + name)), None)
+
+    def blind_repro(self, spelling):
+        outside = self.outside_file(f"outside_{spelling}.ts")
+        project = self.project(f"proj_{spelling}")
+        target = f"file://{outside}" if spelling == "url" else str(outside)
+        write(project / "src" / "blind.ts", f"export const later = import('{target}');\n")
+        return project, outside
+
+    @NEEDS_SANDBOX
+    def test_f1_an_import_the_scanner_misses_cannot_be_opened_by_deno(self):
+        for spelling in ("url", "path"):
+            project, outside = self.blind_repro(spelling)
+            control = self.entry(self.plain_modules(project, "src/blind.ts"), outside.name)
+            self.assertTrue(control and "local" in control and "error" not in control, "the control must be able to open the file")
+            with self.blind_scanner():
+                modules = self.raw_modules(self.nav(project), "src/blind.ts")
+            got = self.entry(modules, outside.name)
+            self.assertTrue(got is not None and "error" in got, (spelling, got))
+            self.assertNotIn("local", got)
+            self.assertNotIn("size", got)
+
+    @NEEDS_SANDBOX
+    def test_f1_the_answer_for_such_a_file_is_refused_and_names_nothing(self):
+        project, outside = self.blind_repro("url")
+        with self.blind_scanner():
+            nav = self.nav(project)
+            answers = [nav.forward_graph("src/blind.ts"), nav.symbols("src/blind.ts")]
+        self.assertEqual((answers[0]["status"], answers[0]["reason"]), ("refused", "unproven_module"))
+        for answer in answers:
+            self.assertNotIn("CANARY", json.dumps(answer))  # (`symbols` may quote the importing line of the file itself, which is allowed)
+        self.assertNotIn(str(outside), json.dumps(answers[0]))
+
+    @NEEDS_SANDBOX
+    def test_f1_the_review_repro_a_tsx_closing_tag_before_a_division(self):
+        outside = self.outside_file()
+        project = self.project()
+        write(project / "src" / "view.tsx", f"const x = <div></div> / 2; export const y = import('file://{outside}');\n")  # one line, as in the review
+        control = self.entry(self.plain_modules(project, "src/view.tsx"), outside.name)
+        self.assertTrue(control and "local" in control, "the repro must be one that opens the file without the sandbox")
+        nav = self.nav(project)
+        reach, refusal = nav._prove("src/view.tsx")
+        if refusal is None:  # the walk did not see the import (it does not, today): Deno is run, in the sandbox
+            modules = self.raw_modules(nav, "src/view.tsx")
+            got = self.entry(modules, outside.name)
+            self.assertTrue(got is not None and "error" in got and "local" not in got, got)
+        answer = nav.forward_graph("src/view.tsx")
+        self.assertEqual(answer["status"], "refused")
+        self.assertNotIn("CANARY", json.dumps(answer))
+
+    @NEEDS_SANDBOX
+    def test_the_profile_denies_reads_writes_and_the_network(self):
+        """What the profile says, tried by the process itself: `deno eval` with every Deno permission granted."""
+        nav = self.nav(self.project())
+        secret = self.outside_file("note.txt")
+        secret.write_text("hello")
+        server = __import__("socket").socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        mirror = Path(tempfile.mkdtemp(dir=str(self.dir))).resolve()
+        probes = {
+            "read": (f"console.log(Deno.readTextFileSync({json.dumps(str(secret))}))", "hello"),
+            "write": (f"Deno.writeTextFileSync({json.dumps(str(secret.parent / 'new.txt'))}, 'x'); console.log('ok')", "ok"),
+            "network": (f"const c = await Deno.connect({{hostname: '127.0.0.1', port: {port}}}); c.close(); console.log('connected')",
+                        "connected"),
+            "inside": (f"Deno.writeTextFileSync({json.dumps(str(mirror / 'a.txt'))}, 'x'); console.log('wrote inside')", None),
+            "listing": ("console.log([...Deno.readDirSync('/Users')].length)", None),
+        }
+        exe = nav._deno_exe()
+        for label, (code, works) in probes.items():
+            argv = [exe, "eval", "--allow-all", "--no-lock", f"try {{ {code} }} catch (e) {{ console.log('denied ' + e.name) }}"]
+            plain = subprocess.run(argv, cwd=mirror, capture_output=True, env=nav._env()).stdout.decode()
+            if works is not None:
+                self.assertEqual(plain.strip(), works, f"{label}: the control must succeed without the sandbox")
+            for leftover in (secret.parent / "new.txt", mirror / "a.txt"):
+                leftover.unlink(missing_ok=True)  # what the control run wrote
+            boxed = subprocess.run(nav._sandboxed(exe, argv[1:], str(mirror)), cwd=mirror, capture_output=True, env=nav._env())
+            self.assertEqual(boxed.stdout.decode().strip(), "denied PermissionDenied", (label, boxed.stderr))
+            self.assertFalse((secret.parent / "new.txt").exists() or (mirror / "a.txt").exists(), label)
+
+    @NEEDS_SANDBOX
+    def test_the_real_deno_still_answers_for_the_fixture_under_the_profile(self):
+        project = self.project()
+        nav = self.nav(project)
+        answer = nav.symbols("src/main.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        graph_answer = nav.forward_graph("src/main.ts")
+        self.assertEqual(graph_answer["status"], "ok", graph_answer)
+        self.assertIn("src/main.ts", [m["path"] for m in graph_answer["modules"]])
+        self.assertTrue(nav.deno_version().startswith("deno "))
+
+
+class SandboxRefusalCase(Tree):
+    """Without a sandbox Deno is not run, whatever the reason there is none. The fake `deno` leaves a marker file when it runs."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    profile = None
+
+    def deno_that_marks(self):
+        return self.fake_deno(f'echo ran >> {self.dir / "marker"}; echo "deno 9.9.9"')
+
+    def fake_sandbox(self, body):
+        path = self.dir / "bin" / "sandbox-exec"
+        write(path, "#!/bin/sh\n" + body + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return str(path)
+
+    def assert_refused_without_running(self, nav, reason):
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call("src/main.ts")
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", reason), call.__name__)
+            self.assertTrue(answer["next_step"])
+        self.assertFalse((self.dir / "marker").exists(), "Deno ran without a sandbox")
+        self.assertIsNone(nav.deno_version())
+
+    def test_no_sandbox_exec_is_a_refusal(self):
+        with mock.patch.object(nav_api, "SANDBOX_EXEC", str(self.dir / "absent")):
+            self.assert_refused_without_running(self.nav(self.project(), deno=self.deno_that_marks()), "sandbox_unavailable")
+
+    def test_a_platform_without_the_sandbox_is_a_refusal(self):
+        with mock.patch.object(nav_api.sys, "platform", "linux"):
+            self.assert_refused_without_running(self.nav(self.project(), deno=self.deno_that_marks()), "sandbox_unavailable")
+
+    def test_a_profile_that_cannot_be_applied_is_a_refusal(self):
+        fake = self.fake_sandbox('echo "sandbox-exec: sandbox_apply: Operation not permitted" >&2; exit 71')
+        with mock.patch.object(nav_api, "SANDBOX_EXEC", fake):
+            self.assert_refused_without_running(self.nav(self.project(), deno=self.deno_that_marks()), "sandbox_failed")
+
+    def test_a_sandbox_that_fails_after_the_first_call_is_a_refusal_too(self):
+        """The check is made once; each call is still judged by how its own sandbox start went."""
+        state = self.dir / "state"
+        fake = self.fake_sandbox(f'if [ -e {state} ]; then echo "sandbox-exec: sandbox_apply: Operation not permitted" >&2; exit 71; fi\n'
+                                 f'touch {state}; echo "deno 9.9.9"')
+        project = self.project()
+        with mock.patch.object(nav_api, "SANDBOX_EXEC", fake):
+            nav = self.nav(project, deno=self.deno_that_marks())
+            self.assertEqual(nav.deno_version(), "deno 9.9.9")
+            for call in (nav.symbols, nav.forward_graph):
+                answer = call("src/main.ts")
+                self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_failed"))
+        self.assertFalse((self.dir / "marker").exists())
+
+    def test_every_deno_process_is_started_through_the_sandbox(self):
+        project = self.project()
+        started = []
+        real = subprocess.run
+
+        def spy(argv, *args, **kwargs):
+            started.append(list(argv))
+            return real(argv, *args, **kwargs)
+        profile = mock.patch.object(nav_api, "SANDBOX_PROFILE", LOOSE_PROFILE)
+        with profile, mock.patch.object(nav_api.subprocess, "run", spy):
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            nav.status()
+            nav.symbols("src/main.ts")
+            nav.forward_graph("src/main.ts")
+        self.assertTrue(len(started) >= 3)
+        for argv in started:
+            self.assertEqual(argv[0], nav_api.SANDBOX_EXEC, argv)
+            self.assertIn("-p", argv)
 
 
 if __name__ == "__main__":

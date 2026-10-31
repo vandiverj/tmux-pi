@@ -1,0 +1,288 @@
+"""CX1 ctx-store: `tp-ctx` as a person or a worker runs it. Every run is a subprocess with a scrubbed environment (no worker
+variables, no real work store) against a temp project; the approve gate is also driven through a pseudo-terminal."""
+import json
+import os
+import pty
+import select
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TP_CTX = ROOT / "bin" / "tp-ctx"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ctx_store"
+AWS = "AKIA" + "IOSFODNN7EXAMPLE"
+API = "apps/launchpad/api/src"
+
+
+class Cli(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name).resolve()
+        self.project = self.tmp / "project"
+        (self.project / API).mkdir(parents=True)
+        (self.project / ".tmux-pi").mkdir()
+        (self.project / API / "a.test.ts").write_text("one\ntwo\n")
+        (self.tmp / "work-config.json").write_text("{}")
+        self.task = self.tmp / "task"
+        self.task.mkdir()
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("TP_")}
+        self.env.update({"TP_WORK_DIR": str(self.tmp / "work"), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
+                         "TP_CTX_TODAY": "2026-10-31"})
+        self.base = [sys.executable, str(TP_CTX), "--project", str(self.project)]
+
+    def run_cli(self, *args, worker=False, env=None, stdin=None):
+        full = dict(self.env, **(env or {}))
+        if worker:
+            full.update({"TP_TASK_DIR": str(self.task), "TP_TASK_ID": "coder-test"})
+        return subprocess.run(self.base + list(args), env=full, capture_output=True, text=True, timeout=60, input=stdin or "",
+                              cwd=str(self.tmp))
+
+    def add(self, *extra, text="Clean up only the rows a test created.", **kw):
+        return self.run_cli("knowledge", "add", "--kind", "convention", "--scope", f"{API}/**/*.test.ts", "--evidence",
+                            f"{API}/a.test.ts:2", "--title", "Clean up own rows", "--tag", "test-isolation", "--text", text, *extra, **kw)
+
+    def log_lines(self):
+        path = self.task / "ctx-calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def candidate_path(self, ident="kn-2026-10-31-clean-up-own-rows"):
+        return self.project / ".tmux-pi" / "knowledge" / "candidates" / f"{ident}.md"
+
+    def approved_path(self, ident="kn-2026-10-31-clean-up-own-rows"):
+        return self.project / ".tmux-pi" / "knowledge" / "approved" / f"{ident}.md"
+
+
+class Knowledge(Cli):
+    def test_add_writes_a_candidate_and_never_an_approved_note(self):
+        done = self.add()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("written as a candidate", done.stdout)
+        self.assertTrue(self.candidate_path().is_file())
+        self.assertFalse(self.approved_path().exists())
+        self.assertIn("status: candidate", self.candidate_path().read_text())
+
+    def test_add_twice_with_one_id_does_not_overwrite(self):
+        self.add("--id", "kn-2026-10-31-same")
+        before = (self.candidate_path("kn-2026-10-31-same")).read_text()
+        again = self.add("--id", "kn-2026-10-31-same", text="Something else entirely.")
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("already exists", again.stderr)
+        self.assertEqual(self.candidate_path("kn-2026-10-31-same").read_text(), before)
+
+    def test_a_secret_looking_body_is_refused_without_echoing_it_and_nothing_is_written(self):
+        done = self.add(text=f"Use {AWS} for the account.")
+        self.assertEqual(done.returncode, 2)
+        self.assertNotIn(AWS, done.stdout + done.stderr)
+        self.assertNotIn("AKIA", done.stdout + done.stderr)
+        self.assertIn("secret-like", done.stderr)
+        self.assertFalse((self.project / ".tmux-pi" / "knowledge").exists())
+
+    def test_invalid_notes_are_refused_with_the_rule(self):
+        cases = {
+            "an oversize body": (dict(text="x" * 1201), "1201 characters; the limit is 1200"),
+            "a bad glob": (dict(scope="../etc/passwd"), "scope glob"),
+            "no evidence": (dict(evidence="review:only#F1"), None),  # a non-file evidence is allowed, so this one passes
+        }
+        for label, (opts, expected) in cases.items():
+            text = opts.get("text", "A body.")
+            done = self.run_cli("knowledge", "add", "--kind", "lesson", "--scope", opts.get("scope", f"{API}/**"), "--evidence",
+                                opts.get("evidence", f"{API}/a.test.ts:1"), "--title", label, "--text", text, "--id", f"kn-2026-10-31-case-{label.split()[-1]}")
+            if expected:
+                self.assertEqual(done.returncode, 1, label)
+                self.assertIn(expected, done.stderr, label)
+            else:
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_list_show_and_the_candidate_status_filter(self):
+        self.add()
+        self.assertEqual(self.run_cli("knowledge", "list").stdout.strip(), "no notes")  # approved only by default
+        listed = self.run_cli("knowledge", "list", "--status", "candidate")
+        self.assertIn("kn-2026-10-31-clean-up-own-rows", listed.stdout)
+        shown = self.run_cli("knowledge", "show", "kn-2026-10-31-clean-up-own-rows", "--json")
+        data = json.loads(shown.stdout)
+        self.assertEqual((data["status"], data["note"]["status"]), ("ok", "candidate"))
+        missing = self.run_cli("knowledge", "show", "kn-2026-10-31-nope")
+        self.assertEqual(missing.returncode, 1)
+
+    def test_show_flags_a_stale_by_path_note_and_audit_lists_it(self):
+        self.add("--id", "kn-2026-10-31-dead-scope")
+        text = self.candidate_path("kn-2026-10-31-dead-scope").read_text().replace(f"{API}/**/*.test.ts", "gone/**")
+        self.candidate_path("kn-2026-10-31-dead-scope").write_text(text)
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-dead-scope", "--json").stdout)
+        self.assertIn("stale_by_path", shown["note"]["flags"])
+        audit = self.run_cli("knowledge", "audit")
+        self.assertIn("stale_by_path", audit.stdout)
+        self.assertIn("scope_no_match:gone/**", audit.stdout)
+
+    def test_a_non_matching_versions_range_is_flagged_through_a_lockfile_pin(self):
+        # the lockfile reader is L5's (not in this lane); the library hook is covered in test_ctx_store. Here the CLI reports
+        # the check as unavailable rather than silently passing.
+        self.add("--version", "drizzle-orm=>=0.45 <0.46", "--id", "kn-2026-10-31-versioned")
+        shown = json.loads(self.run_cli("knowledge", "show", "kn-2026-10-31-versioned", "--json").stdout)
+        note = shown["note"]
+        self.assertEqual(note["versions"], {"drizzle-orm": ">=0.45 <0.46"})
+        self.assertTrue(note.get("version_unchecked") or "stale_by_version" in note.get("flags", []))
+
+    def test_audit_lists_a_file_that_does_not_parse(self):
+        directory = self.project / ".tmux-pi" / "knowledge" / "approved"
+        directory.mkdir(parents=True)
+        (directory / "kn-2026-10-31-broken.md").write_text((FIXTURES / "missing-evidence-approved.md").read_text())
+        audit = self.run_cli("knowledge", "audit")
+        self.assertIn("invalid", audit.stdout)
+        self.assertIn("evidence is required", audit.stdout)
+
+    def test_import_from_work_refuses_an_unknown_or_non_lesson_note(self):
+        done = self.run_cli("knowledge", "import", "--from-work", "note-nope", "--scope", f"{API}/**", "--evidence", f"{API}/a.test.ts:1")
+        self.assertIn(done.returncode, (1, 2))
+        self.assertFalse((self.project / ".tmux-pi" / "knowledge").exists())
+
+    def test_status_reports_counts_and_the_lockfile_reader(self):
+        self.add()
+        out = self.run_cli("status", "--json")
+        data = json.loads(out.stdout)
+        self.assertEqual(data["counts"]["candidate"], 1)
+        self.assertIn("lockfile_reader", data)
+
+    def test_no_project_is_a_usage_error(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        done = subprocess.run([sys.executable, str(TP_CTX), "status"], env=self.env, capture_output=True, text=True, cwd=str(empty), timeout=60)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("no project", done.stderr)
+
+    def test_output_passes_the_redaction_boundary(self):
+        self.add("--id", "kn-2026-10-31-boundary")
+        path = self.candidate_path("kn-2026-10-31-boundary")
+        path.write_text(path.read_text().replace("Clean up only", f"Use {AWS}; clean up only"))  # planted after the add screen
+        shown = self.run_cli("knowledge", "show", "kn-2026-10-31-boundary")
+        self.assertNotIn(AWS, shown.stdout + shown.stderr)
+
+
+class Logging(Cli):
+    def test_a_worker_call_is_logged_and_a_candidate_is_attributed_to_the_task(self):
+        done = self.add(worker=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        line = self.log_lines()[-1]
+        self.assertEqual((line["tool"], line["status"]), ("knowledge.add", "ok"))
+        self.assertIn("source: worker:coder-test", self.candidate_path().read_text())
+
+    def test_a_worker_call_with_no_usable_task_dir_gets_no_answer_and_reads_nothing(self):
+        done = self.run_cli("knowledge", "list", env={"TP_TASK_DIR": str(self.tmp / "missing")})
+        self.assertEqual(done.returncode, 3)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("refusing to answer without a log", done.stderr)
+        added = self.add(env={"TP_TASK_DIR": str(self.tmp / "missing")})
+        self.assertEqual(added.returncode, 3)
+        self.assertFalse((self.project / ".tmux-pi" / "knowledge").exists())
+
+    def test_a_symlinked_log_is_refused(self):
+        target = self.tmp / "target.jsonl"
+        target.write_text("keep\n")
+        (self.task / "ctx-calls.jsonl").symlink_to(target)
+        done = self.run_cli("knowledge", "list", worker=True)
+        self.assertEqual(done.returncode, 3)
+        self.assertEqual(done.stdout, "")
+        self.assertEqual(target.read_text(), "keep\n")
+
+    def test_the_logged_arguments_never_hold_a_secret(self):
+        self.add(text=f"Use {AWS}.", worker=True)
+        raw = (self.task / "ctx-calls.jsonl").read_text()
+        self.assertNotIn(AWS, raw)
+        self.assertEqual(self.log_lines()[-1]["status"], "refused")
+
+    def test_an_operator_call_is_not_logged_and_an_explicit_log_is(self):
+        self.run_cli("knowledge", "list")
+        self.assertEqual(self.log_lines(), [])
+        own = self.tmp / "own.jsonl"
+        self.run_cli("--log", str(own), "knowledge", "list")
+        self.assertEqual(len(own.read_text().splitlines()), 1)
+
+    def test_a_no_project_call_is_logged_as_no_project(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        env = dict(self.env, TP_TASK_DIR=str(self.task), TP_TASK_ID="coder-test")
+        done = subprocess.run([sys.executable, str(TP_CTX), "status"], env=env, capture_output=True, text=True, cwd=str(empty), timeout=60)
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(self.log_lines()[-1]["status"], "no_project")
+
+
+class Approve(Cli):
+    def candidate(self):
+        done = self.add("--id", "kn-2026-10-31-clean-up-own-rows")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_approve_refuses_in_a_worker_shell_even_with_a_terminal_and_changes_nothing(self):
+        self.candidate()
+        for names in ({"TP_TASK_DIR": str(self.task)}, {"TP_TASK_ID": "coder-test"}):
+            done = self.run_cli("knowledge", "approve", "kn-2026-10-31-clean-up-own-rows", env=names)
+            self.assertEqual(done.returncode, 2, names)
+            self.assertIn("marks a worker's shell", done.stderr)
+            self.assertTrue(self.candidate_path().exists())
+            self.assertFalse(self.approved_path().exists())
+        self.assertEqual(self.log_lines(), [])
+
+    def test_approve_refuses_without_a_terminal(self):
+        self.candidate()
+        done = self.run_cli("knowledge", "approve", "kn-2026-10-31-clean-up-own-rows", stdin="kn-2026-10-31-clean-up-own-rows\n")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("interactive terminal", done.stderr)
+        self.assertTrue(self.candidate_path().exists())
+        self.assertFalse(self.approved_path().exists())
+
+    def drive(self, ident, reply, env=None):
+        """Run approve with a pseudo-terminal as stdin and stdout; answer the prompt when it appears. Returns (code, output)."""
+        master, slave = pty.openpty()
+        full = dict(self.env, **(env or {}))
+        proc = subprocess.Popen(self.base + ["knowledge", "approve", ident], stdin=slave, stdout=slave, stderr=slave,
+                                env=full, cwd=str(self.tmp), close_fds=True)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        seen, answered = b"", False
+        while True:
+            ready, _, _ = select.select([master], [], [], 15)
+            if not ready:
+                proc.kill()
+                self.fail(f"approve did not reach its prompt; saw {seen!r}")
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+            if not answered and b"Type the note id" in seen:
+                os.write(master, (reply + "\n").encode())
+                answered = True
+        os.close(master)
+        code = proc.wait(timeout=30)
+        return code, seen.decode(errors="replace")
+
+    def test_approve_on_a_terminal_prints_the_diff_and_moves_the_note_when_the_id_is_typed(self):
+        self.candidate()
+        code, shown = self.drive("kn-2026-10-31-clean-up-own-rows", "kn-2026-10-31-clean-up-own-rows")
+        self.assertEqual(code, 0, shown)
+        self.assertIn("+++ b/.tmux-pi/knowledge/approved/kn-2026-10-31-clean-up-own-rows.md", shown)
+        self.assertIn("+status: approved", shown.replace("\r", ""))
+        self.assertTrue(self.approved_path().is_file())
+        self.assertFalse(self.candidate_path().exists())
+        self.assertIn("last_reviewed: 2026-10-31", self.approved_path().read_text())
+
+    def test_approve_with_the_wrong_id_typed_changes_nothing(self):
+        self.candidate()
+        code, shown = self.drive("kn-2026-10-31-clean-up-own-rows", "yes")
+        self.assertEqual(code, 1, shown)
+        self.assertIn("nothing was changed", shown)
+        self.assertTrue(self.candidate_path().exists())
+        self.assertFalse(self.approved_path().exists())
+
+    def test_approve_of_an_unknown_candidate_is_refused_on_a_terminal(self):
+        code, shown = self.drive("kn-2026-10-31-nope", "x")
+        self.assertEqual(code, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

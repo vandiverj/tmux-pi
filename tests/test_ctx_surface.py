@@ -561,7 +561,8 @@ class Operations(SurfaceCase):
         (directory / "kn-2026-10-06-cand.md").write_text(store.render(candidate))
         hidden = self.run_tool("ctx_knowledge", {"query": "wisdom"})
         self.assertEqual(hidden.notes_returned, [])
-        self.assertIn("1 candidate", hidden.text)
+        self.assertIn("none can be shown (1 withheld, candidate notes", hidden.text)
+        self.assertNotIn("No matching notes", hidden.text)
         shown = self.run_tool("ctx_knowledge", {"query": "wisdom", "include_candidates": True})
         self.assertEqual(shown.notes_returned, ["kn-2026-10-06-cand"])
         self.assertIn("candidate", shown.text)
@@ -1618,6 +1619,198 @@ class AllWithheld(ReviewOne):
     def test_a_list_with_nothing_withheld_still_states_its_absence(self):
         util = f"{API_SRC}/util.ts"
         self.assertIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+
+
+class AbsenceWording(ReviewOne):
+    """Review 5 F1 (and the family it repeats): no output line claims an absence (none, no X, nothing, 0, not found) unless the
+    withheld count for that item is 0. Every absence wording goes through `surface.absent` (list_head calls it), which takes the count."""
+
+    def link_over(self, rel, text="test('x', () => {});\n"):
+        outside = self.tmp / ("elsewhere-" + Path(rel).name)
+        outside.write_text(text)
+        (self.project / rel).unlink()
+        (self.project / rel).symlink_to(outside)
+
+    def brief_tests_lines(self, answer):
+        return [line for line in answer.text.splitlines() if line.startswith("tests:")]
+
+    def test_a_brief_whose_only_test_is_withheld_says_none_can_be_shown_never_none_found(self):
+        for rel, source in ((f"{API_SRC}/orders.test.ts", ORDERS), (SPEC, CART)):
+            with self.subTest(test=rel):
+                self.link_over(rel)
+                answer = self.run_tool("ctx_brief", {"paths": [source]})
+                (line,) = self.brief_tests_lines(answer)
+                self.assertRegex(line, r"none can be shown \(1 withheld")
+                for word in ("none found", "no test", "nothing"):
+                    self.assertNotIn(word, line)
+                for word in ("orders.test", "cart.spec", "elsewhere"):
+                    self.assertNotIn(word, answer.text)
+                self.assertTrue(any("tests" in item and "1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_a_brief_with_no_test_file_at_all_still_states_that_none_was_found(self):
+        (self.project / API_SRC / "orders.test.ts").unlink()
+        (line,) = self.brief_tests_lines(self.run_tool("ctx_brief", {"paths": [ORDERS]}))
+        self.assertEqual(line, "tests: none found next to it")
+
+    def test_a_brief_with_one_test_shown_and_one_withheld_lists_the_shown_one(self):
+        self.put(f"{API_SRC}/__tests__/orders.test.ts", "test('y', () => {});\n")
+        self.link_over(f"{API_SRC}/__tests__/orders.test.ts")
+        answer = self.run_tool("ctx_brief", {"paths": [ORDERS]})
+        (line,) = self.brief_tests_lines(answer)
+        self.assertIn("orders.test.ts", line)
+        self.assertNotIn("none", line)
+        self.assertTrue(any("tests" in item and "1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def hidden_declaration(self):
+        outside = self.tmp / "hidden.ts"
+        outside.write_text("export function hiddenThing() { return 1; }\n")
+        (self.project / "apps" / "hidden.ts").symlink_to(outside)
+
+    def test_a_name_search_that_skipped_a_refused_file_never_says_no_definition_was_found(self):
+        self.hidden_declaration()
+        answer = self.run_tool("ctx_symbol", {"name": "hiddenThing"})
+        self.assertRegex(answer.text, r"none can be shown \(1 withheld")
+        for word in ("no definition", "hidden.ts", "outside"):
+            self.assertNotIn(word, answer.text)
+        relations = self.run_tool("ctx_relations", {"target": "hiddenThing", "direction": "importers"})
+        self.assertRegex(relations.text, r"none can be shown \(1 withheld")
+        self.assertNotIn("no declaration", relations.text)
+        self.assertNotIn("hidden.ts", relations.text)
+
+    def test_a_name_search_that_skipped_nothing_still_says_no_definition_was_found(self):
+        self.assertIn("no definition of nothingHere found", self.run_tool("ctx_symbol", {"name": "nothingHere"}).text)
+        self.assertIn("no declaration of that name was found", self.run_tool("ctx_relations", {"target": "nothingHere", "direction": "importers"}).text)
+
+    def test_a_brief_whose_only_note_is_a_candidate_never_says_no_note_covers_the_files(self):
+        candidate = store.Note(id="kn-2026-10-06-cand", kind="lesson", scope=["apps/**"], source="worker:x", body="Candidate wisdom.",
+                               evidence=[f"{ORDERS}:5"], status="candidate", created="2026-10-31")
+        directory = self.layout.directory("candidate")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "kn-2026-10-06-cand.md").write_text(store.render(candidate))
+        text = self.run_tool("ctx_brief", {"paths": [ORDERS]}).text
+        knowledge = text.split("== knowledge\n")[1].split("\n==")[0]
+        self.assertRegex(knowledge, r"none can be shown \(1 withheld")
+        self.assertNotIn("no approved note", knowledge)
+        self.assertNotIn("Candidate wisdom", text)
+
+    def test_a_brief_with_no_candidate_still_states_that_no_note_covers_the_files(self):
+        text = self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts"]}).text
+        self.assertIn("none: no approved note covers these files", text)
+
+    def test_a_brief_of_a_file_too_large_to_read_never_says_libraries_none(self):
+        self.put(f"{API_SRC}/big.ts", "import { z } from 'zod';\n" + "// pad\n" * 160000)
+        text = self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/big.ts"]}).text
+        libraries = text.split("== libraries\n")[1]
+        self.assertNotRegex(libraries, r"^\s*none\s*$")
+        self.assertRegex(libraries, r"none can be shown \(1 withheld")
+
+    def test_a_brief_whose_files_were_all_read_still_states_that_no_library_is_imported(self):
+        text = self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts"]}).text
+        self.assertRegex(text.split("== libraries\n")[1], r"^\s*none\s*$")
+
+    # ---- the scanner: no absence string outside the helper, and every use of the helper passes a withheld count
+
+    FILES = ("brief.py", "surface.py")
+    WORDS = re.compile(r"\b(none|no|nothing|not found|zero|empty)\b|\(0\)|\(0 of", re.I)
+    HELPERS = {"absent": 1, "list_head": None}  # name -> position of the withheld argument (None: keyword `withheld=` only)
+    OWNED = {"absent", "list_head"}  # function bodies that are the helper
+    OWNED_NAMES = {"NONE_SHOWN", "CUT_NOTHING", "PATH_WHY"}  # constants that are the helper's wording
+    ALLOWED = {  # fragment -> why it is not a claim about a list that a withheld item can hide
+        "no spaces or dots": "argument check text: a rule for the caller's argument",
+        "none empty": "argument check text: a rule for the caller's argument",
+        "no such file": "the caller's own argument path does not exist (a refused path is refused earlier, by Engine.path)",
+        "no project": "a refusal of the command line: no project directory was given",
+        "no package covers this path": "the path has no deno.json/tsconfig.json above it: a fact about directories, not a list of withheld items",
+        "no deno.json": "same: names the missing config file",
+        "no lockfile reader": "states why a library version was not read, not a missing item",
+        "using no navigator": "states that the navigator did not start",
+        "api files have none here": "a fixed fact about the api navigator (it lists no references)",
+        "no export or import graph": "same fact as 'no package covers this path'",
+        "navigator did not start": "the navigator is unavailable; no list was asked for",
+        "no navigator": "the navigator is unavailable; no list was asked for",
+    }
+
+    EXACT = {"none": "the package fact line of a brief (`package: none`): a fact about one file, not a list"}
+
+    def violations(self, source, name="x.py", used=None):
+        import ast
+        tree = ast.parse(source)
+        parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+        def text_of(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                return "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
+            return None
+
+        def inside(node):
+            while node in parent:
+                node = parent[node]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in self.OWNED:
+                    return True
+                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in self.OWNED_NAMES for t in node.targets):
+                    return True
+            return False
+
+        def helper_call(node):
+            """The helper call that `node` is the absence text argument of, or None."""
+            call = parent.get(node)
+            if isinstance(call, ast.keyword):
+                keyword, call = call.arg, parent.get(call)
+            else:
+                keyword = None
+            if not isinstance(call, ast.Call):
+                return None
+            func = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+            if func == "absent" and keyword is None and call.args and call.args[0] is node:
+                return call, func
+            if func == "list_head" and keyword == "empty":
+                return call, func
+            return None
+
+        def passes_count(call, func):
+            where = self.HELPERS[func]
+            given = [k.value for k in call.keywords if k.arg == "withheld"]
+            if where is not None and len(call.args) > where:
+                given.append(call.args[where])
+            return any(not (isinstance(v, ast.Constant) and not v.value) for v in given)  # a literal 0 or None is not a count
+
+        found = []
+        for node in ast.walk(tree):
+            text = text_of(node)
+            if text is None or isinstance(parent.get(node), ast.JoinedStr):
+                continue
+            if isinstance(parent.get(node), ast.Expr) or not self.WORDS.search(text) or inside(node):
+                continue
+            via = helper_call(node)
+            if via:
+                if not passes_count(*via):
+                    found.append((name, node.lineno, text, "the helper is called without a withheld count"))
+                continue
+            hit = [f for f in self.ALLOWED if f in text] + [f for f in self.EXACT if f == text]
+            if used is not None:
+                used.update(hit)
+            if not hit:
+                found.append((name, node.lineno, text, "an absence string outside the helper"))
+        return found
+
+    def test_the_scanner_finds_a_bare_absence_and_a_helper_call_without_a_count(self):
+        self.assertTrue(self.violations('lines.append("tests: none found")'))
+        self.assertTrue(self.violations('lines.append(f"nothing imports {rel}")'))
+        self.assertTrue(self.violations('x = surface.absent("none found", 0)'))
+        self.assertTrue(self.violations('x = surface.absent("none found")'))
+        self.assertTrue(self.violations('x = surface.list_head("a", 0, 0, False, empty="nothing imports")'))
+        self.assertFalse(self.violations('x = surface.absent("none found", refused)'))
+        self.assertFalse(self.violations('x = surface.list_head("a", 0, 0, False, empty="nothing imports", withheld=got.refused)'))
+        self.assertFalse(self.violations('"""no x"""\nx = 1'))
+
+    def test_the_sources_contain_no_absence_string_outside_the_one_helper(self):
+        found, used = [], set()
+        for name in self.FILES:
+            found += self.violations((ROOT / "lib" / "ctxengine" / name).read_text(), name, used)
+        self.assertEqual(found, [])
+        self.assertEqual(sorted((set(self.ALLOWED) | set(self.EXACT)) - used), [], "an allowlist entry that no string uses")
 
 
 if __name__ == "__main__":

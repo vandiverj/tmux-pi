@@ -240,6 +240,7 @@ def build(engine, paths):
     lines, left, tried, good = [], [], [], []
     libraries = set()
     contracts, nexts, missing, incomplete = {}, set(), [], []
+    unread = []  # briefed files whose text could not be read for the library scan
     withheld_imports = 0  # imports of the briefed files that a refused path kept out: a contract may be among them
 
     def track(section, got):
@@ -262,10 +263,12 @@ def build(engine, paths):
         facts = f"kind: {kind_of(rel)} | lines: {line_count(engine, rel)} | package: "
         facts += f"{surface.label_for(rel)} ({package[1] or '.'})" if package else "none"
         lines.append(facts)
-        text = engine.read(rel) or ""
-        libraries |= surface.libraries_in(text)
+        text = engine.read(rel)
+        if text is None:
+            unread.append(rel)  # over 1 MB or unreadable: its imports were not scanned, so "no library" cannot be said
+        libraries |= surface.libraries_in(text or "")
         tests, refused_tests = tests_for(engine, rel)
-        lines.append("tests: " + (", ".join(tests) if tests else "none found next to it"))
+        lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", refused_tests)))
         add_left(left, withheld_note(f"tests of {rel}", refused_tests))
         if package is None:
             lines.append("no package covers this path (no deno.json or tsconfig.json above it), so there is no export or import graph for it")
@@ -319,7 +322,7 @@ def build(engine, paths):
 
     lines.append("== knowledge")
     result, note_lines, cut = engine.find_notes(paths, limit=NOTES_MAX, body_limit=surface.NOTE_BODY_BRIEF)
-    lines += note_lines or ["none: no approved note covers these files"]
+    lines += note_lines or [surface.absent("none: no approved note covers these files", result.candidates_counted, surface.CANDIDATES_WHY)]
     if result.total > len(result.hits):
         left.append(f"notes: {result.total - len(result.hits)} more (ctx_knowledge with paths shows them)")
     if cut:
@@ -335,7 +338,7 @@ def build(engine, paths):
                 why = "no lockfile reader" if engine.pin is None else "not in the lockfile"
                 lines.append(f"  {lib} (version not read: {why})")
     else:
-        lines.append("  none")
+        lines.append("  " + surface.absent("none", len(unread) + len(incomplete), surface.LIBRARIES_WHY))
 
     status = "ok"
     if tried and not good:

@@ -126,7 +126,12 @@ store is as it was.
   shared contracts among the imports). One helper words it (`surface.list_head`, `surface.more_note`): "label (at least N shown, list cut by
   the navigator)" when rows were shown, "label: not found in the part the navigator returned (list cut)" when none were, and a `left_out`
   entry that says the list was cut and gives no count. A list that was not cut states its total ("5 of 7") and its absence ("nothing imports
-  X"). The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
+  X") only when nothing of it was withheld. If every item was refused or withheld, or a search skipped a file, the line says "none can be shown
+  (N withheld, ...)" and never an absence, a zero or "none found". One helper (`surface.absent`, used by `surface.list_head`) takes the withheld
+  count of the item and words every absence in `brief.py` and `surface.py`: lists (importers, imports, exports, contract consumers, the shared
+  contracts, definitions, references), the `tests:` line of `ctx_brief` (a test file at a refused path), the name search of `ctx_symbol` and
+  `ctx_relations` (code files the scan could not read), the notes (candidates not shown) and the libraries (a briefed file too large to read, or a
+  cut import list). A test fails if either file holds an absence string outside the helper. The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
   `path` gives the details of each file that declares the name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is
   `invalid` with a next step (pass a path).
 - **Contract consumers** are marked `[reader]`, `[writer]`, `[reader, writer]`, `[uses]` (imports it, does neither) or `[unread]` (the file

@@ -178,6 +178,80 @@ class CommandTests(unittest.TestCase):
         self.assertEqual((args.command, args.project, args.json, callable(args.func)), ("families", "/x", True, True))
 
 
+class FamilyLabelTests(unittest.TestCase):
+    """Family: names per review round, the repeated ones, and the `tp-evals families` summary line."""
+
+    ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}
+
+    @staticmethod
+    def review(verdict, *names):
+        body = "".join("F{0} [defect] problem {0}.\nFamily: {1}\nCloses by: code\n".format(i, n) for i, n in enumerate(names, 1))
+        return verdict + "\n" + (body or "F1 [defect] problem.\nCloses by: code\n") + "Coverage\nreviewed the changed files."
+
+    def chain(self, state, prefix, results, bad=()):
+        """One coder chain with one review per entry of `results` (the result.md text; "" for a round with no result.md)."""
+        tasks = {}
+        for i, text in enumerate(results, 1):
+            coder, rev = "coder-%s%d" % (prefix, i), "review-%s%d" % (prefix, i)
+            meta = {"role": "coder", "created": "2026-10-01T1%d:00:00Z" % i, "reviews": [rev]}
+            if i > 1:
+                meta["parent"] = "coder-%s%d" % (prefix, i - 1)
+            tasks[coder] = {"meta": meta}
+            tasks[rev] = {"meta": {"role": "code-reviewer", "created": "2026-10-01T1%d:30:00Z" % i},
+                          "files": {"result.md": text} if text else {}}
+        materialize(state, tasks)
+        for i in bad:  # a result.md that cannot be read: not UTF-8
+            (Path(state) / "tasks" / ("review-%s%d" % (prefix, i)) / "result.md").write_bytes(b"\xff\xfe REQUEST_CHANGES\n")
+
+    def fixture(self, state):
+        rc = self.review
+        # a: "cache-key" repeated in rounds 1 and 3, round 2 unlabelled, round 4 approves
+        self.chain(state, "a", [rc("REQUEST_CHANGES", "cache-key", "Other_Name"), rc("REQUEST_CHANGES"),
+                                rc("REQUEST_CHANGES", "cache-key"), rc("APPROVED")])
+        # b: 3 REQUEST_CHANGES, every name different: no repeat
+        self.chain(state, "b", [rc("REQUEST_CHANGES", "one"), rc("REQUEST_CHANGES", "two"), rc("REQUEST_CHANGES", "three")])
+        # c: round 2 has no result.md, round 3 has one that cannot be read
+        self.chain(state, "c", [rc("REQUEST_CHANGES", "x"), "", "unused"], bad=(3,))
+
+    def test_record_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fixture(tmp)
+            got = {r["root"]: r for r in task_family.families(tmp)}
+        a, b, c = got["coder-a1"], got["coder-b1"], got["coder-c1"]
+        self.assertEqual(a["families"], [["cache-key", "other_name"], [], ["cache-key"], []])
+        self.assertEqual((a["labelled_rounds"], a["repeated_families"], a["review_rounds"]), (2, ["cache-key"], 4))
+        self.assertEqual(b["families"], [["one"], ["two"], ["three"]])
+        self.assertEqual((b["labelled_rounds"], b["repeated_families"]), (3, []))
+        self.assertEqual(c["families"], [["x"], [], []])
+        self.assertEqual((c["labelled_rounds"], c["repeated_families"]), (1, []))
+        self.assertEqual([r["families"] for r in a["reviews"]], a["families"])
+
+    def test_a_pruned_review_is_an_unlabelled_round(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            self.chain(tmp, "p", [self.review("REQUEST_CHANGES", "x"), self.review("REQUEST_CHANGES", "x")])
+            shutil.rmtree(Path(tmp) / "tasks" / "review-p1")
+            rec = task_family.families(tmp)[0]
+        self.assertEqual((rec["families"], rec["labelled_rounds"], rec["repeated_families"]), ([[], ["x"]], 1, []))
+
+    def test_summary_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fixture(tmp)
+            self.assertEqual(task_family.summary(task_family.families(tmp)),
+                             "family labels: rounds with a label 6/10; families with a repeated name 1; "
+                             "families with 3+ REQUEST_CHANGES and no repeated name 1")
+
+    def test_cli_prints_the_summary_last_and_survives_an_unreadable_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fixture(Path(tmp) / ".tmux-pi" / "sessions" / "s1")
+            cmd = [sys.executable, str(ROOT / "bin" / "tp-evals"), "families", "--project", tmp]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=self.ENV)
+            data = subprocess.run(cmd + ["--json"], capture_output=True, text=True, timeout=60, env=self.ENV)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.splitlines()[-1].startswith("family labels: rounds with a label 6/10;"), out.stdout)
+        self.assertEqual({r["root"]: r["repeated_families"] for r in json.loads(data.stdout)}["coder-a1"], ["cache-key"])
+
+
 class TpEvalsFamiliesTests(unittest.TestCase):
     """`bin/tp-evals families` reaches task_family.run and needs no routing eval dir."""
 

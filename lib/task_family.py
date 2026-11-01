@@ -13,6 +13,11 @@ Per family (see `family_record`): `attempts` and `reviews` in order, `first_revi
 open: reviewed but not approved, unreviewed), frontier and local tokens (input, output, cache_read, cache_write, cache),
 and wall time. A token or time that was not recorded is None, never 0, and `*_unknown_tasks` counts them.
 
+Family labels: `families` is the `Family:` names of each review round (review_verdict.families on that review's result.md), a list
+with one list per round, [] for an unlabelled round; a review whose result.md is gone or cannot be read is unlabelled. `labelled_rounds`
+counts the rounds with a name and `repeated_families` the names that appear in 2+ rounds (a name repeated inside one round counts once).
+`tp-evals families` ends with a one-line summary of them.
+
 Facts only: a verdict here is read from the reviewer's reply the way `tp-evals export` reads it (routing_evals.review_outcome).
 
 Wired into `tp-evals families [--project DIR] [--json]`: bin/tp-evals calls `task_family.add_subcommand(sub)` and, for that
@@ -24,6 +29,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import review_verdict  # noqa: E402
 import routing_evals as re_  # noqa: E402
 
 FAMILY_SCHEMA = "tmux-pi-task-family:v1"
@@ -121,6 +127,14 @@ def _tokens(nodes):
     return out
 
 
+def _round_families(reviewer_dir):
+    """The distinct Family: names in one review's result.md; [] when it has none or cannot be read."""
+    try:
+        return review_verdict.families(review_verdict.read_review(Path(reviewer_dir) / "result.md"))
+    except (ValueError, OSError):  # ReviewMissing is a ValueError; an unreadable or undecodable file is unlabelled
+        return []
+
+
 def _entry(node):
     meta = node["meta"]
     return {"id": node["id"], "role": node["role"], "worker": meta.get("worker"), "model": node["state"].get("model") or meta.get("model"),
@@ -155,8 +169,15 @@ def family_record(root, members, owner, session=None):
         for key in ("stated_verdict", "incomplete_reason", "unusable_reason"):
             if key in outcome:
                 entry[key] = outcome[key]
+        entry["families"] = _round_families(rn["dir"])
         reviews.append(entry)
         latest[owner[rn["id"]]] = entry["verdict"]
+    by_round = {r["id"]: r["families"] for r in reviews}
+    round_families = [by_round.get(r, []) for r in sequence]  # a pruned review is a round with no label
+    seen_in = {}
+    for names in round_families:
+        for name in names:
+            seen_in[name] = seen_in.get(name, 0) + 1
     accepted = next((a["id"] for a in reversed(attempts) if a["kind"] == "attempt" and latest.get(a["id"]) in APPROVING), None)
     status = "accepted" if accepted else ("open" if sequence else "unreviewed")
     timeline = [{"id": n["id"], "kind": "review" if n["id"] in owner else _kind(n)} for n in members]
@@ -176,6 +197,8 @@ def family_record(root, members, owner, session=None):
         "first_review_verdict": reviews[0]["verdict"] if reviews and sequence[0] in present else None,
         "first_review_known": bool(sequence) and sequence[0] in present, "review_rounds": len(sequence),
         "missing_reviews": missing_reviews,
+        "families": round_families, "labelled_rounds": sum(1 for names in round_families if names),
+        "repeated_families": [n for n, c in seen_in.items() if c > 1],
         "accepted": accepted, "status": status,
         "tokens": {"frontier": _tokens([n for n in members if not _local(n)]), "local": _tokens([n for n in members if _local(n)])},
         "wall_seconds": wall, "task_seconds": task_seconds, "task_seconds_unknown_tasks": task_seconds_missing,
@@ -241,6 +264,17 @@ def render(records):
     return "\n".join(lines)
 
 
+def summary(records):
+    """One line: rounds with a label / all rounds, families with a repeated name, families with 3+ REQUEST_CHANGES and no repeated name."""
+    rounds = sum(r["review_rounds"] for r in records)
+    labelled = sum(r["labelled_rounds"] for r in records)
+    repeated = sum(1 for r in records if r["repeated_families"])
+    unnamed = sum(1 for r in records if not r["repeated_families"]
+                  and sum(1 for v in r["reviews"] if v["verdict"] == "REQUEST_CHANGES") >= 3)
+    return ("family labels: rounds with a label {}/{}; families with a repeated name {}; "
+            "families with 3+ REQUEST_CHANGES and no repeated name {}".format(labelled, rounds, repeated, unnamed))
+
+
 def run(project=None, as_json=False, out=sys.stdout):
     """`tp-evals families`: print the families under `project` (default: $TP_STATE_DIR, else the current directory)."""
     import os
@@ -248,7 +282,7 @@ def run(project=None, as_json=False, out=sys.stdout):
     if as_json:
         out.write(json.dumps(records, indent=2, sort_keys=True) + "\n")
     elif records:
-        out.write(render(records) + "\n")
+        out.write(render(records) + "\n" + summary(records) + "\n")
     return records
 
 

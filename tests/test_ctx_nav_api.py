@@ -7080,6 +7080,19 @@ class SweepCase(Tree):
                 self.assertEqual(self.sweep(fresh=False)["deleted"], 1)
                 self.assertIsInstance(self.cache()._last_sweep(), float)
 
+    def test_s6_a_marker_with_a_number_no_float_can_hold_is_no_throttle_and_is_rewritten(self):
+        for label, text in (("huge int", '{"last_sweep": 1' + "0" * 400 + "}"), ("huge negative", '{"last_sweep": -1' + "0" * 400 + "}"),
+                            ("infinity", '{"last_sweep": Infinity}'), ("minus infinity", '{"last_sweep": -Infinity}')):
+            with self.subTest(label):
+                payload = json.loads(text)
+                self.marker().write_text(seal(graph.SWEEP_MARKER, payload))
+                self.put("nav_api-doc-old.json", 20 * self.DAY)
+                self.assertIsNone(self.cache()._last_sweep(), "the marker's time is not a time")
+                status = self.nav(self.proj).status()["cache"]
+                self.assertIsNone(status["last_sweep"], status)
+                self.assertEqual(self.sweep(fresh=False)["deleted"], 1, "the old entry stayed: the marker stopped the sweep for good")
+                self.assertIsInstance(self.cache()._last_sweep(), float)
+
     def replaced_by(self, how, victim="nav_api-doc-victim.json"):
         """Sweep with `victim` expired and `how(path)` done to it after the listing and before any deletion. Returns the result."""
         path = self.put(victim, 20 * self.DAY)
@@ -7717,6 +7730,85 @@ class SweepCase(Tree):
         self.assertIsInstance(self.cache()._last_sweep(), float, "the marker is whole")
         self.assert_decoy(decoy)
         self.assertEqual([p.name for p in self.folder.iterdir() if p.name.endswith(".tmp") and p.name.startswith(graph.SWEEP_MARKER)], [])
+
+
+class ShapeCase(Tree):
+    """Cache plan S6, the whole-cache family sweep: a cache entry that is a whole envelope (format, name, checksum) can still hold a
+    payload of the wrong inner shape (an older writer, a bug, a writer who can compute the checksum). The envelope rule is that a bad
+    entry is a miss; this holds the readers of index and doc entries to it for the inner shape as well (an info entry is held by
+    InfoCacheCase.test_s3_a_stored_value_of_the_wrong_shape...). Each test failed against the code at 5dfe20a."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+
+    BAD_ROWS = (("row too short", [[1]]), ("spec not text", [[5, 1, False, False]]), ("row not a list", [5]),
+                ("row is text", ["abc"]), ("line is text", [["./x.ts", "a", False, False]]), ("line is a list", [["./x.ts", [1], False, False]]),
+                ("line is a bool", [["./x.ts", True, False, False]]), ("flag is text", [["./x.ts", 1, "yes", False]]),
+                ("row too long", [["./x.ts", 1, False, False, 9]]), ("specs is text", "abc"), ("specs is a dict", {"a": 1}))
+
+    def index_file(self, project):
+        (entry,) = [p for p in project_cache(project).parent.iterdir() if p.name.startswith("nav_api-index-")]
+        return entry
+
+    def test_s6_an_index_entry_with_a_row_of_the_wrong_shape_is_a_miss_not_a_raise(self):
+        for label, specs in self.BAD_ROWS:
+            project = self.project(label.replace(" ", "_"))
+            clean = self.nav(project).importers("src/util/index.ts")
+            self.assertEqual(clean["status"], "ok", clean)
+            entry = self.index_file(project)
+            payload = payload_of(entry)
+            payload["entries"]["src/main.ts"]["specs"] = specs
+            entry.write_text(seal(entry.name, payload))
+            answer = self.nav(project).importers("src/util/index.ts")  # must not raise
+            self.assertEqual((answer["total"], answer["importers"], answer["scanned"]), (clean["total"], clean["importers"], 1), label)  # only that file is read again
+            self.assertNotEqual(payload_of(self.index_file(project))["entries"]["src/main.ts"]["specs"], specs, label)
+
+    def test_s6_an_index_entry_with_a_key_of_the_wrong_shape_is_a_miss(self):
+        for label, key in (("one number", [1]), ("text", ["a", "b"]), ("not a list", 5), ("floats", [1.5, 2]), ("bools", [True, False])):
+            project = self.project(label.replace(" ", "_"))
+            clean = self.nav(project).importers("src/util/index.ts")
+            entry = self.index_file(project)
+            payload = payload_of(entry)
+            payload["entries"]["src/main.ts"]["key"] = key
+            entry.write_text(seal(entry.name, payload))
+            index = graph.ImportIndex(str(project), cache=(self.nav(project)._cache, entry.name), allow=stub_allow(project))
+            self.assertNotEqual(index.entries.get("src/main.ts", {}).get("key"), key, label)
+            self.assertEqual(self.nav(project).importers("src/util/index.ts")["importers"], clean["importers"], label)
+
+    def test_s6_a_good_index_entry_is_still_a_hit(self):
+        project = self.project()
+        self.nav(project).importers("src/util/index.ts")
+        index = graph.ImportIndex(str(project), cache=(self.nav(project)._cache, self.index_file(project).name), allow=stub_allow(project))
+        self.assertIn("src/main.ts", index.entries)
+        self.assertEqual(index.refresh()["scanned"], 0)
+
+    def doc_project(self, name="proj"):
+        project = self.project(name)
+        exe = self.scripted_deno(doc=self.doc_payload(MIRROR, "src/config.ts", "kept", "fine"))
+        miss = self.nav(project, deno=exe).symbols("src/config.ts")
+        self.assertEqual(miss["status"], "ok", miss)
+        (entry,) = project_cache(project).parent.glob("nav_api-doc-*.json")
+        return project, exe, miss, entry
+
+    def test_s6_a_doc_entry_with_a_field_of_the_wrong_type_is_a_miss_and_is_replaced(self):
+        for label, field, value in (("name", "name", {"a": 1}), ("line", "line", "x"), ("line list", "line", [1]), ("line bool", "line", True),
+                                    ("kind", "kind", None), ("signature", "signature", [1]), ("doc", "doc", 5), ("path", "path", ["src/config.ts"])):
+            project, exe, miss, entry = self.doc_project(label.replace(" ", "_"))
+            before = len(self.deno_calls("doc"))
+            payload = payload_of(entry)
+            payload[0][field] = value
+            entry.write_text(seal(entry.name, payload))
+            answer = self.nav(project, deno=exe).symbols("src/config.ts")
+            self.assertEqual(answer, miss, label)
+            self.assertEqual(len(self.deno_calls("doc")), before + 1, label)
+            self.assertIsNot(type(payload_of(entry)[0][field]), type(value), label)  # (True == 1, so the type says it)
+
+    def test_s6_a_good_doc_entry_is_still_a_hit(self):
+        project, exe, miss, entry = self.doc_project()
+        hit = self.nav(project, deno=exe).symbols("src/config.ts")
+        self.assertEqual((hit["cached"], hit["symbols"]), (True, miss["symbols"]))
+        self.assertEqual(len(self.deno_calls("doc")), 1)
 
 
 if __name__ == "__main__":

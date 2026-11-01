@@ -21,7 +21,112 @@ Three sources, each used for what it is good at:
     stray `.tmp` files older than 10 minutes, entries unused for 14 days (index files 30), then the oldest while the folder holds more than
     64 MB or 400 files, within 200 deletions or 50 ms. A hit that accepted its payload touches the entry (once an hour at most), which is
     what "used" means. It lists and deletes only through the judged folder's descriptor, only managed names that are regular files, each
-    judged by the guard and looked at again just before its unlink. `status()` reports `cache`: entries, bytes and the last sweep.
+    judged by the guard and looked at again just before its unlink. `status()` reports `cache`: entries, bytes, the last sweep and
+    `incomplete`. All of it is set out in "Cache" below.
+
+Cache. (Every statement here is about `graph.CacheDir`, `graph.ImportIndex` and this module's `_forward_graph`, `_symbols`,
+`_swept` and `status`; the tests that hold them are in tests/test_ctx_nav_api.py: InfoCacheCase, EnvelopeCase, SweepCase, ShapeCase,
+PathRuleCase.)
+  What is cached. Three things, nothing else. No answer of `importers` or `imports` from the index is stored, and neither are the
+  resolved edges (they are made again from the scanned specifiers on every refresh).
+    - The index: one file per root, `nav_api-index-<16 hex>.json` (the first 16 hex digits of a digest of the project root, the
+      boundary, the root and the config path), holding for each source file its scanned specifiers
+      (`[specifier, line, type_only, dynamic]`) under the key `[mtime_ns, size]`. `ImportIndex.save` writes it from `refresh`
+      whenever a file was new, changed or went, before the proof, so a call that ends in a non-`ok` answer may still have saved it: what
+      it holds is only what a successful read gave, never an answer. It is loaded when the index is made (once per `NavApi`).
+    - `deno doc`: `nav_api-doc-<40 hex>.json`, the list of symbols (name, kind, path, line, signature, doc) of one file, keyed by a
+      digest of the file's name, `Reach.digest()` (the content of every file the walk reached, and the state of the configs and
+      `package.json` files) and the Deno version.
+    - `deno info`: `nav_api-info-<40 hex>.json`, `{format: INFO_FORMAT, external, modules: [{path, imports}]}`, keyed by a digest of
+      the entry, `Reach.digest()`, the Deno version, `INFO_FLAGS` and `INFO_FORMAT`. A key holds content hashes, never a time, a
+      size, an inode or a ctime. The Deno version in a key is the first line of `deno --version`, read once per `NavApi`.
+  Where. In `cache_dir` (default `<project root>/.tmux-pi/ctx-cache`), a `graph.CacheDir` judged once when the `NavApi` is made: inside
+  the project, not the project itself, allowed by the guard (also where a link leads), else there is no cache, and an `ok` answer
+  carries `cache_refused`. An entry is a plain `.json` name (no `/`, not hidden) directly in that folder. The folder is made, mode
+  0700, by the first write and by nothing else (a read, a touch, a sweep and `status()` make nothing); it is opened one component at a
+  time below the boundary with no link followed, and must be the judged folder by the kernel's name each time.
+  The envelope. Every entry is `{"format": ENVELOPE_FORMAT, "name": <its file name>, "sha256": <hash of the payload as compact,
+  key-sorted JSON>, "payload": ...}` with those four keys and no others (`CacheDir.read_json`, `put_json`: the only reader and writer
+  of an entry). It is read with `graph.read_bounded` (like any file, and at most MAX_CACHE_BYTES, 64 MB). Anything else is a MISS (None,
+  never an error): not there, a link or a folder at the name, not UTF-8 or JSON, too deep to read, over the size, another format, another
+  name, a payload that does not hash to `sha256`. The checksum guards against corruption, not a writer who can compute it. A payload is
+  then held to the shape its reader writes, and a payload of another shape is a miss too, replaced by the next write: an index entry
+  (`ImportIndex._entry_shape`: a key of two whole numbers, rows of text, a whole number and two flags; one entry that is not is read
+  again, the others stay), a doc list (`NavApi._doc_item_shape`: text for name, kind, path, signature and doc, a whole number for
+  line), an info graph (`NavApi._info_local`: the format, a whole `external`, a list of modules). Inside an info graph or a doc list,
+  a module or symbol that names a file this walk did not prove, or one the guard refuses now, is dropped, and so is an info module
+  record that is not a path with a list of imports, and an import that is not a proven name.
+  The freshness proof. A stored `deno doc` or `deno info` entry is not an answer. To find its key `prove_reach` reads every file the
+  walk reaches and hashes it with the configs; a hit is then filtered as a fresh result is (only names this walk proved and the guard
+  allows), listed, screened, and ended by `Reach.holds()` as the last step, so a file or config that moved after the key gives
+  `stale_index`; with no sandbox there is no hit (`sandbox_unavailable`) and with no `deno` there is none either. An index answer
+  does not rest on the cache: the walk at its start and the walk of its final proof are made every time, a loaded entry is used only
+  for a file whose `(mtime_ns, size)` is the walk's and that is then opened, and a file that changed is read again.
+  Writing. An entry is JUDGED before the final proof (its name and a unique temporary name, `<name>.<16 hex>.tmp`, are asked of the
+  guard) and WRITTEN after it, only if the answer is still `ok` (the index file excepted, see above): a temporary file made with
+  O_EXCL, never through a link, then renamed over the name. The rename is the commit point: before it any failure leaves every entry
+  as it was (a stray `.tmp` is possible), after it nothing can fail the write. A writer never deletes anything, and two writers of one
+  key write the same bytes. A write that fails is swallowed and the answer is the same.
+  Using an entry. The caller that accepted the shape of a payload touches the entry (`CacheDir.touch`: the time of the last use, for
+  the age rule), after it was read and before the final proof, so an answer that then ends `stale_index` has touched it. A touch is
+  made only when the entry's modification time is at least an hour old or in the future (TOUCH_EVERY_S); it looks at the name in the
+  folder's descriptor, sets the time with `follow_symlinks=False` only on a regular file, and fails silently (a link, a folder, a
+  name the guard refuses, no such file, no permission). Reading touches nothing, so an entry no caller accepts ages out.
+  The sweep (`CacheDir.sweep`, run by `NavApi._swept` after `importers`, `imports`, `forward_graph` and `symbols`, after the answer is
+  final). Due only if this folder's `CacheDir` wrote an entry since it last asked (`written`; a hit never writes), the folder is judged
+  and exists, this object has not swept within an hour, and the marker `nav_api-sweep.json` does not show a sweep within an hour (a
+  marker that is absent, not an envelope of this format, a time that is not a finite number, or dated in the future holds nothing
+  back and is written again). A sweep removes: a plain `*.tmp` file older than 10 minutes (TEMP_MAX_AGE_S, by age only, whoever made
+  it); a doc or info entry whose modification time is older than 14 days (ENTRY_MAX_AGE_S); an index file older than 30 days
+  (INDEX_MAX_AGE_S); then, while the entries that are left (index, doc and info files: temporaries, the marker and every other name
+  are not counted) are more than 400 (SWEEP_CAP_FILES) or hold more than 64,000,000 bytes (SWEEP_CAP_BYTES), the oldest by
+  modification time (then by name) first. It stops after 200 deletions or 50 ms (SWEEP_MAX_DELETIONS, SWEEP_BUDGET_S), counted over
+  listing, judging and deleting together; the marker, written last, records `{version, last_sweep, deleted, skipped, complete}` and
+  `complete` is False when the budget stopped it or a name could not be looked at. The safety rule: it opens the folder only by the
+  judged name with nothing made, lists and deletes only through that descriptor, takes names only from the listing and the kind of
+  each from its own `lstat` there, touches only the names `nav_api-(index|doc|info)-*.json` and `*.tmp` and only if they are regular
+  files (a link, a folder, a FIFO, a hidden or foreign name and the marker are neither counted nor deleted), asks the guard about each
+  name before it is deleted, and looks again just before each unlink: the name must still be a regular file with the device, inode
+  and modification time that were listed, else it is skipped. A sweep never raises and never changes the answer it follows. A folder
+  that is refused or missing is not swept.
+  `status()["cache"]`: `{"entries": int or None, "bytes": int or None, "last_sweep": float or None, "incomplete": bool}`. Read-only
+  (nothing is made, a missing folder is `0`, `0`, `incomplete` False), and each field comes from its own source, so one failing
+  never hides another.
+    - `entries` and `bytes`: the index, doc and info files that are regular files (temporaries, the marker, links, folders and other
+      names are not entries), in the same listing as the sweep's but with no time limit. They are None, and `incomplete` is True,
+      whenever they are not all known: the cache is refused, the folder cannot be opened or is not the judged one, it cannot be
+      listed, or a listed name could not be looked at for a reason other than having gone since the listing. A name that only went
+      is not an error and is not counted. A count of what could be seen is never reported as the whole.
+    - `last_sweep`: the time (seconds since the epoch) in the marker. None only when the marker cannot be read: no cache, no marker
+      (never swept), a link or a folder at its name, not an envelope of this format, a time that is not a finite number, or a folder
+      that cannot be read (a folder of mode 0 hides its marker, so it reports None, with `entries` and `bytes` None as well). A time
+      in the future is reported as it is.
+  Known limits of the cache (as the code behaves; see also "Known limits" below).
+    - A change after the final proof returns, or one that keeps the mtime, size, inode and ctime of a file, is not seen. A source
+      rewritten with the same mtime and size is not seen by the index (its key has no content hash).
+    - An entry is only as safe as the cache folder. The folder is judged and the content is filtered again on every read, but another
+      process running as the same user can still plant a wrong list that names only files inside the proven set (or a wrong set of
+      specifiers in an index file), with a checksum it computed, and be believed.
+    - A time cap or an eviction by the size cap can cost one cold answer: a sweep can remove an entry a call is about to read (a miss),
+      and a long-lived instance keeps using the index it holds in memory when another process's sweep removed its file, until its next
+      write.
+    - A clock that was ahead leaves an entry dated in the future. It is never old, so the age rule does not remove it and it goes last
+      under the cap (the cap still bounds it); the first hit that touches it sets its time to now.
+    - The residual replace race: between the look just before an unlink and the unlink itself nothing closes the window, so a name
+      replaced then can be removed. It costs a cache miss, never a wrong answer (every entry is verified when read and every answer is
+      proved when it is made).
+    - Concurrent sweeps (two processes) can both report success for one unlink on macOS, so `deleted` in the marker can be over-counted.
+    - Only a `NavApi` sweeps. An `ImportIndex` made with its own `cache_path` writes and touches its file but never sweeps its folder.
+    - When the 50 ms budget stops the listing (a folder of thousands of files) the age and size rules apply only to the names listed
+      so far, `complete` is False, and the rest waits for the next sweep, which is due at the earliest an hour later and only after a
+      write.
+    - A call that raises after writing an entry and before `_swept` leaves `written` set, so the next call, a hit included, sweeps once
+      (still held by the hourly throttle). A process that only ever hits never sweeps: entries age out only while something writes.
+    - `last_sweep` is None for a cache folder of mode 0 (the marker cannot be read there).
+    - A plain `*.tmp` file of any name that is a regular file in the cache folder and older than 10 minutes is removed, not only the
+      temporaries this module makes.
+    - An entry over MAX_CACHE_BYTES can be written but is never read back (a miss each time). A doc entry has no format number of
+      its own: only its types are checked, so a change of what `_parse_doc` stores that keeps the types does not change its key.
 
 Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
 a file or folder the guard refuses BY ITS NAME is outside the index by policy (not listed, read or counted; its edges are not
@@ -1294,6 +1399,8 @@ class NavApi:
         names = reach.names
         key = self._doc_key(rel, reach)
         cached = self._read_cache("doc", key)
+        if cached is not None and not all(self._doc_item_shape(item) for item in cached):
+            cached = None  # a list that is not what `_parse_doc` makes (a whole envelope can hold anything): a miss, replaced below
         store = None
         if cached is not None:
             self._cache.touch(self._cache_name("doc", key))  # a symbol list, as asked for: the entry is in use
@@ -1310,6 +1417,14 @@ class NavApi:
         shown = [item for item in (self._present(entry, names) for entry in found) if item]
         return _answer("ok", path=self._show(rel), source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
                        symbols=shown[:limit]), reach, store
+
+    @staticmethod
+    def _doc_item_shape(item):
+        """True when `item` has the types `_parse_doc` writes: text for name, kind, path, signature and doc, a whole number for line.
+        A stored symbol is judged by its types here (the whole entry is a miss when one is wrong) and by `_present` by its path (a
+        symbol that names a file the walk did not prove is dropped)."""
+        return isinstance(item, dict) and all(isinstance(item.get(field), str) for field in ("name", "kind", "path", "signature", "doc")) \
+            and type(item.get("line")) is int
 
     def _present(self, entry, names):
         """One cached or fresh symbol as it may leave the process: None when its path is refused now, or is not one of the files

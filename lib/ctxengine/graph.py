@@ -766,7 +766,8 @@ class CacheDir:
     (index, doc and info entries alike: `read_json` and `put_json` are the only reader and writer). An entry that is not that
     exactly (not JSON, truncated, another format, another name, a payload that does not hash to `sha256`) is a miss: None, never an
     error and never a hit. The checksum guards against corruption, not against a writer who can compute it (the folder is trusted as
-    the project's sources are). The caller that accepted a payload's shape touches the entry's modification time (`touch`, for the
+    the project's sources are). The envelope says nothing about the shape of the payload: each caller holds it to the shape it writes
+    (an index entry `ImportIndex._entry_shape`, a doc list, an info graph) and treats another shape as a miss. The caller that accepted a payload's shape touches the entry's modification time (`touch`, for the
     age rule of the sweep; `read_json` does not): by the folder's descriptor, never following a link, only when the time is an hour
     old or in the future, and a failure of it changes nothing.
 
@@ -951,9 +952,12 @@ class CacheDir:
         of this format, not a number)."""
         data = self.read_json(SWEEP_MARKER)
         value = data.get("last_sweep") if isinstance(data, dict) else None
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        return value
+        try:
+            return value if math.isfinite(value) else None
+        except OverflowError:  # a whole number no float can hold: not a time, and no reason to stop every later sweep
+            return None
 
     def _listing(self, fd, spent):
         """([(name, kind, size, mtime_ns, dev, ino)], complete): the regular files of the folder open on `fd` that the sweep manages
@@ -1850,9 +1854,22 @@ class ImportIndex:
                 or data.get("root") != self.root or not isinstance(data.get("entries"), dict):
             return
         for rel, entry in data["entries"].items():
-            if isinstance(entry, dict) and isinstance(entry.get("key"), list) and isinstance(entry.get("specs"), list):
+            if self._entry_shape(entry):  # one of another shape is a miss for that file: it is read again (a whole envelope can hold anything)
                 self.entries[rel] = {"key": entry["key"], "specs": entry["specs"]}
         self._cache.touch(self._cache_name)  # the shape was accepted: the file is in use (a file this instance rejects ages out)
+
+    @staticmethod
+    def _entry_shape(entry):
+        """True when `entry` is an index entry of the shape `refresh` makes: {"key": [mtime_ns, size], "specs": [[spec, line,
+        type_only, dynamic], ...]} (whole numbers, text and flags of exactly those types). The envelope proves the bytes are the ones a
+        writer made, not that they are this shape; a loaded entry that is not is a miss, never something `_resolve_all` can raise on."""
+        def whole(value):
+            return type(value) is int
+        if not isinstance(entry, dict) or not isinstance(entry.get("key"), list) or len(entry["key"]) != 2 \
+                or not all(whole(item) for item in entry["key"]) or not isinstance(entry.get("specs"), list):
+            return False
+        return all(isinstance(row, list) and len(row) == 4 and isinstance(row[0], str) and whole(row[1]) and type(row[2]) is bool
+                   and type(row[3]) is bool for row in entry["specs"])
 
     def save(self):
         """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True

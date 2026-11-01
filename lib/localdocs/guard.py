@@ -76,7 +76,7 @@ def contained_dir(root, candidate):
 
 
 def read_bytes(path, *, root=None, limit=MAX_FILE):
-    """The bytes of a regular file, read through one open; None if it is missing. Rejects non-files, huge and binary files.
+    """The bytes of a regular file, read through one open; None if it or its root is missing. Rejects non-files, huge and binary files.
 
     The path is resolved through links first and, when `root` is given, the result must be under the resolved root (a link that
     leads out is refused; a link to another file inside the root is read). The RESOLVED path is then opened without following a
@@ -87,7 +87,11 @@ def read_bytes(path, *, root=None, limit=MAX_FILE):
     resolved = path.resolve(strict=False)
     if root is not None:
         try:
-            inside = resolved.relative_to(real_root(root))
+            base = real_root(root)
+        except FileNotFoundError:
+            return None  # the root itself is gone (a package removed after discovery): nothing there to read
+        try:
+            inside = resolved.relative_to(base)
         except ValueError:
             raise Rejected("refused: path resolves outside the allowed directory") from None
         reject_names(inside.parts)

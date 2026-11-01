@@ -895,6 +895,8 @@ def _existing(package_dir, relative, refusals):
     """The package-relative path of an existing allowlisted file, or None (a refusal is noted in `refusals`)."""
     try:
         path = guard.resolve_inside(package_dir, relative)
+    except FileNotFoundError:
+        return None  # the package directory is gone
     except guard.Rejected as exc:
         note = f"{relative}: {exc}"
         if note not in refusals:
@@ -926,7 +928,10 @@ class DirSource:
         return _existing(self.package_dir, key, refusals)
 
     def read(self, key):
-        return guard.read_text(guard.resolve_inside(self.package_dir, key), root=self.package_dir)
+        try:
+            return guard.read_text(guard.resolve_inside(self.package_dir, key), root=self.package_dir)
+        except FileNotFoundError:
+            return None  # the package directory is gone
 
     def module(self, base, specifier, refusals):
         return _module_file(self.package_dir, base, specifier, refusals)

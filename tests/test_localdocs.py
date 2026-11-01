@@ -141,6 +141,13 @@ class GuardTests(unittest.TestCase):
                 read(self.root / "pipe.md", root=self.root)
         self.assertIsNone(guard.read_bytes(self.root / "missing.md", root=self.root))
 
+    def test_a_root_that_does_not_exist_is_a_miss_not_an_error(self):
+        """Review 3 F1: a package directory removed after discovery gave FileNotFoundError, not the missing-file result."""
+        gone = self.root.parent / "gone"
+        for read in (guard.read_text, guard.read_bytes):
+            self.assertIsNone(read(gone / "package.json", root=gone), read.__name__)
+            self.assertIsNone(read(gone / "a" / "b.md", root=gone), read.__name__)
+
     def test_a_link_to_another_file_inside_the_root_is_read(self):
         """Review F1: a package.json that is a link to a file in the same package must still read."""
         (self.root / "real.md").write_text("hello")
@@ -335,6 +342,20 @@ class SignatureTests(ProjectCase):
         found = sig(self.project, "plainpkg", "connect")
         self.assertEqual(found.version, "1.2.3")
         self.assertIn("export declare function connect", found.text)
+
+    def test_a_package_directory_removed_after_discovery_is_a_miss_not_an_internal_error(self):
+        """Review 3 F1: entry_candidates and the DirSource reads on a vanished package dir offer the fallback names / say missing."""
+        gone = self.project / "node_modules" / "vanished"
+        self.assertIsNone(signature.installed_version(gone))
+        candidates = signature.entry_candidates(gone)
+        self.assertIn("index.d.ts", candidates)
+        source = signature.DirSource(gone)
+        refusals = []
+        self.assertEqual(source.entry_candidates(), candidates)
+        for key in candidates:
+            self.assertIsNone(source.existing(key, refusals), key)
+            self.assertIsNone(source.read(key), key)
+        self.assertIsNone(source.module("index.d.ts", "./other", refusals))
 
     def test_a_package_json_that_links_out_of_the_package_is_not_read(self):
         pkg = self.project / "node_modules" / "plainpkg"

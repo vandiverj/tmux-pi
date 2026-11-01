@@ -5,6 +5,7 @@ package directory, the index directory, Deno's npm cache). Symlinks are resolved
 under the root, so a link planted in a package or in node_modules cannot lead out. A path with a component that
 starts with `.env` is never read, whatever its extension or where the link points.
 """
+import errno
 import os
 import stat
 import time
@@ -74,21 +75,36 @@ def contained_dir(root, candidate):
     return target
 
 
-def read_text(path, *, limit=MAX_FILE):
-    """The text of an already-resolved regular file; None if it is missing. Rejects non-files, huge and binary files."""
+def read_bytes(path, *, limit=MAX_FILE):
+    """The bytes of an already-resolved regular file, read through one open; None if it is missing. Rejects non-files, huge and
+    binary files. The open does not follow a link at the last component (a file swapped for a link after the path was resolved is
+    refused, not read), and every check is on the open handle, so what is checked is what is returned and the path is never opened
+    a second time."""
     try:
-        info = os.stat(path)
+        # O_NONBLOCK so that a FIFO planted at the path is refused below instead of blocking the open.
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None
-    if not stat.S_ISREG(info.st_mode):
-        raise Rejected(f"refused: {Path(path).name!r} is not a regular file")
-    if info.st_size > limit:
-        raise Rejected(f"refused: {Path(path).name!r} is larger than {limit} bytes")
-    with open(path, "rb") as handle:
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Rejected(f"refused: {Path(path).name!r} is a link") from None
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise Rejected(f"refused: {Path(path).name!r} is not a regular file")
+        if info.st_size > limit:
+            raise Rejected(f"refused: {Path(path).name!r} is larger than {limit} bytes")
         raw = handle.read(limit + 1)
     if b"\0" in raw:
         raise Rejected(f"refused: {Path(path).name!r} looks binary")
-    return raw.decode("utf-8", "replace")
+    return raw
+
+
+def read_text(path, *, limit=MAX_FILE):
+    """The text of an already-resolved regular file; None if it is missing. See read_bytes."""
+    raw = read_bytes(path, limit=limit)
+    return None if raw is None else raw.decode("utf-8", "replace")
 
 
 def read_record(path, *, limit=200_000):

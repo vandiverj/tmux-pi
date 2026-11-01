@@ -126,12 +126,14 @@ class RemoteSource:
         return target
 
     def _content(self, path, target, *, limit=guard.MAX_FILE):
-        """(text, bytes) of a cache file without Deno's trailer, or None when the file is missing. The same checks as guard.read_text
-        (regular file, size, not binary); an embedded record that names another URL is refused."""
-        text = guard.read_text(target, limit=limit)
-        if text is None:
+        """(text, bytes) of a cache file without Deno's trailer, or None when the file is missing. The file is opened once, through
+        guard.read_bytes (regular file, size, not binary, no link at the last component), and the trailer is cut from those same
+        bytes: the path is never reopened, so a file swapped for a link between a check and a read cannot lead out of the cache. An
+        embedded record that names another URL is refused."""
+        raw = guard.read_bytes(target, limit=limit)
+        if raw is None:
             return None
-        body, record = split_trailer(Path(target).read_bytes())
+        body, record = split_trailer(raw)
         url = record.get("url") if record else None
         if url is not None and url != f"https://{self.host}{path}":
             raise guard.Rejected(f"refused: the cache entry for {path} is recorded for another URL")

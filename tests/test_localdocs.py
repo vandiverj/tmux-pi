@@ -1,5 +1,6 @@
 """lib/localdocs: lockfile pins, allowlisted reads, api_signature, the docs index, call logging. No network, no models."""
 import ast
+import contextlib
 import hashlib
 import io
 import json
@@ -132,6 +133,18 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(guard.Rejected):
             guard.read_text(self.root / "big.md", limit=10)
         self.assertIsNone(guard.read_text(self.root / "missing.md"))
+
+    def test_reads_do_not_follow_a_link_at_the_last_component_or_block_on_a_fifo(self):
+        """A path resolved earlier and swapped since: the read itself refuses a link and a non-file, and returns what it checked."""
+        (self.root / "real.md").write_text("hello")
+        (self.root / "alias.md").symlink_to(self.root / "real.md")
+        os.mkfifo(self.root / "pipe.md")
+        for name in ("alias.md", "pipe.md"):
+            for read in (guard.read_text, guard.read_bytes):
+                with self.assertRaises(guard.Rejected, msg=f"{name} {read.__name__}"):
+                    read(self.root / name)
+        self.assertEqual(guard.read_bytes(self.root / "real.md"), b"hello")
+        self.assertIsNone(guard.read_bytes(self.root / "missing.md"))
 
 
 class SignatureTests(ProjectCase):
@@ -769,6 +782,49 @@ class RemoteEmbeddedTests(RemoteTests):
         with self.assertRaises(signature.Miss) as ctx:
             self.get(self.JSR, "pad")
         self.assertIn("checksum", str(ctx.exception))
+
+    def cache_file(self):
+        digest = hashlib.sha256(b"/x/typed@2.0.1/types.d.ts").hexdigest()
+        return self.deno / "remote" / "https" / "deno.land" / digest
+
+    def test_a_cache_file_swapped_for_a_link_between_two_reads_is_not_followed(self):
+        """Review F1: _content once validated the file and then reopened the path; a link planted in between led out of the cache."""
+        target = self.cache_file()
+        original = target.read_bytes()
+        outside = self.base / "outside.d.ts"
+        outside.write_text("export declare function stolen(): void;\n")
+        source = remote.RemoteSource(self.deno, "deno.land", "/x/typed@2.0.1/")
+        swapped = []
+
+        def swap_after(real):
+            def wrapper(*args, **kwargs):
+                result = real(*args, **kwargs)
+                if not swapped:  # the swap happens once, right after the first read of the cache file returns
+                    swapped.append(True)
+                    target.unlink()
+                    target.symlink_to(outside)
+                return result
+            return wrapper
+
+        with contextlib.ExitStack() as stack:  # whichever guard function the first read goes through, the swap follows it
+            for name in ("read_text", "read_bytes"):
+                if hasattr(guard, name):
+                    stack.enter_context(mock.patch.object(guard, name, swap_after(getattr(guard, name))))
+            found = source._content("/x/typed@2.0.1/types.d.ts", target)
+        self.assertEqual(swapped, [True])
+        self.assertIsNotNone(found)
+        self.assertNotIn(b"stolen", found[1])
+        self.assertEqual(found[1], remote.split_trailer(original)[0])
+
+    def test_a_cache_file_that_is_already_a_link_is_refused_by_the_read(self):
+        target = self.cache_file()
+        outside = self.base / "outside.d.ts"
+        outside.write_text("export declare function stolen(): void;\n")
+        target.unlink()
+        target.symlink_to(outside)
+        source = remote.RemoteSource(self.deno, "deno.land", "/x/typed@2.0.1/")
+        with self.assertRaises(guard.Rejected):
+            source._content("/x/typed@2.0.1/types.d.ts", target)
 
 
 class TrailerTests(unittest.TestCase):

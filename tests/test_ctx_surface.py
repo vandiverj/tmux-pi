@@ -1512,5 +1512,113 @@ class CutLists(ReviewOne):
         self.assertRegex(self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART}).text, r"references of addToCart \(0\)")
 
 
+# ------------------------------------------------------------------------------------------------------- Review 4 (F1)
+
+class AllWithheld(ReviewOne):
+    """F1: when every item of a list was refused or withheld and the navigator did not flag a cut, the list head says none can be
+    shown and how many were withheld; it never claims an absence ("nothing imports X", "imports no ...", "(0)", "no shared ...")."""
+
+    def setUp(self):
+        super().setUp()
+        outside = self.tmp / "outside.ts"
+        outside.write_text("export const x = 1;\n")
+        (self.project / "apps" / "link.ts").symlink_to(outside)
+
+    NONE_SHOWN = re.compile(r"none can be shown \((\d+) withheld")
+    ABSENCES = ("no definition", "nothing imports", "imports no ", "no shared", "none:", "found none", "(0)", "(0 of")
+
+    def web_importers(self, mode):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            self.edges(a["file"], "importers", mode) if a["direction"] == "importers" and a["file"] == CART
+            else web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else [ORDER]))
+
+    def web_imports(self, mode):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            self.edges(a["file"], "imports", mode) if a["direction"] == "imports" else web_edges(a["file"], "importers", [SPEC]))
+
+    def web_consumers(self, mode):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            self.edges(a["file"], "importers", mode) if a["direction"] == "importers" and a["file"] == ORDER
+            else web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else [ORDER]))
+
+    def edges(self, file, direction, mode):
+        return web_edges(file, direction, REFUSED_PATHS if mode == "paths" else [], **({} if mode == "paths" else {"withheld": 4, "total": 4}))
+
+    def api_importers_all(self, mode):
+        fake_navs.BEHAVIOUR[("api", "importers")] = api_importers(REFUSED_PATHS if mode == "paths" else [], **({} if mode == "paths" else {"withheld": 4, "total": 4}))
+
+    def api_imports_all(self, mode):
+        files = [{"path": p, "line": n, "spec": "x"} for n, p in enumerate(REFUSED_PATHS, 1)] if mode == "paths" else []
+        fake_navs.BEHAVIOUR[("api", "imports")] = {"status": "ok", "target": ORDERS, "source": "index", "files": files, "external": [], "unresolved": [],
+                                                   "index_age_s": 3, "unresolved_total": 0, "files_indexed": 40, "scanned": 0,
+                                                   **({} if mode == "paths" else {"withheld": 4})}
+
+    def web_exports_all(self, mode):
+        fake_navs.BEHAVIOUR[("web", "exports")] = {"status": "ok", "is_module": True, "exports": [], "total": 4, "truncated": False, "withheld": 4}
+
+    def web_references_all(self, mode):
+        rows = [{"path": p, "line": 2, "column": 1, "text": "addToCart(x)", "is_definition": False, "is_write": False} for p in REFUSED_PATHS]
+        fake_navs.BEHAVIOUR[("web", "references")] = (
+            {"status": "ok", "definitions": [], "references": rows, "total": 4, "truncated": False} if mode == "paths"
+            else {"status": "ok", "definitions": [], "references": [], "total": 4, "truncated": False, "withheld": 4})
+
+    def web_definitions_all(self, mode):
+        rows = [{"path": p, "line": 5, "name": "addToCart", "kind": "function", "text": "function addToCart()"} for p in REFUSED_PATHS]
+        fake_navs.BEHAVIOUR[("web", "definition")] = (
+            {"status": "ok", "definitions": rows, "signature": "", "doc": ""} if mode == "paths"
+            else {"status": "ok", "definitions": [], "signature": "", "doc": "", "withheld": 4})
+
+    # (operation, arguments, list, setup, regex that selects the lines that open that list)
+    TABLE = [
+        ("ctx_relations", {"target": CART, "direction": "importers"}, "web importers", "web_importers", r"^importers of\b"),
+        ("ctx_brief", {"paths": [CART]}, "web importers", "web_importers", r"^importers\b"),
+        ("ctx_relations", {"target": ORDERS, "direction": "importers"}, "api importers", "api_importers_all", r"^importers of\b"),
+        ("ctx_brief", {"paths": [ORDERS]}, "api importers", "api_importers_all", r"^importers\b"),
+        ("ctx_relations", {"target": CART, "direction": "imports"}, "web imports", "web_imports", r"^\S+ imports\b"),
+        ("ctx_brief", {"paths": [CART]}, "web imports", "web_imports", r"^imports\b"),
+        ("ctx_relations", {"target": ORDERS, "direction": "imports"}, "api imports", "api_imports_all", r"^\S+ imports\b"),
+        ("ctx_brief", {"paths": [ORDERS]}, "api imports", "api_imports_all", r"^imports\b"),
+        ("ctx_relations", {"target": CART, "direction": "contracts"}, "web imports (contracts)", "web_imports", r"^shared \(lib\) contracts\b"),
+        ("ctx_brief", {"paths": [CART]}, "web imports (contracts)", "web_imports", r"^shared \(lib\) contracts\b|^none: the files import"),
+        ("ctx_relations", {"target": CART, "direction": "contracts"}, "web contract consumers", "web_consumers", r"^\s+consumers\b"),
+        ("ctx_brief", {"paths": [CART]}, "web contract consumers", "web_consumers", r"^\s+consumers\b"),
+        ("ctx_brief", {"paths": [CART]}, "web exports", "web_exports_all", r"^exports\b"),
+        ("ctx_symbol", {"name": "addToCart", "path": CART}, "web references", "web_references_all", r"^references of\b"),
+        ("ctx_symbol", {"name": "addToCart", "path": CART}, "web definitions", "web_definitions_all", r"^definitions of\b|^addToCart in\b"),
+    ]
+
+    def check(self, tool, args, label, setup, heads, mode):
+        getattr(self, setup)(mode)
+        if label == "web references":
+            fake_navs.BEHAVIOUR.setdefault(("web", "definition"), {"status": "ok", "definitions": [
+                {"path": CART, "line": 5, "name": "addToCart", "kind": "function", "text": "function addToCart()"}], "signature": "", "doc": ""})
+        answer = self.run_tool(tool, args)
+        where = f"{tool} {label} {mode}"
+        self.assertEqual(answer.status, "ok", (where, answer.text))
+        head = [line for line in answer.text.splitlines() if re.search(heads, line)]
+        self.assertTrue(head, (where, answer.text))
+        for line in head:
+            for word in self.ABSENCES:
+                self.assertNotIn(word, line, (where, line))
+        if label == "web definitions":
+            self.assertTrue(any("refused path" in line for line in head), (where, head))
+        else:
+            self.assertTrue(any(self.NONE_SHOWN.search(line) for line in head), (where, head))
+        self.assertTrue(any("4 withheld" in item for item in answer.data["left_out"]), (where, answer.data["left_out"]))
+        for word in LEAKS:
+            self.assertNotIn(word, answer.text, (where, word))
+
+    def test_a_list_whose_every_item_was_withheld_says_none_can_be_shown_and_never_claims_absence(self):
+        for tool, args, label, setup, heads in self.TABLE:
+            for mode in ("paths", "counted"):
+                with self.subTest(tool=tool, list=label, mode=mode):
+                    fake_navs.reset()
+                    self.check(tool, args, label, setup, heads, mode)
+
+    def test_a_list_with_nothing_withheld_still_states_its_absence(self):
+        util = f"{API_SRC}/util.ts"
+        self.assertIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+
+
 if __name__ == "__main__":
     unittest.main()

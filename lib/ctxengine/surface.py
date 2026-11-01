@@ -189,17 +189,22 @@ def short(text, limit):
 
 
 CUT_SHOWN = "at least {n} shown, list cut by the navigator"
+NONE_SHOWN = "none can be shown ({n} withheld, a path that is refused or outside the project)"
 CUT_NOTHING = "not found in the part the navigator returned (list cut)"
 
 
-def list_head(label, shown, total, cut, empty=None, of=False):
+def list_head(label, shown, total, cut, empty=None, of=False, withheld=0):
     """The line that opens a list of `shown` rows from a navigator, the one place a list's count, zero or absence is worded.
     When `cut` (Engine.loss says the navigator cut its list) the count is a lower bound and `total` is never stated:
     "label (at least N shown, list cut by the navigator):", or "label: not found in the part the navigator returned (list cut)"
-    when nothing was shown. Otherwise "label (total):" ("label (shown of total):" with `of`); an empty list says `empty` when given."""
+    when nothing was shown. When nothing is shown and `withheld` rows were left out (a refused path, or the navigator withheld them)
+    the list is not empty, only unshowable: "label: none can be shown (N withheld, ...)", never a zero or an absence. Otherwise
+    "label (total):" ("label (shown of total):" with `of`); an empty list says `empty` when given and nothing at all was reported."""
     if cut:
         return f"{label}: {CUT_NOTHING}" if shown <= 0 else f"{label} ({CUT_SHOWN.format(n=shown)}):"
-    if shown <= 0 and empty:
+    if shown <= 0 and withheld > 0:
+        return f"{label}: {NONE_SHOWN.format(n=withheld)}"
+    if shown <= 0 and empty and total <= 0:
         return empty
     return f"{label} ({shown} of {total}):" if of and shown > 0 else f"{label} ({total}):"
 
@@ -890,7 +895,7 @@ class Engine(NoteWriter):
         omitted, cut = self.loss(refs)
         refused += omitted
         total = _int(refs.get("total", len(shown) + refused))
-        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, cut, of=True))
+        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, cut, of=True, withheld=refused))
         lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
         add = more_note(f"references of {name}", total - min(5, len(shown)) - refused, cut, "pass path to another file or read the callers directly")
         if add:

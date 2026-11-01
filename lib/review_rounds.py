@@ -76,8 +76,8 @@ def review_ids(meta):
     return ids
 
 
-def earlier_reviews(state_dir, task_id):
-    """Review task ids on the task and its retry ancestors, oldest first (ancestors before the task itself)."""
+def lineage(state_dir, task_id):
+    """[(author, [review ids])] for the task and its retry ancestors, oldest first; an author with no review has an empty list."""
     chain, seen, current = [], set(), task_id
     while True:
         if current in seen:
@@ -96,26 +96,41 @@ def earlier_reviews(state_dir, task_id):
         if not parent:
             break
         current = parent
-    return [(author, review) for author, reviews in reversed(chain) for review in reviews]
+    return list(reversed(chain))
+
+
+def earlier_reviews(state_dir, task_id):
+    """Review task ids on the task and its retry ancestors, oldest first (ancestors before the task itself)."""
+    return [(author, review) for author, reviews in lineage(state_dir, task_id) for review in reviews]
 
 
 def chain_labels(state_dir, task_id):
-    """[(author, review, verdict, families)] for every review of the chain of `task_id`, oldest first (the order of
-    earlier_reviews). `verdict` is the stated verdict word of the review's result.md, None when it is missing, cannot be read or
-    is not a verdict; `families` are its Family: names (review_verdict.families), [] then. The one reader of these names for the
-    retry gate and for the reviewer's round text. Raises Refused as earlier_reviews does."""
-    rows = []
-    for author, review in earlier_reviews(state_dir, task_id):
-        try:
-            text = (task_path(state_dir, review) / "result.md").read_text(encoding="utf-8")
-            families = review_verdict.families(text)
+    """[(author, review, verdict, families, round)] for the chain of `task_id`, oldest first. THE source of review round numbers:
+    `round` counts the reviews of the chain that have a result.md, from 1 (the number tp-review gives the round and the number the
+    missing-family flag uses); None for a review with no result.md. `verdict` is the stated verdict word of the review's result.md,
+    None when it cannot be read or is not a verdict; `families` are its Family: names (review_verdict.families), [] then. An author
+    in the chain with no review at all gets one row (author, None, None, [], None): a retry nobody reviewed, which breaks a run of
+    REQUEST_CHANGES. The one reader of these names for the retry gate, the round text and the flag. Raises Refused as lineage does."""
+    rows, number = [], 0
+    for author, reviews in lineage(state_dir, task_id):
+        if not reviews:
+            rows.append((author, None, None, [], None))
+        for review in reviews:
+            path = task_path(state_dir, review) / "result.md"
+            if not path.exists():
+                rows.append((author, review, None, [], None))
+                continue
+            number += 1
             try:
-                verdict = review_verdict.parse(text)[0]
-            except ValueError:
-                verdict = None
-        except (OSError, ValueError):
-            verdict, families = None, []
-        rows.append((author, review, verdict, families))
+                text = path.read_text(encoding="utf-8")
+                families = review_verdict.families(text)
+                try:
+                    verdict = review_verdict.parse(text)[0]
+                except ValueError:
+                    verdict = None
+            except (OSError, ValueError):
+                verdict, families = None, []
+            rows.append((author, review, verdict, families, number))
     return rows
 
 
@@ -346,20 +361,21 @@ def write(path, text):
 
 def prepare(state_dir, task_id, workdir, out_dir):
     out = Path(out_dir)
-    earlier = earlier_reviews(state_dir, task_id)
+    rows = chain_labels(state_dir, task_id)
     now = snapshot(workdir)
     contexts, skipped, last_state, last_round = [], [], None, 0
     red, redactions, withheld = redactor(), 0, []
     # a review that never produced a reply has no findings to show; a reply that is not a regular file is refused
     reviews = []
-    labels = {review: names for _, review, _, names in chain_labels(state_dir, task_id)}
-    for author, review in earlier:
+    for author, review, _, names, number in rows:
+        if review is None:
+            continue
         result = task_path(state_dir, review) / "result.md"
         if result.is_symlink() or (result.exists() and not result.is_file()):
             raise Refused(f"review '{review}' of '{author}' has an unreadable result.md")
-        (reviews if result.exists() else skipped).append((author, review))
+        (reviews if number else skipped).append((author, review, names, number))
     earlier = reviews
-    for number, (author, review) in enumerate(earlier, 1):
+    for author, review, _, number in earlier:
         directory = task_path(state_dir, review)
         text = (directory / "result.md").read_text(encoding="utf-8", errors="surrogateescape")
         text, count = redact_text(red, text, f"earlier findings of {review}")
@@ -393,7 +409,7 @@ def prepare(state_dir, task_id, workdir, out_dir):
                 f"{last_round} reviewed)\n"
         head = f"[Change in the working tree since the state review round {last_round} reviewed (git diff, round {last_round} tree to now).]\n\n"
         contexts.append(write(out / label, head + body))
-    return {"contexts": contexts, "rounds": len(earlier), "families": [labels.get(review, []) for _, review in earlier], "snapshot": now, "skipped": [review for _, review in skipped],
+    return {"contexts": contexts, "rounds": len(earlier), "families": [names for _, _, names, _ in earlier], "snapshot": now, "skipped": [review for _, review, _, _ in skipped],
             "withheld": withheld, "redactions": redactions}
 
 

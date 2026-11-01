@@ -105,8 +105,20 @@ class RoundsTests(unittest.TestCase):
         self.task("w0", reviews=["r-a", "r-b"])
         self.task("w1", parent="w0", reviews=["r-c", "r-gone"])
         self.assertEqual(review_rounds.chain_labels(self.state, "w1"),
-                         [("w0", "r-a", "REQUEST_CHANGES", ["one"]), ("w0", "r-b", "APPROVED", []),
-                          ("w1", "r-c", None, []), ("w1", "r-gone", None, [])])
+                         [("w0", "r-a", "REQUEST_CHANGES", ["one"], 1), ("w0", "r-b", "APPROVED", [], 2),
+                          ("w1", "r-c", None, [], 3), ("w1", "r-gone", None, [], None)])
+
+    def test_chain_labels_number_only_reviews_with_a_reply_and_give_an_unreviewed_author_a_row(self):
+        self.review("r-a", "REQUEST_CHANGES\n")
+        self.review("r-b", "REQUEST_CHANGES\n")
+        self.task("r-none")
+        self.task("w0", reviews=["r-a"])
+        self.task("w1", parent="w0")
+        self.task("w2", parent="w1", reviews=["r-none", "r-b"])
+        rows = review_rounds.chain_labels(self.state, "w2")
+        self.assertEqual([(r[0], r[1], r[4]) for r in rows],
+                         [("w0", "r-a", 1), ("w1", None, None), ("w2", "r-none", None), ("w2", "r-b", 2)])
+        self.assertEqual(self.prepare("w2")["rounds"], 2)
 
     def test_prepare_returns_the_family_names_of_each_attached_round_and_skips_a_review_with_no_reply(self):
         self.review("r-a", "REQUEST_CHANGES\nF1 x\nFamily: one\nCloses by: code\n")

@@ -238,6 +238,28 @@ class RepeatedFamilyGateTests(RetryCase):
         (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
         self.assertEqual(self.plain_retry(item).returncode, 0)
 
+    def unreviewed_chain(self, shape):
+        """RC=a REQUEST_CHANGES review, --=an author retried and settled with no review at all; the newest author is returned."""
+        item = self.settled()
+        for number, step in enumerate(shape, 1):
+            if number > 1:
+                run = self.plain_retry(item)
+                if run.returncode:
+                    run = self.plain_retry(item, "--route", "design")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                item = json.loads(run.stdout)
+                self.settle(item, "RESULT_STATUS: complete\nDone.\n")
+            if step == "RC":
+                self.attach_review(item, f"review-{number}")
+        return item
+
+    def test_a_retry_nobody_reviewed_breaks_the_run_wherever_it_sits(self):
+        for shape, gated in ((["RC", "--", "RC"], False), (["--", "RC", "RC"], True), (["--", "--", "RC"], False),
+                             (["RC", "--", "--", "RC"], False), (["RC", "RC"], True), (["RC", "--"], False)):
+            with self.subTest(shape=shape):
+                item = self.unreviewed_chain(shape)
+                self.assertEqual(self.plain_retry(item).returncode, 1 if gated else 0)
+
     def test_a_review_that_cannot_be_read_breaks_the_run(self):
         item = self.chain([], [])
         (self.state / "tasks" / "review-1" / "result.md").write_text("not a verdict\n")

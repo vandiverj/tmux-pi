@@ -136,16 +136,16 @@ FAMILY_ROUND = 3  # a REQUEST_CHANGES from this review round on is expected to s
 
 def unlabelled_round(path, review_id):
     """A sentence when the review in `path` (a reviewer task) is round FAMILY_ROUND or later of its author chain and, though it
-    asks for changes, has no Family: line; None otherwise (flagged in the verdict summary, never refused). The round is the
-    review's place among the reviews of the chain that have a verdict; a chain that cannot be walked flags nothing."""
+    asks for changes, has no Family: line; None otherwise (flagged in the verdict summary, never refused). The round is the number
+    review_rounds.chain_labels gives it, the one tp-review shows the reviewer (reviews with a reply, oldest first); a chain that cannot be walked flags nothing."""
     try:
         author = (path / "review-of").read_text().strip()
         base = path.parent.parent
         rows = review_rounds.chain_labels(base, author)
     except (OSError, review_rounds.Refused):
         return None
-    for number, (_, review, _, families) in enumerate(rows, 1):
-        if review == review_id:
+    for _, review, _, families, number in rows:
+        if review == review_id and number:
             return (f"round {number} REQUEST_CHANGES with no Family: line; name the finding family of each finding"
                     if number >= FAMILY_ROUND and not families else None)
     return None
@@ -578,14 +578,15 @@ def repeated_family(base, task_id):
     None otherwise. A review whose reply cannot be read names no family and is no REQUEST_CHANGES. Raises review_rounds.Refused
     when the chain cannot be walked (the same limits as the review rounds)."""
     chain = review_rounds.chain_labels(base, task_id)
-    if not chain or chain[-1][0] != task_id:
+    if not chain or chain[-1][0] != task_id or chain[-1][1] is None:  # the newest review was not written for task_id
         return None
-    named = [(review, families) for _, review, _, families in chain]
+    named = [(review, families) for _, review, _, families, _ in chain if review]
     latest, latest_families = named[-1]
     for family in latest_families:
         for review, families in reversed(named[:-1]):
             if family in families:
                 return family, review, latest
+    # an author with no review (a row with review None) and a review with no verdict sit between and break the run
     if len(chain) > 1 and chain[-1][2] == chain[-2][2] == "REQUEST_CHANGES":
         return None, chain[-2][1], latest
     return None

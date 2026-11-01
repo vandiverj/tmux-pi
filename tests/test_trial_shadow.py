@@ -40,7 +40,8 @@ OTHERS = "- lane beta (lane/beta) owns \"lib/x.py\"\nDo not edit these paths; if
 
 SESSION_WRAPPER = """#!/bin/sh
 case "$1" in
- has-session|kill-session|new-session|set-option|show-options|set-environment|show-environment)
+ kill-session) exec {real} -L {sock} "$@" ;;
+ has-session|new-session|set-option|show-options|set-environment|show-environment)
    case " $* " in *" =tp-trial-"*|*" tp-trial-"*) exec {real} -L {sock} "$@" ;; esac ;;
 esac
 exec {fixture} "$@"
@@ -70,7 +71,7 @@ class StubSpawnRun(ts.Run):
             raise ts.ShadowError(self.case.spawn_error)
         task = self.task_path()
         task.mkdir(parents=True)
-        pane, _ = self.case.pane(self.case.worker_command(task))
+        pane = self.case.session_pane(self.rdir, self.case.worker_command(task))  # a pane in the run's own session, as tp-spawn makes
         (task / "meta.json").write_text(json.dumps({"id": self.task_id, "worker": "pi", "model": self.info["model"], "thinking": self.info["thinking"],
                                                     "role": "coder", "workdir": str(self.worktree), "pane": pane, "created": "2026-10-31T10:00:00Z",
                                                     "deliverable": "Report"}))
@@ -125,6 +126,21 @@ class ShadowCase(lw.LaneCase):
         rdir = trial_session.run_dir(info["project"], info["run"])
         (rdir / "state" / "live-window").write_text("")  # tp-spawn and tp-review in the trial's state get a real pane
         return rdir, info
+
+    def session_pane(self, rdir, command):
+        """A real pane inside the trial session of the run in `rdir` (not the fixture's newest session, which is where a bare new-window
+        goes). Returns its id. It is not recorded as the run's: `record_panes` does that, as the run does after tp-spawn."""
+        target = "=" + trial_session.session_name(Path(rdir).name) + ":"
+        pane = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", target, command)
+        self.tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on")
+        return pane
+
+    def record_panes(self, rdir):
+        owner = ts.Owner(rdir)
+        try:
+            owner.record_panes(self.env)
+        finally:
+            owner.close()
 
     def tree(self, rdir):
         """The place of the run's worktree: chosen by `prepare`, unique to the run (`wt-<id>` under its directory)."""
@@ -741,7 +757,8 @@ class CleanupTests(ShadowCase):
         rdir, info = self.prepare()
         task = rdir / "state" / "tasks" / "trial-live"
         task.mkdir()
-        pane, _ = self.pane(self.worker_command(task))
+        pane = self.session_pane(rdir, self.worker_command(task))
+        self.record_panes(rdir)  # what the run does after tp-spawn
         (task / "meta.json").write_text(json.dumps({"id": "trial-live", "worker": "pi", "model": MODEL, "pane": pane, "role": "coder", "workdir": str(self.repo)}))
         (task / "state.json").write_text(json.dumps({"state": "working"}))
         self.assertEqual(ts.cleanup(rdir, self.env), [])
@@ -1038,19 +1055,23 @@ class WorktreeOwnershipTests(ShadowCase):
 
     def test_r4_the_tree_is_not_removed_while_the_worker_may_still_run(self):
         run = self.made_run()
-        with mock.patch.object(ts.trial_session, "end", return_value=False):  # the session cannot be ended
+        with mock.patch.object(ts.trial_session, "end_exact", return_value=False):  # the session cannot be ended
             leftovers = run.cleanup()
         self.assertTrue(run.worktree.is_dir(), "no removal is raced against a worker that may still be running")
         self.assertTrue(any("may still be running" in l for l in leftovers), leftovers)
         self.assertEqual(run.cleanup(), [], "once the session is gone the tree goes")
         self.assertFalse(run.worktree.exists())
 
-    def test_r4_an_unreadable_owner_record_leaves_the_tree_but_still_ends_the_session(self):
+    def test_r4_an_unreadable_owner_record_leaves_the_tree_and_the_session(self):
+        """Review 5: with no identity recorded by the run, a stop has nothing to match, so it ends nothing (a session found by name
+        is not proof that it is the run's)."""
         run = self.made_run()
         ts.owner_file(run.project, run.run).write_text("{not json")
         leftovers = ts.cleanup(run.rdir, self.env)
         self.assertTrue(run.worktree.is_dir())
         self.assertTrue(any("owner record" in l for l in leftovers), leftovers)
+        self.assertIn("tp-trial-" + run.run, self.session_names())
+        self.assertEqual(run.cleanup(), [], "the runner itself holds what it recorded and does not read the file back")
         self.assertNotIn("tp-trial-" + run.run, self.session_names())
 
     def test_r4_f3_a_link_swapped_in_while_the_worker_runs_still_ends_the_worker_and_the_session(self):
@@ -1095,7 +1116,7 @@ class WorktreeOwnershipTests(ShadowCase):
         self.assertIn("worker was not started", done["error"])
         self.assertFalse((rdir / "state" / "tasks" / run.task_id).exists(), "tp-spawn (here its stand-in) was never reached")
         self.assertEqual(len(self.worktrees().split("\n\n")), trees)
-        self.assertFalse(ts.owner_file(info["project"], info["run"]).exists(), "nothing was created, so nothing is recorded")
+        self.assertNotIn("path", json.loads(ts.owner_file(info["project"], info["run"]).read_text()), "no tree was made, so none is recorded")
 
     def test_f3_time_spent_on_the_worktree_is_checked_again_just_before_tp_spawn(self):
         rdir, info = self.prepare(timeout_s=300)
@@ -1136,10 +1157,10 @@ class StopTests(ShadowCase):
     def test_pid_is_run_requires_the_runner_command_line_and_the_run(self):
         rdir, info = self.prepare()
         child = self.runner(rdir)
-        self.assertTrue(ts.pid_is_run(child.pid, info["run"]))
-        self.assertFalse(ts.pid_is_run(child.pid, "sh-other"))
-        for pid in (None, 0, 1, -5, "12", os.getpid()):
-            self.assertFalse(ts.pid_is_run(pid, info["run"]), pid)
+        self.assertTrue(ts.pid_is_run(child.pid, rdir))
+        self.assertFalse(ts.pid_is_run(child.pid, rdir.with_name("sh-other")))
+        for pid in (None, 0, 1, -5, "12", True, os.getpid()):
+            self.assertFalse(ts.pid_is_run(pid, rdir), pid)
 
     def test_stop_signals_the_runner_waits_for_it_then_cleans_and_marks_the_run(self):
         rdir, info = self.prepare()
@@ -1162,6 +1183,235 @@ class StopTests(ShadowCase):
         self.run_stub(rdir, spawn_error="x")
         done = ts.stop(rdir, self.env)
         self.assertEqual((done["phase"], done["outcome"]), ("done", "spawn_failed"))
+
+
+# ---------------------------------------------------------------------------------------------------- recorded identities (review 5)
+
+class RecordedIdentityTests(ShadowCase):
+    """Review 5 (the worker runs as the same user): every kill, signal and write into a run directory first matches an identity the
+    run recorded itself, never a path, a pid or a pane read from a file the worker can edit."""
+
+    def runner(self, rdir):
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "tp-trial", "run", "--run-dir", str(rdir)], stdin=subprocess.PIPE)
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
+    def trial_task(self, rdir, name, pane, state="working"):
+        task = rdir / "state" / "tasks" / name
+        task.mkdir()
+        (task / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "model": MODEL, "pane": pane, "role": "coder", "workdir": str(self.repo)}))
+        (task / "state.json").write_text(json.dumps({"state": state}))
+        return task
+
+    def live_run_with_task(self, run):
+        """A prepared run with a task whose worker pane is in the run's session and recorded, as after tp-spawn."""
+        rdir, info = self.prepare(run=run)
+        task = rdir / "state" / "tasks" / "trial-live"
+        task.mkdir()
+        pane = self.session_pane(rdir, self.worker_command(task))
+        self.record_panes(rdir)
+        (task / "meta.json").write_text(json.dumps({"id": "trial-live", "worker": "pi", "model": MODEL, "pane": pane, "role": "coder", "workdir": str(self.repo)}))
+        (task / "state.json").write_text(json.dumps({"state": "working"}))
+        return rdir, info, pane
+
+    # -- what prepare records
+    def test_prepare_records_the_run_dir_the_state_dir_and_the_session_before_any_worker_exists(self):
+        rdir, info = self.prepare()
+        record = json.loads(ts.owner_file(info["project"], info["run"]).read_text())
+        self.assertEqual((record["rdir_id"]["dev"], record["rdir_id"]["ino"]), (os.stat(rdir).st_dev, os.stat(rdir).st_ino))
+        self.assertEqual(record["state_id"]["ino"], os.stat(rdir / "state").st_ino)
+        found = trial_session.named(info["session"], self.env)
+        self.assertEqual(record["session"], {"id": found[0], "created": found[1], "name": info["session"]})
+        self.assertEqual(record["panes"], [])
+        self.assertNotIn("path", record, "no tree yet")
+
+    # -- F2: stop signals only this project's runner of this run
+    def test_f2_stop_does_not_signal_another_projects_runner_of_a_run_with_the_same_name(self):
+        rdir, info = self.prepare(run="sh-same")
+        elsewhere = self.root / "other-project" / ".tmux-pi" / "trial" / "sh-same"
+        stranger = self.runner(elsewhere)  # another project's runner: same run name, other directory
+        ts.update_run(rdir, pid=stranger.pid, phase="wait")  # what a worker can write into run.json
+        done = ts.stop(rdir, self.env, sleep=lambda _: stranger.poll())
+        self.assertIsNone(stranger.poll(), "the other project's runner was not signalled")
+        self.assertEqual(done["phase"], "done")
+
+    def test_f2_pid_is_run_needs_the_whole_run_directory(self):
+        rdir, _ = self.prepare(run="sh-whole")
+        elsewhere = self.root / "other-project" / ".tmux-pi" / "trial" / "sh-whole"
+        child = self.runner(elsewhere)
+        self.assertTrue(ts.pid_is_run(child.pid, elsewhere))
+        self.assertFalse(ts.pid_is_run(child.pid, rdir))
+
+    # -- F3: a task's pane is the worker's to edit
+    def test_f3_a_task_whose_meta_names_a_main_workers_pane_does_not_stop_it(self):
+        main_task = self.local_task(self.state)  # made first: a bare new-window of the fixture lands in the newest session
+        main_pane = json.loads((self.state / "tasks" / main_task / "meta.json").read_text())["pane"]
+        rdir, info = self.prepare()
+        self.session_pane(rdir, "sleep 300")
+        self.record_panes(rdir)
+        self.trial_task(rdir, "trial-evil", main_pane)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(self.alive(main_pane), "Main's worker is still running")
+        self.assertTrue(any("not a pane this run recorded" in l for l in leftovers), leftovers)
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names(), "the run's own session is still ended")
+
+    def test_f3_the_runner_does_not_stop_a_main_worker_either_when_the_worker_edits_its_meta(self):
+        main_task = self.local_task(self.state)
+        main_pane = json.loads((self.state / "tasks" / main_task / "meta.json").read_text())["pane"]
+        rdir, info = self.prepare()
+
+        def redirect_then_settle(n, run):
+            meta = run.task_path() / "meta.json"
+            data = json.loads(meta.read_text())
+            data["pane"] = main_pane
+            meta.write_text(json.dumps(data))
+            self.settle_worker(run)
+        run, done = self.run_stub(rdir, on_poll=redirect_then_settle)
+        self.assertTrue(self.alive(main_pane), "Main's worker is still running")
+        self.assertEqual(done["outcome"], "error")
+        self.assertIn("not a pane this run recorded", done["error"])
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+
+    def test_f3_a_pane_in_the_runs_session_that_it_did_not_record_is_not_stopped_by_name_but_dies_with_the_session(self):
+        rdir, info = self.prepare()
+        pane = self.session_pane(rdir, "sleep 300")  # joined later: never recorded
+        self.trial_task(rdir, "trial-late", pane)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("not a pane this run recorded" in l for l in leftovers), leftovers)
+        self.assertFalse(self.alive(pane), "the session kill takes it")
+
+    def test_f3_a_recorded_pane_that_was_moved_to_another_session_is_not_stopped(self):
+        rdir, info, pane = self.live_run_with_task("sh-moved")
+        self.tmux("new-session", "-d", "-s", "elsewhere", "sleep 300")
+        self.tmux("break-pane", "-d", "-s", pane, "-t", "elsewhere:")
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("not this run's" in l for l in leftovers), leftovers)
+        self.assertTrue(self.alive(pane), "a pane that left the run's session is no longer the run's to end")
+
+    def test_f3_a_recorded_pane_in_the_runs_session_is_stopped(self):
+        rdir, info, pane = self.live_run_with_task("sh-own")
+        self.assertEqual(ts.cleanup(rdir, self.env), [])
+        self.assertFalse(self.alive(pane))
+
+    # -- F4: a run directory that is (or became) a link
+    def test_f4_a_run_dir_replaced_by_a_link_to_another_run_stops_none_of_that_runs_tasks_and_changes_nothing_there(self):
+        other, other_info, other_pane = self.live_run_with_task("sh-other")
+        rdir, info = self.prepare(run="sh-mine")
+        before = (other / "run.json").read_bytes()
+        shutil.move(str(rdir), str(self.root / "aside-run"))
+        os.symlink(str(other), str(rdir))
+        with self.assertRaises(ts.ShadowError) as caught:
+            ts.stop(rdir, self.env)
+        self.assertIn("not the run's own directory", str(caught.exception))
+        self.assertTrue(self.alive(other_pane), "the other run's worker is still running")
+        self.assertIn("tp-trial-sh-other", self.session_names())
+        self.assertEqual((other / "run.json").read_bytes(), before, "nothing was written through the link")
+        self.assertNotIn("tp-trial-sh-mine", self.session_names(), "the run's own session goes by its recorded id")
+
+    def test_f4_a_run_dir_replaced_by_another_directory_is_refused_the_same_way(self):
+        rdir, info = self.prepare()
+        shutil.move(str(rdir), str(self.root / "aside-run"))
+        rdir.mkdir()
+        (rdir / "run.json").write_text(json.dumps({"phase": "wait", "pid": os.getpid()}))
+        with self.assertRaises(ts.ShadowError):
+            ts.stop(rdir, self.env)
+        self.assertEqual(json.loads((rdir / "run.json").read_text()), {"phase": "wait", "pid": os.getpid()}, "the stand-in directory is not written")
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+
+    def test_f4_the_runner_holds_its_run_dir_so_a_rename_and_a_link_redirect_nothing(self):
+        other, other_info, other_pane = self.live_run_with_task("sh-other")
+        rdir, info = self.prepare(run="sh-mine")
+        before = (other / "run.json").read_bytes()
+        aside = self.root / "aside-run"
+
+        def swap(n, run):
+            os.rename(str(rdir), str(aside))
+            os.symlink(str(other), str(rdir))
+        run, done = self.run_stub(rdir, on_poll=swap)
+        self.assertEqual(done["outcome"], "error")
+        self.assertTrue(self.alive(other_pane), "the other run's worker is still running")
+        self.assertEqual((other / "run.json").read_bytes(), before, "nothing was written into the other run")
+        self.assertEqual(json.loads((aside / "run.json").read_text())["outcome"], "error", "the run's own run.json, held open, got the outcome")
+        self.assertNotIn("tp-trial-sh-mine", self.session_names())
+        self.assertIn("tp-trial-sh-other", self.session_names())
+
+    # -- F5: the session is ended by the id recorded
+    def replacement_session(self, run, set_state):
+        name = "tp-trial-" + run
+        self.tmux("kill-session", "-t", "=" + name)
+        self.tmux("new-session", "-d", "-s", name, "sleep 300")
+        if set_state:
+            self.tmux("set-option", "-t", name, "@tp_state_dir", set_state)
+        return name
+
+    def forge_created(self, info, created="1"):
+        """What a worker could write into the owner file: the run's session id with a created time that is not tmux's."""
+        owner = ts.owner_file(info["project"], info["run"])
+        record = json.loads(owner.read_text())
+        record["session"]["created"] = created
+        owner.write_text(json.dumps(record))
+
+    def forge_created(self, info, created="1"):
+        """What a worker could write into the owner file: the run's session id with a created time that is not tmux's."""
+        owner = ts.owner_file(info["project"], info["run"])
+        record = json.loads(owner.read_text())
+        record["session"]["created"] = created
+        owner.write_text(json.dumps(record))
+
+    def test_f5_a_session_that_took_the_name_after_the_runs_own_ended_is_not_killed(self):
+        rdir, info = self.prepare()
+        name = self.replacement_session(info["run"], None)
+        self.assertEqual(ts.cleanup(rdir, self.env), [], "the run's own session is gone; nothing of the run is left to end")
+        self.assertIn(name, self.session_names(), "and the stranger on the name is left alone")
+
+    def test_f5_nor_one_that_copies_the_state_dir_option(self):
+        rdir, info = self.prepare()
+        name = self.replacement_session(info["run"], info["state"])
+        ts.cleanup(rdir, self.env)
+        self.assertIn(name, self.session_names(), "name and state dir are not the identity; the id is")
+
+    def test_f5_the_id_with_another_created_time_is_not_the_session_the_run_made(self):
+        rdir, info = self.prepare()
+        self.forge_created(info)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertIn("tp-trial-" + info["run"], self.session_names(), "the id matched but not the created time: not killed")
+        self.assertTrue(any("not the session this run created" in l for l in leftovers), leftovers)
+
+    def test_f5_the_runs_own_session_is_ended_by_its_id(self):
+        rdir, info = self.prepare()
+        self.assertEqual(ts.cleanup(rdir, self.env), [])
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names())
+        self.assertEqual(ts.cleanup(rdir, self.env), [], "and a session that is already gone is fine")
+
+    def test_f5_a_session_the_worker_renamed_is_still_the_runs_and_is_ended(self):
+        rdir, info = self.prepare()
+        self.tmux("rename-session", "-t", "=tp-trial-" + info["run"], "renamed-by-worker")
+        self.assertEqual(ts.cleanup(rdir, self.env), [])
+        self.assertNotIn("renamed-by-worker", self.session_names(), "the id and created time are the identity, not the name")
+
+    def test_f5_a_stranger_on_the_name_does_not_keep_the_tree_and_is_not_killed(self):
+        run = self.made_run()
+        name = self.replacement_session(run.run, None)
+        leftovers = run.cleanup()
+        self.assertEqual(leftovers, [])
+        self.assertFalse(run.worktree.exists(), "the run's own session is gone, so its worker is too; the tree goes")
+        self.assertIn(name, self.session_names())
+
+    def test_f5_a_forged_session_record_keeps_the_tree_and_kills_nothing(self):
+        run = self.made_run()
+        self.forge_created({"project": run.owner.project, "run": run.run})
+        leftovers = ts.cleanup(run.rdir, self.env)
+        self.assertIn("tp-trial-" + run.run, self.session_names())
+        self.assertTrue(any("not the session this run created" in l for l in leftovers), leftovers)
+        self.assertTrue(run.worktree.exists(), "the session is not shown to be gone, so a worker may be in the tree")
+
+    def made_run(self):
+        rdir, info = self.prepare()
+        run = ts.Run(rdir, self.env)
+        run.make_worktree()
+        return run
 
 
 # --------------------------------------------------------------------------------------------------------- the command line
@@ -1383,6 +1633,11 @@ class FullRunTests(ShadowCase):
                     seen["review_packet"] = (task / "packet.md").read_text()
                     self.settle(task, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
                 else:
+                    # the fixture's stub new-window names a pane that does not exist; a real tp-spawn leaves a pane in the run's own session
+                    meta_now = json.loads((task / "meta.json").read_text())
+                    meta_now["pane"] = self.session_pane(rdir, "sleep 300")
+                    (task / "meta.json").write_text(json.dumps(meta_now))
+                    run.owner.record_panes(self.env)
                     seen["spawned_meta"] = json.loads((task / "meta.json").read_text())
                     seen["run_sh"] = (task / "run.sh").read_text()
                     seen["packet"] = (task / "packet.md").read_text()

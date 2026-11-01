@@ -164,6 +164,50 @@ def end(run, env=None):
     return _tmux(["kill-session", "-t", "=" + name], env, check=False).returncode == 0
 
 
+SEP = "|"
+FIELDS = "#{session_id}" + SEP + "#{session_created}" + SEP + "#{session_name}" + SEP + "#{@tp_state_dir}"
+
+
+def identity_of(target, env=None):
+    """(session id, created time, session name, @tp_state_dir) of the session that holds tmux `target` (a session `$id`, a `=name:` or
+    a pane `%id`), or None when tmux does not know it. A session id is not given to a second session while the tmux server lives;
+    the created time tells a session of the same id apart after a server restart. The name and state dir are only informative: a
+    worker can rename a session, so they are never what decides whether it is the run's."""
+    run = _tmux(["display-message", "-p", "-t", target, FIELDS], env, check=False)
+    if run.returncode:
+        return None
+    parts = run.stdout.rstrip("\n").split(SEP, 3)  # the state dir is last: a path may hold the separator
+    return tuple(parts) if len(parts) == 4 and parts[0].startswith("$") and parts[1].isdigit() else None
+
+
+def named(name, env=None):
+    """The identity (see `identity_of`) of the session now called `name`, or None."""
+    return identity_of("=" + name + ":", env)
+
+
+def is_session(sid, created, env=None):
+    """Whether `sid` is still the session this run created: the same id and the same created time."""
+    found = identity_of(sid, env)
+    return found is not None and found[0] == sid and found[1] == str(created)
+
+
+def end_exact(sid, created, env=None):
+    """Kill the session `sid` only when it still is the session recorded for this run (`is_session`). Returns True when it was ended,
+    False when no session has that id any more; raises SessionError when the id now belongs to a session that is not this run's,
+    which is left alone."""
+    found = identity_of(sid, env)
+    if found is None:
+        return False
+    if not is_session(sid, created, env):
+        raise SessionError("tmux session {} ({}) is not the session this run created ({} created {}); it was not ended".format(found[0], found[2], sid, created))
+    return _tmux(["kill-session", "-t", sid], env, check=False).returncode == 0
+
+
+def panes_in(sid, env=None):
+    """Ids of every pane in the session `sid`."""
+    return _tmux(["list-panes", "-s", "-t", sid, "-F", "#{pane_id}"], env).stdout.split()
+
+
 def local_active(state, env=None):
     """Ids of the running local pi tasks in the tmux-pi state dir `state`, by `tp-agent list` (the classifier Main's own capacity
     check reads). A state dir that cannot be listed raises: an unknown count is never read as zero."""

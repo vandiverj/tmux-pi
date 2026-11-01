@@ -3,7 +3,7 @@ session, review its diff and write a record. The real lane, step, branch and Mai
 
     prepare(...)   validate, check the guard, create the run (run.json) and its session; nothing is started yet
     launch(...)    start `bin/tp-trial run <run>` detached, so the caller is never blocked
-    execute(...)   the run itself (what `tp-trial run` calls): worktree at base_commit, shared deps, tp-spawn, wait, soft reset,
+    execute(...)   the run itself (what `tp-trial run` calls): worktree at base_commit, shared deps, tp-spawn, wait, HEAD to the base,
                    review, record, cleanup, bounded by trial.attempt_timeout_s
     cleanup(...)   idempotent: end running trial tasks, drop the worktree and the shadow refs, end the session
     stop(...)      end a run early
@@ -14,8 +14,17 @@ Everything a run writes is under <project>/.tmux-pi/trial/<run>/ (run.json, requ
 
 What the run does to git: `git worktree add --detach` at the source task's base_commit (nothing under refs/heads), a temporary
 ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable until the record is written, and removal of both at
-the end, on success and on failure. A branch the worker made in the worktree (`git checkout -b`) is detached and deleted; no
-other branch is ever deleted.
+the end, on success and on failure. The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
+the tree on a branch (`git checkout -b`, a rename, a branch someone else made meanwhile), the collect step detaches HEAD (so moving
+it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json; a
+tree it cannot detach ends the collect with an error before HEAD is moved. HEAD is written with `update-ref --no-deref`, never
+`checkout --detach` or `reset --soft`, which refuse in the middle of a merge, a rebase or a cherry-pick: the patch and the removal of
+the tree do not depend on the state the worker left git in. `git add -A` skips a path git cannot index (a repository the worker made
+inside the tree) and names it as `unindexed` in run.json; the worktree is removed with a rmtree that makes a read-only directory
+writable first; git's output is decoded with errors replaced, and the patch is kept as bytes. The refs the run does make (the one above) are made
+create-only, written to a ledger in the owner record (`refs`: name -> commit) and removed only when the ledger names them and they
+still name the recorded commit; any other ref under the run's prefix, or one at another commit, is kept and reported by the
+cleanup. A tree already on a branch that existed before the run (`heads_before`) is refused as damaged, never reset.
 
 Ownership (the worker runs as the same OS user, is not sandboxed, and can write run.json, its task's meta.json and everything beside
 its tree, so nothing there proves anything). Every destructive act (a signal, a tmux kill, a worktree removal, a write into a run
@@ -40,17 +49,35 @@ read only as a plain file, never waiting on a FIFO (`trial_session.read_plain`);
 before the session kill has one budget, STOP_TASKS_S, however many task dirs there are; a base_commit from run.json reaches git only
 as a commit id.
 
-KNOWN LIMITS (not defended): a stop of a runner that has died reads those identities from the owner file
-`<project>/.tmux-pi/trial-owner/<run>.json`, which the same user, so the worker, can rewrite. And a check is not atomic with the
-command after it: between `check_stop` and the tp-agent command that reads them, the worker can rewrite meta.json and process.json
-(or the session's options). See `Owner`. The record builder (lib/trial_record.py, L2) reads the task's files its own way, before
-the cleanup: a FIFO among them would hold the runner there with the session not yet ended.
+Every read of a file the worker can write (run.json, the task's meta.json, process.json and dispatch.json, the source task's files, the
+worktree's .git file and the admin dir's gitdir, the owner record, and in lib/trial_record_stub.py the task, reviewer and result
+files) goes through `trial_session.read_plain`: opened O_NONBLOCK | O_NOFOLLOW, required to be a regular file of at most
+MAX_READ bytes (8 MiB), else it is treated as missing or invalid (a FIFO, a link, a directory or a huge file never holds the runner,
+so the session kill always runs). The stub opens records.jsonl for append the same way.
+
+Known limits (non-hostile worker model). The worker is taken to make mistakes (a wrong branch, stray files, odd git state, a file
+of an odd type made by accident); it is not taken to forge records or to attack the runner. These are known and not defended; the
+planned fix is to run the worker as a separate macOS user, which this module does not do:
+  F1 worktree ownership: a stop of a runner that has died reads the run's identities from the owner file
+     `<project>/.tmux-pi/trial-owner/<run>.json`, which the same OS user, so the worker, can rewrite; a forged owner record can make
+     `tp-trial stop` remove another lane's worktree.
+  F3 git execution boundary: the runner's own git commands (`add -A`, `reset`, `diff`, ...) run in the worker's tree, so a git
+     filter, hook or config the worker set there can run during them.
+  F4 review workdir isolation: tp-review takes its working directory from the trial task's meta.json, which the worker can write; an
+     edited `workdir` can point it at another checkout.
+  F6 record integrity: `tp-trial normal` rereads run.json, which the worker can write, and the normal arm's record takes its
+     base commit, source task and pair id from it.
+Also not defended: a check is not atomic with the command after it (between `check_stop` and the tp-agent command that reads them,
+the worker can rewrite meta.json and process.json or the session's options; see `Owner`); the tp-* commands the run starts read the
+task's files themselves and are bounded only by CMD_TIMEOUT; and the record builder of lane L2 (lib/trial_record.py, which is not
+in this tree; lib/trial_record_stub.py is used) reads the task's files its own way before the cleanup.
 
 The record comes from lib/trial_record.py (lane L2). Until it exists, lib/trial_record_stub.py (same call shape) is used.
 `gate_runs` is L2's field and is never read here.
 """
 
 import datetime
+import errno
 import fcntl
 import importlib.util
 import json
@@ -76,6 +103,7 @@ COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 TESTS = ("affected", "full", "none")
 SPEC = re.compile(r"^(.+):([0-9]+)-([0-9]+)$")
 REF_PREFIX = "refs/tmux-pi/shadow/"
+UNINDEXED = re.compile(r"^error: (unable to index file '.*'|'.*' does not have a commit checked out)$")  # what `git add` says of a path it cannot index
 PLACE = re.compile(r"^wt-[0-9a-f]{12}$")  # the attempt-unique name of a run's worktree
 OWNER_DIR = "trial-owner"
 NOT_OURS = "not the tree this run created"
@@ -171,7 +199,7 @@ def read_run_at(fd):
 
 
 def write_at(fd, name, text):
-    """Write `text` as `name` in the directory held open as `fd` (`name` a path and `fd` None: in its directory), atomically. The
+    """Write `text` (str, or bytes written as they are) as `name` in the directory held open as `fd` (`name` a path and `fd` None: in its directory), atomically. The
     directory is the worker's to write and the temp name has the runner's pid, which run.json shows: whatever is at the temp name
     is removed and the temp file is made new (O_EXCL), so nothing is written through a link the worker put there and no write
     waits on a FIFO."""
@@ -181,9 +209,25 @@ def write_at(fd, name, text):
         os.unlink(tmp, dir_fd=fd)
     except FileNotFoundError:
         pass
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd), "w", encoding="utf-8") as handle:
+    binary = isinstance(text, bytes)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd), "wb" if binary else "w",
+                   **({} if binary else {"encoding": "utf-8"})) as handle:
         handle.write(text)
     os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+
+
+def remove_tree(path):
+    """`shutil.rmtree`, except that a directory the worker's tools made read-only (a module cache is) is made writable by its owner
+    and the removal of what failed is tried again. Links are removed, never followed, and nothing outside `path` is changed."""
+    def retry(function, failed, *_):
+        for directory in (failed, os.path.dirname(failed)):
+            if os.path.isdir(directory) and not os.path.islink(directory):
+                os.chmod(directory, stat.S_IRWXU)
+        function(failed)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
 
 
 def _take_lock(lock, clock=time.monotonic, pause=time.sleep):
@@ -229,15 +273,18 @@ def _exists_in(fd, name):
 
 # --------------------------------------------------------------------------------------------------------------------- git
 
-def git(cwd, *args, check=True, input_text=None):
+def git(cwd, *args, check=True, input_text=None, raw=False):
+    """git in `cwd`. Output is text with undecodable bytes replaced (a commit message or a file the worker wrote in another encoding
+    must not end the step with a decode error), or with `raw` the bytes as git wrote them (the patch)."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
     try:
-        run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, timeout=GIT_TIMEOUT, env=env,
-                             input=input_text)
+        run = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, timeout=GIT_TIMEOUT, env=env, input=input_text,
+                             **({} if raw else {"text": True, "errors": "replace"}))
     except (subprocess.TimeoutExpired, OSError) as error:
         raise ShadowError("git {} could not run in {} ({})".format(" ".join(args[:2]), cwd, error.__class__.__name__))
     if check and run.returncode:
-        raise ShadowError("git {} failed in {}: {}".format(" ".join(args[:2]), cwd, run.stderr.strip() or "exit {}".format(run.returncode)))
+        stderr = run.stderr.decode("utf-8", "replace") if raw else run.stderr
+        raise ShadowError("git {} failed in {}: {}".format(" ".join(args[:2]), cwd, stderr.strip() or "exit {}".format(run.returncode)))
     return run
 
 
@@ -266,6 +313,15 @@ def _json(path):
     return value if isinstance(value, dict) else {}
 
 
+def _text(path):
+    """The text of a file of the source task, "" when it is not there or is not a plain file within the size limit (the coder that
+    wrote it could have left anything at the name)."""
+    try:
+        return trial_session.read_text(path)
+    except OSError:
+        return ""
+
+
 def other_lane_section(packet_text):
     """The body of the packet's `Paths other lanes own` section, "" when it has none. The section ends at the next heading."""
     lines = packet_text.splitlines()
@@ -290,7 +346,7 @@ def read_source(main_state, task_id):
     if (path / "review-of").exists():
         raise ShadowError("task '{}' is a review, not a coder's work; shadow a coder task".format(task_id))
     meta, dispatch = _json(path / "meta.json"), _json(path / "dispatch.json")
-    request = (path / "request.md").read_text(encoding="utf-8", errors="replace") if (path / "request.md").is_file() else ""
+    request = _text(path / "request.md")
     if not request.strip():
         raise ShadowError("task '{}' has no request.md text to copy".format(task_id))
     base = dispatch.get("base_commit")
@@ -301,7 +357,7 @@ def read_source(main_state, task_id):
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ShadowError("task '{}': dispatch.json {} is not a list of text".format(task_id, name))
     tests = dispatch.get("tests") if dispatch.get("tests") in TESTS else None
-    packet = (path / "packet.md").read_text(encoding="utf-8", errors="replace") if (path / "packet.md").is_file() else ""
+    packet = _text(path / "packet.md")
     workdir = meta.get("workdir") if isinstance(meta.get("workdir"), str) else ""
     return {"task_id": task_id, "task_dir": str(path), "request": request, "base_commit": base, "context": list(contexts), "notes": list(notes),
             "tests": tests, "other_lane_paths": other_lane_section(packet), "role": meta.get("role") if isinstance(meta.get("role"), str) else "",
@@ -579,14 +635,14 @@ class Run:
         (`Owner.prove`; run.json is not consulted: the worker can reach it). Raises when the place holds anything else."""
         return self.owner.prove(self.worktree)
 
-    def wt_git(self, *args, check=True):
+    def wt_git(self, *args, check=True, raw=False):
         """git in the run's worktree, run on the proven real path and only after proving it, every time: the worker has write access
         to its tree and the directory around it and can swap the tree for a link to another one while it runs."""
         state, real = self.prove_worktree()
         if state != "owned":
             raise ShadowError("the run's worktree {} is {}; no git command was run there".format(
                 self.worktree, "not there" if state == "absent" else "damaged ({})".format(self.owner.why)))
-        return git(real, *args, check=check)
+        return git(real, *args, check=check, raw=raw)
 
     def require_time(self, step):
         """Raise AttemptExpired when the attempt's clock (from `prepare`) is already spent: no worktree is made and no worker started."""
@@ -657,7 +713,7 @@ class Run:
             raise ShadowError("the worker could not be ended: {}".format(run.stderr.strip() or "tp-agent exited {}".format(run.returncode)))
 
     def collect_work(self):
-        """Read the commit messages, then soft-reset to the base so a review sees the work as an uncommitted change (a non-lane
+        """Read the commit messages, then move HEAD to the base (what a soft reset does) so a review sees the work as an uncommitted change (a non-lane
         review diffs HEAD). Returns after saving the patch and counting the final diff."""
         self.note(phase="reset")
         base = self.info["base_commit"]
@@ -668,23 +724,54 @@ class Run:
         self.commit_messages = [m.strip("\n") for m in log.stdout.split("\0") if m.strip()] if log.returncode == 0 else None
         head = self.wt_git("rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
         if head and head != base:
-            git(self.project, "update-ref", "{}{}/head".format(REF_PREFIX, self.run), head)
-        stray = self.wt_git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
-        if stray.startswith("refs/heads/") and stray not in self.heads_before:  # the worker made a branch here: it is not ours to leave
-            self.wt_git("checkout", "-q", "--detach", check=False)
-            git(self.project, "update-ref", "-d", stray, check=False)
-            self.note(stray_branch=stray)
-        self.wt_git("reset", "--soft", base)
-        self.wt_git("add", "-A")  # the worker's new files count in the diff and in the review's file list
+            self.owner.keep_ref("{}{}/head".format(REF_PREFIX, self.run), head)  # a ref this run makes and records: cleanup removes it by name and commit
+        self.leave_branch()
+        # HEAD to the base, the index and the files as they are: what `reset --soft` does, except that it refuses in the middle of a merge
+        # (a worker that gave up there would cost the whole patch), and that `--no-deref` can only ever move HEAD itself, never a branch
+        self.wt_git("update-ref", "--no-deref", "-m", "tp-trial: HEAD to the base for the review", "HEAD", base)
+        self.add_all()
         stat = self.wt_git("diff", "--cached", "--numstat", base).stdout.splitlines()
         lines = 0
         for row in stat:
             added, removed = row.split("\t")[:2]
             lines += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
         self.diff = (len(stat), lines)
-        patch = self.wt_git("diff", "--cached", "--binary", base).stdout
+        patch = self.wt_git("diff", "--cached", "--binary", base, raw=True).stdout
         write_at(self.owner.need("rdir"), "final.patch", patch)
         self.note(diff_files=self.diff[0], diff_lines=self.diff[1])
+
+    def add_all(self):
+        """`git add -A`: the worker's new files count in the diff and in the review's file list. A path git cannot index (a repository
+        the worker made inside the tree with no commit in it) is skipped and named in run.json (`unindexed`), so one stray path does
+        not cost the whole patch; any other failure ends the collect, as before."""
+        added = self.wt_git("add", "-A", "--ignore-errors", check=False)
+        if not added.returncode:
+            return
+        lines = [line.strip() for line in added.stderr.splitlines() if line.strip()]
+        skipped = [line for line in lines if UNINDEXED.match(line)]
+        if not lines or len(skipped) != len(lines):
+            raise ShadowError("git add -A failed in {}: {}".format(self.worktree, added.stderr.strip() or "exit {}".format(added.returncode)))
+        self.note(unindexed=[line[:200] for line in skipped if "unable to index" in line][:20])
+
+    def leave_branch(self):
+        """Make sure HEAD of the run's tree is detached before it is moved to the base, which would otherwise move the branch it is on. A
+        branch HEAD is on is never deleted, moved or judged: the run created no branch (its tree is `worktree add --detach`), so it
+        has none recorded as its own, and a branch it cannot show it made stays. It is named in run.json (`branch_left`: the ref and
+        the commit it was at) for whoever wants it gone. Detaching only moves HEAD, so it is safe for any branch (one the worker made,
+        renamed, or one somebody else made meanwhile). HEAD is written directly (`update-ref --no-deref`), not with `checkout --detach`,
+        which refuses in the middle of a merge or a cherry-pick. Raises when HEAD cannot be shown detached: it is not moved."""
+        probe = self.wt_git("symbolic-ref", "-q", "HEAD", check=False)
+        if probe.returncode == 1:  # detached already: the move to the base moves HEAD alone
+            return
+        if probe.returncode != 0 or not probe.stdout.strip():
+            raise ShadowError("cannot tell what HEAD of the run's tree is on; HEAD was not moved to the base")
+        ref = probe.stdout.strip()
+        tip = self.wt_git("rev-parse", "-q", "--verify", ref + "^{commit}", check=False).stdout.strip()
+        if tip:  # a branch with no commit yet (`checkout --orphan`) has no commit for HEAD to name: it stays as it is, and the collect stops
+            self.wt_git("update-ref", "--no-deref", "-m", "tp-trial: leave the branch", "HEAD", tip, check=False)
+        if not tip or self.wt_git("symbolic-ref", "-q", "HEAD", check=False).returncode != 1:
+            raise ShadowError("HEAD of the run's tree is on {} and could not be detached; HEAD was not moved to the base".format(ref))
+        self.note(branch_left={"ref": ref, "commit": tip or None})
 
     def review(self):
         self.note(phase="review")
@@ -922,6 +1009,15 @@ def _gitfile_target(path):
     return os.path.realpath(text[len("gitdir:"):].strip()) if text.startswith("gitdir:") else None
 
 
+def _unreadable(error):
+    """Why `trial_session.read_plain` refused a file, as the end of a sentence about it."""
+    if error.errno == errno.EINVAL:
+        return "is not a plain file"
+    if error.errno == errno.EFBIG:
+        return "is larger than {} bytes".format(trial_session.MAX_READ)
+    return "cannot be opened as a plain file ({})".format(error.strerror)
+
+
 def registered_worktrees(project):
     """{real path: branch ref or None} of every worktree git lists for the repository of `project`."""
     found = {}
@@ -1033,6 +1129,10 @@ class Owner:
         if not ok:
             self.problem = "the owner record {} does not describe this run; nothing is ended or removed".format(self.file)
             return
+        refs = value.get("refs", {})
+        prefix = "{}{}/".format(REF_PREFIX, self.run)  # an entry that is not a ref of this run with a commit id is dropped: that ref is then kept
+        value["refs"] = {k: v for k, v in refs.items() if isinstance(k, str) and k.startswith(prefix) and isinstance(v, str) and COMMIT.fullmatch(v)} \
+            if isinstance(refs, dict) else {}
         self.record = value
         self.problem = None
 
@@ -1213,20 +1313,11 @@ class Owner:
         def refuse(why):
             return ShadowError("task {}: meta.json {}; nothing was started for the task".format(task.name, why))
         try:
-            fd = os.open(str(task / "meta.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            data = trial_session.read_plain(task / "meta.json")
         except FileNotFoundError:
             return None
         except OSError as error:
-            raise refuse("cannot be opened as a plain file ({})".format(error.strerror))
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise refuse("is not a plain file")
-            with os.fdopen(os.dup(fd), "rb") as handle:
-                data = handle.read()
-        except OSError:
-            raise refuse("cannot be read")
-        finally:
-            os.close(fd)
+            raise refuse(_unreadable(error))
         try:
             meta = json.loads(data.decode("utf-8"))  # one value only; a byte-order mark is refused (json refuses it in a str)
         except (UnicodeDecodeError, ValueError, RecursionError):  # nesting too deep to decode is a refusal, not a crash
@@ -1298,20 +1389,13 @@ class Owner:
         def refuse(why):
             return ShadowError("task {}: process.json {}; the task was not stopped through tp-agent (it keeps running until the run's session is ended)".format(task.name, why))
         try:
-            fd = os.open(str(task / "process.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            rec = json.loads(trial_session.read_plain(task / "process.json").decode("utf-8"))
         except FileNotFoundError:
             return
         except OSError as error:
-            raise refuse("cannot be opened as a plain file ({})".format(error.strerror))
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise refuse("is not a plain file")
-            with os.fdopen(os.dup(fd), encoding="utf-8") as handle:
-                rec = json.load(handle)
-        except (OSError, ValueError, RecursionError):  # nesting too deep to decode is a refusal, not a crash
+            raise refuse(_unreadable(error))
+        except (UnicodeDecodeError, ValueError, RecursionError):  # nesting too deep to decode is a refusal, not a crash
             raise refuse("cannot be read")
-        finally:
-            os.close(fd)
         if not (isinstance(rec, dict) and isinstance(rec.get("pane"), str) and isinstance(rec.get("group"), bool)
                 and all(isinstance(rec.get(k), int) and not isinstance(rec.get(k), bool) for k in ("pid", "pgid"))):
             raise refuse("is malformed")
@@ -1396,6 +1480,42 @@ class Owner:
             self.why = "it is on {}, a branch that was there before the run and is not the run's".format(branch)
             return "damaged", path
         return "owned", path
+
+    def ref_prefix(self):
+        return "{}{}/".format(REF_PREFIX, self.run)
+
+    def keep_ref(self, ref, commit):
+        """Make the ref `ref` (one under this run's own prefix) point at `commit`, only when there is no such ref, and record its
+        name and commit in the owner record. `drop_refs` removes a ref only by that record, and only while it still names that commit.
+        A ref that is already there and was not made by this call is an error: nothing is moved."""
+        if not ref.startswith(self.ref_prefix()) or not COMMIT.fullmatch(commit or ""):
+            raise ShadowError("{} at {!r} is not a ref this run may make".format(ref, commit))
+        if self.record is None:
+            raise ShadowError(self.problem or "there is no owner record for this run; it was not prepared")
+        refs = self.record.setdefault("refs", {})
+        if refs.get(ref) == commit:
+            return
+        git(self.project, "update-ref", ref, commit, "")  # an empty old value: the ref must not exist yet
+        refs[ref] = commit
+        try:
+            self._write()
+        except OSError:
+            git(self.project, "update-ref", "-d", ref, commit, check=False)  # not recorded, so not left for a cleanup that cannot know it
+            refs.pop(ref, None)
+            raise
+
+    def drop_refs(self):
+        """Delete the refs under this run's prefix that the run recorded, each only while it still names the recorded commit (`update-ref
+        -d <ref> <commit>` fails otherwise). A ref there that the run did not record, or that names another commit, is kept. Returns
+        the list of those, and the caller reports them."""
+        listing = git(self.project, "for-each-ref", "--format=%(refname) %(objectname)", self.ref_prefix(), check=False).stdout.splitlines()
+        kept = []
+        for line in listing:
+            ref, _, oid = line.partition(" ")
+            want = (self.record or {}).get("refs", {}).get(ref)
+            if want is None or want != oid or git(self.project, "update-ref", "-d", ref, want, check=False).returncode:
+                kept.append(ref)
+        return kept
 
     def remove_admin(self):
         """Remove the run's own git admin directory when it is still there and is the very one recorded (not `git worktree prune`,
@@ -1502,15 +1622,15 @@ def _cleanup(owner, env):
         if real is not None and os.path.lexists(real):  # damaged, or git would not remove it: the directory is the run's by identity
             state, real = owner.prove(hint)
             if state in ("owned", "damaged") and os.path.lexists(real):
-                shutil.rmtree(real)
+                remove_tree(real)
         owner.remove_admin()
         owner.mark_removed()
         owner.try_update(worktree_removed=now())
 
     def drop_refs():
-        listing = git(project, "for-each-ref", "--format=%(refname)", "{}{}/".format(REF_PREFIX, run), check=False).stdout.split()
-        for ref in listing:
-            git(project, "update-ref", "-d", ref)
+        kept = owner.drop_refs()
+        if kept:
+            raise ShadowError("kept {}: the run did not record making them, or they name another commit than the one it recorded".format(", ".join(kept)))
 
     attempt("tasks", end_tasks)
     attempt("session", end_session)

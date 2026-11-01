@@ -15,7 +15,11 @@ Signature copied from L2's trial_record at 790c52c:
 import datetime
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import trial_session  # noqa: E402  (read_plain: the one way a file the worker can write is read)
 
 RECORDS = "records.jsonl"
 SCHEMA = 0  # 0 marks a stub record; L2's is 1
@@ -32,9 +36,9 @@ def trial_dir(project):
 
 
 def _json(path):
-    try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    try:  # the task's files are the worker's to write: a FIFO, a link, a directory or a huge file reads as no file
+        value = json.loads(trial_session.read_plain(path).decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -48,7 +52,7 @@ def _first_review(meta, state_dir):
         return 0, None, None
     reviewer = _json(Path(state_dir) / "tasks" / ids[0] / "meta.json")
     try:
-        text = (Path(state_dir) / "tasks" / ids[0] / "result.md").read_text(encoding="utf-8", errors="replace")
+        text = trial_session.read_text(Path(state_dir) / "tasks" / ids[0] / "result.md")
     except OSError:
         text = ""
     first = next((line.strip() for line in text.splitlines() if line.strip()), "")
@@ -87,7 +91,7 @@ def append(project, record):
     """Append one JSON line to <project>/.tmux-pi/trial/records.jsonl (a stub: no lock; L2's append uses the shared eval-log lock)."""
     directory = trial_dir(project)
     directory.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(directory / RECORDS), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    fd = os.open(str(directory / RECORDS), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
     finally:

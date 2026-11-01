@@ -37,6 +37,7 @@ CONFIG = ROOT / "config" / "orchestration.json"
 TRIAL_DEFAULTS = {"max_local_workers": 1, "attempt_timeout_s": 2700, "model": "lmstudio/qwen/qwen3.6-35b-a3b", "thinking": "medium"}
 THINKING = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 TMUX_TIMEOUT = 30
+MAX_READ = 8 * 1024 * 1024  # the most the runner reads of any one file the worker can write (`read_plain`)
 
 
 class SessionError(ValueError):
@@ -327,19 +328,34 @@ def local_active(state, env=None):
             if isinstance(r, dict) and r.get("status") in ACTIVE and r.get("harness") == "pi" and str(r.get("model") or "").startswith(LOCAL)]
 
 
-def read_plain(path, dir_fd=None):
-    """The bytes of the plain file at `path`, read without waiting and never through a link. The worker can write every file of the
-    run (run.json, its task files, the owner record, its worktree's .git): one made a FIFO would hold a read until a writer came,
-    and with it the runner (its attempt clock, its session kill) or a `tp-trial` command. Raises OSError for anything but a plain
-    file (FileNotFoundError when there is none), so a caller's `except OSError` covers it."""
+def read_plain(path, dir_fd=None, limit=None):
+    """The bytes of the plain file at `path`, read without waiting, never through a link and never more than `limit` bytes
+    (MAX_READ). The worker can write every file of the run (run.json, its task files, the owner record, its worktree's .git): a
+    FIFO would hold a read until a writer came, a directory or a device is not a file, a link leads elsewhere, and a file of any
+    size would be read whole. Each is refused before a byte is read: the open is O_NONBLOCK | O_NOFOLLOW, the descriptor must be a
+    regular file (fstat) no larger than the limit, and the read itself stops one byte past it. Raises OSError for anything else
+    (FileNotFoundError when there is none), so a caller's `except OSError` covers every case and treats the file as missing or invalid.
+    This is the one way the runner reads a file the worker can write."""
+    limit = MAX_READ if limit is None else limit
     fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EINVAL, "not a plain file", str(path))
+        if st.st_size > limit:
+            raise OSError(errno.EFBIG, "larger than {} bytes".format(limit), str(path))
         with os.fdopen(os.dup(fd), "rb") as handle:
-            return handle.read()
+            data = handle.read(limit + 1)  # a file that grew since fstat is still bounded
     finally:
         os.close(fd)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "larger than {} bytes".format(limit), str(path))
+    return data
+
+
+def read_text(path, dir_fd=None, limit=None):
+    """`read_plain` decoded as UTF-8 (undecodable bytes replaced), for a file that is read as text and not as JSON."""
+    return read_plain(path, dir_fd, limit).decode("utf-8", errors="replace")
 
 
 def _run_info(directory):

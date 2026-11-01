@@ -13,7 +13,16 @@ and its own tmux session, reviews the diff and writes a trial record. It never t
 
 The main state dir is TP_STATE_DIR, else the session's @tp_state_dir (the same lookup as tp-agent); `status`, `stop` and `normal`
 need it only when --project is not given. A run's own files are under
-<project>/.tmux-pi/trial/<run>/; the records are <project>/.tmux-pi/trial/records.jsonl."""
+<project>/.tmux-pi/trial/<run>/; the records are <project>/.tmux-pi/trial/records.jsonl.
+
+Known limits (non-hostile worker model): the worker is taken to make mistakes, not to forge records or attack the runner. These are
+known and not defended; the planned fix is to run the worker as a separate macOS user (not done).
+  F1  a forged owner record (<project>/.tmux-pi/trial-owner/<run>.json, writable by the worker's OS user) can make `tp-trial stop`
+      remove another lane's worktree.
+  F3  a git filter, hook or config the worker set in its tree can run during the runner's own git commands (e.g. `git add -A`).
+  F4  a worker-edited `workdir` in the trial task's meta.json can point tp-review at another checkout.
+  F6  `tp-trial normal` rereads run.json, which the worker can write.
+Details: the lib/trial_shadow.py module docstring."""
 
 import argparse
 import json
@@ -28,6 +37,8 @@ import trial_session  # noqa: E402
 import trial_shadow  # noqa: E402
 
 SUBCOMMANDS = ("shadow", "status", "stop", "normal", "run")
+LIMITS_TITLE = "Known limits (non-hostile worker model)"
+KNOWN_LIMITS = LIMITS_TITLE + __doc__.split(LIMITS_TITLE, 1)[1]
 FIELDS = ("run", "phase", "outcome", "source_task", "model", "session")
 
 
@@ -142,7 +153,8 @@ def cmd_normal(args):
 
 
 def parser():
-    top = argparse.ArgumentParser(prog="tp-trial", description=__doc__.split("\n\n")[0])
+    top = argparse.ArgumentParser(prog="tp-trial", description=__doc__.split("\n\n")[0], epilog=KNOWN_LIMITS,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = top.add_subparsers(dest="cmd", required=True)
 
     def common(p):

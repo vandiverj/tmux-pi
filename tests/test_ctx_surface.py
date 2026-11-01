@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -772,8 +773,9 @@ def api_importers(paths, target=ORDERS, **extra):
 def web_edges(file, direction, others, **extra):
     """A web `imports` answer: `others` import `file` (importers), or `file` imports `others` (imports)."""
     edges = [{"from": o, "line": 1, "specifier": "x", "to": file, "depth": 1} if direction == "importers"
-             else {"from": file, "line": n, "specifier": "x", "to": o, "depth": 1} for n, o in enumerate(others, 1)]
-    return {"status": "ok", "direction": direction, "target": file, "edges": edges, "total": len(edges), "truncated": False, "unresolved": 0, **extra}
+             else {"specifier": "x", "line": n, "resolved": o, "external": False} for n, o in enumerate(others, 1)]  # CX2 host.mjs op_imports
+    return {"status": "ok", "direction": direction, "target": file, "edges": edges, "total": len(edges), "truncated": False, "unresolved": 0,
+            "index_age_s": 3, **extra}
 
 
 class ReviewOne(SurfaceCase):
@@ -2215,7 +2217,7 @@ class FamilySweep(ReviewOne):
                     self.api_answers("imports", api_imports(UTIL, files=[(7, 1)]))
                 else:
                     fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: {**web_edges(a["file"], a["direction"], []), "edges": [
-                        {"from": a["file"], "line": 1, "specifier": "x", "to": 7, "depth": 1}], "total": 1} if a["direction"] == "imports" else \
+                        {"specifier": "x", "line": 1, "resolved": 7, "external": False}], "total": 1} if a["direction"] == "imports" else \
                         web_edges(a["file"], a["direction"], [])
                 brief = self.say("ctx_brief", {"paths": [path]})
                 self.assertNotIn("none: the files import no shared (lib) contract", brief)
@@ -2281,6 +2283,244 @@ class FamilySweep(ReviewOne):
                 self.assertNotIn(f"no definition of {name} found", self.say("ctx_symbol", {"name": name}))
         for text in ("const hiddenX = 1;\n", "x.hidden = 1;\n", "export { hidden as other };\n", "call(hidden);\n"):
             self.assertIsNone(surface.declaration_pattern("hidden").search(text), text)
+
+
+
+class RealShapes(ReviewOne):
+    """Review 8 F1 and the real-shape-drop-in sweep: for every operation of the real CX2 and CX3 navigators, an answer shaped as the real
+    source emits it (fake_navs.SHAPES, read from host.mjs and nav_api.py, not from the surface) is read by the surface. The table of ops,
+    directions and statuses is in the report."""
+
+    def setUp(self):
+        super().setUp()
+        self.put(LONE, "export const lone = 1;\n")
+
+    def say(self, tool, args):
+        answer = self.run_tool(tool, args)
+        return answer.text + "\n" + "\n".join(answer.data.get("left_out") or [])
+
+    def web_imports(self, imports=None, importers=None, **extra):
+        """CX2 `imports` answers: `imports` rows are {specifier, line, resolved, external}; `importers` rows are (from, line) pairs."""
+        def answer(a):
+            if a["direction"] == "imports":
+                return {"status": "ok", "direction": "imports", "target": a["file"], "edges": imports or [], "total": len(imports or []),
+                        "truncated": False, "unresolved": sum(1 for r in imports or [] if r["resolved"] is None), "index_age_s": 3, **extra}
+            rows = [{"from": f, "line": n, "specifier": "x", "to": a["file"], "depth": 1} for f, n in importers or []]
+            return {"status": "ok", "direction": "importers", "target": a["file"], "edges": rows, "total": len(rows), "truncated": False,
+                    "unresolved": 0, "index_age_s": 3}
+        fake_navs.BEHAVIOUR[("web", "imports")] = answer
+
+    def test_every_fake_answer_has_exactly_the_keys_of_the_real_source(self):
+        """The fake copied the surface's assumption once (review 8): its rows and envelopes are checked against the table read from source."""
+        web, api = fake_navs.NavWeb("/p", "tsconfig.json"), fake_navs.NavApi("/p")
+        asked = {("web", "exports", None): web.exports(CART), ("web", "imports", "imports"): web.imports(CART),
+                 ("web", "imports", "importers"): web.imports(ORDER, direction="importers"),
+                 ("web", "definition", None): web.definition(CART, name="addToCart"), ("web", "references", None): web.references(CART, name="addToCart"),
+                 ("api", "importers", None): api.importers(ORDERS), ("api", "imports", None): api.imports(ORDERS),
+                 ("api", "symbols", None): api.symbols(ORDERS)}
+        self.assertEqual(set(asked), set(fake_navs.SHAPES))
+        for case, answer in asked.items():
+            keys, lists = fake_navs.SHAPES[case]
+            with self.subTest(case=case):
+                self.assertEqual(set(answer), set(keys))
+                for name, row_keys in lists.items():
+                    self.assertTrue(answer[name], f"{case} {name} must have a row to compare")
+                    for row in answer[name]:
+                        self.assertEqual(set(row) - fake_navs.OPTIONAL.get(case[0], set()), set(row_keys), row)
+        for case, answer in (("web definition not_found", web.definition(CART, name="nope")), ("web references not_found", web.references(CART, name="nope"))):
+            self.assertEqual(set(answer), set(fake_navs.SHAPES[("web", case.split()[1], None)][0]), case)
+
+    def test_f1_a_real_web_imports_row_is_an_import_of_its_resolved_file(self):
+        """F1: imports rows carry `resolved`, not `to`; every real row was withheld."""
+        self.web_imports(imports=[{"specifier": "../../../../lib/launchpad/types/order", "line": 1, "resolved": ORDER, "external": False}])
+        said = self.say("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertIn(f"{CART} imports (1 of 1)", said)
+        self.assertIn(ORDER, said)
+        self.assertNotIn("withheld", said)
+        brief = self.say("ctx_brief", {"paths": [CART]})
+        self.assertIn(f"  {ORDER}  (line 1)", brief)
+        self.assertNotIn("withheld", brief)
+        self.assertIn(CART, self.say("ctx_relations", {"target": CART, "direction": "contracts"}))
+
+    def test_f1_an_external_row_is_a_library_not_a_project_file_nor_a_withheld_one(self):
+        """A package (resolved null, external true) and a file under node_modules (resolved set, external true) are libraries."""
+        self.web_imports(imports=[
+            {"specifier": "../../../../lib/launchpad/types/order", "line": 1, "resolved": ORDER, "external": False},
+            {"specifier": "react", "line": 2, "resolved": "node_modules/react/index.d.ts", "external": True},
+            {"specifier": "zod", "line": 3, "resolved": None, "external": True}])
+        said = self.say("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertIn("external: react, zod", said)
+        self.assertIn(f"  {CART}:1 -> {ORDER}", said)
+        self.assertEqual(said.count("->"), 1, said)
+        # host.mjs counts every row without a resolved path in `unresolved`, a package included: kept as unread (fail closed), see the report
+        self.assertIn("unresolved imports: 1", said)
+        self.assertNotIn("node_modules", said)
+        self.assertNotIn("withheld", said)
+
+    def test_f1_an_import_the_navigator_could_not_resolve_is_unread_never_an_absence(self):
+        """A relative import with resolved null and external false is counted in `unresolved`: "imports no project file" is not said."""
+        self.web_imports(imports=[{"specifier": "./gone", "line": 1, "resolved": None, "external": False}])
+        said = self.say("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertNotIn(f"{CART} imports no project file", said)
+        self.assertIn("unresolved imports: 1", said)
+        self.assertNotIn("none: the files import no shared (lib) contract", self.say("ctx_brief", {"paths": [CART]}))
+
+    def test_f1_only_external_imports_say_the_file_imports_no_project_file_when_nothing_is_unresolved(self):
+        self.web_imports(imports=[])
+        said = self.say("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertIn(f"{CART} imports no project file", said)
+
+    def test_f1_a_row_that_is_not_the_imports_shape_is_unreadable_never_taken_as_unresolved(self):
+        """A row with no `resolved` field (the importers shape, or anything else) is not assumed to be an unresolved import."""
+        self.web_imports(imports=[{"from": CART, "line": 1, "specifier": "x", "to": ORDER, "depth": 1}])
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: {"status": "ok", "direction": a["direction"], "target": a["file"], "unresolved": 0,
+                                                              "edges": [{"from": CART, "line": 1, "specifier": "x", "to": ORDER, "depth": 1}],
+                                                              "total": 1, "truncated": False, "index_age_s": 3}
+        said = self.say("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertNotIn(f"{CART} imports no project file", said)
+        self.assertNotIn("(1 of 1)", said)
+
+    def test_a_real_withheld_placeholder_in_resolved_is_withheld_and_counted_once(self):
+        """nav_web.py _clean turns a refused `resolved` into "<withheld>" and adds one to `withheld`."""
+        self.web_imports(imports=[{"specifier": "./secret", "line": 1, "resolved": "<withheld>", "external": False},
+                                  {"specifier": "../../../../lib/launchpad/types/order", "line": 2, "resolved": ORDER, "external": False}],
+                         withheld=1)
+        answer = self.run_tool("ctx_relations", {"target": CART, "direction": "imports"})
+        self.assertNotIn("<withheld>", answer.text)
+        self.assertIn(ORDER, answer.text)
+        self.assertTrue(any("1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        self.assertNotIn("2 withheld", "\n".join(answer.data["left_out"]))
+
+    def test_a_real_importers_row_dropped_by_the_navigator_guard_is_counted_once(self):
+        """nav_web.py _clean drops an importers row whose `from` is refused and adds one to `withheld`; `total` still counts it."""
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: {
+            "status": "ok", "direction": "importers", "target": a["file"], "unresolved": 0, "index_age_s": 3, "withheld": 1, "total": 2,
+            "truncated": False, "edges": [{"from": SPEC, "line": 1, "specifier": "./cart", "to": a["file"], "depth": 1}]}
+        answer = self.run_tool("ctx_relations", {"target": CART, "direction": "importers"})
+        self.assertIn(SPEC, answer.text)
+        self.assertTrue(any("1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        self.assertNotIn("more", "\n".join(answer.data["left_out"]).replace("withheld", ""))
+
+    def test_a_real_exports_row_for_a_reexport_has_no_line_and_a_defined_at(self):
+        """host.mjs op_exports: a re-export has line null and defined_at "path:line" (or "<withheld>" with a withheld count)."""
+        rows = [{"name": "Order", "kind": "type", "line": None, "reexport": True, "defined_at": f"{ORDER}:4"},
+                {"name": "OrderSchema", "kind": "const", "line": 3, "reexport": False, "defined_at": None}]
+        fake_navs.BEHAVIOUR[("web", "exports")] = {"status": "ok", "is_module": True, "exports": rows, "total": 2, "truncated": False, "index_age_s": 3}
+        said = self.say("ctx_brief", {"paths": [CART]})
+        self.assertIn("exports (2):", said)
+        self.assertRegex(said, r"(?m)^  Order \(type\)$")
+        self.assertIn("  OrderSchema (const) :3", said)
+        self.assertNotIn("None", said)
+        rows[0]["defined_at"] = "<withheld>"
+        fake_navs.BEHAVIOUR[("web", "exports")] = {"status": "ok", "is_module": True, "exports": rows, "total": 2, "truncated": False,
+                                                   "index_age_s": 3, "withheld": 1}
+        said = self.say("ctx_brief", {"paths": [CART]})
+        self.assertNotIn("<withheld>", said)
+        self.assertIn("exports of " + CART + ": 1 withheld", said)
+
+    def test_a_real_definition_row_without_a_line_or_in_node_modules_is_shown_without_none(self):
+        """host.mjs loc(): a location with no source file has line null and column null; a definition in node_modules has external true."""
+        rows = [{"path": CART, "line": None, "column": None, "external": False, "name": "addToCart", "kind": "function", "container": "", "text": ""},
+                {"path": "node_modules/zod/index.d.ts", "line": 9, "column": 1, "external": True, "name": "addToCart", "kind": "function",
+                 "container": "", "text": "declare function addToCart(): void;"}]
+        fake_navs.BEHAVIOUR[("web", "definition")] = {"status": "ok", "at": {"line": 5, "column": 17}, "definitions": rows, "signature": "", "doc": "",
+                                                       "omitted_outside_root": 0, "index_age_s": 3}
+        said = self.say("ctx_symbol", {"name": "addToCart", "path": CART})
+        self.assertNotIn("None", said)
+        self.assertIn(CART, said)
+
+    def test_a_real_definition_not_found_answer_is_not_a_found_definition_nor_an_error(self):
+        """host.mjs gives status not_found with a full envelope when no definition is in the root: the surface says the navigator answered
+        not_found (it does not turn the status into an absence: an omitted_outside_root count may sit behind it)."""
+        answer = self.run_tool("ctx_symbol", {"name": "nope", "path": CART})
+        self.assertEqual(answer.status, "ok", answer.text)
+        self.assertIn("definitions of nope in " + CART + ": not available (the navigator answered not_found)", answer.text)
+
+    def test_a_real_references_answer_counts_what_it_left_out(self):
+        """host.mjs op_references: omitted_outside_root (refused) and omitted_external (node_modules) are counts the surface must not drop."""
+        refs = [{"path": f"{WEB_SRC}/p01.ts", "line": 1, "column": 10, "external": False, "text": "addToCart(x)", "is_definition": False, "is_write": False}]
+        defs = [{"path": CART, "line": 5, "column": 17, "external": False, "name": "addToCart", "kind": "function"}]
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "ok", "at": {"line": 5, "column": 17}, "definitions": defs, "references": refs, "total": 1,
+                                                       "truncated": False, "omitted_outside_root": 2, "omitted_external": 3, "index_age_s": 3}
+        answer = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART})
+        left = "\n".join(answer.data["left_out"])
+        self.assertIn(f"{WEB_SRC}/p01.ts:1", answer.text)
+        self.assertNotIn("references of addToCart (1 of 1)", answer.text)
+        self.assertIn("withheld", left)
+
+    def test_a_real_references_not_found_answer_is_not_an_absence_when_it_omitted_something(self):
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "not_found", "at": {"line": 5, "column": 17}, "definitions": [], "references": [],
+                                                       "total": 0, "truncated": False, "omitted_outside_root": 0, "omitted_external": 4, "index_age_s": 3}
+        said = self.say("ctx_symbol", {"name": "addToCart", "path": CART})
+        self.assertNotIn("references of addToCart: none", said)
+        self.assertNotIn("no references", said)
+
+    def test_a_real_api_importers_row_with_flags_is_read(self):
+        """nav_api.py _slim adds type_only, dynamic and config to a row only when set."""
+        rows = [{"path": GOOD, "line": 3, "spec": "../orders.ts", "type_only": True}, {"path": f"{API_SRC}/routes/r02.ts", "line": 4, "spec": "../orders.ts", "dynamic": True},
+                {"path": f"{API_SRC}/routes/r03.ts", "line": 5, "spec": "@orders", "config": "deno.json"}]
+        fake_navs.BEHAVIOUR[("api", "importers")] = api_importers([], importers=rows, total=3)
+        said = self.say("ctx_relations", {"target": ORDERS, "direction": "importers"})
+        self.assertIn("importers of " + ORDERS + " (3 of 3)", said)
+        self.assertIn(GOOD, said)
+
+    def test_a_real_api_imports_answer_with_external_and_unresolved_entries_is_read(self):
+        """nav_api.py _imports: `external` is a list of specifier strings, `unresolved` a list of {line, spec, reason}."""
+        files = [{"path": f"{API_SRC}/util.ts", "line": 3, "spec": "./util.ts"}]
+        fake_navs.BEHAVIOUR[("api", "imports")] = api_imports(ORDERS, files=[(f"{API_SRC}/util.ts", 3)], external=["zod", "npm:hono"],
+                                                              unresolved=[{"line": 9, "spec": "./gone.ts", "reason": "not_found"}], unresolved_total=1)
+        said = self.say("ctx_relations", {"target": ORDERS, "direction": "imports"})
+        self.assertIn("external: npm:hono, zod", said)
+        self.assertIn("unresolved imports: 1", said)
+        self.assertIn(f"{API_SRC}/util.ts", said)
+
+    def test_the_api_imports_call_never_asks_for_the_deno_forward_graph(self):
+        """nav_api.py imports(source="auto") falls back to deno_info, whose answer has `modules` and an integer `external`, no `files`."""
+        self.say("ctx_relations", {"target": ORDERS, "direction": "imports"})
+        asked = [c[2] for c in fake_navs.CALLS if c[:2] == ("api", "imports")]
+        self.assertTrue(asked)
+        self.assertTrue(all(a["source"] == "index" for a in asked), asked)
+
+    def test_a_forward_graph_answer_where_files_are_expected_is_not_a_crash_nor_an_absence(self):
+        fake_navs.BEHAVIOUR[("api", "imports")] = {"status": "ok", "target": ORDERS, "source": "deno_info", "truncated": False, "total": 2, "external": 3,
+                                                   "modules": [{"path": ORDERS, "imports": [UTIL]}, {"path": UTIL, "imports": []}]}
+        for args in ({"tool": "ctx_relations", "a": {"target": ORDERS, "direction": "imports"}}, {"tool": "ctx_brief", "a": {"paths": [ORDERS]}}):
+            said = self.say(args["tool"], args["a"])
+            self.assertNotIn("Traceback", said)
+            self.assertNotIn(f"{ORDERS} imports no project file", said)
+            self.assertNotIn("imports (0)", said)
+
+    def test_a_real_api_symbols_answer_with_a_stale_index_or_a_refusal_shows_no_rows(self):
+        """nav_api.py: stale_index carries the rows' envelope; a sandbox refusal carries `reason` and `next_step` only."""
+        stale = {**api_importers([GOOD]), "status": "stale_index", "next_step": "ask again"}
+        fake_navs.BEHAVIOUR[("api", "importers")] = stale
+        said = self.say("ctx_relations", {"target": ORDERS, "direction": "importers"})
+        self.assertNotIn(GOOD, said)
+        for reason in ("sandbox_unavailable", "sandbox_failed", "sandbox_grant_overlap", "outside_project", "reaches_refused_path", "unmodelled_config"):
+            with self.subTest(reason=reason):
+                fake_navs.BEHAVIOUR[("api", "symbols")] = {"status": "refused", "reason": reason, "next_step": "do the next thing"}
+                answer = self.run_tool("ctx_symbol", {"name": "createOrder", "path": ORDERS})
+                self.assertIn(reason, answer.text + str(answer.data))
+
+
+class DeclarationPatternIsLinear(unittest.TestCase):
+    """Review 8 N1: a destructuring span is bounded, so a long unterminated line cannot make the text scan quadratic."""
+
+    def test_a_long_unterminated_destructuring_line_is_scanned_in_linear_time(self):
+        for k in (20000, 40000):
+            for text in ("const {" + " hidden," * k, "export const [" + "x, hidden, " * k, "const {" + ("a: {" * k) + " hidden",
+                         "\n".join(["const { hidden"] * k)):
+                with self.subTest(k=k, head=text[:20]):
+                    start = time.monotonic()
+                    surface.declaration_pattern("hidden").search(text)
+                    self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_a_destructuring_within_the_bound_is_still_found(self):
+        pattern = surface.declaration_pattern("hidden")
+        for text in ("const { a, hidden } = x;\n", "export const [first, hidden]: T = y;\n", "const {\n  a,\n  hidden,\n} = z;\n",
+                     "const { a: { hidden } } = z;\n", "const { " + "a, " * 400 + "hidden } = z;\n"):
+            self.assertIsNotNone(pattern.search(text), text[:40])
+        self.assertIsNone(pattern.search("const { a, hidden"), "unterminated")
 
 
 if __name__ == "__main__":

@@ -299,7 +299,7 @@ def build(engine, paths):
         got = engine.exports(rel)
         if track("exports", got):
             lines.append(surface.list_head("exports", len(got.rows[:EXPORTS_MAX]), got.total, got.completeness()))
-            lines += [f"  {name} ({kind}) :{line}" for name, kind, line in got.rows[:EXPORTS_MAX]]
+            lines += [f"  {name} ({kind})" + (f" :{line}" if line else "") for name, kind, line in got.rows[:EXPORTS_MAX]]
             add_left(left, more_note(f"exports of {rel}", got.total - EXPORTS_MAX, got.cut, "ctx_symbol with path shows one name", got.total))
             add_left(left, withheld_note(f"exports of {rel}", got.refused))
         mark = (lambda row, rel=rel: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None

@@ -545,18 +545,28 @@ def libraries_in(text):
 DYNAMIC_RE = re.compile(r"""\b(?:import|require)\s*\(\s*(?!['"][^'"\n]{1,200}['"]\s*[,)])""")
 
 
+DESTRUCTURE_START = r"(?:declare[ \t]+)?(?:const|let|var)[ \t]*[{\[]"
+DESTRUCTURE_SPAN = 2000  # characters between a destructuring's bracket and its `=` (or an export list's braces): a longer one is not matched (see declaration_pattern)
+
+
 def declaration_pattern(name):
     """The text-scan pattern for a top-level declaration of `name`, group `export` set when it is exported: a declaration
     (function, class, const, let, var, type, interface, enum, namespace, module), a destructured const/let/var, `import name =`,
     and the export forms that bind a name (`export { a as name }`, `export * as name`). A line may start with a byte order mark;
-    `name` is bounded by characters that cannot be part of a name, so a name with `$` matches."""
+    `name` is bounded by characters that cannot be part of a name, so a name with `$` matches.
+    A destructuring is matched only when its `=` follows within DESTRUCTURE_SPAN characters, and the scan from each start is linear in
+    that span: a lookahead finds the `=`, and the first occurrence of `name` is taken atomically (a later occurrence would see the same
+    closing bracket and `=`), so a long unterminated line cannot make the scan quadratic. A destructuring longer than the span is not
+    found; the scan is a hint, and ctx_symbol says it is a text scan."""
     n = r"(?<![\w$])" + re.escape(name) + r"(?![\w$])"
     lead = r"^[ \t\ufeff]*(?P<export>export\b[ \t]*)?"
     forms = (r"(?:default[ \t]+)?(?:declare[ \t]+)?(?:abstract[ \t]+)?(?:async[ \t]+)?"
              r"(?:function[ \t]*\*?|class|const|let|var|type|interface|enum|namespace|module)[ \t]+" + n,
-             r"(?:declare[ \t]+)?(?:const|let|var)[ \t]*[{\[][^=;]*?" + n + r"[^=;]*?[}\]][ \t]*(?::[^=;]*)?=",
+             DESTRUCTURE_START + r"(?=[^=;]{0,%d}=)" % DESTRUCTURE_SPAN
+             + r"(?=(?P<before>[^=;]{0,%d}?" % DESTRUCTURE_SPAN + n + r"))(?P=before)"
+             + r"[^=;]{0,%d}?[}\]][ \t]*(?::[^=;]{0,%d})?=" % (DESTRUCTURE_SPAN, DESTRUCTURE_SPAN),
              r"import[ \t]+" + n + r"[ \t]*=",
-             r"(?<=export)[ \t]*(?:\{[^}]*?\bas[ \t\r\n]+" + n + r"[^}]*\}|\*[ \t]*as[ \t]+" + n + ")")
+             r"(?<=export)[ \t]*(?:\{[^}]{0,%d}?\bas[ \t\r\n]+" % DESTRUCTURE_SPAN + n + r"[^}]{0,%d}\}|\*[ \t]*as[ \t]+" % DESTRUCTURE_SPAN + n + ")")
     return re.compile(lead + "(?:" + "|".join(forms) + ")", re.M)
 
 
@@ -906,13 +916,16 @@ class Engine(NoteWriter):
         rows = [(str(s.get("name", "")), str(s.get("kind", "")), _int(s.get("line"))) for s in listed]
         return Got(rows=rows, total=_int(raw.get("total", handed)), seen=handed, unreadable=unreadable, raw=raw)
 
-    def _edges(self, raw, rows, index, handed, unreadable, **more):
+    def _edges(self, raw, rows, index, handed, unreadable, total=None, placed=0, **more):
         """A Got from navigator rows: refused paths dropped and counted, rows it cannot read counted, and the navigator's own
-        truncation kept."""
+        truncation kept. `handed` is the rows of the list that are in `rows` or unreadable; `total` replaces the navigator's when some
+        of its rows are not edges to a project file (external or unresolved). `placed` is the rows whose path is the placeholder the
+        navigator leaves for a path it withheld: they are in the list and in the navigator's `withheld` count, so they count once."""
         kept, screened = self.screen_rows(rows, index)
         withheld, _ = self.loss(raw)
-        return Got(rows=kept, total=_int(raw.get("total", handed)), seen=handed + withheld, screened=screened, unreadable=unreadable,
-                   raw=raw, **more)
+        twice = min(placed, withheld, screened)
+        return Got(rows=kept, total=_int(raw.get("total", handed)) if total is None else max(total, 0), seen=handed + withheld - twice,
+                   screened=screened - twice, unreadable=unreadable, raw=raw, **more)
 
     def importers(self, rel, limit=10):
         """Got whose rows are (importing file, line, rel)."""
@@ -946,9 +959,27 @@ class Engine(NoteWriter):
             if bad:
                 return bad
             listed, handed, unreadable = listed_rows(raw, "edges")
-            rows = [(rel, _int(e.get("line")), e.get("to")) for e in listed]
-            return self._edges(raw, rows, 2, handed, unreadable)
-        raw = self.call(kind, made, "imports", rel)
+            # CX2's imports rows are {specifier, line, resolved, external} (host.mjs op_imports; from, to and depth belong to importers). An
+            # import of a project file has `external` not true and `resolved` naming a file. An external row (a package, or a file under
+            # node_modules) is a library, kept in `external`; a row with `resolved` null is an import the navigator could not resolve, which
+            # its `unresolved` count carries. A row with no `resolved` field at all is not this shape: unreadable, never assumed unresolved.
+            rows, libraries, apart = [], [], 0
+            for e in listed:
+                if "resolved" not in e:
+                    unreadable += 1
+                elif e.get("external") is True:
+                    apart += 1
+                    if isinstance(e.get("specifier"), str):
+                        libraries.append(e["specifier"])
+                elif e["resolved"] is None:
+                    apart += 1
+                else:
+                    rows.append((rel, _int(e.get("line")), e["resolved"]))
+            placed = sum(1 for row in rows if isinstance(row[2], str) and row[2].strip() == WITHHELD)
+            got = self._edges(raw, rows, 2, handed - apart, unreadable, total=_int(raw.get("total", handed)) - apart, placed=placed)
+            got.external = sorted(set(libraries))
+            return got
+        raw = self.call(kind, made, "imports", rel, source="index")
         bad = self._status(kind, raw)
         if bad:
             return bad
@@ -956,8 +987,11 @@ class Engine(NoteWriter):
         rows = [(rel, _int(e.get("line")), e.get("path")) for e in listed]
         kept, screened = self.screen_rows(rows, 2)
         omitted, _ = self.loss(raw)
+        outside = raw.get("external")  # a list of specifiers in CX3's index answer; anything else is not this shape
+        if outside is not None and not isinstance(outside, list):
+            unreadable += 1
         return Got(rows=kept, total=max(_int(raw.get("total")), handed) + omitted, seen=handed + omitted, screened=screened,
-                   unreadable=unreadable, external=[str(x) for x in raw.get("external") or []], age=raw.get("index_age_s"), raw=raw)
+                   unreadable=unreadable, external=[str(x) for x in outside] if isinstance(outside, list) else [], age=raw.get("index_age_s"), raw=raw)
 
     # ----------------------------------------------------------------------------------------------- text-scan locator
 
@@ -1099,7 +1133,7 @@ class Engine(NoteWriter):
     def _definition_lines(self, rows, left, cut, label="definitions"):
         lines = []
         for row in rows[:5]:
-            lines.append(f"{row['path']}:{row.get('line', 0)} {row.get('kind', '')} {short(row.get('text', ''), 160)}".rstrip())
+            lines.append(f"{at(row['path'], row.get('line'))} {row.get('kind', '')} {short(row.get('text', ''), 160)}".rstrip())
         if len(rows) > 5 and not cut:  # a cut list already has its note; it names no count
             left.append(f"{label}: {len(rows) - 5} more")
         return lines
@@ -1145,7 +1179,7 @@ class Engine(NoteWriter):
         refused, cut = read.withheld, read.cut
         total = _int(refs.get("total", len(shown) + refused))
         lines.append(list_head(f"references of {name}", min(5, len(shown)), total, read, of=True))
-        lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
+        lines += [f"  {at(r['path'], r.get('line'))}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
         add = more_note(f"references of {name}", total - min(5, len(shown)) - refused, cut, "pass path to another file or read the callers directly")
         if add:
             left.append(add)
@@ -1177,7 +1211,7 @@ class Engine(NoteWriter):
                                     read, label=f"definitions of {name} in {rel}"))
             return "ok", None
         lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), read))
-        lines += [f"{s['path']}:{s.get('line', 0)} {s.get('kind', '')}" for s in named[:5]]
+        lines += [f"{at(s['path'], s.get('line'))} {s.get('kind', '')}" for s in named[:5]]
         add = more_note(f"definitions of {name}", len(named) - 5, partial, "pass path to a narrower file")
         if add:
             left.append(add)
@@ -1220,6 +1254,12 @@ def _remove(path):
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+def at(path, line):
+    """`path:line`, or the path alone when the navigator gave no line (CX2 gives line null for a location with no source file)."""
+    number = _int(line)
+    return f"{path}:{number}" if number > 0 else str(path)
 
 
 def _int(value):

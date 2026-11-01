@@ -5,6 +5,34 @@ The surface loads navigators by module name (surface.NAV_MODULES); the tests poi
 navigator drops in with no change to the surface. CALLS records every method call; BEHAVIOUR replaces one answer (a refusal, a
 warming helper) so the tests can see how each status is surfaced. Nothing here starts a process or opens a socket."""
 
+# The answer shapes of the real navigators, read from their source (not from the surface):
+#   web: CX2 lane/ctx-nav-web lib/ctxengine/nav_web/host.mjs, op_definition, op_references, op_exports, op_imports, op_stats; the status words
+#        and the "withheld" count / "<withheld>" placeholder of nav_web.py (_clean).
+#   api: CX3 lane/ctx-nav-api lib/ctxengine/nav_api.py, _importers, _imports, _forward_graph, _symbols, status.
+# {(kind, op, variant): (answer keys, {row list key: row keys})}; keys the real code adds only sometimes are in OPTIONAL.
+SHAPES = {
+    ("web", "exports", None): (("status", "is_module", "exports", "total", "truncated", "index_age_s"),
+                               {"exports": ("name", "kind", "line", "reexport", "defined_at")}),
+    ("web", "imports", "imports"): (("status", "direction", "target", "edges", "total", "truncated", "unresolved", "index_age_s"),
+                                    {"edges": ("specifier", "line", "resolved", "external")}),
+    ("web", "imports", "importers"): (("status", "direction", "target", "edges", "total", "truncated", "unresolved", "index_age_s"),
+                                      {"edges": ("from", "line", "specifier", "to", "depth")}),
+    ("web", "definition", None): (("status", "at", "definitions", "signature", "doc", "omitted_outside_root", "index_age_s"),
+                                  {"definitions": ("path", "line", "column", "external", "name", "kind", "container", "text")}),
+    ("web", "references", None): (("status", "at", "definitions", "references", "total", "truncated", "omitted_outside_root", "omitted_external",
+                                   "index_age_s"),
+                                  {"definitions": ("path", "line", "column", "external", "name", "kind"),
+                                   "references": ("path", "line", "column", "external", "text", "is_definition", "is_write")}),
+    ("api", "importers", None): (("status", "target", "total", "truncated", "importers", "index_age_s", "unresolved_total", "files_indexed", "scanned"),
+                                 {"importers": ("path", "line", "spec")}),
+    ("api", "imports", None): (("status", "target", "source", "files", "external", "unresolved", "index_age_s", "unresolved_total", "files_indexed",
+                                "scanned"),
+                               {"files": ("path", "line", "spec")}),
+    ("api", "symbols", None): (("status", "path", "source", "cached", "total", "truncated", "symbols"),
+                               {"symbols": ("name", "kind", "path", "line", "signature", "doc")}),
+}
+OPTIONAL = {"api": {"type_only", "dynamic", "config"}}  # on a CX3 edge row only when true / set
+
 CALLS = []
 INSTANCES = []   # (kind, constructor arguments) of every navigator the surface built
 BEHAVIOUR = {}   # {("web" | "api", method): answer dict or callable(args) -> answer dict}
@@ -49,50 +77,63 @@ class NavWeb:
             return out
         rows = {CART: [("addToCart", "function", 5), ("view", "const", 9)], ORDER: [("OrderSchema", "const", 3), ("Order", "type", 4)]}.get(file, [])
         shown = [{"name": n, "kind": k, "line": line, "reexport": False, "defined_at": None} for n, k, line in rows]
-        return {"status": "ok", "is_module": bool(rows), "exports": shown[:limit], "total": len(shown), "truncated": len(shown) > limit}
+        return {"status": "ok", "is_module": bool(rows), "exports": shown[:limit], "total": len(shown), "truncated": len(shown) > limit,
+                "index_age_s": 3}
 
     def imports(self, file, direction="imports", limit=25, depth=1):
+        """Rows as CX2's host.mjs op_imports emits them: direction "imports" rows are {specifier, line, resolved, external} (no from, to or
+        depth), sorted by line; direction "importers" rows are {from, line, specifier, to, depth}, sorted by depth, from, line."""
         out = self._go("imports", file=file, direction=direction, limit=limit, depth=depth)
         if out:
             return out
-        rows = []
-        if direction == "importers" and file == ORDER:
-            rows = [{"from": CART, "line": 1, "specifier": "../../../../lib/launchpad/types/order", "to": ORDER, "depth": 1}]
-            rows += [{"from": ORDERS, "line": 2, "specifier": "order.ts", "to": ORDER, "depth": 1}]
-            rows += [{"from": p, "line": 1, "specifier": "order", "to": ORDER, "depth": 1} for p in WEB_P]
-        elif direction == "imports" and file == CART:
-            rows = [{"from": CART, "line": 1, "specifier": "../../../../lib/launchpad/types/order", "to": ORDER, "depth": 1}]
-        elif direction == "importers" and file == CART:
-            rows = [{"from": "apps/launchpad/web/src/cart.spec.ts", "line": 1, "specifier": "./cart", "to": CART, "depth": 1}]
-        rows.sort(key=lambda r: (r["depth"], r["from"], r["line"]))
+        rows, unresolved = [], 0
+        if direction == "importers":
+            if file == ORDER:
+                rows = [{"from": CART, "line": 1, "specifier": "../../../../lib/launchpad/types/order", "to": ORDER, "depth": 1}]
+                rows += [{"from": ORDERS, "line": 2, "specifier": "order.ts", "to": ORDER, "depth": 1}]
+                rows += [{"from": p, "line": 1, "specifier": "order", "to": ORDER, "depth": 1} for p in WEB_P]
+            elif file == CART:
+                rows = [{"from": "apps/launchpad/web/src/cart.spec.ts", "line": 1, "specifier": "./cart", "to": CART, "depth": 1}]
+            rows.sort(key=lambda r: (r["depth"], r["from"], r["line"]))
+        elif file == CART:
+            rows = [{"specifier": "../../../../lib/launchpad/types/order", "line": 1, "resolved": ORDER, "external": False}]
+            unresolved = sum(1 for r in rows if r["resolved"] is None)  # host.mjs counts every row without a resolved path
+            rows.sort(key=lambda r: (r["line"], r["specifier"]))
         return {"status": "ok", "direction": direction, "target": file, "edges": rows[:limit], "total": len(rows),
-                "truncated": len(rows) > limit, "unresolved": 0}
+                "truncated": len(rows) > limit, "unresolved": unresolved, "index_age_s": 3}
 
     def definition(self, file, line=None, column=None, name=None):
         out = self._go("definition", file=file, line=line, column=column, name=name)
         if out:
             return out
         if file == CART and name == "addToCart":
-            row = {"path": CART, "line": 5, "column": 17, "name": "addToCart", "kind": "function", "container": "",
+            row = {"path": CART, "line": 5, "column": 17, "external": False, "name": "addToCart", "kind": "function", "container": "",
                    "text": "export function addToCart(item: unknown) {"}
             return {"status": "ok", "at": {"line": line or 5, "column": 1}, "definitions": [row],
                     "signature": "function addToCart(item: unknown): ZodSafeParseResult", "doc": "Adds an item to the cart. " + "x" * 600,
-                    "omitted_outside_root": 0}
+                    "omitted_outside_root": 0, "index_age_s": 3}
         return {"status": "not_found", "at": {"line": line or 1, "column": 1}, "definitions": [], "signature": "", "doc": "",
-                "omitted_outside_root": 0}
+                "omitted_outside_root": 0, "index_age_s": 3}
 
     def references(self, file, line=None, column=None, name=None, limit=25):
         out = self._go("references", file=file, line=line, column=column, name=name, limit=limit)
         if out:
             return out
+        at = {"line": 5, "column": 17}
         if file == CART and name == "addToCart":
-            rows = [{"path": p, "line": 1, "column": 10, "text": "addToCart(x)", "is_definition": False, "is_write": False} for p in WEB_P[:7]]
-            return {"status": "ok", "at": {"line": 5, "column": 17}, "definitions": [{"path": CART, "line": 5}], "references": rows[:limit],
-                    "total": len(rows), "truncated": len(rows) > limit, "omitted_outside_root": 0, "omitted_external": 0}
-        return {"status": "not_found", "definitions": [], "references": [], "total": 0, "truncated": False}
+            rows = [{"path": p, "line": 1, "column": 10, "external": False, "text": "addToCart(x)", "is_definition": False, "is_write": False}
+                    for p in WEB_P[:7]]
+            return {"status": "ok", "at": at, "definitions": [{"path": CART, "line": 5, "column": 17, "external": False, "name": "addToCart",
+                                                               "kind": "function"}],
+                    "references": rows[:limit], "total": len(rows), "truncated": len(rows) > limit, "omitted_outside_root": 0,
+                    "omitted_external": 0, "index_age_s": 3}
+        return {"status": "not_found", "at": at, "definitions": [], "references": [], "total": 0, "truncated": False, "omitted_outside_root": 0,
+                "omitted_external": 0, "index_age_s": 3}
 
     def stats(self):
-        return {"status": "ok"}
+        return {"status": "ok", "typescript": "5.4.5", "tsconfig": "apps/launchpad/web/tsconfig.json", "root_files": 12, "program_files": 40,
+                "program_builds": 1, "cold_build_ms": 900, "last_build_ms": 900, "import_edges_files": 12, "rss_mb": 200, "heap_mb": 90,
+                "index_age_s": 3}
 
 
 class NavApi:

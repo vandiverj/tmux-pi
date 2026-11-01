@@ -265,6 +265,30 @@ class RepeatedFamilyGateTests(RetryCase):
         (self.state / "tasks" / "review-1" / "result.md").write_text("not a verdict\n")
         self.assertEqual(self.plain_retry(item).returncode, 0)
 
+    def test_the_gate_words_are_true_for_every_caller_and_every_label_shape(self):
+        """caller (refusal, route Notes line, parked.md) x label shape -> the exact sentence; one table."""
+        unnamed = "reviews review-1 and review-2 both asked for changes (REQUEST_CHANGES twice in a row); "
+        named = "finding family state-matrix was named by review review-1 and again by review review-2"
+        table = (
+            ([[], []], unnamed + "review-1 gave no Family: line and review-2 gave no Family: line"),
+            ([["state-matrix"], []], unnamed + "review-1 gave state-matrix and review-2 gave no Family: line"),
+            ([[], ["state-matrix"]], unnamed + "review-1 gave no Family: line and review-2 gave state-matrix"),
+            ([["state-matrix"], ["error-path"]], unnamed + "review-1 gave state-matrix and review-2 gave error-path"),
+            ([["state-matrix"], ["state-matrix"]], named),
+        )
+        for rounds, words in table:
+            with self.subTest(rounds=rounds):
+                item = self.chain(*rounds)
+                refused = self.plain_retry(item)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(words + ": another retry would", refused.stderr)
+                routed = self.plain_retry(item, "--route", "rule-first")
+                self.assertEqual(routed.returncode, 0, routed.stderr)
+                self.assertIn(f"by route rule-first: {words};", self.packet(json.loads(routed.stdout)))
+                item = self.chain(*rounds)
+                self.assertEqual(self.plain_retry(item, "--route", "park").returncode, 0)
+                self.assertIn(f"{words[0].upper()}{words[1:]}. ", (self.task_dir(item) / "parked.md").read_text())
+
     def test_routes_take_an_unnamed_repeat_and_the_notes_and_parked_md_say_so(self):
         item = self.chain([], [])
         run = self.plain_retry(item, "--route", "rule-first")

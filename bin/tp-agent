@@ -571,10 +571,11 @@ ROUTE_SENTENCE = "the brief must change the rule or the design, not one more sit
 
 
 def repeated_family(base, task_id):
-    """(family, earlier_review, latest_review) when the newest review of the author chain of `task_id` was written for `task_id`
+    """(family, earlier_review, latest_review, given) when the newest review of the author chain of `task_id` was written for `task_id`
     itself and either names a finding family an earlier review of the chain also named (names matched case-folded, see
     review_verdict.families), or is the second REQUEST_CHANGES in a row (the review before it in the chain also asked for changes,
-    labelled or not); in that second case `family` is None, an unnamed family, and `earlier_review` is the review before it.
+    labelled or not); in that second case `family` is None, an unnamed family, and `earlier_review` is the review before it. `given` is
+    ((earlier_review, its names), (latest_review, its names)), the Family: names each of the two reviews gave ([] for none).
     None otherwise. A review whose reply cannot be read names no family and is no REQUEST_CHANGES. Raises review_rounds.Refused
     when the chain cannot be walked (the same limits as the review rounds)."""
     chain = review_rounds.chain_labels(base, task_id)
@@ -585,25 +586,27 @@ def repeated_family(base, task_id):
     for family in latest_families:
         for review, families in reversed(named[:-1]):
             if family in families:
-                return family, review, latest
+                return family, review, latest, ((review, families), (latest, latest_families))
     # an author with no review (a row with review None) and a review with no verdict sit between and break the run
     if len(chain) > 1 and chain[-1][2] == chain[-2][2] == "REQUEST_CHANGES":
-        return None, chain[-2][1], latest
+        return None, chain[-2][1], latest, ((chain[-2][1], chain[-2][3]), (latest, latest_families))
     return None
 
 
-def family_words(family, earlier, latest):
-    """The gate's finding in words: a named family, or the unnamed one of two REQUEST_CHANGES in a row."""
+def family_words(family, earlier, latest, given):
+    """The gate's finding in words. A named family: which two reviews named it. Unnamed: the two review ids, that both asked for
+    changes, and the names each gave ("no Family: line" for a review without one), whatever the label shape."""
     if family:
         return f"finding family {family} was named by review {earlier} and again by review {latest}"
-    return f"reviews {earlier} and {latest} both asked for changes (REQUEST_CHANGES twice in a row) and name no family twice"
+    gave = " and ".join(f"{review} gave {', '.join(names) if names else 'no Family: line'}" for review, names in given)
+    return f"reviews {earlier} and {latest} both asked for changes (REQUEST_CHANGES twice in a row); {gave}"
 
 
-def park_retry(base, previous, task_id, family, earlier, latest):
+def park_retry(base, previous, task_id, family, earlier, latest, given):
     """Write parked.md in the author task directory (a link already there is replaced, never written through) and return the
     record `retry --route park` prints: nothing is retried."""
     path = previous / "parked.md"
-    why = family_words(family, earlier, latest)
+    why = family_words(family, earlier, latest, given)
     atomic_text(path, f"# Parked: {task_id}\n\n{why[0].upper()}{why[1:]}. "
                       "Another retry on the same family would fix one more site; the owner decides what changes instead "
                       "(the rule, the design, or whether to stop).\n", base)
@@ -1452,8 +1455,7 @@ def main():
         if not args.force_alive:
             guard_retry(previous)
         if repeated and not args.route:
-            family, earlier, latest = repeated
-            raise ValueError(f"{family_words(family, earlier, latest)}: another retry would "
+            raise ValueError(f"{family_words(*repeated)}: another retry would "
                              f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
                              f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
         if args.route and not repeated:

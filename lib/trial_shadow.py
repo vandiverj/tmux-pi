@@ -50,10 +50,11 @@ before the session kill has one budget, STOP_TASKS_S, however many task dirs the
 as a commit id.
 
 Every read of a file the worker can write (run.json, the task's meta.json, process.json and dispatch.json, the source task's files, the
-worktree's .git file and the admin dir's gitdir, the owner record, and in lib/trial_record_stub.py the task, reviewer and result
-files) goes through `trial_session.read_plain`: opened O_NONBLOCK | O_NOFOLLOW, required to be a regular file of at most
+worktree's .git file and the admin dir's gitdir, the owner record, and, in lib/trial_record.py, the task, reviewer, result and
+transcript files) goes through `trial_session.read_plain`: opened O_NONBLOCK | O_NOFOLLOW, required to be a regular file of at most
 MAX_READ bytes (8 MiB), else it is treated as missing or invalid (a FIFO, a link, a directory or a huge file never holds the runner,
-so the session kill always runs). The stub opens records.jsonl for append the same way.
+so the session kill always runs). The record file is appended to only after `append_record` found its name and its lock's name
+free of anything but a regular file (`trial_record.append` opens them blocking, and a FIFO there would hold it).
 
 Known limits (non-hostile worker model). The worker is taken to make mistakes (a wrong branch, stray files, odd git state, a file
 of an odd type made by accident); it is not taken to forge records or to attack the runner. These are known and not defended; the
@@ -69,17 +70,17 @@ planned fix is to run the worker as a separate macOS user, which this module doe
      base commit, source task and pair id from it.
 Also not defended: a check is not atomic with the command after it (between `check_stop` and the tp-agent command that reads them,
 the worker can rewrite meta.json and process.json or the session's options; see `Owner`); the tp-* commands the run starts read the
-task's files themselves and are bounded only by CMD_TIMEOUT; and the record builder of lane L2 (lib/trial_record.py, which is not
-in this tree; lib/trial_record_stub.py is used) reads the task's files its own way before the cleanup.
+task's files themselves and are bounded only by CMD_TIMEOUT.
 
-The record comes from lib/trial_record.py (lane L2). Until it exists, lib/trial_record_stub.py (same call shape) is used.
-`gate_runs` is L2's field and is never read here.
+The record comes from lib/trial_record.py (lane L2): `build` for a task the worker left, `no_task` for a spawn that made none. Both
+give the keys lib/trial_report.py reads (the first review's outcome, size, gate_runs, ...); `gate_runs` is L2's field and is never
+read here.
 """
 
 import datetime
 import errno
 import fcntl
-import importlib.util
+import importlib
 import json
 import os
 import re
@@ -145,9 +146,22 @@ def now():
 
 
 def load_record_module():
-    """lib/trial_record.py (lane L2) when it exists, else the stub with the same call shape."""
-    name = "trial_record" if importlib.util.find_spec("trial_record") else "trial_record_stub"
-    return importlib.import_module(name)
+    """lib/trial_record.py (lane L2), imported when a record is first needed."""
+    return importlib.import_module("trial_record")
+
+
+def append_record(records, project, record):
+    """`records.append`, but never into a name that is not a plain file: L2's append opens records.jsonl and its lock for writing and
+    would wait for a reader at a FIFO, and the runner must go on to its cleanup. A name that is not there yet is made by the append."""
+    directory = records.trial_dir(project)
+    for name in (records.RECORDS, records.RECORDS + ".lock"):
+        try:
+            mode = os.lstat(str(directory / name)).st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(mode):
+            raise ShadowError("{} is not a plain file; the record was not written".format(directory / name))
+    records.append(project, record)
 
 
 # ---------------------------------------------------------------------------------------------------------------- run.json
@@ -810,12 +824,11 @@ class Run:
 
     def spawn_failed_record(self):
         """A failed spawn may leave no task dir, so the builder has nothing to read. The record still says what was tried and that it
-        failed (a spawn failure is data too), with the keys the builder's records share and `no_task` set."""
-        return {"schema": getattr(self.records, "SCHEMA", None), "created": now(), "pair_id": self.info["pair_id"], "arm": "qwen", "mode": "shadow",
-                "task_id": self.task_id, "role": self.source_role() or self.info.get("source_role"), "diff": None, "model": self.info["model"],
-                "effort": self.info["thinking"], "first_review_verdict": None, "review_rounds": 0, "reviewer_model": None,
-                "commit_messages": None, "base_commit": self.info["base_commit"], "brief_drift": None, "no_task": True,
-                "error": self.info.get("error")}
+        failed (a spawn failure is data too): L2's `no_task`, which has the keys the builder's records have and `no_task` set."""
+        record = self.records.no_task("qwen", "shadow", self.info["pair_id"], task_id=self.task_id, role=self.source_role() or self.info.get("source_role"),
+                                      model=self.info["model"], effort=self.info["thinking"], base_commit=self.info["base_commit"], now=now())
+        record["error"] = self.info.get("error")
+        return record
 
     def write_record(self):
         if self.recorded:
@@ -829,7 +842,7 @@ class Run:
             record = self.spawn_failed_record()
             record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
                            "normal_reviewer_model": self.info.get("normal_reviewer_model"), "reviewer_mismatch": None})
-            self.records.append(self.project, record)
+            append_record(self.records, self.project, record)
             self.note(recorded=now())
             return
         record = self.records.build(self.task_path(), "qwen", "shadow", self.info["pair_id"], state_dir=self.state, role=self.source_role(),
@@ -839,7 +852,7 @@ class Run:
         record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
                        "normal_reviewer_model": normal,
                        "reviewer_mismatch": None if not (normal and mine) else normal != mine})
-        self.records.append(self.project, record)
+        append_record(self.records, self.project, record)
         self.note(recorded=now())
 
     def source_role(self):
@@ -975,7 +988,7 @@ def _record_normal(owner, record_module, info=None):
     files, lines = _diff_counts(_json(path / "meta.json").get("workdir"), info["base_commit"])
     record = records.build(path, "normal", "shadow", info["pair_id"], state_dir=main_state, diff_files=files, diff_lines=lines)
     record.update({"run": run, "source_task": info["source_task"], "outcome": "completed"})
-    records.append(project, record)
+    append_record(records, project, record)
     owner.update(normal_recorded=now())
     return record
 

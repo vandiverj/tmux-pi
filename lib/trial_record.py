@@ -47,6 +47,15 @@ def trial_dir(project):
     return Path(project) / ".tmux-pi" / "trial"
 
 
+def _check(arm, mode, pair_id):
+    if arm not in ARMS:
+        raise RecordError("arm must be one of {}: {!r}".format(", ".join(ARMS), arm))
+    if mode not in MODES:
+        raise RecordError("mode must be one of {}: {!r}".format(", ".join(MODES), mode))
+    if not isinstance(pair_id, str) or not pair_id.strip():
+        raise RecordError("pair_id is required")
+
+
 def size_bucket(files, lines):
     """small / medium / large from the final diff's file and changed-line counts; None when either is unknown."""
     if not isinstance(files, int) or not isinstance(lines, int) or isinstance(files, bool) or isinstance(lines, bool):
@@ -236,12 +245,7 @@ def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files
 
     `commit_messages` are the bodies of `git log <base>..HEAD`, read before the shadow worktree is reset; they feed the
     commit and think-leak rules. `diff_files`/`diff_lines` come from the final diff. `brief_drift` is replay-only."""
-    if arm not in ARMS:
-        raise RecordError("arm must be one of {}: {!r}".format(", ".join(ARMS), arm))
-    if mode not in MODES:
-        raise RecordError("mode must be one of {}: {!r}".format(", ".join(MODES), mode))
-    if not isinstance(pair_id, str) or not pair_id.strip():
-        raise RecordError("pair_id is required")
+    _check(arm, mode, pair_id)
     original = Path(task_dir)
     state_dir = Path(state_dir) if state_dir else original.parent.parent
     with tempfile.TemporaryDirectory(prefix="tp-trial-record-") as scratch:
@@ -306,6 +310,48 @@ def _build(task_dir, state_dir, original, arm, mode, pair_id, role, diff_files, 
         "docs_calls": read_docs_calls(task_dir / "docs-calls.jsonl"),
         "base_commit": dispatch.get("base_commit") if isinstance(dispatch.get("base_commit"), str) else None,
         "brief_drift": brief_drift if mode == "replay" else None,
+    }
+
+
+def no_task(arm, mode, pair_id, *, task_id=None, role=None, model=None, effort=None, base_commit=None, now=None):
+    """The record of an attempt that made no task dir (a spawn that failed before tp-spawn wrote one), so there is nothing for `build`
+    to read. It has every key `build` gives, so the report reads it like any other: what was tried (ids, model, effort, base commit)
+    is filled in, everything about the work is None (not 0), so no median counts it, there is no first review (`no_review` in the
+    report) and `no_task` is true. The caller adds its own keys (the error, the run)."""
+    _check(arm, mode, pair_id)
+    return {
+        "schema": SCHEMA,
+        "created": now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pair_id": pair_id.strip(),
+        "arm": arm,
+        "mode": mode,
+        "task_id": task_id,
+        "role": role,
+        "size": None,
+        "diff": None,
+        "model": model,
+        "effort": effort,
+        "state": None,
+        "exit": None,
+        "first_review_verdict": None,
+        "first_review_outcome": None,
+        "review_rounds": None,
+        "reviewer_model": None,
+        "finding_categories": [],
+        "finding_closes_by": [],
+        "transcript": {"harness": None, "status": "missing", "commands": None, "bad_lines": 0},
+        "rule_slips": {"complete": False, "total": 0, "by_rule": {}},
+        "gate_runs": None,
+        "tokens": None,
+        "wall_time_s": None,
+        "turns": None,
+        "tool_errors": None,
+        "brief_size_bytes": None,
+        "context_files": None,
+        "docs_calls": None,
+        "base_commit": base_commit,
+        "brief_drift": None,
+        "no_task": True,
     }
 
 

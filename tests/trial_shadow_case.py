@@ -23,7 +23,7 @@ import test_trial_session as tts  # noqa: E402
 from lane_fixture import MODEL, ROOT, TMUX  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "lib"))
-import trial_record_stub  # noqa: E402
+import trial_record  # noqa: E402
 import trial_session  # noqa: E402
 import trial_shadow as ts  # noqa: E402
 
@@ -233,14 +233,17 @@ class ShadowCase(lw.LaneCase):
 
 
 class RecordingRecords:
-    """A record module that keeps what it was asked to build, in order, next to the stub it delegates to."""
+    """A record module that keeps what it was asked to build, in order, next to the real one (lib/trial_record.py) that it delegates to."""
+    RECORDS = trial_record.RECORDS
+    SCHEMA = trial_record.SCHEMA
 
     def __init__(self):
         self.calls = []
 
     def build(self, task_dir, arm, mode, pair_id, **kw):
         self.calls.append((arm, dict(kw)))
-        return trial_record_stub.build(task_dir, arm, mode, pair_id, **kw)
+        return trial_record.build(task_dir, arm, mode, pair_id, **kw)
 
-    append = staticmethod(trial_record_stub.append)
-    trial_dir = staticmethod(trial_record_stub.trial_dir)
+    no_task = staticmethod(trial_record.no_task)
+    append = staticmethod(trial_record.append)
+    trial_dir = staticmethod(trial_record.trial_dir)

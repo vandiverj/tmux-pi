@@ -71,10 +71,9 @@ class PureTests(unittest.TestCase):
         self.assertTrue(trial_session.RUN.fullmatch(ts.default_run_id("Very_Long Task.ID/with*odd" * 4, "20261031120000")))
         self.assertTrue(trial_session.RUN.fullmatch(ts.default_run_id("!!!", "1")))
 
-    def test_the_record_module_is_the_real_one_when_it_exists_else_the_stub(self):
-        import importlib.util
-        want = "trial_record" if importlib.util.find_spec("trial_record") else "trial_record_stub"
-        self.assertEqual(ts.load_record_module().__name__, want)
+    def test_the_record_module_is_lane_l2s_and_no_stub_is_left(self):
+        self.assertEqual(ts.load_record_module().__name__, "trial_record")
+        self.assertFalse((ROOT / "lib" / "trial_record_stub.py").exists())
 
 # ---------------------------------------------------------------------------------------------------------------- the source
 
@@ -264,7 +263,7 @@ class CollectWorkTests(ShadowCase):
         run.records = records
         self.edit(run, commits=(("lib/x.py", "x edited\n", "Change x"),))
         (run.task_path()).mkdir(parents=True)
-        (run.task_path() / "meta.json").write_text(json.dumps({"id": run.task_id, "role": "coder", "model": MODEL}))
+        (run.task_path() / "meta.json").write_text(json.dumps({"id": run.task_id, "role": "coder", "worker": "pi", "model": MODEL, "thinking": "medium"}))
         run.outcome = "completed"
         run.collect_work()
         run.write_record()

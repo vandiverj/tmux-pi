@@ -1627,10 +1627,12 @@ class ImportIndex:
         one judged, by the kernel's name, before it is listed.
 
         Nothing is asked of a name until it has been judged: the listing is kept as entries and none is asked its type until its name
-        is allowed, because `DirEntry.is_dir` stats the name on a file system whose listing gives no type. Once a name is allowed, one
-        with no source suffix is asked its type and dropped unless it is a folder, so it is never opened, read or looked at again.
-        (A guard-free skip of names that can never be source cannot know they are not folders without asking, and asking must wait
-        for the judgement.)"""
+        is allowed, because `DirEntry.is_dir` stats the name on a file system whose listing gives no type. Once a name is allowed, it is
+        looked at once, by `lstat` of the name in the folder's descriptor, never by `DirEntry.is_dir` (which may answer from the type
+        the listing cached and so never notice that the name has gone): a name that is gone or moved since the listing is a race
+        (`entry_changed`, so `stale_index`), any other error `entry_unreadable`. A name with no source suffix is then dropped unless
+        it is a folder, so it is never opened, read or looked at again. (A guard-free skip of names that can never be source cannot
+        know they are not folders without asking, and asking must wait for the judgement.)"""
         found = {}
         if self.root is None:
             return found
@@ -1657,18 +1659,13 @@ class ImportIndex:
                     rel = lexical_path(self.base, full)
                     if rel is None or name in SKIP_DIRS or not self._allowed(rel):
                         continue  # judged by its name: nothing is asked of it
-                    if not name.endswith(SOURCE_EXTENSIONS):
-                        try:
-                            if not entry.is_dir(follow_symlinks=False):
-                                continue  # allowed, but can never be read as a source nor descended into
-                        except OSError as error:
-                            self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
-                            continue
                     try:
-                        info = os.lstat(name, dir_fd=fd)
+                        info = os.lstat(name, dir_fd=fd)  # confirms the listed name is still there: the listing's type (`d_type`) may be old
                     except OSError as error:
-                        self._gap(_entry_gap(error))
+                        self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
                         continue
+                    if not name.endswith(SOURCE_EXTENSIONS) and not stat.S_ISDIR(info.st_mode):
+                        continue  # allowed and still there, but can never be read as a source nor descended into
                     config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
                     if stat.S_ISDIR(info.st_mode):
                         if not _excluded(config_rel, patterns):

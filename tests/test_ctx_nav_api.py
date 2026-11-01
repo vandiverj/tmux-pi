@@ -3075,8 +3075,7 @@ class PathRuleCase(Tree):
         ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "ImportIndex._walk", "os.scandir"): "that descriptor",
-        ("graph.py", "ImportIndex._walk", "entry.is_dir"): "after the guard allowed the name, and only for a name with no source suffix; no_follow (a stat of the name when the listing gives no type)",
-        ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name",
+                ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name; decides the type of every allowed name (no is_dir: the listing's type may be old)",
         ("nav_api.py", "stub_check_path", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi.__init__", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
@@ -4222,7 +4221,9 @@ class AnswerProofCase(Tree):
         self.assertNotIn("src/holdings/inner.ts", asked, "a refused folder is not listed")
         self.assertEqual(answer["status"], "ok", answer)
 
-    def test_s1_f1_an_allowed_name_is_asked_its_type_only_after_the_guard_and_a_source_name_is_not_asked(self):
+    def test_s1_f1_an_allowed_name_is_looked_at_only_after_the_guard_and_never_by_a_type_question(self):
+        """S4 F1: the walk decides the type of an allowed name by its own `lstat`, taken after the guard judged the name; `is_dir` is
+        never asked of any name, source or not (its answer may be the one cached at the listing)."""
         project = self.project().resolve()
         write(project / "src" / "notes.txt", "hello\n")
         order, log = [], []
@@ -4230,12 +4231,55 @@ class AnswerProofCase(Tree):
         def check(root, path):
             order.append(("guard", path.rsplit("/", 1)[-1]))
             return nav_api.stub_check_path(root, path)
-        real = self.unknown_type_listing(order)
-        with real:
+        real_lstat = graph.os.lstat
+
+        def lstat(path, *a, **k):
+            if k.get("dir_fd") is not None and path in ("notes.txt", "run.ts"):
+                order.append(("lstat", path))
+            return real_lstat(path, *a, **k)
+        with self.unknown_type_listing(order), mock.patch.object(graph.os, "lstat", lstat):
             answer = self.nav(project, check_path=check).importers("src/app/run.ts")
         self.assertEqual(answer["status"], "ok", answer)
-        self.assertLess(order.index(("guard", "notes.txt")), order.index(("is_dir", "notes.txt")))
-        self.assertNotIn(("is_dir", "run.ts"), order, "a source name is decided by its lstat, never by a type question")
+        self.assertLess(order.index(("guard", "notes.txt")), order.index(("lstat", "notes.txt")))
+        self.assertLess(order.index(("guard", "run.ts")), order.index(("lstat", "run.ts")))
+        self.assertFalse([item for item in order if item[0] == "is_dir"], "no name is asked a type question")
+
+    def test_s4_f1_a_non_source_entry_removed_after_the_listing_is_stale_index_with_the_real_listing_type(self):
+        """Review F1 (stale-index-listing-race): `DirEntry.is_dir` may answer from the type cached at the listing, so a non-source
+        name that went away after the listing was skipped with no gap. No `is_dir` is mocked: the guard (which runs after the
+        listing and before anything is asked of the name) removes the real file, and the walk's own `lstat` must see it gone."""
+        project = self.project().resolve()
+        notes = write(project / "src" / "notes.txt", "hello\n")
+
+        def check(root, path):
+            if path.rsplit("/", 1)[-1] == "notes.txt" and notes.exists():
+                notes.unlink()  # after the listing, after the name is judged, before it is skipped
+            return nav_api.stub_check_path(root, path)
+        answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assert_no_data(answer)
+        self.assertIn("entry_changed", json.dumps(answer))
+
+    def test_s4_f1_a_non_source_entry_that_cannot_be_looked_at_is_index_incomplete(self):
+        project = self.project().resolve()
+        write(project / "src" / "notes.txt", "hello\n")
+        real, judged = graph.os.lstat, []
+
+        def check(root, path):
+            got = nav_api.stub_check_path(root, path)
+            if path.endswith("notes.txt"):
+                judged.append(path)  # the guard's own looks at the name are done: the walk's lstat is the next one
+            return got
+
+        def lstat(path, *a, **k):
+            if path == "notes.txt" and judged:
+                raise PermissionError(errno.EACCES, "no")
+            return real(path, *a, **k)
+        with mock.patch.object(graph.os, "lstat", lstat):
+            answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertNotEqual(answer["status"], "ok", answer)
+        self.assertNotEqual(answer["status"], "stale_index", answer)
+        self.assertIn("entry_unreadable", json.dumps(answer))
 
     def test_s1_every_file_read_is_asked_of_the_guard_once_per_answer(self):
         project = self.project().resolve()
@@ -6529,33 +6573,18 @@ class EnvelopeCase(Tree):
 
     # --- the stale index
 
-    def listing_raising(self, name, error):
-        """An `os.scandir` whose entry `name` fails its type question with `error`."""
-        real = os.scandir
+    def lstat_raising(self, name, error):
+        """Patch the `lstat` of the entry `name` in a folder's descriptor so the walk's look at it (the second of a call: the guard's
+        own is the first) fails with `error`. The listing is the real one: no type question is mocked."""
+        real, seen = os.lstat, []
 
-        class Entry:
-            def __init__(self, entry):
-                self.entry, self.name = entry, entry.name
-
-            def is_dir(self, follow_symlinks=True):
-                if self.name == name:
+        def failing(path, *a, **k):
+            if k.get("dir_fd") is not None and path == name:
+                seen.append(1)
+                if len(seen) % 2 == 0:
                     raise error
-                return self.entry.is_dir(follow_symlinks=follow_symlinks)
-
-        class Listing:
-            def __init__(self, inner):
-                self.inner = inner
-
-            def __enter__(self):
-                self.inner.__enter__()
-                return self
-
-            def __exit__(self, *exc):
-                return self.inner.__exit__(*exc)
-
-            def __iter__(self):
-                return (Entry(entry) for entry in self.inner)
-        return mock.patch.object(graph.os, "scandir", lambda *a, **k: Listing(real(*a, **k)))
+            return real(path, *a, **k)
+        return mock.patch.object(os, "lstat", failing)
 
     def test_s4_an_entry_that_vanishes_or_moves_between_the_listing_and_its_type_check_is_a_stale_index(self):
         for error in (FileNotFoundError(2, "gone"), NotADirectoryError(20, "moved"), OSError(errno.ELOOP, "link on the way")):
@@ -6563,7 +6592,7 @@ class EnvelopeCase(Tree):
                 project = self.project(f"p{id(error)}").resolve()
                 write(project / "src" / "notes.txt", "hello\n")
                 nav = self.nav(project)
-                with self.listing_raising("notes.txt", error):
+                with self.lstat_raising("notes.txt", error):
                     self.blocked(nav.importers("src/util/slug.ts"), "stale_index", None, "entry_changed")
                 self.assert_whole_again(nav)
 
@@ -6573,14 +6602,14 @@ class EnvelopeCase(Tree):
                 project = self.project(f"p{id(error)}").resolve()
                 write(project / "src" / "notes.txt", "hello\n")
                 nav = self.nav(project)
-                with self.listing_raising("notes.txt", error):
+                with self.lstat_raising("notes.txt", error):
                     self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "entry_unreadable")
                 self.assert_whole_again(nav)
 
     def test_s4_a_type_check_that_fails_is_stale_on_every_index_route(self):
         project = self.project().resolve()
         write(project / "src" / "notes.txt", "hello\n")
-        with self.listing_raising("notes.txt", FileNotFoundError(2, "gone")):
+        with self.lstat_raising("notes.txt", FileNotFoundError(2, "gone")):
             nav = self.nav(project)
             self.blocked(nav.importers("src/util/slug.ts"), "stale_index", None, "entry_changed")
             answer = nav.imports("src/main.ts", source="index")

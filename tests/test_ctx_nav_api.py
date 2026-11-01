@@ -334,13 +334,17 @@ class IndexCase(Tree):
         self.assertEqual((after["scanned"], after["stale"]), (1, []))
         self.assertIn("src/lazy.ts", [e["from"] for e in index.importers("src/config.ts")])
 
-    def test_an_unreadable_or_oversized_file_has_no_edges_and_does_not_stop_the_build(self):
+    def test_an_unreadable_or_oversized_file_is_not_indexed_does_not_stop_the_build_and_is_a_gap(self):
+        """Round 10: it used to be an entry with no imports (a file that imports nothing). It is no entry, and `gaps` says so; the
+        rest of the index is built, and `NavApi` answers nothing from it (`IncompleteIndexCase`)."""
         project = self.project()
         write(project / "src" / "huge.ts", "import './config.ts';\n" + "// pad\n" * 10)
         with mock.patch.object(graph, "MAX_BYTES", 30):
             index = self.index(project, cache_path=None)
             index.refresh()
-        self.assertEqual(index.imports("src/huge.ts"), [])
+        self.assertIsNone(index.imports("src/huge.ts"))
+        self.assertIn("source_unreadable", index.gaps)  # (with the limit at 30 bytes, the other files and the config are over it too)
+        self.assertEqual(index.incomplete()[:2], ("incomplete", "index_incomplete"))
 
     def test_project_path_keeps_a_path_inside_and_refuses_one_that_leaves(self):
         base = str(self.dir.resolve())
@@ -3117,6 +3121,406 @@ class PathRuleCase(Tree):
         with mock.patch.object(Path, "read_text", lambda self: sample if self.name in ("graph.py", "nav_api.py") else ""):
             found = self.fs_calls()
         self.assertEqual(len([c for c in found if c[0] == "graph.py"]), 14, found)
+
+
+class IncompleteIndexCase(Tree):
+    """Round 10 (review 9 F1-F2, rule first): THE INDEX KEEPS A RECORD OF EVERY GAP, AND NO ANSWER IS `ok` WITH ONE OPEN. The index
+    (`graph.ImportIndex.gaps`) records whatever it could not get, and `NavApi._fresh` is the one place an index answer is let
+    through: a gap that is a refusal refuses (as the Deno side does), a gap that is a race gives `stale_index`, any other gives
+    `error` with `reason`; each names the gap codes (counts, never paths). The split, decided by Main: a file or folder the guard
+    refuses BY ITS NAME is outside the index by policy and is not a gap (`test_r9_policy_*`); a refusal at READ time, a path that
+    turns out to be outside the root, an unreadable folder, file or config, and a config the index cannot use are gaps. Every probe
+    of the family sweep is a test here; each failed against a83d75b (see the report)."""
+
+    needs_user = unittest.skipIf(os.geteuid() == 0, "root can read a file with mode 0")
+
+    def denied(self, path):
+        path = Path(path)
+        mode = path.stat().st_mode
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, mode & 0o7777)
+
+    def blocked(self, answer, status, reason, code, label=""):
+        self.assertEqual((answer["status"], answer.get("reason")), (status, reason), (label, answer))
+        self.assertIn(code, answer.get("gaps", {}), (label, answer))
+        for key in ("importers", "files", "external", "unresolved", "total"):
+            self.assertNotIn(key, answer, (label, answer))  # nothing is answered from part of the project
+        self.assertTrue(answer.get("next_step"), (label, answer))
+
+    def both(self, nav):
+        return {"importers": nav.importers("src/app/run.ts"), "imports": nav.imports("src/main.ts", source="index")}
+
+    def assert_whole_again(self, nav):
+        """The same questions, once the cause is gone, are answered in full (a failed read left nothing behind in the entries or the cache)."""
+        answers = self.both(nav)
+        self.assertEqual(answers["importers"]["status"], "ok", answers)
+        self.assertEqual([(i["path"], i["line"]) for i in answers["importers"]["importers"]],
+                         [("src/app/run_test.ts", 1), ("src/main.ts", 1), ("src/main.ts", 9)])
+        self.assertEqual(answers["imports"]["status"], "ok", answers)
+        self.assertTrue(answers["imports"]["files"], answers)
+
+    # --- F1: a folder or file the index could not read
+
+    @needs_user
+    def test_r9_f1_repro_an_unreadable_folder_is_not_an_empty_one(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.denied(project / "src")
+        answer = nav.importers("shared/types.ts")  # asked about a file beside the folder, so the guard has no objection to the target
+        self.blocked(answer, "error", "index_incomplete", "folder_unreadable")
+        os.chmod(project / "src", 0o755)
+        self.assertEqual([i["path"] for i in nav.importers("src/util/slug.ts")["importers"]], ["src/util/index.ts"])
+
+    @needs_user
+    def test_r9_f1_repro_an_unreadable_source_is_not_a_module_without_imports(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.denied(project / "src" / "main.ts")
+        answers = self.both(nav)
+        self.blocked(answers["importers"], "error", "index_incomplete", "source_unreadable")
+        self.blocked(answers["imports"], "error", "index_incomplete", "source_unreadable")
+        os.chmod(project / "src" / "main.ts", 0o644)
+        self.assert_whole_again(nav)  # not an entry with no imports, kept because its mtime did not change
+        self.assert_whole_again(self.nav(project))  # nor one saved in the cache
+
+    def test_r9_an_oversized_source_is_a_gap_not_an_empty_module(self):
+        project = self.project().resolve()
+        write(project / "src" / "huge.ts", "import './config.ts';\n" + "// pad\n" * 10)
+        with mock.patch.object(graph, "MAX_BYTES", 30):
+            self.blocked(self.nav(project).importers("src/config.ts"), "error", "index_incomplete", "source_unreadable")
+        (project / "src" / "huge.ts").unlink()
+        self.assertEqual(self.nav(project).importers("src/config.ts")["status"], "ok")
+
+    @needs_user
+    def test_r9_a_folder_that_can_be_entered_but_not_listed_is_a_gap(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        os.chmod(project / "src" / "util", 0o311)
+        self.addCleanup(os.chmod, project / "src" / "util", 0o755)
+        self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "folder_unreadable")
+
+    @needs_user
+    def test_r9_a_folder_that_can_be_listed_but_not_looked_into_is_a_gap_and_not_a_guard_refusal(self):
+        """Mode 0644: the names can be listed, none can be looked at, so the guard cannot judge them (`unreadable_path`). That is not
+        a refusal by name (the policy): before, the walk skipped each as one and the answer was `ok` without them."""
+        project = self.project().resolve()
+        nav = self.nav(project)
+        os.chmod(project / "src" / "util", 0o644)
+        self.addCleanup(os.chmod, project / "src" / "util", 0o755)
+        self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "guard_unjudged")
+        os.chmod(project / "src" / "util", 0o755)
+        self.assert_whole_again(nav)
+
+    def test_r9_a_guard_that_could_not_look_is_a_gap_in_the_index_and_a_refusal_everywhere_else(self):
+        project = self.project().resolve()
+        real = nav_api.stub_check_path
+
+        def guard(root, value):
+            if str(value).endswith("slug.ts"):
+                raise nav_api.Refused("unreadable_path")
+            return real(root, value)
+        nav = self.nav(project, check_path=guard)
+        self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "guard_unjudged")
+        self.assertEqual(nav.importers("src/util/slug.ts")["status"], "refused")  # the target itself: a refusal, as ever
+        self.assertTrue(nav._permits("src/main.ts"))
+        with self.assertRaises(graph.CannotJudge):
+            nav._permits("src/util/slug.ts")
+        index = graph.ImportIndex(str(project), str(project), str(project / "deno.json"), [], allow=nav._permits)
+        index.refresh()
+        self.assertEqual(graph.judged_is_file(str(project), "src/util/slug.ts", nav._permits), False)  # not an index user: a refusal
+
+    def test_r9_a_link_loop_in_the_tree_cannot_be_judged_and_a_dangling_link_can(self):
+        """A link that loops is a name the guard cannot follow (`unreadable_path`): a gap. A link to nothing leads nowhere: nothing to
+        judge, nothing missing. Neither is followed or indexed (the walk's policy for every link)."""
+        project = self.project().resolve()
+        os.symlink("nowhere.ts", project / "src" / "dangling.ts")
+        self.assert_whole_again(self.nav(project))
+        os.symlink("loop.ts", project / "src" / "loop.ts")
+        self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "guard_unjudged")
+        (project / "src" / "loop.ts").unlink()
+        self.assert_whole_again(self.nav(project))
+
+    def test_r9_a_fifo_source_is_not_a_module_and_a_fifo_config_is_a_gap(self):
+        project = self.project().resolve()
+        os.mkfifo(project / "src" / "pipe.ts")
+        self.assert_whole_again(self.nav(project))  # not a regular file: nothing a module can be read from, so nothing is missing
+        fifo = self.project("fifo").resolve()
+        (fifo / "deno.json").unlink()
+        os.mkfifo(fifo / "deno.json")
+        self.blocked(self.nav(fifo).importers("src/app/run.ts"), "error", "index_incomplete", "config_unreadable")
+
+    def test_r9_a_file_that_vanishes_between_the_listing_and_the_look_is_a_race(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        real = os.lstat
+
+        def vanishing(path, *a, **k):
+            if k.get("dir_fd") is not None and path == "slug.ts":
+                raise FileNotFoundError(2, "gone", path)
+            return real(path, *a, **k)
+        with mock.patch.object(os, "lstat", vanishing):
+            self.blocked(nav.importers("src/util/slug.ts"), "stale_index", None, "entry_changed")
+        self.assert_whole_again(nav)
+
+    def test_r9_an_entry_that_cannot_be_looked_at_is_a_gap(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        real = os.lstat
+
+        def denied(path, *a, **k):
+            if k.get("dir_fd") is not None and path == "slug.ts":
+                raise PermissionError(13, "denied", path)
+            return real(path, *a, **k)
+        with mock.patch.object(os, "lstat", denied):  # the guard and the walk both look at it: the guard cannot judge it
+            self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "guard_unjudged")
+        self.assert_whole_again(nav)
+
+    def test_r9_an_entry_the_guard_passed_but_the_walk_cannot_look_at_is_a_gap(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        real, seen = os.lstat, []
+
+        def denied(path, *a, **k):
+            if k.get("dir_fd") is not None and path == "slug.ts":
+                seen.append(1)
+                if len(seen) > 1:  # the first look is the guard's, the second the walk's
+                    raise PermissionError(13, "denied", path)
+            return real(path, *a, **k)
+        with mock.patch.object(os, "lstat", denied):
+            self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "entry_unreadable")
+        self.assert_whole_again(nav)
+
+    def test_r9_a_file_that_vanishes_between_the_walk_and_the_read_is_a_race(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        real = graph.read_sources
+
+        def racing(paths, *a, **k):
+            os.unlink(project / "src" / "lazy.ts")
+            return real(paths, *a, **k)
+        with mock.patch.object(graph, "read_sources", racing):
+            self.blocked(nav.importers("src/app/run.ts"), "stale_index", None, "source_changed")
+        self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+
+    def test_r9_a_file_swapped_for_a_link_between_the_walk_and_the_read_is_not_read_and_is_a_gap(self):
+        project = self.project().resolve()
+        secret = write(self.dir / "secret.ts", "import './LEAKED.ts';\n")
+        real = graph.read_sources
+
+        def racing(paths, *a, **k):
+            os.unlink(project / "src" / "lazy.ts")
+            os.symlink(secret, project / "src" / "lazy.ts")
+            return real(paths, *a, **k)
+        with mock.patch.object(graph, "read_sources", racing):  # a link that leads out is "outside" at read time: a gap, and not read
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+
+    def test_r9_a_folder_swapped_for_a_link_after_the_listing_is_a_race(self):
+        project = self.project().resolve()
+        elsewhere = self.dir / "elsewhere"
+        write(elsewhere / "slug.ts", "export const SWAPPED = 1;\n")
+        real = os.open
+        swapped = []
+
+        def swapping(path, *a, **k):  # after the listing saw a folder, before the walk opens it
+            if str(path) == str(project / "src" / "util") and not swapped:
+                swapped.append(1)
+                shutil.move(str(project / "src" / "util"), str(self.dir / "moved-util"))
+                (project / "src" / "util").symlink_to(elsewhere)
+            return real(path, *a, **k)
+        with mock.patch.object(os, "open", swapping):
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "stale_index", None, "folder_changed")
+        self.assertEqual(swapped, [1])
+
+    def test_r9_a_walk_that_is_not_the_one_judged_is_a_race_and_one_the_kernel_cannot_name_is_a_gap(self):
+        project = self.project().resolve()
+        with mock.patch.object(graph, "_opened_path", lambda fd: "/somewhere/else"):
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "stale_index", None, "folder_changed")
+        with mock.patch.object(graph, "_opened_path", lambda fd: None):
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "folder_unreadable")
+
+    # --- the split: refused by name is policy; refused or outside at read time is a gap
+
+    def test_r9_policy_a_file_or_folder_refused_by_its_name_is_outside_the_index_and_not_a_gap(self):
+        project = self.project().resolve()
+        write(project / "src" / "secrets" / "s.ts", "import '../util/slug.ts';\n")
+        write(project / "src" / ".env.ts", "import '../util/slug.ts';\n")
+        write(project / "src" / ".ssh" / "id.ts", "import '../util/slug.ts';\n")
+        answer = self.nav(project).importers("src/util/slug.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertNotIn("gaps", answer)
+        self.assertEqual([i["path"] for i in answer["importers"]], ["src/util/index.ts"])  # the refused files' edges are not named
+
+    def test_r9_a_refusal_at_read_time_is_a_gap(self):
+        project = self.project().resolve()
+        state = {"late": False}
+
+        def check(root, path):
+            if state["late"] and path.endswith("util/slug.ts"):
+                raise nav_api.Refused("sensitive_path")  # allowed when the walk judged the name, refused when the read does
+            return nav_api.stub_check_path(root, path)
+        real = graph.read_sources
+
+        def racing(paths, *a, **k):
+            state["late"] = True
+            return real(paths, *a, **k)
+        with mock.patch.object(graph, "read_sources", racing):
+            self.blocked(self.nav(project, check_path=check).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+
+    def test_r9_a_read_that_is_outside_the_root_is_a_gap(self):
+        project = self.project().resolve()
+        real = graph.read_bounded
+
+        def outside(path, admitted, boundary, allow, limit=None):
+            if str(path).endswith("util/slug.ts"):
+                return "outside", None, None
+            return real(path, admitted, boundary, allow, limit)
+        with mock.patch.object(graph, "read_bounded", outside):
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+
+    # --- F2: a config the index could not use
+
+    def test_r9_f2_repro_a_refused_config_refuses_the_index_answers_as_it_does_deno(self):
+        project = self.project().resolve()
+        write(project / ".git" / "deno.json", (project / "deno.json").read_text())
+        self.assertRaises(nav_api.Refused, nav_api.stub_check_path, str(project), ".git/deno.json")
+        nav = self.nav(project, config=str(project / ".git" / "deno.json"), deno=self.fake_deno('echo "{}"'))
+        self.assertEqual(nav.symbols("src/main.ts")["status"], "refused")  # the Deno side
+        answers = self.both(nav)
+        self.blocked(answers["importers"], "refused", "reaches_refused_path", "config_refused")
+        self.blocked(answers["imports"], "refused", "reaches_refused_path", "config_refused")
+        auto = nav.imports("src/main.ts")  # `auto` falls back to `deno info`, whose own proof refuses the same config
+        self.assertEqual((auto["status"], auto.get("reason")), ("refused", "reaches_refused_path"), auto)
+        self.assertNotIn(".git", json.dumps(answers))
+
+    def test_r9_f2_a_refused_or_outside_overlay_refuses_too(self):
+        project = self.project().resolve()
+        write(project / ".git" / "deno.test.json", json.dumps({"imports": {"@host": "./src/mock_host.ts"}}))
+        nav = self.nav(project, overlays=[str(project / ".git" / "deno.test.json")])
+        self.blocked(nav.importers("src/app/run.ts"), "refused", "reaches_refused_path", "config_refused", "overlay")
+        outside = write(self.dir / "outside.json", json.dumps({"imports": {}}))
+        linked = self.project("linked").resolve()
+        (linked / "deno.test.json").unlink()
+        (linked / "deno.test.json").symlink_to(outside)
+        got = self.nav(linked, overlays=[str(linked / "deno.test.json")]).importers("src/app/run.ts")
+        self.assertEqual(got["status"], "refused", got)
+        self.assertIn("config_refused", got["gaps"])
+
+    def test_r9_f2_a_config_that_leads_outside_or_changes_is_refused_or_a_race(self):
+        project = self.project().resolve()
+        index = graph.ImportIndex(str(project), cache_path=None, allow=stub_allow(project))
+        with mock.patch.object(graph, "_config_read", lambda *a: (("outside",), None)):
+            index.refresh()
+        self.assertEqual(index.incomplete()[:2], ("refused", "outside_project"))
+        self.assertIn("config_outside", index.gaps)
+        with mock.patch.object(graph, "_config_read", lambda *a: (("changed",), None)):
+            index.refresh()
+        self.assertEqual(index.incomplete()[0], "changed")
+        self.assertIn("config_changed", index.gaps)
+
+    def test_r9_f2_a_config_that_cannot_be_parsed_or_modelled_is_a_gap(self):
+        project = self.project().resolve()
+        original = (project / "deno.json").read_text()
+        nav = self.nav(project)
+        (project / "deno.json").write_text("{ not json")
+        self.blocked(nav.importers("src/app/run.ts"), "error", "unmodelled_config", "config_invalid")
+        (project / "deno.json").write_text("[1]")
+        self.blocked(nav.importers("src/app/run.ts"), "error", "unmodelled_config", "config_invalid")
+        for key, value in (("importMap", "./map.json"), ("patch", ["../x"]), ("unstable", ["sloppy-imports"]), ("workspace", ["./a"])):
+            config = json.loads(original)
+            config[key] = value
+            (project / "deno.json").write_text(json.dumps(config))
+            self.blocked(nav.importers("src/app/run.ts"), "error", "unmodelled_config", "config_unmodelled", key)
+        (project / "deno.json").write_text(original)
+        self.assert_whole_again(nav)
+
+    def test_r9_no_config_at_all_is_a_complete_index(self):
+        project = self.project().resolve()
+        (project / "deno.json").unlink()
+        answer = self.nav(project).importers("src/util/slug.ts")
+        self.assertEqual(answer["status"], "ok", answer)  # nothing is there, and the kernel said so: the map is empty, not unknown
+        self.assertNotIn("gaps", answer)
+
+    @needs_user
+    def test_r9_an_unreadable_config_is_a_gap(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.denied(project / "deno.json")
+        self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "config_unreadable")
+        os.chmod(project / "deno.json", 0o644)
+        self.assert_whole_again(nav)
+
+    def test_r9_a_root_that_is_refused_is_a_gap_in_the_index_itself(self):
+        project = self.project().resolve()
+        index = graph.ImportIndex(str(project), root=str(project / ".ssh"), cache_path=None, allow=stub_allow(project))
+        index.refresh()
+        self.assertEqual(index.incomplete()[:2], ("refused", "reaches_refused_path"))
+        self.assertIn("root_refused", index.gaps)
+
+    # --- an edge whose target could not be looked at
+
+    def test_r9_an_import_of_a_file_that_cannot_be_looked_at_is_not_a_missing_file(self):
+        project = self.project().resolve()  # src/main.ts imports ./data.json, which the walk does not index: it is looked at by name
+        real_look, real_nofollow = graph._look, graph.lstat_nofollow
+        for label, patched, code in (("judging the way", "_look", "guard_unjudged"), ("looking at the file", "lstat_nofollow", "target_unreadable")):
+            def denied(path, *a, _real=real_look if patched == "_look" else real_nofollow, **k):
+                if str(path).endswith("data.json"):
+                    raise PermissionError(13, "denied", path)
+                return _real(path, *a, **k)
+            with mock.patch.object(graph, patched, denied):
+                self.blocked(self.nav(project).imports("src/main.ts", source="index"), "error", "index_incomplete", code, label)
+
+    def test_r9_the_reach_walk_takes_nothing_there_as_nothing_and_a_file_it_cannot_look_at_as_unproven(self):
+        """`prove_reach` (the Deno side) has its own `continue`: a file gone is nothing; one that cannot be looked at is not."""
+        project = self.project().resolve()
+        real = graph.lstat_nofollow
+
+        def look(path):
+            if str(path).endswith("config.ts"):
+                raise PermissionError(13, "denied", path)
+            return real(path)
+        for patched, ok in ((real, True), (look, False)):
+            with mock.patch.object(graph, "lstat_nofollow", patched):
+                nav = self.nav(project)
+                answer = nav.imports("src/main.ts", source="deno")
+                if ok:
+                    self.assertEqual(answer["status"], "ok", answer)
+                else:
+                    self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unreadable_file"), answer)
+
+    def test_r9_a_target_that_is_not_there_is_missing_and_not_a_gap(self):
+        project = self.project().resolve()
+        write(project / "src" / "uses.ts", "import './nowhere.ts';\n")
+        answer = self.nav(project).imports("src/uses.ts", source="index")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual([u["reason"] for u in answer["unresolved"]], ["missing"])
+
+    # --- bookkeeping
+
+    def test_r9_gaps_are_forgotten_when_the_cause_is_gone_and_do_not_pile_up(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        seen = []
+        for _ in range(2):
+            with mock.patch.object(graph, "_opened_path", lambda fd: None):
+                seen.append(nav.importers("src/app/run.ts")["gaps"])
+        self.assertEqual(seen[0], seen[1])
+        self.assert_whole_again(nav)
+
+    def test_r9_status_says_what_the_index_could_not_get(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        with mock.patch.object(graph, "_opened_path", lambda fd: None):
+            nav.importers("src/app/run.ts")
+        self.assertIn("folder_unreadable", nav.status().get("index_gaps", {}))
+
+    def test_r9_a_cache_written_before_this_change_is_not_trusted(self):
+        project = self.project().resolve()
+        cache = project_cache(project, nav_api.NavApi._cache_name("index", self.nav(project)._root_key()))
+        write(cache, json.dumps({"version": 1, "base": str(project), "root": str(project),
+                                 "entries": {"src/main.ts": {"key": [0, 0], "specs": []}}}))
+        index = graph.ImportIndex(str(project), cache_path=str(cache), allow=stub_allow(project))
+        self.assertEqual(index.entries, {})
+        self.assertEqual(self.nav(project).importers("src/app/run.ts")["status"], "ok")
 
 
 if __name__ == "__main__":

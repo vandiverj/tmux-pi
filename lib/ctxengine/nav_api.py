@@ -8,6 +8,18 @@ Three sources, each used for what it is good at:
     first doc-comment lines), cached by the content hash of every file the walk reached.
   - `deno info --json`: the forward module graph of one entry, capped at 30 s. Used when the index cannot be built, or when asked for.
 
+Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
+a file or folder the guard refuses BY ITS NAME is outside the index by policy (not listed, read or counted; its edges are not
+named), and is not a gap. A refusal at read time, a path that turns out to be outside the root, a folder, file, entry or import
+target that cannot be read or looked at, a name the guard could not judge because it could not look (`unreadable_path`: not a
+refusal by name; `graph.CannotJudge`), a config or overlay that is refused, outside, unreadable, not JSON or not modelled (the
+same configs the Deno side refuses), and a root that is refused are gaps (`graph.GAPS`). A gap that is a refusal gives `refused`
+(with the Deno side's `reason`), a race (a file gone or a link in its place between the walk and the read) `stale_index`, anything
+else `error` with `reason`; each carries `gaps` ({code: count}, no paths) and no data. A missing config is no gap (nothing is
+there), nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
+its own reach. A link in the tree is not followed or indexed (as before): an edge through one is not in the index; this is a
+policy limit of the walk, not a gap.
+
 Every answer is a dict with a `status`: `ok`, `unavailable` (no `deno`, for the operations that need it), `no_project` (no such
 directory), `refused` (a path outside the project, or a sensitive one), `bad_argument`, `not_found`, `stale_index` (a file changed
 while it was being read; ask again), `timeout`, `error`. Anything other than `ok` carries a one-line `next_step`.
@@ -95,6 +107,9 @@ Known limits (what is not proven):
     either, so a hard-linked source file can be taken as changed (a refusal, never a wrong answer).
   - The mirror holds the bytes the walk read, so a file swapped for a link after the walk cannot reach Deno; a change to a file the
     walk read is still noticed afterwards (`stale_index`), so an answer is never given for a tree that moved.
+  - Cleaning up a mirror (`graph.remove_own_folder`) holds the parent's descriptor but does not keep the identity of the folder it
+    made: a process of the same operating-system user that swaps its own scratch folder for another between the make and the
+    removal gets the other one removed. Accepted: that user can remove those files anyway, and nothing is read through it.
   - Case-insensitive file systems: a name that differs from a refused one only by case is the guard's to refuse.
   - The index (importers/imports) is not part of the proof; its edges ignore `@deno-types`/`@ts-types` pragmas and percent-encoded
     spellings, so an importer list can miss an edge Deno would see.
@@ -148,7 +163,10 @@ SANDBOX_APPLY_FAILED = 71  # sandbox-exec's exit status when the profile could n
 SANDBOX_NEXT_STEP = "Deno is only run inside an operating-system sandbox (macOS sandbox-exec); importers and imports still work without it"
 GRANT_NEXT_STEP = ("point DENO_DIR (and XDG_CACHE_HOME) at a directory outside the project and its repository, and keep the deno "
                    "executable outside them; importers and imports still work without Deno")
-SCRATCH_NEXT_STEP = "pass a mirror_parent outside the project and outside any sensitive folder"
+INDEX_NEXT_STEP = ("make the folders, files and config the index could not read readable, or use a config it can model; `gaps` counts "
+                   "what was missed. imports from `deno info` do not need the index")
+CONFIG_NEXT_STEP = "point config (and overlays) at a file inside the project that the guard allows"
+SCRATCH_NEXT_STEP ="pass a mirror_parent outside the project and outside any sensitive folder"
 SCRATCH_REASON = "scratch_unavailable"  # internal: the directory for a probe or a mirror could not be made (an error, not a refusal)
 WORKSPACE_MARKERS = ("pnpm-workspace.yaml", "turbo.json", "nx.json", "lerna.json", "rush.json")
 NEXT_STEP = {
@@ -365,7 +383,22 @@ class NavApi:
             stats = index.refresh()
         except OSError as error:
             return None, None, _answer("error", detail=f"index could not be built: {type(error).__name__}")
+        blocked = index.incomplete()
+        if blocked:
+            return None, None, self._incomplete(*blocked)
         return index, stats, None
+
+    @staticmethod
+    def _incomplete(kind, reason, gaps):
+        """The answer for an index that could not get everything (`graph.ImportIndex.incomplete`): never `ok`, and no part of what
+        it did get. `refused` is the Deno side's answer for the same config; a race is `stale_index`; the rest is an `error` that
+        names the reason. `gaps` are codes and counts, never paths."""
+        if kind == "refused":
+            return _answer("refused", reason=reason, gaps=gaps, next_step=CONFIG_NEXT_STEP)
+        if kind == "changed":
+            return _answer("stale_index", gaps=gaps, detail="a file or folder changed while the index was being built")
+        return _answer("error", reason=reason, gaps=gaps, next_step=INDEX_NEXT_STEP,
+                       detail="part of the project could not be read, so nothing is answered from the rest")
 
     def _target(self, path):
         """(relative path, None) for a path that may be asked about, or (None, answer)."""
@@ -710,7 +743,15 @@ class NavApi:
         return self._version or None
 
     def _permits(self, rel):
-        return self._allowed(rel) is not None
+        """The guard's verdict as a bool, for `graph`. A guard that refused because it could not look (`unreadable_path`) did not
+        judge the name: `graph.CannotJudge`, which every user but the index takes as a refusal, and the index records as a gap."""
+        try:
+            got = self.check_path(self.project_root, rel)
+        except Exception as error:
+            if getattr(error, "reason", None) == "unreadable_path":
+                raise graph.CannotJudge(rel) from None
+            return False
+        return isinstance(got, str)
 
     def _prove(self, rel):
         """(reach, None) when every module Deno would load from `rel` has been shown allowed (`graph.prove_reach`), else
@@ -957,4 +998,6 @@ class NavApi:
             out["root_refused"] = self._root_refusal
         if self._index is not None:
             out.update(files_indexed=len(self._index.entries), index_age_s=self._index.age_s())
+            if self._index.gaps:
+                out["index_gaps"] = dict(self._index.gaps)
         return self._out(out)

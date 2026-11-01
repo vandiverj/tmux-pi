@@ -104,6 +104,8 @@ def _index_line(row):
             note = " [review unusable: neither a rejection nor an approval]"
         else:
             note = ""
+        if _is_text(row.get("family_missing")) and row["family_missing"] != "":
+            note += " [no Family: line on a round 3+ REQUEST_CHANGES]"
         fields.append(f"verdict={row['verdict']}{note}")
     if _is_text(row.get("result_path")):
         fields.append(row["result_path"])

@@ -105,3 +105,27 @@ Labels are conservative:
 Selections and exports are raw material for later evals, instruction tuning, fine-tuning or an
 alternative router. Nothing here retrains the learned layer or reads the frozen qualification set.
 Retraining stays `bin/tp-calibrate` behind its tune/holdout gate.
+
+## Task families and finding-family labels
+
+```sh
+bin/tp-evals families [--project DIR] [--json]
+```
+
+Groups the tasks of one piece of work (attempts, reviews, accepted attempt, tokens, wall time; see `lib/task_family.py`).
+Each family record also carries the `Family:` labels reviewers gave their findings, read from each review's `result.md` with
+`review_verdict.families` (the same rule as `Closes by:` labels: a label counts only when it ends its line and is not quoted):
+
+- `families`: one list of names per review round, in round order (same length as `review_rounds`). A round with no label is `[]`.
+  A review whose `result.md` is missing, empty, oversized or unreadable is an unlabelled round; it never stops the report.
+  The label comes from `result.md` alone: a malformed `acceptance-items.json` (or any other companion file) does not drop it.
+  (The verdict is separate: `review_outcome` reads the review with its companion list and calls such a review `unparsed`.)
+  Each entry of `reviews` carries the same list as its own `families`.
+- `labelled_rounds`: how many rounds have at least one name.
+- `repeated_families`: the names that appear in 2 or more rounds (a name repeated inside one round counts once).
+
+Text output prints, under each family that has any label, one line: `families: <names of round 1> | <names of round 2> | ...` (`-` for an
+unlabelled round), `labelled rounds N/M` and `repeated: <names>` (`-` for none). It ends with one summary line over the families printed:
+`family labels: rounds with a label N/M; families with a repeated name K; families with 3+ REQUEST_CHANGES and no repeated name J`.
+The last count uses reviews whose verdict is `REQUEST_CHANGES` (an `UNUSABLE` or `incomplete` review is not counted). `--json` prints
+the records only, without the summary line. Nothing is written; this is a read-only report.

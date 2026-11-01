@@ -4364,6 +4364,15 @@ export default [
      "review_unusable": "REQUEST_CHANGES without a Closes by: code finding"
     },
     {
+     "id": "rev-4",
+     "role": "reviewer",
+     "harness": "pi",
+     "status": "settled",
+     "verdict": "REQUEST_CHANGES",
+     "review_complete": true,
+     "family_missing": "round 3 REQUEST_CHANGES with no Family: line; name the finding family of each finding"
+    },
+    {
      "id": "bad",
      "status": "failed",
      "reason": "exit 1"
@@ -4377,7 +4386,7 @@ export default [
    "unstatused": [],
    "recent": []
   },
-  "text": "tmux-pi task index (injected; run `tp-agent index` only if this is missing):\nobjective: ship it\nreplied without a result status: none\npaused: none\nneeds input:\n- coder-ask coder pi needs_input [awaits: capability request pending]\n- coder-perm coder pi needs_input [awaits: permission prompt pending]\n- coder-bare coder pi needs_input\nqueue entries that will not start:\n- shape01 queued (start refused: the queue entry is not an object)\nactive:\n- coder-1 coder claude working\npending:\n- rev-1 reviewer pi settled result=complete verdict=approve [review incomplete: not an approval] /s/rev-1/result.md\n- rev-2 reviewer pi settled verdict=approve\n- rev-3 reviewer pi settled verdict=REQUEST_CHANGES [review unusable: neither a rejection nor an approval]\n- bad failed (exit 1)"
+  "text": "tmux-pi task index (injected; run `tp-agent index` only if this is missing):\nobjective: ship it\nreplied without a result status: none\npaused: none\nneeds input:\n- coder-ask coder pi needs_input [awaits: capability request pending]\n- coder-perm coder pi needs_input [awaits: permission prompt pending]\n- coder-bare coder pi needs_input\nqueue entries that will not start:\n- shape01 queued (start refused: the queue entry is not an object)\nactive:\n- coder-1 coder claude working\npending:\n- rev-1 reviewer pi settled result=complete verdict=approve [review incomplete: not an approval] /s/rev-1/result.md\n- rev-2 reviewer pi settled verdict=approve\n- rev-3 reviewer pi settled verdict=REQUEST_CHANGES [review unusable: neither a rejection nor an approval]\n- rev-4 reviewer pi settled verdict=REQUEST_CHANGES [no Family: line on a round 3+ REQUEST_CHANGES]\n- bad failed (exit 1)"
  },
  {
   "name": "paused tier 1: full rows",

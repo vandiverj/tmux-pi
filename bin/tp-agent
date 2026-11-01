@@ -20,6 +20,7 @@ import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import failing_tests  # noqa: E402
+import family_sweep  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
 import owner_confirm  # noqa: E402
@@ -131,6 +132,26 @@ def usage_fields(state):
     return fields
 
 
+FAMILY_ROUND = 3  # a REQUEST_CHANGES from this review round on is expected to say which finding family it belongs to
+
+
+def unlabelled_round(path, review_id):
+    """A sentence when the review in `path` (a reviewer task) is round FAMILY_ROUND or later of its author chain and, though it
+    asks for changes, has no Family: line; None otherwise (flagged in the verdict summary, never refused). The round is the number
+    review_rounds.chain_labels gives it, the one tp-review shows the reviewer (reviews with a reply, oldest first); a chain that cannot be walked flags nothing."""
+    try:
+        author = (path / "review-of").read_text().strip()
+        base = path.parent.parent
+        rows = review_rounds.chain_labels(base, author)
+    except (OSError, review_rounds.Refused):
+        return None
+    for _, review, _, families, number in rows:
+        if review == review_id and number:
+            return (f"round {number} REQUEST_CHANGES with no Family: line; name the finding family of each finding"
+                    if number >= FAMILY_ROUND and not families else None)
+    return None
+
+
 def record(path, include_result=False):
     meta = read_json(path / "meta.json")
     state = read_json(path / "state.json")
@@ -180,6 +201,10 @@ def record(path, include_result=False):
         except ValueError as exc:
             result["verdict"], result["verdict_notes"], incomplete = "unparseable", str(exc), str(exc)
         result["review_complete"] = incomplete is None
+        if result["verdict"] == "REQUEST_CHANGES":
+            unlabelled = unlabelled_round(path, result["id"])
+            if unlabelled:
+                result["family_missing"] = unlabelled
         if incomplete:
             result["review_incomplete_reason"] = incomplete
             result["stated_result_status"], result["result_status"] = result["result_status"], "incomplete"
@@ -300,7 +325,7 @@ def build_index(base):
                "reason", "updated")}
         # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves. A
         # REQUEST_CHANGES with no Closes by: code finding keeps its verdict and says why it is neither a rejection nor an approval
-        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "lane", "lane_step")
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step")
                     if key in row})
         if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
             out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1
@@ -547,36 +572,47 @@ ROUTE_SENTENCE = "the brief must change the rule or the design, not one more sit
 
 
 def repeated_family(base, task_id):
-    """(family, earlier_review, latest_review) when the newest review of the author chain of `task_id` was written for `task_id`
-    itself and names a finding family an earlier review of the chain also named (names matched case-folded, see
-    review_verdict.families); None otherwise. A review whose reply cannot be read names no family. Raises review_rounds.Refused
+    """(family, earlier_review, latest_review, given) when the newest review of the author chain of `task_id` was written for `task_id`
+    itself and either names a finding family an earlier review of the chain also named (names matched case-folded, see
+    review_verdict.families), or is the second REQUEST_CHANGES in a row (the review before it in the chain also asked for changes,
+    labelled or not); in that second case `family` is None, an unnamed family, and `earlier_review` is the review before it. `given` is
+    ((earlier_review, its names), (latest_review, its names)), the Family: names each of the two reviews gave ([] for none).
+    None otherwise. A review whose reply cannot be read names no family and is no REQUEST_CHANGES. Raises review_rounds.Refused
     when the chain cannot be walked (the same limits as the review rounds)."""
-    chain = review_rounds.earlier_reviews(base, task_id)
-    if not chain or chain[-1][0] != task_id:
+    chain = review_rounds.chain_labels(base, task_id)
+    if not chain or chain[-1][0] != task_id or chain[-1][1] is None:  # the newest review was not written for task_id
         return None
-    named = []
-    for _, review in chain:
-        try:
-            named.append((review, review_verdict.families((task_dir(base, review) / "result.md").read_text())))
-        except (OSError, ValueError):
-            named.append((review, []))
+    named = [(review, families) for _, review, _, families, _ in chain if review]
     latest, latest_families = named[-1]
     for family in latest_families:
         for review, families in reversed(named[:-1]):
             if family in families:
-                return family, review, latest
+                return family, review, latest, ((review, families), (latest, latest_families))
+    # an author with no review (a row with review None) and a review with no verdict sit between and break the run
+    if len(chain) > 1 and chain[-1][2] == chain[-2][2] == "REQUEST_CHANGES":
+        return None, chain[-2][1], latest, ((chain[-2][1], chain[-2][3]), (latest, latest_families))
     return None
 
 
-def park_retry(base, previous, task_id, family, earlier, latest):
+def family_words(family, earlier, latest, given):
+    """The gate's finding in words. A named family: which two reviews named it. Unnamed: the two review ids, that both asked for
+    changes, and the names each gave ("no Family: line" for a review without one), whatever the label shape."""
+    if family:
+        return f"finding family {family} was named by review {earlier} and again by review {latest}"
+    gave = " and ".join(f"{review} gave {', '.join(names) if names else 'no Family: line'}" for review, names in given)
+    return f"reviews {earlier} and {latest} both asked for changes (REQUEST_CHANGES twice in a row); {gave}"
+
+
+def park_retry(base, previous, task_id, family, earlier, latest, given):
     """Write parked.md in the author task directory (a link already there is replaced, never written through) and return the
     record `retry --route park` prints: nothing is retried."""
     path = previous / "parked.md"
-    atomic_text(path, f"# Parked: {task_id}\n\nThe finding family `{family}` was named by review {earlier} and again by review {latest}. "
+    why = family_words(family, earlier, latest, given)
+    atomic_text(path, f"# Parked: {task_id}\n\n{why[0].upper()}{why[1:]}. "
                       "Another retry on the same family would fix one more site; the owner decides what changes instead "
                       "(the rule, the design, or whether to stop).\n", base)
     return {"id": task_id, "parked": str(path), "family": family, "reviews": [earlier, latest],
-            "next": f"No attempt was started. The owner decides: {family} was named in {earlier} and {latest}."}
+            "next": f"No attempt was started. The owner decides: {family or 'two REQUEST_CHANGES in a row'} in {earlier} and {latest}."}
 
 
 def replay_inputs(previous, kept, problem=None):
@@ -590,6 +626,7 @@ def replay_inputs(previous, kept, problem=None):
     contexts, omitted = admitted_context(previous, kept["context"])
     omitted = len(set(kept["omitted_context"] + omitted))
     notes = [note for note in kept["notes"] if not note.startswith("Retry of ")]
+    contexts = [spec for spec in contexts if not family_sweep.is_sweep(spec)]  # the sweep of the prior retry; the next one makes its own
     return contexts, notes, (f"{omitted} context input(s) omitted as sensitive in the prior attempt were not replayed"
                              if omitted else "")
 
@@ -1082,6 +1119,23 @@ def discover_context(task, workdir=None):
     return {"contexts": out["contexts"], "reasons": context_reasons(out["manifest"]), "skipped": out["skipped"]}
 
 
+def dispatched_sweep(base, task_id):
+    """The path of the sweep.md among the context files `task_id` was dispatched with (dispatch.json), or None. A dispatch record that
+    cannot be read names none. A sweep that has since gone from disk is said on stderr and the review goes on without it."""
+    try:
+        specs = read_json(task_dir(base, task_id) / "dispatch.json").get("context") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    found = [spec for spec in specs if isinstance(spec, str) and family_sweep.is_sweep(spec)]
+    if not found:
+        return None
+    path = Path(found[-1])
+    if not path.is_file():
+        print(f"tp-agent: {task_id} was dispatched with {path}, which is gone; the review runs without it (the sweep's table is not checked)", file=sys.stderr)
+        return None
+    return str(path)
+
+
 def review(base, args):
     """Run bin/tp-review for a finished task. The reviewer is chosen by the resolver (lib/model_router.review_plan):
     never the author's provider when another is available."""
@@ -1101,6 +1155,9 @@ def review(base, args):
         raise ValueError("--dispositions may be given only once")
     for path in args.dispositions:  # what Main ruled on in earlier rounds; bin/tp-review refuses an unusable (or empty-named) file
         command += ["--dispositions", path]
+    sweep = dispatched_sweep(base, args.id)  # the sweep.md the task was dispatched with: the review confirms its table
+    if sweep:
+        command += ["--sweep", sweep]
     if args.same_provider:
         if not (args.approved_by_user or "").strip():
             raise ValueError("--same-provider needs --approved-by-user with the user's approval quoted")
@@ -1420,12 +1477,11 @@ def main():
         if not args.force_alive:
             guard_retry(previous)
         if repeated and not args.route:
-            family, earlier, latest = repeated
-            raise ValueError(f"finding family {family} was named by review {earlier} and again by review {latest}: another retry would "
+            raise ValueError(f"{family_words(*repeated)}: another retry would "
                              f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
                              f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
         if args.route and not repeated:
-            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named, "
+            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
                              "so there is nothing to route; retry without --route")
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
@@ -1438,6 +1494,13 @@ def main():
             raise ValueError(f"{problem}; the prior attempt's test scope is unknown, pass --tests")
         else:
             tests = kept["tests"] or TESTS_DEFAULT  # None only in an older valid record
+        if repeated and args.route in ("rule-first", "design"):  # the gated retry gets sweep.md, written beside parked.md and attached as context
+            try:
+                sweep = previous / family_sweep.SWEEP_NAME
+                atomic_text(sweep, family_sweep.build(base, args.id, repeated[0], meta.get("workdir")), base)
+                contexts = contexts + [str(sweep)]
+            except (review_rounds.Refused, OSError, ValueError) as error:  # a sweep that cannot be made does not stop the retry
+                print(f"tp-agent: sweep.md was not written: {error}", file=sys.stderr)
         lane_meta = lane_tags(meta)
         preroute = None
         if args.escalate:
@@ -1461,7 +1524,7 @@ def main():
                                          tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
                                                       + brief_note + (f" {remark}; see the prior packet." if remark else "")]
-                                         + ([f"Retry of {args.id} by route {args.route}: finding family {repeated[0]} was named by review {repeated[1]} and again by review {repeated[2]}; {ROUTE_SENTENCE}."]
+                                         + ([f"Retry of {args.id} by route {args.route}: {family_words(*repeated)}; {ROUTE_SENTENCE}."]
                                             if args.route else []))
         value = dispatch(replacement, base)
         if problem is not None:  # reachable only through an explicit --tests

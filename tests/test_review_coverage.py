@@ -17,6 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import routing_evals  # noqa: E402
 import task_record  # noqa: E402
@@ -263,6 +264,38 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn("Closes by: code", rows["rv-check"]["review_unusable"])
         for ident in ("code", "bare", "ok"):
             self.assertNotIn("review_unusable", rows[f"rv-{ident}"], ident)
+
+    def test_a_round_three_request_changes_with_no_family_line_is_flagged_not_refused(self):
+        rc = lambda *fam: "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong.\n" + "".join(f"Family: {f}\n" for f in fam) + "Closes by: code\n" + COMPLETE
+        for n, reply in ((1, rc()), (2, rc()), (3, rc()), (4, rc("state-matrix")), (5, "APPROVED\n" + COMPLETE)):
+            self.task(f"rv{n}", reply, review_of="author")
+        self.task("author", "done\n", meta={"reviews": [f"rv{n}" for n in range(1, 6)]})
+        flags = {n: self.agent.record(self.state / "tasks" / f"rv{n}").get("family_missing") for n in range(1, 6)}
+        self.assertEqual([n for n, v in flags.items() if v], [3])
+        self.assertIn("round 3 REQUEST_CHANGES with no Family: line", flags[3])
+        self.assertEqual(self.agent.record(self.state / "tasks" / "rv3")["verdict"], "REQUEST_CHANGES")
+        rows = {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}
+        self.assertIn("family_missing", rows["rv3"])
+        self.assertNotIn("family_missing", rows["rv2"])
+
+    def test_the_flag_numbers_rounds_as_tp_review_does(self):
+        # rv2 has no reply (tp-review skips it) and w1, between w0 and w2, has no review: rv3 is round 2, rv4 round 3
+        rc = "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong.\nCloses by: code\n" + COMPLETE
+        self.task("rv1", rc, review_of="w0")
+        self.task("rv2", rc, review_of="w0").joinpath("result.md").unlink()
+        self.task("rv3", rc, review_of="w2")
+        self.task("rv4", rc, review_of="w3")
+        self.task("w0", "x\n", meta={"reviews": ["rv1", "rv2"]})
+        self.task("w1", "x\n", meta={"parent": "w0"})
+        self.task("w2", "x\n", meta={"parent": "w1", "reviews": ["rv3"]})
+        self.task("w3", "x\n", meta={"parent": "w2", "reviews": ["rv4"]})
+        flags = {n: self.agent.record(self.state / "tasks" / n).get("family_missing") for n in ("rv1", "rv3", "rv4")}
+        self.assertEqual([n for n, v in flags.items() if v], ["rv4"])
+        self.assertIn("round 3 REQUEST_CHANGES", flags["rv4"])
+        # the round tp-review would give the next review of w2 is the same count the flag used for a review in that place
+        out = self.state / "out"
+        out.mkdir()
+        self.assertEqual(review_rounds.prepare(self.state, "w2", self.state, out)["rounds"], 2)
 
     # escalation evidence
     def test_escalation_counts_a_stated_request_changes_and_never_an_incomplete_approval(self):

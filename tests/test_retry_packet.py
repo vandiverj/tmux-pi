@@ -104,7 +104,9 @@ class FixBriefTests(RetryCase):
         self.assertEqual(review_verdict.named_briefs(self.request(again)), [brief])
 
 
-def review_text(*families):
+def review_text(*families, verdict="REQUEST_CHANGES"):
+    if verdict != "REQUEST_CHANGES":
+        return f"{verdict}\nRESULT_STATUS: complete\n\nCoverage\nI read the changed files and their callers.\n"
     labels = "".join(f"F{n} [defect] one cell of the matrix is wrong.\nFamily: {name}\nCloses by: code\n\n" for n, name in enumerate(families, 1))
     return (f"REQUEST_CHANGES\nRESULT_STATUS: complete\n{labels or 'F1 [defect] wrong.\nCloses by: code\n'}\n"
             "Coverage\nI read the changed files and their callers.\n")
@@ -210,12 +212,94 @@ class RepeatedFamilyGateTests(RetryCase):
 
     def test_a_family_round_one_did_not_name_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], ["error-path"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
 
-    def test_a_latest_review_naming_no_family_allows_a_plain_retry(self):
+    def test_a_latest_review_naming_no_family_after_an_approval_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], [])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
         self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_two_request_changes_in_a_row_refuse_a_plain_retry_with_no_family_named(self):
+        for rounds in ([[], []], [["state-matrix"], ["error-path"]]):
+            with self.subTest(rounds=rounds):
+                item = self.chain(*rounds)
+                before = self.tasks()
+                run = self.plain_retry(item)
+                self.assertEqual(run.returncode, 1, run.stdout)
+                for word in ("review-1", "review-2", "REQUEST_CHANGES twice in a row", "--route rule-first", "--route design", "--route park"):
+                    self.assertIn(word, run.stderr)
+                self.assertNotIn("finding family", run.stderr)
+                self.assertEqual(self.tasks(), before)
+
+    def test_an_approval_between_two_request_changes_breaks_the_run(self):
+        item = self.chain(["a"], ["b"], ["c"])  # round 2 is gated, so the chain passes through --route design
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def unreviewed_chain(self, shape):
+        """RC=a REQUEST_CHANGES review, --=an author retried and settled with no review at all; the newest author is returned."""
+        item = self.settled()
+        for number, step in enumerate(shape, 1):
+            if number > 1:
+                run = self.plain_retry(item)
+                if run.returncode:
+                    run = self.plain_retry(item, "--route", "design")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                item = json.loads(run.stdout)
+                self.settle(item, "RESULT_STATUS: complete\nDone.\n")
+            if step == "RC":
+                self.attach_review(item, f"review-{number}")
+        return item
+
+    def test_a_retry_nobody_reviewed_breaks_the_run_wherever_it_sits(self):
+        for shape, gated in ((["RC", "--", "RC"], False), (["--", "RC", "RC"], True), (["--", "--", "RC"], False),
+                             (["RC", "--", "--", "RC"], False), (["RC", "RC"], True), (["RC", "--"], False)):
+            with self.subTest(shape=shape):
+                item = self.unreviewed_chain(shape)
+                self.assertEqual(self.plain_retry(item).returncode, 1 if gated else 0)
+
+    def test_a_review_that_cannot_be_read_breaks_the_run(self):
+        item = self.chain([], [])
+        (self.state / "tasks" / "review-1" / "result.md").write_text("not a verdict\n")
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_the_gate_words_are_true_for_every_caller_and_every_label_shape(self):
+        """caller (refusal, route Notes line, parked.md) x label shape -> the exact sentence; one table."""
+        unnamed = "reviews review-1 and review-2 both asked for changes (REQUEST_CHANGES twice in a row); "
+        named = "finding family state-matrix was named by review review-1 and again by review review-2"
+        table = (
+            ([[], []], unnamed + "review-1 gave no Family: line and review-2 gave no Family: line"),
+            ([["state-matrix"], []], unnamed + "review-1 gave state-matrix and review-2 gave no Family: line"),
+            ([[], ["state-matrix"]], unnamed + "review-1 gave no Family: line and review-2 gave state-matrix"),
+            ([["state-matrix"], ["error-path"]], unnamed + "review-1 gave state-matrix and review-2 gave error-path"),
+            ([["state-matrix"], ["state-matrix"]], named),
+        )
+        for rounds, words in table:
+            with self.subTest(rounds=rounds):
+                item = self.chain(*rounds)
+                refused = self.plain_retry(item)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(words + ": another retry would", refused.stderr)
+                routed = self.plain_retry(item, "--route", "rule-first")
+                self.assertEqual(routed.returncode, 0, routed.stderr)
+                self.assertIn(f"by route rule-first: {words};", self.packet(json.loads(routed.stdout)))
+                item = self.chain(*rounds)
+                self.assertEqual(self.plain_retry(item, "--route", "park").returncode, 0)
+                self.assertIn(f"{words[0].upper()}{words[1:]}. ", (self.task_dir(item) / "parked.md").read_text())
+
+    def test_routes_take_an_unnamed_repeat_and_the_notes_and_parked_md_say_so(self):
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "rule-first")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("both asked for changes", self.packet(json.loads(run.stdout)))
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "park")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        parked = (self.task_dir(item) / "parked.md").read_text()
+        for word in ("review-1", "review-2", "REQUEST_CHANGES"):
+            self.assertIn(word, parked)
 
     def test_only_the_latest_review_is_judged_against_the_earlier_ones(self):
         item = self.chain(["state-matrix", "error-path"], ["state-matrix"], ["error-path"])  # round 3 repeats a family of round 1 only
@@ -232,6 +316,7 @@ class RepeatedFamilyGateTests(RetryCase):
 
     def test_a_route_without_a_repeated_family_is_refused(self):
         item = self.chain(["state-matrix"], ["error-path"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         before = self.tasks()
         run = self.plain_retry(item, "--route", "park")
         self.assertEqual(run.returncode, 1, run.stdout)
@@ -253,6 +338,70 @@ class RepeatedFamilyGateTests(RetryCase):
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("repeated-family gate was not checked", run.stderr)
+
+
+SITE_REVIEW = ("REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] the matrix cell is wrong at lib/matrix.py:12 and `lib/other.py:40`.\n"
+               "Family: state-matrix\nCloses by: code\n\nCoverage\nI read the changed files and their callers.\n")
+
+
+class SweepTests(RepeatedFamilyGateTests):
+    """sweep.md: generated on a gated retry (--route rule-first or design), attached after the task, not replayed, not on a plain retry."""
+    for _name in [n for n in dir(RepeatedFamilyGateTests) if n.startswith("test_")]:
+        locals()[_name] = None  # the gate's own tests are not run again here
+    del _name
+
+    def gated(self, *extra):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        (self.state / "tasks" / "review-1" / "result.md").write_text(SITE_REVIEW.replace("lib/matrix.py:12", "lib/early.py:3"))
+        (self.state / "tasks" / "review-2" / "result.md").write_text(SITE_REVIEW)
+        run = self.plain_retry(item, *extra)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return item, json.loads(run.stdout)
+
+    def test_a_gated_retry_gets_sweep_md_in_its_packet_after_the_task_and_keeps_the_route_note(self):
+        for route in ("rule-first", "design"):
+            with self.subTest(route=route):
+                item, again = self.gated("--route", route)
+                self.assertTrue((self.task_dir(item) / "sweep.md").is_file())
+                packet = self.packet(again)
+                for word in ("# Sweep: finding family `state-matrix`", "lib/early.py:3", "lib/matrix.py:12", "lib/other.py:40",
+                             "| Site | Disposition | Evidence |", "git -C ", f"route {route}"):
+                    self.assertIn(word, packet)
+                self.assertLess(packet.index(OLD), packet.index("# Sweep:"))  # after the task
+                self.assertIn(f"## .tmux-pi/tasks/{item['id']}/sweep.md", packet)  # the packet names a context file relative to the workdir
+
+    def test_an_unnamed_family_retry_gets_one_too(self):
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "rule-first")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("# Sweep: the unnamed family", self.packet(json.loads(run.stdout)))
+
+    def test_a_retry_that_was_not_gated_gets_no_sweep(self):
+        item = self.chain(["a"], ["b"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
+        again = json.loads(self.plain_retry(item).stdout)
+        self.assertNotIn("# Sweep", self.packet(again))
+        self.assertFalse((self.task_dir(item) / "sweep.md").exists())
+
+    def test_route_park_writes_no_sweep(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        self.assertEqual(self.plain_retry(item, "--route", "park").returncode, 0)
+        self.assertFalse((self.task_dir(item) / "sweep.md").exists())
+
+    def test_the_sweep_is_not_replayed_into_the_next_retry(self):
+        item, again = self.gated("--route", "rule-first")
+        self.settle(again, "RESULT_STATUS: complete\nDone.\n")
+        later = self.retry(again, "later")
+        self.assertNotIn("# Sweep", self.packet(later))
+        self.assertNotIn("sweep.md", (self.task_dir(later) / "dispatch.json").read_text())
+
+    def test_a_sweep_that_cannot_be_made_does_not_stop_the_retry(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        (self.task_dir(item) / "sweep.md").mkdir()  # a directory where the file goes: the write fails
+        run = self.plain_retry(item, "--route", "design")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("sweep.md was not written", run.stderr)
+        self.assertNotIn("# Sweep", self.packet(json.loads(run.stdout)))
 
 
 @unittest.skipUnless(TMUX, "tmux not installed")

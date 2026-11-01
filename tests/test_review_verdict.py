@@ -182,6 +182,47 @@ class FamilyTests(unittest.TestCase):
         self.assertEqual(review_verdict.closes_by(text), ["code"])
 
 
+class SweepRowsTests(unittest.TestCase):
+    """A review of a task with a sweep.md: unresolved rows of the coder's table that carry no Closes by: note keep an approval
+    from being complete (REQUEST_CHANGES is not touched). Recorded beside the review as sweep-rows.json by bin/tp-review."""
+    OK = "\nCoverage\nI reviewed a.py and checked its callers and the tests.\n"
+
+    def text(self, verdict, open_rows):
+        return review_verdict.ReviewText(f"{verdict}\nRESULT_STATUS: complete\n{self.OK}", None, open_rows)
+
+    def test_an_approval_with_an_open_row_is_incomplete_and_names_the_site(self):
+        for verdict in ("APPROVED", "APPROVED_WITH_NOTES"):
+            problem = review_verdict.assess(self.text(verdict, ["lib/a.py:12"]))[2]
+            self.assertIn("lib/a.py:12", problem)
+            self.assertIn("Closes by:", problem)
+            self.assertFalse(review_verdict.approves(self.text(verdict, ["lib/a.py:12"])))
+
+    def test_the_other_cases_are_untouched(self):
+        self.assertIsNone(review_verdict.assess(self.text("APPROVED", None))[2])    # no sweep
+        self.assertIsNone(review_verdict.assess(self.text("APPROVED", []))[2])      # a sweep with nothing open
+        self.assertIsNone(review_verdict.assess(self.text("REQUEST_CHANGES", ["x.py:1"]))[2])  # a rejection stays a rejection
+        self.assertTrue(review_verdict.approves(self.text("APPROVED", [])))
+
+    def test_strip_keeps_the_rows(self):
+        self.assertIn("x.py:1", review_verdict.assess(self.text("APPROVED", ["x.py:1"]).strip())[2])
+
+    def test_read_review_applies_the_recorded_rows_and_a_record_that_cannot_be_read_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = Path(tmp, "result.md")
+            result.write_text(f"APPROVED\nRESULT_STATUS: complete\n{self.OK}")
+            self.assertIsNone(review_verdict.assess(review_verdict.read_review(result))[2])
+            Path(tmp, "sweep-rows.json").write_text(json.dumps({"open": ["lib/a.py:12"]}))
+            self.assertIn("lib/a.py:12", review_verdict.assess(review_verdict.read_review(result))[2])
+            out = subprocess.run([sys.executable, str(ROOT / "lib/review_verdict.py"), str(result)], text=True, capture_output=True)
+            self.assertFalse(json.loads(out.stdout)["complete"])
+            Path(tmp, "sweep-rows.json").write_text(json.dumps({"open": []}))
+            self.assertIsNone(review_verdict.assess(review_verdict.read_review(result))[2])
+            for bad in ("{not json", json.dumps({"open": "x"}), json.dumps({"open": [1]}), json.dumps([])):
+                Path(tmp, "sweep-rows.json").write_text(bad)
+                with self.assertRaises(ValueError):
+                    review_verdict.read_review(result)
+
+
 class SuppliedProblemTests(unittest.TestCase):
     """The one rule for a file Main supplies, which tp-review and tp-agent retry share."""
 

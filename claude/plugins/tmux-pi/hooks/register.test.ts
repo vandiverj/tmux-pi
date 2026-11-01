@@ -897,6 +897,19 @@ test('the injected index marks a REQUEST_CHANGES with no Closes by: code finding
   expect(text).not.toContain('rv-code code-reviewer settled verdict=REQUEST_CHANGES [')
 })
 
+test('the injected index flags a round 3+ REQUEST_CHANGES with no Family: line beside its verdict', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [
+    { id: 'rv-flag', role: 'code-reviewer', status: 'settled', verdict: 'REQUEST_CHANGES', review_complete: true, family_missing: 'round 3 REQUEST_CHANGES with no Family: line; name the finding family of each finding' },
+    { id: 'rv-plain', role: 'code-reviewer', status: 'settled', verdict: 'REQUEST_CHANGES', review_complete: true },
+  ]
+  await $.session.start(start(true))
+  const text = await injected($ as never, w)
+  expect(text).toContain('rv-flag code-reviewer settled verdict=REQUEST_CHANGES [no Family: line on a round 3+ REQUEST_CHANGES]')
+  expect(text).toContain('rv-plain code-reviewer settled verdict=REQUEST_CHANGES')
+  expect(text).not.toContain('rv-plain code-reviewer settled verdict=REQUEST_CHANGES [')
+})
+
 test('refused queue entries sit with paused and awaiting rows, ahead of the active rows', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [

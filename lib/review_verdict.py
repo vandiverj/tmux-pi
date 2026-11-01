@@ -109,7 +109,7 @@ def read_review(path):
         raise ValueError(f"the review result {path} is not valid UTF-8: {exc}") from None
     if not text.strip():
         raise ValueError(f"the review result {path} is empty")
-    return ReviewText(text, recorded_items(path))
+    return ReviewText(text, recorded_items(path), recorded_sweep_open(path))
 
 
 class ReviewText(str):
@@ -117,13 +117,14 @@ class ReviewText(str):
     that assess() applies the Acceptance criteria rule for every consumer that reads a reply through read_review. strip()
     keeps them: tp-agent, lane_steps, routing_evals and task_record all pass the text on after it."""
 
-    def __new__(cls, text, items=None):
+    def __new__(cls, text, items=None, sweep_open=None):
         self = super().__new__(cls, text)
         self.acceptance_items = list(items) if items else None
+        self.sweep_open = None if sweep_open is None else list(sweep_open)  # None: no sweep; []: a sweep with nothing open
         return self
 
     def strip(self, *chars):
-        return ReviewText(super().strip(*chars), self.acceptance_items)
+        return ReviewText(super().strip(*chars), self.acceptance_items, self.sweep_open)
 
 
 ITEMS_FILE = "acceptance-items.json"  # beside a review's result.md; bin/tp-review writes it when the task listed numbered criteria
@@ -144,6 +145,26 @@ def recorded_items(result_path):
     if not isinstance(items, list) or not all(isinstance(i, int) and not isinstance(i, bool) and i > 0 for i in items):
         raise ValueError(f"the acceptance items recorded in {path} are not a list of item numbers")
     return items or None
+
+
+SWEEP_FILE = "sweep-rows.json"  # beside a review's result.md; bin/tp-review writes it when the task had a sweep.md
+
+
+def recorded_sweep_open(result_path):
+    """The sites of the unresolved rows without a Closes by: note that bin/tp-review recorded beside `result_path` ([] when the sweep
+    had none), or None when the task had no sweep. A record that exists but cannot be read refuses, as recorded_items does."""
+    path = os.path.join(os.path.dirname(os.fspath(result_path)), SWEEP_FILE)
+    try:
+        with open(path, "rb") as handle:
+            value = json.loads(handle.read(MAX_REVIEW_BYTES).decode("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"the sweep rows recorded in {path} are unreadable: {exc}") from None
+    rows = value.get("open") if isinstance(value, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, str) for row in rows):
+        raise ValueError(f"the sweep rows recorded in {path} are not a list of sites")
+    return rows
 
 
 def normalise(text):
@@ -316,13 +337,23 @@ def acceptance_problem(text, items):
     return None
 
 
+def sweep_problem(verdict, sweep_open):
+    """Why an approval cannot stand, or None: the task's sweep.md table has `unresolved` rows with no `Closes by:` note
+    (family_sweep.open_rows). A REQUEST_CHANGES keeps its verdict; no sweep (None) or none open asks nothing."""
+    if verdict == "REQUEST_CHANGES" or not sweep_open:
+        return None
+    return (f"the sweep's table has {len(sweep_open)} unresolved row{'s' if len(sweep_open) > 1 else ''} with no Closes by: note "
+            f"({', '.join(sweep_open)}); it cannot be approved until each has one or is resolved")
+
+
 def assess(text):
     """(verdict, notes, incomplete_reason) for a reviewer's reply; ValueError when the reply is not a verdict. The stated
     verdict is always kept for the record; incomplete_reason is None only for a review with a non-empty Coverage section and,
     when its task listed numbered acceptance criteria (a ReviewText from read_review carries them), an Acceptance criteria
-    section that names every item."""
+    section that names every item; and, for an approval, when the task's sweep table had unresolved rows with no Closes by: note."""
     verdict, notes = parse(text)
-    return verdict, notes, coverage_problem(text) or acceptance_problem(text, getattr(text, "acceptance_items", None))
+    return verdict, notes, (coverage_problem(text) or acceptance_problem(text, getattr(text, "acceptance_items", None))
+                            or sweep_problem(verdict, getattr(text, "sweep_open", None)))
 
 
 # "Closes by: code|check|decision|none" ends each finding (bin/tp-review findings_rule). Case-insensitive; Markdown bold may surround

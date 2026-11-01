@@ -30,7 +30,7 @@ class TpReviewTests(unittest.TestCase):
         shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
         for name in ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py"):   # the last two: the files contract.py's lifecycle and bin/tp-agent read: the files contract.py's lifecycle reads
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py"):   # the last two: the files contract.py's lifecycle and bin/tp-agent read: the files contract.py's lifecycle reads
             shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
         shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
         (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
@@ -652,6 +652,50 @@ echo review-1
         self.assertIn("recorded no reviewed state", (copies / names[2]).read_text())
         self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviews"], ["old-2", "review-1"])
 
+    def lineage(self, old1, old2):
+        """The task reviewed twice already (old-1 on its parent w0, old-2 on itself) with these replies."""
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.reviewer_dir("old-1", old1)
+        self.reviewer_dir("old-2", old2)
+        parent = self.state / "tasks" / "w0"
+        parent.mkdir()
+        (parent / "meta.json").write_text(json.dumps({"id": "w0", "worker": "pi", "workdir": str(self.work), "review": "old-1", "reviews": ["old-1"]}))
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"parent": "w0", "review": "old-2", "reviews": ["old-2"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+
+    def test_a_later_round_lists_the_family_names_of_the_earlier_rounds_and_asks_for_reuse_or_new(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\nFamily: State-Matrix\nCloses by: code\n", "REQUEST_CHANGES\nF1 y\nFamily: error-path\nCloses by: code\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.log.read_text()
+        self.assertIn("This is review round 3 of this work", log)
+        self.assertIn("Family names used by the earlier rounds: round 1: state-matrix; round 2: error-path.", log)
+        self.assertIn("'Family: <that name>' exactly as written", log)
+        self.assertIn("for a finding that is new, say in the finding that it is new", log)
+        self.assertIn("From round 3 on, a REQUEST_CHANGES reply with no 'Family:' line is flagged in the verdict summary", log)
+
+    def test_a_round_two_with_names_and_a_round_with_none_say_so_without_the_round_three_flag(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\nFamily: state-matrix\nCloses by: code\n", "REQUEST_CHANGES\nF1 y\nCloses by: code\n")
+        (self.state / "tasks" / "w0" / "meta.json").write_text(json.dumps({"id": "w0", "worker": "pi", "workdir": str(self.work)}))
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"parent": None, "review": "old-1", "reviews": ["old-1"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.log.read_text()
+        self.assertIn("This is review round 2 of this work", log)
+        self.assertIn("Family names used by the earlier rounds: round 1: state-matrix.", log)
+        self.assertNotIn("From round 3 on", log)
+
+    def test_rounds_that_named_no_family_say_so(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\n", "REQUEST_CHANGES\nF1 y\n")
+        self.assertEqual(self.review().returncode, 0)
+        log = self.log.read_text()
+        self.assertIn("No earlier round named a finding family", log)
+        self.assertNotIn("Family names used by the earlier rounds", log)
+
     def test_recorded_state_that_cannot_be_used_refuses_before_spawning(self):
         self.git("init", "-q")
         self.reviewer_dir("old-1", "REQUEST_CHANGES\nF1\n", {"workdir": str(self.work.resolve()), "tree": "0" * 40})
@@ -1167,6 +1211,138 @@ echo review-1
         (self.work / "x.ts").write_text("await sleep(50)\n")
         self.assertEqual(self.review().returncode, 0)
         self.assertIn("none were found", self.copy(self.spawn_contexts()[-1]).read_text())
+
+
+    # F4: a task with a sweep.md is reviewed against its table
+    SWEEP_TABLE = ("| Site | Disposition | Evidence |\n| --- | --- | --- |\n| `lib/a.py:12` | fixed | changed |\n"
+                   "| `bin/tp-x:7` | unresolved | owner picks. Closes by: decision |\n| `lib/b.py:30` | unresolved | blocked |\n")
+
+    def sweep(self, family="date-parse"):
+        d = self.state / "tasks" / "w0"
+        d.mkdir(exist_ok=True)
+        (d / "sweep.md").write_text(f"# Sweep: finding family `{family}`\n\nSWEEP-BODY\n")
+        return str(d / "sweep.md")
+
+    def sweep_marker(self):
+        return self.state / "tasks" / "review-1" / "sweep-rows.json"
+
+    def test_a_sweep_and_the_coders_table_are_attached_and_the_reviewer_is_asked_to_confirm_each_row(self):
+        (self.task / "result.md").write_text("done\n\n" + self.SWEEP_TABLE + "\nRESULT_STATUS: complete\n")
+        r = self.review("--sweep", self.sweep())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertIn("sweep-review.md", names)
+        attached = self.copy("sweep-review.md").read_text()
+        for part in ("SWEEP-BODY", "| `bin/tp-x:7` | unresolved |", "| `lib/b.py:30` | unresolved | blocked |"):
+            self.assertIn(part, attached)
+        task = self.task_text()
+        self.assertIn("Confirm each row against the tree", task)
+        self.assertIn("add every site the table missed as a row", task)
+        self.assertIn("'Family: date-parse'", task)
+        self.assertIn("cannot be APPROVED", task)
+        self.assertIn("`lib/b.py:30`", task)  # the open row is named
+        self.assertNotIn("`bin/tp-x:7`", task.split("cannot be APPROVED", 1)[1].split("\n")[0])  # the one with a note is not
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": ["`lib/b.py:30`"]})
+
+    def test_a_sweep_with_no_readable_table_is_said_and_records_nothing_open(self):
+        r = self.review("--sweep", self.sweep())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no table", self.copy("sweep-review.md").read_text())
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": []})
+
+    def test_the_table_in_the_durable_report_alone_holds_the_approval(self):
+        (self.task / "report.md").write_text("# Report\n\n" + self.SWEEP_TABLE)
+        (self.task / "result.md").write_text("done, see report.md\nRESULT_STATUS: complete\n")
+        r = self.review("--sweep", self.sweep())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("read from report.md", self.copy("sweep-review.md").read_text())
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": ["`lib/b.py:30`"]})
+
+    def test_a_table_in_both_is_read_from_the_report_and_the_file_says_so(self):
+        (self.task / "report.md").write_text(self.SWEEP_TABLE)
+        (self.task / "result.md").write_text("| Site | Disposition | Evidence |\n| --- | --- | --- |\n| `lib/z.py:1` | fixed | ok |\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        attached = self.copy("sweep-review.md").read_text()
+        self.assertIn("read from report.md", attached)
+        self.assertNotIn("lib/z.py:1", attached)
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": ["`lib/b.py:30`"]})
+
+    def test_a_report_that_cannot_be_read_is_an_open_row(self):
+        (self.task / "report.md").write_text(self.SWEEP_TABLE)
+        (self.task / "report.md").chmod(0)
+        try:
+            if os.access(self.task / "report.md", os.R_OK):
+                self.skipTest("file permissions are not enforced here")
+            self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        finally:
+            (self.task / "report.md").chmod(0o644)
+        self.assertEqual(len(json.loads(self.sweep_marker().read_text())["open"]), 1)
+        self.assertIn("cannot be read", json.loads(self.sweep_marker().read_text())["open"][0])
+
+    def test_a_result_that_names_a_report_that_is_missing_is_an_open_row(self):
+        (self.task / "result.md").write_text(f"table is in {self.task}/report.md\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        opened = json.loads(self.sweep_marker().read_text())["open"]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("missing", opened[0])
+
+    def test_a_review_with_no_sweep_is_as_before(self):
+        self.assertEqual(self.review().returncode, 0)
+        self.assertNotIn("sweep-review.md", [Path(p).name for p in self.spawn_contexts()])
+        self.assertNotIn("sweep", self.task_text().lower())
+        self.assertFalse(self.sweep_marker().exists())
+
+    def test_a_sweep_file_that_cannot_be_used_is_refused_and_starts_no_reviewer(self):
+        r = self.review("--sweep", str(self.work / "nope.md"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nope.md", r.stderr)
+        self.assertFalse(self.log.exists() and self.log.read_text())
+
+    def test_the_approval_of_a_sweep_review_with_an_open_row_is_incomplete_through_the_reader(self):
+        (self.task / "result.md").write_text(self.SWEEP_TABLE + "\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        review = self.state / "tasks" / "review-1"
+        text = "APPROVED\nRESULT_STATUS: complete\nCoverage\nI reviewed a.py and checked its callers and tests.\n"
+        (review / "result.md").write_text(text)
+        out = subprocess.run([sys.executable, str(self.root / "lib/review_verdict.py"), str(review / "result.md")], text=True, capture_output=True)
+        verdict = json.loads(out.stdout)
+        self.assertFalse(verdict["complete"])
+        self.assertIn("lib/b.py:30", verdict["incomplete_reason"])
+        (review / "result.md").write_text(text.replace("APPROVED", "REQUEST_CHANGES\nF1 [defect] x\nCloses by: code", 1))
+        out = subprocess.run([sys.executable, str(self.root / "lib/review_verdict.py"), str(review / "result.md")], text=True, capture_output=True)
+        self.assertIsNone(json.loads(out.stdout)["incomplete_reason"])
+
+    def dispatch(self, *context):
+        (self.task / "dispatch.json").write_text(json.dumps({"context": list(context), "omitted_context": [], "notes": [], "tests": "t"}))
+
+    def test_tp_agent_review_passes_the_sweep_the_task_was_dispatched_with(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        sweep = self.sweep()
+        self.dispatch("/abs/other.md", sweep)
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1"], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text().splitlines(), ["--sweep", sweep, "w1"])
+
+    def test_tp_agent_review_with_a_sweep_gone_from_disk_says_so_and_reviews_without_it(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        gone = str(self.state / "tasks" / "w0" / "sweep.md")
+        self.dispatch(gone)
+        r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1"], text=True, capture_output=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(record.read_text().splitlines(), ["w1"])
+        self.assertIn("sweep.md", r.stderr)
+        self.assertIn("without it", r.stderr)
+
+    def test_tp_agent_review_without_a_dispatch_record_or_a_sweep_passes_nothing_extra(self):
+        record = self.plan.parent / "review.args"
+        self.stub("tp-review", f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{record}"\necho review-1\n')
+        for write in (lambda: None, lambda: self.dispatch("/abs/a.md"), lambda: (self.task / "dispatch.json").write_text("{bad")):
+            write()
+            r = subprocess.run([str(self.root / "bin/tp-agent"), "review", "w1"], text=True, capture_output=True, env=self.env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(record.read_text().splitlines(), ["w1"])
 
 
 if __name__ == "__main__":

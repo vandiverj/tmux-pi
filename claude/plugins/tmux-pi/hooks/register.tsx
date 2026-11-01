@@ -310,16 +310,18 @@ async function poll($: EngineInterface) {
 
 function indexLine(row: unknown): string | undefined {
   if (typeof row !== 'object' || row === null) return undefined
-  const { id, role, harness, status, result_status, result_path, reason, verdict, review_complete, review_unusable } = row as Record<string, unknown>
+  const { id, role, harness, status, result_status, result_path, reason, verdict, review_complete, review_unusable, family_missing } = row as Record<string, unknown>
   if (typeof id !== 'string') return undefined
   const fields = [id, role, harness, status].filter(field => typeof field === 'string' && field !== '')
   if (typeof result_status === 'string') fields.push(`result=${result_status}`)
   // a review's stated verdict never reads as an approval unless its Coverage section was there (tp-agent: review_complete),
-  // and a REQUEST_CHANGES with no Closes by: code finding (review_unusable) is neither a rejection nor an approval
+  // and a REQUEST_CHANGES with no Closes by: code finding (review_unusable) is neither a rejection nor an approval;
+  // a round 3+ REQUEST_CHANGES with no Family: line (family_missing) is flagged beside the verdict, as lib/index_text.py does
   if (typeof verdict === 'string') {
     const note = review_complete !== true ? ' [review incomplete: not an approval]'
       : typeof review_unusable === 'string' && review_unusable !== '' ? ' [review unusable: neither a rejection nor an approval]' : ''
-    fields.push(`verdict=${verdict}${note}`)
+    const missing = typeof family_missing === 'string' && family_missing !== '' ? ' [no Family: line on a round 3+ REQUEST_CHANGES]' : ''
+    fields.push(`verdict=${verdict}${note}${missing}`)
   }
   if (typeof result_path === 'string') fields.push(result_path)
   if (typeof reason === 'string' && reason !== '') fields.push(`(${reason})`)

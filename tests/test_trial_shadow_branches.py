@@ -121,7 +121,7 @@ class BranchTests(TreeCase):
         git(run.worktree, "checkout", "-q", "-b", "tmp-local")
         git(run.worktree, "checkout", "-q", "--detach")
         git(self.repo, "branch", "other-lane", self.base)  # exists before the tree is made in the next run
-        run2 = self.worktree_run()
+        run2 = self.worktree_run(run="second-run")  # a run id is made from the second, so name it
         git(run2.worktree, "checkout", "-q", "other-lane")
         self.edit(run2)
         tip = git(run2.worktree, "rev-parse", "HEAD")

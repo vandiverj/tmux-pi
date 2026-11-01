@@ -268,5 +268,67 @@ class BuildTests(unittest.TestCase):
         self.assertFalse(family_sweep.is_sweep("/s/tasks/coder-1/other.md"))
 
 
+
+TABLE = """Done.
+
+| Site | Disposition | Evidence |
+| --- | --- | --- |
+| `lib/a.py:12` | fixed | changed the parse |
+| `bin/tp-x:7` | **Unresolved** | needs the owner. Closes by: decision, owner picks the format |
+| `lib/b.py:30-34` | `unresolved` | blocked, Closes by: none |
+| (sites you found) | | |
+
+RESULT_STATUS: complete
+"""
+
+
+class ReportTableTests(unittest.TestCase):
+    def test_rows_are_read_with_the_disposition_folded(self):
+        rows = family_sweep.report_table(TABLE)
+        self.assertEqual([(r[0], r[1]) for r in rows], [("`lib/a.py:12`", "fixed"), ("`bin/tp-x:7`", "unresolved"),
+                                                          ("`lib/b.py:30-34`", "unresolved"), ("(sites you found)", "")])
+
+    def test_no_table_is_none_and_the_last_table_wins(self):
+        self.assertIsNone(family_sweep.report_table("no table here\n| a | b |\n"))
+        two = TABLE + "\n| site | disposition | evidence |\n|---|---|---|\n| x.py:1 | fixed | y |\n"
+        self.assertEqual([r[0] for r in family_sweep.report_table(two)], ["x.py:1"])
+
+    def test_an_escaped_pipe_stays_in_its_cell(self):
+        rows = family_sweep.report_table("| Site | Disposition | Evidence |\n| - | - | - |\n| a.py:1 | fixed | a \\| b |\n")
+        self.assertEqual(rows[0][2], "a | b")
+
+    def test_open_rows_are_unresolved_ones_without_a_real_closes_by_note(self):
+        self.assertEqual(family_sweep.open_rows(family_sweep.report_table(TABLE)), ["`lib/b.py:30-34`"])
+        self.assertEqual(family_sweep.open_rows(None), [])
+
+    def test_a_note_is_closes_by_followed_by_something_that_says_something(self):
+        for evidence, open_ in (("Closes by: decision", False), ("**Closes by:** check, the log", False), ("closes by:", True),
+                                ("Closes by: tbd", True), ("closes by", True), ("no note", True)):
+            rows = [("a.py:1", "unresolved", evidence)]
+            self.assertEqual(bool(family_sweep.open_rows(rows)), open_, evidence)
+
+
+class PrepareReviewTests(unittest.TestCase):
+    def test_the_evidence_file_holds_the_sweep_and_the_rows_and_the_open_ones_are_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep, result = Path(tmp, "sweep.md"), Path(tmp, "result.md")
+            sweep.write_text("# Sweep: finding family `date-parse`\n\nbody\n")
+            result.write_text(TABLE)
+            out = family_sweep.prepare_review(sweep, result, Path(tmp, "out"))
+            self.assertEqual(out["open"], ["`lib/b.py:30-34`"])
+            self.assertEqual(out["rows"], 4)
+            self.assertEqual(out["family"], "date-parse")
+            text = Path(out["file"]).read_text()
+            self.assertIn("body", text)
+            self.assertIn("| `bin/tp-x:7` | unresolved |", text)
+
+    def test_no_table_and_an_unreadable_report_are_said_not_guessed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = Path(tmp, "sweep.md")
+            sweep.write_text("# Sweep: the unnamed family (REQUEST_CHANGES twice in a row)\n")
+            out = family_sweep.prepare_review(sweep, Path(tmp, "missing.md"), Path(tmp, "out"))
+            self.assertEqual((out["open"], out["rows"], out["family"]), ([], 0, None))
+            self.assertIn("no table", Path(out["file"]).read_text())
+
 if __name__ == "__main__":
     unittest.main()

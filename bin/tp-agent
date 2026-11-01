@@ -1119,6 +1119,23 @@ def discover_context(task, workdir=None):
     return {"contexts": out["contexts"], "reasons": context_reasons(out["manifest"]), "skipped": out["skipped"]}
 
 
+def dispatched_sweep(base, task_id):
+    """The path of the sweep.md among the context files `task_id` was dispatched with (dispatch.json), or None. A dispatch record that
+    cannot be read names none. A sweep that has since gone from disk is said on stderr and the review goes on without it."""
+    try:
+        specs = read_json(task_dir(base, task_id) / "dispatch.json").get("context") or []
+    except (OSError, ValueError, AttributeError):
+        return None
+    found = [spec for spec in specs if isinstance(spec, str) and family_sweep.is_sweep(spec)]
+    if not found:
+        return None
+    path = Path(found[-1])
+    if not path.is_file():
+        print(f"tp-agent: {task_id} was dispatched with {path}, which is gone; the review runs without it (the sweep's table is not checked)", file=sys.stderr)
+        return None
+    return str(path)
+
+
 def review(base, args):
     """Run bin/tp-review for a finished task. The reviewer is chosen by the resolver (lib/model_router.review_plan):
     never the author's provider when another is available."""
@@ -1138,6 +1155,9 @@ def review(base, args):
         raise ValueError("--dispositions may be given only once")
     for path in args.dispositions:  # what Main ruled on in earlier rounds; bin/tp-review refuses an unusable (or empty-named) file
         command += ["--dispositions", path]
+    sweep = dispatched_sweep(base, args.id)  # the sweep.md the task was dispatched with: the review confirms its table
+    if sweep:
+        command += ["--sweep", sweep]
     if args.same_provider:
         if not (args.approved_by_user or "").strip():
             raise ValueError("--same-provider needs --approved-by-user with the user's approval quoted")

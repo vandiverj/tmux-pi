@@ -3066,7 +3066,7 @@ class PathRuleCase(Tree):
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
         ("graph.py", "CacheDir.touch", "os.lstat"): "dir_fd of the opened folder (no folder made); a plain .json name read_json judged; never follows a link",
         ("graph.py", "CacheDir.touch", "os.utime"): "dir_fd of that folder, follow_symlinks=False: the name itself, never what a link leads to",
-        ("graph.py", "CacheDir._listing", "os.scandir"): "the judged folder's descriptor (sweep, summary); names only, no type taken from the listing",
+        ("graph.py", "CacheDir._listing", "os.scandir"): "the judged folder's descriptor (sweep, the counts of summary); names only, no type taken from the listing",
         ("graph.py", "CacheDir._listing", "os.lstat"): "dir_fd of that folder; only names that match nav_api-(index|doc|info)-*.json or *.tmp; no link followed; regular files only",
         ("graph.py", "CacheDir._sweep_in", "os.lstat"): "dir_fd of the judged folder, after the guard allowed the name: must be the regular file that was listed (device, inode, mtime)",
         ("graph.py", "CacheDir._sweep_in", "os.unlink"): "dir_fd of the judged folder; a managed name the guard allowed and the look just before it matched; never follows a link",
@@ -7513,6 +7513,92 @@ class SweepCase(Tree):
                 with mock.patch.object(graph.os, "lstat", failing):
                     got = cache.summary()
                 self.assertEqual((got["entries"], got["bytes"], got["incomplete"]), expected)
+
+    def test_s5_f1_status_fields_come_from_their_own_sources(self):
+        """Family status-partial-listing: `summary()` computes entries/bytes (the folder: open, judge, list, look at each name) and
+        last_sweep (the marker) independently. A failure in the folder part makes only entries and bytes unknown; a marker that
+        cannot be read makes only last_sweep None. Each row is one state of the folder part with a good marker."""
+        for name in ("nav_api-doc-a.json", "nav_api-info-b.json"):
+            self.put(name, 5, size=100)
+        stamp = time.time() - 1234.0
+        self.assertTrue(self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": stamp}))
+        cache = self.cache()
+        unknown = (None, None, True)
+        real_lstat = os.lstat
+
+        def lstat_fails(path, *a, dir_fd=None, **kw):
+            if dir_fd is not None and path == "nav_api-info-b.json":
+                raise OSError(5, "io")
+            return real_lstat(path, *a, dir_fd=dir_fd, **kw)
+        real_opened = graph._opened_path
+
+        def judged_by_counts(wrong):
+            """`_opened_path` as it is, except for the folder judged by the counting part (the marker's read uses it too, unharmed)."""
+            def opened(fd):
+                if sys._getframe(1).f_code.co_name != "_counts":
+                    return real_opened(fd)
+                if isinstance(wrong, Exception):
+                    raise wrong
+                return wrong
+            return opened
+        rows = {
+            "all readable": (lambda: contextlib.nullcontext(), (2, 200, False)),
+            "scandir I/O error": (lambda: mock.patch.object(graph.os, "scandir", side_effect=OSError(5, "io")), unknown),
+            "scandir permission": (lambda: mock.patch.object(graph.os, "scandir", side_effect=PermissionError(13, "denied")), unknown),
+            "listing raises a bug": (lambda: mock.patch.object(graph.CacheDir, "_listing", side_effect=RuntimeError("bug")), unknown),
+            "one lookup fails": (lambda: mock.patch.object(graph.os, "lstat", lstat_fails), unknown),
+            "folder open raises": (lambda: mock.patch.object(graph, "open_folder_below", side_effect=OSError(5, "io")), unknown),
+            "folder open bug": (lambda: mock.patch.object(graph, "open_folder_below", side_effect=RuntimeError("bug")), unknown),
+            "folder not the judged one": (lambda: mock.patch.object(graph, "_opened_path", judged_by_counts("/elsewhere")), unknown),
+            "judging the folder raises": (lambda: mock.patch.object(graph, "_opened_path", judged_by_counts(OSError(5, "io"))), unknown),
+        }
+        for label, (patch, expected) in rows.items():
+            with self.subTest(label), patch():
+                got = cache.summary()
+                self.assertEqual((got["entries"], got["bytes"], got["incomplete"]), expected)
+                self.assertEqual(got["last_sweep"], stamp, "a readable marker's time was dropped by the folder part")
+        # the marker part alone: a marker that cannot be read is None, and the counts are still known
+        for label, make in (("absent", lambda: self.marker().unlink()),
+                            ("bad", lambda: self.marker().write_text("bad")),
+                            ("directory", lambda: (self.marker().unlink(), self.marker().mkdir())),
+                            ("link", lambda: (self.marker().rmdir(), self.marker().symlink_to(self.decoy())))):
+            with self.subTest("marker " + label):
+                make()
+                self.assertEqual(cache.summary(), {"entries": 2, "bytes": 200, "last_sweep": None, "incomplete": False})
+        with self.subTest("marker read raises"), mock.patch.object(graph.CacheDir, "_last_sweep", side_effect=RuntimeError("bug")):
+            self.assertEqual(cache.summary(), {"entries": 2, "bytes": 200, "last_sweep": None, "incomplete": False})
+
+    def test_s5_f1_status_of_a_missing_refused_or_unreachable_folder_still_reads_what_it_can(self):
+        stamp = time.time() - 99.0
+        self.assertTrue(self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": stamp}))
+        cache = self.cache()
+        # a missing folder: 0 and 0, nothing is made, no marker
+        moved = self.dir / "moved-folder"
+        os.rename(self.folder, moved)
+        self.assertEqual(cache.summary(), {"entries": 0, "bytes": 0, "last_sweep": None, "incomplete": False})
+        self.assertFalse(self.folder.exists(), "status made the folder")
+        # a link at the folder: not the judged one, so nothing in it is believed (the marker is read through no link)
+        self.folder.symlink_to(moved)
+        self.assertEqual(cache.summary(), {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True})
+        self.folder.unlink()
+        os.rename(moved, self.folder)
+        self.assertEqual(cache.summary()["last_sweep"], stamp)
+        # a refused folder: no cache, so nothing is read
+        outside = self.dir / "outside-cache"
+        outside.mkdir()
+        refused = self.cache(cache_dir=str(outside))
+        self.assertTrue(refused.refusal)
+        self.assertEqual(refused.summary(), {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True})
+        # a folder nobody can look into: neither the names nor the marker are readable
+        if os.geteuid() != 0:
+            self.folder.chmod(0)
+            self.addCleanup(lambda: self.folder.chmod(0o700))
+            self.assertEqual(cache.summary(), {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True})
+        # the clock: a marker from the future is reported as it is, with the counts
+        self.folder.chmod(0o700)
+        future = time.time() + 400 * self.DAY
+        self.assertTrue(cache.write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": future}))
+        self.assertEqual(cache.summary(), {"entries": 0, "bytes": 0, "last_sweep": future, "incomplete": False})
 
     def test_s5_status_never_raises(self):
         nav = self.nav(self.proj)

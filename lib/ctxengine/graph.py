@@ -1078,38 +1078,47 @@ class CacheDir:
             pass  # the next write sweeps again (this object waits an hour, another may not)
         return result
 
-    def summary(self):
-        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None, "incomplete": bool}: the entries the sweep
-        manages (index, doc and info files that are regular files; temporaries and the marker are not entries) and the marker's
-        time. Read-only, nothing is made (a missing folder is 0 and 0). Entries and bytes are None, and `incomplete` True, when
-        they are not known: there is no cache (refused), the folder cannot be listed, or a listed name could not be looked at (a
-        count of the names that could be would pass for the whole). Never raises."""
-        none = {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True}
+    def _counts(self):
+        """(entries, bytes) of the entries the sweep manages, or (None, None) when they are not all known: there is no cache (refused),
+        the folder cannot be opened or is not the judged one, it cannot be listed, or a listed name could not be looked at (a count of
+        the names that could be would pass for the whole). (0, 0) when the folder is not there yet (nothing is made). Never raises."""
         if self.refusal:
-            return none
+            return None, None
         try:
             fd = open_folder_below(self.base, self.rel.split("/"), make=False)
         except FileNotFoundError:
-            return {"entries": 0, "bytes": 0, "last_sweep": None, "incomplete": False}  # nothing is there yet: an empty cache, and nothing is made
+            return 0, 0  # nothing is there yet: an empty cache, and nothing is made
         except Exception:
-            return none
-        if _opened_path(fd) != self.path:
-            close_quietly(fd)
-            return none
+            return None, None
         try:
+            if _opened_path(fd) != self.path:
+                return None, None
             found, complete = self._listing(fd, lambda: False)
         except Exception:
-            return none
+            return None, None
         finally:
             close_quietly(fd)
+        if not complete:
+            return None, None
+        entries = [item for item in found if item[1] != "temp"]
+        return len(entries), sum(item[2] for item in entries)
+
+    def summary(self):
+        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None, "incomplete": bool}: the entries the sweep
+        manages (index, doc and info files that are regular files; temporaries and the marker are not entries) and the marker's
+        time. Read-only, nothing is made (a missing folder is 0 and 0). Each field comes from its own source and no failure of one
+        source hides another: entries and bytes are None, and `incomplete` True, when they are not known (see `_counts`); `last_sweep`
+        is None only when the marker itself cannot be read (no cache, absent, not an envelope of this format, not a number), and is
+        the marker's time when it can, whatever the listing did. Never raises."""
         try:
             last = self._last_sweep()
         except Exception:
             last = None
-        if not complete:
-            return {**none, "last_sweep": last}
-        entries = [item for item in found if item[1] != "temp"]
-        return {"entries": len(entries), "bytes": sum(item[2] for item in entries), "last_sweep": last, "incomplete": False}
+        try:
+            entries, size = self._counts()
+        except Exception:
+            entries, size = None, None
+        return {"entries": entries, "bytes": size, "last_sweep": last, "incomplete": entries is None or size is None}
 
 
 def read_source(path, base, allow, failures=None, expect=None):

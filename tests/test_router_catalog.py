@@ -7,6 +7,7 @@ import unittest
 
 import route_fixture as fx
 
+import route_resolve as rr  # noqa: E402
 import router_catalog as rc  # noqa: E402
 
 CAT = fx.fixture_catalog((fx.HAIKU, fx.LUNA, fx.QWEN))  # chain order the mutation tests below index into; not the shipped order
@@ -52,6 +53,19 @@ class ValidationTests(unittest.TestCase):
         for entry in SHIPPED["router"]["chain"]:
             if entry["provider"] == "local":
                 self.assertNotIn(entry.get("max_level"), (None, "top", "strong"))
+
+    def test_fable_is_explicit_only_after_opus_and_changes_no_automatic_pick(self):
+        top = level(SHIPPED, "top")
+        names = [m["model"] for m in top["models"]]
+        self.assertLess(names.index(fx.OPUS), names.index("claude-fable-5-1"))
+        ctx = {"role": "coder"}
+        _, entry, effort, _ = rr.validate_explicit(SHIPPED, "claude-fable-5-1", "claude", "high", ctx, {})
+        self.assertEqual((entry["model"], effort), ("claude-fable-5-1", "high"))
+        picked = rr.resolve({"level_key": "top", "effort": "high", "review": "optional", "shape": None, "reason": "t"},
+                            SHIPPED, {}, {"role": "coder", "skip_caps": True})
+        self.assertEqual(picked["model"], fx.OPUS)
+        prior = {"level_key": "mid", "effort_abstract": "high", "model": fx.SONNET, "review": "optional", "decided_by": None}
+        self.assertEqual(rr.escalate(prior, SHIPPED, {}, {"role": "coder"})["model"], fx.OPUS)
 
     def test_the_shipped_chain_is_qwen_first_with_the_confirm_rule_and_a_mid_cap(self):
         chain = SHIPPED["router"]["chain"]

@@ -1534,10 +1534,11 @@ class ImportIndex:
         the guard refuses is not listed, and each directory is opened with no link on its path (`NOFOLLOW_ANY`) and must be the
         one judged, by the kernel's name, before it is listed.
 
-        A name the listing itself shows is not a folder and has no source suffix can never be read as a source nor descended into, so
-        it is skipped before the guard: it is not judged, not looked at, and a guard that cannot judge it (`CannotJudge`) records no
-        `guard_unjudged` gap for it, since nothing of the index depends on it. (The listing's own entry type is used; no call is made
-        at the name, except on a file system whose listing gives no type, where Python asks for it relative to the listed folder.)"""
+        Nothing is asked of a name until it has been judged: the listing is kept as entries and none is asked its type until its name
+        is allowed, because `DirEntry.is_dir` stats the name on a file system whose listing gives no type. Once a name is allowed, one
+        with no source suffix is asked its type and dropped unless it is a folder, so it is never opened, read or looked at again.
+        (A guard-free skip of names that can never be source cannot know they are not folders without asking, and asking must wait
+        for the judgement.)"""
         found = {}
         if self.root is None:
             return found
@@ -1556,15 +1557,21 @@ class ImportIndex:
                     self._gap("folder_unreadable" if opened is None else "folder_changed")  # a link was swapped in after the judgement
                     continue
                 with os.scandir(fd) as listing:
-                    names = sorted((entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing)
+                    entries = sorted(listing, key=lambda entry: entry.name)  # kept as entries: nothing is asked of any of them yet
                 subdirs = []
-                for name, listed_dir in names:
-                    if not listed_dir and not name.endswith(SOURCE_EXTENSIONS):
-                        continue  # can never be read as a source nor descended into: never reaches the guard (see below)
+                for entry in entries:
+                    name = entry.name
                     full = os.path.join(here, name)
                     rel = lexical_path(self.base, full)
                     if rel is None or name in SKIP_DIRS or not self._allowed(rel):
                         continue  # judged by its name: nothing is asked of it
+                    if not name.endswith(SOURCE_EXTENSIONS):
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue  # allowed, but can never be read as a source nor descended into
+                        except OSError:
+                            self._gap("entry_unreadable")
+                            continue
                     try:
                         info = os.lstat(name, dir_fd=fd)
                     except OSError as error:

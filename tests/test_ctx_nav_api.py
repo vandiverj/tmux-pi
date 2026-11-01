@@ -3058,7 +3058,7 @@ class PathRuleCase(Tree):
         ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "ImportIndex._walk", "os.scandir"): "that descriptor",
-        ("graph.py", "ImportIndex._walk", "entry.is_dir"): "d_type of the entry from the descriptor's listing, no_follow; the name is skipped or judged after it",
+        ("graph.py", "ImportIndex._walk", "entry.is_dir"): "after the guard allowed the name, and only for a name with no source suffix; no_follow (a stat of the name when the listing gives no type)",
         ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name",
         ("nav_api.py", "stub_check_path", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi.__init__", "os.path.realpath"): "the boundary itself",
@@ -4096,20 +4096,69 @@ class AnswerProofCase(Tree):
         self.assert_no_data(answer)
         self.assertIn("source_changed", json.dumps(answer))
 
-    def test_s1_a_name_that_can_never_be_source_does_not_reach_the_guard_or_the_filesystem(self):
+    def unknown_type_listing(self, log):
+        """A `os.scandir` whose entries have no listed type: asking one `is_dir` is a stat of its name, which `log` records as ("is_dir", name)."""
+        real = os.scandir
+
+        class Entry:
+            def __init__(self, entry):
+                self.entry, self.name = entry, entry.name
+
+            def is_dir(self, follow_symlinks=True):
+                log.append(("is_dir", self.name))  # on a file system with no d_type this is an lstat at the name
+                return self.entry.is_dir(follow_symlinks=follow_symlinks)
+
+        class Listing:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+
+            def __iter__(self):
+                return (Entry(entry) for entry in self.inner)
+        return mock.patch.object(graph.os, "scandir", lambda *a, **k: Listing(real(*a, **k)))
+
+    def test_s1_f1_a_refused_name_is_never_asked_its_type_when_the_listing_gives_none(self):
+        """Review F1 (path-boundary): `DirEntry.is_dir` stats the name when d_type is unknown, so no name may be asked its type until
+        the guard has allowed it. A guard-refused name (neutral, here `hold.cfg` and a folder `holdings`) is judged and dropped; nothing
+        is asked of it, and the answer is as before."""
         project = self.project().resolve()
-        write(project / "src" / "notes.txt", "hello\n")
-        write(project / "src" / "img.png", "x\n")
-        asked = []
+        write(project / "src" / "hold.cfg", "x\n")
+        write(project / "src" / "holdings" / "inner.ts", "export const h = 1;\n")
+        log, asked = [], []
 
         def check(root, path):
             asked.append(path)
+            if path.rsplit("/", 1)[-1] in ("hold.cfg", "holdings"):
+                raise nav_api.Refused("sensitive_path")
             return nav_api.stub_check_path(root, path)
-        answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        with self.unknown_type_listing(log):
+            answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertEqual(log.count(("is_dir", "hold.cfg")), 0, log)
+        self.assertEqual(log.count(("is_dir", "holdings")), 0, log)
+        self.assertTrue(any(a.endswith("hold.cfg") for a in asked), "the name was judged")
+        self.assertNotIn("src/holdings/inner.ts", asked, "a refused folder is not listed")
         self.assertEqual(answer["status"], "ok", answer)
-        self.assertNotIn("gaps", answer)
-        self.assertEqual([a for a in asked if a.endswith((".txt", ".png"))], [])
-        self.assertTrue(any(a.endswith(".ts") for a in asked))
+
+    def test_s1_f1_an_allowed_name_is_asked_its_type_only_after_the_guard_and_a_source_name_is_not_asked(self):
+        project = self.project().resolve()
+        write(project / "src" / "notes.txt", "hello\n")
+        order, log = [], []
+
+        def check(root, path):
+            order.append(("guard", path.rsplit("/", 1)[-1]))
+            return nav_api.stub_check_path(root, path)
+        real = self.unknown_type_listing(order)
+        with real:
+            answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertLess(order.index(("guard", "notes.txt")), order.index(("is_dir", "notes.txt")))
+        self.assertNotIn(("is_dir", "run.ts"), order, "a source name is decided by its lstat, never by a type question")
 
     def test_s1_every_file_read_is_asked_of_the_guard_once_per_answer(self):
         project = self.project().resolve()

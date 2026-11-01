@@ -6026,15 +6026,17 @@ class InfoCacheCase(Tree):
             self.assertEqual(planted.read_text(), "x")
             self.assertTrue(all(p.name in ("nav_api-info-f4.json", planted.name) or p.name.endswith(".tmp") for p in folder.iterdir()))
 
-    def _failing_folder_close(self, folder):
-        """An `os.close` that closes a descriptor on a directory (the cache folder or any folder above it) and then fails with EIO."""
+    def _failing_folder_close(self, folder, only_folder=False):
+        """An `os.close` that closes a descriptor on a directory (the cache folder or any folder above it; with `only_folder`, the
+        cache folder itself) and then fails with EIO."""
         real = os.close
 
         def close(fd):
             import fcntl
             try:
                 path = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).split(b"\0")[0].decode()
-                is_dir = os.path.isdir(path) and os.fstat(fd).st_mode & 0o170000 == 0o040000
+                is_dir = os.path.isdir(path) and os.fstat(fd).st_mode & 0o170000 == 0o040000 \
+                    and (not only_folder or os.path.realpath(path) == os.path.realpath(str(folder)))
             except OSError:
                 is_dir = False
             real(fd)
@@ -6050,13 +6052,50 @@ class InfoCacheCase(Tree):
         name = "nav_api-info-f4.json"
         self.assertTrue(nav._cache.write_json(name, {"v": 1}))
         token = nav._cache.prepare_json(name)  # judged first: the guard's own folder lookups close descriptors too, and fail closed
-        with self._failing_folder_close(folder):
+        with self._failing_folder_close(folder, only_folder=True):
             self.assertTrue(nav._cache.put_json(token, {"v": 2}))
         self.assertEqual(json.loads((folder / name).read_text()), {"v": 2})
+
+    def test_s3_f4_a_close_failure_of_a_folder_above_the_cache_folder_is_before_the_commit_so_the_entry_is_kept_and_false(self):
+        """The folders above the cache folder are closed on the way down, before the rename: that failure fails the write (the rename
+        works here), replaces nothing and makes nothing, and no descriptor is closed twice."""
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        name = "nav_api-info-f4.json"
+        self.assertTrue(nav._cache.write_json(name, {"v": 1}))
+        token = nav._cache.prepare_json(name)
+        with self._failing_folder_close(folder), mock.patch.object(graph.os, "rename", wraps=os.rename) as rename:
+            self.assertFalse(nav._cache.put_json(token, {"v": 2}))
+        rename.assert_not_called()  # the failure came before the rename was tried
+        self.assertEqual(json.loads((folder / name).read_text()), {"v": 1})
         token = nav._cache.prepare_json("nav_api-doc-f4.json")
-        with self._failing_folder_close(folder):  # a first write too (the folders above are closed on the way)
-            self.assertTrue(nav._cache.put_json(token, {"v": 3}))
-        self.assertEqual(json.loads((folder / "nav_api-doc-f4.json").read_text()), {"v": 3})
+        with self._failing_folder_close(folder):
+            self.assertFalse(nav._cache.put_json(token, {"v": 3}))
+        self.assertFalse((folder / "nav_api-doc-f4.json").exists())
+
+    def test_s3_f4_a_failed_folder_open_releases_each_descriptor_once(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        opened, closed = [], []
+        real_open, real_close = os.open, os.close
+
+        def op(*a, **k):
+            fd = real_open(*a, **k)
+            opened.append(fd)
+            return fd
+
+        def cl(fd):
+            closed.append(fd)
+            real_close(fd)
+            if len(closed) == 1:
+                raise OSError(5, "Input/output error")
+        with mock.patch.object(graph.os, "open", op), mock.patch.object(graph.os, "close", cl):
+            with self.assertRaises(OSError):
+                graph.open_folder_below(nav._cache.base, nav._cache.rel.split("/"))
+        self.assertEqual(sorted(closed), sorted(opened))  # every descriptor released, none twice
+        self.assertEqual(len(closed), len(set(closed)))
 
     def test_s3_f4_a_folder_descriptor_close_failure_before_the_rename_leaves_the_entry_and_returns_false(self):
         project = self.project()

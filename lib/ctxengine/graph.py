@@ -706,7 +706,8 @@ def close_quietly(fd):
 def open_folder_below(base, parts):
     """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing: `base` is opened with no link on the
     way (`NOFOLLOW_ANY`) and each part is made with `mkdir` and opened with `O_NOFOLLOW` relative to the one before, so no link is
-    followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR)."""
+    followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR, or the close of a folder
+    on the way failing: this runs before a write's commit point, so that failure fails the open; the descriptor is released once)."""
     fd = os.open(base, DIR_FLAGS | NOFOLLOW_ANY)
     try:
         for part in parts:
@@ -715,8 +716,8 @@ def open_folder_below(base, parts):
             except FileExistsError:
                 pass
             inner = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
-            close_quietly(fd)
-            fd = inner
+            done, fd = fd, inner
+            os.close(done)  # a failure raises (the kernel has released `done`); `fd` is already `inner`, closed below
     except BaseException:
         close_quietly(fd)
         raise
@@ -805,7 +806,7 @@ class CacheDir:
         """Write `value` under the names `prepare_json` judged (a temporary file with O_EXCL and no link followed, then a rename, both
         in the folder's descriptor). It asks the guard nothing and calls no project code, so it can follow the last proof of an
         answer. True when written; False (swallowed) when `token` is None, a link is at the name, or the write fails (serialising,
-        os.write, os.close of the temporary file or the rename).
+        os.write, os.close of the temporary file, the close of a folder above the cache folder, or the rename).
 
         The rename is the single commit point. Before it, any failure returns False and leaves every entry byte-identical. After it
         succeeds the result is True and nothing can raise or change it: the folder descriptor is closed with `close_quietly`, so a

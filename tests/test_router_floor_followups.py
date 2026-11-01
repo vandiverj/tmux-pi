@@ -3,6 +3,9 @@ explicit low level is checked against the route's effective bound (not the role'
 import copy
 import unittest
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
 from route_fixture import HAIKU, LUNA, QWEN, SOL, SONNET
 

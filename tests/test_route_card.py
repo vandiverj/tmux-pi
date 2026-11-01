@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture  # noqa: F401  (puts lib on sys.path)
 
 import route_card as rc  # noqa: E402

@@ -5,6 +5,9 @@ import json
 import re
 import unittest
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
 
 import route_resolve as rr  # noqa: E402

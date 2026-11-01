@@ -5453,5 +5453,321 @@ class MonorepoCase(Tree):
         self.assertNotIn("a `.git` is refused by name), so a rewrite that keeps size, mtime and ctime is not seen", text)
 
 
+
+class InfoCacheCase(Tree):
+    """Cache plan S3: a disk cache for `deno info` (`NavApi._forward_graph`). Each test failed against the code without it."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+
+    INFO = {"modules": [
+        {"specifier": f"file://{MIRROR}/src/main.ts", "dependencies": [
+            {"code": {"specifier": f"file://{MIRROR}/src/config.ts"}}, {"code": {"specifier": "npm:zod@4"}}]},
+        {"specifier": f"file://{MIRROR}/src/config.ts", "dependencies": []},
+        {"specifier": "node:path"}]}
+
+    def nav_for(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(info=self.INFO), **kw)
+
+    @staticmethod
+    def entries(project):
+        folder = project_cache(project).parent
+        return sorted(folder.glob("nav_api-info-*.json")) if folder.exists() else []
+
+    def filled(self, name="proj"):
+        project = self.project(name)
+        miss = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(miss["status"], "ok", miss)
+        self.assertEqual(len(self.entries(project)), 1)
+        return project, miss
+
+    def test_s3_a_hit_equals_a_miss_and_does_not_run_deno(self):
+        project, miss = self.filled()
+        self.assertEqual(len(self.deno_calls("info")), 1)
+        hit = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(hit, miss)
+        self.assertEqual(len(self.deno_calls("info")), 1, "a hit ran deno info")
+        self.assertEqual((hit["external"], [m["path"] for m in hit["modules"]]), (1, ["src/config.ts", "src/main.ts"]))
+
+    def test_s3_a_hit_is_the_same_cut_as_a_miss(self):
+        project = self.project()
+        with mock.patch.object(nav_api, "MAX_MODULES", 1):
+            miss = self.nav_for(project).forward_graph("src/main.ts")
+            hit = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual((miss["truncated"], miss["total"]), (True, 2))
+        self.assertEqual(hit, miss)
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
+    def test_s3_every_input_of_the_key_is_a_miss_when_it_moves(self):
+        project, _ = self.filled()
+        edited = project / "src" / "config.ts"
+        before = edited.stat()
+        edited.write_text(edited.read_text() + "// edit\n")  # content, not time: even with the old mtime
+        os.utime(edited, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(len(self.deno_calls("info")), 2, "a content change was a hit")
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@other"] = "./src/lazy.ts"
+        (project / "deno.json").write_text(json.dumps(config))
+        self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(len(self.deno_calls("info")), 3, "a config change was a hit")
+        self.nav_for(project).forward_graph("src/config.ts")  # another entry
+        self.assertEqual(len(self.deno_calls("info")), 4, "another entry was a hit")
+        with mock.patch.object(nav_api, "INFO_FORMAT", 2):
+            self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(len(self.deno_calls("info")), 5, "another format was a hit")
+        with mock.patch.object(nav_api, "INFO_FLAGS", ("info", "--json", "--no-remote", "--no-lock", "--x")):
+            self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(len(self.deno_calls("info")), 6, "other flags were a hit")
+
+    def test_s3_another_deno_version_is_a_miss(self):
+        project, _ = self.filled()
+        exe = self.fake_deno(f'echo "$@" >> {self.dir / "deno.log"}\ncase "$1" in\n --version) echo "deno 1.2.3";;\n'
+                             f' info) sed "s|{MIRROR}|$PWD|g" {self.dir / "info.json"};;\nesac')
+        self.assertEqual(self.nav(project, deno=exe).forward_graph("src/main.ts")["status"], "ok")
+        self.assertEqual(len(self.deno_calls("info")), 2)
+
+    def test_s3_a_file_changed_after_the_key_is_stale_index(self):
+        project, _ = self.filled()
+        nav = self.nav_for(project)
+        real = nav._read_cache
+
+        def read(*args):
+            got = real(*args)
+            write(project / "src" / "config.ts", "export const changed = 1;\n")
+            return got
+        nav._read_cache = read
+        answer = nav.forward_graph("src/main.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertNotIn("modules", answer)
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
+    def test_s3_a_config_changed_after_the_key_is_stale_index(self):
+        project, _ = self.filled()
+        nav = self.nav_for(project)
+        real = nav._read_cache
+
+        def read(*args):
+            got = real(*args)
+            config = json.loads((project / "deno.json").read_text())
+            config["imports"]["@late"] = "./src/lazy.ts"
+            (project / "deno.json").write_text(json.dumps(config))
+            return got
+        nav._read_cache = read
+        self.assertEqual(nav.forward_graph("src/main.ts")["status"], "stale_index")
+
+    def test_s3_what_is_not_ok_is_not_stored(self):
+        for label, body in (("exit", "exit 1"), ("not json", "echo not json"), ("not a graph", "echo '{\"modules\": 5}'"),
+                            ("slow", "exec sleep 30")):
+            project = self.project(label.replace(" ", "_"))
+            answer = self.nav(project, deno=self.fake_deno(body), timeout=0.3).forward_graph("src/main.ts")
+            self.assertNotEqual(answer["status"], "ok", label)
+            self.assertEqual(self.entries(project), [], label)
+        outside = write(self.dir / "outside.ts", "export const o = 1;\n")
+        project = self.project("unproven")
+        info = {"modules": [{"specifier": f"file://{outside}", "dependencies": []}]}
+        answer = self.nav(project, deno=self.scripted_deno(info=info)).forward_graph("src/main.ts")
+        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unproven_module"))
+        self.assertEqual(self.entries(project), [])
+        project = self.project("stale")
+        nav = self.nav_for(project)
+        real = nav._run_deno
+        nav._run_deno = lambda *a, **k: (write(project / "src" / "config.ts", "export const z = 1;\n"), real(*a, **k))[1]
+        self.assertEqual(nav.forward_graph("src/main.ts")["status"], "stale_index")
+        self.assertEqual(self.entries(project), [])
+        self.filled("control")  # the same folder does take an entry that is ok
+
+    def asked_by(self, project, **kw):
+        asked = []
+
+        def check_path(root, path):
+            asked.append(path)
+            return path
+        self.assertEqual(self.nav_for(project, check_path=check_path, **kw).forward_graph("src/main.ts")["status"], "ok")
+        return {name: asked.count(name) for name in set(asked)}
+
+    def overwrite_entry(self, project, value):
+        (entry,) = self.entries(project)
+        entry.write_text(value if isinstance(value, str) else json.dumps(value))
+
+    def test_s3_a_planted_entry_names_only_what_the_walk_proved(self):
+        project, miss = self.filled()
+        outside = write(self.dir / "outside.ts", "export const o = 1;\n")
+        self.overwrite_entry(project, {"format": nav_api.INFO_FORMAT, "external": 1, "modules": [
+            {"path": "src/main.ts", "imports": ["src/config.ts", "../outside.ts", str(outside), "src/not_walked.ts", 7, None]},
+            {"path": "src/config.ts", "imports": []},
+            {"path": "src/not_walked.ts", "imports": ["src/main.ts"]}, {"path": "../outside.ts", "imports": []},
+            {"path": str(outside), "imports": []}, {"path": 5, "imports": []}, "x", {"path": "src/lazy.ts", "imports": 3}]})
+        answer = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(answer, miss)
+        text = json.dumps(answer)
+        for leaked in ("outside", "not_walked"):
+            self.assertNotIn(leaked, text)
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
+    def test_s3_a_guard_that_refuses_a_name_the_entry_holds_gives_a_refusal_not_the_entry(self):
+        project, _ = self.filled()
+
+        def check_path(root, path):
+            if path == "src/config.ts":
+                raise nav_api.Refused("blocked_by_test")
+            return path
+        answer = self.nav_for(project, check_path=check_path).forward_graph("src/main.ts")
+        self.assertEqual(answer["status"], "refused")
+        self.assertNotIn("src/config.ts", json.dumps(answer))
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
+    def test_s3_a_stored_value_of_the_wrong_shape_is_a_miss_and_is_replaced(self):
+        for label, value in (("list", []), ("text", "not json"), ("old format", {"format": 0, "external": 0, "modules": []}),
+                             ("bool", {"format": nav_api.INFO_FORMAT, "external": True, "modules": []}),
+                             ("negative", {"format": nav_api.INFO_FORMAT, "external": -1, "modules": []}),
+                             ("modules", {"format": nav_api.INFO_FORMAT, "external": 0, "modules": {}})):
+            project, miss = self.filled(label.replace(" ", "_"))
+            before = len(self.deno_calls("info"))
+            self.overwrite_entry(project, value)
+            self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss, label)
+            self.assertEqual(len(self.deno_calls("info")), before + 1, label)
+            self.assertEqual(json.loads(self.entries(project)[0].read_text())["format"], nav_api.INFO_FORMAT, label)
+
+    def test_s3_no_sandbox_is_a_refusal_even_with_an_entry(self):
+        project, _ = self.filled()
+        with mock.patch.object(nav_api, "SANDBOX_EXEC", str(self.dir / "absent")):
+            answer = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_unavailable"))
+        self.assertNotIn("modules", answer)
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
+    def test_s3_no_deno_is_unavailable_even_with_an_entry(self):
+        project, _ = self.filled()
+        answer = self.nav(project, deno=str(self.dir / "no" / "deno")).forward_graph("src/main.ts")
+        self.assertEqual(answer["status"], "unavailable")
+
+    def test_s3_a_link_at_the_name_is_neither_read_nor_replaced(self):
+        project, miss = self.filled()
+        (entry,) = self.entries(project)
+        planted = write(self.dir / "elsewhere.json", json.dumps({"format": nav_api.INFO_FORMAT, "external": 9, "modules": []}))
+        entry.unlink()
+        entry.symlink_to(planted)
+        answer = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(answer, miss)  # a miss: Deno ran
+        self.assertEqual(len(self.deno_calls("info")), 2)
+        self.assertTrue(entry.is_symlink())
+        self.assertEqual(json.loads(planted.read_text())["external"], 9)
+
+    def test_s3_a_refused_cache_folder_means_no_cache(self):
+        project = self.project()
+        cache = project_cache(project).parent
+
+        def check_path(root, path):
+            if path.startswith(".tmux-pi/ctx-cache"):
+                raise nav_api.Refused("blocked_by_test")
+            return path
+        for _ in range(2):
+            nav = self.nav_for(project, check_path=check_path)
+            answer = nav.forward_graph("src/main.ts")
+            self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual(len(self.deno_calls("info")), 2)
+        self.assertFalse(cache.exists() and list(cache.iterdir()))
+        self.assertTrue(nav.cache_refused)
+        self.filled("control")
+
+    def test_s3_a_cache_folder_that_is_a_link_gives_no_cache(self):
+        project = self.project()
+        target = self.dir / "away"
+        target.mkdir()
+        project_cache(project).parent.parent.mkdir(parents=True, exist_ok=True)
+        project_cache(project).parent.symlink_to(target)
+        for _ in range(2):
+            self.assertEqual(self.nav_for(project).forward_graph("src/main.ts")["status"], "ok")
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(len(self.deno_calls("info")), 2)
+        self.filled("control")
+
+    def test_s3_a_hit_asks_the_guard_no_more_often_than_a_miss(self):
+        missed = self.asked_by(self.project("miss"))
+        project, _ = self.filled("hit")
+        hit = self.asked_by(project)
+        self.assertEqual(self.entries(project)[0].exists(), True)
+        self.assertTrue(hit)
+        self.assertEqual({name: n for name, n in hit.items() if n > missed.get(name, 0)}, {})
+
+    def test_s3_the_stored_file_is_one_json_value_in_the_cache_folder(self):
+        project, _ = self.filled()
+        (entry,) = self.entries(project)
+        self.assertRegex(entry.name, r"^nav_api-info-[0-9a-f]{40}\.json$")
+        self.assertEqual([p.name for p in entry.parent.iterdir() if p.name.endswith(".tmp")], [])
+        self.assertEqual(sorted(json.loads(entry.read_text())), ["external", "format", "modules"])
+
+    def test_s3_the_module_text_says_every_name_but_the_skipped_ones_is_asked_of_the_guard(self):
+        text = " ".join(nav_api.__doc__.split())
+        self.assertIn("except the names of `graph.SKIP_DIRS`", text)
+        self.assertIn("nav_api-info-<key>.json", text)
+
+    @NEEDS_DENO
+    def test_s3_a_real_deno_hit_equals_its_miss(self):
+        project = self.project()
+        miss = self.nav(project).forward_graph("src/main.ts")
+        self.assertEqual(len(self.entries(project)), 1)
+        self.assertEqual(self.nav(project).forward_graph("src/main.ts"), miss)
+
+
+    # --- sweep: the entry's own state x route
+
+    def test_s3_an_entry_that_is_not_a_readable_file_is_a_miss(self):
+        project, miss = self.filled()
+        (entry,) = self.entries(project)
+        data = entry.read_bytes()
+        entry.unlink()
+        entry.mkdir()  # a directory at the name
+        self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss, "directory")
+        self.assertTrue(entry.is_dir())
+        entry.rmdir()
+        os.mkfifo(entry)  # a FIFO at the name: never opened for a blocking read
+        self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss, "fifo")
+        entry.unlink()
+        entry.write_bytes(b" " * (graph.MAX_CACHE_BYTES + 1))
+        self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss, "over the cap")
+        entry.write_bytes(data[: len(data) // 2])  # torn
+        self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss, "torn")
+        self.assertEqual(len(self.deno_calls("info")), 5)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read any file")
+    def test_s3_an_unreadable_entry_is_a_miss(self):
+        project, miss = self.filled()
+        (entry,) = self.entries(project)
+        entry.chmod(0)
+        self.addCleanup(entry.chmod, 0o644)
+        self.assertEqual(self.nav_for(project).forward_graph("src/main.ts"), miss)
+        self.assertEqual(len(self.deno_calls("info")), 2)
+
+    def test_s3_a_guard_that_refuses_the_entry_name_gives_a_miss_and_no_write(self):
+        project, miss = self.filled()
+
+        def check_path(root, path):
+            if "nav_api-info-" in path:
+                raise nav_api.Refused("blocked_by_test")
+            return path
+        before = self.entries(project)[0].read_bytes()
+        self.assertEqual(self.nav_for(project, check_path=check_path).forward_graph("src/main.ts"), miss)
+        self.assertEqual(len(self.deno_calls("info")), 2)
+        self.assertEqual(self.entries(project)[0].read_bytes(), before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write anywhere")
+    def test_s3_a_cache_folder_that_cannot_be_written_still_answers(self):
+        project = self.project()
+        folder = project_cache(project).parent
+        folder.mkdir(parents=True)
+        folder.chmod(0o500)
+        self.addCleanup(folder.chmod, 0o700)
+        answer = self.nav_for(project).forward_graph("src/main.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual(self.entries(project), [])
+
+    def test_s3_the_other_deno_routes_use_the_same_cache(self):
+        project, miss = self.filled()
+        answer = self.nav_for(project).imports("src/main.ts", source="deno")
+        self.assertEqual(answer, miss)
+        self.assertEqual(len(self.deno_calls("info")), 1)
+
 if __name__ == "__main__":
     unittest.main()

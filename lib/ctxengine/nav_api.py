@@ -7,6 +7,10 @@ Three sources, each used for what it is good at:
   - `deno doc --json`: the exported symbols of one file (name, kind, definition `path:line`, the source line as the signature, the
     first doc-comment lines), cached by the content hash of every file the walk reached.
   - `deno info --json`: the forward module graph of one entry, capped at 30 s. Used when the index cannot be built, or when asked for.
+    Its graph is cached on disk (`nav_api-info-<key>.json`), keyed by the content hash of every file and config the walk reached,
+    the entry, the Deno version, the flags and the format. A hit is filtered as a fresh result is, listed, screened and proved last
+    (a changed file gives `stale_index`); with no sandbox there is no hit; only an `ok` graph is stored. A planted entry can name
+    only files this walk proved and the guard allows. The cache folder is judged as for `deno doc`; a refused one means no cache.
 
 Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
 a file or folder the guard refuses BY ITS NAME is outside the index by policy (not listed, read or counted; its edges are not
@@ -28,8 +32,9 @@ the answer. A race with the answer (anything that moves after the snapshot) is t
 `source` of `auto`, which falls back to `deno info` only when the index could not be built at all.
 The guard is asked once per name per answer (a memo that belongs to exactly one public call, a nested or concurrent call having its own, and is dropped on every exit; a
 guard that raises is a refusal and is remembered as one, `_permits`). Every name in a listing is asked of the guard BEFORE it is
-asked its type (a type question can stat the name); only after the guard allows it is a name that can never be read as a source (not
-a folder, no source suffix) dropped without being read or opened. Nothing is remembered between answers.
+asked its type (a type question can stat the name), except the names of `graph.SKIP_DIRS`, which are skipped by name first and never asked
+of anything; only after the guard allows a name is one that can never be read as a source (not a folder, no source suffix) dropped
+without being read or opened. Nothing is remembered between answers.
 A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
 An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it. Of
 those inputs the regular files inside the boundary are also content-hashed (sha256; `_boundary_hash`, the one exception to the refusal of
@@ -186,6 +191,8 @@ DEFAULT_TIMEOUT = 30
 MAX_IMPORTERS = 25
 MAX_SYMBOLS = 20
 MAX_MODULES = 200
+INFO_FORMAT = 1  # the stored `deno info` graph (`NavApi._forward_graph`); a change of shape is a change of this number
+INFO_FLAGS = ("info", "--json", "--no-remote", "--no-lock")
 DOC_LINE_MAX = 400
 SIGNATURE_MAX = 200
 MAX_DENO_OUTPUT = 40_000_000
@@ -1117,7 +1124,12 @@ class NavApi:
             return self._final(answer, self._reach_proof(reach))
 
     def _forward_graph(self, target):
-        """(answer, reach); the public wrapper makes the final check (`_final`)."""
+        """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one.
+        The raw graph (`INFO_FORMAT`: each reached project file and the project files it imports, as proven names, and the count of
+        packages and URLs) is cached on disk by the content of everything the walk reached (`_info_key`). A hit is not an answer:
+        it goes through the same filter as a fresh result (`_info_local`: only names this walk proved, deps the guard allows), and
+        then the same listing, screen and last proof. With no sandbox Deno is not run, so nothing is answered from what it said
+        earlier either."""
         rel, error = self._target(target)
         if error:
             return error, None
@@ -1126,40 +1138,54 @@ class NavApi:
         reach, refusal = self._prove(rel)
         if refusal:
             return refusal, None
-        refusal, out, mirror = self._run_mirrored(["info", "--json", "--no-remote", "--no-lock"], reach)
-        if refusal:
-            return refusal, None
-        try:
-            data = json.loads(out)
-            modules = data["modules"]
-        except (ValueError, KeyError, TypeError):
-            return _answer("error", detail="deno info gave output that is not a module graph"), None
-        if not isinstance(modules, list):
-            return _answer("error", detail="deno info gave output that is not a module graph"), None
         names = reach.names
-        local, external = {}, 0
-        for module in modules:
-            if not isinstance(module, dict):
-                continue
-            path = _file_url_path(module.get("specifier"))
-            if path is None:
-                external += 1
-                continue
-            inside = mirror.to_real(path)  # None: a path outside the mirror, so Deno read something that was not given to it
-            if inside is None or inside not in names:
-                if module.get("error") and inside is not None:
-                    continue  # a module Deno could not load (not in the mirror): nothing was read, nothing to list
-                return _answer("refused", reason="unproven_module"), None  # Deno loaded a file the walk did not show allowed
-            deps = set()
-            for dep in module.get("dependencies") or []:
-                if not isinstance(dep, dict):
+        key = None
+        if self._deno_exe() is not None:
+            reason = self._check_sandbox()
+            if reason:  # not even a cached answer
+                return self._sandbox_refusal(reason), None
+            key = self._info_key(rel, reach)
+        stored = self._read_cache("info", key, dict) if key else None
+        found = self._info_local(stored, names) if stored is not None else None
+        if found is not None:
+            local, external = found
+        else:
+            refusal, out, mirror = self._run_mirrored([*INFO_FLAGS], reach)
+            if refusal:
+                return refusal, None
+            try:
+                data = json.loads(out)
+                modules = data["modules"]
+            except (ValueError, KeyError, TypeError):
+                return _answer("error", detail="deno info gave output that is not a module graph"), None
+            if not isinstance(modules, list):
+                return _answer("error", detail="deno info gave output that is not a module graph"), None
+            local, external = {}, 0
+            for module in modules:
+                if not isinstance(module, dict):
                     continue
-                for key in ("code", "type"):
-                    dest = _file_url_path(dep.get(key, {}).get("specifier")) if isinstance(dep.get(key), dict) else None
-                    dest = mirror.to_real(dest) if dest else None
-                    if dest and dest in names and self._allowed(dest) is not None:
-                        deps.add(dest)
-            local[inside] = sorted(deps)
+                path = _file_url_path(module.get("specifier"))
+                if path is None:
+                    external += 1
+                    continue
+                inside = mirror.to_real(path)  # None: a path outside the mirror, so Deno read something that was not given to it
+                if inside is None or inside not in names:
+                    if module.get("error") and inside is not None:
+                        continue  # a module Deno could not load (not in the mirror): nothing was read, nothing to list
+                    return _answer("refused", reason="unproven_module"), None  # Deno loaded a file the walk did not show allowed
+                deps = set()
+                for dep in module.get("dependencies") or []:
+                    if not isinstance(dep, dict):
+                        continue
+                    for kind in ("code", "type"):
+                        dest = _file_url_path(dep.get(kind, {}).get("specifier")) if isinstance(dep.get(kind), dict) else None
+                        dest = mirror.to_real(dest) if dest else None
+                        if dest and dest in names and self._allowed(dest) is not None:
+                            deps.add(dest)
+                local[inside] = sorted(deps)
+            if key:  # only a graph Deno gave and the walk accepted whole: nothing refused, failed or cut is ever stored
+                self._write_cache("info", key, {"format": INFO_FORMAT, "external": external,
+                                                "modules": [{"path": path, "imports": deps} for path, deps in sorted(local.items())]})
         keep = [path for path in [rel, *local.get(rel, [])] if path in local]
         chosen = set(keep[:MAX_MODULES])
         for path in sorted(local):
@@ -1169,6 +1195,28 @@ class NavApi:
         listed = [{"path": self._show(path), "imports": [self._show(dep) for dep in local[path]]} for path in sorted(chosen)]
         return _answer("ok", target=self._show(rel), source="deno_info", modules=listed, truncated=len(local) > len(listed), total=len(local),
                        external=external), reach
+
+    def _info_key(self, rel, reach):
+        """Cache key for `deno info` of one entry: the content of every file and config the walk reached (`Reach.digest`), the entry,
+        the Deno version, the flags it is run with and the format of what is stored. Never a time or a size."""
+        return _digest("info", rel, reach.digest(), self.deno_version() or "", " ".join(INFO_FLAGS), INFO_FORMAT)[:40]
+
+    def _info_local(self, stored, names):
+        """({path: [imports]}, external) from a stored graph, filtered as a fresh one is (`names`: the files this walk proved; an
+        import must also be allowed now), or None when it is not a graph of the stored shape (then it is a miss). An entry naming
+        anything else is dropped, so a planted or old file cannot name what the walk did not prove."""
+        modules, external = stored.get("modules"), stored.get("external")
+        if stored.get("format") != INFO_FORMAT or not isinstance(modules, list) or isinstance(external, bool) \
+                or not isinstance(external, int) or external < 0:
+            return None
+        local = {}
+        for module in modules:
+            if not isinstance(module, dict) or not isinstance(module.get("path"), str) or module["path"] not in names \
+                    or not isinstance(module.get("imports"), list):
+                continue
+            local[module["path"]] = sorted({dep for dep in module["imports"]
+                                            if isinstance(dep, str) and dep in names and self._allowed(dep) is not None})
+        return local, external
 
     def symbols(self, path, limit=MAX_SYMBOLS):
         """The exported symbols of `path` from `deno doc --json`: name, kind, definition path and line, the definition's source
@@ -1268,11 +1316,11 @@ class NavApi:
         do not stand for content (a checkout can restore both), so none is used."""
         return _digest(rel, reach.digest(), self.deno_version() or "")[:40]
 
-    def _read_cache(self, kind, key):
-        """The cached list, read by the judged cache folder (`graph.CacheDir.read_json`: `read_bounded`, no link, a plain `.json`
-        directly in the folder, the guard judging its name), or None."""
+    def _read_cache(self, kind, key, shape=list):
+        """The cached `shape` (a list, or a dict), read by the judged cache folder (`graph.CacheDir.read_json`: `read_bounded`, no
+        link, a plain `.json` directly in the folder, the guard judging its name), or None."""
         data = self._cache.read_json(self._cache_name(kind, key))
-        return data if isinstance(data, list) else None
+        return data if isinstance(data, shape) else None
 
     def _write_cache(self, kind, key, value):
         """Written through the judged cache folder (`graph.CacheDir.write_json`); nothing when the folder was refused."""

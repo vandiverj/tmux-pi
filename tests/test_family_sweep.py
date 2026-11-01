@@ -32,12 +32,60 @@ class SiteTests(unittest.TestCase):
 
     def test_the_findings_end_at_their_closes_by_line_and_coverage_is_not_a_finding(self):
         got = family_sweep.findings(review(F1, F3))
-        self.assertEqual([(names, tokens) for _, names, tokens in got],
+        self.assertEqual([(names, tokens) for _, names, tokens, _ in got],
                          [(["date-parse"], ["lib/a.py:12", "lib/b.py:30-34"]), ([], [])])
-        self.assertNotIn("never_listed", " ".join(text for text, _, _ in got))
+        self.assertNotIn("never_listed", " ".join(text for text, _, _, _ in got))
 
     def test_a_reply_that_is_not_a_verdict_has_no_findings(self):
         self.assertEqual(family_sweep.findings("looks fine at lib/a.py:1"), [])
+
+
+SHAPES = [  # (input shape, text, expected sites): every row failed or was not covered before the rework
+    ("plain", "at lib/a.py:12 here", ["lib/a.py:12"]),
+    ("backticked", "at `lib/a.py:12` here", ["lib/a.py:12"]),
+    ("fenced", "x\n```\nlib/a.py:12: boom\n```", ["lib/a.py:12"]),
+    ("tilde fenced", "x\n~~~\nlib/a.py:12\n~~~", ["lib/a.py:12"]),
+    ("line range", "lib/a.py:12-15", ["lib/a.py:12-15"]),
+    ("en dash range", "lib/a.py:12\u201315", ["lib/a.py:12-15"]),
+    ("line and column", "lib/a.py:12:7", ["lib/a.py:12"]),
+    ("quoted path with space, backticks", "`my dir/a file.py:12`", ["my dir/a file.py:12"]),
+    ("quoted path with space, double quotes", 'see "my dir/a.py:3-4" now', ["my dir/a.py:3-4"]),
+    ("escaped space", "my\\ dir/a.py:12", []),
+    ("windows path", "C:\\repo\\lib\\a.py:12", ["C:\\repo\\lib\\a.py:12"]),
+    ("windows path, forward slashes", "C:/repo/lib/a.py:12", ["C:/repo/lib/a.py:12"]),
+    ("windows relative", "lib\\a.py:12", ["lib\\a.py:12"]),
+    ("windows path with a space in a directory", "C:\\Program Files\\x\\a.py:12", []),
+    ("absolute posix", "in /srv/app/lib/a.py:12", ["/srv/app/lib/a.py:12"]),
+    ("home relative", "in ~/proj/a.py:7", ["~/proj/a.py:7"]),
+    ("dot relative", "in ./lib/a.py:7 and ../x/b.py:8", ["./lib/a.py:7", "../x/b.py:8"]),
+    ("URL with port", "see http://example.com:8080/x and example.com:80", []),
+    ("URL then a path", "http://localhost:8080/ then lib/a.py:5", ["lib/a.py:5"]),
+    ("host:port in prose", "connect to db.example.com:5432 first", []),
+    ("ip:port", "127.0.0.1:8080", []),
+    ("no extension, with directory", "bin/tp-agent:1402", ["bin/tp-agent:1402"]),
+    ("no extension, bare name", "Makefile:3 and Note:12", ["Makefile:3"]),
+    ("trailing punctuation", "(lib/a.py:12), lib/b.py:3. lib/c.py:4; lib/d.py:5!", ["lib/a.py:12", "lib/b.py:3", "lib/c.py:4", "lib/d.py:5"]),
+    ("markdown link", "[x](lib/a.py:12)", ["lib/a.py:12"]),
+    ("a time and a version", "at 12:30 on v1.2:4", []),
+    ("path then word, not a line", "lib/a.py:fix", []),
+    ("scoped package path", "node_modules/@scope/pkg/i.js:9", ["node_modules/@scope/pkg/i.js:9"]),
+    ("UNC path", "\\\\server\\share\\a.py:4", ["\\\\server\\share\\a.py:4"]),
+    ("file URL", "file:///srv/a.py:9", []),
+    ("comma list keeps the first line only", "lib/a.py:12,14", ["lib/a.py:12"]),
+    ("repeat", "lib/a.py:1 lib/a.py:1", ["lib/a.py:1"]),
+]
+
+
+class ShapeTests(unittest.TestCase):
+    def test_every_input_shape_gives_the_expected_sites(self):
+        for name, text, expected in SHAPES:
+            with self.subTest(name):
+                self.assertEqual(family_sweep.sites(text), expected)
+
+    def test_an_ambiguous_path_is_flagged_not_emitted(self):
+        for text in ("my\\ dir/a.py:12", "C:\\Program Files\\x\\a.py:12"):
+            with self.subTest(text):
+                self.assertEqual(family_sweep.scan(text), ([], True))
 
 
 class BuildTests(unittest.TestCase):
@@ -83,9 +131,9 @@ class BuildTests(unittest.TestCase):
 
     def test_a_finding_with_no_site_is_listed_verbatim_and_not_dropped(self):
         text = family_sweep.build(self.state(review(F3), review(F1)), "author-2", None)
-        self.assertIn("Findings with no file:line token, verbatim", text)
+        self.assertIn("Findings with no file:line site, verbatim", text)
         self.assertIn("> F3 [defect] the error path is odd somewhere in the importer.", text)
-        self.assertIn("From review review-1:", text)
+        self.assertIn("From review review-1, finding 1:", text)
 
     def test_a_review_that_cannot_be_read_is_named_and_does_not_stop_the_sweep(self):
         state = self.state(review(F1), review(F2))
@@ -100,12 +148,70 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn("review-1 (round", text)
         self.assertIn("`bin/tp-x:7`", text)
 
-    def test_a_long_finding_is_shortened_but_its_sites_are_listed_in_full(self):
-        long = "F1 [defect] " + "word " * 2000 + "at lib/deep.py:5\nCloses by: code"
+    def test_a_finding_that_fits_is_quoted_whole_however_long(self):
+        long = "F1 [defect] " + "word " * 1500 + "at lib/deep.py:5\nCloses by: code"
         text = family_sweep.build(self.state(review(long), review(long)), "author-2", None)
-        self.assertIn("shortened", text)
+        self.assertIn("> " + long.split("\n")[0], text)
+        self.assertNotIn("shortened", text)
         self.assertIn("- `lib/deep.py:5` (cited by review-1, review-2)", text)
-        self.assertLess(len(text), 20000)
+
+    def test_over_budget_findings_become_pointers_and_the_sites_stay_complete(self):
+        big = "F%d [defect] " + "word " * 3000 + "at lib/s%d.py:%d\nCloses by: code"
+        bigs = [big % (n, n, n) for n in range(1, 5)]
+        state = self.state(review(*bigs), review(*bigs))
+        text = family_sweep.build(state, "author-2", None)
+        self.assertLessEqual(len(text.encode()), family_sweep.SWEEP_BUDGET)
+        self.assertLess(family_sweep.SWEEP_BUDGET, family_sweep.SPAWN_MAX_FILE)
+        for n in range(1, 5):
+            self.assertIn(f"- `lib/s{n}.py:{n}` (cited by review-1, review-2)", text)
+            self.assertIn(f"| `lib/s{n}.py:{n}` | | |", text)
+        pointers = [line for line in text.split("\n") if line.startswith("- review review-2, finding ")]
+        self.assertTrue(pointers)
+        self.assertIn("/tasks/review-2/result.md", pointers[0])
+        quoted = text.count("\n> F")
+        self.assertEqual(quoted + len(pointers), 4)  # every finding of the latest review is quoted whole or pointed at, none cut
+        self.assertNotIn("[...", text)
+
+    def test_a_sweep_whose_sites_alone_exceed_the_budget_raises_and_names_nothing_partial(self):
+        sites = " ".join(f"lib/f{n}.py:{n}" for n in range(1, 4000))
+        with self.assertRaises(family_sweep.SweepTooLarge):
+            family_sweep.build(self.state(review(f"F1 [defect] {sites}\nCloses by: code"), review(F2)), "author-2", None)
+
+    def test_review_text_is_redacted_before_it_reaches_sweep_md(self):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ab"
+        first = f"F1 [defect] token={secret} leaks at lib/a.py:12 and {secret}\nFamily: leak\nCloses by: code"
+        second = f"F2 [defect] no site, still token={secret}\nCloses by: code"
+        text = family_sweep.build(self.state(review(first), review(second)), "author-2", None)
+        self.assertNotIn(secret, text)
+        self.assertIn("REDACTED", text)
+        self.assertIn("`lib/a.py:12`", text)
+
+    def test_a_redactor_that_cannot_load_refuses_instead_of_writing_unredacted_text(self):
+        state = self.state(review(F1), review(F2))
+        original = review_rounds.redactor
+        review_rounds.redactor = lambda: (_ for _ in ()).throw(review_rounds.Refused("no redactor"))
+        self.addCleanup(setattr, review_rounds, "redactor", original)
+        with self.assertRaises(review_rounds.Refused):
+            family_sweep.build(state, "author-2", None)
+
+    def test_sites_in_fenced_code_are_listed_and_the_fence_is_in_the_quote(self):
+        fenced = "F1 [defect] run this:\n```\nlib/in_fence.py:9: bad call\n```\nCloses by: code"
+        text = family_sweep.build(self.state(review(F2), review(fenced)), "author-2", None)
+        self.assertIn("- `lib/in_fence.py:9` (cited by review-2)", text)
+        self.assertIn("```", text)
+
+    def test_a_family_line_inside_a_fence_is_not_a_family_name(self):
+        fenced = "F1 [defect] example:\n```\nFamily: fake\nCloses by: doc\n```\nat lib/a.py:3\nFamily: real\nCloses by: code"
+        got = family_sweep.findings(review(fenced))
+        self.assertEqual([(names, tokens) for _, names, tokens, _ in got], [(["real"], ["lib/a.py:3"])])
+
+    def test_an_ambiguous_path_is_listed_verbatim_not_cut(self):
+        one = "F1 [defect] see my\\ dir/a.py:12 for it\nCloses by: code"
+        text = family_sweep.build(self.state(review(one), review(F2)), "author-2", None)
+        self.assertNotIn("`dir/a.py:12`", text)
+        self.assertIn("Findings with no file:line site, verbatim", text)
+        self.assertIn("> F1 [defect] see my\\ dir/a.py:12 for it", text)
+
 
     def test_a_chain_that_cannot_be_walked_raises_refused(self):
         with self.assertRaises(review_rounds.Refused):

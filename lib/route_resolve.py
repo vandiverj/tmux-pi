@@ -99,6 +99,8 @@ class ExplicitError(ValueError):
 def unusable_reason(cat, m, ctx, health):
     """Why a catalog model cannot be used for this request, or None when it can."""
     provider = m["provider"]
+    if m.get("explicit_only") and not ctx.get("explicit_choice"):
+        return "{} is explicit-only: it is chosen only by an explicit --model, never by routing, escalation, review or redirect".format(m["model"])
     if not m["in_roster"] and not ctx.get("allow_unrostered"):
         return "{} is not in the roster".format(m["model"])
     if not provider_ok(health, provider, m["model"]):
@@ -135,7 +137,7 @@ def validate_explicit(cat, model, worker, thinking, ctx, health):
         raise ExplicitError("model {} is at level {}, which is not offered".format(model, level["key"]))
     if worker and worker != entry["worker"]:
         raise ExplicitError("model {} belongs to {}, not {}".format(model, entry["worker"], worker))
-    reason = unusable_reason(cat, entry, dict(ctx, require_worker=worker or ctx.get("require_worker")), health)
+    reason = unusable_reason(cat, entry, dict(ctx, require_worker=worker or ctx.get("require_worker"), explicit_choice=True), health)
     if reason:
         raise ExplicitError("model {} cannot be used: {}".format(model, reason))
     notes = []

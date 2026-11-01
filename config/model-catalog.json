@@ -267,7 +267,7 @@
         },
         {
           "provider": "anthropic", "worker": "claude", "model": "claude-fable-5-1",
-          "efforts": ["low", "medium", "high"], "context_window": 200000, "max_output": 64000, "in_roster": true
+          "efforts": ["low", "medium", "high"], "context_window": 200000, "max_output": 64000, "in_roster": true, "explicit_only": true
         },
         {
           "provider": "openai", "worker": "pi", "model": "openai/gpt-6-astra",

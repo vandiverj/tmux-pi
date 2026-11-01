@@ -11,6 +11,7 @@ from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET
 import route_resolve as rr  # noqa: E402  (route_fixture put lib on sys.path)
 import router_catalog as rc  # noqa: E402
 
+FABLE = "claude-fable-5-1"
 CAT = fx.fixture_catalog((HAIKU, LUNA, QWEN))  # explicit chain order; the shipped order does not matter here
 ROSTER = json.loads((fx.ROOT / "config" / "router.json").read_text())["models"]
 
@@ -35,10 +36,11 @@ class RosterTests(unittest.TestCase):
         roster = {m["model"]: m for m in ROSTER}
         catalog = {m["model"]: m for lv in CAT["levels"] for m in lv["models"]}
         for name, entry in catalog.items():
-            if entry["in_roster"]:
+            if entry["in_roster"] and not entry.get("explicit_only"):  # an explicit-only model stays out of the router roster
                 self.assertIn(name, roster)
                 self.assertEqual((roster[name]["worker"], roster[name]["thinking"]), (entry["worker"], entry["efforts"]), name)
         self.assertEqual(sorted(set(roster) - set(catalog)), [])
+        self.assertNotIn(FABLE, roster)
         self.assertFalse(catalog["openai/gpt-6.1-sol"]["in_roster"])
 
 
@@ -704,3 +706,39 @@ class CoderFloorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExplicitOnlyTests(unittest.TestCase):
+    """claude-fable-5-1 is in the top level but only an explicit --model may return it."""
+    OUT = {"anthropic:" + OPUS: {"status": "exhausted"}}
+
+    def test_fable_is_flagged_and_after_opus(self):
+        names = [m["model"] for m in next(lv for lv in CAT["levels"] if lv["key"] == "top")["models"]]
+        self.assertLess(names.index(OPUS), names.index(FABLE))
+        self.assertTrue(rc.level_of(CAT, FABLE)[1]["explicit_only"])
+
+    def test_top_pick_with_opus_out_is_astra_not_fable(self):
+        r = R(K("top", "high"), role="architect", health=self.OUT)
+        self.assertEqual(r["model"], ASTRA)
+
+    def test_escalation_from_mid_with_opus_out_is_astra_not_fable(self):
+        prior = {"level_key": "mid", "effort_abstract": "high", "model": SONNET, "review": "optional", "decided_by": None}
+        r = rr.escalate(prior, CAT, self.OUT, {"role": "coder"})
+        self.assertEqual(r["model"], ASTRA)
+
+    def test_explicit_top_reviewer_never_fable(self):
+        r = rr.pick_reviewer("openai", "mid", CAT, self.OUT, "required", {"level_key": "top"})
+        self.assertNotEqual(r.get("model"), FABLE)
+
+    def test_candidates_and_redirects_skip_it(self):
+        top = next(lv for lv in CAT["levels"] if lv["key"] == "top")
+        self.assertNotIn(FABLE, [m["model"] for m in rr.candidates_at(CAT, top, {}, {})])
+        problems, _ = rr.redirect_problems(CAT, {"worker": "claude", "model": FABLE, "thinking": "high"}, {"role": "coder"}, {}, True)
+        self.assertTrue(any("explicit" in p for p in problems))
+
+    def test_router_card_does_not_offer_it(self):
+        self.assertNotIn(FABLE, rc.build_system(CAT))
+
+    def test_explicit_model_still_validates(self):
+        _, entry, effort, _ = rr.validate_explicit(CAT, FABLE, "claude", "high", {"role": "coder"}, {})
+        self.assertEqual((entry["model"], effort), (FABLE, "high"))

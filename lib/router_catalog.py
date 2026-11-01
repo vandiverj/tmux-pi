@@ -187,7 +187,7 @@ def validate_catalog(cat):
             _fail("{} has no models".format(where))
         for model in level["models"]:
             _object(model, where + " model", ("provider", "worker", "model", "efforts", "context_window", "max_output", "in_roster"),
-                    ("max_packet_tokens", "unverified"))
+                    ("max_packet_tokens", "unverified", "explicit_only"))
             name = _text(model["model"], where + " model name")
             if model["provider"] not in providers:
                 _fail("{}: unknown provider {!r}".format(name, model["provider"]))
@@ -203,6 +203,8 @@ def validate_catalog(cat):
             _int(model["context_window"], name + " context_window")
             _int(model["max_output"], name + " max_output")
             _flag(model["in_roster"], name + " in_roster")
+            if "explicit_only" in model:
+                _flag(model["explicit_only"], name + " explicit_only")
             if "max_packet_tokens" in model:
                 _int(model["max_packet_tokens"], name + " max_packet_tokens")
             for target in emap.values():
@@ -385,6 +387,8 @@ def _prose(text, cat):
 def _level_models(level):
     by = {}
     for m in level["models"]:
+        if m.get("explicit_only"):
+            continue  # the router card never offers a model only an explicit --model may pick
         by.setdefault(m["provider"], []).append(m["model"].split("/")[-1])
     return "; ".join("{}: {}".format(p, ", ".join(ms)) for p, ms in by.items())
 

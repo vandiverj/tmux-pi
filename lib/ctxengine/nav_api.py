@@ -10,12 +10,18 @@ Three sources, each used for what it is good at:
     Its graph is cached on disk (`nav_api-info-<key>.json`), keyed by the content hash of every file and config the walk reached,
     the entry, the Deno version, the flags and the format. A hit is filtered as a fresh result is, listed, screened and proved last
     (a changed file gives `stale_index`); with no sandbox there is no hit. An entry (this one and the `deno doc` one) is JUDGED before the final proof and WRITTEN
-    after it, and never removed: before the proof (`_final`) the entry's name and a unique temporary name are asked
+    after it, and never removed by a call that writes: before the proof (`_final`) the entry's name and a unique temporary name are asked
     of the guard once (the cache folder was judged when the cache was made) (a refusal means no store); the proof runs; only an answer that is still `ok` then writes the temporary file
     and renames it, with no guard and no project code, a failure being swallowed (entries unchanged; a stray `.tmp` is possible
-    and is swept by S5). A refusal, gap, stale answer, error or exception
-    therefore writes nothing, and no entry is ever deleted. A planted entry can name only files this walk proved and the guard allows.
+    and is swept by the cache sweep). A refusal, gap, stale answer, error or exception
+    therefore writes nothing, and no call that writes deletes an entry. A planted entry can name only files this walk proved and the guard allows.
     The cache folder is judged as for `deno doc`; a refused one means no cache.
+  - The cache sweep (`graph.CacheDir.sweep`, run by `_swept` after a call that WROTE an entry, never after a hit, and after the answer
+    is final, so nothing it does can change the answer; every failure of it is swallowed): at most once an hour per folder, it removes
+    stray `.tmp` files older than 10 minutes, entries unused for 14 days (index files 30), then the oldest while the folder holds more than
+    64 MB or 400 files, within 200 deletions or 50 ms. A hit that accepted its payload touches the entry (once an hour at most), which is
+    what "used" means. It lists and deletes only through the judged folder's descriptor, only managed names that are regular files, each
+    judged by the guard and looked at again just before its unlink. `status()` reports `cache`: entries, bytes and the last sweep.
 
 Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
 a file or folder the guard refuses BY ITS NAME is outside the index by policy (not listed, read or counted; its edges are not
@@ -709,7 +715,8 @@ class NavApi:
     def importers(self, target, limit=MAX_IMPORTERS):
         """Files that import `target` directly, ordered by (path, line); `limit` is 1 to 25."""
         with self._answering():
-            return self._final(*self._importers(target, limit))
+            answer = self._final(*self._importers(target, limit))
+        return self._swept(answer)
 
     def _importers(self, target, limit):
         """(answer, proof); the public wrapper makes the final check (`_final`)."""
@@ -731,7 +738,8 @@ class NavApi:
         """What `target` imports directly: `files` (project paths), `external` (packages, builtins, URLs) and `unresolved`.
         `source` is `auto` (the index, and `deno info` when no index can be built), `index` or `deno`."""
         with self._answering():
-            return self._final(*self._imports(target, source))
+            answer = self._final(*self._imports(target, source))
+        return self._swept(answer)
 
     def _imports(self, target, source):
         """(answer, proof): the check `_final` makes last (see `_index_answer`, `_reach_proof`); None for an answer that carries no
@@ -1126,6 +1134,18 @@ class NavApi:
             return None
         return lambda: None if reach.holds() else _answer("stale_index", detail="a file changed while the answer was being made")
 
+    def _swept(self, answer):
+        """`answer`, unchanged, after the cache sweep (`graph.CacheDir.sweep`) had its chance. It runs when the call wrote a cache
+        entry (a hit writes nothing, so a hit never sweeps), after the answer was proved, screened and made, so nothing it does can
+        change it: it has a guard memo of its own (`_answering`), takes at most the sweep's budget, and any failure of it is swallowed."""
+        try:
+            if self._cache.written:
+                with self._answering():
+                    self._cache.sweep()
+        except Exception:
+            pass
+        return answer
+
     @staticmethod
     def _scrub(text, mirror, names):
         """`text` with each path in the mirror shown as its project-relative name when the walk proved that file, else `<file>`:
@@ -1144,7 +1164,8 @@ class NavApi:
         MAX_MODULES, `target` and its direct imports are kept and the rest is cut in path order."""
         with self._answering():
             answer, reach, store = self._forward_graph(target)
-            return self._final(answer, self._reach_proof(reach), store)
+            answer = self._final(answer, self._reach_proof(reach), store)
+        return self._swept(answer)
 
     def _forward_graph(self, target):
         """(answer, reach, store); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one, and
@@ -1172,6 +1193,7 @@ class NavApi:
         stored = self._read_cache("info", key, dict) if key else None
         found = self._info_local(stored, names) if stored is not None else None
         if found is not None:
+            self._cache.touch(self._cache_name("info", key))  # the stored graph has the shape asked for: the entry is in use
             local, external = found
         else:
             refusal, out, mirror = self._run_mirrored([*INFO_FLAGS], reach)
@@ -1248,7 +1270,8 @@ class NavApi:
         line as `signature`, and the first doc-comment lines. A re-export is listed at the file that defines it."""
         with self._answering():
             answer, reach, store = self._symbols(path, limit)
-            return self._final(answer, self._reach_proof(reach), store)
+            answer = self._final(answer, self._reach_proof(reach), store)
+        return self._swept(answer)
 
     def _symbols(self, path, limit):
         """(answer, reach, store); the public wrapper makes the final check (`_final`) and runs `store` (the write of the entry, or
@@ -1273,6 +1296,7 @@ class NavApi:
         cached = self._read_cache("doc", key)
         store = None
         if cached is not None:
+            self._cache.touch(self._cache_name("doc", key))  # a symbol list, as asked for: the entry is in use
             found, hit = cached, True
         else:
             refusal, out, mirror = self._run_mirrored(["doc", "--json", "--no-remote", "--no-lock"], reach)
@@ -1367,7 +1391,8 @@ class NavApi:
 
     def status(self):
         """What this instance would use: the Deno it found, the root and config, the cache folder (and why it is refused, when it
-        is), and the index's size and age. The config is looked at only when it is shown allowed."""
+        is), what it holds (`cache`: {"entries", "bytes", "last_sweep"}, seconds since the epoch; None where unknown), and the index's
+        size and age. The config is looked at only when it is shown allowed."""
         exe = self._deno_exe()
         out = {"status": "ok", "deno": exe, "deno_version": self.deno_version() if exe else None,
                "root": None if self.root is None else self._show_path(self.root),
@@ -1378,6 +1403,7 @@ class NavApi:
             out["root_refused"] = self._root_refusal
         if self._boundary_unmodelled:
             out["boundary_refused"] = BOUNDARY_UNMODELLED
+        out["cache"] = self._cache.summary()  # entries, bytes and the time of the last sweep (seconds since the epoch); None where unknown
         if self._index is not None:
             out.update(files_indexed=len(self._index.entries), index_age_s=self._index.age_s())
             if self._index.gaps:

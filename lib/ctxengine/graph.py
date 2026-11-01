@@ -39,12 +39,14 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
 import secrets
 import shutil
 import stat
+import threading
 import time
 from urllib.parse import unquote
 
@@ -728,6 +730,19 @@ def open_folder_below(base, parts, make=True):
 
 ENVELOPE_FORMAT = 1  # the wrapper of every cache entry (`CacheDir`); a change of its shape is a change of this number
 
+# The sweep (`CacheDir.sweep`): what stays in a cache folder, and how much work one sweep may do.
+ENTRY_MAX_AGE_S = 14 * 86400  # an info or doc entry unused (not written, not touched by a hit) for this long is removed
+INDEX_MAX_AGE_S = 30 * 86400  # the same for an index file
+SWEEP_CAP_BYTES = 64_000_000  # the entries of a folder together; the oldest (by mtime) go first
+SWEEP_CAP_FILES = 400
+TEMP_MAX_AGE_S = 600  # a `.tmp` older than this is a crash leftover, whoever made it (the names are random, not pid-based)
+SWEEP_EVERY_S = 3600  # at most one sweep per folder per hour (the marker file carries the time)
+SWEEP_MAX_DELETIONS = 200
+SWEEP_BUDGET_S = 0.050  # listing, judging and deleting together
+TOUCH_EVERY_S = 3600  # a hit touches an entry only when its mtime is at least this old
+SWEEP_MARKER = "nav_api-sweep.json"
+_ENTRY_NAME = re.compile(r"nav_api-(index|doc|info)-.*\.json")
+
 CACHE_REFUSALS = {"outside_project": "cache_dir_outside_project", "reaches_refused_path": "cache_dir_refused",
                   "unreadable_file": "cache_dir_unreadable"}
 
@@ -751,13 +766,29 @@ class CacheDir:
     (index, doc and info entries alike: `read_json` and `put_json` are the only reader and writer). An entry that is not that
     exactly (not JSON, truncated, another format, another name, a payload that does not hash to `sha256`) is a miss: None, never an
     error and never a hit. The checksum guards against corruption, not against a writer who can compute it (the folder is trusted as
-    the project's sources are). A hit touches the entry's modification time (`touch`, for the age rule of the sweep): by the folder's
-    descriptor, never following a link, and a failure of it changes nothing."""
+    the project's sources are). The caller that accepted a payload's shape touches the entry's modification time (`touch`, for the
+    age rule of the sweep; `read_json` does not): by the folder's descriptor, never following a link, only when the time is an hour
+    old or in the future, and a failure of it changes nothing.
+
+    The sweep (`sweep`, cache plan S5). After a write (`put_json` sets `written`; a hit never does) the owner calls `sweep`, which
+    removes, at most once an hour per folder (the time is kept in the marker `nav_api-sweep.json`), stray temporaries older than
+    10 minutes, entries unused for 14 days (index files 30), then the oldest entries while the folder holds more than 64 MB or 400
+    files; it stops after 200 deletions or 50 ms. The safety rule: it lists and deletes only through a descriptor on the judged
+    folder (`_open_folder`); it looks only at names that are `nav_api-(index|doc|info)-*.json`, `*.tmp` or the marker, and of those
+    only regular files (a link, a folder or anything else is left untouched, not even counted); the guard judges each name before it
+    is deleted; and just before each unlink the name is looked at again (`lstat` through the descriptor, no link followed): it must
+    still be the regular file that was listed (same device, inode and modification time), else it is skipped. A name replaced
+    between that look and the unlink can still be removed (no system call closes that): it costs a cache miss, never a wrong
+    answer, because every entry is verified (envelope) and every answer is proved when it is made. Every failure is swallowed:
+    `sweep` never raises, and no answer depends on it. A refused or missing folder is not swept."""
 
     def __init__(self, base, folder, allow):
         self.base = base
         self.allow = allow
         self.rel = self.path = self.refusal = None
+        self.written = False  # an entry was written since the last sweep was considered: the only thing that makes a sweep due
+        self._swept_at = None  # when this object last sweeped (or tried to): the marker file may not be writable
+        self._sweeping = threading.Lock()
         if allow is None:
             self.refusal = "cache_dir_unguarded"
             return
@@ -795,32 +826,40 @@ class CacheDir:
 
     def read_json(self, name):
         """The payload in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES, and any
-        entry that is not a whole envelope of this format with a matching checksum: see the class docstring). A hit touches the file."""
+        entry that is not a whole envelope of this format with a matching checksum: see the class docstring). Reading touches nothing: the
+        caller touches the entry (`touch`) once it accepted the shape of the payload, so an entry of this format that no caller
+        accepts ages out."""
         if self.refusal or not self._plain(name) or not name.endswith(".json"):
             return None
         full = os.path.join(self.path, name)
         status, data, _ = read_bounded(full, full, self.base, self._allow_file, limit=MAX_CACHE_BYTES)
         if status != READ_OK:
             return None
-        payload = self._open_payload(name, data)
-        if payload is not None:
-            self.touch(name)
-        return payload
+        return self._open_payload(name, data)
 
     def touch(self, name):
-        """Set the modification time of the cache file `name` to now, for the age rule. True when done; False when it was not (a
-        link or anything but a regular file at the name, a folder that is not the judged one, no such file, no permission, a system
-        that cannot do it). Best effort and silent: nothing here raises, and no answer depends on it. The folder is opened by its
-        descriptor without making anything, the name is looked at without following a link, and the time is set on the name itself
-        (`follow_symlinks=False`), so a link swapped in after the read is never followed."""
+        """Set the modification time of the cache file `name` to now, for the age rule, when it is at least TOUCH_EVERY_S old or in
+        the future (a clock that was ahead): True when the time is now recent (set, or recent already); False when it was not
+        (a link or anything but a regular file at the name, a name the guard refuses, a folder that is not the judged one, no such
+        file, no permission, a system that cannot do it). Best effort and silent: nothing here raises, and no answer depends on it.
+        The folder is opened by its descriptor without making anything, the name is looked at without following a link, and the
+        time is set on the name itself (`follow_symlinks=False`), so a link swapped in after the read is never followed."""
         if self.refusal or not self._plain(name) or not name.endswith(".json"):
+            return False
+        try:
+            if not self._allow_file(posixpath.join(self.rel, name)):
+                return False
+        except Exception:
             return False
         fd = self._open_folder(make=False)
         if fd is None:
             return False
         try:
-            if not stat.S_ISREG(os.lstat(name, dir_fd=fd).st_mode):
+            info = os.lstat(name, dir_fd=fd)
+            if not stat.S_ISREG(info.st_mode):
                 return False
+            if 0 <= time.time() - info.st_mtime < TOUCH_EVERY_S:
+                return True  # recent enough for the age rule: no write for a hit
             os.utime(name, None, dir_fd=fd, follow_symlinks=False)
             return True
         except Exception:
@@ -861,7 +900,7 @@ class CacheDir:
         The rename is the single commit point. Before it, any failure returns False and leaves every entry byte-identical. After it
         succeeds the result is True and nothing can raise or change it: the folder descriptor is closed with `close_quietly`, so a
         failed close of it (which changes nothing on disk) is not a failed write. Nothing here deletes anything: a failed write may
-        leave its own stray `.tmp` (a unique random name), which the sweep (S5) removes; another writer's file is never touched."""
+        leave its own stray `.tmp` (a unique random name), which the sweep removes once it is 10 minutes old; another writer's file is never touched."""
         if token is None:
             return False
         name, temp = token
@@ -884,6 +923,7 @@ class CacheDir:
         except OSError:  # before the commit only (lstat, write, close of the temporary, rename), also FileExistsError: the entry is as it was
             return False
         else:
+            self.written = True  # a sweep is now due (`sweep` decides); a flag is all this writer does, it deletes nothing
             return True  # after the commit nothing can raise: the `finally` closes quietly
         finally:
             close_quietly(fd)
@@ -892,6 +932,177 @@ class CacheDir:
         """`prepare_json` then `put_json`: True when written; False when there is no cache, a name is refused, a link is at the
         name, or the write fails (every entry is left as it was, a stray `.tmp` is possible, and only the next start is cold)."""
         return self.put_json(self.prepare_json(name), value)
+
+    # --- the sweep
+
+    @staticmethod
+    def _managed(name):
+        """What the sweep may look at a name as: "temp" (`*.tmp`), "index", "entry" (doc or info), or None for the marker and every
+        other name (those are never touched). The name is plain: no `/`, not hidden."""
+        if not CacheDir._plain(name):
+            return None
+        if name.endswith(".tmp"):
+            return "temp"
+        found = _ENTRY_NAME.fullmatch(name)
+        return None if found is None else ("index" if found.group(1) == "index" else "entry")
+
+    def _last_sweep(self):
+        """The time of the last sweep as the marker file records it (seconds since the epoch), or None (no marker, not an envelope
+        of this format, not a number)."""
+        data = self.read_json(SWEEP_MARKER)
+        value = data.get("last_sweep") if isinstance(data, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        return value
+
+    def _listing(self, fd, spent):
+        """([(name, kind, size, mtime_ns, dev, ino)], complete): the regular files of the folder open on `fd` that the sweep manages
+        (see `_managed`), each looked at with `lstat` in the descriptor (no link followed). Only names are taken from the listing,
+        never a type from it; a name that goes before it is looked at, or is not a regular file, is left out. Stops early (complete
+        False) when `spent()`; what was found is still true of those files."""
+        found, complete = [], True
+        with os.scandir(fd) as listing:
+            for count, entry in enumerate(listing):
+                if count % 64 == 63 and spent():
+                    complete = False
+                    break
+                kind = self._managed(entry.name)
+                if kind is None:
+                    continue
+                try:
+                    info = os.lstat(entry.name, dir_fd=fd)
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    found.append((entry.name, kind, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino))
+        return found, complete
+
+    def sweep(self):
+        """Remove what has aged out of the folder, when a sweep is due (see the class docstring for the rules and the safety rule).
+        Due means: an entry was written since the last time this was asked (`written`), no sweep by this object or by the marker
+        file within SWEEP_EVERY_S (a marker time in the future, from a clock that was ahead, does not hold a sweep back), and the
+        folder is judged and exists. Returns None when no sweep was made, else {"deleted": n, "skipped": n, "complete": bool}
+        (`complete` False: the budget ran out). The marker is written last; it counts as a write only for the sweep that wrote it.
+        Never raises."""
+        if self.refusal or not self.written or not self._sweeping.acquire(blocking=False):
+            return None
+        fd = None
+        try:
+            self.written = False
+            now = time.time()
+            if self._swept_at is not None and 0 <= now - self._swept_at < SWEEP_EVERY_S:
+                return None
+            last = self._last_sweep()
+            if last is not None and 0 <= now - last < SWEEP_EVERY_S:
+                return None
+            self._swept_at = now
+            fd = self._open_folder(make=False)
+            if fd is None:
+                return None
+            return self._sweep_in(fd, now)
+        except Exception:
+            return None
+        finally:
+            if fd is not None:
+                close_quietly(fd)
+            self.written = False  # the marker is the sweep's own write, not a reason for another sweep
+            self._sweeping.release()
+
+    def _sweep_in(self, fd, now):
+        """The sweep itself in the judged folder's descriptor `fd`; see `sweep`."""
+        started = time.perf_counter()
+        deleted, skipped = 0, 0
+
+        def spent():
+            return deleted >= SWEEP_MAX_DELETIONS or time.perf_counter() - started >= SWEEP_BUDGET_S
+
+        def remove(item):
+            """True when the file was removed; False when it was skipped; None when the budget is spent (nothing was done)."""
+            nonlocal deleted, skipped
+            if spent():
+                return None
+            name, _, _, mtime_ns, dev, ino = item
+            try:
+                allowed = self._allow_file(posixpath.join(self.rel, name))  # the guard judges the name before it goes
+                info = os.lstat(name, dir_fd=fd) if allowed else None  # the same file that was listed, looked at again
+                if info is None or not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_mtime_ns) != (dev, ino, mtime_ns):
+                    skipped += 1
+                    return False
+                os.unlink(name, dir_fd=fd)
+            except Exception:
+                skipped += 1
+                return False
+            deleted += 1
+            return True
+
+        try:
+            found, complete = self._listing(fd, spent)
+        except Exception:
+            found, complete = [], False
+        def life(kind):
+            return TEMP_MAX_AGE_S if kind == "temp" else INDEX_MAX_AGE_S if kind == "index" else ENTRY_MAX_AGE_S
+
+        order = sorted(found, key=lambda item: (item[3], item[0]))  # oldest first
+        tried, removed, stopped = set(), set(), False
+        for item in order:  # age: a stray temporary, an entry unused for too long; a time in the future is never old
+            if now - item[3] / 1e9 > life(item[1]):
+                tried.add(item[0])
+                got = remove(item)
+                if got is None:
+                    stopped = True
+                    break
+                if got:
+                    removed.add(item[0])
+        if not stopped:  # size: the entries that are left (a temporary is not an entry), oldest first, until both caps hold
+            entries = [item for item in order if item[1] != "temp" and item[0] not in removed]
+            count, size = len(entries), sum(item[2] for item in entries)
+            for item in entries:
+                if count <= SWEEP_CAP_FILES and size <= SWEEP_CAP_BYTES:
+                    break
+                if item[0] in tried:
+                    continue  # asked once already and skipped
+                got = remove(item)
+                if got is None:
+                    stopped = True
+                    break
+                if got:
+                    count, size = count - 1, size - item[2]
+        result = {"deleted": deleted, "skipped": skipped, "complete": complete and not stopped}
+        try:
+            self.put_json(self.prepare_json(SWEEP_MARKER), {"version": 1, "last_sweep": now, **result})
+        except Exception:
+            pass  # the next write sweeps again (this object waits an hour, another may not)
+        return result
+
+    def summary(self):
+        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None}: the entries the sweep manages (index, doc and
+        info files that are regular files; temporaries and the marker are not entries) and the marker's time. Read-only, nothing
+        is made (a missing folder is 0 and 0). None for entries and bytes when there is no cache (refused) or the folder cannot be
+        listed. Never raises."""
+        none = {"entries": None, "bytes": None, "last_sweep": None}
+        if self.refusal:
+            return none
+        try:
+            fd = open_folder_below(self.base, self.rel.split("/"), make=False)
+        except FileNotFoundError:
+            return {"entries": 0, "bytes": 0, "last_sweep": None}  # nothing is there yet: an empty cache, and nothing is made
+        except Exception:
+            return none
+        if _opened_path(fd) != self.path:
+            close_quietly(fd)
+            return none
+        try:
+            found, _ = self._listing(fd, lambda: False)
+        except Exception:
+            return none
+        finally:
+            close_quietly(fd)
+        entries = [item for item in found if item[1] != "temp"]
+        try:
+            last = self._last_sweep()
+        except Exception:
+            last = None
+        return {"entries": len(entries), "bytes": sum(item[2] for item in entries), "last_sweep": last}
 
 
 def read_source(path, base, allow, failures=None, expect=None):
@@ -1625,6 +1836,7 @@ class ImportIndex:
         for rel, entry in data["entries"].items():
             if isinstance(entry, dict) and isinstance(entry.get("key"), list) and isinstance(entry.get("specs"), list):
                 self.entries[rel] = {"key": entry["key"], "specs": entry["specs"]}
+        self._cache.touch(self._cache_name)  # the shape was accepted: the file is in use (a file this instance rejects ages out)
 
     def save(self):
         """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True

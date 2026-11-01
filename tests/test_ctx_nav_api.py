@@ -4,6 +4,7 @@ Every project here is a copy of tests/fixtures/ctx_api/project or a small tree b
 Deno skip when it is not on PATH; none of them touches the network (the fixture imports nothing but local files and `node:path`),
 and the fake `deno` programs used for the timeout, failure and environment cases are shell scripts written into the temporary
 directory."""
+import contextlib
 import errno
 import hashlib
 import json
@@ -14,6 +15,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -3063,7 +3066,13 @@ class PathRuleCase(Tree):
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
         ("graph.py", "CacheDir.touch", "os.lstat"): "dir_fd of the opened folder (no folder made); a plain .json name read_json judged; never follows a link",
         ("graph.py", "CacheDir.touch", "os.utime"): "dir_fd of that folder, follow_symlinks=False: the name itself, never what a link leads to",
-        ("graph.py", "CacheDir.read_json", "self.touch"): "after read_bounded passed and the envelope held",
+        ("graph.py", "CacheDir._listing", "os.scandir"): "the judged folder's descriptor (sweep, summary); names only, no type taken from the listing",
+        ("graph.py", "CacheDir._listing", "os.lstat"): "dir_fd of that folder; only names that match nav_api-(index|doc|info)-*.json or *.tmp; no link followed; regular files only",
+        ("graph.py", "CacheDir._sweep_in", "os.lstat"): "dir_fd of the judged folder, after the guard allowed the name: must be the regular file that was listed (device, inode, mtime)",
+        ("graph.py", "CacheDir._sweep_in", "os.unlink"): "dir_fd of the judged folder; a managed name the guard allowed and the look just before it matched; never follows a link",
+        ("graph.py", "ImportIndex._load", "self._cache.touch"): "after the index payload's shape was accepted; touch is by descriptor, guard-judged, never follows a link",
+        ("nav_api.py", "NavApi._forward_graph", "self._cache.touch"): "after the stored graph's shape was accepted (`_info_local`)",
+        ("nav_api.py", "NavApi._symbols", "self._cache.touch"): "after the stored symbol list was accepted (a list)",
         ("graph.py", "CacheDir.put_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name prepare_json judged (asks no guard)",
         ("graph.py", "CacheDir.put_json", "os.rename"): "dir_fd of the checked folder; names prepare_json judged",
         ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
@@ -5981,10 +5990,14 @@ class InfoCacheCase(Tree):
             events.append(path)
             return path
         nav = self.nav_for(project, check_path=check)
+        real_final = nav._final
+        nav._final = lambda *a, **k: (lambda got: (events.append("returned"), got)[1])(real_final(*a, **k))
         with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
             self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
-        self.assertEqual(events[-1], "proof", events)
         folder = project_cache(project).parent.relative_to(project).as_posix()
+        self.assertEqual(events[events.index("returned") - 1], "proof", events)  # nothing runs between the proof and the answer
+        after = events[events.index("returned") + 1:]  # the sweep, once the answer is made: only its own marker's names
+        self.assertTrue(all(e.startswith(f"{folder}/{graph.SWEEP_MARKER}") for e in after), events)
         before = events[:events.index("proof")]
         self.assertEqual(sum(1 for e in before if e.startswith(folder + "/nav_api-info-") and e.endswith(".tmp")), 1, events)
         self.assertEqual(len(self.entries(project)), 1)
@@ -6092,7 +6105,7 @@ class InfoCacheCase(Tree):
                 mock.patch.object(graph.os, "rmdir", fail))
 
     def _names(self, folder):
-        return {p.name: p.read_bytes() for p in folder.iterdir()} if folder.exists() else {}
+        return {p.name: p.read_bytes() for p in folder.iterdir() if p.name != graph.SWEEP_MARKER} if folder.exists() else {}  # the marker is the sweep's, not an entry
 
     def test_s3_f4_a_failed_write_leaves_every_entry_byte_identical_and_removes_nothing(self):
         for call in ("forward_graph", "symbols"):
@@ -6587,6 +6600,7 @@ class EnvelopeCase(Tree):
         self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO, "a link swapped in after the read was followed")
         # and if the look at the name were fooled, the time is still set on the name itself, never on what it leads to
         real_lstat = os.lstat
+        os.utime(good, (self.LONG_AGO, self.LONG_AGO))  # an old entry: the touch (throttled to entries an hour old) reaches `utime`
         with mock.patch.object(graph.os, "lstat", lambda name, *a, **k: real_lstat(good) if name == entry2.name else real_lstat(name, *a, **k)):
             cache2.touch(entry2.name)
         self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO, "utime followed the link")
@@ -6608,8 +6622,10 @@ class EnvelopeCase(Tree):
             for kind in ("info", "doc", "index"):
                 with self.subTest(kind=kind, failure=type(failure).__name__):
                     project, entry, base, ran = self.filled(kind, f"{kind}-{n}")
-                    with mock.patch.object(graph.os, "utime", side_effect=failure):
+                    os.utime(entry, (self.LONG_AGO, self.LONG_AGO))  # old, so the throttled touch reaches `utime`
+                    with mock.patch.object(graph.os, "utime", side_effect=failure) as utime:
                         answer, ran_now = self.ask(project, kind)
+                    utime.assert_called()
                     self.assertEqual(answer["status"], "ok", answer)
                     self.assertEqual(ran_now, ran if kind != "index" else 0, "a failed touch cost the hit")
         project, entry, _, _ = self.filled("info", "folder")
@@ -6730,6 +6746,859 @@ class EnvelopeCase(Tree):
         self.assertIn("src/late.ts", [i["path"] for i in again["importers"]])
         run = [(i["path"], i["line"]) for i in self.nav(project).importers("src/app/run.ts")["importers"]]
         self.assertIn("src/util/slug.ts", [path for path, _ in run], "the edit the rejected answer missed is seen by the next one")
+
+
+
+KILL_SCRIPT = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from ctxengine import graph
+base, folder, name = sys.argv[2:5]
+cache = graph.CacheDir(base, folder, lambda rel: True)
+assert cache.refusal is None, cache.refusal
+def die(*a, **k):
+    os._exit(9)  # the process is gone between the temporary file and the rename
+os.rename = die
+cache.put_json(cache.prepare_json(name), {"a": 1})
+os._exit(0)
+"""
+
+SWEEPER_SCRIPT = """
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from ctxengine import graph
+base, folder, go = sys.argv[2:5]
+graph.SWEEP_BUDGET_S = 600.0
+cache = graph.CacheDir(base, folder, lambda rel: True)
+cache.written = True
+print("ready", flush=True)
+while not os.path.exists(go):  # waits on the event: the parent made the go file
+    pass
+print(json.dumps(cache.sweep()), flush=True)
+"""
+
+
+@contextlib.contextmanager
+def _both(*patches):
+    """Several `mock.patch` objects as one context."""
+    with contextlib.ExitStack() as stack:
+        for item in patches:
+            stack.enter_context(item)
+        yield
+
+
+class SweepCase(Tree):
+    """Cache plan S5: the sweep (`graph.CacheDir.sweep`, called by `NavApi` after a call that wrote an entry): age, cap, stray
+    temporaries, throttle, budget, `status()`, and the safety rule (descriptor only; managed names, regular files only; the guard
+    judges a name and the look just before the unlink must find the file that was listed). The sweep table of the report maps each
+    site and state to a test here."""
+
+    DAY = 86400
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+    INFO = InfoCacheCase.INFO
+    BUDGET = graph.SWEEP_BUDGET_S  # read before setUp patches it
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(graph, "SWEEP_BUDGET_S", 600.0)  # a rule is tested without the clock; the budget has its own tests
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.proj = self.project("sweep")
+        self.folder = project_cache(self.proj).parent
+        self.folder.mkdir(parents=True, mode=0o700)
+
+    # --- helpers
+
+    def cache(self, project=None, **kw):
+        return self.nav(project or self.proj, **kw)._cache
+
+    def put(self, name, age=0, size=10, folder=None):
+        """A regular file `name` of `size` bytes whose mtime is `age` seconds ago."""
+        path = (folder or self.folder) / name
+        path.write_bytes(b"x" * size)
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    def sweep(self, cache=None, fresh=True):
+        """Sweep as after a write. `fresh`: with no marker (a sweep not held back by the throttle)."""
+        cache = cache or self.cache()
+        if fresh:
+            self.marker().unlink(missing_ok=True)
+        cache.written = True
+        return cache.sweep()
+
+    def marker(self):
+        return self.folder / graph.SWEEP_MARKER
+
+    def left(self, folder=None):
+        return sorted(p.name for p in (folder or self.folder).iterdir() if p.name != graph.SWEEP_MARKER)
+
+    def decoy(self, name="decoy.txt", age=40 * 86400):
+        """A file outside the cache folder, old, that no sweep may read, touch or remove (nor through a link)."""
+        path = write(self.dir / name, "decoy\n")
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    def assert_decoy(self, path, age=40 * 86400):
+        self.assertEqual(path.read_text(), "decoy\n")
+        self.assertLess(path.stat().st_mtime, time.time() - age + 60, "the decoy was touched")
+
+    # --- age
+
+    def test_s5_an_entry_unused_for_14_days_goes_and_an_index_file_for_30(self):
+        for name, age in (("nav_api-doc-old.json", 15), ("nav_api-info-old.json", 15), ("nav_api-index-old.json", 31),
+                          ("nav_api-doc-new.json", 13), ("nav_api-info-new.json", 1), ("nav_api-index-mid.json", 20),
+                          ("nav_api-index-new.json", 29)):
+            self.put(name, age * self.DAY)
+        result = self.sweep()
+        self.assertEqual(self.left(), ["nav_api-doc-new.json", "nav_api-index-mid.json", "nav_api-index-new.json", "nav_api-info-new.json"])
+        self.assertEqual((result["deleted"], result["complete"]), (3, True))
+
+    # --- cap
+
+    def test_s5_more_than_400_files_the_oldest_by_mtime_go_first(self):
+        for i in range(405):
+            self.put(f"nav_api-{('doc', 'info', 'index')[i % 3]}-{i:04d}.json", 1000 + (405 - i) * 10)  # 0000 is the oldest
+        self.sweep()
+        names = self.left()
+        self.assertEqual(len(names), 400)
+        gone = {f"nav_api-{('doc', 'info', 'index')[i % 3]}-{i:04d}.json" for i in range(5)}
+        self.assertEqual(gone & set(names), set(), "the five oldest were not the ones removed")
+
+    def test_s5_more_than_64_mb_the_oldest_by_mtime_go_first(self):
+        with mock.patch.object(graph, "SWEEP_CAP_BYTES", 1000):
+            for i in range(5):
+                self.put(f"nav_api-doc-{i}.json", 500 - i * 100, size=300)  # 0 is the oldest
+            self.sweep()
+        self.assertEqual(self.left(), ["nav_api-doc-2.json", "nav_api-doc-3.json", "nav_api-doc-4.json"])
+
+    def test_s5_the_default_caps_are_the_plan_numbers(self):
+        self.assertEqual((graph.SWEEP_CAP_BYTES, graph.SWEEP_CAP_FILES), (64_000_000, 400))
+        self.assertEqual((graph.ENTRY_MAX_AGE_S, graph.INDEX_MAX_AGE_S, graph.TEMP_MAX_AGE_S), (14 * 86400, 30 * 86400, 600))
+        self.assertEqual((graph.SWEEP_EVERY_S, graph.SWEEP_MAX_DELETIONS, self.BUDGET), (3600, 200, 0.05))
+
+    def test_s5_what_the_caps_count_is_the_entries_only(self):
+        with mock.patch.object(graph, "SWEEP_CAP_BYTES", 1000), mock.patch.object(graph, "SWEEP_CAP_FILES", 3):
+            for i in range(3):
+                self.put(f"nav_api-doc-{i}.json", 100 + i, size=300)
+            self.put("scratch.tmp", 30, size=5000)  # a young temporary is being written: not an entry, not counted
+            self.put("notes.txt", 30, size=5000)
+            self.put("nav_api-sweep.json", 30, size=5000)
+            result = self.sweep()
+        self.assertEqual(result["deleted"], 0, result)
+        self.assertEqual(len(self.left()), 5)
+
+    def test_s5_expired_entries_go_before_the_cap_counts(self):
+        with mock.patch.object(graph, "SWEEP_CAP_FILES", 3):
+            for i in range(2):
+                self.put(f"nav_api-doc-old{i}.json", 20 * self.DAY)
+            for i in range(4):
+                self.put(f"nav_api-doc-new{i}.json", 100 - i)  # new3 is the newest
+            self.sweep()
+        self.assertEqual(self.left(), ["nav_api-doc-new1.json", "nav_api-doc-new2.json", "nav_api-doc-new3.json"])
+
+    # --- stray temporaries
+
+    def test_s5_a_temporary_older_than_10_minutes_goes_by_age_alone(self):
+        stray = ("nav_api-doc-a.json.0123456789abcdef.tmp", "other.tmp", f"nav_api-doc-c.json.{os.getpid()}.tmp", "nav_api-info-d.json.1.tmp")
+        for name in stray:
+            self.put(name, 11 * 60)
+        for name in ("nav_api-doc-b.json.fedcba9876543210.tmp", f"nav_api-doc-e.json.{os.getpid() + 1}.tmp", "young.tmp"):
+            self.put(name, 9 * 60)  # a writer's temporary, whoever's: not old enough
+        self.put(".hidden.tmp", self.DAY)  # not a plain name
+        self.sweep()
+        self.assertEqual(self.left(), [".hidden.tmp", "nav_api-doc-b.json.fedcba9876543210.tmp", f"nav_api-doc-e.json.{os.getpid() + 1}.tmp",
+                                       "young.tmp"])
+
+    def test_s5_a_kill_between_the_temporary_and_the_rename_leaves_a_temporary_a_later_sweep_removes(self):
+        name = "nav_api-info-killed.json"
+        done = subprocess.run([sys.executable, "-I", "-c", KILL_SCRIPT, str(ROOT / "lib"), str(self.proj), str(self.folder), name],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 9, done)
+        (stray,) = [p for p in self.folder.iterdir() if p.name.endswith(".tmp")]
+        self.assertTrue(stray.name.startswith(name + "."))
+        self.assertFalse((self.folder / name).exists(), "no torn entry")
+        self.assertIsNone(self.cache().read_json(name), "a miss, never a torn hit")
+        self.sweep()
+        self.assertEqual(self.left(), [stray.name], "a temporary of a minute ago may be a live writer's")
+        when = time.time() - 11 * 60
+        os.utime(stray, (when, when))
+        self.sweep()
+        self.assertEqual(self.left(), [])
+
+    # --- throttle
+
+    def test_s5_a_sweep_runs_at_most_once_an_hour_by_the_marker(self):
+        self.put("nav_api-doc-old1.json", 20 * self.DAY)
+        before = time.time()
+        self.assertEqual(self.sweep()["deleted"], 1)
+        envelope = json.loads(self.marker().read_text())
+        self.assertEqual((envelope["name"], envelope["format"]), (graph.SWEEP_MARKER, graph.ENVELOPE_FORMAT))
+        self.assertGreaterEqual(envelope["payload"]["last_sweep"], before - 1)
+        self.assertEqual({"version", "last_sweep", "deleted", "skipped", "complete"}, set(envelope["payload"]))
+        self.put("nav_api-doc-old2.json", 20 * self.DAY)
+        self.assertIsNone(self.sweep(fresh=False), "held back by the marker")
+        self.assertIn("nav_api-doc-old2.json", self.left())
+        for ago, due in ((3599, False), (3601, True)):
+            self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": time.time() - ago})
+            self.assertEqual(self.sweep(fresh=False) is not None, due, ago)
+        self.assertNotIn("nav_api-doc-old2.json", self.left())
+
+    def test_s5_an_object_that_swept_waits_an_hour_even_if_the_marker_cannot_be_written(self):
+        cache = self.cache()
+        self.put("nav_api-doc-old1.json", 20 * self.DAY)
+        self.assertEqual(self.sweep(cache)["deleted"], 1)
+        self.marker().unlink()
+        self.put("nav_api-doc-old2.json", 20 * self.DAY)
+        self.assertIsNone(self.sweep(cache, fresh=False))
+        self.assertIn("nav_api-doc-old2.json", self.left())
+
+    def test_s5_nothing_is_swept_unless_an_entry_was_written(self):
+        cache = self.cache()
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        self.assertIsNone(cache.sweep())
+        self.assertFalse(cache.written)
+        self.assertEqual((self.left(), self.marker().exists()), (["nav_api-doc-old.json"], False))
+        self.assertFalse(cache.write_json("not-json.txt", {}))
+        self.assertFalse(cache.written, "a refused write is not a write")
+        self.assertTrue(cache.write_json("nav_api-doc-new.json", []))
+        self.assertTrue(cache.written)
+        self.assertEqual(cache.sweep()["deleted"], 1)
+        self.assertFalse(cache.written, "one sweep per write")
+
+    # --- budget
+
+    def test_s5_a_sweep_stops_after_200_deletions(self):
+        for i in range(205):
+            self.put(f"nav_api-doc-{i:03d}.json", 20 * self.DAY + i)
+        result = self.sweep()
+        self.assertEqual((result["deleted"], result["complete"]), (200, False))
+        self.assertEqual(len(self.left()), 5)
+        self.assertTrue(self.marker().exists(), "the budget does not cost the throttle")
+
+    def test_s5_a_sweep_stops_when_its_time_is_spent(self):
+        for i in range(30):
+            self.put(f"nav_api-doc-{i:03d}.json", 20 * self.DAY + i)
+        ticks = iter(x * 0.02 for x in range(1, 10_000))
+        fake = types.SimpleNamespace(time=time.time, perf_counter=lambda: next(ticks))  # every look at the clock costs 20 ms
+        with mock.patch.object(graph, "SWEEP_BUDGET_S", 0.05), mock.patch.object(graph, "time", fake):
+            result = self.sweep()
+        self.assertEqual(result["complete"], False)
+        self.assertTrue(0 < result["deleted"] < 30, result)
+        self.assertEqual(len(self.left()), 30 - result["deleted"])
+
+    def test_s5_a_budget_of_nothing_deletes_nothing_and_a_later_sweep_finishes(self):
+        for i in range(100):
+            self.put(f"nav_api-doc-{i:03d}.json", 20 * self.DAY)
+        with mock.patch.object(graph, "SWEEP_BUDGET_S", 0.0):
+            result = self.sweep()
+        self.assertEqual((result["deleted"], result["complete"], len(self.left())), (0, False, 100))
+        self.assertTrue(self.marker().exists())
+        self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": time.time() - 3700})
+        self.assertEqual((self.sweep(fresh=False)["deleted"], self.left()), (100, []))
+
+    # --- the safety rule: managed names, regular files, descriptor only
+
+    def foreign(self):
+        """Old things in the folder that the sweep must not touch: other names, links, folders, a FIFO, hidden names."""
+        decoy = self.decoy()
+        keep = []
+        for name in ("notes.txt", "deno.lock", "nav_api-other-1.json", "nav_api-doc-x.json.bak", "README", "nav_api-docs-1.json",
+                     "index.json", "nav_api-sweep.json.bak", ".nav_api-doc-hidden.json", ".hidden.tmp"):
+            self.put(name, 40 * self.DAY)
+            keep.append(name)
+        for name in ("nav_api-doc-link.json", "nav_api-index-link.json", "stale.tmp", "nav_api-info-x.json.0000000000000000.tmp"):
+            (self.folder / name).symlink_to(decoy)
+            keep.append(name)
+        (self.folder / "nav_api-doc-dir.json" / "inner").mkdir(parents=True)
+        write(self.folder / "nav_api-doc-dir.json" / "inner" / "nav_api-doc-in.json", "inner\n")
+        (self.folder / "dir.tmp").mkdir()
+        write(self.folder / "dir.tmp" / "old.tmp", "inner\n")
+        keep += ["nav_api-doc-dir.json", "dir.tmp"]
+        os.mkfifo(self.folder / "nav_api-info-fifo.json")
+        os.mkfifo(self.folder / "fifo.tmp")
+        keep += ["nav_api-info-fifo.json", "fifo.tmp"]
+        for name in ("nav_api-doc-dir.json", "dir.tmp", "nav_api-doc-link.json", "nav_api-index-link.json", "stale.tmp",
+                     "nav_api-info-x.json.0000000000000000.tmp", "nav_api-info-fifo.json", "fifo.tmp"):
+            when = time.time() - 40 * self.DAY
+            os.utime(self.folder / name, (when, when), follow_symlinks=False)
+        return decoy, sorted(keep)
+
+    def test_s5_foreign_names_links_folders_and_fifos_are_left_untouched(self):
+        decoy, keep = self.foreign()
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        self.put("old.tmp", 20 * 60)
+        asked = []
+        cache = self.nav(self.proj, check_path=lambda root, path: (asked.append(path), nav_api.stub_check_path(root, path))[1])._cache
+        result = self.sweep(cache)
+        self.assertEqual(result["deleted"], 2, result)
+        self.assertEqual(self.left(), keep)
+        self.assert_decoy(decoy)
+        self.assertEqual((self.folder / "nav_api-doc-dir.json" / "inner" / "nav_api-doc-in.json").read_text(), "inner\n")
+        judged = {p for p in asked if p.startswith(".tmux-pi/ctx-cache/") and not p.startswith(f".tmux-pi/ctx-cache/{graph.SWEEP_MARKER}")}
+        self.assertEqual(judged, {".tmux-pi/ctx-cache/nav_api-doc-old.json", ".tmux-pi/ctx-cache/old.tmp"},
+                         "the guard was asked about a name the sweep never touches")
+
+    def test_s5_the_marker_is_never_removed_by_age_or_cap_and_a_link_or_folder_there_is_left_alone(self):
+        self.put(graph.SWEEP_MARKER, 90 * self.DAY, size=3)
+        when = time.time() - 90 * self.DAY
+        os.utime(self.marker(), (when, when))
+        with mock.patch.object(graph, "SWEEP_CAP_FILES", 0):
+            self.sweep(fresh=False)
+        self.assertTrue(self.marker().exists())
+        self.assertGreater(json.loads(self.marker().read_text())["payload"]["last_sweep"], 0, "an ancient bad marker is not a throttle; it is rewritten")
+        # a link at the marker
+        decoy = self.decoy()
+        self.marker().unlink()
+        self.marker().symlink_to(decoy)
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        self.assertEqual(self.sweep(fresh=False)["deleted"], 1)
+        self.assertTrue(self.marker().is_symlink())
+        self.assert_decoy(decoy)
+        # a folder at the marker
+        self.marker().unlink()
+        self.marker().mkdir()
+        write(self.marker() / "inner.txt", "inner\n")
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        self.assertEqual(self.sweep(fresh=False)["deleted"], 1)
+        self.assertEqual((self.marker() / "inner.txt").read_text(), "inner\n")
+
+    def test_s5_a_bad_marker_is_no_throttle(self):
+        for label, content in (("empty", b""), ("text", b"yesterday"), ("bare", json.dumps({"last_sweep": time.time()}).encode()),
+                               ("string", seal(graph.SWEEP_MARKER, {"last_sweep": "now"}).encode()),
+                               ("bool", seal(graph.SWEEP_MARKER, {"last_sweep": True}).encode()),
+                               ("nan", seal(graph.SWEEP_MARKER, {"last_sweep": float("nan")}).encode()),
+                               ("list", seal(graph.SWEEP_MARKER, [time.time()]).encode()),
+                               ("other name", seal("nav_api-doc-x.json", {"last_sweep": time.time()}).encode())):
+            with self.subTest(label):
+                self.marker().write_bytes(content)
+                self.put("nav_api-doc-old.json", 20 * self.DAY)
+                self.assertEqual(self.sweep(fresh=False)["deleted"], 1)
+                self.assertIsInstance(self.cache()._last_sweep(), float)
+
+    def replaced_by(self, how, victim="nav_api-doc-victim.json"):
+        """Sweep with `victim` expired and `how(path)` done to it after the listing and before any deletion. Returns the result."""
+        path = self.put(victim, 20 * self.DAY)
+        self.put("nav_api-doc-other.json", 20 * self.DAY)  # the control: still removed
+        real = graph.CacheDir._listing
+
+        def listing(this, fd, spent):
+            got = real(this, fd, spent)
+            how(path)
+            return got
+        with mock.patch.object(graph.CacheDir, "_listing", listing):
+            result = self.sweep()
+        self.assertNotIn("nav_api-doc-other.json", self.left(), "the control entry was not removed")
+        return result
+
+    def test_s5_a_file_replaced_by_another_file_between_the_listing_and_the_delete_is_skipped_by_inode(self):
+        def replace(path):
+            old = path.stat()
+            fresh = write(self.folder / "replacement.partial", "new content\n")
+            os.utime(fresh, ns=(old.st_atime_ns, old.st_mtime_ns))  # the same age: only the inode tells
+            os.rename(fresh, path)
+        result = self.replaced_by(replace)
+        self.assertEqual(result["deleted"], 1, result)
+        self.assertEqual((self.folder / "nav_api-doc-victim.json").read_text(), "new content\n")
+
+    def test_s5_a_file_touched_between_the_listing_and_the_delete_is_skipped(self):
+        self.replaced_by(lambda path: os.utime(path, None))
+        self.assertIn("nav_api-doc-victim.json", self.left())
+
+    def test_s5_a_file_replaced_by_a_link_a_folder_or_a_fifo_is_not_removed(self):
+        decoy = self.decoy()
+
+        def link(path):
+            path.unlink()
+            path.symlink_to(decoy)
+
+        def folder(path):
+            path.unlink()
+            path.mkdir()
+            write(path / "inner.txt", "inner\n")
+
+        def fifo(path):
+            path.unlink()
+            os.mkfifo(path)
+        for label, how in (("link", link), ("folder", folder), ("fifo", fifo)):
+            with self.subTest(label):
+                victim = f"nav_api-doc-{label}.json"
+                self.replaced_by(how, victim)
+                kept = self.folder / victim
+                self.assertTrue(kept.is_symlink() if label == "link" else kept.exists(), label)
+                self.assert_decoy(decoy)
+                if label == "folder":
+                    self.assertEqual((kept / "inner.txt").read_text(), "inner\n")
+                (kept.unlink() if kept.is_symlink() or label == "fifo" else shutil.rmtree(kept))
+
+    def test_s5_a_file_gone_between_the_listing_and_the_delete_is_a_skip_not_an_error(self):
+        result = self.replaced_by(lambda path: path.unlink())
+        self.assertEqual((result["deleted"], result["skipped"]), (1, 1))
+
+    def test_s5_a_file_on_another_device_is_skipped(self):
+        self.put("nav_api-doc-victim.json", 20 * self.DAY)
+        real, seen = os.lstat, []
+
+        def other_device(name, *a, **k):
+            got = real(name, *a, **k)
+            if k.get("dir_fd") is not None and name == "nav_api-doc-victim.json":
+                seen.append(1)
+                if len(seen) > 1:
+                    return types.SimpleNamespace(st_mode=got.st_mode, st_dev=got.st_dev + 1, st_ino=got.st_ino, st_mtime_ns=got.st_mtime_ns)
+            return got
+        with mock.patch.object(graph.os, "lstat", other_device):
+            result = self.sweep()
+        self.assertEqual((result["deleted"], self.left()), (0, ["nav_api-doc-victim.json"]))
+
+    def test_s5_the_sweep_lists_and_deletes_only_through_the_folder_descriptor(self):
+        for i in range(3):
+            self.put(f"nav_api-doc-old{i}.json", 20 * self.DAY)
+        self.put("old.tmp", 20 * 60)
+        calls = []
+        real_unlink, real_scandir, real_lstat = os.unlink, os.scandir, os.lstat
+        cache = self.cache()
+        self.marker().unlink(missing_ok=True)
+        entered = []
+        real_in = graph.CacheDir._sweep_in
+
+        def sweep_in(this, fd, now):
+            entered.append(1)
+            try:
+                return real_in(this, fd, now)
+            finally:
+                entered.append(0)
+
+        def unlink(name, *a, **k):
+            calls.append(("unlink", name, k.get("dir_fd")))
+            return real_unlink(name, *a, **k)
+
+        def scandir(where=".", *a):
+            if entered and entered[-1]:
+                calls.append(("scandir", where, None))
+            return real_scandir(where, *a)
+
+        def lstat(name, *a, **k):
+            if entered and entered[-1]:
+                calls.append(("lstat", name, k.get("dir_fd")))
+            return real_lstat(name, *a, **k)
+        with mock.patch.object(graph.CacheDir, "_sweep_in", sweep_in), mock.patch.object(graph.os, "unlink", unlink), \
+                mock.patch.object(graph.os, "scandir", scandir), mock.patch.object(graph.os, "lstat", lstat):
+            self.assertEqual(self.sweep(cache, fresh=False)["deleted"], 4)
+        self.assertEqual(len([c for c in calls if c[0] == "unlink"]), 4)
+        for kind, name, dir_fd in calls:
+            if kind == "scandir":
+                self.assertIsInstance(name, int, "a listing by path")
+            elif kind == "unlink" or (kind == "lstat" and "/" not in name):  # the guard's own looks are by path, its business
+                self.assertIsInstance(dir_fd, int, (kind, name))
+                self.assertNotIn("/", name)
+
+    def test_s5_the_guard_judges_each_name_before_it_is_deleted(self):
+        for name in ("nav_api-doc-ok.json", "nav_api-doc-refused.json", "nav_api-doc-raises.json", "nav_api-doc-cannot.json"):
+            self.put(name, 20 * self.DAY)
+        events = []
+
+        def check(root, path):
+            name = path.rsplit("/", 1)[-1]
+            events.append(("judge", name))
+            if name == "nav_api-doc-refused.json":
+                raise nav_api.Refused("blocked_by_test")
+            if name == "nav_api-doc-raises.json":
+                raise RuntimeError("guard down")
+            if name == "nav_api-doc-cannot.json":
+                raise nav_api.Refused("unreadable_path")
+            return path
+        real = os.unlink
+        self.marker().unlink(missing_ok=True)
+        with mock.patch.object(graph.os, "unlink", lambda name, *a, **k: (events.append(("unlink", name)), real(name, *a, **k))[1]):
+            result = self.sweep(self.cache(check_path=check), fresh=False)
+        self.assertEqual(self.left(), ["nav_api-doc-cannot.json", "nav_api-doc-raises.json", "nav_api-doc-refused.json"])
+        self.assertEqual((result["deleted"], result["skipped"]), (1, 3))
+        self.assertLess(events.index(("judge", "nav_api-doc-ok.json")), events.index(("unlink", "nav_api-doc-ok.json")))
+        self.assertEqual([e for e in events if e[0] == "unlink"], [("unlink", "nav_api-doc-ok.json")])
+
+    def test_s5_an_unreadable_entry_and_an_unwritable_folder(self):
+        if os.geteuid() == 0:
+            self.skipTest("mode 000 does not stop root")
+        path = self.put("nav_api-doc-closed.json", 20 * self.DAY)
+        path.chmod(0)
+        self.addCleanup(lambda: path.exists() and path.chmod(0o644))
+        self.assertEqual(self.sweep()["deleted"], 1, "the sweep never reads a file, so a closed one goes by age")
+        self.put("nav_api-doc-stuck.json", 20 * self.DAY)
+        self.marker().unlink()
+        self.folder.chmod(0o500)
+        self.addCleanup(lambda: self.folder.chmod(0o700))
+        cache = self.cache()
+        cache.written = True
+        self.assertEqual(cache.sweep(), {"deleted": 0, "skipped": 1, "complete": True})
+        self.assertEqual(self.left(), ["nav_api-doc-stuck.json"])
+        self.folder.chmod(0)
+        cache = self.cache()
+        cache.written = True
+        self.assertIsNone(cache.sweep(), "a folder that cannot be opened is not swept")
+        self.folder.chmod(0o700)
+
+    # --- a refused or missing folder
+
+    def test_s5_a_refused_or_missing_cache_folder_is_never_swept(self):
+        outside = self.dir / "outside-cache"
+        outside.mkdir()
+        self.put("nav_api-doc-old.json", 20 * self.DAY, folder=outside)
+        cache = self.cache(cache_dir=str(outside))
+        self.assertTrue(cache.refusal)
+        self.assertIsNone(self.sweep(cache))
+        self.assertEqual(self.left(outside), ["nav_api-doc-old.json"])
+        # a guard that refuses the folder
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        def refuse(root, path):
+            if "ctx-cache" in path:
+                raise nav_api.Refused("sensitive_path")
+            return nav_api.stub_check_path(root, path)
+        refusing = self.cache(check_path=refuse)
+        self.assertTrue(refusing.refusal)
+        self.assertIsNone(self.sweep(refusing))
+        # no guard at all
+        unguarded = graph.CacheDir(str(self.proj), str(self.folder), None)
+        unguarded.written = True
+        self.assertIsNone(unguarded.sweep())
+        self.assertIn("nav_api-doc-old.json", self.left())
+        # a folder that is a link to a place outside
+        shutil.rmtree(self.folder)
+        self.folder.symlink_to(outside)
+        linked = self.cache()
+        self.assertTrue(linked.refusal)
+        self.assertIsNone(self.sweep(linked, fresh=False))
+        self.assertEqual(self.left(outside), ["nav_api-doc-old.json"])
+        # missing: nothing is made
+        self.folder.unlink()
+        shutil.rmtree(self.proj / ".tmux-pi")
+        cache = self.cache()
+        cache.written = True
+        self.assertIsNone(cache.sweep())
+        self.assertFalse((self.proj / ".tmux-pi").exists(), "the sweep made the folder")
+
+    def test_s5_a_folder_swapped_for_a_link_after_it_was_judged_is_not_swept(self):
+        cache = self.cache()
+        self.assertIsNone(cache.refusal)
+        decoy_folder = self.dir / "decoy-folder"
+        decoy_folder.mkdir()
+        self.put("nav_api-doc-old.json", 20 * self.DAY, folder=decoy_folder)
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        os.rename(self.folder, self.dir / "moved-away")
+        self.folder.symlink_to(decoy_folder)
+        self.assertIsNone(self.sweep(cache, fresh=False))
+        self.assertEqual(self.left(decoy_folder), ["nav_api-doc-old.json"])
+        self.assertEqual(self.left(self.dir / "moved-away"), ["nav_api-doc-old.json"])
+
+    # --- clock in the future
+
+    def test_s5_a_time_in_the_future_is_never_old_and_is_the_last_to_go_under_the_cap(self):
+        for name in ("nav_api-doc-future.json", "nav_api-index-future.json", "tmp-future.tmp"):
+            self.put(name, -400 * self.DAY)
+        self.assertEqual(self.sweep()["deleted"], 0)
+        self.assertEqual(len(self.left()), 3)
+        with mock.patch.object(graph, "SWEEP_CAP_FILES", 3):
+            for i in range(2):
+                self.put(f"nav_api-doc-now{i}.json", 100 - i)
+            self.sweep()
+        self.assertEqual(self.left(), ["nav_api-doc-future.json", "nav_api-doc-now1.json", "nav_api-index-future.json", "tmp-future.tmp"],
+                         "the oldest of the entries went, not the ones dated ahead")
+
+    def test_s5_a_marker_from_the_future_does_not_hold_a_sweep_back_and_is_rewritten(self):
+        self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": time.time() + 400 * self.DAY})
+        self.put("nav_api-doc-old.json", 20 * self.DAY)
+        self.assertEqual(self.sweep(fresh=False)["deleted"], 1)
+        self.assertLess(self.cache()._last_sweep(), time.time() + 60)
+
+    # --- the sweep inside NavApi: only after a write, never on a hit, never changes an answer
+
+    def info_nav(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(info=self.INFO), **kw)
+
+    def test_s5_a_hit_never_sweeps_and_a_write_does(self):
+        project = self.project("hit")
+        folder = project_cache(project).parent
+        miss = self.info_nav(project).forward_graph("src/main.ts")
+        self.assertEqual(miss["status"], "ok")
+        self.assertTrue((folder / graph.SWEEP_MARKER).exists(), "a write sweeps (the first sweep of a folder)")
+        ancient = self.put("nav_api-doc-ancient.json", 20 * self.DAY, folder=folder)
+        (folder / graph.SWEEP_MARKER).unlink()
+        hit = self.info_nav(project).forward_graph("src/main.ts")
+        self.assertEqual(hit, miss)
+        self.assertEqual(len(self.deno_calls("info")), 1, "the control is a hit")
+        self.assertTrue(ancient.exists(), "a hit swept")
+        self.assertFalse((folder / graph.SWEEP_MARKER).exists(), "a hit made the marker")
+        write(project / "src" / "main.ts", (project / "src" / "main.ts").read_text() + "// edited\n")  # a new key: a miss, a write
+        other = self.info_nav(project).forward_graph("src/main.ts")
+        self.assertEqual(other["status"], "ok", other)
+        self.assertEqual(len(self.deno_calls("info")), 2, "the control is a miss")
+        self.assertFalse(ancient.exists(), "a write did not sweep")
+        self.assertTrue((folder / graph.SWEEP_MARKER).exists())
+
+    def test_s5_an_index_hit_never_sweeps_and_an_index_write_does(self):
+        project = self.project("index")
+        folder = project_cache(project).parent
+        self.assertEqual(self.nav(project).importers("src/util/slug.ts")["status"], "ok")
+        ancient = self.put("nav_api-doc-ancient.json", 20 * self.DAY, folder=folder)
+        (folder / graph.SWEEP_MARKER).unlink()
+        self.assertEqual(self.nav(project).importers("src/util/slug.ts")["status"], "ok")
+        self.assertTrue(ancient.exists(), "a warm index (nothing to save) swept")
+        write(project / "src" / "util" / "slug.ts", (project / "src" / "util" / "slug.ts").read_text() + "export const added = 1;\n")
+        self.assertEqual(self.nav(project).imports("src/main.ts", source="index")["status"], "ok")
+        self.assertFalse(ancient.exists())
+
+    CALLS = (("importers", lambda nav: nav.importers("src/util/slug.ts"), "index"),
+             ("imports", lambda nav: nav.imports("src/main.ts", source="index"), "index"),
+             ("forward_graph", lambda nav: nav.forward_graph("src/main.ts"), "info"),
+             ("symbols", lambda nav: nav.symbols("src/main.ts"), "doc"))
+
+    def call_nav(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(info=self.INFO, doc=self.doc_payload(MIRROR, "src/main.ts", "main", "d", line=1)), **kw)
+
+    @staticmethod
+    def volatile(answer):
+        return {k: v for k, v in answer.items() if k not in ("index_age_s", "scanned", "cached", "ms")}
+
+    def failures(self):
+        """{label: a function that makes the patch}: a failure at each site of a sweep (open, marker read, listing, judge, look,
+        unlink, marker write), and a bug in each layer. The file-system failures are only in force while a sweep runs, so they
+        cannot touch the answer that wrote the entry."""
+        state = {"in": 0}
+        real_sweep = graph.CacheDir.sweep
+
+        def tracked(this):
+            state["in"] += 1
+            try:
+                return real_sweep(this)
+            finally:
+                state["in"] -= 1
+
+        def at_sweep(owner, name, error):
+            real = getattr(owner, name)
+
+            def failing(*a, **k):
+                if state["in"]:
+                    raise error
+                return real(*a, **k)
+            return _both(mock.patch.object(graph.CacheDir, "sweep", tracked), mock.patch.object(owner, name, failing))
+
+        def marker_write():
+            real = graph.CacheDir.prepare_json
+            return mock.patch.object(graph.CacheDir, "prepare_json",
+                                     lambda this, name: (_ for _ in ()).throw(OSError(5, "io")) if name == graph.SWEEP_MARKER else real(this, name))
+        return {
+            "sweep raises": lambda: mock.patch.object(graph.CacheDir, "sweep", side_effect=RuntimeError("sweep bug")),
+            "sweep_in raises": lambda: mock.patch.object(graph.CacheDir, "_sweep_in", side_effect=RuntimeError("sweep bug")),
+            "listing raises": lambda: mock.patch.object(graph.CacheDir, "_listing", side_effect=OSError(5, "io")),
+            "marker read raises": lambda: mock.patch.object(graph.CacheDir, "_last_sweep", side_effect=OSError(5, "io")),
+            "marker write fails": marker_write,
+            "guard raises on the cache names": lambda: at_sweep(graph.CacheDir, "_allow_file", RuntimeError("guard down")),
+            "open of the folder fails": lambda: at_sweep(graph, "open_folder_below", OSError(5, "io")),
+            "open of the folder bug": lambda: at_sweep(graph, "open_folder_below", RuntimeError("bug")),
+            "scandir fails": lambda: at_sweep(graph.os, "scandir", OSError(5, "io")),
+            "lstat fails": lambda: at_sweep(graph.os, "lstat", OSError(5, "io")),
+            "unlink fails": lambda: at_sweep(graph.os, "unlink", PermissionError(13, "denied")),
+            "unlink bug": lambda: at_sweep(graph.os, "unlink", RuntimeError("bug")),
+            "marker bytes fail": lambda: at_sweep(graph, "read_bounded", OSError(5, "io")),
+            "temp write fails": lambda: at_sweep(graph, "write_new", OSError(28, "full")),
+        }
+
+    def test_s5_a_sweep_that_fails_anywhere_never_changes_an_answer_or_raises(self):
+        for call, run, kind in self.CALLS:
+            project = self.project(f"fail-{call}")
+            folder = project_cache(project).parent
+
+            def fresh():
+                shutil.rmtree(project / ".tmux-pi", ignore_errors=True)
+                folder.mkdir(parents=True, mode=0o700)
+                self.put("nav_api-doc-ancient.json", 20 * self.DAY, folder=folder)
+            fresh()
+            with mock.patch.object(graph.CacheDir, "sweep", return_value=None):
+                baseline = run(self.call_nav(project))
+            self.assertEqual(baseline["status"], "ok", (call, baseline))
+            for label, patch in self.failures().items():
+                with self.subTest(call=call, failure=label):
+                    fresh()
+                    with patch():
+                        answer = run(self.call_nav(project))
+                    self.assertEqual(self.volatile(answer), self.volatile(baseline))
+                    written = [p for p in folder.glob(f"nav_api-{kind}-*.json") if p.name != "nav_api-doc-ancient.json"]
+                    self.assertEqual(len(written), 1, "the entry the answer wrote is there")
+
+    # --- status
+
+    def test_s5_status_reports_entries_bytes_and_the_last_sweep(self):
+        project = self.project("status")
+        nav = self.info_nav(project)
+        folder = project_cache(project).parent
+        self.assertEqual(nav.status()["cache"], {"entries": 0, "bytes": 0, "last_sweep": None})
+        self.assertFalse(folder.exists(), "status made the cache folder")
+        self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
+        entries = sorted(p for p in folder.glob("nav_api-*-*.json"))
+        marker = json.loads((folder / graph.SWEEP_MARKER).read_text())["payload"]["last_sweep"]
+        cache = nav.status()["cache"]
+        self.assertTrue(entries)
+        self.assertEqual((cache["entries"], cache["bytes"], cache["last_sweep"]), (len(entries), sum(p.stat().st_size for p in entries), marker))
+        before = {p.name: p.stat().st_mtime_ns for p in folder.iterdir()}
+        self.put("nav_api-doc-extra.json", 5, size=100, folder=folder)
+        self.put("young.tmp", 5, size=900, folder=folder)  # not an entry
+        self.put("notes.txt", 5, size=900, folder=folder)
+        (folder / "nav_api-info-link.json").symlink_to(self.decoy())
+        (folder / "nav_api-doc-dir.json").mkdir()
+        os.mkfifo(folder / "nav_api-info-fifo.json")
+        again = nav.status()["cache"]
+        self.assertEqual((again["entries"], again["bytes"]), (cache["entries"] + 1, cache["bytes"] + 100))
+        self.assertEqual({p.name: p.stat().st_mtime_ns for p in folder.iterdir() if p.name in before}, before, "status touched something")
+
+    def test_s5_status_of_a_refused_unreadable_or_oddly_marked_cache(self):
+        nothing = {"entries": None, "bytes": None, "last_sweep": None}
+        outside = self.dir / "outside-cache"
+        outside.mkdir()
+        self.put("nav_api-doc-old.json", 5, folder=outside)
+        self.assertEqual(self.nav(self.proj, cache_dir=str(outside)).status()["cache"], nothing)
+        # the folder is a link; the cache folder is judged once, so a link made after is found by the descriptor
+        nav = self.nav(self.proj)
+        os.rename(self.folder, self.dir / "moved-away")
+        self.folder.symlink_to(outside)
+        self.assertEqual(nav.status()["cache"], nothing)
+        self.folder.unlink()
+        os.rename(self.dir / "moved-away", self.folder)
+        # a marker from the future is reported as it is; a bad one is None
+        self.put("nav_api-doc-a.json", 5)
+        future = time.time() + 5 * self.DAY
+        self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": future})
+        self.assertEqual(nav.status()["cache"]["last_sweep"], future)
+        self.marker().write_text("bad")
+        self.assertEqual(nav.status()["cache"], {"entries": 1, "bytes": 10, "last_sweep": None})
+        self.marker().unlink()
+        self.marker().mkdir()
+        self.assertEqual(nav.status()["cache"]["last_sweep"], None)
+        if os.geteuid() != 0:
+            self.marker().rmdir()
+            self.folder.chmod(0)
+            self.addCleanup(lambda: self.folder.chmod(0o700))
+            self.assertEqual(nav.status()["cache"], nothing)
+
+    def test_s5_status_never_raises(self):
+        nav = self.nav(self.proj)
+        for patch in (mock.patch.object(graph.CacheDir, "_listing", side_effect=OSError(5, "io")),
+                      mock.patch.object(graph.CacheDir, "_last_sweep", side_effect=RuntimeError("bug")),
+                      mock.patch.object(graph, "open_folder_below", side_effect=RuntimeError("bug"))):
+            with patch:
+                self.assertIn("cache", nav.status())
+                self.assertEqual(nav.status()["status"], "ok")
+
+    # --- touch: throttled, and only after the caller accepted the payload
+
+    def test_s5_a_hit_touches_an_entry_only_when_its_time_is_an_hour_old_or_in_the_future(self):
+        cache = self.cache()
+        for label, age, touched in (("30 minutes", 1800, False), ("59 minutes", 3540, False), ("2 hours", 7200, True),
+                                    ("a day", self.DAY, True), ("in the future", -3 * self.DAY, True), ("a minute ahead", -60, True)):
+            with self.subTest(label):
+                path = self.put("nav_api-doc-a.json", age)
+                before = path.stat().st_mtime_ns
+                self.assertTrue(cache.touch(path.name), "true when the entry's time is recent")
+                if touched:
+                    self.assertLess(abs(path.stat().st_mtime - time.time()), 30, "not touched")
+                else:
+                    self.assertEqual(path.stat().st_mtime_ns, before, "touched though recent")
+
+    def test_s5_reading_touches_nothing_and_a_payload_the_caller_rejects_ages_out(self):
+        info_name = nav_api.NavApi._cache_name("info", "k" * 40)
+        stored = self.cache()
+        self.assertTrue(stored.write_json(info_name, ["a list, not a graph"]))
+        path = self.folder / info_name
+        old = time.time() - 20 * self.DAY
+        os.utime(path, (old, old))
+        self.assertEqual(stored.read_json(info_name), ["a list, not a graph"])
+        self.assertLess(path.stat().st_mtime, old + 60, "read_json touched the entry")
+        # the caller (`_read_cache` with the shape a graph has) rejects it: nothing touches it
+        nav = self.nav(self.proj)
+        self.assertIsNone(nav._read_cache("info", "k" * 40, dict))
+        self.assertLess(path.stat().st_mtime, old + 60)
+        self.sweep()
+        self.assertFalse(path.exists(), "an entry nobody accepts did not age out")
+
+    def test_s5_each_caller_touches_after_it_accepted_the_payload(self):
+        for kind in ("info", "doc", "index"):
+            with self.subTest(kind=kind):
+                project = self.project(f"touch-{kind}")
+                nav = self.call_nav(project)
+                run = {"info": lambda n: n.forward_graph("src/main.ts"), "doc": lambda n: n.symbols("src/main.ts"),
+                       "index": lambda n: n.importers("src/util/slug.ts")}[kind]
+                self.assertEqual(run(nav)["status"], "ok")
+                (entry,) = project_cache(project).parent.glob(f"nav_api-{kind}-*.json")
+                old = time.time() - 20 * self.DAY
+                os.utime(entry, (old, old))
+                self.assertEqual(run(self.call_nav(project))["status"], "ok")
+                self.assertLess(abs(entry.stat().st_mtime - time.time()), 30, "an accepted payload was not touched")
+                # the same entry, with a payload this caller rejects (a shape it does not take), and no way for the miss to rewrite it
+                bad = {"info": ["x"], "doc": {"x": 1}, "index": {"version": -1, "base": "x", "root": "x", "entries": {}}}[kind]
+                entry.write_text(seal(entry.name, bad))
+                os.utime(entry, (old, old))
+                with mock.patch.object(nav_api.NavApi, "_prepare_cache", lambda *a: None), mock.patch.object(graph.ImportIndex, "save", lambda *a: False):
+                    self.assertEqual(run(self.call_nav(project))["status"], "ok")
+                self.assertLess(entry.stat().st_mtime, old + 60, "a rejected payload was touched")
+
+    def test_s5_touch_asks_the_guard_and_a_refusal_touches_nothing(self):
+        path = self.put("nav_api-doc-a.json", self.DAY)
+        before = path.stat().st_mtime_ns
+        def refuse(root, p):
+            if p.endswith("nav_api-doc-a.json"):
+                raise nav_api.Refused("sensitive_path")
+            return nav_api.stub_check_path(root, p)
+        refusing = self.cache(check_path=refuse)
+        self.assertFalse(refusing.touch(path.name))
+        self.assertEqual(path.stat().st_mtime_ns, before)
+
+    def test_s5_touch_leaves_a_folder_a_fifo_a_link_and_a_missing_name_alone(self):
+        decoy = self.decoy()
+        old = time.time() - 5 * self.DAY
+        (self.folder / "nav_api-doc-dir.json").mkdir()
+        os.mkfifo(self.folder / "nav_api-doc-fifo.json")
+        (self.folder / "nav_api-doc-link.json").symlink_to(decoy)
+        cache = self.cache()
+        for name in ("nav_api-doc-dir.json", "nav_api-doc-fifo.json", "nav_api-doc-link.json"):
+            os.utime(self.folder / name, (old, old), follow_symlinks=False)
+            self.assertFalse(cache.touch(name), name)
+            self.assertLess(os.lstat(self.folder / name).st_mtime, old + 60, f"{name} was touched")
+        self.assertFalse(cache.touch("nav_api-doc-missing.json"))
+        self.assert_decoy(decoy)
+
+    # --- two processes at once
+
+    def test_s5_two_processes_sweeping_at_once_remove_each_file_once_and_keep_the_rest(self):
+        for i in range(150):
+            self.put(f"nav_api-doc-old{i:03d}.json", 20 * self.DAY + i)
+        for i in range(10):
+            self.put(f"nav_api-doc-new{i}.json", 100 + i)
+        decoy, keep = self.foreign()
+        go = self.dir / "go"
+        procs = [subprocess.Popen([sys.executable, "-I", "-c", SWEEPER_SCRIPT, str(ROOT / "lib"), str(self.proj), str(self.folder), str(go)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        try:
+            for proc in procs:
+                self.assertEqual(proc.stdout.readline().strip(), "ready")  # blocks until the child is waiting at the gate
+            go.write_text("go")
+            outputs = [proc.communicate(timeout=120) for proc in procs]
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertEqual([proc.returncode for proc in procs], [0, 0], outputs)
+        results = [json.loads(out.strip().splitlines()[-1]) for out, _ in outputs]
+        ran = [r for r in results if r is not None]  # one may start after the other finished and find its marker
+        self.assertTrue(ran, results)
+        # Every name was dealt with by each sweep that ran. The sum of "deleted" is not asserted: on macOS two unlinks of one name
+        # at the same moment can both report success (found by experiment), so a count cannot tell that a file went once.
+        self.assertTrue(all(r["deleted"] + r["skipped"] == 150 and r["complete"] for r in ran), results)
+        self.assertEqual(self.left(), sorted([f"nav_api-doc-new{i}.json" for i in range(10)] + keep))
+        self.assertIsInstance(self.cache()._last_sweep(), float, "the marker is whole")
+        self.assert_decoy(decoy)
+        self.assertEqual([p.name for p in self.folder.iterdir() if p.name.endswith(".tmp") and p.name.startswith(graph.SWEEP_MARKER)], [])
 
 
 if __name__ == "__main__":

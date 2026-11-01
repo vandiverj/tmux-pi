@@ -188,6 +188,32 @@ def short(text, limit):
     return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
 
 
+CUT_SHOWN = "at least {n} shown, list cut by the navigator"
+CUT_NOTHING = "not found in the part the navigator returned (list cut)"
+
+
+def list_head(label, shown, total, cut, empty=None, of=False):
+    """The line that opens a list of `shown` rows from a navigator, the one place a list's count, zero or absence is worded.
+    When `cut` (Engine.loss says the navigator cut its list) the count is a lower bound and `total` is never stated:
+    "label (at least N shown, list cut by the navigator):", or "label: not found in the part the navigator returned (list cut)"
+    when nothing was shown. Otherwise "label (total):" ("label (shown of total):" with `of`); an empty list says `empty` when given."""
+    if cut:
+        return f"{label}: {CUT_NOTHING}" if shown <= 0 else f"{label} ({CUT_SHOWN.format(n=shown)}):"
+    if shown <= 0 and empty:
+        return empty
+    return f"{label} ({shown} of {total}):" if of and shown > 0 else f"{label} ({total}):"
+
+
+def more_note(label, beyond, cut, advice, total=None):
+    """The `left_out` entry for rows of a navigator list that are not shown. A cut list gives no count (and no total): it says the
+    list was cut. Otherwise `beyond` rows are named, with `total` when given."""
+    if cut:
+        return f"{label}: the navigator cut its list ({advice})"
+    if beyond > 0:
+        return f"{label}: {beyond} more ({f'{total} total; ' if total is not None else ''}{advice})"
+    return None
+
+
 def footer(left_out):
     if not left_out:
         return ""
@@ -819,12 +845,12 @@ class Engine(NoteWriter):
             return self._symbol_web(kind, made, rel, name, lines, left)
         return self._symbol_api(kind, made, rel, name, lines, left)
 
-    def _definition_lines(self, rows, left, total_noun="definitions"):
+    def _definition_lines(self, rows, left, cut, label="definitions"):
         lines = []
         for row in rows[:5]:
             lines.append(f"{row['path']}:{row.get('line', 0)} {row.get('kind', '')} {short(row.get('text', ''), 160)}".rstrip())
-        if len(rows) > 5:
-            left.append(f"{total_noun}: {len(rows) - 5} more")
+        if len(rows) > 5 and not cut:  # a cut list already has its note; it names no count
+            left.append(f"{label}: {len(rows) - 5} more")
         return lines
 
     def _withheld_note(self, count, left, what):
@@ -841,14 +867,16 @@ class Engine(NoteWriter):
         omitted, cut = self.loss(raw)
         refused += omitted
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
+        head = f"definitions of {name} in {rel}"
         if cut:
-            left.append(f"definitions of {name} in {rel}: the navigator cut its list")
-        if not rows:
-            lines.append(f"no definition of {name} in {rel} (the web navigator found none)" if not refused
-                         else f"{name} in {rel}: every definition the navigator found is at a refused path")
+            left.append(more_note(head, 0, True, "the definition may be in the part not returned"))
+        if not rows and refused and not cut:
+            lines.append(f"{name} in {rel}: every definition the navigator found is at a refused path")
             return "ok", None
-        lines.append(f"{name} — {len(rows)} definition(s):")
-        lines += self._definition_lines(rows, left)
+        lines.append(list_head(head, len(rows[:5]), len(rows), cut, empty=f"no definition of {name} in {rel} (the web navigator found none)"))
+        if not rows:
+            return "ok", None
+        lines += self._definition_lines(rows, left, cut, f"definitions of {name}")
         if raw.get("signature"):
             lines.append(f"  signature: {short(raw['signature'], 300)}")
         if raw.get("doc"):
@@ -862,13 +890,11 @@ class Engine(NoteWriter):
         omitted, cut = self.loss(refs)
         refused += omitted
         total = _int(refs.get("total", len(shown) + refused))
-        lines.append(f"{total} references ({min(5, len(shown))} shown):")
+        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, cut, of=True))
         lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
-        more = total - min(5, len(shown)) - refused
-        if more > 0:
-            left.append(f"references of {name}: {more} more")
-        elif cut:
-            left.append(f"references of {name}: the navigator cut its list, so this count may be short")
+        add = more_note(f"references of {name}", total - min(5, len(shown)) - refused, cut, "pass path to another file or read the callers directly")
+        if add:
+            left.append(add)
         self._withheld_note(refused, left, f"references of {name}")
         return "ok", None
 
@@ -887,18 +913,19 @@ class Engine(NoteWriter):
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
         if not named:
             if partial:
-                lines.append(f"{name} is not among the first {len(listed)} of {total} exports of {rel} that the api navigator listed; "
-                             "the listing was cut, so this does not show that it is not defined there")
+                lines.append(list_head(f"definitions of {name} in {rel}", 0, total, True))
+                lines.append("the listing was cut, so this does not show that it is not defined there")
                 lines.append("Next: read the file directly, or ask ctx_relations for its importers.")
-                left.append(f"symbols of {rel}: {max(total - len(listed), 1)} not listed")
+                left.append(f"symbols of {rel}: " + (f"{total - len(listed)} not listed" if not cut else "more not listed (the navigator cut its list)"))
             else:
                 lines.append(f"no definition of {name} in {rel} (the api navigator lists none by that name)"
                              if not refused else f"{name} in {rel}: every definition the navigator found is at a refused path")
             return "ok", None
-        lines.append(f"{name} — {len(named)} definition(s):")
+        lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), partial))
         lines += [f"{s['path']}:{s.get('line', 0)} {s.get('kind', '')}" for s in named[:5]]
-        if len(named) > 5:
-            left.append(f"definitions: {len(named) - 5} more")
+        add = more_note(f"definitions of {name}", len(named) - 5, partial, "pass path to a narrower file")
+        if add:
+            left.append(add)
         first = named[0]
         if first.get("signature"):
             lines.append(f"  signature: {short(first['signature'], 300)}")

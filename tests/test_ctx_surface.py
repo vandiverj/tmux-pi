@@ -444,7 +444,7 @@ class Brief(SurfaceCase):
         self.assertEqual(len(re.findall(r"routes/r\d\d\.ts:3", text)), 10)
         self.assertIn("r10.ts:3", text)
         self.assertNotIn("r11.ts", text)
-        self.assertTrue(any("importers" in item and "4" in item for item in answer.data["left_out"]), answer.data["left_out"])
+        self.assertTrue(any("importers" in item and "cut" in item for item in answer.data["left_out"]), answer.data["left_out"])
         many = self.brief(paths=(MANY,))
         self.assertIn("s20", many.text)
         self.assertNotIn("s21", many.text)
@@ -496,7 +496,7 @@ class Operations(SurfaceCase):
         self.assertIn("function addToCart(item: unknown)", answer.text)
         doc = [row for row in answer.text.splitlines() if row.strip().startswith("doc:")][0]
         self.assertLessEqual(len(doc.split("doc:", 1)[1].strip()), 400)
-        self.assertIn("7 references", answer.text)
+        self.assertIn("references of addToCart (5 of 7)", answer.text)
         self.assertEqual(len(re.findall(r"apps/launchpad/web/src/p\d\d\.ts:1", answer.text)), 5)
 
     def test_symbol_without_a_path_is_located_by_a_deterministic_text_scan(self):
@@ -940,7 +940,8 @@ class TruncatedImports(ReviewOne):
         fake_navs.BEHAVIOUR[("web", "imports")] = importing(250, 250, 200)
         for answer in (self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"}), self.run_tool("ctx_brief", {"paths": [CART]})):
             self.assertNotIn("no shared contracts", answer.text)
-            self.assertIn("only 200 of 250 imports were read", answer.text)
+            self.assertIn("only 200 imports were read, the navigator cut its list", answer.text)
+            self.assertNotIn("250", answer.text)
             self.assertTrue(any("imports" in item for item in answer.data["left_out"]), answer.data["left_out"])
 
     def test_a_complete_list_makes_no_such_claim(self):
@@ -1371,6 +1372,144 @@ class OneOutputGate(ReviewOne):
         self.assertEqual(brief.contract_use(engine, ORDER, rel), "reader")
         self.put(f"{WEB_SRC}/unused.ts", 'import { Order } from "../../../../lib/launchpad/types/order";\nconsole.log(1);\n')
         self.assertEqual(brief.contract_use(engine, ORDER, f"{WEB_SRC}/unused.ts"), "uses")
+
+
+# ------------------------------------------------------------------------------------------------------- Review 3 (F1, F2)
+
+TOTAL = 913   # a total no fixture list has: if it appears in an answer, a navigator's count of a cut list was repeated
+
+
+class CutLists(ReviewOne):
+    """F1, F2 and the family: when Engine.loss says a navigator cut a list, the answer text for that list never states a total, a
+    zero or an absence; it says "at least N shown, list cut by the navigator" or "not found in the part the navigator returned
+    (list cut)". One table covers every operation and every list."""
+
+    SHOWN = re.compile(r"at least \d+ shown, list cut by the navigator")
+    NOT_FOUND = "not found in the part the navigator returned (list cut)"
+    ABSENCES = ("no definition", "nothing imports", "imports no ", "no shared", "none")
+    ZERO = re.compile(r"(?<![\w.:/-])0(?![\w.])")
+
+    # each setup installs a navigator answer that cuts one list: (empty, total) -> None
+    def web_exports(self, empty, total):
+        rows = [] if empty else [{"name": "addToCart", "kind": "function", "line": 5, "reexport": False, "defined_at": None}]
+        fake_navs.BEHAVIOUR[("web", "exports")] = {"status": "ok", "is_module": True, "exports": rows, "total": total, "truncated": True}
+
+    def web_importers(self, empty, total):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            web_edges(a["file"], "importers", [] if empty else [SPEC], total=total, truncated=True) if a["direction"] == "importers" and a["file"] == CART
+            else web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else [ORDER]))
+
+    def web_imports(self, empty, total):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            web_edges(a["file"], "imports", [] if empty else [f"{WEB_SRC}/x.ts"], total=total, truncated=True) if a["direction"] == "imports"
+            else web_edges(a["file"], "importers", [SPEC]))
+
+    def web_consumers(self, empty, total):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            web_edges(a["file"], "importers", [] if empty else [f"{WEB_SRC}/p01.ts"], total=total, truncated=True)
+            if a["direction"] == "importers" and a["file"] == ORDER
+            else web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else [ORDER]))
+
+    def api_importers_cut(self, empty, total):
+        fake_navs.BEHAVIOUR[("api", "importers")] = api_importers([] if empty else [f"{API_SRC}/routes/r01.ts"], total=total, truncated=True)
+
+    def api_imports_cut(self, empty, total):
+        files = [] if empty else [{"path": f"{API_SRC}/util.ts", "line": 3, "spec": "./util.ts"}]
+        fake_navs.BEHAVIOUR[("api", "imports")] = {"status": "ok", "target": ORDERS, "source": "index", "files": files, "external": [], "unresolved": [],
+                                                   "index_age_s": 3, "unresolved_total": 0, "files_indexed": 40, "scanned": 0, "truncated": True,
+                                                   "total": total}
+
+    def api_symbols_cut(self, empty, total):
+        symbols = [] if empty else [{"name": "other", "kind": "function", "path": ORDERS, "line": 7, "signature": "export function other() {}", "doc": ""}]
+        fake_navs.BEHAVIOUR[("api", "symbols")] = {"status": "ok", "path": ORDERS, "source": "deno_doc", "total": total, "truncated": True, "symbols": symbols}
+
+    def api_symbols_named_cut(self, empty, total):
+        name = "createOrder"
+        symbols = [] if empty else [{"name": name, "kind": "function", "path": ORDERS, "line": 5, "signature": "export function createOrder() {}", "doc": ""}]
+        fake_navs.BEHAVIOUR[("api", "symbols")] = {"status": "ok", "path": ORDERS, "source": "deno_doc", "total": total, "truncated": True, "symbols": symbols}
+
+    def web_definitions(self, empty, total):
+        rows = [] if empty else [{"path": CART, "line": 5, "name": "addToCart", "kind": "function", "text": "function addToCart()"}]
+        fake_navs.BEHAVIOUR[("web", "definition")] = {"status": "ok", "definitions": rows, "signature": "", "doc": "", "truncated": True}
+
+    def web_references(self, empty, total):
+        rows = [] if empty else [{"path": SPEC, "line": 2, "column": 1, "text": "addToCart(x)", "is_definition": False, "is_write": False}]
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "ok", "definitions": [], "references": rows, "total": total, "truncated": True}
+
+    # (operation, arguments, list, setup, regex that selects the lines that open that list)
+    TABLE = [
+        ("ctx_brief", {"paths": [CART]}, "web exports", "web_exports", r"^exports\b"),
+        ("ctx_brief", {"paths": [CART]}, "web importers", "web_importers", r"^importers\b"),
+        ("ctx_brief", {"paths": [CART]}, "web imports", "web_imports", r"^imports\b"),
+        ("ctx_brief", {"paths": [CART]}, "web contract consumers", "web_consumers", r"^\s+consumers\b"),
+        ("ctx_brief", {"paths": [CART]}, "web imports (contracts absent)", "web_imports", r"^shared \(lib\) contracts\b"),
+        ("ctx_brief", {"paths": [ORDERS]}, "api exports", "api_symbols_cut", r"^exports\b"),
+        ("ctx_brief", {"paths": [ORDERS]}, "api importers", "api_importers_cut", r"^importers\b"),
+        ("ctx_brief", {"paths": [ORDERS]}, "api imports", "api_imports_cut", r"^imports\b"),
+        ("ctx_relations", {"target": CART, "direction": "importers"}, "web importers", "web_importers", r"^importers of\b"),
+        ("ctx_relations", {"target": CART, "direction": "imports"}, "web imports", "web_imports", r"^\S+ imports\b"),
+        ("ctx_relations", {"target": CART, "direction": "contracts"}, "web imports (contracts absent)", "web_imports", r"^shared \(lib\) contracts\b"),
+        ("ctx_relations", {"target": CART, "direction": "contracts"}, "web contract consumers", "web_consumers", r"^\s+consumers\b"),
+        ("ctx_relations", {"target": ORDERS, "direction": "importers"}, "api importers", "api_importers_cut", r"^importers of\b"),
+        ("ctx_relations", {"target": ORDERS, "direction": "imports"}, "api imports", "api_imports_cut", r"^\S+ imports\b"),
+        ("ctx_symbol", {"name": "addToCart", "path": CART}, "web definitions", "web_definitions", r"^definitions of\b"),
+        ("ctx_symbol", {"name": "addToCart", "path": CART}, "web references", "web_references", r"^references of\b"),
+        ("ctx_symbol", {"name": "createOrder", "path": ORDERS}, "api symbols (definitions)", "api_symbols_named_cut", r"^definitions of\b|^createOrder in\b"),
+    ]
+
+    def check(self, tool, args, label, setup, heads, empty, total):
+        getattr(self, setup)(empty, total)
+        if label.startswith("web definitions") and not empty:
+            self.web_references(True, 0)
+        answer = self.run_tool(tool, args)
+        where = f"{tool} {label} empty={empty} total={total}"
+        self.assertIn(answer.status, ("ok",), (where, answer.text))
+        head = [line for line in answer.text.splitlines() if re.search(heads, line)]
+        self.assertTrue(head, (where, answer.text))
+        cut_lines = [line for line in head if "list cut" in line]
+        self.assertTrue(cut_lines, (where, head))
+        for line in head:
+            self.assertNotRegex(line, self.ZERO, (where, line))
+            self.assertNotIn(str(TOTAL), line, (where, line))
+        if empty or "absent" in label:  # an absence derived from a cut list is always "not found in the part returned"
+            self.assertTrue(any(self.NOT_FOUND in line for line in cut_lines), (where, cut_lines))
+        else:
+            self.assertTrue(any(self.SHOWN.search(line) for line in cut_lines), (where, cut_lines))
+        # nothing anywhere in the answer, its footer or its left_out repeats the navigator's total for the cut list
+        self.assertNotIn(str(TOTAL), answer.text, (where, answer.text))
+        self.assertNotIn(str(TOTAL), " ".join(answer.data["left_out"]), (where, answer.data["left_out"]))
+        for line in head:
+            for word in self.ABSENCES:
+                self.assertNotIn(word, line, (where, line))
+        self.assertTrue(any("cut" in item for item in answer.data["left_out"]), (where, answer.data["left_out"]))
+        return answer
+
+    def test_every_cut_list_in_every_operation_is_said_to_be_cut_and_states_no_total_zero_or_absence(self):
+        for tool, args, label, setup, heads in self.TABLE:
+            for empty, total in ((False, TOTAL), (True, TOTAL), (True, 0)):
+                with self.subTest(tool=tool, list=label, empty=empty, total=total):
+                    fake_navs.reset()
+                    self.check(tool, args, label, setup, heads, empty, total)
+
+    def test_f1_f2_the_reported_cases(self):
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "ok", "definitions": [], "references": [], "total": 0, "truncated": True}
+        text = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART}).text
+        self.assertNotIn("0 references", text)
+        self.assertIn("references of addToCart: " + self.NOT_FOUND, text)
+        fake_navs.BEHAVIOUR[("web", "definition")] = {"status": "ok", "definitions": [], "truncated": True}
+        text = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART}).text
+        self.assertNotIn("no definition", text)
+        self.assertNotIn("found none", text)
+        self.assertIn("definitions of addToCart in " + CART + ": " + self.NOT_FOUND, text)
+
+    def test_a_list_that_was_not_cut_still_states_its_total_and_its_absences(self):
+        text = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART}).text
+        self.assertRegex(text, r"references of addToCart \(5 of 7\)")
+        self.assertNotIn("list cut", text)
+        util = f"{API_SRC}/util.ts"
+        self.assertIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+        fake_navs.BEHAVIOUR[("web", "references")] = {"status": "ok", "definitions": [], "references": [], "total": 0, "truncated": False}
+        self.assertRegex(self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART}).text, r"references of addToCart \(0\)")
 
 
 if __name__ == "__main__":

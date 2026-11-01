@@ -121,10 +121,14 @@ store is as it was.
 - **Paths.** Every path a navigator returns (importers, imports, contract consumers, definitions, references, listed symbols) goes through
   the same path policy as the arguments before it is shown. One that is sensitive, outside the project, a link out of it, or a `<withheld>`
   placeholder is never named: it is counted in `left_out` (`N withheld`).
-- **Truncation.** A navigator list that was cut is reported as cut (`left_out`, and "25 of 26" rather than "25 of 25"); the contracts view
-  says "only N of M imports were read" instead of "no shared contracts". `ctx_symbol` never concludes that an api symbol is absent from a
-  listing the navigator cut: it says so and gives a next step. `ctx_symbol` with no `path` gives the details of each file that declares the
-  name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is `invalid` with a next step (pass a path).
+- **Truncation.** When a navigator says it cut a list (`truncated`), the answer text for that list never states a total, a zero or an
+  absence, in any operation and for every list (definitions, references, importers, imports, exports, symbols, contract consumers, the
+  shared contracts among the imports). One helper words it (`surface.list_head`, `surface.more_note`): "label (at least N shown, list cut by
+  the navigator)" when rows were shown, "label: not found in the part the navigator returned (list cut)" when none were, and a `left_out`
+  entry that says the list was cut and gives no count. A list that was not cut states its total ("5 of 7") and its absence ("nothing imports
+  X"). The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
+  `path` gives the details of each file that declares the name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is
+  `invalid` with a next step (pass a path).
 - **Contract consumers** are marked `[reader]`, `[writer]`, `[reader, writer]`, `[uses]` (imports it, does neither) or `[unread]` (the file
   could not be read). A text scan of the consumer's own import statements (calls such as `.parse(`, `.extend(`, `import type`, `export * from`), not
   type analysis.

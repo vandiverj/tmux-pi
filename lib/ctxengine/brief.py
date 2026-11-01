@@ -34,13 +34,7 @@ def first_line(got):
     return got.text.splitlines()[0] if got.text else got.status
 
 
-def more_note(label, beyond, incomplete, advice):
-    """The `left_out` entry for rows of a navigator answer that were not read: how many, or that the navigator cut the list."""
-    if beyond > 0:
-        return f"{label}: {beyond} more ({advice})"
-    if incomplete:
-        return f"{label}: the navigator cut its list ({advice})"
-    return None
+more_note = surface.more_note  # one wording for rows a navigator list did not give, shared with the symbol view
 
 
 def withheld_note(label, refused):
@@ -80,6 +74,13 @@ def _names(clause):
             names.append(words[-1])
             typed = typed and is_type
     return names, spaces, typed
+
+
+def read_phrase(got):
+    """What was read of an imports list that is not whole: a cut list gives no total, only what was read."""
+    if got.cut:
+        return f"only {len(got.rows)} imports were read, the navigator cut its list"
+    return f"only {len(got.rows)} of {got.total} imports were read"
 
 
 def contract_use(engine, contract, consumer):
@@ -147,13 +148,10 @@ def contract_block(engine, rel, contracts, limit, left, exclude):
             continue
         consumers = sorted({(a, b) for a, b, _ in got.rows if a not in exclude})
         total = max(got.total - got.refused - (len(got.rows) - len(consumers)), len(consumers))
-        lines.append(f"  consumers ({total}):")
+        lines.append("  " + surface.list_head("consumers", len(consumers[:limit]), total, got.cut))
         lines += [f"  {a}:{b} [{contract_use(engine, contract, a)}]" for a, b in consumers[:limit]]
-        add_left(left, withheld_note(f"consumers of {contract}", got.refused))
-        if total > limit:
-            left.append(f"contract consumers of {contract}: {total - limit} more")
-        elif got.cut:
-            left.append(f"contract consumers of {contract}: the navigator cut its list (ctx_relations importers shows more)")
+        add_left(left, withheld_note(f"consumers of {contract}", got.refused),
+                 more_note(f"contract consumers of {contract}", total - limit, got.cut, "ctx_relations importers shows more"))
     return lines, failed
 
 
@@ -166,9 +164,10 @@ def relations(engine, rel, direction, limit, lines):
             return engine.finish(got.status, lines + [got.text], reason=first_line(got))
         shown = got.rows[:limit]
         mark = (lambda row: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
-        lines += edge_block(f"importers of {rel} ({len(shown)} of {got.total}):", shown, 0, mark) if shown else [f"nothing imports {rel}"]
-        add_left(left, more_note("importers", got.total - len(shown) - got.refused, got.cut,
-                                 f"{got.total} total; raise limit up to 25"), withheld_note("importers", got.refused))
+        lines += edge_block(surface.list_head(f"importers of {rel}", len(shown), got.total, got.cut, empty=f"nothing imports {rel}", of=True),
+                            shown, 0, mark)
+        add_left(left, more_note("importers", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
+                 withheld_note("importers", got.refused))
         if got.unresolved:
             lines.append(f"unresolved imports: {got.unresolved}")
         return engine.finish("ok", lines, left, age=got.age)
@@ -177,9 +176,10 @@ def relations(engine, rel, direction, limit, lines):
         return engine.finish(got.status, lines + [got.text], reason=first_line(got))
     if direction == "imports":
         shown = got.rows[:limit]
-        lines += edge_block(f"{rel} imports ({len(shown)} of {got.total}):", shown, 2) if shown else [f"{rel} imports no project file"]
-        add_left(left, more_note("imports", got.total - len(shown) - got.refused, got.cut,
-                                 f"{got.total} total; raise limit up to 25"), withheld_note("imports", got.refused))
+        lines += edge_block(surface.list_head(f"{rel} imports", len(shown), got.total, got.cut, empty=f"{rel} imports no project file", of=True),
+                            shown, 2)
+        add_left(left, more_note("imports", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
+                 withheld_note("imports", got.refused))
         if got.external:
             lines.append("external: " + ", ".join(sorted(got.external)))
         if got.unresolved:
@@ -191,11 +191,11 @@ def relations(engine, rel, direction, limit, lines):
             contracts.setdefault(to, []).append(f"{rel}:{line}")
     if got.incomplete:  # the shared contracts may be among the imports that were not read
         add_left(left, more_note("imports not read", got.beyond, got.cut, "shared contracts among them are missing from this answer"))
-        lines.append(f"warning: only {len(got.rows)} of {got.total} imports were read, so the contracts below may be incomplete")
+        lines.append(f"warning: {read_phrase(got)}, so the contracts below may be incomplete")
     add_left(left, withheld_note("imports", got.refused))
     if not contracts:
-        return engine.finish("ok", lines + [f"{rel} imports no shared (lib) contract file" + (" among the imports read" if got.incomplete else "")],
-                             left, age=got.age)
+        return engine.finish("ok", lines + [surface.list_head("shared (lib) contracts", 0, 0, got.incomplete,
+                                                              empty=f"{rel} imports no shared (lib) contract file")], left, age=got.age)
     block, failed = contract_block(engine, rel, contracts, limit, left, {rel})
     status = "ok" if len(failed) < len(contracts) else failed[0].status
     return engine.finish(status, lines + [f"contracts used by {rel}:"] + block, left, age=got.age)
@@ -271,31 +271,28 @@ def build(engine, paths):
             continue
         got = engine.exports(rel)
         if track("exports", got):
-            lines.append(f"exports ({got.total}):")
+            lines.append(surface.list_head("exports", len(got.rows[:EXPORTS_MAX]), got.total, got.cut))
             lines += [f"  {name} ({kind}) :{line}" for name, kind, line in got.rows[:EXPORTS_MAX]]
-            if got.total > EXPORTS_MAX:
-                left.append(f"exports of {rel}: {got.total - EXPORTS_MAX} more ({got.total} total)")
-            elif got.cut:
-                left.append(f"exports of {rel}: the navigator cut its list")
+            add_left(left, more_note(f"exports of {rel}", got.total - EXPORTS_MAX, got.cut, "ctx_symbol with path shows one name", got.total))
             add_left(left, withheld_note(f"exports of {rel}", got.refused))
         mark = (lambda row, rel=rel: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
         got = engine.importers(rel, IMPORTERS_MAX)
         if track("importers", got):
             shown = sorted(got.rows)[:IMPORTERS_MAX]
-            lines.append(f"importers ({got.total}):")
+            lines.append(surface.list_head("importers", len(shown), got.total, got.cut))
             lines += [f"  {a}:{b}" + (f" [{mark((a, b, rel))}]" if mark else "") for a, b, _ in shown]
-            add_left(left, more_note(f"importers of {rel}", got.total - len(shown) - got.refused, got.cut, f"{got.total} total"),
+            add_left(left, more_note(f"importers of {rel}", got.total - len(shown) - got.refused, got.cut, "ctx_relations importers shows more", got.total),
                      withheld_note(f"importers of {rel}", got.refused))
         got = engine.imports(rel)
         if track("imports", got):
             rows = sorted(got.rows, key=lambda r: (r[2], r[1]))
-            lines.append(f"imports ({got.total - got.refused}):")
+            lines.append(surface.list_head("imports", len(rows[:IMPORTS_MAX]), got.total - got.refused, got.cut))
             lines += [f"  {to}  (line {line})" for _, line, to in rows[:IMPORTS_MAX]]
-            add_left(left, more_note(f"imports of {rel}", got.total - min(len(rows), IMPORTS_MAX) - got.refused, got.cut, f"{got.total} total"),
+            add_left(left, more_note(f"imports of {rel}", got.total - min(len(rows), IMPORTS_MAX) - got.refused, got.cut, "ctx_relations imports shows more", got.total),
                      withheld_note(f"imports of {rel}", got.refused))
             if got.incomplete:
                 incomplete.append(rel)
-                lines.append(f"  (only {len(rows)} of {got.total} imports were read)")
+                lines.append(f"  ({read_phrase(got)})")
             libraries |= {lib for name in got.external if (lib := surface.library_of(name))}
             for _, line, to in rows:
                 if surface.label_for(to) == "lib":
@@ -313,8 +310,7 @@ def build(engine, paths):
             nexts.update(line[6:] for line in got.text.splitlines() if line.startswith("Next: "))
         lines += block
     else:
-        lines.append("none: the files import no shared (lib) contract" +
-                     (" among the imports read" if incomplete else ""))
+        lines.append(surface.list_head("shared (lib) contracts", 0, 0, bool(incomplete), empty="none: the files import no shared (lib) contract"))
     if incomplete:
         lines.append(f"warning: the import list of {', '.join(incomplete)} was cut, so shared contracts may be missing here")
         left.append(f"contracts: imports not read for {', '.join(incomplete)}; shared contracts among them are missing")

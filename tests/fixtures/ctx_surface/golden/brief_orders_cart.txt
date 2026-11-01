@@ -5,7 +5,7 @@ exports (3):
   createOrder (function) :5
   cancelOrder (function) :9
   OrderStatus (variable) :13
-importers (14):
+importers (at least 10 shown, list cut by the navigator):
   apps/launchpad/api/src/routes/r01.ts:3
   apps/launchpad/api/src/routes/r02.ts:3
   apps/launchpad/api/src/routes/r03.ts:3
@@ -48,4 +48,4 @@ lib/launchpad/types/order.ts — imported at apps/launchpad/api/src/orders.ts:2,
 == libraries
   react (version not read: not in the lockfile)
   zod 4.6.7 — use api_signature(zod, <symbol>) for exact signatures
-(left out: importers of apps/launchpad/api/src/orders.ts: 4 more (14 total); contract consumers of lib/launchpad/types/order.ts: 2 more; note text cut at 300 characters (ctx_knowledge shows it whole): kn-2026-10-01-parse)
+(left out: importers of apps/launchpad/api/src/orders.ts: the navigator cut its list (ctx_relations importers shows more); contract consumers of lib/launchpad/types/order.ts: 2 more (ctx_relations importers shows more); note text cut at 300 characters (ctx_knowledge shows it whole): kn-2026-10-01-parse)

@@ -3044,11 +3044,9 @@ class PathRuleCase(Tree):
         ("graph.py", "read_bounded", "os.read"): "after every check",
         ("graph.py", "write_new", "os.open"): "O_EXCL|O_NOFOLLOW, relative to a checked folder descriptor",
         ("graph.py", "write_new", "os.write"): "the new file",
-        ("graph.py", "write_new", "os.unlink"): "dir_fd of the checked folder; only the file this call made with O_EXCL, by that name, when its write failed",
         ("graph.py", "open_folder_below", "os.open"): "base NOFOLLOW_ANY, then each part O_NOFOLLOW relative to the one before",
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
         ("graph.py", "CacheDir.put_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name prepare_json judged (asks no guard)",
-        ("graph.py", "CacheDir.put_json", "os.unlink"): "dir_fd of the checked folder; only this write's own unique temporary name",
         ("graph.py", "CacheDir.put_json", "os.rename"): "dir_fd of the checked folder; names prepare_json judged",
         ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
         ("graph.py", "make_own_folder", "os.open"): "the judged scratch parent, folder descriptor, NOFOLLOW_ANY; kernel path checked",
@@ -5944,35 +5942,72 @@ class InfoCacheCase(Tree):
             raise OSError(28, "No space left on device")
         return mock.patch.object(graph.os, "write", write)
 
-    def test_s3_f4_a_failed_write_removes_its_own_temporary_and_leaves_an_existing_entry(self):
+    def _failing_close(self):
+        """An `os.close` that closes a cache temporary's descriptor and then fails with EIO."""
+        real = os.close
+
+        def close(fd):
+            import fcntl
+            try:
+                is_tmp = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).split(b"\0")[0].endswith(b".tmp")
+            except OSError:
+                is_tmp = False
+            real(fd)
+            if is_tmp:
+                raise OSError(5, "Input/output error")
+        return mock.patch.object(graph.os, "close", close)
+
+    def _no_removal(self):
+        """Patches that fail the test when the cache code removes or renames-over anything but by the one rename of a write."""
+        def fail(*a, **k):
+            raise AssertionError("a cache write removed something")
+        return (mock.patch.object(graph.os, "unlink", fail), mock.patch.object(graph.os, "remove", fail),
+                mock.patch.object(graph.os, "rmdir", fail))
+
+    def _names(self, folder):
+        return {p.name: p.read_bytes() for p in folder.iterdir()} if folder.exists() else {}
+
+    def test_s3_f4_a_failed_write_leaves_every_entry_byte_identical_and_removes_nothing(self):
         for call in ("forward_graph", "symbols"):
-            for after in (0, 3):
-                project = self.project(f"{call}{after}")
+            for kind, failing in (("write 0 bytes", lambda: self._failing_write(0)), ("write 3 bytes", lambda: self._failing_write(3)),
+                                  ("close", self._failing_close)):
+                project = self.project(f"{call}{kind.replace(' ', '')}")
                 make = self.doc_nav if call == "symbols" else self.nav_for
                 self.assertEqual(getattr(make(project), call)("src/main.ts")["status"], "ok")
                 folder = project_cache(project).parent
-                before = {p.name: p.read_bytes() for p in folder.iterdir()}
+                before = self._names(folder)
                 self.assertEqual(len(before), 1, call)
-                self.assertTrue(next(iter(before)).endswith(".json"))
+                entry = next(iter(before))
+                self.assertTrue(entry.endswith(".json"))
+                planted = folder / f"{entry}.0000000000000000.tmp"
+                planted.write_bytes(b"another writer")
+                before[planted.name] = b"another writer"
                 other = make(project)
-                token = other._cache.prepare_json(next(iter(before)))
-                with self._failing_write(after):
-                    self.assertFalse(other._cache.put_json(token, {"a": 1}))
-                self.assertEqual({p.name: p.read_bytes() for p in folder.iterdir()}, before, (call, after))
+                token = other._cache.prepare_json(entry)
+                no_unlink, no_remove, no_rmdir = self._no_removal()
+                with failing(), no_unlink, no_remove, no_rmdir:
+                    self.assertFalse(other._cache.put_json(token, {"a": 1}), (call, kind))
+                after = self._names(folder)
+                for name, data in before.items():
+                    self.assertEqual(after[name], data, (call, kind, name))  # the entry and the planted temporary, byte-identical
+                self.assertTrue(all(n in before or n.startswith(entry + ".") and n.endswith(".tmp") for n in after), (call, kind, sorted(after)))
 
-    def test_s3_f4_a_failed_write_through_each_cache_kind_leaves_no_temporary(self):
+    def test_s3_f4_a_failed_write_makes_no_entry_in_each_cache_kind_and_deletes_nothing(self):
         project = self.project()
         nav = self.nav_for(project)
-        for name in ("nav_api-info-f4.json", "nav_api-doc-f4.json", "nav_api-index-f4.json"):
-            with self._failing_write(2):
-                self.assertFalse(nav._cache.write_json(name, {"a": 1}), name)
-        self.assertEqual(list(project_cache(project).parent.iterdir()), [])
+        folder = project_cache(project).parent
+        for kind, failing in (("write", lambda: self._failing_write(2)), ("close", self._failing_close)):
+            for name in ("nav_api-info-f4.json", "nav_api-doc-f4.json", "nav_api-index-f4.json"):
+                no_unlink, no_remove, no_rmdir = self._no_removal()
+                with failing(), no_unlink, no_remove, no_rmdir:
+                    self.assertFalse(nav._cache.write_json(name, {"a": 1}), (kind, name))
+                self.assertFalse((folder / name).exists(), (kind, name))
+        self.assertTrue(all(p.name.endswith(".tmp") for p in folder.iterdir()))  # at most strays, never an entry
         with self._failing_write(1):
             self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
         self.assertEqual(self.entries(project), [])
-        self.assertEqual(list(project_cache(project).parent.iterdir()), [])
 
-    def test_s3_f4_a_failed_rename_or_interrupted_rename_removes_only_its_own_temporary(self):
+    def test_s3_f4_a_failed_or_interrupted_rename_leaves_the_entry_and_removes_nothing(self):
         project = self.project()
         nav = self.nav_for(project)
         folder = project_cache(project).parent
@@ -5980,20 +6015,22 @@ class InfoCacheCase(Tree):
         planted = folder / "nav_api-info-f4.json.0000000000000000.tmp"
         planted.write_text("x")
         for error in (OSError(5, "io"), KeyboardInterrupt()):
-            with mock.patch.object(graph.os, "rename", side_effect=error):
+            no_unlink, no_remove, no_rmdir = self._no_removal()
+            with mock.patch.object(graph.os, "rename", side_effect=error), no_unlink, no_remove, no_rmdir:
                 if isinstance(error, OSError):
                     self.assertFalse(nav._cache.write_json("nav_api-info-f4.json", {"v": 2}))
                 else:
                     with self.assertRaises(KeyboardInterrupt):
                         nav._cache.write_json("nav_api-info-f4.json", {"v": 2})
-            self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted([planted.name, "nav_api-info-f4.json"]))
             self.assertEqual(json.loads((folder / "nav_api-info-f4.json").read_text()), {"v": 1})
+            self.assertEqual(planted.read_text(), "x")
+            self.assertTrue(all(p.name in ("nav_api-info-f4.json", planted.name) or p.name.endswith(".tmp") for p in folder.iterdir()))
 
     def test_s3_f4_a_value_that_cannot_be_serialised_makes_nothing(self):
         project = self.project()
         nav = self.nav_for(project)
         self.assertFalse(nav._cache.write_json("nav_api-info-f4.json", {"a": object()}))
-        self.assertEqual([p.name for p in project_cache(project).parent.glob("*.tmp")], [])
+        self.assertEqual(list(project_cache(project).parent.iterdir()), [])  # serialised first: nothing was made
 
     def test_s3_f3_putting_an_entry_asks_the_guard_nothing_and_a_refused_name_is_not_judged_in(self):
         project = self.project()

@@ -12,7 +12,8 @@ Three sources, each used for what it is good at:
     (a changed file gives `stale_index`); with no sandbox there is no hit. An entry (this one and the `deno doc` one) is JUDGED before the final proof and WRITTEN
     after it, and never removed: before the proof (`_final`) the entry's name and a unique temporary name are asked
     of the guard once (the cache folder was judged when the cache was made) (a refusal means no store); the proof runs; only an answer that is still `ok` then writes the temporary file
-    and renames it, with no guard and no project code, a failure being swallowed. A refusal, gap, stale answer, error or exception
+    and renames it, with no guard and no project code, a failure being swallowed (entries unchanged; a stray `.tmp` is possible
+    and is swept by S5). A refusal, gap, stale answer, error or exception
     therefore writes nothing, and no entry is ever deleted. A planted entry can name only files this walk proved and the guard allows.
     The cache folder is judged as for `deno doc`; a refused one means no cache.
 
@@ -1097,7 +1098,7 @@ class NavApi:
         cache was made; `graph.CacheDir.prepare_json`); a refusal, or any exception, means no store. The proof then runs as the last thing that
         touches the project. Only when the answer is still `ok` is the returned function called: it writes the temporary file and
         renames it (`graph.CacheDir.put_json`), asks no guard and calls no project code, and a failure of it is swallowed (the
-        answer stays `ok`). Nothing is ever removed, so a failed proof, a proof that raises, a refusal, a gap or an error leaves
+        answer stays `ok`; entries are unchanged and a stray `.tmp` may remain, swept by S5). Nothing is ever removed, so a failed proof, a proof that raises, a refusal, a gap or an error leaves
         no entry because none was written, and no other writer's entry is touched (the entry is keyed by the content it was made
         from, so a second writer of the same key writes the same bytes by an atomic rename)."""
         out = self._out(answer)

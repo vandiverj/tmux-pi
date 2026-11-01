@@ -23,8 +23,10 @@ whose proof found nothing is `ok`. THE LAST PROOF IS THE LAST STEP: the answer i
 proof again after the screen, as the very last thing before the answer is returned (for the index as for `deno info`; the one rule
 is `_final`); a proof that fails then gives the gaps and nothing from the answer.
 A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
-An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it; one
-file's bytes are never read to decide the boundary (a `.git` is refused by name), so a rewrite that keeps size, mtime and ctime is not seen.
+An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it. Of
+those inputs the regular files inside the boundary are also content-hashed (sha256; `_boundary_hash`, the one exception to the refusal of
+`.git` by name, see "The monorepo"), so a rewrite that keeps size, mtime and ctime is seen too. A `.git` FOLDER is a boundary input by
+kind and identity only (its contents are never read, and ordinary git work changes them), so a change inside one is not a boundary change by design.
 A change after the final proof returns is not detected.
 A missing config is no gap (nothing is there; one that was there when its folder was walked and is gone at its read is a race),
 nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
@@ -57,7 +59,12 @@ inside that package's folder (a `workspaces` key that is present must hold such 
 config's folder or any folder up to the root, and any other form, are `unmodelled_config` (nothing is guessed). The `package.json` of
 every folder from the config's folder to the root is read, cut down and mirrored, and is an input the final proof checks again. So is
 the choice of the root itself (`_probe_boundary`): the `.git` of each folder looked at on the way up, every marker of the folder
-chosen (`_boundary_input`: kind, identity, size, mtime, ctime; nothing read), and the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
+chosen (`_boundary_input`: kind, identity, size, mtime, ctime, a link's target; nothing read), the sha256 of each of those that is a regular file
+inside the boundary (`_boundary_hash`: a `.git` file of a worktree or submodule, by the one narrow exception to the refusal of `.git`; a marker
+only if the guard allows its name): opened with O_NOFOLLOW and O_NONBLOCK, only if it is the regular file the stat saw, at most BOUNDARY_HASH_CAP
+(4 KiB) bytes, read only to be hashed, never returned, logged, mirrored or given to Deno. One that is larger, unreadable or swapped is
+`unmodelled_config` for every answer. A link, a FIFO or a folder at such a name is never opened. Above the folder chosen nothing is opened. And
+the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
 from the index (`ImportIndex.boundary_holds`) and from Deno (`Reach.boundary_holds`), warm, cold or cache-loaded.
 
 The path rule (graph.py states it in full; a test holds every file-system call in both modules to a table): nothing is asked of the
@@ -109,7 +116,9 @@ only files the walk proved (any other path is `<file>`).
 
 Known limits (what is not proven):
   - A change after the final proof returns is not detected, and neither is a source or config rewritten with the same mtime and size
-    (the index's key; no content hash). The answer is a snapshot as of its last proof. A `package.json` or `deno.json` in a
+    (the index's key; no content hash). The boundary inputs are the exception (a `.git` file and the workspace markers are hashed), but a
+    `.git` folder whose contents change is not a boundary change, by design, and a `.git` or marker above the folder chosen, or one the
+    guard refuses by name, is known by its stat fingerprint only. The answer is a snapshot as of its last proof. A `package.json` or `deno.json` in a
     folder the walk reached outside the chain from the config's folder to the monorepo root is not read as a config.
   - The mirror keeps Deno from opening a project file it was not given; the sandbox keeps it from opening anything else. An import
     the scanner missed, whatever it names (`/etc/x`, `../../x`, `file:///abs/x`), is a path the process is not allowed to open: Deno
@@ -195,6 +204,7 @@ GRANT_NEXT_STEP = ("point DENO_DIR (and XDG_CACHE_HOME) at a directory outside t
                    "executable outside them; importers and imports still work without Deno")
 INDEX_NEXT_STEP = ("make the folders, files and config the index could not read readable, or use a config it can model; `gaps` counts "
                    "what was missed. imports from `deno info` do not need the index")
+BOUNDARY_UNMODELLED = "unmodelled_config"  # a boundary input (`.git` file, workspace marker) that cannot be hashed: see `_boundary_hash`
 CONFIG_NEXT_STEP = "point config (and overlays) at a file inside the project that the guard allows"
 SCRATCH_NEXT_STEP ="pass a mirror_parent outside the project and outside any sensitive folder"
 SCRATCH_REASON = "scratch_unavailable"  # internal: the directory for a probe or a mirror could not be made (an error, not a refusal)
@@ -322,13 +332,48 @@ def _file_url_path(url):
     return os.path.normpath(unquote(url[len("file://"):])) if isinstance(url, str) and url.startswith("file://") else None
 
 
+BOUNDARY_HASH_CAP = 4096  # bytes: the most of a `.git` file or a workspace marker that is read, only to be hashed (larger: `unmodelled_config`)
+
+
+def _boundary_hash(path, identity):
+    """The ONE exception to the refusal of `.git` by name, and the only place a boundary input is ever read: `("sha256", hex)` of
+    the bytes of the regular file `path` (a `.git` file of a worktree or submodule, or a workspace marker), or `("unmodelled",
+    reason)` (never an error): it is opened with O_NOFOLLOW and O_NONBLOCK (a link or a FIFO is never followed or waited for),
+    must be a regular file with the `(dev, ino)` that `_boundary_input` saw (a swap in between is not hashed), and may hold at
+    most BOUNDARY_HASH_CAP bytes. The content goes into the digest and nowhere else: it is not returned, logged, mirrored or
+    handed to Deno, and `reason` is a code with no path or content. The caller names only a file inside the boundary."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        return ("unmodelled", f"open_{error.errno}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != identity:
+            return ("unmodelled", "not_the_file_seen")
+        if st.st_size > BOUNDARY_HASH_CAP:
+            return ("unmodelled", "too_large")
+        data = b""
+        while len(data) <= BOUNDARY_HASH_CAP:
+            chunk = os.read(fd, BOUNDARY_HASH_CAP + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > BOUNDARY_HASH_CAP:
+            return ("unmodelled", "too_large")
+        return ("sha256", hashlib.sha256(data).hexdigest())
+    except OSError as error:
+        return ("unmodelled", f"read_{error.errno}")
+    finally:
+        os.close(fd)
+
+
 def _boundary_input(path):
     """The one fingerprint of an input of the boundary decision (a `.git`, a workspace marker), taken by `os.lstat` and, for a link,
     `os.readlink` (the link itself, never what it leads to); nothing is opened or read, so a refused name (`.git`) is never read.
     A folder: its kind and identity (its mtime moves with ordinary git work, so it is not part of it). Anything else: kind,
     identity, size, mtime and ctime in ns (ctime cannot be set back, so an edit that restores the mtime is still seen), and for a
-    link its target text. ("absent",) for nothing there; ("error", errno) when it cannot be looked at. A change of content that
-    keeps size, mtime and ctime is not detected (a known limit)."""
+    link its target text. ("absent",) for nothing there; ("error", errno) when it cannot be looked at. Nothing is read here: the
+    content of a regular file is added by `NavApi._probe_boundary` through `_boundary_hash`, for the inputs inside the boundary."""
     try:
         st = os.lstat(path)
     except OSError as error:
@@ -396,6 +441,7 @@ class NavApi:
         """The folder nothing outside is ever read: the monorepo root around the project, else the project root. The choice and
         everything it was made from are recorded (`_boundary_token`) and proved again with every answer (`_boundary_holds`)."""
         folder, self._boundary_token = self._probe_boundary()
+        self._boundary_unmodelled = any(entry[0] == "content" and entry[2] == "unmodelled" for entry in self._boundary_token)
         return folder
 
     def _boundary_holds(self):
@@ -407,37 +453,63 @@ class NavApi:
             return False
 
     def _probe_boundary(self):
-        """(folder, observations). The folder is the monorepo root around the project: the nearest folder at or above the project
-        with a `.git`, when it has a workspace marker (`WORKSPACE_MARKERS`) and is not the project itself; the walk stops at the
+        """(folder, observations): `_choose_boundary`'s choice and what it rests on, plus the content of the inputs that are regular
+        files inside the folder chosen: each `.git` (a worktree's or submodule's pointer file; a folder keeps its kind and identity,
+        its contents are never read, ordinary git work changes them), by the one exception to the refusal of `.git` (`_boundary_hash`),
+        and each workspace marker the guard allows (`check_path(folder, name)`; one it refuses keeps its stat fingerprint). Each is an
+        entry `("content", path, "sha256", hex)`, or `("content", path, "unmodelled", reason)` for one that cannot be hashed (too
+        large, not the file seen, unreadable): `_fresh` and `_prove` refuse every answer then (`unmodelled_config`) and a probe that
+        finds it changed gives `stale_index`. An input above the folder chosen (outside the boundary) is never opened."""
+        folder, seen, regular = self._choose_boundary()
+        hashed = []
+        for path, identity in regular:
+            if not path.startswith(folder + os.sep):
+                continue  # outside the boundary, or the folder was not taken: stat only, never opened
+            name = os.path.basename(path)
+            if name != ".git":
+                try:
+                    if not isinstance(self.check_path(folder, name), str):
+                        continue
+                except Exception:
+                    continue
+            hashed.append((path, *_boundary_hash(path, identity)))
+        return folder, (*seen, *(("content", *entry) for entry in hashed))
+
+    def _choose_boundary(self):
+        """(folder, observations, regular). The folder is the monorepo root around the project: the nearest folder at or above the
+        project with a `.git`, when it has a workspace marker (`WORKSPACE_MARKERS`) and is not the project itself; the walk stops at the
         first `.git`, so a repository nested in another is never crossed. Else it is the project root. Existence probes of exact
         names (the closed exception to the path rule, as in `_guarded_roots`); nothing is read. A folder that is `/`, holds the home
         folder, has a sensitive component or cannot be judged is not taken. `observations` is what the choice rests on: for each
         folder visited the fingerprint of its `.git`, for the one that has it the same of each marker (`_boundary_input`, the one
-        fingerprint of every input of this decision), and the home folder; two probes that differ chose from a different tree."""
-        seen = []
+        fingerprint of every input of this decision), and the home folder; two probes that differ chose from a different tree.
+        `regular` is [(path, (dev, ino))] of each input that was a regular file."""
+        seen, regular = [], []
 
         def look(path):
             fingerprint = _boundary_input(path)
             seen.append((path, *fingerprint))
+            if fingerprint[0] == stat.S_IFREG:
+                regular.append((path, (fingerprint[1], fingerprint[2])))
             return fingerprint != ("absent",) and fingerprint[0] not in ("error",)
         folder = self.project_root
         while not look(os.path.join(folder, ".git")):
             parent = os.path.dirname(folder)
             if parent == folder:
-                return self.project_root, tuple(seen)
+                return self.project_root, tuple(seen), regular
             folder = parent
         markers = [look(os.path.join(folder, name)) for name in WORKSPACE_MARKERS]
         if folder == self.project_root or not any(markers):
-            return self.project_root, tuple(seen)
+            return self.project_root, tuple(seen), regular
         try:
             home = judged_location(os.path.expanduser("~"))
         except graph.Unproven:
             seen.append(("home", None))
-            return self.project_root, tuple(seen)
+            return self.project_root, tuple(seen), regular
         seen.append(("home", home))
         if folder == os.sep or _sensitive_location(folder) or os.path.commonpath([folder, home]) == folder:
-            return self.project_root, tuple(seen)
-        return folder, tuple(seen)
+            return self.project_root, tuple(seen), regular
+        return folder, tuple(seen), regular
 
     def _show_path(self, path):
         """The resolved absolute `path` as a posix path relative to the project root (`..` segments for a place in the monorepo
@@ -490,6 +562,8 @@ class NavApi:
         shown allowed is refused before anything is asked of it."""
         if self._root_refusal:
             return None, None, _answer("refused", reason=self._root_refusal)
+        if self._boundary_unmodelled:
+            return None, None, _answer("refused", reason=BOUNDARY_UNMODELLED, next_step=CONFIG_NEXT_STEP)
         if not graph.judged_is_dir(self.boundary, self.root, self._permits):
             return None, None, _answer("no_project", detail="project directory not found")
         index = self._get_index()
@@ -915,6 +989,8 @@ class NavApi:
         try:
             reach = graph.prove_reach(self.boundary, os.path.join(self.boundary, rel), self.config, self._permits)
             reach.boundary_holds = self._boundary_holds
+            if self._boundary_unmodelled:  # after the walk, whose own reason (an unreadable marker it reads, say) is the more precise one
+                return None, _answer("refused", reason=BOUNDARY_UNMODELLED, next_step=CONFIG_NEXT_STEP)
             return reach, None
         except graph.Unproven as error:
             if error.reason == "changed_during_walk":  # a link moved while the walk read: ask again
@@ -1168,6 +1244,8 @@ class NavApi:
             out["boundary"] = self._show_path(self.boundary)
         if self._root_refusal:
             out["root_refused"] = self._root_refusal
+        if self._boundary_unmodelled:
+            out["boundary_refused"] = BOUNDARY_UNMODELLED
         if self._index is not None:
             out.update(files_indexed=len(self._index.entries), index_age_s=self._index.age_s())
             if self._index.gaps:

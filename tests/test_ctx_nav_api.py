@@ -4,6 +4,7 @@ Every project here is a copy of tests/fixtures/ctx_api/project or a small tree b
 Deno skip when it is not on PATH; none of them touches the network (the fixture imports nothing but local files and `node:path`),
 and the fake `deno` programs used for the timeout, failure and environment cases are shell scripts written into the temporary
 directory."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -2427,6 +2428,12 @@ class BoundedReadCase(Tree):
                     if owner == "read_bounded" and called == "read" and isinstance(callee, ast.Attribute) \
                             and isinstance(callee.value, ast.Name) and callee.value.id == "os":
                         continue
+                    if name == "nav_api.py" and owner == "_boundary_hash":
+                        # step 3, the ONE exception (owner decision "setup hash"): a boundary input (`.git` file, marker) is read only to be
+                        # hashed, opened O_NOFOLLOW|O_NONBLOCK; its bytes go to sha256 and nowhere else (see the step 3 tests)
+                        if ast.unparse(callee) == "os.read" or (ast.unparse(callee) == "os.open"
+                                                                and all(f in ast.unparse(node.args[1]) for f in ("O_NOFOLLOW", "O_NONBLOCK"))):
+                            continue
                     if owner in ("open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder") and ast.unparse(callee) == "os.open" \
                             and ast.unparse(node.args[1]).startswith("DIR_FLAGS"):
                         continue  # a descriptor on a folder (O_DIRECTORY): listed or written in, never read from
@@ -3059,6 +3066,9 @@ class PathRuleCase(Tree):
         ("nav_api.py", "NavApi._guarded_roots", "os.path.lexists"): "monorepo markers: exact names in the project's ancestors",
         ("nav_api.py", "_boundary_input", "os.lstat"): "monorepo root and markers: exact names in the project's ancestors; stat only, nothing read",
         ("nav_api.py", "_boundary_input", "os.readlink"): "the link itself at such a name, never what it leads to",
+        ("nav_api.py", "_boundary_hash", "os.open"): "the one exception to the .git refusal: a regular file at an exact boundary-input name inside the boundary; O_NOFOLLOW|O_NONBLOCK",
+        ("nav_api.py", "_boundary_hash", "os.fstat"): "the descriptor just opened: must be the regular file the lstat saw",
+        ("nav_api.py", "_boundary_hash", "os.read"): "at most BOUNDARY_HASH_CAP+1 bytes, only to be hashed",
         ("nav_api.py", "NavApi._grant_kinds", "os.lstat"): "a grant resolved by judged_location, not sensitive",
         ("nav_api.py", "NavApi._sandboxed", "os.access"): "the fixed SANDBOX_EXEC",
         ("nav_api.py", "NavApi._check_sandbox", "subprocess.run"): "SANDBOX_EXEC with judged grants and the probe folder",
@@ -4059,7 +4069,15 @@ class MonorepoCase(Tree):
             patcher.stop()
         self.env_patchers = []
 
+    frozen = ()
+
+    def thaw(self):
+        for patcher in reversed(self.frozen):
+            patcher.stop()
+        self.frozen = ()
+
     def reset(self, git_file=False):
+        self.thaw()  # a frozen stat belonged to the tree being replaced
         self.undo_env()  # an edit that changed HOME is undone with the tree it belonged to
         shutil.rmtree(self.dir / "mono", ignore_errors=True)
         mono, project = self.mono()
@@ -4834,12 +4852,317 @@ class MonorepoCase(Tree):
                         self.addCleanup(lambda t=target: os.path.lexists(t) and t.is_file() and not t.is_symlink() and os.chmod(t, 0o644))
                         self.assertFalse(reach.holds())
 
+    # --- step 3 (owner decision "setup hash"): a file-form `.git` and the workspace markers are content-hashed
+
+    SECRET_GIT, SECRET_MARKER = "gitdir: /elsewhere/SECRET_GITDIR_7f3a\n", '{"SECRET_MARKER_91c2": 1}'
+
+    def freeze_stat(self, path):
+        """From now on `os.lstat(path)` answers what it answers now: what an edit that kept size, mtime AND ctime would leave (the
+        ctime cannot be set back on a real file system). Undone with the test."""
+        target, before, real = os.path.realpath(path), os.lstat(path), os.lstat
+        patcher = mock.patch("os.lstat", lambda p, *a, **k: before if isinstance(p, (str, os.PathLike)) and str(p) == target
+                             else real(p, *a, **k))
+        patcher.start()
+        self.frozen = (*self.frozen, patcher)
+        self.addCleanup(self.thaw)
+
+    def content_edits(self):
+        """label -> (git_file tree?, edit(mono, project)): a rewrite of a hashed input that keeps size, mtime and ctime."""
+        def git(mono, project):
+            self.freeze_stat(mono / ".git")
+            (mono / ".git").write_text("gitdir: /elsewhere/bbb\n")  # the same length as the tree's "gitdir: /elsewhere/aaa\n"
+
+        def marker(mono, project):
+            self.freeze_stat(mono / "nx.json")
+            (mono / "nx.json").write_text("[]")
+        return {".git file rewritten, size mtime ctime kept": (True, git), "nx.json rewritten, size mtime ctime kept": (False, marker)}
+
+    def test_the_boundary_token_carries_the_hash_of_a_git_file_and_a_marker_and_no_content(self):
+        mono, project = self.reset(git_file=True)
+        token = nav_api.NavApi(str(project))._boundary_token
+        real = os.path.realpath(mono)
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        self.assertIn(("content", os.path.join(real, ".git"), "sha256", digest(b"gitdir: /elsewhere/aaa\n")), token)
+        self.assertIn(("content", os.path.join(real, "nx.json"), "sha256", digest(b"{}")), token)
+        self.assertNotIn("elsewhere", repr(token).replace(real, ""))  # the hash, never the bytes
+        write(mono / ".git", "gitdir: /elsewhere/bbb\n")
+        self.assertNotEqual(nav_api.NavApi(str(project))._boundary_token, token)
+
+    def test_a_rewrite_of_a_hashed_input_that_keeps_size_mtime_and_ctime_is_stale_on_every_route(self):
+        """Sweep (input x route): index and Deno, a change during the call (after the refresh / inside the run / after the screen),
+        between calls on a warm instance and on one that loads the cache."""
+        routes = [("index", "refresh", self.index_calls), ("index", "screen", self.index_calls),
+                  ("deno", "deno", self.deno_calls_), ("deno", "screen", self.deno_calls_)]
+        for label, (git_file, edit) in self.content_edits().items():
+            for kind, hook, calls in routes:
+                for number, call in enumerate(calls):
+                    with self.subTest(label, route=kind, hook=hook, call=number):
+                        mono, project = self.reset(git_file)
+                        nav = self.deno_nav(project)
+                        self.during(nav, hook, lambda: edit(mono, project))
+                        self.no_data(call(nav), label)
+        doc = self.doc_payload(MIRROR, "src/uses_lib.ts", "W", "w", line=3)
+        for label, (git_file, edit) in self.content_edits().items():
+            with self.subTest(label, route="between calls"):
+                mono, project = self.reset(git_file)
+                warm, cold = (self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload())) for _ in range(2))
+                for call in (*self.index_calls, *self.deno_calls_):
+                    self.assertEqual(call(warm)["status"], "ok")
+                self.assertTrue(self.deno_calls_[0](cold)["cached"], label)
+                edit(mono, project)
+                for number, call in enumerate((*self.index_calls, *self.deno_calls_)):
+                    for route, nav in (("cache-loaded", cold), ("warm", warm)):
+                        self.no_data(call(nav), f"{label} {route} {number}")
+                self.assertFalse(warm._boundary_holds())
+
+    def test_a_rewrite_that_changes_nothing_is_not_a_change(self):
+        for label, (git_file, edit) in self.content_edits().items():
+            with self.subTest(label):
+                mono, project = self.reset(git_file)
+                nav = self.deno_nav(project)
+                self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
+                path = mono / (".git" if ".git" in label else "nx.json")
+                data = path.read_bytes()
+                self.freeze_stat(path)
+                path.write_bytes(data)
+                self.assertTrue(nav._boundary_holds())
+                self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
+
+    def opened_paths(self):
+        opened, real = [], os.open
+        patcher = mock.patch("os.open", lambda p, *a, **k: (opened.append(str(p)), real(p, *a, **k))[1])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return opened
+
+    def test_the_hash_is_the_only_read_of_a_git_file_and_only_that_one_is_opened(self):
+        mono, project = self.reset(git_file=True)
+        opened = self.opened_paths()
+        nav = self.deno_nav(project)
+        nav.importers("../../lib/shared/util.ts")
+        git = [p for p in opened if os.sep + ".git" in p]
+        self.assertEqual(set(git), {os.path.join(os.path.realpath(mono), ".git")}, opened)
+
+    def test_a_git_folder_keeps_its_kind_and_identity_and_is_never_opened_or_hashed(self):
+        mono, project = self.mono()
+        opened = self.opened_paths()
+        nav = self.deno_nav(project)
+        self.assertEqual(nav.boundary, str(mono))
+        self.assertFalse([entry for entry in nav._boundary_token if entry[0] == "content" and entry[1].endswith(".git")])
+        for call in (*self.index_calls, *self.deno_calls_):
+            self.assertEqual(call(nav)["status"], "ok")
+        self.assertEqual([p for p in opened if os.sep + ".git" in p], [], opened)
+        write(mono / ".git" / "refs" / "heads" / "x", "abc\n")  # ordinary git work: not a change
+        self.assertTrue(nav._boundary_holds())
+
+    def test_a_git_file_over_the_cap_is_unmodelled_config_and_no_data_on_every_route(self):
+        cap = nav_api.BOUNDARY_HASH_CAP
+        for label, size, ok in (("at the cap", cap, True), ("one byte over", cap + 1, False)):
+            with self.subTest(label):
+                mono, project = self.reset(git_file=True)
+                write(mono / ".git", "gitdir: /x/" + "a" * (size - len("gitdir: /x/")))
+                self.assertEqual((mono / ".git").stat().st_size, size)
+                nav = self.deno_nav(project)
+                self.assertEqual(nav.boundary, str(mono))
+                for number, call in enumerate((*self.index_calls, *self.deno_calls_)):
+                    answer = call(nav)
+                    if ok:
+                        self.assertEqual(answer["status"], "ok", answer)
+                    else:
+                        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), (number, answer))
+                        for key in DATA_KEYS + ("modules", "symbols"):
+                            self.assertNotIn(key, answer)
+                        self.assertNotIn("gitdir", json.dumps(answer))
+                self.assertEqual("boundary_refused" in nav.status(), not ok)
+
+    def test_a_hashed_input_that_grows_past_the_cap_or_becomes_unreadable_during_use_is_stale(self):
+        edits = {"git file grows": (True, lambda mono: write(mono / ".git", "gitdir: /x/" + "a" * (nav_api.BOUNDARY_HASH_CAP + 10))),
+                 "marker grows": (False, lambda mono: write(mono / "nx.json", "{" + " " * nav_api.BOUNDARY_HASH_CAP + "}"))}
+        if os.geteuid() != 0:
+            edits["git file unreadable"] = (True, lambda mono: os.chmod(mono / ".git", 0))
+        for label, (git_file, edit) in edits.items():
+            with self.subTest(label):
+                mono, project = self.reset(git_file)
+                self.addCleanup(lambda p=mono / ".git": os.path.lexists(p) and not p.is_dir() and os.chmod(p, 0o644))
+                warm = self.deno_nav(project)
+                for call in (*self.index_calls, *self.deno_calls_):
+                    self.assertEqual(call(warm)["status"], "ok")
+                edit(mono)
+                for call in (*self.index_calls, *self.deno_calls_):
+                    self.no_data(call(warm), label)
+
+    def test_a_git_file_or_marker_that_cannot_be_hashed_at_construction_is_refused(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+        for label, git_file, name in (("unreadable .git", True, ".git"), ("unreadable marker", False, "nx.json")):
+            with self.subTest(label):
+                mono, project = self.reset(git_file)
+                os.chmod(mono / name, 0)
+                self.addCleanup(os.chmod, mono / name, 0o644)
+                nav = self.deno_nav(project)
+                self.assertEqual(nav.boundary, str(mono))
+                self.assert_refused(nav, "unmodelled_config")
+                self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "refused")
+
+    def test_the_hash_never_follows_a_link_waits_on_a_fifo_or_takes_a_swapped_file(self):
+        base = self.dir / "hash"
+        base.mkdir()
+        (base / "plain").write_text("data")
+        os.mkfifo(base / "fifo")
+        (base / "link").symlink_to(base / "plain")
+        (base / "folder").mkdir()
+        identity = lambda p: (lambda st: (st.st_dev, st.st_ino))(os.lstat(p))
+        self.assertEqual(nav_api._boundary_hash(str(base / "plain"), identity(base / "plain")),
+                         ("sha256", hashlib.sha256(b"data").hexdigest()))
+        for name, expected in (("fifo", "not_the_file_seen"), ("folder", "not_the_file_seen")):
+            self.assertEqual(nav_api._boundary_hash(str(base / name), identity(base / name)), ("unmodelled", expected), name)
+        self.assertEqual(nav_api._boundary_hash(str(base / "link"), identity(base / "plain"))[0], "unmodelled")  # O_NOFOLLOW
+        self.assertEqual(nav_api._boundary_hash(str(base / "plain"), identity(base / "folder")), ("unmodelled", "not_the_file_seen"))
+        self.assertEqual(nav_api._boundary_hash(str(base / "plain"), (0, 0)), ("unmodelled", "not_the_file_seen"))
+        self.assertEqual(nav_api._boundary_hash(str(base / "nothing"), (0, 0))[0], "unmodelled")
+
+    def test_a_git_that_is_a_fifo_or_a_link_is_never_opened_and_keeps_its_old_behaviour(self):
+        for label, make in (("fifo", lambda p: os.mkfifo(p)), ("link to a file", lambda p: p.symlink_to(self.dir / "outside.ts")),
+                            ("dangling link", lambda p: p.symlink_to(self.dir / "nowhere"))):
+            with self.subTest(label):
+                mono, project = self.reset()
+                shutil.rmtree(mono / ".git")
+                make(mono / ".git")
+                opened = self.opened_paths()
+                nav = self.deno_nav(project)
+                self.assertEqual(nav.boundary, str(mono))
+                self.assertFalse([e for e in nav._boundary_token if e[0] == "content" and e[1].endswith(".git")])
+                self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
+                self.assertEqual([p for p in opened if p.endswith(os.sep + ".git")], [], opened)
+
+    def test_a_git_swapped_for_a_fifo_between_the_stat_and_the_open_is_unmodelled(self):
+        mono, project = self.reset(git_file=True)
+        real, git = nav_api._boundary_hash, os.path.join(os.path.realpath(mono), ".git")
+
+        def swap(path, identity):
+            if path == git:
+                os.unlink(path)
+                os.mkfifo(path)
+            return real(path, identity)
+        with mock.patch.object(nav_api, "_boundary_hash", swap):
+            nav = self.deno_nav(project)
+        self.assertTrue(nav._boundary_unmodelled)
+        self.assert_refused(nav, "unmodelled_config")
+
+    def test_an_input_the_guard_refuses_by_name_or_above_the_boundary_is_never_opened(self):
+        mono, project = self.reset(git_file=True)
+
+        def refuse_nx(project_root, path):
+            if str(path).endswith("nx.json"):
+                raise nav_api.Refused("sensitive_path")
+            return nav_api.stub_check_path(project_root, path)
+        opened = self.opened_paths()
+        nav = self.deno_nav(project, check_path=refuse_nx)
+        self.assertEqual(nav.boundary, str(mono))
+        self.assertFalse([p for p in opened if p.endswith("nx.json")], opened)
+        self.assertFalse([e for e in nav._boundary_token if e[0] == "content" and e[1].endswith("nx.json")])
+
+    def test_a_git_file_above_a_project_that_has_no_monorepo_root_is_stat_only(self):
+        """The folder above the project is not the boundary when it is not taken (no marker; the home folder): nothing there is opened."""
+        for label in ("no marker", "home above"):
+            with self.subTest(label):
+                mono, project = self.reset(git_file=True)
+                opened = self.opened_paths()
+                with mock.patch.dict(os.environ, {"HOME": str(mono) if label == "home above" else os.environ["HOME"]}):
+                    if label == "no marker":
+                        (mono / "nx.json").unlink()
+                    nav = self.deno_nav(project)
+                    self.assertEqual(nav.boundary, str(project))
+                    nav.importers("src/main.ts")
+                self.assertEqual([p for p in opened if os.sep + ".git" in p], [], opened)
+                self.assertFalse([e for e in nav._boundary_token if e[0] == "content"])
+
+    def test_the_projects_own_git_file_is_hashed_when_there_is_no_monorepo_root(self):
+        project = self.project("plain")
+        write(project / ".git", "gitdir: /elsewhere/aaa\n")
+        nav = self.nav(project)
+        self.assertEqual(nav.boundary, str(project.resolve()))
+        self.assertTrue([e for e in nav._boundary_token if e[0] == "content" and e[2] == "sha256"])
+        self.assertEqual(nav.importers("src/main.ts")["status"], "ok")
+        write(project / ".git", "gitdir: /elsewhere/bbb\n")
+        self.assertFalse(nav._boundary_holds())
+
+    def test_the_content_of_a_hashed_input_is_in_no_answer_cache_mirror_or_output(self):
+        import contextlib
+        import io
+        mono, project = self.reset(git_file=True)
+        write(mono / ".git", self.SECRET_GIT)
+        write(mono / "nx.json", self.SECRET_MARKER)
+        hits = self.dir / "mirror-hits.log"
+        doc = self.doc_payload(MIRROR, "src/uses_lib.ts", "W", "w", line=3)
+        write(self.dir / "doc.json", json.dumps(doc))
+        write(self.dir / "info.json", json.dumps(self.info_payload()))
+        log = self.dir / "deno.log"
+        deno = self.fake_deno(f'echo "$@" >> {log}\ngrep -rIl SECRET_ "$PWD" >> {hits} 2>/dev/null\ncase "$1" in\n --version) echo "deno 9.9.9";;\n'
+                              f' doc) sed "s|{MIRROR}|$PWD|g" {self.dir / "doc.json"};;\n info) sed "s|{MIRROR}|$PWD|g" {self.dir / "info.json"};;\nesac')
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.assertNoLogs(level="DEBUG"):
+            nav = self.nav(project, deno=deno)
+            answers = [nav.importers("../../lib/shared/util.ts"), nav.imports("src/uses_lib.ts", source="index"), nav.imports("src/uses_lib.ts"),
+                       nav.symbols("src/uses_lib.ts"), nav.forward_graph("src/uses_lib.ts"), nav.status(), nav.symbols("src/uses_lib.ts")]
+        self.assertEqual([a["status"] for a in answers[:5]], ["ok"] * 5, answers)
+        text = json.dumps(answers) + out.getvalue() + err.getvalue() + repr(nav._boundary_token) + repr(vars(nav).get("_boundary_unmodelled"))
+        for secret in ("SECRET_GITDIR_7f3a", "SECRET_MARKER_91c2", "elsewhere"):
+            self.assertNotIn(secret, text)
+            for folder, _, files in os.walk(project):  # the cache folder and everything else under the project
+                for name in files:
+                    self.assertNotIn(secret.encode(), (Path(folder) / name).read_bytes(), name)
+        self.assertTrue(self.deno_calls("doc") and self.deno_calls("info"), "Deno was run (the mirror was looked at)")
+        self.assertFalse(hits.exists() and hits.read_text().strip(), "the mirror held a hashed input's content")
+        # and an unmodelled input's refusal carries no content either
+        write(mono / ".git", "gitdir: /elsewhere/SECRET_GITDIR_7f3a" + "a" * nav_api.BOUNDARY_HASH_CAP)
+        refused = self.nav(project, deno=deno)
+        self.assertNotIn("SECRET_GITDIR", json.dumps([refused.importers("../../lib/shared/util.ts"), refused.symbols("src/uses_lib.ts"),
+                                                      refused.status()]))
+
+    def test_sweep_pass_2_every_marker_and_the_projects_own_git_file_rewritten_with_the_stat_kept(self):
+        """Pass 2: each of the five markers (alone in the root) and a `.git` file in a project with no monorepo root, on the index and the
+        Deno route, warm."""
+        for marker in nav_api.WORKSPACE_MARKERS:
+            with self.subTest(marker):
+                mono, project = self.reset()
+                for name in os.listdir(mono):
+                    if name in nav_api.WORKSPACE_MARKERS:
+                        (mono / name).unlink()
+                write(mono / marker, "{}")
+                nav = self.deno_nav(project)
+                self.assertEqual(nav.boundary, str(mono))
+                self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
+                self.freeze_stat(mono / marker)
+                (mono / marker).write_text("[]")
+                for call in self.index_calls:
+                    self.no_data(call(nav), marker)
+                for call in self.deno_calls_:  # a marker of another tool is `unmodelled_config` to Deno's walk in any case
+                    answer = call(nav)
+                    if marker in graph.UNMODELLED_WORKSPACE_FILES:
+                        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), answer)
+                    else:
+                        self.no_data(answer, marker)
+        with self.subTest("the project's own .git file"):
+            self.thaw()
+            project = self.project("own")
+            write(project / ".git", "gitdir: /elsewhere/aaa\n")
+            nav = self.nav(project)
+            self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+            self.freeze_stat(project / ".git")
+            (project / ".git").write_text("gitdir: /elsewhere/bbb\n")
+            self.no_data(nav.importers("src/app/run.ts"), "own .git")
+            self.no_data(nav.imports("src/main.ts", source="index"), "own .git")
+
     # --- documentation
 
     def test_the_known_limits_say_what_the_final_proof_does_not_cover(self):
         text = " ".join(nav_api.__doc__.split()).lower()
         self.assertIn("a change after the final proof returns is not detected", text)
         self.assertIn("same mtime and size", text)
+        self.assertIn("a `.git` folder whose contents change is not a boundary change", text)
+        self.assertIn("the one exception to the refusal of `.git` by name", text)
+        self.assertNotIn("a `.git` is refused by name), so a rewrite that keeps size, mtime and ctime is not seen", text)
 
 
 if __name__ == "__main__":

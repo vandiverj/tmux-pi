@@ -931,7 +931,7 @@ class CacheDir:
 
     def write_json(self, name, value):
         """`prepare_json` then `put_json`: True when written; False when there is no cache, a name is refused, a link is at the
-        name, or the write fails (every entry is left as it was, a stray `.tmp` is possible, and only the next start is cold)."""
+        name, or the write fails (every entry is left as it was, a stray `.tmp` is possible, and a later start loads whatever entry is there)."""
         return self.put_json(self.prepare_json(name), value)
 
     # --- the sweep
@@ -1875,7 +1875,7 @@ class ImportIndex:
     def save(self):
         """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True
         when written; no cache, a symlink at the name, or a failed write leaves the cache as it was and returns False (the index
-        still works, only the next start is cold)."""
+        still works; a later start loads whatever index file is there and rescans each source file it does not hold as current)."""
         if self.cache_path is None:
             return False
         data = {"version": INDEX_VERSION, "base": self.base, "root": self.root, "entries": self.entries}

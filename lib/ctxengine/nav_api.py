@@ -34,7 +34,7 @@ PathRuleCase.)
       (`[specifier, line, type_only, dynamic]`) under the key `[mtime_ns, size]`. `ImportIndex.save` writes it from `refresh`
       whenever a file was new, changed or went, before the proof, so a call that ends in a non-`ok` answer may still have saved it: what
       it holds is only what a successful read gave, never an answer. If that write fails (no cache, a link at the name, I/O) it is
-      swallowed: `save` returns False, the file is as it was, the answer is unchanged and only the next start is cold. It is loaded
+      swallowed: `save` returns False, the file is as it was, the answer is unchanged, and a later NavApi loads whatever index file is there (the older one, or none) and rescans every source file that file does not hold as current. It is loaded
       when the index is made (once per `NavApi`).
     - `deno doc`: `nav_api-doc-<40 hex>.json`, the list of symbols (name, kind, path, line, signature, doc) of one file, keyed by a
       digest of the file's name, `Reach.digest()` (the content of every file the walk reached, and the state of the configs and
@@ -53,7 +53,7 @@ PathRuleCase.)
   of an entry). It is read with `graph.read_bounded` (like any file, and at most MAX_CACHE_BYTES, 64 MB). Anything else is a MISS (None,
   never an error): not there, a link or a folder at the name, not UTF-8 or JSON, too deep to read, over the size, another format, another
   name, a payload that does not hash to `sha256`. The checksum guards against corruption, not a writer who can compute it. A payload is
-  then held to the shape its reader writes, and a payload of another shape is a miss too, replaced by the next write: an index entry
+  then held to the shape its reader writes, and a payload of another shape is a miss too, replaced when that name is written: an index entry
   (`ImportIndex._entry_shape`: a key of two whole numbers, a modification time and a size from 0, both within 64 bits, and rows of text, a line from 1
   and two flags; one entry that is not is read again, the others stay), a doc list (`NavApi._doc_item_shape`: text for name, kind,
   path, signature and doc, with name, kind and path not empty and signature and doc no longer than their cut, and a line from 1 within 64 bits), an
@@ -90,8 +90,8 @@ PathRuleCase.)
   `{version, last_sweep, deleted, skipped, complete}`; `complete` is False when the budget stopped it or a name could not be looked
   at. The marker write is best effort, like any entry write: if the guard refuses `nav_api-sweep.json` (or its temporary name) or the
   write fails (I/O, a link at the name), it is swallowed, the sweep still returns its result and keeps what it deleted, no marker is
-  made or changed (`last_sweep` stays None or at its earlier value), and the next call that writes sweeps again (this object waits an
-  hour, another process may not). The marker write does not make a sweep due again. The safety rule: it opens the folder only by the
+  made or changed (`last_sweep` stays None or at its earlier value), and a later call that writes makes a sweep due again (this object
+  waits an hour from this attempt, another process may not). The marker write does not make a sweep due again. The safety rule: it opens the folder only by the
   judged name with nothing made, lists and deletes only through that descriptor, takes names only from the listing and the kind of
   each from its own `lstat` there, touches only the names `nav_api-(index|doc|info)-*.json` and `*.tmp` and only if they are regular
   files (a link, a folder, a FIFO, a hidden or foreign name and the marker are neither counted nor deleted), asks the guard about each
@@ -117,10 +117,10 @@ PathRuleCase.)
       process running as the same user can still plant a wrong list that names only files inside the proven set (or a wrong set of
       specifiers in an index file), with a checksum it computed, and be believed.
     - A time cap or an eviction by the size cap can cost one cold answer: a sweep can remove an entry a call is about to read (a miss),
-      and a long-lived instance keeps using the index it holds in memory when another process's sweep removed its file, until its next
-      write.
+      and a long-lived instance keeps using the index it holds in memory when another process's sweep removed its file, until it
+      saves again.
     - A clock that was ahead leaves an entry dated in the future. It is never old, so the age rule does not remove it and it goes last
-      under the cap (the cap still bounds it); the first hit that touches it sets its time to now.
+      under the cap (the cap still bounds it); a hit that touches it sets its time to now.
     - The residual replace race: between the look just before an unlink and the unlink itself nothing closes the window, so a name
       replaced then can be removed. It costs a cache miss, never a wrong answer (every entry is verified when read and every answer is
       proved when it is made).
@@ -129,8 +129,8 @@ PathRuleCase.)
     - When the 50 ms budget stops the listing (a folder of thousands of files) the age and size rules apply only to the names listed
       so far, `complete` is False, and the rest waits for the next sweep, which is due at the earliest an hour later and only after a
       write.
-    - A call that raises after writing an entry and before `_swept` leaves `written` set, so the next call, a hit included, sweeps once
-      (still held by the hourly throttle). A process that only ever hits never sweeps: entries age out only while something writes.
+    - A call that raises after writing an entry and before `_swept` leaves `written` set, so a later call, a hit included, finds a sweep
+      due (the hourly throttle still applies). A process that only ever hits never sweeps: entries age out only while something writes.
     - `last_sweep` is None for a cache folder of mode 0 (the marker cannot be read there).
     - A plain `*.tmp` file of any name that is a regular file in the cache folder and older than 10 minutes is removed, not only the
       temporaries this module makes.

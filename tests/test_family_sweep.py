@@ -73,7 +73,28 @@ SHAPES = [  # (input shape, text, expected sites): every row failed or was not c
     ("file URL", "file:///srv/a.py:9", []),
     ("comma list keeps the first line only", "lib/a.py:12,14", ["lib/a.py:12"]),
     ("repeat", "lib/a.py:1 lib/a.py:1", ["lib/a.py:1"]),
+    ("unquoted line and column", "bin/tp-agent:1402:9 here", ["bin/tp-agent:1402"]),
+    ("backticked line and column", "`lib/a.py:12:7`", ["lib/a.py:12"]),
+    ("backticked range", "`lib/a.py:12-15`", ["lib/a.py:12-15"]),
+    ("quoted spaced path with column", "`my dir/a file.py:12:7`", ["my dir/a file.py:12"]),
+    ("double-quoted spaced path with column", 'see "my dir/a.py:3:1" now', ["my dir/a.py:3"]),
+    ("single-quoted spaced path", "see 'my dir/a.py:3-4' now", ["my dir/a.py:3-4"]),
+    ("windows spaced path with column, quoted", "`C:\\Program Files\\x\\a.py:12:3`", ["C:\\Program Files\\x\\a.py:12"]),
+    ("quoted span holding two sites", "`lib/a.py:1 lib/b.py:2`", []),
+    ("quoted span holding two spaced sites", "`my dir/a.py:1 and my dir/b.py:2`", []),
+    ("quoted span with a site and prose", "`lib/a.py:12 is wrong`", []),
+    ("quoted span with prose before the site", '"see lib/a.py:12 now"', []),
+    ("quoted spaced path with trailing junk", "`my dir/a.py:12 extra`", []),
+    ("quoted span that is not a site", "run `git grep -n foo` at lib/a.py:3", ["lib/a.py:3"]),
+    ("quoted host:port is neither", "`db.example.com:5432`", []),
+    ("apostrophes are not quotes", "the reviewer's lib/a.py:12 and the author's bin/x:3", ["lib/a.py:12", "bin/x:3"]),
+    ("contractions", "don't see lib/a.py:3, it's fine", ["lib/a.py:3"]),
+    ("padded code span", "` lib/a.py:3 `", ["lib/a.py:3"]),
+    ("two sites in separate spans", "`x.py:1`\n`y.py:2`", ["x.py:1", "y.py:2"]),
+    ("site after a quoted span", "`my dir/a.py:1` then lib/b.py:2", ["my dir/a.py:1", "lib/b.py:2"]),
 ]
+AMBIGUOUS_QUOTED = ["`lib/a.py:1 lib/b.py:2`", "`my dir/a.py:1 and my dir/b.py:2`", "`lib/a.py:12 is wrong`", '"see lib/a.py:12 now"',
+                    "`my dir/a.py:12 extra`", "`lib/a.py`:12", "`lib/a.py:12:`"]
 
 
 class ShapeTests(unittest.TestCase):
@@ -81,6 +102,11 @@ class ShapeTests(unittest.TestCase):
         for name, text, expected in SHAPES:
             with self.subTest(name):
                 self.assertEqual(family_sweep.sites(text), expected)
+
+    def test_a_quoted_span_that_is_not_exactly_one_site_is_ambiguous_and_gives_nothing(self):
+        for text in AMBIGUOUS_QUOTED:
+            with self.subTest(text):
+                self.assertEqual(family_sweep.scan(text), ([], True))
 
     def test_an_ambiguous_path_is_flagged_not_emitted(self):
         for text in ("my\\ dir/a.py:12", "C:\\Program Files\\x\\a.py:12"):
@@ -185,6 +211,25 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn(secret, text)
         self.assertIn("REDACTED", text)
         self.assertIn("`lib/a.py:12`", text)
+
+    def test_a_secret_shaped_value_in_no_input_slot_reaches_sweep_md(self):
+        def key(tag):  # an AWS-access-key-shaped value the redaction pass recognises, built here so no secret sits in this file
+            return "AKIA" + (tag * 16)[:16]
+        slots = {"family name": key("A"), "gate family": key("B"), "site path": key("C"), "finding body": key("D"), "fenced code": key("E"),
+                 "family name, round 2": key("F"), "loose finding": key("G")}
+        first = (f"F1 [defect] body {slots['finding body']} at lib/{slots['site path']}.py:12\nFamily: {slots['family name']}\nCloses by: code\n\n"
+                 f"F2 [defect] fenced:\n```\nlib/x.py:3 {slots['fenced code']}\n```\nFamily: {slots['family name']}\nCloses by: code")
+        second = (f"F1 [defect] no site {slots['loose finding']}\nFamily: {slots['family name, round 2']}\nCloses by: code\n\n"
+                  f"F2 [defect] again {slots['gate family']}\nFamily: {slots['gate family']}\nCloses by: code")
+        for gate in (slots["gate family"], slots["gate family"].lower(), slots["family name"].lower(), None):  # the gate passes names lower-cased
+            with self.subTest(gate=gate):
+                text = family_sweep.build(self.state(review(first), review(second)), "author-2", gate)
+                for slot, value in slots.items():
+                    self.assertNotIn(value, text, slot)
+                    self.assertNotIn(value.lower(), text, slot)
+                self.assertIn("REDACTED", text)
+                if gate and gate != gate.upper():
+                    self.assertIn("a family whose name the redaction pass changed", text)
 
     def test_a_redactor_that_cannot_load_refuses_instead_of_writing_unredacted_text(self):
         state = self.state(review(F1), review(F2))

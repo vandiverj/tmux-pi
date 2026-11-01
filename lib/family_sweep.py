@@ -6,7 +6,7 @@ Everything in it comes from the author chain's review replies (review_rounds.cha
 the one reader of the Family: and Closes by: labels): the Family: names each review gave, every file:line token any earlier
 REQUEST_CHANGES finding cites, the finding of the latest review in the reviewer's own words, how to look for the sites no review
 cited, and the table the coder reports back. A finding with no readable file:line token is listed
-verbatim, never dropped. Every review reply (and the Family: names read from it) goes through the redaction pass first (ids, paths and
+verbatim, never dropped. Every review reply goes through the redaction pass once, first, and the findings, Family: names and sites are all read from that redacted text (the gate family passed in is printed only as a name those replies give) (ids, paths and
 the working directory are not review text). The file has a hard byte budget, SWEEP_BUDGET, derived from tp-spawn's cap on a context
 file: findings are quoted whole while they fit and are never cut; the rest are listed as pointers (review, finding number, result.md);
 the sites and the table are always complete, or SweepTooLarge is raised and the retry goes on without a sweep. No model call.
@@ -33,38 +33,76 @@ _DIRS = r"(?:@?[\w.-]+[\\/])+"
 # path.ext:line or path.ext:line-line, in prose, backticks or code; a path with a directory needs no extension; not host:port
 SITE = re.compile(r"(?<![\w/.\\~@-])(?<!//)(" + _ROOT + r"(?:" + _DIRS + r"[\w-][\w.-]*|[\w-][\w.-]*\.[A-Za-z][A-Za-z0-9]{0,7}|(?:"
                   + "|".join(BARE_NAMES) + r")))" + _LINES)
-# a quoted path (backticks or quotes) taken whole, spaces and all: the content is exactly path:line
-QUOTED = re.compile(r"(`)([^`\n]+)`|(\")([^\"\n]+)\"|(')([^'\n]+)'")
-SPACED = re.compile(r"^(?P<path>" + _ROOT + r"[^:`\"'<>|?*\n]*[^\s:`\"'<>|?*])\s*" + _LINES.replace("(?![\\w])", "") + r"$")
+# a quoted path (backticks or quotes) taken whole, spaces and all. A single quote opens only after a non-word character and closes
+# only before one, so the apostrophe of "reviewer's" or "don't" is not a quote.
+QUOTED = re.compile(r"(`)([^`\n]+)`|(\")([^\"\n]+)\"|(?<![\w'])(')([^'\n]+)'(?![\w])")
+_COL = r"(?::\d+)?"  # the column of path:line:col, dropped
+SPACED = re.compile(r"^(?P<path>" + _ROOT + r"[^:`\"'<>|?*\n]*[^\s:`\"'<>|?*])\s*" + _LINES.replace("(?![\\w])", "") + _COL + r"$")
 
 
-def scan(text):
-    """([site tokens], ambiguous): the distinct file:line (or file:line-line) tokens in `text`, in order, and whether some token has a
-    path that cannot be told (a backslash-escaped space, a Windows path after a space inside a directory name). A token whose path is
-    ambiguous is never emitted, not even in part. A backtick- or quote-quoted `path with spaces:12` is one token, whole."""
+def _quoted(inner):
+    """(kind, token parts) for the inside of a quoted span. The whole span must be path:line, path:line:col or path:line-line, the path
+    spaces and all ('site', (path, first, last)). Anything else that holds a site (prose around one, two sites) is 'ambiguous': it gives no
+    token, not even a part of one. A span that holds no site at all (code, a host:port) is 'none'. The unquoted scanner never runs
+    inside a quoted span except to see whether the span holds a site."""
+    inner = inner.strip()  # a code span may be padded
+    whole = SITE.match(inner)
+    if whole and re.fullmatch(_COL, inner[whole.end():]):
+        path = whole.group(1)
+        if "." in path and path.rsplit(".", 1)[-1].lower() in TLDS and "/" not in path and "\\" not in path:
+            return "none", None
+        return "site", (path, whole.group(2), whole.group(3))
+    spaced = SPACED.match(inner)
+    if spaced and " " in spaced.group("path") and re.search(r"[\\/]", spaced.group("path")):
+        return "site", (spaced.group("path"), spaced.group(2), spaced.group(3))
+    tokens, ambiguous = _unquoted(inner)
+    return ("ambiguous" if tokens or ambiguous else "none"), None
+
+
+def _unquoted(text):
     found, ambiguous = [], False
-
-    def add(path, first, last):
-        token = path + ":" + first + (("-" + last) if last else "")
-        if token not in found:
-            found.append(token)
-    blanked = list(text)
-    for match in QUOTED.finditer(text):
-        inner = match.group(2) or match.group(4) or match.group(6)
-        spaced = SPACED.match(inner)
-        if spaced and " " in spaced.group("path") and re.search(r"[\\/]", spaced.group("path")):
-            add(spaced.group("path"), spaced.group(2), spaced.group(3))
-            blanked[match.start():match.end()] = " " * (match.end() - match.start())
-    rest = "".join(blanked)
-    for match in SITE.finditer(rest):
+    for match in SITE.finditer(text):
         path, start = match.group(1), match.start(1)
-        before = rest[:start]
+        before = text[:start]
         if before.endswith("\\ ") or (("\\" in path) and re.search(r"\\[^\s\\]+ $", before)):
             ambiguous = True
             continue
         if "." in path and path.rsplit(".", 1)[-1].lower() in TLDS and "/" not in path and "\\" not in path:
             continue
-        add(path, match.group(2), match.group(3))
+        token = path + ":" + match.group(2) + (("-" + match.group(3)) if match.group(3) else "")
+        if token not in found:
+            found.append(token)
+    return found, ambiguous
+
+
+def scan(text):
+    """([site tokens], ambiguous): the distinct file:line (or file:line-line) tokens in `text`, in order, and whether some token has a
+    path that cannot be told (a backslash-escaped space, a Windows path after a space inside a directory name, a quoted span that is
+    more than one site). A token whose path is ambiguous is never emitted, not even in part. A backtick- or quote-quoted
+    `path with spaces:12` is one token, whole, when the span is exactly that."""
+    spans, ambiguous = [], False
+    blanked = list(text)
+    for match in QUOTED.finditer(text):
+        kind, parts = _quoted(match.group(2) or match.group(4) or match.group(6))
+        if kind == "none" and re.match(r":\d", text[match.end():]) and SITE.match(match.group(0)[1:-1].strip() + ":0"):
+            kind = "ambiguous"  # `lib/a.py`:12, the line outside the quotes: a site that cannot be read whole
+        if kind == "ambiguous":
+            ambiguous = True
+        elif kind == "site":
+            spans.append((match.start(), parts))
+        blanked[match.start():match.end()] = " " * (match.end() - match.start())  # the scanner below never reads inside a span
+    rest = "".join(blanked)
+    tokens, unsure = _unquoted(rest)
+    ambiguous = ambiguous or unsure
+    placed = [(start, path + ":" + first + (("-" + last) if last else "")) for start, (path, first, last) in spans]
+    for match in SITE.finditer(rest):  # the unquoted tokens at their positions, so the order is the order of the text
+        token = match.group(1) + ":" + match.group(2) + (("-" + match.group(3)) if match.group(3) else "")
+        if token in tokens:
+            placed.append((match.start(), token))
+    found = []
+    for _, token in sorted(placed, key=lambda item: item[0]):
+        if token not in found:
+            found.append(token)
     return found, ambiguous
 
 
@@ -132,22 +170,22 @@ class SweepTooLarge(ValueError):
 
 
 def _rows(state_dir, task_id, red):
-    """[(review id, round, [(finding, names, sites, ambiguous)], families)] for each REQUEST_CHANGES review of the chain, oldest first,
-    plus the ids of reviews that could not be read. Each reply goes through the redaction pass (review_rounds.redact_text) before
-    anything is taken from it."""
+    """([(review id, round, [(finding, names, sites, ambiguous)], families)], unread) for each REQUEST_CHANGES review of the chain,
+    oldest first, plus the ids of reviews that could not be read. Each reply goes through the redaction pass (review_rounds.redact_text)
+    once, and the findings, the Family: names and the sites are all read from that redacted text, never from the raw reply."""
     rows, unread = [], []
-    for _, review, verdict, families, number in review_rounds.chain_labels(state_dir, task_id):
+    for _, review, verdict, _, number in review_rounds.chain_labels(state_dir, task_id):
         if review is None or verdict != "REQUEST_CHANGES":
             if review is not None and number is not None and verdict is None:
                 unread.append(review)
             continue
         try:
-            text = review_verdict.read_review(review_rounds.task_path(state_dir, review) / "result.md")
+            raw = review_verdict.read_review(review_rounds.task_path(state_dir, review) / "result.md")
         except ValueError:
             unread.append(review)
             continue
-        text, _ = review_rounds.redact_text(red, text, f"review {review} for sweep.md")
-        families = [review_rounds.redact_text(red, name, f"family name of {review}")[0] for name in families or []]  # label text is review text
+        text, _ = review_rounds.redact_text(red, raw, f"review {review} for sweep.md")
+        families = review_verdict.families(text)
         rows.append((review, number, findings(text), families))
     return rows, unread
 
@@ -193,6 +231,10 @@ def build(state_dir, task_id, family, workdir=None):
     and the table, then the reviewer's words, then the verbatim findings, then pointers for what no longer fits."""
     red = review_rounds.redactor()
     rows, unread = _rows(state_dir, task_id, red)
+    withheld = False
+    if family:  # a value from outside is used only as a name the redacted reviews give; otherwise the redaction pass over it, or nothing
+        if family not in {name for _, _, _, names in rows for name in names}:
+            family, withheld = None, True  # the pass changed the name (or no review gives it): it is not repeated verbatim here
     cited, loose = {}, []  # site -> review ids; findings with no readable site: (review id, number, text, result.md)
     rule = []
     latest = rows[-1] if rows else None
@@ -210,7 +252,8 @@ def build(state_dir, task_id, family, workdir=None):
     if latest and not rule:
         rule = [(latest[0], number, text, str(review_rounds.task_path(state_dir, latest[0]) / "result.md"))
                 for number, (text, _, _, _) in enumerate(latest[2], 1)]
-    title = f"finding family `{family}`" if family else "the unnamed family (REQUEST_CHANGES twice in a row)"
+    title = (f"finding family `{family}`" if family else "a family whose name the redaction pass changed" if withheld
+             else "the unnamed family (REQUEST_CHANGES twice in a row)")
     head = [f"# Sweep: {title}", "",
             "The reviews of this work asked for changes more than once on the same kind of finding. Fixing the one site the last review "
             "cited has not ended it, so this retry fixes the rule: every site of it, not one more.", "",

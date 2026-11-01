@@ -1250,6 +1250,42 @@ echo review-1
         self.assertIn("no table", self.copy("sweep-review.md").read_text())
         self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": []})
 
+    def test_the_table_in_the_durable_report_alone_holds_the_approval(self):
+        (self.task / "report.md").write_text("# Report\n\n" + self.SWEEP_TABLE)
+        (self.task / "result.md").write_text("done, see report.md\nRESULT_STATUS: complete\n")
+        r = self.review("--sweep", self.sweep())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("read from report.md", self.copy("sweep-review.md").read_text())
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": ["`lib/b.py:30`"]})
+
+    def test_a_table_in_both_is_read_from_the_report_and_the_file_says_so(self):
+        (self.task / "report.md").write_text(self.SWEEP_TABLE)
+        (self.task / "result.md").write_text("| Site | Disposition | Evidence |\n| --- | --- | --- |\n| `lib/z.py:1` | fixed | ok |\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        attached = self.copy("sweep-review.md").read_text()
+        self.assertIn("read from report.md", attached)
+        self.assertNotIn("lib/z.py:1", attached)
+        self.assertEqual(json.loads(self.sweep_marker().read_text()), {"open": ["`lib/b.py:30`"]})
+
+    def test_a_report_that_cannot_be_read_is_an_open_row(self):
+        (self.task / "report.md").write_text(self.SWEEP_TABLE)
+        (self.task / "report.md").chmod(0)
+        try:
+            if os.access(self.task / "report.md", os.R_OK):
+                self.skipTest("file permissions are not enforced here")
+            self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        finally:
+            (self.task / "report.md").chmod(0o644)
+        self.assertEqual(len(json.loads(self.sweep_marker().read_text())["open"]), 1)
+        self.assertIn("cannot be read", json.loads(self.sweep_marker().read_text())["open"][0])
+
+    def test_a_result_that_names_a_report_that_is_missing_is_an_open_row(self):
+        (self.task / "result.md").write_text(f"table is in {self.task}/report.md\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.review("--sweep", self.sweep()).returncode, 0)
+        opened = json.loads(self.sweep_marker().read_text())["open"]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("missing", opened[0])
+
     def test_a_review_with_no_sweep_is_as_before(self):
         self.assertEqual(self.review().returncode, 0)
         self.assertNotIn("sweep-review.md", [Path(p).name for p in self.spawn_contexts()])

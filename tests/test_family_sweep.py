@@ -330,5 +330,43 @@ class PrepareReviewTests(unittest.TestCase):
             self.assertEqual((out["open"], out["rows"], out["family"]), ([], 0, None))
             self.assertIn("no table", Path(out["file"]).read_text())
 
+class ReportFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "sweep.md").write_text("# Sweep: finding family `date-parse`\n")
+
+    def run_review(self, report=True):
+        return family_sweep.prepare_review(self.dir / "sweep.md", self.dir / "result.md", self.dir / "out",
+                                           self.dir / "report.md" if report else None)
+
+    def test_report_only_both_and_neither(self):
+        (self.dir / "result.md").write_text("see report\n")
+        (self.dir / "report.md").write_text(TABLE)
+        self.assertEqual((self.run_review()["open"], self.run_review()["source"]), (["`lib/b.py:30-34`"], "report.md"))
+        (self.dir / "result.md").write_text("| Site | Disposition | Evidence |\n| - | - | - |\n| a | fixed | x |\n")
+        self.assertEqual(self.run_review()["rows"], 4)
+        (self.dir / "report.md").unlink()
+        self.assertEqual((self.run_review()["rows"], self.run_review()["source"]), (1, "result.md"))
+        (self.dir / "result.md").write_text("nothing\n")
+        self.assertEqual((self.run_review()["open"], self.run_review()["source"]), ([], None))
+
+    def test_a_report_without_a_table_falls_back_to_the_result(self):
+        (self.dir / "report.md").write_text("no table\n")
+        (self.dir / "result.md").write_text(TABLE)
+        self.assertEqual(self.run_review()["source"], "result.md")
+
+    def test_an_unreadable_report_and_a_missing_named_report_are_open_rows(self):
+        (self.dir / "result.md").write_text("x\n")
+        (self.dir / "report.md").mkdir()  # exists, cannot be read as a file
+        out = self.run_review()
+        self.assertEqual(len(out["open"]), 1)
+        self.assertIn("cannot be read", out["open"][0])
+        (self.dir / "report.md").rmdir()
+        (self.dir / "result.md").write_text(f"see {self.dir}/report.md\n")
+        self.assertIn("missing", self.run_review()["open"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

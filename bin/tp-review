@@ -36,7 +36,7 @@
 # and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules,
 # except the acceptance rule below.
 # --sweep FILE (once; tp-agent review passes it for a task dispatched with a sweep.md, the file tp-agent generates for a gated retry,
-# lib/family_sweep.py): the sweep and the coder's `Site | Disposition | Evidence` table, read from the author's result, are attached as
+# lib/family_sweep.py): the sweep and the coder's `Site | Disposition | Evidence` table, read from the task dir's report.md when it has one, else the author's result (fail closed: an unreadable or missing named report.md is an open row), are attached as
 # one context file (`sweep-review.md`); the task text asks the reviewer to confirm each row against the tree and to add every site the
 # table missed as a row with the sweep's Family: name. The sites of the `unresolved` rows with no `Closes by:` note in their Evidence are
 # recorded beside the review's result (sweep-rows.json) so that lib/review_verdict.py calls an approval of that reply incomplete; a
@@ -328,7 +328,7 @@ while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -
 sweep_open='[]'
 if [[ "$have_sweep" == 1 ]]; then
   mkdir "$excerpt_dir/sweep"
-  sweep_info="$(python3 "$ROOT/lib/family_sweep.py" review "$sweep" "$dir/result.md" "$excerpt_dir/sweep")" || die "cannot attach the sweep '$sweep' to the review of '$id'"
+  sweep_info="$(python3 "$ROOT/lib/family_sweep.py" review "$sweep" "$dir/result.md" "$excerpt_dir/sweep" "$dir/report.md")" || die "cannot attach the sweep '$sweep' to the review of '$id'"
   add_segments "$(jq -r '.file' <<<"$sweep_info")" sweep-review
   sweep_open="$(jq -c '.open' <<<"$sweep_info")"
   sweep_family="$(jq -r '.family // empty' <<<"$sweep_info")"

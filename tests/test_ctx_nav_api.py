@@ -5928,6 +5928,72 @@ class InfoCacheCase(Tree):
         self.assertEqual(self.entries(project), [])
         self.assertEqual(list(folder.glob("*.tmp")), [])
 
+    def _failing_write(self, after):
+        """An `os.write` that writes `after` bytes of the first call and then fails with ENOSPC."""
+        real = os.write
+        state = {"n": 0}
+
+        def write(fd, data):
+            import fcntl
+            if not fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).split(b"\0")[0].endswith(b".tmp"):
+                return real(fd, data)  # only a cache temporary fails
+            state["n"] += 1
+            if state["n"] == 1 and after:
+                return real(fd, bytes(data)[:after])
+            raise OSError(28, "No space left on device")
+        return mock.patch.object(graph.os, "write", write)
+
+    def test_s3_f4_a_failed_write_removes_its_own_temporary_and_leaves_an_existing_entry(self):
+        for call in ("forward_graph", "symbols"):
+            for after in (0, 3):
+                project = self.project(f"{call}{after}")
+                make = self.doc_nav if call == "symbols" else self.nav_for
+                self.assertEqual(getattr(make(project), call)("src/main.ts")["status"], "ok")
+                folder = project_cache(project).parent
+                before = {p.name: p.read_bytes() for p in folder.iterdir()}
+                self.assertEqual(len(before), 1, call)
+                self.assertTrue(next(iter(before)).endswith(".json"))
+                other = make(project)
+                token = other._cache.prepare_json(next(iter(before)))
+                with self._failing_write(after):
+                    self.assertFalse(other._cache.put_json(token, {"a": 1}))
+                self.assertEqual({p.name: p.read_bytes() for p in folder.iterdir()}, before, (call, after))
+
+    def test_s3_f4_a_failed_write_through_each_cache_kind_leaves_no_temporary(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        for name in ("nav_api-info-f4.json", "nav_api-doc-f4.json", "nav_api-index-f4.json"):
+            with self._failing_write(2):
+                self.assertFalse(nav._cache.write_json(name, {"a": 1}), name)
+        self.assertEqual(list(project_cache(project).parent.iterdir()), [])
+        with self._failing_write(1):
+            self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
+        self.assertEqual(self.entries(project), [])
+        self.assertEqual(list(project_cache(project).parent.iterdir()), [])
+
+    def test_s3_f4_a_failed_rename_or_interrupted_rename_removes_only_its_own_temporary(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        self.assertTrue(nav._cache.write_json("nav_api-info-f4.json", {"v": 1}))
+        planted = folder / "nav_api-info-f4.json.0000000000000000.tmp"
+        planted.write_text("x")
+        for error in (OSError(5, "io"), KeyboardInterrupt()):
+            with mock.patch.object(graph.os, "rename", side_effect=error):
+                if isinstance(error, OSError):
+                    self.assertFalse(nav._cache.write_json("nav_api-info-f4.json", {"v": 2}))
+                else:
+                    with self.assertRaises(KeyboardInterrupt):
+                        nav._cache.write_json("nav_api-info-f4.json", {"v": 2})
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted([planted.name, "nav_api-info-f4.json"]))
+            self.assertEqual(json.loads((folder / "nav_api-info-f4.json").read_text()), {"v": 1})
+
+    def test_s3_f4_a_value_that_cannot_be_serialised_makes_nothing(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        self.assertFalse(nav._cache.write_json("nav_api-info-f4.json", {"a": object()}))
+        self.assertEqual([p.name for p in project_cache(project).parent.glob("*.tmp")], [])
+
     def test_s3_f3_putting_an_entry_asks_the_guard_nothing_and_a_refused_name_is_not_judged_in(self):
         project = self.project()
         asked = []

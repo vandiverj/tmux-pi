@@ -681,12 +681,20 @@ def read_bounded(path, admitted, boundary, allow, limit=None, expect=None, take=
 def write_new(path, data, dir_fd=None):
     """Write `data` to `path` (relative to the directory open on `dir_fd`, when given) as a new regular file (never through a link,
     anywhere on the way: `NOFOLLOW_ANY`; never over an existing file): the one way this module and `nav_api` write a file. Raises
-    OSError when `path` exists or a folder on the way is a link (a mirror folder swapped for one after it was made)."""
+    OSError when `path` exists or a folder on the way is a link (a mirror folder swapped for one after it was made). When the write
+    fails after the file was made, the file this call made is removed (by its name, which O_EXCL showed is its own) before the error
+    is raised; a file that was already there is never touched."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW_ANY | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
+    except BaseException:
+        try:
+            os.unlink(path, dir_fd=dir_fd)  # a write that failed (ENOSPC, EIO) leaves no half file: this call made it (O_EXCL), by this name
+        except OSError:
+            pass
+        raise
     finally:
         os.close(fd)
 
@@ -807,18 +815,24 @@ class CacheDir:
             except FileNotFoundError:
                 pass
             try:
-                write_new(temp, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"), dir_fd=fd)
+                data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            except (ValueError, TypeError):
+                return False  # nothing was made yet
+            try:
+                write_new(temp, data, dir_fd=fd)  # removes its own half file when the write fails
             except FileExistsError:
                 return False  # not our file (the name is random): leave it
             try:
                 os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
                 return True
-            except OSError:
+            except BaseException as error:
                 try:
-                    os.unlink(temp, dir_fd=fd)
+                    os.unlink(temp, dir_fd=fd)  # this attempt's own temporary, by its random name; never an entry name
                 except OSError:
                     pass
-                return False
+                if isinstance(error, OSError):
+                    return False
+                raise
         except OSError:
             return False
         finally:

@@ -35,7 +35,7 @@
 # cannot hold them is refused, never trimmed. A file that is missing, not a regular file, unreadable or empty, one named `.env*`,
 # and one inside the trust store is refused, naming the file, before any reviewer starts. The flags do not change the verdict rules,
 # except the acceptance rule below.
-# --sweep FILE (once; tp-agent review passes it for a task dispatched with a sweep.md, the file tp-agent generates for a gated retry,
+# --sweep FILE (once; tp-agent review passes it for a task dispatched with a sweep.md, the file the harness generates for a gated retry,
 # lib/family_sweep.py): the sweep and the coder's `Site | Disposition | Evidence` table, read from the task dir's report.md when it has one, else the author's result (fail closed: an unreadable or missing named report.md is an open row), are attached as
 # one context file (`sweep-review.md`); the task text asks the reviewer to confirm each row against the tree and to add every site the
 # table missed as a row with the sweep's Family: name. The sites of the `unresolved` rows with no `Closes by:` note in their Evidence are
@@ -335,7 +335,7 @@ if [[ "$have_sweep" == 1 ]]; then
   sweep_rows="$(jq -r '.rows' <<<"$sweep_info")"
   if [[ -n "$sweep_family" ]]; then sweep_label="'Family: $sweep_family' (before its 'Closes by:' line)"
   else sweep_label="the same 'Family:' line the sweep's earlier findings used, when it lists one (before its 'Closes by:' line)"; fi
-  review_task="$review_task This work was given a sweep: a brief tp-agent generated from the earlier reviews so that its retry fixes every site of the finding. The context file headed 'The sweep this work was given' is that brief, and the part headed 'The coder's report table for it' holds the $sweep_rows row(s) the coder reported. Confirm each row against the tree: for every row say confirmed or not confirmed, citing its site and the line or command that shows it. Search for the sites the table missed (the sweep says how) and add every site the table missed as a row of your own, a defect among them as a finding that ends with $sweep_label."
+  review_task="$review_task This work was given a sweep: a brief the harness generated from the earlier reviews so that its retry fixes every site of the finding. The context file headed 'The sweep this work was given' is that brief, and the part headed 'The coder's report table for it' holds the $sweep_rows row(s) the coder reported. Confirm each row against the tree: for every row say confirmed or not confirmed, citing its site and the line or command that shows it. Search for the sites the table missed (the sweep says how) and add every site the table missed as a row of your own, a defect among them as a finding that ends with $sweep_label."
   if [[ "$sweep_open" != '[]' ]]; then
     review_task="$review_task The coder left $(jq -r 'length' <<<"$sweep_open") row(s) unresolved with no 'Closes by:' note in the Evidence cell ($(jq -r '.[:10] | map(.[:100]) | join(", ")' <<<"$sweep_open")$(jq -r 'if length > 10 then ", and \(length - 10) more" else "" end' <<<"$sweep_open")): this work cannot be APPROVED or APPROVED_WITH_NOTES until each has such a note (an approval is then recorded as incomplete); say so as a finding that ends 'Closes by: decision' or 'Closes by: code'."
   fi

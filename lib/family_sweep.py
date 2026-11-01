@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sweep.md: the brief tp-agent generates for a retry that the repeated-family gate stopped (`--route rule-first` or `design`), so the
+"""sweep.md: the brief the harness generates for a retry that the repeated-family gate stopped (`--route rule-first` or `design`), so the
 retry fixes every site of the finding and not the one the last review cited.
 
 Everything in it comes from the author chain's review replies (review_rounds.chain_labels is the one reader of the chain, review_verdict

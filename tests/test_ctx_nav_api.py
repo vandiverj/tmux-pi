@@ -3750,8 +3750,9 @@ class AnswerProofCase(Tree):
     def test_r10_the_gate_lets_no_data_out_with_a_status_other_than_ok(self):
         project = self.project().resolve()
         nav = self.nav(project)
-        answer, blocked = nav._index_answer(lambda index, stats: nav_api._answer("stale_index", target="x", importers=[1]))
+        answer, blocked, proof = nav._index_answer(lambda index, stats: nav_api._answer("stale_index", target="x", importers=[1]))
         self.assertFalse(blocked)
+        self.assertIsNotNone(proof)
         self.assertEqual(set(answer) - {"status", "next_step", "detail"}, set(), answer)
 
     # --- the family sweep: every input x every state x every entry path
@@ -3760,8 +3761,11 @@ class AnswerProofCase(Tree):
     # an entry path: `cold` (a new instance with no cache), `warm` (the instance that answered before), `loaded` (a new instance
     # loading the cache the first one saved), or a change made while an answer is being made: in the build's read of the sources
     # (`read_*`), at its walk (`walk_*`), or after the build, at the proof (`proof_*`), on a warm instance or a cold one
-    ROUTES = ("cold", "warm", "loaded", "read_warm", "read_cold", "walk_warm", "walk_cold", "proof_warm", "proof_cold")
-    HOOKS = {"read": (graph, "read_sources"), "walk": (graph.ImportIndex, "_walk"), "proof": (graph.ImportIndex, "prove")}
+    # (round 12: `screen_*`, a change made while the answer is being screened, after the first proof and before the last)
+    ROUTES = ("cold", "warm", "loaded", "read_warm", "read_cold", "walk_warm", "walk_cold", "proof_warm", "proof_cold",
+              "screen_warm", "screen_cold")
+    HOOKS = {"read": (graph, "read_sources"), "walk": (graph.ImportIndex, "_walk"), "proof": (graph.ImportIndex, "prove"),
+             "screen": (None, "guard")}  # the output screen is the instance's own `guard`
     NAMES = {"source": "src/main.ts", "config": "deno.json", "overlay": "deno.test.json", "folder": "src/util",
              "nested_folder": "src/app", "target": "src/data.json", "missing_target": "src/later.ts"}
 
@@ -3845,6 +3849,7 @@ class AnswerProofCase(Tree):
             hook, kind = route.split("_")
             asked = first if kind == "warm" else self.nav(project, cache="cold")
             owner, name = self.HOOKS[hook]
+            owner = asked if owner is None else owner
             real = getattr(owner, name)
             moved = []
 
@@ -3893,6 +3898,125 @@ class AnswerProofCase(Tree):
 
     def test_r10_sweep_cache(self):
         self.sweep("cache")
+
+
+    # --- round 12 (review 11 F1, rule first): THE PROOF IS THE LAST STEP BEFORE AN INDEX ANSWER IS RETURNED, after screening.
+    # `NavApi._final` is the one place that makes it, for the index and for `deno info`/`deno doc` alike: it screens, then runs the
+    # answer's proof, and returns the answer or (when the proof fails) the gaps and nothing else.
+    #
+    # Route table (every index answer -> the steps between its first proof and its return):
+    #   importers             -> _index_answer (build, proof 1) -> _final: _out (cache_refused note, screen) -> proof 2 -> return
+    #   imports (index/auto)  -> _index_answer (build, proof 1) -> _final: _out -> proof 2 -> return
+    #   imports (auto, deno)  -> _forward_graph (reach walk) -> _final: _out -> reach.holds() -> return
+    #   forward_graph/symbols -> _final: _out -> reach.holds() -> return (a cached doc answer too)
+    #   status                -> carries no index edge data and makes no `ok` claim about a file: not an index answer
+    # Nothing is filtered, paged or cached after proof 1 (`build` pages; `refresh` saves the cache before it).
+
+    def screening_mutation(self, project, mutate, ask, before="ok", **kw):
+        """(nav, answer): `ask` twice on one instance; the second time `mutate` runs on the output screen's first call."""
+        nav = self.nav(project, **kw)
+        self.assertEqual(ask(nav)["status"], before)  # warm
+        real, moved = nav.guard, []
+
+        def moving(text):
+            if not moved:
+                moved.append(1)
+                mutate()
+            return real(text)
+        nav.guard = moving
+        answer = ask(nav)
+        nav.guard = real
+        self.assertEqual(moved, [1])
+        return nav, answer
+
+    def test_r11_f1_repro_a_config_changed_during_screening_is_not_ok(self):
+        project = self.project().resolve()
+        config = project / "deno.json"
+        nav, answer = self.screening_mutation(
+            project, lambda: config.write_text(config.read_text().replace("./src/real_host.ts", "./src/mock_host.ts")),
+            lambda n: n.importers("src/real_host.ts"), overlays=[])
+        self.assert_no_data(answer)
+        self.assertIn(answer["status"], ("stale_index", "error"), answer)
+        self.assertIn("config_changed", answer["gaps"], answer)
+        after = nav.importers("src/real_host.ts")  # asked again: the tree's own answer
+        self.assertEqual((after["status"], after["importers"]), ("ok", []), after)
+
+    def test_r11_f1_repro_a_source_changed_during_screening_is_not_ok(self):
+        project = self.project().resolve()
+        main = project / "src" / "main.ts"
+        nav, answer = self.screening_mutation(
+            project, lambda: main.write_text(main.read_text().replace("import { run } from '@/app/run.ts';\n", "import './lazy.ts';\n")),
+            lambda n: n.importers("src/app/run.ts"))
+        self.assert_no_data(answer)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertIn("source_changed", answer["gaps"], answer)
+        self.sound(nav.importers("src/app/run.ts"), self.expected(project)[0], "asked again", live=True)
+
+    def test_r11_f1_imports_through_the_index_is_held_to_the_same_rule(self):
+        project = self.project().resolve()
+        config = project / "deno.json"
+        nav, answer = self.screening_mutation(
+            project, lambda: config.write_text(config.read_text().replace("./src/real_host.ts", "./src/mock_host.ts")),
+            lambda n: n.imports("src/main.ts", source="index"), overlays=[])
+        self.assert_no_data(answer)
+        self.assertIn("config_changed", answer["gaps"], answer)
+
+    def test_r11_f1_a_not_found_answer_is_proved_after_screening_as_well(self):
+        project = self.project().resolve()
+        nav, answer = self.screening_mutation(project, lambda: write(project / "src" / "nothing.ts", "export const n = 1;\n"),
+                                              lambda n: n.importers("src/nothing.ts"), before="not_found")
+        self.assert_no_data(answer)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertEqual(nav.importers("src/nothing.ts")["status"], "ok")
+
+    def test_r11_f1_nothing_runs_after_the_last_proof(self):
+        """The order of events of an answered call: the first proof, then the screen's calls, then the proof as the last event."""
+        project = self.project().resolve()
+        for label, ask in (("importers", lambda n: n.importers("src/app/run.ts")),
+                           ("imports", lambda n: n.imports("src/main.ts", source="index")),
+                           ("auto", lambda n: n.imports("src/main.ts")),
+                           ("not_found", lambda n: n.importers("src/nothing.ts"))):
+            with self.subTest(label):
+                nav = self.nav(project, cache=f"order-{label}")
+                events, real_guard, real_prove = [], nav.guard, graph.ImportIndex.prove
+
+                def guard(text):
+                    events.append("screen")
+                    return real_guard(text)
+
+                def prove(index):
+                    events.append("prove")
+                    return real_prove(index)
+                nav.guard = guard
+                with mock.patch.object(graph.ImportIndex, "prove", prove):
+                    answer = ask(nav)
+                self.assertIn(answer["status"], ("ok", "not_found"), answer)
+                self.assertEqual(events[-1], "prove", events)
+                self.assertEqual(events.index("screen"), 1, events)  # the first proof still comes first
+                self.assertEqual(events.count("prove"), 2, events)
+
+    def test_r11_f1_one_final_check_for_every_route(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        answer = nav_api._answer("ok", target="x")
+        self.assertEqual(nav._final(answer, None)["status"], "ok")
+        events = []
+        out = nav._final(answer, lambda: (events.append("proof"), None)[1])
+        self.assertEqual((out["status"], events), ("ok", ["proof"]))
+        out = nav._final(answer, lambda: nav_api._answer("stale_index", detail="moved"))
+        self.assertEqual(out["status"], "stale_index")
+        self.assertNotIn("target", out)
+
+        class Reach:
+            holds = staticmethod(lambda: False)
+        self.assertEqual(nav._reach_proof(Reach)()["status"], "stale_index")
+        self.assertIsNone(nav._reach_proof(None))
+
+    def test_r11_sweep_has_the_screen_dimension(self):
+        """The dimension added to the table: 8 inputs x 10 states x 11 routes (`screen_warm` and `screen_cold` are new) = 880 cells."""
+        self.assertEqual(len(self.ROUTES), 11)
+        self.assertEqual(len(self.STATES) * len(self.ROUTES) * (len(self.NAMES) + 1), 880)
+        self.assertEqual({r for r in self.ROUTES if r.startswith("screen")}, {"screen_warm", "screen_cold"})
 
 
 if __name__ == "__main__":

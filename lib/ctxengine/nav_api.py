@@ -19,7 +19,10 @@ the answer) `stale_index`, anything else `error` with `reason`; each carries `ga
 makes every index answer (`_index_answer`): the answer is built, then `graph.ImportIndex.prove` looks again at every input it
 depends on (each config's state, the folder listing, a stat, an open for reading and the indexed `(mtime, size)` of every source,
 and every import target that was judged), on a cold build, a warm instance and one that loaded the cache alike; only an answer
-whose proof found nothing is `ok`. A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
+whose proof found nothing is `ok`. THE LAST PROOF IS THE LAST STEP: the answer is then screened (`_out`), and `_final` runs the
+proof again after the screen, as the very last thing before the answer is returned (for the index as for `deno info`; the one rule
+is `_final`); a proof that fails then gives the gaps and nothing from the answer.
+A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
 A missing config is no gap (nothing is there; one that was there when its folder was walked and is gone at its read is a race),
 nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
 its own reach. A link in the tree is not followed or indexed (as before): an edge through one is not in the index; this is a
@@ -385,7 +388,7 @@ class NavApi:
             return None, None, _answer("no_project", detail="project directory not found")
         index = self._get_index()
         try:
-            stats = index.refresh(prove=False)  # `_index_answer` proves once, after the answer is built
+            stats = index.refresh(prove=False)  # `_index_answer` proves after the answer is built, `_final` once more after the screen
         except OSError as error:
             return None, None, _answer("error", detail=f"index could not be built: {type(error).__name__}")
         blocked = index.incomplete()
@@ -394,28 +397,35 @@ class NavApi:
         return index, stats, None
 
     def _index_answer(self, build):
-        """(answer, blocked): THE ONE WAY an answer is made from the index. `build(index, stats)` makes it from the refreshed index
-        (no I/O but the index's own `target_state`). Then, before it is given, `index.prove()` looks again at every input it
-        depends on (see `graph.ImportIndex`), and the gaps the build itself met (`target_state`) are added: any gap gives
-        `_incomplete` instead, with the gaps and nothing else. A non-`ok` answer from `build` keeps only its status words (`detail`
-        and `next_step`): no answer other than `ok` carries index data, whatever `build` put in it. `blocked` is True when the
-        index could not answer (the caller may fall back to `deno info`)."""
+        """(answer, blocked, proof): THE ONE WAY an answer is made from the index. `build(index, stats)` makes it from the refreshed
+        index (no I/O but the index's own `target_state`). Then `_proved` looks again at every input it depends on (see
+        `graph.ImportIndex`) and adds the gaps the build itself met: any gap gives `_incomplete` instead, with the gaps and nothing
+        else. A non-`ok` answer from `build` keeps only its status words (`detail`): no answer other than `ok` carries index
+        data, whatever `build` put in it. `blocked` is True when the index could not answer (the caller may fall back to `deno
+        info`). `proof` is the check `_final` makes AFTER the answer is screened, as the last step before it is returned (None for
+        an answer that is already a failure, which carries no index data)."""
         index, stats, error = self._fresh()
         if error:
-            return error, True
+            return error, True, None
         answer = build(index, stats)
+        failed = self._proved(index)
+        if failed:
+            return failed, True, None
+        if answer.get("status") != "ok":
+            answer = _answer(answer["status"], **{k: v for k, v in answer.items() if k == "detail"})
+        return answer, False, lambda: self._proved(index)
+
+    def _proved(self, index):
+        """None when `index.prove()` and the gaps the build met are empty, else the answer to give instead (`_incomplete`, or an
+        `error` when the proof could not be made). The one definition of "the index answer still holds"."""
         try:
             proof = index.prove()
         except OSError as error:
-            return _answer("error", detail=f"index could not be proved: {type(error).__name__}"), True
+            return _answer("error", detail=f"index could not be proved: {type(error).__name__}")
         for code, count in index.gaps.items():
             proof[code] = proof.get(code, 0) + count
         blocked = index.incomplete(proof)
-        if blocked:
-            return self._incomplete(*blocked), True
-        if answer.get("status") != "ok":
-            answer = _answer(answer["status"], **{k: v for k, v in answer.items() if k == "detail"})
-        return answer, False
+        return self._incomplete(*blocked) if blocked else None
 
     @staticmethod
     def _incomplete(kind, reason, gaps):
@@ -485,21 +495,23 @@ class NavApi:
 
     def importers(self, target, limit=MAX_IMPORTERS):
         """Files that import `target` directly, ordered by (path, line); `limit` is 1 to 25."""
-        return self._out(self._importers(target, limit))
+        return self._final(*self._importers(target, limit))
 
     def _importers(self, target, limit):
+        """(answer, proof); the public wrapper makes the final check (`_final`)."""
         rel, error = self._target(target)
         if error:
-            return error
+            return error, None
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_IMPORTERS:
-            return _answer("bad_argument", detail=f"limit must be a whole number from 1 to {MAX_IMPORTERS}")
+            return _answer("bad_argument", detail=f"limit must be a whole number from 1 to {MAX_IMPORTERS}"), None
         def build(index, stats):
             found = index.importers(rel)
             if not found and not index.indexed(rel) and index.target_state(rel) != "":
                 return _answer("not_found", detail="no such file in the project")  # an unreadable one is a gap (`_index_answer`)
             return _answer("ok", target=rel, total=len(found), truncated=len(found) > limit,
                            importers=[self._slim(e, "from") for e in found[:limit]], **self._meta(index, stats))
-        return self._index_answer(build)[0]
+        answer, _, proof = self._index_answer(build)
+        return answer, proof
 
     def imports(self, target, source="auto"):
         """What `target` imports directly: `files` (project paths), `external` (packages, builtins, URLs) and `unresolved`.
@@ -507,7 +519,8 @@ class NavApi:
         return self._final(*self._imports(target, source))
 
     def _imports(self, target, source):
-        """(answer, reach): `reach` is the proof an answer from `deno info` rests on (None for the index)."""
+        """(answer, proof): the check `_final` makes last (see `_index_answer`, `_reach_proof`); None for an answer that carries no
+        index or Deno data."""
         rel, error = self._target(target)
         if error:
             return error, None
@@ -524,10 +537,11 @@ class NavApi:
                                unresolved=[{"line": e["line"], "spec": e["spec"], "reason": e["reason"]}
                                            for e in edges if e["kind"] == "unresolved"],
                                **self._meta(index, stats))
-            answer, blocked = self._index_answer(build)
+            answer, blocked, proof = self._index_answer(build)
             if not blocked or source == "index":
-                return answer, None
-        return self._forward_graph(target)
+                return answer, proof
+        answer, reach = self._forward_graph(target)
+        return answer, self._reach_proof(reach)
 
     # --- deno
 
@@ -824,17 +838,27 @@ class NavApi:
             return _answer("stale_index", detail="a file changed while Deno was reading it"), None, None
         return None, out, mirror
 
-    def _final(self, answer, reach):
-        """What a public operation returns: `answer` screened (`_out`), and then, when it is an `ok` answer that rests on a proof
-        (`reach`, cached or fresh), `reach.holds()` as the very last step: the screen runs before it, so nothing (the guard
-        included) runs between the check and the return of an `ok` answer. Config files count (`Reach.configs`). A tree that moved
-        gives `stale_index`, which carries nothing from the answer."""
+    def _final(self, answer, proof):
+        """What every public operation returns, from the index and from Deno alike: `answer` screened (`_out`), and then, when it
+        rests on a proof (`proof()`: None when what it rests on still holds, else the answer to give instead), that proof as the
+        very last step: the screen, the filtering and the paging are all done before it, so nothing (the guard included) runs
+        between the check and the return. A tree that moved gives that answer (`stale_index`, or the index's gaps), which carries
+        nothing from `answer`."""
         out = self._out(answer)
-        if reach is None or out["status"] != "ok":
+        if proof is None:
             return out
-        if reach.holds():
+        failed = proof()
+        if failed is None:
             return out
-        return self._out(_answer("stale_index", detail="a file changed while the answer was being made"))
+        return self._out(failed)
+
+    @staticmethod
+    def _reach_proof(reach):
+        """The proof an answer from `deno info` or `deno doc` rests on (`reach.holds()`, config files included: `Reach.configs`);
+        None when the answer rests on none."""
+        if reach is None:
+            return None
+        return lambda: None if reach.holds() else _answer("stale_index", detail="a file changed while the answer was being made")
 
     @staticmethod
     def _scrub(text, mirror, names):
@@ -852,7 +876,8 @@ class NavApi:
         """The local modules `target` reaches, from `deno info --json` (30 s cap): {"modules": [{"path", "imports": [paths]}]}.
         Only files inside the project are listed; packages and URLs are counted in `external`. When the graph is longer than
         MAX_MODULES, `target` and its direct imports are kept and the rest is cut in path order."""
-        return self._final(*self._forward_graph(target))
+        answer, reach = self._forward_graph(target)
+        return self._final(answer, self._reach_proof(reach))
 
     def _forward_graph(self, target):
         """(answer, reach); the public wrapper makes the final check (`_final`)."""
@@ -911,7 +936,8 @@ class NavApi:
     def symbols(self, path, limit=MAX_SYMBOLS):
         """The exported symbols of `path` from `deno doc --json`: name, kind, definition path and line, the definition's source
         line as `signature`, and the first doc-comment lines. A re-export is listed at the file that defines it."""
-        return self._final(*self._symbols(path, limit))
+        answer, reach = self._symbols(path, limit)
+        return self._final(answer, self._reach_proof(reach))
 
     def _symbols(self, path, limit):
         """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one."""

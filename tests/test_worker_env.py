@@ -1,6 +1,6 @@
 """tp-spawn --worker-env (trial lane L3, design §3/§10): allowlisted KEY=VAL pairs are exported by run.sh, nothing else is; a spawn
 without the option writes the same run.sh as before; --other-lane-paths works without --lane; --state-dir/--parent reach the
-preamble only when lib/preamble.py takes them. Real tp-spawn, fake tmux, no model."""
+preamble of a task with a parent. Real tp-spawn, fake tmux, no model."""
 import json
 import os
 from pathlib import Path

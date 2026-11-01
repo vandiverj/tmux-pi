@@ -213,22 +213,37 @@ def read_run_at(fd):
     return value
 
 
+TEMP_TRIES = 8
+
+
 def write_at(fd, name, text):
     """Write `text` (str, or bytes written as they are) as `name` in the directory held open as `fd` (`name` a path and `fd` None: in its directory), atomically. The
-    directory is the worker's to write and the temp name has the runner's pid, which run.json shows: whatever is at the temp name
-    is removed and the temp file is made new (O_EXCL), so nothing is written through a link the worker put there and no write
-    waits on a FIFO."""
+    directory is the worker's to write and the temp name has the runner's pid, which run.json shows. A file or a link at the temp
+    name is removed and the temp file is made new (O_EXCL), so nothing is written through a link the worker put there and no write
+    waits on a FIFO. Anything that cannot be unlinked (a directory, and what is in it, is the worker's) is left alone: the next
+    name, `<name>.tmp.<pid>.<n>`, is tried, TEMP_TRIES names in all, and then the write is an OSError."""
     name = str(name)
-    tmp = "{}.tmp.{}".format(name, os.getpid())
-    try:
-        os.unlink(tmp, dir_fd=fd)
-    except FileNotFoundError:
-        pass
     binary = isinstance(text, bytes)
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd), "wb" if binary else "w",
-                   **({} if binary else {"encoding": "utf-8"})) as handle:
-        handle.write(text)
-    os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    last = None
+    for attempt in range(TEMP_TRIES):
+        tmp = "{}.tmp.{}{}".format(name, os.getpid(), ".{}".format(attempt) if attempt else "")
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            last = error
+            continue
+        try:
+            raw = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        except FileExistsError as error:
+            last = error
+            continue
+        with os.fdopen(raw, "wb" if binary else "w", **({} if binary else {"encoding": "utf-8"})) as handle:
+            handle.write(text)
+        os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        return
+    raise OSError("{}: every temp name is taken ({})".format(name, last))
 
 
 def remove_tree(path):

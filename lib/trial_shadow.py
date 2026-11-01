@@ -16,7 +16,8 @@ What the run does to git: `git worktree add --detach` at the source task's base_
 ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable until the record is written, and removal of both at
 the end, on success and on failure. The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
 the tree on a branch (`git checkout -b`, a rename, a branch someone else made meanwhile), the collect step detaches HEAD (so moving
-it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json; a
+it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json (every
+branch made since the tree was, HEAD's or not, is listed there as `new_branches`); a
 tree it cannot detach ends the collect with an error before HEAD is moved. HEAD is written with `update-ref --no-deref`, never
 `checkout --detach` or `reset --soft`, which refuse in the middle of a merge, a rebase or a cherry-pick: the patch and the removal of
 the tree do not depend on the state the worker left git in. `git add -A` skips a path git cannot index (a repository the worker made
@@ -740,6 +741,7 @@ class Run:
         if head and head != base:
             self.owner.keep_ref("{}{}/head".format(REF_PREFIX, self.run), head)  # a ref this run makes and records: cleanup removes it by name and commit
         self.leave_branch()
+        self.list_new_branches()
         # HEAD to the base, the index and the files as they are: what `reset --soft` does, except that it refuses in the middle of a merge
         # (a worker that gave up there would cost the whole patch), and that `--no-deref` can only ever move HEAD itself, never a branch
         self.wt_git("update-ref", "--no-deref", "-m", "tp-trial: HEAD to the base for the review", "HEAD", base)
@@ -786,6 +788,19 @@ class Run:
         if not tip or self.wt_git("symbolic-ref", "-q", "HEAD", check=False).returncode != 1:
             raise ShadowError("HEAD of the run's tree is on {} and could not be detached; HEAD was not moved to the base".format(ref))
         self.note(branch_left={"ref": ref, "commit": tip or None})
+
+    def list_new_branches(self):
+        """Design (f): a branch the worker made is left where it is and listed. `branch_left` names the one HEAD was on; this names every
+        head that was not there when the run's tree was made (`heads_before`, the runner's own memory), whether HEAD is on it or not, as
+        `new_branches` [{ref, commit}] in run.json (absent when there is none). One that somebody else made meanwhile is listed too: the
+        run cannot tell who made it. Nothing is deleted or moved. A failed listing is not a failed collect."""
+        listed = git(self.project, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", check=False)
+        if listed.returncode:
+            return
+        rows = [line.split(" ", 1) for line in listed.stdout.splitlines() if " " in line]
+        made = [{"ref": ref, "commit": commit} for ref, commit in sorted(rows) if ref not in self.heads_before]
+        if made:
+            self.note(new_branches=made)
 
     def review(self):
         self.note(phase="review")

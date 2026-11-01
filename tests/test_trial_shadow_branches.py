@@ -51,6 +51,47 @@ class BranchTests(TreeCase):
         self.assertEqual(self.heads(), before | {"refs/heads/worker-branch " + tip})
         self.assertEqual(self.refs("refs/tmux-pi"), "")
 
+    def test_every_branch_the_worker_made_is_listed_in_run_json_whether_or_not_head_is_on_it(self):
+        """Design (f): worker-made branches are left in place and listed. `branch_left` names the one HEAD was on; a branch made with
+        `git branch` and left alone is not HEAD's, so `new_branches` lists every head that was not there when the tree was made."""
+        run = self.worktree_run()
+        before = self.heads()
+        git(run.worktree, "branch", "scratch", self.base)
+        git(run.worktree, "checkout", "-q", "-b", "kept")
+        self.edit(run)
+        tip = git(run.worktree, "rev-parse", "HEAD")
+        run.collect_work()
+        want = [{"ref": "refs/heads/kept", "commit": tip}, {"ref": "refs/heads/scratch", "commit": self.base}]
+        self.assertEqual(run.info["new_branches"], want)
+        self.assertEqual(ts.read_run(run.rdir)["new_branches"], want, "reported in run.json")
+        self.assertEqual(self.heads(), before | {"refs/heads/kept " + tip, "refs/heads/scratch " + self.base}, "both are left where they are")
+        self.assertEqual(ts.cleanup(run.rdir, self.env), [])
+        self.assertEqual(self.heads(), before | {"refs/heads/kept " + tip, "refs/heads/scratch " + self.base})
+
+    def test_a_branch_that_was_there_before_the_run_is_not_listed_as_new(self):
+        git(self.repo, "branch", "old-branch", self.base)
+        run = self.worktree_run()
+        self.edit(run)
+        run.collect_work()
+        self.assertNotIn("new_branches", run.info)
+        self.assertNotIn("new_branches", ts.read_run(run.rdir))
+
+    def test_the_branches_of_a_finished_run_are_in_the_report_the_run_returns(self):
+        rdir, info = self.prepare()
+
+        def poll(n, run):
+            if n == 1:
+                git(run.worktree, "branch", "side-work", self.base)
+                self.edit(run)
+                self.settle_worker(run)
+            elif n == 2:
+                for p in (run.state / "tasks").iterdir():
+                    if (p / "review-of").exists():
+                        self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+        _, done = self.run_stub(rdir, poll)
+        self.assertEqual(done["new_branches"], [{"ref": "refs/heads/side-work", "commit": self.base}])
+        self.assertEqual(self.refs("refs/heads/side-work"), "refs/heads/side-work " + self.base)
+
     def test_a_branch_somebody_else_made_after_the_run_began_is_never_deleted_or_moved(self):
         # heads_before was taken when the tree was made: this branch is not in it, and the worker's HEAD is on it
         run = self.worktree_run()

@@ -1391,7 +1391,8 @@ class NavApi:
 
     def status(self):
         """What this instance would use: the Deno it found, the root and config, the cache folder (and why it is refused, when it
-        is), what it holds (`cache`: {"entries", "bytes", "last_sweep"}, seconds since the epoch; None where unknown), and the index's
+        is), what it holds (`cache`: {"entries", "bytes", "last_sweep", "incomplete"}; seconds since the epoch; entries and bytes None, and
+        incomplete True, where they are not all known), and the index's
         size and age. The config is looked at only when it is shown allowed."""
         exe = self._deno_exe()
         out = {"status": "ok", "deno": exe, "deno_version": self.deno_version() if exe else None,
@@ -1403,7 +1404,7 @@ class NavApi:
             out["root_refused"] = self._root_refusal
         if self._boundary_unmodelled:
             out["boundary_refused"] = BOUNDARY_UNMODELLED
-        out["cache"] = self._cache.summary()  # entries, bytes and the time of the last sweep (seconds since the epoch); None where unknown
+        out["cache"] = self._cache.summary()  # entries, bytes, the time of the last sweep (seconds since the epoch) and whether the count is not all known
         if self._index is not None:
             out.update(files_indexed=len(self._index.entries), index_age_s=self._index.age_s())
             if self._index.gaps:

@@ -7434,7 +7434,7 @@ class SweepCase(Tree):
         project = self.project("status")
         nav = self.info_nav(project)
         folder = project_cache(project).parent
-        self.assertEqual(nav.status()["cache"], {"entries": 0, "bytes": 0, "last_sweep": None})
+        self.assertEqual(nav.status()["cache"], {"entries": 0, "bytes": 0, "last_sweep": None, "incomplete": False})
         self.assertFalse(folder.exists(), "status made the cache folder")
         self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
         entries = sorted(p for p in folder.glob("nav_api-*-*.json"))
@@ -7454,7 +7454,7 @@ class SweepCase(Tree):
         self.assertEqual({p.name: p.stat().st_mtime_ns for p in folder.iterdir() if p.name in before}, before, "status touched something")
 
     def test_s5_status_of_a_refused_unreadable_or_oddly_marked_cache(self):
-        nothing = {"entries": None, "bytes": None, "last_sweep": None}
+        nothing = {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True}
         outside = self.dir / "outside-cache"
         outside.mkdir()
         self.put("nav_api-doc-old.json", 5, folder=outside)
@@ -7472,7 +7472,7 @@ class SweepCase(Tree):
         self.cache().write_json(graph.SWEEP_MARKER, {"version": 1, "last_sweep": future})
         self.assertEqual(nav.status()["cache"]["last_sweep"], future)
         self.marker().write_text("bad")
-        self.assertEqual(nav.status()["cache"], {"entries": 1, "bytes": 10, "last_sweep": None})
+        self.assertEqual(nav.status()["cache"], {"entries": 1, "bytes": 10, "last_sweep": None, "incomplete": False})
         self.marker().unlink()
         self.marker().mkdir()
         self.assertEqual(nav.status()["cache"]["last_sweep"], None)
@@ -7481,6 +7481,38 @@ class SweepCase(Tree):
             self.folder.chmod(0)
             self.addCleanup(lambda: self.folder.chmod(0o700))
             self.assertEqual(nav.status()["cache"], nothing)
+
+    def test_s5_f1_status_of_a_folder_that_lists_but_cannot_be_looked_into_is_unknown_not_a_partial_count(self):
+        """A folder of mode 0400 lists its names but every lookup (`lstat` in the descriptor) fails: no entry may be counted as
+        complete, so entries and bytes are None and `incomplete` is True. The marker's time is still reported when it can be read."""
+        if os.geteuid() == 0:
+            self.skipTest("root looks into any folder")
+        for name in ("nav_api-doc-a.json", "nav_api-info-b.json", "nav_api-index-c.json"):
+            self.put(name, 5, size=100)
+        nav = self.nav(self.proj)
+        self.assertEqual(nav.status()["cache"], {"entries": 3, "bytes": 300, "last_sweep": None, "incomplete": False})
+        self.folder.chmod(0o400)
+        self.addCleanup(lambda: self.folder.chmod(0o700))
+        self.assertEqual(nav.status()["cache"], {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True})
+        self.assertEqual(sorted(os.listdir(self.folder)), ["nav_api-doc-a.json", "nav_api-index-c.json", "nav_api-info-b.json"], "status changed the folder")
+
+    def test_s5_f1_status_is_unknown_when_one_lookup_fails_and_complete_when_a_name_has_only_gone(self):
+        for name in ("nav_api-doc-a.json", "nav_api-doc-b.json"):
+            self.put(name, 5, size=100)
+        cache = self.cache()
+        real = os.lstat
+
+        def failing(path, *a, dir_fd=None, **kw):
+            if path == "nav_api-doc-b.json" and dir_fd is not None:
+                raise self.error
+            return real(path, *a, dir_fd=dir_fd, **kw)
+        for error, expected in ((PermissionError(13, "denied"), (None, None, True)), (OSError(5, "io"), (None, None, True)),
+                                (FileNotFoundError(2, "gone"), (1, 100, False))):
+            with self.subTest(type(error).__name__ + str(error.errno)):
+                self.error = error
+                with mock.patch.object(graph.os, "lstat", failing):
+                    got = cache.summary()
+                self.assertEqual((got["entries"], got["bytes"], got["incomplete"]), expected)
 
     def test_s5_status_never_raises(self):
         nav = self.nav(self.proj)

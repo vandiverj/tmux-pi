@@ -958,8 +958,9 @@ class CacheDir:
     def _listing(self, fd, spent):
         """([(name, kind, size, mtime_ns, dev, ino)], complete): the regular files of the folder open on `fd` that the sweep manages
         (see `_managed`), each looked at with `lstat` in the descriptor (no link followed). Only names are taken from the listing,
-        never a type from it; a name that goes before it is looked at, or is not a regular file, is left out. Stops early (complete
-        False) when `spent()`; what was found is still true of those files."""
+        never a type from it; a name that has gone before it is looked at, or is not a regular file, is left out. `complete` is False
+        when `spent()` stopped the listing early, or when a name could not be looked at for any other reason (a folder that lists
+        but cannot be looked into, an I/O error): what was found is still true of those files, but is not all of them."""
         found, complete = [], True
         with os.scandir(fd) as listing:
             for count, entry in enumerate(listing):
@@ -971,7 +972,10 @@ class CacheDir:
                     continue
                 try:
                     info = os.lstat(entry.name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue  # gone since the listing: not there now
                 except OSError:
+                    complete = False  # there, but not looked at: the list is not all of what is in the folder
                     continue
                 if stat.S_ISREG(info.st_mode):
                     found.append((entry.name, kind, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino))
@@ -982,7 +986,7 @@ class CacheDir:
         Due means: an entry was written since the last time this was asked (`written`), no sweep by this object or by the marker
         file within SWEEP_EVERY_S (a marker time in the future, from a clock that was ahead, does not hold a sweep back), and the
         folder is judged and exists. Returns None when no sweep was made, else {"deleted": n, "skipped": n, "complete": bool}
-        (`complete` False: the budget ran out). The marker is written last; it counts as a write only for the sweep that wrote it.
+        (`complete` False: the budget ran out, or a listed name could not be looked at). The marker is written last; it counts as a write only for the sweep that wrote it.
         Never raises."""
         if self.refusal or not self.written or not self._sweeping.acquire(blocking=False):
             return None
@@ -1075,34 +1079,37 @@ class CacheDir:
         return result
 
     def summary(self):
-        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None}: the entries the sweep manages (index, doc and
-        info files that are regular files; temporaries and the marker are not entries) and the marker's time. Read-only, nothing
-        is made (a missing folder is 0 and 0). None for entries and bytes when there is no cache (refused) or the folder cannot be
-        listed. Never raises."""
-        none = {"entries": None, "bytes": None, "last_sweep": None}
+        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None, "incomplete": bool}: the entries the sweep
+        manages (index, doc and info files that are regular files; temporaries and the marker are not entries) and the marker's
+        time. Read-only, nothing is made (a missing folder is 0 and 0). Entries and bytes are None, and `incomplete` True, when
+        they are not known: there is no cache (refused), the folder cannot be listed, or a listed name could not be looked at (a
+        count of the names that could be would pass for the whole). Never raises."""
+        none = {"entries": None, "bytes": None, "last_sweep": None, "incomplete": True}
         if self.refusal:
             return none
         try:
             fd = open_folder_below(self.base, self.rel.split("/"), make=False)
         except FileNotFoundError:
-            return {"entries": 0, "bytes": 0, "last_sweep": None}  # nothing is there yet: an empty cache, and nothing is made
+            return {"entries": 0, "bytes": 0, "last_sweep": None, "incomplete": False}  # nothing is there yet: an empty cache, and nothing is made
         except Exception:
             return none
         if _opened_path(fd) != self.path:
             close_quietly(fd)
             return none
         try:
-            found, _ = self._listing(fd, lambda: False)
+            found, complete = self._listing(fd, lambda: False)
         except Exception:
             return none
         finally:
             close_quietly(fd)
-        entries = [item for item in found if item[1] != "temp"]
         try:
             last = self._last_sweep()
         except Exception:
             last = None
-        return {"entries": len(entries), "bytes": sum(item[2] for item in entries), "last_sweep": last}
+        if not complete:
+            return {**none, "last_sweep": last}
+        entries = [item for item in found if item[1] != "temp"]
+        return {"entries": len(entries), "bytes": sum(item[2] for item in entries), "last_sweep": last, "incomplete": False}
 
 
 def read_source(path, base, allow, failures=None, expect=None):

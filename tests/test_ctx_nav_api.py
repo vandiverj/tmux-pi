@@ -3044,6 +3044,7 @@ class PathRuleCase(Tree):
         ("graph.py", "read_bounded", "os.read"): "after every check",
         ("graph.py", "write_new", "os.open"): "O_EXCL|O_NOFOLLOW, relative to a checked folder descriptor",
         ("graph.py", "write_new", "os.write"): "the new file",
+        ("graph.py", "write_new", "os.unlink"): "dir_fd of the checked folder; only the file this call made with O_EXCL, by that name, when its write failed",
         ("graph.py", "open_folder_below", "os.open"): "base NOFOLLOW_ANY, then each part O_NOFOLLOW relative to the one before",
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
         ("graph.py", "CacheDir.put_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name prepare_json judged (asks no guard)",
@@ -6069,6 +6070,65 @@ class InfoCacheCase(Tree):
             .forward_graph("src/main.ts")
         self.assertNotEqual(answer["status"], "ok")
         self.assertEqual(self.entries(project), [])
+
+
+    # --- sweep (path-boundary, config-freshness): a change after the key, on every route, for each input of the key
+
+    def test_s3_sweep_a_change_after_the_key_is_stale_index_on_the_miss_hit_and_warm_routes_of_both_kinds(self):
+        """Not failing-first: the sweep found these already right. They fix the table: input x change x route x kind."""
+        def edit(p):
+            write(p / "src" / "config.ts", "export const q = 2;\n")
+
+        def config(p):
+            data = json.loads((p / "deno.json").read_text())
+            data["imports"]["@late"] = "./src/lazy.ts"
+            (p / "deno.json").write_text(json.dumps(data))
+
+        def remove(p):
+            (p / "src" / "config.ts").unlink()
+
+        def link(p):
+            copy = write(p.parent / "copy.ts", (p / "src" / "config.ts").read_text())
+            (p / "src" / "config.ts").unlink()
+            (p / "src" / "config.ts").symlink_to(copy)
+
+        def hide(p):
+            os.chmod(p / "src" / "config.ts", 0)
+
+        def no_config(p):
+            (p / "deno.json").unlink()
+
+        def marker(p):
+            os.mkdir(p / ".git")
+        changes = [edit, config, remove, link, no_config, marker] + ([] if os.geteuid() == 0 else [hide])
+        for kind in ("info", "doc"):
+            for route in ("miss", "hit", "warm"):
+                for change in changes:
+                    label = (kind, route, change.__name__)
+                    shutil.rmtree(self.dir / "p", ignore_errors=True)
+                    project = self.project("p")
+                    make = (lambda: self.nav_for(project)) if kind == "info" else (lambda: self.doc_nav(project))
+                    call = "forward_graph" if kind == "info" else "symbols"
+                    if route != "miss":
+                        getattr(make(), call)("src/main.ts")
+                    nav = make()
+                    if route == "warm":
+                        getattr(nav, call)("src/main.ts")
+                    moved, hook = [], "_run_deno" if route == "miss" else "_read_cache"
+                    real = getattr(nav, hook)
+
+                    def once(*a, real=real, moved=moved, change=change, project=project, **k):
+                        got = real(*a, **k)
+                        if not moved:
+                            moved.append(1)
+                            change(project)
+                        return got
+                    setattr(nav, hook, once)
+                    answer = getattr(nav, call)("src/main.ts")
+                    self.assertEqual(answer["status"], "stale_index", (label, answer))
+                    self.assertNotIn("modules" if kind == "info" else "symbols", answer, label)
+                    if route == "miss":
+                        self.assertEqual(self.entries(project) + self.doc_entries(project), [], label)
 
 
 if __name__ == "__main__":

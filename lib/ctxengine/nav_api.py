@@ -23,6 +23,9 @@ whose proof found nothing is `ok`. THE LAST PROOF IS THE LAST STEP: the answer i
 proof again after the screen, as the very last thing before the answer is returned (for the index as for `deno info`; the one rule
 is `_final`); a proof that fails then gives the gaps and nothing from the answer.
 A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
+An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it; one
+file's bytes are never read to decide the boundary (a `.git` is refused by name), so a rewrite that keeps size, mtime and ctime is not seen.
+A change after the final proof returns is not detected.
 A missing config is no gap (nothing is there; one that was there when its folder was walked and is gone at its read is a race),
 nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
 its own reach. A link in the tree is not followed or indexed (as before): an edge through one is not in the index; this is a
@@ -54,7 +57,7 @@ inside that package's folder (a `workspaces` key that is present must hold such 
 config's folder or any folder up to the root, and any other form, are `unmodelled_config` (nothing is guessed). The `package.json` of
 every folder from the config's folder to the root is read, cut down and mirrored, and is an input the final proof checks again. So is
 the choice of the root itself (`_probe_boundary`): the `.git` of each folder looked at on the way up, every marker of the folder
-chosen (kind, identity, mtime, size), and the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
+chosen (`_boundary_input`: kind, identity, size, mtime, ctime; nothing read), and the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
 from the index (`ImportIndex.boundary_holds`) and from Deno (`Reach.boundary_holds`), warm, cold or cache-loaded.
 
 The path rule (graph.py states it in full; a test holds every file-system call in both modules to a table): nothing is asked of the
@@ -319,6 +322,29 @@ def _file_url_path(url):
     return os.path.normpath(unquote(url[len("file://"):])) if isinstance(url, str) and url.startswith("file://") else None
 
 
+def _boundary_input(path):
+    """The one fingerprint of an input of the boundary decision (a `.git`, a workspace marker), taken by `os.lstat` and, for a link,
+    `os.readlink` (the link itself, never what it leads to); nothing is opened or read, so a refused name (`.git`) is never read.
+    A folder: its kind and identity (its mtime moves with ordinary git work, so it is not part of it). Anything else: kind,
+    identity, size, mtime and ctime in ns (ctime cannot be set back, so an edit that restores the mtime is still seen), and for a
+    link its target text. ("absent",) for nothing there; ("error", errno) when it cannot be looked at. A change of content that
+    keeps size, mtime and ctime is not detected (a known limit)."""
+    try:
+        st = os.lstat(path)
+    except OSError as error:
+        return ("absent",) if isinstance(error, (FileNotFoundError, NotADirectoryError)) else ("error", error.errno)
+    kind = stat.S_IFMT(st.st_mode)
+    if kind == stat.S_IFDIR:
+        return (kind, st.st_dev, st.st_ino)
+    target = None
+    if kind == stat.S_IFLNK:
+        try:
+            target = os.readlink(path)
+        except OSError as error:
+            target = ("error", error.errno)
+    return (kind, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, target)
+
+
 class NavApi:
     """Navigation questions about the Deno project below `root` (default `project_root`); paths in and out are relative to
     `project_root`. One instance keeps one index; its cache files live in `cache_dir` (default `.tmux-pi/ctx-cache` under the
@@ -386,25 +412,21 @@ class NavApi:
         first `.git`, so a repository nested in another is never crossed. Else it is the project root. Existence probes of exact
         names (the closed exception to the path rule, as in `_guarded_roots`); nothing is read. A folder that is `/`, holds the home
         folder, has a sensitive component or cannot be judged is not taken. `observations` is what the choice rests on: for each
-        folder visited the kind and identity of its `.git`, for the one that has it the same of each marker (and its mtime and
-        size), and the home folder; two probes that differ chose from a different tree."""
+        folder visited the fingerprint of its `.git`, for the one that has it the same of each marker (`_boundary_input`, the one
+        fingerprint of every input of this decision), and the home folder; two probes that differ chose from a different tree."""
         seen = []
 
-        def look(path, full):
-            try:
-                st = os.lstat(path)
-            except OSError as error:
-                seen.append((path, "absent" if isinstance(error, (FileNotFoundError, NotADirectoryError)) else error.errno))
-                return False
-            seen.append((path, stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino, *((st.st_mtime_ns, st.st_size) if full else ())))
-            return True
+        def look(path):
+            fingerprint = _boundary_input(path)
+            seen.append((path, *fingerprint))
+            return fingerprint != ("absent",) and fingerprint[0] not in ("error",)
         folder = self.project_root
-        while not look(os.path.join(folder, ".git"), False):
+        while not look(os.path.join(folder, ".git")):
             parent = os.path.dirname(folder)
             if parent == folder:
                 return self.project_root, tuple(seen)
             folder = parent
-        markers = [look(os.path.join(folder, name), True) for name in WORKSPACE_MARKERS]
+        markers = [look(os.path.join(folder, name)) for name in WORKSPACE_MARKERS]
         if folder == self.project_root or not any(markers):
             return self.project_root, tuple(seen)
         try:

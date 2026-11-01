@@ -3057,7 +3057,8 @@ class PathRuleCase(Tree):
         ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
         ("nav_api.py", "NavApi._executable", "os.access"): "the same resolved candidate",
         ("nav_api.py", "NavApi._guarded_roots", "os.path.lexists"): "monorepo markers: exact names in the project's ancestors",
-        ("nav_api.py", "NavApi._probe_boundary", "os.lstat"): "monorepo root and markers: exact names in the project's ancestors, identity only",
+        ("nav_api.py", "_boundary_input", "os.lstat"): "monorepo root and markers: exact names in the project's ancestors; stat only, nothing read",
+        ("nav_api.py", "_boundary_input", "os.readlink"): "the link itself at such a name, never what it leads to",
         ("nav_api.py", "NavApi._grant_kinds", "os.lstat"): "a grant resolved by judged_location, not sensitive",
         ("nav_api.py", "NavApi._sandboxed", "os.access"): "the fixed SANDBOX_EXEC",
         ("nav_api.py", "NavApi._check_sandbox", "subprocess.run"): "SANDBOX_EXEC with judged grants and the probe folder",
@@ -4058,10 +4059,14 @@ class MonorepoCase(Tree):
             patcher.stop()
         self.env_patchers = []
 
-    def reset(self):
+    def reset(self, git_file=False):
         self.undo_env()  # an edit that changed HOME is undone with the tree it belonged to
         shutil.rmtree(self.dir / "mono", ignore_errors=True)
-        return self.mono()
+        mono, project = self.mono()
+        if git_file:  # a worktree or submodule: the monorepo's `.git` is a file that points elsewhere
+            shutil.rmtree(mono / ".git")
+            write(mono / ".git", "gitdir: /elsewhere/aaa\n")
+        return mono, project
 
     def deno_nav(self, project, **kw):
         return self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), **kw)
@@ -4597,6 +4602,78 @@ class MonorepoCase(Tree):
             "the home folder becomes the root": home,
         }
 
+    def git_file_edits(self):
+        """Review 2 F1: the same inputs when the monorepo `.git` is a file (`gitdir:` pointer): an edit in place that keeps the inode
+        (same size, new size, same size with the old mtime put back), a replacement by a file with the same bytes, removal, and a
+        change of kind. Run on a tree made with `reset(git_file=True)`."""
+        def keep_times(path, edit):
+            before = os.stat(path)
+            edit()
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        def rewrite(mono, text, same_times=False):
+            path = mono / ".git"
+            if same_times:
+                keep_times(path, lambda: path.write_text(text))
+            else:
+                path.write_text(text)
+
+        def replace_same_bytes(mono):
+            data = (mono / ".git").read_bytes()
+            (mono / ".git").unlink()
+            (mono / ".git").write_bytes(data)
+        return {
+            ".git file edited in place, same size": lambda mono, project: rewrite(mono, "gitdir: /elsewhere/bbb\n"),
+            ".git file edited in place, new size": lambda mono, project: rewrite(mono, "gitdir: /elsewhere/much/longer\n"),
+            ".git file edited in place, same size, old mtime put back":
+                lambda mono, project: rewrite(mono, "gitdir: /elsewhere/ccc\n", same_times=True),
+            ".git file replaced by a file with the same bytes": lambda mono, project: replace_same_bytes(mono),
+            ".git file removed": lambda mono, project: (mono / ".git").unlink(),
+            ".git file replaced by a folder": lambda mono, project: ((mono / ".git").unlink(), (mono / ".git" / "HEAD").parent.mkdir()),
+            ".git file replaced by a link": lambda mono, project: ((mono / ".git").unlink(), (mono / ".git").symlink_to(self.dir / "outside.ts")),
+        }
+
+    def marker_edits(self):
+        """Review 2 F1: a marker edited in place with the same size (and with the old mtime put back)."""
+        def same_times(mono, project):
+            path = mono / "nx.json"
+            before = os.stat(path)
+            path.write_text('{"x":"y"}'[:len(path.read_text())].ljust(len(path.read_text())))
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return {"nx.json edited in place, same size": lambda mono, project: (mono / "nx.json").write_text("[]"),
+                "nx.json edited in place, same size, old mtime put back": same_times}
+
+    def package_edits(self):
+        """Review 2 F1 sweep: the `package.json` files the decision and Deno's workspace view rest on (the monorepo root's, with the
+        `workspaces` list, and one between the root and the project): same-size edit (also with the old mtime put back), new size,
+        removal, replacement by a link."""
+        def edit(rel, make, same_times=False):
+            def run(mono, project):
+                path = mono / rel
+                before = os.stat(path) if path.exists() else None
+                make(path)
+                if same_times and before:
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return run
+        out = {}
+        for rel in ("package.json", "apps/package.json"):
+            name = rel.replace("/", " ")
+            if rel != "package.json":
+                continue
+            out[f"{name} workspaces edited, same size"] = edit(rel, lambda p: p.write_text(p.read_text().replace("apps/web", "apps/wev")))
+            out[f"{name} workspaces edited, same size, old mtime put back"] = edit(
+                rel, lambda p: p.write_text(p.read_text().replace("apps/web", "apps/wev")), same_times=True)
+            out[f"{name} edited, new size"] = edit(rel, lambda p: p.write_text(p.read_text().replace("true", "true, \"x\": 1")))
+            out[f"{name} removed"] = edit(rel, lambda p: p.unlink())
+            out[f"{name} replaced by a link"] = edit(rel, lambda p: (p.unlink(), p.symlink_to(self.dir / "outside.ts")))
+        out["apps/package.json added"] = lambda mono, project: write(mono / "apps" / "package.json", '{"name": "apps"}')
+        return out
+
+    def edit_cases(self):
+        """(label, git_file, edit): every change to an input of the boundary decision, on the tree it applies to."""
+        return [*((label, False, edit) for label, edit in {**self.boundary_edits(), **self.marker_edits(), **self.package_edits()}.items()),
+                *((label, True, edit) for label, edit in self.git_file_edits().items())]
+
     def not_a_monorepo_edits(self):
         """The same, for a project that was not in a monorepo when the instance was made (its boundary is the project)."""
         return {
@@ -4641,32 +4718,39 @@ class MonorepoCase(Tree):
         """Sweep: input x state x route (index: after the refresh, after the screen; Deno: inside the run, after the screen)."""
         routes = [("index", "refresh", self.index_calls), ("index", "screen", self.index_calls),
                   ("deno", "deno", self.deno_calls_), ("deno", "screen", self.deno_calls_)]
-        for label, edit in self.boundary_edits().items():
+        for label, git_file, edit in self.edit_cases():
             for kind, hook, calls in routes:
+                if kind == "index" and label in self.package_edits():
+                    continue  # the index never reads a package.json: its answer does not rest on one (Deno's does)
                 for number, call in enumerate(calls):
                     with self.subTest(label, route=kind, hook=hook, call=number):
-                        mono, project = self.reset()
+                        mono, project = self.reset(git_file)
                         nav = self.deno_nav(project)
                         self.during(nav, hook, lambda: edit(mono, project))
                         self.no_data(call(nav), label)
 
     def test_a_change_to_the_boundary_decision_between_calls_withholds_the_answer(self):
         """Warm instance (index kept, Deno answer cached) and an instance made before the change that loads the cache."""
-        for label, edit in self.boundary_edits().items():
+        for label, git_file, edit in self.edit_cases():
             with self.subTest(label):
-                mono, project = self.reset()
-                cache = str(self.dir / "cache")
+                mono, project = self.reset(git_file)
                 doc = self.doc_payload(MIRROR, "src/uses_lib.ts", "W", "w", line=3)
 
-                def make():
-                    return self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload()), cache_dir=cache)
+                def make():  # the default cache folder, inside the project: a Deno answer is really cached and loaded
+                    return self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload()))
                 warm, cold = make(), make()
                 for call in (*self.index_calls, *self.deno_calls_):
                     self.assertEqual(call(warm)["status"], "ok")
+                self.assertTrue(self.deno_calls_[0](cold)["cached"], label)
                 edit(mono, project)
-                for number, call in enumerate((*self.index_calls, *self.deno_calls_)):
-                    self.no_data(call(warm), f"{label} warm {number}")
-                    self.no_data(call(cold), f"{label} cache-loaded {number}")
+                for number, call in enumerate((*(() if label in self.package_edits() else self.index_calls), *self.deno_calls_)):
+                    for route, nav in (("cache-loaded", cold), ("warm", warm)):  # the first to ask must not be served the old cache
+                        answer = call(nav)
+                        if label in self.package_edits():  # made again from the new tree; the second may load what the first wrote
+                            if route == "cache-loaded":
+                                self.assertFalse(answer.get("cached"), (label, route, answer))
+                        else:
+                            self.no_data(answer, f"{label} {route} {number}")
 
     def test_a_project_that_became_part_of_a_monorepo_during_a_call_withholds_the_answer(self):
         for label, edit in self.not_a_monorepo_edits().items():
@@ -4687,9 +4771,9 @@ class MonorepoCase(Tree):
                             self.assertNotIn(key, answer, (label, answer))
 
     def test_reach_and_the_index_hold_only_while_the_boundary_decision_holds(self):
-        for label, edit in self.boundary_edits().items():
+        for label, git_file, edit in self.edit_cases():
             with self.subTest(label):
-                mono, project = self.reset()
+                mono, project = self.reset(git_file)
                 nav = self.deno_nav(project)
                 reach, refusal = nav._prove("src/uses_lib.ts")
                 self.assertIsNone(refusal)
@@ -4698,7 +4782,8 @@ class MonorepoCase(Tree):
                 self.assertEqual(nav._get_index().prove(), {})
                 edit(mono, project)
                 self.assertFalse(reach.holds())
-                self.assertNotEqual(nav._get_index().prove(), {})
+                if label not in self.package_edits():
+                    self.assertNotEqual(nav._get_index().prove(), {})
 
     def test_an_unchanged_boundary_decision_is_not_a_change(self):
         mono, project = self.mono()
@@ -4708,6 +4793,11 @@ class MonorepoCase(Tree):
             self.assertEqual(nav.symbols("src/uses_lib.ts")["status"], "ok")
         write(mono / "lib" / "other.ts", "export const O = 1;\n")  # not an input of the decision
         self.assertTrue(nav._boundary_holds())
+        write(mono / ".git" / "index.lock", "x")  # ordinary git work moves the mtime of a `.git` folder: not a change of the decision
+        write(mono / ".git" / "refs" / "heads" / "main", "abc\n")
+        (mono / ".git" / "index.lock").unlink()
+        self.assertTrue(nav._boundary_holds())
+        self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
 
     def test_reach_holds_follows_the_package_json_chain_in_every_state(self):
         """Sweep pass 2: each package.json Deno looks at (root, between, project), present or absent when proved, then removed,

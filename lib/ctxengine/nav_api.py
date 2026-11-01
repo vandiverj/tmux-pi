@@ -49,10 +49,13 @@ guard is asked as `check_path(root, name)`; a file anywhere in the monorepo that
 followed and mirrored like a project file. Paths in and out stay relative to the project (`../../lib/x.ts`). A specifier that
 resolves outside the monorepo root stays `outside_project`, and nothing there is looked at. Importers cover the files of the Deno
 root only. Only the workspace form the launchpad tree uses is modelled: `package.json` `workspaces` as a list of plain folder paths
-inside that package's folder, no glob, negation, `..` or object form; `pnpm-workspace.yaml`, `lerna.json` or `rush.json` in the
+inside that package's folder (a `workspaces` key that is present must hold such a non-empty list: `null`, `false`, `0`, `""`, `[]`,
+`{}` and a mixed list are `unmodelled_config`, only an absent key is no workspace), no glob, negation, `..` or object form; `pnpm-workspace.yaml`, `lerna.json` or `rush.json` in the
 config's folder or any folder up to the root, and any other form, are `unmodelled_config` (nothing is guessed). The `package.json` of
-every folder from the config's folder to the root is read, cut down and mirrored, and, like the root marker files probed, is an input
-the final proof checks again.
+every folder from the config's folder to the root is read, cut down and mirrored, and is an input the final proof checks again. So is
+the choice of the root itself (`_probe_boundary`): the `.git` of each folder looked at on the way up, every marker of the folder
+chosen (kind, identity, mtime, size), and the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
+from the index (`ImportIndex.boundary_holds`) and from Deno (`Reach.boundary_holds`), warm, cold or cache-loaded.
 
 The path rule (graph.py states it in full; a test holds every file-system call in both modules to a table): nothing is asked of the
 file system about a path until its name is shown inside the project and allowed by `check_path`. That covers the path argument
@@ -364,26 +367,55 @@ class NavApi:
     # --- plumbing
 
     def _boundary(self):
-        """The folder nothing outside is ever read: the monorepo root around the project, else the project root. The monorepo root
-        is the nearest folder at or above the project with a `.git`, when it has a workspace marker (`WORKSPACE_MARKERS`) and is
-        not the project itself; the walk stops at the first `.git`, so a repository nested in another is never crossed. Existence
-        probes of exact names (the closed exception to the path rule, as in `_guarded_roots`); nothing is read. A folder that is
-        `/`, holds the home folder, has a sensitive component or cannot be judged is not taken: the project root is the boundary."""
+        """The folder nothing outside is ever read: the monorepo root around the project, else the project root. The choice and
+        everything it was made from are recorded (`_boundary_token`) and proved again with every answer (`_boundary_holds`)."""
+        folder, self._boundary_token = self._probe_boundary()
+        return folder
+
+    def _boundary_holds(self):
+        """True when the boundary would be chosen again, from the same observations: each `.git` looked for on the way up, the
+        workspace markers of the folder chosen, and the home folder. A removed, added, replaced or changed one is False."""
+        try:
+            return self._probe_boundary()[1] == self._boundary_token
+        except Exception:
+            return False
+
+    def _probe_boundary(self):
+        """(folder, observations). The folder is the monorepo root around the project: the nearest folder at or above the project
+        with a `.git`, when it has a workspace marker (`WORKSPACE_MARKERS`) and is not the project itself; the walk stops at the
+        first `.git`, so a repository nested in another is never crossed. Else it is the project root. Existence probes of exact
+        names (the closed exception to the path rule, as in `_guarded_roots`); nothing is read. A folder that is `/`, holds the home
+        folder, has a sensitive component or cannot be judged is not taken. `observations` is what the choice rests on: for each
+        folder visited the kind and identity of its `.git`, for the one that has it the same of each marker (and its mtime and
+        size), and the home folder; two probes that differ chose from a different tree."""
+        seen = []
+
+        def look(path, full):
+            try:
+                st = os.lstat(path)
+            except OSError as error:
+                seen.append((path, "absent" if isinstance(error, (FileNotFoundError, NotADirectoryError)) else error.errno))
+                return False
+            seen.append((path, stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino, *((st.st_mtime_ns, st.st_size) if full else ())))
+            return True
         folder = self.project_root
-        while not os.path.lexists(os.path.join(folder, ".git")):
+        while not look(os.path.join(folder, ".git"), False):
             parent = os.path.dirname(folder)
             if parent == folder:
-                return self.project_root
+                return self.project_root, tuple(seen)
             folder = parent
-        if folder == self.project_root or not any(os.path.lexists(os.path.join(folder, name)) for name in WORKSPACE_MARKERS):
-            return self.project_root
+        markers = [look(os.path.join(folder, name), True) for name in WORKSPACE_MARKERS]
+        if folder == self.project_root or not any(markers):
+            return self.project_root, tuple(seen)
         try:
             home = judged_location(os.path.expanduser("~"))
         except graph.Unproven:
-            return self.project_root
+            seen.append(("home", None))
+            return self.project_root, tuple(seen)
+        seen.append(("home", home))
         if folder == os.sep or _sensitive_location(folder) or os.path.commonpath([folder, home]) == folder:
-            return self.project_root
-        return folder
+            return self.project_root, tuple(seen)
+        return folder, tuple(seen)
 
     def _show_path(self, path):
         """The resolved absolute `path` as a posix path relative to the project root (`..` segments for a place in the monorepo
@@ -428,6 +460,7 @@ class NavApi:
         if self._index is None:
             self._index = graph.ImportIndex(self.boundary, self.root, self.config, self.overlays,
                                             cache=(self._cache, self._cache_name("index", self._root_key())), allow=self._permits)
+            self._index.boundary_holds = self._boundary_holds
         return self._index
 
     def _fresh(self):
@@ -858,7 +891,9 @@ class NavApi:
         excluded file) and whether the index could be built make no difference. A walk that fails for any other reason is a
         refusal as well."""
         try:
-            return graph.prove_reach(self.boundary, os.path.join(self.boundary, rel), self.config, self._permits), None
+            reach = graph.prove_reach(self.boundary, os.path.join(self.boundary, rel), self.config, self._permits)
+            reach.boundary_holds = self._boundary_holds
+            return reach, None
         except graph.Unproven as error:
             if error.reason == "changed_during_walk":  # a link moved while the walk read: ask again
                 return None, _answer("stale_index", detail="a file changed while it was being read")

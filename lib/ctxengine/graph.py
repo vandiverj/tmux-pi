@@ -996,6 +996,7 @@ class Reach:
         self.config_data = {}
         self.packages = {}
         self.configs = {}
+        self.boundary_holds = None  # () -> bool: does the choice of `base` (the monorepo root, its .git and marker) still hold?
 
     @property
     def names(self):
@@ -1010,6 +1011,8 @@ class Reach:
         return h.hexdigest()
 
     def holds(self):
+        if self.boundary_holds is not None and not self.boundary_holds():
+            return False
         for rel, (real, fingerprint) in self.files.items():
             status, data, _ = read_bounded(os.path.join(self.base, rel), os.path.join(self.base, real), self.base, self.allow)
             if status != READ_OK or _fingerprint(data) != fingerprint:
@@ -1150,12 +1153,11 @@ def check_workspaces(base, folder, value, allow):
     """Raises Unproven(`unmodelled_config`) unless the `workspaces` of the `package.json` in `folder` is a form that is modelled: the
     one form this module supports is npm's list of plain folder paths (`["apps/web", "./apps/e2e"]`): non-empty strings, no glob
     character, no `..`, each a folder strictly below `folder` and inside `base`, and allowed by `allow` by its name. An empty or
-    absent value is no workspace. Anything else (an object with `packages`, a glob, a negation, a path out of `folder`, a name the
-    guard refuses, a non-list) is refused, never guessed. Nothing is looked at: members are names; the mirror's `package.json` has
+    absent key is no workspace (the caller does not call this); a key that is present must hold such a list and nothing else. Anything
+    else (null, false, 0, an empty string, an empty list, an empty object, an object with `packages`, a mixed list, a glob, a
+    negation, a path out of `folder`, a name the guard refuses) is refused, never guessed. Nothing is looked at: members are names; the mirror's `package.json` has
     no `workspaces`, so Deno is given no member, and a bare specifier that names one resolves to nothing there."""
-    if not value:
-        return
-    if not isinstance(value, list):
+    if not isinstance(value, list) or not value:
         raise Unproven("unmodelled_config")
     for item in value:
         if not isinstance(item, str) or not item.strip() or any(ch in _WORKSPACE_GLOB for ch in item) or item.startswith("/") \
@@ -1209,7 +1211,8 @@ def _check_package_json(base, directory, configs, allow):
             raise Unproven("unmodelled_config")
         if not isinstance(data, dict):
             raise Unproven("unmodelled_config")
-        check_workspaces(base, folder, data.get("workspaces"), allow)
+        if "workspaces" in data:  # present means present: null, false, 0, "" and {} are forms this module does not model
+            check_workspaces(base, folder, data["workspaces"], allow)
         kept = {key: data[key] for key in _PACKAGE_KEEP if isinstance(data.get(key), str)}
         for field in _PACKAGE_DEPENDENCIES:
             table = data.get(field)
@@ -1466,6 +1469,7 @@ class ImportIndex:
         self.meta = {"ignored": [], "config_error": ""}
         self.gaps = {}  # code -> how many times, from the last refresh (see GAPS)
         self._sink = self.gaps  # where `_gap` records: `gaps`, or the proof being made
+        self.boundary_holds = None  # () -> bool: does the choice of `base` still hold? `prove` asks (a change is `config_changed`)
         self._configs = []  # [(path, state token)]: each config and overlay as the last refresh read it (`prove` reads it again)
         self._exclude = []  # the config's `exclude`, as the last walk used it
         self._targets = {}  # absolute path -> verdict: each import target the edges were made from (`prove` judges it again)
@@ -1618,6 +1622,8 @@ class ImportIndex:
         proof, stale = {}, []
         self._sink = proof
         try:
+            if self.boundary_holds is not None and not self.boundary_holds():
+                self._gap("config_changed")
             for path, token in self._configs:
                 state = _config_state(path, self.base, self._allowed)
                 if _state_token(state) != token:

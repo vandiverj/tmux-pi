@@ -3057,7 +3057,7 @@ class PathRuleCase(Tree):
         ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
         ("nav_api.py", "NavApi._executable", "os.access"): "the same resolved candidate",
         ("nav_api.py", "NavApi._guarded_roots", "os.path.lexists"): "monorepo markers: exact names in the project's ancestors",
-        ("nav_api.py", "NavApi._boundary", "os.path.lexists"): "monorepo root and markers: exact names in the project's ancestors",
+        ("nav_api.py", "NavApi._probe_boundary", "os.lstat"): "monorepo root and markers: exact names in the project's ancestors, identity only",
         ("nav_api.py", "NavApi._grant_kinds", "os.lstat"): "a grant resolved by judged_location, not sensitive",
         ("nav_api.py", "NavApi._sandboxed", "os.access"): "the fixed SANDBOX_EXEC",
         ("nav_api.py", "NavApi._check_sandbox", "subprocess.run"): "SANDBOX_EXEC with judged grants and the probe folder",
@@ -4051,7 +4051,15 @@ class MonorepoCase(Tree):
         write(self.dir / "outside.ts", "export const OUTSIDE = 1;\n")
         return mono, project
 
+    env_patchers = ()
+
+    def undo_env(self):
+        for patcher in reversed(self.env_patchers):
+            patcher.stop()
+        self.env_patchers = []
+
     def reset(self):
+        self.undo_env()  # an edit that changed HOME is undone with the tree it belonged to
         shutil.rmtree(self.dir / "mono", ignore_errors=True)
         return self.mono()
 
@@ -4335,7 +4343,7 @@ class MonorepoCase(Tree):
         return mono, project
 
     def test_the_plain_path_list_form_is_modelled(self):
-        for workspaces in (["apps/web", "apps/e2e"], ["./apps/web/"], ["apps/web", "apps/web"], []):
+        for workspaces in (["apps/web", "apps/e2e"], ["./apps/web/"], ["apps/web", "apps/web"]):
             with self.subTest(workspaces):
                 mono, project = self.with_root_package(workspaces)
                 self.assert_ok(self.deno_nav(project))
@@ -4346,11 +4354,28 @@ class MonorepoCase(Tree):
                  "a question mark": ["apps/w?b"], "a parent": ["../other"], "a parent in the middle": ["apps/web/../x"],
                  "an absolute path": ["/etc"], "a number": [1], "null in the list": [None], "a string": "apps/web", "a number alone": 5,
                  "the root itself": ["."], "blank": ["  "], "a backslash": ["apps\\web"], "a guard-refused name": ["apps/.env-app"],
-                 "a nested list": [["apps/web"]], "true": True, "an empty object": {"x": 1}}
+                 "a nested list": [["apps/web"]], "true": True, "an empty object": {"x": 1},
+                 "null": None, "false": False, "zero": 0, "an empty string": "", "an empty list": [], "an empty dict": {},
+                 "a mixed list": ["apps/web", 1], "a list with an empty string": ["apps/web", ""], "a list with a dict": ["apps/web", {}]}
         for label, workspaces in forms.items():
             with self.subTest(label):
                 mono, project = self.with_root_package(workspaces)
                 self.assert_refused(self.deno_nav(project), "unmodelled_config", label=label)
+
+    def test_a_workspaces_key_that_is_present_is_never_read_as_absent(self):
+        """Review 1 F1: `null`, `false`, `0`, `""`, `[]` and `{}` are falsy but present; each is refused in the root, in a folder
+        between and in the project folder, from the Deno route and from `check_workspaces` itself; an absent key is no workspace."""
+        for folder in ("", "apps", "apps/api"):
+            for label, value in (("null", None), ("false", False), ("zero", 0), ("empty string", ""), ("empty list", []), ("empty dict", {})):
+                with self.subTest(f"{folder}:{label}"):
+                    mono, project = self.reset()
+                    write(mono / folder / "package.json", json.dumps({"name": "x", "workspaces": value}))
+                    self.assert_refused(self.deno_nav(project), "unmodelled_config", label=label)
+                    with self.assertRaises(graph.Unproven):
+                        graph.check_workspaces(str(mono), str(mono / folder), value, lambda rel: True)
+            mono, project = self.reset()
+            write(mono / folder / "package.json", json.dumps({"name": "x"}))
+            self.assert_ok(self.deno_nav(project), label=f"absent in {folder!r}")
 
     def test_a_workspaces_in_a_package_json_between_the_project_and_the_root_follows_the_same_rule(self):
         mono, project = self.mono()
@@ -4539,6 +4564,185 @@ class MonorepoCase(Tree):
             for call in (nav.importers, nav.imports):
                 with self.subTest(path, call=call.__name__):
                     self.assertEqual(call(path)["status"], status, call(path))
+
+    # --- review 1 F2: the boundary decision is an input of every answer
+
+    def boundary_edits(self):
+        """Every input of the boundary decision (the monorepo `.git`, each marker, a nearer `.git`, the home folder) x a state
+        (removed, replaced by a folder or a link, changed, added). Each is a function (mono, project) that changes the tree."""
+        def replace(path, make):
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif os.path.lexists(path):
+                path.unlink()
+            make(path)
+
+        def home(mono, project):
+            patcher = mock.patch.dict(os.environ, {"HOME": str(mono)})
+            patcher.start()
+            if not self.env_patchers:
+                self.addCleanup(self.undo_env)
+            self.env_patchers = [*self.env_patchers, patcher]
+        return {
+            ".git removed": lambda mono, project: shutil.rmtree(mono / ".git"),
+            ".git replaced by a file": lambda mono, project: replace(mono / ".git", lambda p: write(p, "gitdir: /elsewhere\n")),
+            ".git replaced by a link": lambda mono, project: replace(mono / ".git", lambda p: p.symlink_to(self.dir / "outside.ts")),
+            "nx.json removed": lambda mono, project: (mono / "nx.json").unlink(),
+            "nx.json replaced by a folder": lambda mono, project: replace(mono / "nx.json", lambda p: p.mkdir()),
+            "nx.json replaced by a link": lambda mono, project: replace(mono / "nx.json", lambda p: p.symlink_to(self.dir / "outside.ts")),
+            "nx.json changed": lambda mono, project: write(mono / "nx.json", '{"changed": "yes, and longer"}'),
+            "another marker added": lambda mono, project: write(mono / "turbo.json", "{}"),
+            "a nearer .git between": lambda mono, project: write(mono / "apps" / ".git" / "HEAD", "x"),
+            "a .git in the project": lambda mono, project: write(project / ".git" / "HEAD", "x"),
+            "the home folder becomes the root": home,
+        }
+
+    def not_a_monorepo_edits(self):
+        """The same, for a project that was not in a monorepo when the instance was made (its boundary is the project)."""
+        return {
+            "the marker appears": lambda mono, project: write(mono / "nx.json", "{}"),
+            "the .git appears": lambda mono, project: write(mono / ".git" / "HEAD", "x"),
+            "the .git appears as a file": lambda mono, project: write(mono / ".git", "gitdir: /elsewhere\n"),
+        }
+
+    def no_data(self, answer, label):
+        if "home folder" in label and answer.get("reason") == "sandbox_grant_overlap":
+            pass  # Deno's cache sits under the new HOME, inside the new "root": the grants refuse it first; still no data
+        else:
+            self.assertEqual(answer["status"], "stale_index", (label, answer))
+        for key in DATA_KEYS + ("modules", "symbols"):
+            self.assertNotIn(key, answer, (label, answer))
+
+    index_calls = (lambda n: n.importers("../../lib/shared/util.ts"), lambda n: n.imports("src/uses_lib.ts", source="index"))
+    deno_calls_ = (lambda n: n.symbols("src/uses_lib.ts"), lambda n: n.forward_graph("src/uses_lib.ts"))
+
+    def during(self, nav, hook, edit):
+        """Runs `edit()` once, at `hook`: after the index refresh, inside the Deno run, or after the output screen (so after
+        everything but the last proof)."""
+        done = []
+
+        def once(real):
+            def wrapper(*a, **k):
+                out = real(*a, **k)
+                if not done:
+                    done.append(1)
+                    edit()
+                return out
+            return wrapper
+        if hook == "refresh":
+            index = nav._get_index()
+            index.refresh = once(index.refresh)
+        elif hook == "deno":
+            nav._run_deno = once(nav._run_deno)
+        else:
+            nav._out = once(nav._out)
+
+    def test_a_change_to_the_boundary_decision_during_a_call_withholds_the_answer(self):
+        """Sweep: input x state x route (index: after the refresh, after the screen; Deno: inside the run, after the screen)."""
+        routes = [("index", "refresh", self.index_calls), ("index", "screen", self.index_calls),
+                  ("deno", "deno", self.deno_calls_), ("deno", "screen", self.deno_calls_)]
+        for label, edit in self.boundary_edits().items():
+            for kind, hook, calls in routes:
+                for number, call in enumerate(calls):
+                    with self.subTest(label, route=kind, hook=hook, call=number):
+                        mono, project = self.reset()
+                        nav = self.deno_nav(project)
+                        self.during(nav, hook, lambda: edit(mono, project))
+                        self.no_data(call(nav), label)
+
+    def test_a_change_to_the_boundary_decision_between_calls_withholds_the_answer(self):
+        """Warm instance (index kept, Deno answer cached) and an instance made before the change that loads the cache."""
+        for label, edit in self.boundary_edits().items():
+            with self.subTest(label):
+                mono, project = self.reset()
+                cache = str(self.dir / "cache")
+                doc = self.doc_payload(MIRROR, "src/uses_lib.ts", "W", "w", line=3)
+
+                def make():
+                    return self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload()), cache_dir=cache)
+                warm, cold = make(), make()
+                for call in (*self.index_calls, *self.deno_calls_):
+                    self.assertEqual(call(warm)["status"], "ok")
+                edit(mono, project)
+                for number, call in enumerate((*self.index_calls, *self.deno_calls_)):
+                    self.no_data(call(warm), f"{label} warm {number}")
+                    self.no_data(call(cold), f"{label} cache-loaded {number}")
+
+    def test_a_project_that_became_part_of_a_monorepo_during_a_call_withholds_the_answer(self):
+        for label, edit in self.not_a_monorepo_edits().items():
+            for kind, hook, calls in (("index", "refresh", self.index_calls), ("index", "screen", self.index_calls),
+                                      ("deno", "deno", self.deno_calls_), ("deno", "screen", self.deno_calls_)):
+                for number, call in enumerate(calls):
+                    with self.subTest(label, route=kind, hook=hook, call=number):
+                        mono, project = self.reset()
+                        keep = ".git" if "marker" in label else "nx.json"  # the one input already there; the edit adds the other
+                        gone = mono / ("nx.json" if keep == ".git" else ".git")
+                        shutil.rmtree(gone) if gone.is_dir() else gone.unlink()
+                        nav = self.deno_nav(project)
+                        self.assertEqual(nav.boundary, str(project))
+                        self.during(nav, hook, lambda: edit(mono, project))
+                        answer = call(nav)
+                        self.assertNotEqual(answer["status"], "ok", (label, answer))
+                        for key in DATA_KEYS + ("modules", "symbols"):
+                            self.assertNotIn(key, answer, (label, answer))
+
+    def test_reach_and_the_index_hold_only_while_the_boundary_decision_holds(self):
+        for label, edit in self.boundary_edits().items():
+            with self.subTest(label):
+                mono, project = self.reset()
+                nav = self.deno_nav(project)
+                reach, refusal = nav._prove("src/uses_lib.ts")
+                self.assertIsNone(refusal)
+                nav._fresh()
+                self.assertTrue(reach.holds())
+                self.assertEqual(nav._get_index().prove(), {})
+                edit(mono, project)
+                self.assertFalse(reach.holds())
+                self.assertNotEqual(nav._get_index().prove(), {})
+
+    def test_an_unchanged_boundary_decision_is_not_a_change(self):
+        mono, project = self.mono()
+        nav = self.deno_nav(project)
+        for _ in range(3):
+            self.assertEqual(nav.importers("../../lib/shared/util.ts")["status"], "ok")
+            self.assertEqual(nav.symbols("src/uses_lib.ts")["status"], "ok")
+        write(mono / "lib" / "other.ts", "export const O = 1;\n")  # not an input of the decision
+        self.assertTrue(nav._boundary_holds())
+
+    def test_reach_holds_follows_the_package_json_chain_in_every_state(self):
+        """Sweep pass 2: each package.json Deno looks at (root, between, project), present or absent when proved, then removed,
+        replaced by a folder or a link, made unreadable, or made a different file."""
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+
+        def unreadable(f):
+            write(f, "{}")
+            os.chmod(f, 0)
+        edits = {"removed": lambda f: f.unlink(), "a folder": lambda f: (f.unlink(), f.mkdir()),
+                 "a link": lambda f: (f.unlink(), f.symlink_to(self.dir / "outside.ts")),
+                 "unreadable": lambda f: (f.unlink(), unreadable(f)),
+                 "another file": lambda f: write(f, '{"name": "another, longer"}')}
+        for folder in ("", "apps", "apps/api"):
+            for present in (True, False):
+                for label, edit in edits.items():
+                    if not present and label in ("removed", "another file"):
+                        continue
+                    with self.subTest(folder, present=present, state=label):
+                        mono, project = self.reset()
+                        target = mono / folder / "package.json"
+                        if present:
+                            write(target, '{"name": "x"}')
+                        elif target.exists():
+                            target.unlink()
+                        reach = graph.prove_reach(str(mono), str(project / "src" / "uses_lib.ts"), str(project / "deno.json"),
+                                                  lambda rel: True)
+                        reach.boundary_holds = None
+                        self.assertTrue(reach.holds())
+                        if not present:
+                            write(target, '{"name": "x"}')
+                        edit(target)
+                        self.addCleanup(lambda t=target: os.path.lexists(t) and t.is_file() and not t.is_symlink() and os.chmod(t, 0o644))
+                        self.assertFalse(reach.holds())
 
     # --- documentation
 

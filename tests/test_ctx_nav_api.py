@@ -4,6 +4,7 @@ Every project here is a copy of tests/fixtures/ctx_api/project or a small tree b
 Deno skip when it is not on PATH; none of them touches the network (the fixture imports nothing but local files and `node:path`),
 and the fake `deno` programs used for the timeout, failure and environment cases are shell scripts written into the temporary
 directory."""
+import errno
 import hashlib
 import json
 import os
@@ -55,6 +56,20 @@ def write(path, text=""):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return path
+
+
+def seal(name, value):
+    """The text of the cache entry `name` holding `value`: the envelope `graph.CacheDir` writes (format, name, checksum, payload)."""
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True)
+    return json.dumps({"format": graph.ENVELOPE_FORMAT, "name": name, "sha256": hashlib.sha256(payload.encode()).hexdigest(),
+                       "payload": value})
+
+
+def payload_of(path):
+    """The payload of the cache entry file at `path` (what `seal` wraps); the envelope itself is checked."""
+    envelope = json.loads(Path(path).read_text())
+    assert envelope["format"] == graph.ENVELOPE_FORMAT and envelope["name"] == Path(path).name, envelope
+    return envelope["payload"]
 
 
 class Tree(unittest.TestCase):
@@ -3046,6 +3061,9 @@ class PathRuleCase(Tree):
         ("graph.py", "write_new", "os.write"): "the new file",
         ("graph.py", "open_folder_below", "os.open"): "base NOFOLLOW_ANY, then each part O_NOFOLLOW relative to the one before",
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
+        ("graph.py", "CacheDir.touch", "os.lstat"): "dir_fd of the opened folder (no folder made); a plain .json name read_json judged; never follows a link",
+        ("graph.py", "CacheDir.touch", "os.utime"): "dir_fd of that folder, follow_symlinks=False: the name itself, never what a link leads to",
+        ("graph.py", "CacheDir.read_json", "self.touch"): "after read_bounded passed and the envelope held",
         ("graph.py", "CacheDir.put_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name prepare_json judged (asks no guard)",
         ("graph.py", "CacheDir.put_json", "os.rename"): "dir_fd of the checked folder; names prepare_json judged",
         ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
@@ -3913,10 +3931,10 @@ class AnswerProofCase(Tree):
             elif what == "target":
                 path.write_text('{"changed": true, "longer": 1}\n')
             elif path.exists():  # the cache: one written from another state of the tree (its keys match nothing)
-                data = json.loads(path.read_text())
+                data = payload_of(path)
                 for entry in data["entries"].values():
                     entry["key"], entry["specs"] = [1, 1], []
-                path.write_text(json.dumps(data))
+                path.write_text(seal(path.name, data))
             return contextlib.nullcontext()
         if not path.exists() and not path.is_symlink():
             return contextlib.nullcontext()
@@ -5587,7 +5605,7 @@ class InfoCacheCase(Tree):
 
     def overwrite_entry(self, project, value):
         (entry,) = self.entries(project)
-        entry.write_text(value if isinstance(value, str) else json.dumps(value))
+        entry.write_text(value if isinstance(value, str) else seal(entry.name, value))
 
     def test_s3_a_planted_entry_names_only_what_the_walk_proved(self):
         project, miss = self.filled()
@@ -5695,7 +5713,8 @@ class InfoCacheCase(Tree):
         (entry,) = self.entries(project)
         self.assertRegex(entry.name, r"^nav_api-info-[0-9a-f]{40}\.json$")
         self.assertEqual([p.name for p in entry.parent.iterdir() if p.name.endswith(".tmp")], [])
-        self.assertEqual(sorted(json.loads(entry.read_text())), ["external", "format", "modules"])
+        self.assertEqual(sorted(json.loads(entry.read_text())), ["format", "name", "payload", "sha256"])
+        self.assertEqual(sorted(payload_of(entry)), ["external", "format", "modules"])
 
     def test_s3_the_module_text_says_every_name_but_the_skipped_ones_is_asked_of_the_guard(self):
         text = " ".join(nav_api.__doc__.split())
@@ -6022,7 +6041,7 @@ class InfoCacheCase(Tree):
                 else:
                     with self.assertRaises(KeyboardInterrupt):
                         nav._cache.write_json("nav_api-info-f4.json", {"v": 2})
-            self.assertEqual(json.loads((folder / "nav_api-info-f4.json").read_text()), {"v": 1})
+            self.assertEqual(payload_of(folder / "nav_api-info-f4.json"), {"v": 1})
             self.assertEqual(planted.read_text(), "x")
             self.assertTrue(all(p.name in ("nav_api-info-f4.json", planted.name) or p.name.endswith(".tmp") for p in folder.iterdir()))
 
@@ -6054,7 +6073,7 @@ class InfoCacheCase(Tree):
         token = nav._cache.prepare_json(name)  # judged first: the guard's own folder lookups close descriptors too, and fail closed
         with self._failing_folder_close(folder, only_folder=True):
             self.assertTrue(nav._cache.put_json(token, {"v": 2}))
-        self.assertEqual(json.loads((folder / name).read_text()), {"v": 2})
+        self.assertEqual(payload_of(folder / name), {"v": 2})
 
     def test_s3_f4_a_close_failure_of_a_folder_above_the_cache_folder_is_before_the_commit_so_the_entry_is_kept_and_false(self):
         """The folders above the cache folder are closed on the way down, before the rename: that failure fails the write (the rename
@@ -6068,7 +6087,7 @@ class InfoCacheCase(Tree):
         with self._failing_folder_close(folder), mock.patch.object(graph.os, "rename", wraps=os.rename) as rename:
             self.assertFalse(nav._cache.put_json(token, {"v": 2}))
         rename.assert_not_called()  # the failure came before the rename was tried
-        self.assertEqual(json.loads((folder / name).read_text()), {"v": 1})
+        self.assertEqual(payload_of(folder / name), {"v": 1})
         token = nav._cache.prepare_json("nav_api-doc-f4.json")
         with self._failing_folder_close(folder):
             self.assertFalse(nav._cache.put_json(token, {"v": 3}))
@@ -6106,7 +6125,7 @@ class InfoCacheCase(Tree):
         token = nav._cache.prepare_json(name)
         with self._failing_folder_close(folder), mock.patch.object(graph.os, "rename", side_effect=OSError(5, "io")):
             self.assertFalse(nav._cache.put_json(token, {"v": 2}))  # the close failure does not hide or replace the result
-        self.assertEqual(json.loads((folder / name).read_text()), {"v": 1})
+        self.assertEqual(payload_of(folder / name), {"v": 1})
 
     def test_s3_f4_a_value_that_cannot_be_serialised_makes_nothing(self):
         project = self.project()
@@ -6123,7 +6142,7 @@ class InfoCacheCase(Tree):
         del asked[:]
         self.assertTrue(nav._cache.put_json(token, {"a": 1}))
         self.assertEqual(asked, [])
-        self.assertEqual(json.loads((project_cache(project).parent / "nav_api-info-zz.json").read_text()), {"a": 1})
+        self.assertEqual(payload_of(project_cache(project).parent / "nav_api-info-zz.json"), {"a": 1})
         self.assertFalse(nav._cache.put_json(None, {}))
         self.assertIsNone(nav._cache.prepare_json("../x.json"))
         self.assertIsNone(nav._cache.prepare_json("x.txt"))
@@ -6248,6 +6267,376 @@ class InfoCacheCase(Tree):
                     self.assertNotIn("modules" if kind == "info" else "symbols", answer, label)
                     if route == "miss":
                         self.assertEqual(self.entries(project) + self.doc_entries(project), [], label)
+
+
+class EnvelopeCase(Tree):
+    """Cache plan S4: the envelope (format, name, checksum) around every cache entry, touch-on-hit, the stale index, and the index save.
+    The sweep table of the report maps each site and state to a test here."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    INFO = InfoCacheCase.INFO
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+    blocked = IncompleteIndexCase.blocked
+    assert_whole_again = IncompleteIndexCase.assert_whole_again
+    both = IncompleteIndexCase.both
+    LONG_AGO = 946_684_800  # 2000-01-01
+
+    def deno(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(info=self.INFO, doc=self.doc_payload(MIRROR, "src/main.ts", "main", "d", line=1)), **kw)
+
+    @staticmethod
+    def folder(project):
+        return project_cache(project).parent
+
+    def entry(self, project, kind):
+        found = sorted(self.folder(project).glob(f"nav_api-{kind}-*.json")) if self.folder(project).exists() else []
+        self.assertEqual(len(found), 1, (kind, found))
+        return found[0]
+
+    def ask(self, project, kind):
+        """(answer, how many times the expensive step ran) of a NEW instance on `project`."""
+        if kind == "index":
+            answer = self.nav(project).importers("src/app/run.ts")
+            return answer, answer["scanned"]
+        nav = self.deno(project)
+        answer = nav.forward_graph("src/main.ts") if kind == "info" else nav.symbols("src/main.ts")
+        return answer, len(self.deno_calls("info" if kind == "info" else "doc"))
+
+    def filled(self, kind, name="proj"):
+        project = self.project(name)
+        base, ran = self.ask(project, kind)
+        self.assertEqual(base["status"], "ok", base)
+        self.assertGreater(ran, 0)
+        entry = self.entry(project, kind)
+        again, ran_again = self.ask(project, kind)
+        self.assertEqual(self.stable(again), self.stable(base))
+        self.assertEqual(ran_again, ran if kind != "index" else 0, "the control is a hit")
+        return project, entry, base, ran
+
+    @staticmethod
+    def stable(answer):
+        return {k: v for k, v in answer.items() if k not in ("index_age_s", "scanned", "cached")}
+
+    @staticmethod
+    def damaged(entry, state):
+        raw = entry.read_bytes()
+        env = json.loads(raw)
+        if state == "truncated":
+            entry.write_bytes(raw[: len(raw) // 2])
+        elif state == "empty":
+            entry.write_bytes(b"")
+        elif state == "wrong_checksum":
+            env["sha256"] = "0" * 64
+            entry.write_text(json.dumps(env))
+        elif state == "payload_edited":  # the payload moved, the checksum did not
+            env["payload"] = [] if isinstance(env["payload"], list) else {**env["payload"], "extra": 1}
+            entry.write_text(json.dumps(env))
+        elif state == "wrong_version":
+            env["format"] = graph.ENVELOPE_FORMAT + 1
+            entry.write_text(json.dumps(env))
+        elif state == "version_true":  # True == 1 in Python
+            env["format"] = True
+            entry.write_text(json.dumps(env))
+        elif state == "version_missing":
+            del env["format"]
+            entry.write_text(json.dumps(env))
+        elif state == "other_name":  # a good entry copied to another key
+            env["name"] = "nav_api-doc-elsewhere.json"
+            entry.write_text(json.dumps(env))
+        elif state == "extra_key":
+            env["note"] = "x"
+            entry.write_text(json.dumps(env))
+        elif state == "bare_payload":  # the format before the envelope
+            entry.write_text(json.dumps(env["payload"]))
+        elif state == "not_utf8":
+            entry.write_bytes(b"\xff\xfe\x00" + raw)
+        elif state == "too_deep":
+            entry.write_text("[" * 100_000 + "]" * 100_000)
+        elif state == "not_an_object":
+            entry.write_text("[1,2,3]")
+        else:
+            raise AssertionError(state)
+
+    STATES = ("truncated", "empty", "wrong_checksum", "payload_edited", "wrong_version", "version_true", "version_missing",
+              "other_name", "extra_key", "bare_payload", "not_utf8", "too_deep", "not_an_object")
+
+    def test_s4_a_damaged_entry_is_a_miss_for_every_kind_and_state_never_an_error_or_a_hit(self):
+        for kind in ("info", "doc", "index"):
+            for state in self.STATES:
+                with self.subTest(kind=kind, state=state):
+                    project, entry, base, ran = self.filled(kind, f"{kind}-{state}")
+                    self.damaged(entry, state)
+                    answer, ran_now = self.ask(project, kind)
+                    self.assertEqual(answer["status"], "ok", answer)
+                    self.assertGreater(ran_now, ran if kind != "index" else 0, "a damaged entry was a hit")
+                    self.assertEqual(self.stable(answer), self.stable(base))
+                    self.assertEqual(payload_of(self.entry(project, kind)) is not None, True, "the miss wrote a whole entry again")
+                    self.assertEqual([p.name for p in self.folder(project).glob("*.tmp")], [])
+
+    def test_s4_a_good_entry_is_a_hit_for_every_kind(self):
+        for kind in ("info", "doc", "index"):
+            with self.subTest(kind=kind):
+                self.filled(kind, kind)
+
+    def test_s4_what_a_writer_writes_is_the_envelope(self):
+        for kind in ("info", "doc", "index"):
+            project, entry, _, _ = self.filled(kind, kind)
+            env = json.loads(entry.read_text())
+            self.assertEqual(sorted(env), ["format", "name", "payload", "sha256"], kind)
+            self.assertEqual((env["format"], env["name"]), (graph.ENVELOPE_FORMAT, entry.name), kind)
+            self.assertEqual(json.loads(seal(entry.name, env["payload"])), env, kind)
+
+    def test_s4_a_link_at_the_name_is_a_miss_the_target_is_not_read_touched_or_replaced(self):
+        for kind in ("info", "doc", "index"):
+            with self.subTest(kind=kind):
+                project, entry, base, ran = self.filled(kind, kind)
+                decoy = self.dir / f"decoy-{kind}.json"
+                decoy.write_bytes(entry.read_bytes())
+                os.utime(decoy, (self.LONG_AGO, self.LONG_AGO))
+                entry.unlink()
+                entry.symlink_to(decoy)
+                answer, ran_now = self.ask(project, kind)
+                self.assertEqual(answer["status"], "ok", answer)
+                self.assertGreater(ran_now, ran if kind != "index" else 0, "a link was a hit")
+                self.assertTrue(entry.is_symlink(), "the link was replaced")
+                self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO, "the target was touched")
+
+    @unittest.skipIf(os.geteuid() == 0, "mode 000 does not stop root")
+    def test_s4_an_unreadable_entry_is_a_miss_and_is_written_over(self):
+        for kind in ("info", "doc", "index"):
+            with self.subTest(kind=kind):
+                project, entry, base, ran = self.filled(kind, kind)
+                entry.chmod(0)
+                self.addCleanup(lambda e=entry: e.exists() and e.chmod(0o644))
+                answer, ran_now = self.ask(project, kind)
+                self.assertEqual(answer["status"], "ok", answer)
+                self.assertGreater(ran_now, ran if kind != "index" else 0)
+
+    def test_s4_the_bytes_that_were_read_are_the_ones_verified(self):
+        """Changed between the read and the verify: the verdict is on the bytes read, not on a second look at the file."""
+        project, entry, _, _ = self.filled("doc")
+        cache = self.deno(project)._cache
+        good = entry.read_bytes()
+        real = graph.read_bounded
+
+        def swapped(*a, **k):
+            got = real(*a, **k)
+            entry.write_bytes(good[: len(good) // 2])  # a truncated file arrives after the read
+            return got
+        with mock.patch.object(graph, "read_bounded", swapped):
+            self.assertIsInstance(cache.read_json(entry.name), list)  # the whole read verified
+        entry.write_bytes(good)
+
+        def torn(*a, **k):
+            status, data, opened = real(*a, **k)
+            return status, data[: len(data) // 2], opened  # the bytes read are the torn ones
+        with mock.patch.object(graph, "read_bounded", torn):
+            self.assertIsNone(cache.read_json(entry.name))
+
+    # --- touch
+
+    def test_s4_a_hit_touches_the_entry_and_a_miss_does_not(self):
+        for kind in ("info", "doc", "index"):
+            with self.subTest(kind=kind):
+                project, entry, base, ran = self.filled(kind, kind)
+                os.utime(entry, (self.LONG_AGO, self.LONG_AGO))
+                self.ask(project, kind)
+                self.assertGreater(entry.stat().st_mtime, self.LONG_AGO + 86400 * 365, "a hit did not touch")
+                self.damaged(entry, "wrong_checksum")
+                os.utime(entry, (self.LONG_AGO, self.LONG_AGO))
+                before = entry.read_bytes()
+                cache = self.nav(project)._cache
+                self.assertIsNone(cache.read_json(entry.name))
+                self.assertEqual((entry.stat().st_mtime, entry.read_bytes()), (self.LONG_AGO, before), "a miss touched the entry")
+
+    def test_s4_touch_never_follows_a_link(self):
+        project, entry, _, _ = self.filled("info")
+        cache = self.nav(project)._cache
+        decoy = self.dir / "decoy.json"
+        decoy.write_text("{}")
+        os.utime(decoy, (self.LONG_AGO, self.LONG_AGO))
+        entry.unlink()
+        entry.symlink_to(decoy)
+        self.assertFalse(cache.touch(entry.name))
+        self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO)
+        # a link swapped in after the read: the read verified a whole entry, the touch finds a link
+        entry.unlink()
+        good = self.dir / "good.json"
+        project2, entry2, _, _ = self.filled("info", "second")
+        good.write_bytes(entry2.read_bytes())
+        entry2.write_bytes(good.read_bytes())
+        cache2 = self.nav(project2)._cache
+        real = graph.read_bounded
+
+        def swap_after(*a, **k):
+            got = real(*a, **k)
+            entry2.unlink()
+            entry2.symlink_to(decoy)
+            return got
+        with mock.patch.object(graph, "read_bounded", swap_after):
+            self.assertIsInstance(cache2.read_json(entry2.name), dict)
+        self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO, "a link swapped in after the read was followed")
+        # and if the look at the name were fooled, the time is still set on the name itself, never on what it leads to
+        real_lstat = os.lstat
+        with mock.patch.object(graph.os, "lstat", lambda name, *a, **k: real_lstat(good) if name == entry2.name else real_lstat(name, *a, **k)):
+            cache2.touch(entry2.name)
+        self.assertEqual(decoy.stat().st_mtime, self.LONG_AGO, "utime followed the link")
+
+    def test_s4_touch_makes_nothing_and_a_missing_entry_or_folder_is_false(self):
+        project = self.project()
+        cache = self.nav(project)._cache
+        self.assertFalse(cache.touch("nav_api-info-nothing.json"))
+        self.assertFalse(self.folder(project).exists(), "touch made the cache folder")
+        self.assertFalse(cache.touch("../x.json"))
+        self.assertFalse(cache.touch("nav_api-info-x.txt"))
+        self.assertFalse(cache.touch(None))
+        refused = self.nav(project, cache_dir=str(self.dir / "outside-cache"))._cache
+        self.assertTrue(refused.refusal)
+        self.assertFalse(refused.touch("nav_api-info-x.json"))
+
+    def test_s4_a_touch_that_fails_never_changes_the_answer(self):
+        for n, failure in enumerate((OSError(5, "io"), PermissionError(13, "denied"), NotImplementedError("no utime"), RuntimeError("odd"))):
+            for kind in ("info", "doc", "index"):
+                with self.subTest(kind=kind, failure=type(failure).__name__):
+                    project, entry, base, ran = self.filled(kind, f"{kind}-{n}")
+                    with mock.patch.object(graph.os, "utime", side_effect=failure):
+                        answer, ran_now = self.ask(project, kind)
+                    self.assertEqual(answer["status"], "ok", answer)
+                    self.assertEqual(ran_now, ran if kind != "index" else 0, "a failed touch cost the hit")
+        project, entry, _, _ = self.filled("info", "folder")
+        cache = self.nav(project)._cache
+        for failure in (OSError(5, "io"), FileNotFoundError(2, "folder gone")):  # the touch cannot open the folder
+            with mock.patch.object(graph, "open_folder_below", side_effect=failure):
+                self.assertIsInstance(cache.read_json(entry.name), dict, "a touch that cannot open the folder cost the hit")
+
+    def test_s4_a_write_that_fails_before_or_after_the_commit_point_leaves_a_whole_entry_or_the_old_one(self):
+        project, entry, _, _ = self.filled("info")
+        cache = self.nav(project)._cache
+        before = entry.read_bytes()
+        with mock.patch.object(graph.os, "rename", side_effect=OSError(5, "io")):
+            self.assertFalse(cache.write_json(entry.name, {"v": 2}))
+        self.assertEqual(entry.read_bytes(), before)
+        with mock.patch.object(graph.json, "dumps", side_effect=RecursionError("too deep")):
+            self.assertFalse(cache.write_json(entry.name, {"v": 2}), "a payload too deep to serialise")
+        self.assertEqual(entry.read_bytes(), before)
+        with mock.patch.object(graph.json, "loads", side_effect=RecursionError("too deep")):
+            self.assertIsNone(cache.read_json(entry.name), "an entry too deep to read is a miss, not an error")
+        # a folder close after the rename cannot raise or change the result: InfoCacheCase.test_s3_f4_a_folder_descriptor_close_failure_after_the_rename_is_still_a_written_entry
+        self.assertTrue(cache.write_json(entry.name, {"v": 3}))
+        self.assertEqual(payload_of(entry), {"v": 3})
+        self.assertEqual(cache.read_json(entry.name), {"v": 3})
+
+    # --- the stale index
+
+    def listing_raising(self, name, error):
+        """An `os.scandir` whose entry `name` fails its type question with `error`."""
+        real = os.scandir
+
+        class Entry:
+            def __init__(self, entry):
+                self.entry, self.name = entry, entry.name
+
+            def is_dir(self, follow_symlinks=True):
+                if self.name == name:
+                    raise error
+                return self.entry.is_dir(follow_symlinks=follow_symlinks)
+
+        class Listing:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+
+            def __iter__(self):
+                return (Entry(entry) for entry in self.inner)
+        return mock.patch.object(graph.os, "scandir", lambda *a, **k: Listing(real(*a, **k)))
+
+    def test_s4_an_entry_that_vanishes_or_moves_between_the_listing_and_its_type_check_is_a_stale_index(self):
+        for error in (FileNotFoundError(2, "gone"), NotADirectoryError(20, "moved"), OSError(errno.ELOOP, "link on the way")):
+            with self.subTest(error=type(error).__name__):
+                project = self.project(f"p{id(error)}").resolve()
+                write(project / "src" / "notes.txt", "hello\n")
+                nav = self.nav(project)
+                with self.listing_raising("notes.txt", error):
+                    self.blocked(nav.importers("src/util/slug.ts"), "stale_index", None, "entry_changed")
+                self.assert_whole_again(nav)
+
+    def test_s4_other_errors_at_the_type_check_stay_index_incomplete(self):
+        for error in (PermissionError(13, "denied"), OSError(5, "io error"), OSError(24, "too many open files")):
+            with self.subTest(error=type(error).__name__):
+                project = self.project(f"p{id(error)}").resolve()
+                write(project / "src" / "notes.txt", "hello\n")
+                nav = self.nav(project)
+                with self.listing_raising("notes.txt", error):
+                    self.blocked(nav.importers("src/app/run.ts"), "error", "index_incomplete", "entry_unreadable")
+                self.assert_whole_again(nav)
+
+    def test_s4_a_type_check_that_fails_is_stale_on_every_index_route(self):
+        project = self.project().resolve()
+        write(project / "src" / "notes.txt", "hello\n")
+        with self.listing_raising("notes.txt", FileNotFoundError(2, "gone")):
+            nav = self.nav(project)
+            self.blocked(nav.importers("src/util/slug.ts"), "stale_index", None, "entry_changed")
+            answer = nav.imports("src/main.ts", source="index")
+            self.assertEqual(answer["status"], "stale_index", answer)
+            self.assertNotIn("files", answer)
+
+    def test_s4_the_lstat_after_the_type_check_maps_the_same_errors(self):
+        for error, expected in ((NotADirectoryError(20, "moved"), ("stale_index", None, "entry_changed")),
+                                (OSError(errno.ELOOP, "loop"), ("stale_index", None, "entry_changed")),
+                                (OSError(5, "io"), ("error", "index_incomplete", "entry_unreadable"))):
+            with self.subTest(error=type(error).__name__):
+                project = self.project(f"p{id(error)}").resolve()
+                nav = self.nav(project)
+                real = os.lstat
+                seen = []
+
+                def failing(path, *a, error=error, seen=seen, **k):
+                    if k.get("dir_fd") is not None and path == "slug.ts":
+                        seen.append(1)
+                        if len(seen) == 2:  # the first look is the guard's, the second the walk's
+                            raise error
+                    return real(path, *a, **k)
+                with mock.patch.object(os, "lstat", failing):
+                    self.blocked(nav.importers("src/app/run.ts"), *expected)
+                self.assert_whole_again(nav)
+
+    # --- the index save
+
+    def test_s4_an_index_saved_before_a_proof_that_rejects_it_never_gives_a_wrong_answer(self):
+        """`refresh()` saves the entries it read before the answer-time proof. Each entry is `[mtime_ns, size]` and the specs of a file
+        read with exactly that open signature, so it says "this file, as keyed, imports these" and nothing about the tree. A proof
+        that then rejects the answer (a file moved after the snapshot) gives `stale_index` and the saved entries are still true of
+        the files they were keyed from; the next instance trusts one only when the file still has its key, so the saved file can
+        never make an answer for a tree it does not describe."""
+        project = self.project().resolve()
+        moved = []
+        target = project / "src" / "util" / "slug.ts"
+        original = target.read_text()
+
+        def check(root, path):
+            if path.endswith("src/app/run.ts") and not moved:  # after the snapshot's walk, before the final proof
+                moved.append(1)
+                write(project / "src" / "late.ts", "import './util/slug.ts';\n")
+                target.write_text(original + "import '../app/run.ts';\n")
+            return nav_api.stub_check_path(root, path)
+        first = self.nav(project, check_path=check).importers("src/util/slug.ts")
+        self.assertEqual(first["status"], "stale_index", first)
+        self.assertNotIn("importers", first)
+        self.assertEqual(len(list(self.folder(project).glob("nav_api-index-*.json"))), 1, "the index was saved before the proof")
+        again = self.nav(project).importers("src/util/slug.ts")
+        expected = self.nav(project, cache_dir=str(project / "alt-cache")).importers("src/util/slug.ts")  # no cache at all, on the tree as it is now
+        self.assertEqual(again["status"], "ok", again)
+        self.assertEqual([(i["path"], i["line"]) for i in again["importers"]], [(i["path"], i["line"]) for i in expected["importers"]])
+        self.assertIn("src/late.ts", [i["path"] for i in again["importers"]])
+        run = [(i["path"], i["line"]) for i in self.nav(project).importers("src/app/run.ts")["importers"]]
+        self.assertIn("src/util/slug.ts", [path for path, _ in run], "the edit the rejected answer missed is seen by the next one")
 
 
 if __name__ == "__main__":

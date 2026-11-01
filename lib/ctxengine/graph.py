@@ -703,18 +703,20 @@ def close_quietly(fd):
         pass
 
 
-def open_folder_below(base, parts):
-    """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing: `base` is opened with no link on the
+def open_folder_below(base, parts, make=True):
+    """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing (with `make` False none is made: a
+    missing one raises FileNotFoundError): `base` is opened with no link on the
     way (`NOFOLLOW_ANY`) and each part is made with `mkdir` and opened with `O_NOFOLLOW` relative to the one before, so no link is
     followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR, or the close of a folder
     on the way failing: this runs before a write's commit point, so that failure fails the open; the descriptor is released once)."""
     fd = os.open(base, DIR_FLAGS | NOFOLLOW_ANY)
     try:
         for part in parts:
-            try:
-                os.mkdir(part, 0o700, dir_fd=fd)
-            except FileExistsError:
-                pass
+            if make:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
             inner = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
             done, fd = fd, inner
             os.close(done)  # a failure raises (the kernel has released `done`); `fd` is already `inner`, closed below
@@ -723,6 +725,8 @@ def open_folder_below(base, parts):
         raise
     return fd
 
+
+ENVELOPE_FORMAT = 1  # the wrapper of every cache entry (`CacheDir`); a change of its shape is a change of this number
 
 CACHE_REFUSALS = {"outside_project": "cache_dir_outside_project", "reaches_refused_path": "cache_dir_refused",
                   "unreadable_file": "cache_dir_unreadable"}
@@ -741,7 +745,14 @@ class CacheDir:
     Each cache file is a plain `.json` name directly in the folder (no `/`, not hidden), read with `read_bounded` (boundary `base`,
     the guard judging the file's project-relative name as well) and written through a descriptor on the folder, made one component
     at a time below `base` with no link followed and checked to be the judged folder, so a folder swapped for a link after the
-    judgement is neither read nor written."""
+    judgement is neither read nor written.
+
+    The envelope. Every entry is `{"format": ENVELOPE_FORMAT, "name": <file name>, "sha256": <hash of the payload>, "payload": value}`
+    (index, doc and info entries alike: `read_json` and `put_json` are the only reader and writer). An entry that is not that
+    exactly (not JSON, truncated, another format, another name, a payload that does not hash to `sha256`) is a miss: None, never an
+    error and never a hit. The checksum guards against corruption, not against a writer who can compute it (the folder is trusted as
+    the project's sources are). A hit touches the entry's modification time (`touch`, for the age rule of the sweep): by the folder's
+    descriptor, never following a link, and a failure of it changes nothing."""
 
     def __init__(self, base, folder, allow):
         self.base = base
@@ -765,24 +776,63 @@ class CacheDir:
     def _allow_file(self, rel):
         return posixpath.dirname(rel) == self.rel and self._plain(posixpath.basename(rel)) and _allows(self.allow, rel)
 
+    @staticmethod
+    def _checksum(value):
+        return hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _open_payload(self, name, data):
+        """The payload of the envelope in `data` (the bytes read from the file `name`), or None for anything that is not exactly an
+        envelope of this format, for this name, whose checksum holds."""
+        try:
+            envelope = json.loads(data.decode("utf-8"))
+            if not isinstance(envelope, dict) or set(envelope) != {"format", "name", "sha256", "payload"} \
+                    or type(envelope["format"]) is not int or envelope["format"] != ENVELOPE_FORMAT or envelope["name"] != name \
+                    or envelope["sha256"] != self._checksum(envelope["payload"]):
+                return None
+        except (ValueError, RecursionError):  # not UTF-8, not JSON, nested too deep to read or to hash: a miss
+            return None
+        return envelope["payload"]
+
     def read_json(self, name):
-        """The JSON value in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES)."""
+        """The payload in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES, and any
+        entry that is not a whole envelope of this format with a matching checksum: see the class docstring). A hit touches the file."""
         if self.refusal or not self._plain(name) or not name.endswith(".json"):
             return None
         full = os.path.join(self.path, name)
         status, data, _ = read_bounded(full, full, self.base, self._allow_file, limit=MAX_CACHE_BYTES)
         if status != READ_OK:
             return None
-        try:
-            return json.loads(data.decode("utf-8"))
-        except ValueError:
-            return None
+        payload = self._open_payload(name, data)
+        if payload is not None:
+            self.touch(name)
+        return payload
 
-    def _open_folder(self):
-        """A descriptor on the cache folder, made where missing (`open_folder_below`), or None; it must be the judged folder by the
-        kernel's name."""
+    def touch(self, name):
+        """Set the modification time of the cache file `name` to now, for the age rule. True when done; False when it was not (a
+        link or anything but a regular file at the name, a folder that is not the judged one, no such file, no permission, a system
+        that cannot do it). Best effort and silent: nothing here raises, and no answer depends on it. The folder is opened by its
+        descriptor without making anything, the name is looked at without following a link, and the time is set on the name itself
+        (`follow_symlinks=False`), so a link swapped in after the read is never followed."""
+        if self.refusal or not self._plain(name) or not name.endswith(".json"):
+            return False
+        fd = self._open_folder(make=False)
+        if fd is None:
+            return False
         try:
-            fd = open_folder_below(self.base, self.rel.split("/"))
+            if not stat.S_ISREG(os.lstat(name, dir_fd=fd).st_mode):
+                return False
+            os.utime(name, None, dir_fd=fd, follow_symlinks=False)
+            return True
+        except Exception:
+            return False
+        finally:
+            close_quietly(fd)
+
+    def _open_folder(self, make=True):
+        """A descriptor on the cache folder, made where missing (`open_folder_below`; with `make` False, only opened), or None; it
+        must be the judged folder by the kernel's name."""
+        try:
+            fd = open_folder_below(self.base, self.rel.split("/"), make=make)
         except OSError:
             return None
         if _opened_path(fd) != self.path:
@@ -825,8 +875,9 @@ class CacheDir:
             except FileNotFoundError:
                 pass
             try:
-                data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-            except (ValueError, TypeError):
+                data = json.dumps({"format": ENVELOPE_FORMAT, "name": name, "sha256": self._checksum(value), "payload": value},
+                                  separators=(",", ":"), sort_keys=True).encode("utf-8")
+            except (ValueError, TypeError, RecursionError):
                 return False  # nothing was made yet
             write_new(temp, data, dir_fd=fd)  # a failed write may leave its half file: nothing is deleted here
             os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)  # the commit point
@@ -1434,6 +1485,12 @@ _CONFIG_GAP = {"refused": "config_refused", "outside": "config_outside", "change
 _READ_GAP = {"absent": "source_changed", "changed": "source_changed", "refused": "source_refused", "outside": "source_refused"}
 
 
+def _entry_gap(error):
+    """The gap for an entry of a listing that could not be looked at: `entry_changed` when it is gone or its way moved since the
+    listing (no such name, a folder on the way now a file or a link), else `entry_unreadable`."""
+    return "entry_changed" if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP) else "entry_unreadable"
+
+
 def _key(fingerprint):
     """The persisted key of a walk fingerprint: `[mtime_ns, size]`. The rest (`ino`, `ctime_ns`, `dev`) is only ever compared inside
     one process (a cache from another checkout must still match), by the snapshot and the proof."""
@@ -1604,13 +1661,13 @@ class ImportIndex:
                         try:
                             if not entry.is_dir(follow_symlinks=False):
                                 continue  # allowed, but can never be read as a source nor descended into
-                        except OSError:
-                            self._gap("entry_unreadable")
+                        except OSError as error:
+                            self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
                             continue
                     try:
                         info = os.lstat(name, dir_fd=fd)
                     except OSError as error:
-                        self._gap("entry_changed" if isinstance(error, FileNotFoundError) else "entry_unreadable")
+                        self._gap(_entry_gap(error))
                         continue
                     config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
                     if stat.S_ISDIR(info.st_mode):

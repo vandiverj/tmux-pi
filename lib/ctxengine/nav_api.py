@@ -16,12 +16,19 @@ refusal by name; `graph.CannotJudge`), a config or overlay that is refused, outs
 same configs the Deno side refuses), and a root that is refused are gaps (`graph.GAPS`). A gap that is a refusal gives `refused`
 (with the Deno side's `reason`), a race (a file, folder or config that changed, went or was replaced between the walk, the read and
 the answer) `stale_index`, anything else `error` with `reason`; each carries `gaps` ({code: count}, no paths) and no data. One gate
-makes every index answer (`_index_answer`): the answer is built, then `graph.ImportIndex.prove` looks again at every input it
-depends on (each config's state, the folder listing, a stat, an open for reading and the indexed `(mtime, size)` of every source,
-and every import target that was judged), on a cold build, a warm instance and one that loaded the cache alike; only an answer
-whose proof found nothing is `ok`. THE LAST PROOF IS THE LAST STEP: the answer is then screened (`_out`), and `_final` runs the
-proof again after the screen, as the very last thing before the answer is returned (for the index as for `deno info`; the one rule
-is `_final`); a proof that fails then gives the gaps and nothing from the answer.
+makes every index answer (`_index_answer`): ONE START SNAPSHOT AND ONE FINAL PROOF. The start is the index's refresh: one walk of the
+tree (each source with its mtime, size, ino and ctime), the reading of the sources whose key changed, and an open for reading (no
+byte read) of those kept by key that this instance has not already read or opened at exactly that fingerprint (so a warm answer
+opens nothing, a cache-loaded one opens each source once); the answer is built from it. THE LAST PROOF IS THE LAST STEP: the
+answer is screened (`_out`), and `_final` then runs `graph.ImportIndex.prove` as the very last thing before the answer is returned
+(for the index as for `deno info`; the one rule is `_final`): the configs' states, the choice of the boundary, every import target
+that was judged, and a new walk that must find the snapshot (the same files with the same fingerprints). Cold build, warm instance
+and cache-loaded one alike; only an answer whose proof found nothing is `ok`. A proof that fails gives the gaps and nothing from
+the answer. A race with the answer (anything that moves after the snapshot) is therefore `stale_index`, also for `imports` with a
+`source` of `auto`, which falls back to `deno info` only when the index could not be built at all.
+The guard is asked once per name per answer (a memo that lives for the length of one public call and is dropped on every exit; a
+guard that raises is a refusal and is remembered as one, `_permits`), and a name that can never be read as a source (not a folder,
+no source suffix) is not asked at all. Nothing is remembered between answers.
 A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
 An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it. Of
 those inputs the regular files inside the boundary are also content-hashed (sha256; `_boundary_hash`, the one exception to the refusal of
@@ -62,7 +69,7 @@ the choice of the root itself (`_probe_boundary`): the `.git` of each folder loo
 chosen (`_boundary_input`: kind, identity, size, mtime, ctime, a link's target; nothing read), the sha256 of each of those that is a regular file
 inside the boundary (`_boundary_hash`: a `.git` file of a worktree or submodule, by the one narrow exception to the refusal of `.git`; a marker
 only if the guard allows its name): opened with O_NOFOLLOW and O_NONBLOCK, only if it is the regular file the stat saw, at most BOUNDARY_HASH_CAP
-(4 KiB) bytes, read only to be hashed, never returned, logged, mirrored or given to Deno. One that is larger, unreadable or swapped is
+(4 KiB) bytes for a `.git` file and MARKER_HASH_CAP (64 KiB) for a marker, read only to be hashed, never returned, logged, mirrored or given to Deno. One that is larger, unreadable or swapped is
 `unmodelled_config` for every answer. A link, a FIFO or a folder at such a name is never opened. Above the folder chosen nothing is opened. And
 the home folder. A removed, added, replaced or changed one gives `stale_index` and no data
 from the index (`ImportIndex.boundary_holds`) and from Deno (`Reach.boundary_holds`), warm, cold or cache-loaded.
@@ -137,10 +144,12 @@ Known limits (what is not proven):
     call, though Deno would not follow it either: the walk cannot tell. A source file over 2 MB refuses the call.
   - Modules named only by `new URL(..., import.meta.url)`, `Worker`, `require()` in CommonJS, or runtime reads are not followed; Deno
     does not load them for `info` or `doc` either, but that is Deno's behaviour, not something proven here.
-  - There is one way to read a file's bytes in this module and in `graph`: `graph.read_bounded`. It opens the file, asks the
-    kernel which file is open, checks that it is the path the caller judged, inside the project and
-    allowed by the guard, and only then reads; a file that fails a check is never read. That covers sources, the Deno config,
-    overlays, `package.json` files and both caches. A link swapped in between the check of a name and its read gives
+  - There are two ways to read a file's bytes in this module and in `graph`, and a test holds both files to them. The way is
+    `graph.read_bounded`: it opens the file, asks the kernel which file is open, checks that it is the path the caller judged,
+    inside the project and allowed by the guard, and only then reads; a file that fails a check is never read. That covers
+    sources, the Deno config, overlays, `package.json` files and both caches. The one exception is `_boundary_hash`, which reads a
+    `.git` file (at most 4 KiB) or a workspace marker (at most 64 KiB) only to hash it, never returns, logs, mirrors or hands the
+    bytes to Deno, and opens nothing but a regular file at an exact name in the boundary-input list (see "The monorepo"). A link swapped in between the check of a name and its read gives
     `stale_index` (the walk) or a gap (the index: no answer), and its bytes are not read. Where the kernel cannot name
     an open file (not macOS or Linux), nothing is read as checked. A hard link is one file under two names; the kernel may name
     either, so a hard-linked source file can be taken as changed (a refusal, never a wrong answer).
@@ -156,6 +165,7 @@ Known limits (what is not proven):
 Until CX1 merges, `check_path` and `guard` here are STUBS (`stub_check_path`, `stub_guard`) with the signatures of CX1's
 `redact.check_path(project, path) -> relative posix path | raises Refused` and `redact.guard(text) -> text`, so CX4 swaps them in
 by passing `check_path=redact.check_path, guard=redact.guard` to `NavApi`. Any exception from `check_path` is a refusal."""
+import contextlib
 import hashlib
 import json
 import os
@@ -222,6 +232,9 @@ NEXT_STEP = {
 _SENSITIVE_NAMES = ("id_rsa", "id_ed25519", "credentials", "secrets")
 _SENSITIVE_DIRS = (".git", ".ssh", ".aws", ".gnupg")
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+
+
+CANNOT_JUDGE = object()  # what the per-answer guard memo holds for a name the guard could not look at (see `NavApi._permits`)
 
 
 class Refused(Exception):
@@ -332,15 +345,16 @@ def _file_url_path(url):
     return os.path.normpath(unquote(url[len("file://"):])) if isinstance(url, str) and url.startswith("file://") else None
 
 
-BOUNDARY_HASH_CAP = 4096  # bytes: the most of a `.git` file or a workspace marker that is read, only to be hashed (larger: `unmodelled_config`)
+BOUNDARY_HASH_CAP = 4096  # bytes: the most of a `.git` file that is read, only to be hashed (larger: `unmodelled_config`)
+MARKER_HASH_CAP = 65536  # bytes: the same for a workspace marker (`WORKSPACE_MARKERS`; a `turbo.json` or `nx.json` is longer than a pointer file)
 
 
-def _boundary_hash(path, identity):
+def _boundary_hash(path, identity, cap=BOUNDARY_HASH_CAP):
     """The ONE exception to the refusal of `.git` by name, and the only place a boundary input is ever read: `("sha256", hex)` of
     the bytes of the regular file `path` (a `.git` file of a worktree or submodule, or a workspace marker), or `("unmodelled",
     reason)` (never an error): it is opened with O_NOFOLLOW and O_NONBLOCK (a link or a FIFO is never followed or waited for),
     must be a regular file with the `(dev, ino)` that `_boundary_input` saw (a swap in between is not hashed), and may hold at
-    most BOUNDARY_HASH_CAP bytes. The content goes into the digest and nowhere else: it is not returned, logged, mirrored or
+    most `cap` bytes (BOUNDARY_HASH_CAP for a `.git` file, MARKER_HASH_CAP for a workspace marker). The content goes into the digest and nowhere else: it is not returned, logged, mirrored or
     handed to Deno, and `reason` is a code with no path or content. The caller names only a file inside the boundary."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
@@ -350,15 +364,15 @@ def _boundary_hash(path, identity):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != identity:
             return ("unmodelled", "not_the_file_seen")
-        if st.st_size > BOUNDARY_HASH_CAP:
+        if st.st_size > cap:
             return ("unmodelled", "too_large")
         data = b""
-        while len(data) <= BOUNDARY_HASH_CAP:
-            chunk = os.read(fd, BOUNDARY_HASH_CAP + 1 - len(data))
+        while len(data) <= cap:
+            chunk = os.read(fd, cap + 1 - len(data))
             if not chunk:
                 break
             data += chunk
-        if len(data) > BOUNDARY_HASH_CAP:
+        if len(data) > cap:
             return ("unmodelled", "too_large")
         return ("sha256", hashlib.sha256(data).hexdigest())
     except OSError as error:
@@ -405,6 +419,7 @@ class NavApi:
 
     def __init__(self, project_root, root=None, config=None, overlays=(), cache_dir=None, deno="deno", timeout=DEFAULT_TIMEOUT,
                  check_path=stub_check_path, guard=stub_guard, mirror_parent=None):
+        self._asked = None  # {rel: verdict} while a public call is being answered (`_answering`, `_permits`), else None
         self.check_path = check_path
         self.guard = guard
         spelled = os.path.abspath(project_root)
@@ -472,7 +487,7 @@ class NavApi:
                         continue
                 except Exception:
                     continue
-            hashed.append((path, *_boundary_hash(path, identity)))
+            hashed.append((path, *_boundary_hash(path, identity, BOUNDARY_HASH_CAP if name == ".git" else MARKER_HASH_CAP)))
         return folder, (*seen, *(("content", *entry) for entry in hashed))
 
     def _choose_boundary(self):
@@ -577,20 +592,17 @@ class NavApi:
         return index, stats, None
 
     def _index_answer(self, build):
-        """(answer, blocked, proof): THE ONE WAY an answer is made from the index. `build(index, stats)` makes it from the refreshed
-        index (no I/O but the index's own `target_state`). Then `_proved` looks again at every input it depends on (see
-        `graph.ImportIndex`) and adds the gaps the build itself met: any gap gives `_incomplete` instead, with the gaps and nothing
-        else. A non-`ok` answer from `build` keeps only its status words (`detail`): no answer other than `ok` carries index
-        data, whatever `build` put in it. `blocked` is True when the index could not answer (the caller may fall back to `deno
-        info`). `proof` is the check `_final` makes AFTER the answer is screened, as the last step before it is returned (None for
-        an answer that is already a failure, which carries no index data)."""
+        """(answer, blocked, proof): THE ONE WAY an answer is made from the index. `_fresh` is the start: the snapshot (one walk) with
+        everything the index could not get as a gap, and nothing is answered then (`blocked` is True: the caller may fall back to
+        `deno info`). `build(index, stats)` makes the answer from the refreshed index (no I/O but the index's own `target_state`).
+        A non-`ok` answer from `build` keeps only its status words (`detail`): no answer other than `ok` carries index data, whatever
+        `build` put in it. `proof` is the ONE proof, which `_final` makes AFTER the answer is screened, as the last step before it is
+        returned (`_proved`: `graph.ImportIndex.prove` against the snapshot, plus the gaps the build itself met; any gap gives
+        `_incomplete` instead, with the gaps and nothing else). There is no proof between the build and the screen."""
         index, stats, error = self._fresh()
         if error:
             return error, True, None
         answer = build(index, stats)
-        failed = self._proved(index)
-        if failed:
-            return failed, True, None
         if answer.get("status") != "ok":
             answer = _answer(answer["status"], **{k: v for k, v in answer.items() if k == "detail"})
         return answer, False, lambda: self._proved(index)
@@ -682,7 +694,8 @@ class NavApi:
 
     def importers(self, target, limit=MAX_IMPORTERS):
         """Files that import `target` directly, ordered by (path, line); `limit` is 1 to 25."""
-        return self._final(*self._importers(target, limit))
+        with self._answering():
+            return self._final(*self._importers(target, limit))
 
     def _importers(self, target, limit):
         """(answer, proof); the public wrapper makes the final check (`_final`)."""
@@ -703,7 +716,8 @@ class NavApi:
     def imports(self, target, source="auto"):
         """What `target` imports directly: `files` (project paths), `external` (packages, builtins, URLs) and `unresolved`.
         `source` is `auto` (the index, and `deno info` when no index can be built), `index` or `deno`."""
-        return self._final(*self._imports(target, source))
+        with self._answering():
+            return self._final(*self._imports(target, source))
 
     def _imports(self, target, source):
         """(answer, proof): the check `_final` makes last (see `_index_answer`, `_reach_proof`); None for an answer that carries no
@@ -970,16 +984,45 @@ class NavApi:
             return None
         return self._version or None
 
+    @contextlib.contextmanager
+    def _answering(self):
+        """The length of ONE answer, for the guard memo (`_permits`): every public call that asks the guard is made in one. The memo
+        starts empty and is dropped on every way out (a return, an exception), so nothing is remembered from one answer to the
+        next: the next one asks the guard again. A call made inside another one (none is today) shares the outer one's memo."""
+        outer = self._asked is None
+        if outer:
+            self._asked = {}
+        try:
+            yield
+        finally:
+            if outer:
+                self._asked = None
+
     def _permits(self, rel):
-        """The guard's verdict as a bool, for `graph`. A guard that refused because it could not look (`unreadable_path`) did not
-        judge the name: `graph.CannotJudge`, which every user but the index takes as a refusal, and the index records as a gap."""
+        """The guard's verdict as a bool, for `graph`, asked once per name per answer (`_answering`: the walk at the start, the new
+        walk of the proof, the probes and the reads all name the same files). A guard that refused because it could not look
+        (`unreadable_path`) did not judge the name: `graph.CannotJudge`, which every user but the index takes as a refusal, and the
+        index records as a gap. FAIL CLOSED: a guard that raises is a refusal, and so is what the memo holds for the name for the rest
+        of the answer (a failure is never turned into an allow by asking again, nor is an allow ever stored for a failure); a name
+        the guard could not judge raises `CannotJudge` every time it is asked."""
+        memo = self._asked
+        if memo is not None and rel in memo:
+            if memo[rel] is CANNOT_JUDGE:
+                raise graph.CannotJudge(rel) from None
+            return memo[rel]
         try:
             got = self.check_path(self.boundary, rel)
         except Exception as error:
             if getattr(error, "reason", None) == "unreadable_path":
+                if memo is not None:
+                    memo[rel] = CANNOT_JUDGE
                 raise graph.CannotJudge(rel) from None
-            return False
-        return isinstance(got, str)
+            verdict = False
+        else:
+            verdict = isinstance(got, str)
+        if memo is not None:
+            memo[rel] = verdict
+        return verdict
 
     def _prove(self, rel):
         """(reach, None) when every module Deno would load from `rel` has been shown allowed (`graph.prove_reach`), else
@@ -1067,8 +1110,9 @@ class NavApi:
         """The local modules `target` reaches, from `deno info --json` (30 s cap): {"modules": [{"path", "imports": [paths]}]}.
         Only files inside the project are listed; packages and URLs are counted in `external`. When the graph is longer than
         MAX_MODULES, `target` and its direct imports are kept and the rest is cut in path order."""
-        answer, reach = self._forward_graph(target)
-        return self._final(answer, self._reach_proof(reach))
+        with self._answering():
+            answer, reach = self._forward_graph(target)
+            return self._final(answer, self._reach_proof(reach))
 
     def _forward_graph(self, target):
         """(answer, reach); the public wrapper makes the final check (`_final`)."""
@@ -1127,8 +1171,9 @@ class NavApi:
     def symbols(self, path, limit=MAX_SYMBOLS):
         """The exported symbols of `path` from `deno doc --json`: name, kind, definition path and line, the definition's source
         line as `signature`, and the first doc-comment lines. A re-export is listed at the file that defines it."""
-        answer, reach = self._symbols(path, limit)
-        return self._final(answer, self._reach_proof(reach))
+        with self._answering():
+            answer, reach = self._symbols(path, limit)
+            return self._final(answer, self._reach_proof(reach))
 
     def _symbols(self, path, limit):
         """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one."""

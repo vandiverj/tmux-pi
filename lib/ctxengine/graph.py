@@ -19,7 +19,8 @@ only there, so a file the walk missed is a file Deno cannot open.
 THE PATH RULE, for this module and nav_api.py (a test scans both for any file-system call and holds each to a table): no file-system
 call (open, stat, lstat, listing, readlink, realpath, a mkdir, a write or a removal) is made at a path until its name has been shown
 inside the boundary and allowed by the guard. Links are followed only by `judged_realpath`, which judges each link's target by name
-before it looks at it; bytes are read only by `read_bounded`; a cache lives only in a `CacheDir`, a folder inside the project judged
+before it looks at it; bytes are read only by `read_bounded`, with ONE exception (nav_api's `_boundary_hash`, which reads a `.git`
+file or a workspace marker only to hash it, see nav_api's "The monorepo"); a cache lives only in a `CacheDir`, a folder inside the project judged
 once like any other path; files and folders are made and removed only relative to a descriptor opened with no link on the way
 (`write_new`, `open_folder_below`, `make_own_folder`, `remove_own_folder`). A location not shown allowed is refused, and the refusal
 does not depend on whether anything is there. Places outside any project (what the sandbox grants: Deno's cache and executable, the
@@ -1398,6 +1399,12 @@ _CONFIG_GAP = {"refused": "config_refused", "outside": "config_outside", "change
 _READ_GAP = {"absent": "source_changed", "changed": "source_changed", "refused": "source_refused", "outside": "source_refused"}
 
 
+def _key(fingerprint):
+    """The persisted key of a walk fingerprint: `[mtime_ns, size]`. The rest (`ino`, `ctime_ns`, `dev`) is only ever compared inside
+    one process (a cache from another checkout must still match), by the snapshot and the proof."""
+    return [fingerprint[0], fingerprint[1]]
+
+
 class ImportIndex:
     """`file -> imports` for the source files below `root`, and the reverse map derived from it.
 
@@ -1430,15 +1437,21 @@ class ImportIndex:
     a file or folder the guard refuses by its name (outside the index by policy). An answer that could depend on a gap is not `ok`:
     `NavApi` is the one place that decides (`_index_answer`).
 
-    The proof (`prove`). What the index holds is never taken as still true because a key matched once: `prove()` looks again at
-    every input the edges were made from, and returns the gaps it finds ({} when everything holds). Each folder listing: the walk is
-    made again and must find the same files with the same keys. Each source: stat and open-for-read must succeed, with its open
-    signature the indexed one (`probe_sources`, no byte read). Each config and overlay: read again, its state and fingerprint must be
-    the ones the map was made from (gone, or another one, is `config_changed`; now unreadable or refused is that gap). Each import
-    target that was looked at: its verdict must be the same. `refresh()` ends with one (a change during the build is found there);
-    `NavApi` makes one more after the answer is built and before it is given. Entries loaded from the cache, entries kept by an
-    instance and entries just read get the same proof. Its limit is the key's: a file rewritten with the same mtime_ns and size is
-    not seen (the design's `(path, mtime, size)` key), and the cache folder is trusted as the project's sources are."""
+    The proof (ONE SNAPSHOT, ONE FINAL PROOF). What the index holds is never taken as still true because a key matched once. The
+    start of an answer is `refresh()`'s walk, the snapshot: every source with its fingerprint `(mtime_ns, size, ino, ctime_ns, dev)`
+    (the index persists only the first two). A source whose key changed or is new is read (`read_sources`, the open signature
+    checked against the snapshot); one kept by key is opened for reading, no byte read (`probe_sources`), unless this instance
+    already read or opened it at exactly this fingerprint: those are the only opens of an answer, so a warm answer opens nothing, and
+    a cache-loaded one opens each source once. A source that cannot be read or opened is a gap there. The proof (`prove()`, the only
+    one: `NavApi._final` makes it as the last step of an answer) looks again at every input the edges were made from and returns the
+    gaps it finds ({} when everything holds): the walk is made again and must find the snapshot (the same files with the same
+    fingerprints: an edit, a chmod, a replace, or a file that appeared or went, is `source_changed` or `folder_changed`; nothing is
+    opened, because a file that is the same file with the same ctime cannot have stopped being readable); each config and overlay is
+    read again, its state and fingerprint must be the ones the map was made from (gone, or another one, is `config_changed`; now
+    unreadable or refused is that gap); each import target that was looked at must have the same verdict; and the choice of `base`
+    must hold (`boundary_holds`). `refresh()` with `prove` (the default) ends with one. Entries loaded from the cache, entries kept by
+    an instance and entries just read get the same proof. Its limit is the fingerprint's: a file rewritten with the same mtime_ns,
+    size, ino and ctime_ns is not seen, and the cache folder is trusted as the project's sources are."""
 
     def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None, cache=None):
         spelled = os.path.abspath(base)
@@ -1474,6 +1487,8 @@ class ImportIndex:
         self._exclude = []  # the config's `exclude`, as the last walk used it
         self._targets = {}  # absolute path -> verdict: each import target the edges were made from (`prove` judges it again)
         self._unread = set()  # sources the last walk found and the build could not read (each already a gap)
+        self._snapshot = None  # {rel: fingerprint}: the walk the last refresh made its answer from (the START of the one proof)
+        self._verified = {}  # rel -> fingerprint at which this instance last read or opened the file successfully
         self._reverse = {}
         self._known = set()
         self.refreshed_at = None
@@ -1513,10 +1528,16 @@ class ImportIndex:
     # --- building
 
     def _walk(self, patterns):
-        """{rel: [mtime_ns, size]} for the source files below `root`. Each entry is judged by its name (the guard, SKIP_DIRS) before
+        """{rel: fingerprint} for the source files below `root`; the fingerprint is `(mtime_ns, size, ino, ctime_ns, dev)` (see
+        `_key`: the first two are the key the index keeps). Each entry is judged by its name (the guard, SKIP_DIRS) before
         anything is asked of it, and then looked at with no link followed: a link is neither indexed nor followed, a directory
         the guard refuses is not listed, and each directory is opened with no link on its path (`NOFOLLOW_ANY`) and must be the
-        one judged, by the kernel's name, before it is listed."""
+        one judged, by the kernel's name, before it is listed.
+
+        A name the listing itself shows is not a folder and has no source suffix can never be read as a source nor descended into, so
+        it is skipped before the guard: it is not judged, not looked at, and a guard that cannot judge it (`CannotJudge`) records no
+        `guard_unjudged` gap for it, since nothing of the index depends on it. (The listing's own entry type is used; no call is made
+        at the name, except on a file system whose listing gives no type, where Python asks for it relative to the listed folder.)"""
         found = {}
         if self.root is None:
             return found
@@ -1535,9 +1556,11 @@ class ImportIndex:
                     self._gap("folder_unreadable" if opened is None else "folder_changed")  # a link was swapped in after the judgement
                     continue
                 with os.scandir(fd) as listing:
-                    names = sorted(entry.name for entry in listing)
+                    names = sorted((entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing)
                 subdirs = []
-                for name in names:
+                for name, listed_dir in names:
+                    if not listed_dir and not name.endswith(SOURCE_EXTENSIONS):
+                        continue  # can never be read as a source nor descended into: never reaches the guard (see below)
                     full = os.path.join(here, name)
                     rel = lexical_path(self.base, full)
                     if rel is None or name in SKIP_DIRS or not self._allowed(rel):
@@ -1552,7 +1575,7 @@ class ImportIndex:
                         if not _excluded(config_rel, patterns):
                             subdirs.append(full)
                     elif stat.S_ISREG(info.st_mode) and name.endswith(SOURCE_EXTENSIONS) and not _excluded(config_rel, patterns):
-                        found[rel] = [info.st_mtime_ns, info.st_size]
+                        found[rel] = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns, info.st_dev)
                     # anything else (a link, a FIFO, a socket, a device) is neither indexed nor followed
                 stack.extend(reversed(subdirs))
             except OSError:
@@ -1582,23 +1605,38 @@ class ImportIndex:
             overlay_maps.append((os.path.basename(path), omap))
             self.meta["ignored"] += [f"{os.path.basename(path)}:{item}" for item in odetails["ignored"]]
         self._exclude = list(details["exclude"])
-        current = self._walk(self._exclude)
-        changed = sorted(rel for rel, key in current.items() if rel not in self.entries or self.entries[rel]["key"] != key)
+        current = self._walk(self._exclude)  # THE SNAPSHOT: everything below is made from it, and the final proof must find it again
+        self._snapshot = dict(current)
+        changed = sorted(rel for rel, fp in current.items() if rel not in self.entries or self.entries[rel]["key"] != _key(fp))
         removed = [rel for rel in self.entries if rel not in current]
         for rel in removed:
             del self.entries[rel]
+        self._verified = {rel: fp for rel, fp in self._verified.items() if current.get(rel) == fp}  # one at another fingerprint is not
         failures, self._unread = {}, set()
         texts = read_sources([self._abs(rel) for rel in changed], self.base, self._allowed, failures=failures,
-                             keys={self._abs(rel): current[rel] for rel in changed})
+                             keys={self._abs(rel): _key(current[rel]) for rel in changed})
         for rel in changed:
             text = texts[self._abs(rel)]
             if text is None:  # not read: no entry (an entry with no imports would stand for a file that has none), and a gap
                 self._gap(_READ_GAP.get(failures.get(self._abs(rel)), "source_unreadable"))
                 self.entries.pop(rel, None)
+                self._verified.pop(rel, None)
                 self._unread.add(rel)
                 continue
             specs = [[s["spec"], s["line"], s["type_only"], s["dynamic"]] for s in scan_specifiers(text)]
-            self.entries[rel] = {"key": current[rel], "specs": specs}  # read with its open signature equal to this key
+            self.entries[rel] = {"key": _key(current[rel]), "specs": specs}  # read with its open signature equal to this key
+            self._verified[rel] = current[rel]
+        # An entry kept by key (warm, or loaded from the cache) was not opened this time. It is opened now, without reading a byte,
+        # unless this instance already opened it at exactly this fingerprint (same ino and ctime as well as mtime and size: a chmod,
+        # a replace or a rewrite moves one of them): those are the only probes an answer makes, and the final proof makes none.
+        unopened = sorted(rel for rel in current if rel not in changed and self._verified.get(rel) != current[rel])
+        probed = probe_sources([(self._abs(rel), _key(current[rel])) for rel in unopened], self.base, self._allowed)
+        for rel in unopened:
+            status = probed[self._abs(rel)]
+            if status == READ_OK:
+                self._verified[rel] = current[rel]
+            else:
+                self._gap(_READ_GAP.get(status, "source_unreadable"))
         self._known = set(current)
         self._resolve_all(imap, overlay_maps)
         self.refreshed_at = time.time()
@@ -1629,20 +1667,14 @@ class ImportIndex:
                 if _state_token(state) != token:
                     self._gap(_CONFIG_GAP.get(state[0], "config_changed") if state[0] != "absent" else "config_changed")
             current = self._walk(self._exclude)
-            indexed = {rel: entry["key"] for rel, entry in self.entries.items()}
-            if set(current) - set(indexed) - self._unread or set(indexed) - set(current):
-                self._gap("folder_changed")  # a file appeared or went, beyond those the build already counted as gaps
-            for rel in sorted(indexed):
-                if rel in current and current[rel] != indexed[rel]:
-                    stale.append(rel)
+            # the snapshot of the last refresh; an instance that was never refreshed holds the entries (loaded from a cache) to their keys
+            snapshot = self._snapshot if self._snapshot is not None else {rel: tuple(e["key"]) for rel, e in self.entries.items()}
+            if set(current) != set(snapshot):
+                self._gap("folder_changed")  # a file appeared or went since the snapshot
+            for rel in sorted(snapshot):
+                if rel in current and current[rel][:len(snapshot[rel])] != tuple(snapshot[rel]):
+                    stale.append(rel)  # mtime, size, ino or ctime moved: nothing is opened again, the fingerprint says it is not the file
                     self._gap("source_changed")
-            probed = probe_sources([(self._abs(rel), indexed[rel]) for rel in sorted(indexed) if current.get(rel) == indexed[rel]],
-                                   self.base, self._allowed)
-            for path, status in probed.items():
-                if status != READ_OK:
-                    if status in ("absent", "changed"):
-                        stale.append(lexical_path(self.base, path))
-                    self._gap(_READ_GAP.get(status, "source_unreadable"))
             for path, verdict in list(self._targets.items()):
                 if self._verdict(path) != verdict:
                     self._gap("target_changed")

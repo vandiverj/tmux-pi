@@ -3058,6 +3058,7 @@ class PathRuleCase(Tree):
         ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "ImportIndex._walk", "os.scandir"): "that descriptor",
+        ("graph.py", "ImportIndex._walk", "entry.is_dir"): "d_type of the entry from the descriptor's listing, no_follow; the name is skipped or judged after it",
         ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name",
         ("nav_api.py", "stub_check_path", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi.__init__", "os.path.realpath"): "the boundary itself",
@@ -3324,7 +3325,8 @@ class IncompleteIndexCase(Tree):
             os.symlink(secret, project / "src" / "lazy.ts")
             return real(paths, *a, **k)
         with mock.patch.object(graph, "read_sources", racing):  # a link that leads out is "outside" at read time: a gap, and not read
-            self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+            # S1: the swap changes the file's fingerprint after the one start snapshot, so the one final proof names it: stale_index (was a gap, found by the old middle probe)
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "stale_index", None, "source_changed")
 
     def test_r9_a_folder_swapped_for_a_link_after_the_listing_is_a_race(self):
         project = self.project().resolve()
@@ -3364,19 +3366,53 @@ class IncompleteIndexCase(Tree):
 
     def test_r9_a_refusal_at_read_time_is_a_gap(self):
         project = self.project().resolve()
+        real = graph.read_bounded
+
+        def refusing(path, admitted, boundary, allow, limit=None, **checks):  # S1: the read's own check refuses (the guard verdict is memoised per answer, so a flip is not re-asked mid-answer)
+            if str(path).endswith("util/slug.ts"):
+                return "refused", None, None
+            return real(path, admitted, boundary, allow, limit, **checks)
+        with mock.patch.object(graph, "read_bounded", refusing):
+            self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+
+    def test_s1_the_guard_verdict_is_memoised_for_one_answer_and_asked_again_for_the_next(self):
+        project = self.project().resolve()
         state = {"late": False}
+        asked = []
 
         def check(root, path):
+            asked.append(path)
             if state["late"] and path.endswith("util/slug.ts"):
-                raise nav_api.Refused("sensitive_path")  # allowed when the walk judged the name, refused when the read does
+                raise nav_api.Refused("sensitive_path")
             return nav_api.stub_check_path(root, path)
+        nav = self.nav(project, check_path=check)
         real = graph.read_sources
 
         def racing(paths, *a, **k):
-            state["late"] = True
+            state["late"] = True  # the verdict flips mid-answer: this answer still uses the one it got
             return real(paths, *a, **k)
         with mock.patch.object(graph, "read_sources", racing):
-            self.blocked(self.nav(project, check_path=check).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
+            self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+        self.assertEqual(asked.count("src/util/slug.ts"), 1)  # asked once for the whole answer
+        asked.clear()
+        answer = nav.importers("src/app/run.ts")  # a new answer asks again and sees the refusal
+        self.assertIn("src/util/slug.ts", asked)
+        self.assertNotIn("src/util/slug.ts", [i["path"] for i in answer.get("importers", [])])
+
+    def test_s1_a_guard_error_is_a_refusal_and_is_not_cached_as_an_allow(self):
+        project = self.project().resolve()
+        calls = []
+
+        def check(root, path):
+            calls.append(path)
+            if path.endswith("util/slug.ts"):
+                raise RuntimeError("guard broke")
+            return nav_api.stub_check_path(root, path)
+        nav = self.nav(project, check_path=check)
+        nav.importers("src/app/run.ts")
+        first = calls.count("src/util/slug.ts")
+        nav.importers("src/app/run.ts")
+        self.assertGreater(calls.count("src/util/slug.ts"), first)  # the next answer asks again
 
     def test_r9_a_read_that_is_outside_the_root_is_a_gap(self):
         project = self.project().resolve()
@@ -3982,7 +4018,7 @@ class AnswerProofCase(Tree):
         self.assertEqual(nav.importers("src/nothing.ts")["status"], "ok")
 
     def test_r11_f1_nothing_runs_after_the_last_proof(self):
-        """The order of events of an answered call: the first proof, then the screen's calls, then the proof as the last event."""
+        """The order of events of an answered call: the screen's calls, then the one final proof as the last event (S1)."""
         project = self.project().resolve()
         for label, ask in (("importers", lambda n: n.importers("src/app/run.ts")),
                            ("imports", lambda n: n.imports("src/main.ts", source="index")),
@@ -4004,8 +4040,118 @@ class AnswerProofCase(Tree):
                     answer = ask(nav)
                 self.assertIn(answer["status"], ("ok", "not_found"), answer)
                 self.assertEqual(events[-1], "prove", events)
-                self.assertEqual(events.index("screen"), 1, events)  # the first proof still comes first
-                self.assertEqual(events.count("prove"), 2, events)
+                # S1: no middle proof (it was the first prove, before the screen); the one final proof is the only one
+                self.assertEqual(events.index("screen"), 0, events)
+                self.assertEqual(events.count("prove"), 1, events)
+
+    # --- S1: one start snapshot, one final proof
+
+    def test_s1_a_warm_answer_walks_twice_the_snapshot_and_the_final_proof_and_opens_no_file(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+        walks, probed = [], []
+        real_walk, real_probe = graph.ImportIndex._walk, graph.probe_sources
+
+        def walk(index, *a, **k):
+            walks.append(1)
+            return real_walk(index, *a, **k)
+
+        def probe(paths, *a, **k):
+            probed.extend(paths)
+            return real_probe(paths, *a, **k)
+        with mock.patch.object(graph.ImportIndex, "_walk", walk), mock.patch.object(graph, "probe_sources", probe):
+            self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+        self.assertEqual((len(walks), probed), (2, []))
+
+    def test_s1_probes_are_for_changed_or_new_keys_only(self):
+        project = self.project().resolve()
+        self.assertEqual(self.nav(project).importers("src/app/run.ts")["status"], "ok")  # builds the cache
+        probed = []
+        real_probe = graph.probe_sources
+
+        def probe(paths, *a, **k):
+            probed.extend(paths)
+            return real_probe(paths, *a, **k)
+        with mock.patch.object(graph, "probe_sources", probe):
+            fresh = self.nav(project)  # a new instance loading the cache: nothing verified yet, so each entry is probed once
+            self.assertEqual(fresh.importers("src/app/run.ts")["status"], "ok")
+            first = len(probed)
+            self.assertGreater(first, 0)
+            self.assertEqual(fresh.importers("src/app/run.ts")["status"], "ok")
+        self.assertEqual(len(probed), first)  # the second answer probed nothing
+
+    def test_s1_an_edit_between_the_start_snapshot_and_the_final_proof_is_stale_index(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+        real_guard = nav.guard
+
+        def guard(text):  # runs after the answer is built, before the final proof
+            write(project / "src" / "util" / "slug.ts", "export const slug = 2; // edited\n")
+            return real_guard(text)
+        nav.guard = guard
+        answer = nav.importers("src/app/run.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assert_no_data(answer)
+        self.assertIn("source_changed", json.dumps(answer))
+
+    def test_s1_a_name_that_can_never_be_source_does_not_reach_the_guard_or_the_filesystem(self):
+        project = self.project().resolve()
+        write(project / "src" / "notes.txt", "hello\n")
+        write(project / "src" / "img.png", "x\n")
+        asked = []
+
+        def check(root, path):
+            asked.append(path)
+            return nav_api.stub_check_path(root, path)
+        answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertNotIn("gaps", answer)
+        self.assertEqual([a for a in asked if a.endswith((".txt", ".png"))], [])
+        self.assertTrue(any(a.endswith(".ts") for a in asked))
+
+    def test_s1_every_file_read_is_asked_of_the_guard_once_per_answer(self):
+        project = self.project().resolve()
+        asked = []
+
+        def check(root, path):
+            asked.append(path)
+            return nav_api.stub_check_path(root, path)
+        nav = self.nav(project, check_path=check)
+        nav.importers("src/app/run.ts")
+        # the asked-for target is also judged once by `_target` (it returns the normalised name and the refusal reason, which the memo does not hold)
+        self.assertEqual([a for a in set(asked) if asked.count(a) > 1], ["src/app/run.ts"], asked)
+        self.assertEqual(asked.count("src/app/run.ts"), 2)
+        self.assertIn("src/util/slug.ts", asked)
+
+    def test_s1_sweep_the_start_probe_of_an_entry_not_opened_this_call_on_the_cache_loaded_and_warm_routes(self):
+        """S1 sweep (path-boundary, incomplete-index-on-io-error): an entry the start snapshot did not open (a cache-loaded or warm one)
+        is probed once at the start; each state of that file gives gaps and no data, on a new instance (cache) and on a warm one."""
+        self.skip_if_root()
+        outside = write(self.dir / "outside.ts", "export const o = 1;\n")
+        states = {
+            "unreadable": lambda f: os.chmod(f, 0),
+            "deleted": lambda f: os.unlink(f),
+            "link_out": lambda f: (os.unlink(f), os.symlink(outside, f)),
+            "rewritten": lambda f: write(f, "export const slug = 3; // other\n"),
+        }
+        for label, edit in states.items():
+            for route in ("cache_loaded", "warm"):
+                with self.subTest(label, route=route):
+                    project = self.project(f"p-{label}-{route}").resolve()
+                    self.addCleanup(self.unlock, project)
+                    warm = self.nav(project, cache=f"sw-{label}-{route}")
+                    self.assertEqual(warm.importers("src/app/run.ts")["status"], "ok")
+                    edit(project / "src" / "util" / "slug.ts")
+                    nav = warm if route == "warm" else self.nav(project, cache=f"sw-{label}-{route}")
+                    for question in QUESTIONS:
+                        got = self.ask(nav, question)
+                        self.assertNotEqual(got, None)
+                        if got["status"] == "ok":
+                            self.assertEqual(self.comparable(got), self.comparable(self.ask(self.nav(project, cache=f"sw-chk-{label}-{route}"), question)), (label, route, question))
+                        else:
+                            self.assert_no_data(got, (label, route, question))
 
     def test_r11_f1_one_final_check_for_every_route(self):
         project = self.project().resolve()
@@ -4955,6 +5101,39 @@ class MonorepoCase(Tree):
         write(mono / ".git" / "refs" / "heads" / "x", "abc\n")  # ordinary git work: not a change
         self.assertTrue(nav._boundary_holds())
 
+    def test_s1_a_marker_is_hashed_up_to_64_kib_and_the_git_file_stays_at_4_kib(self):
+        self.assertEqual((nav_api.BOUNDARY_HASH_CAP, nav_api.MARKER_HASH_CAP), (4096, 65536))
+        cap = nav_api.MARKER_HASH_CAP
+        for label, size, ok in (("over the old 4 KiB", 4097, True), ("at the cap", cap, True), ("one byte over", cap + 1, False)):
+            with self.subTest(label):
+                mono, project = self.reset()
+                write(mono / "nx.json", "{" + " " * (size - 2) + "}")
+                self.assertEqual((mono / "nx.json").stat().st_size, size)
+                nav = self.deno_nav(project)
+                for number, call in enumerate((*self.index_calls, *self.deno_calls_)):
+                    answer = call(nav)
+                    if ok:
+                        self.assertEqual(answer["status"], "ok", (number, answer))
+                    else:
+                        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), (number, answer))
+                        for key in DATA_KEYS + ("modules", "symbols"):
+                            self.assertNotIn(key, answer)
+        mono, project = self.reset(git_file=True)  # the .git file stays at 4 KiB
+        write(mono / ".git", "gitdir: /x/" + "a" * (4097 - len("gitdir: /x/")))
+        self.assert_refused(self.deno_nav(project), "unmodelled_config")
+
+    def test_s1_a_big_marker_edited_in_place_after_construction_is_stale(self):
+        mono, project = self.reset()
+        write(mono / "nx.json", "{" + " " * 20000 + "}")
+        warm = self.deno_nav(project)
+        for call in (*self.index_calls, *self.deno_calls_):
+            self.assertEqual(call(warm)["status"], "ok")
+        info = (mono / "nx.json").stat()
+        write(mono / "nx.json", "{" + "\t" * 20000 + "}")  # same size
+        os.utime(mono / "nx.json", ns=(info.st_atime_ns, info.st_mtime_ns))
+        for call in (*self.index_calls, *self.deno_calls_):
+            self.no_data(call(warm), "same-size edit")
+
     def test_a_git_file_over_the_cap_is_unmodelled_config_and_no_data_on_every_route(self):
         cap = nav_api.BOUNDARY_HASH_CAP
         for label, size, ok in (("at the cap", cap, True), ("one byte over", cap + 1, False)):
@@ -5039,11 +5218,11 @@ class MonorepoCase(Tree):
         mono, project = self.reset(git_file=True)
         real, git = nav_api._boundary_hash, os.path.join(os.path.realpath(mono), ".git")
 
-        def swap(path, identity):
+        def swap(path, identity, cap=nav_api.BOUNDARY_HASH_CAP):
             if path == git:
                 os.unlink(path)
                 os.mkfifo(path)
-            return real(path, identity)
+            return real(path, identity, cap)
         with mock.patch.object(nav_api, "_boundary_hash", swap):
             nav = self.deno_nav(project)
         self.assertTrue(nav._boundary_unmodelled)

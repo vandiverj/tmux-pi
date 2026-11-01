@@ -384,10 +384,9 @@ if [[ -n "$tests" ]]; then
 fi
 # The repository preamble goes to the worker's system prompt, not the packet (see below), so it sits ahead of
 # everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
-# With a parent task, lib/preamble.py (when this checkout's copy takes --state-dir and --parent) adds the prior task's result and
-# review line to the Tools block. A checkout whose preamble.py does not take the options is called exactly as before.
+# With a parent task, lib/preamble.py adds the prior task's result and review line to the Tools block (see lib/agent_tools.py).
 preamble_args=()
-if [[ -n "$parent" ]] && grep -q -e '--state-dir' "$ROOT/lib/preamble.py" 2>/dev/null; then
+if [[ -n "$parent" ]]; then
   preamble_args=(--state-dir "$state_dir" --parent "$parent")
 fi
 preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" ${preamble_args[@]+"${preamble_args[@]}"})" || exit 1

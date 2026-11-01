@@ -131,7 +131,9 @@ class OtherLanePathsWithoutLaneTests(WorkerEnvCase):
 
 
 class PreambleArgsTests(WorkerEnvCase):
-    """tp-spawn passes --state-dir and --parent to preamble.py for a task with a parent, only when preamble.py takes them."""
+    """tp-spawn gives lib/preamble.py --state-dir and --parent for a task with a parent, so the agent-tools block can name the
+    prior task's result and review report (L3 integration item 1). preamble.py on this tree takes both options, so there is no
+    check of its text before passing them."""
 
     def copy_tree(self, copy):
         copy.mkdir()
@@ -139,30 +141,54 @@ class PreambleArgsTests(WorkerEnvCase):
             if (ROOT / name).exists():
                 subprocess.run(["cp", "-R", str(ROOT / name), str(copy / name)], check=True, capture_output=True)
 
-    def test_the_preamble_gets_state_dir_and_parent_when_it_supports_them(self):
-        probe = self.base / "preamble-args"
-        # a copy of the tree whose preamble.py records its argv and accepts the new options
-        copy = self.base / "tree"
-        self.copy_tree(copy)
-        (copy / "lib" / "preamble.py").write_text(
-            "import sys\nopen({!r}, 'w').write(' '.join(sys.argv[1:]))\n# --state-dir --parent\nprint('PREAMBLE')\n".format(str(probe)))
-        env = dict(self.env)
-        run = subprocess.run([str(copy / "bin" / "tp-spawn"), "--worker", "claude", "--task-id", "pa-1", "--parent", "parent-1", "Do"],
-                             env=env, text=True, capture_output=True, timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn("--state-dir " + str(self.state), probe.read_text())
-        self.assertIn("--parent parent-1", probe.read_text())
-
-    def test_the_preamble_is_not_given_them_when_it_does_not_support_them(self):
-        probe = self.base / "preamble-args"
-        copy = self.base / "tree"
+    def spawn_probed(self, task, *args):
+        """A copy of the tree whose preamble.py only records its argv (its source says nothing about any option)."""
+        probe = self.base / ("preamble-args-" + task)
+        copy = self.base / ("tree-" + task)
         self.copy_tree(copy)
         (copy / "lib" / "preamble.py").write_text("import sys\nopen({!r}, 'w').write(' '.join(sys.argv[1:]))\nprint('PREAMBLE')\n".format(str(probe)))
-        run = subprocess.run([str(copy / "bin" / "tp-spawn"), "--worker", "claude", "--task-id", "pa-2", "--parent", "parent-1", "Do"],
+        run = subprocess.run([str(copy / "bin" / "tp-spawn"), "--worker", "claude", "--task-id", task, *args, "Do"],
                              env=self.env, text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertNotIn("--state-dir", probe.read_text())
-        self.assertNotIn("--parent", probe.read_text())
+        return probe.read_text()
+
+    def tools_manifest(self, tools):
+        folder = self.project / ".tmux-pi"
+        folder.mkdir(exist_ok=True)
+        (folder / "agent-tools.json").write_text(json.dumps({"tools": tools}))
+
+    def test_the_preamble_gets_state_dir_and_parent(self):
+        argv = self.spawn_probed("pa-1", "--parent", "parent-1")
+        self.assertIn("--state-dir " + str(self.state), argv)
+        self.assertIn("--parent parent-1", argv)
+
+    def test_a_task_without_a_parent_passes_neither(self):
+        argv = self.spawn_probed("pa-2")
+        self.assertNotIn("--state-dir", argv)
+        self.assertNotIn("--parent", argv)
+
+    def test_the_prior_task_line_reaches_the_worker_system_prompt(self):
+        """Real preamble.py and agent_tools.py: a repository with a tools manifest and a parent that has a result and a review
+        report names both in the system prompt a copy of which tp-spawn keeps."""
+        self.tools_manifest([{"name": "lane-info", "path": "$TP_ROOT/tools/agent/lane-info.sh", "roles": ["coder"],
+                              "use": "orient", "usage": "WORKTREE", "output": "branch"}])
+        parent, review = self.task("parent-1"), self.task("review-1")
+        for folder in (parent, review):
+            folder.mkdir(parents=True)
+        (review / "report.md").write_text("report")
+        (parent / "result.md").write_text("done")
+        (parent / "meta.json").write_text(json.dumps({"review": "review-1"}))
+        run = self.spawn("--parent", "parent-1", "--role", "coder", task="pa-3")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        prompt = (self.task("pa-3") / "system-prompt.md").read_text()
+        self.assertIn("Prior result: " + str(parent / "result.md"), prompt)
+        self.assertIn("review report: " + str(review / "report.md"), prompt)
+
+    def test_no_prior_line_without_a_parent(self):
+        self.tools_manifest([])
+        run = self.spawn("--role", "coder", task="pa-4")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("Prior result", (self.task("pa-4") / "system-prompt.md").read_text())
 
 
 if __name__ == "__main__":

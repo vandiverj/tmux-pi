@@ -810,6 +810,23 @@ class CacheDir:
         finally:
             os.close(fd)
 
+    def remove_json(self, name):
+        """Remove the cache file `name` that `write_json` wrote, by its name alone in the judged folder's descriptor (the folder
+        checked to be the judged one; `unlink` never follows a link). It asks the guard nothing and touches no project path, so it
+        can run after the last proof of an answer. True when removed."""
+        if self.refusal or not self._plain(name) or not name.endswith(".json"):
+            return False
+        fd = self._open_folder()
+        if fd is None:
+            return False
+        try:
+            os.unlink(name, dir_fd=fd)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
 
 def read_source(path, base, allow, failures=None, expect=None):
     """The text of `path` (a resolved path with no link on the way: the index's walk does not follow links), or None when

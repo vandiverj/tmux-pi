@@ -3049,6 +3049,7 @@ class PathRuleCase(Tree):
         ("graph.py", "CacheDir.write_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name the guard allows",
         ("graph.py", "CacheDir.write_json", "os.unlink"): "dir_fd of the checked folder",
         ("graph.py", "CacheDir.write_json", "os.rename"): "dir_fd of the checked folder",
+        ("graph.py", "CacheDir.remove_json", "os.unlink"): "dir_fd of the checked folder; a plain .json name written by write_json, asks no guard (runs after the last proof)",
         ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
         ("graph.py", "make_own_folder", "os.open"): "the judged scratch parent, folder descriptor, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "make_own_folder", "os.mkdir"): "dir_fd-relative to that descriptor, a new random name",
@@ -5819,7 +5820,7 @@ class InfoCacheCase(Tree):
                     getattr(nav, call)("src/main.ts")
             self.assertEqual(self.entries(project) + self.doc_entries(project), [], call)
 
-    def test_s3_f1_the_write_is_the_last_step_after_the_screen_and_the_proof(self):
+    def test_s3_f2_the_proof_is_the_last_step_and_the_write_comes_before_it(self):
         for call, kind in (("forward_graph", "info"), ("symbols", "doc")):
             project = self.project(call)
             events = []
@@ -5833,9 +5834,68 @@ class InfoCacheCase(Tree):
             nav._write_cache = lambda *a, events=events, real_write=real_write: (events.append("write"), real_write(*a))[1]
             with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
                 self.assertEqual(getattr(nav, call)("src/main.ts")["status"], "ok")
-            self.assertEqual(events[-2:], ["proof", "write"], (call, events))
+            self.assertEqual(events[-2:], ["write", "proof"], (call, events))
             self.assertEqual(events.count("write"), 1, call)
             self.assertEqual(len(self.entries(project) + self.doc_entries(project)), 1, kind)
+
+    def test_s3_f2_a_guard_that_moves_the_project_when_asked_about_the_entry_leaves_no_entry(self):
+        """The write asks the guard about the entry's names; a project change made there is seen by the proof, which is after it."""
+        routes = (("forward_graph", lambda n: n.forward_graph("src/main.ts")), ("symbols", lambda n: n.symbols("src/main.ts")),
+                  ("imports via deno", lambda n: n.imports("src/main.ts", source="deno")))
+        for label, run in routes:
+            project = self.project(label.replace(" ", "_"))
+            moved = []
+
+            def check(root, path, project=project, moved=moved):
+                if path.endswith(".tmp"):  # only the write's temporary name, which is asked after the read of the entry
+                    if not moved:
+                        moved.append(path)
+                        write(project / "src" / "config.ts", "export const moved = 1;\n")
+                return path
+            nav = self.doc_nav(project, check_path=check) if label == "symbols" else self.nav_for(project, check_path=check)
+            answer = run(nav)
+            self.assertTrue(moved, label)
+            self.assertEqual(answer["status"], "stale_index", (label, answer))
+            self.assertNotIn("modules", answer)
+            self.assertEqual(self.entries(project) + self.doc_entries(project), [], label)
+            self.assertEqual(list(project_cache(project).parent.glob("*.tmp")) if project_cache(project).parent.exists() else [], [], label)
+
+    def test_s3_f2_an_entry_removed_after_a_failed_proof_is_only_that_entry(self):
+        project, _ = self.filled()
+        other = project_cache(project).parent / "nav_api-info-other.json"
+        other.write_text("{}")
+        again = self.project("again")
+        moved = []
+
+        def check(root, path):
+            if path.endswith(".tmp") and not moved:
+                moved.append(path)
+                write(again / "src" / "config.ts", "export const moved = 1;\n")
+            return path
+        self.assertEqual(self.nav_for(again, check_path=check).forward_graph("src/main.ts")["status"], "stale_index")
+        self.assertEqual(self.entries(again), [])
+        self.assertTrue(other.exists())
+        self.assertEqual(len(self.entries(project)), 2)  # the filled one and `other`, both untouched
+
+    def test_s3_f2_an_exception_in_the_proof_after_the_write_leaves_no_entry(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(lambda reach: (_ for _ in ()).throw(OSError("boom")))):
+            with self.assertRaises(OSError):
+                nav.forward_graph("src/main.ts")
+        self.assertEqual(self.entries(project), [])
+
+    def test_s3_f2_removing_an_entry_asks_the_guard_nothing(self):
+        project = self.project()
+        asked = []
+        nav = self.nav_for(project, check_path=lambda root, path: (asked.append(path), path)[1])
+        self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
+        name = self.entries(project)[0].name
+        del asked[:]
+        self.assertTrue(nav._cache.remove_json(name))
+        self.assertEqual((asked, self.entries(project)), ([], []))
+        self.assertFalse(nav._cache.remove_json(name))
+        self.assertFalse(nav._cache.remove_json("../x.json"))
 
     def test_s3_f1_a_refusal_a_gap_or_no_deno_graph_stores_nothing_on_either_route(self):
         project = self.project("sandbox")

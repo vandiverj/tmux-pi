@@ -1088,20 +1088,37 @@ class NavApi:
         very last step: the screen, the filtering and the paging are all done before it, so nothing (the guard included) runs
         between the check and the return. A tree that moved gives that answer (`stale_index`, or the index's gaps), which carries
         nothing from `answer`.
-        `store` (None, or a function that writes the answer's cache entry) is the only thing that writes a cache from an answer, and
-        it runs only after all of that: the answer is `ok` before and after the screen and the proof held. A refusal, a gap, a
-        stale tree, an error, a screen that failed or an exception on the way never reach it. A store that fails changes nothing:
-        the entry is keyed by the content the answer was made from, and the answer was already proven."""
+        `store` (None, or a function that writes the answer's cache entry and returns the function that removes exactly that entry, or
+        None) is the only thing that writes a cache from an answer. It runs after the screen and only for an answer that is `ok`
+        before and after it, and BEFORE the proof, because the write asks the guard about the entry's names (and so may run project
+        code); the proof is therefore still the last thing that touches the project. When the proof fails, or raises, the entry
+        just written is removed by its name alone (`graph.CacheDir.remove_json`: no guard, no project path) and the answer given is
+        the proof's. A refusal, a gap, a screen that failed or an exception before the write never reach it. A store that fails
+        changes nothing. Between the write and the removal the entry exists on disk, but it is keyed by the content it was made from."""
         out = self._out(answer)
-        failed = proof() if proof is not None else None
-        if failed is not None:
-            return self._out(failed)
+        undo = None
         if store is not None and answer.get("status") == "ok" and out.get("status") == "ok":
             try:
-                store()
+                undo = store()
+            except Exception:
+                undo = None
+        try:
+            failed = proof() if proof is not None else None
+        except BaseException:
+            self._undo(undo)
+            raise
+        if failed is not None:
+            self._undo(undo)
+            return self._out(failed)
+        return out
+
+    @staticmethod
+    def _undo(undo):
+        if undo is not None:
+            try:
+                undo()
             except Exception:
                 pass
-        return out
 
     @staticmethod
     def _reach_proof(reach):
@@ -1335,8 +1352,12 @@ class NavApi:
         return data if isinstance(data, shape) else None
 
     def _write_cache(self, kind, key, value):
-        """Written through the judged cache folder (`graph.CacheDir.write_json`); nothing when the folder was refused."""
-        self._cache.write_json(self._cache_name(kind, key), value)
+        """Written through the judged cache folder (`graph.CacheDir.write_json`); nothing when the folder was refused. Returns the
+        function that removes exactly that entry (`graph.CacheDir.remove_json`: by name, asks no guard), or None when nothing was written."""
+        name = self._cache_name(kind, key)
+        if not self._cache.write_json(name, value):
+            return None
+        return lambda: self._cache.remove_json(name)
 
     # --- status
 

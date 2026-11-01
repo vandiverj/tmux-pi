@@ -19,7 +19,8 @@ only there, so a file the walk missed is a file Deno cannot open.
 THE PATH RULE, for this module and nav_api.py (a test scans both for any file-system call and holds each to a table): no file-system
 call (open, stat, lstat, listing, readlink, realpath, a mkdir, a write or a removal) is made at a path until its name has been shown
 inside the boundary and allowed by the guard. Links are followed only by `judged_realpath`, which judges each link's target by name
-before it looks at it; bytes are read only by `read_bounded`; a cache lives only in a `CacheDir`, a folder inside the project judged
+before it looks at it; bytes are read only by `read_bounded`, with ONE exception (nav_api's `_boundary_hash`, which reads a `.git`
+file or a workspace marker only to hash it, see nav_api's "The monorepo"); a cache lives only in a `CacheDir`, a folder inside the project judged
 once like any other path; files and folders are made and removed only relative to a descriptor opened with no link on the way
 (`write_new`, `open_folder_below`, `make_own_folder`, `remove_own_folder`). A location not shown allowed is refused, and the refusal
 does not depend on whether anything is there. Places outside any project (what the sandbox grants: Deno's cache and executable, the
@@ -31,18 +32,21 @@ folders above it (`_guarded_roots`).
 
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
 import secrets
 import shutil
 import stat
+import threading
 import time
 from urllib.parse import unquote
 
@@ -679,7 +683,9 @@ def read_bounded(path, admitted, boundary, allow, limit=None, expect=None, take=
 def write_new(path, data, dir_fd=None):
     """Write `data` to `path` (relative to the directory open on `dir_fd`, when given) as a new regular file (never through a link,
     anywhere on the way: `NOFOLLOW_ANY`; never over an existing file): the one way this module and `nav_api` write a file. Raises
-    OSError when `path` exists or a folder on the way is a link (a mirror folder swapped for one after it was made)."""
+    OSError when `path` exists or a folder on the way is a link (a mirror folder swapped for one after it was made), or when the
+    write or the close fails. It never removes anything: a write that fails after the file was made leaves that (partial) file, and
+    a file that was already there is never touched."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW_ANY | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
     try:
         view = memoryview(data)
@@ -689,25 +695,53 @@ def write_new(path, data, dir_fd=None):
         os.close(fd)
 
 
-def open_folder_below(base, parts):
-    """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing: `base` is opened with no link on the
+def close_quietly(fd):
+    """Close `fd` and swallow an OSError (a failed close of a folder descriptor changes nothing on disk and must not turn a finished
+    write into a failure, or hide the error that is already being raised). Not for a file that was written: `write_new` lets its
+    close failure show, because the data may not be on disk."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def open_folder_below(base, parts, make=True):
+    """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing (with `make` False none is made: a
+    missing one raises FileNotFoundError): `base` is opened with no link on the
     way (`NOFOLLOW_ANY`) and each part is made with `mkdir` and opened with `O_NOFOLLOW` relative to the one before, so no link is
-    followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR)."""
+    followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR, or the close of a folder
+    on the way failing: this runs before a write's commit point, so that failure fails the open; the descriptor is released once)."""
     fd = os.open(base, DIR_FLAGS | NOFOLLOW_ANY)
     try:
         for part in parts:
-            try:
-                os.mkdir(part, 0o700, dir_fd=fd)
-            except FileExistsError:
-                pass
+            if make:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
             inner = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = inner
+            done, fd = fd, inner
+            os.close(done)  # a failure raises (the kernel has released `done`); `fd` is already `inner`, closed below
     except BaseException:
-        os.close(fd)
+        close_quietly(fd)
         raise
     return fd
 
+
+ENVELOPE_FORMAT = 1  # the wrapper of every cache entry (`CacheDir`); a change of its shape is a change of this number
+
+# The sweep (`CacheDir.sweep`): what stays in a cache folder, and how much work one sweep may do.
+ENTRY_MAX_AGE_S = 14 * 86400  # an info or doc entry unused (not written, not touched by a hit) for this long is removed
+INDEX_MAX_AGE_S = 30 * 86400  # the same for an index file
+SWEEP_CAP_BYTES = 64_000_000  # the entries of a folder together; the oldest (by mtime) go first
+SWEEP_CAP_FILES = 400
+TEMP_MAX_AGE_S = 600  # a `.tmp` older than this is a crash leftover, whoever made it (the names are random, not pid-based)
+SWEEP_EVERY_S = 3600  # at most one sweep per folder per hour (the marker file carries the time)
+SWEEP_MAX_DELETIONS = 200
+SWEEP_BUDGET_S = 0.050  # listing, judging and deleting together
+TOUCH_EVERY_S = 3600  # a hit touches an entry only when its mtime is at least this old
+SWEEP_MARKER = "nav_api-sweep.json"
+_ENTRY_NAME = re.compile(r"nav_api-(index|doc|info)-.*\.json")
 
 CACHE_REFUSALS = {"outside_project": "cache_dir_outside_project", "reaches_refused_path": "cache_dir_refused",
                   "unreadable_file": "cache_dir_unreadable"}
@@ -726,12 +760,36 @@ class CacheDir:
     Each cache file is a plain `.json` name directly in the folder (no `/`, not hidden), read with `read_bounded` (boundary `base`,
     the guard judging the file's project-relative name as well) and written through a descriptor on the folder, made one component
     at a time below `base` with no link followed and checked to be the judged folder, so a folder swapped for a link after the
-    judgement is neither read nor written."""
+    judgement is neither read nor written.
+
+    The envelope. Every entry is `{"format": ENVELOPE_FORMAT, "name": <file name>, "sha256": <hash of the payload>, "payload": value}`
+    (index, doc and info entries alike: `read_json` and `put_json` are the only reader and writer). An entry that is not that
+    exactly (not JSON, truncated, another format, another name, a payload that does not hash to `sha256`) is a miss: None, never an
+    error and never a hit. The checksum guards against corruption, not against a writer who can compute it (the folder is trusted as
+    the project's sources are). The envelope says nothing about the shape of the payload: each caller holds it to the shape it writes
+    (an index entry `ImportIndex._entry_shape`, a doc list, an info graph) and treats another shape as a miss. The caller that accepted a payload's shape touches the entry's modification time (`touch`, for the
+    age rule of the sweep; `read_json` does not): by the folder's descriptor, never following a link, only when the time is an hour
+    old or in the future, and a failure of it changes nothing.
+
+    The sweep (`sweep`, cache plan S5). After a write (`put_json` sets `written`; a hit never does) the owner calls `sweep`, which
+    removes, at most once an hour per folder (the time is kept in the marker `nav_api-sweep.json`), stray temporaries older than
+    10 minutes, entries unused for 14 days (index files 30), then the oldest entries while the folder holds more than 64 MB or 400
+    files; it stops after 200 deletions or 50 ms. The safety rule: it lists and deletes only through a descriptor on the judged
+    folder (`_open_folder`); it looks only at names that are `nav_api-(index|doc|info)-*.json`, `*.tmp` or the marker, and of those
+    only regular files (a link, a folder or anything else is left untouched, not even counted); the guard judges each name before it
+    is deleted; and just before each unlink the name is looked at again (`lstat` through the descriptor, no link followed): it must
+    still be the regular file that was listed (same device, inode and modification time), else it is skipped. A name replaced
+    between that look and the unlink can still be removed (no system call closes that): it costs a cache miss, never a wrong
+    answer, because every entry is verified (envelope) and every answer is proved when it is made. Every failure is swallowed:
+    `sweep` never raises, and no answer depends on it. A refused or missing folder is not swept."""
 
     def __init__(self, base, folder, allow):
         self.base = base
         self.allow = allow
         self.rel = self.path = self.refusal = None
+        self.written = False  # an entry was written since the last sweep was considered: the only thing that makes a sweep due
+        self._swept_at = None  # when this object last sweeped (or tried to): the marker file may not be writable
+        self._sweeping = threading.Lock()
         if allow is None:
             self.refusal = "cache_dir_unguarded"
             return
@@ -750,39 +808,103 @@ class CacheDir:
     def _allow_file(self, rel):
         return posixpath.dirname(rel) == self.rel and self._plain(posixpath.basename(rel)) and _allows(self.allow, rel)
 
+    @staticmethod
+    def _checksum(value):
+        return hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _open_payload(self, name, data):
+        """The payload of the envelope in `data` (the bytes read from the file `name`), or None for anything that is not exactly an
+        envelope of this format, for this name, whose checksum holds."""
+        try:
+            envelope = json.loads(data.decode("utf-8"))
+            if not isinstance(envelope, dict) or set(envelope) != {"format", "name", "sha256", "payload"} \
+                    or type(envelope["format"]) is not int or envelope["format"] != ENVELOPE_FORMAT or envelope["name"] != name \
+                    or envelope["sha256"] != self._checksum(envelope["payload"]):
+                return None
+        except (ValueError, RecursionError):  # not UTF-8, not JSON, nested too deep to read or to hash: a miss
+            return None
+        return envelope["payload"]
+
     def read_json(self, name):
-        """The JSON value in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES)."""
+        """The payload in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES, and any
+        entry that is not a whole envelope of this format with a matching checksum: see the class docstring). Reading touches nothing: the
+        caller touches the entry (`touch`) once it accepted the shape of the payload, so an entry of this format that no caller
+        accepts ages out."""
         if self.refusal or not self._plain(name) or not name.endswith(".json"):
             return None
         full = os.path.join(self.path, name)
         status, data, _ = read_bounded(full, full, self.base, self._allow_file, limit=MAX_CACHE_BYTES)
         if status != READ_OK:
             return None
-        try:
-            return json.loads(data.decode("utf-8"))
-        except ValueError:
-            return None
+        return self._open_payload(name, data)
 
-    def _open_folder(self):
-        """A descriptor on the cache folder, made where missing (`open_folder_below`), or None; it must be the judged folder by the
-        kernel's name."""
+    def touch(self, name):
+        """Set the modification time of the cache file `name` to now, for the age rule, when it is at least TOUCH_EVERY_S old or in
+        the future (a clock that was ahead): True when the time is now recent (set, or recent already); False when it was not
+        (a link or anything but a regular file at the name, a name the guard refuses, a folder that is not the judged one, no such
+        file, no permission, a system that cannot do it). Best effort and silent: nothing here raises, and no answer depends on it.
+        The folder is opened by its descriptor without making anything, the name is looked at without following a link, and the
+        time is set on the name itself (`follow_symlinks=False`), so a link swapped in after the read is never followed."""
+        if self.refusal or not self._plain(name) or not name.endswith(".json"):
+            return False
         try:
-            fd = open_folder_below(self.base, self.rel.split("/"))
+            if not self._allow_file(posixpath.join(self.rel, name)):
+                return False
+        except Exception:
+            return False
+        fd = self._open_folder(make=False)
+        if fd is None:
+            return False
+        try:
+            info = os.lstat(name, dir_fd=fd)
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            if 0 <= time.time() - info.st_mtime < TOUCH_EVERY_S:
+                return True  # recent enough for the age rule: no write for a hit
+            os.utime(name, None, dir_fd=fd, follow_symlinks=False)
+            return True
+        except Exception:
+            return False
+        finally:
+            close_quietly(fd)
+
+    def _open_folder(self, make=True):
+        """A descriptor on the cache folder, made where missing (`open_folder_below`; with `make` False, only opened), or None; it
+        must be the judged folder by the kernel's name."""
+        try:
+            fd = open_folder_below(self.base, self.rel.split("/"), make=make)
         except OSError:
             return None
         if _opened_path(fd) != self.path:
-            os.close(fd)
+            close_quietly(fd)
             return None
         return fd
 
-    def write_json(self, name, value):
-        """Write `value` to the cache file `name` (a temporary file, then a rename, both in the folder's descriptor). True when
-        written; False when there is no cache, the name is refused, a link is at the name, or the write fails (the cache is left as
-        it was, and only the next start is cold)."""
-        temp = f"{name}.{os.getpid()}.tmp"
+    def prepare_json(self, name):
+        """Judge a write before it is made: the cache file `name` and a unique temporary name (random hex, so no other writer's
+        name) are each asked of the guard, once (the folder was judged when the `CacheDir` was made, and is not asked again: the guard
+        is asked once per name per answer). Returns the pair (a token for `put_json`), or None when
+        there is no cache, the name is not a plain `.json` one, or the guard refuses any of them. This is the only step of a write
+        that asks the guard (and so may run project code)."""
+        temp = f"{name}.{secrets.token_hex(8)}.tmp"
         if self.refusal or not self._plain(name) or not name.endswith(".json") \
                 or not all(self._allow_file(posixpath.join(self.rel, item)) for item in (name, temp)):
+            return None
+        return name, temp
+
+    def put_json(self, token, value):
+        """Write `value` under the names `prepare_json` judged (a temporary file with O_EXCL and no link followed, then a rename, both
+        in the folder's descriptor). It asks the guard nothing and calls no project code, so it can follow the last proof of an
+        answer. True when written; False (swallowed) when `token` is None, a link is at the name, or the write fails (serialising,
+        os.write, os.close of the temporary file, the close of a folder above the cache folder, or the rename).
+
+        The rename is the single commit point. Before it, any failure returns False and leaves every entry byte-identical. After it
+        succeeds the result is True and nothing can raise or change it: the folder descriptor is closed with `close_quietly`, so a
+        failed close of it (which changes nothing on disk) is not a failed write. Nothing here deletes anything: a failed write may
+        leave its own stray `.tmp` (a unique random name), which the sweep removes once it is 10 minutes old; another writer's file is never touched."""
+        if token is None:
             return False
+        name, temp = token
         fd = self._open_folder()
         if fd is None:
             return False
@@ -793,20 +915,215 @@ class CacheDir:
             except FileNotFoundError:
                 pass
             try:
-                os.unlink(temp, dir_fd=fd)  # left by a crashed run of this process id; unlink never follows a link
-            except FileNotFoundError:
-                pass
-            write_new(temp, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"), dir_fd=fd)
-            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
-            return True
-        except OSError:
-            try:
-                os.unlink(temp, dir_fd=fd)
-            except OSError:
-                pass
+                data = json.dumps({"format": ENVELOPE_FORMAT, "name": name, "sha256": self._checksum(value), "payload": value},
+                                  separators=(",", ":"), sort_keys=True).encode("utf-8")
+            except (ValueError, TypeError, RecursionError):
+                return False  # nothing was made yet
+            write_new(temp, data, dir_fd=fd)  # a failed write may leave its half file: nothing is deleted here
+            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)  # the commit point
+        except OSError:  # before the commit only (lstat, write, close of the temporary, rename), also FileExistsError: the entry is as it was
             return False
+        else:
+            self.written = True  # a sweep is now due (`sweep` decides); a flag is all this writer does, it deletes nothing
+            return True  # after the commit nothing can raise: the `finally` closes quietly
         finally:
-            os.close(fd)
+            close_quietly(fd)
+
+    def write_json(self, name, value):
+        """`prepare_json` then `put_json`: True when written; False when there is no cache, a name is refused, a link is at the
+        name, or the write fails (every entry is left as it was, a stray `.tmp` is possible, and a later start loads whatever entry is there)."""
+        return self.put_json(self.prepare_json(name), value)
+
+    # --- the sweep
+
+    @staticmethod
+    def _managed(name):
+        """What the sweep may look at a name as: "temp" (`*.tmp`), "index", "entry" (doc or info), or None for the marker and every
+        other name (those are never touched). The name is plain: no `/`, not hidden."""
+        if not CacheDir._plain(name):
+            return None
+        if name.endswith(".tmp"):
+            return "temp"
+        found = _ENTRY_NAME.fullmatch(name)
+        return None if found is None else ("index" if found.group(1) == "index" else "entry")
+
+    def _last_sweep(self):
+        """The time of the last sweep as the marker file records it (seconds since the epoch), or None (no marker, not an envelope
+        of this format, not a number)."""
+        data = self.read_json(SWEEP_MARKER)
+        value = data.get("last_sweep") if isinstance(data, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)  # a whole number in the marker is read as the float the docs promise
+        except OverflowError:  # a whole number no float can hold: not a time, and no reason to stop every later sweep
+            return None
+        return value if math.isfinite(value) and value >= 0 else None  # the writer's `time.time()` is never negative
+
+    def _listing(self, fd, spent):
+        """([(name, kind, size, mtime_ns, dev, ino)], complete): the regular files of the folder open on `fd` that the sweep manages
+        (see `_managed`), each looked at with `lstat` in the descriptor (no link followed). Only names are taken from the listing,
+        never a type from it; a name that has gone before it is looked at, or is not a regular file, is left out. `complete` is False
+        when `spent()` stopped the listing early, or when a name could not be looked at for any other reason (a folder that lists
+        but cannot be looked into, an I/O error): what was found is still true of those files, but is not all of them."""
+        found, complete = [], True
+        with os.scandir(fd) as listing:
+            for count, entry in enumerate(listing):
+                if count % 64 == 63 and spent():
+                    complete = False
+                    break
+                kind = self._managed(entry.name)
+                if kind is None:
+                    continue
+                try:
+                    info = os.lstat(entry.name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue  # gone since the listing: not there now
+                except OSError:
+                    complete = False  # there, but not looked at: the list is not all of what is in the folder
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    found.append((entry.name, kind, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino))
+        return found, complete
+
+    def sweep(self):
+        """Remove what has aged out of the folder, when a sweep is due (see the class docstring for the rules and the safety rule).
+        Due means: an entry was written since the last time this was asked (`written`), no sweep by this object or by the marker
+        file within SWEEP_EVERY_S (a marker time in the future, from a clock that was ahead, does not hold a sweep back), and the
+        folder is judged and exists. Returns None when no sweep was made, else {"deleted": n, "skipped": n, "complete": bool}
+        (`complete` False: the budget ran out, or a listed name could not be looked at). The marker is written last; it counts as a write only for the sweep that wrote it.
+        Never raises."""
+        if self.refusal or not self.written or not self._sweeping.acquire(blocking=False):
+            return None
+        fd = None
+        try:
+            self.written = False
+            now = time.time()
+            if self._swept_at is not None and 0 <= now - self._swept_at < SWEEP_EVERY_S:
+                return None
+            last = self._last_sweep()
+            if last is not None and 0 <= now - last < SWEEP_EVERY_S:
+                return None
+            self._swept_at = now
+            fd = self._open_folder(make=False)
+            if fd is None:
+                return None
+            return self._sweep_in(fd, now)
+        except Exception:
+            return None
+        finally:
+            if fd is not None:
+                close_quietly(fd)
+            self.written = False  # the marker is the sweep's own write, not a reason for another sweep
+            self._sweeping.release()
+
+    def _sweep_in(self, fd, now):
+        """The sweep itself in the judged folder's descriptor `fd`; see `sweep`."""
+        started = time.perf_counter()
+        deleted, skipped = 0, 0
+
+        def spent():
+            return deleted >= SWEEP_MAX_DELETIONS or time.perf_counter() - started >= SWEEP_BUDGET_S
+
+        def remove(item):
+            """True when the file was removed; False when it was skipped; None when the budget is spent (nothing was done)."""
+            nonlocal deleted, skipped
+            if spent():
+                return None
+            name, _, _, mtime_ns, dev, ino = item
+            try:
+                allowed = self._allow_file(posixpath.join(self.rel, name))  # the guard judges the name before it goes
+                info = os.lstat(name, dir_fd=fd) if allowed else None  # the same file that was listed, looked at again
+                if info is None or not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_mtime_ns) != (dev, ino, mtime_ns):
+                    skipped += 1
+                    return False
+                os.unlink(name, dir_fd=fd)
+            except Exception:
+                skipped += 1
+                return False
+            deleted += 1
+            return True
+
+        try:
+            found, complete = self._listing(fd, spent)
+        except Exception:
+            found, complete = [], False
+        def life(kind):
+            return TEMP_MAX_AGE_S if kind == "temp" else INDEX_MAX_AGE_S if kind == "index" else ENTRY_MAX_AGE_S
+
+        order = sorted(found, key=lambda item: (item[3], item[0]))  # oldest first
+        tried, removed, stopped = set(), set(), False
+        for item in order:  # age: a stray temporary, an entry unused for too long; a time in the future is never old
+            if now - item[3] / 1e9 > life(item[1]):
+                tried.add(item[0])
+                got = remove(item)
+                if got is None:
+                    stopped = True
+                    break
+                if got:
+                    removed.add(item[0])
+        if not stopped:  # size: the entries that are left (a temporary is not an entry), oldest first, until both caps hold
+            entries = [item for item in order if item[1] != "temp" and item[0] not in removed]
+            count, size = len(entries), sum(item[2] for item in entries)
+            for item in entries:
+                if count <= SWEEP_CAP_FILES and size <= SWEEP_CAP_BYTES:
+                    break
+                if item[0] in tried:
+                    continue  # asked once already and skipped
+                got = remove(item)
+                if got is None:
+                    stopped = True
+                    break
+                if got:
+                    count, size = count - 1, size - item[2]
+        result = {"deleted": deleted, "skipped": skipped, "complete": complete and not stopped}
+        try:
+            self.put_json(self.prepare_json(SWEEP_MARKER), {"version": 1, "last_sweep": now, **result})
+        except Exception:
+            pass  # the next write sweeps again (this object waits an hour, another may not)
+        return result
+
+    def _counts(self):
+        """(entries, bytes) of the entries the sweep manages, or (None, None) when they are not all known: there is no cache (refused),
+        the folder cannot be opened or is not the judged one, it cannot be listed, or a listed name could not be looked at (a count of
+        the names that could be would pass for the whole). (0, 0) when the folder is not there yet (nothing is made). Never raises."""
+        if self.refusal:
+            return None, None
+        try:
+            fd = open_folder_below(self.base, self.rel.split("/"), make=False)
+        except FileNotFoundError:
+            return 0, 0  # nothing is there yet: an empty cache, and nothing is made
+        except Exception:
+            return None, None
+        try:
+            if _opened_path(fd) != self.path:
+                return None, None
+            found, complete = self._listing(fd, lambda: False)
+        except Exception:
+            return None, None
+        finally:
+            close_quietly(fd)
+        if not complete:
+            return None, None
+        entries = [item for item in found if item[1] != "temp"]
+        return len(entries), sum(item[2] for item in entries)
+
+    def summary(self):
+        """{"entries": n, "bytes": n, "last_sweep": seconds since the epoch or None, "incomplete": bool}: the entries the sweep
+        manages (index, doc and info files that are regular files; temporaries and the marker are not entries) and the marker's
+        time. Read-only, nothing is made (a missing folder is 0 and 0). Each field comes from its own source and no failure of one
+        source hides another: entries and bytes are None, and `incomplete` True, when they are not known (see `_counts`); `last_sweep`
+        is None only when the marker itself cannot be read (no cache, absent, not an envelope of this format, not a number), and is
+        the marker's time when it can, whatever the listing did. Never raises."""
+        try:
+            last = self._last_sweep()
+        except Exception:
+            last = None
+        try:
+            entries, size = self._counts()
+        except Exception:
+            entries, size = None, None
+        return {"entries": entries, "bytes": size, "last_sweep": last, "incomplete": entries is None or size is None}
 
 
 def read_source(path, base, allow, failures=None, expect=None):
@@ -828,7 +1145,8 @@ def read_sources(paths, base, allow, workers=8, failures=None, keys=None):
     in threads, and the CPU work of scanning stays in the caller."""
     paths, keys = list(paths), keys or {}
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(paths) or 1))) as pool:
-        return dict(zip(paths, pool.map(lambda path: read_source(path, base, allow, failures, keys.get(path)), paths)))
+        contexts = [contextvars.copy_context() for _ in paths]  # a worker runs in the caller's context: the answer's guard memo (`NavApi._permits`) is theirs
+        return dict(zip(paths, pool.map(lambda ctx, path: ctx.run(read_source, path, base, allow, failures, keys.get(path)), contexts, paths)))
 
 
 def probe_sources(keyed, base, allow, workers=8):
@@ -837,8 +1155,9 @@ def probe_sources(keyed, base, allow, workers=8):
     byte read. `ok` proves the file is there, can be read and is the version keyed; in threads, as `read_sources`."""
     keyed = list(keyed)
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keyed) or 1))) as pool:
+        contexts = [contextvars.copy_context() for _ in keyed]  # as in `read_sources`
         return dict(zip([path for path, _ in keyed], pool.map(
-            lambda item: read_bounded(item[0], item[0], base, allow, expect=item[1], take=False)[0], keyed)))
+            lambda ctx, item: ctx.run(read_bounded, item[0], item[0], base, allow, expect=item[1], take=False)[0], contexts, keyed)))
 
 
 # ------------------------------------------------------------------------------------------------------- the allow-list walk
@@ -1398,6 +1717,36 @@ _CONFIG_GAP = {"refused": "config_refused", "outside": "config_outside", "change
 _READ_GAP = {"absent": "source_changed", "changed": "source_changed", "refused": "source_refused", "outside": "source_refused"}
 
 
+def _mode_kind(mode):
+    """"dir", "file", "link" or "other" for a `st_mode`."""
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "link" if stat.S_ISLNK(mode) else "other"
+
+
+def _entry_kind(entry):
+    """The kind a `DirEntry` was listed as, with no link followed (see `_mode_kind`); OSError from a look the listing could not answer."""
+    if entry.is_dir(follow_symlinks=False):
+        return "dir"
+    if entry.is_file(follow_symlinks=False):
+        return "file"
+    return "link" if entry.is_symlink() else "other"
+
+
+def _entry_gap(error):
+    """The gap for an entry of a listing that could not be looked at: `entry_changed` when it is gone or its way moved since the
+    listing (no such name, a folder on the way now a file or a link), else `entry_unreadable`."""
+    return "entry_changed" if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP) else "entry_unreadable"
+
+
+def _key(fingerprint):
+    """The persisted key of a walk fingerprint: `[mtime_ns, size]`. The rest (`ino`, `ctime_ns`, `dev`) is only ever compared inside
+    one process (a cache from another checkout must still match), by the snapshot and the proof."""
+    return [fingerprint[0], fingerprint[1]]
+
+
 class ImportIndex:
     """`file -> imports` for the source files below `root`, and the reverse map derived from it.
 
@@ -1430,15 +1779,21 @@ class ImportIndex:
     a file or folder the guard refuses by its name (outside the index by policy). An answer that could depend on a gap is not `ok`:
     `NavApi` is the one place that decides (`_index_answer`).
 
-    The proof (`prove`). What the index holds is never taken as still true because a key matched once: `prove()` looks again at
-    every input the edges were made from, and returns the gaps it finds ({} when everything holds). Each folder listing: the walk is
-    made again and must find the same files with the same keys. Each source: stat and open-for-read must succeed, with its open
-    signature the indexed one (`probe_sources`, no byte read). Each config and overlay: read again, its state and fingerprint must be
-    the ones the map was made from (gone, or another one, is `config_changed`; now unreadable or refused is that gap). Each import
-    target that was looked at: its verdict must be the same. `refresh()` ends with one (a change during the build is found there);
-    `NavApi` makes one more after the answer is built and before it is given. Entries loaded from the cache, entries kept by an
-    instance and entries just read get the same proof. Its limit is the key's: a file rewritten with the same mtime_ns and size is
-    not seen (the design's `(path, mtime, size)` key), and the cache folder is trusted as the project's sources are."""
+    The proof (ONE SNAPSHOT, ONE FINAL PROOF). What the index holds is never taken as still true because a key matched once. The
+    start of an answer is `refresh()`'s walk, the snapshot: every source with its fingerprint `(mtime_ns, size, ino, ctime_ns, dev)`
+    (the index persists only the first two). A source whose key changed or is new is read (`read_sources`, the open signature
+    checked against the snapshot); one kept by key is opened for reading, no byte read (`probe_sources`), unless this instance
+    already read or opened it at exactly this fingerprint: those are the only opens of an answer, so a warm answer opens nothing, and
+    a cache-loaded one opens each source once. A source that cannot be read or opened is a gap there. The proof (`prove()`, the only
+    one: `NavApi._final` makes it as the last step of an answer) looks again at every input the edges were made from and returns the
+    gaps it finds ({} when everything holds): the walk is made again and must find the snapshot (the same files with the same
+    fingerprints: an edit, a chmod, a replace, or a file that appeared or went, is `source_changed` or `folder_changed`; nothing is
+    opened, because a file that is the same file with the same ctime cannot have stopped being readable); each config and overlay is
+    read again, its state and fingerprint must be the ones the map was made from (gone, or another one, is `config_changed`; now
+    unreadable or refused is that gap); each import target that was looked at must have the same verdict; and the choice of `base`
+    must hold (`boundary_holds`). `refresh()` with `prove` (the default) ends with one. Entries loaded from the cache, entries kept by
+    an instance and entries just read get the same proof. Its limit is the fingerprint's: a file rewritten with the same mtime_ns,
+    size, ino and ctime_ns is not seen, and the cache folder is trusted as the project's sources are."""
 
     def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None, cache=None):
         spelled = os.path.abspath(base)
@@ -1474,6 +1829,8 @@ class ImportIndex:
         self._exclude = []  # the config's `exclude`, as the last walk used it
         self._targets = {}  # absolute path -> verdict: each import target the edges were made from (`prove` judges it again)
         self._unread = set()  # sources the last walk found and the build could not read (each already a gap)
+        self._snapshot = None  # {rel: fingerprint}: the walk the last refresh made its answer from (the START of the one proof)
+        self._verified = {}  # rel -> fingerprint at which this instance last read or opened the file successfully
         self._reverse = {}
         self._known = set()
         self.refreshed_at = None
@@ -1494,17 +1851,31 @@ class ImportIndex:
         if self.cache_path is None:
             return
         data = self._cache.read_json(self._cache_name)
-        if not isinstance(data, dict) or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
                 or data.get("root") != self.root or not isinstance(data.get("entries"), dict):
             return
         for rel, entry in data["entries"].items():
-            if isinstance(entry, dict) and isinstance(entry.get("key"), list) and isinstance(entry.get("specs"), list):
+            if rel and self._entry_shape(entry):  # one of another shape is a miss for that file: it is read again (a whole envelope can hold anything)
                 self.entries[rel] = {"key": entry["key"], "specs": entry["specs"]}
+        self._cache.touch(self._cache_name)  # the shape was accepted: the file is in use (a file this instance rejects ages out)
+
+    @staticmethod
+    def _entry_shape(entry):
+        """True when `entry` is an index entry of the shape `refresh` makes: {"key": [mtime_ns, size], "specs": [[spec, line,
+        type_only, dynamic], ...]} (whole numbers, text and flags of exactly those types and in the ranges `refresh` can write: a size from 0, a line from 1). The envelope proves the bytes are the ones a
+        writer made, not that they are this shape; a loaded entry that is not is a miss, never something `_resolve_all` can raise on."""
+        def whole(value, low):
+            return type(value) is int and low <= value < 2 ** 63
+        if not isinstance(entry, dict) or not isinstance(entry.get("key"), list) or len(entry["key"]) != 2 \
+                or not whole(entry["key"][0], -2 ** 63) or not whole(entry["key"][1], 0) or not isinstance(entry.get("specs"), list):
+            return False  # key: a modification time in ns (before 1970 is a negative one) and a size (never negative)
+        return all(isinstance(row, list) and len(row) == 4 and isinstance(row[0], str) and whole(row[1], 1) and type(row[2]) is bool
+                   and type(row[3]) is bool for row in entry["specs"])  # a line counts from 1 (`_tokens`)
 
     def save(self):
         """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True
         when written; no cache, a symlink at the name, or a failed write leaves the cache as it was and returns False (the index
-        still works, only the next start is cold)."""
+        still works; a later start loads whatever index file is there and rescans each source file it does not hold as current)."""
         if self.cache_path is None:
             return False
         data = {"version": INDEX_VERSION, "base": self.base, "root": self.root, "entries": self.entries}
@@ -1513,10 +1884,22 @@ class ImportIndex:
     # --- building
 
     def _walk(self, patterns):
-        """{rel: [mtime_ns, size]} for the source files below `root`. Each entry is judged by its name (the guard, SKIP_DIRS) before
+        """{rel: fingerprint} for the source files below `root`; the fingerprint is `(mtime_ns, size, ino, ctime_ns, dev)` (see
+        `_key`: the first two are the key the index keeps). Each entry is judged by its name (the guard, SKIP_DIRS) before
         anything is asked of it, and then looked at with no link followed: a link is neither indexed nor followed, a directory
         the guard refuses is not listed, and each directory is opened with no link on its path (`NOFOLLOW_ANY`) and must be the
-        one judged, by the kernel's name, before it is listed."""
+        one judged, by the kernel's name, before it is listed.
+
+        Nothing is asked of a name until it has been judged: the listing is kept as entries and none is asked its type until its name
+        is allowed, because `DirEntry.is_dir` stats the name on a file system whose listing gives no type. Once a name is allowed, it is
+        looked at by `lstat` of the name in the folder's descriptor, which decides its type (the `DirEntry` answer alone may be the type
+        the listing cached and so never notice that the name has gone). The listing's type (`DirEntry.is_dir/is_file/is_symlink` with no
+        link followed: the cached `d_type`, and only when the file system gave none a look taken at that moment) is compared with the
+        `lstat` type: a name that is gone or moved, or of another kind (file, folder, link, other) than listed, is a race
+        (`entry_changed`, so `stale_index`); any other error is `entry_unreadable`. A replacement of the same kind (a file by another file)
+        is left to the snapshot proof (mtime and size), as before. A name with no source suffix is then dropped unless
+        it is a folder, so it is never opened, read or looked at again. (A guard-free skip of names that can never be source cannot
+        know they are not folders without asking, and asking must wait for the judgement.)"""
         found = {}
         if self.root is None:
             return found
@@ -1535,24 +1918,31 @@ class ImportIndex:
                     self._gap("folder_unreadable" if opened is None else "folder_changed")  # a link was swapped in after the judgement
                     continue
                 with os.scandir(fd) as listing:
-                    names = sorted(entry.name for entry in listing)
+                    entries = sorted(listing, key=lambda entry: entry.name)  # kept as entries: nothing is asked of any of them yet
                 subdirs = []
-                for name in names:
+                for entry in entries:
+                    name = entry.name
                     full = os.path.join(here, name)
                     rel = lexical_path(self.base, full)
                     if rel is None or name in SKIP_DIRS or not self._allowed(rel):
                         continue  # judged by its name: nothing is asked of it
                     try:
-                        info = os.lstat(name, dir_fd=fd)
+                        listed = _entry_kind(entry)  # the type the listing gave (its cached `d_type`; when none, a look taken now)
+                        info = os.lstat(name, dir_fd=fd)  # the type now, no link followed
                     except OSError as error:
-                        self._gap("entry_changed" if isinstance(error, FileNotFoundError) else "entry_unreadable")
+                        self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
                         continue
+                    if listed != _mode_kind(info.st_mode):
+                        self._gap("entry_changed")  # replaced by another kind of entry (file, folder, link) since the listing
+                        continue
+                    if not name.endswith(SOURCE_EXTENSIONS) and not stat.S_ISDIR(info.st_mode):
+                        continue  # allowed and still there, but can never be read as a source nor descended into
                     config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
                     if stat.S_ISDIR(info.st_mode):
                         if not _excluded(config_rel, patterns):
                             subdirs.append(full)
                     elif stat.S_ISREG(info.st_mode) and name.endswith(SOURCE_EXTENSIONS) and not _excluded(config_rel, patterns):
-                        found[rel] = [info.st_mtime_ns, info.st_size]
+                        found[rel] = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns, info.st_dev)
                     # anything else (a link, a FIFO, a socket, a device) is neither indexed nor followed
                 stack.extend(reversed(subdirs))
             except OSError:
@@ -1582,23 +1972,38 @@ class ImportIndex:
             overlay_maps.append((os.path.basename(path), omap))
             self.meta["ignored"] += [f"{os.path.basename(path)}:{item}" for item in odetails["ignored"]]
         self._exclude = list(details["exclude"])
-        current = self._walk(self._exclude)
-        changed = sorted(rel for rel, key in current.items() if rel not in self.entries or self.entries[rel]["key"] != key)
+        current = self._walk(self._exclude)  # THE SNAPSHOT: everything below is made from it, and the final proof must find it again
+        self._snapshot = dict(current)
+        changed = sorted(rel for rel, fp in current.items() if rel not in self.entries or self.entries[rel]["key"] != _key(fp))
         removed = [rel for rel in self.entries if rel not in current]
         for rel in removed:
             del self.entries[rel]
+        self._verified = {rel: fp for rel, fp in self._verified.items() if current.get(rel) == fp}  # one at another fingerprint is not
         failures, self._unread = {}, set()
         texts = read_sources([self._abs(rel) for rel in changed], self.base, self._allowed, failures=failures,
-                             keys={self._abs(rel): current[rel] for rel in changed})
+                             keys={self._abs(rel): _key(current[rel]) for rel in changed})
         for rel in changed:
             text = texts[self._abs(rel)]
             if text is None:  # not read: no entry (an entry with no imports would stand for a file that has none), and a gap
                 self._gap(_READ_GAP.get(failures.get(self._abs(rel)), "source_unreadable"))
                 self.entries.pop(rel, None)
+                self._verified.pop(rel, None)
                 self._unread.add(rel)
                 continue
             specs = [[s["spec"], s["line"], s["type_only"], s["dynamic"]] for s in scan_specifiers(text)]
-            self.entries[rel] = {"key": current[rel], "specs": specs}  # read with its open signature equal to this key
+            self.entries[rel] = {"key": _key(current[rel]), "specs": specs}  # read with its open signature equal to this key
+            self._verified[rel] = current[rel]
+        # An entry kept by key (warm, or loaded from the cache) was not opened this time. It is opened now, without reading a byte,
+        # unless this instance already opened it at exactly this fingerprint (same ino and ctime as well as mtime and size: a chmod,
+        # a replace or a rewrite moves one of them): those are the only probes an answer makes, and the final proof makes none.
+        unopened = sorted(rel for rel in current if rel not in changed and self._verified.get(rel) != current[rel])
+        probed = probe_sources([(self._abs(rel), _key(current[rel])) for rel in unopened], self.base, self._allowed)
+        for rel in unopened:
+            status = probed[self._abs(rel)]
+            if status == READ_OK:
+                self._verified[rel] = current[rel]
+            else:
+                self._gap(_READ_GAP.get(status, "source_unreadable"))
         self._known = set(current)
         self._resolve_all(imap, overlay_maps)
         self.refreshed_at = time.time()
@@ -1629,20 +2034,14 @@ class ImportIndex:
                 if _state_token(state) != token:
                     self._gap(_CONFIG_GAP.get(state[0], "config_changed") if state[0] != "absent" else "config_changed")
             current = self._walk(self._exclude)
-            indexed = {rel: entry["key"] for rel, entry in self.entries.items()}
-            if set(current) - set(indexed) - self._unread or set(indexed) - set(current):
-                self._gap("folder_changed")  # a file appeared or went, beyond those the build already counted as gaps
-            for rel in sorted(indexed):
-                if rel in current and current[rel] != indexed[rel]:
-                    stale.append(rel)
+            # the snapshot of the last refresh; an instance that was never refreshed holds the entries (loaded from a cache) to their keys
+            snapshot = self._snapshot if self._snapshot is not None else {rel: tuple(e["key"]) for rel, e in self.entries.items()}
+            if set(current) != set(snapshot):
+                self._gap("folder_changed")  # a file appeared or went since the snapshot
+            for rel in sorted(snapshot):
+                if rel in current and current[rel][:len(snapshot[rel])] != tuple(snapshot[rel]):
+                    stale.append(rel)  # mtime, size, ino or ctime moved: nothing is opened again, the fingerprint says it is not the file
                     self._gap("source_changed")
-            probed = probe_sources([(self._abs(rel), indexed[rel]) for rel in sorted(indexed) if current.get(rel) == indexed[rel]],
-                                   self.base, self._allowed)
-            for path, status in probed.items():
-                if status != READ_OK:
-                    if status in ("absent", "changed"):
-                        stale.append(lexical_path(self.base, path))
-                    self._gap(_READ_GAP.get(status, "source_unreadable"))
             for path, verdict in list(self._targets.items()):
                 if self._verdict(path) != verdict:
                     self._gap("target_changed")

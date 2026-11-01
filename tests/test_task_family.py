@@ -251,6 +251,53 @@ class FamilyLabelTests(unittest.TestCase):
         self.assertTrue(out.stdout.splitlines()[-1].startswith("family labels: rounds with a label 6/10;"), out.stdout)
         self.assertEqual({r["root"]: r["repeated_families"] for r in json.loads(data.stdout)}["coder-a1"], ["cache-key"])
 
+    def test_text_output_lists_names_per_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fixture(tmp)
+            self.chain(tmp, "n", [self.review("APPROVED")])  # no label: no families line
+            lines = task_family.render(task_family.families(tmp)).splitlines()
+        fam = [l for l in lines if l.startswith("    families:")]
+        self.assertEqual(fam, ["    families: cache-key,other_name | - | cache-key | -  labelled rounds 2/4  repeated: cache-key",
+                               "    families: one | two | three  labelled rounds 3/3  repeated: -",
+                               "    families: x | - | -  labelled rounds 1/3  repeated: -"])
+        n = next(i for i, l in enumerate(lines) if l.startswith("fam-coder-n1"))
+        self.assertFalse(lines[n + 1:n + 3] and any(l.startswith("    families:") for l in lines[n + 1:n + 3]))
+
+    def test_a_bad_companion_file_does_not_drop_the_label(self):
+        for bad in ("{not json", '{"items": "x"}', '{"items": [0]}'):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as tmp:
+                self.chain(tmp, "m", [self.review("REQUEST_CHANGES", "keep")])
+                (Path(tmp) / "tasks" / "review-m1" / "acceptance-items.json").write_text(bad)
+                rec = task_family.families(tmp)[0]
+            self.assertEqual((rec["families"], rec["labelled_rounds"]), ([["keep"]], 1))
+
+    def test_each_unreadable_result_is_unlabelled(self):
+        for kind in ("missing", "empty", "not utf-8", "oversized", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                self.chain(tmp, "u", [self.review("REQUEST_CHANGES", "k")])
+                path = Path(tmp) / "tasks" / "review-u1" / "result.md"
+                if kind == "missing":
+                    path.unlink()
+                elif kind == "empty":
+                    path.write_text("  \n")
+                elif kind == "not utf-8":
+                    path.write_bytes(b"\xff\xfe Family: k\n")
+                elif kind == "oversized":
+                    path.write_text("Family: k\n" + "x" * 1_000_001)
+                else:
+                    path.unlink()
+                    path.mkdir()
+                rec = task_family.families(tmp)[0]
+            self.assertEqual((rec["families"], rec["labelled_rounds"]), ([[]], 0))
+
+    def test_unreadable_meta_files_do_not_crash_or_invent_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.chain(tmp, "j", [self.review("REQUEST_CHANGES", "k")])
+            (Path(tmp) / "tasks" / "review-j1" / "meta.json").write_text("{broken")
+            (Path(tmp) / "tasks" / "review-j1" / "state.json").write_text("[")
+            rec = task_family.families(tmp)[0]
+        self.assertEqual((rec["families"], rec["labelled_rounds"]), ([["k"]], 1))  # label comes from result.md, round from the author's record
+
 
 class TpEvalsFamiliesTests(unittest.TestCase):
     """`bin/tp-evals families` reaches task_family.run and needs no routing eval dir."""

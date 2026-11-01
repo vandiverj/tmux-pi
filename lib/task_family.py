@@ -16,7 +16,9 @@ and wall time. A token or time that was not recorded is None, never 0, and `*_un
 Family labels: `families` is the `Family:` names of each review round (review_verdict.families on that review's result.md), a list
 with one list per round, [] for an unlabelled round; a review whose result.md is gone or cannot be read is unlabelled. `labelled_rounds`
 counts the rounds with a name and `repeated_families` the names that appear in 2+ rounds (a name repeated inside one round counts once).
-`tp-evals families` ends with a one-line summary of them.
+`tp-evals families` prints, under each family that has a label, one line with its names per round (`-` for none), the labelled
+rounds and the repeated names, and ends with a one-line summary of them. The label is read from result.md alone: a bad
+acceptance-items.json beside it does not drop it.
 
 Facts only: a verdict here is read from the reviewer's reply the way `tp-evals export` reads it (routing_evals.review_outcome).
 
@@ -128,10 +130,17 @@ def _tokens(nodes):
 
 
 def _round_families(reviewer_dir):
-    """The distinct Family: names in one review's result.md; [] when it has none or cannot be read."""
+    """The distinct Family: names in one review's result.md; [] when it has none or result.md itself cannot be read.
+    Only result.md counts: read_review would also refuse on a bad companion (acceptance-items.json), which says nothing
+    about the label, so the file is read here under read_review's limits (size, UTF-8, not empty)."""
     try:
-        return review_verdict.families(review_verdict.read_review(Path(reviewer_dir) / "result.md"))
-    except (ValueError, OSError):  # ReviewMissing is a ValueError; an unreadable or undecodable file is unlabelled
+        with open(Path(reviewer_dir) / "result.md", "rb") as handle:
+            data = handle.read(review_verdict.MAX_REVIEW_BYTES + 1)
+        if len(data) > review_verdict.MAX_REVIEW_BYTES:
+            return []
+        text = data.decode("utf-8")
+        return review_verdict.families(text) if text.strip() else []
+    except (ValueError, OSError):  # missing, a directory, undecodable: unlabelled
         return []
 
 
@@ -261,6 +270,10 @@ def render(records):
         for item in r["timeline"]:
             e = by_id[item["id"]]
             lines.append("    {:<8} {}  {}".format(item["kind"], e["id"], e.get("verdict") or e.get("model") or "-"))
+        if r["labelled_rounds"]:
+            lines.append("    families: {}  labelled rounds {}/{}  repeated: {}".format(
+                " | ".join(",".join(names) if names else "-" for names in r["families"]),
+                r["labelled_rounds"], r["review_rounds"], ",".join(r["repeated_families"]) or "-"))
     return "\n".join(lines)
 
 

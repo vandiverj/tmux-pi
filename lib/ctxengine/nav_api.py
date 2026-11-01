@@ -14,9 +14,14 @@ named), and is not a gap. A refusal at read time, a path that turns out to be ou
 target that cannot be read or looked at, a name the guard could not judge because it could not look (`unreadable_path`: not a
 refusal by name; `graph.CannotJudge`), a config or overlay that is refused, outside, unreadable, not JSON or not modelled (the
 same configs the Deno side refuses), and a root that is refused are gaps (`graph.GAPS`). A gap that is a refusal gives `refused`
-(with the Deno side's `reason`), a race (a file gone or a link in its place between the walk and the read) `stale_index`, anything
-else `error` with `reason`; each carries `gaps` ({code: count}, no paths) and no data. A missing config is no gap (nothing is
-there), nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
+(with the Deno side's `reason`), a race (a file, folder or config that changed, went or was replaced between the walk, the read and
+the answer) `stale_index`, anything else `error` with `reason`; each carries `gaps` ({code: count}, no paths) and no data. One gate
+makes every index answer (`_index_answer`): the answer is built, then `graph.ImportIndex.prove` looks again at every input it
+depends on (each config's state, the folder listing, a stat, an open for reading and the indexed `(mtime, size)` of every source,
+and every import target that was judged), on a cold build, a warm instance and one that loaded the cache alike; only an answer
+whose proof found nothing is `ok`. A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
+A missing config is no gap (nothing is there; one that was there when its folder was walked and is gone at its read is a race),
+nor is a missing import target (`missing`). `imports` with `source` of `auto` still falls back to `deno info`, which proves
 its own reach. A link in the tree is not followed or indexed (as before): an edge through one is not in the index; this is a
 policy limit of the walk, not a gap.
 
@@ -102,7 +107,7 @@ Known limits (what is not proven):
     kernel which file is open, checks that it is the path the caller judged, inside the project and
     allowed by the guard, and only then reads; a file that fails a check is never read. That covers sources, the Deno config,
     overlays, `package.json` files and both caches. A link swapped in between the check of a name and its read gives
-    `stale_index` (the walk) or no edges (the index), and its bytes are not read. Where the kernel cannot name
+    `stale_index` (the walk) or a gap (the index: no answer), and its bytes are not read. Where the kernel cannot name
     an open file (not macOS or Linux), nothing is read as checked. A hard link is one file under two names; the kernel may name
     either, so a hard-linked source file can be taken as changed (a refusal, never a wrong answer).
   - The mirror holds the bytes the walk read, so a file swapped for a link after the walk cannot reach Deno; a change to a file the
@@ -380,13 +385,37 @@ class NavApi:
             return None, None, _answer("no_project", detail="project directory not found")
         index = self._get_index()
         try:
-            stats = index.refresh()
+            stats = index.refresh(prove=False)  # `_index_answer` proves once, after the answer is built
         except OSError as error:
             return None, None, _answer("error", detail=f"index could not be built: {type(error).__name__}")
         blocked = index.incomplete()
         if blocked:
             return None, None, self._incomplete(*blocked)
         return index, stats, None
+
+    def _index_answer(self, build):
+        """(answer, blocked): THE ONE WAY an answer is made from the index. `build(index, stats)` makes it from the refreshed index
+        (no I/O but the index's own `target_state`). Then, before it is given, `index.prove()` looks again at every input it
+        depends on (see `graph.ImportIndex`), and the gaps the build itself met (`target_state`) are added: any gap gives
+        `_incomplete` instead, with the gaps and nothing else. A non-`ok` answer from `build` keeps only its status words (`detail`
+        and `next_step`): no answer other than `ok` carries index data, whatever `build` put in it. `blocked` is True when the
+        index could not answer (the caller may fall back to `deno info`)."""
+        index, stats, error = self._fresh()
+        if error:
+            return error, True
+        answer = build(index, stats)
+        try:
+            proof = index.prove()
+        except OSError as error:
+            return _answer("error", detail=f"index could not be proved: {type(error).__name__}"), True
+        for code, count in index.gaps.items():
+            proof[code] = proof.get(code, 0) + count
+        blocked = index.incomplete(proof)
+        if blocked:
+            return self._incomplete(*blocked), True
+        if answer.get("status") != "ok":
+            answer = _answer(answer["status"], **{k: v for k, v in answer.items() if k == "detail"})
+        return answer, False
 
     @staticmethod
     def _incomplete(kind, reason, gaps):
@@ -464,15 +493,13 @@ class NavApi:
             return error
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_IMPORTERS:
             return _answer("bad_argument", detail=f"limit must be a whole number from 1 to {MAX_IMPORTERS}")
-        index, stats, error = self._fresh()
-        if error:
-            return error
-        found = index.importers(rel)
-        if not found and not graph.judged_is_file(self.project_root, rel, self._permits):
-            return _answer("not_found", detail="no such file in the project")
-        status = "stale_index" if stats["stale"] else "ok"
-        return _answer(status, target=rel, total=len(found), truncated=len(found) > limit,
-                       importers=[self._slim(e, "from") for e in found[:limit]], **self._meta(index, stats))
+        def build(index, stats):
+            found = index.importers(rel)
+            if not found and not index.indexed(rel) and index.target_state(rel) != "":
+                return _answer("not_found", detail="no such file in the project")  # an unreadable one is a gap (`_index_answer`)
+            return _answer("ok", target=rel, total=len(found), truncated=len(found) > limit,
+                           importers=[self._slim(e, "from") for e in found[:limit]], **self._meta(index, stats))
+        return self._index_answer(build)[0]
 
     def imports(self, target, source="auto"):
         """What `target` imports directly: `files` (project paths), `external` (packages, builtins, URLs) and `unresolved`.
@@ -487,19 +514,19 @@ class NavApi:
         if source not in ("auto", "index", "deno"):
             return _answer("bad_argument", detail="source must be auto, index or deno"), None
         if source != "deno":
-            index, stats, error = self._fresh()
-            if error is None:
+            def build(index, stats):
                 edges = index.imports(rel)
                 if edges is None:
-                    return _answer("not_found", detail="the file is not an indexed source file"), None
-                return _answer("stale_index" if stats["stale"] else "ok", target=rel, source="index",
+                    return _answer("not_found", detail="the file is not an indexed source file")
+                return _answer("ok", target=rel, source="index",
                                files=[self._slim(e, "to") for e in edges if e["kind"] == "file"],
                                external=sorted({e["spec"] for e in edges if e["kind"] == "external"}),
                                unresolved=[{"line": e["line"], "spec": e["spec"], "reason": e["reason"]}
                                            for e in edges if e["kind"] == "unresolved"],
-                               **self._meta(index, stats)), None
-            if source == "index":
-                return error, None
+                               **self._meta(index, stats))
+            answer, blocked = self._index_answer(build)
+            if not blocked or source == "index":
+                return answer, None
         return self._forward_graph(target)
 
     # --- deno

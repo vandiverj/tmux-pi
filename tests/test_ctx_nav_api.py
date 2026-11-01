@@ -3370,10 +3370,10 @@ class IncompleteIndexCase(Tree):
         project = self.project().resolve()
         real = graph.read_bounded
 
-        def outside(path, admitted, boundary, allow, limit=None):
+        def outside(path, admitted, boundary, allow, limit=None, **checks):  # `expect`, `take`: the read's own checks, passed on
             if str(path).endswith("util/slug.ts"):
                 return "outside", None, None
-            return real(path, admitted, boundary, allow, limit)
+            return real(path, admitted, boundary, allow, limit, **checks)
         with mock.patch.object(graph, "read_bounded", outside):
             self.blocked(self.nav(project).importers("src/app/run.ts"), "error", "index_incomplete", "source_refused")
 
@@ -3521,6 +3521,378 @@ class IncompleteIndexCase(Tree):
         index = graph.ImportIndex(str(project), cache_path=str(cache), allow=stub_allow(project))
         self.assertEqual(index.entries, {})
         self.assertEqual(self.nav(project).importers("src/app/run.ts")["status"], "ok")
+
+
+DATA_KEYS = ("target", "total", "truncated", "importers", "files", "external", "unresolved", "source", "index_age_s",
+             "unresolved_total", "files_indexed", "scanned", "ignored_config")
+QUESTIONS = (("importers", "src/app/run.ts"), ("importers", "src/real_host.ts"), ("importers", "src/mock_host.ts"),
+             ("importers", "src/util/slug.ts"), ("imports", "src/main.ts"), ("importers", "src/later.ts"))
+
+
+class AnswerProofCase(Tree):
+    """Round 11 (review 10 F1-F3, rule first): EVERY INDEX ANSWER IS PROVED AT ANSWER TIME, AND A NON-OK ONE CARRIES THE GAP AND NO
+    DATA. `NavApi._index_answer` is the one way an answer is made from the index: after the answer is built, `ImportIndex.prove()`
+    re-proves every input it depends on (each folder listing by a new walk, each source by stat and open-for-read with its
+    signature equal to the indexed one, each config and overlay by its fingerprint, each import target looked at by a new verdict);
+    a failed proof is an answer with `gaps` and nothing else. Warm entries, entries loaded from the cache and a cold build get the
+    same proof. The family sweep is `test_r10_sweep_*`: every input x every state x every entry path, held to one oracle (an `ok`
+    answer is what a new instance with no cache says about the tree as it is after the change; anything else has gaps and no
+    data; once nothing moves, no spurious failure)."""
+
+    def ask(self, nav, question):
+        verb, path = question
+        return nav.importers(path) if verb == "importers" else nav.imports(path, source="index")
+
+    def nav(self, project, cache="ctx-cache", **kw):
+        kw.setdefault("overlays", [str(Path(project) / "deno.test.json")])
+        return nav_api.NavApi(str(project), cache_dir=str(Path(project) / ".tmux-pi" / cache), **kw)
+
+    def assert_no_data(self, answer, label=""):
+        self.assertNotEqual(answer["status"], "ok", (label, answer))
+        self.assertTrue(answer.get("gaps") or answer["status"] in ("not_found", "bad_argument", "refused"), (label, answer))
+        for key in DATA_KEYS:
+            self.assertNotIn(key, answer, (label, answer))
+
+    @staticmethod
+    def comparable(answer):
+        return {k: v for k, v in answer.items() if k not in ("index_age_s", "scanned", "cache_refused")}
+
+    def expected(self, project):
+        """The answers of a new instance with no cache, on the tree as it is now: what an `ok` answer must say."""
+        self._fresh_n = getattr(self, "_fresh_n", 0) + 1
+        nav = self.nav(project, cache=f"fresh-{self._fresh_n}")
+        return [self.ask(nav, q) for q in QUESTIONS]
+
+    def sound(self, got, want, label, live):
+        """`ok` only when it is what a fresh build says; otherwise gaps and no data. `live`: once nothing is moving, an answer the
+        fresh build gives as `ok` is `ok` here too (no spurious failure)."""
+        if got["status"] == "ok":
+            self.assertEqual(self.comparable(got), self.comparable(want), label)
+            return
+        self.assert_no_data(got, label)
+        if live:
+            self.assertEqual(got["status"], want["status"], (label, got, want))
+
+    def unlock(self, project):
+        for folder, dirs, files in os.walk(project):
+            for name in dirs + files:
+                full = os.path.join(folder, name)
+                if not os.path.islink(full):
+                    try:
+                        os.chmod(full, 0o755 if os.path.isdir(full) else 0o644)
+                    except OSError:
+                        pass
+
+    def skip_if_root(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+
+    # --- the findings, as reported
+
+    def test_r10_f1_repro_a_warm_index_does_not_answer_from_a_source_that_became_unreadable(self):
+        self.skip_if_root()
+        project = self.project().resolve()
+        nav = self.nav(project)
+        self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+        os.chmod(project / "src" / "main.ts", 0)
+        self.addCleanup(os.chmod, project / "src" / "main.ts", 0o644)
+        for label, instance in (("same instance", nav), ("fresh instance, loaded cache", self.nav(project))):
+            answer = instance.importers("src/app/run.ts")
+            self.assert_no_data(answer, label)
+            self.assertEqual((answer["status"], answer.get("reason")), ("error", "index_incomplete"), (label, answer))
+            self.assertIn("source_unreadable", answer["gaps"], (label, answer))
+        os.chmod(project / "src" / "main.ts", 0o644)
+        self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
+
+    def test_r10_f2_repro_a_config_that_changes_during_the_build_is_a_race(self):
+        project = self.project().resolve()
+        nav = self.nav(project, overlays=[])
+        self.assertEqual(len(nav.importers("src/real_host.ts")["importers"]), 2)
+        real = graph.read_sources
+        config = project / "deno.json"
+
+        def moving(paths, *a, **k):
+            config.write_text(config.read_text().replace("./src/real_host.ts", "./src/mock_host.ts"))
+            return real(paths, *a, **k)
+        with mock.patch.object(graph, "read_sources", moving):
+            answer = nav.importers("src/real_host.ts")
+        self.assert_no_data(answer)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertIn("config_changed", answer["gaps"])
+        after = nav.importers("src/real_host.ts")
+        self.assertEqual((after["status"], after["importers"]), ("ok", []), after)
+
+    def test_r10_f2_repro_a_config_deleted_just_before_its_read_is_a_race_not_an_absent_config(self):
+        project = self.project().resolve()
+        nav = self.nav(project, overlays=[])
+        real = graph.read_bounded
+        config = str(project / "deno.json")
+        done = []
+
+        def vanishing(path, admitted, *a, **k):
+            if str(admitted) == config and not done:
+                done.append(1)
+                os.unlink(config)
+            return real(path, admitted, *a, **k)
+        with mock.patch.object(graph, "read_bounded", vanishing):
+            answer = nav.importers("src/real_host.ts")
+        self.assertEqual(done, [1])
+        self.assert_no_data(answer)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assertIn("config_changed", answer["gaps"])
+        gone_before = self.nav(project, cache="other", overlays=[]).importers("src/real_host.ts")
+        self.assertEqual(gone_before["status"], "ok", gone_before)  # absent before the call: nothing there, no gap
+
+    def test_r10_f3_repro_a_stat_that_fails_after_the_read_never_returns_data(self):
+        for label, error, status in (("denied", PermissionError(13, "denied"), "error"),
+                                     ("gone", FileNotFoundError(2, "gone"), "stale_index")):
+            project = self.project(label).resolve()
+            nav = self.nav(project)
+            after_read = []
+            real_sources, real_nofollow, real_lstat = graph.read_sources, graph.lstat_nofollow, os.lstat
+
+            def reading(paths, *a, **k):
+                out = real_sources(paths, *a, **k)
+                after_read.append(1)
+                return out
+
+            def nofollow(path, *a, **k):
+                if after_read and str(path).endswith("src/main.ts"):
+                    raise error
+                return real_nofollow(path, *a, **k)
+
+            def lstat(path, *a, **k):
+                if after_read and k.get("dir_fd") is not None and path == "main.ts":
+                    raise error
+                return real_lstat(path, *a, **k)
+            with mock.patch.object(graph, "read_sources", reading), mock.patch.object(graph, "lstat_nofollow", nofollow), \
+                    mock.patch.object(os, "lstat", lstat):
+                answer = nav.importers("src/app/run.ts")
+            self.assert_no_data(answer, label)
+            self.assertEqual(answer["status"], status, (label, answer))
+
+    def test_r10_the_index_alone_says_what_its_proof_found(self):
+        project = self.project().resolve()
+        index = graph.ImportIndex(str(project), cache_path=None, allow=stub_allow(project))
+        index.refresh()
+        self.assertEqual(index.prove(), {})
+        (project / "src" / "lazy.ts").write_text("export const lazy = 2; // longer\n")
+        self.assertIn("source_changed", index.prove())
+        write(project / "src" / "new.ts", "export const n = 1;\n")
+        self.assertIn("folder_changed", index.prove())
+        index.refresh()
+        self.assertEqual(index.prove(), {})
+        self.assertIsNone(index.incomplete())
+
+    def test_r10_a_not_found_answer_is_proved_too_and_an_unreadable_target_is_not_a_missing_one(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        real = graph.lstat_nofollow
+
+        def denied(path, *a, **k):
+            if str(path).endswith("src/nothing.ts"):
+                raise PermissionError(13, "denied", path)
+            return real(path, *a, **k)
+        self.assertEqual(nav.importers("src/nothing.ts")["status"], "not_found")
+        with mock.patch.object(graph, "lstat_nofollow", denied):
+            answer = nav.importers("src/nothing.ts")
+        self.assert_no_data(answer)
+        self.assertEqual((answer["status"], answer.get("reason")), ("error", "index_incomplete"), answer)
+        self.assertIn("target_unreadable", answer["gaps"])
+
+    def test_r10_sweep2_a_source_that_stops_being_a_file_during_the_read_is_a_race(self):
+        """Sweep pass 2: the walk keyed a regular file; a folder, FIFO or bigger file found at its read is that file changing
+        (`stale_index`, ask again), not a file that cannot be read; asked again, the answer is the tree's own."""
+        for state in ("folder", "fifo", "grown"):
+            with self.subTest(state=state):
+                project = self.project(f"race-{state}").resolve()
+                nav = self.nav(project, cache=f"cold-{state}")
+                path = project / "src" / "main.ts"
+                real, moved = graph.read_sources, []
+
+                def moving(paths, *a, **k):
+                    if not moved:
+                        moved.append(1)
+                        if state == "grown":
+                            path.write_text("x" * (graph.MAX_BYTES + 1))
+                        else:
+                            path.unlink()
+                            path.mkdir() if state == "folder" else os.mkfifo(path)
+                    return real(paths, *a, **k)
+                with mock.patch.object(graph, "read_sources", moving):
+                    answer = nav.importers("src/app/run.ts")
+                self.assert_no_data(answer, state)
+                self.assertEqual(answer["status"], "stale_index", (state, answer))
+                self.assertIn("source_changed", answer["gaps"], (state, answer))
+                want = self.expected(project)
+                self.sound(self.ask(nav, ("importers", "src/app/run.ts")), want[0], state, live=True)
+                self.assertEqual(graph.read_bounded(str(path), str(path), str(project), lambda rel: True,
+                                                    expect=[1, 1], take=False)[0], "changed", state)
+
+    def test_r10_the_deno_side_takes_a_package_json_gone_at_its_read_as_a_change_too(self):
+        """The F2 rule lives in `_config_read`, which the Deno side's reach proof shares: a `package.json` there when its name was
+        judged and gone at its read refuses the call (`changed_during_walk`); it is not skipped as if there were none."""
+        project = self.project("pkg-gone").resolve()
+        write(project / "package.json", '{"name": "x"}')
+        nav = self.nav(project)
+        real = graph.read_bounded
+
+        def vanishing(path, *a, **k):
+            if str(path).endswith("package.json") and os.path.exists(path):
+                os.unlink(path)
+            return real(path, *a, **k)
+        with mock.patch.object(graph, "read_bounded", vanishing):
+            with self.assertRaises(graph.Unproven) as raised:
+                graph.prove_reach(nav.project_root, str(project / "src" / "main.ts"), nav.config, nav._permits)
+        self.assertEqual(raised.exception.reason, "changed_during_walk")
+        graph.prove_reach(nav.project_root, str(project / "src" / "main.ts"), nav.config, nav._permits)  # gone before: no config
+
+    def test_r10_the_gate_lets_no_data_out_with_a_status_other_than_ok(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        answer, blocked = nav._index_answer(lambda index, stats: nav_api._answer("stale_index", target="x", importers=[1]))
+        self.assertFalse(blocked)
+        self.assertEqual(set(answer) - {"status", "next_step", "detail"}, set(), answer)
+
+    # --- the family sweep: every input x every state x every entry path
+
+    STATES = ("unchanged", "changed", "vanished", "unreadable", "folder", "file", "fifo", "link", "link_out", "stat_fails")
+    # an entry path: `cold` (a new instance with no cache), `warm` (the instance that answered before), `loaded` (a new instance
+    # loading the cache the first one saved), or a change made while an answer is being made: in the build's read of the sources
+    # (`read_*`), at its walk (`walk_*`), or after the build, at the proof (`proof_*`), on a warm instance or a cold one
+    ROUTES = ("cold", "warm", "loaded", "read_warm", "read_cold", "walk_warm", "walk_cold", "proof_warm", "proof_cold")
+    HOOKS = {"read": (graph, "read_sources"), "walk": (graph.ImportIndex, "_walk"), "proof": (graph.ImportIndex, "prove")}
+    NAMES = {"source": "src/main.ts", "config": "deno.json", "overlay": "deno.test.json", "folder": "src/util",
+             "nested_folder": "src/app", "target": "src/data.json", "missing_target": "src/later.ts"}
+
+    def where(self, project, what):
+        if what == "cache":
+            folder = project / ".tmux-pi" / "ctx-cache"
+            found = sorted(folder.glob("nav_api-index-*.json")) if folder.exists() else []
+            return found[0] if found else folder / "nav_api-index-none.json"
+        return project / self.NAMES[what]
+
+    def mutate(self, project, what, state):
+        """Put input `what` into `state`; returns a context manager the answers are asked in (for `stat_fails`, the injection)."""
+        import contextlib
+        path = self.where(project, what)
+        if state == "unchanged":
+            return contextlib.nullcontext()
+        if what == "missing_target" and state != "vanished":
+            write(path, "export const later = 1;\n")  # a target that was not there, now there in the given state
+            if state == "changed":
+                return contextlib.nullcontext()
+        if state == "stat_fails":
+            real, name = os.lstat, path.name
+
+            def failing(p, *a, **k):
+                if k.get("dir_fd") is not None and p == name:
+                    raise PermissionError(13, "denied", p)
+                return real(p, *a, **k)
+            return mock.patch.object(os, "lstat", failing)
+        if state == "changed":
+            if what == "source":
+                path.write_text(path.read_text().replace("import { run } from '@/app/run.ts';\n", "import './lazy.ts';\n"))
+            elif what == "config":
+                path.write_text(path.read_text().replace("./src/real_host.ts", "./src/mock_host.ts"))
+            elif what == "overlay":
+                path.write_text(path.read_text().replace("./src/mock_host.ts", "./src/real_host.ts"))
+            elif what in ("folder", "nested_folder"):
+                write(path / "extra.ts", "import '../app/run.ts';\n" if what == "folder" else "import './run.ts';\n")
+            elif what == "target":
+                path.write_text('{"changed": true, "longer": 1}\n')
+            elif path.exists():  # the cache: one written from another state of the tree (its keys match nothing)
+                data = json.loads(path.read_text())
+                for entry in data["entries"].values():
+                    entry["key"], entry["specs"] = [1, 1], []
+                path.write_text(json.dumps(data))
+            return contextlib.nullcontext()
+        if not path.exists() and not path.is_symlink():
+            return contextlib.nullcontext()
+        if state in ("link", "link_out"):
+            keep = (project / "skipped" if state == "link" else self.dir / f"out-{project.name}") / f"keep-{path.name}"
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(keep))
+            path.symlink_to(keep)
+        elif state == "vanished":
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+        elif state in ("folder", "file", "fifo"):
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+            path.mkdir() if state == "folder" else os.mkfifo(path) if state == "fifo" else path.write_text("x")
+        elif state == "unreadable":
+            os.chmod(path, 0)
+        return contextlib.nullcontext()
+
+    def sweep(self, what):
+        self.skip_if_root()
+        for state in self.STATES:
+            for route in self.ROUTES:
+                label = f"{what}/{state}/{route}"
+                with self.subTest(label):
+                    project = self.project(label.replace("/", "-")).resolve()
+                    write(project / "src" / "uses.ts", "import './later.ts';\nimport '@/app/run.ts';\n")
+                    try:
+                        self.sweep_one(project, what, state, route, label)
+                    finally:
+                        self.unlock(project)
+
+    def sweep_one(self, project, what, state, route, label):
+        first = self.nav(project)
+        if route not in ("cold",) and not route.endswith("_cold"):
+            for q in QUESTIONS:
+                self.assertIn(self.ask(first, q)["status"], ("ok", "not_found"), (label, "before", q))
+        if "_" in route:
+            hook, kind = route.split("_")
+            asked = first if kind == "warm" else self.nav(project, cache="cold")
+            owner, name = self.HOOKS[hook]
+            real = getattr(owner, name)
+            moved = []
+
+            def moving(*a, **k):
+                if not moved:
+                    moved.append(self.mutate(project, what, state))
+                    moved[0].__enter__()
+                return real(*a, **k)
+            try:
+                with mock.patch.object(owner, name, moving):
+                    got = [self.ask(asked, q) for q in QUESTIONS]
+                want = self.expected(project)
+            finally:
+                if moved:
+                    moved[0].__exit__(None, None, None)
+            for q, g, w in zip(QUESTIONS, got, want):
+                self.sound(g, w, (label, q), live=False)
+            return
+        with self.mutate(project, what, state):
+            asked = self.nav(project, cache="cold") if route == "cold" else first if route == "warm" else self.nav(project)
+            got = [self.ask(asked, q) for q in QUESTIONS]
+            want = self.expected(project)
+        for q, g, w in zip(QUESTIONS, got, want):
+            self.sound(g, w, (label, q), live=True)
+
+    def test_r10_sweep_source(self):
+        self.sweep("source")
+
+    def test_r10_sweep_config(self):
+        self.sweep("config")
+
+    def test_r10_sweep_overlay(self):
+        self.sweep("overlay")
+
+    def test_r10_sweep_folder(self):
+        self.sweep("folder")
+
+    def test_r10_sweep_target(self):
+        self.sweep("target")
+
+    def test_r10_sweep_missing_target(self):
+        self.sweep("missing_target")
+
+    def test_r10_sweep_nested_folder(self):
+        self.sweep("nested_folder")
+
+    def test_r10_sweep_cache(self):
+        self.sweep("cache")
 
 
 if __name__ == "__main__":

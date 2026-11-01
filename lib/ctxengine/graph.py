@@ -537,17 +537,25 @@ def judged_realpath(base, path, allow):
     inside `base` and allowed before anything at it is looked at. So resolving never stats, lists or reads a location outside `base`
     or one `allow` refuses, which `os.path.realpath` would do for whatever a link names. Past a name that does not exist, the rest is
     taken as written."""
+    return _judge(base, path, allow)[:2]
+
+
+def _judge(base, path, allow):
+    """`judged_realpath`, and a third value: True when the last name was seen to be there (every name on the way was looked at and
+    found), False when the walk stopped at a name that was not there. A caller that then finds nothing at the name knows whether
+    it was never there or went away after it was judged (a race)."""
     lexical = lexical_path(base, path)
     if lexical is None:
         raise Unproven("outside_project")
     if not _allows(allow, lexical):
         raise Unproven("reaches_refused_path")
-    parts, at, hops = lexical.split("/"), 0, 0
+    parts, at, hops, seen = lexical.split("/"), 0, 0, True
     while at < len(parts):
         here = os.path.join(base, *parts[:at + 1])
         try:
             info, target = _look(here, link=True)  # the folders before it were just seen to be no links, and still are
         except (FileNotFoundError, NotADirectoryError):
+            seen = False
             break  # nothing there: the rest is a name, resolved as written
         except OSError:
             raise Unproven("unreadable_file")  # a link loop, or a folder on the way swapped for a link (ELOOP), or no access
@@ -565,7 +573,7 @@ def judged_realpath(base, path, allow):
         if not _allows(allow, rel):
             raise Unproven("reaches_refused_path")
         parts, at = rel.split("/"), 0  # the parts before `at` held no link, so `..` in the target was resolved by name correctly
-    return lexical, "/".join(parts)
+    return lexical, "/".join(parts), seen
 
 
 def project_path(base, path, allow=None):
@@ -592,7 +600,7 @@ def _opened_path(fd):
 READ_OK = "ok"
 
 
-def read_bounded(path, admitted, boundary, allow, limit=None):
+def read_bounded(path, admitted, boundary, allow, limit=None, expect=None, take=True):
     """(status, bytes or None, opened): THE ONE WAY this module and `nav_api` read the bytes of a file (a test scans both files
     for any other). `admitted` is where the caller judged `path` to lead (a path with no link on it, from `judged_realpath`).
     In this order: (a) both names are inside `boundary` (a resolved directory) and `allow(rel)` is true for both (a guard that
@@ -605,7 +613,12 @@ def read_bounded(path, admitted, boundary, allow, limit=None):
     status: `ok`; `absent` (nothing at `admitted`); `unreadable` (cannot be opened, or is not a regular file, or the kernel cannot
     name it, or is over `limit`); `changed` (a link is now on the way to `admitted`, or `path` no longer leads there: something
     moved after the caller judged the name); `outside` (not inside `boundary`); `refused` (the guard refuses it). `opened` is the
-    kernel's path, None when not known."""
+    kernel's path, None when not known.
+
+    `expect` ([mtime_ns, size], the key of the regular file the caller saw): the open file (`fstat`, at step (e), before the type
+    and size checks) must be a regular file with this signature, else `changed`: the bytes are those of the version the caller
+    keyed, or none, and a folder, FIFO or bigger file in its place is a change, not a file that cannot be read. `take` False: every check is made and nothing is read (`ok` with no bytes):
+    the proof that a file is there, readable and unchanged."""
     admitted, path = os.path.normpath(admitted), os.path.normpath(path)
     limit = MAX_BYTES if limit is None else limit
     names = [lexical_path(boundary, admitted), lexical_path(boundary, path)]
@@ -639,8 +652,12 @@ def read_bounded(path, admitted, boundary, allow, limit=None):
             info = os.fstat(fd)
         except OSError:
             return "unreadable", None, opened
+        if expect is not None and not (stat.S_ISREG(info.st_mode) and [info.st_mtime_ns, info.st_size] == list(expect)):
+            return "changed", None, opened  # not the regular file the caller keyed: it moved (a folder, FIFO, another version)
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             return "unreadable", None, opened
+        if not take:
+            return READ_OK, None, opened
         chunks, left = [], limit + 1
         try:
             while left > 0:  # (d): every check above has passed
@@ -792,11 +809,12 @@ class CacheDir:
             os.close(fd)
 
 
-def read_source(path, base, allow, failures=None):
+def read_source(path, base, allow, failures=None, expect=None):
     """The text of `path` (a resolved path with no link on the way: the index's walk does not follow links), or None when
-    `read_bounded` does not give it (refused, outside `base`, a link swapped in after the walk, over MAX_BYTES). When `failures` is
-    a dict, the `read_bounded` status of a read that failed is kept in it under `path`: the caller says why a file is missing."""
-    status, data, _ = read_bounded(path, path, base, allow)
+    `read_bounded` does not give it (refused, outside `base`, a link swapped in after the walk, over MAX_BYTES, or, with `expect`,
+    not the version the walk keyed). When `failures` is a dict, the `read_bounded` status of a read that failed is kept in it under
+    `path`: the caller says why a file is missing."""
+    status, data, _ = read_bounded(path, path, base, allow, expect=expect)
     if status != READ_OK:
         if failures is not None:
             failures[path] = status
@@ -804,12 +822,23 @@ def read_source(path, base, allow, failures=None):
     return data.decode("utf-8", "replace")
 
 
-def read_sources(paths, base, allow, workers=8, failures=None):
-    """{path: text or None} for each path (`failures`: see `read_source`). Reading is the slow part of a build (many small files, and
-    a cold disk); it is done in threads, and the CPU work of scanning stays in the caller."""
-    paths = list(paths)
+def read_sources(paths, base, allow, workers=8, failures=None, keys=None):
+    """{path: text or None} for each path (`failures`: see `read_source`; `keys`: {path: [mtime_ns, size]}, the signature each read
+    must find, see `read_bounded`'s `expect`). Reading is the slow part of a build (many small files, and a cold disk); it is done
+    in threads, and the CPU work of scanning stays in the caller."""
+    paths, keys = list(paths), keys or {}
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(paths) or 1))) as pool:
-        return dict(zip(paths, pool.map(lambda path: read_source(path, base, allow, failures), paths)))
+        return dict(zip(paths, pool.map(lambda path: read_source(path, base, allow, failures, keys.get(path)), paths)))
+
+
+def probe_sources(keyed, base, allow, workers=8):
+    """{path: `read_bounded` status} for each (path, [mtime_ns, size]) in `keyed`: every check of a read (inside `base`, allowed,
+    opened with no link on the way, the kernel's name, a regular file within MAX_BYTES, its open signature the given one) and no
+    byte read. `ok` proves the file is there, can be read and is the version keyed; in threads, as `read_sources`."""
+    keyed = list(keyed)
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keyed) or 1))) as pool:
+        return dict(zip([path for path, _ in keyed], pool.map(
+            lambda item: read_bounded(item[0], item[0], base, allow, expect=item[1], take=False)[0], keyed)))
 
 
 # ------------------------------------------------------------------------------------------------------- the allow-list walk
@@ -890,10 +919,12 @@ def _config_read(path, base, allow):
     file it leads to is read with one `read_bounded`. A config that leads outside the project, or that the guard refuses, is never
     opened, and no location outside the project is looked at to find that out."""
     try:
-        real = judged_realpath(base, path, allow)[1]
+        _, real, seen = _judge(base, path, allow)
     except Unproven as error:
         return (_JUDGED_STATE.get(error.reason, "unreadable"),), None
     status, data, opened = read_bounded(path, os.path.join(base, *real.split("/")), base, allow)
+    if status == "absent" and seen:
+        return CONFIG_CHANGED, None  # it was there when its name was judged and is gone at the read: a race, not "no config"
     if status != READ_OK:
         return (status,), None
     return ("content", opened, _fingerprint(data)), data
@@ -1277,15 +1308,6 @@ def _excluded(rel, patterns):
     return False
 
 
-def _signature(path):
-    """[mtime_ns, size] of the walked file `path` (judged by the walk), its own entry: no link is followed."""
-    try:
-        info = lstat_nofollow(path)
-    except OSError:
-        return None
-    return [info.st_mtime_ns, info.st_size]
-
-
 def respell(path, spelled, real):
     """`path` (absolute, or relative to `spelled`) with the prefix `spelled` (a directory as the caller wrote it) replaced by `real`
     (the same directory resolved), by name alone: a path written under another spelling of the project (`/var` for `/private/var`)
@@ -1315,8 +1337,9 @@ GAPS = {
     "guard_unjudged": ("incomplete", "index_incomplete"),  # the guard could not look at a name (`CannotJudge`): neither allowed nor refused
     "source_unreadable": ("incomplete", "index_incomplete"),  # cannot be opened, not a regular file, over MAX_BYTES
     "source_refused": ("incomplete", "index_incomplete"),  # allowed when the walk judged the name, refused or outside at the read
-    "source_changed": ("changed", None),  # gone, or a link in its place, at the read
+    "source_changed": ("changed", None),  # gone, a link in its place, or another version (signature), at the read or the proof
     "target_unreadable": ("incomplete", "index_incomplete"),  # an import's target could not be looked at: neither a file nor missing
+    "target_changed": ("changed", None),  # an import's target is not what it was when the edges were made (`prove`)
 }
 _ROOT_GAP = {"outside": "root_outside", "refused": "root_refused", "unreadable": "root_unreadable"}
 _CONFIG_GAP = {"refused": "config_refused", "outside": "config_outside", "changed": "config_changed",
@@ -1354,7 +1377,17 @@ class ImportIndex:
     whose target cannot be looked at, and a root that is refused are gaps; so is a race (a file gone, or a link in its place, between
     the walk and the read). A missing config is not (nothing is there, which the kernel said), nor is a missing import target, nor is
     a file or folder the guard refuses by its name (outside the index by policy). An answer that could depend on a gap is not `ok`:
-    `NavApi` is the one place that decides (`_fresh`)."""
+    `NavApi` is the one place that decides (`_index_answer`).
+
+    The proof (`prove`). What the index holds is never taken as still true because a key matched once: `prove()` looks again at
+    every input the edges were made from, and returns the gaps it finds ({} when everything holds). Each folder listing: the walk is
+    made again and must find the same files with the same keys. Each source: stat and open-for-read must succeed, with its open
+    signature the indexed one (`probe_sources`, no byte read). Each config and overlay: read again, its state and fingerprint must be
+    the ones the map was made from (gone, or another one, is `config_changed`; now unreadable or refused is that gap). Each import
+    target that was looked at: its verdict must be the same. `refresh()` ends with one (a change during the build is found there);
+    `NavApi` makes one more after the answer is built and before it is given. Entries loaded from the cache, entries kept by an
+    instance and entries just read get the same proof. Its limit is the key's: a file rewritten with the same mtime_ns and size is
+    not seen (the design's `(path, mtime, size)` key), and the cache folder is trusted as the project's sources are."""
 
     def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None, cache=None):
         spelled = os.path.abspath(base)
@@ -1384,6 +1417,11 @@ class ImportIndex:
         self.edges = {}  # rel -> [edge]
         self.meta = {"ignored": [], "config_error": ""}
         self.gaps = {}  # code -> how many times, from the last refresh (see GAPS)
+        self._sink = self.gaps  # where `_gap` records: `gaps`, or the proof being made
+        self._configs = []  # [(path, state token)]: each config and overlay as the last refresh read it (`prove` reads it again)
+        self._exclude = []  # the config's `exclude`, as the last walk used it
+        self._targets = {}  # absolute path -> verdict: each import target the edges were made from (`prove` judges it again)
+        self._unread = set()  # sources the last walk found and the build could not read (each already a gap)
         self._reverse = {}
         self._known = set()
         self.refreshed_at = None
@@ -1472,12 +1510,15 @@ class ImportIndex:
                 os.close(fd)
         return found
 
-    def refresh(self):
+    def refresh(self, prove=True):
         """Bring the index up to date with the files on disk. Returns {"files", "scanned", "removed", "unchanged", "stale",
-        "ms"}: `scanned` is how many files were read this time; `stale` lists files that changed again while they were being read
-        (the next call picks them up; the answer should say so)."""
+        "ms"}: `scanned` is how many files were read this time. With `prove` (the default) the build ends with `prove()`, whose
+        gaps are added to `gaps`: `stale` lists the sources it found changed since they were keyed (a change during the build; the
+        next refresh reads them again). `NavApi` passes False and proves after the answer is built instead."""
         started = time.perf_counter()
         self.gaps = {}
+        self._sink = self.gaps
+        self._configs = []
         imap, details = self._load_config(self.config)
         self.meta = {"ignored": list(details["ignored"]), "config_error": details.get("error", "")}
         if self.root_refusal:
@@ -1488,36 +1529,87 @@ class ImportIndex:
             omap, odetails = self._load_config(path)
             overlay_maps.append((os.path.basename(path), omap))
             self.meta["ignored"] += [f"{os.path.basename(path)}:{item}" for item in odetails["ignored"]]
-        current = self._walk(details["exclude"])
+        self._exclude = list(details["exclude"])
+        current = self._walk(self._exclude)
         changed = sorted(rel for rel, key in current.items() if rel not in self.entries or self.entries[rel]["key"] != key)
         removed = [rel for rel in self.entries if rel not in current]
         for rel in removed:
             del self.entries[rel]
-        failures = {}
-        texts = read_sources([self._abs(rel) for rel in changed], self.base, self._allowed, failures=failures)
-        stale = []
+        failures, self._unread = {}, set()
+        texts = read_sources([self._abs(rel) for rel in changed], self.base, self._allowed, failures=failures,
+                             keys={self._abs(rel): current[rel] for rel in changed})
         for rel in changed:
             text = texts[self._abs(rel)]
             if text is None:  # not read: no entry (an entry with no imports would stand for a file that has none), and a gap
                 self._gap(_READ_GAP.get(failures.get(self._abs(rel)), "source_unreadable"))
                 self.entries.pop(rel, None)
+                self._unread.add(rel)
                 continue
             specs = [[s["spec"], s["line"], s["type_only"], s["dynamic"]] for s in scan_specifiers(text)]
-            if _signature(self._abs(rel)) != current[rel]:
-                stale.append(rel)  # keyed by the key seen before the read, so the next refresh reads it again
-            self.entries[rel] = {"key": current[rel], "specs": specs}
+            self.entries[rel] = {"key": current[rel], "specs": specs}  # read with its open signature equal to this key
         self._known = set(current)
         self._resolve_all(imap, overlay_maps)
         self.refreshed_at = time.time()
         if changed or removed:
             self.save()
+        stale = []
+        if prove:
+            proof, stale = self._prove()
+            for code, count in proof.items():
+                self.gaps[code] = self.gaps.get(code, 0) + count
         return {"files": len(current), "scanned": len(changed), "removed": len(removed), "unchanged": len(current) - len(changed),
                 "stale": stale, "ms": round((time.perf_counter() - started) * 1000)}
 
+    def prove(self):
+        """The gaps found by looking again at every input the index's edges were made from ({} when all of them hold); see the class
+        docstring. Nothing is changed: the next `refresh()` brings the index up to date."""
+        return self._prove()[0]
+
+    def _prove(self):
+        """(gaps, [rel of each source found changed])."""
+        proof, stale = {}, []
+        self._sink = proof
+        try:
+            for path, token in self._configs:
+                state = _config_state(path, self.base, self._allowed)
+                if _state_token(state) != token:
+                    self._gap(_CONFIG_GAP.get(state[0], "config_changed") if state[0] != "absent" else "config_changed")
+            current = self._walk(self._exclude)
+            indexed = {rel: entry["key"] for rel, entry in self.entries.items()}
+            if set(current) - set(indexed) - self._unread or set(indexed) - set(current):
+                self._gap("folder_changed")  # a file appeared or went, beyond those the build already counted as gaps
+            for rel in sorted(indexed):
+                if rel in current and current[rel] != indexed[rel]:
+                    stale.append(rel)
+                    self._gap("source_changed")
+            probed = probe_sources([(self._abs(rel), indexed[rel]) for rel in sorted(indexed) if current.get(rel) == indexed[rel]],
+                                   self.base, self._allowed)
+            for path, status in probed.items():
+                if status != READ_OK:
+                    if status in ("absent", "changed"):
+                        stale.append(lexical_path(self.base, path))
+                    self._gap(_READ_GAP.get(status, "source_unreadable"))
+            for path, verdict in list(self._targets.items()):
+                if self._verdict(path) != verdict:
+                    self._gap("target_changed")
+        finally:
+            self._sink = self.gaps
+        return proof, sorted(set(stale))
+
+    def target_state(self, rel):
+        """The index's verdict on the project file `rel` as an import target (see `_verdict`): "" for a regular file an import
+        may point at, else `missing`, `unreadable` (a gap is recorded), `outside` or `refused`. Kept, so `prove` looks again."""
+        path = self._abs(rel)
+        verdict = self._verdict(path)
+        self._targets[path] = verdict
+        return verdict[1]
+
     def _load_config(self, path):
         """`load_config` of the bytes `_config_read` gives (inside the project, allowed): a config that leads out of the project or
-        that the guard refuses is not read, and is reported in `config_error` by its state (`outside`, `refused`)."""
+        that the guard refuses is not read, and is reported in `config_error` by its state (`outside`, `refused`). Its state token
+        is kept (`_configs`): `prove` reads it again and holds the map to it."""
         state, raw = _config_read(path, self.base, self._allowed)
+        self._configs.append((path, _state_token(state)))
         imap, details = load_config(path, raw, error=state[0])
         if state[0] in _CONFIG_GAP:
             self._gap(_CONFIG_GAP[state[0]])
@@ -1529,16 +1621,17 @@ class ImportIndex:
         return imap, details  # "absent" is no gap: nothing is there, which the kernel said, so the map is empty and not unknown
 
     def _gap(self, code):
-        self.gaps[code] = self.gaps.get(code, 0) + 1
+        self._sink[code] = self._sink.get(code, 0) + 1
 
-    def incomplete(self):
-        """None when the last refresh got everything; else (kind, reason, {code: count}) for the most serious kind: `refused` (a
-        refusal: the config or root the index needs), then `incomplete` (something could not be read or used), then `changed` (a
-        race). `reason` is a code a caller may show; `gaps` has counts and never a path."""
+    def incomplete(self, gaps=None):
+        """None when `gaps` (default: those of the last refresh) is empty; else (kind, reason, {code: count}) for the most serious
+        kind: `refused` (a refusal: the config or root the index needs), then `incomplete` (something could not be read or used),
+        then `changed` (a race). `reason` is a code a caller may show; `gaps` has counts and never a path."""
+        gaps = self.gaps if gaps is None else gaps
         for kind in ("refused", "incomplete", "changed"):
-            codes = sorted(code for code in self.gaps if GAPS[code][0] == kind)
+            codes = sorted(code for code in gaps if GAPS[code][0] == kind)
             if codes:
-                return kind, GAPS[codes[0]][1], dict(sorted(self.gaps.items()))
+                return kind, GAPS[codes[0]][1], dict(sorted(gaps.items()))
         return None
 
     def _allowed(self, rel):
@@ -1553,8 +1646,9 @@ class ImportIndex:
             return False  # a guard that fails refuses
 
     def _verdicts(self):
-        """judge(path) -> (rel, reason), remembered for one resolution pass (see `_verdict`)."""
-        memo = {}
+        """judge(path) -> (rel, reason), remembered for one resolution pass (see `_verdict`) in `_targets`, which `prove` judges
+        again: every target an edge was made from is an input of the answer."""
+        memo = self._targets = {}
 
         def judge(path):
             if path not in memo:

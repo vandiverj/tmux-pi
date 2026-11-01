@@ -9,9 +9,12 @@ Three sources, each used for what it is good at:
   - `deno info --json`: the forward module graph of one entry, capped at 30 s. Used when the index cannot be built, or when asked for.
     Its graph is cached on disk (`nav_api-info-<key>.json`), keyed by the content hash of every file and config the walk reached,
     the entry, the Deno version, the flags and the format. A hit is filtered as a fresh result is, listed, screened and proved last
-    (a changed file gives `stale_index`); with no sandbox there is no hit; an entry (this one and the `deno doc` one) is written only as the very last step, after the answer is `ok`, screened
-    and proved (`_final`); a refusal, gap, stale answer, error or exception never writes. A planted entry can name
-    only files this walk proved and the guard allows. The cache folder is judged as for `deno doc`; a refused one means no cache.
+    (a changed file gives `stale_index`); with no sandbox there is no hit. An entry (this one and the `deno doc` one) is JUDGED before the final proof and WRITTEN
+    after it, and never removed: before the proof (`_final`) the entry's name and a unique temporary name are asked
+    of the guard once (the cache folder was judged when the cache was made) (a refusal means no store); the proof runs; only an answer that is still `ok` then writes the temporary file
+    and renames it, with no guard and no project code, a failure being swallowed. A refusal, gap, stale answer, error or exception
+    therefore writes nothing, and no entry is ever deleted. A planted entry can name only files this walk proved and the guard allows.
+    The cache folder is judged as for `deno doc`; a refused one means no cache.
 
 Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
 a file or folder the guard refuses BY ITS NAME is outside the index by policy (not listed, read or counted; its edges are not
@@ -1088,37 +1091,31 @@ class NavApi:
         very last step: the screen, the filtering and the paging are all done before it, so nothing (the guard included) runs
         between the check and the return. A tree that moved gives that answer (`stale_index`, or the index's gaps), which carries
         nothing from `answer`.
-        `store` (None, or a function that writes the answer's cache entry and returns the function that removes exactly that entry, or
-        None) is the only thing that writes a cache from an answer. It runs after the screen and only for an answer that is `ok`
-        before and after it, and BEFORE the proof, because the write asks the guard about the entry's names (and so may run project
-        code); the proof is therefore still the last thing that touches the project. When the proof fails, or raises, the entry
-        just written is removed by its name alone (`graph.CacheDir.remove_json`: no guard, no project path) and the answer given is
-        the proof's. A refusal, a gap, a screen that failed or an exception before the write never reach it. A store that fails
-        changes nothing. Between the write and the removal the entry exists on disk, but it is keyed by the content it was made from."""
+        `store` (None, or a function that JUDGES an entry and returns the function that writes it, or None) is the only thing that
+        writes a cache from an answer, and it has no rollback. Before the proof, for an answer that is `ok` before and after the
+        screen, `store()` chooses the entry's name and a unique temporary name and asks the guard about both (the folder was judged when the
+        cache was made; `graph.CacheDir.prepare_json`); a refusal, or any exception, means no store. The proof then runs as the last thing that
+        touches the project. Only when the answer is still `ok` is the returned function called: it writes the temporary file and
+        renames it (`graph.CacheDir.put_json`), asks no guard and calls no project code, and a failure of it is swallowed (the
+        answer stays `ok`). Nothing is ever removed, so a failed proof, a proof that raises, a refusal, a gap or an error leaves
+        no entry because none was written, and no other writer's entry is touched (the entry is keyed by the content it was made
+        from, so a second writer of the same key writes the same bytes by an atomic rename)."""
         out = self._out(answer)
-        undo = None
+        commit = None
         if store is not None and answer.get("status") == "ok" and out.get("status") == "ok":
             try:
-                undo = store()
+                commit = store()
             except Exception:
-                undo = None
-        try:
-            failed = proof() if proof is not None else None
-        except BaseException:
-            self._undo(undo)
-            raise
+                commit = None
+        failed = proof() if proof is not None else None
         if failed is not None:
-            self._undo(undo)
             return self._out(failed)
-        return out
-
-    @staticmethod
-    def _undo(undo):
-        if undo is not None:
+        if commit is not None:
             try:
-                undo()
+                commit()
             except Exception:
                 pass
+        return out
 
     @staticmethod
     def _reach_proof(reach):
@@ -1212,7 +1209,7 @@ class NavApi:
             if key:  # only a graph Deno gave and the walk accepted whole; `_final` stores it once the answer is ok and proven
                 value = {"format": INFO_FORMAT, "external": external,
                          "modules": [{"path": path, "imports": deps} for path, deps in sorted(local.items())]}
-                store = lambda: self._write_cache("info", key, value)
+                store = lambda: self._prepare_cache("info", key, value)
         keep = [path for path in [rel, *local.get(rel, [])] if path in local]
         chosen = set(keep[:MAX_MODULES])
         for path in sorted(local):
@@ -1283,7 +1280,7 @@ class NavApi:
             found = self._parse_doc(out, names, mirror, reach)
             if found is None:
                 return _answer("error", detail="deno doc gave output that is not a symbol list"), None, None
-            store = lambda: self._write_cache("doc", key, found)
+            store = lambda: self._prepare_cache("doc", key, found)
             hit = False
         shown = [item for item in (self._present(entry, names) for entry in found) if item]
         return _answer("ok", path=self._show(rel), source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
@@ -1351,13 +1348,19 @@ class NavApi:
         data = self._cache.read_json(self._cache_name(kind, key))
         return data if isinstance(data, shape) else None
 
-    def _write_cache(self, kind, key, value):
-        """Written through the judged cache folder (`graph.CacheDir.write_json`); nothing when the folder was refused. Returns the
-        function that removes exactly that entry (`graph.CacheDir.remove_json`: by name, asks no guard), or None when nothing was written."""
-        name = self._cache_name(kind, key)
-        if not self._cache.write_json(name, value):
+    def _prepare_cache(self, kind, key, value):
+        """Judge the entry (`graph.CacheDir.prepare_json`: its name and a unique temporary name, asked of the guard once),
+        and return the function that writes it (`graph.CacheDir.put_json`: no guard, no project code, failure swallowed), or None
+        when the cache is refused or the guard refuses a name. `_final` calls this before its proof and the function after it."""
+        token = self._cache.prepare_json(self._cache_name(kind, key))
+        if token is None:
             return None
-        return lambda: self._cache.remove_json(name)
+        return lambda: self._cache.put_json(token, value)
+
+    def _write_cache(self, kind, key, value):
+        """Judge and write at once (`graph.CacheDir.write_json`); nothing when the folder or a name was refused. Not used for an
+        answer, which goes through `_final`."""
+        return self._cache.write_json(self._cache_name(kind, key), value)
 
     # --- status
 

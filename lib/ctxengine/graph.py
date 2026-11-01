@@ -777,14 +777,26 @@ class CacheDir:
             return None
         return fd
 
-    def write_json(self, name, value):
-        """Write `value` to the cache file `name` (a temporary file, then a rename, both in the folder's descriptor). True when
-        written; False when there is no cache, the name is refused, a link is at the name, or the write fails (the cache is left as
-        it was, and only the next start is cold)."""
-        temp = f"{name}.{os.getpid()}.tmp"
+    def prepare_json(self, name):
+        """Judge a write before it is made: the cache file `name` and a unique temporary name (random hex, so no other writer's
+        name) are each asked of the guard, once (the folder was judged when the `CacheDir` was made, and is not asked again: the guard
+        is asked once per name per answer). Returns the pair (a token for `put_json`), or None when
+        there is no cache, the name is not a plain `.json` one, or the guard refuses any of them. This is the only step of a write
+        that asks the guard (and so may run project code)."""
+        temp = f"{name}.{secrets.token_hex(8)}.tmp"
         if self.refusal or not self._plain(name) or not name.endswith(".json") \
                 or not all(self._allow_file(posixpath.join(self.rel, item)) for item in (name, temp)):
+            return None
+        return name, temp
+
+    def put_json(self, token, value):
+        """Write `value` under the names `prepare_json` judged (a temporary file with O_EXCL and no link followed, then a rename, both
+        in the folder's descriptor). It asks the guard nothing and calls no project code, so it can follow the last proof of an
+        answer. True when written; False (swallowed, the cache left as it was) when `token` is None, a link is at the name, or the
+        write fails. Nothing here removes an entry: a failed write only removes its own unique temporary file."""
+        if token is None:
             return False
+        name, temp = token
         fd = self._open_folder()
         if fd is None:
             return False
@@ -795,37 +807,27 @@ class CacheDir:
             except FileNotFoundError:
                 pass
             try:
-                os.unlink(temp, dir_fd=fd)  # left by a crashed run of this process id; unlink never follows a link
-            except FileNotFoundError:
-                pass
-            write_new(temp, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"), dir_fd=fd)
-            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
-            return True
-        except OSError:
+                write_new(temp, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"), dir_fd=fd)
+            except FileExistsError:
+                return False  # not our file (the name is random): leave it
             try:
-                os.unlink(temp, dir_fd=fd)
+                os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+                return True
             except OSError:
-                pass
+                try:
+                    os.unlink(temp, dir_fd=fd)
+                except OSError:
+                    pass
+                return False
+        except OSError:
             return False
         finally:
             os.close(fd)
 
-    def remove_json(self, name):
-        """Remove the cache file `name` that `write_json` wrote, by its name alone in the judged folder's descriptor (the folder
-        checked to be the judged one; `unlink` never follows a link). It asks the guard nothing and touches no project path, so it
-        can run after the last proof of an answer. True when removed."""
-        if self.refusal or not self._plain(name) or not name.endswith(".json"):
-            return False
-        fd = self._open_folder()
-        if fd is None:
-            return False
-        try:
-            os.unlink(name, dir_fd=fd)
-            return True
-        except OSError:
-            return False
-        finally:
-            os.close(fd)
+    def write_json(self, name, value):
+        """`prepare_json` then `put_json`: True when written; False when there is no cache, a name is refused, a link is at the
+        name, or the write fails (the cache is left as it was, and only the next start is cold)."""
+        return self.put_json(self.prepare_json(name), value)
 
 
 def read_source(path, base, allow, failures=None, expect=None):

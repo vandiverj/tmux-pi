@@ -3046,10 +3046,9 @@ class PathRuleCase(Tree):
         ("graph.py", "write_new", "os.write"): "the new file",
         ("graph.py", "open_folder_below", "os.open"): "base NOFOLLOW_ANY, then each part O_NOFOLLOW relative to the one before",
         ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
-        ("graph.py", "CacheDir.write_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name the guard allows",
-        ("graph.py", "CacheDir.write_json", "os.unlink"): "dir_fd of the checked folder",
-        ("graph.py", "CacheDir.write_json", "os.rename"): "dir_fd of the checked folder",
-        ("graph.py", "CacheDir.remove_json", "os.unlink"): "dir_fd of the checked folder; a plain .json name written by write_json, asks no guard (runs after the last proof)",
+        ("graph.py", "CacheDir.put_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name prepare_json judged (asks no guard)",
+        ("graph.py", "CacheDir.put_json", "os.unlink"): "dir_fd of the checked folder; only this write's own unique temporary name",
+        ("graph.py", "CacheDir.put_json", "os.rename"): "dir_fd of the checked folder; names prepare_json judged",
         ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
         ("graph.py", "make_own_folder", "os.open"): "the judged scratch parent, folder descriptor, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "make_own_folder", "os.mkdir"): "dir_fd-relative to that descriptor, a new random name",
@@ -5820,23 +5819,131 @@ class InfoCacheCase(Tree):
                     getattr(nav, call)("src/main.ts")
             self.assertEqual(self.entries(project) + self.doc_entries(project), [], call)
 
-    def test_s3_f2_the_proof_is_the_last_step_and_the_write_comes_before_it(self):
+    def test_s3_f2_the_entry_is_judged_before_the_proof_and_written_after_it(self):
         for call, kind in (("forward_graph", "info"), ("symbols", "doc")):
             project = self.project(call)
             events = []
             nav = self.nav_for(project, guard=lambda t: (events.append("screen"), t)[1]) if call == "forward_graph" \
                 else self.doc_nav(project, guard=lambda t: (events.append("screen"), t)[1])
-            real_write, real_proof = nav._write_cache, nav_api.NavApi._reach_proof
+            real_prepare, real_proof = nav._prepare_cache, nav_api.NavApi._reach_proof
+
+            def prepare(*a, events=events, real_prepare=real_prepare):
+                events.append("judge")
+                commit = real_prepare(*a)
+                return lambda: (events.append("write"), commit())[1]
 
             def proof(reach, events=events):
                 check = real_proof(reach)
                 return lambda: (events.append("proof"), check())[1]
-            nav._write_cache = lambda *a, events=events, real_write=real_write: (events.append("write"), real_write(*a))[1]
+            nav._prepare_cache = prepare
             with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
                 self.assertEqual(getattr(nav, call)("src/main.ts")["status"], "ok")
-            self.assertEqual(events[-2:], ["write", "proof"], (call, events))
+            self.assertEqual(events[-3:], ["judge", "proof", "write"], (call, events))
             self.assertEqual(events.count("write"), 1, call)
             self.assertEqual(len(self.entries(project) + self.doc_entries(project)), 1, kind)
+
+    def test_s3_f3_the_guard_is_asked_about_the_temporary_name_only_before_the_proof(self):
+        project = self.project()
+        events = []
+        real_proof = nav_api.NavApi._reach_proof
+
+        def proof(reach):
+            check = real_proof(reach)
+            return lambda: (events.append("proof"), check())[1]
+
+        def check(root, path):
+            events.append(path)
+            return path
+        nav = self.nav_for(project, check_path=check)
+        with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
+            self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
+        self.assertEqual(events[-1], "proof", events)
+        folder = project_cache(project).parent.relative_to(project).as_posix()
+        before = events[:events.index("proof")]
+        self.assertEqual(sum(1 for e in before if e.startswith(folder + "/nav_api-info-") and e.endswith(".tmp")), 1, events)
+        self.assertEqual(len(self.entries(project)), 1)
+
+    def test_s3_f3_an_unwritable_folder_during_the_proof_leaves_nothing_on_a_stale_answer(self):
+        for call in ("forward_graph", "symbols", "imports"):
+            project = self.project(call)
+            nav = self.doc_nav(project) if call == "symbols" else self.nav_for(project)
+            folder = project_cache(project).parent
+            folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+            real_proof = nav_api.NavApi._reach_proof
+
+            def proof(reach, folder=folder, real_proof=real_proof):
+                def run():
+                    os.chmod(folder, 0o500)  # the folder becomes unwritable while the proof runs
+                    return _stale()
+                return run
+            _stale = lambda: nav_api._answer("stale_index", detail="x")
+            run = {"forward_graph": lambda: nav.forward_graph("src/main.ts"), "symbols": lambda: nav.symbols("src/main.ts"),
+                   "imports": lambda: nav.imports("src/main.ts", source="deno")}[call]
+            try:
+                with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
+                    answer = run()
+            finally:
+                if folder.exists():
+                    os.chmod(folder, 0o700)
+            self.assertEqual(answer["status"], "stale_index", (call, answer))
+            self.assertEqual(self.entries(project) + self.doc_entries(project), [], call)
+
+    def test_s3_f3_a_failed_proof_does_not_remove_another_writers_entry_of_the_same_key(self):
+        for call in ("forward_graph", "symbols"):
+            project = self.project(call)
+            make = self.doc_nav if call == "symbols" else self.nav_for
+            first, second = make(project), make(project)
+            run = lambda n: getattr(n, call)("src/main.ts")
+            real_proof = nav_api.NavApi._reach_proof
+            done = []
+
+            def proof(reach, second=second, done=done):
+                def go():
+                    if not done:
+                        done.append(1)
+                        self.assertEqual(run(second)["status"], "ok")  # another writer stores the same key during this proof
+                    return nav_api._answer("stale_index", detail="x")
+                return go
+            first._reach_proof = proof
+            self.assertEqual(run(first)["status"], "stale_index", call)
+            self.assertEqual(len(self.entries(project) + self.doc_entries(project)), 1, call)
+            self.assertEqual(list(project_cache(project).parent.glob("*.tmp")), [], call)
+
+    def test_s3_f3_a_write_that_fails_after_the_proof_leaves_the_answer_ok_and_nothing_written(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        real_prepare = nav._prepare_cache
+
+        def prepare(*a):
+            commit = real_prepare(*a)
+            os.chmod(folder, 0o500)
+            return commit
+        nav._prepare_cache = prepare
+        try:
+            self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
+        finally:
+            os.chmod(folder, 0o700)
+        self.assertEqual(self.entries(project), [])
+        self.assertEqual(list(folder.glob("*.tmp")), [])
+
+    def test_s3_f3_putting_an_entry_asks_the_guard_nothing_and_a_refused_name_is_not_judged_in(self):
+        project = self.project()
+        asked = []
+        nav = self.nav_for(project, check_path=lambda root, path: (asked.append(path), path)[1])
+        token = nav._cache.prepare_json("nav_api-info-zz.json")
+        self.assertIsNotNone(token)
+        del asked[:]
+        self.assertTrue(nav._cache.put_json(token, {"a": 1}))
+        self.assertEqual(asked, [])
+        self.assertEqual(json.loads((project_cache(project).parent / "nav_api-info-zz.json").read_text()), {"a": 1})
+        self.assertFalse(nav._cache.put_json(None, {}))
+        self.assertIsNone(nav._cache.prepare_json("../x.json"))
+        self.assertIsNone(nav._cache.prepare_json("x.txt"))
+        refusing = self.nav_for(project, check_path=lambda root, path: (_ for _ in ()).throw(nav_api.Refused("t")) if path.endswith(".tmp") else path)
+        self.assertIsNone(refusing._cache.prepare_json("nav_api-info-yy.json"))
+        self.assertFalse(hasattr(nav._cache, "remove_json"))
 
     def test_s3_f2_a_guard_that_moves_the_project_when_asked_about_the_entry_leaves_no_entry(self):
         """The write asks the guard about the entry's names; a project change made there is seen by the proof, which is after it."""
@@ -5884,18 +5991,6 @@ class InfoCacheCase(Tree):
             with self.assertRaises(OSError):
                 nav.forward_graph("src/main.ts")
         self.assertEqual(self.entries(project), [])
-
-    def test_s3_f2_removing_an_entry_asks_the_guard_nothing(self):
-        project = self.project()
-        asked = []
-        nav = self.nav_for(project, check_path=lambda root, path: (asked.append(path), path)[1])
-        self.assertEqual(nav.forward_graph("src/main.ts")["status"], "ok")
-        name = self.entries(project)[0].name
-        del asked[:]
-        self.assertTrue(nav._cache.remove_json(name))
-        self.assertEqual((asked, self.entries(project)), ([], []))
-        self.assertFalse(nav._cache.remove_json(name))
-        self.assertFalse(nav._cache.remove_json("../x.json"))
 
     def test_s3_f1_a_refusal_a_gap_or_no_deno_graph_stores_nothing_on_either_route(self):
         project = self.project("sandbox")

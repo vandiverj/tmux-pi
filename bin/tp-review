@@ -349,6 +349,15 @@ if [[ -z "${extra[*]+x}" ]]; then  # a research report has no diff
 fi
 if (( round_count > 0 )); then
   review_task="$review_task This is review round $(( round_count + 1 )) of this work. The findings of the $round_count earlier round(s) are attached oldest first, then the diff of the working tree since the last reviewed state. For each earlier finding say whether it is fixed, citing it by round and number (for example round 1 F2); when a new finding repeats an earlier one, name that family. Review the whole change again, not only the fixes: the diff shows only what changed since the last round, and a fix can break what an earlier round passed."
+  used_families="$(jq -r '[.families | to_entries[] | select(.value | length > 0) | "round \(.key + 1): \(.value | join(", "))"] | join("; ")' <<<"$rounds")"
+  if [[ -n "$used_families" ]]; then
+    review_task="$review_task Family names used by the earlier rounds: $used_families. For each finding that belongs to one of these families end it with 'Family: <that name>' exactly as written (before its 'Closes by:' line); for a finding that is new, say in the finding that it is new."
+  else
+    review_task="$review_task No earlier round named a finding family. If a finding repeats an earlier one, name the family with 'Family: <short-kebab-name>'; if every finding is new, say so."
+  fi
+  if (( round_count >= 2 )); then
+    review_task="$review_task From round 3 on, a REQUEST_CHANGES reply with no 'Family:' line is flagged in the verdict summary."
+  fi
 fi
 total=$(( packet_reserve + ${#review_task} ))
 for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do

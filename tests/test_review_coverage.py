@@ -264,6 +264,19 @@ class ConsumerTests(unittest.TestCase):
         for ident in ("code", "bare", "ok"):
             self.assertNotIn("review_unusable", rows[f"rv-{ident}"], ident)
 
+    def test_a_round_three_request_changes_with_no_family_line_is_flagged_not_refused(self):
+        rc = lambda *fam: "REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] wrong.\n" + "".join(f"Family: {f}\n" for f in fam) + "Closes by: code\n" + COMPLETE
+        for n, reply in ((1, rc()), (2, rc()), (3, rc()), (4, rc("state-matrix")), (5, "APPROVED\n" + COMPLETE)):
+            self.task(f"rv{n}", reply, review_of="author")
+        self.task("author", "done\n", meta={"reviews": [f"rv{n}" for n in range(1, 6)]})
+        flags = {n: self.agent.record(self.state / "tasks" / f"rv{n}").get("family_missing") for n in range(1, 6)}
+        self.assertEqual([n for n, v in flags.items() if v], [3])
+        self.assertIn("round 3 REQUEST_CHANGES with no Family: line", flags[3])
+        self.assertEqual(self.agent.record(self.state / "tasks" / "rv3")["verdict"], "REQUEST_CHANGES")
+        rows = {row["id"]: row for row in self.agent.write_index(self.state)["recent"]}
+        self.assertIn("family_missing", rows["rv3"])
+        self.assertNotIn("family_missing", rows["rv2"])
+
     # escalation evidence
     def test_escalation_counts_a_stated_request_changes_and_never_an_incomplete_approval(self):
         for ident, reply, expected in (("a", "REQUEST_CHANGES\nF1 defect", 1), ("b", "REQUEST_CHANGES\nF1\n" + COMPLETE, 1),

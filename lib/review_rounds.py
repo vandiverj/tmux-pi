@@ -24,7 +24,7 @@ next round is the change from that tree to the tree now.
 
   review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir>
       writes the earlier findings files and the diff into out-dir and prints
-      {"contexts": [paths, in order], "rounds": N, "snapshot": {...} | null}
+      {"contexts": [paths, in order], "rounds": N, "families": [the Family: names of each attached round, [] for none], "snapshot": {...} | null}
       exits 1 and says why when recorded state exists but cannot be used (nothing is guessed)
 
 Nothing written to out-dir carries a credential: a changed path the sensitive-read rule flags (lib/sensitive_read.py,
@@ -42,6 +42,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 IDENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
@@ -96,6 +97,26 @@ def earlier_reviews(state_dir, task_id):
             break
         current = parent
     return [(author, review) for author, reviews in reversed(chain) for review in reviews]
+
+
+def chain_labels(state_dir, task_id):
+    """[(author, review, verdict, families)] for every review of the chain of `task_id`, oldest first (the order of
+    earlier_reviews). `verdict` is the stated verdict word of the review's result.md, None when it is missing, cannot be read or
+    is not a verdict; `families` are its Family: names (review_verdict.families), [] then. The one reader of these names for the
+    retry gate and for the reviewer's round text. Raises Refused as earlier_reviews does."""
+    rows = []
+    for author, review in earlier_reviews(state_dir, task_id):
+        try:
+            text = (task_path(state_dir, review) / "result.md").read_text(encoding="utf-8")
+            families = review_verdict.families(text)
+            try:
+                verdict = review_verdict.parse(text)[0]
+            except ValueError:
+                verdict = None
+        except (OSError, ValueError):
+            verdict, families = None, []
+        rows.append((author, review, verdict, families))
+    return rows
 
 
 def git(workdir, *args, env=None):
@@ -331,6 +352,7 @@ def prepare(state_dir, task_id, workdir, out_dir):
     red, redactions, withheld = redactor(), 0, []
     # a review that never produced a reply has no findings to show; a reply that is not a regular file is refused
     reviews = []
+    labels = {review: names for _, review, _, names in chain_labels(state_dir, task_id)}
     for author, review in earlier:
         result = task_path(state_dir, review) / "result.md"
         if result.is_symlink() or (result.exists() and not result.is_file()):
@@ -371,7 +393,7 @@ def prepare(state_dir, task_id, workdir, out_dir):
                 f"{last_round} reviewed)\n"
         head = f"[Change in the working tree since the state review round {last_round} reviewed (git diff, round {last_round} tree to now).]\n\n"
         contexts.append(write(out / label, head + body))
-    return {"contexts": contexts, "rounds": len(earlier), "snapshot": now, "skipped": [review for _, review in skipped],
+    return {"contexts": contexts, "rounds": len(earlier), "families": [labels.get(review, []) for _, review in earlier], "snapshot": now, "skipped": [review for _, review in skipped],
             "withheld": withheld, "redactions": redactions}
 
 

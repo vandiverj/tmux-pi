@@ -104,7 +104,9 @@ class FixBriefTests(RetryCase):
         self.assertEqual(review_verdict.named_briefs(self.request(again)), [brief])
 
 
-def review_text(*families):
+def review_text(*families, verdict="REQUEST_CHANGES"):
+    if verdict != "REQUEST_CHANGES":
+        return f"{verdict}\nRESULT_STATUS: complete\n\nCoverage\nI read the changed files and their callers.\n"
     labels = "".join(f"F{n} [defect] one cell of the matrix is wrong.\nFamily: {name}\nCloses by: code\n\n" for n, name in enumerate(families, 1))
     return (f"REQUEST_CHANGES\nRESULT_STATUS: complete\n{labels or 'F1 [defect] wrong.\nCloses by: code\n'}\n"
             "Coverage\nI read the changed files and their callers.\n")
@@ -210,12 +212,48 @@ class RepeatedFamilyGateTests(RetryCase):
 
     def test_a_family_round_one_did_not_name_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], ["error-path"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
 
-    def test_a_latest_review_naming_no_family_allows_a_plain_retry(self):
+    def test_a_latest_review_naming_no_family_after_an_approval_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], [])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
         self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_two_request_changes_in_a_row_refuse_a_plain_retry_with_no_family_named(self):
+        for rounds in ([[], []], [["state-matrix"], ["error-path"]]):
+            with self.subTest(rounds=rounds):
+                item = self.chain(*rounds)
+                before = self.tasks()
+                run = self.plain_retry(item)
+                self.assertEqual(run.returncode, 1, run.stdout)
+                for word in ("review-1", "review-2", "REQUEST_CHANGES twice in a row", "--route rule-first", "--route design", "--route park"):
+                    self.assertIn(word, run.stderr)
+                self.assertNotIn("finding family", run.stderr)
+                self.assertEqual(self.tasks(), before)
+
+    def test_an_approval_between_two_request_changes_breaks_the_run(self):
+        item = self.chain(["a"], ["b"], ["c"])  # round 2 is gated, so the chain passes through --route design
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_a_review_that_cannot_be_read_breaks_the_run(self):
+        item = self.chain([], [])
+        (self.state / "tasks" / "review-1" / "result.md").write_text("not a verdict\n")
+        self.assertEqual(self.plain_retry(item).returncode, 0)
+
+    def test_routes_take_an_unnamed_repeat_and_the_notes_and_parked_md_say_so(self):
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "rule-first")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("both asked for changes", self.packet(json.loads(run.stdout)))
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "park")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        parked = (self.task_dir(item) / "parked.md").read_text()
+        for word in ("review-1", "review-2", "REQUEST_CHANGES"):
+            self.assertIn(word, parked)
 
     def test_only_the_latest_review_is_judged_against_the_earlier_ones(self):
         item = self.chain(["state-matrix", "error-path"], ["state-matrix"], ["error-path"])  # round 3 repeats a family of round 1 only
@@ -232,6 +270,7 @@ class RepeatedFamilyGateTests(RetryCase):
 
     def test_a_route_without_a_repeated_family_is_refused(self):
         item = self.chain(["state-matrix"], ["error-path"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         before = self.tasks()
         run = self.plain_retry(item, "--route", "park")
         self.assertEqual(run.returncode, 1, run.stdout)

@@ -652,6 +652,50 @@ echo review-1
         self.assertIn("recorded no reviewed state", (copies / names[2]).read_text())
         self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviews"], ["old-2", "review-1"])
 
+    def lineage(self, old1, old2):
+        """The task reviewed twice already (old-1 on its parent w0, old-2 on itself) with these replies."""
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.reviewer_dir("old-1", old1)
+        self.reviewer_dir("old-2", old2)
+        parent = self.state / "tasks" / "w0"
+        parent.mkdir()
+        (parent / "meta.json").write_text(json.dumps({"id": "w0", "worker": "pi", "workdir": str(self.work), "review": "old-1", "reviews": ["old-1"]}))
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"parent": "w0", "review": "old-2", "reviews": ["old-2"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+
+    def test_a_later_round_lists_the_family_names_of_the_earlier_rounds_and_asks_for_reuse_or_new(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\nFamily: State-Matrix\nCloses by: code\n", "REQUEST_CHANGES\nF1 y\nFamily: error-path\nCloses by: code\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.log.read_text()
+        self.assertIn("This is review round 3 of this work", log)
+        self.assertIn("Family names used by the earlier rounds: round 1: state-matrix; round 2: error-path.", log)
+        self.assertIn("'Family: <that name>' exactly as written", log)
+        self.assertIn("for a finding that is new, say in the finding that it is new", log)
+        self.assertIn("From round 3 on, a REQUEST_CHANGES reply with no 'Family:' line is flagged in the verdict summary", log)
+
+    def test_a_round_two_with_names_and_a_round_with_none_say_so_without_the_round_three_flag(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\nFamily: state-matrix\nCloses by: code\n", "REQUEST_CHANGES\nF1 y\nCloses by: code\n")
+        (self.state / "tasks" / "w0" / "meta.json").write_text(json.dumps({"id": "w0", "worker": "pi", "workdir": str(self.work)}))
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"parent": None, "review": "old-1", "reviews": ["old-1"]})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.log.read_text()
+        self.assertIn("This is review round 2 of this work", log)
+        self.assertIn("Family names used by the earlier rounds: round 1: state-matrix.", log)
+        self.assertNotIn("From round 3 on", log)
+
+    def test_rounds_that_named_no_family_say_so(self):
+        self.lineage("REQUEST_CHANGES\nF1 x\n", "REQUEST_CHANGES\nF1 y\n")
+        self.assertEqual(self.review().returncode, 0)
+        log = self.log.read_text()
+        self.assertIn("No earlier round named a finding family", log)
+        self.assertNotIn("Family names used by the earlier rounds", log)
+
     def test_recorded_state_that_cannot_be_used_refuses_before_spawning(self):
         self.git("init", "-q")
         self.reviewer_dir("old-1", "REQUEST_CHANGES\nF1\n", {"workdir": str(self.work.resolve()), "tree": "0" * 40})

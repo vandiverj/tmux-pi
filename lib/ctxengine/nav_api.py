@@ -33,7 +33,9 @@ PathRuleCase.)
       boundary, the root and the config path), holding for each source file its scanned specifiers
       (`[specifier, line, type_only, dynamic]`) under the key `[mtime_ns, size]`. `ImportIndex.save` writes it from `refresh`
       whenever a file was new, changed or went, before the proof, so a call that ends in a non-`ok` answer may still have saved it: what
-      it holds is only what a successful read gave, never an answer. It is loaded when the index is made (once per `NavApi`).
+      it holds is only what a successful read gave, never an answer. If that write fails (no cache, a link at the name, I/O) it is
+      swallowed: `save` returns False, the file is as it was, the answer is unchanged and only the next start is cold. It is loaded
+      when the index is made (once per `NavApi`).
     - `deno doc`: `nav_api-doc-<40 hex>.json`, the list of symbols (name, kind, path, line, signature, doc) of one file, keyed by a
       digest of the file's name, `Reach.digest()` (the content of every file the walk reached, and the state of the configs and
       `package.json` files) and the Deno version.
@@ -73,8 +75,8 @@ PathRuleCase.)
   Using an entry. The caller that accepted the shape of a payload touches the entry (`CacheDir.touch`: the time of the last use, for
   the age rule), after it was read and before the final proof, so an answer that then ends `stale_index` has touched it. A touch is
   made only when the entry's modification time is at least an hour old or in the future (TOUCH_EVERY_S); it looks at the name in the
-  folder's descriptor, sets the time with `follow_symlinks=False` only on a regular file, and fails silently (a link, a folder, a
-  name the guard refuses, no such file, no permission). Reading touches nothing, so an entry no caller accepts ages out.
+  folder's descriptor, sets the time with `follow_symlinks=False` only on a regular file, and fails silently, changing nothing and
+  not affecting the answer (a link, a folder, a name the guard refuses, no such file, no permission). Reading touches nothing, so an entry no caller accepts ages out.
   The sweep (`CacheDir.sweep`, run by `NavApi._swept` after `importers`, `imports`, `forward_graph` and `symbols`, after the answer is
   final). Due only if this folder's `CacheDir` wrote an entry since it last asked (`written`; a hit never writes), the folder is judged
   and exists, this object has not swept within an hour, and the marker `nav_api-sweep.json` does not show a sweep within an hour (a
@@ -84,8 +86,12 @@ PathRuleCase.)
   (INDEX_MAX_AGE_S); then, while the entries that are left (index, doc and info files: temporaries, the marker and every other name
   are not counted) are more than 400 (SWEEP_CAP_FILES) or hold more than 64,000,000 bytes (SWEEP_CAP_BYTES), the oldest by
   modification time (then by name) first. It stops after 200 deletions or 50 ms (SWEEP_MAX_DELETIONS, SWEEP_BUDGET_S), counted over
-  listing, judging and deleting together; the marker, written last, records `{version, last_sweep, deleted, skipped, complete}` and
-  `complete` is False when the budget stopped it or a name could not be looked at. The safety rule: it opens the folder only by the
+  listing, judging and deleting together. After the deletions the sweep tries to write the marker, which records
+  `{version, last_sweep, deleted, skipped, complete}`; `complete` is False when the budget stopped it or a name could not be looked
+  at. The marker write is best effort, like any entry write: if the guard refuses `nav_api-sweep.json` (or its temporary name) or the
+  write fails (I/O, a link at the name), it is swallowed, the sweep still returns its result and keeps what it deleted, no marker is
+  made or changed (`last_sweep` stays None or at its earlier value), and the next call that writes sweeps again (this object waits an
+  hour, another process may not). The marker write does not make a sweep due again. The safety rule: it opens the folder only by the
   judged name with nothing made, lists and deletes only through that descriptor, takes names only from the listing and the kind of
   each from its own `lstat` there, touches only the names `nav_api-(index|doc|info)-*.json` and `*.tmp` and only if they are regular
   files (a link, a folder, a FIFO, a hidden or foreign name and the marker are neither counted nor deleted), asks the guard about each
@@ -101,7 +107,7 @@ PathRuleCase.)
       listed, or a listed name could not be looked at for a reason other than having gone since the listing. A name that only went
       is not an error and is not counted. A count of what could be seen is never reported as the whole.
     - `last_sweep`: the time (seconds since the epoch, always a float: a whole number in the marker is read as one) in the marker. None only when the marker cannot be read: no cache, no marker
-      (never swept), a link or a folder at its name, not an envelope of this format, a time that is not a finite number of at least 0, or a folder
+      (never swept, or swept but the best-effort marker write was refused or failed), a link or a folder at its name, not an envelope of this format, a time that is not a finite number of at least 0, or a folder
       that cannot be read (a folder of mode 0 hides its marker, so it reports None, with `entries` and `bytes` None as well). A time
       in the future is reported as it is.
   Known limits of the cache (as the code behaves; see also "Known limits" below).

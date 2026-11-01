@@ -126,12 +126,18 @@ store is as it was.
   shared contracts among the imports). One helper words it (`surface.list_head`, `surface.more_note`): "label (at least N shown, list cut by
   the navigator)" when rows were shown, "label: not found in the part the navigator returned (list cut)" when none were, and a `left_out`
   entry that says the list was cut and gives no count. A list that was not cut states its total ("5 of 7") and its absence ("nothing imports
-  X") only when nothing of it was withheld. If every item was refused or withheld, or a search skipped a file, the line says "none can be shown
-  (N withheld, ...)" and never an absence, a zero or "none found". One helper (`surface.absent`, used by `surface.list_head`) takes the withheld
-  count of the item and words every absence in `brief.py` and `surface.py`: lists (importers, imports, exports, contract consumers, the shared
-  contracts, definitions, references), the `tests:` line of `ctx_brief` (a test file at a refused path), the name search of `ctx_symbol` and
-  `ctx_relations` (code files the scan could not read), the notes (candidates not shown) and the libraries (a briefed file too large to read, or a
-  cut import list). A test fails if either file holds an absence string outside the helper. The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
+  X") only when the source was read completely. **The rule: an absence is stated only when the read succeeded, nothing was withheld and
+  nothing was cut.** Every list or search carries a `surface.Completeness` (`ok`, `withheld`, `cut`, `unread`, `why`) built from its read result
+  (`Got.completeness()`, `surface.notes_read`, the text scan's own count), never from a literal, and one helper (`surface.absent`, used by
+  `surface.list_head`) words every absence in `brief.py` and `surface.py` from it. A read that failed, was unavailable or never ran (a
+  navigator down, a file no package covers) says "not available", never "none". If the read succeeded but items were refused, withheld or
+  not read, the line says "none can be shown (N withheld, ...)" and never an absence, a zero or "none found". This covers lists (importers,
+  imports, exports, contract consumers, definitions, references), the shared contracts of `ctx_brief` (the imports of every briefed file
+  must have been read; one that was not gives "shared (lib) contracts: not available" or, when a contract was found, a warning naming the
+  file), the `tests:` line (a test file at a refused path), the name search of `ctx_symbol` and `ctx_relations` (code files the scan could not
+  read), the notes (candidates not shown, note files that failed to parse) and the libraries (a briefed file too large to read, or a cut import
+  list). A test fails if either file holds an absence string outside the helper (the allowlist holds whole strings, not fragments), or if a
+  helper call's completeness argument is not built from a read result. The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
   `path` gives the details of each file that declares the name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is
   `invalid` with a next step (pass a path).
 - **Contract consumers** are marked `[reader]`, `[writer]`, `[reader, writer]`, `[uses]` (imports it, does neither) or `[unread]` (the file

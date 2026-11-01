@@ -4,6 +4,10 @@ A brief has a fixed shape so a worker can learn where to look: one block per fil
 then the shared contracts the files use, the notes whose scope covers them, and library hints. The same inputs give the same bytes:
 every list is sorted, nothing carries a time, and each list has a cap with its overflow named in the answer's `left_out`.
 
+An absence ("none", "no X") is worded only from a source that was read completely: every list or search carries a
+`surface.Completeness` built from its read result (ok, withheld, cut, unread), and `surface.absent` / `surface.list_head` say "not
+available" or "none can be shown" instead whenever it is not whole.
+
 Nothing here talks to a navigator directly; it asks the surface Engine, which maps every navigator answer, however it failed, to
 one `Got`. A navigator that is unavailable leaves a line saying so in its place; the brief is `unavailable` only when every
 navigator call it made failed, and it still carries the parts that need no navigator (facts, tests, notes, libraries).
@@ -148,7 +152,7 @@ def contract_block(engine, rel, contracts, limit, left, exclude):
             continue
         consumers = sorted({(a, b) for a, b, _ in got.rows if a not in exclude})
         total = max(got.total - got.refused - (len(got.rows) - len(consumers)), len(consumers))
-        lines.append("  " + surface.list_head("consumers", len(consumers[:limit]), total, got.cut, withheld=got.refused))
+        lines.append("  " + surface.list_head("consumers", len(consumers[:limit]), total, got.completeness()))
         lines += [f"  {a}:{b} [{contract_use(engine, contract, a)}]" for a, b in consumers[:limit]]
         add_left(left, withheld_note(f"consumers of {contract}", got.refused),
                  more_note(f"contract consumers of {contract}", total - limit, got.cut, "ctx_relations importers shows more"))
@@ -164,7 +168,7 @@ def relations(engine, rel, direction, limit, lines):
             return engine.finish(got.status, lines + [got.text], reason=first_line(got))
         shown = got.rows[:limit]
         mark = (lambda row: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
-        lines += edge_block(surface.list_head(f"importers of {rel}", len(shown), got.total, got.cut, empty=f"nothing imports {rel}", of=True, withheld=got.refused),
+        lines += edge_block(surface.list_head(f"importers of {rel}", len(shown), got.total, got.completeness(), empty=f"nothing imports {rel}", of=True),
                             shown, 0, mark)
         add_left(left, more_note("importers", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
                  withheld_note("importers", got.refused))
@@ -176,7 +180,7 @@ def relations(engine, rel, direction, limit, lines):
         return engine.finish(got.status, lines + [got.text], reason=first_line(got))
     if direction == "imports":
         shown = got.rows[:limit]
-        lines += edge_block(surface.list_head(f"{rel} imports", len(shown), got.total, got.cut, empty=f"{rel} imports no project file", of=True, withheld=got.refused),
+        lines += edge_block(surface.list_head(f"{rel} imports", len(shown), got.total, got.completeness(), empty=f"{rel} imports no project file", of=True),
                             shown, 2)
         add_left(left, more_note("imports", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
                  withheld_note("imports", got.refused))
@@ -194,8 +198,8 @@ def relations(engine, rel, direction, limit, lines):
         lines.append(f"warning: {read_phrase(got)}, so the contracts below may be incomplete")
     add_left(left, withheld_note("imports", got.refused))
     if not contracts:
-        return engine.finish("ok", lines + [surface.list_head("shared (lib) contracts", 0, 0, got.incomplete,
-                                                              empty=f"{rel} imports no shared (lib) contract file", withheld=got.refused)], left, age=got.age)
+        return engine.finish("ok", lines + [surface.list_head("shared (lib) contracts", 0, 0, got.completeness(),
+                                                              empty=f"{rel} imports no shared (lib) contract file")], left, age=got.age)
     block, failed = contract_block(engine, rel, contracts, limit, left, {rel})
     status = "ok" if len(failed) < len(contracts) else failed[0].status
     return engine.finish(status, lines + [f"contracts used by {rel}:"] + block, left, age=got.age)
@@ -216,11 +220,12 @@ def line_count(engine, rel):
 
 
 def tests_for(engine, rel):
-    """(test files next to `rel`, number of matching ones left out because their path is refused). Each goes through Engine.allowed."""
+    """(test files next to `rel`, Completeness): the record's `withheld` counts matching test files left out because their path is refused.
+    Each goes through Engine.allowed."""
     folder, name = posixpath.split(rel)
     stem = name.rsplit(".", 1)[0]
     if kind_of(rel) == "test":
-        return [], 0
+        return [], surface.Completeness(withheld=0)
     found, refused = [], 0
     for base in (folder, posixpath.join(folder, "__tests__")):
         for suffix in ("test", "spec"):
@@ -232,7 +237,7 @@ def tests_for(engine, rel):
                         refused += 1
                     elif (engine.project / allowed).is_file():
                         found.append(allowed)
-    return sorted(found), refused
+    return sorted(found), surface.Completeness(withheld=refused)
 
 
 def build(engine, paths):
@@ -241,7 +246,8 @@ def build(engine, paths):
     libraries = set()
     contracts, nexts, missing, incomplete = {}, set(), [], []
     unread = []  # briefed files whose text could not be read for the library scan
-    withheld_imports = 0  # imports of the briefed files that a refused path kept out: a contract may be among them
+    import_reads = []  # the Completeness of each briefed file's imports read: "no contract" is said only when all are whole
+    not_whole = {}  # briefed file -> why its imports were not read completely (a contract may be among the rest)
 
     def track(section, got):
         tried.append(got)
@@ -267,15 +273,17 @@ def build(engine, paths):
         if text is None:
             unread.append(rel)  # over 1 MB or unreadable: its imports were not scanned, so "no library" cannot be said
         libraries |= surface.libraries_in(text or "")
-        tests, refused_tests = tests_for(engine, rel)
-        lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", refused_tests)))
-        add_left(left, withheld_note(f"tests of {rel}", refused_tests))
+        tests, tests_read = tests_for(engine, rel)
+        lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", tests_read)))
+        add_left(left, withheld_note(f"tests of {rel}", tests_read.withheld))
         if package is None:
             lines.append("no package covers this path (no deno.json or tsconfig.json above it), so there is no export or import graph for it")
+            import_reads.append(surface.Completeness(ok=False))  # the imports of this file were never read
+            not_whole[rel] = "outside any package"
             continue
         got = engine.exports(rel)
         if track("exports", got):
-            lines.append(surface.list_head("exports", len(got.rows[:EXPORTS_MAX]), got.total, got.cut, withheld=got.refused))
+            lines.append(surface.list_head("exports", len(got.rows[:EXPORTS_MAX]), got.total, got.completeness()))
             lines += [f"  {name} ({kind}) :{line}" for name, kind, line in got.rows[:EXPORTS_MAX]]
             add_left(left, more_note(f"exports of {rel}", got.total - EXPORTS_MAX, got.cut, "ctx_symbol with path shows one name", got.total))
             add_left(left, withheld_note(f"exports of {rel}", got.refused))
@@ -283,18 +291,22 @@ def build(engine, paths):
         got = engine.importers(rel, IMPORTERS_MAX)
         if track("importers", got):
             shown = sorted(got.rows)[:IMPORTERS_MAX]
-            lines.append(surface.list_head("importers", len(shown), got.total, got.cut, withheld=got.refused))
+            lines.append(surface.list_head("importers", len(shown), got.total, got.completeness()))
             lines += [f"  {a}:{b}" + (f" [{mark((a, b, rel))}]" if mark else "") for a, b, _ in shown]
             add_left(left, more_note(f"importers of {rel}", got.total - len(shown) - got.refused, got.cut, "ctx_relations importers shows more", got.total),
                      withheld_note(f"importers of {rel}", got.refused))
         got = engine.imports(rel)
+        import_reads.append(got.completeness())
+        if not got.ok:
+            not_whole[rel] = "not available"
+        elif not got.completeness().whole:
+            not_whole[rel] = "cut" if got.incomplete else f"{got.refused} withheld"
         if track("imports", got):
             rows = sorted(got.rows, key=lambda r: (r[2], r[1]))
-            lines.append(surface.list_head("imports", len(rows[:IMPORTS_MAX]), got.total - got.refused, got.cut, withheld=got.refused))
+            lines.append(surface.list_head("imports", len(rows[:IMPORTS_MAX]), got.total - got.refused, got.completeness()))
             lines += [f"  {to}  (line {line})" for _, line, to in rows[:IMPORTS_MAX]]
             add_left(left, more_note(f"imports of {rel}", got.total - min(len(rows), IMPORTS_MAX) - got.refused, got.cut, "ctx_relations imports shows more", got.total),
                      withheld_note(f"imports of {rel}", got.refused))
-            withheld_imports += got.refused
             if got.incomplete:
                 incomplete.append(rel)
                 lines.append(f"  ({read_phrase(got)})")
@@ -315,14 +327,17 @@ def build(engine, paths):
             nexts.update(line[6:] for line in got.text.splitlines() if line.startswith("Next: "))
         lines += block
     else:
-        lines.append(surface.list_head("shared (lib) contracts", 0, 0, bool(incomplete), empty="none: the files import no shared (lib) contract", withheld=withheld_imports))
-    if incomplete:
-        lines.append(f"warning: the import list of {', '.join(incomplete)} was cut, so shared contracts may be missing here")
-        left.append(f"contracts: imports not read for {', '.join(incomplete)}; shared contracts among them are missing")
+        read = surface.Completeness.of(*import_reads)
+        lines.append(surface.list_head("shared (lib) contracts", 0, 0, read, empty="none: the files import no shared (lib) contract"))
+    if not_whole:
+        named = ", ".join(f"{rel} ({why})" for rel, why in sorted(not_whole.items()))
+        lines.append(f"warning: the imports of {named} were not read completely, so shared contracts may be missing here")
+        left.append(f"contracts: imports not read completely for {', '.join(sorted(not_whole))}; shared contracts among them may be missing")
 
     lines.append("== knowledge")
     result, note_lines, cut = engine.find_notes(paths, limit=NOTES_MAX, body_limit=surface.NOTE_BODY_BRIEF)
-    lines += note_lines or [surface.absent("none: no approved note covers these files", result.candidates_counted, surface.CANDIDATES_WHY)]
+    lines += note_lines or [surface.absent("none: no approved note covers these files", surface.notes_read(result))]
+    add_left(left, surface.notes_left(result))
     if result.total > len(result.hits):
         left.append(f"notes: {result.total - len(result.hits)} more (ctx_knowledge with paths shows them)")
     if cut:
@@ -338,7 +353,7 @@ def build(engine, paths):
                 why = "no lockfile reader" if engine.pin is None else "not in the lockfile"
                 lines.append(f"  {lib} (version not read: {why})")
     else:
-        lines.append("  " + surface.absent("none", len(unread) + len(incomplete), surface.LIBRARIES_WHY))
+        lines.append("  " + surface.absent("none", surface.Completeness(unread=len(unread) + len(incomplete), why=surface.LIBRARIES_WHY)))
 
     status = "ok"
     if tried and not good:

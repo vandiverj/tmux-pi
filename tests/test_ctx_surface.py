@@ -1708,29 +1708,36 @@ class AbsenceWording(ReviewOne):
         text = self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts"]}).text
         self.assertRegex(text.split("== libraries\n")[1], r"^\s*none\s*$")
 
+
     # ---- the scanner: no absence string outside the helper, and every use of the helper passes a withheld count
 
     FILES = ("brief.py", "surface.py")
     WORDS = re.compile(r"\b(none|no|nothing|not found|zero|empty)\b|\(0\)|\(0 of", re.I)
-    HELPERS = {"absent": 1, "list_head": None}  # name -> position of the withheld argument (None: keyword `withheld=` only)
+    HELPERS = {"absent": 1, "list_head": 3}  # name -> position of the completeness argument (the keyword is `read`)
     OWNED = {"absent", "list_head"}  # function bodies that are the helper
-    OWNED_NAMES = {"NONE_SHOWN", "CUT_NOTHING", "PATH_WHY"}  # constants that are the helper's wording
-    ALLOWED = {  # fragment -> why it is not a claim about a list that a withheld item can hide
-        "no spaces or dots": "argument check text: a rule for the caller's argument",
-        "none empty": "argument check text: a rule for the caller's argument",
-        "no such file": "the caller's own argument path does not exist (a refused path is refused earlier, by Engine.path)",
-        "no project": "a refusal of the command line: no project directory was given",
-        "no package covers this path": "the path has no deno.json/tsconfig.json above it: a fact about directories, not a list of withheld items",
-        "no deno.json": "same: names the missing config file",
+    OWNED_NAMES = {"NONE_SHOWN", "CUT_NOTHING", "PATH_WHY", "NOT_AVAILABLE"}  # constants that are the helper's wording
+    BUILDERS = {"Completeness", "of", "completeness", "notes_read"}  # make a record from a read result (the first two from their arguments)
+    FROM_ARGUMENTS = {"Completeness", "of"}  # these only count when at least one argument is not a literal
+    PRODUCERS = {"locate", "tests_for"}  # functions that read a source and hand back its record as their last result
+    # Whole strings (an f-string's placeholders are `{}`), never fragments: a new string that merely contains one of these words must
+    # be reviewed, not waved through.
+    ALLOWED = {
+        "{} must be a bare identifier (letters, digits, _ and $; no spaces or dots)": "argument check text: a rule for the caller's argument",
+        "{} must be a list of strings (none empty)": "argument check text: a rule for the caller's argument",
+        "no such file": "a briefed path that does not exist: the caller's own argument (a refused path is refused earlier, by Engine.path)",
+        "no such file: ": "same, the start of the Next: line that names the missing paths",
+        "Next: no such file: ": "same",
+        "no such file: {}": "same, for ctx_symbol and ctx_relations",
+        "no project: pass --project DIR or run inside a directory with .tmux-pi or .git": "a refusal of the command line: no project directory was given",
+        "no package covers this path (no deno.json or tsconfig.json above it), so there is no export or import graph for it":
+            "the path has no deno.json/tsconfig.json above it: a fact about directories, not a list a withheld item can hide in",
+        "no package covers this path ({}): no deno.json or tsconfig.json above it\nNext: {}": "same fact, as a navigator failure",
         "no lockfile reader": "states why a library version was not read, not a missing item",
-        "using no navigator": "states that the navigator did not start",
-        "api files have none here": "a fixed fact about the api navigator (it lists no references)",
-        "no export or import graph": "same fact as 'no package covers this path'",
-        "navigator did not start": "the navigator is unavailable; no list was asked for",
-        "no navigator": "the navigator is unavailable; no list was asked for",
+        "the {} navigator did not start ({}); using no navigator": "states that the navigator did not start; no list was asked for",
+        "references: api files have none here; ctx_relations(target={}, direction='importers') lists who imports this file":
+            "a fixed fact about the api navigator (it lists no references)",
+        "none": "the package fact line of a brief (`package: none`): a fact about one file, not a list",
     }
-
-    EXACT = {"none": "the package fact line of a brief (`package: none`): a fact about one file, not a list"}
 
     def violations(self, source, name="x.py", used=None):
         import ast
@@ -1753,6 +1760,9 @@ class AbsenceWording(ReviewOne):
                     return True
             return False
 
+        def callee(call):
+            return call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+
         def helper_call(node):
             """The helper call that `node` is the absence text argument of, or None."""
             call = parent.get(node)
@@ -1762,55 +1772,203 @@ class AbsenceWording(ReviewOne):
                 keyword = None
             if not isinstance(call, ast.Call):
                 return None
-            func = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+            func = callee(call)
             if func == "absent" and keyword is None and call.args and call.args[0] is node:
                 return call, func
             if func == "list_head" and keyword == "empty":
                 return call, func
             return None
 
-        def passes_count(call, func):
+        def scope_of(node):
+            while node in parent:
+                node = parent[node]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                    return node
+            return tree
+
+        def names_in(target):
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return [n for elt in target.elts for n in names_in(elt)]
+            return []
+
+        def from_read(expr, scope, seen=()):
+            """Whether `expr` is a completeness record built from a read result: a builder call that takes something other than literals,
+            a producer call, or a name that the enclosing function binds to one of those."""
+            if isinstance(expr, ast.Call):
+                func = callee(expr)
+                if func in self.FROM_ARGUMENTS:
+                    def real(arg):  # not a literal, and not a record that is itself made of literals
+                        arg = arg.value if isinstance(arg, (ast.Starred, ast.keyword)) else arg
+                        if isinstance(arg, ast.Call) and callee(arg) in self.FROM_ARGUMENTS:
+                            return from_read(arg, scope, seen)
+                        return not isinstance(arg, ast.Constant)
+                    return any(real(a) for a in [*expr.args, *expr.keywords])
+                return func in self.BUILDERS or func in self.PRODUCERS
+            if isinstance(expr, ast.Name) and expr.id not in seen:
+                bound = [n.value for n in ast.walk(scope) if isinstance(n, ast.Assign) and expr.id in [x for t in n.targets for x in names_in(t)]]
+                return bool(bound) and all(from_read(v, scope, seen + (expr.id,)) for v in bound)
+            return False
+
+        def read_argument(call, func):
             where = self.HELPERS[func]
-            given = [k.value for k in call.keywords if k.arg == "withheld"]
-            if where is not None and len(call.args) > where:
+            given = [k.value for k in call.keywords if k.arg == "read"]
+            if len(call.args) > where:
                 given.append(call.args[where])
-            return any(not (isinstance(v, ast.Constant) and not v.value) for v in given)  # a literal 0 or None is not a count
+            return given[0] if given else None
+
+        def helper_problem(call, func):
+            given = read_argument(call, func)
+            if given is None:
+                return "the helper is called without the completeness of the read"
+            if not from_read(given, scope_of(call)):
+                return "the completeness argument is not built from a read result"
+            return None
 
         found = []
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and callee(node) in self.HELPERS and not inside(node):
+                problem = helper_problem(node, callee(node))
+                if problem:
+                    found.append((name, node.lineno, callee(node), problem))
             text = text_of(node)
             if text is None or isinstance(parent.get(node), ast.JoinedStr):
                 continue
             if isinstance(parent.get(node), ast.Expr) or not self.WORDS.search(text) or inside(node):
                 continue
-            via = helper_call(node)
-            if via:
-                if not passes_count(*via):
-                    found.append((name, node.lineno, text, "the helper is called without a withheld count"))
+            if helper_call(node):
                 continue
-            hit = [f for f in self.ALLOWED if f in text] + [f for f in self.EXACT if f == text]
+            hit = [f for f in self.ALLOWED if f == text]
             if used is not None:
                 used.update(hit)
             if not hit:
                 found.append((name, node.lineno, text, "an absence string outside the helper"))
         return found
 
-    def test_the_scanner_finds_a_bare_absence_and_a_helper_call_without_a_count(self):
+    def test_the_scanner_finds_a_bare_absence_and_a_helper_call_without_a_read_record(self):
         self.assertTrue(self.violations('lines.append("tests: none found")'))
         self.assertTrue(self.violations('lines.append(f"nothing imports {rel}")'))
-        self.assertTrue(self.violations('x = surface.absent("none found", 0)'))
         self.assertTrue(self.violations('x = surface.absent("none found")'))
+        self.assertTrue(self.violations('x = surface.absent("none found", 0)'))
+        self.assertTrue(self.violations('x = surface.absent("none found", refused)'))
+        self.assertTrue(self.violations('x = surface.absent("none found", got.refused)'))
+        self.assertTrue(self.violations('x = surface.absent("none found", Completeness())'))
+        self.assertTrue(self.violations('x = surface.absent("none found", Completeness(withheld=0, cut=False))'))
+        self.assertTrue(self.violations('x = surface.absent("none found", Completeness.of(Completeness(), Completeness()))'))
+        self.assertTrue(self.violations('def f():\n    read = 3\n    return surface.absent("none found", read)'))
+        self.assertTrue(self.violations('def f(read):\n    return surface.absent("none found", read)'))
         self.assertTrue(self.violations('x = surface.list_head("a", 0, 0, False, empty="nothing imports")'))
-        self.assertFalse(self.violations('x = surface.absent("none found", refused)'))
-        self.assertFalse(self.violations('x = surface.list_head("a", 0, 0, False, empty="nothing imports", withheld=got.refused)'))
+        self.assertTrue(self.violations('x = surface.list_head("a", 0, 0, empty="nothing imports", withheld=got.refused)'))
+        self.assertTrue(self.violations('x = surface.list_head("a", 0, 0, got.cut, empty="nothing imports")'))
+
+    def test_the_scanner_accepts_a_record_that_is_built_from_a_read_result(self):
+        for source in ('x = surface.absent("none found", got.completeness())',
+                       'x = surface.absent("none found", surface.Completeness(withheld=refused))',
+                       'x = surface.absent("none found", Completeness(unread=len(unread), why=WHY))',
+                       'x = surface.absent("none found", Completeness.of(*reads))',
+                       'x = surface.absent("none found", surface.notes_read(result), label="x")',
+                       'def f():\n    read = got.completeness()\n    return surface.absent("none found", read)',
+                       'def f():\n    where, read = self.locate(name)\n    return surface.absent("none found", read)',
+                       'x = surface.list_head("a", 0, 0, got.completeness(), empty="nothing imports")',
+                       'x = surface.list_head("a", 0, 0, read=Completeness.of(*reads), empty="nothing imports")'):
+            with self.subTest(source=source):
+                self.assertEqual(self.violations(source), [])
         self.assertFalse(self.violations('"""no x"""\nx = 1'))
+
+    def test_the_scanner_allows_a_whole_string_only_never_a_fragment_of_one(self):
+        """Review 6 N3: a new bare absence that merely contains an allowed phrase is still a violation."""
+        for text in ("no navigator is running", "no project file imports it", "none: no package covers this path", "no such file: x and none found",
+                     "no lockfile reader, so none"):
+            with self.subTest(text=text):
+                self.assertTrue(self.violations(f"lines.append({text!r})"))
+        for text in ("no lockfile reader", "none", "no such file: "):
+            self.assertEqual(self.violations(f"lines.append({text!r})"), [], text)
 
     def test_the_sources_contain_no_absence_string_outside_the_one_helper(self):
         found, used = [], set()
         for name in self.FILES:
             found += self.violations((ROOT / "lib" / "ctxengine" / name).read_text(), name, used)
         self.assertEqual(found, [])
-        self.assertEqual(sorted((set(self.ALLOWED) | set(self.EXACT)) - used), [], "an allowlist entry that no string uses")
+        self.assertEqual(sorted(set(self.ALLOWED) - used), [], "an allowlist entry that no string uses")
+
+class UnreadSources(ReviewOne):
+    """Review 6: an absence is stated only when the source was read completely (the read succeeded, nothing was withheld, nothing was
+    cut). F1: the brief's contracts section after a failed or never-run imports read. N1: notes that failed to parse count as unread."""
+
+    CONTRACTS_NONE = "the files import no shared (lib) contract"
+
+    def contracts(self, answer):
+        return answer.text.split("== contracts\n")[1].split("\n==")[0]
+
+    def assertNoClaim(self, section):
+        self.assertNotIn(self.CONTRACTS_NONE, section)
+        self.assertNotRegex(section, r"(?m)^none\b")
+
+    def test_f1_a_brief_whose_imports_read_failed_never_says_the_files_import_no_contract(self):
+        for kind, path, answer_for in (("web", CART, {"status": "unavailable", "message": "navigator down"}),
+                                       ("api", ORDERS, {"status": "unavailable", "message": "navigator down"}),
+                                       ("web", CART, {"status": "refused", "reason": "outside_project", "message": "no"})):
+            with self.subTest(kind=kind, answer=answer_for["status"]):
+                fake_navs.reset()
+                fake_navs.BEHAVIOUR[(kind, "imports")] = answer_for
+                answer = self.run_tool("ctx_brief", {"paths": [path]})
+                section = self.contracts(answer)
+                self.assertNoClaim(section)
+                self.assertIn("shared (lib) contracts: not available", section)
+                self.assertTrue(any("contracts" in item and path in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_f1_a_brief_of_a_file_no_package_covers_never_says_the_files_import_no_contract(self):
+        self.put("loose/tool.ts", "export const x = 1;\n")
+        section = self.contracts(self.run_tool("ctx_brief", {"paths": ["loose/tool.ts"]}))
+        self.assertNoClaim(section)
+        self.assertIn("shared (lib) contracts: not available", section)
+
+    def test_f1_one_unread_file_among_read_ones_is_enough_to_withhold_the_claim(self):
+        self.put("loose/tool.ts", "export const x = 1;\n")
+        section = self.contracts(self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts", "loose/tool.ts"]}))
+        self.assertNoClaim(section)
+        self.assertIn("not available", section)
+
+    def test_f1_a_contract_that_is_found_still_carries_a_warning_when_another_file_was_not_read(self):
+        self.put("loose/tool.ts", "export const x = 1;\n")
+        text = self.run_tool("ctx_brief", {"paths": [CART, "loose/tool.ts"]}).text
+        section = text.split("== contracts\n")[1].split("\n== knowledge")[0]
+        self.assertIn(ORDER, section)
+        self.assertRegex(section, r"warning: .*loose/tool\.ts.*may be missing")
+
+    def test_f1_control_a_brief_whose_imports_were_all_read_still_states_that_no_contract_is_imported(self):
+        section = self.contracts(self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts"]}))
+        self.assertIn("none: " + self.CONTRACTS_NONE, section)
+
+    def invalid_note(self):
+        directory = self.layout.directory("approved")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "kn-2026-10-01-broken.md").write_text("---\nid: [this is not closed\nkind: ???\n---\nBroken body.\n")
+
+    def test_n1_an_approved_note_that_failed_to_parse_means_no_matching_notes_is_never_said(self):
+        self.invalid_note()
+        knowledge = self.run_tool("ctx_knowledge", {"query": "zzzz"})
+        self.assertNotIn("No matching notes", knowledge.text)
+        self.assertRegex(knowledge.text, r"none can be shown \(1 withheld")
+        brief = self.run_tool("ctx_brief", {"paths": [f"{API_SRC}/util.ts"]}).text
+        section = brief.split("== knowledge\n")[1].split("\n==")[0]
+        self.assertNotIn("none: no approved note", section)
+        self.assertRegex(section, r"none can be shown \(1 withheld")
+        for text in (knowledge.text, brief):
+            self.assertNotIn("kn-2026-10-01-broken", text)
+            self.assertNotIn("Broken body", text)
+
+    def test_n1_notes_that_matched_are_shown_and_the_unreadable_one_is_counted_in_left_out(self):
+        self.invalid_note()
+        add_approved(self.layout, "kn-2026-10-02-good", "Good rule", ["apps/**"], "Parse every input.")
+        for tool, args in (("ctx_knowledge", {"paths": [ORDERS]}), ("ctx_brief", {"paths": [ORDERS]})):
+            answer = self.run_tool(tool, args)
+            self.assertIn("kn-2026-10-02-good", answer.text, tool)
+            self.assertTrue(any("1 withheld" in item and "note" in item for item in answer.data["left_out"]), (tool, answer.data["left_out"]))
+
+    def test_n1_control_with_every_note_readable_no_matching_notes_is_still_said(self):
+        self.assertIn("No matching notes", self.run_tool("ctx_knowledge", {"query": "zzzz"}).text)
 
 
 if __name__ == "__main__":

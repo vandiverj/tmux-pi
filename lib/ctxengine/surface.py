@@ -193,39 +193,88 @@ def short(text, limit):
 
 CUT_SHOWN = "at least {n} shown, list cut by the navigator"
 PATH_WHY = "a path that is refused or outside the project"
+NOT_RETURNED_WHY = "rows the navigator did not hand over"
+INVALID_WHY = "note files that could not be read"
 NONE_SHOWN = "none can be shown ({n} withheld, {why})"
 CUT_NOTHING = "not found in the part the navigator returned (list cut)"
+NOT_AVAILABLE = "not available (the read failed or was not run)"
 
 
-def absent(text, withheld=0, why=PATH_WHY, cut=False, label=None):
-    """The one place an absence is worded: `text` ("none found", "no definition of X", "nothing imports X", a zero) is returned only
-    when `withheld`, the number of items of that very list or search that were left out (refused, withheld by the navigator, unread,
-    a candidate not shown), is 0 and the list was not `cut`. Otherwise the list is not known to be empty, only unshowable, and the
-    line says so: "none can be shown (N withheld, why)", or "not found in the part ... returned (list cut)" for a cut list.
-    `label` prefixes the substitute ("label: none can be shown ..."). A count of 0 is passed only where nothing can have been left out."""
-    if cut:
+@dataclass(frozen=True)
+class Completeness:
+    """Whether a read of a source was complete, the one thing an absence may be built on. Built from the read result (Got.completeness,
+    notes_read, the text scan's own count), never from a literal:
+      ok       the read happened and succeeded (False for a navigator that failed or was unavailable, or a read that was never run)
+      withheld items of the source left out because their path is refused or the navigator withheld them
+      cut      the navigator said it cut its list
+      unread   items of the source that were not read (a file too large or past the scan cap, a note that failed to parse, rows not handed over)
+      why      what `withheld` and `unread` were, in words"""
+    ok: bool = True
+    withheld: int = 0
+    cut: bool = False
+    unread: int = 0
+    why: str = PATH_WHY
+
+    @property
+    def left(self):
+        return self.withheld + self.unread
+
+    @property
+    def whole(self):
+        """True only when the source was read completely: the read succeeded, nothing was withheld or unread, nothing was cut."""
+        return self.ok and not self.cut and self.left == 0
+
+    @classmethod
+    def of(cls, *parts):
+        """The record for a source made of several reads: whole only if every part is. No parts is a read that never ran."""
+        if not parts:
+            return cls(ok=False)
+        why = ", and ".join(dict.fromkeys(p.why for p in parts if p.left))
+        return cls(all(p.ok for p in parts), sum(p.withheld for p in parts), any(p.cut for p in parts), sum(p.unread for p in parts),
+                   why or PATH_WHY)
+
+
+def absent(text, read, label=None):
+    """The one place an absence is worded. `text` ("none found", "no definition of X", "nothing imports X", a zero) is returned only
+    when `read` (a Completeness, built from the read result) says the source was read completely. A read that failed, was
+    unavailable or never ran is "not available"; a cut list is "not found in the part ... returned (list cut)"; a source with items
+    withheld or unread is "none can be shown (N withheld, why)". `label` prefixes the substitute ("label: none can be shown ...")."""
+    if not read.ok:
+        said = NOT_AVAILABLE
+    elif read.cut:
         said = CUT_NOTHING
-    elif withheld > 0:
-        said = NONE_SHOWN.format(n=withheld, why=why)
+    elif read.left > 0:
+        said = NONE_SHOWN.format(n=read.left, why=read.why)
     else:
         return text
     return f"{label}: {said}" if label else said
 
 
-def list_head(label, shown, total, cut, empty=None, of=False, withheld=0):
+def list_head(label, shown, total, read, empty=None, of=False):
     """The line that opens a list of `shown` rows from a navigator, the one place a list's count, zero or absence is worded.
-    When `cut` (Engine.loss says the navigator cut its list) the count is a lower bound and `total` is never stated:
-    "label (at least N shown, list cut by the navigator):", or "label: not found in the part the navigator returned (list cut)"
-    when nothing was shown. When nothing is shown and `withheld` rows were left out (a refused path, or the navigator withheld them)
-    the list is not empty, only unshowable: "label: none can be shown (N withheld, ...)", never a zero or an absence. Otherwise
+    `read` is the Completeness of the read the rows came from. When it is cut the count is a lower bound and `total` is never stated:
+    "label (at least N shown, list cut by the navigator):", or "label: not found in the part the navigator returned (list cut)" when
+    nothing was shown. When nothing is shown and the read was not whole (failed, withheld rows, unread rows) the list is not known
+    to be empty: "label: not available ..." or "label: none can be shown (N withheld, ...)", never a zero or an absence. Otherwise
     "label (total):" ("label (shown of total):" with `of`); an empty list says `empty` when given and nothing at all was reported."""
-    if shown > 0 and cut:
+    if shown > 0 and read.cut:
         return f"{label} ({CUT_SHOWN.format(n=shown)}):"
-    if shown <= 0 and (cut or withheld > 0):
-        return absent("", withheld, cut=cut, label=label)
+    if shown <= 0 and not read.whole:
+        return absent("", read, label=label)
     if shown <= 0 and empty and total <= 0:
-        return absent(empty, withheld)
+        return absent(empty, read)
     return f"{label} ({shown} of {total}):" if of and shown > 0 else f"{label} ({total}):"
+
+
+def notes_read(result):
+    """The Completeness of a note search: candidate notes that matched but were not asked for, and note files that failed to parse."""
+    return Completeness.of(Completeness(withheld=result.candidates_counted, why=CANDIDATES_WHY),
+                           Completeness(unread=len(result.invalid), why=INVALID_WHY))
+
+
+def notes_left(result):
+    """The `left_out` entry for note files that failed to parse (they may be among the matches), or None."""
+    return f"notes: {len(result.invalid)} withheld ({INVALID_WHY}, so matching notes may be missing)" if result.invalid else None
 
 
 def more_note(label, beyond, cut, advice, total=None):
@@ -318,6 +367,13 @@ class Got:
     @property
     def incomplete(self):
         return self.beyond > 0 or self.cut
+
+    def completeness(self):
+        """The Completeness of this read: not ok when the navigator failed; else what was withheld, cut or not handed over."""
+        if not self.ok:
+            return Completeness(ok=False)
+        why = ", and ".join(w for w, n in ((PATH_WHY, self.refused), (NOT_RETURNED_WHY, self.beyond)) if n)
+        return Completeness(True, self.refused, self.cut, self.beyond, why or PATH_WHY)
 
 
 def label_for(path):
@@ -743,10 +799,10 @@ class Engine(NoteWriter):
     # ----------------------------------------------------------------------------------------------- text-scan locator
 
     def locate(self, name, package=None, limit=20):
-        """([(path, line, exported)], skipped): where a top-level declaration of `name` sits, by a text scan of the project's code files
-        (neither navigator can search the whole workspace by name), exported declarations first, then by path and line; and the number
-        of code files the scan did not read (a refused path, a file it could not read, files past SCAN_FILES), so that "no declaration
-        found" is never said when a file was skipped."""
+        """([(path, line, exported)], Completeness): where a top-level declaration of `name` sits, by a text scan of the project's code files
+        (neither navigator can search the whole workspace by name), exported declarations first, then by path and line; and the Completeness
+        of the scan, whose `unread` is the number of code files it did not read (a refused path, a file it could not read, files past
+        SCAN_FILES), so that "no declaration found" is never said when a file was skipped."""
         pattern = re.compile(r"^[ \t]*(export[ \t]+)?(?:default[ \t]+)?(?:declare[ \t]+)?(?:abstract[ \t]+)?(?:async[ \t]+)?"
                              r"(?:function\*?|class|const|let|var|type|interface|enum|namespace)[ \t]+" + re.escape(name) + r"\b", re.M)
         found, skipped = [], 0
@@ -769,7 +825,7 @@ class Engine(NoteWriter):
                 found.append((rel, text.count("\n", 0, match.start()) + 1, bool(match.group(1))))
         skipped += sum(1 for rel in ordered[SCAN_FILES:] if rel.endswith(CODE_EXT) and not (package and label_for(rel) != package))
         found.sort(key=lambda f: (not f[2], f[0], f[1]))
-        return found[:limit], skipped
+        return found[:limit], Completeness(unread=skipped, why=SCAN_WHY)
 
     # ------------------------------------------------------------------------------------------------------ the notes
 
@@ -813,9 +869,9 @@ class Engine(NoteWriter):
         limit = args.get("limit", 5)
         result, lines, _ = self.find_notes(paths, args.get("query"), args.get("tags", []), args.get("include_candidates", False), limit,
                                            NOTE_BODY_FULL)
-        left = []
+        left = [notes_left(result)] if result.invalid else []
         if not lines:
-            lines = [absent("No matching notes.", result.candidates_counted, CANDIDATES_WHY)]
+            lines = [absent("No matching notes.", notes_read(result))]
         else:
             lines.insert(0, f"{len(lines)} of {result.total} matching notes:")
             if result.total > len(result.hits):
@@ -838,14 +894,14 @@ class Engine(NoteWriter):
                 return self.finish("invalid", [f"no such file: {rel}", "Next: check the path, or leave path out to search by name."])
             files = [rel]
         else:
-            where, skipped = self.locate(name, package, SYMBOL_PLACES + 1)
+            where, scanned = self.locate(name, package, SYMBOL_PLACES + 1)
             if not where:
                 scope = f" in the {package} package" if package else ""
-                return self.finish("ok", [absent(f"no definition of {name} found{scope} (text scan of the project's code files)", skipped, SCAN_WHY,
+                return self.finish("ok", [absent(f"no definition of {name} found{scope} (text scan of the project's code files)", scanned,
                                                  label=f"definitions of {name}{scope}"),
                                           "Next: check the spelling, or pass path if you know the file."])
-            if skipped:
-                left.append(f"name search: {skipped} withheld ({SCAN_WHY})")
+            if scanned.unread:
+                left.append(f"name search: {scanned.unread} withheld ({SCAN_WHY})")
             if len(where) > SYMBOL_PLACES:
                 left.append(f"definitions: more than {SYMBOL_PLACES} places declare {name}; pass package or path to narrow it")
                 where = where[:SYMBOL_PLACES]
@@ -906,8 +962,8 @@ class Engine(NoteWriter):
         if not rows and refused and not cut:
             lines.append(f"{name} in {rel}: every definition the navigator found is at a refused path")
             return "ok", None
-        lines.append(list_head(head, len(rows[:5]), len(rows), cut, empty=f"no definition of {name} in {rel} (the web navigator found none)",
-                               withheld=refused))
+        lines.append(list_head(head, len(rows[:5]), len(rows), Completeness(withheld=refused, cut=cut),
+                               empty=f"no definition of {name} in {rel} (the web navigator found none)"))
         if not rows:
             return "ok", None
         lines += self._definition_lines(rows, left, cut, f"definitions of {name}")
@@ -924,7 +980,7 @@ class Engine(NoteWriter):
         omitted, cut = self.loss(refs)
         refused += omitted
         total = _int(refs.get("total", len(shown) + refused))
-        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, cut, of=True, withheld=refused))
+        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, Completeness(withheld=refused, cut=cut), of=True))
         lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
         add = more_note(f"references of {name}", total - min(5, len(shown)) - refused, cut, "pass path to another file or read the callers directly")
         if add:
@@ -947,15 +1003,15 @@ class Engine(NoteWriter):
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
         if not named:
             if partial:
-                lines.append(list_head(f"definitions of {name} in {rel}", 0, total, True))
+                lines.append(list_head(f"definitions of {name} in {rel}", 0, total, Completeness(withheld=refused, cut=True)))
                 lines.append("the listing was cut, so this does not show that it is not defined there")
                 lines.append("Next: read the file directly, or ask ctx_relations for its importers.")
                 left.append(f"symbols of {rel}: " + (f"{total - len(listed)} not listed" if not cut else "more not listed (the navigator cut its list)"))
             else:
-                lines.append(absent(f"no definition of {name} in {rel} (the api navigator lists none by that name)", refused,
-                                    label=f"definitions of {name} in {rel}"))
+                lines.append(absent(f"no definition of {name} in {rel} (the api navigator lists none by that name)",
+                                    Completeness(withheld=refused), label=f"definitions of {name} in {rel}"))
             return "ok", None
-        lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), partial))
+        lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), Completeness(withheld=refused, cut=partial)))
         lines += [f"{s['path']}:{s.get('line', 0)} {s.get('kind', '')}" for s in named[:5]]
         add = more_note(f"definitions of {name}", len(named) - 5, partial, "pass path to a narrower file")
         if add:
@@ -977,9 +1033,9 @@ class Engine(NoteWriter):
             if not (self.project / rel).is_file():
                 return self.finish("invalid", [f"no such file: {rel}", "Next: check the path, or name a symbol defined once in the project."])
         else:
-            where, skipped = self.locate(target, limit=SYMBOL_PLACES + 1)
+            where, scanned = self.locate(target, limit=SYMBOL_PLACES + 1)
             if not where:
-                return self.finish("invalid", [f"{target} is not a file path; " + absent("no declaration of that name was found", skipped, SCAN_WHY),
+                return self.finish("invalid", [f"{target} is not a file path; " + absent("no declaration of that name was found", scanned),
                                                "Next: pass a project file path, or check the symbol's spelling."])
             files = list(dict.fromkeys(place[0] for place in where))
             if len(files) > 1:

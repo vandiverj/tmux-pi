@@ -8,6 +8,7 @@ Nothing here talks to a navigator directly; it asks the surface Engine, which ma
 one `Got`. A navigator that is unavailable leaves a line saying so in its place; the brief is `unavailable` only when every
 navigator call it made failed, and it still carries the parts that need no navigator (facts, tests, notes, libraries).
 """
+import os
 import posixpath
 import re
 
@@ -96,6 +97,7 @@ def contract_use(engine, contract, consumer):
         return posixpath.normpath(posixpath.join(here, strip_ext(spec))) == want
 
     reads = writes = False
+    body = IMPORT_STMT.sub("", text)  # the use sites, without the import lines that bind the names
     for match in IMPORT_STMT.finditer(text):
         if not is_contract(match.group(4)):
             continue
@@ -107,6 +109,8 @@ def contract_use(engine, contract, consumer):
             if re.search(rf"\b{ref}\s*\.\s*(?:{'|'.join(WRITES)})\b", text):
                 writes = True
             if re.search(rf"\b{ref}\s*\.\s*(?:{'|'.join(READS)})\s*\(", text) or re.search(rf"\btypeof\s+{ref}\b", text):
+                reads = True
+            if re.search(rf"[:<,|&]\s*{ref}\b|\b(?:as|satisfies|extends|implements)\s+{ref}\b", body):  # a type annotation takes its type
                 reads = True
     if any(is_contract(m.group(2)) for m in REEXPORT_STMT.finditer(text)):
         writes = True
@@ -212,18 +216,23 @@ def line_count(engine, rel):
 
 
 def tests_for(engine, rel):
+    """(test files next to `rel`, number of matching ones left out because their path is refused). Each goes through Engine.allowed."""
     folder, name = posixpath.split(rel)
     stem = name.rsplit(".", 1)[0]
     if kind_of(rel) == "test":
-        return []
-    found = []
+        return [], 0
+    found, refused = [], 0
     for base in (folder, posixpath.join(folder, "__tests__")):
         for suffix in ("test", "spec"):
             for ext in TEST_EXT:
                 candidate = posixpath.join(base, f"{stem}.{suffix}.{ext}")
-                if (engine.project / candidate).is_file():
-                    found.append(candidate)
-    return sorted(found)
+                if os.path.lexists(engine.project / candidate):
+                    allowed = engine.allowed(candidate)
+                    if allowed is None:
+                        refused += 1
+                    elif (engine.project / allowed).is_file():
+                        found.append(allowed)
+    return sorted(found), refused
 
 
 def build(engine, paths):
@@ -254,8 +263,9 @@ def build(engine, paths):
         lines.append(facts)
         text = engine.read(rel) or ""
         libraries |= surface.libraries_in(text)
-        tests = tests_for(engine, rel)
+        tests, refused_tests = tests_for(engine, rel)
         lines.append("tests: " + (", ".join(tests) if tests else "none found next to it"))
+        add_left(left, withheld_note(f"tests of {rel}", refused_tests))
         if package is None:
             lines.append("no package covers this path (no deno.json or tsconfig.json above it), so there is no export or import graph for it")
             continue
@@ -267,6 +277,7 @@ def build(engine, paths):
                 left.append(f"exports of {rel}: {got.total - EXPORTS_MAX} more ({got.total} total)")
             elif got.cut:
                 left.append(f"exports of {rel}: the navigator cut its list")
+            add_left(left, withheld_note(f"exports of {rel}", got.refused))
         mark = (lambda row, rel=rel: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
         got = engine.importers(rel, IMPORTERS_MAX)
         if track("importers", got):

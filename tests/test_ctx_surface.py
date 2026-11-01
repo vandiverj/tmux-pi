@@ -1303,5 +1303,75 @@ class AmbiguousSymbols(ReviewOne):
         self.assertEqual(answer.status, "ok", answer.text)
 
 
+# ------------------------------------------------------------------------------------------------------- Review 2 (F1-F4)
+
+class OneOutputGate(ReviewOne):
+    """Every path that reaches an answer, whoever produced it, passes the guard and the project boundary; a refused one is counted
+    in left_out and never named. Losses a navigator reports (truncated, withheld, omitted_outside_root) all reach left_out."""
+
+    def outside_test_link(self):
+        src = self.project / API_SRC
+        outside = self.tmp / "elsewhere.test.ts"
+        outside.write_text("test('x', () => {});\n")
+        (src / "orders.test.ts").unlink()
+        (src / "orders.test.ts").symlink_to(outside)
+
+    def test_f1_a_symlinked_test_file_is_counted_not_named(self):
+        self.outside_test_link()
+        answer = self.run_tool("ctx_brief", {"paths": [ORDERS]})
+        self.assertNotIn("orders.test.ts", answer.text)
+        self.assertNotIn("elsewhere", answer.text)
+        self.assertTrue(any("tests" in item and "1 withheld" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_the_sources_do_not_enumerate_files_outside_the_gate(self):
+        import ast
+        gated = ("allowed", "check_path", "self.path", "engine.path")
+        reaches = {"is_file", "exists", "iterdir", "listdir", "glob", "rglob", "scandir", "walk", "is_dir", "isfile"}
+        # these only test arguments that were checked by Engine.path, read a checked path, or name an ancestor package directory
+        argument_checked = {"build", "op_ctx_symbol", "op_ctx_relations", "main", "run", "read", "package_for"}
+        bare = []
+        for name in ("brief.py", "surface.py"):
+            source = (ROOT / "lib" / "ctxengine" / name).read_text()
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                body = ast.get_source_segment(source, node)
+                touches = any(isinstance(n, ast.Attribute) and n.attr in reaches for n in ast.walk(node))
+                if touches and node.name not in argument_checked and not any(g in body for g in gated):
+                    bare.append(f"{name}:{node.name}")
+        self.assertEqual(bare, [])
+
+    def test_f2_paths_a_web_navigator_omitted_outside_the_root_are_counted(self):
+        fake_navs.BEHAVIOUR[("web", "definition")] = lambda a: {
+            "status": "ok", "definitions": [{"path": CART, "line": 5, "name": "addToCart", "kind": "function", "text": "function addToCart()"}],
+            "signature": "", "doc": "", "omitted_outside_root": 2}
+        fake_navs.BEHAVIOUR[("web", "references")] = lambda a: {
+            "status": "ok", "definitions": [], "references": [], "total": 0, "truncated": False, "omitted_outside_root": 3}
+        answer = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART})
+        left = " | ".join(answer.data["left_out"])
+        self.assertIn("2 withheld", left)
+        self.assertIn("3 withheld", left)
+
+    def test_f2_omitted_outside_root_is_counted_for_importers_and_imports_too(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], a["direction"],
+                                                                      [SPEC if a["direction"] == "importers" else ORDER], omitted_outside_root=4)
+        for direction in ("importers", "imports"):
+            answer = self.run_tool("ctx_relations", {"target": CART, "direction": direction})
+            self.assertTrue(any("4 withheld" in item for item in answer.data["left_out"]), (direction, answer.data["left_out"]))
+
+    def test_f3_a_truncated_empty_reference_list_is_not_zero_references(self):
+        fake_navs.BEHAVIOUR[("web", "references")] = lambda a: {"status": "ok", "definitions": [], "references": [], "total": 0, "truncated": True}
+        answer = self.run_tool("ctx_symbol", {"name": "addToCart", "path": CART})
+        self.assertTrue(any("references" in item and "cut" in item for item in answer.data["left_out"]), answer.data["left_out"])
+
+    def test_f4_a_typed_annotation_makes_the_consumer_a_reader(self):
+        rel = self.put(f"{WEB_SRC}/annotated.ts", 'import { Order } from "../../../../lib/launchpad/types/order";\nconst order: Order = load();\n')
+        from ctxengine import brief
+        engine = surface.Engine(surface.store.Layout(self.project), navigators=surface.Navigators(surface.store.Layout(self.project), {}))
+        self.assertEqual(brief.contract_use(engine, ORDER, rel), "reader")
+        self.put(f"{WEB_SRC}/unused.ts", 'import { Order } from "../../../../lib/launchpad/types/order";\nconsole.log(1);\n')
+        self.assertEqual(brief.contract_use(engine, ORDER, f"{WEB_SRC}/unused.ts"), "uses")
+
+
 if __name__ == "__main__":
     unittest.main()

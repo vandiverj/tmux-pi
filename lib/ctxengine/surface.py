@@ -587,6 +587,12 @@ class Engine(NoteWriter):
         except redact.Refused:
             return None
 
+    @staticmethod
+    def loss(raw):
+        """(paths the navigator left out itself, whether it cut its list) from any navigator answer: its `withheld` and
+        `omitted_outside_root` counters and its `truncated` flag. The one place those fields are read; every operation uses it."""
+        return _int(raw.get("withheld")) + _int(raw.get("omitted_outside_root")), bool(raw.get("truncated"))
+
     def screen_rows(self, rows, index):
         """(rows whose path at position `index` passes the path policy, with that path normalized; number refused)."""
         kept, refused = [], 0
@@ -621,21 +627,23 @@ class Engine(NoteWriter):
                 return bad
             listed = raw.get("exports") or []
             rows = [(str(e.get("name", "")), str(e.get("kind", "")), _int(e.get("line"))) for e in listed if isinstance(e, dict)]
-            return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=bool(raw.get("truncated")), raw=raw)
+            omitted, cut = self.loss(raw)
+            return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=cut, refused=omitted, raw=raw)
         raw = self.call(kind, made, "symbols", rel, limit=API_SYMBOLS)
         bad = self._status(kind, raw)
         if bad:
             return bad
         listed = raw.get("symbols") or []
         rows = [(str(s.get("name", "")), str(s.get("kind", "")), _int(s.get("line"))) for s in listed if isinstance(s, dict)]
-        return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=bool(raw.get("truncated")), raw=raw)
+        omitted, cut = self.loss(raw)
+        return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=cut, refused=omitted, raw=raw)
 
     def _edges(self, raw, rows, index, listed, **more):
         """A Got from navigator rows: refused paths dropped and counted, and the navigator's own truncation kept."""
         kept, refused = self.screen_rows(rows, index)
-        withheld = _int(raw.get("withheld"))
+        withheld, cut = self.loss(raw)
         return Got(rows=kept, total=_int(raw.get("total", len(rows))), seen=listed + withheld, refused=refused + withheld,
-                   cut=bool(raw.get("truncated")), raw=raw, **more)
+                   cut=cut, raw=raw, **more)
 
     def importers(self, rel, limit=10):
         """Got whose rows are (importing file, line, rel)."""
@@ -678,7 +686,8 @@ class Engine(NoteWriter):
         listed = [e for e in raw.get("files") or [] if isinstance(e, dict)]
         rows = [(rel, _int(e.get("line")), str(e.get("path", ""))) for e in listed]
         kept, refused = self.screen_rows(rows, 2)
-        return Got(rows=kept, total=len(listed), seen=len(listed), refused=refused, external=[str(x) for x in raw.get("external") or []],
+        omitted, cut = self.loss(raw)
+        return Got(rows=kept, total=len(listed) + omitted, seen=len(listed) + omitted, refused=refused + omitted, cut=cut, external=[str(x) for x in raw.get("external") or []],
                    unresolved=_count(raw.get("unresolved")), age=raw.get("index_age_s"), raw=raw)
 
     # ----------------------------------------------------------------------------------------------- text-scan locator
@@ -829,7 +838,11 @@ class Engine(NoteWriter):
             lines.append(bad.text)
             return bad.status, bad.text.splitlines()[0]
         rows, refused = self.screen_dicts([r for r in raw.get("definitions") or []])
-        self._withheld_note(refused + _int(raw.get("withheld")), left, f"definitions of {name} in {rel}")
+        omitted, cut = self.loss(raw)
+        refused += omitted
+        self._withheld_note(refused, left, f"definitions of {name} in {rel}")
+        if cut:
+            left.append(f"definitions of {name} in {rel}: the navigator cut its list")
         if not rows:
             lines.append(f"no definition of {name} in {rel} (the web navigator found none)" if not refused
                          else f"{name} in {rel}: every definition the navigator found is at a refused path")
@@ -846,13 +859,16 @@ class Engine(NoteWriter):
             lines.append("references unavailable — " + bad.text.replace("\n", " "))
             return "ok", None
         shown, refused = self.screen_dicts([r for r in refs.get("references") or []])
-        refused += _int(refs.get("withheld"))
+        omitted, cut = self.loss(refs)
+        refused += omitted
         total = _int(refs.get("total", len(shown) + refused))
         lines.append(f"{total} references ({min(5, len(shown))} shown):")
         lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
         more = total - min(5, len(shown)) - refused
         if more > 0:
             left.append(f"references of {name}: {more} more")
+        elif cut:
+            left.append(f"references of {name}: the navigator cut its list, so this count may be short")
         self._withheld_note(refused, left, f"references of {name}")
         return "ok", None
 
@@ -864,8 +880,10 @@ class Engine(NoteWriter):
             return bad.status, bad.text.splitlines()[0]
         listed = [s for s in raw.get("symbols") or [] if isinstance(s, dict)]
         total = _int(raw.get("total", len(listed)))
-        partial = bool(raw.get("truncated")) or total > len(listed)
+        omitted, cut = self.loss(raw)
+        partial = cut or total > len(listed)
         named, refused = self.screen_dicts([s for s in listed if s.get("name") == name])
+        refused += omitted
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
         if not named:
             if partial:

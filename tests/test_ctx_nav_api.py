@@ -3075,7 +3075,10 @@ class PathRuleCase(Tree):
         ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "ImportIndex._walk", "os.scandir"): "that descriptor",
-                ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name; decides the type of every allowed name (no is_dir: the listing's type may be old)",
+                ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name; decides the type of every allowed name, compared with the listing's type",
+        ("graph.py", "_entry_kind", "entry.is_dir"): "no link followed; called by the walk only for a name the guard allowed; the listing's cached type, compared with the walk's lstat",
+        ("graph.py", "_entry_kind", "entry.is_file"): "same: no link followed, allowed name only",
+        ("graph.py", "_entry_kind", "entry.is_symlink"): "same: allowed name only, never follows",
         ("nav_api.py", "stub_check_path", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi.__init__", "os.path.realpath"): "the boundary itself",
         ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
@@ -4184,6 +4187,14 @@ class AnswerProofCase(Tree):
                 log.append(("is_dir", self.name))  # on a file system with no d_type this is an lstat at the name
                 return self.entry.is_dir(follow_symlinks=follow_symlinks)
 
+            def is_file(self, follow_symlinks=True):
+                log.append(("is_file", self.name))
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+
+            def is_symlink(self):
+                log.append(("is_symlink", self.name))
+                return self.entry.is_symlink()
+
         class Listing:
             def __init__(self, inner):
                 self.inner = inner
@@ -4221,9 +4232,9 @@ class AnswerProofCase(Tree):
         self.assertNotIn("src/holdings/inner.ts", asked, "a refused folder is not listed")
         self.assertEqual(answer["status"], "ok", answer)
 
-    def test_s1_f1_an_allowed_name_is_looked_at_only_after_the_guard_and_never_by_a_type_question(self):
-        """S4 F1: the walk decides the type of an allowed name by its own `lstat`, taken after the guard judged the name; `is_dir` is
-        never asked of any name, source or not (its answer may be the one cached at the listing)."""
+    def test_s1_f1_an_allowed_name_is_looked_at_only_after_the_guard(self):
+        """S4 F1: the walk decides the type of an allowed name by its own `lstat`, taken after the guard judged the name; the listing's
+        type is asked of an allowed name only, after the guard."""
         project = self.project().resolve()
         write(project / "src" / "notes.txt", "hello\n")
         order, log = [], []
@@ -4242,7 +4253,9 @@ class AnswerProofCase(Tree):
         self.assertEqual(answer["status"], "ok", answer)
         self.assertLess(order.index(("guard", "notes.txt")), order.index(("lstat", "notes.txt")))
         self.assertLess(order.index(("guard", "run.ts")), order.index(("lstat", "run.ts")))
-        self.assertFalse([item for item in order if item[0] == "is_dir"], "no name is asked a type question")
+        for name in ("notes.txt", "run.ts"):  # a type question about the listing is asked of an allowed name only, after its guard
+            asked = [i for i, item in enumerate(order) if item == ("is_dir", name)]
+            self.assertTrue(asked and asked[0] > order.index(("guard", name)), (name, order))
 
     def test_s4_f1_a_non_source_entry_removed_after_the_listing_is_stale_index_with_the_real_listing_type(self):
         """Review F1 (stale-index-listing-race): `DirEntry.is_dir` may answer from the type cached at the listing, so a non-source
@@ -4256,6 +4269,57 @@ class AnswerProofCase(Tree):
                 notes.unlink()  # after the listing, after the name is judged, before it is skipped
             return nav_api.stub_check_path(root, path)
         answer = self.nav(project, check_path=check).importers("src/app/run.ts")
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assert_no_data(answer)
+        self.assertIn("entry_changed", json.dumps(answer))
+
+    def listing_race(self, project, rel, change):
+        """Run `importers` with `change()` done when the guard judges the name `rel` (after the real listing, before the walk's look)."""
+        done = []
+
+        def check(root, path):
+            if path == rel and not done:
+                done.append(path)
+                change()
+            return nav_api.stub_check_path(root, path)
+        return self.nav(project, check_path=check).importers("src/app/run.ts"), done
+
+    def test_s4_f1_a_listed_file_replaced_by_a_folder_is_stale_index(self):
+        """Review F1 (round 2): the listed `src/notes.txt` becomes a folder before the walk's look: `stale_index`, not `ok`."""
+        project = self.project().resolve()
+        notes = write(project / "src" / "notes.txt", "hello\n")
+
+        def change():
+            notes.unlink()
+            notes.mkdir()
+        answer, done = self.listing_race(project, "src/notes.txt", change)
+        self.assertTrue(done)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assert_no_data(answer)
+        self.assertIn("entry_changed", json.dumps(answer))
+
+    def test_s4_f1_a_listed_folder_replaced_by_a_file_is_stale_index(self):
+        project = self.project().resolve()
+        write(project / "src" / "extra" / "inner.ts", "export const a = 1\n")
+
+        def change():
+            shutil.rmtree(project / "src" / "extra")
+            write(project / "src" / "extra", "now a file\n")
+        answer, done = self.listing_race(project, "src/extra", change)
+        self.assertTrue(done)
+        self.assertEqual(answer["status"], "stale_index", answer)
+        self.assert_no_data(answer)
+        self.assertIn("entry_changed", json.dumps(answer))
+
+    def test_s4_f1_a_listed_file_replaced_by_a_link_is_stale_index(self):
+        project = self.project().resolve()
+        notes = write(project / "src" / "notes.txt", "hello\n")
+
+        def change():
+            notes.unlink()
+            os.symlink("run.ts", notes)
+        answer, done = self.listing_race(project, "src/notes.txt", change)
+        self.assertTrue(done)
         self.assertEqual(answer["status"], "stale_index", answer)
         self.assert_no_data(answer)
         self.assertIn("entry_changed", json.dumps(answer))

@@ -1485,6 +1485,24 @@ _CONFIG_GAP = {"refused": "config_refused", "outside": "config_outside", "change
 _READ_GAP = {"absent": "source_changed", "changed": "source_changed", "refused": "source_refused", "outside": "source_refused"}
 
 
+def _mode_kind(mode):
+    """"dir", "file", "link" or "other" for a `st_mode`."""
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "link" if stat.S_ISLNK(mode) else "other"
+
+
+def _entry_kind(entry):
+    """The kind a `DirEntry` was listed as, with no link followed (see `_mode_kind`); OSError from a look the listing could not answer."""
+    if entry.is_dir(follow_symlinks=False):
+        return "dir"
+    if entry.is_file(follow_symlinks=False):
+        return "file"
+    return "link" if entry.is_symlink() else "other"
+
+
 def _entry_gap(error):
     """The gap for an entry of a listing that could not be looked at: `entry_changed` when it is gone or its way moved since the
     listing (no such name, a folder on the way now a file or a link), else `entry_unreadable`."""
@@ -1628,9 +1646,12 @@ class ImportIndex:
 
         Nothing is asked of a name until it has been judged: the listing is kept as entries and none is asked its type until its name
         is allowed, because `DirEntry.is_dir` stats the name on a file system whose listing gives no type. Once a name is allowed, it is
-        looked at once, by `lstat` of the name in the folder's descriptor, never by `DirEntry.is_dir` (which may answer from the type
-        the listing cached and so never notice that the name has gone): a name that is gone or moved since the listing is a race
-        (`entry_changed`, so `stale_index`), any other error `entry_unreadable`. A name with no source suffix is then dropped unless
+        looked at by `lstat` of the name in the folder's descriptor, which decides its type (the `DirEntry` answer alone may be the type
+        the listing cached and so never notice that the name has gone). The listing's type (`DirEntry.is_dir/is_file/is_symlink` with no
+        link followed: the cached `d_type`, and only when the file system gave none a look taken at that moment) is compared with the
+        `lstat` type: a name that is gone or moved, or of another kind (file, folder, link, other) than listed, is a race
+        (`entry_changed`, so `stale_index`); any other error is `entry_unreadable`. A replacement of the same kind (a file by another file)
+        is left to the snapshot proof (mtime and size), as before. A name with no source suffix is then dropped unless
         it is a folder, so it is never opened, read or looked at again. (A guard-free skip of names that can never be source cannot
         know they are not folders without asking, and asking must wait for the judgement.)"""
         found = {}
@@ -1660,9 +1681,13 @@ class ImportIndex:
                     if rel is None or name in SKIP_DIRS or not self._allowed(rel):
                         continue  # judged by its name: nothing is asked of it
                     try:
-                        info = os.lstat(name, dir_fd=fd)  # confirms the listed name is still there: the listing's type (`d_type`) may be old
+                        listed = _entry_kind(entry)  # the type the listing gave (its cached `d_type`; when none, a look taken now)
+                        info = os.lstat(name, dir_fd=fd)  # the type now, no link followed
                     except OSError as error:
                         self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
+                        continue
+                    if listed != _mode_kind(info.st_mode):
+                        self._gap("entry_changed")  # replaced by another kind of entry (file, folder, link) since the listing
                         continue
                     if not name.endswith(SOURCE_EXTENSIONS) and not stat.S_ISDIR(info.st_mode):
                         continue  # allowed and still there, but can never be read as a source nor descended into

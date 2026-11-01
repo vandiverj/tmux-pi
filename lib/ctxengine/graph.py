@@ -955,9 +955,10 @@ class CacheDir:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         try:
-            return value if math.isfinite(value) else None
+            value = float(value)  # a whole number in the marker is read as the float the docs promise
         except OverflowError:  # a whole number no float can hold: not a time, and no reason to stop every later sweep
             return None
+        return value if math.isfinite(value) and value >= 0 else None  # the writer's `time.time()` is never negative
 
     def _listing(self, fd, spent):
         """([(name, kind, size, mtime_ns, dev, ino)], complete): the regular files of the folder open on `fd` that the sweep manages
@@ -1850,26 +1851,26 @@ class ImportIndex:
         if self.cache_path is None:
             return
         data = self._cache.read_json(self._cache_name)
-        if not isinstance(data, dict) or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
                 or data.get("root") != self.root or not isinstance(data.get("entries"), dict):
             return
         for rel, entry in data["entries"].items():
-            if self._entry_shape(entry):  # one of another shape is a miss for that file: it is read again (a whole envelope can hold anything)
+            if rel and self._entry_shape(entry):  # one of another shape is a miss for that file: it is read again (a whole envelope can hold anything)
                 self.entries[rel] = {"key": entry["key"], "specs": entry["specs"]}
         self._cache.touch(self._cache_name)  # the shape was accepted: the file is in use (a file this instance rejects ages out)
 
     @staticmethod
     def _entry_shape(entry):
         """True when `entry` is an index entry of the shape `refresh` makes: {"key": [mtime_ns, size], "specs": [[spec, line,
-        type_only, dynamic], ...]} (whole numbers, text and flags of exactly those types). The envelope proves the bytes are the ones a
+        type_only, dynamic], ...]} (whole numbers, text and flags of exactly those types and in the ranges `refresh` can write: a size from 0, a line from 1). The envelope proves the bytes are the ones a
         writer made, not that they are this shape; a loaded entry that is not is a miss, never something `_resolve_all` can raise on."""
-        def whole(value):
-            return type(value) is int
+        def whole(value, low):
+            return type(value) is int and low <= value < 2 ** 63
         if not isinstance(entry, dict) or not isinstance(entry.get("key"), list) or len(entry["key"]) != 2 \
-                or not all(whole(item) for item in entry["key"]) or not isinstance(entry.get("specs"), list):
-            return False
-        return all(isinstance(row, list) and len(row) == 4 and isinstance(row[0], str) and whole(row[1]) and type(row[2]) is bool
-                   and type(row[3]) is bool for row in entry["specs"])
+                or not whole(entry["key"][0], -2 ** 63) or not whole(entry["key"][1], 0) or not isinstance(entry.get("specs"), list):
+            return False  # key: a modification time in ns (before 1970 is a negative one) and a size (never negative)
+        return all(isinstance(row, list) and len(row) == 4 and isinstance(row[0], str) and whole(row[1], 1) and type(row[2]) is bool
+                   and type(row[3]) is bool for row in entry["specs"])  # a line counts from 1 (`_tokens`)
 
     def save(self):
         """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True

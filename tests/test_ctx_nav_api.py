@@ -5755,7 +5755,10 @@ class InfoCacheCase(Tree):
         for label, value in (("list", []), ("text", "not json"), ("old format", {"format": 0, "external": 0, "modules": []}),
                              ("bool", {"format": nav_api.INFO_FORMAT, "external": True, "modules": []}),
                              ("negative", {"format": nav_api.INFO_FORMAT, "external": -1, "modules": []}),
-                             ("modules", {"format": nav_api.INFO_FORMAT, "external": 0, "modules": {}})):
+                             ("modules", {"format": nav_api.INFO_FORMAT, "external": 0, "modules": {}}),
+                             ("format float", {"format": float(nav_api.INFO_FORMAT), "external": 0, "modules": []}),
+                             ("format bool", {"format": True, "external": 0, "modules": []}),
+                             ("external float", {"format": nav_api.INFO_FORMAT, "external": 1.0, "modules": []})):
             project, miss = self.filled(label.replace(" ", "_"))
             before = len(self.deno_calls("info"))
             self.overwrite_entry(project, value)
@@ -7093,6 +7096,18 @@ class SweepCase(Tree):
                 self.assertEqual(self.sweep(fresh=False)["deleted"], 1, "the old entry stayed: the marker stopped the sweep for good")
                 self.assertIsInstance(self.cache()._last_sweep(), float)
 
+    def test_s6_a_whole_number_marker_time_is_a_float_and_a_negative_one_is_no_time(self):
+        for label, value, want in (("whole", 1700000000, 1700000000.0), ("zero", 0, 0.0), ("negative whole", -5, None), ("negative", -0.5, None)):
+            with self.subTest(label):
+                self.marker().write_text(seal(graph.SWEEP_MARKER, {"version": 1, "last_sweep": value}))
+                got = self.cache()._last_sweep()
+                self.assertEqual(got, want)
+                if want is not None:
+                    self.assertIs(type(got), float)
+                status = self.nav(self.proj).status()["cache"]["last_sweep"]
+                self.assertEqual(status, want)
+                self.assertIs(type(status), type(want))
+
     def replaced_by(self, how, victim="nav_api-doc-victim.json"):
         """Sweep with `victim` expired and `how(path)` done to it after the listing and before any deletion. Returns the result."""
         path = self.put(victim, 20 * self.DAY)
@@ -7745,7 +7760,9 @@ class ShapeCase(Tree):
     BAD_ROWS = (("row too short", [[1]]), ("spec not text", [[5, 1, False, False]]), ("row not a list", [5]),
                 ("row is text", ["abc"]), ("line is text", [["./x.ts", "a", False, False]]), ("line is a list", [["./x.ts", [1], False, False]]),
                 ("line is a bool", [["./x.ts", True, False, False]]), ("flag is text", [["./x.ts", 1, "yes", False]]),
-                ("row too long", [["./x.ts", 1, False, False, 9]]), ("specs is text", "abc"), ("specs is a dict", {"a": 1}))
+                ("row too long", [["./x.ts", 1, False, False, 9]]), ("specs is text", "abc"), ("specs is a dict", {"a": 1}),
+                ("line is zero", [["./x.ts", 0, False, False]]), ("line is negative", [["./x.ts", -1, False, False]]),
+                ("line past 64 bits", [["./x.ts", 2 ** 63, False, False]]))
 
     def index_file(self, project):
         (entry,) = [p for p in project_cache(project).parent.iterdir() if p.name.startswith("nav_api-index-")]
@@ -7765,7 +7782,8 @@ class ShapeCase(Tree):
             self.assertNotEqual(payload_of(self.index_file(project))["entries"]["src/main.ts"]["specs"], specs, label)
 
     def test_s6_an_index_entry_with_a_key_of_the_wrong_shape_is_a_miss(self):
-        for label, key in (("one number", [1]), ("text", ["a", "b"]), ("not a list", 5), ("floats", [1.5, 2]), ("bools", [True, False])):
+        for label, key in (("one number", [1]), ("text", ["a", "b"]), ("not a list", 5), ("floats", [1.5, 2]), ("bools", [True, False]),
+                           ("negative size", [1, -1]), ("size past 64 bits", [1, 2 ** 63]), ("time past 64 bits", [2 ** 63, 1])):
             project = self.project(label.replace(" ", "_"))
             clean = self.nav(project).importers("src/util/index.ts")
             entry = self.index_file(project)
@@ -7775,6 +7793,28 @@ class ShapeCase(Tree):
             index = graph.ImportIndex(str(project), cache=(self.nav(project)._cache, entry.name), allow=stub_allow(project))
             self.assertNotEqual(index.entries.get("src/main.ts", {}).get("key"), key, label)
             self.assertEqual(self.nav(project).importers("src/util/index.ts")["importers"], clean["importers"], label)
+
+    def test_s6_an_index_with_a_version_that_is_equal_but_not_whole_is_not_loaded(self):
+        project = self.project()
+        self.nav(project).importers("src/util/index.ts")
+        entry = self.index_file(project)
+        for label, version in (("float", float(graph.INDEX_VERSION)), ("bool", True)):
+            payload = payload_of(entry)
+            payload["version"] = version
+            entry.write_text(seal(entry.name, payload))
+            index = graph.ImportIndex(str(project), cache=(self.nav(project)._cache, entry.name), allow=stub_allow(project))
+            self.assertEqual(index.entries, {}, label)
+
+    def test_s6_an_index_entry_under_an_empty_name_is_not_loaded(self):
+        project = self.project()
+        self.nav(project).importers("src/util/index.ts")
+        entry = self.index_file(project)
+        payload = payload_of(entry)
+        payload["entries"][""] = payload["entries"]["src/main.ts"]
+        entry.write_text(seal(entry.name, payload))
+        index = graph.ImportIndex(str(project), cache=(self.nav(project)._cache, entry.name), allow=stub_allow(project))
+        self.assertNotIn("", index.entries)
+        self.assertIn("src/main.ts", index.entries)
 
     def test_s6_a_good_index_entry_is_still_a_hit(self):
         project = self.project()
@@ -7793,7 +7833,11 @@ class ShapeCase(Tree):
 
     def test_s6_a_doc_entry_with_a_field_of_the_wrong_type_is_a_miss_and_is_replaced(self):
         for label, field, value in (("name", "name", {"a": 1}), ("line", "line", "x"), ("line list", "line", [1]), ("line bool", "line", True),
-                                    ("kind", "kind", None), ("signature", "signature", [1]), ("doc", "doc", 5), ("path", "path", ["src/config.ts"])):
+                                    ("kind", "kind", None), ("signature", "signature", [1]), ("doc", "doc", 5), ("path", "path", ["src/config.ts"]),
+                                    ("line zero", "line", 0), ("line negative", "line", -1), ("line past 64 bits", "line", 2 ** 63),
+                                    ("name empty", "name", ""), ("kind empty", "kind", ""), ("path empty", "path", ""),
+                                    ("signature too long", "signature", "x" * (nav_api.SIGNATURE_MAX + 1)),
+                                    ("doc too long", "doc", "x" * (nav_api.DOC_LINE_MAX + 1))):
             project, exe, miss, entry = self.doc_project(label.replace(" ", "_"))
             before = len(self.deno_calls("doc"))
             payload = payload_of(entry)
@@ -7802,7 +7846,7 @@ class ShapeCase(Tree):
             answer = self.nav(project, deno=exe).symbols("src/config.ts")
             self.assertEqual(answer, miss, label)
             self.assertEqual(len(self.deno_calls("doc")), before + 1, label)
-            self.assertIsNot(type(payload_of(entry)[0][field]), type(value), label)  # (True == 1, so the type says it)
+            self.assertNotEqual((type(payload_of(entry)[0][field]), payload_of(entry)[0][field]), (type(value), value), label)  # replaced by what Deno gave (True == 1, so the type is compared too)
 
     def test_s6_a_good_doc_entry_is_still_a_hit(self):
         project, exe, miss, entry = self.doc_project()

@@ -43,7 +43,8 @@ PathRuleCase.)
   Where. In `cache_dir` (default `<project root>/.tmux-pi/ctx-cache`), a `graph.CacheDir` judged once when the `NavApi` is made: inside
   the project, not the project itself, allowed by the guard (also where a link leads), else there is no cache, and an `ok` answer
   carries `cache_refused`. An entry is a plain `.json` name (no `/`, not hidden) directly in that folder. The folder is made, mode
-  0700, by the first write and by nothing else (a read, a touch, a sweep and `status()` make nothing); it is opened one component at a
+  0700, by a write attempt and by nothing else (`CacheDir.put_json` opens it with make=True, so an attempt that then fails to write
+  can still leave the folder; a read, a touch, a sweep and `status()` make nothing); it is opened one component at a
   time below the boundary with no link followed, and must be the judged folder by the kernel's name each time.
   The envelope. Every entry is `{"format": ENVELOPE_FORMAT, "name": <its file name>, "sha256": <hash of the payload as compact,
   key-sorted JSON>, "payload": ...}` with those four keys and no others (`CacheDir.read_json`, `put_json`: the only reader and writer
@@ -51,9 +52,11 @@ PathRuleCase.)
   never an error): not there, a link or a folder at the name, not UTF-8 or JSON, too deep to read, over the size, another format, another
   name, a payload that does not hash to `sha256`. The checksum guards against corruption, not a writer who can compute it. A payload is
   then held to the shape its reader writes, and a payload of another shape is a miss too, replaced by the next write: an index entry
-  (`ImportIndex._entry_shape`: a key of two whole numbers, rows of text, a whole number and two flags; one entry that is not is read
-  again, the others stay), a doc list (`NavApi._doc_item_shape`: text for name, kind, path, signature and doc, a whole number for
-  line), an info graph (`NavApi._info_local`: the format, a whole `external`, a list of modules). Inside an info graph or a doc list,
+  (`ImportIndex._entry_shape`: a key of two whole numbers, a modification time and a size from 0, both within 64 bits, and rows of text, a line from 1
+  and two flags; one entry that is not is read again, the others stay), a doc list (`NavApi._doc_item_shape`: text for name, kind,
+  path, signature and doc, with name, kind and path not empty and signature and doc no longer than their cut, and a line from 1 within 64 bits), an
+  info graph (`NavApi._info_local`: the whole-number format, a whole `external` from 0, a list of modules). A value of the right type
+  outside the range its writer can make (a negative size, line 0 or -1, an empty path, a float or a bool for a whole number) is a miss. Inside an info graph or a doc list,
   a module or symbol that names a file this walk did not prove, or one the guard refuses now, is dropped, and so is an info module
   record that is not a path with a list of imports, and an import that is not a proven name.
   The freshness proof. A stored `deno doc` or `deno info` entry is not an answer. To find its key `prove_reach` reads every file the
@@ -75,7 +78,7 @@ PathRuleCase.)
   The sweep (`CacheDir.sweep`, run by `NavApi._swept` after `importers`, `imports`, `forward_graph` and `symbols`, after the answer is
   final). Due only if this folder's `CacheDir` wrote an entry since it last asked (`written`; a hit never writes), the folder is judged
   and exists, this object has not swept within an hour, and the marker `nav_api-sweep.json` does not show a sweep within an hour (a
-  marker that is absent, not an envelope of this format, a time that is not a finite number, or dated in the future holds nothing
+  marker that is absent, not an envelope of this format, a time that is not a finite number of at least 0, or dated in the future holds nothing
   back and is written again). A sweep removes: a plain `*.tmp` file older than 10 minutes (TEMP_MAX_AGE_S, by age only, whoever made
   it); a doc or info entry whose modification time is older than 14 days (ENTRY_MAX_AGE_S); an index file older than 30 days
   (INDEX_MAX_AGE_S); then, while the entries that are left (index, doc and info files: temporaries, the marker and every other name
@@ -97,8 +100,8 @@ PathRuleCase.)
       whenever they are not all known: the cache is refused, the folder cannot be opened or is not the judged one, it cannot be
       listed, or a listed name could not be looked at for a reason other than having gone since the listing. A name that only went
       is not an error and is not counted. A count of what could be seen is never reported as the whole.
-    - `last_sweep`: the time (seconds since the epoch) in the marker. None only when the marker cannot be read: no cache, no marker
-      (never swept), a link or a folder at its name, not an envelope of this format, a time that is not a finite number, or a folder
+    - `last_sweep`: the time (seconds since the epoch, always a float: a whole number in the marker is read as one) in the marker. None only when the marker cannot be read: no cache, no marker
+      (never swept), a link or a folder at its name, not an envelope of this format, a time that is not a finite number of at least 0, or a folder
       that cannot be read (a folder of mode 0 hides its marker, so it reports None, with `entries` and `bytes` None as well). A time
       in the future is reported as it is.
   Known limits of the cache (as the code behaves; see also "Known limits" below).
@@ -1358,7 +1361,7 @@ class NavApi:
         import must also be allowed now), or None when it is not a graph of the stored shape (then it is a miss). An entry naming
         anything else is dropped, so a planted or old file cannot name what the walk did not prove."""
         modules, external = stored.get("modules"), stored.get("external")
-        if stored.get("format") != INFO_FORMAT or not isinstance(modules, list) or isinstance(external, bool) \
+        if type(stored.get("format")) is not int or stored.get("format") != INFO_FORMAT or not isinstance(modules, list) or isinstance(external, bool) \
                 or not isinstance(external, int) or external < 0:
             return None
         local = {}
@@ -1421,10 +1424,12 @@ class NavApi:
     @staticmethod
     def _doc_item_shape(item):
         """True when `item` has the types `_parse_doc` writes: text for name, kind, path, signature and doc, a whole number for line.
-        A stored symbol is judged by its types here (the whole entry is a miss when one is wrong) and by `_present` by its path (a
+        Text is judged by what `_parse_doc` can emit (a name, kind and path that are not empty; a signature and doc no longer than the cut)
+        and the line by its range (from 1, as Deno counts from 0 and one is added, and within 64 bits). A stored symbol is judged by its types here (the whole entry is a miss when one is wrong) and by `_present` by its path (a
         symbol that names a file the walk did not prove is dropped)."""
         return isinstance(item, dict) and all(isinstance(item.get(field), str) for field in ("name", "kind", "path", "signature", "doc")) \
-            and type(item.get("line")) is int
+            and all(item[field] for field in ("name", "kind", "path")) and len(item["signature"]) <= SIGNATURE_MAX \
+            and len(item["doc"]) <= DOC_LINE_MAX and type(item.get("line")) is int and 1 <= item["line"] < 2 ** 63
 
     def _present(self, entry, names):
         """One cached or fresh symbol as it may leave the process: None when its path is refused now, or is not one of the files

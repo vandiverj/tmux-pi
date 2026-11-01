@@ -32,6 +32,7 @@ folders above it (`_guarded_roots`).
 
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
@@ -829,7 +830,8 @@ def read_sources(paths, base, allow, workers=8, failures=None, keys=None):
     in threads, and the CPU work of scanning stays in the caller."""
     paths, keys = list(paths), keys or {}
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(paths) or 1))) as pool:
-        return dict(zip(paths, pool.map(lambda path: read_source(path, base, allow, failures, keys.get(path)), paths)))
+        contexts = [contextvars.copy_context() for _ in paths]  # a worker runs in the caller's context: the answer's guard memo (`NavApi._permits`) is theirs
+        return dict(zip(paths, pool.map(lambda ctx, path: ctx.run(read_source, path, base, allow, failures, keys.get(path)), contexts, paths)))
 
 
 def probe_sources(keyed, base, allow, workers=8):
@@ -838,8 +840,9 @@ def probe_sources(keyed, base, allow, workers=8):
     byte read. `ok` proves the file is there, can be read and is the version keyed; in threads, as `read_sources`."""
     keyed = list(keyed)
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keyed) or 1))) as pool:
+        contexts = [contextvars.copy_context() for _ in keyed]  # as in `read_sources`
         return dict(zip([path for path, _ in keyed], pool.map(
-            lambda item: read_bounded(item[0], item[0], base, allow, expect=item[1], take=False)[0], keyed)))
+            lambda ctx, item: ctx.run(read_bounded, item[0], item[0], base, allow, expect=item[1], take=False)[0], contexts, keyed)))
 
 
 # ------------------------------------------------------------------------------------------------------- the allow-list walk

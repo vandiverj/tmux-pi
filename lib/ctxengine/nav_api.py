@@ -26,9 +26,10 @@ that was judged, and a new walk that must find the snapshot (the same files with
 and cache-loaded one alike; only an answer whose proof found nothing is `ok`. A proof that fails gives the gaps and nothing from
 the answer. A race with the answer (anything that moves after the snapshot) is therefore `stale_index`, also for `imports` with a
 `source` of `auto`, which falls back to `deno info` only when the index could not be built at all.
-The guard is asked once per name per answer (a memo that lives for the length of one public call and is dropped on every exit; a
-guard that raises is a refusal and is remembered as one, `_permits`), and a name that can never be read as a source (not a folder,
-no source suffix) is not asked at all. Nothing is remembered between answers.
+The guard is asked once per name per answer (a memo that belongs to exactly one public call, a nested or concurrent call having its own, and is dropped on every exit; a
+guard that raises is a refusal and is remembered as one, `_permits`). Every name in a listing is asked of the guard BEFORE it is
+asked its type (a type question can stat the name); only after the guard allows it is a name that can never be read as a source (not
+a folder, no source suffix) dropped without being read or opened. Nothing is remembered between answers.
 A source rewritten with the same mtime and size is not seen (the index's key; no content hash).
 An input of the boundary decision (`_boundary_input`) is also seen when its mtime is put back, because its ctime and size are part of it. Of
 those inputs the regular files inside the boundary are also content-hashed (sha256; `_boundary_hash`, the one exception to the refusal of
@@ -166,6 +167,7 @@ Until CX1 merges, `check_path` and `guard` here are STUBS (`stub_check_path`, `s
 `redact.check_path(project, path) -> relative posix path | raises Refused` and `redact.guard(text) -> text`, so CX4 swaps them in
 by passing `check_path=redact.check_path, guard=redact.guard` to `NavApi`. Any exception from `check_path` is a refusal."""
 import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -234,6 +236,7 @@ _SENSITIVE_DIRS = (".git", ".ssh", ".aws", ".gnupg")
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 
 
+ANSWER_MEMOS = contextvars.ContextVar("ctxengine_answer_memos", default={})  # {id(NavApi): {rel: verdict}} of the answers the running context is inside (`NavApi._answering`)
 CANNOT_JUDGE = object()  # what the per-answer guard memo holds for a name the guard could not look at (see `NavApi._permits`)
 
 
@@ -419,7 +422,6 @@ class NavApi:
 
     def __init__(self, project_root, root=None, config=None, overlays=(), cache_dir=None, deno="deno", timeout=DEFAULT_TIMEOUT,
                  check_path=stub_check_path, guard=stub_guard, mirror_parent=None):
-        self._asked = None  # {rel: verdict} while a public call is being answered (`_answering`, `_permits`), else None
         self.check_path = check_path
         self.guard = guard
         spelled = os.path.abspath(project_root)
@@ -986,17 +988,17 @@ class NavApi:
 
     @contextlib.contextmanager
     def _answering(self):
-        """The length of ONE answer, for the guard memo (`_permits`): every public call that asks the guard is made in one. The memo
-        starts empty and is dropped on every way out (a return, an exception), so nothing is remembered from one answer to the
-        next: the next one asks the guard again. A call made inside another one (none is today) shares the outer one's memo."""
-        outer = self._asked is None
-        if outer:
-            self._asked = {}
+        """The length of ONE answer, for the guard memo (`_permits`): every public call that asks the guard is made in one. Each
+        call makes its OWN memo, empty, and puts back whatever was current on every way out (a return, an exception): so nothing is
+        remembered from one answer to the next, a call made inside another (from the guard, say) never reads or fills the outer
+        one's memo and leaves it as it was, and a call in another thread on this instance has a memo of its own (the memo is carried by the
+        context, which `graph`'s reader threads copy from the caller). No memo is kept on the instance or between answers."""
+        memo, memos = {}, ANSWER_MEMOS.get()
+        token = ANSWER_MEMOS.set({**memos, id(self): memo})  # copied, never edited in place: an outer answer's mapping stays as it was
         try:
             yield
         finally:
-            if outer:
-                self._asked = None
+            ANSWER_MEMOS.reset(token)
 
     def _permits(self, rel):
         """The guard's verdict as a bool, for `graph`, asked once per name per answer (`_answering`: the walk at the start, the new
@@ -1005,7 +1007,7 @@ class NavApi:
         index records as a gap. FAIL CLOSED: a guard that raises is a refusal, and so is what the memo holds for the name for the rest
         of the answer (a failure is never turned into an allow by asking again, nor is an allow ever stored for a failure); a name
         the guard could not judge raises `CannotJudge` every time it is asked."""
-        memo = self._asked
+        memo = ANSWER_MEMOS.get().get(id(self))
         if memo is not None and rel in memo:
             if memo[rel] is CANNOT_JUDGE:
                 raise graph.CannotJudge(rel) from None

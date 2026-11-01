@@ -3399,6 +3399,66 @@ class IncompleteIndexCase(Tree):
         self.assertIn("src/util/slug.ts", asked)
         self.assertNotIn("src/util/slug.ts", [i["path"] for i in answer.get("importers", [])])
 
+    def test_s1_f1_a_call_made_from_the_guard_has_its_own_memo(self):
+        """Review F1 (per-answer-guard-memo): a public call made while another is being answered (here from the guard itself) must
+        ask the guard afresh for names the outer answer already holds a verdict for, and must not leave anything in the outer memo."""
+        project = self.project().resolve()
+        asked, depth, state = [], [0], {"inner": None, "done": False}
+
+        def check(root, path):
+            asked.append((depth[0], path))
+            if depth[0] == 0 and not state["done"] and path == "src/util/slug.ts":  # asked after src/util/index.ts, whose verdict the outer memo holds by now
+                state["done"] = True
+                depth[0] = 1
+                try:
+                    state["inner"] = nav.importers("src/app/run.ts")
+                finally:
+                    depth[0] = 0
+            return nav_api.stub_check_path(root, path)
+        nav = self.nav(project, check_path=check)
+        outer = nav.importers("src/app/run.ts")
+        self.assertTrue(state["done"], "the guard made the inner call")
+        outer_names = {p for d, p in asked if d == 0}
+        inner_names = {p for d, p in asked if d == 1}
+        self.assertIn("src/util/index.ts", outer_names)
+        self.assertIn("src/util/index.ts", inner_names, "the inner answer asked again for a name the outer one already held")
+        self.assertEqual(state["inner"]["status"], "ok", state["inner"])
+        self.assertEqual(outer["status"], "ok", outer)
+        self.assertEqual(sum(1 for d, p in asked if d == 0 and p == "src/util/slug.ts"), 1, "the outer memo still holds its own verdict")
+
+    def test_s1_f1_a_call_in_another_thread_has_its_own_memo(self):
+        import threading
+        project = self.project().resolve()
+        asked, lock = [], threading.Lock()
+        slug_seen, other_done = threading.Event(), threading.Event()
+        me = {}
+
+        def check(root, path):
+            who = threading.current_thread().name
+            with lock:
+                asked.append((who, path))
+            if who == "first" and path == "src/util/slug.ts" and not slug_seen.is_set():  # src/util/index.ts was asked just before: the first answer's memo holds it
+                slug_seen.set()
+                self.assertTrue(other_done.wait(30), "the other thread did not finish")  # park the first answer here
+            return nav_api.stub_check_path(root, path)
+        nav = self.nav(project, check_path=check)
+
+        def run(name):
+            me[name] = nav.importers("src/app/run.ts")
+        first = threading.Thread(target=run, args=("first",), name="first")
+        first.start()
+        self.assertTrue(slug_seen.wait(30))
+        second = threading.Thread(target=run, args=("second",), name="second")
+        second.start()
+        second.join(30)
+        other_done.set()
+        first.join(30)
+        names = lambda who: [p for w, p in asked if w == who]
+        self.assertIn("src/util/index.ts", names("first"))
+        self.assertEqual(names("second").count("src/util/index.ts"), 1, "the second answer asked the guard itself and did not borrow the first one's memo")
+        self.assertEqual(me["first"]["status"], "ok", me)
+        self.assertEqual(me["second"]["status"], "ok", me)
+
     def test_s1_a_guard_error_is_a_refusal_and_is_not_cached_as_an_allow(self):
         project = self.project().resolve()
         calls = []

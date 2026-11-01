@@ -9,7 +9,8 @@ Three sources, each used for what it is good at:
   - `deno info --json`: the forward module graph of one entry, capped at 30 s. Used when the index cannot be built, or when asked for.
     Its graph is cached on disk (`nav_api-info-<key>.json`), keyed by the content hash of every file and config the walk reached,
     the entry, the Deno version, the flags and the format. A hit is filtered as a fresh result is, listed, screened and proved last
-    (a changed file gives `stale_index`); with no sandbox there is no hit; only an `ok` graph is stored. A planted entry can name
+    (a changed file gives `stale_index`); with no sandbox there is no hit; an entry (this one and the `deno doc` one) is written only as the very last step, after the answer is `ok`, screened
+    and proved (`_final`); a refusal, gap, stale answer, error or exception never writes. A planted entry can name
     only files this walk proved and the guard allows. The cache folder is judged as for `deno doc`; a refused one means no cache.
 
 Gaps. An index answer (importers, imports from the index) is never `ok` when the index could not get part of its input. The split:
@@ -750,8 +751,8 @@ class NavApi:
             answer, blocked, proof = self._index_answer(build)
             if not blocked or source == "index":
                 return answer, proof
-        answer, reach = self._forward_graph(target)
-        return answer, self._reach_proof(reach)
+        answer, reach, store = self._forward_graph(target)
+        return answer, self._reach_proof(reach), store
 
     # --- deno
 
@@ -1081,19 +1082,26 @@ class NavApi:
             return _answer("stale_index", detail="a file changed while Deno was reading it"), None, None
         return None, out, mirror
 
-    def _final(self, answer, proof):
+    def _final(self, answer, proof, store=None):
         """What every public operation returns, from the index and from Deno alike: `answer` screened (`_out`), and then, when it
         rests on a proof (`proof()`: None when what it rests on still holds, else the answer to give instead), that proof as the
         very last step: the screen, the filtering and the paging are all done before it, so nothing (the guard included) runs
         between the check and the return. A tree that moved gives that answer (`stale_index`, or the index's gaps), which carries
-        nothing from `answer`."""
+        nothing from `answer`.
+        `store` (None, or a function that writes the answer's cache entry) is the only thing that writes a cache from an answer, and
+        it runs only after all of that: the answer is `ok` before and after the screen and the proof held. A refusal, a gap, a
+        stale tree, an error, a screen that failed or an exception on the way never reach it. A store that fails changes nothing:
+        the entry is keyed by the content the answer was made from, and the answer was already proven."""
         out = self._out(answer)
-        if proof is None:
-            return out
-        failed = proof()
-        if failed is None:
-            return out
-        return self._out(failed)
+        failed = proof() if proof is not None else None
+        if failed is not None:
+            return self._out(failed)
+        if store is not None and answer.get("status") == "ok" and out.get("status") == "ok":
+            try:
+                store()
+            except Exception:
+                pass
+        return out
 
     @staticmethod
     def _reach_proof(reach):
@@ -1120,11 +1128,12 @@ class NavApi:
         Only files inside the project are listed; packages and URLs are counted in `external`. When the graph is longer than
         MAX_MODULES, `target` and its direct imports are kept and the rest is cut in path order."""
         with self._answering():
-            answer, reach = self._forward_graph(target)
-            return self._final(answer, self._reach_proof(reach))
+            answer, reach, store = self._forward_graph(target)
+            return self._final(answer, self._reach_proof(reach), store)
 
     def _forward_graph(self, target):
-        """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one.
+        """(answer, reach, store); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one, and
+        runs `store` (None, or the write of the entry) only once the answer is ok and proven; this method writes nothing.
         The raw graph (`INFO_FORMAT`: each reached project file and the project files it imports, as proven names, and the count of
         packages and URLs) is cached on disk by the content of everything the walk reached (`_info_key`). A hit is not an answer:
         it goes through the same filter as a fresh result (`_info_local`: only names this walk proved, deps the guard allows), and
@@ -1132,18 +1141,18 @@ class NavApi:
         earlier either."""
         rel, error = self._target(target)
         if error:
-            return error, None
+            return error, None, None
         if not graph.judged_is_file(self.boundary, rel, self._permits):
-            return _answer("not_found", detail="no such file in the project"), None
+            return _answer("not_found", detail="no such file in the project"), None, None
         reach, refusal = self._prove(rel)
         if refusal:
-            return refusal, None
+            return refusal, None, None
         names = reach.names
-        key = None
+        key, store = None, None
         if self._deno_exe() is not None:
             reason = self._check_sandbox()
             if reason:  # not even a cached answer
-                return self._sandbox_refusal(reason), None
+                return self._sandbox_refusal(reason), None, None
             key = self._info_key(rel, reach)
         stored = self._read_cache("info", key, dict) if key else None
         found = self._info_local(stored, names) if stored is not None else None
@@ -1152,14 +1161,14 @@ class NavApi:
         else:
             refusal, out, mirror = self._run_mirrored([*INFO_FLAGS], reach)
             if refusal:
-                return refusal, None
+                return refusal, None, None
             try:
                 data = json.loads(out)
                 modules = data["modules"]
             except (ValueError, KeyError, TypeError):
-                return _answer("error", detail="deno info gave output that is not a module graph"), None
+                return _answer("error", detail="deno info gave output that is not a module graph"), None, None
             if not isinstance(modules, list):
-                return _answer("error", detail="deno info gave output that is not a module graph"), None
+                return _answer("error", detail="deno info gave output that is not a module graph"), None, None
             local, external = {}, 0
             for module in modules:
                 if not isinstance(module, dict):
@@ -1172,7 +1181,7 @@ class NavApi:
                 if inside is None or inside not in names:
                     if module.get("error") and inside is not None:
                         continue  # a module Deno could not load (not in the mirror): nothing was read, nothing to list
-                    return _answer("refused", reason="unproven_module"), None  # Deno loaded a file the walk did not show allowed
+                    return _answer("refused", reason="unproven_module"), None, None  # Deno loaded a file the walk did not show allowed
                 deps = set()
                 for dep in module.get("dependencies") or []:
                     if not isinstance(dep, dict):
@@ -1183,9 +1192,10 @@ class NavApi:
                         if dest and dest in names and self._allowed(dest) is not None:
                             deps.add(dest)
                 local[inside] = sorted(deps)
-            if key:  # only a graph Deno gave and the walk accepted whole: nothing refused, failed or cut is ever stored
-                self._write_cache("info", key, {"format": INFO_FORMAT, "external": external,
-                                                "modules": [{"path": path, "imports": deps} for path, deps in sorted(local.items())]})
+            if key:  # only a graph Deno gave and the walk accepted whole; `_final` stores it once the answer is ok and proven
+                value = {"format": INFO_FORMAT, "external": external,
+                         "modules": [{"path": path, "imports": deps} for path, deps in sorted(local.items())]}
+                store = lambda: self._write_cache("info", key, value)
         keep = [path for path in [rel, *local.get(rel, [])] if path in local]
         chosen = set(keep[:MAX_MODULES])
         for path in sorted(local):
@@ -1194,7 +1204,7 @@ class NavApi:
             chosen.add(path)
         listed = [{"path": self._show(path), "imports": [self._show(dep) for dep in local[path]]} for path in sorted(chosen)]
         return _answer("ok", target=self._show(rel), source="deno_info", modules=listed, truncated=len(local) > len(listed), total=len(local),
-                       external=external), reach
+                       external=external), reach, store
 
     def _info_key(self, rel, reach):
         """Cache key for `deno info` of one entry: the content of every file and config the walk reached (`Reach.digest`), the entry,
@@ -1222,43 +1232,45 @@ class NavApi:
         """The exported symbols of `path` from `deno doc --json`: name, kind, definition path and line, the definition's source
         line as `signature`, and the first doc-comment lines. A re-export is listed at the file that defines it."""
         with self._answering():
-            answer, reach = self._symbols(path, limit)
-            return self._final(answer, self._reach_proof(reach))
+            answer, reach, store = self._symbols(path, limit)
+            return self._final(answer, self._reach_proof(reach), store)
 
     def _symbols(self, path, limit):
-        """(answer, reach); the public wrapper makes the final check (`_final`), for a cached answer as for a fresh one."""
+        """(answer, reach, store); the public wrapper makes the final check (`_final`) and runs `store` (the write of the entry, or
+        None) only once the answer is ok and proven; this method writes nothing."""
         rel, error = self._target(path)
         if error:
-            return error, None
+            return error, None, None
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-            return _answer("bad_argument", detail="limit must be a whole number from 1 to 100"), None
+            return _answer("bad_argument", detail="limit must be a whole number from 1 to 100"), None, None
         if not graph.judged_is_file(self.boundary, rel, self._permits):
-            return _answer("not_found", detail="no such file in the project"), None
+            return _answer("not_found", detail="no such file in the project"), None, None
         if self._deno_exe() is None:
-            return _answer("unavailable", detail="deno was not found on PATH"), None
+            return _answer("unavailable", detail="deno was not found on PATH"), None, None
         reach, refusal = self._prove(rel)
         if refusal:
-            return refusal, None
+            return refusal, None, None
         reason = self._check_sandbox()
         if reason:  # not even a cached answer: with no sandbox Deno is not run, so nothing is answered from what it said
-            return self._sandbox_refusal(reason), None
+            return self._sandbox_refusal(reason), None, None
         names = reach.names
         key = self._doc_key(rel, reach)
         cached = self._read_cache("doc", key)
+        store = None
         if cached is not None:
             found, hit = cached, True
         else:
             refusal, out, mirror = self._run_mirrored(["doc", "--json", "--no-remote", "--no-lock"], reach)
             if refusal:
-                return refusal, None
+                return refusal, None, None
             found = self._parse_doc(out, names, mirror, reach)
             if found is None:
-                return _answer("error", detail="deno doc gave output that is not a symbol list"), None
-            self._write_cache("doc", key, found)
+                return _answer("error", detail="deno doc gave output that is not a symbol list"), None, None
+            store = lambda: self._write_cache("doc", key, found)
             hit = False
         shown = [item for item in (self._present(entry, names) for entry in found) if item]
         return _answer("ok", path=self._show(rel), source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
-                       symbols=shown[:limit]), reach
+                       symbols=shown[:limit]), reach, store
 
     def _present(self, entry, names):
         """One cached or fresh symbol as it may leave the process: None when its path is refused now, or is not one of the files

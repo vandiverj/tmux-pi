@@ -5769,5 +5769,86 @@ class InfoCacheCase(Tree):
         self.assertEqual(answer, miss)
         self.assertEqual(len(self.deno_calls("info")), 1)
 
+    # --- F1 (review): an entry is written only once the answer is ok, screened and proven
+
+    def doc_nav(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(doc=ReviewFixesCase.doc_payload(MIRROR, "src/main.ts", "main", "d")), **kw)
+
+    @staticmethod
+    def doc_entries(project):
+        folder = project_cache(project).parent
+        return sorted(folder.glob("nav_api-doc-*.json")) if folder.exists() else []
+
+    def test_s3_f1_a_screen_that_fails_leaves_no_entry(self):
+        def broken(text):
+            if "src/config.ts" in text:
+                raise RuntimeError("screen down")
+            return text
+        project = self.project("info")
+        answer = self.nav_for(project, guard=broken).forward_graph("src/main.ts")
+        self.assertEqual(answer["status"], "error", answer)
+        self.assertEqual(self.entries(project), [])
+        project = self.project("doc")
+        answer = self.doc_nav(project, guard=lambda text: (_ for _ in ()).throw(RuntimeError("down")) if text == "main" else text) \
+            .symbols("src/main.ts")
+        self.assertEqual(answer["status"], "error", answer)
+        self.assertEqual(self.doc_entries(project), [])
+        self.filled("control")
+
+    def test_s3_f1_a_change_during_the_screen_is_stale_and_leaves_no_entry(self):
+        for call in ("forward_graph", "symbols"):
+            project = self.project(call)
+            moved = []
+
+            def guard(text, project=project, moved=moved):
+                if not moved:
+                    moved.append(1)
+                    write(project / "src" / "config.ts", "export const moved = 1;\n")
+                return text
+            nav = self.nav_for(project, guard=guard) if call == "forward_graph" else self.doc_nav(project, guard=guard)
+            answer = getattr(nav, call)("src/main.ts")
+            self.assertEqual(answer["status"], "stale_index", (call, answer))
+            self.assertEqual(self.entries(project) + self.doc_entries(project), [], call)
+
+    def test_s3_f1_an_exception_before_the_return_leaves_no_entry(self):
+        for call in ("forward_graph", "symbols"):
+            project = self.project(call)
+            nav = self.nav_for(project) if call == "forward_graph" else self.doc_nav(project)
+            with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(lambda reach: (_ for _ in ()).throw(OSError("boom")))):
+                with self.assertRaises(OSError):
+                    getattr(nav, call)("src/main.ts")
+            self.assertEqual(self.entries(project) + self.doc_entries(project), [], call)
+
+    def test_s3_f1_the_write_is_the_last_step_after_the_screen_and_the_proof(self):
+        for call, kind in (("forward_graph", "info"), ("symbols", "doc")):
+            project = self.project(call)
+            events = []
+            nav = self.nav_for(project, guard=lambda t: (events.append("screen"), t)[1]) if call == "forward_graph" \
+                else self.doc_nav(project, guard=lambda t: (events.append("screen"), t)[1])
+            real_write, real_proof = nav._write_cache, nav_api.NavApi._reach_proof
+
+            def proof(reach, events=events):
+                check = real_proof(reach)
+                return lambda: (events.append("proof"), check())[1]
+            nav._write_cache = lambda *a, events=events, real_write=real_write: (events.append("write"), real_write(*a))[1]
+            with mock.patch.object(nav_api.NavApi, "_reach_proof", staticmethod(proof)):
+                self.assertEqual(getattr(nav, call)("src/main.ts")["status"], "ok")
+            self.assertEqual(events[-2:], ["proof", "write"], (call, events))
+            self.assertEqual(events.count("write"), 1, call)
+            self.assertEqual(len(self.entries(project) + self.doc_entries(project)), 1, kind)
+
+    def test_s3_f1_a_refusal_a_gap_or_no_deno_graph_stores_nothing_on_either_route(self):
+        project = self.project("sandbox")
+        with mock.patch.object(nav_api, "SANDBOX_EXEC", str(self.dir / "absent")):
+            self.assertEqual(self.nav_for(project).forward_graph("src/main.ts")["status"], "refused")
+            self.assertEqual(self.doc_nav(project).symbols("src/main.ts")["status"], "refused")
+        self.assertEqual(self.entries(project) + self.doc_entries(project), [])
+        project = self.project("refused_name")
+        answer = self.nav_for(project, check_path=lambda root, path: (_ for _ in ()).throw(nav_api.Refused("t")) if path == "src/main.ts" else path) \
+            .forward_graph("src/main.ts")
+        self.assertNotEqual(answer["status"], "ok")
+        self.assertEqual(self.entries(project), [])
+
+
 if __name__ == "__main__":
     unittest.main()

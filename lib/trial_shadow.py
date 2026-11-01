@@ -22,15 +22,29 @@ its tree, so nothing there proves anything). Every destructive act (a signal, a 
 directory) first matches an identity this attempt recorded itself; the full rule is on `Owner`. In short: `prepare` records the
 identities of the run directory, the state dir and the tmux session before any worker exists; the runner holds the directories open
 and writes run.json through them; a session is killed by its recorded id, and only while that id still has the recorded name and
-state dir; `tp-agent stop` runs only for a pane the run recorded in its own session, and a process.json in the task dir is matched against
-the process the run recorded for that pane (otherwise `stop` is not run and the session kill ends the pane); a prepare that fails after it
-made the session ends that session and removes the run dir it made; the worktree is an attempt-unique place
+state dir; every tp-* command the run starts goes through one gate (`trial_session.start_tp` and its table TP, called by
+`Owner.tp`; `Run.agent` and `Run.command` are the run's way to it): one the table does not name is refused and never started, and
+one that can end anything (tp-agent end-author, stop and review, tp-spawn) runs only after `Owner.check_stop` passed: the session
+the name resolves to is the run's own with @tp_viewing unset, the meta.json pane is one the run recorded in its own session, a
+process.json matches the process the run recorded for that pane, and for `stop` no queue entry is there (otherwise nothing is run
+and the session kill ends the pane); a prepare that fails ends only the session it made and removes only the run dir it made, each
+by the identity it recorded when it made it; the worktree is an attempt-unique place
 `<run dir>/wt-<id>`, proven by the (device, inode) of the tree and of its git admin dir, both held open. Project, state dir, session
 and task id come from where the run dir is, never from run.json. Whatever does not match is left as it is. The attempt clock (§8) is
 checked before the worktree and before tp-spawn.
 
-KNOWN LIMIT (not defended): a stop of a runner that has died reads those identities from the owner file
-`<project>/.tmux-pi/trial-owner/<run>.json`, which the same user, so the worker, can rewrite (see `Owner`).
+Nothing the worker writes can hold the runner or change what it does: the runner's settings are run.json as it was when the
+runner began (before any worker), plus what it noted itself, never the file read back (`Run.note`); a file the worker can write is
+read only as a plain file, never waiting on a FIFO (`trial_session.read_plain`); a file is replaced through a temp file made new
+(`write_at`), never written through what is at the temp name; run.json's lock is waited for at most LOCK_WAIT_S; stopping tasks
+before the session kill has one budget, STOP_TASKS_S, however many task dirs there are; a base_commit from run.json reaches git only
+as a commit id.
+
+KNOWN LIMITS (not defended): a stop of a runner that has died reads those identities from the owner file
+`<project>/.tmux-pi/trial-owner/<run>.json`, which the same user, so the worker, can rewrite. And a check is not atomic with the
+command after it: between `check_stop` and the tp-agent command that reads them, the worker can rewrite meta.json and process.json
+(or the session's options). See `Owner`. The record builder (lib/trial_record.py, L2) reads the task's files its own way, before
+the cleanup: a FIFO among them would hold the runner there with the session not yet ended.
 
 The record comes from lib/trial_record.py (lane L2). Until it exists, lib/trial_record_stub.py (same call shape) is used.
 `gate_runs` is L2's field and is never read here.
@@ -69,6 +83,8 @@ SETTLED = ("settled", "completed")
 OTHER_LANES = "## Paths other lanes own"
 GIT_TIMEOUT = 120
 CMD_TIMEOUT = 300
+LOCK_WAIT_S = 30  # the longest the runner waits for run.json's lock (`_take_lock`)
+STOP_TASKS_S = CMD_TIMEOUT  # the longest the cleanup spends stopping tasks through tp-agent before it ends the session
 # A trial-only line in the packet (design §12 question 2: the shadow skips tests that need the shared database, because two
 # runs on one database would collide). Everything else in the packet is what the normal coder got.
 TRIAL_NOTE = ("This is a trial run in a throwaway worktree. Do not run tests that need the shared database or any other shared "
@@ -114,28 +130,28 @@ def run_file(rdir):
 
 def read_run(rdir):
     try:
-        value = json.loads(run_file(rdir).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise ShadowError("cannot read {}: {}".format(run_file(rdir), error))
+        value = json.loads(trial_session.read_plain(run_file(rdir)).decode("utf-8"))
+    except (OSError, ValueError, RecursionError) as error:  # the worker can write run.json (a FIFO, nesting too deep)
+        raise ShadowError("cannot read {}: {}".format(run_file(rdir), error.__class__.__name__ if isinstance(error, RecursionError) else error))
     if not isinstance(value, dict):
         raise ShadowError("{} is not an object".format(run_file(rdir)))
     return value
 
 
 def update_run(rdir, **fields):
-    """Merge `fields` into run.json under a lock, atomically (a reader never sees half a file). Returns the new content."""
-    path = run_file(rdir)
-    with open(str(Path(rdir) / ".run.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            current = {}
-        current.update(fields)
-        tmp = path.with_name(path.name + ".tmp.{}".format(os.getpid()))
-        tmp.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(str(tmp), str(path))
-    return current
+    """Merge `fields` into run.json under a lock, atomically (a reader never sees half a file). Returns the new content. The same
+    as `update_run_at` (`tp-trial shadow` notes the runner's pid with it once the worker may be going): the lock is waited for at
+    most LOCK_WAIT_S and nothing is read or written through a link."""
+    try:
+        fd = os.open(str(rdir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ShadowError("cannot open the run directory {}: {}".format(rdir, error))
+    try:
+        return update_run_at(fd, **fields)
+    except OSError as error:
+        raise ShadowError("cannot update {}: {}".format(run_file(rdir), error))
+    finally:
+        os.close(fd)
 
 
 def _open_in(fd, name, flags, mode=0o644):
@@ -146,29 +162,50 @@ def _open_in(fd, name, flags, mode=0o644):
 def read_run_at(fd):
     """run.json of the run directory held open as `fd`."""
     try:
-        with os.fdopen(_open_in(fd, "run.json", os.O_RDONLY), encoding="utf-8") as handle:
-            value = json.load(handle)
-    except (OSError, ValueError) as error:
-        raise ShadowError("cannot read run.json: {}".format(error))
+        value = json.loads(trial_session.read_plain("run.json", dir_fd=fd).decode("utf-8"))
+    except (OSError, ValueError, RecursionError) as error:  # the worker can write run.json: nesting too deep is unreadable too
+        raise ShadowError("cannot read run.json: {}".format(error.__class__.__name__ if isinstance(error, RecursionError) else error))
     if not isinstance(value, dict):
         raise ShadowError("run.json is not an object")
     return value
 
 
 def write_at(fd, name, text):
-    """Write `text` as `name` in the directory held open as `fd`, atomically; nothing is written through a link."""
+    """Write `text` as `name` in the directory held open as `fd` (`name` a path and `fd` None: in its directory), atomically. The
+    directory is the worker's to write and the temp name has the runner's pid, which run.json shows: whatever is at the temp name
+    is removed and the temp file is made new (O_EXCL), so nothing is written through a link the worker put there and no write
+    waits on a FIFO."""
+    name = str(name)
     tmp = "{}.tmp.{}".format(name, os.getpid())
-    with os.fdopen(_open_in(fd, tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "w", encoding="utf-8") as handle:
+    try:
+        os.unlink(tmp, dir_fd=fd)
+    except FileNotFoundError:
+        pass
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd), "w", encoding="utf-8") as handle:
         handle.write(text)
     os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+
+
+def _take_lock(lock, clock=time.monotonic, pause=time.sleep):
+    """Take the run.json lock, waiting at most LOCK_WAIT_S. The lock file is in the run dir, so the worker can hold it: an
+    unbounded wait would stop the runner, and with it the attempt clock and the cleanup. Raises ShadowError when it is not had."""
+    deadline = clock() + LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if clock() >= deadline:
+                raise ShadowError("run.json is locked by another process (its .run.lock held for more than {} s); it was not changed".format(LOCK_WAIT_S))
+            pause(0.05)
 
 
 def update_run_at(fd, **fields):
     """`update_run` for the run directory held open as `fd`: the file changed is the one in that directory, whatever the path to it
     has become."""
-    lock = _open_in(fd, ".run.lock", os.O_RDWR | os.O_CREAT)
+    lock = _open_in(fd, ".run.lock", os.O_RDWR | os.O_CREAT | os.O_NONBLOCK)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _take_lock(lock)
         try:
             current = read_run_at(fd)
         except ShadowError:
@@ -223,8 +260,8 @@ def find_task(state, task_id):
 
 def _json(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        value = json.loads(trial_session.read_plain(path).decode("utf-8"))
+    except (OSError, ValueError, RecursionError):  # the worker can write the task's files: a FIFO, nesting too deep
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -366,10 +403,16 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
     ok, reason = trial_session.guard(main_state, project, trial, main_max, trial["model"], env)
     if not ok:
         raise ShadowError("not started: " + reason)
-    session_name = trial_session.session_name(run)
-    session_before = trial_session.has_session(session_name, trial_session.env_for(trial_session.state_dir(project, run), session_name, env))  # one already there is not this prepare's to end
+    rdir.parent.mkdir(parents=True, exist_ok=True)
     try:
-        name, state = trial_session.ensure(project, run, env)
+        os.mkdir(str(rdir))  # this prepare's own run directory: one made by anyone else meanwhile (a racing prepare) is refused here
+    except FileExistsError:
+        raise ShadowError("trial run '{}' already exists ({}); choose another --run".format(run, rdir))
+    made_st = os.lstat(str(rdir))
+    made_dir = (made_st.st_dev, made_st.st_ino)  # what undo_prepare may remove: this directory, and nothing put at its name later
+    made = []  # (id, created) of a session this prepare itself created; undo_prepare ends no other
+    try:
+        name, state = trial_session.ensure(project, run, env, made=made)
         worktree = rdir / ("wt-" + secrets.token_hex(6))  # this attempt's own place: never the same name twice, so a path is never reused
         try:
             owner_file(project, run).unlink()  # a record left by an earlier run of the same name is not this attempt's
@@ -388,43 +431,54 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
                           worktree=str(worktree), task_id="trial-" + run, mode="shadow", phase="queued", outcome=None,
                           created=now(), pid=None)
     except BaseException:
-        undo_prepare(project, run, rdir, session_before, env)
+        undo_prepare(project, run, rdir, made_dir, made, env)
         raise
 
 
-def undo_prepare(project, run, rdir, session_before, env=None):
-    """A prepare that failed after it began creating things: end the session it made (never one that was already there, and only by
-    the id it has now, while it still names this run's state dir), remove the run directory it made (`prepare` refused a run directory
-    that existed) and the owner record. No worker exists yet. Each step is best effort: the failure being reported is the original."""
+def undo_prepare(project, run, rdir, made_dir, made, env=None):
+    """A prepare that failed after it made its run directory. It undoes only what this prepare itself created, each proven by the
+    identity it recorded when it made it, so nothing of a racing prepare or start of the same run is touched:
+
+      the session    each (id, created) in `made` (what tmux printed when this prepare's `ensure` created it), by that id;
+      the run dir    only while the path is still a directory (not a link) with the (device, inode) `made_dir`;
+      the owner file only when it records `made_dir` as its run dir (`rdir_id`), and this process's own temporary file.
+
+    No worker exists yet. Each step is best effort: the failure being reported is the original one."""
     rdir = Path(rdir)
-    if not session_before:
+    session_env = trial_session.env_for(rdir / "state", trial_session.session_name(run), env)
+    for sid, created in made:
         try:
-            env = trial_session.env_for(rdir / "state", trial_session.session_name(run), env)
-            found = trial_session.named(trial_session.session_name(run), env)
-            if found is not None and found[3] and Path(found[3]).resolve() == (rdir / "state").resolve():
-                trial_session.end_exact(found[0], found[1], env)
+            trial_session.end_exact(sid, created, session_env)
         except (trial_session.SessionError, OSError, subprocess.SubprocessError):
             pass
     try:
-        if rdir.is_symlink():
-            rdir.unlink()
-        elif rdir.exists():
+        st = os.lstat(str(rdir))
+        if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == tuple(made_dir):
             shutil.rmtree(str(rdir))
     except OSError:
         pass
-    for leftover in [owner_file(project, run)] + sorted(owner_file(project, run).parent.glob(owner_file(project, run).name + ".tmp.*")):
-        try:
-            leftover.unlink()
-        except OSError:
-            pass
+    record = owner_file(project, run)
+    try:
+        ident = json.loads(trial_session.read_plain(record).decode("utf-8")).get("rdir_id") or {}
+        if (ident.get("dev"), ident.get("ino")) == tuple(made_dir):
+            record.unlink()
+    except (OSError, ValueError, AttributeError, RecursionError):
+        pass
+    try:
+        record.with_name(record.name + ".tmp.{}".format(os.getpid())).unlink()
+    except OSError:
+        pass
 
 
 def launch(rdir, project, env=None):
     """Start the run detached (its own session, output to run.log), so the caller returns at once. Returns the pid."""
     log = open(str(Path(rdir) / "run.log"), "ab")
-    child = subprocess.Popen([sys.executable, str(ROOT / "bin" / "tp-trial"), "run", "--run-dir", str(rdir)], stdin=subprocess.DEVNULL,
-                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(rdir), env=env)
-    log.close()
+    try:
+        child = trial_session.start_tp([sys.executable, str(ROOT / "bin" / "tp-trial"), "run", "--run-dir", str(rdir)], env, cwd=str(rdir), detach=log)
+    except trial_session.SessionError as problem:
+        raise ShadowError(str(problem))
+    finally:
+        log.close()
     return child.pid
 
 
@@ -468,25 +522,29 @@ class Run:
         return max(0.0, (datetime.datetime.now(datetime.timezone.utc) - made).total_seconds())
 
     def note(self, **fields):
-        self.info = self.owner.update(**fields)
+        """Write `fields` into run.json. The runner's own view (`info`) is what it read at the start, before any worker existed, and
+        what it noted since: the file is never read back into it, since the worker can write it (its attempt clock, its poll, its
+        review limit, its model would be the worker's to choose)."""
+        self.info.update(fields)
+        self.owner.update(**fields)
+
+    def note_end(self, **fields):
+        """`note` at the end of a run, best effort: False when run.json could not be read or written (the worker can break it)."""
+        try:
+            self.note(**fields)
+        except (ShadowError, OSError):
+            return False
+        return True
 
     def command(self, args, timeout=CMD_TIMEOUT):
-        self.owner.check_state()  # every command here runs against the state dir: only against the run's own
-        try:
-            return subprocess.run([str(a) for a in args], text=True, capture_output=True, timeout=timeout, env=self.env, cwd=str(self.rdir))
-        except (subprocess.TimeoutExpired, OSError) as error:
-            raise ShadowError("{} could not run ({})".format(Path(str(args[0])).name, error.__class__.__name__))
+        """Run a tp-* command of the run, only through the gate (`Owner.tp`). A command that can end anything is checked first. One
+        the table does not name is refused (ShadowError) and never started."""
+        return self.owner.tp(args, self.env, timeout)
 
     def agent(self, *args, timeout=CMD_TIMEOUT):
+        """`tp-agent <args>`, the one way the run starts tp-agent (see `command`). inspect and list run as they are. end-author, stop
+        and review run only after `Owner.check_stop` passed for the task. Anything else is refused."""
         return self.command([ROOT / "bin" / "tp-agent", *args], timeout)
-
-    def end_task(self, verb, task_id):
-        """`tp-agent <verb> <task>` for a verb that ends the task's process (stop, end-author): only when the pane the task's meta.json
-        names is a pane the run recorded in its own session, and, for `stop`, process.json is absent or names the process the run recorded
-        (`Owner.check_stop`; both files are the worker's to edit)."""
-        self.owner.check_state()
-        self.owner.check_stop(self.task_path(task_id), self.env, verb)
-        return self.agent(verb, task_id)
 
     def task_path(self, task_id=None):
         return self.state / "tasks" / (task_id or self.task_id)
@@ -594,7 +652,7 @@ class Run:
 
     def end_worker(self, outcome):
         """End the worker's process: `end-author` for a task that settled (its pane and scrollback are kept), `stop` for any other."""
-        run = self.end_task("end-author" if outcome == "settled" else "stop", self.task_id)
+        run = self.agent("end-author" if outcome == "settled" else "stop", self.task_id)
         if run.returncode:
             raise ShadowError("the worker could not be ended: {}".format(run.stderr.strip() or "tp-agent exited {}".format(run.returncode)))
 
@@ -630,7 +688,11 @@ class Run:
 
     def review(self):
         self.note(phase="review")
-        run = self.agent("review", "--force", self.task_id)
+        try:  # tp-review ends the author (tp-agent end-author) before it spawns the reviewer, so it is checked like any other end
+            run = self.agent("review", "--force", self.task_id)
+        except ShadowError as problem:
+            self.note(review_error=str(problem)[-600:])
+            return None
         if run.returncode:
             self.note(review_error=(run.stderr.strip() or "tp-agent review exited {}".format(run.returncode))[-600:])
             return None
@@ -649,7 +711,7 @@ class Run:
         self.note(review_wait=result)
         if result == "timeout":
             try:
-                self.end_task("stop", self.review_id)
+                self.agent("stop", self.review_id)
             except ShadowError as problem:
                 self.note(review_error="the reviewer was not stopped: {}".format(problem))
         return self.review_id
@@ -740,31 +802,33 @@ class Run:
                 self.outcome = self.outcome or "error"
                 error = error or str(problem)
         except Interrupted:
-            self.note(interrupted=True)
+            self.note_end(interrupted=True)
         except Exception as problem:  # anything else is a failed run with a reason, never a traceback that skips the cleanup
             self.outcome = self.outcome or "error"
             error = error or "{}: {}".format(problem.__class__.__name__, problem)
         finally:
+            # Every note from here is best effort (`note_end`): run.json is the worker's to break, and a note that cannot be written
+            # never keeps the record or the cleanup (the session kill every refusal relies on) from running.
             try:
                 if error:
-                    self.note(error=error)
+                    self.note_end(error=error)
                 self.outcome = self.outcome or "error"
                 try:
                     self.write_record()
                 except Exception as problem:
-                    self.note(record_error="{}: {}".format(problem.__class__.__name__, problem))
+                    self.note_end(record_error="{}: {}".format(problem.__class__.__name__, problem))
+                self.note_end(phase="cleanup")
                 try:
-                    self.note(phase="cleanup")
                     leftovers = self.cleanup()
                 except Exception as problem:
                     leftovers = ["cleanup: {}".format(problem)]
-                self.note(cleanup_errors=leftovers)
+                self.note_end(cleanup_errors=leftovers)
             finally:
-                self.note(outcome=self.outcome, phase="done", finished=now())
+                self.note_end(outcome=self.outcome, phase="done", finished=now())
         try:
-            record_normal(self.rdir, self.env, self.records, self.owner)
+            record_normal(self.rdir, self.env, self.records, self.owner, info=self.info)
         except Exception as problem:  # the normal arm's record is best effort: a later `tp-trial normal` redoes it
-            self.note(normal_record_error="{}: {}".format(problem.__class__.__name__, problem))
+            self.note_end(normal_record_error="{}: {}".format(problem.__class__.__name__, problem))
         try:
             return self.owner.read()
         finally:
@@ -787,9 +851,11 @@ def execute(rdir, env=None, sleep=time.sleep, clock=time.monotonic, record_modul
 
 def _diff_counts(workdir, base):
     """(files, lines) of the working tree against `base` in `workdir`, or (None, None) when that cannot be read."""
-    if not workdir or not os.path.isdir(workdir):
+    if not isinstance(workdir, str) or not workdir or not os.path.isdir(workdir):
         return None, None
-    run = git(workdir, "diff", "--numstat", base, check=False)
+    if not isinstance(base, str) or not COMMIT.fullmatch(base):  # from run.json, the worker's to write: never an option to git
+        return None, None
+    run = git(workdir, "diff", "--numstat", base, "--", check=False)
     if run.returncode:
         return None, None
     rows = run.stdout.splitlines()
@@ -797,21 +863,22 @@ def _diff_counts(workdir, base):
     return len(rows), lines
 
 
-def record_normal(rdir, env=None, record_module=None, owner=None):
+def record_normal(rdir, env=None, record_module=None, owner=None, info=None):
     """Write the record of the normal arm of the pair (the source task, built from Main's task dir, read only) with the same
     builder. Safe to repeat: L2's report keeps the last record of a pair and arm, so a later call, once the normal task's review
-    has landed, supersedes an earlier one. Returns the record or None when the source task is gone."""
+    has landed, supersedes an earlier one. Returns the record or None when the source task is gone. `info` is the runner's own view
+    of the run (`Run.info`); without it run.json is read, which the worker can have written."""
     mine = owner is None
     owner = owner or Owner(rdir)
     try:
-        return _record_normal(owner, record_module)
+        return _record_normal(owner, record_module, info)
     finally:
         if mine:
             owner.close()
 
 
-def _record_normal(owner, record_module):
-    info = owner.read()
+def _record_normal(owner, record_module, info=None):
+    info = info if info is not None else owner.read()
     project, run = owner.project, owner.run
     records = record_module or load_record_module()
     main_state = Path(info["main_state"])
@@ -849,7 +916,7 @@ def locate(rdir):
 def _gitfile_target(path):
     """Where the `.git` file of the worktree at `path` points (the admin directory), as a real path, or None."""
     try:
-        text = (Path(path) / ".git").read_text(encoding="utf-8").strip()
+        text = trial_session.read_plain(Path(path) / ".git").decode("utf-8").strip()  # the worker's tree: never a wait on a FIFO
     except (OSError, UnicodeDecodeError):
         return None
     return os.path.realpath(text[len("gitdir:"):].strip()) if text.startswith("gitdir:") else None
@@ -891,8 +958,12 @@ class Owner:
                            (`check_pane`), and only when process.json is absent or names exactly the process recorded for one of
                            the run's panes, with a pid that still has the recorded start time (`check_process_record`). Anything
                            else is not acted on: the task is reported and left running until the session kill takes its pane.
-                           (`end-author` reads meta.json only.) A general fix belongs in tp-kill / worker_process (the recorded
-                           follow-up `tp-agent stop pane trust`); this is the trial's own guard until then.
+                           The same check (`check_stop`) runs before end-author and before review, which ends the author through
+                           end-author, and every tp-* command goes through the one gate (`tp`, trial_session.TP) so none can skip
+                           it. Before any of them, and before tp-spawn, the session the run's name resolves to (each tp-* command
+                           finds it by TP_SESSION) must be the recorded one with @tp_viewing unset (tp-kill would swap panes through
+                           tp-view). Before stop there must be no queue entry for the task. A general fix belongs in tp-kill /
+                           worker_process (the recorded follow-up `tp-agent stop pane trust`); this is the trial's own guard until then.
       worktree             (device, inode) of the tree root and of its git admin dir, held open by the runner (`create`): while a
                            descriptor is open no other directory can have that identity, so nothing the worker does (remove and
                            re-add a tree at the same path, git reusing the admin name, `git worktree move`, a link, a rewritten
@@ -903,8 +974,9 @@ class Owner:
     `<project>/.tmux-pi/trial-owner/<run>.json`. That file is outside the run dir but is owned by the same user, so a worker can
     rewrite it, naming another registered worktree, session or pane, and a later `tp-trial stop` of the dead run then trusts it. A
     live runner never reads the file back (it holds what it recorded), so the limit applies only to a stop after the runner is gone.
-    Nor can a check be made atomic with the act that follows it: between `check_state` or `check_pane` and the `tp-agent` command
-    that uses the path, the worker could still swap what the path names.
+    Nor can a check be made atomic with the act that follows it. Between `check_stop` (or `check_state`) and the tp-agent command
+    that reads them, the worker can still rewrite `meta.json` and `process.json`, set the session's @tp_viewing or a queue entry,
+    or swap what a path names. The command then follows what it reads at that moment.
 
     `prove` returns ("owned", path) when every worktree check holds now, ("damaged", path) when the directory is the one the run made
     but git's link to it is broken (git no longer knows it, its `.git` was rewritten, it is on a pre-existing branch: the run may
@@ -934,10 +1006,11 @@ class Owner:
     def load(self):
         """Read the owner file (a runner that has it in memory does not read it back)."""
         try:
-            value = json.loads(self.file.read_text(encoding="utf-8"))
+            value = json.loads(trial_session.read_plain(self.file).decode("utf-8"))
         except FileNotFoundError:
             return
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, RecursionError) as error:  # the owner dir is the worker's to write too: a FIFO, nesting too deep
+            error = error.__class__.__name__ if isinstance(error, RecursionError) else error
             self.problem = "the owner record {} cannot be read ({}); nothing is ended or removed".format(self.file, error)
             return
         try:
@@ -965,9 +1038,7 @@ class Owner:
 
     def _write(self):
         self.file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.file.with_name(self.file.name + ".tmp.{}".format(os.getpid()))
-        tmp.write_text(json.dumps(self.record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(str(tmp), str(self.file))
+        write_at(None, self.file, json.dumps(self.record, indent=2, sort_keys=True) + "\n")  # the owner dir is the worker's to write
 
     def hold(self):
         """Open the run directory and its state dir (never through a link) and keep them open. Each must be the directory the owner
@@ -1134,20 +1205,89 @@ class Owner:
 
     @staticmethod
     def meta_pane(task_path):
-        """The pane the task's meta.json names (the worker can edit it), or None."""
+        """The pane the task's meta.json names (the worker can edit it). None when there is no meta.json (no tp-* command acts on
+        such a task) or it names none. Raises ShadowError for a file that is not one plain JSON object: tp-kill reads the pane with
+        jq, which also takes a stream of values or a byte-order mark, so a file Python cannot read is never taken as "no pane"."""
+        task = Path(task_path)
+
+        def refuse(why):
+            return ShadowError("task {}: meta.json {}; nothing was started for the task".format(task.name, why))
         try:
-            meta = json.loads((Path(task_path) / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            meta = {}
-        return meta.get("pane") if isinstance(meta, dict) else None
+            fd = os.open(str(task / "meta.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise refuse("cannot be opened as a plain file ({})".format(error.strerror))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise refuse("is not a plain file")
+            with os.fdopen(os.dup(fd), "rb") as handle:
+                data = handle.read()
+        except OSError:
+            raise refuse("cannot be read")
+        finally:
+            os.close(fd)
+        try:
+            meta = json.loads(data.decode("utf-8"))  # one value only; a byte-order mark is refused (json refuses it in a str)
+        except (UnicodeDecodeError, ValueError, RecursionError):  # nesting too deep to decode is a refusal, not a crash
+            raise refuse("is not one JSON object")
+        if not isinstance(meta, dict):
+            raise refuse("is not one JSON object")
+        return meta.get("pane")
+
+    def tp(self, args, env, timeout=CMD_TIMEOUT):
+        """Run the tp-* command `args` against the run's state dir, through the one gate (`trial_session.start_tp` and its table TP).
+        A command that can end anything (end-author, stop, review, tp-spawn) starts only after `check_stop` passed for its task, right
+        before it starts. One the table does not name is refused and never started. Raises ShadowError for a refusal or for a command
+        that could not run."""
+        self.check_state()  # every command here runs against the state dir: only against the run's own
+
+        def check(name, task):
+            self.check_state()
+            self.check_stop(self.state / "tasks" / (task or ""), env, name.rsplit(" ", 1)[-1])
+        try:
+            return trial_session.start_tp(args, env, cwd=str(self.rdir), timeout=timeout, check=check)
+        except trial_session.SessionError as problem:
+            raise ShadowError(str(problem))
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise ShadowError("{} could not run ({})".format(Path(str(args[0])).name, error.__class__.__name__))
 
     def check_stop(self, task_path, env, verb="stop"):
-        """Everything checked before `tp-agent <verb> <task>` runs. `end-author` follows only the pane in meta.json. `stop` (tp-kill) also
-        reads `process.json` and signals what it names, so that is matched too. Those are the only two files either reads from the task
-        dir to choose a process; the rest (state, result, exit) decide which task it is, never which process."""
+        """Everything checked before a tp-* command that can end anything runs for the task at `task_path`. `verb` is the last word of
+        its name in trial_session.TP: end-author, stop, review or tp-spawn.
+
+        Each of them finds the session by its name (TP_SESSION). So that name must still be the session this run created, and its
+        @tp_viewing must be unset: when it matches the task, tp-kill swaps the task's pane with @tp_viewer_pane through tp-view, and
+        the trial never sets either option. For a task, the pane in meta.json (end-author, stop, and review through end-author) and
+        process.json (stop, through tp-kill) must be the run's own. For `stop` there must also be no queue entry, since tp-agent stop
+        unlinks queue/<task>.json (through a link at queue/ too). The worker can write every one of these."""
+        self.check_session(env)
+        if verb == "tp-spawn":
+            return  # no task yet: tp-spawn ends only the pane and the task dir it made itself
         self.check_pane(task_path, env)
+        self.check_process_record(task_path)
         if verb == "stop":
-            self.check_process_record(task_path)
+            self.check_queue(Path(task_path).name)
+
+    def check_session(self, env):
+        """Raise unless the session now called by the run's name is the one this run created (its recorded id and created time), and
+        its @tp_viewing is unset."""
+        s = self.session_ref()
+        try:
+            found = trial_session.named(self.session, env)
+            viewing = trial_session.session_option(self.session, "@tp_viewing", env) if found is not None else ""
+        except (trial_session.SessionError, OSError, subprocess.SubprocessError) as problem:
+            raise ShadowError("the tmux session {} cannot be read ({}); nothing was started".format(self.session, problem))
+        if found is None or (found[0], found[1]) != (s["id"], str(s["created"])):
+            raise ShadowError("the tmux session named {} is not the one this run created ({}); nothing was started in it".format(self.session, s["id"]))
+        if viewing:
+            raise ShadowError("the tmux session {} has @tp_viewing set ({!r}), and tp-kill would swap panes through tp-view; nothing was started".format(self.session, viewing))
+
+    def check_queue(self, task):
+        """Raise when tp-agent stop would remove a queue entry: `state/queue` is a link, or `queue/<task>.json` is there."""
+        queue = self.state / "queue"
+        if queue.is_symlink() or os.path.lexists(str(queue / (task + ".json"))):
+            raise ShadowError("task {}: the queue holds an entry for it (or state/queue is a link), which tp-agent stop would remove; the task was not stopped".format(task))
 
     def check_process_record(self, task_path):
         """Raise unless `<task>/process.json` is absent or names the process this run recorded for a pane of its own: the same pane, pid
@@ -1168,7 +1308,7 @@ class Owner:
                 raise refuse("is not a plain file")
             with os.fdopen(os.dup(fd), encoding="utf-8") as handle:
                 rec = json.load(handle)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):  # nesting too deep to decode is a refusal, not a crash
             raise refuse("cannot be read")
         finally:
             os.close(fd)
@@ -1244,7 +1384,7 @@ class Owner:
             self.why = "its .git names {} and not the run's git directory".format(_gitfile_target(path))
             return "damaged", path
         try:
-            back = os.path.realpath(os.path.dirname((Path(admin) / "gitdir").read_text(encoding="utf-8").strip()))
+            back = os.path.realpath(os.path.dirname(trial_session.read_plain(Path(admin) / "gitdir").decode("utf-8").strip()))
         except (OSError, UnicodeDecodeError):
             back = None
         listed = registered_worktrees(self.project)
@@ -1307,24 +1447,33 @@ def _cleanup(owner, env):
         owner.check_state()
         tasks = owner.state / "tasks"
         refused = []
+        # the worker can make any number of task dirs: the step has one budget, and the session kill ends what it did not reach
+        deadline = time.monotonic() + STOP_TASKS_S
         for path in sorted(tasks.iterdir()) if tasks.is_dir() else []:
             if not (path / "meta.json").is_file() or (path / "stopped.json").exists() or (path / "exit").exists():
                 continue
             task = path.name
-            status = subprocess.run([str(ROOT / "bin" / "tp-agent"), "inspect", task], text=True, capture_output=True, env=run_env, timeout=CMD_TIMEOUT)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                refused.append("tasks from {} on were not stopped within {} s".format(task, STOP_TASKS_S))
+                break
             try:
-                state_name = json.loads(status.stdout).get("status") if status.returncode == 0 else None
-            except ValueError:
-                state_name = None
-            if state_name not in trial_session.ACTIVE and state_name is not None:
-                continue  # nothing to stop: no pane is followed
-            try:
-                owner.check_stop(path, run_env)  # meta.json and process.json are the worker's: neither decides anything unless the run recorded it
-                owner.check_state()
+                status = owner.tp([ROOT / "bin" / "tp-agent", "inspect", task], run_env, timeout=left)
+                try:
+                    state_name = json.loads(status.stdout).get("status") if status.returncode == 0 else None
+                except (ValueError, AttributeError):
+                    state_name = None
+                if state_name not in trial_session.ACTIVE and state_name is not None:
+                    continue  # nothing to stop: no pane is followed
+                # through the gate: `Owner.check_stop` runs right before it (session, @tp_viewing, meta.json, process.json, the queue)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    refused.append("tasks from {} on were not stopped within {} s".format(task, STOP_TASKS_S))
+                    break
+                stop = owner.tp([ROOT / "bin" / "tp-agent", "stop", task], run_env, timeout=left)
             except ShadowError as problem:
                 refused.append(str(problem))
                 continue
-            stop = subprocess.run([str(ROOT / "bin" / "tp-agent"), "stop", task], text=True, capture_output=True, env=run_env, timeout=CMD_TIMEOUT)
             if stop.returncode:
                 refused.append("task {} could not be stopped: {}".format(task, stop.stderr.strip()))
         if refused:

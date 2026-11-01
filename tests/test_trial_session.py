@@ -21,6 +21,18 @@ LOCAL_MODEL = "slotstream/stub-qwen"
 
 
 class PureTests(unittest.TestCase):
+    def test_the_tp_table_names_each_command_the_trial_starts_and_the_task_it_acts_on(self):
+        agent, spawn, trial = (str(ROOT / "bin" / n) for n in ("tp-agent", "tp-spawn", "tp-trial"))
+        self.assertEqual(trial_session.tp_command([agent, "inspect", "t-1"]), ("tp-agent inspect", "t-1"))
+        self.assertEqual(trial_session.tp_command([agent, "list"]), ("tp-agent list", None))
+        self.assertEqual(trial_session.tp_command([agent, "end-author", "t-1"]), ("tp-agent end-author", "t-1"))
+        self.assertEqual(trial_session.tp_command([agent, "stop", "t-1"]), ("tp-agent stop", "t-1"))
+        self.assertEqual(trial_session.tp_command([agent, "review", "--force", "t-1"]), ("tp-agent review", "t-1"))
+        self.assertEqual(trial_session.tp_command([spawn, "--task-id", "t-1", "--note", "--view", "--file", "f"]), ("tp-spawn", "t-1"))
+        self.assertEqual(trial_session.tp_command([sys.executable, trial, "run", "--run-dir", "/x"]), ("tp-trial run", None))
+        self.assertEqual({k for k, v in trial_session.TP.items() if v == "ends"},
+                         {"tp-agent end-author", "tp-agent stop", "tp-agent review", "tp-spawn"})
+
     def test_run_ids(self):
         for good in ("a", "sh-x-20261031", "0abc", "a" * 40):
             self.assertEqual(trial_session.valid_run(good), good)
@@ -165,13 +177,44 @@ class SessionTests(unittest.TestCase):
             trial_session.ensure(str(self.project), "sh-a-5", self.env)
         self.assertEqual(self.sessions(), [])
 
-    def test_end_kills_only_the_named_session_and_is_repeatable(self):
-        trial_session.ensure(str(self.project), "sh-a-6", self.env)
+    def test_end_exact_kills_only_the_session_of_that_identity_and_is_repeatable(self):
+        made = []
+        trial_session.ensure(str(self.project), "sh-a-6", self.env, made=made)
         trial_session.ensure(str(self.project), "sh-a-7", self.env)
-        self.assertTrue(trial_session.end("sh-a-6", self.env))
+        self.assertTrue(trial_session.end_exact(*made[0], env=self.env))
         self.assertEqual(self.sessions(), ["tp-trial-sh-a-7"])
-        self.assertFalse(trial_session.end("sh-a-6", self.env))
+        self.assertFalse(trial_session.end_exact(*made[0], env=self.env))
         self.assertEqual(self.sessions(), ["tp-trial-sh-a-7"])
+
+    def test_there_is_no_kill_by_name(self):
+        """Review 7 N2: a session is ended only by the identity recorded when it was made; a name can be taken by another session."""
+        self.assertFalse(hasattr(trial_session, "end"))
+
+    def test_ensure_reports_the_identity_of_a_session_it_made_and_none_for_one_already_there(self):
+        made = []
+        name, _ = trial_session.ensure(str(self.project), "sh-a-m", self.env, made=made)
+        found = trial_session.named(name, self.env)
+        self.assertEqual(made, [(found[0], found[1])])
+        again = []
+        trial_session.ensure(str(self.project), "sh-a-m", self.env, made=again)
+        self.assertEqual(again, [], "this call made nothing")
+
+    def test_ensure_reports_nothing_when_another_start_made_the_session_first(self):
+        state = self.project / ".tmux-pi" / "trial" / "sh-a-r" / "state"
+        real = trial_session.has_session
+        calls = []
+
+        def late(name, env=None):  # the check says no session; another start makes one before new-session runs
+            if not calls:
+                calls.append(name)
+                self.tmux("new-session", "-d", "-s", name, "sleep 300")
+                self.tmux("set-option", "-t", name, "@tp_state_dir", str(state))
+                return False
+            return real(name, env)
+        made = []
+        with mock.patch.object(trial_session, "has_session", side_effect=late):
+            trial_session.ensure(str(self.project), "sh-a-r", self.env, made=made)
+        self.assertEqual(made, [], "the session is the other start's")
 
     def test_live_panes_in_lists_the_running_panes_with_their_pids_and_leaves_a_dead_one_out(self):
         name, _ = trial_session.ensure(str(self.project), "sh-a-9", self.env)
@@ -201,9 +244,9 @@ class SessionTests(unittest.TestCase):
         child.wait()
         self.assertIsNone(trial_session.process_start(child.pid))
 
-    def test_end_does_not_match_a_longer_name_by_prefix(self):
+    def test_named_does_not_match_a_longer_name_by_prefix(self):
         trial_session.ensure(str(self.project), "sh-a-8x", self.env)
-        self.assertFalse(trial_session.end("sh-a-8", self.env))
+        self.assertIsNone(trial_session.named("tp-trial-sh-a-8", self.env))
         self.assertEqual(self.sessions(), ["tp-trial-sh-a-8x"])
 
 

@@ -5,6 +5,9 @@ A shadow or replay run lives in a detached tmux session `tp-trial-<run>` whose `
 the only way to a separate state dir: Main's task index, `max_active_workers`, collect notices and lane gate never see a trial
 task, and a trial never writes into Main's state dir.
 
+`start_tp` is the one gate every tp-* command of the trial goes through (its table `TP` says what each can do); a command
+that can end anything runs only after the run's own check passes, and one the table does not name is never started.
+
 `env_for` is the one place that builds the environment every trial subprocess (tp-spawn, tp-agent, git) gets: TP_STATE_DIR and
 TP_SESSION name the trial's state and session, TMUX and TMUX_PANE are removed (inside tmux, `tp_session` would otherwise pick
 the caller's own session), and nothing that points at Main's state survives.
@@ -15,9 +18,11 @@ tasks, and while the trial's own local runs (running tasks, and runs that are qu
 same classifier Main's own capacity check uses; nothing in Main's state dir is written.
 """
 
+import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -121,15 +126,25 @@ def has_session(name, env=None):
     return _tmux(["has-session", "-t", "=" + name], env, check=False).returncode == 0
 
 
-def session_state(name, env=None):
-    run = _tmux(["show-options", "-qv", "-t", "=" + name + ":", "@tp_state_dir"], env, check=False)
+def session_option(name, option, env=None):
+    """The value of the session option `option` of the session now called `name` ("" when unset or no such session)."""
+    run = _tmux(["show-options", "-qv", "-t", "=" + name + ":", option], env, check=False)
     return run.stdout.strip() if run.returncode == 0 else ""
 
 
-def ensure(project, run, env=None):
+def session_state(name, env=None):
+    return session_option(name, "@tp_state_dir", env)
+
+
+SEP = "|"
+FIELDS = "#{session_id}" + SEP + "#{session_created}" + SEP + "#{session_name}" + SEP + "#{@tp_state_dir}"
+
+
+def ensure(project, run, env=None, made=None):
     """Create or attach `tp-trial-<run>` with its own `@tp_state_dir` (<project>/.tmux-pi/trial/<run>/state). An existing session
     is reused only when it already names this state dir; one that names another is refused, never taken over. Returns the
-    session name and the state dir."""
+    session name and the state dir. When this call itself creates the session and `made` is a list, (session id, created time)
+    of that session (what tmux printed when it made it) is appended: the only proof a caller has that the session is its own."""
     name = session_name(run)
     base = run_dir(project, run)
     state = state_dir(project, run)
@@ -139,9 +154,12 @@ def ensure(project, run, env=None):
             raise SessionError("{} is a symbolic link; the trial's own directories are never links".format(directory))
     env = env_for(state, name, env)
     if not has_session(name, env):
-        created = _tmux(["new-session", "-d", "-s", name, "-n", "trial", "-c", str(base), "tail -f /dev/null"], env, check=False)
+        created = _tmux(["new-session", "-d", "-P", "-F", FIELDS, "-s", name, "-n", "trial", "-c", str(base), "tail -f /dev/null"], env, check=False)
         if created.returncode and not has_session(name, env):  # lost a race to another start of the same run, or a real failure
             raise SessionError("cannot create tmux session {}: {}".format(name, created.stderr.strip() or "exit {}".format(created.returncode)))
+        parts = created.stdout.strip().split(SEP, 3)
+        if created.returncode == 0 and made is not None and len(parts) == 4 and parts[0].startswith("$") and parts[1].isdigit():
+            made.append((parts[0], parts[1]))
     owned = session_state(name, env)
     if owned and Path(owned).resolve() != state.resolve():
         raise SessionError("tmux session {} keeps its state in {}, not {}; it is not this run's".format(name, owned, state))
@@ -156,16 +174,6 @@ def ensure(project, run, env=None):
     return name, state
 
 
-def end(run, env=None):
-    """Kill the run's session. A session that is already gone is fine. Returns whether one was ended."""
-    name = session_name(run)
-    if not has_session(name, env):
-        return False
-    return _tmux(["kill-session", "-t", "=" + name], env, check=False).returncode == 0
-
-
-SEP = "|"
-FIELDS = "#{session_id}" + SEP + "#{session_created}" + SEP + "#{session_name}" + SEP + "#{@tp_state_dir}"
 
 
 def identity_of(target, env=None):
@@ -229,14 +237,84 @@ def process_start(pid):
     return start if run.returncode == 0 and start else None
 
 
+# ------------------------------------------------------------------------------------------- the tp-* commands a trial starts
+#
+# The one gate (`start_tp`) every tp-* command of the trial goes through, and its table. What each command can do, through
+# everything it runs (bin/tp-agent, bin/tp-review, bin/tp-spawn, bin/tp-kill, bin/tp-view, lib/worker_process.py):
+#
+#   reads   tp-agent inspect, list         read task dirs (tp-agent's record / all_records); no signal, kill or removal
+#   ends    tp-agent end-author <task>     worker_process.end_or_refuse: signals the process of the pane meta.json names
+#           tp-agent stop <task>           a queue entry queue/<task>.json is unlinked (through a link at queue/ too); otherwise
+#                                          tp-kill: process.json and the meta.json pane are signalled and killed, and when the
+#                                          session's @tp_viewing is the task, tp-view swaps the pane with @tp_viewer_pane first
+#           tp-agent review [--force] <t>  tp-review: tp-agent end-author <t> (as above), then tp-spawn of a reviewer
+#           tp-spawn ...                   a start that fails kills the pane it made and removes the task dir it made
+#   runner  tp-trial run --run-dir DIR     the run itself (`launch`); everything it starts comes back through this gate
+#
+# Every file named there is the worker's to write (it runs as the same user), and every command resolves its session by the name
+# TP_SESSION. So an `ends` command is started only after the caller's `check` (the run's `Owner.check_stop`) passes, right
+# before it starts; a caller that gives none is refused. Anything else is refused and never started: another tool, another
+# subcommand (collect, reap, retry, message, dispatch, tick, index, ...), a flag (review --force-alive, spawn --view) or an
+# argument the table does not name.
+
+AGENT, SPAWN, TRIAL = (str(ROOT / "bin" / n) for n in ("tp-agent", "tp-spawn", "tp-trial"))
+TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # tp-agent's task id
+TP = {"tp-agent inspect": "reads", "tp-agent list": "reads", "tp-agent end-author": "ends", "tp-agent stop": "ends",
+      "tp-agent review": "ends", "tp-spawn": "ends", "tp-trial run": "runner"}
+SPAWN_FLAGS = frozenset(("--task-id", "--worker", "--model", "--thinking", "--workdir", "--preamble-from", "--worker-env", "--role",
+                         "--tests", "--deliverable", "--other-lane-paths", "--context", "--note", "--file"))  # each takes a value
+
+
+def tp_command(argv):
+    """(name, task) of a tp-* command line the trial may start: `name` is its key in TP, `task` the task id it acts on (None for
+    list and run). Raises SessionError for anything the table does not name."""
+    args = [str(a) for a in argv]
+    if len(args) >= 2 and args[0] == sys.executable and args[1] == TRIAL:
+        args = args[1:]
+    tool, rest = (args[0], args[1:]) if args else ("", [])
+    if tool == AGENT:
+        if rest == ["list"]:
+            return "tp-agent list", None
+        if len(rest) == 2 and rest[0] in ("inspect", "end-author", "stop") and TASK.fullmatch(rest[1]):
+            return "tp-agent " + rest[0], rest[1]
+        if len(rest) in (2, 3) and rest[0] == "review" and rest[1:-1] in ([], ["--force"]) and TASK.fullmatch(rest[-1]):
+            return "tp-agent review", rest[-1]
+    elif tool == SPAWN:
+        pairs = list(zip(rest[0::2], rest[1::2]))
+        ids = [value for flag, value in pairs if flag == "--task-id"]
+        if len(rest) % 2 == 0 and all(flag in SPAWN_FLAGS for flag, _ in pairs) and len(ids) == 1 and TASK.fullmatch(ids[0]):
+            return "tp-spawn", ids[0]
+    elif tool == TRIAL:
+        if len(rest) == 3 and rest[:2] == ["run", "--run-dir"]:
+            return "tp-trial run", None
+    raise SessionError("refused: {!r} is not a command the trial may start (lib/trial_session.py TP); nothing was started".format(" ".join(args)[:300]))
+
+
+def start_tp(argv, env, cwd=None, timeout=None, check=None, detach=None):
+    """Start the tp-* command `argv` through the table (see TP). A `reads` command runs; an `ends` command runs only after
+    `check(name, task)` returned (it raises to refuse), and is refused when no check is given; the `runner` is started detached
+    (its output to the open file `detach`) and its Popen returned. Returns the CompletedProcess otherwise."""
+    name, task = tp_command(argv)
+    kind = TP[name]
+    if (kind == "runner") != (detach is not None):
+        raise SessionError("refused: {} is {}started detached; nothing was started".format(name, "" if kind == "runner" else "not "))
+    if kind == "ends":
+        if check is None:
+            raise SessionError("refused: {} can end a process or remove a file, and no ownership check was given; nothing was started".format(name))
+        check(name, task)
+    args = [str(a) for a in argv]
+    if detach is not None:
+        return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=detach, stderr=subprocess.STDOUT, start_new_session=True, cwd=cwd, env=env)
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env, cwd=cwd)
+
+
 def local_active(state, env=None):
     """Ids of the running local pi tasks in the tmux-pi state dir `state`, by `tp-agent list` (the classifier Main's own capacity
     check reads). A state dir that cannot be listed raises: an unknown count is never read as zero."""
     state = Path(state)
     if not (state / "tasks").is_dir():
         return []
-    run = subprocess.run([str(ROOT / "bin" / "tp-agent"), "list"], text=True, capture_output=True, timeout=120,
-                         env=env_for(state, "", env))
+    run = start_tp([AGENT, "list"], env_for(state, "", env), timeout=120)
     if run.returncode:
         raise SessionError("cannot count the local workers in {}: {}".format(state, run.stderr.strip() or "tp-agent list exited {}".format(run.returncode)))
     try:
@@ -249,10 +327,25 @@ def local_active(state, env=None):
             if isinstance(r, dict) and r.get("status") in ACTIVE and r.get("harness") == "pi" and str(r.get("model") or "").startswith(LOCAL)]
 
 
+def read_plain(path, dir_fd=None):
+    """The bytes of the plain file at `path`, read without waiting and never through a link. The worker can write every file of the
+    run (run.json, its task files, the owner record, its worktree's .git): one made a FIFO would hold a read until a writer came,
+    and with it the runner (its attempt clock, its session kill) or a `tp-trial` command. Raises OSError for anything but a plain
+    file (FileNotFoundError when there is none), so a caller's `except OSError` covers it."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a plain file", str(path))
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
 def _run_info(directory):
     try:
-        value = json.loads((directory / "run.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        value = json.loads(read_plain(directory / "run.json").decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 

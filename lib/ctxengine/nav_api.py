@@ -41,6 +41,19 @@ project or one the guard refuses, in any spelling Deno's URL parser accepts (`%2
 be shown, whether or not a file is there. Every string in an answer, including one read back from the cache, passes through
 `guard(text)` on its way out; a guard that raises gives an `error` answer.
 
+The monorepo. When the project sits inside a monorepo, the boundary of every read is the monorepo root, not the project: the nearest
+folder above the project that holds a `.git` and a workspace marker (`WORKSPACE_MARKERS`; existence only, never read). A root that
+is `/`, is or leads to a sensitive folder, or holds the home folder is not taken (the boundary stays the project). Every check
+(`check_path`, the path rule, the index, the walk, the mirror, the cache key) then works on names relative to that root, and the
+guard is asked as `check_path(root, name)`; a file anywhere in the monorepo that passes the guard and the boundary check is
+followed and mirrored like a project file. Paths in and out stay relative to the project (`../../lib/x.ts`). A specifier that
+resolves outside the monorepo root stays `outside_project`, and nothing there is looked at. Importers cover the files of the Deno
+root only. Only the workspace form the launchpad tree uses is modelled: `package.json` `workspaces` as a list of plain folder paths
+inside that package's folder, no glob, negation, `..` or object form; `pnpm-workspace.yaml`, `lerna.json` or `rush.json` in the
+config's folder or any folder up to the root, and any other form, are `unmodelled_config` (nothing is guessed). The `package.json` of
+every folder from the config's folder to the root is read, cut down and mirrored, and, like the root marker files probed, is an input
+the final proof checks again.
+
 The path rule (graph.py states it in full; a test holds every file-system call in both modules to a table): nothing is asked of the
 file system about a path until its name is shown inside the project and allowed by `check_path`. That covers the path argument
 (`stub_check_path` judges the name before it follows a link), the Deno root and config, every file and folder the index walks or an
@@ -89,6 +102,9 @@ it runs after the output screen, in the public method, and nothing runs between 
 only files the walk proved (any other path is `<file>`).
 
 Known limits (what is not proven):
+  - A change after the final proof returns is not detected, and neither is a source or config rewritten with the same mtime and size
+    (the index's key; no content hash). The answer is a snapshot as of its last proof. A `package.json` or `deno.json` in a
+    folder the walk reached outside the chain from the config's folder to the monorepo root is not read as a config.
   - The mirror keeps Deno from opening a project file it was not given; the sandbox keeps it from opening anything else. An import
     the scanner missed, whatever it names (`/etc/x`, `../../x`, `file:///abs/x`), is a path the process is not allowed to open: Deno
     lists the module with an `error` and no content, and the answer is refused (`unproven_module`). The sandbox is not proven
@@ -318,7 +334,9 @@ class NavApi:
         self.check_path = check_path
         self.guard = guard
         spelled = os.path.abspath(project_root)
-        self.project_root = os.path.realpath(project_root)  # the boundary itself
+        self._spelled = spelled
+        self.project_root = os.path.realpath(project_root)  # the frame of the paths in and out
+        self.boundary = self._boundary()  # the monorepo root around the project, else the project root: nothing outside it is read
         self.root, self._root_refusal = self.project_root, None
         if root is not None and graph.respell(root, spelled, self.project_root) != self.project_root:
             try:
@@ -328,14 +346,14 @@ class NavApi:
         self.config = os.path.join(self.root or self.project_root, "deno.json") if config is None \
             else graph.respell(config, spelled, self.project_root)  # judged on every read (`graph._config_read`)
         self._config_dir = os.path.dirname(self.config)  # by name; resolved below only when it is shown allowed
-        if self._config_dir != self.project_root:
+        if self._config_dir != self.boundary:
             try:
                 self._config_dir = self._judged(self._config_dir)
             except graph.Unproven:
                 pass  # `prove_reach` refuses it; the name is still a folder no grant may overlap
         self.overlays = [graph.respell(path, spelled, self.project_root) for path in overlays]
         self.cache_dir = cache_dir if cache_dir is not None else os.path.join(self.project_root, CACHE_RELATIVE)
-        self._cache = graph.CacheDir(self.project_root, graph.respell(self.cache_dir, spelled, self.project_root), self._permits)
+        self._cache = graph.CacheDir(self.boundary, graph.respell(self.cache_dir, spelled, self.project_root), self._permits)
         self.deno = deno
         self.timeout = timeout
         self.mirror_parent = mirror_parent  # where each call's temporary mirror is made (default: the system's temporary directory)
@@ -345,10 +363,43 @@ class NavApi:
 
     # --- plumbing
 
+    def _boundary(self):
+        """The folder nothing outside is ever read: the monorepo root around the project, else the project root. The monorepo root
+        is the nearest folder at or above the project with a `.git`, when it has a workspace marker (`WORKSPACE_MARKERS`) and is
+        not the project itself; the walk stops at the first `.git`, so a repository nested in another is never crossed. Existence
+        probes of exact names (the closed exception to the path rule, as in `_guarded_roots`); nothing is read. A folder that is
+        `/`, holds the home folder, has a sensitive component or cannot be judged is not taken: the project root is the boundary."""
+        folder = self.project_root
+        while not os.path.lexists(os.path.join(folder, ".git")):
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                return self.project_root
+            folder = parent
+        if folder == self.project_root or not any(os.path.lexists(os.path.join(folder, name)) for name in WORKSPACE_MARKERS):
+            return self.project_root
+        try:
+            home = judged_location(os.path.expanduser("~"))
+        except graph.Unproven:
+            return self.project_root
+        if folder == os.sep or _sensitive_location(folder) or os.path.commonpath([folder, home]) == folder:
+            return self.project_root
+        return folder
+
+    def _show_path(self, path):
+        """The resolved absolute `path` as a posix path relative to the project root (`..` segments for a place in the monorepo
+        outside it; `.` for the project root). Names only."""
+        return os.path.relpath(path, self.project_root).replace(os.sep, "/")
+
+    def _show(self, rel):
+        """A boundary-relative name (what the index, the walk and the guard use) as the project-relative name an answer shows."""
+        if self.boundary == self.project_root or not isinstance(rel, str):
+            return rel
+        return self._show_path(os.path.join(self.boundary, *rel.split("/")))
+
     def _judged(self, path):
         """The resolved absolute path of `path` (inside the project), followed by `graph.judged_realpath` with the guard; raises
         Unproven."""
-        return os.path.join(self.project_root, *graph.judged_realpath(self.project_root, path, self._permits)[1].split("/"))
+        return os.path.join(self.boundary, *graph.judged_realpath(self.boundary, path, self._permits)[1].split("/"))
 
     @property
     def cache_refused(self):
@@ -363,19 +414,19 @@ class NavApi:
         return f"nav_api-{kind}-{key}.json"
 
     def _root_key(self):
-        return _digest(self.project_root, self.root, self.config)[:16]
+        return _digest(self.project_root, self.boundary, self.root, self.config)[:16]
 
     def _allowed(self, rel):
         """The project-relative path `rel` as the guard names it, or None when the guard refuses it (or fails)."""
         try:
-            got = self.check_path(self.project_root, rel)
+            got = self.check_path(self.boundary, rel)
         except Exception:
             return None
         return got if isinstance(got, str) else None
 
     def _get_index(self):
         if self._index is None:
-            self._index = graph.ImportIndex(self.project_root, self.root, self.config, self.overlays,
+            self._index = graph.ImportIndex(self.boundary, self.root, self.config, self.overlays,
                                             cache=(self._cache, self._cache_name("index", self._root_key())), allow=self._permits)
         return self._index
 
@@ -384,7 +435,7 @@ class NavApi:
         shown allowed is refused before anything is asked of it."""
         if self._root_refusal:
             return None, None, _answer("refused", reason=self._root_refusal)
-        if not graph.judged_is_dir(self.project_root, self.root, self._permits):
+        if not graph.judged_is_dir(self.boundary, self.root, self._permits):
             return None, None, _answer("no_project", detail="project directory not found")
         index = self._get_index()
         try:
@@ -443,12 +494,20 @@ class NavApi:
         """(relative path, None) for a path that may be asked about, or (None, answer)."""
         if not isinstance(path, str) or not path.strip() or "\0" in path:
             return None, _answer("bad_argument", detail="path must be a non-empty string")
+        asked = path
+        if self.boundary != self.project_root:  # the path is the project's; the guard and the index name files from the boundary
+            full = graph.respell(path, self._spelled, self.project_root)
+            asked = graph.lexical_path(self.boundary, full)
+            if asked is None:
+                return None, _answer("refused", reason="project_root" if full == self.boundary else "outside_project")
+            if full == self.project_root:
+                return None, _answer("refused", reason="project_root")
         try:
-            rel = self.check_path(self.project_root, path)
+            rel = self.check_path(self.boundary, asked)
         except Exception as error:
             reason = getattr(error, "reason", None) or str(error)[:200] or "refused"
             return None, _answer("refused", reason=reason)
-        if not isinstance(rel, str) or graph.project_path(self.project_root, rel, self._permits) is None:
+        if not isinstance(rel, str) or graph.project_path(self.boundary, rel, self._permits) is None:
             return None, _answer("refused", reason="outside_project")
         return rel, None
 
@@ -481,9 +540,8 @@ class NavApi:
             out["ignored_config"] = list(index.meta["ignored"])
         return out
 
-    @staticmethod
-    def _slim(edge, side):
-        out = {"path": edge[side], "line": edge["line"], "spec": edge["spec"]}
+    def _slim(self, edge, side):
+        out = {"path": self._show(edge[side]), "line": edge["line"], "spec": edge["spec"]}
         for flag in ("type_only", "dynamic"):
             if edge[flag]:
                 out[flag] = True
@@ -508,7 +566,7 @@ class NavApi:
             found = index.importers(rel)
             if not found and not index.indexed(rel) and index.target_state(rel) != "":
                 return _answer("not_found", detail="no such file in the project")  # an unreadable one is a gap (`_index_answer`)
-            return _answer("ok", target=rel, total=len(found), truncated=len(found) > limit,
+            return _answer("ok", target=self._show(rel), total=len(found), truncated=len(found) > limit,
                            importers=[self._slim(e, "from") for e in found[:limit]], **self._meta(index, stats))
         answer, _, proof = self._index_answer(build)
         return answer, proof
@@ -531,7 +589,7 @@ class NavApi:
                 edges = index.imports(rel)
                 if edges is None:
                     return _answer("not_found", detail="the file is not an indexed source file")
-                return _answer("ok", target=rel, source="index",
+                return _answer("ok", target=self._show(rel), source="index",
                                files=[self._slim(e, "to") for e in edges if e["kind"] == "file"],
                                external=sorted({e["spec"] for e in edges if e["kind"] == "external"}),
                                unresolved=[{"line": e["line"], "spec": e["spec"], "reason": e["reason"]}
@@ -593,7 +651,7 @@ class NavApi:
         """The resolved directories no sandbox grant may equal, contain or sit inside: the project, the Deno root, the config's folder
         and the monorepo around the project (the nearest folder above it with a `.git`, and every folder above it with a workspace
         marker file)."""
-        roots = {path for path in (self.project_root, self.root, self._config_dir) if path}  # each judged in __init__, not resolved here
+        roots = {path for path in (self.project_root, self.boundary, self.root, self._config_dir) if path}  # each judged in __init__, not resolved here
         folder, git = self.project_root, False
         while True:
             if (not git and os.path.lexists(os.path.join(folder, ".git"))) or \
@@ -739,7 +797,7 @@ class NavApi:
             parent = judged_location(candidate)  # a folder for this process's own scratch
         except graph.Unproven:
             return None
-        if _sensitive_location(parent) or parent == self.project_root or parent.startswith(self.project_root + os.sep):
+        if _sensitive_location(parent) or parent == self.boundary or parent.startswith(self.boundary + os.sep):
             return None
         return parent
 
@@ -787,7 +845,7 @@ class NavApi:
         """The guard's verdict as a bool, for `graph`. A guard that refused because it could not look (`unreadable_path`) did not
         judge the name: `graph.CannotJudge`, which every user but the index takes as a refusal, and the index records as a gap."""
         try:
-            got = self.check_path(self.project_root, rel)
+            got = self.check_path(self.boundary, rel)
         except Exception as error:
             if getattr(error, "reason", None) == "unreadable_path":
                 raise graph.CannotJudge(rel) from None
@@ -800,7 +858,7 @@ class NavApi:
         excluded file) and whether the index could be built make no difference. A walk that fails for any other reason is a
         refusal as well."""
         try:
-            return graph.prove_reach(self.project_root, os.path.join(self.project_root, rel), self.config, self._permits), None
+            return graph.prove_reach(self.boundary, os.path.join(self.boundary, rel), self.config, self._permits), None
         except graph.Unproven as error:
             if error.reason == "changed_during_walk":  # a link moved while the walk read: ask again
                 return None, _answer("stale_index", detail="a file changed while it was being read")
@@ -884,7 +942,7 @@ class NavApi:
         rel, error = self._target(target)
         if error:
             return error, None
-        if not graph.judged_is_file(self.project_root, rel, self._permits):
+        if not graph.judged_is_file(self.boundary, rel, self._permits):
             return _answer("not_found", detail="no such file in the project"), None
         reach, refusal = self._prove(rel)
         if refusal:
@@ -929,8 +987,8 @@ class NavApi:
             if len(chosen) >= MAX_MODULES:
                 break
             chosen.add(path)
-        listed = [{"path": path, "imports": local[path]} for path in sorted(chosen)]
-        return _answer("ok", target=rel, source="deno_info", modules=listed, truncated=len(local) > len(listed), total=len(local),
+        listed = [{"path": self._show(path), "imports": [self._show(dep) for dep in local[path]]} for path in sorted(chosen)]
+        return _answer("ok", target=self._show(rel), source="deno_info", modules=listed, truncated=len(local) > len(listed), total=len(local),
                        external=external), reach
 
     def symbols(self, path, limit=MAX_SYMBOLS):
@@ -946,7 +1004,7 @@ class NavApi:
             return error, None
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             return _answer("bad_argument", detail="limit must be a whole number from 1 to 100"), None
-        if not graph.judged_is_file(self.project_root, rel, self._permits):
+        if not graph.judged_is_file(self.boundary, rel, self._permits):
             return _answer("not_found", detail="no such file in the project"), None
         if self._deno_exe() is None:
             return _answer("unavailable", detail="deno was not found on PATH"), None
@@ -971,7 +1029,7 @@ class NavApi:
             self._write_cache("doc", key, found)
             hit = False
         shown = [item for item in (self._present(entry, names) for entry in found) if item]
-        return _answer("ok", path=rel, source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
+        return _answer("ok", path=self._show(rel), source="deno_doc", cached=hit, total=len(shown), truncated=len(shown) > limit,
                        symbols=shown[:limit]), reach
 
     def _present(self, entry, names):
@@ -981,7 +1039,9 @@ class NavApi:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or entry["path"] not in names \
                 or self._allowed(entry["path"]) is None:
             return None
-        return {key: entry.get(key, "") for key in ("name", "kind", "path", "line", "signature", "doc")}
+        shown = {key: entry.get(key, "") for key in ("name", "kind", "path", "line", "signature", "doc")}
+        shown["path"] = self._show(shown["path"])
+        return shown
 
     def _parse_doc(self, text, names, mirror, reach):
         """The symbol list for the cache: raw as Deno gave it (cut to length), for files the guard allows now and the walk reached
@@ -1045,8 +1105,10 @@ class NavApi:
         is), and the index's size and age. The config is looked at only when it is shown allowed."""
         exe = self._deno_exe()
         out = {"status": "ok", "deno": exe, "deno_version": self.deno_version() if exe else None,
-               "root": None if self.root is None else (graph.lexical_path(self.project_root, self.root) or "."),
-               "config_found": graph.judged_is_file(self.project_root, self.config, self._permits), "cache_dir": self.cache_dir}
+               "root": None if self.root is None else self._show_path(self.root),
+               "config_found": graph.judged_is_file(self.boundary, self.config, self._permits), "cache_dir": self.cache_dir}
+        if self.boundary != self.project_root:
+            out["boundary"] = self._show_path(self.boundary)
         if self._root_refusal:
             out["root_refused"] = self._root_refusal
         if self._index is not None:

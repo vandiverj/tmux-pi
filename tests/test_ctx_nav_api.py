@@ -3057,6 +3057,7 @@ class PathRuleCase(Tree):
         ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
         ("nav_api.py", "NavApi._executable", "os.access"): "the same resolved candidate",
         ("nav_api.py", "NavApi._guarded_roots", "os.path.lexists"): "monorepo markers: exact names in the project's ancestors",
+        ("nav_api.py", "NavApi._boundary", "os.path.lexists"): "monorepo root and markers: exact names in the project's ancestors",
         ("nav_api.py", "NavApi._grant_kinds", "os.lstat"): "a grant resolved by judged_location, not sensitive",
         ("nav_api.py", "NavApi._sandboxed", "os.access"): "the fixed SANDBOX_EXEC",
         ("nav_api.py", "NavApi._check_sandbox", "subprocess.run"): "SANDBOX_EXEC with judged grants and the probe folder",
@@ -4017,6 +4018,534 @@ class AnswerProofCase(Tree):
         self.assertEqual(len(self.ROUTES), 11)
         self.assertEqual(len(self.STATES) * len(self.ROUTES) * (len(self.NAMES) + 1), 880)
         self.assertEqual({r for r in self.ROUTES if r.startswith("screen")}, {"screen_warm", "screen_cold"})
+
+
+class MonorepoCase(Tree):
+    """Step 2 (lane ctx-nav-api, owner decision "Monorepo-wide, guarded"): a project inside a monorepo may import any file inside the
+    monorepo, provided each reached file passes the guard and the boundary check and is mirrored like a project file. The monorepo
+    root is the nearest folder with a `.git` that also has a workspace marker; it is the boundary of every read. Only the workspace
+    form the launchpad tree uses (`package.json` `workspaces` as a list of plain folder paths) is modelled; any other workspace form
+    is `unmodelled_config`. A specifier that resolves outside the monorepo root stays `outside_project`. Paths in and out stay
+    relative to the project (`../../lib/x.ts` for a file outside it)."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    doc_payload = staticmethod(ReviewFixesCase.doc_payload)
+
+    def mono(self, markers=("nx.json",), workspaces=("apps/web", "apps/e2e")):
+        """(monorepo root, project): `mono/apps/api` is the fixture, whose config maps `@lib/` to `mono/lib/`."""
+        mono = self.dir / "mono"
+        write(mono / ".git" / "HEAD", "ref: refs/heads/main\n")
+        for name in markers:
+            write(mono / name, "{}")
+        write(mono / "package.json", json.dumps({"name": "m", "private": True, "workspaces": list(workspaces)}))
+        write(mono / "lib" / "shared" / "util.ts", "import { M } from './deep/more.ts';\nexport const U = M + 1;\n")
+        write(mono / "lib" / "shared" / "deep" / "more.ts", "export const M = 2;\n")
+        project = mono / "apps" / "api"
+        shutil.copytree(FIXTURE, project)
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@lib/"] = "../../lib/"
+        write(project / "deno.json", json.dumps(config))
+        write(project / "src" / "uses_lib.ts", "import { U } from '@lib/shared/util.ts';\nimport { U as V } from '../../../lib/shared/util.ts';\n"
+                                                "export const W = U + V;\n")
+        write(self.dir / "outside.ts", "export const OUTSIDE = 1;\n")
+        return mono, project
+
+    def reset(self):
+        shutil.rmtree(self.dir / "mono", ignore_errors=True)
+        return self.mono()
+
+    def deno_nav(self, project, **kw):
+        return self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), **kw)
+
+    def refusal(self, nav, target="src/uses_lib.ts"):
+        out = {}
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call(target)
+            out[call.__name__] = (answer["status"], answer.get("reason"))
+        return out
+
+    def assert_refused(self, nav, reason, target="src/uses_lib.ts", label=""):
+        self.assertEqual(self.refusal(nav, target), {"symbols": ("refused", reason), "forward_graph": ("refused", reason)}, label)
+
+    def assert_ok(self, nav, target="src/uses_lib.ts", label=""):
+        self.assertEqual(self.refusal(nav, target), {"symbols": ("ok", None), "forward_graph": ("ok", None)}, label)
+
+    # --- the boundary
+
+    def test_the_boundary_is_the_monorepo_root_and_status_says_so(self):
+        mono, project = self.mono()
+        nav = self.deno_nav(project)
+        self.assertEqual(nav.boundary, str(mono))
+        self.assertEqual(nav.project_root, str(project))
+        self.assertEqual(nav.status()["boundary"], "../..")
+        self.assertNotIn("boundary", self.deno_nav(self.project("plain")).status())
+
+    def test_every_workspace_marker_makes_a_monorepo_root(self):
+        for marker in nav_api.WORKSPACE_MARKERS:
+            with self.subTest(marker):
+                mono, project = self.reset()
+                for name in os.listdir(mono):
+                    if name in nav_api.WORKSPACE_MARKERS:
+                        (mono / name).unlink()
+                write(mono / marker, "{}")
+                self.assertEqual(nav_api.NavApi(str(project)).boundary, str(mono))
+
+    def test_where_there_is_no_monorepo_root_the_boundary_is_the_project(self):
+        cases = {
+            "no .git": lambda mono, project: shutil.rmtree(mono / ".git"),
+            "a .git and no marker": lambda mono, project: (mono / "nx.json").unlink(),
+            "a nearer .git between, without a marker": lambda mono, project: write(mono / "apps" / ".git" / "HEAD", "x"),
+            "the project itself has the .git": lambda mono, project: write(project / ".git" / "HEAD", "x"),
+        }
+        for label, change in cases.items():
+            with self.subTest(label):
+                mono, project = self.reset()
+                change(mono, project)
+                self.assertEqual(nav_api.NavApi(str(project)).boundary, str(project))
+
+    def test_a_monorepo_root_that_holds_the_home_folder_is_not_taken(self):
+        mono, project = self.mono()
+        for home, boundary in ((mono / "apps", project), (mono, project), (self.dir / "elsewhere", mono)):
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                self.assertEqual(nav_api.NavApi(str(project)).boundary, str(boundary), str(home))
+
+    def test_a_monorepo_root_with_a_sensitive_name_is_not_taken(self):
+        mono = self.dir / ".ssh" / "m"
+        write(mono / ".git" / "HEAD", "x")
+        write(mono / "nx.json", "{}")
+        project = mono / "app"
+        shutil.copytree(FIXTURE, project)
+        self.assertEqual(nav_api.NavApi(str(project)).boundary, str(project))
+
+    def test_the_guard_is_asked_from_the_boundary_and_names_files_from_it(self):
+        mono, project = self.mono()
+        asked = []
+
+        def guard(root, rel):
+            asked.append((root, rel))
+            return nav_api.stub_check_path(root, rel)
+        nav = self.nav(project, check_path=guard)
+        nav.imports("src/uses_lib.ts", source="index")
+        self.assertEqual({root for root, _ in asked}, {str(mono)})
+        names = [rel for _, rel in asked]
+        self.assertIn("apps/api/src/uses_lib.ts", names)
+        self.assertIn("lib/shared/util.ts", names)
+
+    def test_a_guard_that_refuses_a_file_of_the_monorepo_by_name_is_obeyed_on_every_route(self):
+        mono, project = self.mono()
+
+        def guard(root, rel):
+            if rel.startswith("lib/shared/deep"):
+                raise nav_api.Refused("sensitive_path")
+            return nav_api.stub_check_path(root, rel)
+        nav = self.nav(project, check_path=guard, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        self.assert_refused(nav, "reaches_refused_path")
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+        self.assertEqual(nav.importers("../../lib/shared/deep/more.ts")["status"], "refused")
+
+    # --- the index
+
+    def test_imports_into_the_monorepo_are_edges_with_project_relative_names(self):
+        mono, project = self.mono()
+        answer = self.nav(project).imports("src/uses_lib.ts", source="index")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual([(f["path"], f["line"]) for f in answer["files"]],
+                         [("../../lib/shared/util.ts", 1), ("../../lib/shared/util.ts", 2)])
+        self.assertEqual((answer["unresolved"], answer["external"], answer["target"]), ([], [], "src/uses_lib.ts"))
+
+    def test_importers_of_a_file_outside_the_project_are_the_project_files_that_import_it(self):
+        mono, project = self.mono()
+        nav = self.nav(project)
+        for target in ("../../lib/shared/util.ts", str(mono / "lib" / "shared" / "util.ts"), "src/../../../lib/shared/util.ts"):
+            answer = nav.importers(target)
+            self.assertEqual(answer["status"], "ok", (target, answer))
+            self.assertEqual(answer["target"], "../../lib/shared/util.ts")
+            self.assertEqual([(e["path"], e["line"]) for e in answer["importers"]], [("src/uses_lib.ts", 1), ("src/uses_lib.ts", 2)])
+
+    def test_a_specifier_beyond_the_monorepo_root_is_still_outside_the_project_and_nothing_there_is_looked_at(self):
+        mono, project = self.mono()
+        trap = self.dir / "trap"
+        write(trap / "x.ts", "export const T = 1;\n")
+        config = json.loads((project / "deno.json").read_text())
+        config["imports"]["@out/"] = "../../../trap/"
+        write(project / "deno.json", json.dumps(config))
+        write(project / "src" / "up.ts", "import '../../../../outside.ts';\nimport '@out/x.ts';\nimport '../../../../trap/x.ts';\n")
+        nav = self.deno_nav(project)
+        answer = nav.imports("src/up.ts", source="index")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual(answer["files"], [])
+        self.assertEqual([u["reason"] for u in answer["unresolved"]], ["outside"] * 3)
+        self.assert_refused(nav, "outside_project", "src/up.ts")
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    def test_a_file_of_the_monorepo_the_guard_refuses_is_not_named_in_the_index_either(self):
+        mono, project = self.mono()
+        write(mono / "lib" / ".env.ts", "export const E = 1;\n")
+        write(project / "src" / "bad.ts", "import '../../../lib/.env.ts';\n")
+        answer = self.nav(project).imports("src/bad.ts", source="index")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual([u["reason"] for u in answer["unresolved"]], ["refused"])
+        self.assertNotIn(".env", json.dumps(answer))
+
+    def test_links_in_the_monorepo_are_judged_by_where_they_lead(self):
+        mono, project = self.mono()
+        write(mono / "lib" / ".env.ts", "export const E = 1;\n")
+        (mono / "lib" / "to_outside.ts").symlink_to(self.dir / "outside.ts")
+        (mono / "lib" / "to_env.ts").symlink_to(mono / "lib" / ".env.ts")
+        (mono / "lib" / "to_util.ts").symlink_to(mono / "lib" / "shared" / "util.ts")
+        for name in ("to_outside", "to_env", "to_util"):
+            write(project / "src" / f"via_{name}.ts", f"import '../../../lib/{name}.ts';\n")
+        nav = self.deno_nav(project)
+        self.assert_refused(nav, "reaches_refused_path", "src/via_to_outside.ts")
+        self.assert_refused(nav, "reaches_refused_path", "src/via_to_env.ts")
+        self.assert_ok(nav, "src/via_to_util.ts")
+
+    def test_the_index_routes_agree_cold_warm_and_loaded_from_the_cache(self):
+        mono, project = self.mono()
+        cache = str(self.dir / "cache")
+        cold = nav_api.NavApi(str(project), cache_dir=cache)
+        first = cold.importers("../../lib/shared/util.ts")
+        warm = cold.importers("../../lib/shared/util.ts")
+        loaded = nav_api.NavApi(str(project), cache_dir=cache).importers("../../lib/shared/util.ts")
+        self.assertEqual(first["status"], "ok", first)
+        volatile = ("index_age_s", "scanned", "cache")
+        for label, answer in (("warm", warm), ("loaded", loaded)):
+            self.assertEqual({k: v for k, v in answer.items() if k not in volatile},
+                             {k: v for k, v in first.items() if k not in volatile}, label)
+
+    # --- the path arguments
+
+    def test_paths_asked_about_may_go_up_to_the_monorepo_root_and_no_further(self):
+        mono, project = self.mono()
+        write(mono / "lib" / ".env.ts", "export const E = 1;\n")
+        nav = self.deno_nav(project)
+        cases = {"../../../outside.ts": "outside_project", str(self.dir / "outside.ts"): "outside_project", "../..": "project_root",
+                 "../../..": "outside_project", ".": "project_root", "../../.git/HEAD": "sensitive_path",
+                 "../../lib/.env.ts": "sensitive_path"}
+        for path, reason in cases.items():
+            for call in (nav.importers, nav.symbols, nav.forward_graph, nav.imports):
+                with self.subTest(path, call=call.__name__):
+                    answer = call(path)
+                    self.assertEqual((answer["status"], answer.get("reason")), ("refused", reason), answer)
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    # --- Deno: the walk, the mirror, the answers
+
+    def info_payload(self):
+        """Deno runs in the config's folder of the mirror (`mirror/apps/api`), so the monorepo's lib is two folders up from MIRROR."""
+        return {"modules": [
+            {"specifier": f"file://{MIRROR}/src/uses_lib.ts", "dependencies": [
+                {"specifier": "@lib/shared/util.ts", "code": {"specifier": f"file://{MIRROR}/../../lib/shared/util.ts"}}]},
+            {"specifier": f"file://{MIRROR}/../../lib/shared/util.ts", "dependencies": [
+                {"specifier": "./deep/more.ts", "code": {"specifier": f"file://{MIRROR}/../../lib/shared/deep/more.ts"}}]},
+            {"specifier": f"file://{MIRROR}/../../lib/shared/deep/more.ts", "dependencies": []}]}
+
+    def test_forward_graph_follows_an_import_into_the_monorepo(self):
+        mono, project = self.mono()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info=self.info_payload()))
+        answer = nav.forward_graph("src/uses_lib.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertEqual({m["path"]: m["imports"] for m in answer["modules"]},
+                         {"src/uses_lib.ts": ["../../lib/shared/util.ts"], "../../lib/shared/util.ts": ["../../lib/shared/deep/more.ts"],
+                          "../../lib/shared/deep/more.ts": []})
+        self.assertEqual(answer["target"], "src/uses_lib.ts")
+
+    def test_deno_is_given_a_mirror_of_the_monorepo_layout_holding_only_what_was_reached(self):
+        mono, project = self.mono()
+        write(mono / "lib" / "shared" / "unreached.ts", "export const NOPE = 1;\n")
+        write(mono / "apps" / "package.json", json.dumps({"name": "apps", "workspaces": ["api"], "scripts": {"x": "y"}}))
+        reach = graph.prove_reach(str(mono), str(project / "src" / "uses_lib.ts"), str(project / "deno.json"), lambda rel: True)
+        self.assertEqual(sorted(reach.files), ["apps/api/src/uses_lib.ts", "lib/shared/deep/more.ts", "lib/shared/util.ts"])
+        mirror = reach.materialize(str(self.dir))
+        self.addCleanup(mirror.cleanup)
+        root = Path(mirror.root)
+        have = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+        self.assertEqual(have, ["apps/api/deno.json", "apps/api/package.json", "apps/api/src/uses_lib.ts", "apps/package.json", "lib/shared/deep/more.ts",
+                                "lib/shared/util.ts", "package.json"])
+        self.assertNotIn("workspaces", json.loads((root / "package.json").read_text()))
+        self.assertEqual(json.loads((root / "apps" / "package.json").read_text()), {"name": "apps"})
+
+    def test_a_mirror_made_inside_the_monorepo_is_refused(self):
+        mono, project = self.mono()
+        (mono / "scratch").mkdir()
+        nav = self.deno_nav(project, mirror_parent=str(mono / "scratch"))
+        for call in (nav.symbols, nav.forward_graph):
+            answer = call("src/uses_lib.ts")
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "scratch_refused"), answer)
+
+    def test_an_import_of_a_refused_file_of_the_monorepo_refuses_the_walk_and_deno_is_not_started(self):
+        mono, project = self.mono()
+        write(mono / "lib" / ".env.ts", "export const E = 1;\n")
+        write(mono / "lib" / "shared" / "viaenv.ts", "import '../.env.ts';\n")
+        write(project / "src" / "bad1.ts", "import '../../../lib/.env.ts';\n")
+        write(project / "src" / "bad2.ts", "import '@lib/shared/viaenv.ts';\n")
+        write(project / "src" / "bad3.ts", "import 'file://" + str(mono / "lib" / ".env.ts") + "';\n")
+        nav = self.deno_nav(project)
+        for name in ("bad1", "bad2", "bad3"):
+            self.assert_refused(nav, "reaches_refused_path", f"src/{name}.ts", name)
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    def test_an_absolute_import_inside_the_monorepo_is_followed_and_one_outside_is_not(self):
+        mono, project = self.mono()
+        write(project / "src" / "abs_in.ts", f"import 'file://{mono}/lib/shared/util.ts';\n")
+        write(project / "src" / "abs_out.ts", f"import 'file://{self.dir}/outside.ts';\n")
+        nav = self.deno_nav(project)
+        self.assert_ok(nav, "src/abs_in.ts")
+        self.assert_refused(nav, "outside_project", "src/abs_out.ts")
+
+    def test_a_file_the_walk_cannot_read_in_the_monorepo_refuses_with_unreadable_file(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+        mono, project = self.mono()
+        victim = mono / "lib" / "shared" / "deep" / "more.ts"
+        os.chmod(victim, 0)
+        self.addCleanup(os.chmod, victim, 0o644)
+        self.assert_refused(self.deno_nav(project), "unreadable_file")
+
+    def test_a_reached_file_that_changes_during_deno_withholds_the_answer(self):
+        edits = {"edited": lambda v: v.write_text("export const M = 3;\n"),
+                 "removed": lambda v: v.unlink(),
+                 "replaced by a link to outside": lambda v: (v.unlink(), v.symlink_to(self.dir / "outside.ts"))}
+        for label, edit in edits.items():
+            for call in ("symbols", "forward_graph"):
+                with self.subTest(label, call=call):
+                    mono, project = self.reset()
+                    nav = self.deno_nav(project)
+                    victim = mono / "lib" / "shared" / "deep" / "more.ts"
+                    real = nav._run_deno
+                    nav._run_deno = lambda *a, _real=real, _edit=edit, _v=victim, **k: (_edit(_v), _real(*a, **k))[1]
+                    answer = getattr(nav, call)("src/uses_lib.ts")
+                    self.assertEqual(answer["status"], "stale_index", answer)
+
+    @NEEDS_SANDBOX
+    def test_the_real_deno_answers_through_the_sandbox_for_a_file_in_the_monorepo(self):
+        mono, project = self.mono()
+        with mock.patch.object(nav_api, "SANDBOX_PROFILE", SANDBOX_PRODUCTION):
+            nav = self.nav(project)
+            answer = nav.forward_graph("src/uses_lib.ts")
+        self.assertEqual(answer["status"], "ok", answer)
+        self.assertIn("../../lib/shared/util.ts", {m["path"] for m in answer["modules"]})
+
+    # --- workspaces: the one modelled form, and everything else refused
+
+    def with_root_package(self, workspaces):
+        mono, project = self.reset()
+        write(mono / "package.json", json.dumps({"name": "m", "workspaces": workspaces}))
+        return mono, project
+
+    def test_the_plain_path_list_form_is_modelled(self):
+        for workspaces in (["apps/web", "apps/e2e"], ["./apps/web/"], ["apps/web", "apps/web"], []):
+            with self.subTest(workspaces):
+                mono, project = self.with_root_package(workspaces)
+                self.assert_ok(self.deno_nav(project))
+
+    def test_any_other_workspace_form_is_unmodelled_config(self):
+        forms = {"an object with packages": {"packages": ["apps/web"]}, "a glob": ["apps/*"], "a double star": ["apps/**"],
+                 "a negation": ["apps/web", "!apps/web/x"], "a brace": ["apps/{a,b}"], "a character class": ["apps/[ab]"],
+                 "a question mark": ["apps/w?b"], "a parent": ["../other"], "a parent in the middle": ["apps/web/../x"],
+                 "an absolute path": ["/etc"], "a number": [1], "null in the list": [None], "a string": "apps/web", "a number alone": 5,
+                 "the root itself": ["."], "blank": ["  "], "a backslash": ["apps\\web"], "a guard-refused name": ["apps/.env-app"],
+                 "a nested list": [["apps/web"]], "true": True, "an empty object": {"x": 1}}
+        for label, workspaces in forms.items():
+            with self.subTest(label):
+                mono, project = self.with_root_package(workspaces)
+                self.assert_refused(self.deno_nav(project), "unmodelled_config", label=label)
+
+    def test_a_workspaces_in_a_package_json_between_the_project_and_the_root_follows_the_same_rule(self):
+        mono, project = self.mono()
+        write(mono / "apps" / "package.json", json.dumps({"name": "apps", "workspaces": ["api"]}))
+        self.assert_ok(self.deno_nav(project))
+        write(mono / "apps" / "package.json", json.dumps({"name": "apps", "workspaces": ["*"]}))
+        self.assert_refused(self.deno_nav(project), "unmodelled_config")
+        write(mono / "apps" / "package.json", json.dumps({"name": "apps", "workspaces": ["../lib"]}))
+        self.assert_refused(self.deno_nav(project), "unmodelled_config")
+
+    def test_a_workspace_file_of_another_tool_is_unmodelled_config_wherever_deno_looks(self):
+        for name in graph.UNMODELLED_WORKSPACE_FILES:
+            for folder in ("", "apps", "apps/api"):
+                with self.subTest(name, folder=folder):
+                    mono, project = self.mono(markers=("nx.json", "turbo.json"))
+                    self.assert_ok(self.deno_nav(project))
+                    write(mono / folder / name, "packages:\n  - 'apps/*'\n")
+                    self.assert_refused(self.deno_nav(project), "unmodelled_config")
+                    shutil.rmtree(self.dir / "mono")
+
+    def test_a_package_json_that_is_not_modelled_is_refused_wherever_deno_looks(self):
+        bad = {"not json": "{", "not an object": "[]", "a local dependency": json.dumps({"dependencies": {"x": "file:../x"}}),
+               "a workspace dependency": json.dumps({"devDependencies": {"x": "workspace:*"}})}
+        for label, text in bad.items():
+            for folder in ("", "apps", "apps/api"):
+                with self.subTest(label, folder=folder):
+                    mono, project = self.reset()
+                    write(mono / folder / "package.json", text)
+                    self.assert_refused(self.deno_nav(project), "unmodelled_config")
+
+    def test_a_workspace_config_in_each_unusable_state_refuses_with_its_reason(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+
+        def link(mono, target):
+            (mono / "package.json").unlink()
+            (mono / "package.json").symlink_to(target)
+
+        def unreadable(mono):
+            os.chmod(mono / "package.json", 0)
+            self.addCleanup(os.chmod, mono / "package.json", 0o644)
+
+        def a_folder(mono):
+            (mono / "package.json").unlink()
+            (mono / "package.json").mkdir()
+
+        def to_refused(mono):
+            write(mono / ".env.json", "{}")
+            link(mono, mono / ".env.json")
+
+        def to_inside(mono):
+            write(mono / "real.json", '{"name":"m"}')
+            link(mono, mono / "real.json")
+        cases = {"unreadable": (unreadable, "unreadable_file"), "a folder": (a_folder, "unreadable_file"),
+                 "a link out": (lambda mono: link(mono, self.dir / "outside.ts"), "reaches_refused_path"),
+                 "a link to a refused file": (to_refused, "reaches_refused_path"), "a link to a file inside": (to_inside, None),
+                 "pnpm-workspace.yaml a folder": (lambda mono: (mono / "pnpm-workspace.yaml").mkdir(), "unreadable_file"),
+                 "lerna.json a link out": (lambda mono: (mono / "lerna.json").symlink_to(self.dir / "outside.ts"), "reaches_refused_path")}
+        for label, (change, reason) in cases.items():
+            with self.subTest(label):
+                mono, project = self.reset()
+                change(mono)
+                nav = self.deno_nav(project)
+                if reason is None:
+                    self.assert_ok(nav)
+                else:
+                    self.assert_refused(nav, reason)
+
+    def test_the_workspace_checks_look_at_nothing_outside_the_monorepo(self):
+        mono, project = self.mono()
+        write(self.dir / "trap_pkg.json", '{"workspaces": ["apps/web"]}')
+        (mono / "package.json").unlink()
+        (mono / "package.json").symlink_to(self.dir / "trap_pkg.json")
+        tracer = FsTracer(self)
+        nav = self.deno_nav(project)
+        self.assert_refused(nav, "reaches_refused_path")
+        tracer.on = False
+        self.assertEqual(tracer.touched(self.dir / "trap_pkg.json"), [])
+
+    # --- workspace configs are inputs: a change after the walk is a stale answer
+
+    def test_a_workspace_config_changing_during_the_call_withholds_the_answer(self):
+        edits = {
+            "the workspaces list edited": lambda mono: write(mono / "package.json", json.dumps({"name": "m", "workspaces": ["apps/web"]})),
+            "the workspaces list made a glob": lambda mono: write(mono / "package.json", json.dumps({"name": "m", "workspaces": ["apps/*"]})),
+            "the root package.json removed": lambda mono: (mono / "package.json").unlink(),
+            "an intermediate package.json appearing": lambda mono: write(mono / "apps" / "package.json", '{"name":"late"}'),
+            "pnpm-workspace.yaml appearing": lambda mono: write(mono / "pnpm-workspace.yaml", "packages: []\n"),
+            "lerna.json appearing in the project folder": lambda mono: write(mono / "apps" / "api" / "lerna.json", "{}"),
+        }
+        for label, edit in edits.items():
+            for call in ("symbols", "forward_graph"):
+                with self.subTest(label, call=call):
+                    mono, project = self.reset()
+                    nav = self.deno_nav(project)
+                    real = nav._run_deno
+                    nav._run_deno = lambda *a, _real=real, _edit=edit, _mono=mono, **k: (_edit(_mono), _real(*a, **k))[1]
+                    answer = getattr(nav, call)("src/uses_lib.ts")
+                    self.assertEqual(answer["status"], "stale_index", answer)
+
+    def test_reach_holds_follows_every_config_file_of_the_chain(self):
+        edits = {"root package.json": lambda mono: write(mono / "package.json", '{"name":"q"}'),
+                 "apps package.json appears": lambda mono: write(mono / "apps" / "package.json", "{}"),
+                 "lerna.json appears at the root": lambda mono: write(mono / "lerna.json", "{}"),
+                 "rush.json appears in apps": lambda mono: write(mono / "apps" / "rush.json", "{}"),
+                 "the config changes": lambda mono: write(mono / "apps" / "api" / "deno.json", "{}")}
+        for label, edit in edits.items():
+            with self.subTest(label):
+                mono, project = self.reset()
+                reach = graph.prove_reach(str(mono), str(project / "src" / "uses_lib.ts"), str(project / "deno.json"), lambda rel: True)
+                self.assertTrue(reach.holds())
+                edit(mono)
+                self.assertFalse(reach.holds())
+
+    # --- sweep passes: states of the new inputs on the routes the first tests did not take
+
+    def test_a_git_file_and_a_marker_that_is_a_dangling_link_still_make_a_monorepo_root(self):
+        mono, project = self.mono()
+        shutil.rmtree(mono / ".git")
+        write(mono / ".git", "gitdir: /elsewhere\n")  # a worktree: `.git` is a file
+        (mono / "nx.json").unlink()
+        (mono / "turbo.json").symlink_to(self.dir / "nowhere.json")  # existence only: nothing is read through the link
+        self.assertEqual(nav_api.NavApi(str(project)).boundary, str(mono))
+
+    def test_a_doc_cache_hit_does_not_skip_the_workspace_check(self):
+        mono, project = self.mono()
+        doc = self.doc_payload(MIRROR, "src/uses_lib.ts", "W", "w", line=3)
+        cache = str(self.dir / "cache")
+        nav = self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload()), cache_dir=cache)
+        first = nav.symbols("src/uses_lib.ts")
+        self.assertEqual(first["status"], "ok", first)
+        write(mono / "package.json", json.dumps({"name": "m", "workspaces": ["apps/*"]}))
+        for fresh in (nav, self.nav(project, deno=self.scripted_deno(doc=doc, info=self.info_payload()), cache_dir=cache)):
+            answer = fresh.symbols("src/uses_lib.ts")
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unmodelled_config"), answer)
+            self.assertNotIn("symbols", answer)
+
+    def test_every_config_file_of_the_chain_in_every_unusable_state(self):
+        """Sweep: package.json and the three workspace files of other tools, in the root, the folder between and the project, each
+        unreadable, a folder, a link out and a link to a refused file; the reason is the same wherever Deno looks."""
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+        states = {"unreadable": ("unreadable_file", lambda f, m: (write(f, "{}"), os.chmod(f, 0))),
+                  "a folder": ("unreadable_file", lambda f, m: f.mkdir()),
+                  "a link out": ("reaches_refused_path", lambda f, m: f.symlink_to(self.dir / "outside.ts")),
+                  "a link to a refused file": ("reaches_refused_path", lambda f, m: (write(m / ".env.json", "{}"), f.symlink_to(m / ".env.json")))}
+        for name in ("package.json", *graph.UNMODELLED_WORKSPACE_FILES):
+            for folder in ("", "apps", "apps/api"):
+                for label, (reason, make) in states.items():
+                    with self.subTest(name, folder=folder, state=label):
+                        mono, project = self.reset()
+                        target = mono / folder / name
+                        if target.exists() or target.is_symlink():
+                            target.unlink()
+                        make(target, mono)
+                        self.addCleanup(lambda t=target: os.path.lexists(t) and not t.is_symlink() and t.is_file() and os.chmod(t, 0o644))
+                        self.assert_refused(self.deno_nav(project), reason)
+
+    def test_an_io_error_on_the_index_route_inside_a_monorepo_is_never_an_ok_answer(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read a file with mode 0")
+        mono, project = self.mono()
+        write(project / "src" / "sub" / "deep.ts", "export const D = 1;\n")
+        for label, path, mode in (("unreadable source", project / "src" / "uses_lib.ts", 0), ("unreadable folder", project / "src" / "sub", 0),
+                                  ("unreadable config", project / "deno.json", 0)):
+            with self.subTest(label):
+                real_mode = stat.S_IMODE(os.stat(path).st_mode)
+                os.chmod(path, mode)
+                self.addCleanup(os.chmod, path, real_mode)
+                for call in (lambda n: n.importers("../../lib/shared/util.ts"), lambda n: n.imports("src/uses_lib.ts", source="index")):
+                    answer = call(self.nav(project))
+                    self.assertNotEqual(answer["status"], "ok", answer)
+                    self.assertNotIn("importers", answer)
+                    self.assertNotIn("files", answer)
+                os.chmod(path, real_mode)
+
+    def test_odd_targets_in_the_monorepo_on_the_index_route(self):
+        mono, project = self.mono()
+        nav = self.nav(project)
+        write(mono / "lib" / ".env.ts", "export const E = 1;\n")
+        (mono / "lib" / "dir.ts").mkdir()
+        (mono / "lib" / "out.ts").symlink_to(self.dir / "outside.ts")
+        cases = {"../../lib/shared": "not_found", "../../lib/dir.ts": "not_found", "../../lib/nope.ts": "not_found",
+                 "../../lib/out.ts": "refused", "../../lib/.env.ts": "refused"}
+        for path, status in cases.items():
+            for call in (nav.importers, nav.imports):
+                with self.subTest(path, call=call.__name__):
+                    self.assertEqual(call(path)["status"], status, call(path))
+
+    # --- documentation
+
+    def test_the_known_limits_say_what_the_final_proof_does_not_cover(self):
+        text = " ".join(nav_api.__doc__.split()).lower()
+        self.assertIn("a change after the final proof returns is not detected", text)
+        self.assertIn("same mtime and size", text)
 
 
 if __name__ == "__main__":

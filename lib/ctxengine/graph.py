@@ -1021,7 +1021,8 @@ class Reach:
         `config_data`: the only tree Deno is given."""
         mirror = Mirror(self.base, parent)
         try:
-            package_files = {posixpath.join(folder, "package.json") for folder in (posixpath.dirname(self.config_rel), "")}
+            package_files = {posixpath.join(folder, "package.json")
+                             for folder in {posixpath.dirname(self.config_rel), "", *self.packages}}  # the two Deno looks in, and each above
             for rel in sorted(self.files):
                 if rel not in package_files and rel != self.config_rel:  # those are written once, below, in their cut-down form
                     mirror.write(rel, self.contents[rel])
@@ -1139,15 +1140,61 @@ _PACKAGE_DEPENDENCIES = ("dependencies", "devDependencies", "optionalDependencie
 _CONFIG_REFUSAL = {"outside": "outside_project", "refused": "reaches_refused_path", "changed": "changed_during_walk"}
 
 
+# Files that define a workspace in a form this module does not model; one in a folder Deno looks in refuses the call. (`turbo.json` and
+# `nx.json` define none: they read the `package.json` `workspaces`, which is modelled below.)
+UNMODELLED_WORKSPACE_FILES = ("pnpm-workspace.yaml", "lerna.json", "rush.json")
+_WORKSPACE_GLOB = frozenset("*?[]{}!()\\\0")
+
+
+def check_workspaces(base, folder, value, allow):
+    """Raises Unproven(`unmodelled_config`) unless the `workspaces` of the `package.json` in `folder` is a form that is modelled: the
+    one form this module supports is npm's list of plain folder paths (`["apps/web", "./apps/e2e"]`): non-empty strings, no glob
+    character, no `..`, each a folder strictly below `folder` and inside `base`, and allowed by `allow` by its name. An empty or
+    absent value is no workspace. Anything else (an object with `packages`, a glob, a negation, a path out of `folder`, a name the
+    guard refuses, a non-list) is refused, never guessed. Nothing is looked at: members are names; the mirror's `package.json` has
+    no `workspaces`, so Deno is given no member, and a bare specifier that names one resolves to nothing there."""
+    if not value:
+        return
+    if not isinstance(value, list):
+        raise Unproven("unmodelled_config")
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or any(ch in _WORKSPACE_GLOB for ch in item) or item.startswith("/") \
+                or ".." in item.split("/"):
+            raise Unproven("unmodelled_config")
+        member = lexical_path(base, os.path.join(folder, item))
+        if member is None or member == (lexical_path(base, folder) or "") or not _allows(allow, member):
+            raise Unproven("unmodelled_config")
+
+
+def _folders_to_base(base, directory):
+    """`directory` and every folder above it up to `base` (inclusive), nearest first: the folders Deno looks in for a
+    `package.json`. Names only."""
+    out, folder = [], os.path.normpath(directory)
+    while True:
+        out.append(folder)
+        if folder == base or lexical_path(base, folder) is None:
+            return out
+        folder = os.path.dirname(folder)
+
+
 def _check_package_json(base, directory, configs, allow):
-    """Deno reads the `package.json` next to its config. A dependency that is a local path (`file:`, `link:`, a workspace) loads
-    code from somewhere the walk does not look: refused. A `package.json` that is not JSON is refused too. Returns {folder: what
-    the mirror gets} for the folders that have one (`""` is the project root, others are project-relative posix paths): the
-    package's `name`, `version`, `type` and dependency tables, and nothing else (its `imports` and `exports` name paths). Each
-    file is read once, with `read_bounded` (one that leads outside the project or that `allow` refuses is never read, and refuses
-    the call); what was read is recorded in `configs` (see `Reach`), absent files too."""
+    """Deno reads the `package.json` next to its config, and looks above it. Every folder from the config's up to the boundary `base`
+    is looked at (the boundary is the project root, or the monorepo root when the project is in one). A dependency that is a local
+    path (`file:`, `link:`, a workspace) loads code from somewhere the walk does not look: refused. A `package.json` that is not
+    JSON is refused too, and so is a `workspaces` that `check_workspaces` does not model, and a `pnpm-workspace.yaml`, `lerna.json`
+    or `rush.json` in any of the folders. Returns {folder: what the mirror gets} for the folders that have a `package.json` (`""` is
+    the boundary, others are boundary-relative posix paths): the package's `name`, `version`, `type` and dependency tables, and
+    nothing else (its `imports`, `exports` and `workspaces` name paths). Each file is read once, with `read_bounded` (one that leads
+    outside the boundary or that `allow` refuses is never read, and refuses the call); what was read is recorded in `configs` (see
+    `Reach`), absent files too."""
     out = {}
-    for folder in dict.fromkeys((directory, base)):
+    for folder in _folders_to_base(base, directory):
+        for name in UNMODELLED_WORKSPACE_FILES:
+            path = os.path.join(folder, name)
+            configs[path], _ = _config_read(path, base, allow)
+            if configs[path] != CONFIG_ABSENT:  # there, whatever it holds: a workspace form that is not modelled (or not readable)
+                state = configs[path][0]
+                raise Unproven(_CONFIG_REFUSAL.get(state, "unmodelled_config" if state == "content" else "unreadable_file"))
         path = os.path.join(folder, "package.json")
         configs[path], raw = _config_read(path, base, allow)
         if raw is None:
@@ -1160,8 +1207,9 @@ def _check_package_json(base, directory, configs, allow):
             data = json.loads(raw.decode("utf-8"))
         except ValueError:
             raise Unproven("unmodelled_config")
-        if not isinstance(data, dict) or data.get("workspaces"):
+        if not isinstance(data, dict):
             raise Unproven("unmodelled_config")
+        check_workspaces(base, folder, data.get("workspaces"), allow)
         kept = {key: data[key] for key in _PACKAGE_KEEP if isinstance(data.get(key), str)}
         for field in _PACKAGE_DEPENDENCIES:
             table = data.get(field)

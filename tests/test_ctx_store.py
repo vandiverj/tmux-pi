@@ -521,7 +521,7 @@ class Screens(Hermetic):
 
 class Writing(Hermetic):
     def candidate(self, ident="kn-2026-10-31-first", **kw):
-        base = dict(id=ident, kind="convention", scope=[f"{API}/**/*.test.ts"], source="human", body="Do the thing.",
+        base = dict(id=ident, kind="convention", scope=[f"{API}/**/*.test.ts"], source="human", body="Do the thing.", created="2026-10-31",
                     evidence=[f"{API}/a.test.ts:1"], title="First", tags=["t"])
         return store.Note(**{**base, **kw})
 

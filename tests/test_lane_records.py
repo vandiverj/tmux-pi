@@ -615,7 +615,7 @@ class ConfigTests(unittest.TestCase):
             lanes.load_machine_config(self.dir / "absent.json")  # the machine file itself must exist
 
     def test_the_shipped_config_sets_max_active_lanes(self):
-        self.assertEqual(lanes.load_machine_config(), {"max_active_lanes": 5, "defaulted": []})
+        self.assertEqual(lanes.load_machine_config(), {"max_active_lanes": 16, "defaulted": []})
 
     def repo_config(self, value=None, raw=None, repo=None):
         repo = repo or self.dir

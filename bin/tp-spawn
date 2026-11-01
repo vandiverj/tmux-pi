@@ -56,7 +56,7 @@
 #   --preamble-from <dir>    the main working tree to read .tmux-pi/worker-preamble.md from when the workdir has none
 #                            (a lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored); recorded in meta. With --lane
 #                            and no --preamble-from, the lane repository's main working tree is used
-#   --other-lane-paths <text> with --lane: the packet section `Paths other lanes own` (tp-agent works it out from the other open
+#   --other-lane-paths <text> with --lane: the packet section `Paths other lanes own` (derived from the other open
 #                            lanes' declared and measured paths; advice, not a lock). Omitted when empty
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role

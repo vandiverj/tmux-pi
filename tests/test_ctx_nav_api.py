@@ -33,6 +33,22 @@ LOOSE_PROFILE = "(version 1)\n(allow default)\n(deny network*)\n"
 SANDBOX_PRODUCTION = nav_api.SANDBOX_PROFILE  # captured before any test patches it
 
 
+def stub_allow(project):
+    """The guard NavApi uses, for an index built directly: allow(rel) is True when the stub check path accepts `rel`."""
+    def allow(rel):
+        try:
+            nav_api.stub_check_path(str(project), rel)
+        except nav_api.Refused:
+            return False
+        return True
+    return allow
+
+
+def project_cache(project, name="index.json"):
+    """The default cache folder of a project (inside it, where the guard allows it), and a file in it."""
+    return Path(project) / ".tmux-pi" / "ctx-cache" / name
+
+
 def write(path, text=""):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,8 +82,7 @@ class Tree(unittest.TestCase):
         return str(path)
 
     def nav(self, project, **kw):
-        kw.setdefault("cache_dir", str(self.dir / "cache"))
-        return nav_api.NavApi(str(project), **kw)
+        return nav_api.NavApi(str(project), **kw)  # the cache is the default one, inside the project
 
 
 class ScannerCase(unittest.TestCase):
@@ -129,7 +144,7 @@ class ResolveCase(Tree):
         self.importer = str(self.dir / "src" / "main.ts")
 
     def res(self, spec):
-        return graph.resolve(spec, self.importer, self.imap)
+        return graph.resolve(spec, self.importer, self.imap, os.path.isfile)
 
     def test_relative_and_import_map_targets(self):
         self.assertEqual(self.res("./a.ts"), ("file", str(self.dir / "src" / "a.ts"), ""))
@@ -139,7 +154,7 @@ class ResolveCase(Tree):
 
     def test_the_longest_key_wins(self):
         imap = graph.ImportMap({"@/": "./src/", "@/deep/": "./lib/types/"}, str(self.dir))
-        self.assertEqual(graph.resolve("@/deep/t.ts", self.importer, imap)[1], str(self.dir / "lib" / "types" / "t.ts"))
+        self.assertEqual(graph.resolve("@/deep/t.ts", self.importer, imap, os.path.isfile)[1], str(self.dir / "lib" / "types" / "t.ts"))
 
     def test_packages_and_their_subpaths_are_external(self):
         self.assertEqual(self.res("zod"), ("external", "npm:zod@4", ""))
@@ -160,7 +175,8 @@ class ResolveCase(Tree):
 
 class IndexCase(Tree):
     def index(self, project, **kw):
-        kw.setdefault("cache_path", str(self.dir / "cache" / "index.json"))
+        kw.setdefault("cache_path", str(project_cache(project)))
+        kw.setdefault("allow", stub_allow(project))
         return graph.ImportIndex(str(project), **kw)
 
     def test_importers_follow_the_import_map_and_relative_chain_in_order(self):
@@ -255,8 +271,8 @@ class IndexCase(Tree):
     def test_a_symlink_at_the_cache_path_is_never_written_through(self):
         project = self.project()
         victim = write(self.dir / "victim.txt", "keep")
-        link = self.dir / "cache" / "index.json"
-        link.parent.mkdir()
+        link = project_cache(project)
+        link.parent.mkdir(parents=True)
         link.symlink_to(victim)
         index = self.index(project)
         index.refresh()
@@ -287,7 +303,7 @@ class IndexCase(Tree):
         index.refresh()
         self.assertFalse(index.indexed("src/linked.ts"))
         self.assertFalse(any(rel.startswith("src/linked_dir") for rel in index.entries))
-        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("", "outside")])  # the specifier leads out through a link: blanked
+        self.assertEqual([(u["spec"], u["reason"]) for u in index.unresolved()], [("", "refused")])  # leads out through a link: blanked; the guard follows the link and refuses the name before graph looks at it
 
     def test_a_relative_import_that_leaves_the_project_is_unresolved_not_returned(self):
         project = self.project()
@@ -403,7 +419,8 @@ class NavCase(Tree):
         nav = self.nav(project, check_path=check_path)
         self.assertEqual(nav.importers("src/main.ts")["reason"], "blocked_by_test")
         self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
-        self.assertEqual(seen[0], (str(project.resolve()), "src/main.ts"))
+        self.assertEqual(seen[0], (str(project.resolve()), ".tmux-pi/ctx-cache"))  # the cache folder is judged once, by the guard
+        self.assertEqual(seen[1], (str(project.resolve()), "src/main.ts"))
 
     def test_imports_split_files_packages_and_unresolved(self):
         project = self.project()
@@ -505,7 +522,7 @@ class NavCase(Tree):
     @NEEDS_DENO
     def test_the_same_question_gives_the_same_answer(self):
         project = self.project()
-        a, b = self.nav(project), self.nav(project, cache_dir=str(self.dir / "other-cache"))
+        a, b = self.nav(project), self.nav(project, cache_dir=str(project / ".tmux-pi" / "other-cache"))
         for call in ("importers", "imports", "symbols", "forward_graph"):
             first, second = getattr(a, call)("src/main.ts"), getattr(b, call)("src/main.ts")
             for key in ("index_age_s", "scanned", "cached"):
@@ -570,7 +587,7 @@ class ReviewFixesCase(Tree):
         text = json.dumps(answer)
         for secret in (".env.ts", "credentials", "hidden_marker"):
             self.assertNotIn(secret, text)
-        for cached in (self.dir / "cache").iterdir():
+        for cached in project_cache(project).parent.iterdir():
             self.assertNotIn("hidden_marker", cached.read_text())  # the refused files were not read, so their imports are not kept
             self.assertNotIn("\"src/.env.ts\"", cached.read_text())  # no entry of its own
         self.assertIn("src/gate.ts", [i["path"] for i in self.nav(project).importers("src/config.ts")["importers"]])
@@ -627,12 +644,12 @@ class ReviewFixesCase(Tree):
         nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
         answer = nav.imports("src/viaparent.ts")
         self.assertEqual(answer["files"], [])
-        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "outside")])
+        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "refused")])  # the guard follows the link and refuses the name before graph looks at it
         self.assertEqual(nav.importers("src/linked_dir/secret.ts")["status"], "refused")
         self.assertEqual(nav._get_index().importers("src/linked_dir/secret.ts"), [])
         for call in (nav.symbols, nav.forward_graph):
             refused = call("src/viaparent.ts")
-            self.assertEqual((refused["status"], refused["reason"]), ("refused", "outside_project"), call.__name__)
+            self.assertEqual((refused["status"], refused["reason"]), ("refused", "reaches_refused_path"), call.__name__)  # the guard
         self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])  # Deno was not run
 
     def test_deno_is_not_run_on_a_file_that_reaches_a_refused_file(self):
@@ -847,7 +864,7 @@ class AllowListCase(Tree):
         (project / "skipped" / "link.ts").symlink_to(outside)
         write(project / "skipped" / "mid.ts", "export { s } from './link.ts';\n")
         write(project / "src" / "top.ts", "export { s } from '../skipped/mid.ts';\n")
-        self.assert_refused(project, "src/top.ts", "outside_project")
+        self.assert_refused(project, "src/top.ts", "reaches_refused_path")  # the guard follows the link and refuses the name before graph looks at it
 
     def test_cause_a_percent_encoded_dot_dot_that_the_url_parser_turns_into_a_parent_directory(self):
         project = self.project()
@@ -1048,7 +1065,7 @@ class AllowListCase(Tree):
         (project / "deno.json").write_text(json.dumps(config))
         write(project / "src" / "named.ts", "import '@gone';\n")
         answer = self.nav(project).imports("src/named.ts")
-        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "missing")])  # no such file, and the path is outside the project
+        self.assertEqual([(u["spec"], u["reason"]) for u in answer["unresolved"]], [("", "outside")])  # judged by name: the same whether or not a file is there
 
     # --- scopes in the index
 
@@ -1060,7 +1077,7 @@ class AllowListCase(Tree):
             "./scoped/": {"@a": "./scoped/a.ts"}, "./scoped/deep/": {"@a": "./scoped/deep/a.ts"}, "./scoped/x/": {"@other": "./a.ts"}})
 
         def res(spec, referrer):
-            return graph.resolve(spec, str(self.dir / referrer), imap)[1]
+            return graph.resolve(spec, str(self.dir / referrer), imap, os.path.isfile)[1]
         self.assertEqual(res("@a", "main.ts"), str(self.dir / "a.ts"))
         self.assertEqual(res("@a", "scoped/m.ts"), str(self.dir / "scoped" / "a.ts"))
         self.assertEqual(res("@a", "scoped/deep/m.ts"), str(self.dir / "scoped" / "deep" / "a.ts"))
@@ -1330,7 +1347,7 @@ class MirrorCase(Tree):
         nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), mirror_parent=str(project))
         for call in (nav.symbols, nav.forward_graph):
             answer = call("src/main.ts")
-            self.assertEqual((answer["status"], answer["reason"]), ("refused", "unmodelled_config"))
+            self.assertEqual((answer["status"], answer["reason"]), ("refused", "scratch_refused"))  # judged before it is made
         self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
         self.assertEqual([p.name for p in project.iterdir() if p.name.startswith("tp-ctx-mirror")], [])  # and nothing was left behind
 
@@ -2271,18 +2288,19 @@ class BoundedReadCase(Tree):
         config = project / "conf" / "deno.json"
         config.parent.mkdir()
         recorder = ReadRecorder(self)
-        real_isfile = os.path.isfile
+        real_isfile = graph.judged_is_file
 
-        def isfile(path):  # the walk sees no config, then a link to an outside one appears before its state is taken
-            got = real_isfile(path)
+        def isfile(base, path, allow):  # the walk sees no config, then a link to an outside one appears before its state is taken
+            got = real_isfile(base, path, allow)
             if path == str(config) and not os.path.lexists(config):
                 config.symlink_to(outside)
             return got
-        with mock.patch.object(graph.os.path, "isfile", isfile):
-            reach = graph.prove_reach(str(project), str(project / "src/config.ts"), str(config), lambda rel: True)
-        self.assertEqual(reach.configs[str(config)], graph.CONFIG_OUTSIDE)
+        with mock.patch.object(graph, "judged_is_file", isfile):
+            with self.assertRaises(graph.Unproven) as raised:  # fail closed: the config moved between the two looks
+                graph.prove_reach(str(project), str(project / "src/config.ts"), str(config), lambda rel: True)
+        self.assertEqual(raised.exception.reason, "changed_during_walk")
+        self.assertTrue(config.is_symlink())
         self.assertFalse(recorder.read(outside))
-        self.assertTrue(reach.holds())  # still a link outside: the state has not changed, and holds() reads it no more than the walk
 
     # --- review 7 F2: a swapped refused file is checked before it is read
 
@@ -2334,20 +2352,20 @@ class BoundedReadCase(Tree):
             target.symlink_to(outside)
             recorder = ReadRecorder(self)
             index = graph.ImportIndex(str(project), overlays=[str(project / "deno.test.json")],
-                                      cache_path=str(self.dir / f"cache-{which}" / "index.json"))
+                                      cache_path=str(project_cache(project)), allow=stub_allow(project))
             index.refresh()
             self.assertFalse(recorder.read(outside), which)
             if which == "config":
-                self.assertEqual(index.meta["config_error"], "outside")
+                self.assertEqual(index.meta["config_error"], "refused")  # the guard follows the link and refuses the name before graph looks at it
 
     def test_r7_a_cache_file_that_is_a_link_is_not_read(self):
         project = self.project().resolve()
-        cache = self.dir / "cache" / "index.json"
+        cache = project_cache(project)
         outside = self.outside("index.json", json.dumps({"version": graph.INDEX_VERSION}))
-        cache.parent.mkdir()
+        cache.parent.mkdir(parents=True)
         cache.symlink_to(outside)
         recorder = ReadRecorder(self)
-        graph.ImportIndex(str(project), cache_path=str(cache))
+        graph.ImportIndex(str(project), cache_path=str(cache), allow=stub_allow(project))
         self.assertFalse(recorder.read(outside))
         nav = self.nav(project)
         os.makedirs(nav.cache_dir, exist_ok=True)
@@ -2405,6 +2423,9 @@ class BoundedReadCase(Tree):
                     if owner == "read_bounded" and called == "read" and isinstance(callee, ast.Attribute) \
                             and isinstance(callee.value, ast.Name) and callee.value.id == "os":
                         continue
+                    if owner in ("open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder") and ast.unparse(callee) == "os.open" \
+                            and ast.unparse(node.args[1]).startswith("DIR_FLAGS"):
+                        continue  # a descriptor on a folder (O_DIRECTORY): listed or written in, never read from
                     if owner == "write_new" and called == "open" and isinstance(callee, ast.Attribute) \
                             and ast.unparse(callee.value) == "os":
                         flags = ast.unparse(node.args[1])
@@ -2426,6 +2447,676 @@ class BoundedReadCase(Tree):
         self.assertIn("O_RDONLY", ast.unparse([n for n in ast.walk(func) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.open"][0]))
         self.assertTrue(reads and checks)
         self.assertLess(max(checks), min(reads), "a check comes after the read")
+
+
+class FsTracer:
+    """Records every location the file system is asked about while it is active, in this process: stat, lstat, open, scandir,
+    listdir, readlink, access, mkdir, rmdir, unlink, rename, replace, chmod, utime (so `os.path.exists`, `isfile`, `lexists`,
+    `realpath`, `shutil.which`, `tempfile` and `shutil.rmtree` are traced too: they call these). Each call is kept as the location it
+    reaches: a `dir_fd`-relative name is joined to the folder the descriptor is open on (as the kernel names it); a call that follows
+    links is kept as where they lead now; one that follows none (`lstat`, `O_NOFOLLOW`, `unlink`...) as its resolved folder and its own
+    name; one under `O_NOFOLLOW_ANY` as written (the kernel follows no link on the way). `touched(place)` lists the calls at or below
+    `place`."""
+
+    CALLS = {"stat": True, "lstat": False, "open": None, "scandir": True, "listdir": True, "readlink": False, "access": True,
+             "mkdir": False, "rmdir": False, "unlink": False, "remove": False, "rename": False, "replace": False, "chmod": True,
+             "utime": True}
+
+    def __init__(self, test):
+        import threading
+        self.calls = []
+        self._busy = threading.local()
+        self.on = True
+        for name, follows in self.CALLS.items():
+            real = getattr(os, name)
+            patch = mock.patch.object(os, name, self._wrap(name, real, follows))
+            patch.start()
+            test.addCleanup(patch.stop)
+
+    def _wrap(self, name, real, follows):
+        def traced(*args, **kwargs):
+            if self.on and not getattr(self._busy, "on", False):
+                self._busy.on = True
+                try:
+                    self._note(name, args, kwargs, follows)
+                finally:
+                    self._busy.on = False
+            return real(*args, **kwargs)
+        return traced
+
+    def _note(self, name, args, kwargs, follows):
+        if name in ("rename", "replace"):
+            pairs = [(args[0] if args else kwargs.get("src"), kwargs.get("src_dir_fd")),
+                     (args[1] if len(args) > 1 else kwargs.get("dst"), kwargs.get("dst_dir_fd"))]
+            follows = False
+        else:
+            target = args[0] if args else kwargs.get("path", ".")
+            pairs = [(target, kwargs.get("dir_fd"))]
+            if name == "open":
+                flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+                anywhere = getattr(os, "O_NOFOLLOW_ANY", 0)
+                follows = "none" if anywhere and flags & anywhere == anywhere else False if flags & os.O_NOFOLLOW else True
+            if kwargs.get("follow_symlinks") is False:
+                follows = False
+        for target, dir_fd in pairs:
+            self.calls.append((name, self.where(target, dir_fd, follows)))
+
+    @staticmethod
+    def where(target, dir_fd, follows):
+        if isinstance(target, int):
+            return graph._opened_path(target) or "?"
+        target = os.fsdecode(os.fspath(target))
+        if dir_fd is not None and not os.path.isabs(target):
+            target = os.path.join(graph._opened_path(dir_fd) or "?", target)
+        target = os.path.abspath(target)
+        if follows == "none":
+            return target
+        if follows:
+            return os.path.realpath(target)
+        folder, name = os.path.split(target)
+        return os.path.join(os.path.realpath(folder), name)
+
+    def touched(self, place, but=()):
+        place = os.path.realpath(str(place))
+        allowed = {os.path.realpath(str(p)) for p in but}
+        return [(name, path) for name, path in self.calls if (path == place or path.startswith(place + os.sep)) and path not in allowed]
+
+
+class PathRuleCase(Tree):
+    """Round 9 (review 8 F1, path-boundary, rule first): THE PATH RULE (graph.py docstring) — no file-system call touches a path
+    until its name has been shown inside the boundary and allowed by the guard; the cache folder is judged like any other project
+    path, before anything in it is read, and is refused (no cache, `cache_refused` on ok answers) when the guard refuses it or it is
+    outside the project. Sandbox grants and the folder scratch copies are made in are resolved the same way with `/` as the boundary
+    (`nav_api.judged_location`). Every probe of the family sweep is a test here; each failed against 0f4bf9f (see the report)."""
+
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
+    deno_that_marks = SandboxRefusalCase.deno_that_marks
+    aimed = SandboxGrantCase.aimed
+    spied_launches = CheckedValueCase.spied_launches
+    params = staticmethod(CheckedValueCase.params)
+
+    def setUp(self):
+        super().setUp()
+        self.trap = self.dir / "trap"  # a folder beside the project: nothing in it may be looked at
+        write(self.trap / "x.ts", "export const TRAPPED = 1;\n")
+        write(self.trap / "deno.json", "{}")
+        write(self.trap / "nav_api-doc-abc.json", "[]")
+
+    def guarded_project(self):
+        """The fixture with a `.git` holding a planted cache file (the review's repro), and refused folders inside `src`."""
+        project = self.project().resolve()
+        write(project / ".git" / "HEAD", "ref: refs/heads/main\n")
+        write(project / ".git" / "nav_api-doc-abc.json", json.dumps([{"name": "PLANTED"}]))
+        write(project / "src" / ".ssh" / "id.ts", "export const ID = 1;\n")
+        write(project / "src" / "secrets" / "s.ts", "export const S = 1;\n")
+        return project
+
+    def every_question(self, nav):
+        answers = [nav.status(), nav.importers("src/util/slug.ts"), nav.imports("src/main.ts", source="index"),
+                   nav.symbols("src/main.ts"), nav.forward_graph("src/main.ts"), nav.imports("src/main.ts", source="deno")]
+        nav._read_cache("doc", "abc")
+        nav._write_cache("doc", "abc", [{"name": "x"}])
+        return answers
+
+    def assert_untouched(self, tracer, project, label=""):
+        self.assertEqual(tracer.touched(self.trap), [], label)
+        self.assertEqual(tracer.touched(project / ".git", but=[project / ".git"]), [], label)  # the monorepo-marker probe only
+        self.assertEqual(tracer.touched(project / "src" / ".ssh"), [], label)
+        self.assertEqual(tracer.touched(project / "src" / "secrets"), [], label)
+
+    def listing(self, folder):
+        return sorted((str(p.relative_to(folder)), p.read_bytes() if p.is_file() else b"") for p in Path(folder).rglob("*"))
+
+    # --- the review 8 F1 repro and the cache folder
+
+    def test_r8_f1_repro_a_cache_folder_in_git_is_refused_and_nothing_in_it_is_read_or_written(self):
+        project = self.guarded_project()
+        before = self.listing(project / ".git")
+        self.assertRaises(nav_api.Refused, nav_api.stub_check_path, str(project), ".git/nav_api-doc-abc.json")
+        tracer = FsTracer(self)
+        nav = self.nav(project, cache_dir=str(project / ".git"), deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        self.assertEqual(nav.cache_refused, "cache_dir_refused")
+        self.assertIsNone(nav._read_cache("doc", "abc"))
+        self.assertIsNone(nav._cache.read_json("nav_api-doc-abc.json"))
+        answers = self.every_question(nav)
+        tracer.on = False
+        self.assert_untouched(tracer, project)
+        self.assertEqual(self.listing(project / ".git"), before)
+        for answer in answers:
+            if answer["status"] == "ok":
+                self.assertEqual(answer.get("cache_refused"), "cache_dir_refused", answer)
+        self.assertEqual(answers[1]["status"], "ok")
+        self.assertNotIn("PLANTED", json.dumps(answers))
+
+    def test_r8_cache_folders_that_are_refused_by_name_or_by_where_they_lead(self):
+        project = self.guarded_project()
+        (project / ".tmux-pi").mkdir()
+        (project / ".tmux-pi" / "to-git").symlink_to(project / ".git")
+        (project / ".tmux-pi" / "to-trap").symlink_to(self.trap)
+        (project / ".tmux-pi" / "to-root").symlink_to(project)
+        cases = {
+            "in .git": (project / ".git", "cache_dir_refused"),
+            "below .git": (project / ".git" / "cache", "cache_dir_refused"),
+            "spelled through ..": (str(project / "src") + "/../.git", "cache_dir_refused"),
+            "relative, through ..": ("src/../.git", "cache_dir_refused"),
+            "a link to .git": (project / ".tmux-pi" / "to-git", "cache_dir_refused"),
+            "below a link to .git": (project / ".tmux-pi" / "to-git" / "c", "cache_dir_refused"),
+            # the stub guard follows links itself, so it refuses a link that leads out before graph looks at it
+            "a link out of the project": (project / ".tmux-pi" / "to-trap", "cache_dir_refused"),
+            "a link to the project root": (project / ".tmux-pi" / "to-root", "cache_dir_refused"),
+            "outside the project": (self.trap, "cache_dir_outside_project"),
+            "a new folder outside": (self.trap / "new-cache", "cache_dir_outside_project"),
+            "the project root": (project, "cache_dir_outside_project"),
+            "a sensitive folder in the project": (project / "src" / ".ssh" / "cache", "cache_dir_refused"),
+            "a secrets folder": (project / "src" / "secrets", "cache_dir_refused"),
+            "an .env folder": (project / ".env.d" / "cache", "cache_dir_refused"),
+            ".git in another case (APFS ignores case)": (project / ".GIT", "cache_dir_refused"),
+            "below .Git through ..": ("SRC/../.Git/c", "cache_dir_refused"),
+        }
+        for label, (folder, reason) in cases.items():
+            with self.subTest(label):
+                tracer = FsTracer(self)
+                nav = self.nav(project, cache_dir=str(folder))
+                self.assertEqual(nav.cache_refused, reason)
+                self.assertIsNone(nav._read_cache("doc", "abc"))
+                nav._write_cache("doc", "abc", [{"name": "x"}])
+                self.assertEqual(nav.importers("src/util/slug.ts").get("cache_refused"), reason)
+                tracer.on = False
+                self.assert_untouched(tracer, project, label)
+                self.assertEqual([call for call in tracer.calls if call[0] in ("mkdir", "rename")], [], label)
+        self.assertFalse((self.trap / "new-cache").exists())
+        self.assertFalse(list(project.glob("nav_api-*")) or list((project / ".git").glob("nav_api-index-*")))
+        self.assertEqual(self.listing(self.trap), [("deno.json", b"{}"), ("nav_api-doc-abc.json", b"[]"),
+                                                   ("x.ts", b"export const TRAPPED = 1;\n")])
+
+    def test_r8_the_default_cache_folder_and_an_alias_spelling_of_it_still_work(self):
+        project = self.project().resolve()
+        alias = self.dir / "alias"
+        alias.symlink_to(project)
+        for label, nav in {"default": self.nav(project),
+                           "alias": nav_api.NavApi(str(alias), cache_dir=str(alias / ".tmux-pi" / "ctx-cache"))}.items():
+            self.assertIsNone(nav.cache_refused, label)
+            nav._write_cache("doc", "k" + label, [{"name": label}])
+            self.assertEqual(nav._read_cache("doc", "k" + label), [{"name": label}], label)
+            self.assertNotIn("cache_refused", nav.importers("src/util/slug.ts"))
+        self.assertTrue((project_cache(project).parent / "nav_api-doc-kalias.json").is_file())
+
+    def test_r8_a_cache_folder_swapped_for_a_link_after_it_was_judged_is_neither_read_nor_written(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        nav._write_cache("doc", "k", [{"name": "mine"}])
+        folder = project_cache(project).parent
+        for target in (self.trap, project / ".git"):
+            write(Path(target) / "nav_api-doc-k.json", json.dumps([{"name": "PLANTED"}]))
+            shutil.rmtree(folder) if folder.is_dir() and not folder.is_symlink() else folder.unlink()
+            folder.symlink_to(target)
+            before = self.listing(target)
+            tracer = FsTracer(self)
+            self.assertIsNone(nav._read_cache("doc", "k"))
+            nav._write_cache("doc", "k2", [{"name": "x"}])
+            nav.importers("src/util/slug.ts")
+            tracer.on = False
+            self.assertEqual(tracer.touched(target, but=[project / ".git"]), [], target)
+            self.assertEqual(self.listing(target), before)
+
+    def test_r8_a_cache_file_that_is_a_folder_or_a_fifo_is_not_read_and_does_not_hang(self):
+        project = self.project().resolve()
+        nav = self.nav(project)
+        folder = project_cache(project).parent
+        folder.mkdir(parents=True)
+        (folder / nav._cache_name("doc", "dir")).mkdir()
+        os.mkfifo(folder / nav._cache_name("doc", "fifo"))
+        self.assertIsNone(nav._read_cache("doc", "dir"))
+        self.assertIsNone(nav._read_cache("doc", "fifo"))
+        os.mkfifo(project_cache(project, "index-fifo.json"))
+        index = graph.ImportIndex(str(project), cache_path=str(project_cache(project, "index-fifo.json")), allow=stub_allow(project))
+        self.assertTrue(index.refresh() is not None or index.entries)
+
+    def test_r8_an_index_without_a_guard_has_no_cache(self):
+        project = self.project().resolve()
+        cache = project_cache(project)
+        index = graph.ImportIndex(str(project), cache_path=str(cache))
+        self.assertIsNone(index.cache_path)
+        self.assertEqual(index.cache_refusal, "cache_dir_unguarded")
+        index.refresh()
+        self.assertFalse(index.save())
+        self.assertFalse(cache.parent.exists())
+
+    # --- every other path the modules are given
+
+    def test_r8_a_root_or_config_outside_or_refused_is_never_looked_at(self):
+        project = self.guarded_project()
+        (project / "to-git").symlink_to(project / ".git")
+        (project / "to-trap").symlink_to(self.trap)
+        for label, kw in {"root outside": {"root": str(self.trap)}, "root a link to .git": {"root": "to-git"},
+                          "root .git": {"root": ".git"}, "root a link out": {"root": "to-trap"},
+                          "config outside": {"config": str(self.trap / "deno.json")},
+                          "config in .git": {"config": ".git/deno.json"},
+                          "config through a link out": {"config": "to-trap/deno.json"},
+                          "overlay outside": {"overlays": [str(self.trap / "deno.json")]}}.items():
+            with self.subTest(label):
+                tracer = FsTracer(self)
+                nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), **kw)
+                answers = self.every_question(nav)
+                tracer.on = False
+                self.assert_untouched(tracer, project, label)
+                if label.startswith("root"):
+                    self.assertEqual(answers[1]["status"], "refused", (label, answers[1]))
+
+    def test_r8_a_target_outside_answers_the_same_whether_or_not_it_exists_and_is_not_looked_at(self):
+        project = self.guarded_project()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        answers = {}
+        for name in ("x.ts", "missing.ts"):
+            tracer = FsTracer(self)
+            answers[name] = [call(target) for target in (f"../trap/{name}", str(self.trap / name), f"src/../../trap/{name}",
+                                                         f".git/{name}", f"src/.ssh/{name}")
+                             for call in (nav.importers, nav.symbols, nav.forward_graph, nav.imports)]
+            tracer.on = False
+            self.assert_untouched(tracer, project, name)
+        self.assertEqual(answers["x.ts"], answers["missing.ts"])
+        self.assertTrue(all(answer["status"] == "refused" for answer in answers["x.ts"]), answers["x.ts"])
+
+    def test_r8_links_in_the_project_that_lead_out_or_to_git_are_never_followed_there(self):
+        project = self.guarded_project()
+        (project / "src" / "out.ts").symlink_to(self.trap / "x.ts")
+        (project / "src" / "outdir").symlink_to(self.trap)
+        (project / "src" / "gitdir").symlink_to(project / ".git")
+        (project / "src" / "chain").symlink_to("hop")
+        (project / "src" / "hop").symlink_to("../src/outdir/x.ts")
+        write(project / "src" / "uses.ts", "import './out.ts';\nimport './outdir/x.ts';\nimport './chain';\nimport './gitdir/x.ts';\n"
+              "import '../../trap/x.ts';\n")
+        tracer = FsTracer(self)
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        index = nav._get_index()
+        nav.status()
+        answers = [nav.imports("src/uses.ts", source="index")] + [call(target) for target in
+                                                                   ("src/out.ts", "src/outdir/x.ts", "src/chain", "src/gitdir/HEAD")
+                                                                   for call in (nav.importers, nav.symbols)]
+        for rel in ("src/out.ts", "src/outdir/x.ts", "src/chain", "src/gitdir/x.ts"):
+            self.assertRaises(nav_api.Refused, nav_api.stub_check_path, str(project), rel)
+            self.assertRaises(graph.Unproven, graph.judged_realpath, str(project), rel, stub_allow(project))
+        tracer.on = False
+        self.assert_untouched(tracer, project)
+        self.assertFalse(any(rel.startswith(("src/outdir/", "src/gitdir/")) for rel in index.entries))
+        self.assertEqual([a["status"] for a in answers[1:]], ["refused"] * (len(answers) - 1), answers)
+
+    def test_r8_the_walk_does_not_list_or_look_at_a_refused_folder(self):
+        project = self.guarded_project()
+        write(project / "src" / "key.pem" / "k.ts", "export const K = 1;\n")
+        tracer = FsTracer(self)
+        index = graph.ImportIndex(str(project), cache_path=str(project_cache(project)), allow=stub_allow(project))
+        index.refresh()
+        tracer.on = False
+        self.assert_untouched(tracer, project)
+        self.assertEqual(tracer.touched(project / "src" / "key.pem"), [])
+        self.assertFalse([rel for rel in index.entries if ".ssh" in rel or "secrets" in rel or ".pem" in rel])
+        self.assertIn("src/main.ts", index.entries)
+
+    def test_r8_a_fifo_source_or_config_does_not_hang_and_is_not_read(self):
+        project = self.project().resolve()
+        os.mkfifo(project / "src" / "pipe.ts")
+        index = graph.ImportIndex(str(project), cache_path=str(project_cache(project)), allow=stub_allow(project))
+        index.refresh()
+        self.assertNotIn("src/pipe.ts", index.entries)
+        for name in ("deno.json", "package.json"):
+            fifo = self.project(f"fifo-{name}").resolve()
+            (fifo / name).unlink(missing_ok=True)
+            os.mkfifo(fifo / name)
+            nav = self.nav(fifo, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+            answer = nav.symbols("src/main.ts")
+            self.assertEqual(answer["status"], "refused", (name, answer))
+            nav.importers("src/util/slug.ts")
+            nav.status()
+
+    def test_r8_a_folder_on_the_way_swapped_for_a_link_is_seen_by_the_look_and_the_read(self):
+        project = self.project().resolve()
+        target = project / "src" / "util" / "slug.ts"
+        self.assertEqual(graph.read_bounded(str(target), str(target), str(project), lambda rel: True)[0], "ok")
+        shutil.move(str(project / "src" / "util"), str(self.trap / "util"))
+        (project / "src" / "util").symlink_to(self.trap / "util")
+        tracer = FsTracer(self)
+        self.assertEqual(graph.read_bounded(str(target), str(target), str(project), lambda rel: True)[:2], ("changed", None))
+        self.assertRaises(OSError, graph.lstat_nofollow, str(target))
+        tracer.on = False
+        self.assertEqual(tracer.touched(self.trap), [])
+
+    def test_r8_the_stub_guard_and_judged_realpath_look_at_nothing_for_a_name_they_refuse(self):
+        project = self.guarded_project()
+        tracer = FsTracer(self)
+        for rel in (".git/x", ".git", "src/.ssh/id.ts", "../trap/x.ts", str(self.trap / "x.ts"), "src/../../trap/x.ts",
+                    "src/secrets/s.ts", "config/local.json", ".env", "a/.ENV.local"):
+            self.assertRaises(nav_api.Refused, nav_api.stub_check_path, str(project), rel)
+            self.assertRaises(graph.Unproven, graph.judged_realpath, str(project), rel, stub_allow(project))
+            self.assertIsNone(graph.project_path(str(project), rel, stub_allow(project)))
+            self.assertFalse(graph.judged_is_file(str(project), rel, stub_allow(project)))
+            self.assertFalse(graph.judged_is_dir(str(project), rel, stub_allow(project)))
+        tracer.on = False
+        self.assertEqual([call for call in tracer.calls if call[1] != str(project) and not str(project).startswith(call[1] + os.sep)],
+                         [], "a refused name was looked at")
+
+    # --- the sandbox grants and the scratch folder
+
+    def test_r8_deno_dir_or_the_executable_in_or_led_to_a_sensitive_place_is_refused_unlooked_at(self):
+        project = self.project().resolve()
+        home = self.dir / "home"
+        ssh = home / ".ssh"
+        write(ssh / "deno" / "x", "")
+        write(self.dir / "plain-file", "")
+        (self.dir / "to-ssh").symlink_to(ssh / "deno")
+        (self.dir / "to-ssh-bin").symlink_to(ssh)
+        marker_deno = self.deno_that_marks()
+        ssh_deno = ssh / "bin" / "deno"
+        write(ssh_deno, Path(marker_deno).read_text())
+        ssh_deno.chmod(0o755)
+        cases = {"DENO_DIR in .ssh": ({"DENO_DIR": ssh / "deno"}, marker_deno),
+                 "DENO_DIR a link into .ssh": ({"DENO_DIR": self.dir / "to-ssh"}, marker_deno),
+                 "DENO_DIR below a link into .ssh": ({"DENO_DIR": self.dir / "to-ssh" / "sub"}, marker_deno),
+                 "XDG_CACHE_HOME in .ssh": ({"DENO_DIR": "", "XDG_CACHE_HOME": ssh}, marker_deno),
+                 "DENO_DIR a file": ({"DENO_DIR": self.dir / "plain-file"}, marker_deno),
+                 "DENO_DIR the home folder": ({"DENO_DIR": home, "HOME": home}, marker_deno),
+                 "DENO_DIR holding the home folder": ({"DENO_DIR": self.dir / "h", "HOME": self.dir / "h" / "me"}, marker_deno),
+                 "the executable in .ssh": ({}, str(ssh_deno)),
+                 "the executable through a link into .ssh": ({}, str(self.dir / "to-ssh-bin" / "bin" / "deno"))}
+        for label, (env, deno) in cases.items():
+            with self.subTest(label):
+                (self.dir / "marker").unlink(missing_ok=True)
+                with self.aimed(project, **env):
+                    tracer = FsTracer(self)
+                    nav = self.nav(project, deno=deno)
+                    answers = [nav.symbols("src/main.ts"), nav.forward_graph("src/main.ts")]
+                    nav.deno_version()
+                    tracer.on = False
+                for answer in answers:
+                    self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_grant_sensitive"), (label, answer))
+                self.assertFalse((self.dir / "marker").exists(), label)
+                self.assertEqual(tracer.touched(ssh), [], label)
+
+    def test_r8_a_deno_on_path_in_a_sensitive_folder_is_not_looked_up_there(self):
+        project = self.project().resolve()
+        ssh_bin = self.dir / "home" / ".ssh" / "bin"
+        ssh_bin.mkdir(parents=True)
+        (self.dir / "linked-bin").symlink_to(ssh_bin)
+        write(ssh_bin / "deno", Path(self.deno_that_marks()).read_text()).chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{ssh_bin}{os.pathsep}{self.dir / 'linked-bin'}{os.pathsep}relative"}):
+            tracer = FsTracer(self)
+            nav = self.nav(project)
+            self.assertIsNone(nav._deno_exe())
+            self.assertEqual(nav.symbols("src/main.ts")["status"], "unavailable")
+            tracer.on = False
+        self.assertEqual(tracer.touched(ssh_bin), [])
+        plain_bin = self.dir / "plain-bin"
+        plain_bin.mkdir()
+        (plain_bin / "deno").symlink_to(ssh_bin / "deno")  # a deno on PATH that is a link into .ssh
+        with mock.patch.dict(os.environ, {"PATH": str(plain_bin)}):
+            tracer = FsTracer(self)
+            nav = self.nav(project)
+            answer = nav.symbols("src/main.ts")
+            tracer.on = False
+        self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_grant_sensitive"))
+        self.assertEqual(tracer.touched(ssh_bin), [])
+        self.assertFalse((self.dir / "marker").exists())
+
+    def test_r8_own_scratch_folders_are_made_where_the_parent_was_judged_never_through_a_link(self):
+        """The mirror and the probe folder are made relative to a descriptor on the judged parent (no link on the way), not by name:
+        a parent swapped for a link (into .ssh) after it was judged refuses with `scratch_refused`, and nothing is made, resolved
+        or looked at past the link."""
+        project = self.project().resolve()
+        ssh = self.dir / "home" / ".ssh"
+        (ssh / "tmp").mkdir(parents=True)
+        parent = self.dir / "scratch"
+        parent.mkdir()
+        made = graph.make_own_folder(str(parent), "tp-x-")
+        self.assertEqual((os.path.dirname(made), stat.S_IMODE(os.lstat(made).st_mode)), (str(parent), 0o700))
+        parent_real = nav_api.NavApi._scratch_parent
+
+        def judged_then_swapped(nav):  # the judged parent becomes a link into .ssh just after it was judged
+            judged = parent_real(nav)
+            shutil.rmtree(parent)
+            parent.symlink_to(ssh / "tmp")
+            return judged
+        shutil.rmtree(parent)
+        parent.symlink_to(ssh / "tmp")
+        tracer = FsTracer(self)
+        with self.assertRaises(graph.Unproven) as raised:
+            graph.Mirror(str(project), str(parent))
+        self.assertEqual(raised.exception.reason, "scratch_refused")
+        for call in ("symbols", "forward_graph"):
+            parent.unlink()
+            parent.mkdir()
+            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), mirror_parent=str(parent))
+            with mock.patch.object(nav_api.NavApi, "_scratch_parent", judged_then_swapped):
+                answer = getattr(nav, call)("src/main.ts")
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "scratch_refused"), (call, answer))
+        tracer.on = False
+        self.assertEqual(tracer.touched(ssh), [])
+        self.assertEqual(list((ssh / "tmp").iterdir()), [])
+        self.assertEqual(self.deno_calls("doc") + self.deno_calls("info"), [])
+
+    def test_r8_a_mirror_folder_swapped_for_a_link_is_not_written_through(self):
+        project = self.project().resolve()
+        mirror = graph.Mirror(str(project), str(self.dir))
+        self.addCleanup(mirror.cleanup)
+        mirror.write("src/a.ts", b"x")
+        shutil.rmtree(mirror.path("src"))
+        os.symlink(self.trap, mirror.path("src"))
+        before = self.listing(self.trap)
+        self.assertRaises(OSError, mirror.write, "src/b.ts", b"LEAK")
+        self.assertRaises(OSError, mirror.write, "src/deep/c.ts", b"LEAK")
+        self.assertEqual(self.listing(self.trap), before)
+
+    def test_r8_the_default_scratch_folder_is_judged_before_anything_is_made_or_written_there(self):
+        """`TMPDIR` names the default scratch folder; `tempfile.gettempdir()` would write a test file in it before any judgement.
+        A sensitive one (or one that leads there) refuses the call, and nothing is made, written or looked at in it."""
+        project = self.project().resolve()
+        ssh = self.dir / "home" / ".ssh"
+        (ssh / "tmp").mkdir(parents=True)
+        (self.dir / "to-ssh").symlink_to(ssh / "tmp")
+        for tmpdir in (ssh / "tmp", self.dir / "to-ssh", "relative/tmp"):
+            with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}), mock.patch.object(tempfile, "tempdir", None):
+                tracer = FsTracer(self)
+                nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+                answer = nav.symbols("src/main.ts")
+                tracer.on = False
+            self.assertEqual((answer["status"], answer.get("reason")), ("refused", "scratch_refused"), (tmpdir, answer))
+            self.assertEqual(tracer.touched(ssh), [], tmpdir)
+            self.assertEqual(list((ssh / "tmp").iterdir()), [])
+        with mock.patch.dict(os.environ, {"TMPDIR": str(self.dir)}):
+            self.assertEqual(self.nav(project)._scratch_parent(), str(self.dir))
+
+    def test_r8_an_own_folder_whose_parent_was_swapped_for_a_link_is_not_removed_through_it(self):
+        parent = self.dir / "scratch"
+        parent.mkdir()
+        made = graph.make_own_folder(str(parent), "tp-x-")
+        write(Path(made) / "a" / "f", "x")
+        twin = self.trap / os.path.basename(made)  # a folder of the same name where the link leads
+        write(twin / "keep", "KEEP")
+        shutil.move(str(parent), str(self.dir / "moved"))
+        parent.symlink_to(self.trap)
+        graph.remove_own_folder(made)
+        self.assertEqual((twin / "keep").read_text(), "KEEP")
+        os.unlink(parent)
+        shutil.move(str(self.dir / "moved"), str(parent))
+        graph.remove_own_folder(made)
+        self.assertFalse(os.path.lexists(made))
+
+    def test_r8_a_mirror_is_made_only_in_a_judged_parent(self):
+        project = self.project().resolve()
+        tracer = FsTracer(self)
+        with mock.patch.object(tempfile, "tempdir", str(self.trap)):
+            for parent in (None, ""):
+                with self.assertRaises(graph.Unproven) as raised:
+                    graph.Mirror(str(project), parent)
+                self.assertEqual(raised.exception.reason, "scratch_refused")
+        tracer.on = False
+        self.assertEqual(tracer.touched(self.trap), [])
+
+    def test_r8_a_scratch_folder_that_is_sensitive_inside_the_project_or_led_there_is_refused_unlooked_at(self):
+        project = self.project().resolve()
+        ssh = self.dir / "home" / ".ssh"
+        (ssh / "tmp").mkdir(parents=True)
+        (self.dir / "to-ssh").symlink_to(ssh / "tmp")
+        (self.dir / "to-project").symlink_to(project / "src")
+        for label, parent in {"in .ssh": ssh / "tmp", "a link into .ssh": self.dir / "to-ssh",
+                              "inside the project": project / "src", "a link into the project": self.dir / "to-project"}.items():
+            with self.subTest(label):
+                tracer = FsTracer(self)
+                nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}), mirror_parent=str(parent))
+                answer = nav.symbols("src/main.ts")
+                tracer.on = False
+                self.assertEqual((answer["status"], answer.get("reason")), ("refused", "scratch_refused"), (label, answer))
+                self.assertEqual(tracer.touched(ssh), [], label)
+                self.assertEqual(list((ssh / "tmp").iterdir()), [])
+                self.assertEqual(self.deno_calls("doc"), [])
+        self.assertFalse([p for p in (project / "src").iterdir() if p.name.startswith("tp-ctx")])
+
+    def test_r8_every_path_handed_to_a_process_is_the_sandbox_the_mirror_or_a_judged_grant(self):
+        project = self.project().resolve()
+        started = self.spied_launches()
+        nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        for call in (nav.symbols, nav.forward_graph):
+            call("src/main.ts")
+        nav.imports("src/main.ts", source="deno")
+        if not started:
+            self.skipTest("no process was started (no sandbox here)")
+        for argv, env in started:
+            params = self.params(argv)
+            self.assertEqual(argv[0], nav_api.SANDBOX_EXEC)
+            granted = {params["ROOT"], params["DENODIR"], params["DENOBIN"]}
+            for grant in (params["DENODIR"], params["DENOBIN"]):
+                self.assertEqual(nav_api.judged_location(grant), grant)
+                self.assertFalse(nav_api._sensitive_location(grant))
+            self.assertEqual(env["DENO_DIR"], params["DENODIR"])
+            for word in argv[1:]:
+                for path in [word.split("=", 1)[1] if "=" in word else word]:
+                    if path.startswith(os.sep) and path != nav_api.SANDBOX_EXEC:
+                        self.assertTrue(path in granted or path.startswith(params["ROOT"] + os.sep), (path, argv))
+            for key, value in env.items():
+                if key not in ("PATH", "HOME", "TMPDIR") and value.startswith(os.sep):
+                    self.assertIn(value, granted, key)
+            self.assertFalse(params["ROOT"].startswith(str(project)), "the mirror is never in the project")
+
+    def test_r8_the_tracer_sees_each_way_a_location_is_looked_at(self):
+        """The tracer itself: each of these touches the trap, and is seen."""
+        (self.dir / "to-trap").symlink_to(self.trap)
+        ways = {"isfile": lambda: os.path.isfile(self.trap / "x.ts"), "exists": lambda: os.path.exists(self.dir / "to-trap" / "no"),
+                "realpath": lambda: os.path.realpath(self.dir / "to-trap" / "x.ts"), "listdir": lambda: os.listdir(self.trap),
+                "scandir": lambda: list(os.scandir(self.dir / "to-trap")),
+                "dir_fd lstat": lambda: self._at(lambda fd: os.lstat("x.ts", dir_fd=fd)),
+                "open": lambda: os.close(os.open(self.dir / "to-trap" / "x.ts", os.O_RDONLY)),
+                "which": lambda: shutil.which("x.ts", path=str(self.trap)), "mkdir": lambda: os.mkdir(self.trap / "new")}
+        for label, way in ways.items():
+            tracer = FsTracer(self)
+            way()
+            tracer.on = False
+            self.assertTrue(tracer.touched(self.trap), label)
+
+    def _at(self, use):
+        fd = os.open(self.trap, os.O_RDONLY)
+        try:
+            return use(fd)
+        finally:
+            os.close(fd)
+
+    # --- the rule, by scan: every file-system call in both files, by owner
+
+    FS_CALLS = {  # (file, owner, call): the check it passes. A call added anywhere, or moved, fails the test until it is listed here.
+        ("graph.py", "resolve", "isfile"): "the caller's judge (`ImportIndex._verdicts`): judged_realpath, then lstat_nofollow",
+        ("graph.py", "_look", "os.open"): "folder descriptor, NOFOLLOW_ANY; the caller judged the name (judged_realpath, lstat_nofollow)",
+        ("graph.py", "_look", "os.lstat"): "dir_fd-relative to that descriptor",
+        ("graph.py", "_look", "os.readlink"): "dir_fd-relative to that descriptor",
+        ("graph.py", "_opened_path", "fcntl.fcntl"): "an open descriptor (F_GETPATH)",
+        ("graph.py", "_opened_path", "os.readlink"): "/proc/self/fd (Linux)",
+        ("graph.py", "read_bounded", "os.open"): "boundary + guard on both names before; NOFOLLOW_ANY; kernel path checked",
+        ("graph.py", "read_bounded", "os.fstat"): "the checked descriptor",
+        ("graph.py", "read_bounded", "os.read"): "after every check",
+        ("graph.py", "write_new", "os.open"): "O_EXCL|O_NOFOLLOW, relative to a checked folder descriptor",
+        ("graph.py", "write_new", "os.write"): "the new file",
+        ("graph.py", "open_folder_below", "os.open"): "base NOFOLLOW_ANY, then each part O_NOFOLLOW relative to the one before",
+        ("graph.py", "open_folder_below", "os.mkdir"): "dir_fd-relative, a part of a judged folder (cache) or of the own mirror",
+        ("graph.py", "CacheDir.write_json", "os.lstat"): "dir_fd of the checked folder; a plain .json name the guard allows",
+        ("graph.py", "CacheDir.write_json", "os.unlink"): "dir_fd of the checked folder",
+        ("graph.py", "CacheDir.write_json", "os.rename"): "dir_fd of the checked folder",
+        ("graph.py", "judged_is_dir", "os.lstat"): "the boundary itself (base == path)",
+        ("graph.py", "make_own_folder", "os.open"): "the judged scratch parent, folder descriptor, NOFOLLOW_ANY; kernel path checked",
+        ("graph.py", "make_own_folder", "os.mkdir"): "dir_fd-relative to that descriptor, a new random name",
+        ("graph.py", "remove_own_folder", "os.open"): "the parent of an own folder, folder descriptor, NOFOLLOW_ANY; kernel path checked",
+        ("graph.py", "remove_own_folder", "shutil.rmtree"): "dir_fd-relative to that descriptor: the own folder's name",
+        ("graph.py", "prove_reach", "os.path.realpath"): "the boundary itself",
+        ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
+        ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
+        ("graph.py", "ImportIndex._walk", "os.scandir"): "that descriptor",
+        ("graph.py", "ImportIndex._walk", "os.lstat"): "dir_fd-relative, after the guard allowed the name",
+        ("nav_api.py", "stub_check_path", "os.path.realpath"): "the boundary itself",
+        ("nav_api.py", "NavApi.__init__", "os.path.realpath"): "the boundary itself",
+        ("nav_api.py", "NavApi._executable", "os.path.isfile"): "a candidate resolved by judged_location (no link, not sensitive)",
+        ("nav_api.py", "NavApi._executable", "os.access"): "the same resolved candidate",
+        ("nav_api.py", "NavApi._guarded_roots", "os.path.lexists"): "monorepo markers: exact names in the project's ancestors",
+        ("nav_api.py", "NavApi._grant_kinds", "os.lstat"): "a grant resolved by judged_location, not sensitive",
+        ("nav_api.py", "NavApi._sandboxed", "os.access"): "the fixed SANDBOX_EXEC",
+        ("nav_api.py", "NavApi._check_sandbox", "subprocess.run"): "SANDBOX_EXEC with judged grants and the probe folder",
+        ("nav_api.py", "NavApi._run_deno", "subprocess.run"): "SANDBOX_EXEC with judged grants and the mirror",
+    }
+
+    @staticmethod
+    def fs_calls():
+        """[(file, owner, call)] for every call in graph.py and nav_api.py that asks the file system anything (os, os.path, shutil,
+        tempfile, subprocess, fcntl, io, pathlib, glob, mmap, a Path method, `open`, the `isfile` judge), but the ones that only
+        work on names."""
+        import ast
+        modules = ("os.", "shutil.", "tempfile.", "subprocess.", "fcntl.", "io.", "pathlib.", "Path(", "glob.", "mmap.")
+        names_only = {"os.path.join", "os.path.normpath", "os.path.split", "os.path.dirname", "os.path.basename", "os.path.isabs",
+                      "os.path.relpath", "os.path.commonpath", "os.path.abspath", "os.path.splitext", "os.fsdecode", "os.fspath",
+                      "os.getpid", "os.close", "os.environ.get", "os.path.expanduser", "os.pathsep.join"}
+        methods = {"stat", "lstat", "open", "read_text", "read_bytes", "write_text", "write_bytes", "iterdir", "glob", "rglob",
+                   "exists", "is_file", "is_dir", "is_symlink", "resolve", "readlink", "scandir", "listdir", "mkdir", "unlink",
+                   "touch", "samefile", "isfile", "isdir", "lexists", "realpath", "access", "which", "rename", "rmdir",
+                   "chmod", "walk", "getsize", "getmtime"}  # os.replace and os.remove are found by their module
+        found = []
+        for name in ("graph.py", "nav_api.py"):
+            tree = ast.parse((ROOT / "lib" / "ctxengine" / name).read_text())
+
+            def visit(node, owner):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.ClassDef):
+                        visit(child, child.name)
+                    elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        visit(child, owner if owner and "." in owner or (owner and not owner[0].isupper())
+                              else f"{owner}.{child.name}" if owner else child.name)
+                    else:
+                        if isinstance(child, ast.Call):
+                            func = child.func
+                            call = ast.unparse(func)
+                            chained = isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call)
+                            method = isinstance(func, ast.Attribute) and func.attr in methods
+                            if call not in names_only and (method or call in ("open", "isfile")
+                                                           or (call.startswith(modules) and not chained)):
+                                found.append((name, owner or "<module>", call))
+                        visit(child, owner)
+            visit(tree, "")
+        return found
+
+    def test_r8_every_file_system_call_in_both_files_is_a_listed_site_with_its_check(self):
+        """Not only `open`: stat, lstat, listing, readlink, realpath, access, mkdir, rename, unlink, temp folders and processes.
+        Each listed site's check is named in FS_CALLS and covered by the probes above."""
+        found = self.fs_calls()
+        self.assertEqual(sorted(set(found) - set(self.FS_CALLS)), [], "a file-system call that is not a listed site")
+        self.assertEqual(sorted(set(self.FS_CALLS) - set(found)), [], "a listed site that is gone: update FS_CALLS")
+        realpaths = sorted({(name, owner) for name, owner, call in found if call.endswith("realpath")})
+        self.assertEqual(realpaths, [("graph.py", "ImportIndex.__init__"), ("graph.py", "prove_reach"),
+                                     ("nav_api.py", "NavApi.__init__"), ("nav_api.py", "stub_check_path")],
+                         "os.path.realpath follows links before their names are judged: only the project boundary itself")
+
+    def test_r8_the_scan_sees_every_kind_of_call_it_bans(self):
+        """The scan itself: each kind of call, put in a function of a scratch module, is found."""
+        import ast
+        sample = ("def f(p, d):\n    os.stat(p)\n    os.lstat(p)\n    os.listdir(p)\n    os.scandir(p)\n    os.path.realpath(p)\n"
+                  "    os.path.isfile(p)\n    os.path.exists(p)\n    Path(p).read_text()\n    p.iterdir()\n    open(p)\n"
+                  "    os.walk(p)\n    shutil.copy(p, d)\n    os.path.getsize(p)\n    glob.glob(p)\n")
+        with mock.patch.object(Path, "read_text", lambda self: sample if self.name in ("graph.py", "nav_api.py") else ""):
+            found = self.fs_calls()
+        self.assertEqual(len([c for c in found if c[0] == "graph.py"]), 14, found)
 
 
 if __name__ == "__main__":

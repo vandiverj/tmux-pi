@@ -21,6 +21,20 @@ project or one the guard refuses, in any spelling Deno's URL parser accepts (`%2
 be shown, whether or not a file is there. Every string in an answer, including one read back from the cache, passes through
 `guard(text)` on its way out; a guard that raises gives an `error` answer.
 
+The path rule (graph.py states it in full; a test holds every file-system call in both modules to a table): nothing is asked of the
+file system about a path until its name is shown inside the project and allowed by `check_path`. That covers the path argument
+(`stub_check_path` judges the name before it follows a link), the Deno root and config, every file and folder the index walks or an
+import names, and the cache folder: `graph.CacheDir`, judged once when the instance is made, must be inside the project and allowed
+(not `.git`, not a link to a refused or outside place); otherwise there is no cache, and `ok` answers say `cache_refused` with the
+reason (`cache_dir_outside_project`, `cache_dir_refused`, `cache_dir_unreadable`). Every cache read is a `read_bounded` like any
+other. A refusal never depends on whether something is there. What the sandbox grants (Deno's cache folder, the executable) is not a
+project path: it is resolved once by `judged_location` (links followed only after each name is judged: nothing in a sensitive folder
+is looked at) and refused (`sandbox_grant_sensitive`) when it is, or leads to, a sensitive folder (`.ssh`, `.git`, ...), holds the
+home folder, or is not a folder (the cache) or a regular file (the executable); `deno` is looked up only in `PATH` folders judged the
+same way. The folder a mirror or probe is made in (`mirror_parent`, else `TMPDIR`, else `/tmp`; never `tempfile.gettempdir()`, which
+writes in a folder before anything judges it) is refused (`scratch_refused`) when it is, or leads to, a sensitive folder or is inside
+the project; the mirror is made, written and removed with no link followed on the way.
+
 Deno is run on a mirror of an allow-list, not on the project. `deno info` and `deno doc` start only after `graph.prove_reach` has
 walked every module Deno would load from the target and shown each one allowed: the walk reads the files itself (so a file the
 index does not hold, such as one under the config's `exclude`, is followed like any other), resolves each specifier through the
@@ -39,7 +53,8 @@ Deno is also run inside an operating-system sandbox, always (`sandbox-exec` with
 executable and cache and the system libraries, may write nothing (its cache is read only), and has no network and cannot start
 another program. So a path the mirror does not hold and the walk never saw (an absolute `file:///...` the scanner missed) cannot
 be opened either. Every path the profile grants other than the mirror (Deno's cache directory, which the worker's environment names
-with `DENO_DIR` or `XDG_CACHE_HOME`, and the Deno executable) is resolved with `realpath` once per launch, and those resolved
+with `DENO_DIR` or `XDG_CACHE_HOME`, and the Deno executable) is resolved once per launch (`judged_location`: links followed only
+after each name is judged, so nothing inside a sensitive folder is looked at), and those resolved
 strings are what is checked and what is handed on: the profile's parameters, `DENO_DIR` and the program that is run. Nothing is
 resolved again after the check. If it equals, contains or sits inside the project, the Deno root, the config's folder, a monorepo root (the nearest
 folder above the project with a `.git`, any with a workspace marker) or the mirror, the call is refused with `sandbox_grant_overlap`,
@@ -72,7 +87,7 @@ Known limits (what is not proven):
   - Modules named only by `new URL(..., import.meta.url)`, `Worker`, `require()` in CommonJS, or runtime reads are not followed; Deno
     does not load them for `info` or `doc` either, but that is Deno's behaviour, not something proven here.
   - There is one way to read a file's bytes in this module and in `graph`: `graph.read_bounded`. It opens the file, asks the
-    kernel which file is open, checks that it is the path the caller judged, inside the project (or the cache directory) and
+    kernel which file is open, checks that it is the path the caller judged, inside the project and
     allowed by the guard, and only then reads; a file that fails a check is never read. That covers sources, the Deno config,
     overlays, `package.json` files and both caches. A link swapped in between the check of a name and its read gives
     `stale_index` (the walk) or no edges (the index), and its bytes are not read. Where the kernel cannot name
@@ -91,10 +106,9 @@ import hashlib
 import json
 import os
 import re
-import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 from urllib.parse import unquote
 
 try:
@@ -134,6 +148,7 @@ SANDBOX_APPLY_FAILED = 71  # sandbox-exec's exit status when the profile could n
 SANDBOX_NEXT_STEP = "Deno is only run inside an operating-system sandbox (macOS sandbox-exec); importers and imports still work without it"
 GRANT_NEXT_STEP = ("point DENO_DIR (and XDG_CACHE_HOME) at a directory outside the project and its repository, and keep the deno "
                    "executable outside them; importers and imports still work without Deno")
+SCRATCH_NEXT_STEP = "pass a mirror_parent outside the project and outside any sensitive folder"
 SCRATCH_REASON = "scratch_unavailable"  # internal: the directory for a probe or a mirror could not be made (an error, not a refusal)
 WORKSPACE_MARKERS = ("pnpm-workspace.yaml", "turbo.json", "nx.json", "lerna.json", "rush.json")
 NEXT_STEP = {
@@ -160,28 +175,78 @@ class Refused(Exception):
 
 
 class GrantOverlap(Exception):
-    """A path the sandbox profile would grant overlaps the project or a monorepo root (see `NavApi._grants`)."""
+    """A path the sandbox profile would grant is not allowed (see `NavApi._grants`): `reason` is `sandbox_grant_overlap` (it
+    overlaps the project, a monorepo root or the mirror) or `sandbox_grant_sensitive` (it is, or is in, a sensitive folder, it
+    holds the home folder, or it is not the kind of file it must be)."""
+
+    def __init__(self, reason="sandbox_grant_overlap"):
+        super().__init__(reason)
+        self.reason = reason
+
+
+GRANT_REASONS = ("sandbox_grant_overlap", "sandbox_grant_sensitive")
+SCRATCH_REFUSED = "scratch_refused"  # the folder a mirror or a probe would be made in is sensitive, or inside the project
+
+
+def _sensitive_part(part):
+    """True for one path component (any case) that the stub guard refuses wherever it is: `.env*`, a key or secret file name, `.git`,
+    `.ssh`, `.aws`, `.gnupg`."""
+    part = part.lower()
+    return part.startswith(".env") or part.endswith(_SENSITIVE_SUFFIXES) or part.startswith(_SENSITIVE_NAMES) \
+        or part in _SENSITIVE_DIRS
+
+
+def _sensitive(rel):
+    """True when the project-relative posix path `rel` is sensitive by its name alone (the stub's rules; nothing is looked at): a
+    sensitive component anywhere, or a `config/local.json` / `agent/auth.json` tail."""
+    parts = rel.split("/")
+    return any(_sensitive_part(part) for part in parts) or "/".join(parts[-2:]).lower() in ("config/local.json", "agent/auth.json")
+
+
+def _sensitive_location(path):
+    """True when the absolute path `path` (resolved) has a sensitive component (see `_sensitive_part`), judged by name."""
+    return any(_sensitive_part(part) for part in path.split(os.sep) if part)
+
+
+def judged_location(path):
+    """The absolute path `path` (a place outside any project: a sandbox grant, the folder scratch copies are made in) with its
+    links followed the way `graph.judged_realpath` follows a project path, with `/` as the boundary and the guard refusing any
+    sensitive component (`_sensitive`): the name, and each link's target joined to the rest, is judged by name before the file
+    system is asked about it, so resolving never looks inside `.ssh`, `.git` or the like, which `os.path.realpath` would do for
+    whatever a link names. Raises graph.Unproven (`reaches_refused_path`, `unreadable_file`)."""
+    full = os.path.normpath(os.path.abspath(path))
+    if full == os.sep:
+        return full
+    return os.sep + graph.judged_realpath(os.sep, full, lambda rel: not _sensitive(rel))[1]
+
+
+_CHECK_REFUSALS = {"outside_project": "outside_project", "reaches_refused_path": "sensitive_path",
+                   "unreadable_file": "unreadable_path"}
 
 
 def stub_check_path(project, value):
     """STUB for CX1's `redact.check_path(project, path)`: the project-relative posix path `value` names, or Refused. Refused:
     `outside_project` (outside `project` by its name or where a symlink in it leads), `sensitive_path` (`.env*`,
-    `config/local.json`, `agent/auth.json`, keys, secrets), `project_root`."""
-    real_root = os.path.realpath(str(project))
-    full = os.path.normpath(value if os.path.isabs(value) else os.path.join(real_root, value))
-    real = os.path.realpath(full)
-    if real == real_root:
+    `config/local.json`, `agent/auth.json`, keys, secrets, `.git` and the like, by its name or where a symlink in it leads),
+    `project_root`, `unreadable_path` (a link loop, or a name on the way that cannot be looked at).
+
+    The name is judged first, with nothing asked of the file system: inside the project, and not sensitive. Only then are its
+    links followed, by `graph.judged_realpath`, which judges each link's target by name before it looks at it. So asking about
+    `../../x` or `.git/x` looks at nothing, and the answer is the same whether or not anything is there."""
+    spelled, real_root = os.path.abspath(str(project)), os.path.realpath(str(project))  # the boundary itself
+    full = graph.respell(value, spelled, real_root)
+    if full == real_root:
         raise Refused("project_root")
-    if not real.startswith(real_root + os.sep):
+    rel = graph.lexical_path(real_root, full)
+    if rel is None:
         raise Refused("outside_project")
-    for candidate in (full, real):
-        parts = os.path.relpath(candidate, real_root).split(os.sep)  # the names inside the project, not the ones above it
-        name = parts[-1].lower()
-        tail = "/".join(parts[-2:]).lower()
-        if name.startswith(".env") or tail in ("config/local.json", "agent/auth.json") or name.endswith(_SENSITIVE_SUFFIXES) \
-                or name.startswith(_SENSITIVE_NAMES) or any(part in _SENSITIVE_DIRS for part in parts):
-            raise Refused("sensitive_path")
-    return os.path.relpath(real, real_root).replace(os.sep, "/")
+    if _sensitive(rel):
+        raise Refused("sensitive_path")
+    try:
+        _, real = graph.judged_realpath(real_root, rel, lambda name: not _sensitive(name))
+    except graph.Unproven as error:
+        raise Refused(_CHECK_REFUSALS.get(error.reason, "outside_project"))
+    return real
 
 
 def stub_guard(text):
@@ -215,19 +280,38 @@ class NavApi:
     project root) and are named after the root, so two projects never share one.
 
     `check_path(project, path)` and `guard(text)` are the path guard and output screen (see the module docstring); the cache holds
-    what Deno said, and both run again on every read of it."""
+    what Deno said, and both run again on every read of it.
+
+    Every path given here is judged by name, inside `project_root` and allowed by `check_path`, before anything is asked of it:
+    `root` (refused, every answer that needs the index is `refused`), the config (judged again on every read) and the cache folder
+    (`graph.CacheDir`, judged once, here). A cache folder outside the project, or one the guard refuses (`.git`, or a link to it),
+    means no cache, never a cache somewhere else: answers still work, and carry `cache_refused` with the reason."""
 
     def __init__(self, project_root, root=None, config=None, overlays=(), cache_dir=None, deno="deno", timeout=DEFAULT_TIMEOUT,
                  check_path=stub_check_path, guard=stub_guard, mirror_parent=None):
-        self.project_root = os.path.realpath(project_root)
-        self.root = os.path.realpath(root or project_root)
-        self.config = os.path.join(self.root, "deno.json") if config is None else os.path.realpath(config)
-        self.overlays = list(overlays)
-        self.cache_dir = cache_dir if cache_dir is not None else os.path.join(self.project_root, CACHE_RELATIVE)
-        self.deno = deno
-        self.timeout = timeout
         self.check_path = check_path
         self.guard = guard
+        spelled = os.path.abspath(project_root)
+        self.project_root = os.path.realpath(project_root)  # the boundary itself
+        self.root, self._root_refusal = self.project_root, None
+        if root is not None and graph.respell(root, spelled, self.project_root) != self.project_root:
+            try:
+                self.root = self._judged(graph.respell(root, spelled, self.project_root))
+            except graph.Unproven as error:
+                self.root, self._root_refusal = None, error.reason
+        self.config = os.path.join(self.root or self.project_root, "deno.json") if config is None \
+            else graph.respell(config, spelled, self.project_root)  # judged on every read (`graph._config_read`)
+        self._config_dir = os.path.dirname(self.config)  # by name; resolved below only when it is shown allowed
+        if self._config_dir != self.project_root:
+            try:
+                self._config_dir = self._judged(self._config_dir)
+            except graph.Unproven:
+                pass  # `prove_reach` refuses it; the name is still a folder no grant may overlap
+        self.overlays = [graph.respell(path, spelled, self.project_root) for path in overlays]
+        self.cache_dir = cache_dir if cache_dir is not None else os.path.join(self.project_root, CACHE_RELATIVE)
+        self._cache = graph.CacheDir(self.project_root, graph.respell(self.cache_dir, spelled, self.project_root), self._permits)
+        self.deno = deno
+        self.timeout = timeout
         self.mirror_parent = mirror_parent  # where each call's temporary mirror is made (default: the system's temporary directory)
         self._index = None
         self._version = None
@@ -235,8 +319,22 @@ class NavApi:
 
     # --- plumbing
 
+    def _judged(self, path):
+        """The resolved absolute path of `path` (inside the project), followed by `graph.judged_realpath` with the guard; raises
+        Unproven."""
+        return os.path.join(self.project_root, *graph.judged_realpath(self.project_root, path, self._permits)[1].split("/"))
+
+    @property
+    def cache_refused(self):
+        """Why there is no cache (`graph.CacheDir.refusal`), or None."""
+        return self._cache.refusal
+
     def _cache_file(self, kind, key):
-        return os.path.join(self.cache_dir, f"nav_api-{kind}-{key}.json")
+        return os.path.join(self._cache.path or self.cache_dir, self._cache_name(kind, key))
+
+    @staticmethod
+    def _cache_name(kind, key):
+        return f"nav_api-{kind}-{key}.json"
 
     def _root_key(self):
         return _digest(self.project_root, self.root, self.config)[:16]
@@ -252,13 +350,15 @@ class NavApi:
     def _get_index(self):
         if self._index is None:
             self._index = graph.ImportIndex(self.project_root, self.root, self.config, self.overlays,
-                                            self._cache_file("index", self._root_key()),
-                                            allow=lambda rel: self._allowed(rel) is not None)
+                                            cache=(self._cache, self._cache_name("index", self._root_key())), allow=self._permits)
         return self._index
 
     def _fresh(self):
-        """(index, stats, None) after a refresh, or (None, None, answer) when there is nothing to navigate."""
-        if not os.path.isdir(self.root):
+        """(index, stats, None) after a refresh, or (None, None, answer) when there is nothing to navigate. A root that is not
+        shown allowed is refused before anything is asked of it."""
+        if self._root_refusal:
+            return None, None, _answer("refused", reason=self._root_refusal)
+        if not graph.judged_is_dir(self.project_root, self.root, self._permits):
             return None, None, _answer("no_project", detail="project directory not found")
         index = self._get_index()
         try:
@@ -276,12 +376,15 @@ class NavApi:
         except Exception as error:
             reason = getattr(error, "reason", None) or str(error)[:200] or "refused"
             return None, _answer("refused", reason=reason)
-        if not isinstance(rel, str) or graph.project_path(self.project_root, rel) is None:
+        if not isinstance(rel, str) or graph.project_path(self.project_root, rel, self._permits) is None:
             return None, _answer("refused", reason="outside_project")
         return rel, None
 
     def _out(self, answer):
-        """`answer` with every string passed through the output screen (the status word excepted); an error answer if it fails."""
+        """`answer` with every string passed through the output screen (the status word excepted); an error answer if it fails.
+        An `ok` answer says `cache_refused` when the cache folder was refused (see `graph.CacheDir`)."""
+        if answer.get("status") == "ok" and self._cache.refusal:
+            answer = {**answer, "cache_refused": self._cache.refusal}
         try:
             return self._screened(answer)
         except Exception:
@@ -332,7 +435,7 @@ class NavApi:
         if error:
             return error
         found = index.importers(rel)
-        if not found and not os.path.isfile(os.path.join(self.project_root, rel)):
+        if not found and not graph.judged_is_file(self.project_root, rel, self._permits):
             return _answer("not_found", detail="no such file in the project")
         status = "stale_index" if stats["stale"] else "ok"
         return _answer(status, target=rel, total=len(found), truncated=len(found) > limit,
@@ -369,7 +472,33 @@ class NavApi:
     # --- deno
 
     def _deno_exe(self):
-        return shutil.which(self.deno)
+        """The Deno executable: `deno` (a path, or a name looked up in the `PATH` folders, in order), with nothing looked at before
+        its name is judged: each candidate is first resolved by `judged_location`. A candidate that is, or leads to, a sensitive
+        place is returned unlooked-at, by name, for `_grants` to refuse (`sandbox_grant_sensitive`); otherwise the first that is an
+        executable regular file. A `PATH` folder that is, or leads to, a sensitive place is skipped; a relative one is ignored."""
+        if os.sep in self.deno:
+            return self._executable(os.path.abspath(self.deno))
+        for folder in os.environ.get("PATH", os.defpath).split(os.pathsep):
+            if not os.path.isabs(folder):
+                continue  # a relative entry names the current folder, which is nobody's choice here
+            try:
+                folder = judged_location(folder)
+            except graph.Unproven:
+                continue
+            found = self._executable(os.path.join(folder, self.deno))
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _executable(candidate):
+        """`candidate` when it is refused by `judged_location` (never looked at; `_grants` refuses it) or leads to an executable
+        regular file (looked at only where it was judged to lead); else None."""
+        try:
+            resolved = judged_location(candidate)
+        except graph.Unproven:
+            return candidate
+        return candidate if os.path.isfile(resolved) and os.access(resolved, os.X_OK) else None
 
     def _base_env(self):
         env = {key: os.environ[key] for key in DENO_ENV_KEEP if key in os.environ}
@@ -377,19 +506,20 @@ class NavApi:
         return env
 
     def _deno_dir(self):
-        """Deno's cache directory as Deno finds it (`DENO_DIR`, else `XDG_CACHE_HOME`, else the platform's cache folder), resolved."""
+        """Deno's cache directory as Deno finds it (`DENO_DIR`, else `XDG_CACHE_HOME`, else the platform's cache folder), by name;
+        `_grants` resolves it."""
         env = self._base_env()
         if env.get("DENO_DIR"):
-            return os.path.realpath(env["DENO_DIR"])
+            return env["DENO_DIR"]
         if env.get("XDG_CACHE_HOME"):
-            return os.path.realpath(os.path.join(env["XDG_CACHE_HOME"], "deno"))
-        return os.path.realpath(os.path.join(env.get("HOME") or os.path.expanduser("~"), "Library", "Caches", "deno"))
+            return os.path.join(env["XDG_CACHE_HOME"], "deno")
+        return os.path.join(env.get("HOME") or os.path.expanduser("~"), "Library", "Caches", "deno")
 
     def _guarded_roots(self):
         """The resolved directories no sandbox grant may equal, contain or sit inside: the project, the Deno root, the config's folder
         and the monorepo around the project (the nearest folder above it with a `.git`, and every folder above it with a workspace
         marker file)."""
-        roots = {self.project_root, self.root, os.path.realpath(os.path.dirname(self.config))}
+        roots = {path for path in (self.project_root, self.root, self._config_dir) if path}  # each judged in __init__, not resolved here
         folder, git = self.project_root, False
         while True:
             if (not git and os.path.lexists(os.path.join(folder, ".git"))) or \
@@ -406,18 +536,46 @@ class NavApi:
         return os.path.commonpath([a, b]) in (a, b)
 
     def _grants(self, exe, mirror=None):
-        """{"DENODIR": Deno's cache, "DENOBIN": the executable}, each resolved with `realpath` exactly once, here, and checked as
+        """{"DENODIR": Deno's cache, "DENOBIN": the executable}, each resolved by `judged_location` exactly once, here, and checked as
         those strings; raises GrantOverlap when one equals, contains or sits inside the project, the Deno root, the config's folder
         or a monorepo root, or contains or sits inside `mirror` (the resolved mirror, checked as the string given). The mirror is
         the one grant that is meant to be a folder of files; every other grant is Deno's own, and a worker's environment can name
         them. The caller hands on these strings and never resolves the paths again (`_sandboxed`), so a link moved after the check
         cannot change what is granted: the profile and `DENO_DIR` name the checked directory, and the sandbox matches the paths Deno
         opens after their links are followed, so a link inside it that is moved later leads to a path that is not granted."""
-        grants = {"DENODIR": self._deno_dir(), "DENOBIN": os.path.realpath(exe)}
+        try:
+            grants = {"DENODIR": judged_location(self._deno_dir()), "DENOBIN": judged_location(exe)}
+        except graph.Unproven:
+            raise GrantOverlap("sandbox_grant_sensitive")  # it is, or a link on the way leads to, a sensitive place
         guarded = self._guarded_roots() | ({mirror} if mirror else set())
         if any(self._overlaps(grant, root) for grant in grants.values() for root in guarded):
             raise GrantOverlap()
+        self._grant_kinds(grants)
         return grants
+
+    @staticmethod
+    def _grant_kinds(grants):
+        """Raises GrantOverlap(`sandbox_grant_sensitive`) when a resolved grant has a sensitive component (`.ssh`, `.git`, `.env*`,
+        a key or secret name: `_sensitive_location`), holds the home folder (or `/`), or is not the kind of file it must be: Deno's
+        cache a folder (or not there yet), the executable a regular file. The grants are resolved and judged by name (no sensitive
+        component), so `lstat` follows no link and looks at no sensitive place."""
+        try:
+            home = judged_location(os.path.expanduser("~"))
+        except graph.Unproven:
+            raise GrantOverlap("sandbox_grant_sensitive")
+        for name, grant in grants.items():
+            if _sensitive_location(grant) or os.path.commonpath([grant, home]) == grant:
+                raise GrantOverlap("sandbox_grant_sensitive")
+            try:
+                mode = os.lstat(grant).st_mode
+            except FileNotFoundError:
+                if name == "DENOBIN":
+                    raise GrantOverlap("sandbox_grant_sensitive")
+                continue
+            except OSError:
+                raise GrantOverlap("sandbox_grant_sensitive")
+            if not (stat.S_ISDIR(mode) if name == "DENODIR" else stat.S_ISREG(mode)):
+                raise GrantOverlap("sandbox_grant_sensitive")
 
     def _sandboxed(self, exe, args, root):
         """(argv, env) that run `exe args` under `SANDBOX_PROFILE`, allowed to read `root` (a resolved directory, the mirror) and
@@ -446,19 +604,24 @@ class NavApi:
         if exe:
             try:
                 self._grants(exe)  # a gate only: nothing is handed on from this check (each launch checks its own grants)
-            except GrantOverlap:
-                return "sandbox_grant_overlap"
+            except GrantOverlap as error:
+                return error.reason
         if self._sandbox is False:
+            parent = self._scratch_parent()
+            if parent is None:
+                return SCRATCH_REFUSED
             try:
-                scratch = tempfile.mkdtemp(prefix="tp-ctx-probe-", dir=self.mirror_parent)
+                scratch = graph.make_own_folder(parent, "tp-ctx-probe-")  # made where `parent` was judged, or not at all
+            except graph.Unproven:
+                return SCRATCH_REFUSED  # the judged folder was swapped for a link
             except OSError:
                 return SCRATCH_REASON
             try:
-                root = os.path.realpath(scratch)
+                root = scratch
                 try:
                     launch = self._sandboxed(exe, ["--version"], root) if exe else None
-                except GrantOverlap:
-                    return "sandbox_grant_overlap"
+                except GrantOverlap as error:
+                    return error.reason
                 self._sandbox = "sandbox_unavailable" if launch is None else None
                 self._version = ""
                 if launch is not None:
@@ -476,7 +639,7 @@ class NavApi:
                         elif run.returncode == 0 and run.stdout.strip():
                             self._version = run.stdout.decode("utf-8", "replace").splitlines()[0].strip()
             finally:
-                shutil.rmtree(scratch, ignore_errors=True)
+                graph.remove_own_folder(scratch)
         return self._sandbox
 
     @staticmethod
@@ -484,7 +647,27 @@ class NavApi:
         """The answer for a reason code from `_check_sandbox` or `_run_deno`."""
         if reason == SCRATCH_REASON:
             return _answer("error", detail="the temporary copy for Deno could not be made")
-        return _answer("refused", reason=reason, next_step=GRANT_NEXT_STEP if reason == "sandbox_grant_overlap" else SANDBOX_NEXT_STEP)
+        if reason == SCRATCH_REFUSED:
+            return _answer("refused", reason=reason, next_step=SCRATCH_NEXT_STEP)
+        return _answer("refused", reason=reason, next_step=GRANT_NEXT_STEP if reason in GRANT_REASONS else SANDBOX_NEXT_STEP)
+
+    def _scratch_parent(self):
+        """The resolved folder a mirror or a probe is made in (`mirror_parent`, else `TMPDIR`, else `/tmp`), or None when it has a
+        sensitive component or is inside the project (a folder around the project is fine: the mirror is a new folder in it, and
+        `graph.Mirror` refuses one that holds the project). Resolved here by `judged_location`, once per use, and handed on as
+        this string; `graph.make_own_folder` makes the folder there. Not `tempfile.gettempdir()`: the first time it is called it
+        writes a test file in `TMPDIR` (or the next folder that works) before anything has judged it. A `TMPDIR` that is refused
+        is not passed over for another folder: the call is refused."""
+        candidate = self.mirror_parent or os.environ.get("TMPDIR") or "/tmp"
+        if not os.path.isabs(candidate):
+            return None  # relative to the current folder, which is nobody's choice here
+        try:
+            parent = judged_location(candidate)  # a folder for this process's own scratch
+        except graph.Unproven:
+            return None
+        if _sensitive_location(parent) or parent == self.project_root or parent.startswith(self.project_root + os.sep):
+            return None
+        return parent
 
     def _run_deno(self, args, cwd, root):
         """(status, stdout, detail): runs `deno` with `args` in `cwd`, under the sandbox, which lets it read `root` (a mirror, as the
@@ -499,8 +682,8 @@ class NavApi:
             return "refused", "", reason
         try:
             launch = self._sandboxed(exe, args, root)
-        except GrantOverlap:
-            return "refused", "", "sandbox_grant_overlap"
+        except GrantOverlap as error:
+            return "refused", "", error.reason
         if launch is None:
             return "refused", "", "sandbox_unavailable"
         argv, env = launch
@@ -549,8 +732,13 @@ class NavApi:
         unchanged, else (the answer to give, None, None). The detail of a Deno failure is rewritten so it names no file the walk did
         not prove."""
         try:
-            mirror = reach.materialize(self.mirror_parent)
+            parent = self._scratch_parent()
+            if parent is None:
+                raise graph.Unproven(SCRATCH_REFUSED)
+            mirror = reach.materialize(parent)
         except graph.Unproven as error:
+            if error.reason == SCRATCH_REFUSED:
+                return self._sandbox_refusal(SCRATCH_REFUSED), None, None
             return _answer("refused", reason=error.reason), None, None
         except Exception:
             return _answer("error", detail="the temporary copy for Deno could not be made"), None, None
@@ -603,8 +791,7 @@ class NavApi:
         rel, error = self._target(target)
         if error:
             return error, None
-        full = os.path.join(self.project_root, rel)
-        if not os.path.isfile(full):
+        if not graph.judged_is_file(self.project_root, rel, self._permits):
             return _answer("not_found", detail="no such file in the project"), None
         reach, refusal = self._prove(rel)
         if refusal:
@@ -665,8 +852,7 @@ class NavApi:
             return error, None
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             return _answer("bad_argument", detail="limit must be a whole number from 1 to 100"), None
-        full = os.path.join(self.project_root, rel)
-        if not os.path.isfile(full):
+        if not graph.judged_is_file(self.project_root, rel, self._permits):
             return _answer("not_found", detail="no such file in the project"), None
         if self._deno_exe() is None:
             return _answer("unavailable", detail="deno was not found on PATH"), None
@@ -749,34 +935,26 @@ class NavApi:
         return _digest(rel, reach.digest(), self.deno_version() or "")[:40]
 
     def _read_cache(self, kind, key):
-        data = graph.read_cache_json(self._cache_file(kind, key))  # not through a link, and only a file directly in the cache dir
+        """The cached list, read by the judged cache folder (`graph.CacheDir.read_json`: `read_bounded`, no link, a plain `.json`
+        directly in the folder, the guard judging its name), or None."""
+        data = self._cache.read_json(self._cache_name(kind, key))
         return data if isinstance(data, list) else None
 
     def _write_cache(self, kind, key, value):
-        path = self._cache_file(kind, key)
-        if os.path.islink(path):
-            return
-        temp = f"{path}.{os.getpid()}.tmp"
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            if os.path.lexists(temp):
-                os.unlink(temp)  # left by a crashed run of this process id
-            graph.write_new(temp, json.dumps(value, separators=(",", ":")).encode("utf-8"))
-            os.replace(temp, path)
-        except OSError:
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
+        """Written through the judged cache folder (`graph.CacheDir.write_json`); nothing when the folder was refused."""
+        self._cache.write_json(self._cache_name(kind, key), value)
 
     # --- status
 
     def status(self):
-        """What this instance would use: the Deno it found, the root and config, and the index's size and age."""
+        """What this instance would use: the Deno it found, the root and config, the cache folder (and why it is refused, when it
+        is), and the index's size and age. The config is looked at only when it is shown allowed."""
         exe = self._deno_exe()
-        out = {"status": "ok", "deno": exe, "deno_version": self.deno_version() if exe else None, "root": os.path.relpath(
-            self.root, self.project_root).replace(os.sep, "/"), "config_found": os.path.isfile(self.config),
-            "cache_dir": self.cache_dir}
+        out = {"status": "ok", "deno": exe, "deno_version": self.deno_version() if exe else None,
+               "root": None if self.root is None else (graph.lexical_path(self.project_root, self.root) or "."),
+               "config_found": graph.judged_is_file(self.project_root, self.config, self._permits), "cache_dir": self.cache_dir}
+        if self._root_refusal:
+            out["root_refused"] = self._root_refusal
         if self._index is not None:
             out.update(files_indexed=len(self._index.entries), index_age_s=self._index.age_s())
         return self._out(out)

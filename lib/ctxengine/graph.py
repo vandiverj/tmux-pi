@@ -16,9 +16,23 @@ files itself and shares only the scanner, the import map and the path helpers wi
 given: `Reach.materialize` copies exactly the proved files, with a rewritten config, into a temporary `Mirror`, and Deno is run
 only there, so a file the walk missed is a file Deno cannot open.
 
+THE PATH RULE, for this module and nav_api.py (a test scans both for any file-system call and holds each to a table): no file-system
+call (open, stat, lstat, listing, readlink, realpath, a mkdir, a write or a removal) is made at a path until its name has been shown
+inside the boundary and allowed by the guard. Links are followed only by `judged_realpath`, which judges each link's target by name
+before it looks at it; bytes are read only by `read_bounded`; a cache lives only in a `CacheDir`, a folder inside the project judged
+once like any other path; files and folders are made and removed only relative to a descriptor opened with no link on the way
+(`write_new`, `open_folder_below`, `make_own_folder`, `remove_own_folder`). A location not shown allowed is refused, and the refusal
+does not depend on whether anything is there. Places outside any project (what the sandbox grants: Deno's cache and executable, the
+`PATH` folders `deno` is looked up in, the folder scratch copies are made in) are resolved the same way, by nav_api's
+`judged_location`: `judged_realpath` with `/` as the boundary and every sensitive name (`.ssh`, `.git`, ...) refused. The closed list
+of calls outside the rule: the realpath of the boundary itself (the project root a caller passes), the check that the fixed
+`sandbox-exec` exists, and the existence probes for monorepo markers (`.git`, workspace files) by exact name in the project and the
+folders above it (`_guarded_roots`).
+
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -26,9 +40,9 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import stat
-import tempfile
 import time
 from urllib.parse import unquote
 
@@ -437,8 +451,9 @@ def load_config(path, raw, error=""):
     return imap, details
 
 
-def resolve(spec, importer, import_map, isfile=os.path.isfile):
-    """How Deno resolves `spec` written in `importer` (absolute path): (kind, target, reason).
+def resolve(spec, importer, import_map, isfile):
+    """How Deno resolves `spec` written in `importer` (absolute path): (kind, target, reason). `isfile(path)` is the caller's
+    judgement of a path (no default: the index passes one that judges the name before it looks, see `ImportIndex._verdict`).
 
     kind `file`: target is an absolute path of an existing file. kind `external`: target is the specifier (a package, a builtin, a
     URL). kind `unresolved`: target is None and reason says why (`missing` file, `bare` specifier no key of the import map matches)."""
@@ -463,20 +478,98 @@ def lexical_path(base, path):
     """`path` (absolute, or relative to `base`) as a posix path relative to `base`, judged by its name alone; None when it is
     `base` itself or outside it. `base` must be a resolved path."""
     full = os.path.normpath(path if os.path.isabs(path) else os.path.join(base, path))
-    if full == base or not full.startswith(base + os.sep):
+    if full == base or not full.startswith(base.rstrip(os.sep) + os.sep):  # `/` as `base`: every other absolute path is inside
         return None
     return os.path.relpath(full, base).replace(os.sep, "/")
 
 
-def project_path(base, path):
-    """`lexical_path`, and also None when the path, with its symlinks followed, leaves `base`. The relative path returned is the one
-    written, not where a symlink inside the project leads. An absolute path may be given in any spelling of the project root
-    (`/tmp/x` for `/private/tmp/x`)."""
-    full = os.path.normpath(path if os.path.isabs(path) else os.path.join(base, path))
-    real = os.path.realpath(full)
-    if real == base or not real.startswith(base + os.sep):
+NOFOLLOW_ANY = getattr(os, "O_NOFOLLOW_ANY", 0) or os.O_NOFOLLOW  # macOS: no link anywhere on the path; else the last name only
+DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)  # a descriptor on a folder, to list it or
+# to make and rename in it: no bytes of a file are read through one
+MAX_LINK_HOPS = 40
+
+
+def lstat_nofollow(path):
+    """`os.lstat(path)` with no link followed anywhere on the way: the folder holding it is opened with `NOFOLLOW_ANY` and the name
+    is looked at relative to it, so a folder on the way swapped for a link gives OSError (ELOOP) and nothing past the link is
+    looked at. (Linux has no `O_NOFOLLOW_ANY`: there only the folder's own name is held to it.)"""
+    return _look(path)[0]
+
+
+def _look(path, link=False):
+    """(lstat of `path`, its link target when `link` and it is a link, else None), both relative to a descriptor on its folder
+    opened with no link on the way (see `lstat_nofollow`)."""
+    parent, name = os.path.split(path)
+    fd = os.open(parent, DIR_FLAGS | NOFOLLOW_ANY)
+    try:
+        info = os.lstat(name, dir_fd=fd)
+        return info, (os.readlink(name, dir_fd=fd) if link and stat.S_ISLNK(info.st_mode) else None)
+    finally:
+        os.close(fd)
+
+
+def _allows(allow, rel):
+    """`allow(rel)` as a bool; a guard that raises refuses."""
+    try:
+        return bool(allow(rel))
+    except Exception:
+        return False
+
+
+def _allow_any(rel):
+    return True
+
+
+def judged_realpath(base, path, allow):
+    """(lexical, real): the `base`-relative posix names of `path` (absolute, or relative to `base`, a resolved directory) as
+    written and with its links followed; raises Unproven `outside_project`, `reaches_refused_path` or `unreadable_file` (a name
+    that cannot be looked at, or a link loop).
+
+    THE ONE WAY these modules follow a link (a test scans both files for `os.path.realpath` outside the few places that resolve a
+    boundary itself). Each name is judged before the file system is asked anything about it: the written name must be inside `base`
+    and allowed before any of its components is looked at, and each link's target, joined to what is left of the path, must be
+    inside `base` and allowed before anything at it is looked at. So resolving never stats, lists or reads a location outside `base`
+    or one `allow` refuses, which `os.path.realpath` would do for whatever a link names. Past a name that does not exist, the rest is
+    taken as written."""
+    lexical = lexical_path(base, path)
+    if lexical is None:
+        raise Unproven("outside_project")
+    if not _allows(allow, lexical):
+        raise Unproven("reaches_refused_path")
+    parts, at, hops = lexical.split("/"), 0, 0
+    while at < len(parts):
+        here = os.path.join(base, *parts[:at + 1])
+        try:
+            info, target = _look(here, link=True)  # the folders before it were just seen to be no links, and still are
+        except (FileNotFoundError, NotADirectoryError):
+            break  # nothing there: the rest is a name, resolved as written
+        except OSError:
+            raise Unproven("unreadable_file")  # a link loop, or a folder on the way swapped for a link (ELOOP), or no access
+        if not stat.S_ISLNK(info.st_mode):
+            at += 1
+            continue
+        hops += 1
+        if target is None:
+            raise Unproven("unreadable_file")
+        if hops > MAX_LINK_HOPS:
+            raise Unproven("unreadable_file")
+        rel = lexical_path(base, os.path.join(os.path.join(base, *parts[:at]), target, *parts[at + 1:]))
+        if rel is None:
+            raise Unproven("outside_project")
+        if not _allows(allow, rel):
+            raise Unproven("reaches_refused_path")
+        parts, at = rel.split("/"), 0  # the parts before `at` held no link, so `..` in the target was resolved by name correctly
+    return lexical, "/".join(parts)
+
+
+def project_path(base, path, allow=None):
+    """`lexical_path`, and also None when the path, with its symlinks followed, leaves `base` (or names a path `allow` refuses).
+    The relative path returned is the one written, not where a symlink inside the project leads. Links are followed by
+    `judged_realpath`, so nothing outside `base` is looked at."""
+    try:
+        return judged_realpath(base, path, allow or _allow_any)[0]
+    except Unproven:
         return None
-    return lexical_path(base, full) or lexical_path(base, real)
 
 
 def _opened_path(fd):
@@ -495,36 +588,47 @@ READ_OK = "ok"
 
 def read_bounded(path, admitted, boundary, allow, limit=None):
     """(status, bytes or None, opened): THE ONE WAY this module and `nav_api` read the bytes of a file (a test scans both files
-    for any other). In this order: (a) open `path`; (b) ask the kernel which file is open (`_opened_path`); (c) check that it is
-    `admitted` (the path the caller judged), that it is inside `boundary` (a resolved directory) by its name and by `path`'s
-    name, that `allow(rel)` is true for both names relative to `boundary` (a guard that raises refuses), and that it is a regular
-    file of at most `limit` bytes (default MAX_BYTES); (d) only then read. Nothing of a file that fails a check is read.
+    for any other). `admitted` is where the caller judged `path` to lead (a path with no link on it, from `judged_realpath`).
+    In this order: (a) both names are inside `boundary` (a resolved directory) and `allow(rel)` is true for both (a guard that
+    raises refuses); nothing is asked of the file system before that; (b) `admitted` is opened, read only, never through a link
+    (`NOFOLLOW_ANY`); (c) the kernel is asked which file is open (`_opened_path`), and it must be `admitted`; (d) when `path` is
+    another name, `judged_realpath` must still lead from it to `admitted`; (e) it must be a regular file of at most `limit` bytes
+    (default MAX_BYTES); (f) only then is it read. Nothing of a file that fails a check is read, and nothing is opened at a name
+    that fails (a).
 
-    status: `ok`; `absent` (nothing at `path`); `unreadable` (cannot be opened, or is not a regular file, or the kernel cannot name
-    it, or is over `limit`); `changed` (the file open is not `admitted`: a link moved after the caller judged the name);
-    `outside` (not inside `boundary`); `refused` (the guard refuses it). `opened` is the kernel's path, None when not known."""
-    admitted = os.path.normpath(admitted)
+    status: `ok`; `absent` (nothing at `admitted`); `unreadable` (cannot be opened, or is not a regular file, or the kernel cannot
+    name it, or is over `limit`); `changed` (a link is now on the way to `admitted`, or `path` no longer leads there: something
+    moved after the caller judged the name); `outside` (not inside `boundary`); `refused` (the guard refuses it). `opened` is the
+    kernel's path, None when not known."""
+    admitted, path = os.path.normpath(admitted), os.path.normpath(path)
     limit = MAX_BYTES if limit is None else limit
+    names = [lexical_path(boundary, admitted), lexical_path(boundary, path)]
+    if None in names:
+        return "outside", None, None
+    for rel in dict.fromkeys(names):
+        if not _allows(allow, rel):
+            return "refused", None, None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-    except (OSError, ValueError):
-        return ("unreadable" if os.path.lexists(path) else "absent"), None, None
+        fd = os.open(admitted, os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW_ANY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return "absent", None, None
+        return ("changed" if error.errno == errno.ELOOP else "unreadable"), None, None
+    except ValueError:
+        return "unreadable", None, None
     try:
         opened = _opened_path(fd)
         if opened is None:
             return "unreadable", None, None
         if opened != admitted:
             return "changed", None, opened
-        names = [lexical_path(boundary, opened), lexical_path(boundary, os.path.normpath(path))]
-        if None in names:
-            return "outside", None, opened
-        for rel in dict.fromkeys(names):
+        if path != admitted:
             try:
-                allowed = bool(allow(rel))
-            except Exception:
-                allowed = False
-            if not allowed:
-                return "refused", None, opened
+                _, real = judged_realpath(boundary, path, allow)
+            except Unproven:
+                return "changed", None, opened
+            if os.path.join(boundary, real) != admitted:
+                return "changed", None, opened
         try:
             info = os.fstat(fd)
         except OSError:
@@ -549,10 +653,11 @@ def read_bounded(path, admitted, boundary, allow, limit=None):
         os.close(fd)
 
 
-def write_new(path, data):
-    """Write `data` to `path` as a new regular file (never through a link, never over an existing file): the one way this module
-    and `nav_api` write a file. Raises OSError when `path` exists."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+def write_new(path, data, dir_fd=None):
+    """Write `data` to `path` (relative to the directory open on `dir_fd`, when given) as a new regular file (never through a link,
+    anywhere on the way: `NOFOLLOW_ANY`; never over an existing file): the one way this module and `nav_api` write a file. Raises
+    OSError when `path` exists or a folder on the way is a link (a mirror folder swapped for one after it was made)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW_ANY | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
     try:
         view = memoryview(data)
         while view:
@@ -561,23 +666,124 @@ def write_new(path, data):
         os.close(fd)
 
 
-def cache_allow(rel):
-    """The guard for a cache directory: a plain file directly in it, no folder and no hidden name."""
-    return "/" not in rel and not rel.startswith(".") and rel.endswith(".json")
-
-
-def read_cache_json(path):
-    """The JSON value in the cache file `path`, or None: read with `read_bounded`, the boundary being the cache directory (resolved
-    now) and the admitted path the file's name in it, so a link at that name, or a link moved in, is not followed."""
-    folder = os.path.realpath(os.path.dirname(path) or ".")
-    admitted = os.path.join(folder, os.path.basename(path))
-    status, data, _ = read_bounded(admitted, admitted, folder, cache_allow, limit=MAX_CACHE_BYTES)
-    if status != READ_OK:
-        return None
+def open_folder_below(base, parts):
+    """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing: `base` is opened with no link on the
+    way (`NOFOLLOW_ANY`) and each part is made with `mkdir` and opened with `O_NOFOLLOW` relative to the one before, so no link is
+    followed anywhere and nothing is made through one. Raises OSError (a link on the way: ELOOP or ENOTDIR)."""
+    fd = os.open(base, DIR_FLAGS | NOFOLLOW_ANY)
     try:
-        return json.loads(data.decode("utf-8"))
-    except ValueError:
-        return None
+        for part in parts:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            inner = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+CACHE_REFUSALS = {"outside_project": "cache_dir_outside_project", "reaches_refused_path": "cache_dir_refused",
+                  "unreadable_file": "cache_dir_unreadable"}
+
+
+class CacheDir:
+    """The folder a cache lives in, judged once, like any other project path, before anything in it is read or written.
+
+    The folder must be inside the project `base` (not `base` itself), and `allow` must allow its name and, followed through its
+    links by `judged_realpath`, where it leads; it is then kept as that resolved path and never resolved again. Otherwise there is
+    no cache, and `refusal` names why: `cache_dir_outside_project`, `cache_dir_refused` (the guard refuses the folder: `.git`, a
+    sensitive name, or a link that leads to one), `cache_dir_unreadable`, `cache_dir_unguarded` (no guard was given, so nothing
+    shows the folder allowed). A folder outside the project is refused rather than judged some other way: the guard can only
+    judge the project.
+
+    Each cache file is a plain `.json` name directly in the folder (no `/`, not hidden), read with `read_bounded` (boundary `base`,
+    the guard judging the file's project-relative name as well) and written through a descriptor on the folder, made one component
+    at a time below `base` with no link followed and checked to be the judged folder, so a folder swapped for a link after the
+    judgement is neither read nor written."""
+
+    def __init__(self, base, folder, allow):
+        self.base = base
+        self.allow = allow
+        self.rel = self.path = self.refusal = None
+        if allow is None:
+            self.refusal = "cache_dir_unguarded"
+            return
+        try:
+            self.rel = judged_realpath(base, folder, allow)[1]
+        except Unproven as error:
+            self.refusal = CACHE_REFUSALS.get(error.reason, "cache_dir_refused")
+            return
+        self.path = os.path.join(base, *self.rel.split("/"))
+
+    @staticmethod
+    def _plain(name):
+        return isinstance(name, str) and "/" not in name and os.sep not in name and "\0" not in name and not name.startswith(".") \
+            and name.endswith((".json", ".tmp"))
+
+    def _allow_file(self, rel):
+        return posixpath.dirname(rel) == self.rel and self._plain(posixpath.basename(rel)) and _allows(self.allow, rel)
+
+    def read_json(self, name):
+        """The JSON value in the cache file `name`, or None (no cache, refused, absent, a link, not JSON, over MAX_CACHE_BYTES)."""
+        if self.refusal or not self._plain(name) or not name.endswith(".json"):
+            return None
+        full = os.path.join(self.path, name)
+        status, data, _ = read_bounded(full, full, self.base, self._allow_file, limit=MAX_CACHE_BYTES)
+        if status != READ_OK:
+            return None
+        try:
+            return json.loads(data.decode("utf-8"))
+        except ValueError:
+            return None
+
+    def _open_folder(self):
+        """A descriptor on the cache folder, made where missing (`open_folder_below`), or None; it must be the judged folder by the
+        kernel's name."""
+        try:
+            fd = open_folder_below(self.base, self.rel.split("/"))
+        except OSError:
+            return None
+        if _opened_path(fd) != self.path:
+            os.close(fd)
+            return None
+        return fd
+
+    def write_json(self, name, value):
+        """Write `value` to the cache file `name` (a temporary file, then a rename, both in the folder's descriptor). True when
+        written; False when there is no cache, the name is refused, a link is at the name, or the write fails (the cache is left as
+        it was, and only the next start is cold)."""
+        temp = f"{name}.{os.getpid()}.tmp"
+        if self.refusal or not self._plain(name) or not name.endswith(".json") \
+                or not all(self._allow_file(posixpath.join(self.rel, item)) for item in (name, temp)):
+            return False
+        fd = self._open_folder()
+        if fd is None:
+            return False
+        try:
+            try:
+                if stat.S_ISLNK(os.lstat(name, dir_fd=fd).st_mode):
+                    return False  # never replace a link (the rename would not follow it, but it is not ours to remove)
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(temp, dir_fd=fd)  # left by a crashed run of this process id; unlink never follows a link
+            except FileNotFoundError:
+                pass
+            write_new(temp, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"), dir_fd=fd)
+            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            return True
+        except OSError:
+            try:
+                os.unlink(temp, dir_fd=fd)
+            except OSError:
+                pass
+            return False
+        finally:
+            os.close(fd)
 
 
 def read_source(path, base, allow):
@@ -648,19 +854,9 @@ def named_paths(spec, importer, import_map):
 def admit(base, path, allow):
     """(lexical, real) project-relative names of `path` when Deno may read it, else raises Unproven: `outside_project` when it, or a
     directory on its way, is not inside `base`; `reaches_refused_path` when `allow(rel)` refuses either name (a guard that raises
-    refuses). Judged by name whether or not a file is there."""
-    lexical = lexical_path(base, path)
-    inside = lexical_path(base, os.path.realpath(path))
-    if lexical is None or inside is None:
-        raise Unproven("outside_project")
-    for rel in dict.fromkeys((lexical, inside)):
-        try:
-            allowed = bool(allow(rel))
-        except Exception:
-            allowed = False
-        if not allowed:
-            raise Unproven("reaches_refused_path")
-    return lexical, inside
+    refuses). Judged by name whether or not a file is there, and through `judged_realpath`, so nothing outside `base` or refused
+    is looked at on the way. `unreadable_file` when a name on the way cannot be looked at."""
+    return judged_realpath(base, path, allow)
 
 
 def _fingerprint(data):
@@ -674,14 +870,45 @@ CONFIG_REFUSED = ("refused",)
 CONFIG_CHANGED = ("changed",)
 
 
+_JUDGED_STATE = {"outside_project": "outside", "reaches_refused_path": "refused", "unreadable_file": "unreadable"}
+
+
 def _config_read(path, base, allow):
-    """(state, bytes or None): the state of the config file `path` (see `_config_state`) and the bytes it was made from, from one
-    `read_bounded`: admitted is where `path` leads when it is judged (now), the boundary is the project `base` and the guard is
-    `allow`. A config that leads outside the project, or that the guard refuses, is never read."""
-    status, data, opened = read_bounded(path, os.path.realpath(path), base, allow)
+    """(state, bytes or None): the state of the config file `path` (see `_config_state`) and the bytes it was made from. `path` is
+    judged now (`judged_realpath`: by name, inside the project `base`, allowed by `allow`, its links followed only inside), and the
+    file it leads to is read with one `read_bounded`. A config that leads outside the project, or that the guard refuses, is never
+    opened, and no location outside the project is looked at to find that out."""
+    try:
+        real = judged_realpath(base, path, allow)[1]
+    except Unproven as error:
+        return (_JUDGED_STATE.get(error.reason, "unreadable"),), None
+    status, data, opened = read_bounded(path, os.path.join(base, *real.split("/")), base, allow)
     if status != READ_OK:
         return (status,), None
     return ("content", opened, _fingerprint(data)), data
+
+
+def judged_is_file(base, path, allow):
+    """True when the judged `path` leads to a regular file (looked at only after `judged_realpath` passes)."""
+    try:
+        real = judged_realpath(base, path, allow)[1]
+        return stat.S_ISREG(lstat_nofollow(os.path.join(base, *real.split("/"))).st_mode)
+    except (Unproven, OSError):
+        return False
+
+
+def judged_is_dir(base, path, allow):
+    """True when `path` is `base` itself or, judged like `judged_is_file`, leads to a directory inside it."""
+    if os.path.normpath(path) == base:
+        try:
+            return stat.S_ISDIR(os.lstat(base).st_mode)  # the boundary itself, resolved by the caller
+        except OSError:
+            return False
+    try:
+        real = judged_realpath(base, path, allow)[1]
+        return stat.S_ISDIR(lstat_nofollow(os.path.join(base, *real.split("/"))).st_mode)
+    except (Unproven, OSError):
+        return False
 
 
 def _config_state(path, base, allow):
@@ -747,7 +974,7 @@ class Reach:
                 return False
         return all(_config_state(path, self.base, self.allow) == state for path, state in self.configs.items())
 
-    def materialize(self, parent=None):
+    def materialize(self, parent):
         """A `Mirror` holding a copy of each proved file and nothing else, under the same relative paths, with a config made from
         `config_data`: the only tree Deno is given."""
         mirror = Mirror(self.base, parent)
@@ -776,15 +1003,62 @@ class Reach:
         return out
 
 
+def make_own_folder(parent, prefix):
+    """A new, empty folder (mode 0700) directly in `parent` (a resolved folder the caller judged), made relative to a descriptor on
+    `parent` opened with no link on the way (`NOFOLLOW_ANY`) and checked by the kernel's name (`_opened_path`) to be `parent`:
+    so it is made where `parent` was judged to be, never through a link swapped in since, and nothing is resolved (no `realpath`)
+    to find that out. Returns its path; raises Unproven(`scratch_refused`) when `parent` is now not that folder (a link on the way)
+    and OSError when it cannot be made (no such folder, no access)."""
+    try:
+        fd = os.open(parent, DIR_FLAGS | NOFOLLOW_ANY)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise Unproven("scratch_refused")
+        raise
+    try:
+        if _opened_path(fd) != parent:
+            raise Unproven("scratch_refused")
+        for _ in range(100):
+            name = prefix + secrets.token_hex(8)
+            try:
+                os.mkdir(name, 0o700, dir_fd=fd)
+            except FileExistsError:
+                continue
+            return os.path.join(parent, name)
+        raise FileExistsError(errno.EEXIST, "no free scratch folder name", parent)
+    finally:
+        os.close(fd)
+
+
+def remove_own_folder(path):
+    """Remove a folder `make_own_folder` made, and what is in it, relative to a descriptor on its parent opened with no link on the
+    way (`shutil.rmtree` with `dir_fd`, which follows no link inside): a parent swapped for a link since is not removed through
+    (the folder is left where it was made). Errors are ignored."""
+    parent, name = os.path.split(path)
+    try:
+        fd = os.open(parent, DIR_FLAGS | NOFOLLOW_ANY)
+    except OSError:
+        return
+    try:
+        if _opened_path(fd) == parent:
+            shutil.rmtree(name, dir_fd=fd, ignore_errors=True)
+    finally:
+        os.close(fd)
+
+
 class Mirror:
     """A temporary directory laid out like the project (same relative paths, so a relative import and the config's `./` targets
     mean the same), holding copies of the files the walk proved and a rewritten config. A file the walk did not prove is not in it,
     so an import the scanner missed, or an import map entry the walk misread, resolves to nothing instead of to a refused file.
-    Files are written as new regular files, never as links. `root` is its resolved path; `cleanup()` removes it."""
+    Files are written as new regular files, never as links. `root` is its resolved path; `cleanup()` removes it. `parent` is
+    required: a resolved folder the caller has judged (nav_api's `_scratch_parent`), never the system default chosen here; the
+    mirror is made directly in it by `make_own_folder`, or not at all (`scratch_refused`)."""
 
-    def __init__(self, base, parent=None):
+    def __init__(self, base, parent):
         self.base = base
-        self.root = os.path.realpath(tempfile.mkdtemp(prefix="tp-ctx-mirror-", dir=parent))
+        if not parent:
+            raise Unproven("scratch_refused")  # no judged folder to make it in
+        self.root = make_own_folder(parent, "tp-ctx-mirror-")  # a folder this process just made, where `parent` was judged
         if self.root == base or self.root.startswith(base + os.sep) or base.startswith(self.root + os.sep):
             self.cleanup()
             raise Unproven("unmodelled_config")  # a mirror inside the project (or around it) would put refused files in Deno's reach
@@ -793,9 +1067,14 @@ class Mirror:
         return os.path.join(self.root, *rel.split("/")) if rel else self.root
 
     def write(self, rel, data):
-        target = self.path(rel)
-        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-        write_new(target, data)
+        """A new file at `rel` (a posix path) in the mirror, its folders made where missing, with no link followed on the way
+        (`open_folder_below`, `write_new` relative to it): a mirror folder swapped for a link is not written through."""
+        parts = rel.split("/")
+        fd = open_folder_below(self.root, parts[:-1])
+        try:
+            write_new(parts[-1], data, dir_fd=fd)
+        finally:
+            os.close(fd)
 
     def write_json(self, rel, value):
         self.write(rel, json.dumps(value, sort_keys=True).encode("utf-8"))
@@ -808,7 +1087,7 @@ class Mirror:
         return os.path.relpath(full, self.root).replace(os.sep, "/")
 
     def cleanup(self):
-        shutil.rmtree(self.root, ignore_errors=True)
+        remove_own_folder(self.root)
 
 
 _PACKAGE_KEEP = ("name", "version", "type")
@@ -832,8 +1111,8 @@ def _check_package_json(base, directory, configs, allow):
         if raw is None:
             if configs[path][0] in _CONFIG_REFUSAL:
                 raise Unproven(_CONFIG_REFUSAL[configs[path][0]])
-            if configs[path] == CONFIG_UNREADABLE and os.path.isfile(path):
-                raise Unproven("unreadable_file")
+            if configs[path] == CONFIG_UNREADABLE:
+                raise Unproven("unreadable_file")  # something is there (a FIFO, a folder, too big): Deno would see it, the mirror not
             continue
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -871,18 +1150,23 @@ def prove_reach(base, entry, config, allow):
     path that was judged, because a link moved in between (`changed_during_walk`).
     The walk is a first check, not the only one: a file it misses is not in the mirror, so Deno cannot read it.
     The index is not used: nothing here depends on it being built."""
-    base = os.path.realpath(base)
+    base = os.path.realpath(base)  # the boundary itself
     reach = Reach(base, allow)
-    config_dir = os.path.realpath(os.path.dirname(config))
+    config_dir = os.path.normpath(os.path.dirname(config))
+    if config_dir != base:
+        try:
+            config_dir = os.path.join(base, *judged_realpath(base, config_dir, allow)[1].split("/"))
+        except Unproven as error:
+            raise Unproven("unmodelled_config" if error.reason == "outside_project" else error.reason)  # a folder outside the project
     config = os.path.join(config_dir, os.path.basename(config))  # one spelling: the configs are read and recorded under it
     roots = []  # (specifier, referrer) pairs the config itself makes Deno load
     config_rel = lexical_path(base, config_dir)
-    if config_rel is None and config_dir != base:
-        raise Unproven("unmodelled_config")  # a config directory outside the project
     reach.config_rel = posixpath.join(config_rel or "", os.path.basename(config))
-    if os.path.isfile(config):
-        if lexical_path(base, os.path.realpath(config)) is None:
-            raise Unproven("unmodelled_config")
+    try:
+        judged_realpath(base, config, allow)  # a config that leads out of the project is not modelled
+    except Unproven as error:
+        raise Unproven("unmodelled_config" if error.reason == "outside_project" else error.reason)
+    if judged_is_file(base, config, allow):
         reach.configs[config], raw = _config_read(config, base, allow)
         if raw is None:
             state = reach.configs[config][0]
@@ -911,8 +1195,11 @@ def prove_reach(base, entry, config, allow):
                 roots += [(source + suffix, config) for suffix in ("", "/jsx-runtime", "/jsx-dev-runtime")]
     else:
         reach.configs[config] = _config_state(config, base, allow)
-        if reach.configs[config][0] == "content":
-            raise Unproven("changed_during_walk")  # none was there when checked above, and one is now
+        state = reach.configs[config][0]
+        if state in ("content", "outside"):
+            raise Unproven("changed_during_walk")  # none was there (or it was inside) when checked above, and that moved
+        if state != "absent":
+            raise Unproven(_CONFIG_REFUSAL.get(state, "unreadable_file"))  # something is there (a FIFO, a folder): fail closed
         imap = ImportMap({}, config_dir)  # the mirror gets a config of its own, so Deno looks for none above it
     reach.packages = _check_package_json(base, config_dir, reach.configs, allow)
     reach.entry = lexical_path(base, os.path.normpath(entry))
@@ -925,7 +1212,13 @@ def prove_reach(base, entry, config, allow):
             continue
         seen.add(path)
         lexical, real = admit(base, path, allow)
-        if not os.path.isfile(path):
+        try:
+            info = lstat_nofollow(os.path.join(base, *real.split("/")))  # where the judged name leads, no link followed
+        except OSError:
+            continue  # nothing there: Deno finds nothing either
+        if stat.S_ISLNK(info.st_mode):
+            raise Unproven("changed_during_walk")  # judged with no link there, and one is there now
+        if not stat.S_ISREG(info.st_mode):
             continue
         if len(reach.files) >= MAX_REACH_FILES:
             raise Unproven("too_many_files")
@@ -972,11 +1265,25 @@ def _excluded(rel, patterns):
 
 
 def _signature(path):
+    """[mtime_ns, size] of the walked file `path` (judged by the walk), its own entry: no link is followed."""
     try:
-        info = os.stat(path)
+        info = lstat_nofollow(path)
     except OSError:
         return None
     return [info.st_mtime_ns, info.st_size]
+
+
+def respell(path, spelled, real):
+    """`path` (absolute, or relative to `spelled`) with the prefix `spelled` (a directory as the caller wrote it) replaced by `real`
+    (the same directory resolved), by name alone: a path written under another spelling of the project (`/var` for `/private/var`)
+    is judged as the path it names. Nothing is looked at."""
+    full = os.path.normpath(path if os.path.isabs(path) else os.path.join(spelled, path))
+    if spelled != real and (full == spelled or full.startswith(spelled + os.sep)):
+        return real + full[len(spelled):]
+    return full
+
+
+_JUDGED_EDGE = {"outside_project": "outside", "reaches_refused_path": "refused"}
 
 
 class ImportIndex:
@@ -985,23 +1292,47 @@ class ImportIndex:
     `base` is the project root: every path in and out is a posix path relative to it, and nothing outside it is read, indexed or
     returned. `allow` is the caller's path guard: a file it refuses is never read or indexed, and an import that resolves to one is
     an `unresolved` edge with reason `refused` whose specifier is blanked (the edge must not name the path); a path that leaves the
-    project, by its name or through a symlinked directory, is `unresolved` with reason `outside`. `config` is the Deno config whose `imports` table resolves bare specifiers (default `root/deno.json`); `overlays` are
-    further configs (for the API, `deno.test.json`, which swaps the Temporal packages for mocks): where one resolves a specifier
+    project, by its name or through a symlinked directory, is `unresolved` with reason `outside`, whether or not anything is there.
+    `config` is the Deno config whose `imports` table resolves bare specifiers (default `root/deno.json`); `overlays` are further
+    configs (for the API, `deno.test.json`, which swaps the Temporal packages for mocks): where one resolves a specifier
     differently from `config`, the extra edge is recorded with `config` set to that file's name, so the importers of a mock module
     are answerable.
+
+    Every path is judged by name before the file system is asked anything about it (`judged_realpath`): `root`, the configs, each
+    directory and file the walk meets (a directory the guard refuses is not listed; nothing is followed through a link) and each
+    file an import names. The cache is a `CacheDir`: `cache` is (CacheDir, file name), or `cache_path` names the file and its folder
+    is judged here; either way, a folder outside the project, refused by the guard, or with no guard to judge it (`allow` None)
+    means no cache (`cache_refusal` says why), and the index works without one.
 
     What is cached, and keyed how: per file the scanned specifiers, keyed by `(mtime_ns, size)`. Resolution is not cached: it is
     string work that costs a fraction of a second for a thousand files, and it has to be redone when a file elsewhere appears (an
     importer of a file that did not exist yet becomes an edge without the importer changing). `refresh()` re-reads only the files
     whose key changed, forgets deleted ones, and returns what it did."""
 
-    def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None):
-        self.base = os.path.realpath(base)
+    def __init__(self, base, root=None, config=None, overlays=(), cache_path=None, allow=None, cache=None):
+        spelled = os.path.abspath(base)
+        self.base = os.path.realpath(base)  # the boundary itself
         self.allow = allow  # allow(rel) -> bool: may this project file be read? None allows every file inside the project
-        self.root = os.path.realpath(root or base)
-        self.config = os.path.join(self.root, "deno.json") if config is None else os.path.realpath(config)
-        self.overlays = [os.path.realpath(p) for p in overlays]
-        self.cache_path = cache_path
+        self.root, self.root_refusal = self.base, None
+        if root is not None and respell(root, spelled, self.base) != self.base:
+            try:
+                self.root = os.path.join(self.base, *judged_realpath(self.base, respell(root, spelled, self.base),
+                                                                     self._allowed)[1].split("/"))
+            except Unproven as error:
+                self.root, self.root_refusal = None, _JUDGED_STATE.get(error.reason, "unreadable")
+        here = self.root or self.base
+        self.config = os.path.join(here, "deno.json") if config is None else respell(config, spelled, self.base)
+        self.overlays = [respell(p, spelled, self.base) for p in overlays]
+        if cache is not None:
+            self._cache, self._cache_name = cache
+        elif cache_path:
+            cache_path = respell(cache_path, spelled, self.base)
+            self._cache, self._cache_name = CacheDir(self.base, os.path.dirname(cache_path), allow), os.path.basename(cache_path)
+        else:
+            self._cache = self._cache_name = None
+        self.cache_refusal = self._cache.refusal if self._cache is not None else None
+        self.cache_path = os.path.join(self._cache.path, self._cache_name) if self._cache is not None and not self.cache_refusal \
+            else None
         self.entries = {}  # rel -> {"key": [mtime_ns, size], "specs": [[spec, line, type_only, dynamic], ...]}
         self.edges = {}  # rel -> [edge]
         self.meta = {"ignored": [], "config_error": ""}
@@ -1013,8 +1344,8 @@ class ImportIndex:
     # --- paths
 
     def normalize(self, path):
-        """`path` as a base-relative posix path, or None when it is outside the project (see `project_path`)."""
-        return project_path(self.base, path)
+        """`path` as a base-relative posix path, or None when it is outside the project or refused (see `project_path`)."""
+        return project_path(self.base, path, self._allowed)
 
     def _abs(self, rel):
         return os.path.join(self.base, rel)
@@ -1022,9 +1353,9 @@ class ImportIndex:
     # --- persistence
 
     def _load(self):
-        if not self.cache_path:
+        if self.cache_path is None:
             return
-        data = read_cache_json(self.cache_path)
+        data = self._cache.read_json(self._cache_name)
         if not isinstance(data, dict) or data.get("version") != INDEX_VERSION or data.get("base") != self.base \
                 or data.get("root") != self.root or not isinstance(data.get("entries"), dict):
             return
@@ -1033,48 +1364,59 @@ class ImportIndex:
                 self.entries[rel] = {"key": entry["key"], "specs": entry["specs"]}
 
     def save(self):
-        """Write the entries to `cache_path` (temp file, then rename). Returns True when written; a symlink at the path, or a
-        failed write, leaves the cache as it was and returns False (the index still works, only the next start is cold)."""
-        if not self.cache_path or os.path.islink(self.cache_path):
+        """Write the entries to the cache (`CacheDir.write_json`: a temporary file, then a rename, in the judged folder). Returns True
+        when written; no cache, a symlink at the name, or a failed write leaves the cache as it was and returns False (the index
+        still works, only the next start is cold)."""
+        if self.cache_path is None:
             return False
         data = {"version": INDEX_VERSION, "base": self.base, "root": self.root, "entries": self.entries}
-        temp = f"{self.cache_path}.{os.getpid()}.tmp"
-        try:
-            os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
-            if os.path.lexists(temp):
-                os.unlink(temp)  # left by a crashed run of this process id
-            write_new(temp, json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-            os.replace(temp, self.cache_path)
-        except OSError:
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
-            return False
-        return True
+        return self._cache.write_json(self._cache_name, data)
 
     # --- building
 
     def _walk(self, patterns):
+        """{rel: [mtime_ns, size]} for the source files below `root`. Each entry is judged by its name (the guard, SKIP_DIRS) before
+        anything is asked of it, and then looked at with no link followed: a link is neither indexed nor followed, a directory
+        the guard refuses is not listed, and each directory is opened with no link on its path (`NOFOLLOW_ANY`) and must be the
+        one judged, by the kernel's name, before it is listed."""
         found = {}
+        if self.root is None:
+            return found
         config_dir = os.path.dirname(self.config)
-        for here, dirs, names in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not os.path.islink(os.path.join(here, d))
-                             and not _excluded(os.path.relpath(os.path.join(here, d), config_dir).replace(os.sep, "/"), patterns))
-            for name in sorted(names):
-                if not name.endswith(SOURCE_EXTENSIONS):
-                    continue
-                full = os.path.join(here, name)
-                try:
-                    info = os.lstat(full)
-                except OSError:
-                    continue
-                if not stat.S_ISREG(info.st_mode):
-                    continue  # a symlink is skipped: it could lead out of the project
-                if not _excluded(os.path.relpath(full, config_dir).replace(os.sep, "/"), patterns):
-                    rel = os.path.relpath(full, self.base).replace(os.sep, "/")
-                    if self._allowed(rel):
+        stack = [self.root]
+        while stack:
+            here = stack.pop()
+            try:
+                fd = os.open(here, DIR_FLAGS | NOFOLLOW_ANY)
+            except OSError:
+                continue
+            try:
+                if _opened_path(fd) != here:
+                    continue  # a link was swapped in on the way after the judgement
+                with os.scandir(fd) as listing:
+                    names = sorted(entry.name for entry in listing)
+                subdirs = []
+                for name in names:
+                    full = os.path.join(here, name)
+                    rel = lexical_path(self.base, full)
+                    if rel is None or name in SKIP_DIRS or not self._allowed(rel):
+                        continue  # judged by its name: nothing is asked of it
+                    try:
+                        info = os.lstat(name, dir_fd=fd)
+                    except OSError:
+                        continue
+                    config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
+                    if stat.S_ISDIR(info.st_mode):
+                        if not _excluded(config_rel, patterns):
+                            subdirs.append(full)
+                    elif stat.S_ISREG(info.st_mode) and name.endswith(SOURCE_EXTENSIONS) and not _excluded(config_rel, patterns):
                         found[rel] = [info.st_mtime_ns, info.st_size]
+                    # anything else (a link, a FIFO, a socket, a device) is neither indexed nor followed
+                stack.extend(reversed(subdirs))
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
         return found
 
     def refresh(self):
@@ -1084,6 +1426,8 @@ class ImportIndex:
         started = time.perf_counter()
         imap, details = self._load_config(self.config)
         self.meta = {"ignored": list(details["ignored"]), "config_error": details.get("error", "")}
+        if self.root_refusal:
+            self.meta["root_error"] = self.root_refusal
         overlay_maps = []
         for path in self.overlays:
             omap, odetails = self._load_config(path)
@@ -1119,52 +1463,57 @@ class ImportIndex:
     def _allowed(self, rel):
         if self.allow is None:
             return True
-        try:
-            return bool(self.allow(rel))
-        except Exception:  # a guard that fails refuses
-            return False
+        return _allows(self.allow, rel)  # a guard that fails refuses
 
-    def _is_file(self):
-        cache = {}
+    def _verdicts(self):
+        """judge(path) -> (rel, reason), remembered for one resolution pass (see `_verdict`)."""
+        memo = {}
 
-        def check(path):
-            if path not in cache:
-                cache[path] = os.path.isfile(path)
-            return cache[path]
-        return check
+        def judge(path):
+            if path not in memo:
+                memo[path] = self._verdict(path)
+            return memo[path]
+        return judge
 
-    def _judge(self, target):
-        """(rel, "") for an existing file an import may point at, else (None, reason): `outside` when it, or a directory on its way,
-        leads out of the project; `refused` when the guard refuses it (by its name or by where it really is); `missing` when
-        a symlink is on the way inside the project (the walk does not follow links, so neither does an edge)."""
+    def _verdict(self, target):
+        """(rel, "") for an existing regular file an import may point at, else (None, reason): `outside` when it, or a link on its
+        way, leads out of the project; `refused` when the guard refuses it (by its name or by where a link leads); `missing` when
+        nothing is there, it is not a regular file, or a symlink is on the way inside the project (the walk does not follow links,
+        so neither does an edge). Judged by name first (`judged_realpath`): an outside or refused path gets its reason without
+        anything being asked of the file system, so the reason never tells whether a file is there."""
         lexical = lexical_path(self.base, target)
         if lexical is None:
             return None, "outside"
         if lexical in self._known:
-            return lexical, ""  # walked, so allowed and free of symlinks
-        real = os.path.realpath(target)
-        inside = lexical_path(self.base, real)
-        if inside is None:
-            return None, "outside"
-        if not (self._allowed(lexical) and self._allowed(inside)):
-            return None, "refused"
-        if real != target:
+            return lexical, ""  # walked, so allowed, a regular file, and free of symlinks
+        try:
+            lexical, real = judged_realpath(self.base, target, self._allowed)
+        except Unproven as error:
+            return None, _JUDGED_EDGE.get(error.reason, "missing")
+        if real != lexical:
             return None, "missing"
-        return lexical, ""
+        try:
+            info = lstat_nofollow(os.path.join(self.base, *real.split("/")))
+        except OSError:
+            return None, "missing"
+        return (lexical, "") if stat.S_ISREG(info.st_mode) else (None, "missing")
 
     def _resolve_all(self, imap, overlay_maps):
-        isfile = self._is_file()
+        judge = self._verdicts()
+
+        def isfile(path):
+            return judge(path)[1] != "missing"  # an outside or refused path is passed on as a file, so `_edge` says why
         edges, reverse = {}, {}
         for rel in sorted(self.entries):
             importer = self._abs(rel)
             out = []
             for spec, line, type_only, dynamic in self.entries[rel]["specs"]:
                 base = resolve(spec, importer, imap, isfile)
-                out.append(self._edge(rel, spec, line, type_only, dynamic, base, None, imap))
+                out.append(self._edge(rel, spec, line, type_only, dynamic, base, None, imap, judge))
                 for name, omap in overlay_maps:
                     alt = resolve(spec, importer, omap, isfile)
                     if alt[:2] != base[:2]:
-                        out.append(self._edge(rel, spec, line, type_only, dynamic, alt, name, omap))
+                        out.append(self._edge(rel, spec, line, type_only, dynamic, alt, name, omap, judge))
             edges[rel] = out
             for edge in out:
                 if edge["kind"] == "file":
@@ -1173,10 +1522,10 @@ class ImportIndex:
             items.sort(key=lambda e: (e["from"], e["line"], e["config"] or ""))
         self.edges, self._reverse = edges, reverse
 
-    def _edge(self, rel, spec, line, type_only, dynamic, resolved, config, imap):
+    def _edge(self, rel, spec, line, type_only, dynamic, resolved, config, imap, judge=None):
         kind, target, reason = resolved
         if kind == "file":
-            inside, why = self._judge(target)
+            inside, why = (judge or self._verdict)(target)
             if inside is None:
                 kind, target, reason = "unresolved", None, why
             else:

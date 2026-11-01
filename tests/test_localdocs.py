@@ -134,17 +134,67 @@ class GuardTests(unittest.TestCase):
             guard.read_text(self.root / "big.md", limit=10)
         self.assertIsNone(guard.read_text(self.root / "missing.md"))
 
-    def test_reads_do_not_follow_a_link_at_the_last_component_or_block_on_a_fifo(self):
-        """A path resolved earlier and swapped since: the read itself refuses a link and a non-file, and returns what it checked."""
-        (self.root / "real.md").write_text("hello")
-        (self.root / "alias.md").symlink_to(self.root / "real.md")
+    def test_a_fifo_is_refused_and_a_missing_file_is_a_miss(self):
         os.mkfifo(self.root / "pipe.md")
-        for name in ("alias.md", "pipe.md"):
+        for read in (guard.read_text, guard.read_bytes):
+            with self.assertRaises(guard.Rejected, msg=read.__name__):
+                read(self.root / "pipe.md", root=self.root)
+        self.assertIsNone(guard.read_bytes(self.root / "missing.md", root=self.root))
+
+    def test_a_link_to_another_file_inside_the_root_is_read(self):
+        """Review F1: a package.json that is a link to a file in the same package must still read."""
+        (self.root / "real.md").write_text("hello")
+        (self.root / "alias.md").symlink_to("real.md")
+        for read, want in ((guard.read_text, "hello"), (guard.read_bytes, b"hello")):
+            self.assertEqual(read(self.root / "alias.md", root=self.root), want)
+
+    def test_a_link_leaving_the_root_is_refused_by_the_read(self):
+        (self.root / "escape.md").symlink_to(self.outside)
+        (self.root / "linkdir").symlink_to(self.outside.parent)
+        for name in ("escape.md", "linkdir/outside.d.ts"):
             for read in (guard.read_text, guard.read_bytes):
                 with self.assertRaises(guard.Rejected, msg=f"{name} {read.__name__}"):
-                    read(self.root / name)
-        self.assertEqual(guard.read_bytes(self.root / "real.md"), b"hello")
-        self.assertIsNone(guard.read_bytes(self.root / "missing.md"))
+                    read(self.root / name, root=self.root)
+
+    def swap_before_open(self, name, swap):
+        """Run `swap()` once, right before the guard opens `name` (after the path was resolved and its identity taken)."""
+        real_open = os.open
+        done = []
+
+        def opener(path, *args, **kwargs):
+            if not done and Path(path).name == name:
+                done.append(True)
+                swap()
+            return real_open(path, *args, **kwargs)
+
+        return done, mock.patch.object(guard.os, "open", opener)
+
+    def test_a_file_swapped_for_a_link_after_the_path_was_resolved_is_refused(self):
+        target = self.root / "real.md"
+        target.write_text("hello")
+
+        def swap():
+            target.unlink()
+            target.symlink_to(self.outside)
+
+        done, patch = self.swap_before_open("real.md", swap)
+        with patch, self.assertRaises(guard.Rejected):
+            guard.read_bytes(target, root=self.root)
+        self.assertEqual(done, [True])
+
+    def test_a_file_replaced_by_another_file_after_the_path_was_resolved_is_refused(self):
+        target = self.root / "real.md"
+        target.write_text("hello")
+        other = self.root / "other.md"
+        other.write_text("something else")
+
+        def swap():
+            os.replace(other, target)
+
+        done, patch = self.swap_before_open("real.md", swap)
+        with patch, self.assertRaises(guard.Rejected):
+            guard.read_bytes(target, root=self.root)
+        self.assertEqual(done, [True])
 
 
 class SignatureTests(ProjectCase):
@@ -273,6 +323,27 @@ class SignatureTests(ProjectCase):
                 self.assertIn(message, str(ctx.exception))
             finally:
                 (pkg / "keep.d.ts").rename(pkg / "index.d.ts")
+
+    def test_a_package_json_that_is_a_link_inside_the_package_still_gives_its_version_and_entry(self):
+        """Review F1: a041172 refused any link at the last component, so package.json -> metadata.json gave a Miss."""
+        pkg = self.project / "node_modules" / "plainpkg"
+        (pkg / "metadata.json").write_text((pkg / "package.json").read_text())
+        (pkg / "package.json").unlink()
+        (pkg / "package.json").symlink_to("metadata.json")
+        self.assertEqual(signature.installed_version(pkg), "1.2.3")
+        self.assertIn("index.d.ts", signature.entry_candidates(pkg))
+        found = sig(self.project, "plainpkg", "connect")
+        self.assertEqual(found.version, "1.2.3")
+        self.assertIn("export declare function connect", found.text)
+
+    def test_a_package_json_that_links_out_of_the_package_is_not_read(self):
+        pkg = self.project / "node_modules" / "plainpkg"
+        outside = self.base / "outside-package.json"
+        outside.write_text('{"name":"plainpkg","version":"9.9.9","types":"stolen.d.ts"}')
+        (pkg / "package.json").unlink()
+        (pkg / "package.json").symlink_to(outside)
+        self.assertIsNone(signature.installed_version(pkg))
+        self.assertNotIn("stolen.d.ts", signature.entry_candidates(pkg))
 
     def test_symlinked_declaration_to_an_env_file_inside_the_package_is_rejected(self):
         pkg = self.project / "node_modules" / "plainpkg"

@@ -117,7 +117,7 @@ class RemoteSource:
         meta = self.directory / (name + ".metadata.json")
         if meta.exists() or meta.is_symlink():
             try:
-                record = json.loads(guard.read_text(guard.resolve_inside(self.directory, meta.name, suffix=False), limit=1_000_000) or "null")
+                record = json.loads(guard.read_text(guard.resolve_inside(self.directory, meta.name, suffix=False), root=self.directory, limit=1_000_000) or "null")
             except ValueError:
                 record = None
             url = record.get("url") if isinstance(record, dict) else None
@@ -127,10 +127,10 @@ class RemoteSource:
 
     def _content(self, path, target, *, limit=guard.MAX_FILE):
         """(text, bytes) of a cache file without Deno's trailer, or None when the file is missing. The file is opened once, through
-        guard.read_bytes (regular file, size, not binary, no link at the last component), and the trailer is cut from those same
+        guard.read_bytes (regular file, size, not binary, resolved under the cache directory, no swap after resolving), and the trailer is cut from those same
         bytes: the path is never reopened, so a file swapped for a link between a check and a read cannot lead out of the cache. An
         embedded record that names another URL is refused."""
-        raw = guard.read_bytes(target, limit=limit)
+        raw = guard.read_bytes(target, root=self.directory, limit=limit)
         if raw is None:
             return None
         body, record = split_trailer(raw)

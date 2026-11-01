@@ -821,7 +821,7 @@ def types_package(name):
 
 def installed_version(directory):
     try:
-        text = guard.read_text(Path(directory) / "package.json", limit=1_000_000)
+        text = guard.read_text(Path(directory) / "package.json", root=directory, limit=1_000_000)
         version = json.loads(text).get("version") if text else None
     except (ValueError, guard.Rejected, OSError):
         return None
@@ -878,7 +878,7 @@ def _from_exports(exports):
 def entry_candidates(package_dir):
     """Declaration entry paths (relative to the package directory), in the order package.json names them."""
     try:
-        text = guard.read_text(Path(package_dir) / "package.json", limit=1_000_000)
+        text = guard.read_text(Path(package_dir) / "package.json", root=package_dir, limit=1_000_000)
         meta = json.loads(text) if text else {}
     except (ValueError, guard.Rejected):
         meta = {}
@@ -926,7 +926,7 @@ class DirSource:
         return _existing(self.package_dir, key, refusals)
 
     def read(self, key):
-        return guard.read_text(guard.resolve_inside(self.package_dir, key))
+        return guard.read_text(guard.resolve_inside(self.package_dir, key), root=self.package_dir)
 
     def module(self, base, specifier, refusals):
         return _module_file(self.package_dir, base, specifier, refusals)

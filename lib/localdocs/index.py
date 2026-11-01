@@ -104,7 +104,7 @@ def collect_docs(root):
                 continue
             relative = os.path.relpath(full, root)
             try:
-                text = guard.read_text(guard.resolve_inside(root, relative))
+                text = guard.read_text(guard.resolve_inside(root, relative), root=root)
             except guard.Rejected:
                 continue
             if text:
@@ -180,7 +180,7 @@ def read_in_index(directory, name, limit):
     target = guard.resolve_inside(directory, name, suffix=False)
     if target.name != name:
         raise guard.Rejected(f"refused: {name!r} in the docs index is a link to {target.name!r}")
-    return guard.read_text(target, limit=limit)
+    return guard.read_text(target, root=directory, limit=limit)
 
 
 def read_meta(directory):

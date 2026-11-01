@@ -75,35 +75,52 @@ def contained_dir(root, candidate):
     return target
 
 
-def read_bytes(path, *, limit=MAX_FILE):
-    """The bytes of an already-resolved regular file, read through one open; None if it is missing. Rejects non-files, huge and
-    binary files. The open does not follow a link at the last component (a file swapped for a link after the path was resolved is
-    refused, not read), and every check is on the open handle, so what is checked is what is returned and the path is never opened
-    a second time."""
+def read_bytes(path, *, root=None, limit=MAX_FILE):
+    """The bytes of a regular file, read through one open; None if it is missing. Rejects non-files, huge and binary files.
+
+    The path is resolved through links first and, when `root` is given, the result must be under the resolved root (a link that
+    leads out is refused; a link to another file inside the root is read). The RESOLVED path is then opened without following a
+    link at the last component, and the open handle must be the very file the resolved path named a moment before (same device and
+    inode as its lstat): a file swapped for a link or for another file after the path was resolved is refused, not read. Every
+    other check is on the open handle, so what is checked is what is returned and the path is never opened a second time."""
+    path = Path(path)
+    resolved = path.resolve(strict=False)
+    if root is not None:
+        try:
+            inside = resolved.relative_to(real_root(root))
+        except ValueError:
+            raise Rejected("refused: path resolves outside the allowed directory") from None
+        reject_names(inside.parts)
+    try:
+        before = os.lstat(resolved)
+    except FileNotFoundError:
+        return None
     try:
         # O_NONBLOCK so that a FIFO planted at the path is refused below instead of blocking the open.
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise Rejected(f"refused: {Path(path).name!r} is a link") from None
+            raise Rejected(f"refused: {resolved.name!r} is a link") from None
         raise
     with os.fdopen(fd, "rb") as handle:
         info = os.fstat(handle.fileno())
+        if (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
+            raise Rejected(f"refused: {resolved.name!r} changed while it was being opened")
         if not stat.S_ISREG(info.st_mode):
-            raise Rejected(f"refused: {Path(path).name!r} is not a regular file")
+            raise Rejected(f"refused: {resolved.name!r} is not a regular file")
         if info.st_size > limit:
-            raise Rejected(f"refused: {Path(path).name!r} is larger than {limit} bytes")
+            raise Rejected(f"refused: {resolved.name!r} is larger than {limit} bytes")
         raw = handle.read(limit + 1)
     if b"\0" in raw:
-        raise Rejected(f"refused: {Path(path).name!r} looks binary")
+        raise Rejected(f"refused: {resolved.name!r} looks binary")
     return raw
 
 
-def read_text(path, *, limit=MAX_FILE):
-    """The text of an already-resolved regular file; None if it is missing. See read_bytes."""
-    raw = read_bytes(path, limit=limit)
+def read_text(path, *, root=None, limit=MAX_FILE):
+    """The text of a regular file; None if it is missing. See read_bytes."""
+    raw = read_bytes(path, root=root, limit=limit)
     return None if raw is None else raw.decode("utf-8", "replace")
 
 

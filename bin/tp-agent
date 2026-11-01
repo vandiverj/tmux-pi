@@ -20,6 +20,7 @@ import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import failing_tests  # noqa: E402
+import family_sweep  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
 import owner_confirm  # noqa: E402
@@ -625,6 +626,7 @@ def replay_inputs(previous, kept, problem=None):
     contexts, omitted = admitted_context(previous, kept["context"])
     omitted = len(set(kept["omitted_context"] + omitted))
     notes = [note for note in kept["notes"] if not note.startswith("Retry of ")]
+    contexts = [spec for spec in contexts if not family_sweep.is_sweep(spec)]  # the sweep of the prior retry; the next one makes its own
     return contexts, notes, (f"{omitted} context input(s) omitted as sensitive in the prior attempt were not replayed"
                              if omitted else "")
 
@@ -1472,6 +1474,13 @@ def main():
             raise ValueError(f"{problem}; the prior attempt's test scope is unknown, pass --tests")
         else:
             tests = kept["tests"] or TESTS_DEFAULT  # None only in an older valid record
+        if repeated and args.route in ("rule-first", "design"):  # the gated retry gets sweep.md, written beside parked.md and attached as context
+            try:
+                sweep = previous / family_sweep.SWEEP_NAME
+                atomic_text(sweep, family_sweep.build(base, args.id, repeated[0], meta.get("workdir")), base)
+                contexts = contexts + [str(sweep)]
+            except (review_rounds.Refused, OSError, ValueError) as error:  # a sweep that cannot be made does not stop the retry
+                print(f"tp-agent: sweep.md was not written: {error}", file=sys.stderr)
         lane_meta = lane_tags(meta)
         preroute = None
         if args.escalate:

@@ -340,6 +340,70 @@ class RepeatedFamilyGateTests(RetryCase):
         self.assertIn("repeated-family gate was not checked", run.stderr)
 
 
+SITE_REVIEW = ("REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] the matrix cell is wrong at lib/matrix.py:12 and `lib/other.py:40`.\n"
+               "Family: state-matrix\nCloses by: code\n\nCoverage\nI read the changed files and their callers.\n")
+
+
+class SweepTests(RepeatedFamilyGateTests):
+    """sweep.md: generated on a gated retry (--route rule-first or design), attached after the task, not replayed, not on a plain retry."""
+    for _name in [n for n in dir(RepeatedFamilyGateTests) if n.startswith("test_")]:
+        locals()[_name] = None  # the gate's own tests are not run again here
+    del _name
+
+    def gated(self, *extra):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        (self.state / "tasks" / "review-1" / "result.md").write_text(SITE_REVIEW.replace("lib/matrix.py:12", "lib/early.py:3"))
+        (self.state / "tasks" / "review-2" / "result.md").write_text(SITE_REVIEW)
+        run = self.plain_retry(item, *extra)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return item, json.loads(run.stdout)
+
+    def test_a_gated_retry_gets_sweep_md_in_its_packet_after_the_task_and_keeps_the_route_note(self):
+        for route in ("rule-first", "design"):
+            with self.subTest(route=route):
+                item, again = self.gated("--route", route)
+                self.assertTrue((self.task_dir(item) / "sweep.md").is_file())
+                packet = self.packet(again)
+                for word in ("# Sweep: finding family `state-matrix`", "lib/early.py:3", "lib/matrix.py:12", "lib/other.py:40",
+                             "| Site | Disposition | Evidence |", "git -C ", f"route {route}"):
+                    self.assertIn(word, packet)
+                self.assertLess(packet.index(OLD), packet.index("# Sweep:"))  # after the task
+                self.assertIn(f"## .tmux-pi/tasks/{item['id']}/sweep.md", packet)  # the packet names a context file relative to the workdir
+
+    def test_an_unnamed_family_retry_gets_one_too(self):
+        item = self.chain([], [])
+        run = self.plain_retry(item, "--route", "rule-first")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("# Sweep: the unnamed family", self.packet(json.loads(run.stdout)))
+
+    def test_a_retry_that_was_not_gated_gets_no_sweep(self):
+        item = self.chain(["a"], ["b"])
+        (self.state / "tasks" / "review-2" / "result.md").write_text(review_text(verdict="APPROVED"))
+        again = json.loads(self.plain_retry(item).stdout)
+        self.assertNotIn("# Sweep", self.packet(again))
+        self.assertFalse((self.task_dir(item) / "sweep.md").exists())
+
+    def test_route_park_writes_no_sweep(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        self.assertEqual(self.plain_retry(item, "--route", "park").returncode, 0)
+        self.assertFalse((self.task_dir(item) / "sweep.md").exists())
+
+    def test_the_sweep_is_not_replayed_into_the_next_retry(self):
+        item, again = self.gated("--route", "rule-first")
+        self.settle(again, "RESULT_STATUS: complete\nDone.\n")
+        later = self.retry(again, "later")
+        self.assertNotIn("# Sweep", self.packet(later))
+        self.assertNotIn("sweep.md", (self.task_dir(later) / "dispatch.json").read_text())
+
+    def test_a_sweep_that_cannot_be_made_does_not_stop_the_retry(self):
+        item = self.chain(["state-matrix"], ["state-matrix"])
+        (self.task_dir(item) / "sweep.md").mkdir()  # a directory where the file goes: the write fails
+        run = self.plain_retry(item, "--route", "design")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("sweep.md was not written", run.stderr)
+        self.assertNotIn("# Sweep", self.packet(json.loads(run.stdout)))
+
+
 @unittest.skipUnless(TMUX, "tmux not installed")
 class ParkWithALiveProcessTests(TmuxCase):
     """Parking starts no attempt, so a process alive on the working tree does not stop it; every other route still is stopped."""

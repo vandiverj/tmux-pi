@@ -6026,6 +6026,49 @@ class InfoCacheCase(Tree):
             self.assertEqual(planted.read_text(), "x")
             self.assertTrue(all(p.name in ("nav_api-info-f4.json", planted.name) or p.name.endswith(".tmp") for p in folder.iterdir()))
 
+    def _failing_folder_close(self, folder):
+        """An `os.close` that closes a descriptor on a directory (the cache folder or any folder above it) and then fails with EIO."""
+        real = os.close
+
+        def close(fd):
+            import fcntl
+            try:
+                path = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024).split(b"\0")[0].decode()
+                is_dir = os.path.isdir(path) and os.fstat(fd).st_mode & 0o170000 == 0o040000
+            except OSError:
+                is_dir = False
+            real(fd)
+            if is_dir:
+                raise OSError(5, "Input/output error")
+        return mock.patch.object(graph.os, "close", close)
+
+    def test_s3_f4_a_folder_descriptor_close_failure_after_the_rename_is_still_a_written_entry(self):
+        """The rename is the commit point: after it, a failed close of the folder descriptor neither raises nor reports a failure."""
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        name = "nav_api-info-f4.json"
+        self.assertTrue(nav._cache.write_json(name, {"v": 1}))
+        token = nav._cache.prepare_json(name)  # judged first: the guard's own folder lookups close descriptors too, and fail closed
+        with self._failing_folder_close(folder):
+            self.assertTrue(nav._cache.put_json(token, {"v": 2}))
+        self.assertEqual(json.loads((folder / name).read_text()), {"v": 2})
+        token = nav._cache.prepare_json("nav_api-doc-f4.json")
+        with self._failing_folder_close(folder):  # a first write too (the folders above are closed on the way)
+            self.assertTrue(nav._cache.put_json(token, {"v": 3}))
+        self.assertEqual(json.loads((folder / "nav_api-doc-f4.json").read_text()), {"v": 3})
+
+    def test_s3_f4_a_folder_descriptor_close_failure_before_the_rename_leaves_the_entry_and_returns_false(self):
+        project = self.project()
+        nav = self.nav_for(project)
+        folder = project_cache(project).parent
+        name = "nav_api-info-f4.json"
+        self.assertTrue(nav._cache.write_json(name, {"v": 1}))
+        token = nav._cache.prepare_json(name)
+        with self._failing_folder_close(folder), mock.patch.object(graph.os, "rename", side_effect=OSError(5, "io")):
+            self.assertFalse(nav._cache.put_json(token, {"v": 2}))  # the close failure does not hide or replace the result
+        self.assertEqual(json.loads((folder / name).read_text()), {"v": 1})
+
     def test_s3_f4_a_value_that_cannot_be_serialised_makes_nothing(self):
         project = self.project()
         nav = self.nav_for(project)

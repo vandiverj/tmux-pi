@@ -693,6 +693,16 @@ def write_new(path, data, dir_fd=None):
         os.close(fd)
 
 
+def close_quietly(fd):
+    """Close `fd` and swallow an OSError (a failed close of a folder descriptor changes nothing on disk and must not turn a finished
+    write into a failure, or hide the error that is already being raised). Not for a file that was written: `write_new` lets its
+    close failure show, because the data may not be on disk."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def open_folder_below(base, parts):
     """A descriptor on the folder `base`/`parts`..., each part made (mode 0700) where missing: `base` is opened with no link on the
     way (`NOFOLLOW_ANY`) and each part is made with `mkdir` and opened with `O_NOFOLLOW` relative to the one before, so no link is
@@ -705,10 +715,10 @@ def open_folder_below(base, parts):
             except FileExistsError:
                 pass
             inner = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
+            close_quietly(fd)
             fd = inner
     except BaseException:
-        os.close(fd)
+        close_quietly(fd)
         raise
     return fd
 
@@ -775,7 +785,7 @@ class CacheDir:
         except OSError:
             return None
         if _opened_path(fd) != self.path:
-            os.close(fd)
+            close_quietly(fd)
             return None
         return fd
 
@@ -795,7 +805,11 @@ class CacheDir:
         """Write `value` under the names `prepare_json` judged (a temporary file with O_EXCL and no link followed, then a rename, both
         in the folder's descriptor). It asks the guard nothing and calls no project code, so it can follow the last proof of an
         answer. True when written; False (swallowed) when `token` is None, a link is at the name, or the write fails (serialising,
-        os.write, os.close or the rename). Nothing here deletes anything: a failed write leaves every entry byte-identical and may
+        os.write, os.close of the temporary file or the rename).
+
+        The rename is the single commit point. Before it, any failure returns False and leaves every entry byte-identical. After it
+        succeeds the result is True and nothing can raise or change it: the folder descriptor is closed with `close_quietly`, so a
+        failed close of it (which changes nothing on disk) is not a failed write. Nothing here deletes anything: a failed write may
         leave its own stray `.tmp` (a unique random name), which the sweep (S5) removes; another writer's file is never touched."""
         if token is None:
             return False
@@ -813,16 +827,14 @@ class CacheDir:
                 data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
             except (ValueError, TypeError):
                 return False  # nothing was made yet
-            try:
-                write_new(temp, data, dir_fd=fd)  # a failed write may leave its half file: nothing is deleted here
-            except FileExistsError:
-                return False  # not our file (the name is random): leave it
-            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)  # an OSError (also from the write) is False below; the entry is unchanged
-            return True
-        except OSError:
+            write_new(temp, data, dir_fd=fd)  # a failed write may leave its half file: nothing is deleted here
+            os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)  # the commit point
+        except OSError:  # before the commit only (lstat, write, close of the temporary, rename), also FileExistsError: the entry is as it was
             return False
+        else:
+            return True  # after the commit nothing can raise: the `finally` closes quietly
         finally:
-            os.close(fd)
+            close_quietly(fd)
 
     def write_json(self, name, value):
         """`prepare_json` then `put_json`: True when written; False when there is no cache, a name is refused, a link is at the

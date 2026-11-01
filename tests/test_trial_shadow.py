@@ -1295,6 +1295,169 @@ class RecordedIdentityTests(ShadowCase):
         self.assertEqual(ts.cleanup(rdir, self.env), [])
         self.assertFalse(self.alive(pane))
 
+    # -- review 6 F1: every file `tp-agent stop` reads from the task dir is the worker's to write; process.json names what is signalled
+    def stranger(self):
+        """A process that is not the run's, in a group of its own (Main's worker, say), and its `ps` start time."""
+        child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        start = " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(child.pid)], text=True, capture_output=True).stdout.split())
+        return child, start
+
+    def plant(self, task, pane, who, start, **over):
+        """The process record `tp-kill` writes itself, as a worker can write it, naming `who`."""
+        rec = {"pane": pane, "pid": who.pid, "pgid": who.pid, "group": True, "members": [[who.pid, start]], "recorded": "2026-10-31T10:00:00+00:00"}
+        (task / "process.json").write_text(json.dumps(dict(rec, **over)))
+
+    def pane_dies(self, pane):
+        """Wait for the event: tmux marks the pane dead (the pane stays, remain-on-exit)."""
+        for _ in range(600):
+            if not self.alive(pane):
+                return
+            subprocess.run(["perl", "-e", "select(undef,undef,undef,0.05)"])
+        self.fail("pane {} did not die".format(pane))
+
+    def test_g1_a_process_record_naming_a_stranger_is_not_signalled_when_the_pane_is_gone(self):
+        child, start = self.stranger()
+        rdir, info, pane = self.live_run_with_task("sh-pj-gone")
+        self.tmux("kill-pane", "-t", pane)
+        task = rdir / "state" / "tasks" / "trial-live"
+        self.plant(task, pane, child, start)
+        run = ts.Run(rdir, self.env)
+        with self.assertRaises(ts.ShadowError) as caught:
+            run.end_task("stop", "trial-live")
+        self.assertIn("process.json", str(caught.exception))
+        self.assertIsNone(child.poll(), "the stranger was not signalled")
+        self.assertFalse((task / "stopped.json").exists(), "tp-agent stop did not run")
+
+    def test_g1_a_process_record_naming_a_stranger_is_not_signalled_when_meta_names_no_pane(self):
+        child, start = self.stranger()
+        rdir, info = self.prepare(run="sh-pj-nopane")
+        self.session_pane(rdir, "sleep 300")
+        self.record_panes(rdir)
+        task = self.trial_task(rdir, "trial-nopane", "")
+        self.plant(task, "%0", child, start)
+        run = ts.Run(rdir, self.env)
+        with self.assertRaises(ts.ShadowError):
+            run.end_task("stop", "trial-nopane")
+        self.assertIsNone(child.poll())
+        self.assertFalse((task / "stopped.json").exists())
+
+    def test_g1_a_process_record_naming_a_stranger_under_a_recorded_panes_name_is_refused(self):
+        child, start = self.stranger()
+        rdir, info, pane = self.live_run_with_task("sh-pj-pid")
+        task = rdir / "state" / "tasks" / "trial-live"
+        self.plant(task, pane, child, start)  # the run's pane, someone else's pid
+        run = ts.Run(rdir, self.env)
+        with self.assertRaises(ts.ShadowError):
+            run.end_task("stop", "trial-live")
+        self.assertIsNone(child.poll())
+        self.assertTrue(self.alive(pane), "nothing was ended")
+
+    def test_g1_a_process_record_naming_a_pane_the_run_did_not_record_is_refused(self):
+        child, start = self.stranger()
+        rdir, info, pane = self.live_run_with_task("sh-pj-pane")
+        other, _ = self.pane("sleep 300")  # a pane outside the run's session
+        task = rdir / "state" / "tasks" / "trial-live"
+        self.plant(task, other, child, start)
+        run = ts.Run(rdir, self.env)
+        with self.assertRaises(ts.ShadowError):
+            run.end_task("stop", "trial-live")
+        self.assertIsNone(child.poll())
+        self.assertTrue(self.alive(other))
+
+    def test_g1_a_process_record_that_is_not_a_plain_file_is_refused(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-link")
+        task = rdir / "state" / "tasks" / "trial-live"
+        os.symlink(str(self.root / "nowhere"), str(task / "process.json"))
+        run = ts.Run(rdir, self.env)
+        with self.assertRaises(ts.ShadowError):
+            run.end_task("stop", "trial-live")
+        self.assertTrue(self.alive(pane))
+
+    def test_g1_a_recorded_pids_start_time_that_no_longer_matches_is_refused(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-reuse")
+        run = ts.Run(rdir, self.env)
+        pid = run.owner.record["pane_procs"][pane]["pid"]
+        run.owner.record["pane_procs"][pane]["start"] = "Mon Jan  1 00:00:00 2001"  # the pid now runs something that started later
+        (rdir / "state" / "tasks" / "trial-live" / "process.json").write_text(json.dumps(
+            {"pane": pane, "pid": pid, "pgid": os.getpgid(pid), "group": os.getpgid(pid) == pid, "members": [[pid, "x"]], "recorded": "2026-10-31T10:00:00+00:00"}))
+        with self.assertRaises(ts.ShadowError):
+            run.end_task("stop", "trial-live")
+        self.assertTrue(self.alive(pane))
+
+    def test_g1_cleanup_leaves_a_stranger_alone_reports_the_task_and_still_ends_the_session(self):
+        child, start = self.stranger()
+        rdir, info, pane = self.live_run_with_task("sh-pj-clean")
+        self.tmux("kill-pane", "-t", pane)
+        self.plant(rdir / "state" / "tasks" / "trial-live", pane, child, start)
+        leftovers = ts.cleanup(rdir, self.env)
+        self.assertTrue(any("trial-live" in l and "process.json" in l for l in leftovers), leftovers)
+        self.assertIsNone(child.poll(), "the stranger was not signalled")
+        self.assertNotIn("tp-trial-" + info["run"], self.session_names(), "the session kill still takes the run's own panes")
+
+    def test_g1_a_record_that_matches_what_the_run_recorded_is_stopped(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-own")
+        run = ts.Run(rdir, self.env)
+        ident = run.owner.record["pane_procs"][pane]
+        (rdir / "state" / "tasks" / "trial-live" / "process.json").write_text(json.dumps(
+            {"pane": pane, "pid": ident["pid"], "pgid": ident["pgid"], "group": ident["pgid"] == ident["pid"],
+             "members": [[ident["pid"], ident["start"]]], "recorded": "2026-10-31T10:00:00+00:00"}))
+        done = run.end_task("stop", "trial-live")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(self.alive(pane))
+
+    def test_g1_end_author_needs_no_process_record(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-ea")
+        run = ts.Run(rdir, self.env)
+        self.assertEqual(run.owner.check_stop(rdir / "state" / "tasks" / "trial-live", self.env, "end-author"), None)
+
+    # -- review 6 F1: what the run records about a pane is its process, taken while the pane is alive
+    def test_g1_a_recorded_pane_carries_its_pid_group_and_start_time(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-rec")
+        pid = int(self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+        start = " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True).stdout.split())
+        record = json.loads(ts.owner_file(info["project"], info["run"]).read_text())
+        self.assertEqual(record["pane_procs"][pane], {"pid": pid, "pgid": os.getpgid(pid), "start": start})
+
+    def test_g1_a_pane_that_is_already_dead_when_recorded_has_no_process_identity(self):
+        rdir, info = self.prepare(run="sh-pj-dead")
+        pane = self.session_pane(rdir, "sleep 300")
+        os.kill(int(self.tmux("display-message", "-p", "-t", pane, "#{pane_pid}")), 9)
+        self.pane_dies(pane)
+        self.record_panes(rdir)
+        record = json.loads(ts.owner_file(info["project"], info["run"]).read_text())
+        self.assertIn(pane, record["panes"])
+        self.assertNotIn(pane, record["pane_procs"], "a dead pane's pid may already be someone else's")
+
+    def test_g1_an_owner_record_with_a_malformed_process_identity_is_not_used(self):
+        rdir, info, pane = self.live_run_with_task("sh-pj-bad")
+        owner = ts.owner_file(info["project"], info["run"])
+        record = json.loads(owner.read_text())
+        record["pane_procs"][pane]["pid"] = "1"
+        owner.write_text(json.dumps(record))
+        self.assertTrue(any("does not describe this run" in l for l in ts.cleanup(rdir, self.env)))
+
+    # -- review 6 N2: prepare that fails after it made the session leaves nothing behind
+    def test_n2_a_prepare_that_fails_after_the_session_was_made_ends_it_and_removes_the_run_dir(self):
+        with mock.patch.object(ts.Owner, "begin", side_effect=ts.ShadowError("begin failed")):
+            with self.assertRaises(ts.ShadowError):
+                ts.prepare(self.state, self.source_id, run="sh-n2", model=MODEL, thinking="medium", env=self.env)
+        self.assertNotIn("tp-trial-sh-n2", self.session_names())
+        self.assertFalse(trial_session.run_dir(self.repo, "sh-n2").exists())
+        self.assertFalse(ts.owner_file(str(self.repo.resolve()), "sh-n2").exists())
+
+    def test_n2_a_session_that_was_there_before_prepare_is_not_ended_by_its_failure(self):
+        state = trial_session.state_dir(self.repo.resolve(), "sh-n2b")
+        state.mkdir(parents=True)
+        trial_session.ensure(self.repo.resolve(), "sh-n2b", self.env)
+        shutil.rmtree(str(trial_session.run_dir(self.repo.resolve(), "sh-n2b")))  # a stale session, its directory gone
+        with mock.patch.object(ts.Owner, "begin", side_effect=ts.ShadowError("begin failed")):
+            with self.assertRaises(ts.ShadowError):
+                ts.prepare(self.state, self.source_id, run="sh-n2b", model=MODEL, thinking="medium", env=self.env)
+        self.assertIn("tp-trial-sh-n2b", self.session_names(), "not made by this prepare")
+        self.assertFalse(trial_session.run_dir(self.repo, "sh-n2b").exists())
+
     # -- F4: a run directory that is (or became) a link
     def test_f4_a_run_dir_replaced_by_a_link_to_another_run_stops_none_of_that_runs_tasks_and_changes_nothing_there(self):
         other, other_info, other_pane = self.live_run_with_task("sh-other")
@@ -1345,13 +1508,6 @@ class RecordedIdentityTests(ShadowCase):
         if set_state:
             self.tmux("set-option", "-t", name, "@tp_state_dir", set_state)
         return name
-
-    def forge_created(self, info, created="1"):
-        """What a worker could write into the owner file: the run's session id with a created time that is not tmux's."""
-        owner = ts.owner_file(info["project"], info["run"])
-        record = json.loads(owner.read_text())
-        record["session"]["created"] = created
-        owner.write_text(json.dumps(record))
 
     def forge_created(self, info, created="1"):
         """What a worker could write into the owner file: the run's session id with a created time that is not tmux's."""

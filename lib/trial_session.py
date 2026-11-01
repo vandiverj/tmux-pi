@@ -208,6 +208,27 @@ def panes_in(sid, env=None):
     return _tmux(["list-panes", "-s", "-t", sid, "-F", "#{pane_id}"], env).stdout.split()
 
 
+def live_panes_in(sid, env=None):
+    """{pane id: pid} for every pane of session `sid` whose process is still running. A dead pane (kept by remain-on-exit) is left out:
+    its pid may already belong to another process."""
+    out = {}
+    for line in _tmux(["list-panes", "-s", "-t", sid, "-F", "#{pane_id} #{pane_dead} #{pane_pid}"], env).stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == "0" and parts[2].isdigit():
+            out[parts[0]] = int(parts[2])
+    return out
+
+
+def process_start(pid):
+    """The start time `ps` gives process `pid` (whitespace collapsed, the form lib/worker_process.py records), or None when no such
+    process runs. A pid that is reused has another start time."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+        return None
+    run = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True, timeout=TMUX_TIMEOUT)
+    start = " ".join(run.stdout.split())
+    return start if run.returncode == 0 and start else None
+
+
 def local_active(state, env=None):
     """Ids of the running local pi tasks in the tmux-pi state dir `state`, by `tp-agent list` (the classifier Main's own capacity
     check reads). A state dir that cannot be listed raises: an unknown count is never read as zero."""

@@ -173,6 +173,34 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(trial_session.end("sh-a-6", self.env))
         self.assertEqual(self.sessions(), ["tp-trial-sh-a-7"])
 
+    def test_live_panes_in_lists_the_running_panes_with_their_pids_and_leaves_a_dead_one_out(self):
+        name, _ = trial_session.ensure(str(self.project), "sh-a-9", self.env)
+        sid = trial_session.named(name, self.env)[0]
+        live = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id} #{pane_pid}", "-t", "=" + name + ":", "sleep 300").split()
+        dead = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id} #{pane_pid}", "-t", "=" + name + ":", "sleep 300").split()
+        self.tmux("set-option", "-p", "-t", dead[0], "remain-on-exit", "on")
+        os.kill(int(dead[1]), signal.SIGKILL)
+        for _ in range(2000):  # the event is tmux noticing the exit
+            if self.tmux("display-message", "-p", "-t", dead[0], "#{pane_dead}") == "1":
+                break
+        else:
+            self.fail("the pane did not die")
+        found = trial_session.live_panes_in(sid, self.env)
+        self.assertEqual(found[live[0]], int(live[1]))
+        self.assertNotIn(dead[0], found)
+
+    def test_process_start_is_the_ps_start_time_and_none_for_no_process(self):
+        child = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        want = " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(child.pid)], text=True, capture_output=True).stdout.split())
+        self.assertEqual(trial_session.process_start(child.pid), want)
+        self.assertIsNone(trial_session.process_start(0))
+        self.assertIsNone(trial_session.process_start(True))
+        child.kill()
+        child.wait()
+        self.assertIsNone(trial_session.process_start(child.pid))
+
     def test_end_does_not_match_a_longer_name_by_prefix(self):
         trial_session.ensure(str(self.project), "sh-a-8x", self.env)
         self.assertFalse(trial_session.end("sh-a-8", self.env))

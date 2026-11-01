@@ -22,7 +22,9 @@ its tree, so nothing there proves anything). Every destructive act (a signal, a 
 directory) first matches an identity this attempt recorded itself; the full rule is on `Owner`. In short: `prepare` records the
 identities of the run directory, the state dir and the tmux session before any worker exists; the runner holds the directories open
 and writes run.json through them; a session is killed by its recorded id, and only while that id still has the recorded name and
-state dir; `tp-agent stop` runs only for a pane the run recorded in its own session; the worktree is an attempt-unique place
+state dir; `tp-agent stop` runs only for a pane the run recorded in its own session, and a process.json in the task dir is matched against
+the process the run recorded for that pane (otherwise `stop` is not run and the session kill ends the pane); a prepare that fails after it
+made the session ends that session and removes the run dir it made; the worktree is an attempt-unique place
 `<run dir>/wt-<id>`, proven by the (device, inode) of the tree and of its git admin dir, both held open. Project, state dir, session
 and task id come from where the run dir is, never from run.json. Whatever does not match is left as it is. The attempt clock (§8) is
 checked before the worktree and before tp-spawn.
@@ -364,24 +366,57 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
     ok, reason = trial_session.guard(main_state, project, trial, main_max, trial["model"], env)
     if not ok:
         raise ShadowError("not started: " + reason)
-    name, state = trial_session.ensure(project, run, env)
-    worktree = rdir / ("wt-" + secrets.token_hex(6))  # this attempt's own place: never the same name twice, so a path is never reused
+    session_name = trial_session.session_name(run)
+    session_before = trial_session.has_session(session_name, trial_session.env_for(trial_session.state_dir(project, run), session_name, env))  # one already there is not this prepare's to end
     try:
-        owner_file(project, run).unlink()  # a record left by an earlier run of the same name is not this attempt's
-    except FileNotFoundError:
+        name, state = trial_session.ensure(project, run, env)
+        worktree = rdir / ("wt-" + secrets.token_hex(6))  # this attempt's own place: never the same name twice, so a path is never reused
+        try:
+            owner_file(project, run).unlink()  # a record left by an earlier run of the same name is not this attempt's
+        except FileNotFoundError:
+            pass
+        owner = Owner(rdir)
+        try:
+            owner.begin(trial_session.env_for(state, name, env))  # before any worker exists: what the run directory, state dir and session are
+        finally:
+            owner.close()
+        (rdir / "request.md").write_text(workdir_text(worktree, project) + "\n\n" + source["request"].rstrip("\n") + "\n", encoding="utf-8")
+        return update_run(rdir, run=run, session=name, state=str(state), main_state=str(Path(main_state).resolve()), project=project,
+                          source_task=task_id, pair_id=pair_id or "shadow-" + task_id, base_commit=source["base_commit"], model=trial["model"],
+                          thinking=trial["thinking"], workdir=str(worktree), timeout_s=trial["attempt_timeout_s"], review_timeout_s=trial.get("review_timeout_s", 1800),
+                          poll_s=poll_s, max_local_workers=trial["max_local_workers"], main_max_local_workers=main_max,
+                          worktree=str(worktree), task_id="trial-" + run, mode="shadow", phase="queued", outcome=None,
+                          created=now(), pid=None)
+    except BaseException:
+        undo_prepare(project, run, rdir, session_before, env)
+        raise
+
+
+def undo_prepare(project, run, rdir, session_before, env=None):
+    """A prepare that failed after it began creating things: end the session it made (never one that was already there, and only by
+    the id it has now, while it still names this run's state dir), remove the run directory it made (`prepare` refused a run directory
+    that existed) and the owner record. No worker exists yet. Each step is best effort: the failure being reported is the original."""
+    rdir = Path(rdir)
+    if not session_before:
+        try:
+            env = trial_session.env_for(rdir / "state", trial_session.session_name(run), env)
+            found = trial_session.named(trial_session.session_name(run), env)
+            if found is not None and found[3] and Path(found[3]).resolve() == (rdir / "state").resolve():
+                trial_session.end_exact(found[0], found[1], env)
+        except (trial_session.SessionError, OSError, subprocess.SubprocessError):
+            pass
+    try:
+        if rdir.is_symlink():
+            rdir.unlink()
+        elif rdir.exists():
+            shutil.rmtree(str(rdir))
+    except OSError:
         pass
-    owner = Owner(rdir)
-    try:
-        owner.begin(trial_session.env_for(state, name, env))  # before any worker exists: what the run directory, state dir and session are
-    finally:
-        owner.close()
-    (rdir / "request.md").write_text(workdir_text(worktree, project) + "\n\n" + source["request"].rstrip("\n") + "\n", encoding="utf-8")
-    return update_run(rdir, run=run, session=name, state=str(state), main_state=str(Path(main_state).resolve()), project=project,
-                      source_task=task_id, pair_id=pair_id or "shadow-" + task_id, base_commit=source["base_commit"], model=trial["model"],
-                      thinking=trial["thinking"], workdir=str(worktree), timeout_s=trial["attempt_timeout_s"], review_timeout_s=trial.get("review_timeout_s", 1800),
-                      poll_s=poll_s, max_local_workers=trial["max_local_workers"], main_max_local_workers=main_max,
-                      worktree=str(worktree), task_id="trial-" + run, mode="shadow", phase="queued", outcome=None,
-                      created=now(), pid=None)
+    for leftover in [owner_file(project, run)] + sorted(owner_file(project, run).parent.glob(owner_file(project, run).name + ".tmp.*")):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
 
 
 def launch(rdir, project, env=None):
@@ -447,9 +482,10 @@ class Run:
 
     def end_task(self, verb, task_id):
         """`tp-agent <verb> <task>` for a verb that ends the task's process (stop, end-author): only when the pane the task's meta.json
-        names is a pane the run recorded in its own session (`Owner.check_pane`; meta.json is the worker's to edit)."""
+        names is a pane the run recorded in its own session, and, for `stop`, process.json is absent or names the process the run recorded
+        (`Owner.check_stop`; both files are the worker's to edit)."""
         self.owner.check_state()
-        self.owner.check_pane(self.task_path(task_id), self.env)
+        self.owner.check_stop(self.task_path(task_id), self.env, verb)
         return self.agent(verb, task_id)
 
     def task_path(self, task_id=None):
@@ -848,9 +884,15 @@ class Owner:
                            by that id, and only while it still has that id and created time (`end_session`): a session that took
                            the name later, or an id reused after a tmux restart, is not this run's. The name is not part of the
                            identity: a worker can rename the session and it is still ended.
-      panes                after tp-spawn and after the review starts, the run records the panes tmux lists in its session. `tp-agent
-                           stop` follows the pane in the task's meta.json (the worker's to edit), so it is run only for a pane
-                           recorded here and still in that session (`check_pane`).
+      panes, their         after tp-spawn and after the review starts, the run records the panes tmux lists in its session and, for each
+      processes            pane that is alive, the process it runs (pid, process group, start time). `tp-agent stop` (tp-kill) reads
+                           two files of the task dir to choose what to end, both the worker's to write: the pane in meta.json, and
+                           the pid and group in process.json. It is run only for a pane recorded here and still in that session
+                           (`check_pane`), and only when process.json is absent or names exactly the process recorded for one of
+                           the run's panes, with a pid that still has the recorded start time (`check_process_record`). Anything
+                           else is not acted on: the task is reported and left running until the session kill takes its pane.
+                           (`end-author` reads meta.json only.) A general fix belongs in tp-kill / worker_process (the recorded
+                           follow-up `tp-agent stop pane trust`); this is the trial's own guard until then.
       worktree             (device, inode) of the tree root and of its git admin dir, held open by the runner (`create`): while a
                            descriptor is open no other directory can have that identity, so nothing the worker does (remove and
                            re-add a tree at the same path, git reusing the admin name, `git worktree move`, a link, a rewritten
@@ -904,7 +946,11 @@ class Owner:
                   and all(isinstance(value[k][f], int) for k in ("rdir_id", "state_id") for f in ("dev", "ino"))
                   and isinstance(value["session"]["id"], str) and isinstance(value["session"]["created"], str) and value["session"]["created"].isdigit()
                   and isinstance(value["session"]["name"], str)
-                  and isinstance(value["panes"], list) and all(isinstance(p, str) for p in value["panes"]))
+                  and isinstance(value["panes"], list) and all(isinstance(p, str) for p in value["panes"])
+                  and isinstance(value.get("pane_procs", {}), dict)
+                  and all(k in value["panes"] and isinstance(v, dict) and isinstance(v.get("start"), str) and v["start"]
+                          and all(isinstance(v.get(f), int) and not isinstance(v.get(f), bool) and v[f] > 1 for f in ("pid", "pgid"))
+                          for k, v in value.get("pane_procs", {}).items()))
             if ok and "path" in value:  # the worktree part exists once the tree was made
                 ok = (PLACE.fullmatch(Path(value["path"]).name) is not None
                       and all(isinstance(value[k][f], int) for k in ("tree", "admin") for f in ("dev", "ino")) and isinstance(value["admin"]["path"], str)
@@ -985,7 +1031,7 @@ class Owner:
             raise ShadowError("the tmux session {} is not there with the state dir {}; the run was not prepared".format(self.session, self.state))
         ident = {kind: {"dev": os.fstat(self.need(kind)).st_dev, "ino": os.fstat(self.need(kind)).st_ino} for kind in ("rdir", "state")}
         self.record = {"schema": 2, "run": self.run, "project": self.project, "run_dir": self.rdir_real, "rdir_id": ident["rdir"],
-                       "state_id": ident["state"], "session": {"id": found[0], "created": found[1], "name": found[2]}, "panes": [], "prepared": now()}
+                       "state_id": ident["state"], "session": {"id": found[0], "created": found[1], "name": found[2]}, "panes": [], "pane_procs": {}, "prepared": now()}
         self.problem = None
         self._write()
 
@@ -1056,28 +1102,95 @@ class Owner:
         return trial_session.end_exact(s["id"], s["created"], env)
 
     def record_panes(self, env):
-        """Add the panes tmux lists in the run's session to the ones the run recorded (called when a worker or reviewer has just been
-        started, before it could move a pane in)."""
+        """Add the panes tmux lists in the run's session to the ones the run recorded, and for each pane that is alive the process it
+        runs: pid, process group and start time (called when a worker or reviewer has just been started, before it could move a pane
+        in or write a process record). A pane's process is recorded once, the first time it is seen alive; `check_process_record`
+        matches every process record against it. A dead pane's pid may already be another process's, so none is taken for it."""
         s = self.session_ref()
         try:
             if not trial_session.is_session(s["id"], s["created"], env):
                 raise ShadowError("the run's tmux session {} is gone or is not the one it created; its panes were not recorded".format(s["name"]))
             found = trial_session.panes_in(s["id"], env)
+            live = trial_session.live_panes_in(s["id"], env)
         except trial_session.SessionError as problem:
             raise ShadowError(str(problem))
         merged = sorted(set(self.record["panes"]) | set(found))
-        if merged != self.record["panes"]:
+        procs = self.record.setdefault("pane_procs", {})
+        changed = merged != self.record["panes"]
+        for pane, pid in live.items():
+            if pane in procs:
+                continue
+            start = trial_session.process_start(pid)
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                continue
+            if start and pgid > 1:
+                procs[pane] = {"pid": pid, "pgid": pgid, "start": start}
+                changed = True
+        if changed:
             self.record["panes"] = merged
             self._write()
 
-    def check_pane(self, task_path, env):
-        """Raise unless the pane the task's meta.json names is a pane this run recorded and is still in the run's session. A task that
-        names no pane has nothing for `tp-agent stop` to follow and passes."""
+    @staticmethod
+    def meta_pane(task_path):
+        """The pane the task's meta.json names (the worker can edit it), or None."""
         try:
             meta = json.loads((Path(task_path) / "meta.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             meta = {}
-        pane = meta.get("pane") if isinstance(meta, dict) else None
+        return meta.get("pane") if isinstance(meta, dict) else None
+
+    def check_stop(self, task_path, env, verb="stop"):
+        """Everything checked before `tp-agent <verb> <task>` runs. `end-author` follows only the pane in meta.json. `stop` (tp-kill) also
+        reads `process.json` and signals what it names, so that is matched too. Those are the only two files either reads from the task
+        dir to choose a process; the rest (state, result, exit) decide which task it is, never which process."""
+        self.check_pane(task_path, env)
+        if verb == "stop":
+            self.check_process_record(task_path)
+
+    def check_process_record(self, task_path):
+        """Raise unless `<task>/process.json` is absent or names the process this run recorded for a pane of its own: the same pane, pid
+        and process group, and a pid that still has the recorded start time (a reused pid has another). The worker can write the file, so
+        nothing in it is trusted alone; one that cannot be matched is not acted on and `tp-agent stop` is not run for the task."""
+        task = Path(task_path)
+
+        def refuse(why):
+            return ShadowError("task {}: process.json {}; the task was not stopped through tp-agent (it keeps running until the run's session is ended)".format(task.name, why))
+        try:
+            fd = os.open(str(task / "process.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise refuse("cannot be opened as a plain file ({})".format(error.strerror))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise refuse("is not a plain file")
+            with os.fdopen(os.dup(fd), encoding="utf-8") as handle:
+                rec = json.load(handle)
+        except (OSError, ValueError):
+            raise refuse("cannot be read")
+        finally:
+            os.close(fd)
+        if not (isinstance(rec, dict) and isinstance(rec.get("pane"), str) and isinstance(rec.get("group"), bool)
+                and all(isinstance(rec.get(k), int) and not isinstance(rec.get(k), bool) for k in ("pid", "pgid"))):
+            raise refuse("is malformed")
+        ident = (self.record.get("pane_procs") or {}).get(rec["pane"]) if rec["pane"] in self.record["panes"] else None
+        if ident is None:
+            raise refuse("names pane {}, which has no process the run recorded for a pane of its own".format(rec["pane"]))
+        meta = self.meta_pane(task)
+        if meta not in (None, "") and meta != rec["pane"]:
+            raise refuse("names pane {}, not the task's pane {}".format(rec["pane"], meta))
+        if (rec["pid"], rec["pgid"], rec["group"]) != (ident["pid"], ident["pgid"], ident["pgid"] == ident["pid"]):
+            raise refuse("names a process (pid {}, group {}) that is not the one the run recorded for pane {}".format(rec["pid"], rec["pgid"], rec["pane"]))
+        running = trial_session.process_start(ident["pid"])
+        if running is not None and running != ident["start"]:
+            raise refuse("names pid {}, which now runs a process that started at another time than the run's pane process".format(ident["pid"]))
+
+    def check_pane(self, task_path, env):
+        """Raise unless the pane the task's meta.json names is a pane this run recorded and is still in the run's session. A task that
+        names no pane has nothing for `tp-agent stop` to follow and passes."""
+        pane = self.meta_pane(task_path)
         if pane in (None, ""):
             return
         s = self.session_ref()
@@ -1206,7 +1319,7 @@ def _cleanup(owner, env):
             if state_name not in trial_session.ACTIVE and state_name is not None:
                 continue  # nothing to stop: no pane is followed
             try:
-                owner.check_pane(path, run_env)  # meta.json is the worker's: its pane decides nothing unless the run recorded it
+                owner.check_stop(path, run_env)  # meta.json and process.json are the worker's: neither decides anything unless the run recorded it
                 owner.check_state()
             except ShadowError as problem:
                 refused.append(str(problem))

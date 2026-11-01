@@ -47,9 +47,11 @@ API_SYMBOLS = 100  # the most symbols CX3 lists for one file
 SYMBOL_PLACES = 20   # declarations of one name that are listed
 SYMBOL_FILES = 5     # files whose details ctx_symbol gives for one name
 SCAN_FILES = 20000
+ANSWER_FILE_KEYS = ("target", "path")  # top-level fields that name the file an answer is about (CX2 imports, CX3 importers/imports/symbols)
 SCAN_BYTES = 1_000_000
 CANDIDATES_WHY = "candidate notes that matched; include_candidates=true shows them, marked"
-LIBRARIES_WHY = "a file too large to read, or an import list that was cut, may import libraries that are not listed"
+LIBRARIES_WHY = ("a file too large to read, an import list that was cut, or an import whose name is not a plain string, may import libraries "
+                 "that are not listed")
 SCAN_WHY = "code files the text scan could not read: a refused path, a file over 1 MB or past the scan cap"
 
 # ------------------------------------------------------------------------------------------------------------- the schema
@@ -192,28 +194,40 @@ def short(text, limit):
 
 
 CUT_SHOWN = "at least {n} shown, list cut by the navigator"
+NOT_ALL_SHOWN = "at least {n} shown, not all returned: {why}"
 PATH_WHY = "a path that is refused or outside the project"
 NOT_RETURNED_WHY = "rows the navigator did not hand over"
 INVALID_WHY = "note files that could not be read"
 NONE_SHOWN = "none can be shown ({n} withheld, {why})"
 CUT_NOTHING = "not found in the part the navigator returned (list cut)"
 NOT_AVAILABLE = "not available (the read failed or was not run)"
+NOT_ANSWERED = "not available (the navigator answered {status})"
+UNRESOLVED_WHY = "imports the navigator could not resolve"
+EXTERNAL_WHY = "places inside installed packages that the navigator dropped"
+CONFIG_WHY = "config entries the navigator's index ignored"
+ERRORS_WHY = "parts the navigator reported errors for"
+UNREADABLE_WHY = "rows the navigator returned in a form this surface cannot read"
+UNKNOWN_WHY = "fields of the answer this surface does not know ({keys})"
 
 
 @dataclass(frozen=True)
 class Completeness:
-    """Whether a read of a source was complete, the one thing an absence may be built on. Built from the read result (Got.completeness,
-    notes_read, the text scan's own count), never from a literal:
-      ok       the read happened and succeeded (False for a navigator that failed or was unavailable, or a read that was never run)
+    """Whether a read of a source was complete, the one thing an absence may be built on. Only `answer_read` makes one, from the whole
+    answer of the read (a navigator answer, a note search, the surface's own scan); `Completeness.of` joins records it made. A test
+    fails if brief.py or surface.py builds one anywhere else.
+      ok       the answer's status is `ok` (False for any other status, a navigator that failed or was unavailable, a read never run)
       withheld items of the source left out because their path is refused or the navigator withheld them
       cut      the navigator said it cut its list
-      unread   items of the source that were not read (a file too large or past the scan cap, a note that failed to parse, rows not handed over)
-      why      what `withheld` and `unread` were, in words"""
+      unread   items of the source that were not read: imports it could not resolve, rows not handed over, a file too large or past
+               the scan cap, a note that failed to parse, a field of the answer this surface does not know
+      why      what `withheld` and `unread` were, in words
+      status   the navigator's own word when `ok` is False ("" for a read that never ran)"""
     ok: bool = True
     withheld: int = 0
     cut: bool = False
     unread: int = 0
     why: str = PATH_WHY
+    status: str = ""
 
     @property
     def left(self):
@@ -228,10 +242,106 @@ class Completeness:
     def of(cls, *parts):
         """The record for a source made of several reads: whole only if every part is. No parts is a read that never ran."""
         if not parts:
-            return cls(ok=False)
+            return answer_read(None)
         why = ", and ".join(dict.fromkeys(p.why for p in parts if p.left))
+        failed = [p.status for p in parts if not p.ok and p.status]
         return cls(all(p.ok for p in parts), sum(p.withheld for p in parts), any(p.cut for p in parts), sum(p.unread for p in parts),
-                   why or PATH_WHY)
+                   why or PATH_WHY, failed[0] if failed else "")
+
+
+# The fields an answer may carry, for `answer_read`. Every field of an answer is one of these three kinds, or unknown.
+# HARMLESS: never a sign that part of the source was left out (the rows themselves, echoes of the question, ages, totals that the
+# caller compares with the rows it was handed, free text). LOSS: a count, list or flag of what was left out, with what it was.
+# Anything else that is not empty is unknown, and an unknown field makes the read not whole: a new navigator field is a loss until
+# someone reads it and puts it on one of the lists.
+COUNTS = frozenset({"total"})  # harmless only when a whole number: any other value makes the read not whole
+HARMLESS = frozenset({
+    "status",                                                    # checked first: only "ok" is a whole read
+    "edges", "exports", "importers", "files", "external", "symbols", "definitions", "references", "hits",   # the rows
+    "direction", "target", "path", "source", "cached", "at", "is_module",                               # echoes of the question
+    "signature", "doc",                                          # text about the one symbol asked for
+    "total",                                                     # compared with the rows handed over (`not_returned`)
+    "index_age_s", "files_indexed", "scanned", "cache",          # how fresh the index is and how much it re-read
+})
+LOSS = {  # field -> (kind, what it counted); kind is withheld, unread or cut
+    "withheld": ("withheld", PATH_WHY), "omitted_outside_root": ("withheld", PATH_WHY), "refused": ("withheld", PATH_WHY),
+    "candidates_counted": ("withheld", CANDIDATES_WHY),
+    "unresolved": ("unread", UNRESOLVED_WHY), "unresolved_total": ("unread", UNRESOLVED_WHY),
+    "omitted_external": ("unread", EXTERNAL_WHY), "ignored_config": ("unread", CONFIG_WHY),
+    "skipped": ("unread", SCAN_WHY), "libraries_unread": ("unread", LIBRARIES_WHY), "invalid": ("unread", INVALID_WHY),
+    "errors": ("unread", ERRORS_WHY),
+    "truncated": ("cut", ""), "cut": ("cut", ""),
+}
+OVERLAP = {"unresolved_total": "unresolved"}  # CX3's index-wide count includes the file's own `unresolved` list: the larger is taken
+
+
+def _amount(value):
+    """How many items a loss field names: a list's length, a count, 1 for any other value that is not empty."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value if value >= 0 else 1
+    if isinstance(value, (list, tuple, set, frozenset, dict, str)):
+        return len(value)
+    return 0 if value is None else 1
+
+
+def answer_read(answer, screened=0, not_returned=0, unreadable=0):
+    """The Completeness of one read, from its whole answer: the one place a Completeness is made. `answer` is the navigator's answer
+    dict, a note search result (its fields), or the surface's own scan as a dict; `screened` the rows the surface dropped because
+    their path fails the path policy, `not_returned` the rows of the navigator's total it did not hand over, `unreadable` the rows
+    it handed over in a form the surface cannot read (listed_rows).
+    The read is whole only when the status is `ok`, every LOSS field is empty, and no field outside HARMLESS and LOSS has a value.
+    No answer (None, not a dict) is a read that never ran."""
+    if not isinstance(answer, dict):
+        return Completeness(ok=False)
+    status = answer.get("status")
+    counts = {"withheld": [], "unread": []}
+    cut, unknown, shared = False, [], {}
+    for key in sorted(answer, key=str):
+        value = answer[key]
+        if key in COUNTS and value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            unreadable += 1  # a count that is not a whole number cannot be compared with the rows
+            continue
+        if key in HARMLESS:
+            continue
+        if key in LOSS:
+            kind, why = LOSS[key]
+            if kind == "cut":
+                cut = cut or bool(value)
+            elif key in OVERLAP or key in OVERLAP.values():
+                group = OVERLAP.get(key, key)
+                shared[group] = (kind, why, max(shared.get(group, (kind, why, 0))[2], _amount(value)))
+            elif _amount(value):
+                counts[kind].append((_amount(value), why))
+        elif _amount(value):
+            unknown.append(str(key))
+    for kind, why, amount in shared.values():
+        if amount:
+            counts[kind].append((amount, why))
+    if unknown:
+        counts["unread"].append((len(unknown), UNKNOWN_WHY.format(keys=short(", ".join(unknown), 80))))
+    if screened:
+        counts["withheld"].append((screened, PATH_WHY))
+    if not_returned:
+        counts["unread"].append((not_returned, NOT_RETURNED_WHY))
+    if unreadable:
+        counts["unread"].append((unreadable, UNREADABLE_WHY))
+    whys = [why for kind in ("withheld", "unread") for n, why in counts[kind] if n]
+    word = "" if status == "ok" else short(str(status or "status missing"), 40)
+    return Completeness(status == "ok", sum(n for n, _ in counts["withheld"]), cut, sum(n for n, _ in counts["unread"]),
+                        ", and ".join(dict.fromkeys(whys)) or PATH_WHY, word)
+
+
+def listed_rows(raw, key):
+    """(the rows of the list `raw[key]` that are objects, the number of items the navigator handed over, the number this surface
+    cannot read): an item that is not an object, or a list that is missing or not a list, is counted as unreadable, never dropped
+    silently, so the read is not whole."""
+    items = raw.get(key)
+    if not isinstance(items, list):
+        return [], 0, 1
+    rows = [item for item in items if isinstance(item, dict)]
+    return rows, len(items), len(items) - len(rows)
 
 
 def absent(text, read, label=None):
@@ -240,7 +350,7 @@ def absent(text, read, label=None):
     unavailable or never ran is "not available"; a cut list is "not found in the part ... returned (list cut)"; a source with items
     withheld or unread is "none can be shown (N withheld, why)". `label` prefixes the substitute ("label: none can be shown ...")."""
     if not read.ok:
-        said = NOT_AVAILABLE
+        said = NOT_ANSWERED.format(status=read.status) if read.status else NOT_AVAILABLE
     elif read.cut:
         said = CUT_NOTHING
     elif read.left > 0:
@@ -259,6 +369,8 @@ def list_head(label, shown, total, read, empty=None, of=False):
     "label (total):" ("label (shown of total):" with `of`); an empty list says `empty` when given and nothing at all was reported."""
     if shown > 0 and read.cut:
         return f"{label} ({CUT_SHOWN.format(n=shown)}):"
+    if shown > 0 and read.unread:
+        return f"{label} ({NOT_ALL_SHOWN.format(n=shown, why=read.why)}):"
     if shown <= 0 and not read.whole:
         return absent("", read, label=label)
     if shown <= 0 and empty and total <= 0:
@@ -267,9 +379,12 @@ def list_head(label, shown, total, read, empty=None, of=False):
 
 
 def notes_read(result):
-    """The Completeness of a note search: candidate notes that matched but were not asked for, and note files that failed to parse."""
-    return Completeness.of(Completeness(withheld=result.candidates_counted, why=CANDIDATES_WHY),
-                           Completeness(unread=len(result.invalid), why=INVALID_WHY))
+    """The Completeness of a note search, from every field of its result: candidate notes that matched but were not asked for, note
+    files that failed to parse, matches past the hits it returned, and any field the surface does not know."""
+    fields = vars(result)
+    hits = fields.get("hits")
+    shown = len(hits) if isinstance(hits, list) else 0
+    return answer_read({"status": "ok", **fields}, not_returned=max(_int(fields.get("total")) - shown, 0), unreadable=0 if isinstance(hits, list) else 1)
 
 
 def notes_left(result):
@@ -352,28 +467,46 @@ class Got:
     rows: list = field(default_factory=list)
     total: int = 0
     external: list = field(default_factory=list)
-    unresolved: int = 0
     age: int | None = None
     raw: dict = field(default_factory=dict)
-    seen: int = 0            # rows the navigator handed over, refused ones included: what `total` is compared with
-    refused: int = 0         # rows left out because their path fails the path policy (counted, never named)
-    cut: bool = False        # the navigator said its list was cut (`truncated`), whatever its `total` says
+    seen: int = 0            # rows the navigator handed over or withheld itself: what `total` is compared with
+    screened: int = 0        # rows the surface dropped because their path fails the path policy (counted, never named)
+    unreadable: int = 0      # rows the navigator handed over in a form the surface cannot read (listed_rows)
 
     @property
     def beyond(self):
         """Rows of the navigator's full answer that are not in `rows` and were not refused: the part not read."""
         return max(self.total - self.seen, 0)
 
+    def completeness(self):
+        """The Completeness of this read, from the navigator's whole answer (answer_read) with the rows the surface screened out and
+        the rows it was not handed. Not ok when the navigator failed."""
+        if not self.ok:
+            read = answer_read(self.raw or None)
+            return read if not read.ok else answer_read(None)
+        return answer_read(self.raw, screened=self.screened, not_returned=self.beyond, unreadable=self.unreadable)
+
+    @property
+    def refused(self):
+        """Rows left out because a path is refused: the ones the surface screened out and the ones the navigator withheld."""
+        return self.completeness().withheld
+
+    @property
+    def cut(self):
+        """The navigator said its list was cut (`truncated`), whatever its `total` says."""
+        return self.completeness().cut
+
     @property
     def incomplete(self):
-        return self.beyond > 0 or self.cut
+        """Part of the answer was not read: rows not handed over, a cut list, unresolved imports or a field this surface does not know
+        (withheld rows are counted apart)."""
+        read = self.completeness()
+        return read.cut or read.unread > 0
 
-    def completeness(self):
-        """The Completeness of this read: not ok when the navigator failed; else what was withheld, cut or not handed over."""
-        if not self.ok:
-            return Completeness(ok=False)
-        why = ", and ".join(w for w, n in ((PATH_WHY, self.refused), (NOT_RETURNED_WHY, self.beyond)) if n)
-        return Completeness(True, self.refused, self.cut, self.beyond, why or PATH_WHY)
+    @property
+    def unresolved(self):
+        """The navigator's count of imports it could not resolve, to show (answer_read counts it as unread)."""
+        return _amount(self.raw.get("unresolved")) or _amount(self.raw.get("unresolved_total"))
 
 
 def label_for(path):
@@ -407,6 +540,30 @@ IMPORT_RE = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)(['"
 
 def libraries_in(text):
     return {lib for _, spec in IMPORT_RE.findall(text) if (lib := library_of(spec))}
+
+
+DYNAMIC_RE = re.compile(r"""\b(?:import|require)\s*\(\s*(?!['"][^'"\n]{1,200}['"]\s*[,)])""")
+
+
+def declaration_pattern(name):
+    """The text-scan pattern for a top-level declaration of `name`, group `export` set when it is exported: a declaration
+    (function, class, const, let, var, type, interface, enum, namespace, module), a destructured const/let/var, `import name =`,
+    and the export forms that bind a name (`export { a as name }`, `export * as name`). A line may start with a byte order mark;
+    `name` is bounded by characters that cannot be part of a name, so a name with `$` matches."""
+    n = r"(?<![\w$])" + re.escape(name) + r"(?![\w$])"
+    lead = r"^[ \t\ufeff]*(?P<export>export\b[ \t]*)?"
+    forms = (r"(?:default[ \t]+)?(?:declare[ \t]+)?(?:abstract[ \t]+)?(?:async[ \t]+)?"
+             r"(?:function[ \t]*\*?|class|const|let|var|type|interface|enum|namespace|module)[ \t]+" + n,
+             r"(?:declare[ \t]+)?(?:const|let|var)[ \t]*[{\[][^=;]*?" + n + r"[^=;]*?[}\]][ \t]*(?::[^=;]*)?=",
+             r"import[ \t]+" + n + r"[ \t]*=",
+             r"(?<=export)[ \t]*(?:\{[^}]*?\bas[ \t\r\n]+" + n + r"[^}]*\}|\*[ \t]*as[ \t]+" + n + ")")
+    return re.compile(lead + "(?:" + "|".join(forms) + ")", re.M)
+
+
+def unnamed_imports(text):
+    """The number of `import(...)` and `require(...)` calls whose module is not a plain string (a template or an expression): the
+    library scan cannot name what they load, so "no library" cannot be said for the file."""
+    return len(DYNAMIC_RE.findall(text))
 
 
 # ---------------------------------------------------------------------------------------------------------- navigators
@@ -670,13 +827,20 @@ class Engine(NoteWriter):
         return Got(False, status, failure_text(kind, raw), raw=raw)
 
     def call(self, kind, made, method, *args, **kw):
-        """The navigator's answer as a dict; an exception or a non-answer becomes an `unavailable` answer."""
+        """The navigator's answer as a dict; an exception or a non-answer becomes an `unavailable` answer, and an answer whose `target`
+        or `path` names another file than the one asked about (args[0]), or an ok answer that does not echo the `direction` asked
+        for, an `error`: its rows are not about this question."""
         try:
             raw = getattr(made, method)(*args, **kw)
         except Exception as exc:
             return {"status": "unavailable", "message": f"the {kind} navigator failed ({type(exc).__name__})", "next": NEXT_DEFAULT["unavailable"]}
         if not isinstance(raw, dict):
             return {"status": "error", "message": f"the {kind} navigator gave an answer that is not an object"}
+        asked = args[0] if args and isinstance(args[0], str) else None
+        if asked and any(key in raw and self.allowed(raw[key]) != asked for key in ANSWER_FILE_KEYS):
+            return {"status": "error", "message": f"the {kind} navigator answered about another file than {asked}"}
+        if "direction" in kw and raw.get("status") == "ok" and raw.get("direction") != kw["direction"]:
+            return {"status": "error", "message": f"the {kind} navigator did not answer for direction {kw['direction']}"}
         return raw
 
     def _status(self, kind, raw):
@@ -695,9 +859,9 @@ class Engine(NoteWriter):
 
     @staticmethod
     def loss(raw):
-        """(paths the navigator left out itself, whether it cut its list) from any navigator answer: its `withheld` and
-        `omitted_outside_root` counters and its `truncated` flag. The one place those fields are read; every operation uses it."""
-        return _int(raw.get("withheld")) + _int(raw.get("omitted_outside_root")), bool(raw.get("truncated"))
+        """(paths the navigator left out itself, whether it cut its list) from any navigator answer, as answer_read counts them."""
+        read = answer_read(raw)
+        return read.withheld, read.cut
 
     def screen_rows(self, rows, index):
         """(rows whose path at position `index` passes the path policy, with that path normalized; number refused)."""
@@ -731,25 +895,24 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            listed = raw.get("exports") or []
-            rows = [(str(e.get("name", "")), str(e.get("kind", "")), _int(e.get("line"))) for e in listed if isinstance(e, dict)]
-            omitted, cut = self.loss(raw)
-            return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=cut, refused=omitted, raw=raw)
+            listed, handed, unreadable = listed_rows(raw, "exports")
+            rows = [(str(e.get("name", "")), str(e.get("kind", "")), _int(e.get("line"))) for e in listed]
+            return Got(rows=rows, total=_int(raw.get("total", handed)), seen=handed, unreadable=unreadable, raw=raw)
         raw = self.call(kind, made, "symbols", rel, limit=API_SYMBOLS)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        listed = raw.get("symbols") or []
-        rows = [(str(s.get("name", "")), str(s.get("kind", "")), _int(s.get("line"))) for s in listed if isinstance(s, dict)]
-        omitted, cut = self.loss(raw)
-        return Got(rows=rows, total=_int(raw.get("total", len(rows))), seen=len(listed), cut=cut, refused=omitted, raw=raw)
+        listed, handed, unreadable = listed_rows(raw, "symbols")
+        rows = [(str(s.get("name", "")), str(s.get("kind", "")), _int(s.get("line"))) for s in listed]
+        return Got(rows=rows, total=_int(raw.get("total", handed)), seen=handed, unreadable=unreadable, raw=raw)
 
-    def _edges(self, raw, rows, index, listed, **more):
-        """A Got from navigator rows: refused paths dropped and counted, and the navigator's own truncation kept."""
-        kept, refused = self.screen_rows(rows, index)
-        withheld, cut = self.loss(raw)
-        return Got(rows=kept, total=_int(raw.get("total", len(rows))), seen=listed + withheld, refused=refused + withheld,
-                   cut=cut, raw=raw, **more)
+    def _edges(self, raw, rows, index, handed, unreadable, **more):
+        """A Got from navigator rows: refused paths dropped and counted, rows it cannot read counted, and the navigator's own
+        truncation kept."""
+        kept, screened = self.screen_rows(rows, index)
+        withheld, _ = self.loss(raw)
+        return Got(rows=kept, total=_int(raw.get("total", handed)), seen=handed + withheld, screened=screened, unreadable=unreadable,
+                   raw=raw, **more)
 
     def importers(self, rel, limit=10):
         """Got whose rows are (importing file, line, rel)."""
@@ -761,16 +924,16 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            listed = [e for e in raw.get("edges") or [] if isinstance(e, dict)]
-            rows = [(str(e.get("from", "")), _int(e.get("line")), rel) for e in listed]
-            return self._edges(raw, rows, 0, len(listed), unresolved=_count(raw.get("unresolved")))
+            listed, handed, unreadable = listed_rows(raw, "edges")
+            rows = [(e.get("from"), _int(e.get("line")), rel) for e in listed]
+            return self._edges(raw, rows, 0, handed, unreadable)
         raw = self.call(kind, made, "importers", rel, limit=limit)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        listed = [e for e in raw.get("importers") or [] if isinstance(e, dict)]
-        rows = [(str(e.get("path", "")), _int(e.get("line")), rel) for e in listed]
-        return self._edges(raw, rows, 0, len(listed), age=raw.get("index_age_s"))
+        listed, handed, unreadable = listed_rows(raw, "importers")
+        rows = [(e.get("path"), _int(e.get("line")), rel) for e in listed]
+        return self._edges(raw, rows, 0, handed, unreadable, age=raw.get("index_age_s"))
 
     def imports(self, rel, limit=WEB_EDGES):
         """Got whose rows are (rel, line in rel, imported file); `external` names the libraries it imports."""
@@ -782,19 +945,19 @@ class Engine(NoteWriter):
             bad = self._status(kind, raw)
             if bad:
                 return bad
-            listed = [e for e in raw.get("edges") or [] if isinstance(e, dict)]
-            rows = [(rel, _int(e.get("line")), str(e.get("to", ""))) for e in listed]
-            return self._edges(raw, rows, 2, len(listed), unresolved=_count(raw.get("unresolved")))
+            listed, handed, unreadable = listed_rows(raw, "edges")
+            rows = [(rel, _int(e.get("line")), e.get("to")) for e in listed]
+            return self._edges(raw, rows, 2, handed, unreadable)
         raw = self.call(kind, made, "imports", rel)
         bad = self._status(kind, raw)
         if bad:
             return bad
-        listed = [e for e in raw.get("files") or [] if isinstance(e, dict)]
-        rows = [(rel, _int(e.get("line")), str(e.get("path", ""))) for e in listed]
-        kept, refused = self.screen_rows(rows, 2)
-        omitted, cut = self.loss(raw)
-        return Got(rows=kept, total=len(listed) + omitted, seen=len(listed) + omitted, refused=refused + omitted, cut=cut, external=[str(x) for x in raw.get("external") or []],
-                   unresolved=_count(raw.get("unresolved")), age=raw.get("index_age_s"), raw=raw)
+        listed, handed, unreadable = listed_rows(raw, "files")
+        rows = [(rel, _int(e.get("line")), e.get("path")) for e in listed]
+        kept, screened = self.screen_rows(rows, 2)
+        omitted, _ = self.loss(raw)
+        return Got(rows=kept, total=max(_int(raw.get("total")), handed) + omitted, seen=handed + omitted, screened=screened,
+                   unreadable=unreadable, external=[str(x) for x in raw.get("external") or []], age=raw.get("index_age_s"), raw=raw)
 
     # ----------------------------------------------------------------------------------------------- text-scan locator
 
@@ -803,8 +966,7 @@ class Engine(NoteWriter):
         (neither navigator can search the whole workspace by name), exported declarations first, then by path and line; and the Completeness
         of the scan, whose `unread` is the number of code files it did not read (a refused path, a file it could not read, files past
         SCAN_FILES), so that "no declaration found" is never said when a file was skipped."""
-        pattern = re.compile(r"^[ \t]*(export[ \t]+)?(?:default[ \t]+)?(?:declare[ \t]+)?(?:abstract[ \t]+)?(?:async[ \t]+)?"
-                             r"(?:function\*?|class|const|let|var|type|interface|enum|namespace)[ \t]+" + re.escape(name) + r"\b", re.M)
+        pattern = declaration_pattern(name)
         found, skipped = [], 0
         ordered = sorted(self.tree.files)
         for rel in ordered[:SCAN_FILES]:
@@ -822,10 +984,10 @@ class Engine(NoteWriter):
             if not text or name not in text:
                 continue
             for match in pattern.finditer(text):
-                found.append((rel, text.count("\n", 0, match.start()) + 1, bool(match.group(1))))
+                found.append((rel, text.count("\n", 0, match.start()) + 1, bool(match.group("export"))))
         skipped += sum(1 for rel in ordered[SCAN_FILES:] if rel.endswith(CODE_EXT) and not (package and label_for(rel) != package))
         found.sort(key=lambda f: (not f[2], f[0], f[1]))
-        return found[:limit], Completeness(unread=skipped, why=SCAN_WHY)
+        return found[:limit], answer_read({"status": "ok", "skipped": skipped})
 
     # ------------------------------------------------------------------------------------------------------ the notes
 
@@ -952,9 +1114,10 @@ class Engine(NoteWriter):
         if bad:
             lines.append(bad.text)
             return bad.status, bad.text.splitlines()[0]
-        rows, refused = self.screen_dicts([r for r in raw.get("definitions") or []])
-        omitted, cut = self.loss(raw)
-        refused += omitted
+        listed, handed, unreadable = listed_rows(raw, "definitions")
+        rows, screened = self.screen_dicts(listed)
+        read = answer_read(raw, screened=screened, not_returned=max(_int(raw.get("total", handed)) - handed, 0), unreadable=unreadable)
+        refused, cut = read.withheld, read.cut
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
         head = f"definitions of {name} in {rel}"
         if cut:
@@ -962,7 +1125,7 @@ class Engine(NoteWriter):
         if not rows and refused and not cut:
             lines.append(f"{name} in {rel}: every definition the navigator found is at a refused path")
             return "ok", None
-        lines.append(list_head(head, len(rows[:5]), len(rows), Completeness(withheld=refused, cut=cut),
+        lines.append(list_head(head, len(rows[:5]), len(rows), read,
                                empty=f"no definition of {name} in {rel} (the web navigator found none)"))
         if not rows:
             return "ok", None
@@ -976,11 +1139,12 @@ class Engine(NoteWriter):
         if bad:
             lines.append("references unavailable — " + bad.text.replace("\n", " "))
             return "ok", None
-        shown, refused = self.screen_dicts([r for r in refs.get("references") or []])
-        omitted, cut = self.loss(refs)
-        refused += omitted
+        listed, handed, unreadable = listed_rows(refs, "references")
+        shown, screened = self.screen_dicts(listed)
+        read = answer_read(refs, screened=screened, not_returned=max(_int(refs.get("total", handed)) - handed, 0), unreadable=unreadable)
+        refused, cut = read.withheld, read.cut
         total = _int(refs.get("total", len(shown) + refused))
-        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, Completeness(withheld=refused, cut=cut), of=True))
+        lines.append(list_head(f"references of {name}", min(5, len(shown)), total, read, of=True))
         lines += [f"  {r['path']}:{r.get('line', 0)}  {short(r.get('text', ''), 100)}".rstrip() for r in shown[:5]]
         add = more_note(f"references of {name}", total - min(5, len(shown)) - refused, cut, "pass path to another file or read the callers directly")
         if add:
@@ -994,24 +1158,25 @@ class Engine(NoteWriter):
         if bad:
             lines.append(bad.text)
             return bad.status, bad.text.splitlines()[0]
-        listed = [s for s in raw.get("symbols") or [] if isinstance(s, dict)]
-        total = _int(raw.get("total", len(listed)))
-        omitted, cut = self.loss(raw)
-        partial = cut or total > len(listed)
-        named, refused = self.screen_dicts([s for s in listed if s.get("name") == name])
-        refused += omitted
+        listed, handed, unreadable = listed_rows(raw, "symbols")
+        total = _int(raw.get("total", handed))
+        named, screened = self.screen_dicts([s for s in listed if s.get("name") == name])
+        read = answer_read(raw, screened=screened, not_returned=max(total - handed, 0), unreadable=unreadable)
+        refused, cut = read.withheld, read.cut
+        partial = cut or total > handed
         self._withheld_note(refused, left, f"definitions of {name} in {rel}")
         if not named:
             if partial:
-                lines.append(list_head(f"definitions of {name} in {rel}", 0, total, Completeness(withheld=refused, cut=True)))
-                lines.append("the listing was cut, so this does not show that it is not defined there")
+                lines.append(list_head(f"definitions of {name} in {rel}", 0, total, read))
+                lines.append("the listing was cut, so this does not show that it is not defined there" if cut else
+                             "the navigator did not return the whole listing, so this does not show that it is not defined there")
                 lines.append("Next: read the file directly, or ask ctx_relations for its importers.")
-                left.append(f"symbols of {rel}: " + (f"{total - len(listed)} not listed" if not cut else "more not listed (the navigator cut its list)"))
+                left.append(f"symbols of {rel}: " + (f"{total - handed} not listed" if not cut else "more not listed (the navigator cut its list)"))
             else:
                 lines.append(absent(f"no definition of {name} in {rel} (the api navigator lists none by that name)",
-                                    Completeness(withheld=refused), label=f"definitions of {name} in {rel}"))
+                                    read, label=f"definitions of {name} in {rel}"))
             return "ok", None
-        lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), Completeness(withheld=refused, cut=partial)))
+        lines.append(list_head(f"definitions of {name} in {rel}", min(5, len(named)), len(named), read))
         lines += [f"{s['path']}:{s.get('line', 0)} {s.get('kind', '')}" for s in named[:5]]
         add = more_note(f"definitions of {name}", len(named) - 5, partial, "pass path to a narrower file")
         if add:
@@ -1055,12 +1220,6 @@ def _remove(path):
         os.unlink(path)
     except FileNotFoundError:
         pass
-
-
-def _count(value):
-    if isinstance(value, list):
-        return len(value)
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _int(value):

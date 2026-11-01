@@ -5,8 +5,8 @@ then the shared contracts the files use, the notes whose scope covers them, and 
 every list is sorted, nothing carries a time, and each list has a cap with its overflow named in the answer's `left_out`.
 
 An absence ("none", "no X") is worded only from a source that was read completely: every list or search carries a
-`surface.Completeness` built from its read result (ok, withheld, cut, unread), and `surface.absent` / `surface.list_head` say "not
-available" or "none can be shown" instead whenever it is not whole.
+`surface.Completeness` that `surface.answer_read` made from the whole answer of its read (status, every loss field, any field it does
+not know), and `surface.absent` / `surface.list_head` say "not available" or "none can be shown" instead whenever it is not whole.
 
 Nothing here talks to a navigator directly; it asks the surface Engine, which maps every navigator answer, however it failed, to
 one `Got`. A navigator that is unavailable leaves a line saying so in its place; the brief is `unavailable` only when every
@@ -24,7 +24,7 @@ IMPORTS_MAX = 10
 CONTRACTS_MAX = 5
 CONSUMERS_MAX = 8
 NOTES_MAX = 5
-TEST_EXT = ("ts", "tsx", "js", "jsx", "mts")
+TEST_EXT = tuple(ext.lstrip(".") for ext in surface.CODE_EXT)  # a test is looked for in every code extension the surface reads
 USE_FILE_MAX = 200_000
 SOURCE_EXT = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
 IMPORT_STMT = re.compile(r"""\bimport\s+(type\s+)?([^;'"]{0,600}?)\s*from\s*(['"])([^'"\n]{1,300})\3""", re.S)
@@ -82,9 +82,23 @@ def _names(clause):
 
 def read_phrase(got):
     """What was read of an imports list that is not whole: a cut list gives no total, only what was read."""
-    if got.cut:
+    read = got.completeness()
+    if read.cut:
         return f"only {len(got.rows)} imports were read, the navigator cut its list"
-    return f"only {len(got.rows)} of {got.total} imports were read"
+    if got.beyond:
+        return f"only {len(got.rows)} of {got.total} imports were read"
+    return f"not all imports were returned: {read.left} withheld or unread, {read.why}"
+
+
+def not_whole_why(got):
+    """Why the imports of a briefed file were not read completely, from the record of that read (N1: "cut" only when the navigator
+    flagged its list as cut)."""
+    read = got.completeness()
+    if not read.ok:
+        return "not available"
+    if read.cut:
+        return "cut"
+    return f"not all returned: {read.left} withheld or unread, {read.why}"
 
 
 def contract_use(engine, contract, consumer):
@@ -194,7 +208,8 @@ def relations(engine, rel, direction, limit, lines):
         if surface.label_for(to) == "lib":
             contracts.setdefault(to, []).append(f"{rel}:{line}")
     if got.incomplete:  # the shared contracts may be among the imports that were not read
-        add_left(left, more_note("imports not read", got.beyond, got.cut, "shared contracts among them are missing from this answer"))
+        add_left(left, more_note("imports not read", got.beyond, got.cut, "shared contracts among them are missing from this answer")
+                 or f"contracts: imports of {rel} not read completely ({got.completeness().why}); shared contracts among them may be missing")
         lines.append(f"warning: {read_phrase(got)}, so the contracts below may be incomplete")
     add_left(left, withheld_note("imports", got.refused))
     if not contracts:
@@ -225,7 +240,7 @@ def tests_for(engine, rel):
     folder, name = posixpath.split(rel)
     stem = name.rsplit(".", 1)[0]
     if kind_of(rel) == "test":
-        return [], surface.Completeness(withheld=0)
+        return [], surface.answer_read({"status": "ok"})
     found, refused = [], 0
     for base in (folder, posixpath.join(folder, "__tests__")):
         for suffix in ("test", "spec"):
@@ -237,7 +252,7 @@ def tests_for(engine, rel):
                         refused += 1
                     elif (engine.project / allowed).is_file():
                         found.append(allowed)
-    return sorted(found), surface.Completeness(withheld=refused)
+    return sorted(found), surface.answer_read({"status": "ok", "withheld": refused})
 
 
 def build(engine, paths):
@@ -270,15 +285,15 @@ def build(engine, paths):
         facts += f"{surface.label_for(rel)} ({package[1] or '.'})" if package else "none"
         lines.append(facts)
         text = engine.read(rel)
-        if text is None:
-            unread.append(rel)  # over 1 MB or unreadable: its imports were not scanned, so "no library" cannot be said
+        if text is None or surface.unnamed_imports(text):
+            unread.append(rel)  # over 1 MB, unreadable, or an import it cannot name: "no library" cannot be said
         libraries |= surface.libraries_in(text or "")
         tests, tests_read = tests_for(engine, rel)
         lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", tests_read)))
         add_left(left, withheld_note(f"tests of {rel}", tests_read.withheld))
         if package is None:
             lines.append("no package covers this path (no deno.json or tsconfig.json above it), so there is no export or import graph for it")
-            import_reads.append(surface.Completeness(ok=False))  # the imports of this file were never read
+            import_reads.append(surface.answer_read(None))  # the imports of this file were never read
             not_whole[rel] = "outside any package"
             continue
         got = engine.exports(rel)
@@ -297,10 +312,8 @@ def build(engine, paths):
                      withheld_note(f"importers of {rel}", got.refused))
         got = engine.imports(rel)
         import_reads.append(got.completeness())
-        if not got.ok:
-            not_whole[rel] = "not available"
-        elif not got.completeness().whole:
-            not_whole[rel] = "cut" if got.incomplete else f"{got.refused} withheld"
+        if not got.completeness().whole:
+            not_whole[rel] = not_whole_why(got)
         if track("imports", got):
             rows = sorted(got.rows, key=lambda r: (r[2], r[1]))
             lines.append(surface.list_head("imports", len(rows[:IMPORTS_MAX]), got.total - got.refused, got.completeness()))
@@ -353,7 +366,7 @@ def build(engine, paths):
                 why = "no lockfile reader" if engine.pin is None else "not in the lockfile"
                 lines.append(f"  {lib} (version not read: {why})")
     else:
-        lines.append("  " + surface.absent("none", surface.Completeness(unread=len(unread) + len(incomplete), why=surface.LIBRARIES_WHY)))
+        lines.append("  " + surface.absent("none", surface.answer_read({"status": "ok", "libraries_unread": len(unread) + len(incomplete)})))
 
     status = "ok"
     if tried and not good:

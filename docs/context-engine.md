@@ -127,8 +127,19 @@ store is as it was.
   the navigator)" when rows were shown, "label: not found in the part the navigator returned (list cut)" when none were, and a `left_out`
   entry that says the list was cut and gives no count. A list that was not cut states its total ("5 of 7") and its absence ("nothing imports
   X") only when the source was read completely. **The rule: an absence is stated only when the read succeeded, nothing was withheld and
-  nothing was cut.** Every list or search carries a `surface.Completeness` (`ok`, `withheld`, `cut`, `unread`, `why`) built from its read result
-  (`Got.completeness()`, `surface.notes_read`, the text scan's own count), never from a literal, and one helper (`surface.absent`, used by
+  nothing was cut.** Every list or search carries a `surface.Completeness` (`ok`, `withheld`, `cut`, `unread`, `why`, `status`) that one
+  mapper, `surface.answer_read`, derives from the whole navigator or search answer, never from fields picked at a call site: the status
+  must be `ok`; every field that signals loss (unresolved, refused, withheld, omitted, truncated/cut, skipped, errors, invalid, ignored
+  config) makes the read incomplete; any non-empty field not on the explicit `surface.HARMLESS` list counts as incomplete, so a field a
+  navigator adds later fails closed. `Got.completeness()`, `surface.notes_read`, `locate` and the brief's reads all go through it; a test
+  fails if `Completeness(...)` is built anywhere but the mapper. Every row list is read through `surface.listed_rows`: a row that
+  is not an object, or a list that is missing, null or not a list, is counted as unreadable; a `total` that is not a whole number,
+  or above the rows handed over, makes the read not whole; a row path that is not text is withheld, never shown. An ok answer
+  whose `target` or `path` names another file, or that does not echo the `direction` asked for, is an `error`. The text scan
+  (`surface.declaration_pattern`) also finds export renames, destructured bindings, `export * as`, `import x =`, a first line with
+  a byte order mark and names with `$`; test files are looked for in every code extension; an `import(...)`/`require(...)` whose
+  module is not a plain string makes the libraries line "none can be shown". A status other than `ok` reads "not available (the navigator answered
+  STATUS)"; a list the navigator did not flag as cut but that was not whole reads "not all returned", never "cut". One helper (`surface.absent`, used by
   `surface.list_head`) words every absence in `brief.py` and `surface.py` from it. A read that failed, was unavailable or never ran (a
   navigator down, a file no package covers) says "not available", never "none". If the read succeeded but items were refused, withheld or
   not read, the line says "none can be shown (N withheld, ...)" and never an absence, a zero or "none found". This covers lists (importers,

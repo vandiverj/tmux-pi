@@ -1715,9 +1715,10 @@ class AbsenceWording(ReviewOne):
     WORDS = re.compile(r"\b(none|no|nothing|not found|zero|empty)\b|\(0\)|\(0 of", re.I)
     HELPERS = {"absent": 1, "list_head": 3}  # name -> position of the completeness argument (the keyword is `read`)
     OWNED = {"absent", "list_head"}  # function bodies that are the helper
-    OWNED_NAMES = {"NONE_SHOWN", "CUT_NOTHING", "PATH_WHY", "NOT_AVAILABLE"}  # constants that are the helper's wording
-    BUILDERS = {"Completeness", "of", "completeness", "notes_read"}  # make a record from a read result (the first two from their arguments)
-    FROM_ARGUMENTS = {"Completeness", "of"}  # these only count when at least one argument is not a literal
+    OWNED_NAMES = {"NONE_SHOWN", "CUT_NOTHING", "PATH_WHY", "NOT_AVAILABLE", "NOT_ANSWERED"}  # constants that are the helper's wording
+    BUILDERS = {"answer_read", "of", "completeness", "notes_read"}  # make a record from a read result (the first two from their arguments)
+    FROM_ARGUMENTS = {"answer_read", "of"}  # these only count when at least one argument is not a literal
+    MAPPER = {"answer_read", "of"}  # Review 7: the only functions that may construct a Completeness (`of` joins records the mapper made)
     PRODUCERS = {"locate", "tests_for"}  # functions that read a source and hand back its record as their last result
     # Whole strings (an f-string's placeholders are `{}`), never fragments: a new string that merely contains one of these words must
     # be reviewed, not waved through.
@@ -1803,6 +1804,8 @@ class AbsenceWording(ReviewOne):
                         arg = arg.value if isinstance(arg, (ast.Starred, ast.keyword)) else arg
                         if isinstance(arg, ast.Call) and callee(arg) in self.FROM_ARGUMENTS:
                             return from_read(arg, scope, seen)
+                        if isinstance(arg, ast.Dict):  # an answer made of literals is a literal
+                            return any(v is not None and not isinstance(v, ast.Constant) for v in arg.values)
                         return not isinstance(arg, ast.Constant)
                     return any(real(a) for a in [*expr.args, *expr.keywords])
                 return func in self.BUILDERS or func in self.PRODUCERS
@@ -1826,8 +1829,17 @@ class AbsenceWording(ReviewOne):
                 return "the completeness argument is not built from a read result"
             return None
 
+        def in_mapper(node):
+            while node in parent:
+                node = parent[node]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return node.name in self.MAPPER
+            return False
+
         found = []
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and callee(node) == "Completeness" and not in_mapper(node):
+                found.append((name, node.lineno, "Completeness", "a Completeness built by hand, not by answer_read from the whole answer"))
             if isinstance(node, ast.Call) and callee(node) in self.HELPERS and not inside(node):
                 problem = helper_problem(node, callee(node))
                 if problem:
@@ -1856,6 +1868,9 @@ class AbsenceWording(ReviewOne):
         self.assertTrue(self.violations('x = surface.absent("none found", Completeness())'))
         self.assertTrue(self.violations('x = surface.absent("none found", Completeness(withheld=0, cut=False))'))
         self.assertTrue(self.violations('x = surface.absent("none found", Completeness.of(Completeness(), Completeness()))'))
+        self.assertTrue(self.violations('x = surface.absent("none found", surface.Completeness(withheld=refused))'))
+        self.assertTrue(self.violations('x = surface.absent("none found", answer_read({"status": "ok"}))'))
+        self.assertTrue(self.violations('x = surface.absent("none found", answer_read(None))'))
         self.assertTrue(self.violations('def f():\n    read = 3\n    return surface.absent("none found", read)'))
         self.assertTrue(self.violations('def f(read):\n    return surface.absent("none found", read)'))
         self.assertTrue(self.violations('x = surface.list_head("a", 0, 0, False, empty="nothing imports")'))
@@ -1864,8 +1879,8 @@ class AbsenceWording(ReviewOne):
 
     def test_the_scanner_accepts_a_record_that_is_built_from_a_read_result(self):
         for source in ('x = surface.absent("none found", got.completeness())',
-                       'x = surface.absent("none found", surface.Completeness(withheld=refused))',
-                       'x = surface.absent("none found", Completeness(unread=len(unread), why=WHY))',
+                       'x = surface.absent("none found", surface.answer_read({"status": "ok", "withheld": refused}))',
+                       'x = surface.absent("none found", answer_read(raw, screened=screened))',
                        'x = surface.absent("none found", Completeness.of(*reads))',
                        'x = surface.absent("none found", surface.notes_read(result), label="x")',
                        'def f():\n    read = got.completeness()\n    return surface.absent("none found", read)',
@@ -1891,6 +1906,7 @@ class AbsenceWording(ReviewOne):
             found += self.violations((ROOT / "lib" / "ctxengine" / name).read_text(), name, used)
         self.assertEqual(found, [])
         self.assertEqual(sorted(set(self.ALLOWED) - used), [], "an allowlist entry that no string uses")
+
 
 class UnreadSources(ReviewOne):
     """Review 6: an absence is stated only when the source was read completely (the read succeeded, nothing was withheld, nothing was
@@ -1969,6 +1985,302 @@ class UnreadSources(ReviewOne):
 
     def test_n1_control_with_every_note_readable_no_matching_notes_is_still_said(self):
         self.assertIn("No matching notes", self.run_tool("ctx_knowledge", {"query": "zzzz"}).text)
+
+
+# ------------------------------------------------------------------------------------------------------- Review 7 (F1, N1)
+
+def api_imports(target, files=(), **extra):
+    """A CX3 `imports` answer from the index: `files` are (path, line) pairs."""
+    rows = [{"path": p, "line": n, "spec": "./x.ts"} for p, n in files]
+    return {"status": "ok", "target": target, "source": "index", "files": rows, "external": [], "unresolved": [], "index_age_s": 3,
+            "unresolved_total": 0, "files_indexed": 40, "scanned": 0, **extra}
+
+
+class WholeAnswer(ReviewOne):
+    """Review 7 F1 (family withheld-path): completeness comes from the whole answer, by one mapper (`surface.answer_read`), never
+    from fields a call site picks. An import the navigator could not resolve, a status other than ok, or a field the surface does not
+    know means the read is not whole, so no absence is stated from it. N1: an imports list the navigator did not flag as cut is
+    "not all returned", never "cut"."""
+
+    CONTRACTS_NONE = "the files import no shared (lib) contract"
+    RELATIONS_NONE = "imports no shared (lib) contract file"
+    UNRESOLVED = [{"line": 2, "spec": "@launchpad/types/order", "reason": "unmodelled_import"}]
+
+    def contracts(self, answer):
+        return answer.text.split("== contracts\n")[1].split("\n==")[0]
+
+    def assertNoContractClaim(self, path, why):
+        brief = self.run_tool("ctx_brief", {"paths": [path]})
+        section = self.contracts(brief)
+        self.assertNotIn(self.CONTRACTS_NONE, section, why)
+        self.assertNotRegex(section, r"(?m)^none\b", why)
+        self.assertTrue(any("contracts" in item and path in item for item in brief.data["left_out"]), (why, brief.data["left_out"]))
+        relations = self.run_tool("ctx_relations", {"target": path, "direction": "contracts"})
+        self.assertNotIn(self.RELATIONS_NONE, relations.text, why)
+        self.assertRegex(relations.text, r"shared \(lib\) contracts: (none can be shown|not available)", why)
+        return brief, relations
+
+    def web_imports_unresolved(self, a):
+        if a["direction"] == "imports" and a["file"] == CART:
+            return web_edges(CART, "imports", [], unresolved=1)
+        return web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else [])
+
+    def test_f1_api_imports_with_an_unresolved_import_never_say_no_contract(self):
+        fake_navs.BEHAVIOUR[("api", "imports")] = api_imports(ORDERS, unresolved=self.UNRESOLVED, unresolved_total=1)
+        self.assertNoContractClaim(ORDERS, "api unresolved")
+        self.assertNotIn(f"{ORDERS} imports no project file", self.run_tool("ctx_relations", {"target": ORDERS, "direction": "imports"}).text)
+
+    def test_f1_web_imports_with_an_unresolved_import_never_say_no_contract(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = self.web_imports_unresolved
+        self.assertNoContractClaim(CART, "web unresolved")
+        self.assertNotIn(f"{CART} imports no project file", self.run_tool("ctx_relations", {"target": CART, "direction": "imports"}).text)
+
+    def test_f1_unresolved_importers_anywhere_mean_nothing_imports_is_never_said(self):
+        util = f"{API_SRC}/util.ts"
+        fake_navs.BEHAVIOUR[("api", "importers")] = api_importers([], target=util, unresolved_total=2)
+        self.assertNotIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: web_edges(a["file"], a["direction"], [], unresolved=3)
+        self.assertNotIn(f"nothing imports {CART}", self.run_tool("ctx_relations", {"target": CART, "direction": "importers"}).text)
+
+    def test_f1_an_answer_with_a_field_the_surface_does_not_know_is_not_whole(self):
+        util = f"{API_SRC}/util.ts"
+        for name, value in (("modules", [{"path": ORDER, "imports": []}]), ("partial_index", True), ("future_loss", 3)):
+            with self.subTest(field=name):
+                fake_navs.reset()
+                fake_navs.BEHAVIOUR[("api", "imports")] = api_imports(util, **{name: value})
+                self.assertNoContractClaim(util, name)
+                fake_navs.BEHAVIOUR[("api", "importers")] = api_importers([], target=util, **{name: value})
+                self.assertNotIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+
+    def test_f1_a_search_result_with_a_field_the_surface_does_not_know_never_says_no_matching_notes(self):
+        real = surface.search.query
+
+        def query(*args, **kw):
+            result = real(*args, **kw)
+            result.skipped_notes = 2
+            return result
+        with mock.patch.object(surface.search, "query", query):
+            self.assertNotIn("No matching notes", self.run_tool("ctx_knowledge", {"query": "zzzz"}).text)
+
+    def test_f1_a_status_other_than_ok_is_not_a_whole_read(self):
+        util = f"{API_SRC}/util.ts"
+        fake_navs.BEHAVIOUR[("api", "imports")] = {"status": "not_found", "detail": "the file is not an indexed source file", "next_step": "x"}
+        self.assertNoContractClaim(util, "not_found")
+
+    def test_f1_control_an_answer_with_only_known_fields_still_states_its_absences(self):
+        util = f"{API_SRC}/util.ts"
+        self.assertIn("none: " + self.CONTRACTS_NONE, self.contracts(self.run_tool("ctx_brief", {"paths": [util]})))
+        self.assertIn(f"{util} {self.RELATIONS_NONE}", self.run_tool("ctx_relations", {"target": util, "direction": "contracts"}).text)
+        self.assertIn(f"nothing imports {util}", self.run_tool("ctx_relations", {"target": util, "direction": "importers"}).text)
+
+    def test_n1_an_imports_list_the_navigator_did_not_flag_as_cut_is_not_all_returned_never_cut(self):
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: (
+            web_edges(CART, "imports", [f"{WEB_SRC}/x.ts"], total=5) if a["direction"] == "imports" and a["file"] == CART
+            else web_edges(a["file"], a["direction"], [SPEC] if a["direction"] == "importers" else []))
+        warning = [line for line in self.run_tool("ctx_brief", {"paths": [CART]}).text.splitlines() if line.startswith("warning: the imports of")]
+        self.assertTrue(warning)
+        self.assertIn(f"{CART} (not all returned", warning[0])
+        self.assertNotIn(f"{CART} (cut)", warning[0])
+
+    def test_the_mapper_reads_every_field_of_the_answer(self):
+        whole = {"status": "ok", "target": "a.ts", "edges": [{"from": "b.ts"}], "total": 1, "truncated": False, "unresolved": 0,
+                 "index_age_s": 3, "files_indexed": 4, "scanned": 1, "unresolved_total": 0, "omitted_outside_root": 0}
+        self.assertTrue(surface.answer_read(whole).whole)
+        for key, value in (("unresolved", 1), ("unresolved", [{"spec": "x"}]), ("unresolved_total", 2), ("withheld", 1),
+                           ("omitted_outside_root", 1), ("omitted_external", 1), ("refused", 1), ("truncated", True), ("cut", True),
+                           ("skipped", 1), ("errors", ["e"]), ("invalid", ["n.md"]), ("ignored_config", ["importMap"]),
+                           ("modules", [{"path": "x"}]), ("a_new_field", 1), ("a_new_list", ["x"]), ("status", "not_found"),
+                           ("status", "stale_index"), ("message", "partly")):
+            with self.subTest(key=key, value=value):
+                self.assertFalse(surface.answer_read({**whole, key: value}).whole)
+        for missing in (None, {}, [], "ok"):
+            self.assertFalse(surface.answer_read(missing).ok, missing)
+        self.assertFalse(surface.answer_read(whole, screened=1).whole)
+        self.assertFalse(surface.answer_read(whole, not_returned=1).whole)
+        both = surface.answer_read({**whole, "unresolved": [{"spec": "x"}], "unresolved_total": 3})
+        self.assertEqual((both.unread, both.why), (3, surface.UNRESOLVED_WHY), "the index-wide count includes the file's own list")
+
+    def test_the_scanner_finds_a_completeness_built_outside_the_mapper(self):
+        scanner = AbsenceWording("test_the_sources_contain_no_absence_string_outside_the_one_helper")
+        for source in ("x = surface.Completeness(withheld=refused)", "x = Completeness(unread=len(skipped), why=WHY)",
+                       "def f(got):\n    return surface.Completeness(True, got.refused, got.cut, 0)"):
+            with self.subTest(source=source):
+                self.assertTrue(scanner.violations(source), source)
+        self.assertEqual(scanner.violations("def answer_read(answer):\n    return Completeness(ok=False)"), [])
+
+
+
+LONE = f"{WEB_SRC}/lone.ts"
+UTIL = f"{API_SRC}/util.ts"
+
+
+class FamilySweep(ReviewOne):
+    """The family sweep for withheld-path: every probe of the sweep (each line that can state an absence, each way an item can be
+    hidden from it) that found an absence stated over a hidden item. None of these lines may state its absence."""
+
+    BRIEF_ABSENCES = ("exports (0)", "importers (0)", "imports (0)", "none: the files import no shared (lib) contract", "== libraries\n  none\n")
+
+    def setUp(self):
+        super().setUp()
+        self.put(LONE, "export const lone = 1;\n")
+
+    def say(self, tool, args):
+        answer = self.run_tool(tool, args)
+        return answer.text + "\n" + "\n".join(answer.data.get("left_out") or [])
+
+    def assertNoAbsence(self, text, absences, why):
+        for absence in absences:
+            self.assertNotIn(absence, text, why)
+
+    def api_answers(self, op, answer):
+        fake_navs.BEHAVIOUR[("api", op)] = answer
+
+    def test_rows_the_navigator_handed_over_in_a_form_the_surface_cannot_read_are_never_an_absence(self):
+        """Pass 1: a row that is not an object, a row list that is null, missing or not a list, or a total above the rows handed
+        over were dropped silently (api imports), so "imports (0)" and "no shared contract" were said."""
+        for name, files in (("a row that is not an object", {"files": ["x"]}), ("null", {"files": None}), ("not a list", {"files": {"path": "x"}}),
+                            ("a total above the rows", {"total": 2}), ("missing", None)):
+            with self.subTest(name=name):
+                fake_navs.reset()
+                answer = api_imports(UTIL)
+                if files is None:
+                    del answer["files"]
+                else:
+                    answer.update(files)
+                self.api_answers("imports", answer)
+                self.assertNoAbsence(self.say("ctx_brief", {"paths": [UTIL]}), self.BRIEF_ABSENCES[2:4], name)
+                text = self.say("ctx_relations", {"target": UTIL, "direction": "imports"})
+                self.assertNotIn(f"{UTIL} imports no project file", text, name)
+                self.assertNotIn("imports no shared (lib) contract file", self.say("ctx_relations", {"target": UTIL, "direction": "contracts"}), name)
+        for name, answer in (("exports: a row that is not an object, no total", {"status": "ok", "is_module": True, "exports": ["x"], "truncated": False}),
+                             ("exports: missing", {"status": "ok", "is_module": True, "total": 0, "truncated": False})):
+            with self.subTest(name=name):
+                fake_navs.reset()
+                fake_navs.BEHAVIOUR[("web", "exports")] = answer
+                self.assertNotIn("exports (0)", self.say("ctx_brief", {"paths": [LONE]}), name)
+        with self.subTest(name="symbols: a row that is not an object"):
+            fake_navs.reset()
+            self.api_answers("symbols", {"status": "ok", "path": UTIL, "source": "deno_doc", "cached": False, "truncated": False, "symbols": ["nope"]})
+            self.assertNotIn("no definition of nope in", self.say("ctx_symbol", {"name": "nope", "path": UTIL}))
+        with self.subTest(name="definitions: a total above the rows (pass 2)"):
+            fake_navs.reset()
+            fake_navs.BEHAVIOUR[("web", "definition")] = {"status": "ok", "at": {"line": 1, "column": 1}, "definitions": [], "signature": "", "doc": "",
+                                                          "omitted_outside_root": 0, "total": 2}
+            self.assertNotIn("no definition of nope in", self.say("ctx_symbol", {"name": "nope", "path": LONE}))
+
+    def test_a_count_that_is_not_a_whole_number_makes_the_read_not_whole(self):
+        """Pass 4: `total: true` was read as 0, so a list said "(0)"."""
+        whole = {"status": "ok", "edges": [], "total": 0, "truncated": False}
+        self.assertTrue(surface.answer_read(whole).whole)
+        for value in (True, "2", -1, 1.5, [1]):
+            with self.subTest(total=value):
+                self.assertFalse(surface.answer_read({**whole, "total": value}).whole)
+                fake_navs.reset()
+                self.api_answers("importers", api_importers([], target=UTIL, total=value))
+                self.assertNotIn("importers (0)", self.say("ctx_brief", {"paths": [UTIL]}))
+                self.assertNotIn(f"nothing imports {UTIL}", self.say("ctx_relations", {"target": UTIL, "direction": "importers"}))
+
+    def test_an_answer_about_another_file_or_direction_is_an_error_never_an_absence(self):
+        """Pass 4 and 7: an ok answer whose `target` or `path` names another file, or whose `direction` is not the one asked for (or
+        missing), was read as the answer about this file, so its empty rows said "nothing imports" and "no contract"."""
+        cases = (("api importers about another file", ("api", "importers"), api_importers([], target=ORDERS), "importers", UTIL),
+                 ("api imports about another file", ("api", "imports"), api_imports(ORDERS), "imports", UTIL),
+                 ("web importers about another file", ("web", "imports"), lambda a: web_edges(CART, a["direction"], []), "importers", LONE),
+                 ("web importers answered as imports", ("web", "imports"), lambda a: web_edges(a["file"], "imports", []), "importers", LONE),
+                 ("web imports answered as importers", ("web", "imports"), lambda a: web_edges(a["file"], "importers", []), "imports", LONE),
+                 ("web imports with no direction", ("web", "imports"),
+                  lambda a: {k: v for k, v in web_edges(a["file"], a["direction"], []).items() if k != "direction"}, "imports", LONE))
+        for name, where, answer, direction, target in cases:
+            with self.subTest(name=name):
+                fake_navs.reset()
+                fake_navs.BEHAVIOUR[where] = answer
+                text = self.say("ctx_relations", {"target": target, "direction": direction})
+                self.assertNotIn(f"nothing imports {target}", text, name)
+                self.assertNotIn(f"{target} imports no project file", text, name)
+                self.assertIn("another file" if "another" in name else "direction", text, name)
+                lines = self.BRIEF_ABSENCES[1:2] if direction == "importers" else self.BRIEF_ABSENCES[2:4]  # the brief lines the bad answer feeds
+                self.assertNoAbsence(self.say("ctx_brief", {"paths": [target]}), lines, name)
+        with self.subTest(name="api symbols about another file"):
+            fake_navs.reset()
+            self.api_answers("symbols", {"status": "ok", "path": ORDERS, "source": "deno_doc", "cached": False, "total": 0, "truncated": False, "symbols": []})
+            self.assertNotIn("no definition of nope in", self.say("ctx_symbol", {"name": "nope", "path": UTIL}))
+            self.assertNotIn("exports (0)", self.say("ctx_brief", {"paths": [UTIL]}))
+
+    def test_an_imports_row_whose_path_is_not_text_is_withheld_never_shown(self):
+        """Pass 9: a row whose path was a number became the path "7", shown as an import, and "no shared contract" was said."""
+        for kind, path in (("api", UTIL), ("web", LONE)):
+            with self.subTest(kind=kind):
+                fake_navs.reset()
+                if kind == "api":
+                    self.api_answers("imports", api_imports(UTIL, files=[(7, 1)]))
+                else:
+                    fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: {**web_edges(a["file"], a["direction"], []), "edges": [
+                        {"from": a["file"], "line": 1, "specifier": "x", "to": 7, "depth": 1}], "total": 1} if a["direction"] == "imports" else \
+                        web_edges(a["file"], a["direction"], [])
+                brief = self.say("ctx_brief", {"paths": [path]})
+                self.assertNotIn("none: the files import no shared (lib) contract", brief)
+                self.assertNotRegex(brief, r"(?m)^  7  \(line")
+                self.assertNotIn("imports no shared (lib) contract file", self.say("ctx_relations", {"target": path, "direction": "contracts"}))
+
+    def test_note_matches_past_the_hits_returned_never_say_no_matching_notes(self):
+        """Pass 2: a search whose total was above the hits it returned (none) said "No matching notes"."""
+        real = surface.search.query
+
+        def query(*args, **kw):
+            result = real(*args, **kw)
+            result.total = 2
+            return result
+        with mock.patch.object(surface.search, "query", query):
+            self.assertNotIn("No matching notes", self.say("ctx_knowledge", {"query": "zzzz"}))
+            self.assertNotIn("none: no approved note covers these files", self.say("ctx_brief", {"paths": [LONE]}))
+        self.assertFalse(surface.notes_read(surface.search.Result(total=2)).whole)
+        self.assertTrue(surface.notes_read(surface.search.Result()).whole)
+
+    def test_an_import_the_library_scan_cannot_name_never_says_no_library(self):
+        """Pass 2: `import(`zod`)` and `require(name)` load a library the text scan cannot name, and the brief said libraries: none."""
+        self.put("tools/lone.ts", "export const z = 1;\n")
+        self.assertIn("== libraries\n  none\n", self.say("ctx_brief", {"paths": [LONE]}), "control: a file with no import")
+        for path in (LONE, "tools/lone.ts"):
+            for text in ("const z = await import(`zod`);\n", "const z = require(name);\n", "const m = import(prefix + 'x');\n",
+                         "const z = await import(\n  `zod`\n);\n"):
+                with self.subTest(path=path, text=text):
+                    self.put(path, text)
+                    said = self.say("ctx_brief", {"paths": [path]})
+                    self.assertNotIn("== libraries\n  none\n", said)
+                    self.assertIn("an import whose name is not a plain string", said)
+        for text in ("import { z } from 'zod';\n", "const z = require('zod');\n", "const z = await import('zod');\n"):
+            self.assertEqual(surface.unnamed_imports(text), 0, text)
+
+    def test_a_test_file_in_any_code_extension_is_found(self):
+        """Pass 4: `lone.test.cts` and `lone.test.mjs` were not looked for, so "tests: none found next to it" was said."""
+        self.assertIn("tests: none found next to it", self.say("ctx_brief", {"paths": [LONE]}), "control")
+        for ext in ("cts", "mjs", "cjs", "tsx", "mts", "js", "jsx", "ts"):
+            with self.subTest(ext=ext):
+                test = self.put(f"{WEB_SRC}/lone.test.{ext}", "x\n")
+                said = self.say("ctx_brief", {"paths": [LONE]})
+                self.assertNotIn("tests: none found next to it", said)
+                self.assertIn(test, said)
+                (self.project / test).unlink()
+
+    def test_the_text_scan_finds_every_form_that_declares_a_name(self):
+        """Pass 5: an export rename, a destructured binding, `export * as`, `import x =` and a first line with a byte order mark
+        declare the name, but the scan's pattern missed them and said "no definition of X found"."""
+        forms = ("const a = 1;\nexport { a as hidden };\n", "const a = 1;\nexport {\n  a as hidden,\n};\n", "const a = 1;\nexport{a as hidden};\n",
+                 "export const { hidden } = obj;\n", "export const { a: { hidden } } = obj;\n", "export const [hidden] = list;\n",
+                 "export * as hidden from './x';\n", "import hidden = require('x');\n", "\ufeffexport const hidden = 1;\n",
+                 "export function* hidden() {}\n", "declare module 'm' {\n  export function hidden(): void;\n}\n")
+        self.assertIn("no definition of hidden found", self.say("ctx_symbol", {"name": "hidden"}), "control")
+        for text in forms:
+            with self.subTest(text=text):
+                self.put(f"{WEB_SRC}/forms.ts", text)
+                self.assertNotIn("no definition of hidden found", self.say("ctx_symbol", {"name": "hidden"}))
+                self.assertNotIn("no declaration of that name was found", self.say("ctx_relations", {"target": "hidden", "direction": "importers"}))
+        for name in ("hidden$", "$hidden"):
+            with self.subTest(name=name):
+                self.put(f"{WEB_SRC}/forms.ts", f"export const {name} = 1;\n")
+                self.assertNotIn(f"no definition of {name} found", self.say("ctx_symbol", {"name": name}))
+        for text in ("const hiddenX = 1;\n", "x.hidden = 1;\n", "export { hidden as other };\n", "call(hidden);\n"):
+            self.assertIsNone(surface.declaration_pattern("hidden").search(text), text)
 
 
 if __name__ == "__main__":

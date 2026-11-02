@@ -19,6 +19,7 @@ SENTENCE = "Do not edit these paths; if the task needs them, stop and send tp-ag
 
 
 class OtherLanePathsTests(LaneCase):
+    snapshot_lane = False  # measured 7% CPU-s gain, under the 10% bar
     beta = property(lambda self: self.root / "proj-wt-beta")
 
     def make_beta(self, touches="docs", edit="lib/x.py", closed_step=None):

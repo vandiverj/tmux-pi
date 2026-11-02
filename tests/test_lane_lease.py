@@ -25,6 +25,8 @@ def start_of(pid):
 
 
 class LeaseCase(LaneCase):
+    snapshot_lane = True  # made_lane and RemedyCase start from the default dispatch; a test that touches anything first dispatches for real
+
     def setUp(self):
         super().setUp()
         self.state2 = self.root / "session2" / ".tmux-pi"
@@ -79,7 +81,7 @@ class LeaseCase(LaneCase):
 class SharedOccupancyTests(LeaseCase):
     def test_a_started_worker_is_a_holder_in_the_common_git_directory_naming_session_task_process_and_pane(self):
         (self.state / "live-window").write_text("")
-        item, _ = self.lane_ok()
+        item, _ = self.lane_ok(snapshot=False)
         [holder] = self.lease()
         self.assertEqual((holder["kind"], holder["access"], holder["task"], holder["session"]), ("worker", "write", item["id"], str(self.state)))
         self.assertTrue(holder["pane"].startswith("%"))
@@ -88,7 +90,7 @@ class SharedOccupancyTests(LeaseCase):
 
     def test_a_second_session_with_its_own_state_directory_sees_the_first_sessions_writer(self):
         (self.state / "live-window").write_text("")
-        item, _ = self.lane_ok()
+        item, _ = self.lane_ok(snapshot=False)
         [holder] = self.lease()
         run = self.run_in(self.env2, *self.lane_args(step="s1", extra=()))
         self.refused(run, "lane alpha already has a writer", item["id"], str(self.state))
@@ -101,7 +103,7 @@ class SharedOccupancyTests(LeaseCase):
 
     def test_a_second_session_reviewer_waits_for_the_writer_of_the_first(self):
         (self.state / "live-window").write_text("")
-        item, _ = self.lane_ok()
+        item, _ = self.lane_ok(snapshot=False)
         run = self.run_in(self.env2, *self.lane_args(role="code-reviewer", step="s1", extra=()))
         self.refused(run, "lane alpha already has a writer", item["id"])
 

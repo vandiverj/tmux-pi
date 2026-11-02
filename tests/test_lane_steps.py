@@ -225,6 +225,8 @@ class GateRowsTests(StepCase):
         stderr = self.untouched(self.next_step, "step s1 is not closed", "has no review yet", f"tp-agent review {author} --force")
         self.assertIn("tp-agent lane close alpha s1", stderr)
         self.assertEqual(self.lanes()["waiting_on"], "review")
+        # lane close of the same settled, unreviewed step prints the same backticked remedy
+        self.assertIn(f"tp-agent review {author} --force", self.printed(self.close, "has no review yet", f"`tp-agent review {author} --force`"))
         # the named review, typed, is the one the gate then waits for, and once it approves the step closes
         reviewer = self.new_reviewer(author)
         self.untouched(self.close, f"{reviewer.name} is reviewing this tree")

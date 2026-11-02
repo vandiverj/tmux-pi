@@ -341,7 +341,8 @@ class EscalationTests(Base):
         (task2 / "exit").write_text("0")
         (task2 / "result.md").write_text("RESULT_STATUS: complete\n")
         (task2 / "meta.json").write_text(json.dumps(dict(json.loads((task2 / "meta.json").read_text()), review="review-2")))
-        third = self.retry(second, "--escalate")
+        # the second REQUEST_CHANGES in a row is gated: a retry needs a --route (--escalate alone does not pass it)
+        third = self.retry(second, "--escalate", "--route", "rule-first")
         self.assertEqual(self.meta(third)["thinking"], "high")
 
 

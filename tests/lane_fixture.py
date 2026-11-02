@@ -75,6 +75,7 @@ class TmuxCase(unittest.TestCase):
     server once for the class; after each test every session and window the test made is ended (the anchor stays), and the
     server is killed when the class ends. Such a class's tests must not depend on a fresh server."""
     shared_server = False
+    stable_root = False  # a shared-server class may ask for each test's root at `class_root/run` (same path every test; a lane snapshot needs it)
 
     @classmethod
     def setUpClass(cls):
@@ -102,15 +103,15 @@ class TmuxCase(unittest.TestCase):
             pass
 
     def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name).resolve()
-        self.project = self.root / "project"
-        self.project.mkdir()
-        self.other = self.root / "other"
-        self.other.mkdir()
-        self.state = self.project / ".tmux-pi"
-        (self.state / "tasks").mkdir(parents=True)
+        if self.shared_server and self.stable_root:
+            self.root = self.class_root / "run"
+            self.root.mkdir()
+            self.addCleanup(shutil.rmtree, self.root, True)
+        else:
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            self.root = Path(temp.name).resolve()
+        self.lay_out_root()
         if self.shared_server:
             fake = self.fake
         else:
@@ -127,6 +128,15 @@ class TmuxCase(unittest.TestCase):
         else:
             self.tmux("new-session", "-d", "-s", "anchor", "sleep 300")
             self.addCleanup(self.stop_server)
+
+    def lay_out_root(self):
+        """The empty folders of a test's root: the project (with the state dir and its tasks folder) and `other`."""
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.other = self.root / "other"
+        self.other.mkdir()
+        self.state = self.project / ".tmux-pi"
+        (self.state / "tasks").mkdir(parents=True)
 
     def clear_server(self):
         """End what the test left on the shared server: every session but the anchor, every window but the anchor's own."""

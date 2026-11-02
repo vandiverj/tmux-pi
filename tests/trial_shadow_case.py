@@ -94,11 +94,12 @@ class ShadowCase(lw.LaneCase):
     def passthrough_trial_sessions(self):
         """The fixture's tmux stub answers every session query with Main's own state. A trial session is real here: its session
         commands (and only those) reach the private server; new-window, list-panes and the rest stay the fixture's."""
-        wrapper = self.root / "bin" / "tmux"
-        fixture = wrapper.with_name("tmux-fixture")
-        wrapper.rename(fixture)
-        wrapper.write_text(SESSION_WRAPPER.format(real=TMUX, sock=self.sock, fixture=fixture))
+        bindir = self.root / "bin"  # per test, ahead of the class-shared fake dir (self.fake), which stays untouched
+        bindir.mkdir()
+        wrapper = bindir / "tmux"
+        wrapper.write_text(SESSION_WRAPPER.format(real=TMUX, sock=self.sock, fixture=self.fake / "tmux"))
         wrapper.chmod(0o755)
+        self.env["PATH"] = str(bindir) + os.pathsep + self.env["PATH"]
 
     def make_source(self, task_id="src-1", meta=None, dispatch=None, request="Make a focused change in lib/x.py\n", packet=None, review_of=False):
         task = self.state / "tasks" / task_id

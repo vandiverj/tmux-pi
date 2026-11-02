@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from lane_fixture import MODEL, ROOT, TMUX, git  # noqa: E402
 from test_lane_lease import LeaseCase  # noqa: E402
-from test_lane_steps import APPROVED, CHANGES, StepCase  # noqa: E402
+from test_lane_steps import APPROVED, CHANGES, StepCase, backticked  # noqa: E402
 import contract  # noqa: E402
 import lane_lease  # noqa: E402
 import result_status  # noqa: E402
@@ -566,52 +566,13 @@ class AuditTests(RemedyCase):
 
 
 
-def backticked(text):
-    """Every command in backticks in a refusal, in order: what a person pastes."""
-    return re.findall(r"`([^`]+)`", text)
-
-
 class StepRemedyTests(StepCase):
     """L4: every refusal of the review gate, `lane close` and the next-step rule names a command; each test prints the refusal,
     runs what it names (through sh, as typed, with only the placeholders the text itself marks as ones to fill: NEW-ID, ROLE) and
     shows the refusal gone or moved on to the next step of the way. The last test walks one lane from a working writer to a
     closed step by only typing what the refusals said."""
 
-    def shell(self, command, cwd=None):
-        env = dict(self.env)
-        env["PATH"] = os.pathsep.join([str(ROOT / "bin"), env["PATH"]])
-        return subprocess.run(["sh", "-c", command], env=env, cwd=cwd or self.repo, text=True, capture_output=True, timeout=90)
-
-    def type_(self, command, **fill):
-        for word, value in fill.items():
-            command = command.replace(word, value)
-        run = self.shell(command)
-        self.assertEqual(run.returncode, 0, f"{command}\n{run.stderr}")
-        return run
-
-    def printed(self, make_run, *words):
-        """The commands (in backticks) the refusal prints, after checking it is a clean refusal that says `words`."""
-        return backticked(self.untouched(make_run, *words))
-
-    def new_reviewer(self, author, command=None):
-        before = {p.name for p in (self.state / "tasks").glob("review-*")}
-        run = self.type_(command or f"tp-agent review {author} --force")
-        found = [p for p in (self.state / "tasks").glob("review-*") if p.name not in before]
-        self.assertEqual(len(found), 1, run.stdout)
-        return found[0]
-
     # --- the gate ---------------------------------------------------------------------------------------------------
-
-    def test_a_working_writer_names_stop_and_stop_clears_it(self):
-        author, task = self.writer(settled=False)
-        self.edit()
-        self.commit()
-        commands = self.printed(self.next_step, author, f"`tp-agent stop {author}`")
-        self.assertIn(f"tp-agent stop {author}", commands)
-        self.type_(f"tp-agent stop {author}")
-        # moved on: the next refusal does not mention the writer as unfinished, and it names a command too
-        stderr = self.untouched(self.next_step, "step s1 is not closed", "No writer of the step can be reviewed")
-        self.assertNotIn("so the step's work is not finished", stderr)
 
     def test_a_queued_task_names_stop_and_stop_takes_it_out(self):
         self.writer()
@@ -627,17 +588,6 @@ class StepRemedyTests(StepCase):
         self.assertFalse((self.state / "queue/coder-queued0002.json").exists())
         self.untouched(self.close, "step s1 of lane alpha cannot be closed", "has no review yet")
 
-    def test_a_settled_unreviewed_author_names_review_and_the_review_it_starts_counts(self):
-        author, _ = self.writer()
-        self.edit()
-        self.commit()
-        self.printed(self.close, "has no review yet", f"`tp-agent review {author} --force`")
-        reviewer = self.new_reviewer(author)
-        # the gate sees the reviewer tp-review made: started (so waiting), then, answered, approving
-        self.untouched(self.close, f"{reviewer.name} is reviewing this tree")
-        self.settle(reviewer, result=APPROVED)
-        self.assertEqual(self.closes()["closed"][0]["review"], reviewer.name)
-
     def test_a_running_review_names_stop_and_a_stopped_one_names_review_again(self):
         author, _ = self.writer()
         self.edit()
@@ -649,17 +599,6 @@ class StepRemedyTests(StepCase):
         second = self.new_reviewer(author)
         self.settle(second, result=APPROVED)
         self.assertEqual(self.closes()["closed"][0]["review"], second.name)
-
-    def test_a_review_that_asked_for_changes_names_retry_and_retry_puts_a_new_writer_in_the_step(self):
-        author, _ = self.writer()
-        self.edit()
-        self.commit()
-        reviewer, _ = self.review(author, CHANGES)
-        commands = self.printed(self.next_step, f"{reviewer} asked for changes")
-        retry = next(c for c in commands if c.startswith("tp-agent retry"))
-        self.type_(retry + " --worker pi --model " + MODEL)
-        stderr = self.untouched(self.next_step, "step s1 is not closed")
-        self.assertRegex(stderr, r"coder-[0-9a-f]+ is (starting|running)")  # the new writer, in the same step: the lane is moving
 
     def test_approved_work_that_is_not_committed_names_the_commit_and_the_close(self):
         author, _ = self.writer()

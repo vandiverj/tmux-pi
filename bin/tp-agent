@@ -1237,9 +1237,10 @@ def main(argv=None, env=None):
     if env is None:
         return _main(argv)
     saved = dict(os.environ)
-    os.environ.clear()
-    os.environ.update(env)
+    wanted = dict(env)  # a copy first: env may be os.environ itself, which the clear below would empty
     try:
+        os.environ.clear()
+        os.environ.update(wanted)
         return _main(argv)
     finally:
         os.environ.clear()

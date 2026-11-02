@@ -1,10 +1,14 @@
 """tests/tp_agent_inproc.run gives the same rc, stdout and stderr as a bin/tp-agent subprocess (five commands, one per exit path)."""
+import contextlib
+import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,6 +22,11 @@ COMMANDS = {
     "inspect missing task (rc 1, tp-agent: error)": ["inspect", "no-such-task"],
     "unknown command (rc 2, argparse usage)": ["bogus"],
 }
+
+
+def stable(text):
+    """Output with the clock removed: `index` prints the current second, which can differ between the two runs."""
+    return re.sub(r'("updated": )"[^"]*"', r'\1"T"', text)
 
 
 class InProcessMatchesSubprocess(unittest.TestCase):
@@ -34,7 +43,7 @@ class InProcessMatchesSubprocess(unittest.TestCase):
                     rc, out, err = tp_agent_inproc.run(argv, env, cwd)
                     t2 = time.monotonic()
                     times.append((name, t1 - t0, t2 - t1))
-                    self.assertEqual((rc, out, err), (sub.returncode, sub.stdout, sub.stderr))
+                    self.assertEqual((rc, stable(out), err), (sub.returncode, stable(sub.stdout), sub.stderr))
             for name, sub_s, in_s in times:
                 print(f"  {name}: subprocess {sub_s:.3f}s, in-process {in_s:.3f}s", file=sys.stderr)
 
@@ -44,6 +53,21 @@ class InProcessMatchesSubprocess(unittest.TestCase):
             tp_agent_inproc.run(["list"], {"TP_STATE_DIR": state, "ONLY_HERE": "1"}, state)
             tp_agent_inproc.run(["bogus"], {"TP_STATE_DIR": state})
         self.assertEqual((dict(os.environ), os.getcwd()), (before_env, before_cwd))
+
+    def test_main_with_os_environ_keeps_the_environment(self):
+        agent = tp_agent_inproc.load()
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.dict(os.environ, {"TP_STATE_DIR": state}):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    agent.main(["list"], os.environ)
+                self.assertEqual(os.environ.get("TP_STATE_DIR"), state)
+
+    def test_invalid_env_value_leaves_os_environ_intact(self):
+        agent = tp_agent_inproc.load()
+        before = dict(os.environ)
+        with self.assertRaises(TypeError):
+            agent.main(["list"], {"TP_STATE_DIR": 5})
+        self.assertEqual(dict(os.environ), before)
 
 
 if __name__ == "__main__":

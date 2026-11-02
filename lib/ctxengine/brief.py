@@ -296,9 +296,10 @@ def tests_for(engine, rel):
 def library_lines(engine, used):
     """The lines of the libraries block for `used`, a set of (package directory, import specifier). Each specifier is classified once, in its
     own package, by `Engine.classify`: a project alias there, else a library with the version that package's lockfile pins (or why not). A
-    library with the same outcome in every package is one line; when the packages differ (an alias in one, another version or none in
-    another) there is one line per package, so one package's alias or pin is never said of another's. In a package where only some
-    specifiers of a library are aliases (`@pkg/sub` mapped, `@pkg` not) the alias line names those specifiers and the library its own line."""
+    line names the exact specifier as imported: a mapped specifier (`@pkg/sub`) is reported as that specifier being a project alias and is
+    never folded into its root package name; the root package's own line appears only when the root or an unmapped subpath is imported.
+    Packages whose (alias specifiers, pins) are identical give one line; when they differ there is one line per package, so one package's
+    alias or pin is never said of another's."""
     found = {}  # library -> package directory -> (alias specifiers, set of (version, why) of its non-alias specifiers)
     for where, spec in sorted(used):
         lib, alias = engine.classify(spec, where)
@@ -311,13 +312,12 @@ def library_lines(engine, used):
     lines = []
     for lib in sorted(found):
         per_package = found[lib]
-        same = len({(bool(aliases), tuple(sorted(pins, key=str))) for aliases, pins in per_package.values()}) == 1
+        same = len({(tuple(sorted(aliases)), tuple(sorted(pins, key=str))) for aliases, pins in per_package.values()}) == 1
         for where in sorted(per_package):
             aliases, pins = per_package[where]
             at = "" if same else f" in {where or '.'}"
             if aliases:
-                name = lib if not pins else ", ".join(sorted(aliases))
-                lines.append(f"  {name}{at} (a project alias for code in this repository, not a library)")
+                lines.append(f"  {', '.join(sorted(aliases))}{at} (a project alias for code in this repository, not a library)")
             for version, why in sorted(pins, key=str):
                 lines.append(f"  {lib}{at} {version} — use api_signature({lib}, <symbol>) for exact signatures" if version
                              else f"  {lib}{at} (version not read: {why})")

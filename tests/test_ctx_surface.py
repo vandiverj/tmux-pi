@@ -495,8 +495,8 @@ class Brief(SurfaceCase):
         self.assertIn("  drizzle-orm 0.41.5 — use api_signature(drizzle-orm, <symbol>)", libraries)
         self.assertIn("  zod 4.6.7 —", libraries)
         self.assertNotIn("Pin(", libraries)
-        for alias in ("@launchpad/types", "@launchpad/utils"):
-            self.assertRegex(libraries, rf"  {alias} \(a project alias[^)]*\)")
+        for alias in ("@launchpad/types/order.ts", "@launchpad/utils, @launchpad/utils/dates"):  # the exact specifiers as imported, not their root
+            self.assertIn(f"  {alias} (a project alias for code in this repository, not a library)", libraries)
         self.assertNotIn("not in the lockfile", libraries)
         self.assertNotIn(" in apps/", libraries)  # one outcome in every package that names a library: one unattributed line
 
@@ -516,6 +516,21 @@ class Brief(SurfaceCase):
         self.assertIn(f"  @oak/oak/subpath in {jobs} (a project alias for code in this repository, not a library)", mixed)  # only the mapped specifier
         self.assertIn(f"  @oak/oak in {web} (a project alias for code in this repository, not a library)", mixed)
         self.assertNotIn("not in the lockfile", mixed)
+
+        # F3 (round 2): a package that imports only a mapped subpath never has the bare root called an alias; two packages that map different
+        # subpaths are told apart by package, not folded into one unattributed line.
+        cron, sched = "apps/launchpad/cron", "apps/launchpad/sched"
+        put(self.project, f"{cron}/deno.json", json.dumps({"imports": {"@oak/oak/subpath": "./src/stub.ts"}}))
+        put(self.project, f"{cron}/src/tick.ts", 'import { stub } from "@oak/oak/subpath";\n')
+        put(self.project, f"{sched}/deno.json", json.dumps({"imports": {"@oak/oak/other": "./src/stub.ts"}}))
+        put(self.project, f"{sched}/src/tick.ts", 'import { other } from "@oak/oak/other";\n')
+        only = self.run_tool("ctx_brief", {"paths": [f"{cron}/src/tick.ts"]}, pin=pins.get, pin_in=pins_in).text.split("== libraries\n")[1]
+        self.assertIn("  @oak/oak/subpath (a project alias for code in this repository, not a library)", only)
+        self.assertNotRegex(only, r"(?m)^  @oak/oak(?! ?/)")  # no bare @oak/oak line, as alias or as library
+        both = self.run_tool("ctx_brief", {"paths": [f"{cron}/src/tick.ts", f"{sched}/src/tick.ts"]}, pin=pins.get, pin_in=pins_in).text.split("== libraries\n")[1]
+        self.assertIn(f"  @oak/oak/subpath in {cron} (a project alias", both)
+        self.assertIn(f"  @oak/oak/other in {sched} (a project alias", both)
+        self.assertNotRegex(both, r"(?m)^  @oak/oak(?! ?/)")
 
     def test_a_file_the_navigator_does_not_cover_still_gets_a_brief(self):
         (self.project / "bin").mkdir()

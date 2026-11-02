@@ -87,6 +87,45 @@ class BranchTests(TreeCase):
         self.assertEqual(self.heads(), before, "only the listing happened: nothing moved or deleted")
         self.assertEqual(git(self.repo, "rev-parse", "old-branch"), old_tip, "the branch that predates the run is where the worker left it")
 
+    def other_repo(self, path):
+        """A repository that is not the run's, with a branch of its own, at `path`."""
+        path.mkdir()
+        git(path, "init", "-q")
+        (path / "f").write_text("other\n")
+        git(path, "add", "f")
+        git(path, "-c", "user.name=o", "-c", "user.email=o@x", "commit", "-q", "-m", "other")
+        git(path, "branch", "foreign-branch")
+        return path
+
+    def test_review_f3_a_project_moved_aside_with_another_repository_in_its_place_has_its_branches_not_listed(self):
+        """Review round 2 F3: the ref query runs only against the project the run held when it took `heads_before` (the root and its
+        git dir, by identity). Another repository at the old path is not listed; that the branches could not be listed is recorded."""
+        run = self.worktree_run()
+        git(run.worktree, "branch", "worker-scratch", self.base)
+        aside = self.repo.with_name(self.repo.name + "-aside")
+        os.rename(str(self.repo), str(aside))
+        self.addCleanup(lambda: (shutil.rmtree(str(self.repo), ignore_errors=True), os.rename(str(aside), str(self.repo))))
+        self.other_repo(self.repo)
+        with self.assertRaises(ts.ShadowError):
+            run.collect_work()  # the tree is not at its path any more: the collect stops, and the listing came first
+        info = run.owner.read()  # through the held run directory, which moved with the project
+        self.assertNotIn("new_branches", info, "no head of the other repository is listed")
+        self.assertIn("project", info["new_branches_error"])
+        self.assertNotIn("foreign-branch", json.dumps(info))
+
+    def test_review_f3_a_git_directory_swapped_under_the_project_has_its_branches_not_listed(self):
+        run = self.worktree_run()
+        git(run.worktree, "branch", "worker-scratch", self.base)
+        other = self.other_repo(self.root / "another-repo")
+        held = self.repo / ".git"
+        os.rename(str(held), str(self.root / "git-aside"))
+        self.addCleanup(lambda: (shutil.rmtree(str(held), ignore_errors=True), os.rename(str(self.root / "git-aside"), str(held))))
+        os.rename(str(other / ".git"), str(held))
+        run.list_new_branches()
+        self.assertNotIn("new_branches", run.info)
+        self.assertIn("git directory", run.info["new_branches_error"])
+        self.assertNotIn("foreign-branch", json.dumps(ts.read_run(run.rdir)))
+
     def test_a_branch_the_worker_made_is_listed_when_the_tree_is_gone_at_the_collect(self):
         run = self.worktree_run()
         git(run.worktree, "branch", "worker-scratch", self.base)

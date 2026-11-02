@@ -18,7 +18,8 @@ ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable unt
 the end, on success and on failure. The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
 the tree on a branch (`git checkout -b`, a rename, a branch someone else made meanwhile), the collect step detaches HEAD (so moving
 it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json (every
-branch made since the tree was, HEAD's or not, is listed there as `new_branches`); a
+branch made since the tree was, HEAD's or not, is listed there as `new_branches`, read only from the project and git directory
+the run recorded, else `new_branches_error`); a
 tree it cannot detach ends the collect with an error before HEAD is moved. HEAD is written with `update-ref --no-deref`, never
 `checkout --detach` or `reset --soft`, which refuse in the middle of a merge, a rebase or a cherry-pick: the patch and the removal of
 the tree do not depend on the state the worker left git in. `git add -A` skips a path git cannot index (a repository the worker made
@@ -692,6 +693,7 @@ class Run:
         self.owner.check_place(self.worktree)
         if os.path.lexists(str(self.worktree)):
             raise ShadowError("{} already exists; a run makes its tree at a new place of its own and never reuses one".format(self.worktree))
+        self.owner.hold_project()  # the branch listing later reads refs only from this project and git directory
         self.heads_before = heads(self.project)
         self.heads_taken = True
         git(self.project, "worktree", "add", "--detach", str(self.worktree), self.info["base_commit"])
@@ -853,22 +855,28 @@ class Run:
         head that was not there when the run's tree was made (`heads_before`, the runner's own memory), whether HEAD is on it or not, as
         `new_branches` [{ref, commit}] in run.json (absent when there is none). One that somebody else made meanwhile is listed too: the
         run cannot tell who made it. Nothing is deleted or moved: this only reads the project's refs (the listing is of the project, not
-        of the worker's tree, so it needs no proof of the tree). A run that never took `heads_before` (it stopped before its tree was
+        of the worker's tree, so it needs no proof of the tree). The refs are read only from the project the run recorded: its root and
+        its git directory must still be the directories held open when the tree was made (`Owner.check_project`, before and after the
+        query); when they are not (the project moved aside and another repository put in its place, a swapped `.git`), or the query
+        fails, nothing is listed and `new_branches_error` says why. A run that never took `heads_before` (it stopped before its tree was
         made) lists nothing. It is called first in `collect_work`, and by `execute` when the run ended without collecting, so a run
         that stops at an ownership check still names the branches the worker made. A failed listing is not a failed collect."""
         if self.branches_listed or not self.heads_taken:
             return
+        self.branches_listed = True  # one try: a listing that could not be made is reported, not retried against what is there later
         try:
+            self.owner.check_project()
             listed = git(self.project, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", check=False)
             if listed.returncode:
-                return
-            rows = [line.split(" ", 1) for line in listed.stdout.splitlines() if " " in line]
-            made = [{"ref": ref, "commit": commit} for ref, commit in sorted(rows) if ref not in self.heads_before]
-            if made:
-                self.note(new_branches=made)
-        except (ShadowError, OSError):
+                raise ShadowError("git for-each-ref failed in {}: {}".format(self.project, listed.stderr.strip() or "exit {}".format(listed.returncode)))
+            self.owner.check_project()  # the project could have been swapped while the query ran: then what it read is not listed
+        except (ShadowError, OSError) as error:
+            self.note(new_branches_error="the branches the worker made could not be listed: {}".format(error))
             return
-        self.branches_listed = True
+        rows = [line.split(" ", 1) for line in listed.stdout.splitlines() if " " in line]
+        made = [{"ref": ref, "commit": commit} for ref, commit in sorted(rows) if ref not in self.heads_before]
+        if made:
+            self.note(new_branches=made)
 
     def review(self):
         self.note(phase="review")
@@ -1309,6 +1317,10 @@ class Owner:
                            descriptor is open no other directory can have that identity, so nothing the worker does (remove and
                            re-add a tree at the same path, git reusing the admin name, `git worktree move`, a link, a rewritten
                            `.git`) produces a directory that proves as this run's.
+      project, its git     (device, inode) of the project root and of its common git directory, held open by the runner from just
+      directory            before the tree is made (`hold_project`). The branch listing reads refs/heads only while both paths are
+                           still those directories and git in the project still finds that git directory (`check_project`); a
+                           project moved aside with another repository in its place is not read (`new_branches_error`).
 
     KNOWN LIMIT (not fixed; the threat model is that the worker runs as the same OS user and nothing is sandboxed). A stop of a runner
     that has died holds no descriptors and no memory: it reads the identities above from the owner file
@@ -1479,6 +1491,43 @@ class Owner:
         self.record.update({"path": real, "tree": ident["tree"], "admin": dict(ident["admin"], path=admin), "heads_before": sorted(heads_before),
                             "created": now(), "removed": None})
         self._write()
+
+    def hold_project(self):
+        """Open the project root and its git directory (the common one, where refs/heads is) and keep them open, before the run's
+        tree is made: the branch listing reads the project's refs only while both paths still name these directories
+        (`check_project`). The runner holds them in memory only: a stop after the runner is gone lists no branches."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        found = git(self.project, "rev-parse", "--git-common-dir")
+        gitdir = os.path.realpath(os.path.join(self.project, found.stdout.strip()))
+        fds = {}
+        try:
+            for kind, path in (("project", self.project), ("gitdir", gitdir)):
+                fds[kind] = os.open(path, flags)
+        except OSError as error:
+            for fd in fds.values():
+                os.close(fd)
+            raise ShadowError("the project {} or its git directory {} cannot be opened ({})".format(self.project, gitdir, error.strerror))
+        self._close("project", "gitdir")
+        self.fds.update(fds)
+        self.gitdir = gitdir
+
+    def check_project(self):
+        """Raise unless the project root and its git directory, at their paths now, are the directories `hold_project` opened, and
+        git in the project still finds that git directory. Nothing in the worker's tree is needed for this."""
+        for kind, path, what in (("project", self.project, "the project"), ("gitdir", getattr(self, "gitdir", None), "the project's git directory")):
+            fd = self.fds.get(kind)
+            if fd is None or path is None:
+                raise ShadowError("{} was not held open when the run's tree was made; its refs are not read".format(what))
+            held = os.fstat(fd)
+            try:
+                now_ = os.lstat(path)
+            except OSError:
+                now_ = None
+            if now_ is None or stat.S_ISLNK(now_.st_mode) or (now_.st_dev, now_.st_ino) != (held.st_dev, held.st_ino):
+                raise ShadowError("{} {} is not the one the run recorded any more (moved, a link, or another directory); its refs are not read".format(what, path))
+        found = git(self.project, "rev-parse", "--git-common-dir", check=False)
+        if found.returncode or os.path.realpath(os.path.join(self.project, found.stdout.strip())) != self.gitdir:
+            raise ShadowError("git in the project {} no longer finds the git directory the run recorded ({}); its refs are not read".format(self.project, self.gitdir))
 
     def _close(self, *kinds):
         for kind in kinds:

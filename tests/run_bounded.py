@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -90,12 +91,24 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
     before = tmux_sockets()
     chunks = []
     started = time.monotonic()
-    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+    # Our own pipe and raw reads: a buffered proc.stdout.close() blocks on the lock a blocked reader holds, so a
+    # descendant that keeps the pipe open could hold the parent past its bound.
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=write_fd,
+                                start_new_session=True)
+    finally:
+        os.close(write_fd)
     pgid = proc.pid  # a new session makes the child its own group leader
+    stop = threading.Event()
 
     def pump():
-        for data in iter(lambda: proc.stdout.read1(65536), b""):
+        while not stop.is_set():
+            if not select.select([read_fd], [], [], 0.1)[0]:
+                continue
+            data = os.read(read_fd, 65536)
+            if not data:
+                return
             chunks.append(data)
             if echo:
                 sys.stdout.buffer.write(data)
@@ -113,13 +126,19 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
         stop_group(pgid, proc, grace)
         raise
     reader.join(grace)  # a stray holder of the pipe must not hold the parent
-    proc.stdout.close()
+    stop.set()
+    reader.join(1)  # the reader wakes every 0.1 s, so it sees `stop`
+    if not reader.is_alive():
+        os.close(read_fd)
     seconds = time.monotonic() - started
     output = b"".join(chunks).decode(errors="replace")
     per_file = dict(per_file or {})
     ran = RAN.findall(output)
-    if len(files) == 1 and files[0] not in per_file and ran and not timed_out:
-        per_file[files[0]] = float(ran[-1][1])
+    if len(files) == 1 and files[0] not in per_file:
+        if timed_out:
+            per_file[files[0]] = round(seconds, 2)  # it ran to the bound; no summary line to read
+        elif ran:
+            per_file[files[0]] = float(ran[-1][1])
     record = {"cmd": list(cmd), "files": files, "seconds": round(seconds, 2), "rc": proc.returncode,
               "timed_out": timed_out, "load1": load1(), "per_file": per_file,
               "leftovers": sorted(tmux_sockets() - before)}

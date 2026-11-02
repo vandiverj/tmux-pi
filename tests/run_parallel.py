@@ -18,7 +18,7 @@ import run_bounded  # noqa: E402
 
 ROOT = TESTS.parent
 MAX_JOBS = 4
-MODULE_TIMEOUT = 600.0  # seconds one module may run before its process group is stopped
+MODULE_TIMEOUT = run_bounded.DEFAULT_TIMEOUT  # seconds one module may run before its process group is stopped
 # Pseudo-terminal repaint timing and loopback HTTP servers: kept out of the pool so load cannot skew them.
 SERIAL = {"test_status_repaint", "test_lmstudio", "test_routing_evals"}
 

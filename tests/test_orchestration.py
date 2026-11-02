@@ -340,10 +340,10 @@ esac
                             ("linked", "readable symlink to a valid record")):
             entries[stem] = (label, None)
         # A thread timer interrupts this thread with SIGUSR2. signal.alarm would share the process's one SIGALRM
-        # timer and cancel an outer `perl -e 'alarm N'` bound.
+        # timer and cancel an outer `perl -e 'alarm N'` bound. 180 s is a hang guard (the test takes ~28 s under load 14).
         previous = signal.signal(signal.SIGUSR2, lambda *_: self.fail("a reader blocked on a queue entry"))
         main_thread = threading.get_ident()
-        watchdog = threading.Timer(20, signal.pthread_kill, (main_thread, signal.SIGUSR2))
+        watchdog = threading.Timer(180, signal.pthread_kill, (main_thread, signal.SIGUSR2))
         watchdog.daemon = True
         watchdog.start()
         self.addCleanup(signal.signal, signal.SIGUSR2, previous)

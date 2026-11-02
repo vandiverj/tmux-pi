@@ -84,6 +84,29 @@ class RunBoundedTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual([p for p in pids if alive(p)], [])
 
+    def test_grandchild_holding_stdout_cannot_keep_the_runner_past_the_bound(self):
+        # the leader sleeps; a grandchild in its own session (outside the group) keeps the output pipe open
+        pidfile = self.dir / "holder"
+        code = ("import subprocess, sys, time\n"
+                "h = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)\n"
+                f"open({str(pidfile)!r}, 'w').write(str(h.pid))\n"
+                "time.sleep(60)")
+        started = time.monotonic()
+        record, _ = self.run_py(code, timeout=2, files=["tests/test_x.py"])
+        elapsed = time.monotonic() - started
+        try:
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.assertTrue(record["timed_out"])
+        self.assertLess(elapsed, 2 + 1 + 1 + 4)  # timeout + grace + reader wait, plus slack; the holder lives 30 s
+        self.assertEqual(self.records()[-1], record)
+
+    def test_timeout_fills_per_file_with_the_seconds_it_ran(self):
+        record, _ = self.run_py("import time; time.sleep(60)", timeout=1, files=["tests/test_x.py"])
+        self.assertTrue(record["timed_out"])
+        self.assertEqual(record["per_file"], {"tests/test_x.py": record["seconds"]})
+
     def test_only_its_own_group_is_signalled(self):
         bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         self.addCleanup(bystander.wait)

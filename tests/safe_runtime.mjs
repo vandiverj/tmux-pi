@@ -6,14 +6,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { linkPiHost } from './fixtures/pi_host.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const pkg = process.env.PI_CODING_AGENT_PACKAGE;
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tp-safe-')));
 // The extensions run from a copy beside a node_modules that holds the installed Pi packages.
-fs.mkdirSync(path.join(tmp, 'node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(pkg, path.join(tmp, 'node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(path.join(pkg, 'node_modules/@earendil-works/pi-ai'), path.join(tmp, 'node_modules/@earendil-works/pi-ai'));
+linkPiHost(tmp, pkg);
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.mkdirSync(path.join(tmp, 'ext'));
 for (const name of ['safe.ts', 'sensitive.ts']) fs.copyFileSync(path.join(root, 'agent/extensions', name), path.join(tmp, 'ext', name));

@@ -5,14 +5,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { linkPiHost } from './fixtures/pi_host.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const pkg = process.env.PI_CODING_AGENT_PACKAGE;
 const fixtures = path.join(root, 'tests/fixtures/assistant');
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tp-assistant-')));
-fs.mkdirSync(path.join(tmp, 'ext/node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(pkg, path.join(tmp, 'ext/node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(path.join(pkg, 'node_modules/@earendil-works/pi-ai'), path.join(tmp, 'ext/node_modules/@earendil-works/pi-ai'));
+fs.mkdirSync(path.join(tmp, 'ext'), { recursive: true });
+linkPiHost(path.join(tmp, 'ext'), pkg);
 fs.writeFileSync(path.join(tmp, 'ext/package.json'), '{"type":"module"}\n');
 fs.copyFileSync(path.join(root, 'agent/extensions/assistant.ts'), path.join(tmp, 'ext/assistant.ts'));
 fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(tmp, 'ext/lib'), { recursive: true });

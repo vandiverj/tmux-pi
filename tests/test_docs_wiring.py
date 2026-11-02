@@ -37,7 +37,7 @@ class LauncherCase(unittest.TestCase):
         self.rec = self.tmp / "rec"
         self.env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "REC": str(self.rec), "TP_PI_NODE": "",
                     "TP_CLAUDE_CONFIG_DIR": str(self.tmp / "cfg")}
-        for name in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE", "TP_DOCS_TOOLS"):
+        for name in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE", "TP_DOCS_TOOLS", "TP_CTX_TOOLS"):
             self.env.pop(name, None)
 
     def launch(self, which, case, **extra):

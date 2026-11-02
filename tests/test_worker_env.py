@@ -163,7 +163,7 @@ class WorkerEnvRefusalTests(WorkerEnvCase):
     """Refusals exit before anything is created; each test starts from an empty state dir."""
 
     def test_an_unlisted_key_is_refused_and_nothing_is_created(self):
-        for key in ("PATH", "LD_PRELOAD", "TP_STATE_DIR", "TP_TASK_ID", "tp_trial_id", "TP_TRIAL_ID_X", ""):
+        for key in ("PATH", "LD_PRELOAD", "TP_STATE_DIR", "TP_TASK_ID", "tp_trial_id", "TP_TRIAL_ID_X", "TP_CTX_TOOLS", ""):
             with self.subTest(key=key):
                 run = self.spawn("--worker-env", key + "=x")
                 self.assertNotEqual(run.returncode, 0)
@@ -180,12 +180,6 @@ class WorkerEnvRefusalTests(WorkerEnvCase):
                 run = self.spawn(*args)
                 self.assertNotEqual(run.returncode, 0)
                 self.assertFalse(list((self.state / "tasks").iterdir()))
-
-    def test_the_option_cannot_set_the_ctx_switch(self):
-        """--worker-env refuses TP_CTX_TOOLS, so the spawner's environment is the only way to turn the ctx tools on."""
-        run = self.spawn("--worker-env", "TP_CTX_TOOLS=1", task="ctx-opt")
-        self.assertNotEqual(run.returncode, 0)
-        self.assertIn("not allowed", run.stderr)
 
 
 class PreambleArgsTests(WorkerEnvCase):

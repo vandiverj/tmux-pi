@@ -594,6 +594,8 @@ class Run:
         self.recorded = False
         self.record_problem = None
         self.heads_before = set()
+        self.heads_taken = False
+        self.branches_listed = False
         self.diff = (None, None)
         self.commit_messages = None
         self.review_id = None
@@ -654,6 +656,7 @@ class Run:
         if os.path.lexists(str(self.worktree)):
             raise ShadowError("{} already exists; a run makes its tree at a new place of its own and never reuses one".format(self.worktree))
         self.heads_before = heads(self.project)
+        self.heads_taken = True
         git(self.project, "worktree", "add", "--detach", str(self.worktree), self.info["base_commit"])
         self.owner.create(self.worktree, self.heads_before)  # what this run created: every later git command proves it first
         self.note(worktree_removed=None)
@@ -750,16 +753,16 @@ class Run:
         review diffs HEAD). Returns after saving the patch and counting the final diff."""
         self.note(phase="reset")
         base = self.info["base_commit"]
+        self.list_new_branches()  # first: the listing reads the project's refs, not the worker's tree, so a refusal below does not lose it
         state, _ = self.prove_worktree()
         if state == "absent":  # the work cannot be read, and a review of nothing is no review of the worker's work
             raise ShadowError("the run's worktree {} is gone; the worker's work was not collected".format(self.worktree))
-        log =self.wt_git("log", "--reverse", base + "..HEAD", "--format=%B%x00", check=False)
+        log = self.wt_git("log", "--reverse", base + "..HEAD", "--format=%B%x00", check=False)
         self.commit_messages = [m.strip("\n") for m in log.stdout.split("\0") if m.strip()] if log.returncode == 0 else None
         head = self.wt_git("rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
         if head and head != base:
             self.owner.keep_ref("{}{}/head".format(REF_PREFIX, self.run), head)  # a ref this run makes and records: cleanup removes it by name and commit
         self.leave_branch()
-        self.list_new_branches()
         # HEAD to the base, the index and the files as they are: what `reset --soft` does, except that it refuses in the middle of a merge
         # (a worker that gave up there would cost the whole patch), and that `--no-deref` can only ever move HEAD itself, never a branch
         self.wt_git("update-ref", "--no-deref", "-m", "tp-trial: HEAD to the base for the review", "HEAD", base)
@@ -811,14 +814,23 @@ class Run:
         """Design (f): a branch the worker made is left where it is and listed. `branch_left` names the one HEAD was on; this names every
         head that was not there when the run's tree was made (`heads_before`, the runner's own memory), whether HEAD is on it or not, as
         `new_branches` [{ref, commit}] in run.json (absent when there is none). One that somebody else made meanwhile is listed too: the
-        run cannot tell who made it. Nothing is deleted or moved. A failed listing is not a failed collect."""
-        listed = git(self.project, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", check=False)
-        if listed.returncode:
+        run cannot tell who made it. Nothing is deleted or moved: this only reads the project's refs (the listing is of the project, not
+        of the worker's tree, so it needs no proof of the tree). A run that never took `heads_before` (it stopped before its tree was
+        made) lists nothing. It is called first in `collect_work`, and by `execute` when the run ended without collecting, so a run
+        that stops at an ownership check still names the branches the worker made. A failed listing is not a failed collect."""
+        if self.branches_listed or not self.heads_taken:
             return
-        rows = [line.split(" ", 1) for line in listed.stdout.splitlines() if " " in line]
-        made = [{"ref": ref, "commit": commit} for ref, commit in sorted(rows) if ref not in self.heads_before]
-        if made:
-            self.note(new_branches=made)
+        try:
+            listed = git(self.project, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", check=False)
+            if listed.returncode:
+                return
+            rows = [line.split(" ", 1) for line in listed.stdout.splitlines() if " " in line]
+            made = [{"ref": ref, "commit": commit} for ref, commit in sorted(rows) if ref not in self.heads_before]
+            if made:
+                self.note(new_branches=made)
+        except (ShadowError, OSError):
+            return
+        self.branches_listed = True
 
     def review(self):
         self.note(phase="review")
@@ -973,6 +985,7 @@ class Run:
                 if error:
                     self.note_end(error=error)
                 self.outcome = self.outcome or "error"
+                self.list_new_branches()  # a run that stopped before its collect still names what the worker made, before the cleanup
                 self.try_record()  # the first try failed, or was never reached: a record of the attempt is written here when it can be
                 if self.record_problem and self.outcome == "completed":
                     self.outcome = "record_failed"  # the attempt ran but its Qwen record is missing: not a completed trial

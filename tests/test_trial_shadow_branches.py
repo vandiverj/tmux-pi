@@ -68,6 +68,67 @@ class BranchTests(TreeCase):
         self.assertEqual(ts.cleanup(run.rdir, self.env), [])
         self.assertEqual(self.heads(), before | {"refs/heads/kept " + tip, "refs/heads/scratch " + self.base})
 
+    def test_a_branch_the_worker_made_is_listed_even_when_the_collect_stops_at_a_branch_that_was_there_before(self):
+        """Review F3: the listing does not depend on the collect getting as far as `leave_branch`. The worker made a branch and then
+        checked out one that predates the run: the collect refuses (and moves nothing), and the made branch is still named."""
+        git(self.repo, "branch", "old-branch", self.base)
+        run = self.worktree_run()
+        git(run.worktree, "branch", "worker-scratch", self.base)
+        git(run.worktree, "checkout", "-q", "old-branch")
+        self.edit(run)  # the worker's commit moves old-branch: the worker did that, not the runner
+        old_tip = git(run.worktree, "rev-parse", "HEAD")
+        before = self.heads()
+        with self.assertRaises(ts.ShadowError) as caught:
+            run.collect_work()
+        self.assertIn("old-branch", str(caught.exception))
+        want = [{"ref": "refs/heads/worker-scratch", "commit": self.base}]
+        self.assertEqual(run.info["new_branches"], want)
+        self.assertEqual(ts.read_run(run.rdir)["new_branches"], want, "reported in run.json")
+        self.assertEqual(self.heads(), before, "only the listing happened: nothing moved or deleted")
+        self.assertEqual(git(self.repo, "rev-parse", "old-branch"), old_tip, "the branch that predates the run is where the worker left it")
+
+    def test_a_branch_the_worker_made_is_listed_when_the_tree_is_gone_at_the_collect(self):
+        run = self.worktree_run()
+        git(run.worktree, "branch", "worker-scratch", self.base)
+        shutil.rmtree(str(run.worktree))
+        with self.assertRaises(ts.ShadowError):
+            run.collect_work()
+        self.assertEqual(ts.read_run(run.rdir)["new_branches"], [{"ref": "refs/heads/worker-scratch", "commit": self.base}])
+
+    def test_a_branch_the_worker_made_is_listed_when_the_run_stops_before_it_collects(self):
+        class CannotEnd(StubSpawnRun):
+            def end_worker(self, outcome):
+                raise ts.ShadowError("the worker could not be ended: refused")
+        rdir, _ = self.prepare()
+
+        def poll(n, run):
+            git(run.worktree, "branch", "side-work", self.base)
+            self.settle_worker(run)
+        _, done = self.run_stub(rdir, poll, run_class=CannotEnd)
+        self.assertEqual(done["outcome"], "error", done)
+        self.assertEqual(done["new_branches"], [{"ref": "refs/heads/side-work", "commit": self.base}])
+        self.assertEqual(self.refs("refs/heads/side-work"), "refs/heads/side-work " + self.base, "left where it is")
+
+    def test_a_run_that_made_no_branch_lists_none_when_it_stops_before_it_collects(self):
+        class CannotEnd(StubSpawnRun):
+            def end_worker(self, outcome):
+                raise ts.ShadowError("the worker could not be ended: refused")
+        rdir, _ = self.prepare()
+        _, done = self.run_stub(rdir, lambda n, run: self.settle_worker(run), run_class=CannotEnd)
+        self.assertEqual(done["outcome"], "error", done)
+        self.assertNotIn("new_branches", done)
+
+    def test_a_run_that_never_made_its_tree_lists_no_branches(self):
+        """`heads_before` is taken when the tree is made; a run that stopped earlier has none, and must not name every branch as new."""
+        rdir, _ = self.prepare()
+
+        class NoTree(StubSpawnRun):
+            def make_worktree(self):
+                raise ts.ShadowError("refused before the tree")
+        _, done = self.run_stub(rdir, run_class=NoTree)
+        self.assertEqual(done["outcome"], "error", done)
+        self.assertNotIn("new_branches", done)
+
     def test_a_branch_that_was_there_before_the_run_is_not_listed_as_new(self):
         git(self.repo, "branch", "old-branch", self.base)
         run = self.worktree_run()

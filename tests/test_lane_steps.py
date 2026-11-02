@@ -52,8 +52,6 @@ def backticked(text):
 class StepCase(LaneCase):
     """A lane `alpha` whose steps are driven by hand: writers through tp-agent, reviewers as the files tp-review leaves."""
 
-    snapshot_lane = True  # the first s1 writer of a test restores the class's one real dispatch (LaneCase.lane_ok)
-
     def setUp(self):
         super().setUp()
         self.made = 0
@@ -671,6 +669,8 @@ class CloseAndNextStepTests(StepCase):
 
 
 class OpenStepTests(StepCase):
+    snapshot_lane = True  # measured: the only StepCase class that gains (GateRows and CloseAndNextStep: under 10 percent CPU-s, left off)
+
     """Which step is open is read from every step that is not closed, never from the newest task; and a task a lane names whose
     record cannot be read keeps its step open (a task no lane names is an orphan, as before)."""
 

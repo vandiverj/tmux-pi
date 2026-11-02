@@ -184,11 +184,11 @@ class SurfaceCase(unittest.TestCase):
         fake_navs.reset()
         self.addCleanup(fake_navs.reset)
 
-    def engine(self, modules="default", pin=None, env=None):
+    def engine(self, modules="default", pin=None, env=None, pin_in=None):
         modules = self.modules if modules == "default" else modules
         navs = surface.Navigators(self.layout, modules=modules)
         env = {"TP_CTX_TODAY": "2026-10-31", **(env or {})}
-        engine = surface.Engine(self.layout, navigators=navs, pin=pin, env=env)
+        engine = surface.Engine(self.layout, navigators=navs, pin=pin, env=env, pin_in=pin_in)
         self.addCleanup(engine.close)
         return engine
 
@@ -473,6 +473,32 @@ class Brief(SurfaceCase):
         self.assertRegex(text, r"react \(version not read[^)]*\)")
         self.assertNotIn("slug", text.split("== libraries")[1])  # a relative import is not a library
 
+    def test_library_hints_print_the_version_skip_project_aliases_and_read_the_lock_in_the_package_directory(self):
+        """G4/G5: a localdocs Pin is printed as its version (not its repr); an alias that maps into lib/ (deno.json imports, tsconfig paths with
+        comments) is not a library "missing from the lockfile"; a jsr package that only the api package's deno.lock names is found there."""
+        from localdocs import lock  # noqa: PLC0415
+        api, web = "apps/launchpad/api", "apps/launchpad/web"
+        put(self.project, f"{api}/deno.json", json.dumps({"imports": {"zod": "npm:zod@4", "@oak/oak": "jsr:@oak/oak@^17.1.4",
+                                                                       "@launchpad/types/": "../../../lib/launchpad/types/"}}))
+        put(self.project, f"{api}/deno.lock", json.dumps({"version": "5", "specifiers": {"jsr:@oak/oak@^17.1.4": "17.2.0"},
+                                                          "jsr": {"@oak/oak@17.2.0": {"integrity": "x"}}}))
+        put(self.project, f"{web}/tsconfig.json", '{\n  // aliases of the workspace\n  "compilerOptions": {"paths": {"@launchpad/utils": ["../../../lib/launchpad/utils/index.ts"],'
+                                                  ' "@launchpad/utils/*": ["../../../lib/launchpad/utils/*"], "@/*": ["./src/*"]}}\n}\n')
+        put(self.project, f"{api}/src/hints.ts", 'import { Router } from "@oak/oak";\nimport { S } from "@launchpad/types/order.ts";\nimport { drizzle } from "drizzle-orm";\n'
+                                                  'import { z } from "zod";\n')
+        put(self.project, f"{web}/src/hints.ts", 'import { f } from "@launchpad/utils";\nimport { g } from "@launchpad/utils/dates";\n')
+        pins = {"drizzle-orm": lock.Pin("0.41.5", "package-lock.json", "sha512-x"), "zod": "4.6.7"}
+        pins_in = lambda where: surface.pin_reader(str(self.project), where)  # noqa: E731 -- the real reader, over the real deno.lock
+        text = self.run_tool("ctx_brief", {"paths": [f"{api}/src/hints.ts", f"{web}/src/hints.ts"]}, pin=pins.get, pin_in=pins_in).text
+        libraries = text.split("== libraries\n")[1]
+        self.assertIn("  @oak/oak 17.2.0 — use api_signature(@oak/oak, <symbol>)", libraries)
+        self.assertIn("  drizzle-orm 0.41.5 — use api_signature(drizzle-orm, <symbol>)", libraries)
+        self.assertIn("  zod 4.6.7 —", libraries)
+        self.assertNotIn("Pin(", libraries)
+        for alias in ("@launchpad/types", "@launchpad/utils"):
+            self.assertRegex(libraries, rf"  {alias} \(a project alias[^)]*\)")
+        self.assertNotIn("not in the lockfile", libraries)
+
     def test_a_file_the_navigator_does_not_cover_still_gets_a_brief(self):
         (self.project / "bin").mkdir()
         (self.project / "bin" / "tool.py").write_text("print('hi')\n")
@@ -531,13 +557,27 @@ class Operations(SurfaceCase):
         self.assertIn("zod", imports.text)
         contracts = self.run_tool("ctx_relations", {"target": ORDERS, "direction": "contracts"})
         self.assertIn(ORDER, contracts.text)
-        self.assertIn(CART, contracts.text)
+        self.assertIn("consumers in api package apps/launchpad/api (0):", contracts.text)  # asked of the api root that imports it, and says so
+        self.assertNotIn(CART, contracts.text)  # a web file is not seen from the api root: the web file's own contracts show its consumers
         self.assertNotIn(f"{ORDERS}:2 -> {ORDER}\n", contracts.text.split(ORDER, 1)[1])  # the target itself is not its own consumer
+        web = self.run_tool("ctx_relations", {"target": CART, "direction": "contracts"}).text
+        self.assertIn("consumers in web package apps/launchpad/web (", web)
+        self.assertIn("apps/launchpad/web/src/p01.ts:1", web)
 
     def test_relations_groups_by_package_and_orders_edges_stably(self):
         text = self.run_tool("ctx_relations", {"target": ORDER, "direction": "importers"}).text
         self.assertLess(text.index("[web]"), text.index("[api]"))
         self.assertEqual(text, self.run_tool("ctx_relations", {"target": ORDER, "direction": "importers"}).text)
+
+    def test_importers_of_a_lib_file_name_the_packages_past_the_cap_they_did_not_ask(self):
+        """G1: a shared lib file is asked of each app package, up to a cap; the packages past it are named in left_out, not silently absent."""
+        for n in range(1, 14):
+            put(self.project, f"apps/extra/p{n:02d}/tsconfig.json", "{}")
+        answer = self.run_tool("ctx_relations", {"target": ORDER, "direction": "importers"})
+        notes = [item for item in answer.data["left_out"] if "not asked in" in item]
+        self.assertEqual(len(notes), 1, answer.data["left_out"])
+        self.assertIn("api package apps/launchpad/api", notes[0])  # web packages sort first, so the api package is among those not asked
+        self.assertEqual(len(re.findall(r"^nothing imports \S+ in \w+ package", answer.text, re.M)), 10, answer.text)
 
     def test_relations_takes_a_symbol_and_names_the_file_it_resolved_to(self):
         answer = self.run_tool("ctx_relations", {"target": "addToCart", "direction": "importers"})
@@ -2330,6 +2370,40 @@ class RealShapes(ReviewOne):
                         self.assertEqual(set(row) - fake_navs.OPTIONAL.get(case[0], set()), set(row_keys), row)
         for case, answer in (("web definition not_found", web.definition(CART, name="nope")), ("web references not_found", web.references(CART, name="nope"))):
             self.assertEqual(set(answer), set(fake_navs.SHAPES[("web", case.split()[1], None)][0]), case)
+
+    def test_a_captured_real_answer_has_the_keys_of_the_table_and_no_field_the_surface_cannot_place(self):
+        """G2/N6: answers captured from the real navigators (fake_navs.REAL) agree with the table of shapes, and every field of them is one the
+        surface classifies (a row list, an echo, a total, a timing, or a named loss): a new field of a real navigator, as web's `server_ms` once
+        was, fails here instead of turning every answer into "not all returned" in the field."""
+        self.assertEqual(set(fake_navs.REAL), set(fake_navs.SHAPES))
+        for case, answer in fake_navs.REAL.items():
+            keys, lists = fake_navs.SHAPES[case]
+            with self.subTest(case=case):
+                self.assertEqual(set(answer), set(keys))
+                for name, row_keys in lists.items():
+                    for row in answer[name]:
+                        self.assertEqual(set(row) - fake_navs.OPTIONAL.get(case[0], set()), set(row_keys), row)
+                self.assertEqual([k for k in answer if k not in surface.HARMLESS and k not in surface.LOSS], [])
+
+    def test_a_captured_real_web_answer_reads_whole_not_hedged_by_a_timing_field(self):
+        """G2: the real web navigator adds `server_ms` to every answer; with it the imports, importers, exports and symbol answers still read
+        "2 of 2" / "(2)" and none says "not all returned"."""
+        real = fake_navs.REAL
+        fake_navs.BEHAVIOUR[("web", "imports")] = lambda a: dict(real[("web", "imports", a["direction"])])
+        fake_navs.BEHAVIOUR[("web", "exports")] = dict(real[("web", "exports", None)])
+        fake_navs.BEHAVIOUR[("web", "definition")] = dict(real[("web", "definition", None)])
+        fake_navs.BEHAVIOUR[("web", "references")] = dict(real[("web", "references", None)])
+        for direction in ("imports", "importers"):
+            said = self.say("ctx_relations", {"target": CART, "direction": direction, "limit": 25})
+            self.assertIn("(2 of 2):", said)
+            self.assertNotIn("not all returned", said)
+        brief = self.say("ctx_brief", {"paths": [CART]})
+        for heading in ("exports (2):", "importers (2):", "imports (2):"):
+            self.assertIn(heading, brief)
+        symbol = self.say("ctx_symbol", {"name": "Cart", "path": CART})
+        for text in (brief, symbol):
+            self.assertNotIn("not all returned", text)
+            self.assertNotIn("does not know", text)
 
     def test_f1_a_real_web_imports_row_is_an_import_of_its_resolved_file(self):
         """F1: imports rows carry `resolved`, not `to`; every real row was withheld."""

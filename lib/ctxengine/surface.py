@@ -47,6 +47,7 @@ API_SYMBOLS = 100  # the most symbols CX3 lists for one file
 SYMBOL_PLACES = 20   # declarations of one name that are listed
 SYMBOL_FILES = 5     # files whose details ctx_symbol gives for one name
 SCAN_FILES = 20000
+PACKAGE_FILES = ("deno.json", "deno.jsonc", "tsconfig.json")  # what makes a directory a package (package_for)
 ANSWER_FILE_KEYS = ("target", "path")  # top-level fields that name the file an answer is about (CX2 imports, CX3 importers/imports/symbols)
 SCAN_BYTES = 1_000_000
 CANDIDATES_WHY = "candidate notes that matched; include_candidates=true shows them, marked"
@@ -262,6 +263,7 @@ HARMLESS = frozenset({
     "signature", "doc",                                          # text about the one symbol asked for
     "total",                                                     # compared with the rows handed over (`not_returned`)
     "index_age_s", "files_indexed", "scanned", "cache",          # how fresh the index is and how much it re-read
+    "server_ms",                                                 # the web navigator's own timing of the call (nav_web/server.mjs)
 })
 LOSS = {  # field -> (kind, what it counted); kind is withheld, unread or cut
     "withheld": ("withheld", PATH_WHY), "omitted_outside_root": ("withheld", PATH_WHY), "refused": ("withheld", PATH_WHY),
@@ -669,13 +671,27 @@ class Navigators:
 
 # -------------------------------------------------------------------------------------------------------------- the engine
 
-def pin_reader(project):
-    """A `pin(name)` callable from L5's lockfile reader when that module is present, else None (versions are then unchecked)."""
+def _json_lines(text):
+    """`text` of a tsconfig.json (JSON with comments) without whole-line // comments, which is all the configs read here use."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+
+
+def pin_reader(project, where=""):
+    """A `pin(name)` callable from L5's lockfile reader when that module is present, else None (versions are then unchecked). It reads the
+    lockfiles in the project directory `where` (the project itself by default) and finds a package as an npm one, else as a jsr one (deno.lock)."""
     try:
         from localdocs import lock  # noqa: PLC0415
     except ImportError:
         return None
-    return lambda name: lock.pin(project, name)
+    directory = os.path.join(project, where) if where else project
+
+    def pin(name):
+        found = lock.pin(directory, name)
+        if found:
+            return found
+        jsr = lock.pin(directory, name, scheme="jsr")
+        return jsr if jsr or jsr.candidates else found
+    return pin
 
 
 class NoteWriter:
@@ -743,14 +759,16 @@ class NoteWriter:
 
 
 class Engine(NoteWriter):
-    def __init__(self, layout, navigators=None, pin=None, env=None):
+    def __init__(self, layout, navigators=None, pin=None, env=None, pin_in=None):
         self.layout = layout
+        self.pin_in = pin_in  # pin_in(directory) -> a pin(name) for the lockfiles in that project directory, or None
         self.project = Path(os.path.realpath(str(layout.project)))
         self.navs = navigators or Navigators(layout)
         self.pin = pin
         self.env = os.environ if env is None else env
         self.today = store.today(self.env)
         self._tree = None
+        self._cache = {}
 
     def close(self):
         self.navs.close()
@@ -791,13 +809,59 @@ class Engine(NoteWriter):
                 return None
             here = posixpath.dirname(here)
 
-    def pinned(self, name):
+    def app_packages(self):
+        """[(kind, directory)] of the packages outside lib/ (an app's deno.json or tsconfig.json), in path order: the roots whose navigators
+        can see the files that import a shared lib file."""
+        found = []
+        for rel in sorted(self.tree.files):
+            name = posixpath.basename(rel)
+            here = posixpath.dirname(rel)
+            if name not in PACKAGE_FILES or not here or label_for(rel) == "lib":
+                continue
+            package = self.package_for(posixpath.join(here, "_"))
+            if package and package not in found:
+                found.append(package)
+        return found
+
+    def alias_of(self, name, where):
+        """True when the bare specifier root `name` is a project alias in the config of package directory `where`: a key of the `imports`
+        of its deno.json or of the `paths` of its tsconfig.json (`@scope/pkg`, `@scope/pkg/`, `@scope/pkg/*`, or something under it) whose
+        target is a relative path. Such a name is code in this project, not a library the lockfile can pin."""
+        key = (where, "aliases")
+        if key not in self._cache:
+            found = set()
+            for config, section in (("deno.json", "imports"), ("deno.jsonc", "imports"), ("tsconfig.json", "paths")):
+                text = self.read(posixpath.join(where, config), SCAN_BYTES)
+                try:
+                    data = json.loads(_json_lines(text)) if text else {}
+                except ValueError:
+                    continue
+                table = data.get("compilerOptions", {}).get(section) if section == "paths" else data.get(section)
+                for alias, target in (table.items() if isinstance(table, dict) else ()):
+                    first = target[0] if isinstance(target, list) and target else target
+                    if isinstance(first, str) and first.startswith("."):
+                        found.add(alias.removesuffix("*").rstrip("/"))
+            self._cache[key] = found
+        return any(alias == name or alias.startswith(name + "/") for alias in self._cache[key])
+
+    def pinned(self, name, where=""):
+        """(version, why) of library `name`: the version text the lockfile pins, else None and why not (None when no reader). The lockfile
+        in the package directory `where` is read first (an app's deno.lock), then the project's; `pin(name)` may give a version text or
+        a localdocs Pin (its `reason` is the why)."""
         if self.pin is None:
-            return None
-        try:
-            return self.pin(name)
-        except Exception:
-            return None
+            return None, "no lockfile reader"
+        readers = [self.pin_in(where)] if where and self.pin_in else []
+        why = "not in the lockfile"
+        for read in readers + [self.pin]:
+            try:
+                found = read(name)
+            except Exception:
+                continue
+            version = getattr(found, "version", found)
+            if isinstance(version, str) and version:
+                return version, ""
+            why = getattr(found, "reason", "") or why
+        return None, why
 
     def finish(self, status, lines, left_out=(), notes=(), age=None, data=None, reason=None, undo=None):
         text, left = fit([redact.guard(line) for line in lines], left_out)
@@ -820,9 +884,10 @@ class Engine(NoteWriter):
 
     # ---------------------------------------------------------------------------------------------------- navigation
 
-    def _ask(self, rel, wanted):
-        """(navigator kind, navigator, None) for the file `rel`, or (None, None, Got) when no navigator can serve it."""
-        package = self.package_for(rel)
+    def _ask(self, rel, wanted, package=None):
+        """(navigator kind, navigator, None) for the file `rel`, or (None, None, Got) when no navigator can serve it. `package` is a
+        (kind, directory) to ask instead of the one that covers `rel` (a shared lib file is asked of the apps that import it)."""
+        package = package or self.package_for(rel)
         if package is None:
             return None, None, Got(False, "no_project", f"no package covers this path ({rel}): no deno.json or tsconfig.json above it\n"
                                    f"Next: {NEXT_DEFAULT['no_project']}")
@@ -927,9 +992,9 @@ class Engine(NoteWriter):
         return Got(rows=kept, total=_int(raw.get("total", handed)) if total is None else max(total, 0), seen=handed + withheld - twice,
                    screened=screened - twice, unreadable=unreadable, raw=raw, **more)
 
-    def importers(self, rel, limit=10):
-        """Got whose rows are (importing file, line, rel)."""
-        kind, made, failure = self._ask(rel, "importers")
+    def importers(self, rel, limit=10, package=None):
+        """Got whose rows are (importing file, line, rel). `package` as for _ask."""
+        kind, made, failure = self._ask(rel, "importers", package)
         if failure:
             return failure
         if kind == "web":
@@ -1304,7 +1369,8 @@ def main(argv):
         layout = store.Layout(project)
         if args.tool == "ctx_schema":
             return calls.Answer("ok", json.dumps(schema(), sort_keys=True), data={"truncated": False, "left_out": []})
-        engine = Engine(layout, Navigators(layout, modules_from_env(os.environ)), pin_reader(project), os.environ)
+        engine = Engine(layout, Navigators(layout, modules_from_env(os.environ)), pin_reader(project), os.environ,
+                        pin_in=lambda where: pin_reader(project, where))
         try:
             return engine.run(args.tool, parsed)
         finally:

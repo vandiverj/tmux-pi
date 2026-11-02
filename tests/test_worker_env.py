@@ -1,6 +1,10 @@
 """tp-spawn --worker-env (trial lane L3, design §3/§10): allowlisted KEY=VAL pairs are exported by run.sh, nothing else is; a spawn
 without the option writes the same run.sh as before; --other-lane-paths works without --lane; --state-dir/--parent reach the
-preamble of a task with a parent. Real tp-spawn, fake tmux, no model."""
+preamble of a task with a parent. Real tp-spawn, fake tmux, no model.
+
+Every successful spawn is slow, so the tests that only read what a spawn wrote share it: SharedSpawnTests makes its spawns once in
+setUpClass. Tests that need a fresh state dir (refusals leave no task) or different tree/manifest state make their own."""
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -12,19 +16,19 @@ ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = ROOT / "tests" / "fixtures" / "trial_shadow" / "run.sh.golden"
 
 
-class WorkerEnvCase(unittest.TestCase):
-    def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.base = Path(temp.name).resolve()
-        self.state = self.base / ".tmux-pi"
-        (self.state / "tasks").mkdir(parents=True)
-        self.project = self.base / "project"
-        self.project.mkdir()
-        fake = self.base / "fake-bin"
-        fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('''#!/bin/sh
+def build_fixture(target, cleanup):
+    """State dir, project, fake tmux and spawner env on `target` (a test case or a test class)."""
+    temp = tempfile.TemporaryDirectory()
+    cleanup(temp.cleanup)
+    target.base = Path(temp.name).resolve()
+    target.state = target.base / ".tmux-pi"
+    (target.state / "tasks").mkdir(parents=True)
+    target.project = target.base / "project"
+    target.project.mkdir()
+    fake = target.base / "fake-bin"
+    fake.mkdir()
+    tmux = fake / "tmux"
+    tmux.write_text('''#!/bin/sh
 case "$1" in
  has-session) exit 0 ;;
  show-options)
@@ -36,15 +40,17 @@ case "$1" in
  new-window) printf '%%fake\\n' ;;
 esac
 ''')
-        tmux.chmod(0o755)
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_MAIN_PANE": "%main",
-                    "TP_MAIN_CWD": str(self.project), "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
-        for key in ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_CTX_TOOLS"):
-            self.env.pop(key, None)
+    tmux.chmod(0o755)
+    target.env = {**os.environ, "TP_STATE_DIR": str(target.state), "TP_SESSION": "fixture", "TP_MAIN_PANE": "%main",
+                  "TP_MAIN_CWD": str(target.project), "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+    for key in ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_CTX_TOOLS"):
+        target.env.pop(key, None)
 
-    def spawn(self, *args, task="env-1", worker="claude"):
+
+class SpawnMixin:
+    def spawn(self, *args, task="env-1", worker="claude", env=None):
         return subprocess.run([str(ROOT / "bin" / "tp-spawn"), "--worker", worker, "--task-id", task, *args, "Do a thing"],
-                              env=self.env, text=True, capture_output=True, timeout=60)
+                              env=env or self.env, text=True, capture_output=True, timeout=60)
 
     def task(self, task="env-1"):
         return self.state / "tasks" / task
@@ -53,16 +59,108 @@ esac
         return (self.task(task) / "run.sh").read_text()
 
 
-class WorkerEnvTests(WorkerEnvCase):
+class WorkerEnvCase(SpawnMixin, unittest.TestCase):
+    def setUp(self):
+        build_fixture(self, self.addCleanup)
+
+
+class SharedSpawnTests(SpawnMixin, unittest.TestCase):
+    """Spawns made once; each test reads the run.sh / packet of the spawn whose settings it is about."""
+    SECTION = "## Paths other lanes own"
+    LANE_BODY = "- lane beta (lane/beta) owns \"lib/x.py\"\nDo not edit these paths."
+    CTX = (("1", True), ("0", False), ("true", False), ("", False))
+
+    @classmethod
+    def setUpClass(cls):
+        build_fixture(cls, cls.addClassCleanup)
+        cls.nasty = "a b'c\"d $(touch {m}) `touch {m}` ; touch {m} \\ *".format(m=cls.base / "ran")
+        jobs = {
+            "listed": (("--worker-env", "TP_TRIAL_ID=sh-a-1", "--worker-env", "TP_DOCS_TOOLS=1"), None),
+            "nasty": (("--worker-env", "TP_DOCS_TOOLS=" + cls.nasty), None),
+            "equals": (("--worker-env", "TP_TRIAL_ID=a=b", "--worker-env", "TP_DOCS_TOOLS="), None),
+            "gold-1": ((), None),
+            "lane": (("--other-lane-paths", cls.LANE_BODY), None),
+        }
+        for value, _ in cls.CTX:
+            jobs["ctx-" + (value or "empty")] = ((), {**cls.env, "TP_CTX_TOOLS": value})
+        # independent processes with distinct task ids: start them together, wait for all
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {task: pool.submit(cls.spawn_in, cls, *args, task=task, env=env) for task, (args, env) in jobs.items()}
+            cls.runs = {task: future.result() for task, future in futures.items()}
+
+    @staticmethod
+    def spawn_in(cls, *args, task, env=None):
+        return SpawnMixin.spawn(cls, *args, task=task, env=env)
+
     def test_a_listed_key_is_exported_by_run_sh_and_the_task_still_starts(self):
-        run = self.spawn("--worker-env", "TP_TRIAL_ID=sh-a-1", "--worker-env", "TP_DOCS_TOOLS=1")
+        run = self.runs["listed"]
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout.strip(), "env-1")
-        text = self.run_sh()
+        self.assertEqual(run.stdout.strip(), "listed")
+        text = self.run_sh("listed")
         self.assertIn("export TP_TRIAL_ID=sh-a-1\n", text)
         self.assertIn("export TP_DOCS_TOOLS=1\n", text)
         self.assertLess(text.index("export TP_TASK_ID"), text.index("export TP_TRIAL_ID"))
         self.assertLess(text.index("export TP_TRIAL_ID"), text.index("tp-claude"))  # set before the worker starts
+
+    def test_values_are_quoted_so_the_shell_reads_them_back_as_text_and_runs_nothing(self):
+        run = self.runs["nasty"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        line = next(l for l in self.run_sh("nasty").splitlines() if l.startswith("export TP_DOCS_TOOLS"))
+        read = subprocess.run(["bash", "-c", line + '\nprintf %s "$TP_DOCS_TOOLS"'], text=True, capture_output=True, timeout=20)
+        self.assertEqual(read.stdout, self.nasty)
+        self.assertFalse((self.base / "ran").exists(), "quoting must not run the value")
+
+    def test_the_value_may_be_empty_or_contain_equals(self):
+        run = self.runs["equals"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        text = self.run_sh("equals")
+        self.assertIn("export TP_TRIAL_ID=a=b\n", text)
+        self.assertIn("export TP_DOCS_TOOLS=''\n", text)
+
+    def test_without_the_option_run_sh_is_what_it_was(self):
+        """Golden (design §10 item 4): the run.sh of a spawn without --worker-env, paths normalised, equals the one written before
+        this option existed."""
+        run = self.runs["gold-1"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        text = self.run_sh("gold-1")
+        for value, name in ((str(self.task("gold-1")), "@TASK_DIR@"), (str(self.state), "@STATE@"), (str(self.project), "@WORKDIR@"), (str(ROOT), "@ROOT@")):
+            text = text.replace(value, name)
+        self.assertEqual(text, GOLDEN.read_text())
+        self.assertNotIn("TP_TRIAL_ID", text)
+        self.assertNotIn("TP_DOCS_TOOLS", text)
+
+    def test_ctx_tools_follow_the_spawner(self):
+        """ctx-enable: main with TP_CTX_TOOLS=1 gives the worker `export TP_CTX_TOOLS=1` before it starts; any other value in main
+        gives `unset TP_CTX_TOOLS`, and the effective value follows the spawner even if the worker window inherits a stale 1."""
+        for value, exported in self.CTX:
+            with self.subTest(value=value):
+                task = "ctx-" + (value or "empty")
+                run = self.runs[task]
+                self.assertEqual(run.returncode, 0, run.stderr)
+                text = self.run_sh(task)
+                self.assertEqual("export TP_CTX_TOOLS=1\n" in text, exported)
+                self.assertEqual("unset TP_CTX_TOOLS\n" in text, not exported)
+                lines = [l for l in text.splitlines() if "TP_CTX_TOOLS" in l]
+                read = subprocess.run(["bash", "-c", "\n".join(lines) + '\nprintf %s "${TP_CTX_TOOLS-unset}"'], text=True,
+                                      capture_output=True, timeout=20, env={**os.environ, "TP_CTX_TOOLS": "1"})
+                self.assertEqual(read.stdout, "1" if exported else "unset")
+                if exported:
+                    self.assertLess(text.index("export TP_CTX_TOOLS=1"), text.index("tp-claude"))
+
+    def test_a_spawn_without_a_lane_passes_the_section_to_the_packet(self):
+        run = self.runs["lane"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        packet = (self.task("lane") / "packet.md").read_text()
+        self.assertIn(self.SECTION, packet)
+        self.assertIn("lib/x.py", packet.split(self.SECTION, 1)[1])
+
+    def test_no_section_without_the_option(self):
+        self.assertEqual(self.runs["gold-1"].returncode, 0)
+        self.assertNotIn(self.SECTION, (self.task("gold-1") / "packet.md").read_text())
+
+
+class WorkerEnvRefusalTests(WorkerEnvCase):
+    """Refusals exit before anything is created; each test starts from an empty state dir."""
 
     def test_an_unlisted_key_is_refused_and_nothing_is_created(self):
         for key in ("PATH", "LD_PRELOAD", "TP_STATE_DIR", "TP_TASK_ID", "tp_trial_id", "TP_TRIAL_ID_X", ""):
@@ -83,74 +181,11 @@ class WorkerEnvTests(WorkerEnvCase):
                 self.assertNotEqual(run.returncode, 0)
                 self.assertFalse(list((self.state / "tasks").iterdir()))
 
-    def test_values_are_quoted_so_the_shell_reads_them_back_as_text_and_runs_nothing(self):
-        marker = self.base / "ran"
-        nasty = "a b'c\"d $(touch {m}) `touch {m}` ; touch {m} \\ *".format(m=marker)
-        run = self.spawn("--worker-env", "TP_DOCS_TOOLS=" + nasty)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        line = next(l for l in self.run_sh().splitlines() if l.startswith("export TP_DOCS_TOOLS"))
-        read = subprocess.run(["bash", "-c", line + '\nprintf %s "$TP_DOCS_TOOLS"'], text=True, capture_output=True, timeout=20)
-        self.assertEqual(read.stdout, nasty)
-        self.assertFalse(marker.exists(), "quoting must not run the value")
-
-    def test_the_value_may_be_empty_or_contain_equals(self):
-        run = self.spawn("--worker-env", "TP_TRIAL_ID=a=b", "--worker-env", "TP_DOCS_TOOLS=")
-        self.assertEqual(run.returncode, 0, run.stderr)
-        text = self.run_sh()
-        self.assertIn("export TP_TRIAL_ID=a=b\n", text)
-        self.assertIn("export TP_DOCS_TOOLS=''\n", text)
-
-    def test_without_the_option_run_sh_is_what_it_was(self):
-        """Golden (design §10 item 4): the run.sh of a spawn without --worker-env, paths normalised, equals the one written before
-        this option existed."""
-        run = self.spawn(task="gold-1")
-        self.assertEqual(run.returncode, 0, run.stderr)
-        task = self.task("gold-1")
-        text = self.run_sh("gold-1")
-        for value, name in ((str(task), "@TASK_DIR@"), (str(self.state), "@STATE@"), (str(self.project), "@WORKDIR@"), (str(ROOT), "@ROOT@")):
-            text = text.replace(value, name)
-        self.assertEqual(text, GOLDEN.read_text())
-        self.assertNotIn("TP_TRIAL_ID", text)
-        self.assertNotIn("TP_DOCS_TOOLS", text)
-
-    def test_ctx_tools_follow_the_spawner_and_cannot_be_set_by_the_option(self):
-        """ctx-enable: main with TP_CTX_TOOLS=1 gives the worker `export TP_CTX_TOOLS=1` before it starts; any other value in main
-        gives nothing; --worker-env still refuses the key, so the spawner's environment is the only way to turn it on."""
-        for value, exported in (("1", True), ("0", False), ("true", False), ("", False)):
-            with self.subTest(value=value):
-                task = "ctx-" + (value or "empty")
-                self.env["TP_CTX_TOOLS"] = value
-                run = self.spawn(task=task)
-                self.assertEqual(run.returncode, 0, run.stderr)
-                text = self.run_sh(task)
-                self.assertEqual("export TP_CTX_TOOLS=1\n" in text, exported)
-                self.assertEqual("unset TP_CTX_TOOLS\n" in text, not exported)
-                # the worker window may inherit a stale TP_CTX_TOOLS=1 from the session: run.sh's effective value must follow the spawner
-                lines = [l for l in text.splitlines() if "TP_CTX_TOOLS" in l]
-                read = subprocess.run(["bash", "-c", "\n".join(lines) + '\nprintf %s "${TP_CTX_TOOLS-unset}"'], text=True,
-                                      capture_output=True, timeout=20, env={**os.environ, "TP_CTX_TOOLS": "1"})
-                self.assertEqual(read.stdout, "1" if exported else "unset")
-                if exported:
-                    self.assertLess(text.index("export TP_CTX_TOOLS=1"), text.index("tp-claude"))
+    def test_the_option_cannot_set_the_ctx_switch(self):
+        """--worker-env refuses TP_CTX_TOOLS, so the spawner's environment is the only way to turn the ctx tools on."""
         run = self.spawn("--worker-env", "TP_CTX_TOOLS=1", task="ctx-opt")
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("not allowed", run.stderr)
-
-
-class OtherLanePathsWithoutLaneTests(WorkerEnvCase):
-    SECTION = "## Paths other lanes own"
-
-    def test_a_spawn_without_a_lane_passes_the_section_to_the_packet(self):
-        body = "- lane beta (lane/beta) owns \"lib/x.py\"\nDo not edit these paths."
-        run = self.spawn("--other-lane-paths", body)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        packet = (self.task() / "packet.md").read_text()
-        self.assertIn(self.SECTION, packet)
-        self.assertIn("lib/x.py", packet.split(self.SECTION, 1)[1])
-
-    def test_no_section_without_the_option(self):
-        self.assertEqual(self.spawn().returncode, 0)
-        self.assertNotIn(self.SECTION, (self.task() / "packet.md").read_text())
 
 
 class PreambleArgsTests(WorkerEnvCase):
@@ -158,20 +193,24 @@ class PreambleArgsTests(WorkerEnvCase):
     prior task's result and review report (L3 integration item 1). preamble.py on this tree takes both options, so there is no
     check of its text before passing them."""
 
-    def copy_tree(self, copy):
-        copy.mkdir()
+    @classmethod
+    def setUpClass(cls):
+        """One copy of the tree whose preamble.py only records its argv (its source says nothing about any option); the argv goes
+        to the file named by PREAMBLE_PROBE in the spawner env."""
+        temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        cls.copy = Path(temp.name).resolve() / "tree"
+        cls.copy.mkdir()
         for name in ("agent", "bin", "catalog", "claude", "config", "lib", "skills", "templates"):
             if (ROOT / name).exists():
-                subprocess.run(["cp", "-R", str(ROOT / name), str(copy / name)], check=True, capture_output=True)
+                subprocess.run(["cp", "-R", str(ROOT / name), str(cls.copy / name)], check=True, capture_output=True)
+        (cls.copy / "lib" / "preamble.py").write_text(
+            "import os, sys\nopen(os.environ['PREAMBLE_PROBE'], 'w').write(' '.join(sys.argv[1:]))\nprint('PREAMBLE')\n")
 
     def spawn_probed(self, task, *args):
-        """A copy of the tree whose preamble.py only records its argv (its source says nothing about any option)."""
         probe = self.base / ("preamble-args-" + task)
-        copy = self.base / ("tree-" + task)
-        self.copy_tree(copy)
-        (copy / "lib" / "preamble.py").write_text("import sys\nopen({!r}, 'w').write(' '.join(sys.argv[1:]))\nprint('PREAMBLE')\n".format(str(probe)))
-        run = subprocess.run([str(copy / "bin" / "tp-spawn"), "--worker", "claude", "--task-id", task, *args, "Do"],
-                             env=self.env, text=True, capture_output=True, timeout=60)
+        run = subprocess.run([str(self.copy / "bin" / "tp-spawn"), "--worker", "claude", "--task-id", task, *args, "Do"],
+                             env={**self.env, "PREAMBLE_PROBE": str(probe)}, text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         return probe.read_text()
 

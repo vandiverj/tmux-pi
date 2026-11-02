@@ -1904,6 +1904,7 @@ class ImportIndex:
         if self.root is None:
             return found
         config_dir = os.path.dirname(self.config)
+        base, allowed, lstat, skip_dirs, extensions = self.base, self._allowed, os.lstat, SKIP_DIRS, SOURCE_EXTENSIONS
         stack = [self.root]
         while stack:
             here = stack.pop()
@@ -1920,28 +1921,35 @@ class ImportIndex:
                 with os.scandir(fd) as listing:
                     entries = sorted(listing, key=lambda entry: entry.name)  # kept as entries: nothing is asked of any of them yet
                 subdirs = []
-                for entry in entries:
+                # A listed name holds no separator and is never `.` or `..`, so the path of an entry is its folder's path and the name:
+                # the folder's paths are made once (`lexical_path`, `relpath`) instead of one normpath and relpath per entry.
+                here_rel = "" if here == base else lexical_path(base, here)  # None: `here` is outside `base`, so no entry is judged
+                here_config = os.path.relpath(here, config_dir).replace(os.sep, "/") if patterns else None
+                for entry in entries if here_rel is not None else ():
                     name = entry.name
-                    full = os.path.join(here, name)
-                    rel = lexical_path(self.base, full)
-                    if rel is None or name in SKIP_DIRS or not self._allowed(rel):
+                    rel = f"{here_rel}/{name}" if here_rel else name
+                    if name in skip_dirs or not allowed(rel):
                         continue  # judged by its name: nothing is asked of it
                     try:
                         listed = _entry_kind(entry)  # the type the listing gave (its cached `d_type`; when none, a look taken now)
-                        info = os.lstat(name, dir_fd=fd)  # the type now, no link followed
+                        info = lstat(name, dir_fd=fd)  # the type now, no link followed
                     except OSError as error:
                         self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
                         continue
                     if listed != _mode_kind(info.st_mode):
                         self._gap("entry_changed")  # replaced by another kind of entry (file, folder, link) since the listing
                         continue
-                    if not name.endswith(SOURCE_EXTENSIONS) and not stat.S_ISDIR(info.st_mode):
+                    mode = info.st_mode
+                    is_dir = stat.S_ISDIR(mode)
+                    if not is_dir and not name.endswith(extensions):
                         continue  # allowed and still there, but can never be read as a source nor descended into
-                    config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
-                    if stat.S_ISDIR(info.st_mode):
-                        if not _excluded(config_rel, patterns):
-                            subdirs.append(full)
-                    elif stat.S_ISREG(info.st_mode) and name.endswith(SOURCE_EXTENSIONS) and not _excluded(config_rel, patterns):
+                    if patterns:
+                        config_rel = name if here_config == "." else f"{here_config}/{name}"
+                        if _excluded(config_rel, patterns):
+                            continue
+                    if is_dir:
+                        subdirs.append(os.path.join(here, name))
+                    elif stat.S_ISREG(mode):
                         found[rel] = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns, info.st_dev)
                     # anything else (a link, a FIFO, a socket, a device) is neither indexed nor followed
                 stack.extend(reversed(subdirs))

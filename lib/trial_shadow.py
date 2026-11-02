@@ -4,7 +4,8 @@ session, review its diff and write a record. The real lane, step, branch and Mai
     prepare(...)   validate, check the guard, create the run (run.json) and its session; nothing is started yet
     launch(...)    start `bin/tp-trial run <run>` detached, so the caller is never blocked
     execute(...)   the run itself (what `tp-trial run` calls): worktree at base_commit, shared deps, tp-spawn, wait, HEAD to the base,
-                   review, record, cleanup, bounded by trial.attempt_timeout_s
+                   review, cleanup, records, bounded by trial.attempt_timeout_s; the outcome is decided at the end by
+                   one rule read from evidence (`Run.execute`), and only `completed` exits 0
     cleanup(...)   idempotent: end running trial tasks, drop the worktree and the shadow refs, end the session
     stop(...)      end a run early
 
@@ -13,7 +14,7 @@ Everything a run writes is under <project>/.tmux-pi/trial/<run>/ (run.json, requ
 (`read_source`, and `record_normal` for the normal arm's record) and the local-slot count of the guard.
 
 What the run does to git: `git worktree add --detach` at the source task's base_commit (nothing under refs/heads), a temporary
-ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable until the record is written, and removal of both at
+ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable until the cleanup, and removal of both at
 the end, on success and on failure. The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
 the tree on a branch (`git checkout -b`, a rename, a branch someone else made meanwhile), the collect step detaches HEAD (so moving
 it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json (every
@@ -128,7 +129,8 @@ def workdir_text(worktree, project):
 
 
 TERMINAL_OUTCOMES = ("completed", "timeout", "worker_failed", "paused", "stopped", "spawn_failed", "error", "record_failed", "no_review",
-                     "review_timeout")
+                     "review_timeout", "cleanup_failed")
+REVIEW_VERDICTS = ("approved", "request_changes", "inconclusive")  # a first review's outcome that is a verdict (lib/trial_record.py OUTCOMES)
 
 
 class ShadowError(Exception):
@@ -164,6 +166,37 @@ def append_record(records, project, record):
         if not stat.S_ISREG(mode):
             raise ShadowError("{} is not a plain file; the record was not written".format(directory / name))
     records.append(project, record)
+
+
+def record_rows(records, project, run, arm):
+    """(count, None): how many rows of `arm` for run `run` records.jsonl has now, or (None, why it cannot be read). The completed
+    rule reads the record back from here rather than trusting the append. The file is opened without waiting and never through a link,
+    and must be a regular file (a FIFO there never holds the runner); it is read line by line, so a file of any size is counted. A
+    line that is not a JSON object (a torn last line) is not a row."""
+    path = records.trial_dir(project) / records.RECORDS
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return 0, None
+    except OSError as error:
+        return None, "{} cannot be opened as a plain file ({})".format(path, error.strerror)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "{} is not a plain file".format(path)
+        count = 0
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(row, dict) and row.get("run") == run and row.get("arm") == arm:
+                    count += 1
+        return count, None
+    except OSError as error:
+        return None, "{} cannot be read ({})".format(path, error.strerror)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------------------------------------------- run.json
@@ -591,8 +624,12 @@ class Run:
         self.started_at = clock() - self.prepared_ago()
         self.records = record_module or load_record_module()
         self.outcome = None
+        self.settled = False  # `settle` has decided the outcome from the end evidence: until then `completed` is a claim, not a result
+        self.worker_ended = False
         self.recorded = False
         self.record_problem = None
+        self.cleanup_problem = None
+        self.normal_problem = None
         self.heads_before = set()
         self.heads_taken = False
         self.branches_listed = False
@@ -747,6 +784,7 @@ class Run:
         run = self.agent("end-author" if outcome == "settled" else "stop", self.task_id)
         if run.returncode:
             raise ShadowError("the worker could not be ended: {}".format(run.stderr.strip() or "tp-agent exited {}".format(run.returncode)))
+        self.worker_ended = True  # what `settle` reads: the end command ran and said so
 
     def collect_work(self):
         """Read the commit messages, then move HEAD to the base (what a soft reset does) so a review sees the work as an uncommitted change (a non-lane
@@ -864,7 +902,8 @@ class Run:
         return self.review_id
 
     def reviewed_outcome(self):
-        """Review the work and say how the run ended: `completed` when the reviewer ran to its verdict, `no_review` when no review could be
+        """Review the work and say how the steps ended: `completed` when the reviewer settled (still only a claim: the completed rule
+        at the end of `execute` reads the verdict from the record and checks the rest), `no_review` when no review could be
         started or the reviewer failed, stopped or paused, `review_timeout` when it did not finish in time. The last two have no first
         review in the record, which L2's report counts as no review; the attempt is recorded either way."""
         if self.review() is None:
@@ -886,47 +925,148 @@ class Run:
         record["error"] = self.info.get("error")
         return record
 
-    def write_record(self):
-        """Append the run's qwen record. `recorded` is set by an append that succeeded and by nothing else, so a record that could not be
-        written is tried again by whoever calls this next (the end of `execute`), and is never reported as written."""
-        if self.recorded:
-            return
+    def qwen_record(self):
+        """The run's Qwen record, built and not yet written, or None when there is no task to build it from (and the run is not a
+        spawn failure, which is recorded with L2's `no_task`). Raises when the builder cannot make it."""
         has_task = (self.task_path() / "meta.json").is_file()
         if not has_task and self.outcome != "spawn_failed":
-            return
-        self.note(phase="record")
+            return None
         if not has_task:
             record = self.spawn_failed_record()
-            record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
+            record.update({"run": self.run, "source_task": self.info["source_task"], "workdir": str(self.worktree),
                            "normal_reviewer_model": self.info.get("normal_reviewer_model"), "reviewer_mismatch": None})
-            append_record(self.records, self.project, record)
-            self.recorded = True
-            self.note(recorded=now())
-            return
+            return record
         record = self.records.build(self.task_path(), "qwen", "shadow", self.info["pair_id"], state_dir=self.state, role=self.source_role(),
                                     diff_files=self.diff[0], diff_lines=self.diff[1], commit_messages=self.commit_messages)
         normal = self.info.get("normal_reviewer_model")
         mine = self.reviewer_model()
-        record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
-                       "normal_reviewer_model": normal,
+        record.update({"run": self.run, "source_task": self.info["source_task"], "workdir": str(self.worktree), "normal_reviewer_model": normal,
                        "reviewer_mismatch": None if not (normal and mine) else normal != mine})
-        append_record(self.records, self.project, record)
-        self.recorded = True  # not before: a failed append must leave this run able to try once more
-        self.note(recorded=now())
+        return record
 
-    def try_record(self):
-        """`write_record` as a step of the run: a failure does not end the run, it is kept (`record_problem`, and `record_error` in run.json)
-        for the retry at the end of `execute`. Returns whether the record is written. An interrupt passes through."""
+    def rows(self, arm):
+        """(count, None) of the rows of `arm` for this run in records.jsonl, read back now, or (None, why they cannot be counted)."""
+        return record_rows(self.records, self.project, self.run, arm)
+
+    def collected(self):
+        """Why the work is not shown collected from the proven tree, or None: `final.patch` is in the run directory (written by
+        `collect_work` through the held directory, after every git command of the collect ran in the tree proven to be this run's)."""
         try:
-            self.write_record()
-        except Exception as problem:
-            self.record_problem = "{}: {}".format(problem.__class__.__name__, problem)
-            self.note_end(record_error=self.record_problem)
-            return False
-        if self.record_problem:  # written by the retry: the first failure is kept under another name, so run.json does not claim a missing record
-            self.note_end(record_error=None, record_retried=self.record_problem)
-        self.record_problem = None
-        return True
+            if self.diff[0] is not None and _exists_in(self.owner.need("rdir"), "final.patch"):
+                return None
+        except (ShadowError, OSError):
+            pass
+        return "the work was not collected: final.patch is not in the run directory"
+
+    def cleanup_unmet(self):
+        """Why the cleanup is not shown to have ended the run's session and removed its worktree, read from what is there now, or None."""
+        try:
+            if self.owner.session_alive(self.env):
+                return "the cleanup did not end the session {}: it is still there".format(self.owner.session)
+        except (ShadowError, trial_session.SessionError) as problem:
+            return "the session {} cannot be shown to be gone: {}".format(self.owner.session, problem)
+        for path in {(self.owner.record or {}).get("path"), str(self.worktree)} - {None}:
+            if os.path.lexists(path):
+                return "the cleanup did not remove the worktree {}: it is still there".format(path)
+        return None
+
+    def write_normal(self):
+        """Write the normal arm's record (`record_normal`, best effort as before) and say whether its row is as the completed rule allows:
+        None when its row is in records.jsonl, or when it is absent for a reason this names in run.json, which are the allowed absences:
+        `normal_record_error` (it could not be built or appended; `tp-trial normal` redoes it) and `normal_record_absent` (the source
+        task is gone, so there is no normal arm to record). Otherwise (an append that returned and left no row) why not."""
+        try:
+            record = record_normal(self.rdir, self.env, self.records, self.owner, info=self.info)
+        except Exception as problem:  # the normal arm's record is best effort: a later `tp-trial normal` redoes it
+            self.note_end(normal_record_error="{}: {}".format(problem.__class__.__name__, problem))
+            return None
+        if record is None:
+            self.note_end(normal_record_absent="the source task {} is gone; there is no normal arm to record".format(self.info["source_task"]))
+            return None
+        count, why = self.rows("normal")
+        if count:
+            return None
+        return "the normal arm's record was appended but records.jsonl has no normal row of this run ({})".format(why or "0 rows")
+
+    def settle(self, record, missing=None):
+        """The outcome by the completed rule (see `execute`): the outcome the steps gave when it is not `completed`, else the first condition
+        that does not hold, from the evidence there is now. `record` is the Qwen record about to be written (None when none could be
+        built, `missing` says why); the Qwen row itself is checked after the append (`write_record`)."""
+        if self.outcome != "completed":
+            return self.outcome, None
+        if not self.worker_ended:
+            return "error", "the worker was not shown ended: its end command did not run to success"
+        why = self.collected()
+        if why:
+            return "error", why
+        if record is None:
+            return "record_failed", missing or "no Qwen record could be built"
+        if record.get("first_review_outcome") not in REVIEW_VERDICTS:
+            return "no_review", "the reviewer settled without a verdict the record can read"
+        if self.normal_problem:
+            return "record_failed", self.normal_problem
+        if self.cleanup_problem:
+            return "cleanup_failed", self.cleanup_problem
+        return "completed", None
+
+    def write_record(self):
+        """Settle the outcome (`settle`), then append the run's Qwen record with that outcome and read it back: exactly one row of this
+        run must be in records.jsonl afterwards. A record that could not be built or appended is tried once more, and an append is
+        repeated only when the readback found no row (one that raised after writing is not written twice). When the row is not there
+        exactly once, a run the rule had `completed` or `cleanup_failed` is `record_failed` (the Qwen row comes before the cleanup in
+        the rule); any other outcome is kept. `record_error` says what failed; `recorded` is noted only after the readback found the
+        row. A run with no task that does not need one (it stopped before its task existed) has no row, as before."""
+        if self.recorded:
+            return
+        problems, unmet = [], None
+        for _ in range(2):
+            try:
+                record = self.qwen_record()
+                built, missing = True, None if record is not None else "the task's meta.json is not there, so no Qwen record could be built"
+            except Exception as problem:
+                record, built, missing = None, False, "{}: {}".format(problem.__class__.__name__, problem)
+            self.outcome, unmet = self.settle(record, missing)
+            self.settled = True
+            if record is None:
+                if built and self.outcome != "record_failed":
+                    if unmet:
+                        self.note_end(unmet=unmet)
+                    return
+                problems.append(missing)
+                if built:  # meta.json does not come back by trying again
+                    break
+                continue
+            self.note_end(phase="record")
+            record["outcome"] = self.outcome
+            try:
+                append_record(self.records, self.project, record)
+            except Exception as problem:
+                problems.append("{}: {}".format(problem.__class__.__name__, problem))
+            count, why = self.rows("qwen")
+            if count == 1:
+                self.recorded = True
+                break
+            if count is None or count > 1:
+                problems.append(why or "records.jsonl has {} Qwen rows of this run, not one".format(count))
+                break
+            if len(problems) == 0:
+                problems.append("the append returned and records.jsonl has no Qwen row of this run")
+        if self.recorded:
+            self.record_problem = None
+            fields = {"recorded": now()}
+            if problems:  # written by the second try: the first failure is kept under another name, so run.json does not claim a missing record
+                fields.update(record_error=None, record_retried=problems[0])
+            if unmet:
+                fields["unmet"] = unmet
+            self.note_end(**fields)
+            return
+        self.record_problem = "; ".join(problems) or "no Qwen record was written"
+        if self.outcome in ("completed", "cleanup_failed"):
+            self.outcome, unmet = "record_failed", self.record_problem
+        fields = {"record_error": self.record_problem}
+        if unmet:
+            fields["unmet"] = unmet
+        self.note_end(**fields)
 
     def source_role(self):
         meta = _json(self.task_path() / "meta.json")
@@ -937,6 +1077,26 @@ class Run:
 
     # -- the whole run
     def execute(self):
+        """The run. Its outcome is decided once, at the end, by one rule (review round 3, family false-completed-trial). A run is
+        `completed` only when all of these hold, each read then from evidence, not from a flag set along the way:
+
+          1. the worker ended                  its end command (end-author / stop) ran to success (`worker_ended`)   else `error`
+          2. the work was collected            final.patch is in the run directory (`collected`)                     else `error`
+             from the proven tree
+          3. a review settled with a verdict   the reviewer settled (`reviewed_outcome`) and the record built from
+                                               its files has a first-review outcome (`settle`)                         else `no_review`
+                                                                                                          (`review_timeout` for a
+                                                                                                          reviewer out of time)
+          4. exactly one Qwen row of the run   read back from records.jsonl after the append (`write_record`)        else `record_failed`
+          5. the normal arm's row exists, or   read back (`write_normal`); the allowed absences are named in run.json:
+             its absence is an allowed one     `normal_record_error` and `normal_record_absent`                       else `record_failed`
+          6. the cleanup ended the session     the session's recorded id is gone and nothing is at the worktree's
+             and removed the worktree          place (`cleanup_unmet`)                                               else `cleanup_failed`
+
+        A run whose steps already gave another outcome (timeout, preempted, worker_failed, stopped, paused, spawn_failed, error) keeps it:
+        that is its first unmet condition. Otherwise the outcome names the first condition that does not hold, and `unmet` in run.json
+        says why. The order at the end serves this: the cleanup, then the normal arm's record, then the Qwen record, so the Qwen row is
+        written with the outcome the run ends with. `tp-trial` exits non-zero for any outcome but `completed`."""
         self.note(pid=os.getpid(), started=now(), phase="starting")
         error = None
         try:
@@ -964,7 +1124,6 @@ class Run:
                     self.outcome = self.reviewed_outcome()
                 elif result not in ("timeout", "preempted"):
                     self.outcome = {"failed": "worker_failed", "stopped": "stopped", "paused": "paused"}[result]
-                self.try_record()
             except Interrupted:
                 self.outcome = "stopped"
                 raise
@@ -980,27 +1139,28 @@ class Run:
             error = error or "{}: {}".format(problem.__class__.__name__, problem)
         finally:
             # Every note from here is best effort (`note_end`): run.json is the worker's to break, and a note that cannot be written
-            # never keeps the record or the cleanup (the session kill every refusal relies on) from running.
+            # never keeps the cleanup (the session kill every refusal relies on) or the records from running.
             try:
                 if error:
                     self.note_end(error=error)
                 self.outcome = self.outcome or "error"
                 self.list_new_branches()  # a run that stopped before its collect still names what the worker made, before the cleanup
-                self.try_record()  # the first try failed, or was never reached: a record of the attempt is written here when it can be
-                if self.record_problem and self.outcome == "completed":
-                    self.outcome = "record_failed"  # the attempt ran but its Qwen record is missing: not a completed trial
                 self.note_end(phase="cleanup")
                 try:
                     leftovers = self.cleanup()
                 except Exception as problem:
                     leftovers = ["cleanup: {}".format(problem)]
                 self.note_end(cleanup_errors=leftovers)
+                self.cleanup_problem = self.cleanup_unmet()
+                self.normal_problem = self.write_normal()
+                self.write_record()  # settles the outcome by the rule above and writes the Qwen row with it
+            except Interrupted:
+                self.note_end(interrupted=True)
+                raise
             finally:
+                if not self.settled and self.outcome == "completed":  # stopped before the rule was checked: not shown completed
+                    self.outcome = "stopped"
                 self.note_end(outcome=self.outcome, phase="done", finished=now())
-        try:
-            record_normal(self.rdir, self.env, self.records, self.owner, info=self.info)
-        except Exception as problem:  # the normal arm's record is best effort: a later `tp-trial normal` redoes it
-            self.note_end(normal_record_error="{}: {}".format(problem.__class__.__name__, problem))
         try:
             return self.owner.read()
         finally:

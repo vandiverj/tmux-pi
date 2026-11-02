@@ -1245,15 +1245,25 @@ class UnscopedPatchTests(unittest.TestCase):
         pids = top.parent / (top.name + ".pids")
         self.addCleanup(pids.unlink, True)
         slow = self.fake_git(f"sleep 60 &\necho $$ $! > '{pids}'\nwait")
+        # The classifier starts its clock before it spawns git, so under load a short limit can pass before the fake ever runs
+        # (no pid file: nothing was started, nothing to check). Wait on that event: when the fake did not report in, the same
+        # scenario runs again with a longer limit. Each run still has to wait out its own limit.
         limit = 1.0
-        with self.on_path(slow), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit):
-            started = time.monotonic()
-            result = bash("git diff", str(top))
-            elapsed = time.monotonic() - started
-        self.assertTrue(result["sensitive"])
-        self.assertEqual(result["reason"], "unscoped patch output may include credential files")
-        # It waited for the limit (the fake git never answers); the upper bound only catches a hang (the fake sleeps 60 s).
-        self.assertTrue(limit <= elapsed < 50, elapsed)
+        for _ in range(5):
+            pids.unlink(missing_ok=True)
+            with self.on_path(slow), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit):
+                started = time.monotonic()
+                result = bash("git diff", str(top))
+                elapsed = time.monotonic() - started
+            self.assertTrue(result["sensitive"])
+            self.assertEqual(result["reason"], "unscoped patch output may include credential files")
+            # It waited for the limit (the fake git never answers); the upper bound only catches a hang (the fake sleeps 60 s).
+            self.assertTrue(limit <= elapsed < 50, elapsed)
+            if pids.exists() and len(pids.read_text().split()) == 2:
+                break
+            limit *= 2
+        else:
+            self.fail("the fake git never started, even with a limit of %s s" % (limit / 2))
         # The query and what it started are gone, not left running (init reaps the killed process: wait for that, no fixed delay).
         for pid in pids.read_text().split():
             with self.subTest(pid=pid):

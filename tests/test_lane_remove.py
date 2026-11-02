@@ -878,6 +878,8 @@ exec {shutil.which("git")} "$@"
 
 
 class AgeColumnTests(RemoveCase):
+    snapshot_lane = False  # two tests, CPU-s 3.1 either way
+
     def test_the_lanes_rows_carry_created_and_age(self):
         self.writer("s1")
         rows = json.loads(self.raw("lanes", "--repo", str(self.repo)).stdout)

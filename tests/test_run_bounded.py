@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -102,6 +103,42 @@ class RunBoundedTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5 + 4)  # the reader's grace, not the 30 s holder
         self.assertEqual((record["rc"], record["timed_out"]), (0, False))
         self.assertTrue(alive(int(pidfile.read_text())))  # outside the group: never signalled
+
+    # Resources x exit paths: pipe read end, pipe write end, reader thread, process group. Each is released on launch
+    # failure, normal end, timeout and interrupt; these tests count descriptors and threads over repeated runs.
+    @staticmethod
+    def open_fds():
+        for base in ("/dev/fd", "/proc/self/fd"):
+            if os.path.isdir(base):
+                return len(os.listdir(base))
+        raise unittest.SkipTest("no fd directory")
+
+    def assertStableAcross(self, action, repeat=8):
+        action()  # warm up one-time allocations
+        fds, threads = self.open_fds(), threading.active_count()
+        for _ in range(repeat):
+            action()
+        self.assertEqual((self.open_fds(), threading.active_count()), (fds, threads))
+
+    def test_launch_failure_leaks_no_descriptor(self):
+        def fail():
+            with self.assertRaises(OSError):
+                run_bounded.run_bounded([str(self.dir / "no-such-command")], log=False, echo=False)
+        self.assertStableAcross(fail)
+
+    def test_interrupt_stops_the_group_and_leaks_no_descriptor_or_thread(self):
+        def interrupt():
+            with mock.patch.object(run_bounded, "wait_group", side_effect=[KeyboardInterrupt, True, True]), \
+                    mock.patch.object(run_bounded, "stop_group", wraps=run_bounded.stop_group) as stopped:
+                with self.assertRaises(KeyboardInterrupt):
+                    run_bounded.run_bounded([sys.executable, "-c", "import time; time.sleep(60)"], grace=1,
+                                            log=False, echo=False)
+            stopped.assert_called_once()
+        self.assertStableAcross(interrupt, repeat=3)
+
+    def test_normal_and_timeout_runs_leak_no_descriptor_or_thread(self):
+        self.assertStableAcross(lambda: self.run_py("print(1)"))
+        self.assertStableAcross(lambda: self.run_py("import time; time.sleep(60)", timeout=0.3, grace=1), repeat=2)
 
     def test_clean_run_is_recorded_as_valid_json(self):
         record, output = self.run_py("print('hi')", files=["tests/test_x.py"])

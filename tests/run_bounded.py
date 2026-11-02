@@ -124,10 +124,14 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
     # descendant that keeps the pipe open could hold the parent past its bound.
     read_fd, write_fd = os.pipe()
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=write_fd,
-                                start_new_session=True)
-    finally:
-        os.close(write_fd)
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=write_fd,
+                                    start_new_session=True)
+        finally:
+            os.close(write_fd)  # the child has its own copy; ours must go whether or not the launch worked
+    except BaseException:
+        os.close(read_fd)  # launch failed: nothing reads this end
+        raise
     pgid = proc.pid  # a new session makes the child its own group leader
     stop = threading.Event()
 
@@ -144,7 +148,6 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
                 sys.stdout.buffer.flush()
 
     reader = threading.Thread(target=pump, daemon=True)
-    reader.start()
     # The rule: the run ends only when no process is left in the group it started, or the deadline passes.
     #   leader exited | group empty | deadline | result
     #   yes           | yes         | before   | done: rc = leader's rc, timed_out false
@@ -152,18 +155,25 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
     #   any           | no          | reached  | killpg TERM, grace, killpg KILL; timed_out true, rc null
     # The reader does not decide the end: after the end it drains for at most `grace` seconds, because a process
     # outside the group (its own session) may hold the pipe and is not ours to wait for or to kill.
+    # Release rule: on every exit (normal, timeout, interrupt, error) the group is stopped if the run did not end
+    # cleanly, the reader is told to stop, and the read end is closed unless the reader is still inside it.
     try:
-        timed_out = not wait_group(pgid, proc, started + timeout)
-        if timed_out:
+        try:
+            reader.start()
+            timed_out = not wait_group(pgid, proc, started + timeout)
+            if timed_out:
+                stop_group(pgid, proc, grace)
+        except BaseException:  # the caller is interrupted: do not leave the group behind
             stop_group(pgid, proc, grace)
-    except BaseException:  # the caller is interrupted: do not leave the group behind
-        stop_group(pgid, proc, grace)
-        raise
-    reader.join(grace)  # bounded: a holder of the pipe outside the group must not hold the parent
-    stop.set()
-    reader.join(1)  # the reader wakes every 0.1 s, so it sees `stop`
-    if not reader.is_alive():
-        os.close(read_fd)
+            raise
+        if reader.is_alive():
+            reader.join(grace)  # bounded: a holder of the pipe outside the group must not hold the parent
+    finally:
+        stop.set()
+        if reader.is_alive():
+            reader.join(1)  # the reader wakes every 0.1 s, so it sees `stop`
+        if not reader.is_alive():
+            os.close(read_fd)
     seconds = time.monotonic() - started
     output = b"".join(chunks).decode(errors="replace")
     per_file = dict(per_file or {})

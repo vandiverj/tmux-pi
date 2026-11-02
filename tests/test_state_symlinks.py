@@ -718,6 +718,25 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertReplaced(link, "one two\n")
 
+    def test_tp_write_many_is_tp_write_for_each_chunk_in_one_start(self):
+        link = self.plant(self.task / "request.md")
+        run = self.sh('{ printf "%s\\n\\0" "one"; printf "%s\\0" "two"; printf "%s\\n\\0" "#!x"; } | '
+                      'tp_write_many --root "$1" --mkdir "$1/tasks/n" --file "$2" --file "$1/tasks/n/b" --exec "$1/tasks/n/c"',
+                      str(self.state), str(link))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertReplaced(link, "one\n")
+        self.assertEqual((self.state / "tasks/n/b").read_text(), "two")
+        self.assertEqual((self.state / "tasks/n/c").read_text(), "#!x\n")
+        self.assertTrue(os.access(self.state / "tasks/n/c", os.X_OK) and not os.access(self.state / "tasks/n/b", os.X_OK))
+        # A chunk count that does not match the targets, or a planted directory link, writes nothing.
+        bad = self.sh('printf "%s\\0" one | tp_write_many --root "$1" --file "$1/tasks/w1/p" --file "$1/tasks/w1/q"', str(self.state))
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertFalse((self.task / "p").exists())
+        (self.state / "tasks/lnk").symlink_to(self.outside_dir, target_is_directory=True)
+        linked = self.sh('printf "%s\\0" one | tp_write_many --root "$1" --file "$1/tasks/lnk/p"', str(self.state))
+        self.assertNotEqual(linked.returncode, 0)
+        self.assertFalse((self.outside_dir / "p").exists())
+
     def test_tp_write_keeps_the_mode_of_the_file_it_replaces(self):
         path = self.task / "meta.json"
         path.write_text("{}")

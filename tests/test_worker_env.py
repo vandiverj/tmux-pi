@@ -124,6 +124,12 @@ class WorkerEnvTests(WorkerEnvCase):
                 self.assertEqual(run.returncode, 0, run.stderr)
                 text = self.run_sh(task)
                 self.assertEqual("export TP_CTX_TOOLS=1\n" in text, exported)
+                self.assertEqual("unset TP_CTX_TOOLS\n" in text, not exported)
+                # the worker window may inherit a stale TP_CTX_TOOLS=1 from the session: run.sh's effective value must follow the spawner
+                lines = [l for l in text.splitlines() if "TP_CTX_TOOLS" in l]
+                read = subprocess.run(["bash", "-c", "\n".join(lines) + '\nprintf %s "${TP_CTX_TOOLS-unset}"'], text=True,
+                                      capture_output=True, timeout=20, env={**os.environ, "TP_CTX_TOOLS": "1"})
+                self.assertEqual(read.stdout, "1" if exported else "unset")
                 if exported:
                     self.assertLess(text.index("export TP_CTX_TOOLS=1"), text.index("tp-claude"))
         run = self.spawn("--worker-env", "TP_CTX_TOOLS=1", task="ctx-opt")

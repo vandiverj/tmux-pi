@@ -57,5 +57,40 @@ class ReviewVerdictTests(EndCase):
                 self.assertEqual((qwen["outcome"], qwen["first_review_outcome"]), ("no_review", "inconclusive"))
 
 
+class AttemptRowTests(EndCase):
+    """F4: the Qwen and normal rows are read back by this attempt's id (`attempt` in run.json and in each row it wrote)."""
+
+    def stale(self, arm):
+        def prepare():
+            rdir, info = self.prepare()
+            trial_record.append(self.repo, {"run": info["run"], "arm": arm, "pair_id": info["pair_id"], "attempt": "an-earlier-attempt",
+                                            "outcome": "completed"})
+            return rdir, info
+        return prepare
+
+    def test_the_rows_a_run_writes_carry_its_attempt_id(self):
+        _, done, info = self.fast()
+        self.assertEqual(done["outcome"], "completed", done)
+        self.assertRegex(done.get("attempt") or "", r"^[0-9a-f]{16}$")
+        self.assertEqual({r["arm"]: r.get("attempt") for r in self.records()}, {"qwen": done["attempt"], "normal": done["attempt"]})
+
+    def test_a_stale_qwen_row_of_the_run_id_never_stands_in_for_an_append_that_failed(self):
+        _, done, info = self.fast(record_module=FlakyRecords(fail=99), prepare=self.stale("qwen"))
+        self.assertEqual(done["outcome"], "record_failed", done)
+        self.assertNotIn("recorded", done)
+        self.assertIn("0 of them this attempt's", done["record_error"])
+        self.assertEqual([r.get("attempt") for r in self.qwen_of(info["run"])], ["an-earlier-attempt"], "only the stale row is there")
+
+    def test_a_stale_normal_row_of_the_run_id_never_stands_in_for_an_append_that_left_none(self):
+        class NormalLost(RecordingRecords):
+            def append(self, project, record):
+                if record.get("arm") == "normal":
+                    return None  # the append returned, and nothing of this attempt is in records.jsonl
+                return trial_record.append(project, record)
+        _, done, _ = self.fast(record_module=NormalLost(), prepare=self.stale("normal"))
+        self.assertEqual(done["outcome"], "record_failed", done)
+        self.assertIn("no normal row of this attempt", done["unmet"])
+
+
 if __name__ == "__main__":
     unittest.main()

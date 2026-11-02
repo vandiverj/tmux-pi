@@ -171,22 +171,24 @@ def append_record(records, project, record):
     records.append(project, record)
 
 
-def record_rows(records, project, run, arm):
-    """(count, None): how many rows of `arm` for run `run` records.jsonl has now, or (None, why it cannot be read). The completed
-    rule reads the record back from here rather than trusting the append. The file is opened without waiting and never through a link,
-    and must be a regular file (a FIFO there never holds the runner); it is read line by line, so a file of any size is counted. A
-    line that is not a JSON object (a torn last line) is not a row."""
+def record_rows(records, project, run, arm, attempt):
+    """(rows, mine, None): how many rows of `arm` for run `run` records.jsonl has now, and how many of them carry `attempt` (the id of
+    the attempt that wrote them, `Run.attempt`), or (None, None, why it cannot be read). The completed rule reads the record back from
+    here rather than trusting the append, and counts a row as this attempt's only by that id: a row left by an earlier attempt with
+    the same run id never stands in for it. The file is opened without waiting and never through a link, and must be a regular file
+    (a FIFO there never holds the runner); it is read line by line, so a file of any size is counted. A line that is not a JSON
+    object (a torn last line) is not a row."""
     path = records.trial_dir(project) / records.RECORDS
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return 0, None
+        return 0, 0, None
     except OSError as error:
-        return None, "{} cannot be opened as a plain file ({})".format(path, error.strerror)
+        return None, None, "{} cannot be opened as a plain file ({})".format(path, error.strerror)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None, "{} is not a plain file".format(path)
-        count = 0
+            return None, None, "{} is not a plain file".format(path)
+        count = mine = 0
         with os.fdopen(os.dup(fd), "rb") as handle:
             for line in handle:
                 try:
@@ -195,9 +197,10 @@ def record_rows(records, project, run, arm):
                     continue
                 if isinstance(row, dict) and row.get("run") == run and row.get("arm") == arm:
                     count += 1
-        return count, None
+                    mine += row.get("attempt") == attempt
+        return count, mine, None
     except OSError as error:
-        return None, "{} cannot be read ({})".format(path, error.strerror)
+        return None, None, "{} cannot be read ({})".format(path, error.strerror)
     finally:
         os.close(fd)
 
@@ -626,6 +629,9 @@ class Run:
         self.sleep, self.clock = sleep, clock
         self.started_at = clock() - self.prepared_ago()
         self.records = record_module or load_record_module()
+        # This attempt's own id, made here and written into every record row it appends (`attempt`): the readback of the completed
+        # rule counts a row only by it, so a row an earlier attempt with the same run id left never counts for this one.
+        self.attempt = secrets.token_hex(8)
         self.outcome = None
         self.settled = False  # `settle` has decided the outcome from the end evidence: until then `completed` is a claim, not a result
         self.worker_ended = False
@@ -943,20 +949,21 @@ class Run:
             return None
         if not has_task:
             record = self.spawn_failed_record()
-            record.update({"run": self.run, "source_task": self.info["source_task"], "workdir": str(self.worktree),
+            record.update({"run": self.run, "attempt": self.attempt, "source_task": self.info["source_task"], "workdir": str(self.worktree),
                            "normal_reviewer_model": self.info.get("normal_reviewer_model"), "reviewer_mismatch": None})
             return record
         record = self.records.build(self.task_path(), "qwen", "shadow", self.info["pair_id"], state_dir=self.state, role=self.source_role(),
                                     diff_files=self.diff[0], diff_lines=self.diff[1], commit_messages=self.commit_messages)
         normal = self.info.get("normal_reviewer_model")
         mine = self.reviewer_model()
-        record.update({"run": self.run, "source_task": self.info["source_task"], "workdir": str(self.worktree), "normal_reviewer_model": normal,
-                       "reviewer_mismatch": None if not (normal and mine) else normal != mine})
+        record.update({"run": self.run, "attempt": self.attempt, "source_task": self.info["source_task"], "workdir": str(self.worktree),
+                       "normal_reviewer_model": normal, "reviewer_mismatch": None if not (normal and mine) else normal != mine})
         return record
 
     def rows(self, arm):
-        """(count, None) of the rows of `arm` for this run in records.jsonl, read back now, or (None, why they cannot be counted)."""
-        return record_rows(self.records, self.project, self.run, arm)
+        """(rows, mine, None): the rows of `arm` for this run in records.jsonl, read back now, and how many of them are this attempt's
+        (`attempt`), or (None, None, why they cannot be counted)."""
+        return record_rows(self.records, self.project, self.run, arm, self.attempt)
 
     def collected(self):
         """Why the work is not shown collected from the proven tree, or None: `final.patch` is in the run directory (written by
@@ -982,7 +989,8 @@ class Run:
 
     def write_normal(self):
         """Write the normal arm's record (`record_normal`, best effort as before) and say whether its row is as the completed rule allows:
-        None when its row is in records.jsonl, or when it is absent for a reason this names in run.json, which are the allowed absences:
+        None when a row of it that this attempt wrote (`attempt`) is in records.jsonl, or when it is absent for a reason this names in
+        run.json, which are the allowed absences:
         `normal_record_error` (it could not be built or appended; `tp-trial normal` redoes it) and `normal_record_absent` (the source
         task is gone, so there is no normal arm to record). Otherwise (an append that returned and left no row) why not."""
         try:
@@ -993,10 +1001,11 @@ class Run:
         if record is None:
             self.note_end(normal_record_absent="the source task {} is gone; there is no normal arm to record".format(self.info["source_task"]))
             return None
-        count, why = self.rows("normal")
-        if count:
+        count, mine, why = self.rows("normal")
+        if mine:
             return None
-        return "the normal arm's record was appended but records.jsonl has no normal row of this run ({})".format(why or "0 rows")
+        return "the normal arm's record was appended but records.jsonl has no normal row of this attempt ({})".format(
+            why or "{} rows of the run, none of this attempt".format(count))
 
     def settle(self, record, missing=None):
         """The outcome by the completed rule (see `execute`): the outcome the steps gave when it is not `completed`, else the first condition
@@ -1021,12 +1030,13 @@ class Run:
         return "completed", None
 
     def write_record(self):
-        """Settle the outcome (`settle`), then append the run's Qwen record with that outcome and read it back: exactly one row of this
-        run must be in records.jsonl afterwards. A record that could not be built or appended is tried once more, and an append is
-        repeated only when the readback found no row (one that raised after writing is not written twice). When the row is not there
-        exactly once, a run the rule had `completed` or `cleanup_failed` is `record_failed` (the Qwen row comes before the cleanup in
-        the rule); any other outcome is kept. `record_error` says what failed; `recorded` is noted only after the readback found the
-        row. A run with no task that does not need one (it stopped before its task existed) has no row, as before."""
+        """Settle the outcome (`settle`), then append the run's Qwen record with that outcome and read it back: afterwards records.jsonl
+        must have exactly one Qwen row of this run, and it must be this attempt's (it carries `attempt`). A record that could not be
+        built or appended is tried once more, and an append is repeated only when the readback found no row of the run (one that
+        raised after writing is not written twice). When that does not hold (no row, a row an earlier attempt with this run id left,
+        two rows), a run the rule had `completed` or `cleanup_failed` is `record_failed` (the Qwen row comes before the cleanup in the
+        rule); any other outcome is kept. `record_error` says what failed; `recorded` is noted only after the readback found the row.
+        A run with no task that does not need one (it stopped before its task existed) has no row, as before."""
         if self.recorded:
             return
         problems, unmet = [], None
@@ -1053,12 +1063,13 @@ class Run:
                 append_record(self.records, self.project, record)
             except Exception as problem:
                 problems.append("{}: {}".format(problem.__class__.__name__, problem))
-            count, why = self.rows("qwen")
-            if count == 1:
+            count, mine, why = self.rows("qwen")
+            if count == 1 and mine == 1:
                 self.recorded = True
                 break
-            if count is None or count > 1:
-                problems.append(why or "records.jsonl has {} Qwen rows of this run, not one".format(count))
+            if count is None or count:  # unreadable, or rows of the run that are not exactly one of this attempt: another append adds none
+                problems.append(why or "records.jsonl has {} Qwen rows of this run, {} of them this attempt's ({}); the rule needs exactly one, "
+                                       "this attempt's".format(count, mine, self.attempt))
                 break
             if len(problems) == 0:
                 problems.append("the append returned and records.jsonl has no Qwen row of this run")
@@ -1099,9 +1110,12 @@ class Run:
                                                request_changes (`settle`, REVIEW_VERDICTS); `inconclusive` is none   else `no_review`
                                                                                                           (`review_timeout` for a
                                                                                                           reviewer out of time)
-          4. exactly one Qwen row of the run   read back from records.jsonl after the append (`write_record`)        else `record_failed`
-          5. the normal arm's row exists, or   read back (`write_normal`); the allowed absences are named in run.json:
-             its absence is an allowed one     `normal_record_error` and `normal_record_absent`                       else `record_failed`
+          4. exactly one Qwen row of the run,  read back from records.jsonl after the append, by the attempt id it
+             and it is this attempt's         carries (`write_record`, `record_rows`); a row an earlier attempt
+                                               with this run id left never counts                                    else `record_failed`
+          5. this attempt's normal-arm row     read back the same way (`write_normal`); the allowed absences are
+             exists, or its absence is an      named in run.json: `normal_record_error` and `normal_record_absent`  else `record_failed`
+             allowed one
           6. the cleanup ended the session     the session's recorded id is gone and nothing is at the worktree's
              and removed the worktree          place (`cleanup_unmet`)                                               else `cleanup_failed`
 
@@ -1111,7 +1125,7 @@ class Run:
         written with the outcome the run ends with. An end step that fails before the rule is checked leaves no run `completed`: an
         interrupt makes it `stopped`, any other failure `error` (and the failure is raised). `tp-trial` exits non-zero for any outcome
         but `completed`."""
-        self.note(pid=os.getpid(), started=now(), phase="starting")
+        self.note(pid=os.getpid(), started=now(), phase="starting", attempt=self.attempt)
         error = None
         try:
             try:
@@ -1238,7 +1252,8 @@ def _record_normal(owner, record_module, info=None):
         return None
     files, lines = _diff_counts(_json(path / "meta.json").get("workdir"), info["base_commit"])
     record = records.build(path, "normal", "shadow", info["pair_id"], state_dir=main_state, diff_files=files, diff_lines=lines)
-    record.update({"run": run, "source_task": info["source_task"], "outcome": "completed"})
+    # the attempt that wrote it (`Run.attempt`, noted in run.json when the run began): the completed rule reads its own row back by it
+    record.update({"run": run, "attempt": info.get("attempt"), "source_task": info["source_task"], "outcome": "completed"})
     append_record(records, project, record)
     owner.update(normal_recorded=now())
     return record

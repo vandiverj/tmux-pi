@@ -4,10 +4,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 HARNESS = ROOT / "tests/extension_session_runtime.mjs"
 REAL = "tmux-pi-0123456789ab-cdef01234567"
 
@@ -50,8 +53,7 @@ class ExtensionSessionCase(unittest.TestCase):
             path.mkdir(parents=True)
         fake = self.base / "fake-bin"
         fake.mkdir()
-        (fake / "tmux").write_text(TMUX)
-        (fake / "tmux").chmod(0o755)
+        fake_tmux(fake, TMUX)
         self.log = self.base / "tmux.log"
         self.log.write_text("")
         self.env = {**os.environ, "TMUX": "/tmp/fake,1,0", "TMUX_PANE": "%main", "TP_STATE_DIR": str(self.state),

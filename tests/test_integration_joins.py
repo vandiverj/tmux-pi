@@ -23,6 +23,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 SEP = "\x1f"
 
 
@@ -48,16 +50,13 @@ class JoinFixture(unittest.TestCase):
         (self.state / "queue").mkdir()
         fake = self.root / "bin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('''#!/bin/sh
-case "$1" in
+        fake_tmux(fake, '''case "$1" in
   has-session) exit 0 ;;
   show-options) case "$*" in *@tp_state_dir*) printf '%s\\n' "$TP_STATE_DIR" ;; esac ;;
   list-panes) for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do printf '%%%s 0\\n' "$n"; done ;;
 esac
 exit 0
 ''')
-        tmux.chmod(0o755)
         self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "joins", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)

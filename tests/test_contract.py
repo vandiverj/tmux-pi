@@ -8,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 from contract import (ContractError, artifact_info, build, duration, dynamic_terms, evaluate, extension,  # noqa: E402
                       escalation_record, is_local, ledger_row, lifecycle, load_research, message, note, quantity, rate,
                       read_escalations, read_ledger, select_escalation, summary_line, upsert, write_escalations)
@@ -140,9 +142,7 @@ class ContractTests(unittest.TestCase):
         state.mkdir()
         fake = self.dir / "fake-bin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('#!/bin/sh\ncase "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0 99999999";;\n esac\n')
-        tmux.chmod(0o755)
+        fake_tmux(fake, 'case "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0 99999999";;\n esac\n')
         env = dict(os.environ, TP_STATE_DIR=str(state), TP_SESSION="fixture",
                    PATH=str(fake) + os.pathsep + os.environ["PATH"])
         env.pop("TMUX", None)
@@ -317,9 +317,7 @@ class ContractTests(unittest.TestCase):
         marker = task / "review-required.json"
         marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True,
                                       "reasons": ["reviewer unavailable"]}))
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "worker-1"]
         for content in (marker.read_text(), "{bad json", json.dumps({"task_id": "wrong", "status": "resolved"})):
@@ -349,9 +347,7 @@ class ContractTests(unittest.TestCase):
         (task / "meta.json").write_text(json.dumps({"id": "dep", "worker": "pi", "pane": "%1"}))
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "result.md").write_text("Started a sleep; waiting.\n")
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 0 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir, 'echo "%1 0 99999999"\n')
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
             [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
@@ -371,9 +367,7 @@ class ContractTests(unittest.TestCase):
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "result.md").write_text("Out of budget.\nRESULT_STATUS: blocked\n")
         (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "reason": "budget", "at": T0}]}))
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 0 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir, 'echo "%1 0 99999999"\n')
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
             [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
@@ -395,9 +389,7 @@ class ContractTests(unittest.TestCase):
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "exit").write_text("0\n")
         (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "author"]
         def collect_ok():
@@ -482,9 +474,7 @@ class ContractTests(unittest.TestCase):
 
     def test_local_escalation_cli_prefers_available_gpt6(self):
         state = self.dir / "state"
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         for idx, model in enumerate(("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b")):
             task_id = "local-{}".format(idx)
@@ -510,9 +500,7 @@ class ContractTests(unittest.TestCase):
         (task / "meta.json").write_text(json.dumps(meta))
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0 + 60)}))
         (task / "checkpoints.json").write_text(json.dumps({"events": []}))
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\necho "%1 1 99999999"\n')
-        tmux.chmod(0o755)
+        fake_tmux(self.dir)
         (task / "exit").write_text("1\n")
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         plan = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", "task-1", "--trigger", "model_error",
@@ -538,9 +526,7 @@ class ContractTests(unittest.TestCase):
                                                     "model": "openai/gpt-6-luna", "thinking": "medium"}))
         # Never ask the real tmux server: its pane %1 may be alive, which would make "killed" untestable.
         panes = self.dir / "panes"
-        tmux = self.dir / "tmux"
-        tmux.write_text('#!/bin/sh\ncat "%s"\n' % panes)
-        tmux.chmod(0o755)
+        fake_tmux(self.dir, 'cat "%s"\n' % panes)
         env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "escalate", "stopped", "--trigger", "model_error", "--reason", "error"]
         # killed: the pane is gone; cancelled and completed: the pane is still alive.

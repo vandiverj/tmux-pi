@@ -253,7 +253,9 @@ class RepeatedFamilyGateTests(RetryCase):
 
     def test_the_families_are_matched_by_name_with_the_case_folded(self):
         item = self.chain(["State-Matrix"], ["state-matrix"])
-        self.assertEqual(self.plain_retry(item).returncode, 1)
+        refused = self.plain_retry(item)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("finding family state-matrix was named by review review-1 and again by review review-2", refused.stderr)  # not the two-in-a-row refusal
 
     def test_route_design_and_rule_first_retry_and_the_notes_say_which_route(self):
         for route in ("design", "rule-first"):

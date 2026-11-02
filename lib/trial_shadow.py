@@ -131,7 +131,9 @@ def workdir_text(worktree, project):
 
 TERMINAL_OUTCOMES = ("completed", "timeout", "preempted", "worker_failed", "paused", "stopped", "spawn_failed", "error", "record_failed",
                      "no_review", "review_timeout", "cleanup_failed")
-REVIEW_VERDICTS = ("approved", "request_changes", "inconclusive")  # a first review's outcome that is a verdict (lib/trial_record.py OUTCOMES)
+# A first review's outcome (lib/trial_record.py `first_review`) that the completed rule takes as a verdict. L2's `inconclusive` (a review
+# that is incomplete, unparseable or a label without a finding) is none: the run is then `no_review`, and its row keeps `inconclusive`.
+REVIEW_VERDICTS = ("approved", "request_changes")
 
 
 class ShadowError(Exception):
@@ -1010,7 +1012,8 @@ class Run:
         if record is None:
             return "record_failed", missing or "no Qwen record could be built"
         if record.get("first_review_outcome") not in REVIEW_VERDICTS:
-            return "no_review", "the reviewer settled without a verdict the record can read"
+            return "no_review", "the reviewer settled without a verdict the record can read (first review: {})".format(
+                record.get("first_review_outcome") or "none")
         if self.normal_problem:
             return "record_failed", self.normal_problem
         if self.cleanup_problem:
@@ -1092,7 +1095,8 @@ class Run:
           2. the work was collected            final.patch is in the run directory (`collected`)                     else `error`
              from the proven tree
           3. a review settled with a verdict   the reviewer settled (`reviewed_outcome`) and the record built from
-                                               its files has a first-review outcome (`settle`)                         else `no_review`
+                                               its files has a first-review outcome that is a verdict, approved or
+                                               request_changes (`settle`, REVIEW_VERDICTS); `inconclusive` is none   else `no_review`
                                                                                                           (`review_timeout` for a
                                                                                                           reviewer out of time)
           4. exactly one Qwen row of the run   read back from records.jsonl after the append (`write_record`)        else `record_failed`

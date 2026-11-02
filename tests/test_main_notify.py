@@ -3,10 +3,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 MODEL = "openai/gpt-6-sol"
 
 
@@ -24,9 +27,7 @@ class MainNotifyTests(unittest.TestCase):
             (state / "tasks").mkdir(parents=True)
         fake = self.root / "bin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text("#!/bin/sh\ncase \"$1\" in\n show-options) printf '%s\\n' \"$TP_STATE_DIR\" ;;\n new-window) printf '%%fake\\\\n' ;;\n *) exit 0 ;;\nesac\n")
-        tmux.chmod(0o755)
+        fake_tmux(fake, "case \"$1\" in\n show-options) printf '%s\\n' \"$TP_STATE_DIR\" ;;\n new-window) printf '%%fake\\\\n' ;;\n *) exit 0 ;;\nesac\n")
         self.env = {key: value for key, value in os.environ.items() if key not in ("TMUX", "TP_TASK_DIR", "TP_MAIN_ID", "CLAUDE_CODE_SESSION_ID")}
         self.env.update(TP_STATE_DIR=str(self.here), TP_SESSION="fixture", TP_WORK_DIR=str(self.root / "work-store"),
                         PATH=str(fake) + os.pathsep + os.environ["PATH"])

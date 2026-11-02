@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
+from fake_tools import fake_tmux  # noqa: E402
 from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET, reply
 
 import model_router  # noqa: E402
@@ -30,16 +31,13 @@ class Base(unittest.TestCase):
         (self.state / "tasks").mkdir(parents=True)
         fake = self.root / "fakebin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('''#!/bin/sh
-case "$1" in
+        fake_tmux(fake, '''case "$1" in
  has-session) exit 0 ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window) printf '%%fake\\n' ;;
  *) exit 0 ;;
 esac
 ''')
-        tmux.chmod(0o755)
         self.stubs = fx.Stubs(self.root, {"claude": [{"text": reply(3, "medium", "optional", None, "ordinary")}]})
         self.addCleanup(self.stubs.close)
         guard, self.hits = fx.laya_guard(self.root)

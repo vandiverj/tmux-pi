@@ -20,7 +20,20 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import GIT, GIT_ENV, git  # noqa: E402
+import sensitive_read
 from sensitive_read import classify, hook_response
+
+# The classifier fails closed when its own wall-clock limits run out (a git query: 2 s, a directory walk: 1-2 s), which is right
+# for the product but turns machine load into "sensitive" verdicts the tests do not expect. The tests run with those limits
+# raised far above any load time; test_timeout_prompts sets its own short git limit to prove the limit still applies.
+LOAD_PROOF = 120.0
+_LIMITS = {"_GIT_TIMEOUT": LOAD_PROOF, "WALK_SECONDS": LOAD_PROOF, "WALK_CALL_SECONDS": LOAD_PROOF}
+
+
+def setUpModule():
+    patcher = mock.patch.multiple(sensitive_read, **_LIMITS)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 ENV = "." + "env"
 AUTH = "auth" + ".json"
@@ -866,7 +879,7 @@ class SensitiveReadTableTests(unittest.TestCase):
             env["TP_REDACTION"] = "shadow"
             done = subprocess.run([sys.executable, str(ROOT / "bin/tp-sensitive-read"), *args],
                                   input=json.dumps(event), text=True, capture_output=True, env=env, cwd=CWD,
-                                  check=True, timeout=30)
+                                  check=True, timeout=300)  # hang guard, not a speed limit
             return json.loads(done.stdout) if done.stdout.strip() else None
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cat local.json"}}
         self.assertEqual(run(event), {"sensitive": False})
@@ -1232,24 +1245,32 @@ class UnscopedPatchTests(unittest.TestCase):
         pids = top.parent / (top.name + ".pids")
         self.addCleanup(pids.unlink, True)
         slow = self.fake_git(f"sleep 60 &\necho $$ $! > '{pids}'\nwait")
-        with self.on_path(slow):
+        limit = 1.0
+        with self.on_path(slow), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit):
             started = time.monotonic()
             result = bash("git diff", str(top))
             elapsed = time.monotonic() - started
         self.assertTrue(result["sensitive"])
         self.assertEqual(result["reason"], "unscoped patch output may include credential files")
-        self.assertTrue(1.5 < elapsed < 10, elapsed)
-        # The query and what it started are gone, not left running.
-        time.sleep(0.2)
+        # It waited for the limit (the fake git never answers); the upper bound only catches a hang (the fake sleeps 60 s).
+        self.assertTrue(limit <= elapsed < 50, elapsed)
+        # The query and what it started are gone, not left running (init reaps the killed process: wait for that, no fixed delay).
         for pid in pids.read_text().split():
-            with self.subTest(pid=pid), self.assertRaises(ProcessLookupError):
-                os.kill(int(pid), 0)
+            with self.subTest(pid=pid):
+                give_up = time.monotonic() + 30
+                while True:
+                    try:
+                        os.kill(int(pid), 0)
+                    except ProcessLookupError:
+                        break
+                    self.assertLess(time.monotonic(), give_up, "still running")
+                    time.sleep(0.02)
         # Output without end is cut off as well.
         endless = self.fake_git("while :; do printf 'README.md\\000'; done")
-        with self.on_path(endless):
+        with self.on_path(endless), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit):
             started = time.monotonic()
             self.assertTrue(bash("git log -p", str(top))["sensitive"])
-            self.assertLess(time.monotonic() - started, 10)
+            self.assertLess(time.monotonic() - started, 50)
 
     def test_query_runs_only_for_unscoped_patch_forms(self):
         top = self.repo()
@@ -1330,7 +1351,7 @@ class UnscopedPatchTests(unittest.TestCase):
             git(top, "config", key, str(program))
         git(top, "config", "log.showSignature", "true")
         # The configuration is live: git itself runs the program for an ordinary diff.
-        subprocess.run([GIT, "diff"], cwd=top, env=GIT_ENV, capture_output=True, timeout=60)
+        subprocess.run([GIT, "diff"], cwd=top, env=GIT_ENV, capture_output=True, timeout=300)
         self.assertTrue(marker.exists(), "the planted configuration did not run, so this test proves nothing")
         marker.unlink()
         time.sleep(1.1)  # past the index timestamp, so the query has files to refresh
@@ -1477,7 +1498,7 @@ class UnscopedPatchTests(unittest.TestCase):
         git(top, "config", "filter.plant.clean", f"{sys.executable} {helper} {marker}")
         commands = ["git diff", "git diff --cached", "git stash show -p", "git log -p"]
         # The filter is live: git itself runs it to compare the work tree for an ordinary diff.
-        subprocess.run([GIT, "diff"], cwd=top, env=GIT_ENV, capture_output=True, timeout=60)
+        subprocess.run([GIT, "diff"], cwd=top, env=GIT_ENV, capture_output=True, timeout=300)
         self.assertTrue(marker.exists(), "the planted filter did not run, so this test proves nothing")
         marker.unlink()
         time.sleep(1.1)  # past the index timestamp, so a query has files to compare
@@ -1514,7 +1535,7 @@ class UnscopedPatchTests(unittest.TestCase):
         # With this setting git prints, and would list, only the name below the working directory.
         git(top, "config", "diff.relative", "true")
         self.assertIn("diff --git a/local.json b/local.json", subprocess.run(
-            [GIT, "diff"], cwd=folder, env=GIT_ENV, capture_output=True, text=True, timeout=60).stdout)
+            [GIT, "diff"], cwd=folder, env=GIT_ENV, capture_output=True, text=True, timeout=300).stdout)
         self.verdicts(top, ["git diff", "git diff HEAD"], True, folder)
         self.assertIn(LOCAL, bash("git diff", folder)["target"])
         self.verdicts(top, ["git diff", "git diff HEAD"], True, str(top / "lib"))  # listed although not printed there

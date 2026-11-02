@@ -1904,7 +1904,7 @@ class ImportIndex:
         if self.root is None:
             return found
         config_dir = os.path.dirname(self.config)
-        base, allowed, lstat, skip_dirs, extensions = self.base, self._allowed, os.lstat, SKIP_DIRS, SOURCE_EXTENSIONS
+        base, allowed, skip_dirs, extensions = self.base, self._allowed, SKIP_DIRS, SOURCE_EXTENSIONS
         stack = [self.root]
         while stack:
             here = stack.pop()
@@ -1932,7 +1932,7 @@ class ImportIndex:
                         continue  # judged by its name: nothing is asked of it
                     try:
                         listed = _entry_kind(entry)  # the type the listing gave (its cached `d_type`; when none, a look taken now)
-                        info = lstat(name, dir_fd=fd)  # the type now, no link followed
+                        info = os.lstat(name, dir_fd=fd)  # the type now, no link followed
                     except OSError as error:
                         self._gap(_entry_gap(error))  # gone or moved since the listing: a race; anything else: unreadable
                         continue

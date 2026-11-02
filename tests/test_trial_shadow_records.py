@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 import trial_record  # noqa: E402
 import trial_report  # noqa: E402
 
-RUN_KEYS = {"run", "source_task", "outcome", "workdir", "normal_reviewer_model", "reviewer_mismatch"}  # what the shadow adds to a record
+RUN_KEYS = {"run", "attempt", "source_task", "outcome", "workdir", "normal_reviewer_model", "reviewer_mismatch"}  # what the shadow adds to a record
 APPROVED = "APPROVED\nRESULT_STATUS: complete\n## Coverage\nReviewed lib/x.py in full.\n"
 TRANSCRIPT = ROOT / "tests" / "fixtures" / "trial" / "claude_transcript.jsonl"
 

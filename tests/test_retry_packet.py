@@ -211,7 +211,11 @@ class RepeatedFamilyGateTests(RetryCase):
 
         def depth(task):  # an id is named by its role and how many retries it follows, not by its random digits
             return 0 if not metas.get(task, {}).get("parent") else 1 + depth(metas[task]["parent"])
-        names = {task: f"{meta.get('role')}-{depth(task)}" for task, meta in metas.items()}
+        order = {r: n for meta in metas.values() for n, r in enumerate(meta.get("reviews", []))}  # the order an author's reviews were recorded in
+        names = {}
+        for task in sorted(metas, key=lambda t: (depth(t), order.get(t, 0))):  # two tasks of one role and depth stay two names
+            role = metas[task].get("role")
+            names[task] = f"{role}-{sum(1 for n in names if metas[n].get('role') == role)}"
         out = {}
         for path in sorted(self.state.rglob("*")):
             if path.is_file() and not path.name.endswith(".lock"):
@@ -250,6 +254,8 @@ class RepeatedFamilyGateTests(RetryCase):
         self.assertEqual(restored, self.state_digest())
         self.assertEqual(first, restored)
         self.assertGreater(len(restored), 10)
+        (self.state / "tasks" / "review-1" / "result.md").write_text("a different first review")  # the two reviews are two names
+        self.assertNotEqual(restored, self.state_digest())
 
     def test_the_families_are_matched_by_name_with_the_case_folded(self):
         item = self.chain(["State-Matrix"], ["state-matrix"])

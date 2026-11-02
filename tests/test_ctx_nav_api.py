@@ -231,6 +231,60 @@ class IndexCase(Tree):
             checked += 1
         self.assertEqual(checked, 10)
 
+    @staticmethod
+    def walk_by_lexical_path(index, patterns):
+        """The walk as it was before the entry paths were made from the folder's (`lexical_path` and `relpath` per entry): the oracle."""
+        found, config_dir, stack = {}, os.path.dirname(index.config), [index.root]
+        while stack:
+            here = stack.pop()
+            fd = os.open(here, graph.DIR_FLAGS | graph.NOFOLLOW_ANY)
+            try:
+                with os.scandir(fd) as listing:
+                    entries = sorted(listing, key=lambda entry: entry.name)
+                subdirs = []
+                for entry in entries:
+                    name, full = entry.name, os.path.join(here, entry.name)
+                    rel = graph.lexical_path(index.base, full)
+                    if rel is None or name in graph.SKIP_DIRS or not index._allowed(rel):
+                        continue
+                    info = os.lstat(name, dir_fd=fd)
+                    if not name.endswith(graph.SOURCE_EXTENSIONS) and not stat.S_ISDIR(info.st_mode):
+                        continue
+                    config_rel = os.path.relpath(full, config_dir).replace(os.sep, "/")
+                    if stat.S_ISDIR(info.st_mode):
+                        if not graph._excluded(config_rel, patterns):
+                            subdirs.append(full)
+                    elif stat.S_ISREG(info.st_mode) and not graph._excluded(config_rel, patterns):
+                        found[rel] = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns, info.st_dev)
+                stack.extend(reversed(subdirs))
+            finally:
+                os.close(fd)
+        return found
+
+    def test_walk_makes_the_same_paths_as_lexical_path_for_every_root_and_exclude(self):
+        project = self.project().resolve()
+        write(project / "src" / "deep" / "er" / "x.ts")
+        write(project / "src" / "deep" / "er" / "x.json")
+        write(project / "src" / "deep" / "keep.mjs")
+        write(project / ".git" / "skipme.ts")
+        os.symlink(project / "src" / "main.ts", project / "src" / "link.ts")
+        configs = {"project config": project / "deno.json", "config below the root": project / "src" / "app" / "deno.json",
+                   "config above the root": project.parent / "deno.json"}
+        roots = {"root is base": project, "root below base": project / "src", "root two below": project / "src" / "deep"}
+        patterns = {"none": [], "folder": ["skipped"], "nested folder": ["src/deep/er"], "glob": ["**/*.mjs", "src/*/er"], "slashes": ["/src/app/"]}
+        checked = 0
+        for root_label, root in roots.items():
+            for config_label, config in configs.items():
+                index = graph.ImportIndex(str(project), root=str(root), config=str(config), cache_path=None, allow=stub_allow(project))
+                for pattern_label, pats in patterns.items():
+                    with self.subTest(root=root_label, config=config_label, exclude=pattern_label):
+                        walked = index._walk(pats)
+                        self.assertEqual(walked, self.walk_by_lexical_path(index, pats))
+                        self.assertTrue(walked or pats, "an empty walk proves nothing")
+                        self.assertEqual(index.gaps, {})
+                        checked += 1
+        self.assertEqual(checked, 45)
+
     def test_touching_one_file_rescans_only_that_file(self):
         project = self.project()
         index = self.index(project)

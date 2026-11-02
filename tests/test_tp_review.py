@@ -17,24 +17,33 @@ PLAN = {"review": "required", "policy": "required",
 
 
 class TpReviewTests(unittest.TestCase):
+    TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py")   # the last two: the files contract.py's lifecycle and bin/tp-agent read
+
+    @classmethod
+    def setUpClass(cls):
+        # The lib files are copied once per class; each test copies this template (tests write stubs and overwrite lib files in their copy).
+        cls._template_tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._template_tmp.cleanup)
+        cls.template = Path(cls._template_tmp.name) / "root"
+        (cls.template / "bin").mkdir(parents=True)
+        (cls.template / "lib").mkdir()
+        shutil.copy(ROOT / "bin/tp-review", cls.template / "bin/tp-review")
+        shutil.copy(ROOT / "lib/tp.sh", cls.template / "lib/tp.sh")
+        # tp-review asks tp-agent's classifier whether the worker is paused (tp-agent shares lib/contract.py's pause rule).
+        shutil.copy(ROOT / "bin/tp-agent", cls.template / "bin/tp-agent")
+        shutil.copy(ROOT / "lib/contract.py", cls.template / "lib/contract.py")
+        for name in cls.TEMPLATE_LIBS + ("worker_process.py",):
+            shutil.copy(ROOT / "lib" / name, cls.template / "lib" / name)
+        (cls.template / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
+                                                         "def iter_task_dirs(state_dir, include_archive=True):\n    return iter(())\n")  # lane_steps scans the session with it
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)
         self.root = base / "root"
-        (self.root / "bin").mkdir(parents=True)
-        (self.root / "lib").mkdir()
-        shutil.copy(ROOT / "bin/tp-review", self.root / "bin/tp-review")
-        shutil.copy(ROOT / "lib/tp.sh", self.root / "lib/tp.sh")
-        # tp-review asks tp-agent's classifier whether the worker is paused (tp-agent shares lib/contract.py's pause rule).
-        shutil.copy(ROOT / "bin/tp-agent", self.root / "bin/tp-agent")
-        shutil.copy(ROOT / "lib/contract.py", self.root / "lib/contract.py")
-        for name in ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py"):   # the last two: the files contract.py's lifecycle and bin/tp-agent read: the files contract.py's lifecycle reads
-            shutil.copy(ROOT / "lib" / name, self.root / "lib" / name)
-        shutil.copy(ROOT / "lib/worker_process.py", self.root / "lib/worker_process.py")
-        (self.root / "lib/task_record.py").write_text("def request_text(d):\n    return 'x'\n\ndef refresh_record(state_dir, task_id):\n    return ''\n\n"
-                                                      "def iter_task_dirs(state_dir, include_archive=True):\n    return iter(())\n")  # lane_steps scans the session with it
+        shutil.copytree(self.template, self.root)
         self.log = base / "spawn.log"
         self.state = base / "state"
         # tp-route --review-plan: prints plan.json and exits with plan.rc (0 plan, 3 no review needed, 4 no independent reviewer)

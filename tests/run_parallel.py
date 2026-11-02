@@ -5,34 +5,56 @@ The reference command stays `python3 -m unittest discover -s tests -p 'test_*.py
 Each module runs in its own interpreter; modules in SERIAL run one at a time afterwards.
 """
 import argparse
+import os
 import re
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS))
+import run_bounded  # noqa: E402
+
 ROOT = TESTS.parent
 MAX_JOBS = 4
+MODULE_TIMEOUT = run_bounded.DEFAULT_TIMEOUT  # seconds one module may run before its process group is stopped
 # Pseudo-terminal repaint timing and loopback HTTP servers: kept out of the pool so load cannot skew them.
 SERIAL = {"test_status_repaint", "test_lmstudio", "test_routing_evals"}
 
 
-def run(module):
-    started = time.monotonic()
-    proc = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", module + ".py"],
-                          cwd=ROOT, capture_output=True, text=True)
-    output = proc.stdout + proc.stderr
+def default_jobs():
+    """Half the cores (1 to MAX_JOBS) when the machine is quiet, else 2: process starts are the cost, so a busy
+    machine gets fewer at once."""
+    cores = os.cpu_count() or 2
+    try:
+        busy = os.getloadavg()[0] >= cores / 2
+    except OSError:
+        busy = True
+    return 2 if busy else max(1, min(MAX_JOBS, cores // 2))
+
+
+def run(module, timeout=MODULE_TIMEOUT, log=None):
+    """Run one module under the bound and log its seconds and the load, in run_bounded's format."""
+    record, output = run_bounded.run_bounded(
+        [sys.executable, "-m", "unittest", "discover", "-s", str(TESTS), "-p", module + ".py"],
+        timeout=timeout, log=log, cwd=ROOT, files=[module], echo=False)
     ran = re.search(r"^Ran (\d+) tests?", output, re.M)
-    return module, proc.returncode, int(ran.group(1)) if ran else 0, time.monotonic() - started, output
+    if record["timed_out"]:
+        output += f"\n{module} hit the {timeout:g}s bound and its process group was stopped\n"
+    return module, 124 if record["timed_out"] else record["rc"], int(ran.group(1)) if ran else 0, record["seconds"], output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-j", "--jobs", type=int, default=2, help=f"parallel modules, 1-{MAX_JOBS} (default 2)")
+    parser.add_argument("-j", "--jobs", type=int, default=None,
+                        help=f"parallel modules, 1-{MAX_JOBS} (default: by core count when the load is low, else 2)")
+    parser.add_argument("--module-timeout", type=float, default=MODULE_TIMEOUT, help="seconds per module")
+    parser.add_argument("--log", help="JSON lines file for per-module seconds (default: run_bounded's)")
     parser.add_argument("modules", nargs="*", help="module names such as test_goal (default: all)")
     args = parser.parse_args()
+    if args.jobs is None:
+        args.jobs = default_jobs()
     if not 1 <= args.jobs <= MAX_JOBS:
         parser.error(f"--jobs must be between 1 and {MAX_JOBS}")
     found = sorted(p.stem for p in TESTS.glob("test_*.py"))
@@ -56,9 +78,12 @@ def main():
             print(output, flush=True)
         return ok
 
+    def bounded(module):
+        return run(module, args.module_timeout, args.log)
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        passed = [report(r) for r in pool.map(run, [m for m in wanted if m not in SERIAL])]
-    passed += [report(run(m)) for m in wanted if m in SERIAL]
+        passed = [report(r) for r in pool.map(bounded, [m for m in wanted if m not in SERIAL])]
+    passed += [report(bounded(m)) for m in wanted if m in SERIAL]
     total = sum(r[2] for r in results)
     failed = passed.count(False)
     print(f"Ran {total} tests in {len(results)} modules in {time.monotonic() - started:.1f}s with -j{args.jobs}: "

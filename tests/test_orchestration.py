@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
 import unittest
 import sys
 
@@ -338,9 +339,15 @@ esac
         for stem, label in (("dangling", "dangling symlink"), ("adir", "directory"), ("afifo", "FIFO"),
                             ("linked", "readable symlink to a valid record")):
             entries[stem] = (label, None)
-        signal.signal(signal.SIGALRM, lambda *_: self.fail("a reader blocked on a queue entry"))
-        signal.alarm(20)
-        self.addCleanup(signal.alarm, 0)
+        # A thread timer interrupts this thread with SIGUSR2. signal.alarm would share the process's one SIGALRM
+        # timer and cancel an outer `perl -e 'alarm N'` bound. 180 s is a hang guard (the test takes ~28 s under load 14).
+        previous = signal.signal(signal.SIGUSR2, lambda *_: self.fail("a reader blocked on a queue entry"))
+        main_thread = threading.get_ident()
+        watchdog = threading.Timer(180, signal.pthread_kill, (main_thread, signal.SIGUSR2))
+        watchdog.daemon = True
+        watchdog.start()
+        self.addCleanup(signal.signal, signal.SIGUSR2, previous)
+        self.addCleanup(watchdog.cancel)
         entries["unreadable"] = ("unreadable", json.dumps({**good, "id": "unreadable"}))
         for stem, (_, content) in entries.items():
             if content is not None:

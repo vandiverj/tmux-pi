@@ -1,6 +1,7 @@
 """Lanes L3: dispatch into a lane, the one-writer rule and the preamble (bin/tp-agent, bin/tp-spawn, bin/tp-review,
 lib/worker_process.py). The numbered checks are those of the design's table (3.1). Every repository is a temporary one and
 tmux is the private fixture server of tests/lane_fixture.py; no model runs."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,15 +53,20 @@ class LaneCase(TmuxCase):
         self.env["TP_MAIN_CWD"] = str(self.repo)  # the main pane's directory, which a dispatch into an existing lane starts from
 
     def fingerprint(self):
-        """Every path under the root (relative) with its mode, and for files the size and mtime: two roots with the same fingerprint hold
-        the same tree (a folder's own mtime is left out, setUp makes the folders new each test)."""
+        """Every path under the root (relative) with its mode and, for a file, the hash of its contents (for a link, its target): two
+        roots with the same fingerprint hold the same tree, whatever their mtimes (setUp makes them new each test)."""
         rows = []
         for folder, dirs, files in os.walk(self.root):
             for name in dirs + files:
                 path = Path(folder) / name
                 info = path.lstat()
-                folder_ = path.is_dir() and not path.is_symlink()
-                rows.append((str(path.relative_to(self.root)), info.st_mode, 0 if folder_ else info.st_size, 0 if folder_ else info.st_mtime_ns))
+                if path.is_symlink():
+                    content = os.readlink(path)
+                elif path.is_dir():
+                    content = ""
+                else:
+                    content = hashlib.sha256(path.read_bytes()).hexdigest()
+                rows.append((str(path.relative_to(self.root)), info.st_mode, content))
         return sorted(rows)
 
     def reset_fixture(self):
@@ -87,8 +93,8 @@ class LaneCase(TmuxCase):
 
     def lane_ok(self, snapshot=True, **kw):
         """A dispatch that must succeed; returns (item, task dir). With `snapshot_lane`, the first call in the class is a real dispatch
-        whose resulting root is copied aside, keyed on the root just before it and the call's full arguments; a later call with the same key
-        restores that copy instead of dispatching."""
+        whose resulting root is copied aside, keyed on the root just before it; a later default call with the same key restores that copy
+        instead of dispatching. A call with other arguments is always real, and neither takes nor uses the snapshot."""
         key = self.snapshot_key(snapshot, **kw)
         if key and self._lane_snapshot and self._lane_snapshot[0] == key:
             return self.lane_item(self.restore_lane())
@@ -101,11 +107,12 @@ class LaneCase(TmuxCase):
         return self.lane_item(run.stdout)
 
     def snapshot_key(self, snapshot=True, **kw):
-        """What a snapshot is valid for: the root's tree (relative paths), the environment, and the arguments with defaults filled in.
-        None when the class has not opted in or the call refuses it."""
-        if not (snapshot and self.snapshot_lane):
+        """What a snapshot is valid for: the default call (the arguments of a bare `lane_ok()`; `step="s1"` is that call) on this root's
+        tree (relative paths, modes, contents) and environment. None for any other call, and when the class has not opted in: those
+        are always real dispatches."""
+        if not (snapshot and self.snapshot_lane) or self.lane_args(**kw) != self.lane_args():
             return None
-        return (self.fingerprint(), sorted(self.env.items()), self.lane_args(**kw))
+        return (self.fingerprint(), sorted(self.env.items()))
 
     def lane_item(self, stdout):
         item = json.loads(stdout)
@@ -560,6 +567,19 @@ class LaneSnapshotTests(LaneCase):
         out.append((self.worktree.exists(), git(self.repo, "branch", "--list", "lane/alpha"), self.lane_dir().exists()))
         return out
 
+    def reserves_and_releases(self):
+        """The lane is free to take: a writer's reservation by this process succeeds, shows in lease.json, and is released."""
+        lease = self.lane_dir() / "lease.json"
+        words = ["--lane", "alpha", "--workdir", str(self.worktree), "--task", "coder-probe0001"]
+        script = str(ROOT / "lib/lane_lease.py")
+        run = subprocess.run([sys.executable, script, "reserve", *words, "--role", "coder", "--session", str(self.state), "--pid", str(os.getpid())],
+                             text=True, capture_output=True, env=self.env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([h["task"] for h in json.loads(lease.read_text())["holders"]], ["coder-probe0001"])
+        run = subprocess.run([sys.executable, script, "release", *words], text=True, capture_output=True, env=self.env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(lease.read_text())["holders"] if lease.exists() else [], [])
+
     def expect_dispatched(self, item, task):
         """What a lane's first dispatch must have left, stated outright (not compared with another copy of itself)."""
         record = json.loads((self.lane_dir() / "lane.json").read_text())
@@ -575,6 +595,7 @@ class LaneSnapshotTests(LaneCase):
         self.assertEqual((item["lane"], item["lane_step"], item["lane_created"]), ("alpha", "s1", True))
         meta = json.loads((task / "meta.json").read_text())
         self.assertEqual((meta["lane"], meta["lane_step"]), ("alpha", "s1"))
+        self.assertEqual(meta["pane"], "%9999")  # written after tp-spawn's `activate`, which refuses a task that holds no reservation
         self.assertTrue(self.worktree.is_dir())
         self.assertIn("lane/alpha", git(self.repo, "worktree", "list"))
         # the lease: a dispatch starts no worker, so the lane holds no occupant (a lease.json naming one would block the commands below)
@@ -600,15 +621,20 @@ class LaneSnapshotTests(LaneCase):
         self.assertIsNotNone(key)
         self.assertIsNone(self.snapshot_key(snapshot=False))
         self.assertEqual(self.snapshot_key(step="s1", role="coder", name="alpha"), key)  # defaults spelled out are the default call
-        self.assertNotEqual(self.snapshot_key(name="beta"), key)
-        self.assertNotEqual(self.snapshot_key(role="code-reviewer"), key)
-        self.assertNotEqual(self.snapshot_key(step="s2"), key)
-        self.assertNotEqual(self.snapshot_key(extra=()), key)
+        for other in ({"name": "beta"}, {"role": "code-reviewer"}, {"step": "s2"}, {"extra": ()}, {"tests": "unit"}):
+            self.assertIsNone(self.snapshot_key(**other), f"{other} is not the default call: it is never cached or restored")
         (self.state / "live-window").touch()  # a flag file
         self.assertNotEqual(self.snapshot_key(), key)
         (self.state / "live-window").unlink()
         self.assertEqual(self.snapshot_key(), key, "the same tree again is the same key")
         (self.repo / "lib/x.py").write_text("edited\n")  # a repository edit
+        self.assertNotEqual(self.snapshot_key(), key)
+        self.reset_fixture()
+        self.assertEqual(self.snapshot_key(), key)
+        edited = self.repo / "lib/x.py"  # same size, same mtime, other contents
+        before = edited.stat()
+        edited.write_text("y\n")
+        os.utime(edited, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertNotEqual(self.snapshot_key(), key)
         self.reset_fixture()
         self.assertEqual(self.snapshot_key(), key)
@@ -621,6 +647,7 @@ class LaneSnapshotTests(LaneCase):
         item, task = self.lane_ok()  # the first call is a real dispatch and takes the snapshot
         self.assertIsNotNone(self._lane_snapshot)
         self.expect_dispatched(item, task)
+        self.reserves_and_releases()
         real = self.described(item, task), self.then(task.name)
         self.reset_fixture()
         self.assertFalse(self.worktree.exists())
@@ -628,6 +655,7 @@ class LaneSnapshotTests(LaneCase):
         self.assertEqual(len(counted), 1, "the second call must not dispatch")
         self.assertEqual(item2, item)  # the snapshot carries the real dispatch's own answer, id included
         self.expect_dispatched(item2, task2)
+        self.reserves_and_releases()
         restored = self.described(item2, task2), self.then(task2.name)
         self.assertEqual(restored[0], real[0])
         self.assertEqual(restored[1], real[1])
@@ -635,13 +663,19 @@ class LaneSnapshotTests(LaneCase):
         self.assertEqual(real[0]["worktrees"].count("lane/alpha"), 1)
 
     def test_a_call_that_differs_or_follows_a_touched_root_dispatches_for_real(self):
+        self.forget_snapshot()
         counted = self.count_dispatches()
-        self.lane_ok()
+        self.lane_ok(name="beta")  # not the default call: real, and it does not take the snapshot
+        self.assertIsNone(self._lane_snapshot)
+        self.reset_fixture()
+        self.lane_ok()  # the first default call takes it
+        self.assertIsNotNone(self._lane_snapshot)
         self.reset_fixture()
         (self.state / "live-window").touch()
-        self.lane_ok()
+        self.lane_ok()  # a root that differs from the snapshot's: real
+        self.assertEqual(len(counted), 3)
         self.reset_fixture()
-        self.lane_ok(name="alpha", step="s2")
+        self.lane_ok()  # the snapshot is still the first default call's
         self.assertEqual(len(counted), 3)
 
 

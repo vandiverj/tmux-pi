@@ -800,6 +800,51 @@ class OpenStepTests(StepCase):
         self.untouched(self.next_step, f"`rm -r {task}`")
 
 
+class RestoredLaneCloseTests(StepCase):
+    """The snapshot of the first lane dispatch (LaneCase.snapshot_lane) is the real dispatch to `lane close`: the same settled work, the
+    same APPROVED review record (self.review, as the gate tests make it), then close, `lanes` and the lane record agree on both."""
+    snapshot_lane = True
+
+    def normalized(self, text, author):
+        text = text.replace(str(self.root), "<root>").replace(author, "<author>")
+        text = re.sub(r"\b[0-9a-f]{40}\b", "<sha>", text)
+        text = re.sub(r"\d{4}-\d\d-\d\dT[\d:]+(?:Z|\+00:00)", "<time>", text)
+        text = re.sub(r'"age": "[^"]*"', '"age": "<age>"', text)
+        return re.sub(r"sel-[0-9a-f]{32}", "<selection>", text)
+
+    def closed_after_dispatch(self):
+        """Dispatch the lane (default call), settle it, commit its work, review it APPROVED, close step s1: what each command said."""
+        item, task = self.lane_ok()
+        author = item["id"]
+        self.settle(task)
+        self.edit()
+        self.commit()
+        self.review(author, APPROVED)
+        closed = self.close()
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(json.loads(closed.stdout)["closed"][0]["verdict"], "APPROVED")
+        record = {k: v for k, v in self.record().items() if k not in ("updated", "created")}
+        lanes = self.raw("lanes", "--repo", str(self.repo))
+        self.assertEqual(lanes.returncode, 0, lanes.stderr)
+        return author, [self.normalized(text, author) for text in (closed.stdout, closed.stderr, lanes.stdout, json.dumps(record, sort_keys=True),
+                                                                git(self.worktree, "log", "-1", "--format=%s"))]
+
+    def test_a_restored_lane_closes_like_the_real_one(self):
+        type(self)._lane_snapshot = None
+        shutil.rmtree(self.class_root / "snapshot", ignore_errors=True)
+        counted = []
+        real = self.lane_dispatch
+        self.lane_dispatch = lambda **kw: (counted.append(kw), real(**kw))[1]
+        _, first = self.closed_after_dispatch()
+        self.assertEqual(len(counted), 1)
+        self.reset_fixture()
+        self.made = 0
+        _, second = self.closed_after_dispatch()
+        self.assertEqual(len(counted), 1, "the second dispatch must be restored")
+        self.assertEqual(second, first)
+        self.assertIn("s1", first[0])
+
+
 class UnitTests(StepCase):
     def test_a_session_with_no_state_directory_lists_nulls_and_warns(self):
         self.writer()

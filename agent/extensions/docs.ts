@@ -1,7 +1,8 @@
 /**
  * docs — offline, read-only library docs for pi workers: `api_signature` and `docs_search`.
  *
- * The pi twin of claude/mcp/docs.mjs, loaded by bin/tp-pi only when TP_DOCS_TOOLS=1. Both tools run `bin/tp-docs --json`,
+ * The pi twin of claude/mcp/docs.mjs, loaded by bin/tp-pi only for a task (TP_TASK_DIR set) with TP_DOCS_TOOLS=1, never for
+ * Main. Both tools run `bin/tp-docs --json`,
  * which answers from allowlisted local files (.d.ts/.d.mts/.d.cts/.md under the pinned package or the index), caps the
  * answer at 8 KB and logs every call to $TP_TASK_DIR/docs-calls.jsonl. This extension opens no sockets and reads no
  * files; if tp-docs cannot log (no TP_TASK_DIR) it answers nothing and the tool call fails.

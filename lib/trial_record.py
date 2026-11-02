@@ -5,19 +5,27 @@ transcript, docs-calls.jsonl) and returns a JSON-safe dict. It keeps counts, ids
 command text. Both arms of a pair (`qwen`, `normal`) get a record joined by `pair_id`.
 
 The first review is `meta.reviews[0]`, not the last: a later round says what the author fixed, not what the first attempt was.
+The task dir, the reviewers' dirs and the Claude transcript can all be written by the worker, so `build` never opens them itself: it
+copies their plain files into a private temp dir through `trial_session.read_plain` (non-blocking, never through a link, a regular
+file within MAX_READ; a transcript within trial_scan.MAX_TRANSCRIPT_BYTES) and reads the copy. A FIFO, a link, a directory or a file
+past the limit at a name reads as no file there.
+
 `first_review_outcome` is `approved` (a complete APPROVED or APPROVED_WITH_NOTES), `request_changes`, or `inconclusive` (an
 incomplete, unparsed or label-only review, which is neither an approval nor a rejection), and None when there is no first review.
 """
 
 import datetime
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import review_verdict  # noqa: E402
 import routing_evals  # noqa: E402
 import trial_scan  # noqa: E402
+import trial_session  # noqa: E402  (read_plain: the one way a file the worker can write is read)
 
 RECORDS = "records.jsonl"
 SCHEMA = 1
@@ -39,6 +47,15 @@ def trial_dir(project):
     return Path(project) / ".tmux-pi" / "trial"
 
 
+def _check(arm, mode, pair_id):
+    if arm not in ARMS:
+        raise RecordError("arm must be one of {}: {!r}".format(", ".join(ARMS), arm))
+    if mode not in MODES:
+        raise RecordError("mode must be one of {}: {!r}".format(", ".join(MODES), mode))
+    if not isinstance(pair_id, str) or not pair_id.strip():
+        raise RecordError("pair_id is required")
+
+
 def size_bucket(files, lines):
     """small / medium / large from the final diff's file and changed-line counts; None when either is unknown."""
     if not isinstance(files, int) or not isinstance(lines, int) or isinstance(files, bool) or isinstance(lines, bool):
@@ -54,6 +71,52 @@ def size_bucket(files, lines):
 
 def _json(path):
     return routing_evals._read_json(path) or {}
+
+
+def _copy_plain(source, target, limit=None):
+    """Copy the file at `source` to `target` through trial_session.read_plain: a FIFO, a link, a directory, a file past the limit or
+    anything unreadable is not copied (True when a file was)."""
+    try:
+        data = trial_session.read_plain(source, limit=limit)
+    except OSError:
+        return False
+    Path(target).write_bytes(data)
+    return True
+
+
+def _snapshot_task(source, target):
+    """Copy the plain files of a task dir (its top level) into `target`; whatever else is at a name there reads as no file."""
+    Path(target).mkdir(parents=True, exist_ok=True)
+    try:
+        names = sorted(os.listdir(source))
+    except OSError:
+        return
+    for name in names:
+        _copy_plain(Path(source) / name, Path(target) / name)
+
+
+def _snapshot(task_dir, state_dir, scratch):
+    """(task dir, state dir) of a copy, under `scratch`, of what `build` reads: the task's plain files, those of the reviewers its
+    meta names (from tasks/ or archive/), and the Claude transcript its transcript-path names. The task dir is worker-writable, so
+    a FIFO there would hold a plain read until a writer came, a link would lead elsewhere and a file could be any size; `build`
+    reads the copy, and every read of the original is read_plain's."""
+    scratch = Path(scratch)
+    task = scratch / "tasks" / Path(task_dir).name
+    _snapshot_task(task_dir, task)
+    for name in _review_ids(_json(task / "meta.json")):
+        for base in ("tasks", "archive"):
+            source = Path(state_dir) / base / name
+            if source.is_dir() and not source.is_symlink() and (source / "meta.json").is_file():
+                _snapshot_task(source, scratch / "tasks" / name)
+                break
+    named = task / "transcript-path"
+    if named.is_file():
+        copy = scratch / "transcript.jsonl"
+        wanted = named.read_text(encoding="utf-8", errors="replace").strip()
+        if wanted:
+            named.write_text(str(copy) if _copy_plain(wanted, copy, limit=trial_scan.MAX_TRANSCRIPT_BYTES) else str(scratch / "no-transcript"),
+                             encoding="utf-8")
+    return task, scratch
 
 
 def _review_ids(meta):
@@ -182,22 +245,24 @@ def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files
 
     `commit_messages` are the bodies of `git log <base>..HEAD`, read before the shadow worktree is reset; they feed the
     commit and think-leak rules. `diff_files`/`diff_lines` come from the final diff. `brief_drift` is replay-only."""
-    if arm not in ARMS:
-        raise RecordError("arm must be one of {}: {!r}".format(", ".join(ARMS), arm))
-    if mode not in MODES:
-        raise RecordError("mode must be one of {}: {!r}".format(", ".join(MODES), mode))
-    if not isinstance(pair_id, str) or not pair_id.strip():
-        raise RecordError("pair_id is required")
-    task_dir = Path(task_dir)
-    if not (task_dir / "meta.json").is_file():
-        raise RecordError("not a task dir (no meta.json): {}".format(task_dir))
-    state_dir = Path(state_dir) if state_dir else task_dir.parent.parent
+    _check(arm, mode, pair_id)
+    original = Path(task_dir)
+    state_dir = Path(state_dir) if state_dir else original.parent.parent
+    with tempfile.TemporaryDirectory(prefix="tp-trial-record-") as scratch:
+        task_dir, state_dir_copy = _snapshot(original, state_dir, scratch)
+        if not (task_dir / "meta.json").is_file():
+            raise RecordError("not a task dir (no meta.json): {}".format(original))
+        return _build(task_dir, state_dir_copy, original, arm, mode, pair_id, role, diff_files, diff_lines, commit_messages, brief_drift, now)
+
+
+def _build(task_dir, state_dir, original, arm, mode, pair_id, role, diff_files, diff_lines, commit_messages, brief_drift, now):
+    """`build` over the copy (`task_dir`, `state_dir`) that `_snapshot` made of the task at `original`."""
     meta, dispatch = _json(task_dir / "meta.json"), _json(task_dir / "dispatch.json")
     dirs_by_id = {d.name: d for d in routing_evals._task_dirs(state_dir)}
     try:
         summary = routing_evals.task_summary(task_dir, dirs_by_id)
     except (KeyError, TypeError) as exc:  # task_summary reads worker, model and thinking from a recorded task
-        raise RecordError("task record {} is incomplete: {!r}".format(task_dir, exc)) from exc
+        raise RecordError("task record {} is incomplete: {!r}".format(original, exc)) from exc
     rounds, first = first_review(meta, state_dir)
     scan = trial_scan.scan_task(task_dir)
     leaks = []
@@ -210,7 +275,7 @@ def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files
             leaks.append("think_leak")
     extra = trial_scan.commit_message_slips(commit_messages) if commit_messages is not None else []
     context = dispatch.get("context") if isinstance(dispatch.get("context"), list) else None
-    brief = _count(task_dir / "request.md")
+    brief = _count(original / "request.md")  # a size only: stat never waits on a FIFO and a link is not counted
     created = now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "schema": SCHEMA,
@@ -245,6 +310,48 @@ def build(task_dir, arm, mode, pair_id, *, state_dir=None, role=None, diff_files
         "docs_calls": read_docs_calls(task_dir / "docs-calls.jsonl"),
         "base_commit": dispatch.get("base_commit") if isinstance(dispatch.get("base_commit"), str) else None,
         "brief_drift": brief_drift if mode == "replay" else None,
+    }
+
+
+def no_task(arm, mode, pair_id, *, task_id=None, role=None, model=None, effort=None, base_commit=None, now=None):
+    """The record of an attempt that made no task dir (a spawn that failed before tp-spawn wrote one), so there is nothing for `build`
+    to read. It has every key `build` gives, so the report reads it like any other: what was tried (ids, model, effort, base commit)
+    is filled in, everything about the work is None (not 0), so no median counts it, there is no first review (`no_review` in the
+    report) and `no_task` is true. The caller adds its own keys (the error, the run)."""
+    _check(arm, mode, pair_id)
+    return {
+        "schema": SCHEMA,
+        "created": now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pair_id": pair_id.strip(),
+        "arm": arm,
+        "mode": mode,
+        "task_id": task_id,
+        "role": role,
+        "size": None,
+        "diff": None,
+        "model": model,
+        "effort": effort,
+        "state": None,
+        "exit": None,
+        "first_review_verdict": None,
+        "first_review_outcome": None,
+        "review_rounds": None,
+        "reviewer_model": None,
+        "finding_categories": [],
+        "finding_closes_by": [],
+        "transcript": {"harness": None, "status": "missing", "commands": None, "bad_lines": 0},
+        "rule_slips": {"complete": False, "total": 0, "by_rule": {}},
+        "gate_runs": None,
+        "tokens": None,
+        "wall_time_s": None,
+        "turns": None,
+        "tool_errors": None,
+        "brief_size_bytes": None,
+        "context_files": None,
+        "docs_calls": None,
+        "base_commit": base_commit,
+        "brief_drift": None,
+        "no_task": True,
     }
 
 

@@ -1,5 +1,11 @@
 {
   "max_local_workers": 2,
   "max_active_workers": 10,
-  "lanes": { "max_active_lanes": 16 }
+  "lanes": { "max_active_lanes": 16 },
+  "trial": {
+    "max_local_workers": 1,
+    "attempt_timeout_s": 2700,
+    "model": "lmstudio/qwen/qwen3.6-35b-a3b",
+    "thinking": "medium"
+  }
 }

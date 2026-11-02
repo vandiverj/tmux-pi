@@ -8,6 +8,7 @@ import atexit
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -36,15 +37,19 @@ def setUpModule():
     unittest.addModuleCleanup(patcher.stop)
 
 
-class _StartedClock:
-    """Stands in for `time` inside sensitive_read: monotonic() does not advance until the fake git has written its pid file
-    (two numbers), then runs at real speed. If that takes longer than `guard` real seconds, `expired` is set and the clock
-    jumps ahead so the classifier gives up at once (the test then fails with a clear message)."""
+class _ChildClock:
+    """Stands in for `time` and `select` inside sensitive_read, so every short limit counts from the fake git's start.
+
+    monotonic() does not advance until the fake git has written its pid file (two numbers), then runs at real speed, and
+    select() waits on the same clock, in small slices of the real select. A limit therefore cannot run out while the child is
+    still being started, whatever the machine load. Waiting for the start is bounded by a separate, generous real-time `guard`:
+    past it `expired` is set and the clock jumps ahead so the classifier gives up at once (the test then fails with its message).
+    """
     guard = 120.0
+    slice = 0.05
 
     def __init__(self, pids):
-        self.pids, self.expired = pids, False
-        self._began = time.monotonic()
+        self.pids, self.expired, self.began = pids, False, time.monotonic()
         self._base, self._mark = 1000.0, None
 
     def __getattr__(self, name):
@@ -59,12 +64,23 @@ class _StartedClock:
                 reported = False
             if reported:
                 self._mark = now
-            elif now - self._began > self.guard:
+            elif now - self.began > self.guard:
                 self.expired = True
                 return self._base + 1e6
             else:
                 return self._base
         return self._base + (now - self._mark)
+
+    def select(self, readable, writable, failed, timeout):
+        end = self.monotonic() + timeout
+        while True:
+            ready = select.select(readable, writable, failed, self.slice)
+            if any(ready) or self.monotonic() >= end:
+                return ready
+
+    def since_start(self):
+        """Real seconds since the fake git started (0 while it has not)."""
+        return 0.0 if self._mark is None else time.monotonic() - self._mark
 
 ENV = "." + "env"
 AUTH = "auth" + ".json"
@@ -1271,30 +1287,25 @@ class UnscopedPatchTests(unittest.TestCase):
         with self.on_path(failing):
             self.verdicts(top, UNSCOPED, True)
 
-    def test_timeout_prompts(self):
-        top = self.repo()
+    def child_run(self, top, script, command, limit):
+        """Judge `command` with a fake git running `script` and a git limit of `limit` seconds that counts from the fake git's
+        start (see _ChildClock). The script writes its pid file with `$$ $!`-style two numbers first. Returns the verdict, the clock
+        and the pids."""
         pids = top.parent / (top.name + ".pids")
         self.addCleanup(pids.unlink, True)
         pids.unlink(missing_ok=True)
-        slow = self.fake_git(f"sleep 60 &\necho $$ $! > '{pids}'\nwait")
-        limit = 1.0
-        clock = _StartedClock(pids)
-        # The classifier starts its clock before it spawns git. Its clock stands still here until the fake git has reported in, so
-        # the short limit counts from the child's start and load cannot use it up first. Waiting for the start is bounded by a
-        # separate, generous guard (clock.guard), which fails with its own message.
-        with self.on_path(slow), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit), \
-                mock.patch.object(sensitive_read, "time", clock):
-            started = time.monotonic()
-            result = bash("git diff", str(top))
-            elapsed = time.monotonic() - started
+        clock = _ChildClock(pids)
+        with self.on_path(self.fake_git(script.format(pids=pids))), \
+                mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit), \
+                mock.patch.object(sensitive_read, "time", clock), mock.patch.object(sensitive_read, "select", clock):
+            result = bash(command, str(top))
         self.assertFalse(clock.expired, "the fake git did not start within %s s" % clock.guard)
-        self.assertTrue(result["sensitive"])
-        self.assertEqual(result["reason"], "unscoped patch output may include credential files")
         self.assertEqual(len(pids.read_text().split()), 2)
-        # It waited for the limit after the start (the fake git never answers); the upper bound only catches a hang (it sleeps 60 s).
-        self.assertTrue(limit <= elapsed < 50, elapsed)
-        # The query and what it started are gone, not left running (init reaps the killed process: wait for that, no fixed delay).
-        for pid in pids.read_text().split():
+        return result, clock, pids.read_text().split()
+
+    def assert_gone(self, pids):
+        """The query and what it started are gone, not left running (init reaps the killed process: wait for that, no fixed delay)."""
+        for pid in pids:
             with self.subTest(pid=pid):
                 give_up = time.monotonic() + 30
                 while True:
@@ -1304,12 +1315,26 @@ class UnscopedPatchTests(unittest.TestCase):
                         break
                     self.assertLess(time.monotonic(), give_up, "still running")
                     time.sleep(0.02)
-        # Output without end is cut off as well.
-        endless = self.fake_git("while :; do printf 'README.md\\000'; done")
-        with self.on_path(endless), mock.patch.object(sensitive_read, "_GIT_TIMEOUT", limit):
-            started = time.monotonic()
-            self.assertTrue(bash("git log -p", str(top))["sensitive"])
-            self.assertLess(time.monotonic() - started, 50)
+
+    def test_timeout_prompts(self):
+        top = self.repo()
+        limit = 1.0
+        # The classifier starts its clock before it spawns git; here both its clock and its wait count from the fake git's start,
+        # so load (a slow start) cannot use the short limit up first.
+        result, clock, pids = self.child_run(top, "sleep 60 &\necho $$ $! > '{pids}'\nwait", "git diff", limit)
+        self.assertTrue(result["sensitive"])
+        self.assertEqual(result["reason"], "unscoped patch output may include credential files")
+        # It waited for the limit after the start (the fake git never answers); the upper bound only catches a hang (it sleeps 60 s).
+        self.assertTrue(limit <= clock.since_start() < 50, clock.since_start())
+        self.assert_gone(pids)
+        # Output without end is cut off by its size, not by the limit: the limit here is far longer than the cut takes, and is
+        # not reached.
+        limit = 60.0
+        result, clock, pids = self.child_run(
+            top, "echo $$ $$ > '{pids}'\nwhile :; do printf 'README.md\\000'; done", "git log -p", limit)
+        self.assertTrue(result["sensitive"])
+        self.assertLess(clock.since_start(), limit, "ended by the time limit, not the size cut")
+        self.assert_gone(pids)
 
     def test_query_runs_only_for_unscoped_patch_forms(self):
         top = self.repo()

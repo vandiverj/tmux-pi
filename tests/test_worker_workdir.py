@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+HANG_GUARD = 300  # seconds; far above the worst load time seen (27 s for the slowest test), below a stuck run's bound
 
 
 class WorkdirTests(unittest.TestCase):
@@ -49,8 +50,9 @@ esac
 
     def cli(self, script, *args, **updates):
         env = {**self.env, **updates}
+        # The timeout is a hang guard, not a speed limit: one tp-review takes 10-15 s on a loaded machine (many process starts).
         return subprocess.run([str(ROOT / "bin" / script), *args], env=env, text=True,
-                              capture_output=True, timeout=25)
+                              capture_output=True, timeout=HANG_GUARD)
 
     def meta(self, run):
         self.assertEqual(run.returncode, 0, run.stderr)

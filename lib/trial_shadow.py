@@ -597,6 +597,7 @@ class Run:
         self.diff = (None, None)
         self.commit_messages = None
         self.review_id = None
+        self.review_result = None
         self.wait_result = None
 
     # -- helpers
@@ -841,6 +842,7 @@ class Run:
         self.note(review_id=self.review_id)
         self.owner.record_panes(self.env)  # the reviewer's pane, now that it exists
         result = self.wait(self.review_id, self.clock() + self.info.get("review_timeout_s", 1800), "review-wait")
+        self.review_result = result
         self.note(review_wait=result)
         if result == "timeout":
             try:
@@ -848,6 +850,16 @@ class Run:
             except ShadowError as problem:
                 self.note(review_error="the reviewer was not stopped: {}".format(problem))
         return self.review_id
+
+    def reviewed_outcome(self):
+        """Review the work and say how the run ended: `completed` when the reviewer ran to its verdict, `no_review` when no review could be
+        started or the reviewer failed, stopped or paused, `review_timeout` when it did not finish in time. The last two have no first
+        review in the record, which L2's report counts as no review; the attempt is recorded either way."""
+        if self.review() is None:
+            return "no_review"
+        if self.review_result == "settled":
+            return "completed"
+        return "review_timeout" if self.review_result == "timeout" else "no_review"
 
     def reviewer_model(self):
         meta = _json(self.task_path() / "meta.json")
@@ -937,8 +949,7 @@ class Run:
                 self.end_worker(result)
                 self.collect_work()
                 if result == "settled":
-                    self.review()
-                    self.outcome = "completed"
+                    self.outcome = self.reviewed_outcome()
                 elif result not in ("timeout", "preempted"):
                     self.outcome = {"failed": "worker_failed", "stopped": "stopped", "paused": "paused"}[result]
                 self.try_record()

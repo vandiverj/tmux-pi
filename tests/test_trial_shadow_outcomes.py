@@ -107,6 +107,52 @@ class RecordFailureTests(OutcomeCase):
         self.assertIn("ValueError", done["record_error"])
 
 
+class ReviewOutcomeTests(OutcomeCase):
+    """F2: a review that did not run, or did not finish, is not a completed trial; the report counts it as no review."""
+
+    def test_a_review_that_cannot_start_is_no_review_and_the_attempt_is_still_recorded(self):
+        rdir, _ = self.prepare()
+        _, done = self.run_stub(rdir, self.settle_then_review(), run_class=NoReviewRun)
+        self.assertEqual(done["outcome"], "no_review", done)
+        self.assertIn("review refused", done["review_error"])
+        self.assertIsNone(done.get("review_id"))
+        qwen, = self.qwen()
+        self.assertEqual((qwen["outcome"], qwen["first_review_outcome"]), ("no_review", None))
+        counts = self.report()["by_arm"]["qwen"]
+        self.assertEqual((counts["no_review"], counts["approved"]), (1, 0))
+
+    def test_a_reviewer_that_does_not_finish_in_time_is_a_review_timeout(self):
+        rdir, _ = self.prepare(review_timeout_s=300)
+        _, done = self.run_stub(rdir, self.settle_then_review(approve=False))
+        self.assertEqual((done["outcome"], done["review_wait"]), ("review_timeout", "timeout"), done)
+        self.assertTrue(done["review_id"])
+        qwen, = self.qwen()
+        self.assertEqual((qwen["outcome"], qwen["first_review_outcome"]), ("review_timeout", None))
+        self.assertEqual(self.report()["by_arm"]["qwen"]["no_review"], 1)
+
+    def test_a_reviewer_that_fails_is_no_review(self):
+        rdir, _ = self.prepare()
+
+        def poll(n, run):
+            if n == 1:
+                self.edit(run)
+                self.settle_worker(run)
+            else:
+                for p in (run.state / "tasks").iterdir():
+                    if (p / "review-of").exists():
+                        (p / "exit").write_text("1\n")
+                        self.tmux("kill-pane", "-t", json.loads((p / "meta.json").read_text())["pane"])
+        _, done = self.run_stub(rdir, poll)
+        self.assertEqual(done["review_wait"], "failed", done)
+        self.assertEqual(done["outcome"], "no_review")
+
+    def test_a_review_that_ran_is_completed(self):
+        rdir, _ = self.prepare()
+        _, done = self.run_stub(rdir, self.settle_then_review())
+        self.assertEqual((done["outcome"], done["review_wait"]), ("completed", "settled"), done)
+        self.assertEqual(self.qwen()[0]["first_review_outcome"], "approved")
+
+
 
 if __name__ == "__main__":
     unittest.main()

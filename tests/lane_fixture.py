@@ -14,34 +14,30 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = "openai/gpt-6-sol"
 TMUX = shutil.which("tmux")
+GIT_ENV = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
 
-@unittest.skipUnless(TMUX, "tmux not installed")
-class TmuxCase(unittest.TestCase):
-    def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name).resolve()
-        self.project = self.root / "project"
-        self.project.mkdir()
-        self.other = self.root / "other"
-        self.other.mkdir()
-        self.state = self.project / ".tmux-pi"
-        (self.state / "tasks").mkdir(parents=True)
-        self.sock = f"tp-t3-{os.getpid()}-{self.id().split('.')[-1][-20:]}"
-        fake = self.root / "bin"
-        fake.mkdir()
-        wrapper = fake / "tmux"
-        # Pane queries and kills are real; everything that would start a worker is a no-op.
-        wrapper.write_text(f'''#!/bin/sh
+def git(cwd, *args):
+    """Run git in `cwd` (fixed author and committer, no inherited GIT_* variables); return stdout, stripped. A non-zero exit fails."""
+    run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, env=GIT_ENV)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip()
+
+
+def write_wrappers(fake, sock):
+    """Write the fake `tmux` and `ps` into `fake`; the tmux wrapper reaches the private server on `sock`."""
+    wrapper = fake / "tmux"
+    # Pane queries and kills are real; everything that would start a worker is a no-op.
+    wrapper.write_text(f'''#!/bin/sh
 case "$1" in
  list-panes) [ ! -f "$TP_STATE_DIR/list-fail" ] || {{ echo "no server" >&2; exit 1; }}
    if [ -f "$TP_STATE_DIR/list-rows" ]; then cat "$TP_STATE_DIR/list-rows"; exit 0; fi
-   exec {TMUX} -L {self.sock} "$@" ;;
+   exec {TMUX} -L {sock} "$@" ;;
  display-message) if [ -n "$TP_MAIN_CWD" ]; then case "$*" in *pane_current_path*) printf '%s\\n' "$TP_MAIN_CWD"; exit 0 ;; esac; fi
-   exec {TMUX} -L {self.sock} "$@" ;;
- kill-pane) if [ -f "$TP_STATE_DIR/kill-fail" ]; then echo "cannot kill pane" >&2; exit 1; fi; exec {TMUX} -L {self.sock} "$@" ;;
- new-session|new-window-real) exec {TMUX} -L {self.sock} "$@" ;;
+   exec {TMUX} -L {sock} "$@" ;;
+ kill-pane) if [ -f "$TP_STATE_DIR/kill-fail" ]; then echo "cannot kill pane" >&2; exit 1; fi; exec {TMUX} -L {sock} "$@" ;;
+ new-session|new-window-real) exec {TMUX} -L {sock} "$@" ;;
  set-option) if [ -f "$TP_STATE_DIR/hang-after-activate" ]; then : > "$TP_STATE_DIR/hung"; sleep 300; fi; exit 0 ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window)
@@ -52,7 +48,7 @@ case "$1" in
    if [ -f "$TP_STATE_DIR/live-window" ]; then
      # the command line carries the run.sh path, as a real worker's does: that is how a killed starter's pane is found again
      for last; do :; done
-     pane=$({TMUX} -L {self.sock} new-window -d -P -F '#{{pane_id}}' "sh -c 'sleep 300; :' sleeper $last") || exit 1
+     pane=$({TMUX} -L {sock} new-window -d -P -F '#{{pane_id}}' "sh -c 'sleep 300; :' sleeper $last") || exit 1
      if [ -f "$TP_STATE_DIR/break-after-window" ]; then touch "$TP_STATE_DIR/list-fail"; fi
      # with hang-after-window the starter stops here, pane made and not yet reported: a test kills it in this interval
      if [ -f "$TP_STATE_DIR/hang-after-window" ]; then : > "$TP_STATE_DIR/hung"; sleep 300; fi
@@ -61,22 +57,88 @@ case "$1" in
  *) exit 0 ;;
 esac
 ''')
-        wrapper.chmod(0o755)
-        # ps shows what is really running, plus (while ghost-ps exists) one recorded row that never dies: a survivor of KILL.
-        (fake / "ps").write_text(f'''#!/bin/sh
+    wrapper.chmod(0o755)
+    # ps shows what is really running, plus (while ghost-ps exists) one recorded row that never dies: a survivor of KILL.
+    (fake / "ps").write_text(f'''#!/bin/sh
 out=$(/bin/ps "$@"); printf '%s\\n' "$out"
 if [ -f "$TP_STATE_DIR/ghost-ps" ]; then
   pid=$(cut -d' ' -f1 "$TP_STATE_DIR/ghost-ps")
   printf '%s\\n' "$out" | awk -v p="$pid" '$1 == p && $3 !~ /^Z/ {{ f = 1 }} END {{ exit !f }}' || cat "$TP_STATE_DIR/ghost-ps"
 fi
 ''')
-        (fake / "ps").chmod(0o755)
+    (fake / "ps").chmod(0o755)
+
+
+@unittest.skipUnless(TMUX, "tmux not installed")
+class TmuxCase(unittest.TestCase):
+    """A private tmux server and a state directory per test. A class that sets `shared_server = True` builds the wrappers and the
+    server once for the class; after each test every session and window the test made is ended (the anchor stays), and the
+    server is killed when the class ends. Such a class's tests must not depend on a fresh server."""
+    shared_server = False
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not cls.shared_server:
+            return
+        temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        cls.class_root = Path(temp.name).resolve()
+        cls.sock = f"tp-t3-{os.getpid()}-{cls.__name__[-24:]}"
+        cls.fake = cls.class_root / "bin"
+        cls.fake.mkdir()
+        write_wrappers(cls.fake, cls.sock)
+        cls.addClassCleanup(cls.kill_server)  # registered last, so it runs before the folder is removed
+        subprocess.run([TMUX, "-L", cls.sock, "new-session", "-d", "-s", "anchor", "sleep 86400"], check=True, capture_output=True)
+        cls.anchor_window = subprocess.run([TMUX, "-L", cls.sock, "display-message", "-p", "-t", "anchor", "#{window_id}"], text=True,
+                                           check=True, capture_output=True).stdout.strip()
+
+    @classmethod
+    def kill_server(cls):
+        out = subprocess.run([TMUX, "-L", cls.sock, "display-message", "-p", "#{pid}"], text=True, capture_output=True)
+        try:
+            os.kill(int(out.stdout.strip()), signal.SIGKILL)
+        except (ProcessLookupError, ValueError):
+            pass
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.other = self.root / "other"
+        self.other.mkdir()
+        self.state = self.project / ".tmux-pi"
+        (self.state / "tasks").mkdir(parents=True)
+        if self.shared_server:
+            fake = self.fake
+        else:
+            self.sock = f"tp-t3-{os.getpid()}-{self.id().split('.')[-1][-20:]}"
+            fake = self.root / "bin"
+            fake.mkdir()
+            write_wrappers(fake, self.sock)
         self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
         self.env.pop("TMUX_PANE", None)
-        self.tmux("new-session", "-d", "-s", "anchor", "sleep 300")
-        self.addCleanup(self.stop_server)
+        if self.shared_server:
+            self.addCleanup(self.clear_server)
+        else:
+            self.tmux("new-session", "-d", "-s", "anchor", "sleep 300")
+            self.addCleanup(self.stop_server)
+
+    def clear_server(self):
+        """End what the test left on the shared server: every session but the anchor, every window but the anchor's own."""
+        rows = [line.split() for line in self.tmux("list-windows", "-a", "-F", "#{session_name} #{window_id}").splitlines()]
+        chain = []
+        for session, window in rows:
+            if session != "anchor":
+                chain += ["kill-session", "-t", session, ";"]
+            elif window != self.anchor_window:
+                chain += ["kill-window", "-t", window, ";"]
+        if chain:
+            subprocess.run([TMUX, "-L", self.sock, *chain[:-1]], capture_output=True)
 
     def tmux(self, *args):
         return subprocess.run([TMUX, "-L", self.sock, *args], text=True, capture_output=True, check=True).stdout.strip()

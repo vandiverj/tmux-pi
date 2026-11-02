@@ -5,12 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { linkPiHost } from '../pi_host.mjs';
 
 const spec = JSON.parse(process.env.CTX_RUNTIME_SPEC);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-ctx-ext-'));
-fs.mkdirSync(path.join(tmp, 'node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(spec.pkg, path.join(tmp, 'node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(path.join(spec.pkg, 'node_modules/@earendil-works/pi-ai'), path.join(tmp, 'node_modules/@earendil-works/pi-ai'));
+linkPiHost(tmp, spec.pkg);
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.copyFileSync(path.join(spec.root, 'agent/extensions/ctx.ts'), path.join(tmp, 'ctx.ts'));
 const mod = await import(pathToFileURL(path.join(tmp, 'ctx.ts')).href);

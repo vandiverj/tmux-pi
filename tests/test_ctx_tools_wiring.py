@@ -240,6 +240,15 @@ class PiExtension(Workspace):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         return json.loads(run.stdout.strip().splitlines()[-1])
 
+    def test_every_tmux_pi_extension_loads_against_the_installed_pi(self):
+        # An import the installed pi no longer provides (pi 1.5.0 dropped Type from pi-ai) fails here, not in a user's session.
+        run = subprocess.run(["node", "--experimental-strip-types", str(FIX.parent / "load_extensions.mjs"), str(pi_package()), str(ROOT)],
+                             cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        out = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["failed"], {})
+        self.assertEqual(out["loaded"], sorted(p.name for p in (ROOT / "agent/extensions").glob("*.ts")))
+
     def test_it_registers_nothing_without_the_switch_and_the_five_tools_with_it(self):
         out = self.run_extension([])
         self.assertEqual(out["off"], 0)

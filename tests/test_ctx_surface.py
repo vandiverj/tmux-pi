@@ -730,7 +730,8 @@ class CommandLine(SurfaceCase):
     def test_the_command_line_with_no_navigator_module_is_unavailable_and_exits_1(self):
         task = self.tmp / "task"
         task.mkdir()
-        full = clean_env({"TP_TASK_DIR": str(task)})
+        # The default modules (ctxengine.nav_web, ctxengine.nav_api) are real navigators now, so "no module" names one that is not there.
+        full = clean_env({"TP_TASK_DIR": str(task), "TP_CTX_NAV_MODULES": "tp_no_such_navigator_module"})
         done = subprocess.run([sys.executable, str(TP_CTX), "--project", str(self.project), "--json", "ctx_relations", "--input",
                                json.dumps({"target": ORDERS, "direction": "importers"})], capture_output=True, text=True, env=full, timeout=120,
                               stdin=subprocess.DEVNULL)

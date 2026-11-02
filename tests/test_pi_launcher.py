@@ -16,10 +16,9 @@ ASK_LOCAL = r'''
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-const [tmp, pkg, ai, source] = process.argv.slice(2);
-fs.mkdirSync(path.join(tmp, 'node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(pkg, path.join(tmp, 'node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(ai, path.join(tmp, 'node_modules/@earendil-works/pi-ai'));
+const [tmp, pkg, ai, source, host] = process.argv.slice(2);
+const { linkPiHost } = await import(pathToFileURL(host).href);
+linkPiHost(tmp, pkg);
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.copyFileSync(source, path.join(tmp, 'assistant.ts'));
 const mod = await import(pathToFileURL(path.join(tmp, 'assistant.ts')).href);
@@ -139,7 +138,7 @@ class PiLauncherTests(unittest.TestCase):
         script.write_text(ASK_LOCAL)
         env = {**self.env, "TMUX": "fixture", "TP_MODE": "orchestrator", "PI_CODING_AGENT_DIR": str(root / "agent")}
         run = subprocess.run(["node", "--experimental-strip-types", str(script), str(work), str(package), str(ai),
-                              str(ROOT / "agent/extensions/assistant.ts")],
+                              str(ROOT / "agent/extensions/assistant.ts"), str(ROOT / "tests/fixtures/pi_host.mjs")],
                              env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual(run.stdout.strip(), "stub reply")

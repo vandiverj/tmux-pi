@@ -540,8 +540,13 @@ def library_of(specifier):
 IMPORT_RE = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)(['"])([^'"\n]{1,200})\1""")
 
 
+def specifiers_in(text):
+    """The import specifiers written in `text` that name a library or a library-like alias (not a relative path or a builtin)."""
+    return {spec.strip() for _, spec in IMPORT_RE.findall(text) if library_of(spec)}
+
+
 def libraries_in(text):
-    return {lib for _, spec in IMPORT_RE.findall(text) if (lib := library_of(spec))}
+    return {library_of(spec) for spec in specifiers_in(text)}
 
 
 DYNAMIC_RE = re.compile(r"""\b(?:import|require)\s*\(\s*(?!['"][^'"\n]{1,200}['"]\s*[,)])""")
@@ -671,9 +676,37 @@ class Navigators:
 
 # -------------------------------------------------------------------------------------------------------------- the engine
 
-def _json_lines(text):
-    """`text` of a tsconfig.json (JSON with comments) without whole-line // comments, which is all the configs read here use."""
-    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+def loads_jsonc(text):
+    """The value of `text` as JSON with comments (deno.json, deno.jsonc, tsconfig.json): `//` and `/* */` comments anywhere outside a string and
+    trailing commas before `}` or `]` are dropped, then it is parsed as JSON. Raises ValueError as json.loads does."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':  # a string, copied whole (an escaped quote does not end it)
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        elif c in "}]":  # a comma that only whitespace separates from here is a trailing one
+            k = len(out) - 1
+            while k >= 0 and not out[k].strip():
+                k -= 1
+            if k >= 0 and out[k] == ",":
+                out[k] = " "
+            out.append(c)
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return json.loads("".join(out))
 
 
 def pin_reader(project, where=""):
@@ -823,26 +856,40 @@ class Engine(NoteWriter):
                 found.append(package)
         return found
 
-    def alias_of(self, name, where):
-        """True when the bare specifier root `name` is a project alias in the config of package directory `where`: a key of the `imports`
-        of its deno.json or of the `paths` of its tsconfig.json (`@scope/pkg`, `@scope/pkg/`, `@scope/pkg/*`, or something under it) whose
-        target is a relative path. Such a name is code in this project, not a library the lockfile can pin."""
+    def alias_of(self, specifier, where):
+        """True when the import specifier `specifier`, exactly as written, is a project alias in the config of package directory `where`: it is
+        a key of the `imports` of its deno.json / deno.jsonc or of the `paths` of its tsconfig.json whose target is a relative path, or it
+        starts with such a key that ends in `/` or `*` (a prefix mapping). A key for a subpath (`@pkg/sub`) maps only that specifier, not
+        `@pkg`. Such a specifier is code in this project, not a library the lockfile can pin."""
         key = (where, "aliases")
         if key not in self._cache:
-            found = set()
+            exact, prefixes = set(), set()
             for config, section in (("deno.json", "imports"), ("deno.jsonc", "imports"), ("tsconfig.json", "paths")):
                 text = self.read(posixpath.join(where, config), SCAN_BYTES)
                 try:
-                    data = json.loads(_json_lines(text)) if text else {}
+                    data = loads_jsonc(text) if text else {}
                 except ValueError:
                     continue
-                table = data.get("compilerOptions", {}).get(section) if section == "paths" else data.get(section)
+                scope = data.get("compilerOptions") if section == "paths" and isinstance(data, dict) else data
+                table = scope.get(section) if isinstance(scope, dict) else None
                 for alias, target in (table.items() if isinstance(table, dict) else ()):
                     first = target[0] if isinstance(target, list) and target else target
-                    if isinstance(first, str) and first.startswith("."):
-                        found.add(alias.removesuffix("*").rstrip("/"))
-            self._cache[key] = found
-        return any(alias == name or alias.startswith(name + "/") for alias in self._cache[key])
+                    if not (isinstance(first, str) and first.startswith(".")):
+                        continue
+                    if alias.endswith("*") or alias.endswith("/"):
+                        prefixes.add(alias.removesuffix("*"))
+                    else:
+                        exact.add(alias)
+            self._cache[key] = (exact, prefixes)
+        exact, prefixes = self._cache[key]
+        return specifier in exact or any(specifier.startswith(prefix) for prefix in prefixes)
+
+    def classify(self, specifier, where):
+        """(library, alias) of the import specifier `specifier` written in a file of package directory `where`: the package it names (None
+        when it names none: a relative path, a builtin) and whether it is a project alias there. The one rule for the libraries block, whether
+        the specifier came from the source scan or from a navigator's `external` list."""
+        lib = library_of(specifier)
+        return lib, bool(lib) and self.alias_of(specifier.strip(), where)
 
     def pinned(self, name, where=""):
         """(version, why) of library `name`: the version text the lockfile pins, else None and why not (None when no reader). The lockfile

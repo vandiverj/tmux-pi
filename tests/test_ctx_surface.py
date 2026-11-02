@@ -482,8 +482,8 @@ class Brief(SurfaceCase):
                                                                        "@launchpad/types/": "../../../lib/launchpad/types/"}}))
         put(self.project, f"{api}/deno.lock", json.dumps({"version": "5", "specifiers": {"jsr:@oak/oak@^17.1.4": "17.2.0"},
                                                           "jsr": {"@oak/oak@17.2.0": {"integrity": "x"}}}))
-        put(self.project, f"{web}/tsconfig.json", '{\n  // aliases of the workspace\n  "compilerOptions": {"paths": {"@launchpad/utils": ["../../../lib/launchpad/utils/index.ts"],'
-                                                  ' "@launchpad/utils/*": ["../../../lib/launchpad/utils/*"], "@/*": ["./src/*"]}}\n}\n')
+        put(self.project, f"{web}/tsconfig.json", '{\n  // aliases of the workspace\n  "compilerOptions": {"paths": {"@launchpad/utils": ["../../../lib/launchpad/utils/index.ts"], /* the index */\n'
+                                                  '    "@launchpad/utils/*": ["../../../lib/launchpad/utils/*"], "@/*": ["./src/*"],},},  // trailing commas\n}\n')
         put(self.project, f"{api}/src/hints.ts", 'import { Router } from "@oak/oak";\nimport { S } from "@launchpad/types/order.ts";\nimport { drizzle } from "drizzle-orm";\n'
                                                   'import { z } from "zod";\n')
         put(self.project, f"{web}/src/hints.ts", 'import { f } from "@launchpad/utils";\nimport { g } from "@launchpad/utils/dates";\n')
@@ -498,6 +498,24 @@ class Brief(SurfaceCase):
         for alias in ("@launchpad/types", "@launchpad/utils"):
             self.assertRegex(libraries, rf"  {alias} \(a project alias[^)]*\)")
         self.assertNotIn("not in the lockfile", libraries)
+        self.assertNotIn(" in apps/", libraries)  # one outcome in every package that names a library: one unattributed line
+
+        # F1-F3: one specifier classified in its own package. api pins @oak/oak 17.2.0; jobs (deno.jsonc with inline comments and trailing
+        # commas) pins 16.0.0 and maps only the subpath @oak/oak/subpath to a stub; web maps @oak/oak itself to code.
+        jobs = "apps/launchpad/jobs"
+        put(self.project, f"{jobs}/deno.jsonc", '{\n  // jobs package\n  "imports": {\n    "@oak/oak": "jsr:@oak/oak@^16.0.0", /* pinned in deno.lock */\n'
+                                                '    "@oak/oak/subpath": "./src/stub.ts", // local stub\n  },\n}\n')
+        put(self.project, f"{jobs}/deno.lock", json.dumps({"version": "5", "specifiers": {"jsr:@oak/oak@^16.0.0": "16.0.0"}, "jsr": {"@oak/oak@16.0.0": {"integrity": "y"}}}))
+        put(self.project, f"{jobs}/src/run.ts", 'import { Router } from "@oak/oak";\nimport { stub } from "@oak/oak/subpath";\n')
+        put(self.project, f"{web}/tsconfig.json", '{"compilerOptions": {"paths": {"@oak/oak": ["./src/oak.ts"], /* local */},},}')
+        put(self.project, f"{web}/src/oak.ts", 'import { Router } from "@oak/oak";\n')
+        mixed = self.run_tool("ctx_brief", {"paths": [f"{api}/src/hints.ts", f"{jobs}/src/run.ts", f"{web}/src/oak.ts"]}, pin=pins.get, pin_in=pins_in).text
+        mixed = mixed.split("== libraries\n")[1]
+        self.assertIn(f"  @oak/oak in {api} 17.2.0 — use api_signature(@oak/oak, <symbol>)", mixed)  # a local mapping elsewhere does not hide it
+        self.assertIn(f"  @oak/oak in {jobs} 16.0.0 — use api_signature(@oak/oak, <symbol>)", mixed)  # a package's own pin, not the first package's
+        self.assertIn(f"  @oak/oak/subpath in {jobs} (a project alias for code in this repository, not a library)", mixed)  # only the mapped specifier
+        self.assertIn(f"  @oak/oak in {web} (a project alias for code in this repository, not a library)", mixed)
+        self.assertNotIn("not in the lockfile", mixed)
 
     def test_a_file_the_navigator_does_not_cover_still_gets_a_brief(self):
         (self.project / "bin").mkdir()

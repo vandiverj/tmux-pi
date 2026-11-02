@@ -293,10 +293,41 @@ def tests_for(engine, rel):
     return sorted(found), surface.answer_read({"status": "ok", "withheld": refused})
 
 
+def library_lines(engine, used):
+    """The lines of the libraries block for `used`, a set of (package directory, import specifier). Each specifier is classified once, in its
+    own package, by `Engine.classify`: a project alias there, else a library with the version that package's lockfile pins (or why not). A
+    library with the same outcome in every package is one line; when the packages differ (an alias in one, another version or none in
+    another) there is one line per package, so one package's alias or pin is never said of another's. In a package where only some
+    specifiers of a library are aliases (`@pkg/sub` mapped, `@pkg` not) the alias line names those specifiers and the library its own line."""
+    found = {}  # library -> package directory -> (alias specifiers, set of (version, why) of its non-alias specifiers)
+    for where, spec in sorted(used):
+        lib, alias = engine.classify(spec, where)
+        if lib:
+            aliases, pins = found.setdefault(lib, {}).setdefault(where, (set(), set()))
+            if alias:
+                aliases.add(spec)
+            else:
+                pins.add(engine.pinned(lib, where))
+    lines = []
+    for lib in sorted(found):
+        per_package = found[lib]
+        same = len({(bool(aliases), tuple(sorted(pins, key=str))) for aliases, pins in per_package.values()}) == 1
+        for where in sorted(per_package):
+            aliases, pins = per_package[where]
+            at = "" if same else f" in {where or '.'}"
+            if aliases:
+                name = lib if not pins else ", ".join(sorted(aliases))
+                lines.append(f"  {name}{at} (a project alias for code in this repository, not a library)")
+            for version, why in sorted(pins, key=str):
+                lines.append(f"  {lib}{at} {version} — use api_signature({lib}, <symbol>) for exact signatures" if version
+                             else f"  {lib}{at} (version not read: {why})")
+    return list(dict.fromkeys(lines))
+
+
 def build(engine, paths):
     """The answer of ctx_brief for the project-relative `paths` (already checked)."""
     lines, left, tried, good = [], [], [], []
-    libraries = {}  # library name -> the package directories of the briefed files that import it (where its lockfile and aliases are read)
+    libraries = set()  # (package directory of a briefed file, import specifier as written): where its lockfile and aliases are read
     contracts, nexts, missing, incomplete = {}, set(), [], []
     unread = []  # briefed files whose text could not be read for the library scan
     import_reads = []  # the Completeness of each briefed file's imports read: "no contract" is said only when all are whole
@@ -326,8 +357,7 @@ def build(engine, paths):
         if text is None or surface.unnamed_imports(text):
             unread.append(rel)  # over 1 MB, unreadable, or an import it cannot name: "no library" cannot be said
         here = package[1] if package else ""
-        for lib in surface.libraries_in(text or ""):
-            libraries.setdefault(lib, []).append(here)
+        libraries.update((here, spec) for spec in surface.specifiers_in(text or ""))
         tests, tests_read = tests_for(engine, rel)
         lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", tests_read)))
         add_left(left, withheld_note(f"tests of {rel}", tests_read.withheld))
@@ -364,9 +394,7 @@ def build(engine, paths):
             if got.incomplete:
                 incomplete.append(rel)
                 lines.append(f"  ({read_phrase(got)})")
-            for lib in (surface.library_of(name) for name in got.external):
-                if lib:
-                    libraries.setdefault(lib, []).append(package[1])
+            libraries.update((here, name.strip()) for name in got.external if surface.library_of(name))
             for _, line, to in rows:
                 if surface.label_for(to) == "lib":
                     contracts.setdefault(to, []).append(f"{rel}:{line}")
@@ -401,19 +429,7 @@ def build(engine, paths):
 
     lines.append("== libraries")
     if libraries:
-        for lib in sorted(libraries):
-            wheres = list(dict.fromkeys(libraries[lib]))
-            if any(engine.alias_of(lib, where) for where in wheres):
-                lines.append(f"  {lib} (a project alias for code in this repository, not a library)")
-                continue
-            for where in wheres:
-                version, why = engine.pinned(lib, where)
-                if version:
-                    break
-            if version:
-                lines.append(f"  {lib} {version} — use api_signature({lib}, <symbol>) for exact signatures")
-            else:
-                lines.append(f"  {lib} (version not read: {why})")
+        lines += library_lines(engine, libraries)
     else:
         lines.append("  " + surface.absent("none", surface.answer_read({"status": "ok", "libraries_unread": len(unread) + len(incomplete)})))
 

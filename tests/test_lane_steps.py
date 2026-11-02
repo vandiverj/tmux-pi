@@ -672,8 +672,6 @@ class OpenStepTests(StepCase):
     """Which step is open is read from every step that is not closed, never from the newest task; and a task a lane names whose
     record cannot be read keeps its step open (a task no lane names is an orphan, as before)."""
 
-    snapshot_lane = True  # measured: the only StepCase class that gains (GateRows and CloseAndNextStep: under 10 percent CPU-s, left off)
-
     def two_steps(self):
         """s1 approved, committed and closed; s2 begun, settled and unreviewed (no change in the tree: empty, but not closed)."""
         author, reviewer = self.approved_and_committed()

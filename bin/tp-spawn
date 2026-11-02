@@ -376,7 +376,7 @@ packet="$(printf '# Task\n\n%s\n' "$task")"
 if [[ -n "$tests" ]]; then
   packet+=$'\n\n# Test Scope\n\n'
   case "$tests" in
-    affected) packet+="Run the tests that check the code you changed, whether or not those test files were edited, plus any test you add or edit. Say how you decided which tests cover the change. Do not run the whole suite." ;;
+    affected) packet+="Run the tests that check the code you changed, whether or not those test files were edited, plus any test you add or edit. Say how you decided which tests cover the change. State which test files you ran, their seconds, and which existing tests you extended instead of adding. Do not run the whole suite." ;;
     full)     packet+="Run the whole test suite." ;;
     none)     packet+="Do not run tests. Say that none were run." ;;
   esac

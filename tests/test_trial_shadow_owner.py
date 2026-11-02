@@ -333,7 +333,7 @@ class WorktreeOwnershipTests(ShadowCase):
             else:
                 for p in (r.state / "tasks").iterdir():
                     if (p / "review-of").exists() and not (p / "state.json").exists():
-                        self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+                        self.settle(p, "waiting", "APPROVED\nRESULT_STATUS: complete\n## Coverage\nReviewed lib/x.py in full.\n")
         run, done = self.run_stub(rdir, on_poll=poll)
         self.assertEqual(done["outcome"], "completed")
 

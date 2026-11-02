@@ -565,7 +565,7 @@ class FullRunTests(ShadowCase):
                     continue
                 if (task / "review-of").exists():
                     seen["review_packet"] = (task / "packet.md").read_text()
-                    self.settle(task, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+                    self.settle(task, "waiting", "APPROVED\nRESULT_STATUS: complete\n## Coverage\nReviewed lib/x.py in full.\n")
                 else:
                     # the fixture's stub new-window names a pane that does not exist; a real tp-spawn leaves a pane in the run's own session
                     meta_now = json.loads((task / "meta.json").read_text())

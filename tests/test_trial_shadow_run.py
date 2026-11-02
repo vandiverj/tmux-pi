@@ -56,7 +56,7 @@ class RunStepTests(ShadowCase):
             elif n == 2:
                 for p in (run.state / "tasks").iterdir():
                     if (p / "review-of").exists():
-                        self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+                        self.settle(p, "waiting", "APPROVED\nRESULT_STATUS: complete\n## Coverage\nReviewed lib/x.py in full.\n")
         run, done = self.run_stub(rdir, on_poll=poll)
         self.assertEqual(done["outcome"], "completed", "a settled worker is taken whatever Main holds")
 
@@ -111,7 +111,7 @@ class RunStepTests(ShadowCase):
                 reviews = [p for p in (run.state / "tasks").iterdir() if (p / "review-of").exists()]
                 seen["reviews"] = [p.name for p in reviews]
                 for p in reviews:
-                    self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+                    self.settle(p, "waiting", "APPROVED\nRESULT_STATUS: complete\n## Coverage\nReviewed lib/x.py in full.\n")
 
         run, done = self.run_stub(rdir, poll)
         self.assertEqual((done["outcome"], done["wait_result"]), ("completed", "settled"))

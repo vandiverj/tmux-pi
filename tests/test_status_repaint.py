@@ -1025,6 +1025,22 @@ class StatusEchoTtyTest(StatusPaneFixture):
         self.assertIn("echo", flags)                          # previous mode restored on exit
         self.assertIn("icanon", flags)
 
+    def test_signal_inside_a_redirected_loop_still_restores_the_tty(self):
+        # The detail reader runs `while read ...; done < <(python3 tp_detail.py)`: fd 0 is a pipe there. The stub
+        # python3 parks in that loop until released, so the signal lands inside it deterministically.
+        self.make_jobs(1)
+        real = shutil.which("python3")
+        self.script("python3", '#!/bin/sh\ncase "$1" in *tp_detail.py) touch "$FAKE_BASE/in_loop"; '
+                    'while [ ! -f "$FAKE_BASE/release" ]; do sleep 0.02; done;; esac\nexec %s "$@"\n' % real)
+        self.assertTrue(self.lflag() & termios.ECHO)          # starts the pane; the fixture really echoes
+        self.assertTrue(self.wait_for((self.base / "in_loop").exists, 60), "pane never reached the detail loop")
+        self.assertFalse(self.lflag() & termios.ECHO)
+        _, status, flags = self.signal_status(15)
+        (self.base / "release").touch()
+        self.assertEqual(status, 143)
+        self.assertIn("echo", flags)                          # restored although fd 0 was a pipe at the signal
+        self.assertIn("icanon", flags)
+
     def test_keyboard_enter_and_mode_restore_on_hangup_signal(self):
         self.make_jobs(2)
         first = self.first_frame(b"job1", b"job2")

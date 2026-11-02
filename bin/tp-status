@@ -87,15 +87,19 @@ row_ids=()    # screen line (1-based) -> subagent id, from the last painted fram
 # echoed into the pane as literal ^[[<64;x;yM. The previous mode is put back on
 # exit so a shell that owns this tty (or a restarted status process) is not left
 # without echo. No stty or no tty: carry on with per-read -s only.
+# The tty is also held on fd 7: a TERM/HUP/INT trap can run inside a `while ... done <<<"$rows"` loop
+# (or any other stdin redirection), where fd 0 is a pipe or file and stty would fail with "stdin isn't
+# a terminal", leaving the pane without echo.
 tty_saved=""
 if [[ -t 0 ]] && command -v stty >/dev/null 2>&1; then
+  exec 7<&0
   tty_saved="$(stty -g 2>/dev/null)" || tty_saved=""
   if [[ -n "$tty_saved" ]]; then stty -echo -icanon min 1 time 0 2>/dev/null || tty_saved=""; fi
 fi
 cleanup() {
   [[ -z "$cache_dir" ]] || rm -rf -- "$cache_dir"
   printf '%s[?1006l%s[?1000l%s[?25h%s[0m' "$esc" "$esc" "$esc" "$esc"
-  if [[ -n "$tty_saved" ]]; then stty "$tty_saved" 2>/dev/null; fi
+  if [[ -n "$tty_saved" ]]; then stty "$tty_saved" <&7 2>/dev/null; fi
   return 0
 }
 printf '%s[?25l%s[?1000h%s[?1006h' "$esc" "$esc" "$esc"

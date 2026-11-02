@@ -326,7 +326,15 @@ class WorktreeOwnershipTests(ShadowCase):
     def test_f3_an_attempt_with_time_left_still_spawns(self):
         rdir, info = self.prepare(timeout_s=300)
         ts.update_run(rdir, created=self.ago(250))
-        run, done = self.run_stub(rdir, on_poll=lambda n, r: self.settle_worker(r))
+
+        def poll(n, r):  # the worker settles, then the reviewer does: a reviewer that never answers is `review_timeout`, not `completed`
+            if n == 1:
+                self.settle_worker(r)
+            else:
+                for p in (r.state / "tasks").iterdir():
+                    if (p / "review-of").exists() and not (p / "state.json").exists():
+                        self.settle(p, "waiting", "RESULT_STATUS: complete\nAPPROVED\n")
+        run, done = self.run_stub(rdir, on_poll=poll)
         self.assertEqual(done["outcome"], "completed")
 
 # ---------------------------------------------------------------------------------------------------- recorded identities (review 5)

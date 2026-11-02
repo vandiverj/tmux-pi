@@ -12,7 +12,9 @@
       "Bash(python3 -m unittest:*)", "Bash(pytest:*)", "Bash(npm test:*)", "Bash(npm run test:*)", "Bash(cargo test:*)", "Bash(go test:*)",
       "mcp__tmux-pi-subagents",
       "mcp__tmux-pi-safe__safe_read", "mcp__tmux-pi-safe__safe_grep",
-      "mcp__tmux-pi-docs__api_signature", "mcp__tmux-pi-docs__docs_search"
+      "mcp__tmux-pi-docs__api_signature", "mcp__tmux-pi-docs__docs_search",
+      "mcp__tmux-pi-ctx__ctx_brief", "mcp__tmux-pi-ctx__ctx_symbol", "mcp__tmux-pi-ctx__ctx_relations",
+      "mcp__tmux-pi-ctx__ctx_knowledge", "mcp__tmux-pi-ctx__ctx_note"
     ]
   },
   "statusLine": {

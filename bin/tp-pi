@@ -66,6 +66,11 @@ fi
 if [[ "${TP_DOCS_TOOLS:-}" == 1 && -n "${TP_TASK_DIR:-}" ]]; then
   extensions+=("$ROOT/agent/extensions/docs.ts")
 fi
+# The ctx tools (ctx_brief, ctx_symbol, ctx_relations, ctx_knowledge, ctx_note) likewise only for a task with TP_CTX_TOOLS=1: tp-ctx logs
+# each call to $TP_TASK_DIR/ctx-calls.jsonl and answers nothing without it. bin/tp-spawn passes TP_CTX_TOOLS=1 on to a worker when main has it.
+if [[ "${TP_CTX_TOOLS:-}" == 1 && -n "${TP_TASK_DIR:-}" ]]; then
+  extensions+=("$ROOT/agent/extensions/ctx.ts")
+fi
 args=(--no-skills --no-context-files --no-extensions)
 for extension in "${extensions[@]}"; do args+=(--extension "$extension"); done
 if [[ -z "${TP_TASK_DIR:-}" && "${TP_MODE:-}" == orchestrator ]]; then

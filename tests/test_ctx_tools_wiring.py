@@ -16,6 +16,7 @@ FIX = ROOT / "tests" / "fixtures" / "ctx_surface"
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "lib"))
 from test_ctx_surface import clean_env, copy_project  # noqa: E402
+from test_docs_wiring import CASES, GOLDEN, LauncherCase  # noqa: E402  (the stub pi/claude launcher harness and its golden argv)
 
 NODE = shutil.which("node")
 TOOLS = ["ctx_brief", "ctx_symbol", "ctx_relations", "ctx_knowledge", "ctx_note"]
@@ -123,6 +124,63 @@ class SchemaConsistency(Workspace):
         self.assertLess(ts.index('process.env.TP_CTX_TOOLS !== "1"'), ts.index("registerTool("))
         mjs = (ROOT / "claude/mcp/ctx.mjs").read_text()
         self.assertLess(mjs.index('process.env.TP_CTX_TOOLS !== "1"'), mjs.index("createInterface("))
+
+
+class Launchers(LauncherCase):
+    """ctx-enable: with TP_CTX_TOOLS=1 a task's tp-pi loads ctx.ts and a task's tp-claude adds mcp.ctx.json; everything else is the golden argv."""
+    PI_EXT = "{ROOT}/agent/extensions/ctx.ts"
+    CLAUDE_CFG = "{ROOT}/claude/mcp.ctx.json"
+
+    def setUp(self):
+        super().setUp()
+        self.env.pop("TP_CTX_TOOLS", None)
+
+    def with_ctx_pi(self, golden):
+        argv = list(golden)
+        last = max(i for i, a in enumerate(argv) if a == "--extension" and argv[i + 1].endswith(".ts"))
+        argv[last + 2:last + 2] = ["--extension", self.PI_EXT]
+        return argv
+
+    def test_pi_loads_the_extension_for_a_task_only_when_the_switch_is_1(self):
+        for case in CASES:
+            with self.subTest(case=case):
+                self.assertEqual(self.launch("pi", case), GOLDEN["pi"][case])
+                got = self.launch("pi", case, TP_CTX_TOOLS="1")
+                if "TP_TASK_DIR" in CASES[case] and case != "strict":
+                    self.assertEqual(got, self.with_ctx_pi(GOLDEN["pi"][case]))
+                    self.assertNotIn("--tools", got)  # a worker has no --tools list to extend
+                else:
+                    self.assertEqual(got, GOLDEN["pi"][case])
+
+    def test_claude_adds_the_ctx_config_for_a_task_only_when_the_switch_is_1(self):
+        for case in CASES:
+            with self.subTest(case=case):
+                self.assertEqual(self.launch("claude", case), GOLDEN["claude"][case])
+                got = self.launch("claude", case, TP_CTX_TOOLS="1")
+                if "TP_TASK_DIR" in CASES[case]:
+                    want = list(GOLDEN["claude"][case])
+                    at = want.index("{ROOT}/claude/mcp.json") + 1
+                    want[at:at] = ["--mcp-config", self.CLAUDE_CFG]
+                    self.assertEqual(got, want)
+                    self.assertEqual(got.count("--strict-mcp-config"), 1)
+                else:
+                    self.assertEqual(got, GOLDEN["claude"][case])
+
+    def test_only_the_exact_value_1_turns_it_on(self):
+        for value in ("", "0", "true", "01", " 1", "1 "):
+            self.assertNotIn(self.PI_EXT, self.launch("pi", "worker", TP_CTX_TOOLS=value), value)
+            self.assertNotIn(self.CLAUDE_CFG, self.launch("claude", "worker", TP_CTX_TOOLS=value), value)
+
+    def test_the_ctx_and_docs_switches_add_both(self):
+        pi = self.launch("pi", "worker", TP_CTX_TOOLS="1", TP_DOCS_TOOLS="1")
+        self.assertIn(self.PI_EXT, pi)
+        self.assertIn("{ROOT}/agent/extensions/docs.ts", pi)
+        claude = self.launch("claude", "worker", TP_CTX_TOOLS="1", TP_DOCS_TOOLS="1")
+        self.assertEqual(claude.count("--mcp-config"), 3)
+
+    def test_the_shared_claude_permissions_allow_exactly_the_five_ctx_tools(self):
+        allow = json.loads((ROOT / "claude/settings.json").read_text())["permissions"]["allow"]
+        self.assertEqual([a for a in allow if "tmux-pi-ctx" in a], [f"mcp__tmux-pi-ctx__{t}" for t in TOOLS])
 
 
 @unittest.skipUnless(NODE, "node is not installed")

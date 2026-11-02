@@ -44,6 +44,9 @@ fi
 # which stays under --strict-mcp-config. Unset, the argument list is exactly the one below without the extra pair.
 mcp_args=(--mcp-config "$CLAUDE_DIR/mcp.json")
 [[ "${TP_DOCS_TOOLS:-}" != 1 ]] || mcp_args+=(--mcp-config "$CLAUDE_DIR/mcp.docs.json")
+# Ctx tools server (ctx_brief, ctx_symbol, ctx_relations, ctx_knowledge, ctx_note) only for a task (TP_TASK_DIR set: tp-ctx logs each
+# call there and answers nothing without it) with TP_CTX_TOOLS=1, which bin/tp-spawn passes on to a worker when main has it.
+[[ "${TP_CTX_TOOLS:-}" != 1 || -z "${TP_TASK_DIR:-}" ]] || mcp_args+=(--mcp-config "$CLAUDE_DIR/mcp.ctx.json")
 
 exec claude \
   --setting-sources "" \

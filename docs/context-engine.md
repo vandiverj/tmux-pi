@@ -118,6 +118,13 @@ store is as it was.
 `tp-ctx --json <tool> --input <json>` answers `{status, text, truncated, left_out}` in at most 6144 bytes; `agent/extensions/ctx.ts` (pi) and
 `claude/mcp/ctx.mjs` (Claude) are thin wrappers over it, loaded only when `TP_CTX_TOOLS=1`. What a worker can rely on:
 
+**Turning them on.** `export TP_CTX_TOOLS=1` before starting main. `bin/tp-spawn` then writes `export TP_CTX_TOOLS=1` into the run.sh of
+every worker main spawns (there is no per-task flag, and `--worker-env` refuses the key), and a worker's `bin/tp-pi` loads
+`agent/extensions/ctx.ts` / `bin/tp-claude` adds `claude/mcp.ctx.json` (shared settings pre-allow the five `mcp__tmux-pi-ctx__*` tools). Only a
+task gets them: both launchers need `TP_TASK_DIR` too, because every call is logged to `$TP_TASK_DIR/ctx-calls.jsonl`; main itself does not.
+Known limit: `ctx_note` writes a candidate into the worker's own project store; a worker in a git worktree writes to that worktree's
+`.tmux-pi`, not main's, so its candidates stay there until someone imports or approves them from that worktree.
+
 - **Paths.** Every path a navigator returns (importers, imports, contract consumers, definitions, references, listed symbols) goes through
   the same path policy as the arguments before it is shown. One that is sensitive, outside the project, a link out of it, or a `<withheld>`
   placeholder is never named: it is counted in `left_out` (`N withheld`).

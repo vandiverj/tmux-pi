@@ -221,8 +221,39 @@ if [[ -z "$lane" ]]; then python3 "$ROOT/lib/lanes.py" check-tree "$workdir" || 
 max_file=60000 max_packet=300000
 
 # Never hand credentials to a worker (often a remote model).
+# screen_contexts classifies every --context file in ONE bin/tp-sensitive-read call (--batch; each start costs ~0.5 s), before the
+# files are read. A file is sensitive unless the reply says "sensitive": false for it; a call that fails or answers with anything
+# but one decision per file marks every file sensitive (what a failing single call always meant).
+screened_paths=() screened_secret=()
+screen_contexts() {
+  local spec p listed=() verdicts v
+  for spec in ${contexts[@]+"${contexts[@]}"}; do
+    p="$spec"
+    if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then p="${BASH_REMATCH[1]}"; fi
+    [[ "$p" == /* ]] || p="$workdir/$p"
+    if [[ -f "$p" ]]; then listed+=("$p"); fi
+  done
+  (( ${#listed[@]} > 0 )) || return 0
+  verdicts="$(jq -cn '$ARGS.positional | map({tool_name:"Read",tool_input:{file_path:.}})' --args "${listed[@]}" |
+    "$ROOT/bin/tp-sensitive-read" --batch 2>/dev/null |
+    jq -r --argjson n "${#listed[@]}" 'if type == "array" and length == $n then .[] | (if (try .sensitive catch null) == false then 0 else 1 end) else range($n) | 1 end' 2>/dev/null)" ||
+    verdicts=""
+  screened_paths=("${listed[@]}")
+  screened_secret=()
+  while IFS= read -r v; do screened_secret+=("$v"); done <<<"$verdicts"
+  # Anything short of one verdict per file is a failed screening: every file counts as sensitive.
+  if (( ${#screened_secret[@]} != ${#listed[@]} )); then
+    screened_secret=(); for v in "${listed[@]}"; do screened_secret+=(1); done
+  fi
+}
+
+# secret_file <path> — 0 when the file is sensitive (or cannot be judged), 1 when it is not. The screening above answers for the
+# files it covered; any other path is asked about alone.
 secret_file() {
-  local decision
+  local i decision
+  for i in "${!screened_paths[@]}"; do
+    if [[ "${screened_paths[$i]}" == "$1" ]]; then [[ "${screened_secret[$i]}" == 1 ]]; return; fi
+  done
   decision="$(jq -cn --arg path "$1" '{tool_name:"Read",tool_input:{file_path:$path}}' |
     "$ROOT/bin/tp-sensitive-read")" || return 0
   jq -e '.sensitive == true' <<<"$decision" >/dev/null 2>&1 && return 0
@@ -283,6 +314,7 @@ read_context() {
 
 if [[ "$check" == 1 ]]; then
   python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" >/dev/null || exit 1
+  screen_contexts
   for spec in ${contexts[@]+"${contexts[@]}"}; do read_context "$spec" || true; done
   printf '%s\n' "$workdir"
   exit 0
@@ -440,6 +472,7 @@ if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file"
   if [[ ${#contexts[@]} -gt 0 ]]; then packet+=" The files below were chosen for this task; read others only if the task needs them."; fi
   packet+=$'\n'
 fi
+screen_contexts
 for spec in ${contexts[@]+"${contexts[@]}"}; do
   if ! read_context "$spec"; then
     notes+=("Sensitive context $spec was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")

@@ -730,6 +730,19 @@ esac
         self.assertNotIn("PRIVATE_TOKEN=example", packet)
         self.assertIn("Sensitive context .env was omitted", packet)
         self.assertEqual(item["status"], "starting")
+        # Several contexts are screened in one call: each file gets its own verdict (the secret between two clean ones).
+        (self.project / "before.txt").write_text("BEFORE_MARKER\n")
+        (self.project / "after.txt").write_text("AFTER_MARKER\n")
+        item = self.cli("dispatch", "--role", "coder", "--task", "Mixed contexts", "--worker", "pi", "--model", MODEL,
+                        "--workdir", str(self.project), "--context", "before.txt", "--context", ".env",
+                        "--context", "after.txt")
+        packet = self.packet(item)
+        self.assertIn("BEFORE_MARKER", packet)
+        self.assertIn("AFTER_MARKER", packet)
+        self.assertNotIn("PRIVATE_TOKEN=example", packet)
+        self.assertIn("Sensitive context .env was omitted", packet)
+        self.assertNotIn("Sensitive context before.txt", packet)
+        self.assertNotIn("Sensitive context after.txt", packet)
 
     def test_worker_request_is_visible_and_message_answers_it(self):
         item = self.dispatch()

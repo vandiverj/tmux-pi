@@ -39,9 +39,19 @@ def resolver(args, quiet=False):
         return None
 
 
+def _decide(event, args):
+    try:
+        cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+        return classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
+    except Exception as error:
+        return {"error": str(error)}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--claude-hook", action="store_true")
+    parser.add_argument("--batch", action="store_true",
+                        help="stdin is a JSON array of events; print a JSON array with one decision per event, in order")
     parser.add_argument("--trusted", action="store_true",
                         help="lift prompts that a name or directory guess raised in a tree the owner vouched for")
     # Test seams: where the trust store and its log live, and which directories count as temporary.
@@ -49,6 +59,11 @@ def main():
     parser.add_argument("--temp-root", action="append", help=argparse.SUPPRESS)
     args = parser.parse_args()
     event = json.load(sys.stdin)
+    if args.batch:
+        # One start for many reads (bin/tp-spawn screens every --context file in one call). Each event is judged exactly as a
+        # single call judges it; one that cannot be judged has no "sensitive": false, which a caller treats as sensitive.
+        print(json.dumps([_decide(item, args) for item in event] if isinstance(event, list) else []))
+        return
     # The shell's directory when the tool ran; relative paths and search roots are
     # judged from it. Absent (older callers), the classifier assumes nothing.
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None

@@ -876,6 +876,12 @@ class SensitiveReadTableTests(unittest.TestCase):
         self.assertEqual(asked["hookSpecificOutput"]["permissionDecision"], "ask")
         # A relative directory in the event is unknown, not the directory the command runs in.
         self.assertTrue(run({**event, "cwd": "config"})["sensitive"])
+        # --batch: one decision per event, in order, each the one a single call gives; a bad event is not "sensitive": false.
+        read = lambda path: {"tool_name": "Read", "tool_input": {"file_path": path}}
+        decisions = run([read("/tmp/x/ok.txt"), read("/tmp/x/.env"), read("/tmp/x/ok2.txt"), "junk"], "--batch")
+        self.assertEqual([d.get("sensitive") for d in decisions], [False, True, False, None])
+        self.assertEqual(decisions[1], run(read("/tmp/x/.env")))
+        self.assertEqual(run({"not": "a list"}, "--batch"), [])
         self.assertEqual(run({**event, "cwd": "lib"}, "--claude-hook")["hookSpecificOutput"]["permissionDecision"],
                          "ask")
 

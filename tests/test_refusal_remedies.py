@@ -575,7 +575,6 @@ class StepRemedyTests(StepCase):
     shows the refusal gone or moved on to the next step of the way. The last test walks one lane from a working writer to a
     closed step by only typing what the refusals said."""
     snapshot_lane = False  # measured under 10% CPU-s gain (or none) with the snapshot on
-    snapshot_lane = True
 
     # --- the gate ---------------------------------------------------------------------------------------------------
 

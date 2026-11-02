@@ -1,14 +1,19 @@
 """tp-agent retry: a retry that carries its fix brief (--reason naming an .md file) in the request it starts with, and the
 gate on a finding family a reviewer names twice. The fixture is the orchestration one (fake tmux, no model runs)."""
+import copy
 import json
 import os
 from pathlib import Path
 import pwd
+import re
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_orchestration  # noqa: E402  (the module, so its own tests are not collected twice)
+from fake_tools import fake_tmux  # noqa: E402
 from lane_fixture import TMUX, TmuxCase  # noqa: E402
 
 MODEL = test_orchestration.MODEL
@@ -16,14 +21,72 @@ OLD = "Make a focused change"
 
 
 class RetryCase(unittest.TestCase):
-    for _name in ("setUp", "raw", "cli", "task_dir", "packet", "settle", "dispatch", "retry"):
+    """The orchestration fixture (fake tmux, no model runs). The state tree of a settled author, or of a reviewed chain, is built
+    once per class (a real dispatch, real retries) and put back by copy for a later test that asks for the same one first thing."""
+    for _name in ("raw", "cli", "task_dir", "packet", "settle", "dispatch", "retry"):
         locals()[_name] = test_orchestration.OrchestrationTests.__dict__[_name]
     del _name
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        cls.class_root = Path(temp.name)
+        cls.snapshots = {}  # key -> (copy of the state tree, the item the build returned)
+
+    def setUp(self):
+        self.root = self.class_root / "run"  # one path for every test, so a copied state tree names the same paths
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.build_root()
+
+    def build_root(self):
+        self.root.mkdir()
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.state = self.project / ".tmux-pi"
+        (self.state / "tasks").mkdir(parents=True)
+        fake = self.root / "bin"
+        fake.mkdir()
+        fake_tmux(fake, '''case "$1" in
+ has-session) exit 0 ;;
+ show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
+ new-window) printf '%%fake\\n' ;;
+ send-keys) exit 0 ;;
+ *) exit 0 ;;
+esac
+''')
+        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
+                    "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+        self.env.pop("TMUX", None)
+
+    def state_files(self):
+        return sorted(str(p.relative_to(self.state)) for p in self.state.rglob("*"))
+
+    def built_once(self, key, build):
+        """What `build()` returns, and the state tree it leaves. The first call for `key` in the class builds for real and keeps a copy
+        of the tree; a later call puts the copy back, but only while the state is still empty (no task, no other file), else it
+        builds for real, as a second call inside one test always did."""
+        if self.state_files() != ["tasks"]:
+            return build()
+        saved = self.snapshots.get(key)
+        if saved is None:
+            item = build()
+            kept = self.class_root / f"snap-{len(self.snapshots)}"
+            shutil.copytree(self.state, kept, symlinks=True)
+            self.snapshots[key] = (kept, copy.deepcopy(item))
+            return item
+        shutil.rmtree(self.state)
+        shutil.copytree(saved[0], self.state, symlinks=True)
+        return copy.deepcopy(saved[1])
 
     def request(self, item):
         return (self.task_dir(item) / "request.md").read_text()
 
     def settled(self):
+        return self.built_once(("settled",), self.build_settled)
+
+    def build_settled(self):
         item = self.dispatch()
         self.settle(item, "RESULT_STATUS: complete\nDone.\n")
         return item
@@ -125,6 +188,9 @@ class RepeatedFamilyGateTests(RetryCase):
         path.write_text(json.dumps(meta))
 
     def chain(self, *rounds):
+        return self.built_once(("chain", json.dumps(rounds)), lambda: self.build_chain(*rounds))
+
+    def build_chain(self, *rounds):
         """The author reviewed once per round (each round is the families its review names), each retried from the last (plainly, or
         with --route design where the gate asks for a route); the newest author is returned. Every review is `review-N`."""
         item = self.settled()
@@ -138,6 +204,29 @@ class RepeatedFamilyGateTests(RetryCase):
             self.settle(item, "RESULT_STATUS: complete\nDone.\n")
             self.attach_review(item, f"review-{number}", *families)
         return item
+
+    def state_digest(self):
+        """Every file of the state tree by path, with task ids, selection ids and times replaced, so two builds can be compared."""
+        metas = {p.parent.name: json.loads(p.read_text()) for p in (self.state / "tasks").glob("*/meta.json")}
+
+        def depth(task):  # an id is named by its role and how many retries it follows, not by its random digits
+            return 0 if not metas.get(task, {}).get("parent") else 1 + depth(metas[task]["parent"])
+        order = {r: n for meta in metas.values() for n, r in enumerate(meta.get("reviews", []))}  # the order an author's reviews were recorded in
+        names = {}
+        for task in sorted(metas, key=lambda t: (depth(t), order.get(t, 0))):  # two tasks of one role and depth stay two names
+            role = metas[task].get("role")
+            names[task] = f"{role}-{sum(1 for n in names if metas[n].get('role') == role)}"
+        out = {}
+        for path in sorted(self.state.rglob("*")):
+            if path.is_file() and not path.name.endswith(".lock"):
+                out[str(path.relative_to(self.state))] = path.read_text()
+        def clean(text):
+            for task, name in names.items():
+                text = text.replace(task, name)
+            text = re.sub(r"sel-[0-9a-f]{32}", "SEL", text)
+            text = re.sub(r'"seconds":[0-9.]+', '"seconds":0', text)  # the time the router took
+            return re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+(?:Z|\+00:00)?", "TIME", text)
+        return {clean(path): clean(text) for path, text in out.items()}
 
     def tasks(self):
         return sorted(p.name for p in (self.state / "tasks").iterdir())
@@ -153,10 +242,26 @@ class RepeatedFamilyGateTests(RetryCase):
         for word in ("state-matrix", "review-1", "review-2", "--route rule-first", "--route design", "--route park"):
             self.assertIn(word, run.stderr)
         self.assertEqual(self.tasks(), before)  # no task was spawned
+        # the chain this class restores from a copy is the one a real build makes (ids and times aside)
+        first = self.state_digest()
+        shutil.rmtree(self.root)
+        self.build_root()
+        self.chain(["state-matrix"], ["state-matrix"])  # the cache is warm by now: this one is restored
+        restored = self.state_digest()
+        shutil.rmtree(self.root)
+        self.build_root()
+        self.build_chain(["state-matrix"], ["state-matrix"])
+        self.assertEqual(restored, self.state_digest())
+        self.assertEqual(first, restored)
+        self.assertGreater(len(restored), 10)
+        (self.state / "tasks" / "review-1" / "result.md").write_text("a different first review")  # the two reviews are two names
+        self.assertNotEqual(restored, self.state_digest())
 
     def test_the_families_are_matched_by_name_with_the_case_folded(self):
         item = self.chain(["State-Matrix"], ["state-matrix"])
-        self.assertEqual(self.plain_retry(item).returncode, 1)
+        refused = self.plain_retry(item)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("finding family state-matrix was named by review review-1 and again by review review-2", refused.stderr)  # not the two-in-a-row refusal
 
     def test_route_design_and_rule_first_retry_and_the_notes_say_which_route(self):
         for route in ("design", "rule-first"):

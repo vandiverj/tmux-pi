@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from lane_fixture import MODEL, ROOT  # noqa: E402
-from test_lane_writer import GIT_ENV, LaneCase, git  # noqa: E402
+from lane_fixture import GIT_ENV, MODEL, ROOT, git  # noqa: E402
+from test_lane_writer import LaneCase  # noqa: E402
 import lane_steps  # noqa: E402
 
 APPROVED = "APPROVED\n\nThe change does what the task asked.\n\n## Coverage\nI read lib/x.py and the callers it changes and ran the tests.\n\nRESULT_STATUS: complete\n"
@@ -41,6 +42,11 @@ CHECK_ONLY = LABELLED["check and none"]
 NO_COVERAGE = "APPROVED\n\nLooks fine to me.\n\nRESULT_STATUS: complete\n"
 NOT_A_VERDICT = "I think this is fine.\n\n## Coverage\nI read lib/x.py and the callers it changes.\n\nRESULT_STATUS: complete\n"
 DECORATED = "**APPROVED**\n\n## Coverage\nI read lib/x.py and the callers it changes.\n\nRESULT_STATUS: complete\n"
+
+
+def backticked(text):
+    """Every command in backticks in a refusal, in order: what a person pastes."""
+    return re.findall(r"`([^`]+)`", text)
 
 
 class StepCase(LaneCase):
@@ -171,15 +177,46 @@ class StepCase(LaneCase):
         shutil.rmtree(lease, ignore_errors=True)
         self.made = 0
 
+    # --- the commands a refusal prints, typed as a person would ------------------------------------------------------
+
+    def shell(self, command, cwd=None):
+        env = dict(self.env)
+        env["PATH"] = os.pathsep.join([str(ROOT / "bin"), env["PATH"]])
+        return subprocess.run(["sh", "-c", command], env=env, cwd=cwd or self.repo, text=True, capture_output=True, timeout=90)
+
+    def type_(self, command, **fill):
+        for word, value in fill.items():
+            command = command.replace(word, value)
+        run = self.shell(command)
+        self.assertEqual(run.returncode, 0, f"{command}\n{run.stderr}")
+        return run
+
+    def printed(self, make_run, *words):
+        """The commands (in backticks) the refusal prints, after checking it is a clean refusal that says `words`."""
+        return backticked(self.untouched(make_run, *words))
+
+    def new_reviewer(self, author, command=None):
+        before = {p.name for p in (self.state / "tasks").glob("review-*")}
+        run = self.type_(command or f"tp-agent review {author} --force")
+        found = [p for p in (self.state / "tasks").glob("review-*") if p.name not in before]
+        self.assertEqual(len(found), 1, run.stdout)
+        return found[0]
+
 
 class GateRowsTests(StepCase):
     """Design section 8, rows 1 to 5: the gate refuses until the committed tree is approved."""
 
     def test_row_1_step_b_waits_while_a_s_author_is_working(self):
         author, _ = self.writer(settled=False)
+        self.edit()
+        self.commit()
         stderr = self.untouched(self.next_step, "lane alpha: step s1 is not closed", author, f"tp-agent stop {author}")
+        self.assertIn(f"tp-agent stop {author}", backticked(stderr))
         self.assertIn("The next step starts after the review of s1 finishes", stderr)
         self.assertEqual(self.lanes()["waiting_on"], "worker")
+        self.type_(f"tp-agent stop {author}")  # the named command clears the wait: the next refusal no longer calls the work unfinished
+        stderr = self.untouched(self.next_step, "step s1 is not closed", "No writer of the step can be reviewed")
+        self.assertNotIn("so the step's work is not finished", stderr)
 
     def test_row_1_step_b_waits_while_the_author_is_settled_and_unreviewed(self):
         author, _ = self.writer()
@@ -188,6 +225,13 @@ class GateRowsTests(StepCase):
         stderr = self.untouched(self.next_step, "step s1 is not closed", "has no review yet", f"tp-agent review {author} --force")
         self.assertIn("tp-agent lane close alpha s1", stderr)
         self.assertEqual(self.lanes()["waiting_on"], "review")
+        # lane close of the same settled, unreviewed step prints the same backticked remedy
+        self.assertIn(f"tp-agent review {author} --force", self.printed(self.close, "has no review yet", f"`tp-agent review {author} --force`"))
+        # the named review, typed, is the one the gate then waits for, and once it approves the step closes
+        reviewer = self.new_reviewer(author)
+        self.untouched(self.close, f"{reviewer.name} is reviewing this tree")
+        self.settle(reviewer, result=APPROVED)
+        self.assertEqual(self.closes()["closed"][0]["review"], reviewer.name)
 
     def test_row_1_step_b_waits_while_the_review_is_running(self):
         author, _ = self.writer()
@@ -202,8 +246,12 @@ class GateRowsTests(StepCase):
         self.edit()
         self.commit()
         reviewer, _ = self.review(author, CHANGES)
-        self.untouched(self.next_step, "step s1 is not closed", f"{reviewer} asked for changes", f"tp-agent retry {author}")
+        stderr = self.untouched(self.next_step, "step s1 is not closed", f"{reviewer} asked for changes", f"tp-agent retry {author}")
         self.assertEqual(self.lanes()["waiting_on"], "orchestrator-dispatch")
+        retry = next(c for c in backticked(stderr) if c.startswith("tp-agent retry"))
+        self.type_(retry + " --worker pi --model " + MODEL)  # the named retry puts a new writer in the same step: the lane is moving
+        stderr = self.untouched(self.next_step, "step s1 is not closed")
+        self.assertRegex(stderr, r"coder-[0-9a-f]+ is (starting|running)")
 
     def test_row_2_approved_but_uncommitted_cannot_be_closed(self):
         author, _ = self.writer()

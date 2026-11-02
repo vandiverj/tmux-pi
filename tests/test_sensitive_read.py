@@ -18,6 +18,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import GIT, GIT_ENV, git  # noqa: E402
 from sensitive_read import classify, hook_response
 
 ENV = "." + "env"
@@ -900,10 +902,6 @@ class SensitiveReadTableTests(unittest.TestCase):
                 self.assertEqual(bash(command), {"sensitive": False})
 
 
-GIT = shutil.which("git")
-GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-GIT_ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_COMMITTER_NAME="t",
-               GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_EMAIL="t@example.invalid")
 # What the classifier may ask git: by argument list, with nothing the repository configures able to run.
 QUERY_GUARD = ["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=", "-c", "diff.external=",
                "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "-c", "log.showSignature=false"]
@@ -1054,11 +1052,6 @@ NEVER_QUERIED = [
 ]
 # git takes `lib` here as a path, and so does the classifier: scoped, passed and never queried
 NEVER_QUERIED.append(("git diff --color lib", False))
-
-
-def git(repo, *args):
-    return subprocess.run([GIT, *args], cwd=repo, env=GIT_ENV, check=True, capture_output=True, text=True,
-                          timeout=60).stdout
 
 
 @unittest.skipUnless(GIT, "git is not installed")

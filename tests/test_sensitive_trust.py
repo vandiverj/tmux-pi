@@ -2,9 +2,10 @@
 
 Four groups:
 
-  1. The whole of tests/test_sensitive_read.py re-run with no trust at all (`trust=None`), with a record for an
-     unrelated repository, and with a refused record for the very tree under test. Every row must give the answer
-     it gives today.
+  1. The whole of tests/test_sensitive_read.py re-run with a record for an unrelated repository, and with a
+     refused record for the very tree under test. Every row must give the answer it gives today. (A re-run with
+     `trust=None` is not here: classify's default is `trust=None`, so it is the same call test_sensitive_read makes;
+     test_trust_none below checks the explicit argument.)
   2. The guarantees of design section 8, each in a trusted fixture tree: what stops prompting, what keeps prompting,
      and that no record, a bad record, a moved root and `trust=None` give identical answers.
   3. The skip log, the guard gate, the walk, and the library callers that must not be lifted.
@@ -142,7 +143,7 @@ class World(unittest.TestCase):
 
 class _Rerun:
     """Runs every test of a test_sensitive_read.py class with a resolver (or an explicit `trust=None`) behind classify."""
-    mode = "none"
+    mode = "unrelated"
 
     def setUp(self):
         super().setUp()
@@ -153,16 +154,14 @@ class _Rerun:
         os.makedirs(tdir, mode=0o700)
         for folder in (os.path.join(home, ".config"), os.path.join(home, ".config", "tmux-pi"), tdir):
             os.chmod(folder, 0o700)
-        resolver = None
-        if self.mode != "none":
-            if self.mode == "unrelated":
-                root = self.fixture_repo(os.path.join(self.keep, "elsewhere"))
-                self.write(tdir, root)
-            else:
-                # a record for the very tree under test, refused: the statement is not the one the reader accepts
-                self.write(tdir, BASE.CWD, statement="a different statement")
-            resolver = trust_lift.Resolver("claude", home=home, temp_roots=(), now=NOW, env={},
-                                           log_dir=os.path.join(self.keep, "log"))
+        if self.mode == "unrelated":
+            root = self.fixture_repo(os.path.join(self.keep, "elsewhere"))
+            self.write(tdir, root)
+        else:
+            # a record for the very tree under test, refused: the statement is not the one the reader accepts
+            self.write(tdir, BASE.CWD, statement="a different statement")
+        resolver = trust_lift.Resolver("claude", home=home, temp_roots=(), now=NOW, env={},
+                                       log_dir=os.path.join(self.keep, "log"))
         real_classify, real_hook = sr.classify, sr.hook_response
         patches = [
             mock.patch.object(BASE, "classify", lambda tool, params, cwd=None: real_classify(tool, params, cwd, resolver)),
@@ -191,7 +190,7 @@ class _Rerun:
         os.chmod(path, 0o400)
 
 
-for _mode in ("none", "unrelated", "refused"):
+for _mode in ("unrelated", "refused"):
     for _base in (BASE.SensitiveReadTableTests, BASE.UnscopedPatchTests):
         _name = "%s_%s" % (_base.__name__, _mode)
         globals()[_name] = type(_name, (_Rerun, _base), {"mode": _mode, "__module__": __name__})

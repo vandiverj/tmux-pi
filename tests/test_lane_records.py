@@ -11,18 +11,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import git  # noqa: E402
 import lanes  # noqa: E402
 
 SHA = "a" * 40
 SHA2 = "b" * 40
-
-
-def git(cwd, *args):
-    run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True,
-                         env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-                              "GIT_COMMITTER_EMAIL": "t@t"})
-    assert run.returncode == 0, run.stderr
-    return run.stdout.strip()
 
 
 def good(**over):

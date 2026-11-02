@@ -1231,8 +1231,24 @@ def investigate(base, args):
                 cleanup=f"git -C {workdir} worktree remove --force {tree}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, env=None):
+    """Run the command line. argv is the argument list (default sys.argv[1:]). env, when given, is the whole environment for the call:
+    os.environ holds exactly env until main returns or raises, so every read here and in lib, and every child process, sees it."""
+    if env is None:
+        return _main(argv)
+    saved = dict(os.environ)
+    wanted = dict(env)  # a copy first: env may be os.environ itself, which the clear below would empty
+    try:
+        os.environ.clear()
+        os.environ.update(wanted)
+        return _main(argv)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def _main(argv):
+    parser = argparse.ArgumentParser(prog="tp-agent", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     d = sub.add_parser("dispatch", help="route and start or queue a role task",
                        epilog="With autonomy on, an open blocking decision of an attached workspace holds back the dispatches its --affects "
@@ -1391,7 +1407,7 @@ def main():
     fd.add_argument("--all", action="store_true", help="include archived and superseded workspaces and notes")
     fd.add_argument("--limit", type=int, default=20)
     fd.add_argument("--json", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # The output boundary for the whole `find` and `work` family: every subcommand, every exception type, stdout, stderr and JSON
     # go through work_find.bounded, which relabels configured roots and redacts the complete output once before it is printed.
     if args.command == "find":
@@ -1712,9 +1728,14 @@ def run_work(args):
     return work_commands.run(args, session, task_status, tasks)
 
 
-if __name__ == "__main__":
+def cli(argv=None, env=None):
+    """main plus the error report of the command line: a failure prints "tp-agent: ..." to stderr and exits 1."""
     try:
-        main()
+        main(argv, env)
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f"tp-agent: {error}", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()

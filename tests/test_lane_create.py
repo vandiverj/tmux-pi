@@ -10,18 +10,13 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import GIT_ENV, git  # noqa: E402
 import lane_commands  # noqa: E402
 import lanes  # noqa: E402
 
-ENV = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+ENV = GIT_ENV
 MACHINE = {"max_active_lanes": 2, "defaulted": []}
-
-
-def git(cwd, *args):
-    run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, env=ENV)
-    assert run.returncode == 0, run.stderr
-    return run.stdout.strip()
 
 
 class Scratch(unittest.TestCase):

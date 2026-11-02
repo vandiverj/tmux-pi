@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
 import unittest
 import sys
 
@@ -12,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MODEL = "openai/gpt-6-sol"
 WAITING = '{"state":"waiting"}'
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 from sensitive_read import classify, hook_response
 
 
@@ -26,9 +29,7 @@ class OrchestrationTests(unittest.TestCase):
         (self.state / "tasks").mkdir(parents=True)
         fake = self.root / "bin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('''#!/bin/sh
-case "$1" in
+        fake_tmux(fake, '''case "$1" in
  has-session) exit 0 ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window) printf '%%fake\\n' ;;
@@ -36,7 +37,6 @@ case "$1" in
  *) exit 0 ;;
 esac
 ''')
-        tmux.chmod(0o755)
         self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
@@ -167,16 +167,13 @@ esac
     def test_dispatch_without_workdir_validates_the_main_pane_workdir(self):
         fake = self.root / "bin2"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text(f'''#!/bin/sh
-case "$1" in
+        fake_tmux(fake, f'''case "$1" in
  has-session) exit 0 ;;
  show-options) case "$4$5" in *@tp_main_pane*) echo %main ;; *) echo "$TP_STATE_DIR" ;; esac ;;
  display-message) echo "{self.project}" ;;
  *) exit 0 ;;
 esac
 ''')
-        tmux.chmod(0o755)
         env = {**self.env, "PATH": str(fake) + os.pathsep + self.env["PATH"]}
         args = ("dispatch", "--role", "coder", "--task", "t", "--worker", "pi", "--model", MODEL, "--thinking", "low")
         (self.state / "worker-preamble.md").write_text("x" * 8001)
@@ -338,9 +335,15 @@ esac
         for stem, label in (("dangling", "dangling symlink"), ("adir", "directory"), ("afifo", "FIFO"),
                             ("linked", "readable symlink to a valid record")):
             entries[stem] = (label, None)
-        signal.signal(signal.SIGALRM, lambda *_: self.fail("a reader blocked on a queue entry"))
-        signal.alarm(20)
-        self.addCleanup(signal.alarm, 0)
+        # A thread timer interrupts this thread with SIGUSR2. signal.alarm would share the process's one SIGALRM
+        # timer and cancel an outer `perl -e 'alarm N'` bound. 180 s is a hang guard (the test takes ~28 s under load 14).
+        previous = signal.signal(signal.SIGUSR2, lambda *_: self.fail("a reader blocked on a queue entry"))
+        main_thread = threading.get_ident()
+        watchdog = threading.Timer(180, signal.pthread_kill, (main_thread, signal.SIGUSR2))
+        watchdog.daemon = True
+        watchdog.start()
+        self.addCleanup(signal.signal, signal.SIGUSR2, previous)
+        self.addCleanup(watchdog.cancel)
         entries["unreadable"] = ("unreadable", json.dumps({**good, "id": "unreadable"}))
         for stem, (_, content) in entries.items():
             if content is not None:

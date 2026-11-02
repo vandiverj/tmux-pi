@@ -4,10 +4,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 HOOK = ROOT / "claude/plugins/tmux-pi/hooks/report.sh"
 
 
@@ -25,9 +28,7 @@ class ClaudeReportTests(unittest.TestCase):
         (self.task / "packet.md").write_text("Read fixture")
         fake = self.base / "fake-bin"
         fake.mkdir()
-        tmux = fake / "tmux"
-        tmux.write_text('#!/bin/sh\ncase "$1" in\n has-session) exit 0;;\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%fake";;\n *) exit 0;;\nesac\n')
-        tmux.chmod(0o755)
+        fake_tmux(fake, 'case "$1" in\n has-session) exit 0;;\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%fake";;\n *) exit 0;;\nesac\n')
         self.env = {**os.environ, "TP_TASK_DIR": str(self.task), "TP_TASK_ID": "w1",
                     "TP_STATE_DIR": str(self.state_dir), "TP_SESSION": "fixture",
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}

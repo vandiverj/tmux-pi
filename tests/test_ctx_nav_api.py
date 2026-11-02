@@ -1740,25 +1740,6 @@ class SandboxRefusalCase(Tree):
                 self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_failed"))
         self.assertFalse((self.dir / "marker").exists())
 
-    def test_every_deno_process_is_started_through_the_sandbox(self):
-        project = self.project()
-        started = []
-        real = subprocess.run
-
-        def spy(argv, *args, **kwargs):
-            started.append(list(argv))
-            return real(argv, *args, **kwargs)
-        profile = mock.patch.object(nav_api, "SANDBOX_PROFILE", LOOSE_PROFILE)
-        with profile, mock.patch.object(nav_api.subprocess, "run", spy):
-            nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
-            nav.status()
-            nav.symbols("src/main.ts")
-            nav.forward_graph("src/main.ts")
-        self.assertTrue(len(started) >= 3)
-        for argv in started:
-            self.assertEqual(argv[0], nav_api.SANDBOX_EXEC, argv)
-            self.assertIn("-p", argv)
-
 
 class SandboxGrantCase(Tree):
     """Round 6 F1 (path-boundary, the rule and not one more site): every path the sandbox profile grants, other than the per-call
@@ -3004,14 +2985,17 @@ class PathRuleCase(Tree):
         project = self.project().resolve()
         started = self.spied_launches()
         nav = self.nav(project, deno=self.scripted_deno(doc={"nodes": {}}, info={"modules": []}))
+        nav.status()
         for call in (nav.symbols, nav.forward_graph):
             call("src/main.ts")
         nav.imports("src/main.ts", source="deno")
         if not started:
             self.skipTest("no process was started (no sandbox here)")
+        self.assertTrue(len(started) >= 3)  # the version probe, doc and info: every Deno process is started through the sandbox
         for argv, env in started:
             params = self.params(argv)
             self.assertEqual(argv[0], nav_api.SANDBOX_EXEC)
+            self.assertIn("-p", argv)
             granted = {params["ROOT"], params["DENODIR"], params["DENOBIN"]}
             for grant in (params["DENODIR"], params["DENOBIN"]):
                 self.assertEqual(nav_api.judged_location(grant), grant)

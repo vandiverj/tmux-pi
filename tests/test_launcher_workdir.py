@@ -3,10 +3,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 
 class LauncherWorkdirTests(unittest.TestCase):
     def setUp(self):
@@ -20,8 +23,7 @@ class LauncherWorkdirTests(unittest.TestCase):
         self.fake.mkdir()
         self.state = self.base / "state.json"
         self.log = self.base / "log.jsonl"
-        tmux = self.fake / "tmux"
-        tmux.write_text('''#!/usr/bin/env python3
+        fake_tmux(self.fake, '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 p=Path(os.environ['TEST_TMUX_STATE'])
@@ -43,7 +45,6 @@ if cmd=='split-window': print('%side')
 if cmd=='list-panes': pass
 p.write_text(json.dumps(s))
 ''')
-        tmux.chmod(0o755)
         for name in ('pi', 'claude'):
             harness = self.fake / name
             harness.write_text('#!/bin/sh\npwd -P > "$TEST_HARNESS_CWD"\n')

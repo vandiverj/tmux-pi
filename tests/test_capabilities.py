@@ -8,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fake_tools import fake_tmux  # noqa: E402
 from capabilities import (REGISTRY_VERSION, disclosure_note, handle_capability_request, registry,  # noqa: E402
                           select_capabilities)
 
@@ -110,9 +112,7 @@ class CapabilityRegistryTests(unittest.TestCase):
             task.mkdir(parents=True)
             (task / "meta.json").write_text(json.dumps({"id": "worker-1", "worker": "pi", "pane": "%1"}))
             (task / "request.md").write_text("Plan complex tradeoffs\n")
-            fake = root / "tmux"
-            fake.write_text('#!/bin/sh\necho "$*" >> "$TMUX_LOG"\n')
-            fake.chmod(0o755)
+            fake_tmux(root, 'echo "$*" >> "$TMUX_LOG"\n')
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get("PATH", ""), TMUX_LOG=str(root / "signals"))
             for key in ("TP_TASK_DIR", "TP_TASK_ID", "TMUX", "TMUX_PANE"):
                 env.pop(key, None)

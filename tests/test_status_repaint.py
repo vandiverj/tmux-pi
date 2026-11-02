@@ -229,6 +229,17 @@ esac
         os.write(self.master, b"s")
         self.output_until(lambda frame: b"s stats" in frame and b"\x1b[J" in frame)
 
+    def acknowledge_input(self):
+        """Read the pty up to the pane's answer to everything written so far, with no clock: `x` makes the pane paint a
+        footer ("kill jobN? y/n") that no earlier frame has and then wait for a key; frames are in order, so that frame is
+        the last of the backlog. The answer `n` cancels and the frame it repaints is read too, so what is read next belongs to
+        the next key."""
+        os.write(self.master, b"x")
+        asked = self.output_until(lambda frame: b"y/n" in frame and b"\x1b[J" in frame, seconds=20)
+        self.assertIn(b"y/n", asked, "the pane never asked")
+        os.write(self.master, b"n")
+        self.output_until(lambda frame: b"\x1b[J" in frame and b"y/n" not in frame, seconds=20)
+
     def wait_viewing(self, name, seconds=60.0):
         """Poll the fake tmux viewing option until it names `name`, bounded."""
         path = self.base / "viewing"
@@ -284,6 +295,18 @@ class StatusRepaintTest(StatusPaneFixture):
         tail = self.output_until(lambda frame: b"\x1b[?1000l" in frame)
         self.assertIn(b"\x1b[?1006l\x1b[?1000l", tail)
         self.assertEqual(self.proc.wait(timeout=3), 143)
+
+    def test_slow_load_does_not_make_the_next_pass_reload(self):
+        """The time a paint is stamped with is read after the load, as $SECONDS was: a load that outlasts the second must not
+        leave the stamp behind and send the loop straight into another load. The stub tput (run inside the load) moves the
+        fake clock on by 2 once, the way a slow load lets real time pass."""
+        self.make_jobs(1)
+        self.script("tput", '#!/bin/sh\necho tput >> "$FAKE_BASE/calls"\n[ -f "$FAKE_BASE/slow" ] || { touch "$FAKE_BASE/slow"; echo 2 > "$FAKE_BASE/clock"; }\n'
+                    'case "$1" in cols|lines) cat "$FAKE_BASE/$1";; esac\n')
+        self.first_frame(b"job1")
+        self.barrier()      # input is in order: the loop has come round to read the clock (2) again, and would have loaded
+        self.assertEqual((self.base / "clock").read_text().strip(), "2")
+        self.assertEqual((self.base / "calls").read_text().split().count("tput"), 2)    # one load: cols and lines
 
     def test_click_maps_rendered_rows(self):
         self.make_jobs(3)
@@ -575,7 +598,7 @@ class StatusRepaintTest(StatusPaneFixture):
             json.dumps({"status": "pending", "target": "~/.ssh"}))
         self.first_frame(b"job6")
         self.assert_keys_only_redraw()
-        self.output(0.3)    # frames of the keys above may still be queued (the barrier can match an earlier one); read them off
+        self.acknowledge_input()    # the barrier can match a frame queued for an earlier key; this one cannot
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertIn("── job".encode(), moved)    # the redraw still shows the moved selection
@@ -635,7 +658,7 @@ class StatusRepaintTest(StatusPaneFixture):
         self.make_waiting_world()
         self.first_frame(*self.WAITING)
         self.assert_keys_only_redraw()
-        self.output(0.3)    # frames the pane painted for the keys above may still be unread; they are not the answer to this key
+        self.acknowledge_input()    # frames painted for the keys above may still be unread; read up to the pane's answer
         os.write(self.master, b"k")
         needles = (b"paused", b"capability approval pending", b"start refused: ")
         moved = self.output_until(lambda frame: b"\x1b[J" in frame and all(n in frame for n in needles))
@@ -973,7 +996,7 @@ class StatusEchoTtyTest(StatusPaneFixture):
     def command(self):
         # A parent shell owns the tty and outlives the status process, as in a
         # pane: it records the tty mode the status process left behind.
-        return ["bash", "-c", 'exec 3<&0; bash "$0" <&3 & echo $! > "$FAKE_BASE/pid"; wait $!; '
+        return ["bash", "-c", 'exec 3<&0; bash "$0" <&3 3<&- & echo $! > "$FAKE_BASE/pid"; wait $!; '
                 'echo $? > "$FAKE_BASE/rc.tmp"; stty -a > "$FAKE_BASE/stty_after"; '
                 'mv "$FAKE_BASE/rc.tmp" "$FAKE_BASE/rc"', str(ROOT / "bin/tp-status")]
 
@@ -1025,15 +1048,28 @@ class StatusEchoTtyTest(StatusPaneFixture):
         self.assertIn("echo", flags)                          # previous mode restored on exit
         self.assertIn("icanon", flags)
 
+    def fd_zero_is_pipe(self):
+        """Parent-side event: the status process (not the stub) has a pipe on fd 0, so it is inside the redirected loop."""
+        out = subprocess.run(["lsof", "-a", "-p", (self.base / "pid").read_text().strip(), "-d", "0", "-Ft"],
+                             capture_output=True, text=True).stdout
+        return "tPIPE" in out or "tFIFO" in out
+
     def test_signal_inside_a_redirected_loop_still_restores_the_tty(self):
         # The detail reader runs `while read ...; done < <(python3 tp_detail.py)`: fd 0 is a pipe there. The stub
-        # python3 parks in that loop until released, so the signal lands inside it deterministically.
+        # python3 parks in that loop until released; the signal is sent once the status process itself has the pipe on
+        # fd 0 (the stub's own marker is written by the other side of the pipe, so it proves nothing about the parent).
+        # The stub also records any terminal still open in the reader beyond the standard three: the pane keeps none.
+        if not shutil.which("lsof"):
+            self.skipTest("needs lsof")
         self.make_jobs(1)
         real = shutil.which("python3")
-        self.script("python3", '#!/bin/sh\ncase "$1" in *tp_detail.py) touch "$FAKE_BASE/in_loop"; '
+        self.script("python3", '#!/bin/sh\ncase "$1" in *tp_detail.py) for f in 3 4 5 6 7 8 9; do [ -t $f ] && echo $f >> "$FAKE_BASE/leaks"; done; '
+                    'touch "$FAKE_BASE/in_loop"; '
                     'while [ ! -f "$FAKE_BASE/release" ]; do sleep 0.02; done;; esac\nexec %s "$@"\n' % real)
         self.assertTrue(self.lflag() & termios.ECHO)          # starts the pane; the fixture really echoes
         self.assertTrue(self.wait_for((self.base / "in_loop").exists, 60), "pane never reached the detail loop")
+        self.assertTrue(self.wait_for(self.fd_zero_is_pipe, 60), "the status process never entered the redirected loop")
+        self.assertFalse((self.base / "leaks").exists(), "a child holds the pane's terminal open")
         self.assertFalse(self.lflag() & termios.ECHO)
         _, status, flags = self.signal_status(15)
         (self.base / "release").touch()

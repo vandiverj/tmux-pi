@@ -1,5 +1,6 @@
-"""TP_DOCS_TOOLS wiring: bin/tp-pi and bin/tp-claude argv stay byte-identical when it is unset, gain the docs tools when it is 1;
-the Claude MCP server and the pi extension carry the same two tools. Stub pi/claude binaries; no model, no network."""
+"""TP_DOCS_TOOLS wiring: bin/tp-pi and bin/tp-claude argv stay byte-identical when it is unset, gain the docs tools when it is 1
+(bin/tp-pi only for a task, TP_TASK_DIR set: L3 integration item 7); the Claude MCP server and the pi extension carry the same two
+tools. Stub pi/claude binaries; no model, no network."""
 import json
 import os
 import re
@@ -55,7 +56,7 @@ class LauncherCase(unittest.TestCase):
 
 
 def with_docs_pi(golden):
-    """What tp-pi should launch with TP_DOCS_TOOLS=1: docs.ts after the last file extension, and the tool names on --tools."""
+    """What tp-pi should launch for a task with TP_DOCS_TOOLS=1: docs.ts after the last file extension, and the tool names on --tools."""
     argv = list(golden)
     if "--no-context-files" not in argv:  # strict mode hands pi over with only --no-skills and the kill guard
         return argv
@@ -88,20 +89,22 @@ class GoldenArgvTests(LauncherCase):
                 self.assertEqual(self.launch("pi", case, TP_DOCS_TOOLS=value), GOLDEN["pi"][case], (value, case))
                 self.assertEqual(self.launch("claude", case, TP_DOCS_TOOLS=value), GOLDEN["claude"][case], (value, case))
 
-    def test_pi_argv_includes_the_docs_extension_and_tools_when_set(self):
+    def test_pi_argv_includes_the_docs_extension_only_for_a_task_when_set(self):
+        """Item 7 (review round 4 F5): with TP_DOCS_TOOLS=1, tp-pi loads docs.ts only when TP_TASK_DIR is set (each call logs to
+        $TP_TASK_DIR/docs-calls.jsonl and fails without it). A launch with no task is byte-identical to the one with it unset."""
         for case in CASES:
             got = self.launch("pi", case, TP_DOCS_TOOLS="1")
-            self.assertEqual(got, with_docs_pi(GOLDEN["pi"][case]), case)
-            if case != "strict":
-                self.assertIn("{ROOT}/agent/extensions/docs.ts", got, case)
-                self.assertEqual(got.count("{ROOT}/agent/extensions/docs.ts"), 1)
+            if "TP_TASK_DIR" in CASES[case]:
+                self.assertEqual(got, with_docs_pi(GOLDEN["pi"][case]), case)
+                self.assertEqual(got.count("{ROOT}/agent/extensions/docs.ts"), 1, case)
+            else:
+                self.assertEqual(got, GOLDEN["pi"][case], case)
+                self.assertNotIn("{ROOT}/agent/extensions/docs.ts", got, case)
 
-    def test_pi_main_tool_list_gains_exactly_the_two_tools_and_stays_unique(self):
+    def test_pi_main_without_a_task_dir_gets_neither_the_docs_extension_nor_the_docs_tools(self):
         argv = self.launch("pi", "main", TP_DOCS_TOOLS="1")
-        tools = argv[argv.index("--tools") + 1].split(",")
-        before = GOLDEN["pi"]["main"][GOLDEN["pi"]["main"].index("--tools") + 1].split(",")
-        self.assertEqual(tools, before + TOOLS)
-        self.assertEqual(len(tools), len(set(tools)))
+        self.assertEqual(argv, GOLDEN["pi"]["main"])
+        self.assertEqual(set(argv[argv.index("--tools") + 1].split(",")) & set(TOOLS), set())
 
     def test_a_worker_gets_the_extension_but_no_tools_flag(self):
         argv = self.launch("pi", "worker", TP_DOCS_TOOLS="1")
@@ -115,13 +118,11 @@ class GoldenArgvTests(LauncherCase):
             self.assertEqual(got.count("--strict-mcp-config"), 1, case)  # the strict flag still governs every config
             self.assertEqual(got.count("--mcp-config"), 2)
 
-    def test_the_main_tool_list_in_pi_covers_every_tool_the_docs_extension_registers(self):
+    def test_the_docs_extension_registers_exactly_the_two_tools(self):
         source = (ROOT / "agent/extensions/docs.ts").read_text()
         names = re.findall(r'registerTool\(\s*\{\s*name:\s*["\']([^"\']+)["\']', source)
         self.assertEqual(len(names), source.count("registerTool("))
         self.assertEqual(names, TOOLS)
-        listed = self.launch("pi", "main", TP_DOCS_TOOLS="1")
-        self.assertEqual(set(names) - set(listed[listed.index("--tools") + 1].split(",")), set())
 
     def test_docs_server_is_in_its_own_config_and_not_in_the_default_one(self):
         docs = json.loads((ROOT / "claude/mcp.docs.json").read_text())
@@ -273,10 +274,11 @@ class ExtensionContractTests(unittest.TestCase):
     def test_a_failed_call_throws_so_a_missing_log_returns_no_answer(self):
         self.assertRegex(self.SOURCE, r"if \(r\.code !== 0\) throw new Error\(")
 
-    def test_the_extension_is_listed_by_the_pi_launcher_only_behind_the_variable(self):
+    def test_the_extension_is_listed_by_the_pi_launcher_only_behind_the_variable_and_a_task_dir(self):
         script = (ROOT / "bin/tp-pi").read_text()
         self.assertEqual(script.count("docs.ts"), 1)
-        self.assertRegex(script, r'if \[\[ "\$\{TP_DOCS_TOOLS:-\}" == 1 \]\]; then\n\s+extensions\+=\("\$ROOT/agent/extensions/docs\.ts"\)')
+        self.assertRegex(script, r'if \[\[ "\$\{TP_DOCS_TOOLS:-\}" == 1 && -n "\$\{TP_TASK_DIR:-\}" \]\]; then\n'
+                                 r'\s+extensions\+=\("\$ROOT/agent/extensions/docs\.ts"\)')
 
 
 class ExtensionRuntimeTests(ProjectCase):

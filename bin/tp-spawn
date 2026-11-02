@@ -577,7 +577,10 @@ undo_start() {
       echo "tp-spawn: could not release lane $lane for $id; its reservation ends with this process" >&2
     fi
   fi
-  if [[ "$made_task_dir" == 1 && "$task_dir" == "$state_dir/tasks/$id" ]]; then rm -rf -- "$task_dir"; fi
+  # Never remove through a link: the directories between the state directory and the task directory are checked again now.
+  if [[ "$made_task_dir" == 1 && "$task_dir" == "$state_dir/tasks/$id" ]] && tp_not_link --root "$state_dir" "$task_dir" 2>/dev/null; then
+    rm -rf -- "$task_dir"
+  fi
 }
 trap undo_start EXIT
 if [[ -n "$lane" ]]; then
@@ -601,12 +604,13 @@ fi
 # Keep the verbatim request for legacy/review compatibility; task.md is written
 # as the human-facing canonical record after meta.json exists.
 # Durable provenance: skill-selection.json holds only matching skill profiles and their body hashes.
-rc=0
-{ printf '%s\n\0' "$task"; printf '%s\n\0' "$packet"; printf '%s\n\0' "$skill_selection_json"; } |
+rc=0 owned=""
+owned="$({ printf '%s\n\0' "$task"; printf '%s\n\0' "$packet"; printf '%s\n\0' "$skill_selection_json"; } |
   tp_write_many --root "$state_dir" ${mkdir_args[@]+"${mkdir_args[@]}"} \
-    --file "$task_dir/request.md" --file "$task_dir/packet.md" --file "$task_dir/skill-selection.json" || rc=$?
-# The directory is this run's to remove only once it exists and is a real directory (a refused link is not ours).
-if [[ -d "$task_dir" && ! -L "$task_dir" ]]; then made_task_dir=1; fi
+    --file "$task_dir/request.md" --file "$task_dir/packet.md" --file "$task_dir/skill-selection.json")" || rc=$?
+# The directory is this run's to remove only when the writer said it made it after checking every directory above it (as
+# tp_owned_dir did). Never inferred from [ -d ] on the path: that is also true through a linked tasks/.
+if [[ $'\n'"$owned"$'\n' == *$'\n'"owned $task_dir"$'\n'* ]]; then made_task_dir=1; fi
 (( rc == 0 )) || exit "$rc"
 if [[ -n "$main_contract_file" ]]; then
   jq . "$main_contract_file" | tp_write "$task_dir/main-contract.json" --root "$state_dir"

@@ -227,7 +227,8 @@ def main(argv=None):
     p.add_argument("--root")
     p.add_argument("paths", nargs="+")
     p = sub.add_parser("write-many", help="one start for several writes: mkdir each --mkdir DIR, then write each --file/--exec PATH "
-                                          "with the next NUL-terminated chunk of stdin, in the order given")
+                                          "with the next NUL-terminated chunk of stdin, in the order given; "
+                                          "prints `owned DIR` for each --mkdir DIR once it was checked and exists")
     p.add_argument("--root")
     p.add_argument("--mkdir", action="append", default=[], metavar="DIR")
     p.add_argument("--file", action="append", default=[], metavar="PATH", dest="targets", type=lambda v: ("file", v))
@@ -240,6 +241,7 @@ def main(argv=None):
                 raise ValueError("write-many wants one NUL-terminated chunk of stdin per --file/--exec")
             for path in args.mkdir:
                 ensure_dir(path, root=args.root)
+                print(f"owned {path}", flush=True)  # said only once every ancestor was checked and the directory exists
             for (kind, path), body in zip(args.targets, chunks):  # --file and --exec keep their command-line order
                 write_atomic(path, body, create=0o777 if kind == "exec" else 0o666, root=args.root, keep_mode=kind != "exec")
         elif args.command == "mkdir":

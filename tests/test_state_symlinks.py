@@ -724,6 +724,7 @@ esac
                       'tp_write_many --root "$1" --mkdir "$1/tasks/n" --file "$2" --file "$1/tasks/n/b" --exec "$1/tasks/n/c"',
                       str(self.state), str(link))
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, f"owned {self.state}/tasks/n\n")  # what tp-spawn takes as "this run made it"
         self.assertReplaced(link, "one\n")
         self.assertEqual((self.state / "tasks/n/b").read_text(), "two")
         self.assertEqual((self.state / "tasks/n/c").read_text(), "#!x\n")
@@ -736,6 +737,7 @@ esac
         linked = self.sh('printf "%s\\0" one | tp_write_many --root "$1" --file "$1/tasks/lnk/p"', str(self.state))
         self.assertNotEqual(linked.returncode, 0)
         self.assertFalse((self.outside_dir / "p").exists())
+        self.assertNotIn("owned", linked.stdout)
 
     def test_tp_write_keeps_the_mode_of_the_file_it_replaces(self):
         path = self.task / "meta.json"
@@ -777,6 +779,30 @@ esac
         self.assertTrue(link.is_symlink())
         self.assertFalse((self.outside_dir / "not-yet").exists())
         self.assertUntouched()
+
+    def test_tp_spawn_does_not_clean_up_through_a_tasks_directory_swapped_for_a_link(self):
+        """tasks/ becomes a link to a directory that holds the task id after the id was found free: the writer refuses, and
+        the cleanup must not take the directory behind the link for one this run made."""
+        sentinel = self.outside_dir / "raced" / "keep.txt"
+        sentinel.parent.mkdir()
+        sentinel.write_text("mine")
+        real_jq = shutil.which("jq")
+        wrap = self.base / "fakebin" / "jq"
+        wrap.write_text(f'''#!/bin/sh
+[ "$1" = . ] && [ $# = 1 ] || exec "{real_jq}" "$@"
+input="$(cat)"
+if [ "$input" = "[]" ] && [ ! -L "$TP_STATE_DIR/tasks" ]; then
+  rm -rf "$TP_STATE_DIR/tasks" && ln -s "{self.outside_dir}" "$TP_STATE_DIR/tasks"
+fi
+printf '%s\\n' "$input" | exec "{real_jq}" .
+''')
+        wrap.chmod(0o755)
+        (self.state / "tasks").mkdir(exist_ok=True)
+        run = self.spawn("--task-id", "raced")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertTrue((self.state / "tasks").is_symlink(), "the swap did not happen; the test proves nothing")
+        self.assertEqual(sentinel.read_text(), "mine")
+        self.assertTrue(sentinel.parent.is_dir())
 
     def test_the_exit_file_a_worker_writes_replaces_a_planted_link(self):
         run = self.spawn()

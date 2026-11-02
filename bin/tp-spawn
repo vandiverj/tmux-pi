@@ -676,6 +676,8 @@ run_sh="$(
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
   for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
+  # The ctx tools follow the spawner: main started with TP_CTX_TOOLS=1 gives every worker it spawns the tools (not settable by --worker-env).
+  [[ "${TP_CTX_TOOLS:-}" != 1 ]] || echo 'export TP_CTX_TOOLS=1'
   # The packet text is the first message (not @packet.md: pi would present it as
   # a file in the task dir, and models then resolve relative paths against that).
   printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"

@@ -39,7 +39,7 @@ esac
         tmux.chmod(0o755)
         self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_MAIN_PANE": "%main",
                     "TP_MAIN_CWD": str(self.project), "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
-        for key in ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR"):
+        for key in ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_CTX_TOOLS"):
             self.env.pop(key, None)
 
     def spawn(self, *args, task="env-1", worker="claude"):
@@ -112,6 +112,23 @@ class WorkerEnvTests(WorkerEnvCase):
         self.assertEqual(text, GOLDEN.read_text())
         self.assertNotIn("TP_TRIAL_ID", text)
         self.assertNotIn("TP_DOCS_TOOLS", text)
+
+    def test_ctx_tools_follow_the_spawner_and_cannot_be_set_by_the_option(self):
+        """ctx-enable: main with TP_CTX_TOOLS=1 gives the worker `export TP_CTX_TOOLS=1` before it starts; any other value in main
+        gives nothing; --worker-env still refuses the key, so the spawner's environment is the only way to turn it on."""
+        for value, exported in (("1", True), ("0", False), ("true", False), ("", False)):
+            with self.subTest(value=value):
+                task = "ctx-" + (value or "empty")
+                self.env["TP_CTX_TOOLS"] = value
+                run = self.spawn(task=task)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                text = self.run_sh(task)
+                self.assertEqual("export TP_CTX_TOOLS=1\n" in text, exported)
+                if exported:
+                    self.assertLess(text.index("export TP_CTX_TOOLS=1"), text.index("tp-claude"))
+        run = self.spawn("--worker-env", "TP_CTX_TOOLS=1", task="ctx-opt")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("not allowed", run.stderr)
 
 
 class OtherLanePathsWithoutLaneTests(WorkerEnvCase):

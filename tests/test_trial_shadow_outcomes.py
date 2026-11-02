@@ -354,6 +354,7 @@ class TpTrialExitTests(unittest.TestCase):
                     mock.patch("builtins.print"):
                 self.assertEqual(cli.cmd_run(mock.Mock(run_dir="/nowhere")), 0 if outcome == "completed" else 1)
         self.assertIn("cleanup_failed", ts.TERMINAL_OUTCOMES)
+        self.assertIn("preempted", ts.TERMINAL_OUTCOMES, "review round 4 F6: a run Main preempted is an outcome the exit is checked for")
 
 
 if __name__ == "__main__":

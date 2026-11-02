@@ -129,8 +129,8 @@ def workdir_text(worktree, project):
             "{proj} is not yours: do not read it for the task's files or change anything in it.").format(wt=worktree, proj=project)
 
 
-TERMINAL_OUTCOMES = ("completed", "timeout", "worker_failed", "paused", "stopped", "spawn_failed", "error", "record_failed", "no_review",
-                     "review_timeout", "cleanup_failed")
+TERMINAL_OUTCOMES = ("completed", "timeout", "preempted", "worker_failed", "paused", "stopped", "spawn_failed", "error", "record_failed",
+                     "no_review", "review_timeout", "cleanup_failed")
 REVIEW_VERDICTS = ("approved", "request_changes", "inconclusive")  # a first review's outcome that is a verdict (lib/trial_record.py OUTCOMES)
 
 

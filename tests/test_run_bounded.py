@@ -8,10 +8,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS))
 import run_bounded
+import run_parallel
 
 FIELDS = {"cmd", "files", "seconds", "rc", "timed_out", "load1", "per_file", "leftovers"}
 
@@ -122,6 +124,35 @@ class RunBoundedTests(unittest.TestCase):
         record, _ = self.run_py(f"open({str(sockets / 'new')!r}, 'w').close()")
         self.assertEqual(record["leftovers"], ["new"])  # "old" was there before the run
         self.assertTrue((sockets / "new").exists())
+
+
+class RunParallelTests(unittest.TestCase):
+    def test_default_jobs_follow_cores_and_load(self):
+        with mock.patch("os.cpu_count", return_value=16):
+            with mock.patch("os.getloadavg", return_value=(1.0, 1.0, 1.0)):
+                self.assertEqual(run_parallel.default_jobs(), run_parallel.MAX_JOBS)  # quiet: cores//2, capped
+            with mock.patch("os.getloadavg", return_value=(9.0, 1.0, 1.0)):
+                self.assertEqual(run_parallel.default_jobs(), 2)  # busy
+        with mock.patch("os.cpu_count", return_value=2), mock.patch("os.getloadavg", return_value=(0.0, 0, 0)):
+            self.assertEqual(run_parallel.default_jobs(), 1)
+
+    def test_module_run_is_logged_with_seconds_and_a_slow_module_is_stopped(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        tests = Path(temp.name)
+        log = tests / "log.jsonl"
+        (tests / "test_fast.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n")
+        (tests / "test_slow.py").write_text("import unittest, time\nclass T(unittest.TestCase):\n"
+                                            "    def test_a(self): time.sleep(60)\n")
+        with mock.patch.object(run_parallel, "TESTS", tests):
+            fast = run_parallel.run("test_fast", timeout=20, log=log)
+            slow = run_parallel.run("test_slow", timeout=1, log=log)
+        self.assertEqual(fast[:3], ("test_fast", 0, 1))
+        self.assertEqual(slow[:2], ("test_slow", 124))
+        rows = [json.loads(l) for l in log.read_text().splitlines()]
+        self.assertEqual([r["timed_out"] for r in rows], [False, True])
+        self.assertIn("test_fast", rows[0]["per_file"])  # seconds per module, in run_bounded's format
+        self.assertEqual(rows[0]["files"], ["test_fast"])
 
 
 if __name__ == "__main__":

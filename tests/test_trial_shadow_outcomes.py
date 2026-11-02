@@ -153,6 +153,21 @@ class ReviewOutcomeTests(OutcomeCase):
         self.assertEqual(self.qwen()[0]["first_review_outcome"], "approved")
 
 
+class CollectOutcomeTests(OutcomeCase):
+    """The rest of the family: a step after the worker ended that cannot do its work does not end in `completed`."""
+
+    def test_a_tree_that_is_gone_when_the_work_is_collected_is_an_error_and_nothing_is_reviewed(self):
+        rdir, _ = self.prepare()
+
+        def poll(n, run):
+            self.settle_worker(run)
+            shutil.rmtree(str(run.worktree))
+        _, done = self.run_stub(rdir, poll)
+        self.assertEqual(done["outcome"], "error", done)
+        self.assertIn("worktree", done["error"])
+        self.assertIsNone(done.get("review_id"))
+        self.assertEqual([r["outcome"] for r in self.qwen()], ["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

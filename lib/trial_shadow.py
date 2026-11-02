@@ -751,9 +751,9 @@ class Run:
         self.note(phase="reset")
         base = self.info["base_commit"]
         state, _ = self.prove_worktree()
-        if state == "absent":
-            return
-        log = self.wt_git("log", "--reverse", base + "..HEAD", "--format=%B%x00", check=False)
+        if state == "absent":  # the work cannot be read, and a review of nothing is no review of the worker's work
+            raise ShadowError("the run's worktree {} is gone; the worker's work was not collected".format(self.worktree))
+        log =self.wt_git("log", "--reverse", base + "..HEAD", "--format=%B%x00", check=False)
         self.commit_messages = [m.strip("\n") for m in log.stdout.split("\0") if m.strip()] if log.returncode == 0 else None
         head = self.wt_git("rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
         if head and head != base:

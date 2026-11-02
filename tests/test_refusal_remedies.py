@@ -50,6 +50,7 @@ class RemedyCase(LeaseCase):
 
 class CrossSessionStopTests(RemedyCase):
     """F1: a stop printed for a holder in another session works as printed, from a pane of any tmux session."""
+    snapshot_lane = False  # measured under 10% CPU-s gain (or none) with the snapshot on
 
     def setUp(self):
         super().setUp()
@@ -71,7 +72,7 @@ class CrossSessionStopTests(RemedyCase):
     def live_holder(self):
         """A lane writer in this session whose pane is real, so the lease names a live process (the other session sees it)."""
         (self.state / "live-window").write_text("")
-        item, task = self.lane_ok()
+        item, task = self.lane_ok(snapshot=False)
         (self.state / "live-window").unlink()
         return item, task, json.loads((task / "meta.json").read_text())["pane"]
 
@@ -158,10 +159,11 @@ class ReviewerHoldingTests(RemedyCase):
 
 class SettledHolderTests(RemedyCase):
     """F3: a worker that has settled is not running, waiting never frees the lane, and collect (then stop) does."""
+    snapshot_lane = False  # measured under 10% CPU-s gain (or none) with the snapshot on
 
     def settled_holder(self, **kw):
         (self.state / "live-window").write_text("")  # the worker's pane is real and the lease names it, as a started worker's does
-        item, task = self.lane_ok(**kw)
+        item, task = self.lane_ok(snapshot=False, **kw)
         (self.state / "live-window").unlink()
         self.settle(task)
         return item, task
@@ -194,7 +196,7 @@ class SettledHolderTests(RemedyCase):
 
     def test_f3_a_worker_still_at_work_is_running_and_may_be_waited_for(self):
         (self.state / "live-window").write_text("")
-        item, task = self.lane_ok()
+        item, task = self.lane_ok(snapshot=False)
         (self.state / "live-window").unlink()
         (task / "state.json").write_text(json.dumps({"state": "working"}))
         run = self.lane_dispatch(step="s1", extra=())
@@ -341,6 +343,7 @@ class RetryRefusalTests(RemedyCase):
 
 class ReviewRefusalTests(RemedyCase):
     """The review guard (tp-agent review / guard-review) names the same, state-aware commands."""
+    snapshot_lane = False  # measured under 10% CPU-s gain (or none) with the snapshot on
 
     def test_a_review_beside_a_settled_writer_names_collect_and_it_clears(self):
         author, author_task, author_pane, _ = self.live_task()
@@ -571,6 +574,7 @@ class StepRemedyTests(StepCase):
     runs what it names (through sh, as typed, with only the placeholders the text itself marks as ones to fill: NEW-ID, ROLE) and
     shows the refusal gone or moved on to the next step of the way. The last test walks one lane from a working writer to a
     closed step by only typing what the refusals said."""
+    snapshot_lane = False  # measured under 10% CPU-s gain (or none) with the snapshot on
     snapshot_lane = True
 
     # --- the gate ---------------------------------------------------------------------------------------------------

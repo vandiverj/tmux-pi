@@ -332,7 +332,7 @@ class EscalationTests(Base):
             review = self.state / "tasks" / f"review-{n}"
             review.mkdir()
             (review / "meta.json").write_text(json.dumps({"id": f"review-{n}"}))
-            (review / "result.md").write_text("REQUEST_CHANGES\nRESULT_STATUS: complete\nfix it")
+            (review / "result.md").write_text("REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] fix it\nFamily: shared-defect\nCloses by: code")
         # only one review is linked per attempt, so link the first attempt to one and retry once more
         meta = json.loads((task / "meta.json").read_text())
         (task / "meta.json").write_text(json.dumps(dict(meta, review="review-1")))

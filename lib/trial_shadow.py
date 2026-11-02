@@ -127,7 +127,8 @@ def workdir_text(worktree, project):
             "{proj} is not yours: do not read it for the task's files or change anything in it.").format(wt=worktree, proj=project)
 
 
-TERMINAL_OUTCOMES = ("completed", "timeout", "worker_failed", "paused", "stopped", "spawn_failed", "error")
+TERMINAL_OUTCOMES = ("completed", "timeout", "worker_failed", "paused", "stopped", "spawn_failed", "error", "record_failed", "no_review",
+                     "review_timeout")
 
 
 class ShadowError(Exception):
@@ -591,6 +592,7 @@ class Run:
         self.records = record_module or load_record_module()
         self.outcome = None
         self.recorded = False
+        self.record_problem = None
         self.heads_before = set()
         self.diff = (None, None)
         self.commit_messages = None
@@ -861,18 +863,20 @@ class Run:
         return record
 
     def write_record(self):
+        """Append the run's qwen record. `recorded` is set by an append that succeeded and by nothing else, so a record that could not be
+        written is tried again by whoever calls this next (the end of `execute`), and is never reported as written."""
         if self.recorded:
             return
         has_task = (self.task_path() / "meta.json").is_file()
         if not has_task and self.outcome != "spawn_failed":
             return
-        self.recorded = True
         self.note(phase="record")
         if not has_task:
             record = self.spawn_failed_record()
             record.update({"run": self.run, "source_task": self.info["source_task"], "outcome": self.outcome, "workdir": str(self.worktree),
                            "normal_reviewer_model": self.info.get("normal_reviewer_model"), "reviewer_mismatch": None})
             append_record(self.records, self.project, record)
+            self.recorded = True
             self.note(recorded=now())
             return
         record = self.records.build(self.task_path(), "qwen", "shadow", self.info["pair_id"], state_dir=self.state, role=self.source_role(),
@@ -883,7 +887,22 @@ class Run:
                        "normal_reviewer_model": normal,
                        "reviewer_mismatch": None if not (normal and mine) else normal != mine})
         append_record(self.records, self.project, record)
+        self.recorded = True  # not before: a failed append must leave this run able to try once more
         self.note(recorded=now())
+
+    def try_record(self):
+        """`write_record` as a step of the run: a failure does not end the run, it is kept (`record_problem`, and `record_error` in run.json)
+        for the retry at the end of `execute`. Returns whether the record is written. An interrupt passes through."""
+        try:
+            self.write_record()
+        except Exception as problem:
+            self.record_problem = "{}: {}".format(problem.__class__.__name__, problem)
+            self.note_end(record_error=self.record_problem)
+            return False
+        if self.record_problem:  # written by the retry: the first failure is kept under another name, so run.json does not claim a missing record
+            self.note_end(record_error=None, record_retried=self.record_problem)
+        self.record_problem = None
+        return True
 
     def source_role(self):
         meta = _json(self.task_path() / "meta.json")
@@ -922,7 +941,7 @@ class Run:
                     self.outcome = "completed"
                 elif result not in ("timeout", "preempted"):
                     self.outcome = {"failed": "worker_failed", "stopped": "stopped", "paused": "paused"}[result]
-                self.write_record()
+                self.try_record()
             except Interrupted:
                 self.outcome = "stopped"
                 raise
@@ -943,10 +962,9 @@ class Run:
                 if error:
                     self.note_end(error=error)
                 self.outcome = self.outcome or "error"
-                try:
-                    self.write_record()
-                except Exception as problem:
-                    self.note_end(record_error="{}: {}".format(problem.__class__.__name__, problem))
+                self.try_record()  # the first try failed, or was never reached: a record of the attempt is written here when it can be
+                if self.record_problem and self.outcome == "completed":
+                    self.outcome = "record_failed"  # the attempt ran but its Qwen record is missing: not a completed trial
                 self.note_end(phase="cleanup")
                 try:
                     leftovers = self.cleanup()

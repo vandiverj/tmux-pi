@@ -89,7 +89,7 @@ class TmuxCase(unittest.TestCase):
         cls.fake.mkdir()
         write_wrappers(cls.fake, cls.sock)
         cls.addClassCleanup(cls.kill_server)  # registered last, so it runs before the folder is removed
-        subprocess.run([TMUX, "-L", cls.sock, "new-session", "-d", "-s", "anchor", "sleep 300"], check=True, capture_output=True)
+        subprocess.run([TMUX, "-L", cls.sock, "new-session", "-d", "-s", "anchor", "sleep 86400"], check=True, capture_output=True)
         cls.anchor_window = subprocess.run([TMUX, "-L", cls.sock, "display-message", "-p", "-t", "anchor", "#{window_id}"], text=True,
                                            check=True, capture_output=True).stdout.strip()
 

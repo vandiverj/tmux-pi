@@ -33,12 +33,75 @@ class RunBoundedTests(unittest.TestCase):
         self.dir = Path(temp.name)
         self.log = self.dir / "t" / "tests.jsonl"
 
-    def run_py(self, code, timeout=10, **kw):
-        return run_bounded.run_bounded([sys.executable, "-c", code], timeout=timeout, grace=1, log=self.log,
+    def run_py(self, code, timeout=10, grace=1, **kw):
+        return run_bounded.run_bounded([sys.executable, "-c", code], timeout=timeout, grace=grace, log=self.log,
                                        echo=False, **kw)
 
     def records(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def assertGone(self, pids):
+        """Wait for the event (each pid gone, reaped by init once killed), with a 10 s cap."""
+        deadline = time.monotonic() + 10
+        while any(alive(p) for p in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([p for p in pids if alive(p)], [])
+
+    def leader_leaves_child(self, child, extra=""):
+        """Code for a leader that starts `child` in its own group, waits until the child has written its pid (after
+        its setup), and exits 0. Returns (code, pidfile); the cleanup kills the child if it is still there."""
+        pidfile = self.dir / "child"
+        child = child.replace("READY", f"import os; open({str(pidfile)!r} + '.tmp', 'w').write(str(os.getpid())); "
+                                       f"os.rename({str(pidfile)!r} + '.tmp', {str(pidfile)!r})")
+        code = ("import os, subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child!r}]{extra})\n"
+                f"while not os.path.exists({str(pidfile)!r}): time.sleep(0.01)\n")
+
+        def cleanup():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(cleanup)
+        return code, pidfile
+
+    # Rule rows (see run_bounded.run_bounded): leader exited / group empty / deadline / reader done.
+    def test_child_the_leader_left_is_waited_for_and_its_output_kept(self):
+        # leader exits; a same-group child still holds stdout; it ends before the deadline
+        code, pidfile = self.leader_leaves_child("READY\nimport time; time.sleep(1); print('late', flush=True)")
+        record, output = self.run_py(code, timeout=20, grace=0.2)
+        self.assertEqual((record["rc"], record["timed_out"]), (0, False))
+        self.assertEqual(output, "late\n")  # read after the leader exited and after the reader's grace
+        self.assertFalse(alive(int(pidfile.read_text())))  # the run ended only once the group was empty
+
+    def test_child_the_leader_left_past_the_bound_is_killed_and_the_run_times_out(self):
+        # the reviewer's case: leader exits 0; a same-group child holds stdout, ignores SIGTERM, sleeps
+        code, pidfile = self.leader_leaves_child(
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nREADY\ntime.sleep(60)")
+        started = time.monotonic()
+        record, _ = self.run_py(code, timeout=1.5, grace=0.3)
+        self.assertLess(time.monotonic() - started, 1.5 + 3 * 0.3 + 4)  # bound + TERM grace + KILL wait + reader
+        self.assertEqual((record["rc"], record["timed_out"]), (None, True))
+        self.assertEqual(self.records()[-1], record)
+        self.assertGone([int(pidfile.read_text())])
+
+    def test_child_with_its_output_closed_is_still_part_of_the_run(self):
+        # leader exits; the reader has seen end of file; a same-group child lives on past the deadline
+        code, pidfile = self.leader_leaves_child(
+            "READY\nimport time; time.sleep(60)",
+            extra=", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL")
+        record, _ = self.run_py(code, timeout=1.5, grace=0.3)
+        self.assertEqual((record["rc"], record["timed_out"]), (None, True))
+        self.assertGone([int(pidfile.read_text())])
+
+    def test_holder_outside_the_group_does_not_hold_a_finished_run(self):
+        # leader exits and the group is empty; a process in its own session holds the pipe: not ours to wait for
+        code, pidfile = self.leader_leaves_child("READY\nimport time; time.sleep(30)", extra=", start_new_session=True")
+        started = time.monotonic()
+        record, _ = self.run_py(code, timeout=20, grace=0.5)
+        self.assertLess(time.monotonic() - started, 0.5 + 4)  # the reader's grace, not the 30 s holder
+        self.assertEqual((record["rc"], record["timed_out"]), (0, False))
+        self.assertTrue(alive(int(pidfile.read_text())))  # outside the group: never signalled
 
     def test_clean_run_is_recorded_as_valid_json(self):
         record, output = self.run_py("print('hi')", files=["tests/test_x.py"])
@@ -64,7 +127,7 @@ class RunBoundedTests(unittest.TestCase):
         record, _ = self.run_py(code, timeout=1)
         self.assertLess(time.monotonic() - started, 20)
         self.assertTrue(record["timed_out"])
-        self.assertNotEqual(record["rc"], 0)
+        self.assertIsNone(record["rc"])  # the bound was hit: the leader's rc is not the run's
         self.assertTrue(self.records()[-1]["timed_out"])
 
     def test_term_ignoring_child_and_grandchild_in_the_group_are_killed(self):
@@ -77,12 +140,8 @@ class RunBoundedTests(unittest.TestCase):
                 "time.sleep(60)")
         record, _ = self.run_py(code, timeout=2)
         self.assertTrue(record["timed_out"])
-        self.assertEqual(record["rc"], -signal.SIGKILL)
-        pids = [int(p) for p in pidfile.read_text().split()]
-        deadline = time.monotonic() + 10
-        while any(alive(p) for p in pids) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertEqual([p for p in pids if alive(p)], [])
+        self.assertIsNone(record["rc"])
+        self.assertGone([int(p) for p in pidfile.read_text().split()])
 
     def test_grandchild_holding_stdout_cannot_keep_the_runner_past_the_bound(self):
         # the leader sleeps; a grandchild in its own session (outside the group) keeps the output pipe open

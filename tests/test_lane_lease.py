@@ -25,11 +25,15 @@ def start_of(pid):
 
 
 class LeaseCase(LaneCase):
+    snapshot_lane = True  # made_lane and RemedyCase start from the default dispatch; a test that touches anything first dispatches for real
+
     def setUp(self):
         super().setUp()
         self.state2 = self.root / "session2" / ".tmux-pi"
         (self.state2 / "tasks").mkdir(parents=True)
         self.env2 = {**self.env, "TP_STATE_DIR": str(self.state2)}
+        if self.snapshot_lane:
+            self._pristine = (self.fingerprint(), dict(self.env))  # the second session's folder is part of the fixture
 
     def run_in(self, env, *args):
         return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env, text=True, capture_output=True, timeout=90)

@@ -571,6 +571,16 @@ class StepRemedyTests(StepCase):
     runs what it names (through sh, as typed, with only the placeholders the text itself marks as ones to fill: NEW-ID, ROLE) and
     shows the refusal gone or moved on to the next step of the way. The last test walks one lane from a working writer to a
     closed step by only typing what the refusals said."""
+    snapshot_lane = True
+
+    def writer(self, step="s1", settled=True):
+        """StepCase.writer, except that the lane's first writer in s1 is the default dispatch (the restored snapshot)."""
+        if self.exists() or step != "s1":
+            return super().writer(step=step, settled=settled)
+        item, task = self.lane_ok()
+        if settled:
+            self.settle(task)
+        return item["id"], task
 
     # --- the gate ---------------------------------------------------------------------------------------------------
 

@@ -1,0 +1,51 @@
+== apps/launchpad/api/src/orders.ts
+kind: source | lines: 13 | package: api (apps/launchpad/api)
+tests: apps/launchpad/api/src/orders.test.ts
+exports (3):
+  createOrder (function) :5
+  cancelOrder (function) :9
+  OrderStatus (variable) :13
+importers (at least 10 shown, list cut by the navigator):
+  apps/launchpad/api/src/routes/r01.ts:3
+  apps/launchpad/api/src/routes/r02.ts:3
+  apps/launchpad/api/src/routes/r03.ts:3
+  apps/launchpad/api/src/routes/r04.ts:3
+  apps/launchpad/api/src/routes/r05.ts:3
+  apps/launchpad/api/src/routes/r06.ts:3
+  apps/launchpad/api/src/routes/r07.ts:3
+  apps/launchpad/api/src/routes/r08.ts:3
+  apps/launchpad/api/src/routes/r09.ts:3
+  apps/launchpad/api/src/routes/r10.ts:3
+imports (2):
+  apps/launchpad/api/src/util.ts  (line 3)
+  lib/launchpad/types/order.ts  (line 2)
+== apps/launchpad/web/src/cart.ts
+kind: source | lines: 9 | package: web (apps/launchpad/web)
+tests: apps/launchpad/web/src/cart.spec.ts
+exports (2):
+  addToCart (function) :5
+  view (const) :9
+importers (1):
+  apps/launchpad/web/src/cart.spec.ts:1
+imports (1):
+  lib/launchpad/types/order.ts  (line 1)
+== contracts
+lib/launchpad/types/order.ts — imported at apps/launchpad/api/src/orders.ts:2, apps/launchpad/web/src/cart.ts:1
+  consumers (10):
+  apps/launchpad/web/src/p01.ts:1 [unread]
+  apps/launchpad/web/src/p02.ts:1 [unread]
+  apps/launchpad/web/src/p03.ts:1 [unread]
+  apps/launchpad/web/src/p04.ts:1 [unread]
+  apps/launchpad/web/src/p05.ts:1 [unread]
+  apps/launchpad/web/src/p06.ts:1 [unread]
+  apps/launchpad/web/src/p07.ts:1 [unread]
+  apps/launchpad/web/src/p08.ts:1 [unread]
+== knowledge
+  kn-2026-10-01-parse (convention) — Parse input before use: Always parse. pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp…
+  kn-2026-10-02-routes (convention) — Routes are thin: Keep routes thin.
+  kn-2026-10-04-elsewhere (convention) — Not for orders: Web only.
+  kn-2026-10-03-repo (convention) — Repo-wide habit: Use strict mode.
+== libraries
+  react (version not read: not in the lockfile)
+  zod 4.6.7 — use api_signature(zod, <symbol>) for exact signatures
+(left out: importers of apps/launchpad/api/src/orders.ts: the navigator cut its list (ctx_relations importers shows more); contract consumers of lib/launchpad/types/order.ts: 2 more (ctx_relations importers shows more); note text cut at 300 characters (ctx_knowledge shows it whole): kn-2026-10-01-parse)

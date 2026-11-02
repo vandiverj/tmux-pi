@@ -6,10 +6,14 @@ refused, not followed; a link anywhere in the task directory's path is refused t
 (redact.guard) before they are logged and before they are hashed; the hash is over the screened arguments.
 
 Two kinds of call. A query operation (the default) always needs a usable $TP_TASK_DIR and has no other log. An operator command
-(`operator=True`: approve, audit, show, list) is a person's: with neither TP_TASK_DIR nor TP_TASK_ID set it may run unlogged,
-or log to an explicit file when run on a terminal; with either set it is a worker's shell and is logged like any call. An
-explicit log file is accepted only for an operator command on a terminal with no worker variable, so a worker cannot point its
-log elsewhere or skip it.
+(`operator=True`: approve, audit, show, list, status) is a person's: with neither TP_TASK_DIR nor TP_TASK_ID set, and only at
+a terminal (stdin and stdout), it may run unlogged or log to an explicit file; with either set, or with no terminal, it is
+logged like any call (so needs a usable task directory). An explicit log file is accepted only for an operator command on a
+terminal with no worker variable, so a worker cannot point its log elsewhere or skip it, and a worker that clears its
+variables but has no terminal is still refused.
+
+TP_TASK_DIR must be spelled as its own normalized absolute path (no `..`, `.`, repeated or trailing slash): a `..` after a
+symlink would name a different directory than the one the checks looked at.
 
 Links in the task directory's path: for `<state>/tasks/<id>` (or `archive/<id>`) every part below the sessions directory
 (`<state>`, `tasks`, `<id>`) must be a real directory. For any other spelling nothing marks where tmux-pi's state begins, so
@@ -20,6 +24,7 @@ A line: {ts, tool, args_hash, args, status, bytes, ms, notes_returned, index_age
 Statuses: ok, invalid (bad arguments), refused (a screen said no), no_project, stale_index, unavailable (a navigator or
 reader is missing), error (a bug; the text says so without a traceback).
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -32,6 +37,7 @@ import safe_write
 from . import redact
 
 LOG_NAME = "ctx-calls.jsonl"
+LOCK_NAME = "ctx-calls.lock"
 ARG_LIMIT = 500
 NOTES_LIMIT = 50
 STATUSES = ("ok", "invalid", "refused", "no_project", "stale_index", "unavailable", "error")
@@ -49,6 +55,7 @@ class Answer:
     index_age_s: int | None = None
     reason: str | None = None
     data: object = None  # whatever structured result the caller wants back; not logged
+    undo: object = None  # for a call that wrote something: takes the write back when the call cannot be logged
 
 
 WORKER_ENV = ("TP_TASK_DIR", "TP_TASK_ID")
@@ -69,7 +76,9 @@ def _worker_vars(env):
 def check_task_dir(task_dir):
     """The directory `safe_write` should treat as the root for writes in `task_dir` (None when no part of the path marks one),
     after refusing a task directory that is, or sits behind, a symlink. LogUnavailable otherwise."""
-    task_dir = os.path.abspath(str(task_dir))
+    task_dir = str(task_dir)
+    if not os.path.isabs(task_dir) or os.path.normpath(task_dir) != task_dir:
+        raise LogUnavailable("TP_TASK_DIR is not a normalized absolute path; refusing to answer without a log")
     if os.path.islink(task_dir) or not os.path.isdir(task_dir):
         raise LogUnavailable("TP_TASK_DIR is not a real absolute directory; refusing to answer without a log")
     state = safe_write.task_root(task_dir)
@@ -94,22 +103,23 @@ def log_path(override=None, env=None, operator=False):
     """Where this call is logged, or None when it may run unlogged. LogUnavailable when it cannot be logged.
 
     $TP_TASK_DIR/ctx-calls.jsonl when a task directory is set and usable. `override` (an explicit file) only for an operator
-    command on a terminal with neither TP_TASK_DIR nor TP_TASK_ID set. None only for an operator command with neither set and
-    no override. Everything else, with no usable task directory, is LogUnavailable."""
+    command on a terminal with neither TP_TASK_DIR nor TP_TASK_ID set. None only for an operator command on a terminal with
+    neither set and no override. Everything else, with no usable task directory, is LogUnavailable."""
     env = os.environ if env is None else env
     workers = _worker_vars(env)
     if override:
         if not operator or workers or not on_terminal():
-            raise LogUnavailable("--log is for a person running approve, audit, show or list at a terminal with no TP_TASK_DIR or "
-                                 "TP_TASK_ID; refusing to answer without a log")
+            raise LogUnavailable("--log is for a person running approve, audit, show, list or status at a terminal with no "
+                                 "TP_TASK_DIR or TP_TASK_ID; refusing to answer without a log")
         return Path(override)
     task_dir = env.get("TP_TASK_DIR", "")
     if not task_dir:
-        if operator and not workers:
+        if operator and not workers and on_terminal():
             return None
+        if operator and not workers:
+            raise LogUnavailable("TP_TASK_DIR is not set and there is no terminal, so the call cannot run unlogged; refusing to "
+                                 "answer without a log")
         raise LogUnavailable("TP_TASK_DIR is not set, so the call cannot be logged; refusing to answer without a log")
-    if not os.path.isabs(task_dir):
-        raise LogUnavailable("TP_TASK_DIR is not a real absolute directory; refusing to answer without a log")
     check_task_dir(task_dir)
     return Path(task_dir) / LOG_NAME
 
@@ -144,13 +154,59 @@ def record(path, tool, args, answer, ms=0, task_dir=None):
         raise LogUnavailable(f"cannot write {path}: {exc}; refusing to answer without a log") from exc
 
 
-def call(tool, args, run, *, log_file=None, env=None, operator=False):
+class _Lock:
+    """An exclusive lock on <task dir>/ctx-calls.lock for a call that counts, writes and logs as one step."""
+
+    def __init__(self, task_dir):
+        self.task_dir, self.fd = task_dir, None
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(os.path.join(self.task_dir, LOCK_NAME), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) |
+                              getattr(os, "O_CLOEXEC", 0), 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            if self.fd is not None:
+                os.close(self.fd)
+            raise LogUnavailable(f"cannot lock the call log ({exc.strerror or type(exc).__name__}); refusing to answer without a log") from exc
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)  # closing the descriptor releases the lock
+
+
+def check_writable(path, task_dir=None):
+    """LogUnavailable unless a line could be appended to `path` now (nothing is written). A link, a directory or a refused parent is
+    found here, before a write that could not be logged is made."""
+    try:
+        root = check_task_dir(task_dir) if task_dir else None
+        safe_write.open_append(path, root=root or Path(path).parent).close()
+    except OSError as exc:
+        raise LogUnavailable(f"cannot write {path}: {exc}; refusing to answer without a log") from exc
+
+
+def call(tool, args, run, *, log_file=None, env=None, operator=False, exclusive=False):
     """One logged engine call: resolve the log first (LogUnavailable before anything is read), run `run()` -> Answer, log the
     line, then hand the answer back. A raised exception becomes status `error` with a text that carries no traceback.
-    `operator` marks a person's command (see the module note): the only kind that may run unlogged or use `log_file`."""
+    `operator` marks a person's command (see the module note): the only kind that may run unlogged or use `log_file`.
+
+    `exclusive` is for a call that writes (a candidate note) or counts earlier calls (the per-task note limit): the task's lock is
+    held from before `run()` until the line is written, so two such calls never interleave, and the log is checked to be writable
+    first. If the line still cannot be written, the answer's `undo` takes the write back before LogUnavailable goes up: a write
+    is never left behind without its line."""
     environ = os.environ if env is None else env
     path = log_path(log_file, environ, operator)
     task_dir = environ.get("TP_TASK_DIR") if path is not None and not log_file else None
+    if exclusive and path is not None and task_dir:
+        with _Lock(task_dir):
+            check_writable(path, task_dir)
+            return _run_logged(tool, args, run, path, task_dir)
+    if exclusive and path is not None:
+        check_writable(path)
+    return _run_logged(tool, args, run, path, task_dir)
+
+
+def _run_logged(tool, args, run, path, task_dir):
     started = time.monotonic()
     try:
         answer = run()
@@ -163,5 +219,13 @@ def call(tool, args, run, *, log_file=None, env=None, operator=False):
     except Exception as exc:  # a bug must not escape as a traceback into a worker's context, nor go unlogged
         answer = Answer("error", f"internal error ({type(exc).__name__}); see the call log", reason=repr(exc))
     if path is not None:
-        record(path, tool, args, answer, int((time.monotonic() - started) * 1000), task_dir=task_dir)
+        try:
+            record(path, tool, args, answer, int((time.monotonic() - started) * 1000), task_dir=task_dir)
+        except LogUnavailable:
+            if callable(answer.undo):
+                try:
+                    answer.undo()
+                except Exception:
+                    pass
+            raise
     return answer

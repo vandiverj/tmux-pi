@@ -34,6 +34,7 @@ and never repeats the value.
 | `versions` | optional `{package: range}`; a range such as `>=0.45 <0.46`, `^1.2`, `~1.2.3`, `1.x`, `a \|\| b` |
 | `source` | `human`, or starts with `review:`, `doc:`, `work:` or `worker:` |
 | `evidence` | required for an approved note and for every new candidate; up to 10 entries such as `path:line` or `review:<id>#<finding>` |
+| `evidence_hashes` | optional `{entry: hash}`: a hash of the cited line for each `path:line` entry, taken by the tool when a candidate is written; never set by the caller (see `add` under `tp-ctx`) |
 | `supersedes` | optional ids of approved notes this one replaces |
 | `status`, `created`, `last_reviewed` | set by the tool |
 
@@ -65,15 +66,16 @@ Computed on every read and never stored. A flag does not hide a note; it tells t
 Every `tp-ctx` command except `approve` appends one JSON line to `$TP_TASK_DIR/ctx-calls.jsonl`: `ts, tool, args_hash, args,
 status, bytes, ms, notes_returned, index_age_s` and, when there is one, `reason`. It fails closed: with no usable task
 directory, or a log that cannot be written, the command prints nothing from the store and exits 3. Unusable means: unset,
-relative, not a directory, or a symlink; or a symlink anywhere in its path (for `<state>/tasks/<id>`, the state directory, `tasks`
+relative, not spelled as its own normalized path (`..`, `.`, a repeated or trailing slash), not a directory, or a symlink; or a symlink anywhere in its path (for `<state>/tasks/<id>`, the state directory, `tasks`
 and `<id>` must be real directories; for any other spelling, no ancestor may be a symlink owned by the calling user). The path
 is examined again when the line is written. A symlinked `ctx-calls.jsonl` is refused. Arguments are redacted before they are
 logged and before they are hashed.
 
-Only a person's commands may do otherwise: `list`, `show` and `audit` (and `approve`, which logs nothing). With neither
-`TP_TASK_DIR` nor `TP_TASK_ID` set they may run unlogged, and `--log FILE` writes their line to a file of the person's choice,
-but only on a terminal. `status`, `add`, `import` and the query operations other lanes add (brief, symbol, relations,
-knowledge search, note) always need a usable `TP_TASK_DIR`. With either variable set the shell is a worker's: `--log` is refused
+Only a person's commands may do otherwise: `list`, `show`, `audit` and `status` (and `approve`, which logs nothing). With
+neither `TP_TASK_DIR` nor `TP_TASK_ID` set, and only when stdin and stdout are a terminal, they may run unlogged, and `--log
+FILE` writes their line to a file of the person's choice. With no terminal they need a usable `TP_TASK_DIR` like every other
+command. `add`, `import` and the query operations (brief, symbol, relations, knowledge search, note) always need a usable
+`TP_TASK_DIR`. With either variable set the shell is a worker's: `--log` is refused
 and the call is logged in the task directory like any other.
 
 ## Screens
@@ -110,6 +112,57 @@ accepts a work-store note tagged `lesson` that is not tagged or fenced private.
 terminal. It re-screens the file, prints the diff, and moves the candidate only after the note id is typed. Notes listed in
 `supersedes` move to `superseded/` in the same step; if any step fails, every step already taken is undone and the
 store is as it was.
+
+## The context tools (`ctx_brief`, `ctx_symbol`, `ctx_relations`, `ctx_knowledge`, `ctx_note`)
+
+`tp-ctx --json <tool> --input <json>` answers `{status, text, truncated, left_out}` in at most 6144 bytes; `agent/extensions/ctx.ts` (pi) and
+`claude/mcp/ctx.mjs` (Claude) are thin wrappers over it, loaded only when `TP_CTX_TOOLS=1`. What a worker can rely on:
+
+- **Paths.** Every path a navigator returns (importers, imports, contract consumers, definitions, references, listed symbols) goes through
+  the same path policy as the arguments before it is shown. One that is sensitive, outside the project, a link out of it, or a `<withheld>`
+  placeholder is never named: it is counted in `left_out` (`N withheld`).
+- **Truncation.** When a navigator says it cut a list (`truncated`), the answer text for that list never states a total, a zero or an
+  absence, in any operation and for every list (definitions, references, importers, imports, exports, symbols, contract consumers, the
+  shared contracts among the imports). One helper words it (`surface.list_head`, `surface.more_note`): "label (at least N shown, list cut by
+  the navigator)" when rows were shown, "label: not found in the part the navigator returned (list cut)" when none were, and a `left_out`
+  entry that says the list was cut and gives no count. A list that was not cut states its total ("5 of 7") and its absence ("nothing imports
+  X") only when the source was read completely. **The rule: an absence is stated only when the read succeeded, nothing was withheld and
+  nothing was cut.** Every list or search carries a `surface.Completeness` (`ok`, `withheld`, `cut`, `unread`, `why`, `status`) that one
+  mapper, `surface.answer_read`, derives from the whole navigator or search answer, never from fields picked at a call site: the status
+  must be `ok`; every field that signals loss (unresolved, refused, withheld, omitted, truncated/cut, skipped, errors, invalid, ignored
+  config) makes the read incomplete; any non-empty field not on the explicit `surface.HARMLESS` list counts as incomplete, so a field a
+  navigator adds later fails closed. `Got.completeness()`, `surface.notes_read`, `locate` and the brief's reads all go through it; a test
+  fails if `Completeness(...)` is built anywhere but the mapper. Every row list is read through `surface.listed_rows`: a row that
+  is not an object, or a list that is missing, null or not a list, is counted as unreadable; a `total` that is not a whole number,
+  or above the rows handed over, makes the read not whole; a row path that is not text is withheld, never shown. An ok answer
+  whose `target` or `path` names another file, or that does not echo the `direction` asked for, is an `error`. The text scan
+  (`surface.declaration_pattern`) also finds export renames, destructured bindings, `export * as`, `import x =`, a first line with
+  a byte order mark and names with `$`; test files are looked for in every code extension; an `import(...)`/`require(...)` whose
+  module is not a plain string makes the libraries line "none can be shown". A status other than `ok` reads "not available (the navigator answered
+  STATUS)"; a list the navigator did not flag as cut but that was not whole reads "not all returned", never "cut". One helper (`surface.absent`, used by
+  `surface.list_head`) words every absence in `brief.py` and `surface.py` from it. A read that failed, was unavailable or never ran (a
+  navigator down, a file no package covers) says "not available", never "none". If the read succeeded but items were refused, withheld or
+  not read, the line says "none can be shown (N withheld, ...)" and never an absence, a zero or "none found". This covers lists (importers,
+  imports, exports, contract consumers, definitions, references), the shared contracts of `ctx_brief` (the imports of every briefed file
+  must have been read; one that was not gives "shared (lib) contracts: not available" or, when a contract was found, a warning naming the
+  file), the `tests:` line (a test file at a refused path), the name search of `ctx_symbol` and `ctx_relations` (code files the scan could not
+  read), the notes (candidates not shown, note files that failed to parse) and the libraries (a briefed file too large to read, or a cut import
+  list). A test fails if either file holds an absence string outside the helper (the allowlist holds whole strings, not fragments), or if a
+  helper call's completeness argument is not built from a read result. The contracts view says "only N imports were read, the navigator cut its list" instead of "no shared contracts". `ctx_symbol` with no
+  `path` gives the details of each file that declares the name, up to 5; `ctx_relations` with a bare symbol declared in more than one file is
+  `invalid` with a next step (pass a path).
+- **Contract consumers** are marked `[reader]`, `[writer]`, `[reader, writer]`, `[uses]` (imports it, does neither) or `[unread]` (the file
+  could not be read). A text scan of the consumer's own import statements (calls such as `.parse(`, `.extend(`, `import type`, `export * from`), not
+  type analysis.
+- **Notes.** `ctx_knowledge` shows each note's whole body (up to `store.BODY_MAX`, 1200); `ctx_brief` shows the first 300 characters of the body
+  after the title, and names the notes it cut in `left_out`.
+- **`ctx_note`** writes a candidate and answers `result: {id, status: "candidate", path}` in the `--json` payload (pi: the tool's `details`; MCP:
+  `structuredContent`). The five-per-task limit, the write and the log line are one step under an exclusive lock on
+  `$TP_TASK_DIR/ctx-calls.lock` (`calls.call(..., exclusive=True)`; `knowledge add` and `import` use it too). The log is checked to be appendable
+  before the write, and a line that still cannot be written takes the candidate back (`Answer.undo`), so a candidate never exists without its
+  line. A crash between the write and the line can still leave a candidate that is not logged; `knowledge list --status candidate` shows what is waiting.
+- **`ctx_brief`** with no requested path present is `invalid` with a next step; with some missing it still briefs the rest and ends with a
+  `Next:` line naming the missing ones.
 
 ## For other lanes
 

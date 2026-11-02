@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tmux-pi-ctx": {
+      "command": "node",
+      "args": [
+        "${TP_ROOT}/claude/mcp/ctx.mjs"
+      ]
+    }
+  }
+}

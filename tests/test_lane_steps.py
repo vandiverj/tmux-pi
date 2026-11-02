@@ -65,10 +65,7 @@ class StepCase(LaneCase):
 
     def writer(self, step="s1", settled=True):
         """A coder task in `step` (the first one makes the lane); settled with a reply unless `settled` is False."""
-        if self.exists():
-            item, task = self.existing(step=step)
-        else:  # the default arguments, so that the snapshot applies to the first s1 writer
-            item, task = self.lane_ok() if step == "s1" else self.lane_ok(step=step)
+        item, task = self.existing(step=step) if self.exists() else self.lane_ok(step=step)
         if settled:
             self.settle(task)
         return item["id"], task

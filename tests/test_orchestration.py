@@ -752,6 +752,23 @@ esac
         run = subprocess.run(["bash", "-c", script], env={**self.env, "ROOT": str(ROOT), "workdir": str(self.project)},
                              cwd=self.project, text=True, capture_output=True, timeout=20)
         self.assertEqual(run.stdout.strip(), "REFUSED", run.stderr)
+        # The batch screening fails closed, with ONE context too (an empty reply must not count as one "not sensitive" verdict):
+        # a batch that exits nonzero, prints nothing, answers a different count, or answers with something but a clear
+        # "sensitive": false refuses the file. A clean verdict still passes (the control, so the stub is not just refusing).
+        replies = {"exit-1": "exit 1", "empty": "exit 0", "count": "echo '[]'",
+                   "other": """echo '[{"sensitive":"no"}]'""", "clean": """echo '[{"sensitive":false}]'"""}
+        script = funcs + 'contexts=(after.txt)\n'
+        for name, body in replies.items():
+            stub = self.project / f"fake-{name}/bin/tp-sensitive-read"
+            stub.parent.mkdir(parents=True)
+            stub.write_text(f"#!/bin/sh\ncat >/dev/null\n{body}\n")
+            stub.chmod(0o755)
+            script += (f'ROOT="{stub.parent.parent}"; screen_contexts\n'
+                       f'secret_file "$workdir/after.txt" && echo {name}=REFUSED || echo {name}=READ\n')
+        run = subprocess.run(["bash", "-c", script], env={**self.env, "ROOT": str(ROOT), "workdir": str(self.project)},
+                             cwd=self.project, text=True, capture_output=True, timeout=20)
+        self.assertEqual(run.stdout.split(), ["exit-1=REFUSED", "empty=REFUSED", "count=REFUSED", "other=REFUSED", "clean=READ"],
+                         run.stderr)
 
     def test_worker_request_is_visible_and_message_answers_it(self):
         item = self.dispatch()

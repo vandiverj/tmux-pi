@@ -246,7 +246,7 @@ file_fingerprints() {
   fi
 }
 screen_contexts() {
-  local spec p i listed=() verdicts v fps=()
+  local spec p i ok listed=() verdicts reply v fps=()
   for spec in ${contexts[@]+"${contexts[@]}"}; do
     p="$spec"
     if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then p="${BASH_REMATCH[1]}"; fi
@@ -255,19 +255,26 @@ screen_contexts() {
   done
   (( ${#listed[@]} > 0 )) || return 0
   file_fingerprints "${listed[@]}"; fps=("${fp_out[@]}")
-  verdicts="$(jq -cn '$ARGS.positional | map({tool_name:"Read",tool_input:{file_path:.}})' --args "${listed[@]}" |
-    "$ROOT/bin/tp-sensitive-read" --batch 2>/dev/null |
-    jq -r --argjson n "${#listed[@]}" 'if type == "array" and length == $n then .[] | (if (try .sensitive catch null) == false then 0 else 1 end) else range($n) | 1 end' 2>/dev/null)" ||
-    verdicts=""
+  reply="$(jq -cn '$ARGS.positional | map({tool_name:"Read",tool_input:{file_path:.}})' --args "${listed[@]}" |
+    "$ROOT/bin/tp-sensitive-read" --batch 2>/dev/null)" || reply=""
+  verdicts=""
+  if [[ -n "$reply" ]]; then
+    verdicts="$(jq -r --argjson n "${#listed[@]}" 'if type == "array" and length == $n then .[] | (if (try .sensitive catch null) == false then 0 else 1 end) else empty end' <<<"$reply" 2>/dev/null)" ||
+      verdicts=""
+  fi
   screened_paths=("${listed[@]}")
   screened_secret=() screened_fp=()
   file_fingerprints "${listed[@]}"
   for i in "${!listed[@]}"; do
     if [[ -n "${fps[$i]}" && "${fps[$i]}" == "${fp_out[$i]}" ]]; then screened_fp+=("${fps[$i]}"); else screened_fp+=(""); fi
   done
-  while IFS= read -r v; do screened_secret+=("$v"); done <<<"$verdicts"
-  # Anything short of one verdict per file is a failed screening: every file counts as sensitive.
-  if (( ${#screened_secret[@]} != ${#listed[@]} )); then
+  if [[ -n "$verdicts" ]]; then while IFS= read -r v; do screened_secret+=("$v"); done <<<"$verdicts"; fi
+  # Fail closed: anything short of exactly one verdict (0 or 1) per file (a failed, empty or short batch included) makes every
+  # file sensitive, as a failing single call always did. An empty list must not count as one empty verdict.
+  ok=1
+  (( ${#screened_secret[@]} == ${#listed[@]} )) || ok=0
+  for v in ${screened_secret[@]+"${screened_secret[@]}"}; do [[ "$v" == 0 || "$v" == 1 ]] || ok=0; done
+  if (( ! ok )); then
     screened_secret=(); for v in "${listed[@]}"; do screened_secret+=(1); done
   fi
 }

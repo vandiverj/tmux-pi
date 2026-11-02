@@ -92,6 +92,38 @@ class AttemptRowTests(EndCase):
         self.assertIn("no normal row of this attempt", done["unmet"])
 
 
+class RefConditionTests(EndCase):
+    """F2: condition 7, read from git at the end: each ref `keep_ref` made is gone."""
+
+    def head_ref(self, info):
+        return "{}{}/head".format(ts.REF_PREFIX, info["run"])
+
+    def test_a_ref_left_while_the_cleanup_reported_nothing_kept_is_cleanup_failed(self):
+        class RefStays(FastRun):
+            def __init__(self, *args, **kw):
+                super().__init__(*args, **kw)
+                self.owner.drop_refs = lambda: []  # the cleanup reports no ref kept, and deletes none
+        run, done, info = self.fast(RefStays)
+        self.assertIn(self.head_ref(info), self.refs(ts.REF_PREFIX), "the ref is still there")
+        self.assertEqual((done["outcome"], done["cleanup_errors"]), ("cleanup_failed", []), done)
+        self.assertIn(self.head_ref(info), done["unmet"])
+        self.assertEqual([r["outcome"] for r in self.qwen_of(info["run"])], ["cleanup_failed"], "the row says what the run says")
+
+    def test_a_ref_git_cannot_delete_is_cleanup_failed(self):
+        case = self
+
+        class Locked(FastRun):
+            def cleanup(self):
+                lock = Path(git(case.repo, "rev-parse", "--absolute-git-dir")) / (case.head_ref(self.info) + ".lock")
+                lock.write_text("")  # another git holds the ref: update-ref -d fails
+                case.addCleanup(lambda: lock.unlink() if lock.exists() else None)
+                return super().cleanup()
+        run, done, info = self.fast(Locked)
+        self.assertIn(self.head_ref(info), self.refs(ts.REF_PREFIX))
+        self.assertEqual(done["outcome"], "cleanup_failed", done)
+        self.assertIn("ref", done["unmet"])
+
+
 class EndPathTests(EndCase):
     """F1: the cleanup is in a `finally` around every end step before it; the steps after it run whatever the one before did."""
 

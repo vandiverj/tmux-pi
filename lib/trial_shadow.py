@@ -15,7 +15,7 @@ Everything a run writes is under <project>/.tmux-pi/trial/<run>/ (run.json, requ
 
 What the run does to git: `git worktree add --detach` at the source task's base_commit (nothing under refs/heads), a temporary
 ref refs/tmux-pi/shadow/<run>/head that keeps the worker's commits reachable until the cleanup, and removal of both at
-the end, on success and on failure. The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
+the end, on success and on failure (a ref the run made that git still lists at the end makes the run `cleanup_failed`). The run deletes no branch, ever: it created none, so none is its to delete. If the worker left
 the tree on a branch (`git checkout -b`, a rename, a branch someone else made meanwhile), the collect step detaches HEAD (so moving
 it to the base cannot move that branch), leaves the branch where it is and reports it as `branch_left` {ref, commit} in run.json (every
 branch made since the tree was, HEAD's or not, is listed there as `new_branches`, read only from the project and git directory
@@ -638,6 +638,7 @@ class Run:
         self.recorded = False
         self.record_problem = None
         self.cleanup_problem = None
+        self.refs_problem = None
         self.normal_problem = None
         self.end_errors = []  # the end steps that raised (`end_step`), in order
         self.heads_before = set()
@@ -988,6 +989,26 @@ class Run:
                 return "the cleanup did not remove the worktree {}: it is still there".format(path)
         return None
 
+    def refs_unmet(self):
+        """Why a ref this attempt made (`Owner.made_refs`, kept by `keep_ref` from the moment git made it) cannot be shown gone, read now
+        from git in the project the run recorded (`Owner.check_project`), or None. What the cleanup returned is not consulted: a ref is
+        gone only when git no longer lists it."""
+        made = sorted(self.owner.made_refs)
+        if not made:
+            return None
+        try:
+            self.owner.check_project()
+            listed = git(self.project, "for-each-ref", "--format=%(refname)", *made, check=False)
+        except (ShadowError, OSError) as problem:
+            return "the refs {} the run made cannot be shown gone: {}".format(", ".join(made), problem)
+        if listed.returncode:
+            return "the refs {} the run made cannot be shown gone: git for-each-ref failed: {}".format(
+                ", ".join(made), listed.stderr.strip() or "exit {}".format(listed.returncode))
+        left = sorted(set(listed.stdout.split()) & set(made))
+        if left:
+            return "the cleanup did not remove the ref {} the run made: it is still in {}".format(", ".join(left), self.project)
+        return None
+
     def write_normal(self):
         """Write the normal arm's record (`record_normal`, best effort as before) and say whether its row is as the completed rule allows:
         None when a row of it that this attempt wrote (`attempt`) is in records.jsonl, or when it is absent for a reason this names in
@@ -1028,6 +1049,8 @@ class Run:
             return "record_failed", self.normal_problem
         if self.cleanup_problem:
             return "cleanup_failed", self.cleanup_problem
+        if self.refs_problem:
+            return "cleanup_failed", self.refs_problem
         return "completed", None
 
     def write_record(self):
@@ -1136,6 +1159,8 @@ class Run:
              allowed one
           6. the cleanup ended the session     the session's recorded id is gone and nothing is at the worktree's
              and removed the worktree          place (`cleanup_unmet`)                                               else `cleanup_failed`
+          7. every ref the run made is gone    each ref `keep_ref` made is no longer listed by git in the project
+                                               the run recorded (`refs_unmet`)                                       else `cleanup_failed`
 
         A run whose steps already gave another outcome (timeout, preempted, worker_failed, stopped, paused, spawn_failed, error) keeps it:
         that is its first unmet condition. Otherwise the outcome names the first condition that does not hold, and `unmet` in run.json
@@ -1151,14 +1176,15 @@ class Run:
              (`list_new_branches`)              raised after the end; Interrupted:        `new_branches_error`; outcome unchanged
                                                 `stopped`, raised; the cleanup runs
           c. note phase cleanup (`note_end`)    never                                     the note is lost; outcome unchanged
-          d. the cleanup (`cleanup`)            Exception: kept as `cleanup_errors`;      `cleanup_errors`; condition 6 reads what
-                                                Interrupted: `stopped`, raised            is left, else `cleanup_failed`
+          d. the cleanup (`cleanup`)            Exception: kept as `cleanup_errors`;      `cleanup_errors`; conditions 6 and 7 read
+                                                Interrupted: `stopped`, raised            what is left, else `cleanup_failed`
           e. condition 6 (`cleanup_unmet`)      `error` (`end_step`), raised after        `cleanup_failed`
-          f. the normal record (`write_normal`) `error` (`end_step`), raised after        `record_failed`
-          g. the Qwen record (`write_record`)   `error` (`end_step`), raised after        `record_failed`
-          h. note the outcome (`note_end`)      never                                     run.json lacks it; the Qwen row has it
+          f. condition 7 (`refs_unmet`)         `error` (`end_step`), raised after        `cleanup_failed`
+          g. the normal record (`write_normal`) `error` (`end_step`), raised after        `record_failed`
+          h. the Qwen record (`write_record`)   `error` (`end_step`), raised after        `record_failed`
+          i. note the outcome (`note_end`)      never                                     run.json lacks it; the Qwen row has it
 
-        An interrupt (b or d) skips e-g, and a run not yet settled is `stopped`; `tp-trial stop` runs the idempotent cleanup again."""
+        An interrupt (b or d) skips e-h, and a run not yet settled is `stopped`; `tp-trial stop` runs the idempotent cleanup again."""
         self.note(pid=os.getpid(), started=now(), phase="starting", attempt=self.attempt)
         error = None
         try:
@@ -1219,6 +1245,7 @@ class Run:
                         leftovers = ["cleanup: {}".format(problem)]
                     self.note_end(cleanup_errors=leftovers)
                 self.cleanup_problem = self.end_step(raised, "the session and worktree check", self.cleanup_unmet)
+                self.refs_problem = self.end_step(raised, "the ref check", self.refs_unmet)
                 self.normal_problem = self.end_step(raised, "the normal arm's record", self.write_normal)
                 self.end_step(raised, "the Qwen record", self.write_record)  # settles the outcome by the rule above and writes the Qwen row with it
             except Interrupted:
@@ -1411,6 +1438,7 @@ class Owner:
         self.record = None
         self.problem = None
         self.why = ""
+        self.made_refs = set()  # the refs `keep_ref` made in this process: condition 7 of the completed rule (`Run.refs_unmet`)
         self.load()
         self.hold()
 
@@ -1852,6 +1880,7 @@ class Owner:
         if refs.get(ref) == commit:
             return
         git(self.project, "update-ref", ref, commit, "")  # an empty old value: the ref must not exist yet
+        self.made_refs.add(ref)  # made: from here it must be shown gone at the end, whatever is recorded below
         refs[ref] = commit
         try:
             self._write()

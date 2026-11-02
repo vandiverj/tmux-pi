@@ -24,6 +24,7 @@ IMPORTS_MAX = 10
 CONTRACTS_MAX = 5
 CONSUMERS_MAX = 8
 NOTES_MAX = 5
+SCOPES_MAX = 10  # most packages asked who imports a shared lib file
 TEST_EXT = tuple(ext.lstrip(".") for ext in surface.CODE_EXT)  # a test is looked for in every code extension the surface reads
 USE_FILE_MAX = 200_000
 SOURCE_EXT = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
@@ -150,6 +151,32 @@ def edge_block(title, rows, group_by, mark=None):
     return lines
 
 
+def scope_text(package):
+    """How a package is named in an answer: `api package apps/launchpad/api`."""
+    kind, where = package
+    return f"{kind} package {where or '.'}"
+
+
+def importer_reads(engine, rel, limit, via=(), left=None):
+    """[(scope, Got)]: who imports `rel`. A file outside lib/ is asked of the navigator of its own package (scope ""). A shared lib file is
+    asked of the navigators of the packages that import it (G1): those of the files in `via`, else every app package. Its own package
+    cannot see the apps (a lib root has no consumers there, and an index of it can fail on the build output beside it), so the answer
+    names the scope it covers. With no app package at all the lib file's own package is asked, as for any file. Packages past SCOPES_MAX are
+    not asked; they are named in `left` (when given) so the answer does not read as if they had none."""
+    if surface.label_for(rel) != "lib":
+        return [("", engine.importers(rel, limit))]
+    packages = []
+    for package in [engine.package_for(v) for v in via] if via else engine.app_packages():
+        if package and package not in packages:
+            packages.append(package)
+    if not packages:
+        return [("", engine.importers(rel, limit))]
+    packages.sort(key=lambda package: (surface.LABEL_ORDER.index(package[0]) if package[0] in surface.LABEL_ORDER else len(surface.LABEL_ORDER), package[1]))
+    if left is not None and len(packages) > SCOPES_MAX:
+        left.append(f"importers of {rel}: not asked in {', '.join(scope_text(p) for p in packages[SCOPES_MAX:])} (more than {SCOPES_MAX} packages)")
+    return [(scope_text(package), engine.importers(rel, limit, package=package)) for package in packages[:SCOPES_MAX]]
+
+
 def contract_block(engine, rel, contracts, limit, left, exclude):
     """Lines for the shared (lib) files in `contracts` ({file: [places that import it]}) and who else imports each, every consumer
     marked reader, writer, both or uses."""
@@ -159,17 +186,20 @@ def contract_block(engine, rel, contracts, limit, left, exclude):
         left.append(f"contracts: {len(ordered) - CONTRACTS_MAX} more")
     for contract in ordered[:CONTRACTS_MAX]:
         lines.append(f"{contract} — imported at {', '.join(sorted(contracts[contract]))}")
-        got = engine.importers(contract, 25)
-        if not got.ok:
-            lines.append(f"  consumers unavailable — {first_line(got)}")
-            failed.append(got)
-            continue
-        consumers = sorted({(a, b) for a, b, _ in got.rows if a not in exclude})
-        total = max(got.total - got.refused - (len(got.rows) - len(consumers)), len(consumers))
-        lines.append("  " + surface.list_head("consumers", len(consumers[:limit]), total, got.completeness()))
-        lines += [f"  {a}:{b} [{contract_use(engine, contract, a)}]" for a, b in consumers[:limit]]
-        add_left(left, withheld_note(f"consumers of {contract}", got.refused),
-                 more_note(f"contract consumers of {contract}", total - limit, got.cut, "ctx_relations importers shows more"))
+        reads = importer_reads(engine, contract, 25, [place.rsplit(":", 1)[0] for place in contracts[contract]], left)
+        if all(not got.ok for _, got in reads):
+            failed.append(reads[0][1])
+        for scope, got in reads:
+            tag = f" in {scope}" if scope else ""
+            if not got.ok:
+                lines.append(f"  consumers{tag} unavailable — {first_line(got)}")
+                continue
+            consumers = sorted({(a, b) for a, b, _ in got.rows if a not in exclude})
+            total = max(got.total - got.refused - (len(got.rows) - len(consumers)), len(consumers))
+            lines.append("  " + surface.list_head(f"consumers{tag}", len(consumers[:limit]), total, got.completeness()))
+            lines += [f"  {a}:{b} [{contract_use(engine, contract, a)}]" for a, b in consumers[:limit]]
+            add_left(left, withheld_note(f"consumers of {contract}{tag}", got.refused),
+                     more_note(f"contract consumers of {contract}{tag}", total - limit, got.cut, "ctx_relations importers shows more"))
     return lines, failed
 
 
@@ -177,18 +207,26 @@ def relations(engine, rel, direction, limit, lines):
     """The answer of ctx_relations for the file `rel`."""
     left = []
     if direction == "importers":
-        got = engine.importers(rel, limit)
-        if not got.ok:
+        reads = importer_reads(engine, rel, limit, left=left)
+        if all(not got.ok for _, got in reads):
+            got = reads[0][1]
             return engine.finish(got.status, lines + [got.text], reason=first_line(got))
-        shown = got.rows[:limit]
         mark = (lambda row: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
-        lines += edge_block(surface.list_head(f"importers of {rel}", len(shown), got.total, got.completeness(), empty=f"nothing imports {rel}", of=True),
-                            shown, 0, mark)
-        add_left(left, more_note("importers", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
-                 withheld_note("importers", got.refused))
-        if got.unresolved:
-            lines.append(f"unresolved imports: {got.unresolved}")
-        return engine.finish("ok", lines, left, age=got.age)
+        age = None
+        for scope, got in reads:
+            tag = f" in {scope}" if scope else ""
+            if not got.ok:
+                lines.append(f"importers of {rel}{tag}: not available — {first_line(got)}")
+                continue
+            age = got.age if age is None else age
+            shown = got.rows[:limit]
+            lines += edge_block(surface.list_head(f"importers of {rel}{tag}", len(shown), got.total, got.completeness(),
+                                                  empty=f"nothing imports {rel}{tag}", of=True), shown, 0, mark)
+            add_left(left, more_note(f"importers{tag}", got.total - len(shown) - got.refused, got.cut, "raise limit up to 25", got.total),
+                     withheld_note(f"importers{tag}", got.refused))
+            if got.unresolved:
+                lines.append(f"unresolved imports{tag}: {got.unresolved}")
+        return engine.finish("ok", lines, left, age=age)
     got = engine.imports(rel)
     if not got.ok:
         return engine.finish(got.status, lines + [got.text], reason=first_line(got))
@@ -255,10 +293,41 @@ def tests_for(engine, rel):
     return sorted(found), surface.answer_read({"status": "ok", "withheld": refused})
 
 
+def library_lines(engine, used):
+    """The lines of the libraries block for `used`, a set of (package directory, import specifier). Each specifier is classified once, in its
+    own package, by `Engine.classify`: a project alias there, else a library with the version that package's lockfile pins (or why not). A
+    line names the exact specifier as imported: a mapped specifier (`@pkg/sub`) is reported as that specifier being a project alias and is
+    never folded into its root package name; the root package's own line appears only when the root or an unmapped subpath is imported.
+    Packages whose (alias specifiers, pins) are identical give one line; when they differ there is one line per package, so one package's
+    alias or pin is never said of another's."""
+    found = {}  # library -> package directory -> (alias specifiers, set of (version, why) of its non-alias specifiers)
+    for where, spec in sorted(used):
+        lib, alias = engine.classify(spec, where)
+        if lib:
+            aliases, pins = found.setdefault(lib, {}).setdefault(where, (set(), set()))
+            if alias:
+                aliases.add(spec)
+            else:
+                pins.add(engine.pinned(lib, where))
+    lines = []
+    for lib in sorted(found):
+        per_package = found[lib]
+        same = len({(tuple(sorted(aliases)), tuple(sorted(pins, key=str))) for aliases, pins in per_package.values()}) == 1
+        for where in sorted(per_package):
+            aliases, pins = per_package[where]
+            at = "" if same else f" in {where or '.'}"
+            if aliases:
+                lines.append(f"  {', '.join(sorted(aliases))}{at} (a project alias for code in this repository, not a library)")
+            for version, why in sorted(pins, key=str):
+                lines.append(f"  {lib}{at} {version} — use api_signature({lib}, <symbol>) for exact signatures" if version
+                             else f"  {lib}{at} (version not read: {why})")
+    return list(dict.fromkeys(lines))
+
+
 def build(engine, paths):
     """The answer of ctx_brief for the project-relative `paths` (already checked)."""
     lines, left, tried, good = [], [], [], []
-    libraries = set()
+    libraries = set()  # (package directory of a briefed file, import specifier as written): where its lockfile and aliases are read
     contracts, nexts, missing, incomplete = {}, set(), [], []
     unread = []  # briefed files whose text could not be read for the library scan
     import_reads = []  # the Completeness of each briefed file's imports read: "no contract" is said only when all are whole
@@ -287,7 +356,8 @@ def build(engine, paths):
         text = engine.read(rel)
         if text is None or surface.unnamed_imports(text):
             unread.append(rel)  # over 1 MB, unreadable, or an import it cannot name: "no library" cannot be said
-        libraries |= surface.libraries_in(text or "")
+        here = package[1] if package else ""
+        libraries.update((here, spec) for spec in surface.specifiers_in(text or ""))
         tests, tests_read = tests_for(engine, rel)
         lines.append("tests: " + (", ".join(tests) if tests else surface.absent("none found next to it", tests_read)))
         add_left(left, withheld_note(f"tests of {rel}", tests_read.withheld))
@@ -303,13 +373,14 @@ def build(engine, paths):
             add_left(left, more_note(f"exports of {rel}", got.total - EXPORTS_MAX, got.cut, "ctx_symbol with path shows one name", got.total))
             add_left(left, withheld_note(f"exports of {rel}", got.refused))
         mark = (lambda row, rel=rel: contract_use(engine, rel, row[0])) if surface.label_for(rel) == "lib" else None
-        got = engine.importers(rel, IMPORTERS_MAX)
-        if track("importers", got):
-            shown = sorted(got.rows)[:IMPORTERS_MAX]
-            lines.append(surface.list_head("importers", len(shown), got.total, got.completeness()))
-            lines += [f"  {a}:{b}" + (f" [{mark((a, b, rel))}]" if mark else "") for a, b, _ in shown]
-            add_left(left, more_note(f"importers of {rel}", got.total - len(shown) - got.refused, got.cut, "ctx_relations importers shows more", got.total),
-                     withheld_note(f"importers of {rel}", got.refused))
+        for scope, got in importer_reads(engine, rel, IMPORTERS_MAX, left=left):
+            tag = f" in {scope}" if scope else ""
+            if track(f"importers{tag}", got):
+                shown = sorted(got.rows)[:IMPORTERS_MAX]
+                lines.append(surface.list_head(f"importers{tag}", len(shown), got.total, got.completeness()))
+                lines += [f"  {a}:{b}" + (f" [{mark((a, b, rel))}]" if mark else "") for a, b, _ in shown]
+                add_left(left, more_note(f"importers of {rel}{tag}", got.total - len(shown) - got.refused, got.cut, "ctx_relations importers shows more", got.total),
+                         withheld_note(f"importers of {rel}{tag}", got.refused))
         got = engine.imports(rel)
         import_reads.append(got.completeness())
         if not got.completeness().whole:
@@ -323,7 +394,7 @@ def build(engine, paths):
             if got.incomplete:
                 incomplete.append(rel)
                 lines.append(f"  ({read_phrase(got)})")
-            libraries |= {lib for name in got.external if (lib := surface.library_of(name))}
+            libraries.update((here, name.strip()) for name in got.external if surface.library_of(name))
             for _, line, to in rows:
                 if surface.label_for(to) == "lib":
                     contracts.setdefault(to, []).append(f"{rel}:{line}")
@@ -358,13 +429,7 @@ def build(engine, paths):
 
     lines.append("== libraries")
     if libraries:
-        for lib in sorted(libraries):
-            version = engine.pinned(lib)
-            if version:
-                lines.append(f"  {lib} {version} — use api_signature({lib}, <symbol>) for exact signatures")
-            else:
-                why = "no lockfile reader" if engine.pin is None else "not in the lockfile"
-                lines.append(f"  {lib} (version not read: {why})")
+        lines += library_lines(engine, libraries)
     else:
         lines.append("  " + surface.absent("none", surface.answer_read({"status": "ok", "libraries_unread": len(unread) + len(incomplete)})))
 

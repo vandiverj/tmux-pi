@@ -92,5 +92,57 @@ class AttemptRowTests(EndCase):
         self.assertIn("no normal row of this attempt", done["unmet"])
 
 
+class EndPathTests(EndCase):
+    """F1: the cleanup is in a `finally` around every end step before it; the steps after it run whatever the one before did."""
+
+    def test_a_branch_listing_whose_note_fails_does_not_skip_the_cleanup_or_the_qwen_row(self):
+        rdir, info = self.prepare()
+        self.addCleanup(lambda: ts.cleanup(rdir, self.env))
+        seen = {}
+
+        def poll(n, run):
+            if n == 1:
+                seen["tree"] = run.worktree
+                git(run.worktree, "branch", "worker-made")  # the end path lists it, and that note fails
+                (rdir / "run.json").write_text("not json\n")  # every note raises from here; the run stops before its collect
+                self.settle_worker(run)
+        with self.assertRaises(ts.ShadowError):
+            self.run_stub(rdir, poll, run_class=FastRun)
+        self.gone(info, seen["tree"])
+        self.assertEqual([r["outcome"] for r in self.qwen_of(info["run"])], ["error"])
+
+    def test_an_interrupt_in_the_branch_listing_does_not_skip_the_cleanup(self):
+        class Interrupt(FastRun):
+            calls = 0
+
+            def list_new_branches(self):
+                self.calls += 1
+                if self.calls == 2:  # the end path's call (the collect made the first)
+                    raise ts.Interrupted()
+                return super().list_new_branches()
+        rdir, info = self.prepare()
+        self.addCleanup(lambda: ts.cleanup(rdir, self.env))
+        tree = self.tree(rdir)
+        with self.assertRaises(ts.Interrupted):
+            self.run_stub(rdir, self.worker_done, run_class=Interrupt)
+        done = ts.read_run(rdir)
+        self.assertEqual((done["outcome"], done["phase"], done["cleanup_errors"]), ("stopped", "done", []), done)
+        self.gone(info, tree)
+
+    def test_a_session_check_that_raises_still_writes_the_qwen_row_as_error(self):
+        class Broken(FastRun):
+            def cleanup_unmet(self):
+                raise RuntimeError("boom")
+        rdir, info = self.prepare()
+        self.addCleanup(lambda: ts.cleanup(rdir, self.env))
+        with self.assertRaises(RuntimeError):
+            self.run_stub(rdir, self.worker_done, run_class=Broken)
+        done = ts.read_run(rdir)
+        self.assertEqual(done["outcome"], "error", done)
+        self.assertIn("boom", done["unmet"])
+        self.assertEqual([r["outcome"] for r in self.qwen_of(info["run"])], ["error"], "the steps after the one that raised ran")
+        self.assertEqual([r["arm"] for r in self.records()].count("normal"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

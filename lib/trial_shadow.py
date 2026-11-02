@@ -639,6 +639,7 @@ class Run:
         self.record_problem = None
         self.cleanup_problem = None
         self.normal_problem = None
+        self.end_errors = []  # the end steps that raised (`end_step`), in order
         self.heads_before = set()
         self.heads_taken = False
         self.branches_listed = False
@@ -1097,9 +1098,26 @@ class Run:
     def cleanup(self):
         return cleanup(self.rdir, self.env, self.owner)
 
+    def end_step(self, raised, name, fn):
+        """One step of the end path (see `execute`), run so that a failure never skips the steps after it: an
+        Exception it raises is kept in `raised` (`execute` raises the first once every end step ran), named in run.json
+        (`end_errors`), and leaves a run the steps had `completed` as `error`, with `unmet` saying which step failed. An interrupt is
+        not caught. Returns what `fn` returned, or None when it raised."""
+        try:
+            return fn()
+        except Exception as problem:
+            raised.append(problem)
+            why = "{}: {}: {}".format(name, problem.__class__.__name__, problem)
+            self.end_errors.append(why[:600])
+            self.note_end(end_errors=self.end_errors)
+            if self.outcome == "completed":  # the rule was not shown met
+                self.outcome = "error"
+                self.note_end(unmet="an end step failed before the rule was checked: {}".format(why))
+            return None
+
     # -- the whole run
     def execute(self):
-        """The run. Its outcome is decided once, at the end, by one rule (review round 3, family false-completed-trial). A run is
+        """The run. Its outcome is decided once, at the end, by one rule (review rounds 3 and 4, family false-completed-trial). A run is
         `completed` only when all of these hold, each read then from evidence, not from a flag set along the way:
 
           1. the worker ended                  its end command (end-author / stop) ran to success (`worker_ended`)   else `error`
@@ -1121,10 +1139,26 @@ class Run:
 
         A run whose steps already gave another outcome (timeout, preempted, worker_failed, stopped, paused, spawn_failed, error) keeps it:
         that is its first unmet condition. Otherwise the outcome names the first condition that does not hold, and `unmet` in run.json
-        says why. The order at the end serves this: the cleanup, then the normal arm's record, then the Qwen record, so the Qwen row is
-        written with the outcome the run ends with. An end step that fails before the rule is checked leaves no run `completed`: an
-        interrupt makes it `stopped`, any other failure `error` (and the failure is raised). `tp-trial` exits non-zero for any outcome
-        but `completed`."""
+        says why. `tp-trial` exits non-zero for any outcome but `completed`.
+
+        The end path (review round 4 F1: no end step skips the cleanup). Its steps, in order, and what each does to the outcome when
+        it raises or reports a failure; the cleanup is in a `finally` around the steps before it, and every step after it runs
+        whatever the one before did (`end_step`):
+
+          step                                  raises                                    returns a failure
+          a. note `error` (`note_end`)          never (a failed note returns False)       the note is lost; outcome unchanged
+          b. list the new branches              Exception: `error` (`end_step`),          a listing that cannot be made is noted as
+             (`list_new_branches`)              raised after the end; Interrupted:        `new_branches_error`; outcome unchanged
+                                                `stopped`, raised; the cleanup runs
+          c. note phase cleanup (`note_end`)    never                                     the note is lost; outcome unchanged
+          d. the cleanup (`cleanup`)            Exception: kept as `cleanup_errors`;      `cleanup_errors`; condition 6 reads what
+                                                Interrupted: `stopped`, raised            is left, else `cleanup_failed`
+          e. condition 6 (`cleanup_unmet`)      `error` (`end_step`), raised after        `cleanup_failed`
+          f. the normal record (`write_normal`) `error` (`end_step`), raised after        `record_failed`
+          g. the Qwen record (`write_record`)   `error` (`end_step`), raised after        `record_failed`
+          h. note the outcome (`note_end`)      never                                     run.json lacks it; the Qwen row has it
+
+        An interrupt (b or d) skips e-g, and a run not yet settled is `stopped`; `tp-trial stop` runs the idempotent cleanup again."""
         self.note(pid=os.getpid(), started=now(), phase="starting", attempt=self.attempt)
         error = None
         try:
@@ -1166,34 +1200,36 @@ class Run:
             self.outcome = self.outcome or "error"
             error = error or "{}: {}".format(problem.__class__.__name__, problem)
         finally:
-            # Every note from here is best effort (`note_end`): run.json is the worker's to break, and a note that cannot be written
-            # never keeps the cleanup (the session kill every refusal relies on) or the records from running.
+            # The end path (the second table above). Every note from here is best effort (`note_end`): run.json is the worker's to
+            # break, and a note that cannot be written never keeps the cleanup (the session kill every refusal relies on) or the
+            # records from running.
+            raised = []
             try:
-                if error:
-                    self.note_end(error=error)
-                self.outcome = self.outcome or "error"
-                self.list_new_branches()  # a run that stopped before its collect still names what the worker made, before the cleanup
-                self.note_end(phase="cleanup")
                 try:
-                    leftovers = self.cleanup()
-                except Exception as problem:
-                    leftovers = ["cleanup: {}".format(problem)]
-                self.note_end(cleanup_errors=leftovers)
-                self.cleanup_problem = self.cleanup_unmet()
-                self.normal_problem = self.write_normal()
-                self.write_record()  # settles the outcome by the rule above and writes the Qwen row with it
+                    if error:
+                        self.note_end(error=error)
+                    self.outcome = self.outcome or "error"
+                    # a run that stopped before its collect still names what the worker made, before the cleanup
+                    self.end_step(raised, "the branch listing", self.list_new_branches)
+                    self.note_end(phase="cleanup")
+                finally:  # whatever happened above, an interrupt included
+                    try:
+                        leftovers = self.cleanup()
+                    except Exception as problem:
+                        leftovers = ["cleanup: {}".format(problem)]
+                    self.note_end(cleanup_errors=leftovers)
+                self.cleanup_problem = self.end_step(raised, "the session and worktree check", self.cleanup_unmet)
+                self.normal_problem = self.end_step(raised, "the normal arm's record", self.write_normal)
+                self.end_step(raised, "the Qwen record", self.write_record)  # settles the outcome by the rule above and writes the Qwen row with it
             except Interrupted:
                 self.note_end(interrupted=True)
-                raise
-            except Exception as problem:  # an end step failed in a way none of them handles: the rule was not shown met
-                if not self.settled and self.outcome == "completed":
-                    self.outcome = "error"
-                    self.note_end(unmet="the end steps failed before the rule was checked: {}: {}".format(problem.__class__.__name__, problem))
                 raise
             finally:
                 if not self.settled and self.outcome == "completed":  # stopped before the rule was checked: not shown completed
                     self.outcome = "stopped"
                 self.note_end(outcome=self.outcome, phase="done", finished=now())
+            if raised:  # every end step ran; the first that failed in a way none of them handles is raised
+                raise raised[0]
         try:
             return self.owner.read()
         finally:

@@ -573,15 +573,6 @@ class StepRemedyTests(StepCase):
     closed step by only typing what the refusals said."""
     snapshot_lane = True
 
-    def writer(self, step="s1", settled=True):
-        """StepCase.writer, except that the lane's first writer in s1 is the default dispatch (the restored snapshot)."""
-        if self.exists() or step != "s1":
-            return super().writer(step=step, settled=settled)
-        item, task = self.lane_ok()
-        if settled:
-            self.settle(task)
-        return item["id"], task
-
     # --- the gate ---------------------------------------------------------------------------------------------------
 
     def test_a_queued_task_names_stop_and_stop_takes_it_out(self):

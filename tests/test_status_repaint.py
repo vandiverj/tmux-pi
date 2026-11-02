@@ -20,6 +20,10 @@ ESC = b"\x1b[H"
 class StatusPaneFixture(unittest.TestCase):
     raw_slave = True   # False: leave the pty cooked (ECHO, ICANON on) like a real pane
     extra_env = {}     # more environment for the pane (a test class sets TP_STATUS_WINDOW here)
+    fake_clock = False  # True: the pane reads its time from a file the test moves (TP_STATUS_CLOCK) and waits for keys only, so
+                        # nothing happens until tick(); the pane starts at the first use of self.master, after the test has set up
+    fake_install = False  # True: the pane runs from a copy of the install whose tp-agent is a stub that logs start/end to "ticks"
+    WAKE = b"\x1b[<35;1;1M"   # a mouse move: input the pane ignores, but the loop reads the clock after it
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -55,6 +59,10 @@ esac
         self.environ = dict(os.environ, FAKE_BASE=str(self.base), TMPDIR=str(self.base / "tmp"),
                         PATH=str(self.mockbin) + os.pathsep + os.environ["PATH"],
                         TERM="xterm", TP_SESSION="fake", **self.extra_env)
+        if self.fake_clock:
+            self.environ.update(TP_STATUS_CLOCK=str(self.base / "clock"), TP_STATUS_POLL="3600")
+            self.clock = 0
+            self.write_clock()
         self.environ.pop("TMUX", None)
         self.environ.pop("TMUX_PANE", None)
         self.environ.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir
@@ -62,15 +70,90 @@ esac
         if self.raw_slave:
             tty.setraw(slave)
         self.slave = os.dup(slave)   # kept to read the tty mode back; closed in stop()
-        self.master = master
-        self.proc = subprocess.Popen(self.command(),
-                                     stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
-                                     env=self.environ, start_new_session=True)
-        os.close(slave)
+        self._master, self._child_slave, self.proc, self.carry = master, slave, None, b""
         self.addCleanup(self.stop)
+        if not self.fake_clock:
+            self.start_pane()
+
+    @property
+    def master(self):
+        self.start_pane()
+        return self._master
+
+    def start_pane(self):
+        if self.proc is None:
+            self.proc = subprocess.Popen(self.command(),
+                                         stdin=self._child_slave, stdout=self._child_slave, stderr=subprocess.DEVNULL,
+                                         env=self.environ, start_new_session=True)
+            os.close(self._child_slave)
 
     def command(self):
+        if self.fake_install:
+            return self.install_command()
         return ["bash", str(ROOT / "bin/tp-status")]
+
+    def install_command(self):
+        root = self.base / "root"
+        (root / "bin").mkdir(parents=True)
+        for entry in ROOT.iterdir():
+            if entry.name not in ("bin", ".git") and not entry.name.startswith("."):
+                (root / entry.name).symlink_to(entry)
+        for entry in (ROOT / "bin").iterdir():
+            if entry.name == "tp-status":
+                shutil.copy(entry, root / "bin" / entry.name)    # a real file, so the pane finds its install in the copy
+            elif entry.is_file():
+                (root / "bin" / entry.name).symlink_to(entry)
+        agent = root / "bin" / "tp-agent"
+        agent.unlink()
+        # The stub tick: logs when it starts and ends, stays running while tick_hold exists, fails while tick_fail exists.
+        agent.write_text('#!/bin/sh\necho start >> "$FAKE_BASE/ticks"\n'
+                         'while [ -f "$FAKE_BASE/tick_hold" ]; do sleep 0.05; done\n'
+                         'if [ -f "$FAKE_BASE/tick_fail" ]; then echo "boom: disk full" >&2; exit 3; fi\n'
+                         'echo end >> "$FAKE_BASE/ticks"\nexit 0\n')
+        agent.chmod(0o755)
+        contract = root / "bin" / "tp-contract"
+        contract.unlink()
+        contract.write_text('#!/bin/sh\necho "$*" >> "$FAKE_BASE/asked"\nexec "%s" "$@"\n' % (ROOT / "bin" / "tp-contract"))
+        contract.chmod(0o755)
+        return ["bash", str(root / "bin" / "tp-status")]
+
+    def ticks(self):
+        path = self.base / "ticks"
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def asked(self):
+        path = self.base / "asked"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def write_clock(self):
+        tmp = self.base / "clock.tmp"
+        tmp.write_text("%d\n" % self.clock)
+        os.replace(tmp, self.base / "clock")    # the pane never reads a half-written clock
+
+    def tick(self, secs=1, usage=False, keep=False):
+        """Move the fake clock on by `secs` and return what the pane painted before it had caught up. The ack is a page toggle
+        and back (told by the header; the list can say "usage" in its summary) (`usage`: the pane starts on the usage page); input is handled in order, so both frames come after the
+        clock was read. keep=True leaves the answer to be read by the next output call."""
+        self.clock += secs
+        self.write_clock()
+        master = self.master
+        os.write(master, self.WAKE + b"s")
+        on_usage, on_list = (lambda f: f.startswith(b"\x1b[1musage ")), (lambda f: f.startswith(b"\x1b[1msubagents "))
+        data = self.output_until(on_list if usage else on_usage, seconds=20)
+        answer = data[:data.rfind(ESC)] if ESC in data else data
+        os.write(master, b"s")
+        self.output_until(on_usage if usage else on_list, seconds=20)
+        if keep:
+            self.carry = answer
+        return answer
+
+    def tick_until(self, predicate, secs=5, usage=False, limit=30):
+        """tick() until a painted frame meets predicate; return that frame. Bounded by `limit` ticks."""
+        for _ in range(limit):
+            for frame in self.tick(secs, usage=usage).split(ESC)[1:]:
+                if frame.endswith(b"\x1b[J") and predicate(frame):
+                    return frame
+        self.fail("no frame met the condition in %d ticks" % limit)
 
     def script(self, name, text):
         path = self.mockbin / name
@@ -80,9 +163,11 @@ esac
     def stop(self):
         # Close the pty first: on macOS a process in this session can remain
         # in the exiting state until its controlling pty is released.
-        os.close(self.master)
+        os.close(self._master)
         os.close(self.slave)
-        if self.proc.poll() is None:
+        if self.proc is None:
+            os.close(self._child_slave)
+        elif self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
@@ -92,7 +177,7 @@ esac
 
     def output(self, seconds=0.5):
         end = time.monotonic() + seconds
-        data = b""
+        data, self.carry = self.carry, b""
         while time.monotonic() < end:
             ready, _, _ = select.select([self.master], [], [], max(0, end - time.monotonic()))
             if ready:
@@ -105,15 +190,15 @@ esac
     def output_until(self, predicate, seconds=5.0):
         """Collect PTY output until a frame meets predicate, with a bounded wait."""
         end = time.monotonic() + seconds
-        data = b""
+        data, self.carry = self.carry, b""
         while time.monotonic() < end:
+            if data and predicate(data.split(ESC)[-1]) and data.endswith(b"\x1b[J"):
+                break
             ready, _, _ = select.select([self.master], [], [], max(0, end - time.monotonic()))
             if ready:
                 try:
                     data += os.read(self.master, 65536)
                 except OSError:
-                    break
-                if predicate(data.split(ESC)[-1]) and data.endswith(b"\x1b[J"):
                     break
         return data
 
@@ -187,6 +272,9 @@ esac
 
 
 class StatusRepaintTest(StatusPaneFixture):
+    fake_clock = True     # the timer is the test's: tick() is the only thing that makes the pane look at the disk again
+    fake_install = True
+
     def test_mouse_tracking_lifecycle(self):
         first = self.first_frame(b"\x1b[?1006h")
         self.assertTrue(first.startswith(b"\x1b[?25l\x1b[?1000h\x1b[?1006h"), first[:40])
@@ -270,8 +358,9 @@ class StatusRepaintTest(StatusPaneFixture):
         (queue / "q-null.json").write_text("null")
         (queue / "q-partial.json").write_text(json.dumps({"id": "q-partial", "role": "coder"}))
         (queue / "q-broken.json").write_text("{not json")
-        shown = self.output_until(lambda frame: all(n in frame for n in (b"queued1", b"q-null", b"q-partial", b"q-broken")))
-        frame = shown.split(ESC)[-1]
+        frame = self.tick().split(ESC)[-1]
+        for name in (b"queued1", b"q-null", b"q-partial", b"q-broken"):
+            self.assertIn(name, frame)
         self.assertIn(b"queued1  coder  queued  global worker slots full", frame)
         for name in (b"q-null", b"q-partial", b"q-broken"):
             self.assertRegex(frame, name + rb"  queued  start refused: ")
@@ -292,7 +381,8 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertIn(b"+2 more queued", frame)
         self.assertEqual(frame.count(b"start refused: "), 2)    # the last line left is the count, not a third entry
         (self.base / "lines").write_text("7\n")      # room for all four: nothing to count
-        frame = self.output_until(lambda f: f.count(b"start refused: ") == 4).split(ESC)[-1]
+        frame = self.tick().split(ESC)[-1]
+        self.assertEqual(frame.count(b"start refused: "), 4)
         self.assertNotIn(b"more queued", frame)
 
     def test_a_pane_full_of_active_rows_still_counts_the_queue_in_the_header(self):
@@ -325,36 +415,40 @@ class StatusRepaintTest(StatusPaneFixture):
         self.assertIsNone(self.proc.poll())
 
     def test_idle_no_workers_and_resize(self):
-        first = self.first_frame(b"no subagents", settle=0.3)   # a duplicate initial repaint would show here
+        first = self.first_frame(b"no subagents")
         self.assertIn(b"no subagents", first)
         self.assertEqual(first.count(ESC), 1)
-        self.assertEqual(self.output(1.2), b"")      # a full poll tick stays silent
+        self.assertEqual(self.tick(), b"")      # a full poll tick stays silent (and a duplicate initial repaint would show here)
         (self.state / "main").mkdir()
         (self.state / "main" / "state.json").write_text(json.dumps({
             "model": "main-model", "tokens": {"input": 3, "output": 4}}))
-        self.assertIn(b"main-model", self.output_until(lambda frame: b"main-model" in frame))
-        self.assertEqual(self.output(1.2), b"")
+        changed = self.tick()
+        self.assertIn(b"main-model", changed)
+        self.assertEqual(changed.count(ESC), 1)
+        self.assertEqual(self.tick(), b"")
         (self.base / "lines").write_text("25\n")
-        resized = self.output_until(lambda frame: b"\x1b[J" in frame)
-        self.assertEqual((resized + self.output(1.2)).count(ESC), 1)
+        resized = self.tick()
+        self.assertEqual(resized.count(ESC), 1)
+        self.assertEqual(self.tick(), b"")
 
     def test_state_change_and_keyboard_selection(self):
         self.make_jobs(2)
         tasks = self.state / "tasks"
         first = self.output_until(lambda frame: "── job2 ".encode() in frame and b"task 2" in frame)
         self.assertIn(b"job2", first)
-        self.assertEqual(self.output(1.2), b"")
+        self.assertEqual(self.tick(), b"")
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: "── job1 ".encode() in frame and b"task 1" in frame)
         self.assertIn(b"task 1", moved)
         self.assertEqual(moved.count(ESC), 1)
-        self.assertEqual(self.output(1.2), b"")
+        self.assertEqual(self.tick(), b"")
         (tasks / "job1" / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         (tasks / "job1" / "state.json").write_text(json.dumps({
             "state": "settled", "model": "test-model", "tokens": {
                 "input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
-        changed = self.output_until(lambda frame: b"settled" in frame and "── job1 ".encode() in frame and b"task 1" in frame)
+        changed = self.tick()
         self.assertIn(b"settled", changed)
+        self.assertIn("── job1 ".encode(), changed)
         self.assertEqual(changed.count(ESC), 1)
         self.assertIn(b"task 1", changed)
 
@@ -455,30 +549,18 @@ class StatusRepaintTest(StatusPaneFixture):
 
     def assert_keys_only_redraw(self):
         """Keys that only move the selection or flip the usage page repaint from the last load: they read no file and
-        start no process (every program the pane might start is wrapped and logged by the fixture)."""
+        start no process (every program the pane might start is wrapped and logged by the fixture). No timer runs: the
+        clock stands still, so no load can come but the ones a key asks for."""
         loads, calls = self.base / "loads", self.base / "calls"
         count = lambda path: len(path.read_text().splitlines()) if path.exists() else 0
-        for attempt in range(6):
-            # Start just after a load has finished, so the 1 s timer cannot fire during the keys.
-            seen = count(loads)
-            self.assertTrue(self.wait_for(lambda: count(loads) > seen, 3.0), "no timer load seen")
-            time.sleep(0.2)
-            settle_by = time.monotonic() + 3.0
-            while True:     # the load logs its first call as it starts; let its later programs (cat, python3) finish too
-                before = count(calls)
-                time.sleep(0.15)
-                if count(calls) == before:
-                    break
-                self.assertLess(time.monotonic(), settle_by, "the call log never settled after a load")
-            loads_before, calls_before = count(loads), count(calls)
-            for _ in range(10):
-                for key in (b"k", b"k", b"j", b"s", b"s", b"j", b"k"):
-                    os.write(self.master, key)
-            self.barrier()                   # every key above is handled before this returns
-            if count(loads) == loads_before:
-                break
-        else:
-            self.fail("the timer kept firing during the keys")
+        # the first load started the background tick (a stub that logs nothing as a program); wait for it to end
+        self.assertTrue(self.wait_for(lambda: "end" in self.ticks(), 10.0), "the first background tick never ended")
+        loads_before, calls_before = count(loads), count(calls)
+        for _ in range(10):
+            for key in (b"k", b"k", b"j", b"s", b"s", b"j", b"k"):
+                os.write(self.master, key)
+        self.barrier()                   # every key above is handled before this returns
+        self.assertEqual(count(loads), loads_before, "a key that only moves read the records again")
         extra = calls.read_text().splitlines()[calls_before:]
         self.assertEqual(extra, [], "a key-only redraw ran programs: %r" % extra[:10])
 
@@ -490,9 +572,9 @@ class StatusRepaintTest(StatusPaneFixture):
             (d / "result.md").write_text("reply line %d\n" % n)
         (self.state / "tasks" / "job2" / "permission-request.json").write_text(
             json.dumps({"status": "pending", "target": "~/.ssh"}))
-        self.first_frame(b"job6", settle=0.2)
+        self.first_frame(b"job6")
         self.assert_keys_only_redraw()
-        self.output(0.8)    # frames of the keys above may still be queued (the barrier can match an earlier one); read them off
+        self.output(0.3)    # frames of the keys above may still be queued (the barrier can match an earlier one); read them off
         os.write(self.master, b"k")
         moved = self.output_until(lambda frame: b"\x1b[J" in frame)
         self.assertIn("── job".encode(), moved)    # the redraw still shows the moved selection
@@ -550,7 +632,7 @@ class StatusRepaintTest(StatusPaneFixture):
 
     def test_keys_redraw_paused_awaiting_and_refused_rows_without_reading_or_running_anything(self):
         self.make_waiting_world()
-        self.first_frame(*self.WAITING, settle=0.2)
+        self.first_frame(*self.WAITING)
         self.assert_keys_only_redraw()
         self.output(0.3)    # frames the pane painted for the keys above may still be unread; they are not the answer to this key
         os.write(self.master, b"k")
@@ -623,6 +705,7 @@ class StatusRepaintTest(StatusPaneFixture):
 class StatusWindowTest(StatusPaneFixture):
     """The pane keeps a window of the task list (lib/tp_window.py), follows a new worker, and jumps with g / G."""
     extra_env = {"TP_STATUS_WINDOW": "5"}
+    fake_clock = True
     LIVE = {"state": "working", "model": "m", "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}
     DONE = {"state": "waiting", "model": "m", "tokens": {"input": 3, "cacheRead": 0, "cacheWrite": 0, "output": 4}}
 
@@ -643,6 +726,8 @@ class StatusWindowTest(StatusPaneFixture):
         self.write_state(name, state or self.DONE)
         if state is None:
             (self.state / "tasks" / name / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
+        if self.proc is not None:     # a running pane reads it at the next tick; the frame it paints is left for last_frame
+            self.tick(keep=True)
         return name
 
     @staticmethod
@@ -782,36 +867,9 @@ class StatusBackgroundWorkTest(StatusPaneFixture):
     """The background tick (tp-agent tick) and the record refresh for tasks outside the window. The pane runs from a copy of
     the install whose tp-agent and tp-contract are wrappers that log what they are asked, so a test sees both."""
     extra_env = {"TP_STATUS_WINDOW": "3"}
+    fake_clock = True
+    fake_install = True
     DONE = {"state": "waiting", "model": "m", "tokens": {"input": 3, "cacheRead": 0, "cacheWrite": 0, "output": 4}}
-
-    def command(self):
-        root = self.base / "root"
-        (root / "bin").mkdir(parents=True)
-        for entry in ROOT.iterdir():
-            if entry.name not in ("bin", ".git") and not entry.name.startswith("."):
-                (root / entry.name).symlink_to(entry)
-        for entry in (ROOT / "bin").iterdir():
-            if entry.name == "tp-status":
-                shutil.copy(entry, root / "bin" / entry.name)    # a real file, so the pane finds its install in the copy
-            elif entry.is_file():
-                (root / "bin" / entry.name).symlink_to(entry)
-        now = "python3 -c 'import time; print(time.time())'"
-        agent = root / "bin" / "tp-agent"
-        agent.unlink()
-        agent.write_text('#!/bin/sh\necho "start $(%s)" >> "$FAKE_BASE/ticks"\n'
-                         '[ -f "$FAKE_BASE/tick_sleep" ] && sleep "$(cat "$FAKE_BASE/tick_sleep")"\n'
-                         'if [ -f "$FAKE_BASE/tick_fail" ]; then echo "boom: disk full" >&2; exit 3; fi\n'
-                         'echo "end $(%s)" >> "$FAKE_BASE/ticks"\nexit 0\n' % (now, now))
-        agent.chmod(0o755)
-        contract = root / "bin" / "tp-contract"
-        contract.unlink()
-        contract.write_text('#!/bin/sh\necho "$*" >> "$FAKE_BASE/asked"\nexec "%s" "$@"\n' % (ROOT / "bin" / "tp-contract"))
-        contract.chmod(0o755)
-        return ["bash", str(root / "bin" / "tp-status")]
-
-    def ticks(self):
-        path = self.base / "ticks"
-        return [line.split() for line in path.read_text().splitlines()] if path.exists() else []
 
     def add(self, name, **files):
         directory = self.state / "tasks" / name
@@ -821,75 +879,89 @@ class StatusBackgroundWorkTest(StatusPaneFixture):
             (directory / "task.md").write_text("task of %s\n" % name)
             (directory / "state.json").write_text(json.dumps(self.DONE))
             (directory / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
-            time.sleep(0.02)
+            os.utime(directory / "meta.json", (self.clock + len(os.listdir(self.state / "tasks")),) * 2)
         for fname, value in files.items():
             (directory / fname).write_text(json.dumps(value))
-
-    def asked(self):
-        path = self.base / "asked"
-        return path.read_text().splitlines() if path.exists() else []
 
     def test_a_failed_background_tick_is_shown_in_the_footer_until_a_tick_succeeds(self):
         (self.base / "tick_fail").write_text("")
         self.add("f1")
-        frame = self.first_frame(b"background tick failed (exit 3): boom: disk full", seconds=12)
-        self.assertIn(b"background tick failed (exit 3): boom: disk full", frame)
+        frame = self.tick_until(lambda f: b"background tick failed (exit 3): boom: disk full" in f)
         self.assertIn(b"f1", frame)                              # the list is still there
         (self.base / "tick_fail").unlink()
-        data = self.first_frame(b"f1", seconds=12)               # the next tick, within a few seconds, succeeds
-        gone = self.output_until(lambda frame: b"background tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
-        self.assertNotIn(b"background tick failed", (data + gone).split(ESC)[-1])
+        gone = self.tick_until(lambda f: b"f1" in f and b"background tick failed" not in f)    # a later tick succeeded
+        self.assertNotIn(b"background tick failed", gone)
 
     def test_a_failed_tick_is_flagged_in_the_header_of_the_usage_page(self):
         (self.base / "tick_fail").write_text("")
         self.add("f1")
-        self.first_frame(b"background tick failed", seconds=12)       # the list page has said it in its footer
+        self.tick_until(lambda f: b"background tick failed" in f)       # the list page has said it in its footer
         os.write(self.master, b"s")
-        page = self.output_until(lambda frame: b"usage" in frame and b"tick failed" in frame and b"\x1b[J" in frame, seconds=6)
+        page = self.output_until(lambda frame: b"usage" in frame and b"tick failed" in frame and b"\x1b[J" in frame)
         usage = page.split(ESC)[-1]
         self.assertIn(b"usage", usage)
         self.assertIn(b"tick failed", usage.split(b"\n")[0])          # on the header line: the page has no footer
         (self.base / "tick_fail").unlink()
-        gone = self.output_until(lambda frame: b"usage" in frame and b"tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
-        self.assertNotIn(b"tick failed", gone.split(ESC)[-1])         # a later tick succeeded: the flag goes
+        gone = self.tick_until(lambda f: b"usage" in f and b"tick failed" not in f, usage=True)
+        self.assertNotIn(b"tick failed", gone)                        # a later tick succeeded: the flag goes
 
     def test_a_failed_tick_is_flagged_in_the_header_of_a_compact_pane(self):
         (self.base / "lines").write_text("10\n")                      # under 16 lines: no footer is drawn
         (self.base / "tick_fail").write_text("")
         for n in range(1, 4):
             self.add("f%d" % n)
-        frame = self.first_frame(b"tick failed", seconds=12).split(ESC)[-1]
+        frame = self.tick_until(lambda f: b"tick failed" in f)
         self.assertIn(b"tick failed", frame.split(b"\n")[0])
         self.assertNotIn(b"boom: disk full", frame)                   # the footer's words do not fit; the flag is all there is
         self.assertIn(b"f3", frame)                                   # and the list is still drawn
         (self.base / "tick_fail").unlink()
-        gone = self.output_until(lambda frame: b"f3" in frame and b"tick failed" not in frame and b"\x1b[J" in frame, seconds=14)
-        self.assertNotIn(b"tick failed", gone.split(ESC)[-1])
+        gone = self.tick_until(lambda f: b"f3" in f and b"tick failed" not in f)
+        self.assertNotIn(b"tick failed", gone)
 
     def test_a_tick_that_is_still_running_is_not_started_again_and_the_next_follows_it_closely(self):
-        (self.base / "tick_sleep").write_text("6")
+        (self.base / "tick_hold").write_text("")                      # the stub tick runs until this file goes
         self.add("f1")
-        self.assertTrue(self.wait_for(lambda: len([t for t in self.ticks() if t[0] == "end"]) >= 1, 12.0), "no tick finished")
-        self.assertEqual(len([t for t in self.ticks() if t[0] == "start"]), 1)    # none started while the first ran
-        first_end = float([t for t in self.ticks() if t[0] == "end"][0][1])
-        self.assertTrue(self.wait_for(lambda: len([t for t in self.ticks() if t[0] == "start"]) >= 2, 12.0), "no second tick")
-        second_start = float([t for t in self.ticks() if t[0] == "start"][1][1])
-        # last_tick moves only when a tick is started: the second one starts at the next check (about a second), not 5 s later
-        self.assertLess(second_start - first_end, 3.0)
+        self.first_frame(b"f1")
+        self.assertTrue(self.wait_for(lambda: self.ticks() == ["start"], 10.0), "no tick started")
+        for _ in range(3):
+            self.tick(5)                                              # five seconds on, each time: due, but one is running
+        self.assertEqual(self.ticks(), ["start"])                     # none started while the first ran
+        (self.base / "tick_hold").unlink()
+        self.assertTrue(self.wait_for(lambda: "end" in self.ticks(), 10.0), "the tick never ended")
+        # last_tick moves only when a tick is started: one second on is enough for the next, not another five
+        for _ in range(10):
+            self.tick(1)
+            if self.ticks().count("start") >= 2:
+                break
+        self.assertEqual(self.ticks().count("start"), 2, self.ticks())
 
     def test_a_task_outside_the_window_whose_files_changed_is_asked_about_so_its_record_is_refreshed(self):
         for n in range(1, 9):
             self.add("f%d" % n)
-        self.first_frame(b"f8", settle=0.5)
+        self.first_frame(b"f8")
         self.assertTrue(self.asked())
         self.assertTrue(all("f1" not in line.split() for line in self.asked()))     # the oldest is outside the window of 3
         before = len(self.asked())
         self.add("f1", **{"collected.json": {"at": "2026-01-01T00:00:00Z"}})
-        self.assertTrue(self.wait_for(lambda: any("f1" in line.split() for line in self.asked()[before:]), 8.0),
+        self.tick()
+        self.assertTrue(any("f1" in line.split() for line in self.asked()[before:]),
                         "tp-contract status was not asked about f1: %r" % self.asked()[before:])
         before = len(self.asked())
-        self.output(2.5)                                                        # once only: the next loads leave it alone
+        self.tick()                                                             # once only: the next loads leave it alone
+        self.tick()
         self.assertTrue(all("f1" not in line.split() for line in self.asked()[before:]), self.asked())
+
+
+class StatusRealClockTest(StatusPaneFixture):
+    """The seam unused (no TP_STATUS_CLOCK, no TP_STATUS_POLL): the pane's own clock and one-second timer pick up a change."""
+
+    def test_the_default_timer_repaints_a_changed_record_without_any_key(self):
+        self.make_jobs(1)
+        self.first_frame(b"job1", b"working")
+        (self.state / "tasks" / "job1" / "state.json").write_text(json.dumps({
+            "state": "settled", "model": "test-model", "tokens": {"input": 1, "cacheRead": 0, "cacheWrite": 0, "output": 2}}))
+        changed = self.output_until(lambda frame: b"settled" in frame, seconds=15)    # generous: the timer is a second
+        self.assertIn(b"settled", changed)
 
 
 class StatusEchoTtyTest(StatusPaneFixture):

@@ -44,6 +44,14 @@ session="$(tp_session)" || exit 1
 state_dir="$(tp_opt "$session" @tp_state_dir)"
 tasks="$state_dir/tasks"
 session_label="session ${session//[[:cntrl:]]/?}"   # the header says whose tasks these are; they are this session's alone
+# Clock seam (tests drive it): TP_STATUS_CLOCK names a file that holds whole seconds, read in place of $SECONDS; TP_STATUS_POLL
+# is how many seconds the loop waits for a key before it refreshes. Unset, the pane uses real time and a one-second wait.
+poll="${TP_STATUS_POLL:-1}"   # whole seconds: the shell on macOS is bash 3.2
+now=0
+read_clock() {
+  if [[ -n "${TP_STATUS_CLOCK:-}" ]] && read -r now <"$TP_STATUS_CLOCK" 2>/dev/null && [[ "$now" =~ ^[0-9]+$ ]]; then return 0; fi
+  now=$SECONDS
+}
 last_tick=-5 tick_pid="" tick_note=""   # tick_note: why the background tick is not doing its work, shown in the footer
 keep="${TP_STATUS_WINDOW-60}"
 [[ "$keep" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "tp-status: TP_STATUS_WINDOW must be a positive number, not '$keep'" >&2; exit 1; }
@@ -171,7 +179,7 @@ tick_check() {
   local rc=0 detail
   [[ -n "$tick_pid" ]] || return 0
   if kill -0 "$tick_pid" 2>/dev/null; then
-    (( SECONDS - last_tick > 60 )) && tick_note="background tick has run for $(( SECONDS - last_tick )) s"
+    (( now - last_tick > 60 )) && tick_note="background tick has run for $(( now - last_tick )) s"
     return 0
   fi
   wait "$tick_pid" 2>/dev/null || rc=$?
@@ -193,9 +201,9 @@ usage_lines=() queue_lines=() changed_ids=()   # changed_ids: tasks outside the 
 load_data() {
   local out id queued line panes pass
   tick_check
-  if (( SECONDS - last_tick >= 5 )) && [[ -z "$tick_pid" ]]; then   # tp-agent tick reads every record; never wait for it here
+  if (( now - last_tick >= 5 )) && [[ -z "$tick_pid" ]]; then   # tp-agent tick reads every record; never wait for it here
     "$ROOT/bin/tp-agent" tick >/dev/null 2>"$cache_dir/tick.err" &
-    tick_pid=$! last_tick=$SECONDS   # last_tick moves only when a tick was started, not while the last one still runs
+    tick_pid=$! last_tick=$now   # last_tick moves only when a tick was started, not while the last one still runs
   fi
   cols="$(tput cols)"
   frame_lines="$(tput lines)"
@@ -464,14 +472,15 @@ popup() {
 # was last read (j/k, PgUp/PgDn inside the window, s).
 dirty=1 reload=1 painted_at=-1
 while true; do
-  if (( dirty || reload || SECONDS != painted_at )); then
-    if (( reload || SECONDS != painted_at )); then load_data; reload=0; fi
+  read_clock
+  if (( dirty || reload || now != painted_at )); then
+    if (( reload || now != painted_at )); then load_data; reload=0; fi
     paint
-    painted_at=$SECONDS dirty=0
+    painted_at=$now dirty=0
     message=""
   fi
   key=""
-  IFS= read -rsn1 -t 1 key; rc=$?
+  IFS= read -rsn1 -t "$poll" key; rc=$?
   if (( rc > 128 )); then dirty=1 reload=1; continue; fi  # timeout: just refresh
   if (( rc != 0 )); then sleep 1; dirty=1 reload=1; continue; fi  # no tty (e.g. during resize)
   if [[ "$key" == "$esc" ]]; then

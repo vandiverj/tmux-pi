@@ -743,6 +743,15 @@ esac
         self.assertIn("Sensitive context .env was omitted", packet)
         self.assertNotIn("Sensitive context before.txt", packet)
         self.assertNotIn("Sensitive context after.txt", packet)
+        # A batched verdict binds to the file it screened: a context symlink retargeted to .env after screening is asked about alone.
+        (self.project / "link.txt").symlink_to("after.txt")
+        text = (ROOT / "bin/tp-spawn").read_text()
+        funcs = text[text.index("# A verdict answers only"):text.index("# largest_range")]
+        script = funcs + ('contexts=(link.txt); screen_contexts; secret_file "$workdir/link.txt" && echo WRONG-REFUSED\n'
+                          'ln -sf .env link.txt; secret_file "$workdir/link.txt" && echo REFUSED || echo READ\n')
+        run = subprocess.run(["bash", "-c", script], env={**self.env, "ROOT": str(ROOT), "workdir": str(self.project)},
+                             cwd=self.project, text=True, capture_output=True, timeout=20)
+        self.assertEqual(run.stdout.strip(), "REFUSED", run.stderr)
 
     def test_worker_request_is_visible_and_message_answers_it(self):
         item = self.dispatch()

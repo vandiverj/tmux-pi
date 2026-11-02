@@ -1104,7 +1104,9 @@ class Run:
         A run whose steps already gave another outcome (timeout, preempted, worker_failed, stopped, paused, spawn_failed, error) keeps it:
         that is its first unmet condition. Otherwise the outcome names the first condition that does not hold, and `unmet` in run.json
         says why. The order at the end serves this: the cleanup, then the normal arm's record, then the Qwen record, so the Qwen row is
-        written with the outcome the run ends with. `tp-trial` exits non-zero for any outcome but `completed`."""
+        written with the outcome the run ends with. An end step that fails before the rule is checked leaves no run `completed`: an
+        interrupt makes it `stopped`, any other failure `error` (and the failure is raised). `tp-trial` exits non-zero for any outcome
+        but `completed`."""
         self.note(pid=os.getpid(), started=now(), phase="starting")
         error = None
         try:
@@ -1164,6 +1166,11 @@ class Run:
                 self.write_record()  # settles the outcome by the rule above and writes the Qwen row with it
             except Interrupted:
                 self.note_end(interrupted=True)
+                raise
+            except Exception as problem:  # an end step failed in a way none of them handles: the rule was not shown met
+                if not self.settled and self.outcome == "completed":
+                    self.outcome = "error"
+                    self.note_end(unmet="the end steps failed before the rule was checked: {}: {}".format(problem.__class__.__name__, problem))
                 raise
             finally:
                 if not self.settled and self.outcome == "completed":  # stopped before the rule was checked: not shown completed

@@ -328,6 +328,18 @@ class CompletedRuleTests(OutcomeCase):
         done = ts.read_run(rdir)
         self.assertEqual((done["outcome"], done["phase"]), ("stopped", "done"), done)
 
+    def test_an_unexpected_failure_in_the_end_steps_is_error_never_completed(self):
+        class Broken(FastRun):
+            def cleanup_unmet(self):
+                raise RuntimeError("boom")
+        rdir, _ = self.prepare()
+        self.addCleanup(lambda: ts.cleanup(rdir, self.env))
+        with self.assertRaises(RuntimeError):
+            self.run_stub(rdir, self.worker_done, run_class=Broken)
+        done = ts.read_run(rdir)
+        self.assertEqual((done["outcome"], done["phase"]), ("error", "done"), done)
+        self.assertIn("boom", done["unmet"])
+
 
 class TpTrialExitTests(unittest.TestCase):
     """`tp-trial run` and `tp-trial shadow --foreground` exit 0 for `completed` and for nothing else."""

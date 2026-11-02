@@ -4,13 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { linkPiHost } from './fixtures/pi_host.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const pkg = process.env.PI_CODING_AGENT_PACKAGE;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-offload-'));
-fs.mkdirSync(path.join(tmp, 'node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(pkg, path.join(tmp, 'node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(path.join(pkg, 'node_modules/@earendil-works/pi-ai'), path.join(tmp, 'node_modules/@earendil-works/pi-ai'));
+linkPiHost(tmp, pkg);
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.copyFileSync(path.join(root, 'agent/extensions/offload.ts'), path.join(tmp, 'offload.ts'));
 // Dummy classifier stub: paths containing 'dummy-secret' are sensitive; no real credential files are touched.

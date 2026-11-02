@@ -6,13 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { linkPiHost } from '../pi_host.mjs';
 
 const root = process.env.DOCS_ROOT;
 const pkg = process.env.PI_CODING_AGENT_PACKAGE;
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tp-docs-ext-')));
-fs.mkdirSync(path.join(tmp, 'node_modules/@earendil-works'), { recursive: true });
-fs.symlinkSync(pkg, path.join(tmp, 'node_modules/@earendil-works/pi-coding-agent'));
-fs.symlinkSync(path.join(pkg, 'node_modules/@earendil-works/pi-ai'), path.join(tmp, 'node_modules/@earendil-works/pi-ai'));
+linkPiHost(tmp, pkg);
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}\n');
 fs.copyFileSync(path.join(root, 'agent/extensions/docs.ts'), path.join(tmp, 'docs.ts'));
 

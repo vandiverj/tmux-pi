@@ -4,42 +4,42 @@ tmux is the private fixture server of tests/lane_fixture.py; no model runs."""
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lane_fixture import MODEL, ROOT, TmuxCase  # noqa: E402
-
-GIT_ENV = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-
-
-def git(cwd, *args):
-    run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, env=GIT_ENV)
-    assert run.returncode == 0, run.stderr
-    return run.stdout.strip()
+from lane_fixture import GIT_ENV, MODEL, ROOT, TmuxCase, git  # noqa: E402,F401  (GIT_ENV, git: other lane test files import them from here)
 
 
 class LaneCase(TmuxCase):
-    """A scratch repository (with the integration branch) beside the fixture's state directory."""
+    """A scratch repository (with the integration branch) beside the fixture's state directory. The repository is built once per
+    class and copied for each test; the tmux server is the class's (TmuxCase.shared_server)."""
+    shared_server = True
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.template = cls.class_root / "proj-template"
+        cls.template.mkdir()
+        git(cls.template, "init", "-q", "-b", "main")
+        (cls.template / "lib").mkdir()
+        (cls.template / "lib/x.py").write_text("x\n")
+        (cls.template / "docs").mkdir()
+        (cls.template / "docs/d.md").write_text("d\n")
+        git(cls.template, "add", ".")
+        git(cls.template, "commit", "-q", "-m", "first")
+        git(cls.template, "branch", "lane/integrate")
+        (cls.template / ".tmux-pi").mkdir()  # the git-ignored preamble lives only in the main tree
+        (cls.template / ".tmux-pi/worker-preamble.md").write_text("PREAMBLE-OF-THE-MAIN-TREE\n")
+        git(cls.template, "config", "core.excludesFile", "/dev/null")
+        (cls.template / ".git/info/exclude").write_text(".tmux-pi/\n")
 
     def setUp(self):
         super().setUp()
         self.repo = self.root / "proj"
-        self.repo.mkdir()
-        git(self.repo, "init", "-q", "-b", "main")
-        (self.repo / "lib").mkdir()
-        (self.repo / "lib/x.py").write_text("x\n")
-        (self.repo / "docs").mkdir()
-        (self.repo / "docs/d.md").write_text("d\n")
-        git(self.repo, "add", ".")
-        git(self.repo, "commit", "-q", "-m", "first")
-        git(self.repo, "branch", "lane/integrate")
-        (self.repo / ".tmux-pi").mkdir()  # the git-ignored preamble lives only in the main tree
-        (self.repo / ".tmux-pi/worker-preamble.md").write_text("PREAMBLE-OF-THE-MAIN-TREE\n")
-        git(self.repo, "config", "core.excludesFile", "/dev/null")
-        (self.repo / ".git/info/exclude").write_text(".tmux-pi/\n")
+        shutil.copytree(self.template, self.repo, symlinks=True)
         self.worktree = self.root / "proj-wt-alpha"
         self.env["TP_MAIN_CWD"] = str(self.repo)  # the main pane's directory, which a dispatch into an existing lane starts from
 
@@ -175,36 +175,57 @@ class DispatchIntoALaneTests(LaneCase):
 
 
 class RefusalTableTests(LaneCase):
-    """The design's numbered checks, one test each. A refusal makes no lane, no task and no queue entry."""
+    """The design's numbered checks. A refusal makes no lane, no task and no queue entry. One test per lane state, one subTest per
+    row of the check; a row that changes the repository puts it back before the next."""
 
     def nothing_started(self):
         self.assertEqual(list((self.state / "tasks").iterdir()), [])
         self.assertEqual(list((self.state / "queue").glob("*.json")) if (self.state / "queue").exists() else [], [])
 
-    def test_01_a_bad_lane_name(self):
-        for name in ("Alpha", "-x", "a b", "archive", "a" * 30):
-            self.refused(self.lane_dispatch(name=name), "lane")
-        self.nothing_started()
+    def no_dispatch(self, **kw):
+        return lambda: self.lane_dispatch(**kw)
 
-    def test_02_a_bad_step_id(self):
-        self.refused(self.lane_dispatch(step="bad step"), "step id")
-        self.refused(self.lane_dispatch(step="-s"), "step id")
-        self.no_lane()
-        self.nothing_started()
+    def no_lane_rows(self):
+        """(label, make_run, words, setup, teardown): every dispatch here is a new lane that is refused before anything is made."""
+        new = ("--repo", None, "--domain", "d")
+        rows = [(f"01 lane name {name!r}", self.no_dispatch(name=name), ("lane",)) for name in ("Alpha", "-x", "a b", "archive", "a" * 30)]
+        rows += [(f"02 step id {step!r}", self.no_dispatch(step=step), ("step id",)) for step in ("bad step", "-s")]
+        rows += [
+            ("03 no --step", lambda: self.raw(*(arg for arg in self.lane_args() if not arg.startswith("--step="))), ("--step",)),
+            ("04 --workdir with a lane", lambda: self.raw(*self.lane_args(), "--workdir", str(self.repo)), ("--workdir",)),
+            ("05 --tests full", self.no_dispatch(tests="full"), ("pass --tests affected or --tests none", "run once, from the main checkout")),
+            ("09 no --domain", self.no_dispatch(extra=("--repo", None)), ("--domain",)),
+            ("09 no --touches", self.no_dispatch(extra=("--repo", None, "--domain", "x")), ("--touches",)),
+        ]
+        rows += [(f"14 touch {touches}", self.no_dispatch(extra=(*new, "--touches", touches)), (word,))
+                 for touches, word in (("/abs", "is absolute"), ("../up", "not normalised"), ("a/../b", "not normalised"))]
+        return rows
 
-    def test_03_a_lane_dispatch_without_a_step(self):
-        run = self.raw(*(arg for arg in self.lane_args() if not arg.startswith("--step=")))
-        self.refused(run, "--step")
-        self.no_lane()
-
-    def test_04_workdir_with_lane(self):
-        run = self.raw(*self.lane_args(), "--workdir", str(self.repo))
-        self.refused(run, "--workdir")
-        self.no_lane()
-
-    def test_05_the_whole_suite_is_refused_in_a_lane(self):
-        self.refused(self.lane_dispatch(tests="full"), "pass --tests affected or --tests none", "run once, from the main checkout")
-        self.no_lane()
+    def test_a_new_lane_that_is_refused_makes_no_lane_no_task_and_no_queue_entry(self):
+        for label, make_run, words in self.no_lane_rows():
+            with self.subTest(label):
+                self.refused(make_run(), *words)
+                self.no_lane()
+                self.nothing_started()
+        with self.subTest("14 a touch the orchestrator owns"):
+            (self.repo / ".tmux-pi/lanes.json").write_text(json.dumps({"owned": ["docs"]}))
+            self.refused(self.lane_dispatch(extra=("--repo", None, "--domain", "d", "--touches", "docs/d.md")), "is owned by the orchestrator")
+            self.no_lane()
+            self.nothing_started()
+            (self.repo / ".tmux-pi/lanes.json").unlink()
+        with self.subTest("08 a branch in the way"):
+            git(self.repo, "branch", "lane/alpha")
+            self.refused(self.lane_dispatch(), "lane/alpha")
+            self.assertFalse(self.worktree.exists())
+            self.nothing_started()
+            git(self.repo, "branch", "-D", "lane/alpha")
+        with self.subTest("08 a path in the way is never reused or touched"):
+            self.worktree.mkdir()
+            (self.worktree / "keep.txt").write_text("mine\n")
+            self.refused(self.lane_dispatch(), "already exists")
+            self.assertEqual((self.worktree / "keep.txt").read_text(), "mine\n")
+            self.assertEqual(git(self.repo, "branch", "--list", "lane/alpha"), "")
+            self.nothing_started()
 
     def test_06_a_malformed_machine_config_refuses_naming_key_and_file(self):
         sys.path.insert(0, str(ROOT / "lib"))
@@ -224,64 +245,56 @@ class RefusalTableTests(LaneCase):
         bad.write_text("{}")
         self.assertEqual(lanes.load_machine_config(bad), {"max_active_lanes": 2, "defaulted": ["max_active_lanes"]})
 
-    def test_07_a_corrupt_record_refuses_naming_the_file(self):
-        self.lane_ok()
-        record = self.lane_dir() / "lane.json"
-        record.write_text("{broken")
-        run = self.lane_dispatch(step="s1", extra=())
-        self.refused(run, "lane.json")
-
-    def test_08_a_branch_or_path_in_the_way_refuses_before_anything_is_made(self):
-        git(self.repo, "branch", "lane/alpha")
-        self.refused(self.lane_dispatch(), "lane/alpha")
-        self.assertFalse(self.worktree.exists())
-        self.nothing_started()
-
-    def test_08_an_existing_path_is_never_reused_or_touched(self):
-        self.worktree.mkdir()
-        (self.worktree / "keep.txt").write_text("mine\n")
-        self.refused(self.lane_dispatch(), "already exists")
-        self.assertEqual((self.worktree / "keep.txt").read_text(), "mine\n")
-        self.assertEqual(git(self.repo, "branch", "--list", "lane/alpha"), "")
-        self.nothing_started()
-
-    def test_09_a_new_lane_needs_domain_and_touches(self):
-        self.refused(self.lane_dispatch(extra=("--repo", None)), "--domain")
-        self.refused(self.lane_dispatch(extra=("--repo", None, "--domain", "x")), "--touches")
-        self.no_lane()
-
-    def test_10_an_existing_lane_takes_no_declaration_flags(self):
-        item, task = self.lane_ok()
-        self.settle(task)
-        self.cli("collect", item["id"])
-        for flags in (("--domain", "other"), ("--touches", "docs"), ("--base", "main")):
-            self.refused(self.lane_dispatch(step="s1", extra=flags), "already exists")
-
-    def test_10_an_existing_lane_can_be_located_with_repo(self):
-        item, task = self.lane_ok()
-        self.settle(task)
-        self.cli("collect", item["id"])
-        run = self.lane_dispatch(step="s1", extra=("--repo", str(self.repo)))
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-
-    def test_11_a_lane_that_is_not_open_refuses(self):
+    def test_a_dispatch_into_an_existing_lane_is_refused_by_its_record_its_flags_its_git_and_its_other_tasks(self):
+        """Lane alpha exists and its first task is collected; each row breaks one thing, refuses, and puts it back."""
         item, task = self.lane_ok()
         self.settle(task)
         self.cli("collect", item["id"])
         path = self.lane_dir() / "lane.json"
-        record = json.loads(path.read_text())
-        record["state"] = "abandoned"
-        path.write_text(json.dumps(record))
-        self.refused(self.lane_dispatch(step="s1", extra=()), "abandoned")
-
-    def test_12_a_lane_git_does_not_agree_with_refuses(self):
-        item, task = self.lane_ok()
-        self.settle(task)
-        self.cli("collect", item["id"])
-        git(self.worktree, "checkout", "-q", "--detach")
-        run = self.lane_dispatch(step="s1", extra=())
-        self.assertEqual(run.returncode, 1, run.stdout)
-        self.assertNotEqual(run.stderr.strip(), "")
+        good = path.read_text()
+        with self.subTest("07 a corrupt record names the file"):
+            path.write_text("{broken")
+            self.refused(self.lane_dispatch(step="s1", extra=()), "lane.json")
+            path.write_text(good)
+        for flags in (("--domain", "other"), ("--touches", "docs"), ("--base", "main")):
+            with self.subTest(f"10 declaration flag {flags[0]}"):
+                self.refused(self.lane_dispatch(step="s1", extra=flags), "already exists")
+        with self.subTest("11 a lane that is not open"):
+            record = json.loads(good)
+            record["state"] = "abandoned"
+            path.write_text(json.dumps(record))
+            self.refused(self.lane_dispatch(step="s1", extra=()), "abandoned")
+            path.write_text(good)
+        with self.subTest("12 a lane git does not agree with"):
+            git(self.worktree, "checkout", "-q", "--detach")
+            run = self.lane_dispatch(step="s1", extra=())
+            self.assertEqual(run.returncode, 1, run.stdout)
+            self.assertNotEqual(run.stderr.strip(), "")
+            git(self.worktree, "checkout", "-q", "lane/alpha")
+        with self.subTest("19 a task that cannot be ruled out as a writer"):
+            # a live task with no recorded tree: it might be a writer on any tree
+            other = self.state / "tasks" / "coder-notree0001"
+            other.mkdir()
+            (other / "meta.json").write_text(json.dumps({"id": other.name, "pane": "%9999", "role": "coder"}))
+            (self.state / "list-rows").write_text(f"%9999 0 {self.pane()[1]}\n")
+            self.refused(self.lane_dispatch(step="s1", extra=()), "no recorded working tree")
+            (self.state / "list-rows").unlink()
+            # a task directory with no readable record, while a process of it runs (its run.sh): it may be writing anywhere
+            (other / "meta.json").write_text("{broken")
+            pane, _ = self.pane(self.worker_command(other))
+            self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json", f"tmux kill-pane -t {pane}")
+            (other / "meta.json").unlink()
+            self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json")
+            self.tmux("kill-pane", "-t", pane)
+            # a pane table that cannot be read
+            other.rmdir()
+            (self.state / "list-fail").write_text("")
+            self.refused(self.lane_dispatch(step="s1", extra=()), "tmux panes")
+            (self.state / "list-fail").unlink()
+            self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), [item["id"]])
+        with self.subTest("10 an existing lane can be located with --repo"):
+            run = self.lane_dispatch(step="s1", extra=("--repo", str(self.repo)))
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_13_the_active_lane_limit_refuses_a_new_lane(self):
         sys.path.insert(0, str(ROOT / "lib"))
@@ -292,43 +305,6 @@ class RefusalTableTests(LaneCase):
         run = self.lane_dispatch(name="extra", extra=("--repo", None, "--domain", "e", "--touches", "elsewhere"))
         self.refused(run, "lane")
         self.assertFalse((self.root / "proj-wt-extra").exists())
-
-    def test_14_a_bad_declaration_refuses_before_anything_is_made(self):
-        for touches, word in (("/abs", "is absolute"), ("../up", "not normalised"), ("a/../b", "not normalised")):
-            self.refused(self.lane_dispatch(extra=("--repo", None, "--domain", "d", "--touches", touches)), word)
-        self.no_lane()
-        self.nothing_started()
-
-    def test_14_a_touch_the_orchestrator_owns_refuses_before_anything_is_made(self):
-        (self.repo / ".tmux-pi/lanes.json").write_text(json.dumps({"owned": ["docs"]}))
-        self.refused(self.lane_dispatch(extra=("--repo", None, "--domain", "d", "--touches", "docs/d.md")), "is owned by the orchestrator")
-        self.no_lane()
-        self.nothing_started()
-
-    def test_19_a_task_that_cannot_be_ruled_out_as_a_writer_refuses(self):
-        item, task = self.lane_ok()
-        self.settle(task)
-        self.cli("collect", item["id"])
-        # a live task with no recorded tree: it might be a writer on any tree
-        other = self.state / "tasks" / "coder-notree0001"
-        other.mkdir()
-        (other / "meta.json").write_text(json.dumps({"id": other.name, "pane": "%9999", "role": "coder"}))
-        (self.state / "list-rows").write_text(f"%9999 0 {self.pane()[1]}\n")
-        self.refused(self.lane_dispatch(step="s1", extra=()), "no recorded working tree")
-        (self.state / "list-rows").unlink()
-        # a task directory with no readable record, while a process of it runs (its run.sh): it may be writing anywhere
-        (other / "meta.json").write_text("{broken")
-        pane, _ = self.pane(self.worker_command(other))
-        self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json", f"tmux kill-pane -t {pane}")
-        (other / "meta.json").unlink()
-        self.refused(self.lane_dispatch(step="s1", extra=()), other.name, "no readable meta.json")
-        self.tmux("kill-pane", "-t", pane)
-        # a pane table that cannot be read
-        other.rmdir()
-        (self.state / "list-fail").write_text("")
-        self.refused(self.lane_dispatch(step="s1", extra=()), "tmux panes")
-        (self.state / "list-fail").unlink()
-        self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), [item["id"]])
 
 
 class NoWayAroundTheLaneTests(LaneCase):

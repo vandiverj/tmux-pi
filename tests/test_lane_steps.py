@@ -17,8 +17,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from lane_fixture import MODEL, ROOT  # noqa: E402
-from test_lane_writer import GIT_ENV, LaneCase, git  # noqa: E402
+from lane_fixture import GIT_ENV, MODEL, ROOT, git  # noqa: E402
+from test_lane_writer import LaneCase  # noqa: E402
 import lane_steps  # noqa: E402
 
 APPROVED = "APPROVED\n\nThe change does what the task asked.\n\n## Coverage\nI read lib/x.py and the callers it changes and ran the tests.\n\nRESULT_STATUS: complete\n"

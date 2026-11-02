@@ -21,9 +21,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from lane_fixture import MODEL, ROOT, TMUX  # noqa: E402
+from lane_fixture import MODEL, ROOT, TMUX, git  # noqa: E402
 from test_lane_lease import LeaseCase  # noqa: E402
-from test_lane_writer import git  # noqa: E402
 from test_lane_steps import APPROVED, CHANGES, StepCase  # noqa: E402
 import contract  # noqa: E402
 import lane_lease  # noqa: E402
@@ -276,6 +275,11 @@ class RetryRefusalTests(RemedyCase):
                                                             f"tp-agent collect {second['id']}", f"tp-agent stop {second['id']}"]))
         for ident in (first["id"], second["id"]):  # collect is named before stop for each
             self.assertLess(named(run.stderr).index(f"tp-agent collect {ident}"), named(run.stderr).index(f"tp-agent stop {ident}"))
+        # the escalating retry gets the same guard
+        escalated = self.raw("retry", first["id"], "--reason", "Again", "--escalate")
+        self.assertEqual(escalated.returncode, 1)
+        self.assertIn(f"tp-agent collect {first['id']}", escalated.stderr)
+        self.assertNotIn("tp-agent reap", escalated.stderr)
         # what the old message named lists nothing for a settled worker ...
         self.assertEqual(self.cli("reap")["tasks"], [])
         self.assertEqual(self.retry(first["id"]).returncode, 1)
@@ -286,13 +290,6 @@ class RetryRefusalTests(RemedyCase):
         self.assertFalse(self.alive(first_pane) or self.alive(second_pane))
         retried = self.retry(first["id"])
         self.assertEqual(retried.returncode, 0, retried.stderr)
-
-    def test_f6_the_escalating_retry_gets_the_same_guard(self):
-        (first, _, _), _ = self.two_settled()
-        run = self.raw("retry", first["id"], "--reason", "Again", "--escalate")
-        self.assertEqual(run.returncode, 1)
-        self.assertIn(f"tp-agent collect {first['id']}", run.stderr)
-        self.assertNotIn("tp-agent reap", run.stderr)
 
     def test_f6_force_alive_is_offered_where_it_works_and_does_work(self):
         (first, _, _), _ = self.two_settled()

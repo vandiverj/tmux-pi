@@ -103,6 +103,10 @@ tp_queue_lines() {
 # tp_write <path> [--root STATE_DIR] [--mode OCT | --executable | --fresh] — stdin becomes the file: a temp file in the same
 # directory, then one rename. --root refuses a link in any directory below it; --fresh gives the mode a new file would get.
 tp_write() { python3 "$TP_LIB_DIR/safe_write.py" write "$@"; }
+# tp_write_many [--root STATE_DIR] [--mkdir DIR]... (--file PATH | --exec PATH)... — several tp_write in ONE start (a python start
+# costs ~0.1-0.5 s): stdin holds one NUL-terminated chunk per --file/--exec, in the order given; the --mkdir directories are made first.
+# --file is tp_write PATH, --exec is tp_write PATH --executable.
+tp_write_many() { python3 "$TP_LIB_DIR/safe_write.py" write-many "$@"; }
 # tp_append <path> — stdin is appended; a symlink at the path is refused.
 tp_append() { python3 "$TP_LIB_DIR/safe_write.py" append "$@"; }
 # tp_owned_dir <dir>... — mkdir -p for a directory tmux-pi owns; a symlink in its place is refused, not entered.

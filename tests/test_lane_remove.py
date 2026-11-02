@@ -347,8 +347,6 @@ class ResumableRemoveTests(RemoveCase):
     """`git worktree remove` of a big tree outlives GIT_TIMEOUT and is killed half way. The removal gets its own long timeout, and
     a marker written once the tree was clean lets the next `lane remove` finish what was interrupted (never with --force)."""
 
-    snapshot_lane = True  # measured: ResumableRemoveTests CPU-s 90.3 -> 71.4 (the only class over 10 percent)
-
     def setUp(self):
         super().setUp()
         self.calls = []
@@ -880,6 +878,8 @@ exec {shutil.which("git")} "$@"
 
 
 class AgeColumnTests(RemoveCase):
+    snapshot_lane = False  # two tests, CPU-s 3.1 either way
+
     def test_the_lanes_rows_carry_created_and_age(self):
         self.writer("s1")
         rows = json.loads(self.raw("lanes", "--repo", str(self.repo)).stdout)

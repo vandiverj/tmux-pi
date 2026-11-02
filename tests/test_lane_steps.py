@@ -52,6 +52,8 @@ def backticked(text):
 class StepCase(LaneCase):
     """A lane `alpha` whose steps are driven by hand: writers through tp-agent, reviewers as the files tp-review leaves."""
 
+    snapshot_lane = True  # the first s1 writer of a test restores the class's one real dispatch; measured CPU-s off -> on: Open 64->48, GateRows 104->66, CloseAndNext 128->83, Remove 87->48, Resumable 111->50
+
     def setUp(self):
         super().setUp()
         self.made = 0

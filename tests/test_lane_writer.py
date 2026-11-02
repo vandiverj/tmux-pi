@@ -4,6 +4,7 @@ tmux is the private fixture server of tests/lane_fixture.py; no model runs."""
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -17,10 +18,17 @@ class LaneCase(TmuxCase):
     """A scratch repository (with the integration branch) beside the fixture's state directory. The repository is built once per
     class and copied for each test; the tmux server is the class's (TmuxCase.shared_server)."""
     shared_server = True
+    snapshot_lane = False  # True: `lane_ok()` with the default arguments restores the class's first real dispatch (see restore_lane)
+    _lane_snapshot = None
+
+    @property
+    def stable_root(self):  # a copied lane holds absolute paths (worktree .git file, lane.json), so it must come back to the same path
+        return self.snapshot_lane
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls._lane_snapshot = None
         cls.template = cls.class_root / "proj-template"
         cls.template.mkdir()
         git(cls.template, "init", "-q", "-b", "main")
@@ -42,6 +50,34 @@ class LaneCase(TmuxCase):
         shutil.copytree(self.template, self.repo, symlinks=True)
         self.worktree = self.root / "proj-wt-alpha"
         self.env["TP_MAIN_CWD"] = str(self.repo)  # the main pane's directory, which a dispatch into an existing lane starts from
+        if self.snapshot_lane:
+            self._pristine = (self.fingerprint(), dict(self.env))
+
+    def fingerprint(self):
+        """Every path under the root with its kind, size and mtime: equal to the one taken in setUp means nothing was touched since."""
+        rows = []
+        for folder, dirs, files in os.walk(self.root):
+            for name in dirs + files:
+                path = Path(folder) / name
+                info = path.lstat()
+                rows.append((str(path.relative_to(self.root)), info.st_mode, 0 if path.is_dir() and not path.is_symlink() else info.st_size,
+                             info.st_mtime_ns))
+        return sorted(rows)
+
+    def reset_fixture(self):
+        """Put the root back as setUp left it (empty state, a fresh repository copy), for a test that dispatches from nothing twice."""
+        for child in self.root.iterdir():
+            shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+        self.lay_out_root()
+        shutil.copytree(self.template, self.repo, symlinks=True)
+        self._pristine = (self.fingerprint(), dict(self.env))
+
+    def restore_lane(self):
+        """Replace the root's content with the class's snapshot (the root right after its first real dispatch). Returns that dispatch's stdout."""
+        stdout, saved = self._lane_snapshot
+        shutil.rmtree(self.root)
+        shutil.copytree(saved, self.root, symlinks=True)
+        return stdout
 
     def lane_args(self, name="alpha", step="s1", role="coder", extra=("--repo", None, "--domain", "lib part", "--touches", "lib"), tests="none"):
         extra = [str(self.repo) if part is None else part for part in extra]
@@ -51,10 +87,27 @@ class LaneCase(TmuxCase):
     def lane_dispatch(self, **kw):
         return self.raw(*self.lane_args(**kw))
 
-    def lane_ok(self, **kw):
+    def lane_ok(self, snapshot=True, **kw):
+        """A dispatch that must succeed; returns (item, task dir). With `snapshot_lane`, the default arguments and an untouched fixture:
+        the first call in the class is a real dispatch whose resulting root is copied aside; later calls restore that copy."""
+        use_snapshot = self.snapshot_applies(snapshot, **kw)
+        if use_snapshot and self._lane_snapshot:
+            return self.lane_item(self.restore_lane())
         run = self.lane_dispatch(**kw)
         self.assertEqual(run.returncode, 0, run.stderr)
-        item = json.loads(run.stdout)
+        if use_snapshot:
+            saved = self.class_root / "snapshot"
+            shutil.copytree(self.root, saved, symlinks=True)
+            type(self)._lane_snapshot = (run.stdout, saved)
+        return self.lane_item(run.stdout)
+
+    def snapshot_applies(self, snapshot=True, **kw):
+        """Whether a `lane_ok` call may use the snapshot: the class opted in, the call has the default arguments, and since setUp nothing
+        under the root was touched (no task, flag file, branch, lane, edit) and the environment is the same."""
+        return bool(snapshot and self.snapshot_lane and not kw and self._pristine == (self.fingerprint(), self.env))
+
+    def lane_item(self, stdout):
+        item = json.loads(stdout)
         return item, self.state / "tasks" / item["id"]
 
     def existing(self, **kw):
@@ -467,6 +520,77 @@ class ConcurrentCreateTests(LaneCase):
         with self.assertRaises(ValueError) as caught:
             self.admit(base_requested="main")
         self.assertIn("created meanwhile with base lane/integrate", str(caught.exception))
+
+
+class LaneSnapshotTests(LaneCase):
+    """The opt-in snapshot of the first lane dispatch (LaneCase.snapshot_lane): off unless a class asks, and a restored dispatch is
+    the real one (lane record, task, git state, state dir, and what `lanes`, `lane close` and `lane remove` then do)."""
+    snapshot_lane = True
+
+    def normalized(self, text, task_id):
+        text = text.replace(str(self.root), "<root>").replace(task_id, "<task>")
+        text = re.sub(r"\d{4}-\d\d-\d\dT[\d:]+(?:Z|\+00:00)", "<time>", text)
+        text = re.sub(r"\d{8}T\d{6}Z", "<time>", text)  # the archive name's compact stamp
+        text = re.sub(r'"age": "[^"]*"', '"age": "<age>"', text)  # `lanes` shows the lane's age: a restored lane is older than a fresh one
+        return re.sub(r"sel-[0-9a-f]{32}", "<selection>", text)
+
+    def described(self, item, task):
+        """What a dispatch left, with ids, times and the root path replaced."""
+        lane = self.lane_dir()
+        tree = lambda base: sorted(str(path.relative_to(base)) for path in base.rglob("*") if path.is_file())
+        meta = json.loads((task / "meta.json").read_text())
+        rows = {
+            "item": json.dumps(item, sort_keys=True), "meta": json.dumps(meta, sort_keys=True), "meta keys": sorted(meta),
+            "lane files": {name: (lane / name).read_text() for name in tree(lane)},
+            "state files": tree(self.state), "worktrees": git(self.repo, "worktree", "list"),
+            "branches": git(self.repo, "branch", "-a", "-v"), "status": git(self.worktree, "status", "--porcelain", "--branch"),
+        }
+        return json.loads(self.normalized(json.dumps(rows, sort_keys=True), task.name))
+
+    def then(self, task_id):
+        """What the commands that read and end a lane do from here: (exit code, stdout, stderr) of each, and the state after."""
+        out = []
+        for args in (("lanes", "--repo", str(self.repo)), ("lane", "close", "alpha", "s1", "--repo", str(self.repo)),
+                     ("lane", "remove", "alpha", "--repo", str(self.repo)), ("lanes", "--repo", str(self.repo))):
+            run = self.raw(*args)
+            out.append((run.returncode, self.normalized(run.stdout, task_id), self.normalized(run.stderr, task_id)))
+        out.append((self.worktree.exists(), git(self.repo, "branch", "--list", "lane/alpha"), self.lane_dir().exists()))
+        return out
+
+    def test_the_snapshot_is_off_by_default_and_only_an_untouched_default_call_uses_it(self):
+        self.assertFalse(LaneCase.snapshot_lane)
+        self.assertFalse(DispatchIntoALaneTests.snapshot_lane)
+        self.assertFalse(DispatchIntoALaneTests.stable_root.fget(DispatchIntoALaneTests))
+        self.assertTrue(self.snapshot_applies())
+        self.assertFalse(self.snapshot_applies(snapshot=False))
+        self.assertFalse(self.snapshot_applies(name="beta"))  # not the default arguments
+        self.assertFalse(self.snapshot_applies(role="code-reviewer"))
+        (self.state / "live-window").touch()  # a flag file
+        self.assertFalse(self.snapshot_applies())
+        (self.state / "live-window").unlink()
+        self.assertFalse(self.snapshot_applies(), "a touched directory is not pristine, even when its content is back")
+        self.reset_fixture()
+        self.assertTrue(self.snapshot_applies())
+        (self.repo / "lib/x.py").write_text("edited\n")  # a repository edit
+        self.assertFalse(self.snapshot_applies())
+        self.reset_fixture()
+        self.env["TP_SESSION"] = "other"
+        self.assertFalse(self.snapshot_applies())
+
+    def test_a_restored_dispatch_equals_the_real_one_and_every_later_command_agrees(self):
+        self.assertIsNone(self._lane_snapshot)
+        item, task = self.lane_ok()  # the first call is a real dispatch and takes the snapshot
+        self.assertIsNotNone(self._lane_snapshot)
+        real = self.described(item, task), self.then(task.name)
+        self.reset_fixture()
+        self.assertFalse(self.worktree.exists())
+        item2, task2 = self.lane_ok()  # restored
+        self.assertEqual(item2, item)  # the snapshot carries the real dispatch's own answer, id included
+        restored = self.described(item2, task2), self.then(task2.name)
+        self.assertEqual(restored[0], real[0])
+        self.assertEqual(restored[1], real[1])
+        self.assertTrue(task2.is_dir())
+        self.assertEqual(real[0]["worktrees"].count("lane/alpha"), 1)
 
 
 class AliveOnWorkdirTests(unittest.TestCase):

@@ -224,7 +224,7 @@ class GateTests(ScriptCase):
         self.assertIn("typecheck:. skipped (no deno.json or tsconfig.json)", body)
         deno = self.calls_of("deno")
         self.assertIn(f"cwd={repo}/api", deno)
-        self.assertIn("arg: check\narg: main.ts", deno)
+        self.assertIn("arg: check\narg: --allow-import\narg: main.ts", deno)
         self.assertEqual(self.calls_of("tsc").count("--- call"), 1)
 
     def test_a_change_to_a_web_apps_config_or_js_still_typechecks_the_app(self):

@@ -242,7 +242,7 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
         printf '%s skipped (no ts files)\n' "$label"
       fi
     elif bin="$(tp_find_deno "$WT")"; then
-      run_in "$app" "$label" "$bin" check "${rels[@]}"
+      run_in "$app" "$label" "$bin" check --allow-import "${rels[@]}"
       printf '%s %s\n' "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
     else

@@ -74,3 +74,10 @@
 - E1 round 4: REQUEST_CHANGES. One new site in the probe-specificity family: `git_subcommands` treats a shell comment as a command, so `echo ok # x && git fetch` counts as a fetch. All eight swept rows were confirmed. Waiting on the owner: a round 5 or a merge with the limit documented.
 - C2, F1 r4, D1 r4, B1 r2, K1: Main ran each coder's modules in its own worktree. The only failures were 4 in `test_orchestration` (C2) and 1 in `test_sensitive_trust` (K1), all listed in the baseline. Reviews went out with the search note. C2 was held because its status line was mid-sentence; it has been asked to restate.
 - K1 open owner decision: tracked `agent/mcp.json`, `claude/mcp.json` and `bin/tp-secret-exec` keep the prompt for `agent/`, `claude/` and the repo root.
+
+## 2026-11-07 23:10Z: four reviews rejected; rule-shaped retries out
+- F1 r4 REQUEST_CHANGES: the rollback misses symlinks, writes through a planted link, loses file mode, and leaves the archive reservation. Retry `coder-c556d93f24` (design): `fixes/f1-round5.md`, a whole-directory copy swapped back on failure.
+- D1 r4 REQUEST_CHANGES: the staged section compares against the base, not HEAD. Retry `coder-3464a832e0` (design): `fixes/d1-round5.md`, the four-state rule with a 15-partition table.
+- B1 r2 REQUEST_CHANGES: an ESLint aggregate across apps, a TypeError on a wrong-typed field, and a record written without a tree. Retry `coder-a7350b4c4b` (design): `fixes/b1-round3.md`, per-app checks, a type table, and fail closed.
+- K1 r1 REQUEST_CHANGES: `-f FILE` and `--textconv` pass as plain. Retry `coder-3a6e22f84f`: `fixes/k1-round2.md`, an option allowlist checked by a parity test against `git grep -h`.
+- C2 is in review (`review-coder-86b4ed5fe2-170237`).

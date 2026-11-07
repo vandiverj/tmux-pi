@@ -11,9 +11,29 @@
 # Qwen-authored work), at least mid level. A required review with no independent provider
 # stops and asks the human; an optional one may use the author's provider, marked in the record.
 # The review packet contains the original task, any follow-up requests, the result, and the
-# selected context packet.
-# On a retried task (or a task reviewed before) the reviewer also receives the earlier review rounds'
-# findings, oldest first, and the diff of the working tree since the last reviewed state (lib/review_rounds.py).
+# selected context packet, in this order, claims last (packet_order "claims-last:v1", recorded in the review task's meta.json):
+#   (a) the request as given (request.md; for a task record from before request.md existed, the request as task_record.request_text
+#       reads it from task.md; its briefs and acceptance list are found in that text the same way), the briefs it names that passed the checks, the follow-up requests, and the acceptance list of the
+#       --contract file when it has one (the contract itself stays in (f)); the task text names the item numbers
+#   (b) scope, the file `diff-scope.md`: the changed files and scoped git commands (outside git and for a research report: no file)
+#   (c) the diff of the current tree against the review base, round 1 included (lib/review_rounds.py diff_now): the last reviewed
+#       state when an earlier round recorded one, else the lane's last closed step, else the lane base, else HEAD for a task
+#       outside a lane; sensitive paths withheld, secrets redacted, split into labelled segments when large. It is a diff of the
+#       working tree as it is (base to files). For a path where HEAD or the index differs from the files, the end of (c) adds, per path
+#       and only when non-empty, "Committed since the base, not in the working files:" (base to HEAD) and "Staged, not in the working
+#       files:" (HEAD to index), withheld and redacted like the main diff; the same function serves round 1 and later rounds, and
+#       the scope (b) names each comparison exactly. The scope's path list is the paths of (c) itself (the main diff and every
+#       section; prepare writes scope-input.json and scope reads it with --input), never recomputed; with no commit yet its
+#       commands name the empty tree where they would name HEAD
+#   (d) the earlier review rounds' findings, oldest first
+#   (e) the timer waits in added test lines
+#   (f) what Main supplied: --evidence files, --contract, --dispositions, then the --sweep file
+#   then, under one heading file `Author's account (read after forming your own findings)`:
+#   (g) the author's packet, (h) the author's result, (i) task.md (Main's Orient/Frame and the request as recorded)
+# The task text tells the reviewer to form its findings from (c) and the tree first and to check each claim in (g) to (i) against them.
+# The packet budget is the same as before the order changed: a packet that cannot hold everything is refused, never trimmed.
+# On a retried task (or a task reviewed before) the diff (c) is the one since the last reviewed state and (d) holds the earlier review
+# rounds' findings, oldest first (lib/review_rounds.py).
 # The reply's first line is APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES (lib/review_verdict.py).
 # --force-alive skips the checks that end the author's process and look for a writer on the working tree (this session's
 # tasks). It does NOT apply to a lane's working tree: a lane's one writer is enforced by the lane's lease, shared by every
@@ -60,6 +80,7 @@ while [[ -L "$src" ]]; do
 done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 source "$ROOT/lib/tp.sh"
+PACKET_ORDER="claims-last:v1"   # recorded as packet_order in the review task's meta.json; change it whenever the order below changes
 
 usage() {
   echo "usage: tp-review [--force] [--force-alive] [--level KEY] [--thinking EFFORT] [--approve-effort] [--evidence FILE]... [--contract FILE] [--dispositions FILE] [--sweep FILE] <task-id>" >&2
@@ -114,7 +135,11 @@ supplied_problem() {
   python3 "$ROOT/lib/review_verdict.py" supplied "$1" "$2"   # the one rule (lib/review_verdict.py supplied_problem); tp-agent retry's fix brief uses it too
 }
 for ((i = 0; i < ${#evidence[@]}; i++)); do check_supplied --evidence "${evidence[$i]}"; done   # by index: an empty name is still one entry
-if [[ "$have_contract" == 1 ]]; then check_supplied --contract "$contract"; fi
+contract_acceptance=""   # the contract's own Done means / Acceptance criteria text, attached with the request (a) so it comes before the diff
+if [[ "$have_contract" == 1 ]]; then
+  check_supplied --contract "$contract"
+  contract_acceptance="$(python3 "$ROOT/lib/review_verdict.py" acceptance-text "$contract")" || die "cannot read the acceptance criteria of the contract '$contract'"
+fi
 if [[ "$have_dispositions" == 1 ]]; then check_supplied --dispositions "$dispositions"; fi
 if [[ "$have_sweep" == 1 ]]; then check_supplied --sweep "$sweep"; fi
 if [[ "$same_provider" == 1 ]]; then
@@ -217,7 +242,7 @@ coverage_rule="Review the whole change every time: every changed file, and every
 report_coverage_rule="Check every important claim, not a sample, and do not stop when you have enough findings for a verdict. End your final reply (the reply itself, not only a findings file) with a section headed Coverage that lists the claims you checked, the claims you did not and why, and what depends on a claim you could not check."
 verdict_rule="The first line of your final reply must be exactly APPROVED, APPROVED_WITH_NOTES or REQUEST_CHANGES, with no Markdown or other formatting: REQUEST_CHANGES only when at least one finding is a defect as defined above and ends 'Closes by: code'; APPROVED_WITH_NOTES when there is no defect but you have notes, listed after the second line under the heading Notes, each with the task it belongs to; APPROVED when you have nothing to report. Put RESULT_STATUS: complete|empty|blocked|incomplete on the second line, then"
 outside_rule="Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash: a permission prompt there blocks unattended work."
-review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Inspect the supplied task, context packet, and result, then inspect the working tree and relevant files as needed. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. $outside_rule $findings_rule $coverage_rule $verdict_rule a brief rationale or the findings, including file paths and line references when possible."
+review_task="Review the completed work from subagent '$id'. You are an independent reviewer, not the implementer. Start from the request and the acceptance list, then the changed-file scope and the diff, and inspect the working tree and relevant files as needed; the author's packet, result and task.md come last, under the heading 'Author's account (read after forming your own findings)'. Identify concrete correctness, regression, security, or requirement gaps. Do not change files. Form your findings from the diff and the tree first. Then read the author's account and Main's frame and check each claim against what you found; a claim you could not verify is 'Closes by: check'. $outside_rule $findings_rule $coverage_rule $verdict_rule a brief rationale or the findings, including file paths and line references when possible."
 
 # A research report (M9) is checked for source support rather than code changes.
 extra=()
@@ -227,10 +252,13 @@ if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
   extra=(--note "Research report: $report")
 fi
 if (( ${#evidence[@]} > 0 )); then
-  review_task="$review_task Main (the orchestrator) attached ${#evidence[@]} evidence file(s) after the author's material, each under a heading that reads 'Evidence supplied by Main: <file name>'. That evidence was produced by the orchestrator, not the author, and tp-review has not checked it: it can be checked like any other claim, so check it where you can, and say which finding or Owed-before-close item it answers."
+  review_task="$review_task Main (the orchestrator) attached ${#evidence[@]} evidence file(s) before the author's account (after the diff, the earlier findings and the timer waits), each under a heading that reads 'Evidence supplied by Main: <file name>'. That evidence was produced by the orchestrator, not the author, and tp-review has not checked it: it can be checked like any other claim, so check it where you can, and say which finding or Owed-before-close item it answers."
 fi
 if [[ "$have_contract" == 1 ]]; then
   review_task="$review_task Main attached a reviewer contract under the heading 'Reviewer contract (supplied by Main)'. Judge the work against that contract together with the task."
+  if [[ -n "$contract_acceptance" ]]; then   # set below; its acceptance list is also given with the request, ahead of the diff
+    review_task="$review_task The contract's acceptance list is also given in the context file headed 'Acceptance criteria (from the reviewer contract supplied by Main)', before the diff."
+  fi
 fi
 if [[ "$have_dispositions" == 1 ]]; then
   review_task="$review_task Main attached the dispositions of earlier findings under the heading 'Dispositions of earlier findings (supplied by Main)'. A finding listed there is closed: raise it again only if the tree changed in a way that reopens it, and then cite the disposition and the change."
@@ -238,16 +266,30 @@ fi
 # A numbered Done means / Acceptance criteria list in the request or the contract: the reply must account for each item, and
 # lib/review_verdict.py holds it to that through the item numbers recorded beside the review's result (below, after the start).
 acceptance='{"items":[]}' ac_sources=()
-unread_briefs=""
+unread_briefs="" read_briefs=()   # read_briefs: the named briefs that passed, attached beside the request (they hold its acceptance list)
+excerpt_dir="$(mktemp -d)"   # the request, the briefs, the acceptance list and the packet are read from it; removed on exit (cleanup_excerpts below)
+cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
+trap cleanup_excerpts EXIT
+# The request: request.md, else (a task record from before request.md existed) the request as lib/task_record.py request_text reads it
+# from task.md, written to a file here so that the briefs and the acceptance list are found in it the same way. req_file is empty
+# when there is no request text at all.
+req_file=""
 if [[ -f "$dir/request.md" ]]; then
-  ac_sources+=("$dir/request.md")
+  req_file="$dir/request.md"
+else
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from task_record import request_text; print(request_text(sys.argv[2]))' "$ROOT/lib" "$dir" > "$excerpt_dir/request.md" ||
+    die "cannot read the request of '$id' from its task record"
+  if [[ -n "$(tr -d '[:space:]' < "$excerpt_dir/request.md")" ]]; then req_file="$excerpt_dir/request.md"; fi
+fi
+if [[ -n "$req_file" ]]; then
+  ac_sources+=("$req_file")
   # A request usually says "Read and carry out the brief /abs/path.md": the list is in that brief. Each .md path it names is read
   # when it passes the checks --contract gets; one that does not is not an error, the task text says it was not read and why.
-  named="$(python3 "$ROOT/lib/review_verdict.py" briefs "$dir/request.md")" || die "cannot read the request of '$id'"
+  named="$(python3 "$ROOT/lib/review_verdict.py" briefs "$req_file")" || die "cannot read the request of '$id'"
   while IFS= read -r brief; do
     [[ -n "$brief" ]] || continue
     if why="$(supplied_problem "A brief the request names:" "$brief")"; then
-      ac_sources+=("$brief")
+      ac_sources+=("$brief"); read_briefs+=("$brief")
     else
       unread_briefs="$unread_briefs ${why//$'\n'/ }"
     fi
@@ -265,19 +307,12 @@ if (( ac_count > 0 )); then
   review_task="$review_task The task (or the reviewer contract) has a numbered list of $ac_count item(s), numbers $(jq -r '.items | map(tostring) | join(", ")' <<<"$acceptance"), under a heading 'Done means' or 'Acceptance criteria'. Include in your final reply a section headed Acceptance criteria with one line per item: its number, then met, not met or not checked, then the evidence (file:line, a test, or a command). A reply without that section, or one that names fewer of the item numbers than the list has, is incomplete."
 fi
 
-# Messages the user sent the author after its task (written by the dispatcher) are part of what it was asked to do.
-followups=()
-if [[ -s "$dir/followups.md" ]]; then followups=(--context "$dir/followups.md"); fi
 # tp-spawn caps each context file at 60000 chars and the whole packet at 200000. An
 # oversized author packet/result is never excerpted: it is split into ordered, labelled
 # segments that together hold every character. If all evidence cannot fit in one
 # packet, fail before spawning rather than drop any of it.
 max_file=60000 max_packet=300000 packet_reserve=20000 per_file_overhead=300
-excerpt_dir=""
-cleanup_excerpts() { [[ -z "$excerpt_dir" ]] || rm -rf "$excerpt_dir"; }
-trap cleanup_excerpts EXIT
 ctx_list=()
-excerpt_dir="$(mktemp -d)"
 # add_segments <file> <label> [origin]: appends context paths to ctx_list (runs in this shell,
 # so excerpt_dir and ctx_list survive for cleanup and spawning). origin is the path a segment label names (default: the file).
 add_segments() {
@@ -305,12 +340,26 @@ for n, (a, b) in enumerate(segs, 1):
 PYEOF
   while IFS= read -r line; do ctx_list+=("$line"); done < "$list"
 }
-add_segments "$dir/packet.md" author-packet
-add_segments "$dir/result.md" author-result
-# Earlier review rounds of this task and its retry ancestors, then the change since the last reviewed state.
+# The context list is in reading order, claims last (packet_order claims-last:v1; the order is in the header comment): (a) what the
+# author was asked, (b) the scope, (c) the change, (d) earlier findings, (e) timer waits, (f) what Main supplied, then under one
+# heading the author's account: (g) its packet, (h) its result, and (i) task.md, which tp-spawn is handed last.
+# (a) The request as given, any brief it names that passed the checks, and the messages the user sent the author after its task
+# (written by the dispatcher; part of what it was asked to do). A task record from before request.md existed keeps the request in
+# task.md: lib/task_record.py request_text reads it from there, so (a) is never empty for it.
+if [[ -n "$req_file" ]]; then add_segments "$req_file" request; fi
+for ((i = 0; i < ${#read_briefs[@]}; i++)); do add_segments "${read_briefs[$i]}" "brief-$(printf '%02d' $(( i + 1 )))"; done
+if [[ -s "$dir/followups.md" ]]; then add_segments "$dir/followups.md" followups; fi
+# The reviewer contract's own acceptance list, ahead of the diff; the contract itself stays in (f).
+if [[ -n "$contract_acceptance" ]]; then
+  printf '# Acceptance criteria (from the reviewer contract supplied by Main)\n\n%s\n' "$contract_acceptance" > "$excerpt_dir/contract-acceptance.md" || die "cannot write the contract's acceptance criteria"
+  add_segments "$excerpt_dir/contract-acceptance.md" contract-acceptance
+fi
+scope_at=${#ctx_list[@]}   # (b), the scope file, is inserted here once the packet's headroom is known (below)
+# (c) and (d): the change, then the earlier review rounds of this task and its retry ancestors. The change is the tree now against
+# the review base (the last reviewed state, else the lane's last closed step, else the lane base, else HEAD).
 # Recorded state that cannot be used refuses; nothing is guessed.
 mkdir "$excerpt_dir/rounds"
-rounds="$(python3 "$ROOT/lib/review_rounds.py" prepare "$state_dir" "$id" "$author_workdir" "$excerpt_dir/rounds")" ||
+rounds="$(python3 "$ROOT/lib/review_rounds.py" prepare "$state_dir" "$id" "$author_workdir" "$excerpt_dir/rounds" "$author_lane")" ||
   die "cannot gather the earlier review rounds for '$id'"
 round_count="$(jq -r '.rounds' <<<"$rounds")"
 snapshot="$(jq -c '.snapshot' <<<"$rounds")"
@@ -318,11 +367,33 @@ while IFS= read -r skipped; do
   echo "tp-review: earlier review '$skipped' has no reply; not attached" >&2
 done < <(jq -r '.skipped[]' <<<"$rounds")
 while IFS= read -r withheld; do
-  echo "tp-review: sensitive path '$withheld' changed since the last round; its contents were withheld from the diff" >&2
+  if (( round_count > 0 )); then echo "tp-review: sensitive path '$withheld' changed since the last round; its contents were withheld from the diff" >&2
+  else echo "tp-review: sensitive path '$withheld' changed against the review base; its contents were withheld from the diff" >&2; fi
 done < <(jq -r '.withheld[]' <<<"$rounds")
 redactions="$(jq -r '.redactions' <<<"$rounds")"
 if (( redactions > 0 )); then echo "tp-review: $redactions secret-like value(s) in the earlier findings and diff were replaced with placeholders" >&2; fi
 while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -r '.contexts[]' <<<"$rounds")
+# (e) The added test lines that wait on a clock (a research report has no diff). Computed here, never by the reviewer; facts only.
+if [[ -z "${extra[*]+x}" ]]; then
+  python3 "$ROOT/lib/review_rounds.py" timers "$author_workdir" "$author_lane" "$excerpt_dir/timer-waits.md" || die "cannot compute the timer waits for '$id'"
+  add_segments "$excerpt_dir/timer-waits.md" timer-waits
+  review_task="$review_task The context file headed 'Timer waits in added test lines' lists the added test lines that wait on a clock, as path:line: text; they are facts only, and you judge whether each is a defect."
+fi
+# (f) What Main supplied: each file is copied under its heading, then split like the author's evidence when large. A segment's label
+# names the file Main gave. The evidence comes first, in the order given, then the contract, the dispositions and the sweep.
+supplied_n=0
+attach_supplied() {  # <file> <heading> <note, may be empty> <label>
+  local out="$excerpt_dir/$4.md"
+  { printf '# %s\n\n' "$2"; [[ -z "$3" ]] || printf '%s\n\n' "$3"; cat -- "$1"; } > "$out" || die "cannot read '$1' to attach it to the review"
+  add_segments "$out" "$4" "$1"
+}
+for ((i = 0; i < ${#evidence[@]}; i++)); do
+  f="${evidence[$i]}"
+  supplied_n=$(( supplied_n + 1 ))
+  attach_supplied "$f" "Evidence supplied by Main: $(basename "$f")" "(Produced by the orchestrator, not the author. Check it like any other claim.)" "main-evidence-$(printf '%02d' "$supplied_n")"
+done
+if [[ "$have_contract" == 1 ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
+if [[ "$have_dispositions" == 1 ]]; then attach_supplied "$dispositions" "Dispositions of earlier findings (supplied by Main)" "" main-dispositions; fi
 # The sweep this work was given and the coder's table for it (tp-agent review passes --sweep): one file, the sweep then the rows as the
 # report gave them. The unresolved rows with no Closes by: note are recorded after the start (lib/review_verdict.py holds an approval to them).
 sweep_open='[]'
@@ -340,44 +411,49 @@ if [[ "$have_sweep" == 1 ]]; then
     review_task="$review_task The coder left $(jq -r 'length' <<<"$sweep_open") row(s) unresolved with no 'Closes by:' note in the Evidence cell ($(jq -r '.[:10] | map(.[:100]) | join(", ")' <<<"$sweep_open")$(jq -r 'if length > 10 then ", and \(length - 10) more" else "" end' <<<"$sweep_open")): this work cannot be APPROVED or APPROVED_WITH_NOTES until each has such a note (an approval is then recorded as incomplete); say so as a finding that ends 'Closes by: decision' or 'Closes by: code'."
   fi
 fi
-# What Main supplied: each file is copied under its heading, then split like the author's evidence when large. A segment's label
-# names the file Main gave. The evidence comes first, in the order given, then the contract.
-supplied_n=0
-attach_supplied() {  # <file> <heading> <note, may be empty> <label>
-  local out="$excerpt_dir/$4.md"
-  { printf '# %s\n\n' "$2"; [[ -z "$3" ]] || printf '%s\n\n' "$3"; cat -- "$1"; } > "$out" || die "cannot read '$1' to attach it to the review"
-  add_segments "$out" "$4" "$1"
-}
-for ((i = 0; i < ${#evidence[@]}; i++)); do
-  f="${evidence[$i]}"
-  supplied_n=$(( supplied_n + 1 ))
-  attach_supplied "$f" "Evidence supplied by Main: $(basename "$f")" "(Produced by the orchestrator, not the author. Check it like any other claim.)" "main-evidence-$(printf '%02d' "$supplied_n")"
-done
-if [[ "$have_contract" == 1 ]]; then attach_supplied "$contract" "Reviewer contract (supplied by Main)" "" main-contract; fi
-if [[ "$have_dispositions" == 1 ]]; then attach_supplied "$dispositions" "Dispositions of earlier findings (supplied by Main)" "" main-dispositions; fi
-# The added test lines that wait on a clock (a research report has no diff). Computed here, never by the reviewer; facts only.
-if [[ -z "${extra[*]+x}" ]]; then
-  python3 "$ROOT/lib/review_rounds.py" timers "$author_workdir" "$author_lane" "$excerpt_dir/timer-waits.md" || die "cannot compute the timer waits for '$id'"
-  add_segments "$excerpt_dir/timer-waits.md" timer-waits
-  review_task="$review_task The context file headed 'Timer waits in added test lines' lists the added test lines that wait on a clock, as path:line: text; they are facts only, and you judge whether each is a defect."
-fi
-# The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
-# The scope text is sized to the packet's remaining headroom. Any overflow list goes to $dir/review-changed-files.txt (named in the assignment, not attached, so it cannot exceed the packet budget).
-# Never fails the review: when the list cannot be made, the assignment says so in one line.
+# The author's account, after every independent item: a heading file, then (g) its packet and (h) its result; (i) task.md (Main's
+# Orient/Frame and the request as recorded) follows as the last context, handed to tp-spawn below.
+cat > "$excerpt_dir/author-account.md" <<'EOF'
+# Author's account (read after forming your own findings)
+
+The files after this one are the author's packet and the author's result, and then task.md, which holds the request as recorded and
+Main's Orient/Frame. They are claims, not evidence: form your findings from the diff and the tree first, then check each claim
+here against what you found.
+EOF
+ctx_list+=("$excerpt_dir/author-account.md")
+add_segments "$dir/packet.md" author-packet
+add_segments "$dir/result.md" author-result
+# (b) The changed-file list and the scoped git commands, so the reviewer never needs an unscoped diff (which may print credential files).
+# They are the context file diff-scope.md, placed between the request and the diff (at scope_at), sized to the packet's remaining headroom.
+# Any overflow list goes to $dir/review-changed-files.txt (named in the file, not attached, so it cannot exceed the packet budget).
+# Never fails the review: when the list cannot be made, the file says so in one line.
 scope=""
 if [[ -z "${extra[*]+x}" ]]; then  # a research report has no diff
-  # The scope text may use only what the packet has left after the evidence and the round text (reserve 2000 chars for that line).
-  scope_budget=$(( max_packet - packet_reserve - ${#review_task} - 2000 ))
-  for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
+  scope_note=" The changed files and the scoped git commands are in the context file headed 'Scope of the change', between the request and the diff."
+  review_task="$review_task$scope_note"
+  # The scope text may use only what the packet has left after the evidence and the round text (reserve 2000 chars for that line, and
+  # the file's heading and per-file overhead).
+  scope_heading=$'# Scope of the change (changed files and scoped git commands)\n\n'
+  scope_budget=$(( max_packet - packet_reserve - ${#review_task} - 2000 - ${#scope_heading} - per_file_overhead ))
+  for f in "$dir/task.md" "${ctx_list[@]}"; do
     scope_budget=$(( scope_budget - $(wc -c < "$f") - per_file_overhead ))
   done
   (( scope_budget >= 0 )) || scope_budget=0
-  scope="$(python3 "$ROOT/lib/review_rounds.py" scope "$author_workdir" "$author_lane" "$dir/review-changed-files.txt" "$scope_budget" 2>/dev/null | jq -r '.text' 2>/dev/null)" || scope=""
+  # The changed-file list is the one prepare computed with the diffs above (scope-input.json), never worked out again.
+  scope_input=(); scope_file="$(jq -r '.scope_input // empty' <<<"$rounds")"
+  if [[ -n "$scope_file" ]]; then scope_input=(--input "$scope_file"); fi
+  scope="$(python3 "$ROOT/lib/review_rounds.py" scope "$author_workdir" "$author_lane" "$dir/review-changed-files.txt" "$scope_budget" ${scope_input[@]+"${scope_input[@]}"} 2>/dev/null | jq -r '.text' 2>/dev/null)" || scope=""
   [[ -n "$scope" ]] || scope="Diff scope: the changed-file list could not be computed; inspect the files you need directly."
-  review_task="$review_task $scope"
+  printf '%s%s\n' "$scope_heading" "$scope" > "$excerpt_dir/diff-scope.md" || die "cannot write the scope of '$id'"
+  ordered=()   # ctx_list with the scope file at scope_at (always before the author's account, so the list is never empty here)
+  for ((i = 0; i < ${#ctx_list[@]}; i++)); do
+    if (( i == scope_at )); then ordered+=("$excerpt_dir/diff-scope.md"); fi
+    ordered+=("${ctx_list[$i]}")
+  done
+  ctx_list=("${ordered[@]}")
 fi
 if (( round_count > 0 )); then
-  review_task="$review_task This is review round $(( round_count + 1 )) of this work. The findings of the $round_count earlier round(s) are attached oldest first, then the diff of the working tree since the last reviewed state. For each earlier finding say whether it is fixed, citing it by round and number (for example round 1 F2); when a new finding repeats an earlier one, name that family. Review the whole change again, not only the fixes: the diff shows only what changed since the last round, and a fix can break what an earlier round passed."
+  review_task="$review_task This is review round $(( round_count + 1 )) of this work. The diff of the working tree since the last reviewed state is attached after the request and the scope (against the review base instead when an earlier round recorded no usable state), then the findings of the $round_count earlier round(s), oldest first. For each earlier finding say whether it is fixed, citing it by round and number (for example round 1 F2); when a new finding repeats an earlier one, name that family. Review the whole change again, not only the fixes: the diff shows only what changed since the last round, and a fix can break what an earlier round passed."
   used_families="$(jq -r '[.families | to_entries[] | select(.value | length > 0) | "round \(.key + 1): \(.value | join(", "))"] | join("; ")' <<<"$rounds")"
   if [[ -n "$used_families" ]]; then
     review_task="$review_task Family names used by the earlier rounds: $used_families. For each finding that belongs to one of these families end it with 'Family: <that name>' exactly as written (before its 'Closes by:' line); for a finding that is new, say in the finding that it is new."
@@ -389,7 +465,7 @@ if (( round_count > 0 )); then
   fi
 fi
 total=$(( packet_reserve + ${#review_task} ))
-for f in "$dir/task.md" ${followups[@]+"${followups[@]:1}"} "${ctx_list[@]}"; do
+for f in "$dir/task.md" "${ctx_list[@]}"; do
   total=$(( total + $(wc -c < "$f") + per_file_overhead ))
 done
 (( total <= max_packet )) ||
@@ -404,7 +480,7 @@ fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
 if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer --review-of "$id" ${lane_args[@]+"${lane_args[@]}"} \
-  --context "$dir/task.md" ${followups[@]+"${followups[@]}"} ${ctx_args[@]+"${ctx_args[@]}"} \
+  ${ctx_args[@]+"${ctx_args[@]}"} --context "$dir/task.md" \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy ($independence)" ${same_provider_note[@]+"${same_provider_note[@]}"} \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
@@ -419,6 +495,8 @@ jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --a
 review_dir="$(tp_task_dir "$session" "$review_id")"
 tp_not_link --root "$state_dir" "$review_dir"
 printf '%s\n' "$id" | tp_write "$review_dir/review-of" --root "$state_dir"
+# The order version of the packet this reviewer was given, so evals can split reviews made before and after the order changed.
+jq --arg order "$PACKET_ORDER" '. + {packet_order:$order}' "$review_dir/meta.json" | tp_write "$review_dir/meta.json" --root "$state_dir" --fresh
 # The sweep rows the reply must not approve past; lib/review_verdict.py read_review applies them for every reader of the reply.
 if [[ "$have_sweep" == 1 ]]; then jq -nc --argjson open "$sweep_open" '{open:$open}' | tp_write "$review_dir/sweep-rows.json" --root "$state_dir"; fi
 # The working tree this reviewer saw; the next round's diff starts here. Absent when the workdir is not a git repository.

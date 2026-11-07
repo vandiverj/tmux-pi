@@ -270,6 +270,17 @@ class AcceptanceCriteriaTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(review_verdict.acceptance_items(text), want)
 
+    def test_the_acceptance_text_is_the_list_sections_as_written(self):
+        # bin/tp-review attaches this ahead of the diff when the criteria are only in the contract
+        for name, text, want in (
+                ("heading section stops at the next heading", BRIEF, "## Done means\n1. First thing.\n   continued line\n2. Second thing.\n3. Third thing."),
+                ("a fenced block stays whole", "## Acceptance criteria\n1. a\n```\n## not a heading\n```\n2. b\n", "## Acceptance criteria\n1. a\n```\n## not a heading\n```\n2. b"),
+                ("two sections", "## Done means\n1. a\n\n## Acceptance criteria\n1. b\n", "## Done means\n1. a\n\n## Acceptance criteria\n1. b"),
+                ("a heading with no numbered list gives nothing", "## Done means\n- a bullet\n", ""),
+                ("no heading", "judge it well\n1. a\n", "")):
+            with self.subTest(name):
+                self.assertEqual(review_verdict.acceptance_text(text), want)
+
     def test_two_sources_are_joined(self):
         self.assertEqual(review_verdict.acceptance_items(BRIEF, "## Acceptance criteria\n1. x\n4. y\n"), [1, 2, 3, 4])
 

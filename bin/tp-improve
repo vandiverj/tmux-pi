@@ -3,7 +3,7 @@
 
 Usage:
   tp-improve report [--last N] [--since YYYY-MM-DD] [--json] [session.jsonl ...]
-  tp-improve routines --project DIR [--role R] [--since YYYY-MM-DD] [--min-tasks 3] [--json] [--out PATH]
+  tp-improve routines --project DIR [--role R] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--min-tasks 3] [--json] [--out PATH]
 
 Reads agent/sessions/*/*.jsonl (newest N, default 5, or the files you name) and reports
 measurable friction, ranked by cost: compaction storms, files re-read, main-model work
@@ -136,14 +136,15 @@ def main():
     rt.add_argument("--project", required=True, help="project directory that holds .tmux-pi/sessions")
     rt.add_argument("--role")
     rt.add_argument("--since", default="", help="only tasks created on or after YYYY-MM-DD")
+    rt.add_argument("--until", default="", help="only tasks created on or before YYYY-MM-DD")
     rt.add_argument("--min-tasks", type=int, default=3)
     rt.add_argument("--json", action="store_true")
     rt.add_argument("--out", default="", help="write the report here; previous counts are kept in PATH.counts.json")
     args = ap.parse_args()
     if args.cmd == "routines":
         try:
-            text, warnings = routines.run(args.project, role=args.role or "", since=args.since, min_tasks=args.min_tasks,
-                                          as_json=args.json, out=args.out)
+            text, warnings = routines.run(args.project, role=args.role or "", since=args.since, until=args.until,
+                                          min_tasks=args.min_tasks, as_json=args.json, out=args.out)
         except (ValueError, OSError) as exc:
             print("tp-improve routines: {}".format(exc), file=sys.stderr)
             return 2

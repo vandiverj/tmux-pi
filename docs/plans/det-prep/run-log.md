@@ -113,3 +113,8 @@
 - C2 r3: APPROVED_WITH_NOTES (the only note is that the 4 orchestration failures weren't reproduced on the base; Main's diagnosis traces them to the session env leaking into the tests). Committed as `1263473`, lane closed, merged as `1abfb88`.
 - Owner: "send an agent to figure out why the 4 failures are occuring". Cause: `tests/test_orchestration.py` passes `CLAUDE_CODE_SESSION_ID`/`TP_MAIN_ID` through to `tp-agent`, so "main missing" is filled in from the env (since `03065fe`). The tests pass when those variables are unset. Owner: "yes, open the lane and rerun the baseline list". The baseline modules are being rerun without the session env; the lane brief follows from the result.
 - F1 r7 and D1 r7 (final) coders are done; Main is running their tests.
+
+## 2026-11-08 01:30Z: D1 merged; F1 parked to the owner
+- D1 r7 (final): APPROVED_WITH_NOTES (report-evidence gaps only). Committed as `cbf045b`, lane closed, merged into lane/integrate as `5ea21ba`.
+- F1 r7 (final): REQUEST_CHANGES on a new sweep site. `bin/tp-contract:138-140,226` writes `task.md` through `write_record` with absolute paths, without `relative=True`. If a `tp-contract status` lands between the reconcile and the rename in `lib/task_record.py:837-868`, the archived record links to the old location. Family: retirement-dependency-order. As planned, F1 is **parked for the owner** after round 7. The worktree `tmux-pi-wt-status-cleanup` is left uncommitted and intact. Options for the owner: (a) one more round that applies `relative=True` to every `write_record` caller, enforced by a parity test over the callers, or (b) take the rename under the same task lock that `tp-contract` holds.
+- Battle-soccer V-F waits on F1.

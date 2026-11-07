@@ -15,4 +15,6 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 
 | H9 | **Start check.** tp-spawn (or the status poller) confirms a worker actually took its first prompt (transcript has a user turn, or the context counter rises) within N minutes, and flags the task `stalled` with the pane's last lines (for example "Please run /login") instead of reporting "working". Found live: 6 coders idle 80 min behind an expired login. | wall_s, deterministic failure detection | Main (observed 2026-11-07) | low | open |
 
+| H10 | **Haiku and the redaction hook.** With redaction on, lib/redact_hook.py rewrites every Bash command (appends `|| echo exit-code: nonzero`); Claude Haiku workers treat the rewrite notice as untrusted and stop running Bash, so their steps return incomplete. Fix options: do not rewrite (use PostToolUse only), word the notice so it reads as the harness, or route Claude coders above Haiku when redaction is on. Found live 2026-11-07 (E1, G1). | code_pass, wall_s | Main (observed) | low | open |
+
 Research runs append below this table with their ids.

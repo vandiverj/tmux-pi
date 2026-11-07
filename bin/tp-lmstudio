@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# tp-lmstudio — make sure the LM Studio models this machine's config uses are loaded.
+# tp-lmstudio — make sure the LM Studio models this machine's config uses are loaded, at the size and lifetime
+# config/local-model.json (`local_model`) allows.
 #
 # Usage: tp-lmstudio [ensure|status] [model-id...]
-#   ensure  start LM Studio's server if it is not answering, then load each model that
-#           is not loaded, with no idle unload (default); it asks for the contextWindow
-#           agent/models.json gives the model (LM Studio's MLX engine may fit a larger one)
-#   status  show each model as loaded or not; exit 1 if any is not
+#        tp-lmstudio unload [--if-idle STATE_DIR...] [model-id...]
+#   ensure  start LM Studio's server if it is not answering, then load each model that is not loaded, at the context
+#           agent/models.json gives it (or local_model.context) with --ttl local_model.ttl_seconds. A model loaded with a
+#           context more than 10% above that is unloaded and loaded again at it when local_model.reload_if_larger is true
+#           and no local worker of this session is live; otherwise it is only reported, with the command that reloads it
+#   status  show each model as loaded or not, with its context, TTL and the LM Studio engine's RSS; exit 1 if any is not
+#   unload  unload each loaded model. With --if-idle, do nothing when a listed state directory has a live local worker
+#           (tp-exit uses this for local_model.unload_on_exit)
 #
 # Without model ids: the lmstudio models config/router.json and config/local.json can
 # send work to (routes, escalation, rules, and the follow-up judge when LM Studio
 # serves it), plus the redaction reviewer in config/redaction.json. Nothing to do when
-# the config uses none. TP_LMS names the lms binary.
+# the config uses none. TP_LMS names the lms binary; TP_AGENT names tp-agent (tests).
+# config/local-model.json: local_model.context (default: the model's contextWindow), ttl_seconds (1800),
+# reload_if_larger (true), unload_on_exit (false, read by tp-exit).
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -22,7 +29,35 @@ done
 ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 
 action="${1:-ensure}"
-case "$action" in ensure|status) shift || true ;; *) echo "usage: tp-lmstudio [ensure|status] [model-id...]" >&2; exit 2 ;; esac
+case "$action" in ensure|status|unload) shift || true ;; *) echo "usage: tp-lmstudio [ensure|status|unload] [model-id...]" >&2; exit 2 ;; esac
+
+# unload --if-idle DIR...: the state directories to check; everything after them is nothing (no model ids).
+idle_dirs=()
+if [[ "$action" == unload && "${1:-}" == --if-idle ]]; then
+  shift
+  idle_dirs=("$@")
+  set --
+fi
+
+# A live local worker in a state directory: tp-agent lists it as starting, working or needing input, on a pi worker that
+# runs an LM Studio model (the rule tp-agent uses for its own local slots). Not knowing is busy: an empty or unreadable
+# listing counts as a live worker, so nothing is unloaded on a guess.
+lms_busy() {
+  local dir="$1" rows
+  [[ -n "$dir" ]] || return 0
+  rows="$(TP_STATE_DIR="$dir" "${TP_AGENT:-$ROOT/bin/tp-agent}" list 2>/dev/null)" || return 0
+  jq -e 'type == "array"' <<<"$rows" >/dev/null 2>&1 || return 0
+  jq -e 'any(.[]; (.status == "starting" or .status == "working" or .status == "needs_input") and .harness == "pi" and ((.model // "") | startswith("lmstudio/")))' <<<"$rows" >/dev/null 2>&1
+}
+
+if [[ "$action" == unload && ${#idle_dirs[@]} -gt 0 ]]; then
+  for dir in "${idle_dirs[@]}"; do
+    if lms_busy "$dir"; then
+      echo "tp-lmstudio: not unloading: $dir has a live local worker" >&2
+      exit 0
+    fi
+  done
+fi
 
 # One line per model: id and context window; the provider's base URL first.
 plan="$(python3 - "$ROOT" "$@" <<'EOF'
@@ -64,13 +99,37 @@ models="$(tail -n +2 <<<"$plan")"
 lms="${TP_LMS:-$(command -v lms || echo "$HOME/.lmstudio/bin/lms")}"
 [[ -x "$lms" ]] || { echo "tp-lmstudio: lms not found (install LM Studio, or set TP_LMS)" >&2; exit 1; }
 
+local_cfg="$ROOT/config/local-model.json"
+# local_model.KEY from config/local-model.json, or the default when the key or the file is absent.
+local_setting() {
+  [[ -f "$local_cfg" ]] || { printf '%s\n' "$2"; return 0; }
+  jq -r --arg k "$1" --arg d "$2" '(.local_model // {}) | if has($k) and .[$k] != null then .[$k] | tostring else $d end' "$local_cfg" 2>/dev/null \
+    || { echo "tp-lmstudio: cannot read $local_cfg" >&2; exit 1; }
+}
+ttl="$(local_setting ttl_seconds 1800)"
+reload_larger="$(local_setting reload_if_larger true)"
+context_setting="$(local_setting context "")"
+
 answering() { curl -s --noproxy '*' --max-time 2 -o /dev/null -w '%{http_code}' "$base_url/models" | grep -q '^200$'; }
-# identifier and context length of each loaded model
-loaded() { "$lms" ps --json </dev/null 2>/dev/null | jq -r '.[] | "\(.identifier) \(.contextLength // 0)"'; }
+# identifier, context length and TTL in seconds ("none" when ttlMs is null or missing: loaded without a TTL) of each loaded model
+loaded() { "$lms" ps --json </dev/null 2>/dev/null | jq -r '.[] | "\(.identifier) \(.contextLength // 0) \(if .ttlMs then (.ttlMs / 1000 | floor) else "none" end)"'; }
 context_of() { awk -v id="$1" '$1 == id { print $2 }' <<<"$2"; }
+ttl_of() { awk -v id="$1" '$1 == id { print $3 }' <<<"$2"; }
+# RSS in MB of the model engine processes (0 when none runs): the llmworker and the MLX/llama.cpp backends under
+# ~/.lmstudio/extensions/backends/ (or the same inside the LM Studio app bundle). The LM Studio UI (.../LM Studio.app/
+# Contents/MacOS/LM Studio), its helpers and the lms daemon (~/.lmstudio/bin/lms) are not counted, nor is an unrelated
+# program that merely mentions mlx or lm studio in its arguments. TP_PS names ps (tests).
+engine_mb() {
+  "${TP_PS:-ps}" -axo rss=,command= | awk '
+    { rss = $1; sub(/^[ \t]*[0-9]+[ \t]+/, ""); exe = tolower($0) }
+    exe ~ /^\/([^ ]*\/)?lm studio\.app\// || exe ~ /^\/([^ ]*\/)?\.lmstudio\// {
+      if (exe ~ /llmworker/ || exe ~ /\/extensions\/backends\//) kb += rss
+    }
+    END { printf "%d\n", kb / 1024 }'
+}
 
 if ! answering; then
-  if [[ "$action" == status ]]; then
+  if [[ "$action" != ensure ]]; then
     echo "tp-lmstudio: LM Studio is not answering at $base_url" >&2
     exit 1
   fi
@@ -83,26 +142,64 @@ fi
 
 current="$(loaded)"
 missing=0
-while read -r model window; do
-  have="$(context_of "$model" "$current")"
-  if [[ -n "$have" ]]; then
-    if [[ -n "$window" && "$have" -lt "$window" ]]; then
-      echo "tp-lmstudio: $model is loaded with a $have-token context, below the $window agent/models.json expects; reload it to fix" >&2
+
+if [[ "$action" == unload ]]; then
+  while read -r model _; do
+    [[ -n "$(context_of "$model" "$current")" ]] || continue
+    echo "tp-lmstudio: unloading $model" >&2
+    if ! "$lms" unload "$model" </dev/null >/dev/null 2>&1; then
+      echo "tp-lmstudio: could not unload $model; try: $lms unload $model" >&2
+      missing=1
     fi
-    [[ "$action" == status ]] && echo "$model: loaded (context $have)"
+  done <<<"$models"
+  exit "$missing"
+fi
+
+# load MODEL WINDOW: a fresh load at the context (when one is known), with the TTL; fails when the model is not loaded after.
+load_model() {
+  local args
+  args=(load "$1" -y)
+  [[ -z "$2" ]] || args+=(--context-length "$2")
+  args+=(--ttl "$ttl")
+  echo "tp-lmstudio: loading $1 in LM Studio${2:+ (context $2)}" >&2
+  if ! "$lms" "${args[@]}" </dev/null >/dev/null 2>&1 || [[ -z "$(context_of "$1" "$(loaded)")" ]]; then
+    echo "tp-lmstudio: could not load $1; try: $lms ${args[*]}" >&2
+    return 1
+  fi
+}
+
+while read -r model window; do
+  [[ -z "$context_setting" ]] || window="$context_setting"
+  have="$(context_of "$model" "$current")"
+  if [[ -z "$have" ]]; then
+    if [[ "$action" == status ]]; then
+      echo "$model: not loaded"
+      missing=1
+      continue
+    fi
+    load_model "$model" "$window" || missing=1
     continue
+  fi
+  if [[ -n "$window" && "$have" -lt "$window" ]]; then
+    echo "tp-lmstudio: $model is loaded with a $have-token context, below the $window agent/models.json expects; reload it to fix" >&2
+  fi
+  if [[ -n "$window" ]] && (( have * 10 > window * 11 )); then
+    if [[ "$action" == ensure && "$reload_larger" == true ]] && ! lms_busy "${TP_STATE_DIR:-}"; then
+      echo "tp-lmstudio: $model is loaded with a $have-token context, above the $window it should use; reloading it at $window" >&2
+      if ! "$lms" unload "$model" </dev/null >/dev/null 2>&1; then
+        echo "tp-lmstudio: could not unload $model to reload it; try: $lms unload $model" >&2
+        missing=1
+        continue
+      fi
+      load_model "$model" "$window" || missing=1
+      continue
+    fi
+    echo "tp-lmstudio: $model is loaded with a $have-token context, above the $window it should use; reload it: $lms unload $model && $lms load $model -y --context-length $window --ttl $ttl" >&2
   fi
   if [[ "$action" == status ]]; then
-    echo "$model: not loaded"
-    missing=1
-    continue
-  fi
-  args=(load "$model" -y)
-  [[ -z "$window" ]] || args+=(--context-length "$window")
-  echo "tp-lmstudio: loading $model in LM Studio${window:+ (context $window)}" >&2
-  if ! "$lms" "${args[@]}" </dev/null >/dev/null 2>&1 || [[ -z "$(context_of "$model" "$(loaded)")" ]]; then
-    echo "tp-lmstudio: could not load $model; try: $lms ${args[*]}" >&2
-    missing=1
+    have_ttl="$(ttl_of "$model" "$current")"
+    case "$have_ttl" in none|"") ttl_text="ttl none" ;; *) ttl_text="ttl $have_ttl s" ;; esac
+    echo "$model: loaded (context $have, $ttl_text, engine rss $(engine_mb) MB)"
   fi
 done <<<"$models"
 exit "$missing"

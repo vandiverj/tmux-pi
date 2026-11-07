@@ -17,7 +17,7 @@
           "thinkingLevelMap": {
             "off": "none"
           },
-          "contextWindow": 131072,
+          "contextWindow": 65536,
           "maxTokens": 32768,
           "cost": {
             "input": 0,

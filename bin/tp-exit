@@ -21,6 +21,34 @@ session="$(tp_session)"
 # redisplayed as killed workers when the same workdir is opened again. Retain or
 # archive task records according to the retention policy; never delete blindly.
 state_dir="$(tp_opt "$session" @tp_state_dir)"
+
+# local_model.unload_on_exit (config/local-model.json, default false): unload LM Studio's models unless another tmux-pi
+# session has a live local worker. The other sessions are listed first, while this one is still up: killing the last
+# session shuts the tmux server down, and a listing after that fails. When the listing fails (no server answers),
+# nothing is unloaded.
+local_cfg="$ROOT/config/local-model.json"
+unload_args=()
+if [[ -f "$local_cfg" ]] && [[ "$(jq -r '.local_model.unload_on_exit // false' "$local_cfg" 2>/dev/null)" == true ]]; then
+  if sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)"; then
+    unload_args=(unload --if-idle)
+    while IFS= read -r name; do
+      [[ -n "$name" && "$name" != "$session" ]] || continue
+      other="$(tmux show-options -qv -t "=$name:" @tp_state_dir 2>/dev/null)" || continue
+      [[ -n "$other" && "$(tp_canon "$other")" != "$(tp_canon "$state_dir")" ]] || continue
+      unload_args+=("$other")
+    done <<<"$sessions"
+  fi
+fi
+
+# Start the unload now, detached, so no later step can stop it. tp-exit may run in a pane of this session; tp-reset
+# below kills that pane (and this script), as does kill-session. Not `tmux run-shell -b` (it dies with the server when
+# the last session closes) and not setsid (macOS has none). --if-idle checks only the OTHER sessions' state dirs: this
+# session's workers are about to be stopped, so not waiting for them is correct.
+if [[ ${#unload_args[@]} -gt 0 ]]; then
+  nohup "$ROOT/bin/tp-lmstudio" "${unload_args[@]}" >/dev/null 2>&1 </dev/null &
+  disown
+fi
+
 # Checkpoint the attached workspaces first, while the task records still say what happened; it never blocks the exit.
 if [[ -n "$state_dir" ]]; then
   TP_STATE_DIR="$state_dir" TP_WORK_LOCK_TIMEOUT=2 "$ROOT/bin/tp-agent" work checkpoint --auto --trigger session-end >/dev/null 2>&1 || true

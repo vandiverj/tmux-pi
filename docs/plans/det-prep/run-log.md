@@ -68,3 +68,9 @@
   - lib/sensitive_read.py treats agent/, config/ and claude/ (CREDENTIAL_DIRS, line 61) as credential dirs, even for plain git grep.
   - Plain git grep reads tracked files only. The credential files (agent/auth.json, agent/sessions/, config/local.json) are gitignored, and none are tracked in any lane worktree.
 - 22:35 UTC — The owner approved Fix B. Lane sensitive-grep K1 dispatched as coder-5c2f8af2df (Opus, base lane/integrate). Fix A interim: the search note is appended to review evidence from now on; the real change goes into D2 (bin/tp-review).
+
+## 2026-11-07 23:00Z: G1 merged; E1 round 4 rejected; five reviews out
+- G1 round 4: APPROVED_WITH_NOTES (the note asks only for the missing sweep table). Committed as `e854161`, lane closed, merged into lane/integrate as `46e44b0`. `test_lmstudio` passes 16 of 16 there.
+- E1 round 4: REQUEST_CHANGES. One new site in the probe-specificity family: `git_subcommands` treats a shell comment as a command, so `echo ok # x && git fetch` counts as a fetch. All eight swept rows were confirmed. Waiting on the owner: a round 5 or a merge with the limit documented.
+- C2, F1 r4, D1 r4, B1 r2, K1: Main ran each coder's modules in its own worktree. The only failures were 4 in `test_orchestration` (C2) and 1 in `test_sensitive_trust` (K1), all listed in the baseline. Reviews went out with the search note. C2 was held because its status line was mid-sentence; it has been asked to restate.
+- K1 open owner decision: tracked `agent/mcp.json`, `claude/mcp.json` and `bin/tp-secret-exec` keep the prompt for `agent/`, `claude/` and the repo root.

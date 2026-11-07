@@ -128,3 +128,17 @@ Then for each: `tp-agent collect TASK`, `tp-agent review TASK` (router picks the
 close LANE STEP`. Phase 2 and 3 steps use the same shape with the next brief; B1 waits for A1 to be merged to
 `lane/integrate`. Local verification runs are `tp-agent dispatch --local-only --role tester --task "Run CMD in DIR and
 quote the last 20 lines and the exit line" --tests none`.
+
+## Added 2026-11-07: from the owner's campaign prompts, status list and LM Studio
+
+| Lane | Steps | Brief | Waits for | Level |
+|---|---|---|---|---|
+| F `status-cleanup` | F1 | `f1-status-cleanup.md` | none | mid |
+| G `local-model` | G1 | `g1-local-model-load.md` | none | small |
+| H `main-guards` | H1 | `h1-main-guards.md` | C1 merged | mid |
+| I `campaign` | i1, i2, i3, i4 | `i1-campaign-mechanics.md` | C1, D1, D2 merged; i4 after B1 | mid |
+
+F1 and G1 can start now beside Phase 1 (no shared files). After I lands, `docs/prompt-examples/` is rewritten to drop the
+rules tmux-pi now enforces; that edit is a `small` coder step with the list of rules as its input. One rule there is
+already stale: `04-tmux-pi-operations.md` says a REQUEST_CHANGES with no `code` finding is "not built yet", but
+lib/review_verdict.py already treats it as unusable.

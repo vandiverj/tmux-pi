@@ -95,3 +95,9 @@
 - D1 r5 REQUEST_CHANGES: a prior-HEAD filter hides base→HEAD. Retry `coder-c905fc8013` (`fixes/d1-round6.md`): no filter but the four states.
 - B1 r3 REQUEST_CHANGES: `tp_json_str` drops control bytes. Retry `coder-7fb9a831b4` (`fixes/b1-round4.md`): a single Python serializer and a byte round-trip table. Main accepted the base ImportError as the before-state for the new module.
 - K1 r2 (allowlist plus option 2) and C2 r2 (CommonMark) are done; Main is running their tests.
+
+## 2026-11-08 00:30Z: K1 r2 and C2 r2 rejected; F1/D1/B1 coders done
+- The K1 r2 reviewer hit "Authorize sensitive read?" (a recursive search of a temp fixture). It was denied with Escape and redirected to literal paths and direct classifier calls, and it finished without a second prompt.
+- K1 r2 REQUEST_CHANGES: `--assume-unchanged`, `--skip-worktree` and `core.filemode=false` hide edits from `git diff --raw`. Retry `coder-805ee335ab` (`fixes/k1-round3.md`): hash the bytes on disk to a git blob id and compare it with HEAD; refuse flagged entries.
+- C2 r2 REQUEST_CHANGES: `#Rules:2-3` is parsed as a range, trailing whitespace handling, and the parity test is not on the table fixtures. Retry `coder-17ff9d75bb` (`fixes/c2-round3.md`): one parse order.
+- F1 r6, D1 r6 and B1 r4 coders are done; Main is running their tests.

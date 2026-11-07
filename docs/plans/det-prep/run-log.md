@@ -81,3 +81,10 @@
 - B1 r2 REQUEST_CHANGES: an ESLint aggregate across apps, a TypeError on a wrong-typed field, and a record written without a tree. Retry `coder-a7350b4c4b` (design): `fixes/b1-round3.md`, per-app checks, a type table, and fail closed.
 - K1 r1 REQUEST_CHANGES: `-f FILE` and `--textconv` pass as plain. Retry `coder-3a6e22f84f`: `fixes/k1-round2.md`, an option allowlist checked by a parity test against `git grep -h`.
 - C2 is in review (`review-coder-86b4ed5fe2-170237`).
+
+## 2026-11-07 23:40Z: owner decisions applied (E1 accepted limit, K1 option 2)
+- Owner: "use your recommendations for E1 and K1 questions".
+- E1: the comment limit is documented in the `_simple_commands` docstring and carried into `e2-claude-coverage.md`. Committed in the worktree as `6fbb8c9`. `lane close` needs a review of this tree, and `--override-review` is not allowed, so a fresh review is out with evidence that the owner accepted the limit.
+- K1: option 2 is added to `fixes/k1-round2.md`: a tracked credential-named file that matches the committed version no longer blocks the lift. Before adding it, Main checked the committed files by structure only, with no values printed. Every credential field in both `mcp.json` files is a `${VAR}` reference, and `tp-secret-exec` has no token-like strings. The running K1 coder was messaged.
+- C2 r1 REQUEST_CHANGES (four-backtick fence, trailing `#`, empty heading). Retry `coder-52ad5a71e4`: `fixes/c2-round2.md`, CommonMark fence and heading rules.
+- F1 r5, D1 r5 and B1 r3 coders finished; Main is running their tests.

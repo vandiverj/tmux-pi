@@ -18,3 +18,21 @@ Any option that reads a file (`-f`, `--file`, `--exclude-from`…), runs or chan
 - A parity test that parses `git grep -h` output (the options git actually knows) and asserts every option not on the allowlist keeps the prompt.
 
 Leave the tracked-credential-name rule unchanged; that decision is with the owner.
+
+## Added by the owner's decision (option 2)
+A tracked credential-named file under the root no longer blocks the lift when the working copy is exactly the committed version:
+- the file is a regular file, not a symlink, in both HEAD and the working tree;
+- the index entry equals HEAD;
+- the working-tree content equals the index (`git diff --quiet HEAD -- <file>` through `_git_ask`).
+
+git grep then reads only content already in history. Any difference (unstaged edit, staged edit, type change, symlink, or a git error or timeout) keeps the prompt, as now. Batch the check into one guarded query per root, not one per file.
+
+Owner check (2026-11-07): in this repo the committed `agent/mcp.json` and `claude/mcp.json` hold only `${VAR}` references for credentials, and `bin/tp-secret-exec` holds no token-like strings.
+
+Extra table rows:
+- clean tracked `mcp.json` → lift;
+- `mcp.json` with an unstaged edit → prompt;
+- staged edit → prompt;
+- a tracked `mcp.json` replaced on disk by a symlink → prompt;
+- the git diff query failing → prompt;
+- a clean tracked `*secret*` name → lift.

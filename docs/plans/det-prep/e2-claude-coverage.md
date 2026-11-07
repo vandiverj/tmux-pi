@@ -24,3 +24,6 @@ change that shifts cost from workers to Main would look like a saving. Its re-re
 3. The routines text report shows `measured` beside `est`, and the count of calls measured.
 4. Pi-only behaviour is unchanged (existing tests pass).
 5. Tests for 1 to 3 fail without the change.
+
+## Carried from E1 (accepted limit, 2026-11-07)
+E1 merged with one known limit: `_simple_commands` in `lib/routines.py` does not treat `#` as starting a shell comment, so `echo ok # x && git fetch` counts as a fetch (review-coder-169502cc17-162755 F1). E2 closes it by rule: tokenise as the shell does, where an unquoted `#` at a word start ends the command line. Test it with a table (comments after `;`, `&&` and `|`, a `#` inside quotes, a `#` mid-word as in `a#b`, a heredoc body) and a parity test against `bash -n`/`bash -c 'set -v'` output where practical.

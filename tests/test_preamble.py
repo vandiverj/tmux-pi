@@ -139,12 +139,17 @@ class RenderTests(Base):
             size = sum(len(entry[k].encode()) for k in ("name", "use", "usage", "output"))
             self.assertLessEqual(size, agent_tools.ENTRY_MAX, entry["name"])
 
-    def test_the_test_run_stub_exits_2_with_the_exit_line_last(self):
-        stub = ROOT / "tools" / "agent" / "test-run.sh"
-        self.assertTrue(os.access(stub, os.X_OK))
-        out = subprocess.run([str(stub), str(self.work), "--", "true"], capture_output=True, text=True)
-        self.assertEqual(out.returncode, 2)
+    def test_the_listed_test_run_script_is_the_real_one_and_no_role_names_tp_agent_test_run(self):
+        script = ROOT / "tools" / "agent" / "test-run.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        out = subprocess.run([str(script), str(self.work), "--", "true"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)  # not a git worktree: refused with the exit line last, not "not implemented"
+        self.assertNotIn("not implemented", out.stdout)
         self.assertEqual(out.stdout.splitlines()[-1], "exit=2 log=-")
+        for role in (ROOT / "agent" / "roles").glob("*.md"):
+            self.assertNotIn("tp-agent test-run", role.read_text(), role.name)
+        for role in ("coder", "tester"):
+            self.assertIn("tools/agent/test-run.sh", (ROOT / "agent" / "roles" / f"{role}.md").read_text())
 
     def test_manifest_without_a_preamble_file_still_renders(self):
         self.manifest([TOOL])

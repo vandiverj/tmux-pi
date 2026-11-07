@@ -152,3 +152,6 @@ lib/review_verdict.py already treats it as unusable.
 Order of the remaining work: Phase 2 (B1 C2 E2), Phase 3 (B2 D2), J1 and its control runs, H1, i1 to i4, the
 prompt-examples cleanup, then the improvement loop in `loop/PROTOCOL.md` (research run first, then cycles). The loop's
 state is entirely in `loop/`; read `loop/PROTOCOL.md` after any compaction.
+
+## Added 2026-11-07 (3): lane K `sensitive-grep`
+The owner opened K1 (`k1-tracked-git-grep.md`): a plain `git grep` over agent/, config/ or claude/ stops prompting when git tracks no credential file there. It is based on lane/integrate, the coder is Opus, and it gets a cross-provider review. Fix A, the reviewer instruction in `bin/tp-review:219`, is folded into D2. Until then, Main appends `review-search-note` text to every review's evidence.

@@ -67,3 +67,4 @@
   - tp-review's outside_rule (bin/tp-review:219) tells reviewers to use safe_read/safe_grep only for files OUTSIDE the worktree.
   - lib/sensitive_read.py treats agent/, config/ and claude/ (CREDENTIAL_DIRS, line 61) as credential dirs, even for plain git grep.
   - Plain git grep reads tracked files only. The credential files (agent/auth.json, agent/sessions/, config/local.json) are gitignored, and none are tracked in any lane worktree.
+- 22:35 UTC — The owner approved Fix B. Lane sensitive-grep K1 dispatched as coder-5c2f8af2df (Opus, base lane/integrate). Fix A interim: the search note is appended to review evidence from now on; the real change goes into D2 (bin/tp-review).

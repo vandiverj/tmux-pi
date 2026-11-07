@@ -30,3 +30,4 @@
 ## Events
 - 2026-11-07T16:24:12Z Owner stepping away for several hours. Started caffeinate for 12 h (keeps the Mac awake on AC power). LM Studio: Qwen loaded at 262144 context with no TTL, left as is so local steps keep working.
 - 2026-11-07T16:25:36Z Owner approved web research: searching and reading sites is allowed; downloading or installing anything is not. WebSearch and WebFetch tested and working without prompts.
+- 2026-11-07T16:32:02Z Baseline full suite on lane/integrate (= main abf72de+): 4011 tests, 2575 s, 114 failures + 378 errors + 65 skipped, all pre-existing. 492 failing ids saved in baseline-failing.txt (mostly test_ctx_nav_api 358, test_trust_guard 58, test_ctx_cli 29, test_docs_cli 20; likely missing deno / Pi Node types and date-bound fixtures). Type check fails: Pi Node types not installed. Merge rule: no failing id outside this list. Because the suite takes 43 min, each merge runs the touched test modules; the full suite runs once per phase.

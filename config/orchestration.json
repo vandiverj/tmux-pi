@@ -1,7 +1,7 @@
 {
   "max_local_workers": 2,
   "max_active_workers": 10,
-  "lanes": { "max_active_lanes": 16 },
+  "lanes": { "max_active_lanes": 20 },
   "trial": {
     "max_local_workers": 1,
     "attempt_timeout_s": 2700,

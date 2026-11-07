@@ -1,0 +1,15 @@
+# Context
+
+Working directory: @WORKDIR@. The files below were chosen for this task; read others only if the task needs them.
+
+## ctx.txt
+
+```txt
+hello
+world
+```
+
+## Notes
+
+- a note
+

@@ -21,7 +21,7 @@
 #   --route-json <json>      routing recommendation and actual selection
 #   -f, --file <path>        read the task from a file
 #   -c, --context <path>     add a file to the context packet; repeatable.
-#                            path[:start-end] adds only those lines.
+#                            path[:start-end] adds only those lines; path#Heading adds that markdown section.
 #                            Relative paths are from the workdir.
 #   -N, --note <text>        add a note to the context packet; repeatable
 #   -C, --conversation <path>  add the user's recent conversation with main
@@ -248,12 +248,36 @@ file_fingerprints() {
     for i in "$@"; do fp_out+=(""); done
   fi
 }
+# split_context <spec> — the one place a --context spec gets its form, in this order (docs/legacy-workflow.md lists it):
+#   1. heading spec: the first '#' (not at the start) whose left side is an existing file; everything after it is the heading, so
+#      file.md#Rules:2-3 is the heading "Rules:2-3" and a#b.md#H is the heading "H" of a#b.md;
+#   2. line-range spec: the spec ends in :a-b and the left side is an existing file (a#b.md:2-3);
+#   3. plain path (a file literally named x:2-3).
+# Sets c_path (absolute), c_range ("a-b"), c_heading (leading #s dropped, whitespace trimmed, all else kept) and c_has_heading.
+# screen_contexts and read_context share it.
+split_context() {
+  local spec="$1" i p h
+  c_path="$spec" c_range="" c_heading="" c_has_heading=""
+  for (( i = 1; i < ${#spec}; i++ )); do
+    [[ "${spec:i:1}" == "#" ]] || continue
+    p="${spec:0:i}"; [[ "$p" == /* ]] || p="$workdir/$p"
+    if [[ -f "$p" ]]; then
+      h="${spec:i+1}"; h="${h#"${h%%[!#]*}"}"
+      h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"
+      c_path="$p" c_heading="$h" c_has_heading=1
+      return 0
+    fi
+  done
+  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
+    p="${BASH_REMATCH[1]}"; [[ "$p" == /* ]] || p="$workdir/$p"
+    if [[ -f "$p" ]]; then c_path="$p" c_range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"; return 0; fi
+  fi
+  c_path="$spec"; [[ "$c_path" == /* ]] || c_path="$workdir/$c_path"
+}
 screen_contexts() {
   local spec p i ok listed=() verdicts reply v fps=()
   for spec in ${contexts[@]+"${contexts[@]}"}; do
-    p="$spec"
-    if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then p="${BASH_REMATCH[1]}"; fi
-    [[ "$p" == /* ]] || p="$workdir/$p"
+    split_context "$spec"; p="$c_path"
     if [[ -f "$p" ]]; then listed+=("$p"); fi
   done
   (( ${#listed[@]} > 0 )) || return 0
@@ -317,21 +341,72 @@ print(last or "")
 PY
 }
 
+# section_range <path> <heading> — the markdown section of an ATX heading, by the CommonMark rules (4.2 headings: 0-3 spaces,
+# 1-6 '#', then space or end of line, an optional closing '#' run after a space dropped, text trimmed; 4.5 fences: 3+ backticks or
+# tildes, closed only by the same character at least as long, 0-3 spaces of indent, nothing after; unclosed runs to the end;
+# setext headings are ignored). The query is the heading text split_context already cleaned, compared case-insensitively. Prints "start end"
+# (to the line before the next heading of the same or higher level, or the end of the file), "empty", "missing", or "ambiguous"
+# then one "line: heading" per match.
+section_range() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+path, query = sys.argv[1], sys.argv[2]
+lines = __import__("pathlib").Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+heads, fence = [], None
+for number, line in enumerate(lines, 1):
+    if fence:
+        close = re.match(r"^ {0,3}(%s{%d,})[ \t]*$" % (re.escape(fence[0]), len(fence)), line)
+        if close:
+            fence = None
+        continue
+    opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+    if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+        fence = opening.group(1)
+        continue
+    found = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$", line)
+    if found:
+        text = re.sub(r"(?:^|[ \t]+)#+[ \t]*$", "", (found.group(2) or "").strip()).strip()
+        heads.append((number, len(found.group(1)), text))
+if not query:
+    print("empty")
+    sys.exit()
+hits = [h for h in heads if h[2].casefold() == query.casefold()]
+if not hits:
+    print("missing")
+elif len(hits) > 1:
+    print("ambiguous")
+    for number, level, text in hits:
+        print(f"{number}: {'#' * level} {text}")
+else:
+    number, level, _ = hits[0]
+    after = [h[0] for h in heads if h[0] > number and h[1] <= level]
+    print(number, (after[0] - 1) if after else len(lines))
+PY
+}
+
 # read_context <spec> — sets path, range, body and label for one --context spec and returns 0; returns 1 for a sensitive
 # file (nothing is read); dies for a missing, binary or too large one. A body over the cap is refused with the cap, the size
 # and the largest range from the same first line that fits. tp-spawn --check runs it too, so dispatch refuses a spec before
 # routing instead of at the launch.
 read_context() {
-  local spec="$1" start end fit lines
-  path="$spec" range="" body="" label=""
-  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
-    path="${BASH_REMATCH[1]}" range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-  fi
-  [[ "$path" == /* ]] || path="$workdir/$path"
+  local spec="$1" start end fit lines heading found
+  split_context "$spec"
+  path="$c_path" range="$c_range" heading="$c_heading" body="" label=""
   [[ -f "$path" ]] || die "context file not found: $spec"
   secret_file "$path" && return 1
   if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
-  if [[ -n "$range" ]]; then
+  if [[ -n "$c_has_heading" ]]; then
+    # lines "start end" for one match; "missing", or "ambiguous" then one "line: heading" per match
+    found="$(section_range "$path" "$heading")"
+    case "${found%%$'\n'*}" in
+      empty) die "context heading is empty: $spec names no heading in ${path#"$workdir"/}" ;;
+      missing) die "context heading not found: no heading \"$heading\" in ${path#"$workdir"/} ($spec)" ;;
+      ambiguous) die "context heading is ambiguous: \"$heading\" matches more than one heading in ${path#"$workdir"/} ($spec):"$'\n'"${found#*$'\n'}"$'\n'"Use a line range with path:start-end" ;;
+    esac
+    start="${found% *}" end="${found#* }" range="$start-$end"
+    body="$(sed -n "${start},${end}p" "$path")"
+    label="${path#"$workdir"/} (section \"$heading\", lines $start-$end)"
+  elif [[ -n "$range" ]]; then
     start="${range%-*}" end="${range#*-}"
     (( start >= 1 && end >= start )) || die "bad line range: $spec"
     body="$(sed -n "${start},${end}p" "$path")"

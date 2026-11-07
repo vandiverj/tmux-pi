@@ -101,3 +101,9 @@
 - K1 r2 REQUEST_CHANGES: `--assume-unchanged`, `--skip-worktree` and `core.filemode=false` hide edits from `git diff --raw`. Retry `coder-805ee335ab` (`fixes/k1-round3.md`): hash the bytes on disk to a git blob id and compare it with HEAD; refuse flagged entries.
 - C2 r2 REQUEST_CHANGES: `#Rules:2-3` is parsed as a range, trailing whitespace handling, and the parity test is not on the table fixtures. Retry `coder-17ff9d75bb` (`fixes/c2-round3.md`): one parse order.
 - F1 r6, D1 r6 and B1 r4 coders are done; Main is running their tests.
+
+## 2026-11-08 00:45Z: B1 merged; F1/D1 final rounds
+- B1 r4: APPROVED_WITH_NOTES. The before-state note was already ruled on by Main in `b1-round4.md`: the base's ImportError counts because the module is new. Committed as `074a518`, lane closed, merged into lane/integrate as `4fe780a`. Main is running the touched modules there.
+- F1 r6 REQUEST_CHANGES: the reconcile writes future archive paths, and an empty-directory rename race. Retry `coder-627bab8253` (`fixes/f1-round7.md`): location-free paths and an owned mkdir reservation. This is the final round; F1 parks if it is rejected.
+- D1 r6 REQUEST_CHANGES: a later-round scope recomputed against HEAD, and commands that fail with no commits. Retry `coder-858a228fd2` (`fixes/d1-round7.md`): the scope comes from the attached diffs, the empty tree stands in for HEAD, and every printed command is executed. This is the final round.
+- K1 r3 and C2 r3 coders are done; Main is running their tests.

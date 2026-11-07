@@ -21,6 +21,7 @@ What later slices must not assume:
 import json
 import os
 import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
 
@@ -161,6 +162,61 @@ def other_lanes_section(entries):
         closed = f"last closed step {entry['last_closed']}" if entry["last_closed"] else "no step closed yet"
         lines.append(f"- Lane {entry['name']} (branch {entry['branch']}, {closed}): {', '.join(_code_span(p) for p in entry['paths'])}")
     return "\n".join(lines) + f"\n\n{OTHER_LANES_SENTENCE}" if lines else ""
+
+
+FACTS_CAP = 20
+
+
+def _facts_path(path):
+    """`path` as plain text on one line; one with a control character, a comma or a leading/trailing space is shown as its JSON string."""
+    return path if path.isprintable() and "," not in path and path == path.strip() else json.dumps(path, ensure_ascii=True)
+
+
+def _facts_list(items, cap=None):
+    """`a, b, ...`: all of `items`, or with `cap` the first `cap` then `and N more`; `none` for no entries."""
+    if not items:
+        return "none"
+    shown = items if cap is None or len(items) <= cap else items[:cap] + [f"and {len(items) - cap} more"]
+    return ", ".join(shown)
+
+
+def _name_status(output):
+    """Entries `M path` / `R100 old -> new` of `git diff --name-status -z`."""
+    fields, entries, index = output.split("\0"), [], 0
+    while index < len(fields) and fields[index]:
+        code, index = fields[index], index + 1
+        count = 2 if code[0] in "RC" else 1
+        paths, index = fields[index:index + count], index + count
+        entries.append(f"{code} " + " -> ".join(_facts_path(p) for p in paths))
+    return entries
+
+
+def lane_facts(lane, step):
+    """The packet section `## Lane` for lane record `lane` and step id `step`: the record's branch, worktree, base and last closed
+    step, and what git says in the worktree now (HEAD, ahead/behind the base, paths changed since the base, uncommitted paths).
+    A snapshot: it names the command that refreshes it. Any failure (a record that lacks a field, git failing or timing out)
+    gives the one line `lane facts unavailable: <reason>`; this never raises, because the facts are never a reason to refuse a dispatch."""
+    try:
+        worktree, base = lane["worktree"], lane["base"]["commit"]
+        git = lambda *args: lanes._git(list(args), worktree)[1]
+        head, subject = git("log", "-1", "--format=%H%n%s").rstrip("\n").split("\n", 1)
+        behind, ahead = git("rev-list", "--left-right", "--count", f"{base}...HEAD").split()
+        changed = _name_status(git("diff", "--name-status", "-z", f"{base}...HEAD"))
+        uncommitted = [f"{code.strip() or '?'} " + " -> ".join(_facts_path(p) for p in paths)
+                       for code, paths in _status_entries(git("--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"))]
+        closed = lane["closed"][-1] if lane["closed"] else None
+        last = f"{closed['step']} at {closed['commit'][:7]}" if closed else "none"
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return "\n".join([
+            f"## Lane (snapshot at {stamp}; refresh: tools/agent/lane-info.sh {shlex.quote(worktree)})",
+            f"lane: {lane['name']}  step: {step}  branch: {lane['branch']}  worktree: {worktree}",
+            f"base: {lane['base']['ref']} {base[:7]}  (LANE_BASE is set to this sha)",
+            f"HEAD: {head[:7]} {json.dumps(subject, ensure_ascii=False)}  ahead {ahead} / behind {behind}",
+            f"changed since base ({len(changed)}): {_facts_list(changed, FACTS_CAP)}",
+            f"uncommitted: {_facts_list(uncommitted)}",
+            f"last closed step: {last}"])
+    except Exception as error:  # noqa: BLE001 - advice to a worker; whatever went wrong, the dispatch goes on
+        return "lane facts unavailable: " + " ".join(str(error).split())[:300]
 
 
 def _all_records(common):

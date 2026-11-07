@@ -1,7 +1,8 @@
 # Agent tools: shared helper scripts and the "Tools" block
 
 Workers repeat the same setup routines in every task: orient in the lane, run the pre-commit checks, run web jest. This
-repository ships three plain scripts for them (`tools/agent/`), and a project lists the ones its workers should use in
+repository ships plain scripts for them (`tools/agent/`: `lane-info`, `pre-commit-gate`, `web-jest`, plus a `test-run`
+stub that B1 replaces), and a project lists the ones its workers should use in
 `<project>/.tmux-pi/agent-tools.json`. `lib/preamble.py` renders that list as a "Tools" block in the worker's standing
 instructions, filtered by the worker's role. Nothing here goes into a tracked path of the project: the scripts live in
 this repository and take the worktree as an argument, and `.tmux-pi/` is git-excluded in the project.
@@ -19,6 +20,19 @@ loops). Each prints a short summary; its **last line is `exit=N log=PATH`**, wit
 | `web-jest.sh` | `WORKTREE [--repeat N] [--config-hook PATH] TEST_PATH...` | Runs jest from the package that owns each test with `--runTestsByPath --ci` and `TZ=UTC`; paths with parentheses are passed as one argument and logged quoted. Per-file counts; `--repeat N` prints one `run i exit` line per run, with that run's per-file counts under it. `--config-hook` is a project JS file (absolute path, kept in the project's `.tmux-pi/`) that exports `function (config, { worktree, packageDir })` and returns the jest config to use. Nothing project-specific is built in. |
 
 Exit code of a script = the `N` in the last line.
+
+## Start a project
+
+A project with no `.tmux-pi/agent-tools.json` gives its workers no Tools block at all. To start one, copy the example and
+trim it:
+
+```
+mkdir -p PROJECT/.tmux-pi && cp $TP_ROOT/templates/agent-tools.example.json PROJECT/.tmux-pi/agent-tools.json
+```
+
+The example lists `lane-info`, `pre-commit-gate`, `web-jest` and `test-run`. Remove the roles or entries the project does
+not want; the loader refuses anything invalid. (`tools/agent/test-run.sh` is a stub until its real version lands; it prints
+`test-run: not implemented yet` and exits 2 with the last line `exit=2 log=-`.)
 
 ## The manifest
 
@@ -62,13 +76,18 @@ Rules:
 ```
 ## Tools
 
-Read a file once and keep notes; re-read only after you edit it.
-To ask for a skill, tool or context you lack: tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON
+Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).
+Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.
+tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON
+tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.
 - web-jest: run web jest tests: /…/tmux-pi/tools/agent/web-jest.sh WORKTREE [--repeat N] TEST_PATH... -> per-file counts; last line exit=N log=PATH
 Prior result: /…/tasks/coder-1/result.md; review report: /…/tasks/review-1/report.md
 ```
 
-1. The two standing lines (every worker, whenever a manifest exists).
+1. The four standing lines (every worker, whenever a manifest exists; not filtered by role): do not re-request an
+   unchanged range (fetch refreshed context after an edit or a compaction); read a range with the Read tool or `safe_read`,
+   not `sed -n`, and quote paths with `( ) [ ]` or spaces; how to `tp-agent request` a skill, tool or context; and
+   `tp-agent message TASK --text TEXT` to reply to a question from Main plus `tools/agent/test-run.sh` to run and record a check.
 2. One line per entry listed for the worker's role.
 3. `Prior result: PATH; review report: PATH` only when the task continues an earlier one: the parent's `result.md`, and
    `report.md` of the newest review in the parent's `meta.json` (`reviews`, or `review`), or of its nearest retry ancestor.

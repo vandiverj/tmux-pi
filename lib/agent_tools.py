@@ -19,7 +19,7 @@ A missing manifest adds nothing. A manifest that exists but cannot be used (unre
 duplicate entry, a path that is missing or not executable) is an error, never a silent skip. Like the preamble, the manifest
 of the working tree wins, and `source` (a lane task's preamble_from) is read when the working tree has none.
 
-The block holds two standing lines every worker gets, the entries for the worker's role, and, when the task continues an
+The block holds the four STANDING lines every worker gets, the entries for the worker's role, and, when the task continues an
 earlier one, `Prior result: PATH; review report: PATH` (prior_line).
 
     python3 agent_tools.py <workdir> [role [source]]    prints the block (nothing when there is no manifest)
@@ -39,8 +39,10 @@ NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
 TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 FIELDS = ("name", "path", "roles", "use", "usage", "output")
 STANDING = (
-    "Read a file once and keep notes; re-read only after you edit it.",
-    "To ask for a skill, tool or context you lack: tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON",
+    "Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).",
+    "Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.",
+    "tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON",
+    "tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.",
 )
 MAX_ANCESTORS = 10
 

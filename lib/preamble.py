@@ -14,7 +14,7 @@ task's preamble_from, the repository's main working tree) is read when the worki
 working tree wins (a repository that tracks its preamble versions it with the branch).
 
 A repository that also has <workdir>/.tmux-pi/agent-tools.json (same fallback to `source`; see lib/agent_tools.py) gets a
-"Tools" block after the text above: two standing lines, the helper scripts listed for the worker's role and, when the caller
+"Tools" block after the text above: the standing lines, the helper scripts listed for the worker's role and, when the caller
 passes --state-dir and --parent, the prior result and review report of the task being continued. The whole text, as rendered
 for every role, must stay within MAX_BYTES too. With no such manifest the text is exactly what it was before the block existed.
 """

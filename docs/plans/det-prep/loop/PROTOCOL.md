@@ -29,6 +29,11 @@ never merge to `main`, never push).
    the new `lane/integrate` (it is the new baseline). **Discard**: leave the branch (never delete; it is evidence),
    remove the worktree.
 
+## Off-limits to cycles
+Like `prepare.py` in Karpathy's autoresearch, the scorer is fixed: a cycle never changes `bin/tp-bench`, `lib/bench/`,
+`bench/` or the sealed answers. Changing the bench is its own reviewed step (see "Adding an eval") followed by a new
+control run, never part of a candidate.
+
 ## Keep rule
 - Correctness first: `code_pass`, `review_catch` and `local_exact` must not drop beyond the control's own spread, and no
   single task may flip from pass in both control repeats to fail in both candidate repeats.

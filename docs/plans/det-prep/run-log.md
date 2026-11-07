@@ -28,3 +28,5 @@
 | G1 | local-model | coder-014ac74821 | haiku-5.5 | working (told: config/local-model.json, not orchestration.json) |
 
 ## Events
+- 2026-11-07T16:24:12Z Owner stepping away for several hours. Started caffeinate for 12 h (keeps the Mac awake on AC power). LM Studio: Qwen loaded at 262144 context with no TTL, left as is so local steps keep working.
+- 2026-11-07T16:25:36Z Owner approved web research: searching and reading sites is allowed; downloading or installing anything is not. WebSearch and WebFetch tested and working without prompts.

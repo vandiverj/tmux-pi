@@ -88,3 +88,10 @@
 - K1: option 2 is added to `fixes/k1-round2.md`: a tracked credential-named file that matches the committed version no longer blocks the lift. Before adding it, Main checked the committed files by structure only, with no values printed. Every credential field in both `mcp.json` files is a `${VAR}` reference, and `tp-secret-exec` has no token-like strings. The running K1 coder was messaged.
 - C2 r1 REQUEST_CHANGES (four-backtick fence, trailing `#`, empty heading). Retry `coder-52ad5a71e4`: `fixes/c2-round2.md`, CommonMark fence and heading rules.
 - F1 r5, D1 r5 and B1 r3 coders finished; Main is running their tests.
+
+## 2026-11-08 00:00Z: E1 merged; F1/D1/B1 rejected again with new rules
+- E1 re-review: APPROVED_WITH_NOTES (the only note is the accepted comment limit, owned by E2). Lane closed and merged into lane/integrate as `f63faae`; `test_routines` OK.
+- F1 r5 REQUEST_CHANGES: a write after the copy is lost, a FIFO can't be copied, a hard link is split, and a parent cycle is mishandled. The rollback approach is dropped. Retry `coder-3ebc82a9fa` (`fixes/f1-round6.md`): an atomic, repeatable reconcile in place, then one rename, and parent cycles are skipped.
+- D1 r5 REQUEST_CHANGES: a prior-HEAD filter hides base→HEAD. Retry `coder-c905fc8013` (`fixes/d1-round6.md`): no filter but the four states.
+- B1 r3 REQUEST_CHANGES: `tp_json_str` drops control bytes. Retry `coder-7fb9a831b4` (`fixes/b1-round4.md`): a single Python serializer and a byte round-trip table. Main accepted the base ImportError as the before-state for the new module.
+- K1 r2 (allowlist plus option 2) and C2 r2 (CommonMark) are done; Main is running their tests.

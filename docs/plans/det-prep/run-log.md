@@ -107,3 +107,9 @@
 - F1 r6 REQUEST_CHANGES: the reconcile writes future archive paths, and an empty-directory rename race. Retry `coder-627bab8253` (`fixes/f1-round7.md`): location-free paths and an owned mkdir reservation. This is the final round; F1 parks if it is rejected.
 - D1 r6 REQUEST_CHANGES: a later-round scope recomputed against HEAD, and commands that fail with no commits. Retry `coder-858a228fd2` (`fixes/d1-round7.md`): the scope comes from the attached diffs, the empty tree stands in for HEAD, and every printed command is executed. This is the final round.
 - K1 r3 and C2 r3 coders are done; Main is running their tests.
+
+## 2026-11-08 01:00Z: K1 and C2 merged; F1/D1 final rounds in test
+- K1 r3: APPROVED_WITH_NOTES (the only note is test cost, over the five-process budget). Committed as `63ef110`, lane closed, merged into lane/integrate as `dedc6ce`.
+- C2 r3: APPROVED_WITH_NOTES (the only note is that the 4 orchestration failures weren't reproduced on the base; Main's diagnosis traces them to the session env leaking into the tests). Committed as `1263473`, lane closed, merged as `1abfb88`.
+- Owner: "send an agent to figure out why the 4 failures are occuring". Cause: `tests/test_orchestration.py` passes `CLAUDE_CODE_SESSION_ID`/`TP_MAIN_ID` through to `tp-agent`, so "main missing" is filled in from the env (since `03065fe`). The tests pass when those variables are unset. Owner: "yes, open the lane and rerun the baseline list". The baseline modules are being rerun without the session env; the lane brief follows from the result.
+- F1 r7 and D1 r7 (final) coders are done; Main is running their tests.

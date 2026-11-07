@@ -27,6 +27,7 @@ Nothing else changes, and with no resolver the result is what it always was.
 """
 import collections
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -207,6 +208,27 @@ _GIT_ELSEWHERE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"
                   "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_COUNT",
                   "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
                   "GIT_EXTERNAL_DIFF")
+# The options a git grep may carry and still be judged by its tracked files (K1): they only choose how matches are
+# found and printed. Everything else (reading a file, a content driver or a pager, widening the source) is outside.
+_GIT_GREP_LONG_PLAIN = frozenset((
+    "invert-match", "ignore-case", "word-regexp", "text", "recursive", "extended-regexp", "basic-regexp",
+    "fixed-strings", "perl-regexp", "line-number", "column", "full-name", "files-with-matches", "name-only",
+    "files-without-match", "null", "only-matching", "count", "color", "break", "heading", "context",
+    "before-context", "after-context", "show-function", "function-context", "and", "or", "not", "quiet",
+    "all-match", "max-depth", "max-count"))
+# Every long option git grep knows (`git grep -h`); `no-` forms are added below. A prefix of one is an option too.
+_GIT_GREP_LONG_ALL = frozenset(_GIT_GREP_LONG_PLAIN | {
+    "cached", "no-index", "index", "untracked", "exclude-standard", "recurse-submodules", "textconv", "threads",
+    "open-files-in-pager", "ext-grep"})
+_GIT_GREP_NEGATED = frozenset("no-" + name for name in _GIT_GREP_LONG_ALL if name not in ("no-index", "and", "or", "not"))
+_GIT_GREP_LONG_KNOWN = _GIT_GREP_LONG_ALL | _GIT_GREP_NEGATED
+_GIT_GREP_FLAGS = "vi" "wa" "rEGFP" "InhHlLzocqpW"  # short options without a value
+_GIT_GREP_VALUED = "ABCm"  # short options whose value is the rest of the word or the next word
+# One `git ls-files --stage` entry: mode, object name and stage.
+_STAGE_ENTRY = re.compile(r"^([0-7]{6}) [0-9a-f]+ ([0-3])$")
+_REGULAR_MODES = ("100644", "100755")
+_COMMITTED_SIZE = 1 << 20  # a credential-named tracked file larger than this is not hashed: the prompt stays
+_COMMITTED_FILES = 64  # credential-named tracked files one root may have and still be checked against HEAD
 _RAW_ENTRY = re.compile(r"^:+((?:[0-7]{6} )+)(?:[0-9a-f]+ )+[A-Z]+[0-9]*$")
 _GITLINK = "160000"
 _SUBMODULE_REASON = "patch output touches a submodule and may include the files inside it"
@@ -260,7 +282,8 @@ _RG_ARGS = ({"-A", "-B", "-C", "-g", "-j", "-m", "-M", "-r", "-t", "-T", "-E", "
              "--pre-glob", "--regex-size-limit", "--replace", "--sort", "--sortr", "--threads", "--type",
              "--type-add", "--type-clear", "--type-not", "--hyperlink-format", "--depth", "--ignore", "--ignore-dir"},
             "ABCgjmMrtTE", {"-e", "--regexp", "-f", "--file"}, "ef")
-_GIT_GREP_ARGS = ({"-A", "-B", "-C", "-O", "-m", "--max-depth", "--max-count", "--threads", "--open-files-in-pager"},
+_GIT_GREP_ARGS = ({"-A", "-B", "-C", "-O", "-m", "--max-depth", "--max-count", "--threads", "--open-files-in-pager",
+                   "--context", "--before-context", "--after-context"},
                   "ABCOm", {"-e", "-f"}, "ef")
 _SCRIPT_ARGS = ({"-v", "-F", "--arg", "--argjson", "--slurpfile", "--rawfile", "--indent", "-L", "-i"}, "vFL",
                 {"-e", "--expression", "-f", "--file", "--from-file"}, "ef")
@@ -1143,9 +1166,13 @@ def _first(hits):
     return next((hit for hit in hits if hit), None)
 
 
-def _roots_hit(label, roots, base, reason, pathspec=False):
+def _roots_hit(label, roots, base, reason, pathspec=False, tracked=False):
+    """The first root a bulk read of these roots may reach credentials through. `tracked` is for a plain git grep
+    that the shell itself runs: a credential directory or the repository root is cleared for it by the index (K1)."""
     for root in roots:
         why = _root_reason(root, base, True, pathspec)
+        if why and tracked and why in (_CREDENTIAL_DIR, _ROOT_REASON) and _tracked_clear(root, base):
+            continue
         if why:
             return f"{label} of {root}", reason.format(why=_said(why))
     return None
@@ -1157,6 +1184,12 @@ def _not_a_path(word, base):
         return False
     full = _absolute(_join(base, word))
     return full is not None and not os.path.lexists(full)
+
+
+def _exists(word, base):
+    """A git operand that names something on disk."""
+    full = None if _GLOB.search(word) else _absolute(_join(base, word))
+    return full is not None and os.path.lexists(full)
 
 
 def _narrowed(prog, args, spec):
@@ -1272,20 +1305,194 @@ def _hidden_roots_clear(roots, base):
     return bool(places)
 
 
-def _search_hit(prog, args, cmd, base, bulk, git=False, listing=False):
+def _search_hit(prog, args, cmd, base, bulk, git=False, listing=False, queried=False):
     """A search command, judged with the walk it implies (see `_search_walk`)."""
     spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
     saved = _SHELL["walk"]
     _SHELL["walk"] = _search_walk(prog, args, spec) if not git else Walk(True, ())
     try:
-        return _search_scan(prog, args, cmd, base, bulk, git, listing, spec)
+        return _search_scan(prog, args, cmd, base, bulk, git, listing, spec, queried)
     finally:
         _SHELL["walk"] = saved
 
 
-def _search_scan(prog, args, cmd, base, bulk, git, listing, spec):
+def _plain_git_grep(opts, before, after):
+    """Whether a git grep reads only the tracked files under its pathspecs in the work tree (K1).
+
+    Only with options on an allowlist (`_GIT_GREP_LONG_PLAIN`, `_GIT_GREP_FLAGS`, `_GIT_GREP_VALUED` and `-e`),
+    so an option that reads a file (`-f`), runs a content driver or a pager (`--textconv`, `-O`) or widens the
+    source (`--untracked`, `--no-index`, ...), and any option git adds later, keeps the prompt. A long option
+    git takes by prefix counts only when everything the prefix could mean is on the list. Not with a revision
+    or tree operand: with `--`, every operand before it other than the pattern is one."""
+    if after is not None and before:
+        return False
+    return all(_plain_git_grep_option(opt) for opt in opts)
+
+
+def _plain_git_grep_option(opt):
+    name = opt.partition("=")[0]
+    if name.startswith("--"):
+        if name == "--":
+            return False
+        word = name[2:]
+        meant = [word] if word in _GIT_GREP_LONG_KNOWN else [known for known in _GIT_GREP_LONG_KNOWN
+                                                             if known.startswith(word)]
+        return bool(meant) and all(known in _GIT_GREP_LONG_PLAIN for known in meant)
+    letters, at = opt[1:], 0
+    if "=" in opt or not letters:
+        return False
+    if letters.isdigit():
+        return True  # -NUM
+    while at < len(letters):
+        letter = letters[at]
+        at += 1
+        if letter in _GIT_GREP_FLAGS:
+            continue
+        if letter == "e":  # the pattern is the next word; one joined to the letter is not found by `_split_args`
+            return at == len(letters)
+        if letter in _GIT_GREP_VALUED:
+            return letters[at:].isdigit() or at == len(letters)
+        return False
+    return True
+
+
+def _tracked_clear(root, base):
+    """Whether the files git tracks under this git grep root hold no credential-named path (K1).
+
+    A plain git grep reads only tracked files, so a credential directory or the repository root whose tracked
+    files all have plain names is not a bulk read of credentials. Asked once per root and call (the walk memo).
+    Anything that cannot be shown keeps the prompt: a root git would read as pathspec magic, a glob or anything
+    the shell expands; a query that fails, times out or prints more than allowed; git's top level not being the
+    work tree the root was placed in; more entries than a walk may count; a submodule entry (`submodule.recurse`
+    makes git grep read inside it); or a folder on the way to a tracked file that is a link on disk, which git
+    grep follows (it does not follow a tracked link itself, nor a file replaced by one).
+    """
+    if not root or root.startswith((":", "-")) or re.search(r"[*?\[\]\\{}$`~'\"]", root):
+        return False
+    key = ("K1", base, root)
+    if key not in _SHELL["memo"]:
+        _SHELL["memo"][key] = _tracked_listing_clear(root, base)
+    return _SHELL["memo"][key]
+
+
+def _tracked_listing_clear(root, base):
+    deadline = time.monotonic() + _GIT_TIMEOUT
+    asked = _git_ask(_GIT_TOPLEVEL, base, deadline)
+    if asked is None or not asked[0].endswith("\n"):
+        return False
+    top = _top(os.path.realpath(asked[1]))
+    if not top or os.path.realpath(asked[0][:-1]) != top:
+        return False
+    listed = _git_ask(("ls-files", "--stage", "-z", "--full-name", "--", root), base, deadline)
+    if listed is None:
+        return False
+    fields = listed[0].split("\0")
+    if fields.pop() or len(fields) > WALK_ENTRIES:
+        return False
+    above, folders, named = [part for part in top.split("/") if part], set(), {}
+    for field in fields:
+        entry, tab, name = field.partition("\t")
+        match = _STAGE_ENTRY.match(entry)
+        parts = [part for part in name.split("/") if part]
+        if not tab or not match or match.group(1) == _GITLINK or not parts:
+            return False
+        if _named(parts) or _parts_hit(above + parts):
+            # A credential-named file is let through only as committed (see `_committed`).
+            if (_parts_hit(above) or match.group(2) != "0" or match.group(1) not in _REGULAR_MODES
+                    or len(named) >= _COMMITTED_FILES):
+                return False
+            named[name] = (match.group(1), entry.split(" ")[1])
+        for depth in range(1, len(parts)):
+            folder = "/".join(parts[:depth])
+            if folder not in folders:
+                if os.path.islink(posixpath.join(top, folder)):
+                    return False
+                folders.add(folder)
+        if time.monotonic() > deadline:
+            return False
+    return not named or _committed(named, top, base, deadline)
+
+
+def _committed(named, top, base, deadline):
+    """Whether every one of these tracked, credential-named files is, on disk, the very file HEAD holds, so that
+    git grep reads only what history already holds (K1, owner's decision).
+
+    `named` maps a path from the top of the work tree to its index mode and object name. Nothing from git's change
+    detection is trusted (`--assume-unchanged`, `--skip-worktree` and `core.filemode=false` all hide an edit from
+    it). HEAD is read by one `ls-tree` (same mode and object name as the index); `ls-files -v` must show no
+    assume-unchanged or skip-worktree flag; and each file is checked here: a regular file (no link, no other type)
+    of at most `_COMMITTED_SIZE` bytes, whose exec bit matches HEAD's mode and whose git blob id, computed from its
+    bytes, is the object name HEAD holds. The bytes are hashed, never printed or returned. Comparing nothing
+    through the content filters means none may be configured. Any failure, error or timeout is "not committed".
+    """
+    if _filter_reason(base, deadline) != "":
+        return False
+    spec = [f":(top,literal){name}" for name in named]
+    head = _git_ask(("ls-tree", "-z", "--full-tree", "HEAD", "--", *spec), base, deadline)
+    if head is None:
+        return False
+    seen = {}
+    for field in head[0].split("\0")[:-1]:
+        entry, tab, name = field.partition("\t")
+        bits = entry.split(" ")
+        if not tab or len(bits) != 3 or bits[1] != "blob":
+            return False
+        seen[name] = (bits[0], bits[2])
+    if seen != named:
+        return False
+    flags = _git_ask(("ls-files", "-v", "-z", "--full-name", "--", *spec), base, deadline)
+    if flags is None:
+        return False
+    tagged = set()
+    for field in flags[0].split("\0")[:-1]:
+        tag, space, name = field.partition(" ")
+        if not space or tag != "H" or name not in named:  # lower case: assume-unchanged; S: skip-worktree
+            return False
+        tagged.add(name)
+    if tagged != set(named):
+        return False
+    kind = _git_ask(("rev-parse", "--show-object-format"), base, deadline)
+    algorithm = {"sha1": "sha1", "sha256": "sha256"}.get(kind[0].strip()) if kind else None
+    if not algorithm:
+        return False
+    for name, (mode, oid) in named.items():
+        if time.monotonic() > deadline or _blob_id(posixpath.join(top, name), mode, algorithm) != oid:
+            return False
+    return True
+
+
+def _blob_id(path, mode, algorithm):
+    """The git object name of the file at `path` when it is a regular file of the given mode, else None."""
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _COMMITTED_SIZE:
+            return None
+        if bool(before.st_mode & 0o100) != (mode == "100755"):
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                return None
+            data = b""
+            while len(data) <= _COMMITTED_SIZE:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return None
+    if len(data) > _COMMITTED_SIZE:
+        return None
+    return hashlib.new(algorithm, b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _search_scan(prog, args, cmd, base, bulk, git, listing, spec, queried=False):
     """A search command. `bulk` means file names are appended at run time; `listing` means its output
-    feeds a reader, so even a names-only search is judged by its roots."""
+    feeds a reader, so even a names-only search is judged by its roots. `queried` is for a git grep the
+    shell itself runs in a repository state that can be asked about now (see `_queried`)."""
     opts, before, after, values, has_pattern = _split_args(args, *spec)
     if any(opt in _INFO_OPTS for opt in opts):
         return None
@@ -1301,7 +1508,11 @@ def _search_scan(prog, args, cmd, base, bulk, git, listing, spec):
     if git and after is not None:
         roots = after
     elif git:
-        revision = next((root for root in roots if _REVISION.match(root) or _not_a_path(root, base)), None)
+        # A word led by `..` that names something on disk is a path to git: one that were also a revision would
+        # stop git as ambiguous. Only the queried form relies on that; it is judged by its tracked files (K1).
+        revision = next((root for root in roots if (_REVISION.match(root) and not (
+            queried and (root == ".." or root.startswith("../")) and _exists(root, base))) or _not_a_path(root, base)),
+            None)
         if revision:
             return f"git grep at {revision}", "revision search may include credential files"
     if git:  # an exclusion narrows the search, it does not name a root
@@ -1331,7 +1542,8 @@ def _search_scan(prog, args, cmd, base, bulk, git, listing, spec):
         if prog in _ALWAYS_RECURSIVE and cmd["piped"] and not names_only:
             return None  # searches the piped input, not the tree
         roots = ["."]
-    return _roots_hit("recursive search", roots, base, "search root is {why} and may include credential files", git)
+    return _roots_hit("recursive search", roots, base, "search root is {why} and may include credential files", git,
+                      git and queried and _plain_git_grep(opts, before, after))
 
 
 def _find_roots(args):
@@ -1748,7 +1960,7 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
     if prog == "git":
         sub, rest, base = _git_sub(args, base)
         if sub == "grep":
-            return _search_hit(prog, rest, cmd, base, bulk, git=True)
+            return _search_hit(prog, rest, cmd, base, bulk, git=True, queried=_queried(args, rest, cmd, depth, bulk))
         opts, before, after, values, _ = _split_args(rest, _GIT_VALUES)
         operands = before + (after or [])
         if sub == "diff" and "--no-index" in opts:

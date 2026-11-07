@@ -17,4 +17,6 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 
 | H10 | **Haiku and the redaction hook.** With redaction on, lib/redact_hook.py rewrites every Bash command (appends `|| echo exit-code: nonzero`); Claude Haiku workers treat the rewrite notice as untrusted and stop running Bash, so their steps return incomplete. Fix options: do not rewrite (use PostToolUse only), word the notice so it reads as the harness, or route Claude coders above Haiku when redaction is on. Found live 2026-11-07 (E1, G1). | code_pass, wall_s | Main (observed) | low | open |
 
+| H11 | **Reviewers stop on the sensitive-read prompt.** Four of eight reviewers so far asked for a recursive search of agent/, config/ or tools/agent and waited on "Authorize sensitive read?" until Main denied it. Tell reviewers in the packet which paths are secret stores and to search named files or subfolders, or make the guard exclude known secret files from the search instead of asking. | wall_s, Main turns | Main (observed 2026-11-07) | low | open |
+
 Research runs append below this table with their ids.

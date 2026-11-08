@@ -263,3 +263,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - `- no.test_x fails` is dropped;
   - `- all tests passed` counts as an entry.
   - Root cause: negative-word matching. Round 2 (`coder-45e00e9e96`) removes the negative-word set. An entry now needs a bullet plus a `TEST_ID` token (a dotted unittest id, `test_x`, `TestX`, a test path, or a pytest `::` id).
+
+## 2026-11-08 02:30Z — J1 r5 and N2 r3 dispatched
+
+- J1 round 4 review (review-coder-75b8f67dfe-202132): REQUEST_CHANGES with one new defect. `lmstudio_context` crashes on a successful but malformed reply (family metadata-unknown). All earlier findings are fixed at their sites. The live control run is still owed by Main. Retried as coder-379e83dc48 (rule-first): every metadata reader turns any reply it does not fully understand into null, with a table of malformed shapes.
+- N2 round 2 review (review-coder-45e00e9e96-202316): REQUEST_CHANGES (family entry-validation). A repeated unbulleted `test:` field starts a second entry, and a `note:` value naming a test counts as an entry. Retried as coder-22c8e8dfa7 (rule-first). New rule: only a bullet starts an entry; the id comes only from `test:` or else the bullet's first token; a second `test:` field makes the entry malformed. The end-to-end run against the base parser is owed.
+- Main slip: a stray `tp-agent retry` with an empty reason was refused. No duplicate record was created (checked).

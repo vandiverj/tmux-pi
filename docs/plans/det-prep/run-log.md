@@ -489,3 +489,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Owner: "push". Main pushed main to origin (d8a18a7..dbb101c, 66 commits; config local edits not committed).
 - Owner: "resume it if it is needed work and abandon it if it was left because it was determined failed". F1 status-cleanup was left out after round 9 was rejected (no round 10 by the agreed rule): abandoned. Rounds 1-9 diff saved as fixes/f1-status-cleanup-r9.patch and in stash@{0} ("lane status-cleanup: before remove"); `tp-agent lane remove status-cleanup` archived the record (restore: branch lane/status-cleanup f1a0ad3). The need (200+ status rows) stays open as an idea, not as this design.
 - Owner: "can't we make a summarizer for local models so it can work". Brief ls1-local-summarizer.md: 24 chores, deterministic checker, runner; Main runs the live qualification (S2); summarize_files flips to qualified only at >= 95% holdout with no fabricated citation.
+
+## 2026-11-08 Release gates added (owner-approved)
+- Owner asked what it takes to be confident the changes improve production use without a new failure. Gates G1-G5 in
+  docs/plans/det-prep/release-gates.md. Owner: "yes add the gates and start G1 after the merges".
+- FG-N1 round 2 in review (review-coder-50e09c1158-143214); LS1 round 3 worker (coder-2d4df36f35); M2-F1 review
+  (review-coder-76b4f649f5-135407). G1 runs on main after these merge.

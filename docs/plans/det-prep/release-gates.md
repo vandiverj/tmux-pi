@@ -1,0 +1,47 @@
+# det-prep release gates
+
+Owner 2026-11-08: "where do we need to make it to before we can confidently feel the changes improve the production
+use of tmux-pi and does not introduce a new failing". Answer: these five gates. Per-lane module runs plus a
+cross-provider review prove a lane does what its brief says; they do not prove the whole system. The 2026-11-08
+full-suite gate (run-log) found 387 off-baseline failures in 20 modules that M2's own run and review missed.
+
+Claims each gate allows:
+- G1 + G2: "no new failing".
+- G3 + G4: "improves production use".
+- G5: "safe to port to the work Mac".
+
+## G1: full suite on main
+- **When:** after the open lanes merge (M2-F1, FG-N1, LS1); again after every later merge batch.
+- **What:** all test modules, `/usr/bin/python3` (3.9.6) and `/opt/homebrew/bin/python3` (3.14), session keys unset and
+  dummy TMUX/TP_*, in a clean worktree of the `main` commit (no local config edits). One module per process with a
+  time bound; a bound hit is re-run solo with a longer bound before it counts.
+- **Done when:** zero FAIL/ERROR names outside `baseline-failing.txt` in all four runs. Every off-baseline name is
+  fixed or traced to a cause before the gate passes. Record the commit, counts and logs in the run-log.
+
+## G2: shrink the baseline
+- **What:** each name in `baseline-failing.txt` (13 on 2026-11-08) is fixed or explained.
+- **Done when:** no unexplained entry. An entry that stays is written as a known test-only defect with its cause and why
+  it does not hide a product failure. Shipped-config, exit-code and lane hand-over names are presumed product bugs
+  until shown otherwise.
+
+## G3: end-to-end smoke
+- **What:** one scripted run on the battle-soccer test bed through the real tools: dispatch, a permission prompt that is
+  declined and redirected, retry, cross-provider review, `lane close`, merge, `collect`, `lane remove`.
+- **Done when:** the run completes; afterwards no leftover worktree, tmux session or pane; task records, lane records
+  and the review verdict are correct; repeatable from a script.
+
+## G4: before/after measurement
+- **What:** the same small task set on `d8a18a7` (last pushed commit before this campaign) and on the new `main`.
+  Measure first-try approval rate, review rounds, tokens per task, and answer completeness checked by a deterministic
+  checker (reuse LS1's `tools/qual/summarize_check.py` pattern).
+- **Needs first:** the owner's J1-D1 decision on the local bench tasks (they were refused at routing).
+- **Done when:** the numbers are recorded with the task set and commits; "improves" is claimed only where the numbers
+  show it.
+
+## G5: port rehearsal
+- **What:** a fresh clone on this Mac set up like the work Mac (no `config/local.json`, no LM Studio, Apple Python 3.9),
+  then G1 and G3 there. The work machine itself stays untouched.
+- **Done when:** G1 and G3 pass in the fresh clone; any setup step it needed is written into the port notes.
+
+## Order
+G1 after the merges; G2 and G3 in parallel as lanes; G4 after the J1-D1 decision; G5 last.

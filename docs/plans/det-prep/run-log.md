@@ -219,3 +219,15 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - denominators come from the specs.
 - **Owed.** The owner runs `bin/tp-claude-bootstrap ~/.local/share/tp-bench/work`, then Main does the live control runs from a plain terminal.
 - 2026-11-08: the owner ran `tp-claude-bootstrap` on `~/.local/share/tp-bench/work` and approved trust. Main created the folder first, because bootstrap refuses a missing dir. Running it through `!` failed: with no TTY, Claude fell into `--print` mode. Both points were sent to the J1 coder for `docs/bench.md`.
+
+## 2026-11-08: J1 review, round 2: REQUEST_CHANGES (session-ownership family)
+- **Tests.** Main ran 52 tests in both modes, all OK. `verify` checked 15 tasks.
+- **Accepted.** The round-1 fixes for F1–F4.
+- **New findings:**
+  - F1: a failed `has-session` call is treated as "gone", which skips the stop and the copy cleanup.
+  - F2: the exit codes of `git reset`/`clean` between tasks are ignored.
+  - F3 (note): the orient rows are missing from the denominator table.
+- **Round 3** (`coder-fe9731bcf3`, `--route rule-first`, brief `j1-r3.md`):
+  - absence is proven by `list-sessions`, and any other outcome is `unknown`, so nothing is stopped or removed;
+  - `Shell.run` checks the exit code by default, and every opt-out carries a reason;
+  - after each reset the tree is checked positively, and if that fails the remaining tasks are recorded `not_run: reset-failed`.

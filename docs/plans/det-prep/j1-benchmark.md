@@ -51,3 +51,14 @@ keep or discard, log every run).
 ## First real use (Main, after merge)
 Control run of `main` and `lane/integrate` with `--repeat 2` on all tasks. Record both in `loop/results.tsv`. This is the
 first answer to "did Phases 1 to 3 help", and the control spread becomes the noise floor for the loop.
+
+## Amendment, 2026-11-08 (owner: "start building J1 tp-bench now")
+J1 starts before E2. E1 is merged; E2 (Claude coverage) is not yet built.
+- **Tokens.** Take worker and reviewer tokens from what task records already hold (`lib/task_family.py` `TOKEN_KEYS`). Where a figure is unavailable (Main, or anything E2 would add), write `null` with a `token_sources` note. Never write 0. E2 fills these in later without changing the schema.
+- **Later experiments need these fields in the run record** (X1 `x1-trace-distillation.md` and HL1 `hl1-hashline-readmap.md`):
+  - per task: the task ids, task dir paths and transcript paths (Pi `transcript.jsonl`; for Claude, the file named in `transcript-path`), so traces can be normalized afterwards;
+  - `--env KEY=VALUE` (repeatable) on `run`, passed to the workspace and recorded in the run record. Experiments are gated by env vars such as `TP_X1_ARM` and `TP_HL1`, and `compare` refuses two records whose env differs in keys other than the arm gate unless `--allow-env-diff` is given;
+  - runtime versions: `claude --version`, `pi --version`, node, python, the tmux-pi arm commit, and for local models the loaded context length if the LM Studio API reports it;
+  - `--order random|fixed` (default random, with the seed recorded) for task order within a repeat.
+- **Scope stays as specified otherwise.** The scorer (`bin/tp-bench`, `lib/bench/`, `bench/`) is off-limits to loop cycles once merged.
+- **Pi.** `TP_PI_NODE` must be passable through. The pinned Node path does not exist on this machine, and campaign runs use `TP_PI_NODE=`.

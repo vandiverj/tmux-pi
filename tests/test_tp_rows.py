@@ -2,12 +2,16 @@
 
 The old builder is kept in tests/fixtures/tp_rows_old.sh only for this comparison. Fake tmux; never a live session.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKENS = {"input": 1234, "cacheRead": 2000000, "cacheWrite": 500, "output": 12}
@@ -27,7 +31,7 @@ class TpRowsTest(unittest.TestCase):
         tmux.write_text('#!/bin/sh\ncase "$1" in\n  show-options) printf "%s\\n" "$FAKE_BASE/state" ;;\n'
                         '  list-panes) cat "$FAKE_BASE/panes" ;;\nesac\n')
         tmux.chmod(0o755)
-        self.env = dict(os.environ, FAKE_BASE=str(self.base), ROOT=str(ROOT),
+        self.env = dict(outside_session(), FAKE_BASE=str(self.base), ROOT=str(ROOT),
                         PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         self.env.pop("TMUX", None)
         self.panes = []

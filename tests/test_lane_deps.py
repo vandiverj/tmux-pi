@@ -1,5 +1,6 @@
 """Lane dependencies (lib/lane_deps.py): main's node_modules linked into a lane's worktree, guarded. Every repository is a
 temporary one; nothing runs npm."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import io
 import json

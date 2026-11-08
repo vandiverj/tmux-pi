@@ -1,3 +1,4 @@
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess
@@ -14,6 +15,7 @@ from contract import (ContractError, artifact_info, build, duration, dynamic_ter
                       escalation_record, is_local, ledger_row, lifecycle, load_research, message, note, quantity, rate,
                       read_escalations, read_ledger, select_escalation, summary_line, upsert, write_escalations)
 from router import load_config  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 T0 = 1_800_000_000  # a fixed clock; meta.created is this instant
 
@@ -143,7 +145,7 @@ class ContractTests(unittest.TestCase):
         fake = self.dir / "fake-bin"
         fake.mkdir()
         fake_tmux(fake, 'case "$1" in\n show-options) echo "$TP_STATE_DIR";;\n new-window) echo "%%42";;\n list-panes) echo "%%42 0 99999999";;\n esac\n')
-        env = dict(os.environ, TP_STATE_DIR=str(state), TP_SESSION="fixture",
+        env = dict(outside_session(), TP_STATE_DIR=str(state), TP_SESSION="fixture",
                    PATH=str(fake) + os.pathsep + os.environ["PATH"])
         env.pop("TMUX", None)
         def spawn(label, pf, main, task=None):
@@ -318,7 +320,7 @@ class ContractTests(unittest.TestCase):
         marker.write_text(json.dumps({"task_id": "worker-1", "status": "needs_human", "required": True,
                                       "reasons": ["reviewer unavailable"]}))
         fake_tmux(self.dir)
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "worker-1"]
         for content in (marker.read_text(), "{bad json", json.dumps({"task_id": "wrong", "status": "resolved"})):
             marker.write_text(content)
@@ -348,7 +350,7 @@ class ContractTests(unittest.TestCase):
         (task / "state.json").write_text(json.dumps({"state": "waiting", "updated": iso(T0)}))
         (task / "result.md").write_text("Started a sleep; waiting.\n")
         fake_tmux(self.dir, 'echo "%1 0 99999999"\n')
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
             [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
             env=env, text=True, capture_output=True, check=True).stdout)
@@ -368,7 +370,7 @@ class ContractTests(unittest.TestCase):
         (task / "result.md").write_text("Out of budget.\nRESULT_STATUS: blocked\n")
         (task / "checkpoints.json").write_text(json.dumps({"events": [{"action": "pause", "reason": "budget", "at": T0}]}))
         fake_tmux(self.dir, 'echo "%1 0 99999999"\n')
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         slot = lambda: json.loads(subprocess.run(
             [str(ROOT / "bin/tp-contract"), "slot", "--after", "dep", "--model", "x/y"],
             env=env, text=True, capture_output=True, check=True).stdout)
@@ -390,7 +392,7 @@ class ContractTests(unittest.TestCase):
         (task / "exit").write_text("0\n")
         (task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
         fake_tmux(self.dir)
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "collect", "author"]
         def collect_ok():
             return subprocess.run(cmd, env=env, text=True, capture_output=True).returncode == 0
@@ -475,7 +477,7 @@ class ContractTests(unittest.TestCase):
     def test_local_escalation_cli_prefers_available_gpt6(self):
         state = self.dir / "state"
         fake_tmux(self.dir)
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         for idx, model in enumerate(("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b")):
             task_id = "local-{}".format(idx)
             d = state / "tasks" / task_id
@@ -502,7 +504,7 @@ class ContractTests(unittest.TestCase):
         (task / "checkpoints.json").write_text(json.dumps({"events": []}))
         fake_tmux(self.dir)
         (task / "exit").write_text("1\n")
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         plan = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", "task-1", "--trigger", "model_error",
                                "--reason", "structured reporter error", "--evidence", "state.json:error"],
                               env=env, text=True, capture_output=True, check=True)
@@ -527,7 +529,7 @@ class ContractTests(unittest.TestCase):
         # Never ask the real tmux server: its pane %1 may be alive, which would make "killed" untestable.
         panes = self.dir / "panes"
         fake_tmux(self.dir, 'cat "%s"\n' % panes)
-        env = dict(os.environ, TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(outside_session(), TP_STATE_DIR=str(state), PATH=str(self.dir) + os.pathsep + os.environ.get("PATH", ""))
         cmd = [str(ROOT / "bin/tp-contract"), "escalate", "stopped", "--trigger", "model_error", "--reason", "error"]
         # killed: the pane is gone; cancelled and completed: the pane is still alive.
         for reported, listing in (("working", ""), ("cancelled", "%1 0\n"), ("completed", "%1 0\n")):
@@ -546,7 +548,7 @@ class ContractTests(unittest.TestCase):
                 "model": "openai/gpt-6-sol", "thinking": "medium",
                 "escalated_from": {"id": "task-1", "trigger": "model_error"}}
         (task / "meta.json").write_text(json.dumps(meta))
-        env = dict(os.environ, TP_STATE_DIR=str(state))
+        env = dict(outside_session(), TP_STATE_DIR=str(state))
         denied = subprocess.run([str(ROOT / "bin/tp-contract"), "escalate", "task-2", "--trigger", "model_error",
                                  "--reason", "structured reporter error", "--evidence", "state.json:error"],
                                 env=env, text=True, capture_output=True)

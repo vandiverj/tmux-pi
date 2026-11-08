@@ -3,6 +3,7 @@ a temporary one, tmux is the private -L server of tests/lane_fixture.py and no m
 
 Every refusal is held to two things: it changes nothing, and the command it names clears it (the test runs that command and
 removes the lane). The same table is in README.md, Lanes."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import io
 import json

@@ -1,4 +1,5 @@
 """Lanes L1: the lane record, its validator, reading and writing the file, the check against git, the configuration."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import os

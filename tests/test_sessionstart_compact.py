@@ -1,6 +1,7 @@
 """The SessionStart(compact) command hook (claude/plugins/tmux-pi/hooks/sessionstart-compact.sh): after a compaction it arms recovery
 and prints the task index as hook JSON (additionalContext). Orchestrator main only; fail-open. The real delivery needs a live
 Claude session (see the final report); everything here runs the script itself against temporary stores and state directories."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

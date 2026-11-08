@@ -1,10 +1,14 @@
 """Main-only tool-result offloading: extension behavior and launcher loading; no models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -22,7 +26,7 @@ class OffloadExtensionTests(unittest.TestCase):
         package = pi_package()
         if not package or not (package / "dist/index.js").exists():
             self.skipTest("installed Pi package not found")
-        env = {**os.environ, "PI_CODING_AGENT_PACKAGE": str(package)}
+        env = {**outside_session(), "PI_CODING_AGENT_PACKAGE": str(package)}
         for key in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE"):
             env.pop(key, None)
         run = subprocess.run(["node", "--experimental-strip-types", str(ROOT / "tests/offload_runtime.mjs")],
@@ -34,7 +38,7 @@ class OffloadExtensionTests(unittest.TestCase):
             fake = Path(folder) / "pi"
             fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
             fake.chmod(0o755)
-            env = {**os.environ, "PATH": folder + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
+            env = {**outside_session(), "PATH": folder + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
             for key in ("TP_TASK_DIR", "TP_MODE"):
                 env.pop(key, None)
 

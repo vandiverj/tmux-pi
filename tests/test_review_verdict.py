@@ -1,4 +1,5 @@
 """The reviewer verdict parser: three verdicts, anything else refused; approval with notes carries its notes."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from pathlib import Path
 import subprocess

@@ -1,5 +1,6 @@
 """The deterministic resolver (lib/route_resolve.py) against the committed model catalog, and against copies of it
 edited as data only. Ported from the architect's 31-test prototype and extended for the shipped behaviour."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import sys

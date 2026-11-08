@@ -1,6 +1,7 @@
 """lib/trial_shadow.py: the steps of a run (timeout, preempt, spawn failure, records, the attempt clock) and the idempotent cleanup.
 Fixtures: trial_shadow_case.py.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

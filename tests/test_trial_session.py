@@ -1,5 +1,6 @@
 """lib/trial_session.py (trial lane L3, design §3/§8/§10): the trial's own tmux session and state dir, its environment, its
 configuration, and the capacity guard. Real tmux on a private server (-L socket); tp-agent reads task dirs; no model runs."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from lane_fixture import MODEL, ROOT, TMUX, TmuxCase  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "lib"))
 import trial_session  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 LOCAL_MODEL = "slotstream/stub-qwen"
 
@@ -109,7 +111,7 @@ class SessionTests(unittest.TestCase):
         wrapper = fake / "tmux"
         wrapper.write_text('#!/bin/sh\nexec {} -L {} "$@"\n'.format(TMUX, self.sock))
         wrapper.chmod(0o755)
-        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+        self.env = {**outside_session(), "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         for key in ("TMUX", "TMUX_PANE"):
             self.env.pop(key, None)
         self.addCleanup(self.stop_server)

@@ -1,4 +1,5 @@
 """bin/tp-trust: pty-driven grant and revoke, refusals, atomicity, check against the reader."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import importlib.machinery
 import io

@@ -1,4 +1,5 @@
 """Goal extension continuation, settlement and orphan reconcile; fake Pi and child-process boundary."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import shutil
 import subprocess

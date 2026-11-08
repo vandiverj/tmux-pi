@@ -4,6 +4,7 @@ Sensitive file names are assembled from pieces so this source can be searched an
 without itself looking like a credential read. Every row is judged with an explicit working
 directory inside a throwaway project tree, so the table does not depend on where it is run.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import atexit
 import json
 import os

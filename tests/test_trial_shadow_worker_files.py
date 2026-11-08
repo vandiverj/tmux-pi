@@ -7,6 +7,7 @@ F5  every read of a file the worker can write opens it O_NONBLOCK | O_NOFOLLOW, 
 
 Fixtures: trial_shadow_case.py (TreeCase from test_trial_shadow_branches.py). A FIFO gets a writer thread, so a reader that wrongly waits on it gets valid data and the test fails
 instead of hanging; nothing waits a fixed time."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

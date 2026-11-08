@@ -1,5 +1,6 @@
 """The model catalog: strict validation, the generated router prompt, the top-level wording, and the parser for the
 router's reply."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import re

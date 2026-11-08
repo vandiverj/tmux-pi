@@ -4,6 +4,7 @@ The shadow writes two kinds of qwen record: the builder's, from the task the wor
 task dir, `trial_record.no_task`. Both must carry the keys the builder gives (size, first_review_outcome, gate_runs, the transcript
 and docs fields), because the report reads them by name. Fixtures: trial_shadow_case.py.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

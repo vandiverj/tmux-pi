@@ -11,6 +11,8 @@ import io
 import os
 import sys
 from pathlib import Path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 AGENT = Path(__file__).resolve().parent.parent / "bin" / "tp-agent"
 _module = None
@@ -39,7 +41,7 @@ def run(argv, env=None, cwd=None):
             os.chdir(cwd)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                agent.cli(list(argv), dict(os.environ) if env is None else env)
+                agent.cli(list(argv), outside_session() if env is None else env)
             except SystemExit as stop:
                 code = stop.code
                 rc = 0 if code is None else code if isinstance(code, int) else (print(code, file=sys.stderr) or 1)

@@ -4,6 +4,7 @@ A symlink left where a task file, a session file, a queue entry, a lane record o
 "w") to any file the user can write. For a representative writer of each kind, plant a link at the target pointing at a file
 outside the state directory and check that the outside file is unchanged and that the write replaced the link or refused clearly.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import importlib.machinery
 import importlib.util
 import json
@@ -34,6 +35,8 @@ import work_checkpoint  # noqa: E402
 import worker_process  # noqa: E402
 from safe_write import UnsafePath  # noqa: E402
 from test_lane_records import RepoFixture  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 OUTSIDE = "outside: the user's own file, not tmux-pi state\n"
 MODEL = "openai-codex/gpt-6-sol"
@@ -488,7 +491,7 @@ class LinkedAncestorTests(Planted):
     def test_tp_contract_collect_refuses_a_linked_task_and_writes_nothing_outside(self):
         self.link_tasks()
         run = subprocess.run([str(ROOT / "bin/tp-contract"), "collect", "w1"], text=True, capture_output=True,
-                             env={**os.environ, "TP_STATE_DIR": str(self.state)})
+                             env={**outside_session(), "TP_STATE_DIR": str(self.state)})
         self.assertNotEqual(run.returncode, 0, run.stdout)
         self.assertOutsideAsFound()
 
@@ -699,7 +702,7 @@ esac
         tmux.chmod(0o755)
         self.project = self.base / "project"
         self.project.mkdir()
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.base / "work-store"),
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.base / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
         self.env.pop("TP_MAIN", None)
@@ -833,7 +836,7 @@ class LauncherSessionDirTests(Planted):
         for name in ("pi", "claude"):
             (fake / name).write_text("#!/bin/sh\nexit 0\n")
             (fake / name).chmod(0o755)
-        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TEST_TMUX_LOG": str(self.log),
+        self.env = {**outside_session(), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TEST_TMUX_LOG": str(self.log),
                     "TP_NO_ATTACH": "1"}
         for key in ("TP_SESSION", "TMUX", "TP_MAIN", "TP_MAIN_HARNESS", "TP_STATE_DIR", "TP_WORKDIR"):
             self.env.pop(key, None)

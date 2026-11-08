@@ -1,5 +1,6 @@
 """`tp-agent work promote` (Phase B): a private note or workspace becomes a DRAFT context file in a working tree, and nothing else.
 Only temp stores and temp git repositories are used; the real engineering-context clone is never named or touched."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,11 @@ sys.path.insert(0, str(ROOT / "lib"))
 import work  # noqa: E402
 import work_find  # noqa: E402
 import work_promote  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 AWS = "AKIA" + "IOSFODNN7EXAMPLE"
-GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_OPTIONAL_LOCKS": "0"}
+GIT_ENV = {**outside_session(), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_OPTIONAL_LOCKS": "0"}
 
 
 class PromoteBase(unittest.TestCase):
@@ -319,7 +322,7 @@ class PromoteTests(PromoteBase):
 
 class PromoteCli(PromoteBase):
     def run_cli(self, *args):
-        env = {**os.environ, "TP_STATE_DIR": str(self.tmp / "state")}
+        env = {**outside_session(), "TP_STATE_DIR": str(self.tmp / "state")}
         env.pop("TMUX", None)
         return subprocess.run([str(ROOT / "bin/tp-agent"), "work", *args], env=env, text=True, capture_output=True, timeout=30)
 

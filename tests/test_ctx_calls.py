@@ -1,5 +1,6 @@
 """CX1 ctx-store: the fail-closed call log (ctx-calls.jsonl). No usable task directory means no answer; a symlinked log is
 refused; arguments are redacted before they are logged or hashed."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import sys

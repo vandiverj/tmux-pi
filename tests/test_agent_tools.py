@@ -1,4 +1,5 @@
 """tools/agent/*.sh against throwaway git repositories, with stub tools on PATH. No network; no real prettier, eslint, jest, tsc, deno or gitleaks."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import re

@@ -1,4 +1,5 @@
 """T9: the small orchestration faults, one test each (see report in the task directory)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import importlib.machinery
 import importlib.util
 import json

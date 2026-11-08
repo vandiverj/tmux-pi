@@ -3,12 +3,16 @@
 OLD below is that block (status/detail from lifecycle, collected/stopped, role, permission and capability requests, and
 the selected row's first lines via grep), run per id in bash against the same seeded task directory.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 OLD = r'''
@@ -86,7 +90,7 @@ class TpDetailTest(unittest.TestCase):
         task("unicode", files={"task.md": "naïve — ✓\n", "result.md": "réponse\n"})
         rows_text = "\n".join(rows) + "\n"
         details = "\n".join(lifecycle) + "\n"
-        run = lambda *cmd, **kw: subprocess.run(cmd, input=rows_text, capture_output=True, text=True, check=True, env=dict(os.environ, LC_ALL="en_US.UTF-8"), **kw).stdout
+        run = lambda *cmd, **kw: subprocess.run(cmd, input=rows_text, capture_output=True, text=True, check=True, env=dict(outside_session(), LC_ALL="en_US.UTF-8"), **kw).stdout
         old = run("bash", "-c", OLD, "old", str(tasks), details)
         new = run("python3", str(ROOT / "lib" / "tp_detail.py"), str(tasks), details)
         self.assertEqual(new, old)

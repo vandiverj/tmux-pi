@@ -5,6 +5,7 @@ review-of, reviewed-state.json, state.json, result.md). What the gate reads is t
 
 Every refusal is also held to be side-effect free: the state directory (every file's bytes), the lane directory (lane.json and
 lease.json), the worktree list, the branches, the lane's HEAD and its status are the same after as before."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import hashlib
 import json
 import os

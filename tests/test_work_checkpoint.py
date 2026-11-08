@@ -1,6 +1,7 @@
 """Checkpoints, recovery and the compaction marker (Phase C): lib/work_checkpoint.py, `tp-agent work checkpoint|recover|compacted`,
 the checkpoint entry of the index, the PreCompact hook script and the tp-exit call. Every store and state directory is a temp
 directory; nothing here touches the real user-level work store."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ sys.path.insert(0, str(ROOT / "lib"))
 import work  # noqa: E402
 import work_checkpoint as cp  # noqa: E402
 import work_index  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 HOOK = ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "precompact.sh"
 
@@ -66,7 +69,7 @@ class Base(unittest.TestCase):
         return sorted(p.name for p in (self.store / "checkpoints" / ident).glob("*") if p.is_file())
 
     def cli(self, *args, check=True, env=None, stdin=None):
-        full = {**os.environ, **self.env, **(env or {})}
+        full = {**outside_session(), **self.env, **(env or {})}
         full.pop("TMUX", None)
         run = subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=full, text=True, capture_output=True, timeout=60, input=stdin)
         if check:

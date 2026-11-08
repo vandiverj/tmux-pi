@@ -1,4 +1,5 @@
 """The fixed-form card the router reads: what goes in, what is left out, and what is never sent."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import tempfile
 import unittest
 from pathlib import Path

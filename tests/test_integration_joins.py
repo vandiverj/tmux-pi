@@ -10,6 +10,7 @@ the state directory and sixteen live panes (%1..%16); nothing here starts a work
 - A queued task that waits on a paused predecessor stays queued (tick, dispatch) beside a malformed sibling entry,
   and starts once the predecessor has a status.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import argparse
 import importlib.machinery
 import importlib.util
@@ -25,6 +26,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
+from session_env import outside_session  # noqa: E402
 SEP = "\x1f"
 
 
@@ -57,7 +59,7 @@ class JoinFixture(unittest.TestCase):
 esac
 exit 0
 ''')
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "joins", "TP_WORK_DIR": str(self.root / "work-store"),
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state), "TP_SESSION": "joins", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
         patcher = mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_WORK_DIR": str(self.root / "work-store")})

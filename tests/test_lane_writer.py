@@ -1,6 +1,7 @@
 """Lanes L3: dispatch into a lane, the one-writer rule and the preamble (bin/tp-agent, bin/tp-spawn, bin/tp-review,
 lib/worker_process.py). The numbered checks are those of the design's table (3.1). Every repository is a temporary one and
 tmux is the private fixture server of tests/lane_fixture.py; no model runs."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import hashlib
 import json
 import os

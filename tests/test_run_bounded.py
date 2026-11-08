@@ -1,4 +1,5 @@
 """tests/run_bounded.py: the bound stops what it started (and only that), and every run leaves one valid JSON record."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

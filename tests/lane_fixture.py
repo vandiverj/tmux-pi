@@ -10,6 +10,9 @@ import signal
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = "openai/gpt-6-sol"
@@ -119,7 +122,7 @@ class TmuxCase(unittest.TestCase):
             fake = self.root / "bin"
             fake.mkdir()
             write_wrappers(fake, self.sock)
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         self.env.pop("TMUX", None)
         self.env.pop("TMUX_PANE", None)

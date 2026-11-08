@@ -2,6 +2,7 @@
 
 Fake secrets are generated at runtime so no key-shaped literal is committed.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -20,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from redact import Redactor, exact_values
 from redaction_store import Store
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ALNUM = string.ascii_letters + string.digits
 
@@ -159,7 +162,7 @@ class RedactTests(unittest.TestCase):
         self.assertNotEqual(second.split()[2], second.split()[4])
         other_session = Redactor(Store("s2", store_root)).redact(secret)[0]
         self.assertEqual(other_session, "<REDACTED:secret_key_1>")
-        env = {**os.environ, "TP_REDACTION_DIR": str(store_root)}
+        env = {**outside_session(), "TP_REDACTION_DIR": str(store_root)}
         def run(_):
             return subprocess.run([str(ROOT / "bin/tp-redact"), "--stdin", "--session", "s3"], input="x " + secret,
                                   capture_output=True, text=True, env=env, check=True).stdout
@@ -220,7 +223,7 @@ class RedactTests(unittest.TestCase):
 
     def test_cli_outputs_text_or_json_without_values(self):
         secret = fake("sk_test_", seed=61)
-        env = {**os.environ, "TP_REDACTION_DIR": str(self.dir / "cli")}
+        env = {**outside_session(), "TP_REDACTION_DIR": str(self.dir / "cli")}
         def cli(*args):
             return subprocess.run([str(ROOT / "bin/tp-redact"), "--stdin", "--no-store", *args],
                                   input="CLERK_SECRET_KEY=" + secret + "\n", capture_output=True, text=True, env=env)

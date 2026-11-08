@@ -1,5 +1,6 @@
 """Regression tests for the two router follow-ups: the reviewer minimum bounds availability, and a redirect after an
 explicit low level is checked against the route's effective bound (not the role's full floor)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import unittest
 

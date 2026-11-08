@@ -1,4 +1,5 @@
 """lib/review_rounds.py: earlier review rounds along the retry lineage, and the diff since the last reviewed tree."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from pathlib import Path
 import re

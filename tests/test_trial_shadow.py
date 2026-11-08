@@ -7,11 +7,13 @@ _worker_files.
 One full run goes through the real tp-spawn, tp-agent and tp-review, with `new-window` stubbed, so nothing starts a model.
 No test waits a fixed time: every wait is a poll callback that settles the task, or a clock that jumps.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trial_shadow_case import *  # noqa: E402,F401,F403
+from session_env import outside_session  # noqa: E402
 
 # ------------------------------------------------------------------------------------------------------------- pure functions
 
@@ -508,7 +510,7 @@ class ExplicitQwenRequestTests(unittest.TestCase):
         work = Path(temp.name) / "work"
         work.mkdir()
         (work / "x.txt").write_text("hello\n")
-        env = {**os.environ, "PI_CODING_AGENT_DIR": str(agent)}
+        env = {**outside_session(), "PI_CODING_AGENT_DIR": str(agent)}
         run = subprocess.run(["pi", "-p", "--no-skills", "--no-context-files", "--no-extensions", "--no-session", "--tools", "read", "--model",
                               "lmstudio/qwen/qwen3.6-35b-a3b", "--thinking", thinking, "Read x.txt"],
                              cwd=str(work), env=env, text=True, capture_output=True, timeout=120, stdin=subprocess.DEVNULL)

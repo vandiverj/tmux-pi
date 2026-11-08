@@ -1,6 +1,7 @@
 """The model router through its commands: `tp-route`, `tp-agent dispatch / retry --escalate / review`, and review
 planning (who reviews, and whether). Stub `claude` and `pi` stand in for the routers; tmux is faked as in
 test_orchestration. Nothing here may contact the Laya endpoint (127.0.0.1:11436)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess

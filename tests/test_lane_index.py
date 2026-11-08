@@ -1,4 +1,5 @@
 """L9: lane and lane_step in the task index and `tp-agent list`; a `lanes` summary block. Display only."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path

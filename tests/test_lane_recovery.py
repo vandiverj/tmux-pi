@@ -3,6 +3,7 @@ lib/worker_process.py, agent/extensions/escalate.ts is in tests/escalate_runtime
 session stuck, and each one names the command that clears it. Repositories are temporary; tmux is the private fixture server
 of tests/lane_fixture.py. A starter is killed with SIGKILL in a fixed interval (the fixture's tmux stub stops there), never
 after a sleep."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

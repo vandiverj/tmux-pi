@@ -4,6 +4,7 @@ preamble of a task with a parent. Real tp-spawn, fake tmux, no model.
 
 Every successful spawn is slow, so the tests that only read what a spawn wrote share it: SharedSpawnTests makes its spawns once in
 setUpClass. Tests that need a fresh state dir (refusals leave no task) or different tree/manifest state make their own."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import concurrent.futures
 import json
 import os

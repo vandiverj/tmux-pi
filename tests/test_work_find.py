@@ -1,5 +1,6 @@
 """`tp-agent find` (Phase B): the store, the task records of several sessions, filters, redaction, and the read-only shared clone.
 Every store, project and git repository here is a temp directory; the real work store and engineering-context clone are never read."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import hashlib
 import io
 import json
@@ -15,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import work  # noqa: E402
 import work_find  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 AWS = "AKIA" + "IOSFODNN7EXAMPLE"  # assembled so this file holds no key-shaped literal
 KEY = "AKIA" + "X" * 16
@@ -359,7 +362,7 @@ class TaskFind(FindBase):
 class SharedFind(FindBase):
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.shared), *args], check=True, text=True, capture_output=True,
-                              env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}).stdout.strip()
+                              env={**outside_session(), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}).stdout.strip()
 
     def snapshot(self):
         """Working files (content and mtime), HEAD, the refs and the index file, read without running anything that could refresh them."""
@@ -397,7 +400,7 @@ class SharedFind(FindBase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.head)
         self.assertEqual(subprocess.run(["git", "-C", str(self.shared), "status", "--porcelain"], text=True, capture_output=True,
-                                        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}).stdout, "")
+                                        env={**outside_session(), "GIT_OPTIONAL_LOCKS": "0"}).stdout, "")
 
     def test_a_match_in_the_5001st_shared_file_is_found(self):
         for i in range(5002):
@@ -511,7 +514,7 @@ class DisplayScreen(FindBase):
 
 class FindCli(FindBase):
     def run_cli(self, *args):
-        env = {**os.environ, "TP_STATE_DIR": str(self.project / ".tmux-pi")}
+        env = {**outside_session(), "TP_STATE_DIR": str(self.project / ".tmux-pi")}
         env.pop("TMUX", None)
         return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env, text=True, capture_output=True, timeout=30)
 
@@ -611,7 +614,7 @@ class OutputBoundary(unittest.TestCase):
                     write(tmp / "shared" / "docs" / plant["shared"], "needle\n" + "x" * (work_find.SHARED_MAX + 10) + "\n")
                     config["shared"] = {"path": str(tmp / "shared"), "search": True}
                 (tmp / "work-config.json").write_text(json.dumps(config))
-                env = {**os.environ, "TP_WORK_DIR": str(store), "TP_WORKDIR": str(project), "TP_WORK_CONFIG": str(tmp / "work-config.json"),
+                env = {**outside_session(), "TP_WORK_DIR": str(store), "TP_WORKDIR": str(project), "TP_WORK_CONFIG": str(tmp / "work-config.json"),
                        "TP_STATE_DIR": str(tmp / "state")}
                 env.pop("TMUX", None)
                 title, ticket, tag = plant.get("title", "Needle plain note"), plant.get("ticket", "DMP-77"), plant.get("tag", "loader")
@@ -664,7 +667,7 @@ class WorkBoundary(unittest.TestCase):
         self.tree.mkdir()
         write(self.tmp / "work-config.json", "{}")
         (self.tmp / "state").mkdir()
-        self.env = {**os.environ, "TP_WORK_DIR": str(self.store), "TP_WORKDIR": str(self.tmp), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
+        self.env = {**outside_session(), "TP_WORK_DIR": str(self.store), "TP_WORKDIR": str(self.tmp), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
                     "TP_STATE_DIR": str(self.tmp / "state")}
         self.env.pop("TMUX", None)
 

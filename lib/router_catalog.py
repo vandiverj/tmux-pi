@@ -144,6 +144,7 @@ def validate_catalog(cat):
     if not isinstance(levels, list) or len(levels) < 2:
         _fail("levels must list at least two levels")
     keys, models, last_rank = [], {}, None
+    model_efforts = {}
     for level in levels:
         where = "level {}".format(level.get("key") if isinstance(level, dict) else "?")
         _object(level, where, ("key", "name", "rank", "for", "not_for", "anchors", "expected_share", "models", "effort_map"),
@@ -189,15 +190,19 @@ def validate_catalog(cat):
             _object(model, where + " model", ("provider", "worker", "model", "efforts", "context_window", "max_output", "in_roster"),
                     ("max_packet_tokens", "unverified", "explicit_only"))
             name = _text(model["model"], where + " model name")
+            if name in models and any(model[field] != models[name][1][field]
+                                      for field in ("provider", "worker", "context_window", "max_output")):
+                _fail("model {} is listed twice".format(name))
             if model["provider"] not in providers:
                 _fail("{}: unknown provider {!r}".format(name, model["provider"]))
             if providers[model["provider"]]["worker"] != model["worker"]:
                 _fail("{}: worker {!r} does not match provider {}".format(name, model["worker"], model["provider"]))
             if model["worker"] == "pi" and "/" not in name:
                 _fail("{}: a pi model must be provider/model".format(name))
-            if name in models:
-                _fail("model {} is listed twice".format(name))
             efforts = _names(model["efforts"], name + " efforts", order)
+            if name in models:
+                if min(order.index(e) for e in efforts) <= max(order.index(e) for e in model_efforts[name]):
+                    _fail("model {} is listed twice".format(name))
             if sorted(efforts, key=order.index) != efforts:
                 _fail("{}: efforts must follow effort.order".format(name))
             _int(model["context_window"], name + " context_window")
@@ -210,7 +215,8 @@ def validate_catalog(cat):
             for target in emap.values():
                 if order.index(efforts[0]) > order.index(target):
                     _fail("{}: every allowed effort is above effort_map target {!r} at level {}".format(name, target, level["key"]))
-            models[name] = (level["key"], model)
+            models.setdefault(name, (level["key"], model))
+            model_efforts.setdefault(name, []).extend(efforts)
 
     shown = [lv["key"] for lv in levels if lv.get("shown", True)]
     if len(shown) < 2:
@@ -236,7 +242,7 @@ def validate_catalog(cat):
             _fail("router model {} is not in the catalog".format(name))
         if models[name][1]["provider"] != entry["provider"] or models[name][1]["worker"] != entry["worker"]:
             _fail("router model {} does not match its catalog provider and worker".format(name))
-        if entry["effort"] != "lowest" and entry["effort"] not in models[name][1]["efforts"]:
+        if entry["effort"] != "lowest" and entry["effort"] not in model_efforts[name]:
             _fail("router effort {!r} is not allowed on {}".format(entry["effort"], name))
         _number(entry["timeout_seconds"], "router timeout for " + name)
         if "env" in entry and (not isinstance(entry["env"], dict) or any(
@@ -347,18 +353,18 @@ def shown_keys(cat):
     return [lv["key"] for lv in shown_levels(cat)]
 
 
-def level_of(cat, model):
-    """(level, model entry) for a catalog model name, else (None, None)."""
+def level_of(cat, model, effort=None):
+    """Find a model/effort pair, or the lowest entry for a model when effort is omitted."""
     for level in cat["levels"]:
         for entry in level["models"]:
-            if entry["model"] == model:
+            if entry["model"] == model and (effort is None or effort in entry["efforts"]):
                 return level, entry
     return None, None
 
 
-def provider_of(cat, worker, model):
+def provider_of(cat, worker, model, effort=None):
     """Provider name of a model: its catalog provider, else a guess from the harness and name prefix."""
-    _, entry = level_of(cat, model)
+    _, entry = level_of(cat, model, effort)
     if entry:
         return entry["provider"]
     if worker == "claude":
@@ -389,7 +395,7 @@ def _level_models(level):
     for m in level["models"]:
         if m.get("explicit_only"):
             continue  # the router card never offers a model only an explicit --model may pick
-        by.setdefault(m["provider"], []).append(m["model"].split("/")[-1])
+        by.setdefault(m["provider"], []).append("{} ({})".format(m["model"].split("/")[-1], ", ".join(m["efforts"])))
     return "; ".join("{}: {}".format(p, ", ".join(ms)) for p, ms in by.items())
 
 
@@ -409,7 +415,8 @@ def build_system(cat):
         out += ["", "Level %d - %s (models: %s)" % (i, level["name"], _level_models(level)),
                 "  For: " + _prose(level["for"], cat), "  Not for: " + _prose(level["not_for"], cat)]
         if len(set(level["effort_map"].values())) == 1:
-            out.append("  Effort has no effect at this level; answer %s." % vocab[0])
+            answer = next(iter(level["effort_map"].values()))
+            out.append("  Effort has no effect at this level; answer %s." % (answer if answer in vocab else vocab[0]))
         for anchor in level["anchors"]:
             tail = ", shape %s" % anchor["shape"] if anchor.get("shape") else ""
             out.append('  Example: "%s" -> level %d, effort %s%s' % (anchor["task"], i, anchor["effort"], tail))

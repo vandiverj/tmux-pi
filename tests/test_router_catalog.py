@@ -39,6 +39,24 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(rc.shown_keys(SHIPPED), ["local", "small", "mid", "top"])
         self.assertTrue(level(SHIPPED, "top").get("restricted"))
         self.assertIs(level(SHIPPED, "strong")["shown"], False)
+        for key in ("mid", "strong"):
+            sol = next(m for m in level(SHIPPED, key)["models"] if m["provider"] == "openai")
+            for field, expected in (("model", "openai/gpt-6.1-sol"), ("context_window", 500000)):
+                with self.subTest(level=key, field=field):
+                    self.assertEqual(sol[field], expected)
+            with self.subTest(level=key, field="unverified"):
+                self.assertNotIn("not in config/router.json yet", sol.get("unverified", ""))
+        sol_id = "openai/gpt-6.1-sol"
+        self.assertEqual(rc.level_of(SHIPPED, sol_id)[0]["key"], "mid")
+        for effort, key in (("low", "mid"), ("medium", "mid"), ("high", "strong")):
+            with self.subTest(effort=effort):
+                self.assertEqual(rc.level_of(SHIPPED, sol_id, effort)[0]["key"], key)
+        self.assertEqual(rc.level_of(SHIPPED, sol_id, "max"), (None, None))
+        self.assertEqual(next(m for m in level(SHIPPED, "mid")["models"] if m["model"] == sol_id)["efforts"], ["low", "medium"])
+        self.assertEqual(level(SHIPPED, "strong")["models"][0]["efforts"], ["high"])
+        self.assertNotIn("openai/gpt-6-sol", json.dumps(SHIPPED))
+        self.assertEqual(next(m for m in level(SHIPPED, "small")["models"] if m["provider"] == "openai")["model"], fx.LUNA)
+        self.assertEqual(next(m for m in level(SHIPPED, "top")["models"] if m["provider"] == "openai")["model"], fx.ASTRA)
         chain = SHIPPED["router"]["chain"]
         self.assertEqual(sorted(c["model"] for c in chain), sorted([fx.HAIKU, fx.LUNA, fx.QWEN]))
         for entry in chain:
@@ -107,6 +125,16 @@ class ValidationTests(unittest.TestCase):
         self.bad(lambda c: level(c, "mid")["models"][0].update(provider="nobody"), "unknown provider")
         self.bad(lambda c: level(c, "mid")["models"][0].update(worker="pi"), "does not match provider")
         self.bad(lambda c: level(c, "small")["models"].append(copy.deepcopy(level(c, "mid")["models"][0])), "listed twice")
+        for field, value in (("context_window", 600000), ("max_output", 64000), ("provider", "openrouter"), ("worker", "claude")):
+            with self.subTest(field=field):
+                self.bad(lambda c: level(c, "strong")["models"][0].update({field: value}), "listed twice")
+        self.bad(lambda c: level(c, "strong")["models"][0].update(efforts=["medium", "high"]), "listed twice")
+        reversed_split = copy.deepcopy(CAT)
+        next(m for m in level(reversed_split, "mid")["models"] if m["provider"] == "openai")["efforts"] = ["high"]
+        level(reversed_split, "mid")["effort_map"] = {e: "high" for e in ("low", "medium", "high")}
+        level(reversed_split, "strong")["models"][0]["efforts"] = ["low", "medium"]
+        with self.assertRaisesRegex(rc.CatalogError, "listed twice"):
+            rc.validate_catalog(reversed_split)
         self.bad(lambda c: c.update(default_level="strong"), "default_level")
         self.bad(lambda c: c.update(default_level="nope"), "default_level")
         self.bad(lambda c: level(c, "mid").update(colour="red"), "unknown keys")
@@ -241,7 +269,7 @@ class PromptTests(unittest.TestCase):
     def test_prompt_lists_only_shown_levels_in_order(self):
         prompt = rc.build_system(CAT)
         self.assertEqual(re.findall(r"^Level (\d+) - ", prompt, re.M), ["1", "2", "3", "4"])
-        self.assertNotIn("gpt-6.1-sol", prompt)
+        self.assertNotIn("Level 4 - GPT sol 6.1", prompt)
         self.assertIn('<integer 1-4>', prompt)
         self.assertIn("Level 1 requires a listed shape", prompt)  # {level:local} placeholder rendered as a number
         self.assertNotIn("{level:", prompt)
@@ -254,6 +282,11 @@ class PromptTests(unittest.TestCase):
         prompt = rc.build_system(cat)
         self.assertIn("Level 3 - Workhorse", prompt)
         self.assertIn("For: Whatever the catalog says.", prompt)
+        level(cat, "strong")["shown"] = True
+        prompt = rc.build_system(cat)
+        self.assertIn("gpt-6.1-sol (high)", prompt)
+        self.assertIn("gpt-6.1-sol (low, medium)", prompt)
+        self.assertIn("Effort has no effect at this level; answer high.", prompt)
 
     def test_hashes_follow_the_content(self):
         cat = copy.deepcopy(CAT)

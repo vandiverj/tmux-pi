@@ -13,7 +13,9 @@ from unittest import mock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
-from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET, reply
+from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SONNET, reply
+
+SOL = "openai/gpt-6.1-sol"  # These tests resolve against the committed catalog.
 
 import model_router  # noqa: E402
 import llm_router  # noqa: E402
@@ -515,14 +517,14 @@ class ExplicitChoiceTests(ChainTestCase):
                 with self.assertRaises(model_router.RouteStop):
                     self.select(role=role, local_only=True)  # and --local-only stops rather than run a local model
     def test_explicit_effort_above_high_needs_approval(self):
-        r = self.select(model=SOL, thinking="xhigh")
+        r = self.select(model=ASTRA, thinking="xhigh")
         self.assertEqual((r["thinking"], r["approvals"]), ("high", {"effort_above_high": False}))
         self.assertTrue(any("capped at high" in s for s in r["steps"]))
-        r = self.select(model=SOL, thinking="xhigh", approve_effort=True)
+        r = self.select(model=ASTRA, thinking="xhigh", approve_effort=True)
         self.assertEqual((r["thinking"], r["approvals"]), ("xhigh", {"effort_above_high": True}))
         self.script(claude=text((3, "high")))
         r = self.select(thinking="max", worker="pi", approve_effort=True)
-        self.assertEqual((r["model"], r["thinking"]), (SOL, "max"))
+        self.assertEqual((r["model"], r["thinking"]), (SOL, "medium"))
 
     def test_bad_explicit_requests(self):
         for req in ({"model": SONNET, "worker": "pi"}, {"model": "gpt-x", "worker": "pi"}, {"level": "strong"}, {"level": "nope"},

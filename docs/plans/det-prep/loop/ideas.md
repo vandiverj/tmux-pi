@@ -113,3 +113,9 @@ These build on J1. Each becomes a new bench task kind, a reviewed bench change o
   - Probable mechanism: an intent record written before the call, with an idempotency key. On resume, query the external state by that key before retrying.
   - Score: duplicate effects (must be 0), correct resume state, and time to reconcile.
 - Order: after J1, M1 and X1 pilot. H20 is the cheapest to stage, since it needs only two lanes on battle-soccer. H21 needs the stub service.
+
+## F-SESS (found 2026-11-08): explicit TP_SESSION loses to TMUX
+- **Bug.** `tp_session` (`lib/tp.sh`) works out the session from `TMUX`/`TMUX_PANE` before it looks at `TP_SESSION`. A `tp-exit` run from a detprep pane with `TP_SESSION=bench-x` stopped every detprep worker. See the run-log incident of 2026-11-08 01:31Z.
+- **Rule.** An explicit `TP_SESSION` either wins, or the script refuses when it disagrees with the TMUX session. The destructive scripts (`tp-exit`, `tp-reset`, `tp-clean`) must refuse.
+- **Test.** A table covering every `bin/` script that calls `tp_session`, run with conflicting `TMUX` and `TP_SESSION`.
+- **Status.** Queued after T1, which supplies the session-key list.

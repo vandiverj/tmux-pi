@@ -180,3 +180,17 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Open owner questions:
   - Remove `~/.local/rtk-eval` and RTK's local databases, which still hold raw output from these runs including dummy secrets?
   - Keep or remove the rtk-eval worktree and branch?
+
+## 2026-11-08 01:31Z: incident, J1 live run stopped the detprep workers
+- **What happened.** The J1 coder (`coder-c28f7b48f3`) ran a live `tp-bench run --label control` from its worker pane.
+  - `lib/bench/shell.py` merges the full `os.environ` into every child process, so the pane's `TMUX`/`TMUX_PANE` reached `tp-exit`.
+  - `tp_session` in `lib/tp.sh` checks `TMUX` before `TP_SESSION`, so `tp-exit` and `tp-reset` targeted **detprep** instead of `bench-control-1`.
+  - `tp-reset` stopped every running detprep worker: J1 (%95) and T1 round 2 (`coder-91e90cad04`, %98).
+  - The script died with its pane before `kill-session`. Otherwise the whole detprep session would have been killed, Main included.
+- **Second problem.** The bench workspace's Claude worker stopped at Claude Code's "trust this folder" dialog for the temp copy, and all 4 tasks errored. Session `bench-control-1` is still open on that dialog and nothing answered it. Main's `tmux kill-session` was denied by the auto-mode classifier, so it is left for the owner.
+- **Recovery.**
+  - Stopped both dead records.
+  - Retried both in their kept worktrees, with uncommitted work intact:
+    - T1 is now `coder-cb6b537bac` (%102), restart brief only.
+    - J1 is now `coder-550a178817` (%103). Its brief adds: no live runs from a worker pane; one env builder that strips the session keys from every child, with a parity test that must fail without it; a session-ownership guard before stopping; folder trust done the supported way, never by answering the dialog.
+- **New finding F-SESS.** When `TMUX` is set, `tp_session` ignores an explicit `TP_SESSION`. Any tmux-pi script run from a pane with `TP_SESSION=<other>` acts on the caller's own session. The candidate rule: an explicit `TP_SESSION` wins, or the script refuses when they disagree. This touches every bin script, so it needs its own lane after T1. It is added to the fix queue.

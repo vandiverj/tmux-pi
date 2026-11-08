@@ -495,3 +495,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   docs/plans/det-prep/release-gates.md. Owner: "yes add the gates and start G1 after the merges".
 - FG-N1 round 2 in review (review-coder-50e09c1158-143214); LS1 round 3 worker (coder-2d4df36f35); M2-F1 review
   (review-coder-76b4f649f5-135407). G1 runs on main after these merge.
+
+## 2026-11-08 G2 raised to zero failures (owner)
+- Owner: "I want all failures fixed in the end so they should be determined and fixed". G2 now means
+  baseline-failing.txt goes to empty with each cause found and fixed; no skips or "explained" entries.
+- Plan: G1 first (it fixes the full failing list on merged main), then G2 lanes grouped by cause.

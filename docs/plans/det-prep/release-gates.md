@@ -6,7 +6,7 @@ cross-provider review prove a lane does what its brief says; they do not prove t
 full-suite gate (run-log) found 387 off-baseline failures in 20 modules that M2's own run and review missed.
 
 Claims each gate allows:
-- G1 + G2: "no new failing".
+- G1 + G2: "no failing tests at all" (G1 alone: "no new failing").
 - G3 + G4: "improves production use".
 - G5: "safe to port to the work Mac".
 
@@ -18,11 +18,15 @@ Claims each gate allows:
 - **Done when:** zero FAIL/ERROR names outside `baseline-failing.txt` in all four runs. Every off-baseline name is
   fixed or traced to a cause before the gate passes. Record the commit, counts and logs in the run-log.
 
-## G2: shrink the baseline
-- **What:** each name in `baseline-failing.txt` (13 on 2026-11-08) is fixed or explained.
-- **Done when:** no unexplained entry. An entry that stays is written as a known test-only defect with its cause and why
-  it does not hide a product failure. Shipped-config, exit-code and lane hand-over names are presumed product bugs
-  until shown otherwise.
+## G2: fix every failure (baseline to zero)
+- **Owner 2026-11-08:** "I want all failures fixed in the end so they should be determined and fixed".
+- **What:** every name in `baseline-failing.txt` (13 on 2026-11-08), plus anything G1 finds, gets a found cause and a
+  fix. A test that is itself wrong is fixed as a test, with the cause shown; nothing is skipped, deleted or left
+  "explained" to pass.
+- **How:** group names by cause, one lane per group, the normal lane flow (repro on main, fix, both interpreters and
+  modes, cross-provider review). Each fixed name is removed from `baseline-failing.txt` in the same lane.
+- **Done when:** `baseline-failing.txt` is empty and a G1 run on the resulting `main` has zero FAIL/ERROR names in all
+  four runs.
 
 ## G3: end-to-end smoke
 - **What:** one scripted run on the battle-soccer test bed through the real tools: dispatch, a permission prompt that is

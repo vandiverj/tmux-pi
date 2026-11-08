@@ -1,6 +1,7 @@
 """T12: a failing test a worker says it does not own gets its own investigating worker (lib/failing_tests.py and the collect and
 dispatch --investigate-failure paths of bin/tp-agent). Repositories are temporary ones; tmux is the private fixture server of
 tests/lane_fixture.py, so no worker starts and no model runs."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

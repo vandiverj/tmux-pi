@@ -5,6 +5,7 @@ F2  the runner deletes no branch. A branch HEAD of the worker's tree is on (one 
     The refs the runner does make are recorded (name and commit) and removed only by that record.
 
 Split from test_trial_shadow_worker_files.py so that each file is well under the 300 s bound. Fixtures: trial_shadow_case.py."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import socket
 import sys
 from pathlib import Path

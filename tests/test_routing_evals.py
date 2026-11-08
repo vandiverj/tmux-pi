@@ -1,5 +1,6 @@
 """Experimental Claude preference and routing eval logging (fake Laya; no live model or frozen set)."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import http.server
 import json

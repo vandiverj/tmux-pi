@@ -3,6 +3,7 @@
 The plugin module's startup append renders the same text in TypeScript (readIndex in claude/plugins/tmux-pi/hooks/register.tsx).
 hooks/index-text-cases.ts holds the cases both renderers must answer identically: this file checks the Python renderer against them,
 register.test.ts (`claude plugin test`) checks the module against the same file. Every store and state directory is temporary."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import index_text  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 CASES = ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "index-text-cases.ts"
 
@@ -88,7 +91,7 @@ class TextOption(unittest.TestCase):
         self.state = self.tmp / "project" / ".tmux-pi" / "run-one"
         (self.state / "tasks").mkdir(parents=True)
         (self.tmp / "work-config.json").write_text("{}")
-        self.env = {**os.environ, "TP_WORK_DIR": str(self.tmp / "work"), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
+        self.env = {**outside_session(), "TP_WORK_DIR": str(self.tmp / "work"), "TP_WORK_CONFIG": str(self.tmp / "work-config.json"),
                     "TP_STATE_DIR": str(self.state)}
         self.env.pop("TMUX", None)
 

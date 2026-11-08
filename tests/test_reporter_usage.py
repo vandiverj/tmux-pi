@@ -1,4 +1,5 @@
 """Pi reporter by-model usage, model switch and restart restore; mock API, synthetic data."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import subprocess
 import unittest
 from pathlib import Path

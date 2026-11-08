@@ -1,5 +1,6 @@
 """Qwen-trial record: built from a fixture task dir; the first review decides, not the last."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import sys
 import tempfile

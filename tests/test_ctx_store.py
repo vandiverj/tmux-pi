@@ -1,5 +1,6 @@
 """CX1 ctx-store: the note format and validation, scope globs and ranking, search, the index cache, freshness flags, the
 screens (redact), and writing/approving notes. Every project here is a temp directory; no real store, repo or network is read."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess

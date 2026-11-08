@@ -1,4 +1,5 @@
 """Local-model candidate review: it may only clear candidates, and every failure keeps them redacted."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os

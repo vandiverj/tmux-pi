@@ -1,5 +1,6 @@
 """CX1 ctx-store: `tp-ctx` as a person or a worker runs it. Every run is a subprocess with a scrubbed environment (no worker
 variables, no real work store) against a temp project; the approve gate is also driven through a pseudo-terminal."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import pty

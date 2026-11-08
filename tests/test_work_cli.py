@@ -1,4 +1,5 @@
 """`tp-agent work` commands (Phase A) through the real CLI, with a throwaway store and session."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,7 +24,7 @@ class WorkCli(unittest.TestCase):
         self.store = self.tmp / "work"
         self.state = self.tmp / "project" / ".tmux-pi"
         (self.state / "tasks").mkdir(parents=True)
-        self.env = {**os.environ, "TP_WORK_DIR": str(self.store), "TP_STATE_DIR": str(self.state)}
+        self.env = {**outside_session(), "TP_WORK_DIR": str(self.store), "TP_STATE_DIR": str(self.state)}
         self.env.pop("TMUX", None)
 
     def raw(self, *args, env=None):

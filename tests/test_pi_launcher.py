@@ -1,12 +1,17 @@
 """bin/tp-pi argv per launch kind, against a stub pi on PATH; no models or live sessions."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILTIN = {"read", "bash", "edit", "write", "grep", "find", "ls", "codemode"}
@@ -56,7 +61,7 @@ class PiLauncherTests(unittest.TestCase):
                       'with open(os.environ["TEST_PI_ARGV"], "w") as f: json.dump({"argv": sys.argv[1:], "mode": mode}, f)\n'
                       'print("stub reply")\n')
         pi.chmod(0o755)
-        self.env = {**os.environ, "PATH": str(self.fake) + os.pathsep + os.environ["PATH"],
+        self.env = {**outside_session(), "PATH": str(self.fake) + os.pathsep + os.environ["PATH"],
                     "TEST_PI_ARGV": str(self.record), "TP_PI_NODE": ""}
         for key in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE"):
             self.env.pop(key, None)

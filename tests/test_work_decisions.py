@@ -1,4 +1,5 @@
 """Decision entries (Phase A): every brief-section-9 field, store-global ids, cross-workspace listing, answer/withdraw."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import work  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 
 class Decisions(unittest.TestCase):
@@ -20,7 +23,7 @@ class Decisions(unittest.TestCase):
         self.tmp = Path(temp.name)
         self.state = self.tmp / "p" / ".tmux-pi"
         (self.state / "tasks").mkdir(parents=True)
-        self.env = {**os.environ, "TP_WORK_DIR": str(self.tmp / "work"), "TP_STATE_DIR": str(self.state)}
+        self.env = {**outside_session(), "TP_WORK_DIR": str(self.tmp / "work"), "TP_STATE_DIR": str(self.state)}
         self.env.pop("TMUX", None)
 
     def raw(self, *args):

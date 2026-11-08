@@ -1,4 +1,5 @@
 """pi safe_read / safe_grep (agent/extensions/safe.ts) and their sensitive.ts gate; runs the real tp-redact, no models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import shutil
 import subprocess

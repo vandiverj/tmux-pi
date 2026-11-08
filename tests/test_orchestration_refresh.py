@@ -1,4 +1,5 @@
 """Pi /refresh-status command: main-only registration, stub script success/failure/timeout; mock API."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import subprocess
 import unittest
 from pathlib import Path

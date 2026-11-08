@@ -1,5 +1,6 @@
 """lib/gate_record.py: load, validate, status (fresh, stale, invalid) and missing_required. The records the scripts write are
 covered in test_agent_tools.py; here the records are built by hand."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import os

@@ -1,4 +1,5 @@
 """Pi reporters and the dispatcher never write tmux-pi state through a planted symlink; real extension modules, synthetic data."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import re
 import subprocess

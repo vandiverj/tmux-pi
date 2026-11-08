@@ -1,4 +1,5 @@
 """ask_local keeps an over-cap reply on disk and returns an excerpt plus an evidence manifest; no models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import shutil
 import subprocess

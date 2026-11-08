@@ -1,4 +1,5 @@
 """The QA command is an on-demand Pi skill, not a permanently expanded system prompt."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import unittest
 from pathlib import Path
 

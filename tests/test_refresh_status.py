@@ -1,10 +1,15 @@
 """tp-refresh-status against a fake tmux; no live sessions."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE = '''#!/usr/bin/env python3
@@ -46,7 +51,7 @@ class RefreshStatusTests(unittest.TestCase):
         cfg = {"opts": o, "panes": panes, "respawn_fail": respawn_fail, "starts": s, "quote": quote,
                "current": "@1", "session_panes": session_panes or ["%1", "%2", "%3", "%9"]}
         (base / "cfg.json").write_text(json.dumps(cfg))
-        env = dict(os.environ, PATH=f"{base}:{os.environ['PATH']}", CFG=str(base / "cfg.json"),
+        env = dict(outside_session(), PATH=f"{base}:{os.environ['PATH']}", CFG=str(base / "cfg.json"),
                    LOG=str(base / "log"), TP_SESSION="tp")
         env.pop("TMUX", None); env.pop("TMUX_PANE", None)
         env.pop("TP_STATE_DIR", None)  # the fake session defines its own state dir

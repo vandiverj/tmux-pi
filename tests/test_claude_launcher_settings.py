@@ -1,4 +1,5 @@
 """Exercise bin/tp-claude with a fake claude; no models, live sessions or real Claude config."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 SHARED = ROOT / "claude" / "settings.json"
@@ -22,7 +26,7 @@ class ClaudeLauncherSettingsTests(unittest.TestCase):
         claude = self.fake / "claude"
         claude.write_text('#!/bin/sh\nprintf \'%s\\0\' "$@" > "$TEST_CLAUDE_ARGS"\n')
         claude.chmod(0o755)
-        self.env = {**os.environ, "PATH": str(self.fake) + os.pathsep + os.environ["PATH"],
+        self.env = {**outside_session(), "PATH": str(self.fake) + os.pathsep + os.environ["PATH"],
                     "TEST_CLAUDE_ARGS": str(self.args),
                     "TP_CLAUDE_CONFIG_DIR": str(self.base / "config")}
         for key in ("TP_TASK_DIR", "TP_MODE"):
@@ -112,7 +116,7 @@ class ContextWindowSettingTests(unittest.TestCase):
         claude = fake / "claude"
         claude.write_text('#!/bin/sh\nprintf \'%s\\0\' "$@" > "$TEST_CLAUDE_ARGS"\n')
         claude.chmod(0o755)
-        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"],
+        self.env = {**outside_session(), "PATH": str(fake) + os.pathsep + os.environ["PATH"],
                     "TEST_CLAUDE_ARGS": str(self.args), "TP_CLAUDE_CONFIG_DIR": str(self.base / "config")}
         for key in ("TP_TASK_DIR", "TP_MODE"):
             self.env.pop(key, None)

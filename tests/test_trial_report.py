@@ -1,5 +1,6 @@
 """Qwen-trial report: rates, the n<5 noise flag, medians, the paired 2x2, empty input, and the tp-evals trial command."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import subprocess
 import sys

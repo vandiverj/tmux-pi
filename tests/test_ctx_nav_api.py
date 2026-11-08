@@ -4,6 +4,7 @@ Every project here is a copy of tests/fixtures/ctx_api/project or a small tree b
 Deno skip when it is not on PATH; none of them touches the network (the fixture imports nothing but local files and `node:path`),
 and the fake `deno` programs used for the timeout, failure and environment cases are shell scripts written into the temporary
 directory."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import errno
 import hashlib

@@ -1,4 +1,5 @@
 """Exercise the real launcher with a stateful fake tmux; no models or live sessions."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 class LauncherWorkdirTests(unittest.TestCase):
     def setUp(self):
@@ -49,7 +51,7 @@ p.write_text(json.dumps(s))
             harness = self.fake / name
             harness.write_text('#!/bin/sh\npwd -P > "$TEST_HARNESS_CWD"\n')
             harness.chmod(0o755)
-        self.env = {**os.environ, 'PATH': str(self.fake)+os.pathsep+os.environ['PATH'],
+        self.env = {**outside_session(), 'PATH': str(self.fake)+os.pathsep+os.environ['PATH'],
                     'TEST_TMUX_STATE':str(self.state), 'TEST_TMUX_LOG':str(self.log),
                     'TEST_HARNESS_CWD':str(self.base/'cwd'), 'TP_NO_ATTACH':'1', 'TP_PI_NODE':''}
         for key in ('TP_SESSION','TMUX','TP_WORKDIR','TP_MAIN_HARNESS'):

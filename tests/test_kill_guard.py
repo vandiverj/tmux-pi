@@ -4,6 +4,7 @@ The table in tests/fixtures/kill_guard/cases.json lists every command that must 
 Entry points are checked too: the Claude hook (a PreToolUse payload through kill-guard.sh), the pi mode, the worker/Main
 switch, and the registration in hooks.json.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess

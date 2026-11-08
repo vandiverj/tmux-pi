@@ -1,4 +1,5 @@
 """Pi main-agent extensions act on the session of their own pane and on TP_STATE_DIR, never a decoy."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
+from session_env import outside_session  # noqa: E402
 HARNESS = ROOT / "tests/extension_session_runtime.mjs"
 REAL = "tmux-pi-0123456789ab-cdef01234567"
 
@@ -56,7 +58,7 @@ class ExtensionSessionCase(unittest.TestCase):
         fake_tmux(fake, TMUX)
         self.log = self.base / "tmux.log"
         self.log.write_text("")
-        self.env = {**os.environ, "TMUX": "/tmp/fake,1,0", "TMUX_PANE": "%main", "TP_STATE_DIR": str(self.state),
+        self.env = {**outside_session(), "TMUX": "/tmp/fake,1,0", "TMUX_PANE": "%main", "TP_STATE_DIR": str(self.state),
                     "FAKE_LOG": str(self.log), "FAKE_REAL": REAL, "FAKE_REAL_STATE": str(self.state),
                     "FAKE_DECOY_STATE": str(self.decoy_state), "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
         for name in ("TP_SESSION", "TP_TASK_DIR", "TP_TASK_ID", "TP_MODE"):

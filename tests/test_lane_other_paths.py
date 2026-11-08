@@ -1,6 +1,7 @@
 """A dispatch or retry into a lane tells its worker which paths other open lanes own (packet section `Paths other lanes own`):
 lib/lane_commands.py paths_owned_elsewhere / other_lanes_section, bin/tp-agent launch, bin/tp-spawn --other-lane-paths. The
 repositories and tmux are the fixtures of tests/test_lane_writer.py; no model runs."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from pathlib import Path
 import re

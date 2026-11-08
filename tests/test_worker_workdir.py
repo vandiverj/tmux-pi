@@ -1,4 +1,5 @@
 """Worker cwd selection with real tp-spawn/tp-review and fake tmux (no agent launch)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import io
 import json

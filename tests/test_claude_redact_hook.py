@@ -3,6 +3,7 @@
 Tool result shapes follow tests/fixtures/tool_shapes (captured from Claude Code 2.1.289).
 Fake secrets are generated at runtime.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

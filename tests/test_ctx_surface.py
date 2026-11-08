@@ -1,6 +1,7 @@
 """CX4 ctx-tools: the folded-in CX1 review notes (N1-N8), the surface (argument checks, the 6 KB answer, the status vocabulary),
 the deterministic brief, the five operations on stubbed and on fake-real navigators, and the call log. No model, no network,
 no real navigator: the stubs and small fakes that copy the real answer shapes stand in."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import fcntl
 import inspect
 import json

@@ -10,6 +10,7 @@ of tests/lane_fixture.py; no model runs.
   F6  a non-lane retry names collect/stop, reap only for a collected task, --force-alive only where it applies
   F5  a Markdown-decorated RESULT_STATUS line is a status line, through the one shared reader; the paused notice says the form
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ import lane_lease  # noqa: E402
 import result_status  # noqa: E402
 import review_verdict  # noqa: E402
 import worker_process  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 def named(text):
     """The tp-agent commands a refusal names, in the order it names them: each is in backticks, so what is pasted is exactly it."""
@@ -66,7 +68,7 @@ class CrossSessionStopTests(RemedyCase):
         (shim / "tmux").chmod(0o755)
         path = os.pathsep.join([str(shim), str(ROOT / "bin"), os.environ["PATH"]])
         # a shell in the second session: inside tmux, its own pane, its own state directory
-        self.typed = {**os.environ, "PATH": path, "TMUX": "/private/tmux,1,0", "TMUX_PANE": self.second_pane,
+        self.typed = {**outside_session(), "PATH": path, "TMUX": "/private/tmux,1,0", "TMUX_PANE": self.second_pane,
                       "TP_STATE_DIR": str(self.state2), "TP_SESSION": "second"}
 
     def live_holder(self):

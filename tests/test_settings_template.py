@@ -1,10 +1,14 @@
 """bin/tp-pi seeds agent/settings.json from agent/settings.example.json only when it is missing."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,7 +25,7 @@ class SettingsTemplateTests(unittest.TestCase):
         fake.mkdir()
         (fake / "pi").write_text("#!/bin/sh\nexit 0\n")
         (fake / "pi").chmod(0o755)
-        self.env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
+        self.env = {**outside_session(), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TP_PI_NODE": ""}
         for key in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE", "PI_CODING_AGENT_DIR"):
             self.env.pop(key, None)
 

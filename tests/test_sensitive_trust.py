@@ -14,6 +14,7 @@ Four groups:
 Credential names are assembled from pieces (as in test_sensitive_read.py) so this source can be searched and read.
 Everything uses a temp home passed as `home=` or `--home`; nothing here reads or writes the owner's real config.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import datetime
 import importlib.util
 import json

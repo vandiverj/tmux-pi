@@ -1,6 +1,7 @@
 """The router call chain (lib/llm_router.py via lib/model_router.select) with stub `claude` and `pi` on PATH.
 No live model is called. Covers the chain order, failover, the invalid-reply retry, the Qwen cap, local-only work,
 the all-fail fallback and what each router is (and is not) given."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import os
@@ -17,6 +18,7 @@ from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET, reply
 import model_router  # noqa: E402
 import llm_router  # noqa: E402
 import router_catalog as rc  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 CAT = fx.catalog()
 TASK = ("Add pagination to the /orders endpoint with tests, following the existing list endpoints. "
@@ -255,7 +257,7 @@ class DirectChatTests(ChainTestCase):
         local = self.base / "local.json"
         local.write_text(json.dumps({"followup": {"base_url": self.stubs.chat.url, "model": "configured/model", "ask_between": [0.25, 0.9],
                                                   "extra_body": {"reasoning_effort": "high", "top_p": 0.3}}}))
-        env = dict(os.environ, TP_LOCAL_CONFIG=str(local))
+        env = dict(outside_session(), TP_LOCAL_CONFIG=str(local))
         env.pop("TP_ROUTER_LLM_URL")
         with mock.patch.dict(os.environ, env, clear=True):
             r = self.ask_local()

@@ -1,5 +1,6 @@
 """The `work` block of the session index (Phase B): candidates, notes, decisions and what they cost, plus `index --no-write`,
 `index --bounded` (Pi's task_index) and the atomic objective write. Every store and state directory is a temp directory."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 from datetime import datetime, timedelta, timezone
 import importlib.util
@@ -19,6 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 import work  # noqa: E402
 import work_index  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 SECRET_QUESTION = "Should we rotate the quokka credentials"
 INDEX_KEYS = {"schema", "updated", "objective", "active", "pending", "unstatused", "paused", "recent"}
@@ -72,7 +75,7 @@ class IndexBase(unittest.TestCase):
         return work_index.build(self.state, workdir)
 
     def cli(self, *args, env=None):
-        full = {**os.environ, **self.env, **(env or {})}
+        full = {**outside_session(), **self.env, **(env or {})}
         full.pop("TMUX", None)
         run = subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=full, text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -477,7 +480,7 @@ class MalformedDocumentTests(IndexBase):
         (self.store / "workspaces" / "binary.md").write_bytes(b"\xff\xfe\x00---\n\xc3\x28")
 
     def run_cli(self, *args):
-        env = {**os.environ, **self.env}
+        env = {**outside_session(), **self.env}
         env.pop("TMUX", None)
         return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env, text=True, capture_output=True, timeout=60)
 

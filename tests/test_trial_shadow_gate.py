@@ -1,6 +1,7 @@
 """lib/trial_shadow.py and lib/trial_session.py: the one gate every tp-* command of a trial goes through, and what the worker can
 write that holds or steers the runner. Fixtures: trial_shadow_case.py.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

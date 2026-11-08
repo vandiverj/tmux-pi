@@ -1,10 +1,14 @@
 """Run the real Pi extension with fake events, UI and child-process boundary."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 HARNESS = ROOT / "tests/dispatcher_runtime.mjs"
@@ -209,7 +213,7 @@ class DispatcherRuntime(unittest.TestCase):
         for name, (reply, sent_back) in replies.items():
             with self.subTest(name):
                 run = subprocess.run(["node", "--experimental-strip-types", str(HARNESS), "review-changes"], cwd=ROOT, text=True,
-                                     capture_output=True, check=True, timeout=15, env={**os.environ, "REVIEW_CHANGES_REPLY": reply})
+                                     capture_output=True, check=True, timeout=15, env={**outside_session(), "REVIEW_CHANGES_REPLY": reply})
                 d = json.loads(run.stdout)
                 self.assertEqual(d["taskReview"], "needs_human")
                 self.assertEqual(len([c for c in d["calls"] if c["name"] == "tp-review"]), 2 if sent_back else 1)
@@ -253,7 +257,7 @@ class DispatcherRuntime(unittest.TestCase):
             self.assertNotEqual(subprocess.run(cmd, cwd=ROOT, env={"TP_TASK_DIR": "worker"},
                                                capture_output=True).returncode, 0)
             self.assertEqual(json.loads(marker.read_text())["status"], "needs_human")
-            human_env = os.environ.copy()
+            human_env = outside_session()
             human_env.pop("TP_TASK_DIR", None)
             subprocess.run(cmd, cwd=ROOT, env=human_env, check=True, capture_output=True)
             self.assertEqual(json.loads(marker.read_text())["status"], "resolved")

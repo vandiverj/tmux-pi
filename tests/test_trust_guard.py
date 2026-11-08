@@ -7,6 +7,7 @@ filled in from the fixture, and so are `{TREE}` (holds a link to the store), `{T
 links to the one above the store), `{TREE3}` (a link to the home directory) and `{PLAIN}` (links, none of which
 lead near the store).
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import ast
 import contextlib
 import glob

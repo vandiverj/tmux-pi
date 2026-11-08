@@ -1,5 +1,6 @@
 """Qwen-trial transcript scanners: one positive and one negative case per slip rule, gate runs, Claude and pi transcripts."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import sys
 import tempfile

@@ -1,5 +1,6 @@
 """tp-review gates, the reviewer chosen by the review plan, and the oversized-packet boundary (stubbed tmux/tp-spawn/tp-route;
 no models). The plan itself is tested in test_model_routing."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

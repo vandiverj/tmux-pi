@@ -1,4 +1,5 @@
 """Which main dispatched a task, and `tp-agent list --main`: the data the Claude main's notifier wakes on."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
+from session_env import outside_session  # noqa: E402
 MODEL = "openai/gpt-6-sol"
 
 
@@ -28,7 +30,7 @@ class MainNotifyTests(unittest.TestCase):
         fake = self.root / "bin"
         fake.mkdir()
         fake_tmux(fake, "case \"$1\" in\n show-options) printf '%s\\n' \"$TP_STATE_DIR\" ;;\n new-window) printf '%%fake\\\\n' ;;\n *) exit 0 ;;\nesac\n")
-        self.env = {key: value for key, value in os.environ.items() if key not in ("TMUX", "TP_TASK_DIR", "TP_MAIN_ID", "CLAUDE_CODE_SESSION_ID")}
+        self.env = outside_session()
         self.env.update(TP_STATE_DIR=str(self.here), TP_SESSION="fixture", TP_WORK_DIR=str(self.root / "work-store"),
                         PATH=str(fake) + os.pathsep + os.environ["PATH"])
 
@@ -109,7 +111,7 @@ class MainNotifyTests(unittest.TestCase):
 
 class LegacyEntryWarningTests(unittest.TestCase):
     def test_tp_warns_on_stderr_when_tp_main_is_set(self):
-        env = {**os.environ, "TP_MAIN": "bogus"}
+        env = {**outside_session(), "TP_MAIN": "bogus"}
         run = subprocess.run([str(ROOT / "bin/tp")], env=env, text=True, capture_output=True, timeout=25, cwd="/")
         self.assertIn("tp: warning: TP_MAIN is the legacy entry point", run.stderr)
         self.assertEqual(run.stdout, "")

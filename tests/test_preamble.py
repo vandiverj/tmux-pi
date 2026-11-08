@@ -1,4 +1,5 @@
 """lib/preamble.py with lib/agent_tools.py: the Tools block rendered from <workdir>/.tmux-pi/agent-tools.json."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import shutil

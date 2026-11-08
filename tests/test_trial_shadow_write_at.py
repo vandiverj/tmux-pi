@@ -3,6 +3,7 @@
 The temp name is `<name>.tmp.<runner pid>` and run.json shows the pid, so a worker (or an accident) can leave anything at it: a plain
 file, a link, a FIFO, a directory. The write must finish, write nothing through what is there, wait on nothing, and delete nothing but
 a file or a link (a directory and what is in it are the worker's)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import sys
 import tempfile

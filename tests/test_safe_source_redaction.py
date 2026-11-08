@@ -10,6 +10,7 @@ The path of a line reaches the model too, so it is redacted as text: a token-sha
 A link re-pointed from a protected file to an ordinary one between the tool's read and its redaction still gets the
 protected file's rules, and a file that changed during the call is withheld (F2).
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import importlib.machinery
 import importlib.util

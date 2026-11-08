@@ -160,3 +160,7 @@ Claude Bash and Pi bash output from a command that is not a search (e.g. `sh -c 
 ## H26 — a detector over display or command text needs a fail-closed default from round 1 (signal from F-GREP)
 
 F-GREP took five review rounds in one finding family (source-path-redaction): each round fixed the cited head or command shape and the next review found another. It converged only when round 4/5 set the rule "uncertain → strictest". Rule for briefs: any fix that decides a security rule from parsing text (display heads, command lines, file names) must state its fail-closed default in the first brief, and the reviewer checks the default, not the parser's coverage.
+
+## H27 — Pi workers bundle `git diff` and search globs into commands that hit permission prompts (signal from H10, T1b, F-GREP r6)
+
+Three coders this round stopped on a permission prompt Main had to escape and redirect: H10 and T1b ran `git diff` chained with other commands, and F-GREP ran `rg` with a `!*.env*` exclusion glob that the sensitive-read gate read as a `.env` access. Each prompt costs a Main round trip, and a second prompt parks the task. Rule for the coder packet: run `git diff`/`git status` as standalone commands (they are allow-listed alone), never chain them; exclude secret files with the safe_* tools or by naming the directories to search, not with a negated `.env` glob. Check: count worker permission prompts per lane in the run log before and after the packet change.

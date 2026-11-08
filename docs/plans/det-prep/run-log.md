@@ -138,3 +138,4 @@
 - Owner proposed model-specific worker profiles, citing arXiv:2609.20804. The brief is `m1-model-profiles.md`, queued after the RTK eval and before J1.
 
 - 2026-11-08: owner added ast-grep structural sweeps as loop idea H13 (replay on F1/D1/K1/C2/E1/G1 families, then A/B on review-loop tasks); RTK eval and M1 registered as H14/H15.
+- 2026-11-08: owner added OpenTelemetry usage monitoring as loop idea H16 (Claude built-in OTel + Pi extension, local stdlib receiver, overhead/fidelity/insight eval before adoption).

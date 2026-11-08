@@ -22,6 +22,7 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 | H13 | **Structural sweep with ast-grep.** When a review finding names a family, Main or the coder writes an ast-grep rule (pattern with metavariables, or YAML rule) for the defect shape; `ast-grep scan` lists every site in `bin/`, `lib/`, `agent/extensions/`, `tests/` before the fix, the same rule runs after the fix and must return zero (or only allowlisted) hits, and the rule file is kept as the parity check. Targets the F1/D1/K1 pattern of 5–8 rounds where each round fixed only the cited site. | rounds_to_approve, review_catch, tokens_per_accepted | owner (2026-11-08) | medium | open |
 | H14 | **RTK command-output compression** (`rtk-eval` branch; eval running 2026-11-08, plan `docs/plans/rtk-eval/plan.md`). | tokens_per_accepted at equal code_pass | owner (2026-11-08) | low | running |
 | H15 | **Model-specific worker profiles** (guided vs expert instructions, planning scaffold, tool surface per model group; `m1-model-profiles.md`, arXiv:2609.20804). | code_pass, rounds_to_approve, tokens_per_accepted | owner (2026-11-08) | medium | open |
+| H16 | **OpenTelemetry usage monitoring** (Claude Code built-in OTel; Pi matched by an extension emitting the same event shape). Per-request tokens/cost, per-tool result sizes and durations, permission decisions, API errors, joined to tmux-pi task ids. Eval measures what it reveals and what it costs before any adoption. | orient_waste, tokens_per_accepted (attribution), wall_s overhead | owner (2026-11-08) | medium | open |
 
 Research runs append below this table with their ids.
 
@@ -61,3 +62,33 @@ Eval design:
 
 Install for the eval: one pinned release binary, checksum-verified, in an isolated dir, the same way as RTK. Don't use global installs without the owner.
 Adopt if: replay recall beats the text-grep sweep on at least 4 of the 6 families, live rounds_to_approve drops, and tokens per accepted step don't rise.
+
+## H16: OpenTelemetry usage monitoring (owner, 2026-11-08)
+Owner: use https://code.claude.com/docs/en/monitoring-usage "to better understand what is occurring", standardize Pi to match for eval; do not adopt if having it on harms the system; eval effectiveness and cost first.
+
+What we measure today: task records carry summed tokens per task (`lib/task_family.py` TOKEN_KEYS). We cannot see *where* inside a task the tokens went (which tool output, which retry, which permission stop).
+
+What Claude Code exports (enabled by `CLAUDE_CODE_ENABLE_TELEMETRY=1` plus `OTEL_*` exporter vars, all per process env, so `bin/tp-claude` can set them per worker):
+- Events: `api_request` (model, input/output/cache tokens, cost_usd, duration_ms, query_source), `tool_result` (tool_name, success, duration_ms, `tool_input_size_bytes`, `tool_result_size_bytes`), `tool_decision` (accept/reject and source: config, hook, user_abort...), `api_error`, `api_refusal`, `safety_event`, `user_prompt`. `prompt.id` links all events of one prompt; `agent_id`/`parent_agent_id` mark subagents.
+- Metrics: `token.usage`, `cost.usage`, `active_time.total`, `lines_of_code.count`, `code_edit_tool.decision`.
+- `OTEL_RESOURCE_ATTRIBUTES` can carry `tp.task_id`, `tp.role`, `tp.lane`, `tp.arm` so every event joins to our records.
+- Content is redacted by default. Keep it that way: do not set `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_CONTENT` or `OTEL_LOG_RAW_API_BODIES`. `OTEL_LOG_TOOL_DETAILS=1` (Bash commands, file paths) is tested only as a separate arm because commands can carry secrets; it must pass through the redact rules before storage.
+
+Questions it could answer (the "benefit" side):
+1. Which tool outputs dominate input tokens (direct input for H14 RTK and the ctx work): top `tool_result_size_bytes` by tool and command class.
+2. Where wall time goes: API latency vs tool duration vs waiting on a prompt.
+3. Permission stops (H11): `tool_decision` with source `hook`/`user_reject` counts, instead of scraping panes.
+4. Retries and API errors per task that today are invisible.
+5. Reviewer vs coder vs Main token split, and subagent cost (`agent_id`).
+
+Pi parity: Pi has no OTel exporter. Write a Pi extension (`agent/extensions/otel.ts`) that emits the same event names and fields from Pi's turn/tool hooks (api_request from usage, tool_result with sizes/durations) to the same receiver. Fields Pi cannot supply are left empty, never guessed. Qwen-local requests get cost 0 and model `qwen-local`.
+
+Receiver: no install needed for the eval. A small stdlib Python OTLP http/json receiver bound to 127.0.0.1 that appends to a JSONL file under the session dir (`OTEL_EXPORTER_OTLP_PROTOCOL=http/json`). Do not use the `console` exporter: it writes into the worker pane and would corrupt the TUI and our pane scraping. Installing an OTel collector, Prometheus or Grafana needs owner approval.
+
+Eval design:
+1. **Overhead A/B (the "harm" side).** Same tp-bench tasks, telemetry off vs on (redacted), 3 repeats each on Claude Sonnet and on Pi/Qwen. Measure wall_s, CPU/RSS of the worker process, code_pass, tokens_per_accepted. Telemetry is client-side, so model tokens should be identical in distribution; any change is a red flag. Also test receiver-down: the worker must not stall or error if 127.0.0.1 is unreachable.
+2. **Fidelity.** Telemetry token totals per task must match the task-record totals within 2%; Pi extension totals must match Pi's own usage.
+3. **Insight value.** Run one det-prep-style lane with telemetry on, produce the five answers above, and list concrete changes they point to (e.g. a tool whose output should be truncated). Value = number of actionable findings not visible from current records.
+4. **Storage/privacy.** JSONL size per task; grep the stored events for secrets with the redact rules (must be zero hits).
+
+Adopt (default-on for evals, and optionally for normal runs) if: no measurable overhead (wall_s within noise, no stalls with receiver down), fidelity within 2%, zero secret hits, and at least 2 actionable findings. Otherwise keep it as an opt-in `TP_OTEL=1` for evals only, or drop it.

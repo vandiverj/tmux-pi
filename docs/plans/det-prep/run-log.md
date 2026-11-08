@@ -118,3 +118,10 @@
 - D1 r7 (final): APPROVED_WITH_NOTES (report-evidence gaps only). Committed as `cbf045b`, lane closed, merged into lane/integrate as `5ea21ba`.
 - F1 r7 (final): REQUEST_CHANGES on a new sweep site. `bin/tp-contract:138-140,226` writes `task.md` through `write_record` with absolute paths, without `relative=True`. If a `tp-contract status` lands between the reconcile and the rename in `lib/task_record.py:837-868`, the archived record links to the old location. Family: retirement-dependency-order. As planned, F1 is **parked for the owner** after round 7. The worktree `tmux-pi-wt-status-cleanup` is left uncommitted and intact. Options for the owner: (a) one more round that applies `relative=True` to every `write_record` caller, enforced by a parity test over the callers, or (b) take the rename under the same task lock that `tp-contract` holds.
 - Battle-soccer V-F waits on F1.
+
+## 2026-11-08 02:10Z: baseline rerun without the session env; T1 lane opened
+- All 15 baseline modules were rerun in lane/integrate with `CLAUDE_CODE_SESSION_ID`, `TP_MAIN_ID` and `TP_TASK_DIR` unset. An earlier attempt in the main checkout is void: Main's local catalog edit (`openai/gpt-6` → `openai-codex/gpt-6`) made `openai/gpt-6-sol` fixtures fail.
+- Session-env-caused: only the 4 `test_orchestration` entries. That module passes 40/40 without the session env.
+- The 5 `unittest.loader._FailedTest` entries are not session-env-caused. They come from a full-suite discover run and don't show up when modules run by name.
+- Real failures, unchanged without the session env: 483. Among them are the ctx/docs modules (test_ctx_nav_api 357 errors, test_ctx_cli, test_docs_cli, test_docs_wiring), test_trust_guard 58, and one each in test_sensitive_trust (`test_rg_…`), test_lane_recovery, test_lane_records, test_run_bounded, test_trial_session, test_trust_record and the trial_shadow modules.
+- T1 lane `test-env` opened from lane/integrate (`5ea21ba`). Brief `t1-test-session-env.md`: a shared `tests/session_env.py` helper, a parity test over modules that copy `os.environ`, and a positive optional-main case. Coder `coder-47ae1f2cac` (claude-sonnet-5-5).

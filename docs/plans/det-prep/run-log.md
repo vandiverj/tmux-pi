@@ -341,3 +341,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Owner: "merge P1 to main so the live hook is fixed". Cherry-picked the P1 commit b4dc3cd onto main as 8eaa6f2 (-x). It is not a merge of lane/guard-py39, which would also bring the 19 integrate commits. The three files were identical on main and at P1's base 3a1bcb4, so it applied clean.
 - On main, both modes: trust_guard 310, sensitive_trust 184, trust_record 69, all OK. The live hook bin/tp-trust-guard under /usr/bin/python3 allows `ls tests/test_*.py` and the T1 r3 request shape, and still denies a literal store path. Not pushed.
 - When integrate later merges to main, git sees the same change on both sides (no conflict expected).
+
+## 2026-11-08 04:40Z–05:05Z — F-GREP and T1 r3 to review
+
+- F-GREP coder-51390d04c9 complete. Main's run of the 9 modules on the uncommitted tree, both modes, all OK (Pi tests with PI_CODING_AGENT_PACKAGE). Out-of-touch files flagged: agent/extensions/sensitive.ts, bin/tp-redact, lib/redact.py. Review review-coder-51390d04c9-223858 (gpt-6-sol).
+- The F-GREP reviewer hit "Authorize sensitive read?" on a probe that builds a temp `.env`. Main pressed Escape, ran the probe itself and sent the output: body redacted, a token in the path is shown (the coder's listed "path parts" risk). The reviewer had already moved to a non-.env path.
+- T1 r3 coder-eead542ff6 two-mode run of 118 modules done: 482 distinct failing names, 0 outside the baseline once the `tests.` prefix is dropped. The 4 test_orchestration lines pass. test_trial_shadow_end_path is intermittent in both modes (Main reran 3x per mode: one outside failure), baseline-listed. Four modules (test_ctx_calls, test_ctx_surface, test_ctx_tools_wiring, test_localdocs) crash at import on Python 3.9 (PY39-UNION). Main's ruling on the 22 NOT_YET_TAKEN modules: follow-up after their lanes merge. Review review-coder-eead542ff6-225801.

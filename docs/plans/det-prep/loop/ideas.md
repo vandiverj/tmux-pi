@@ -144,3 +144,7 @@ A hook denied coder-eead542ff6's scope request nine times. The worker could only
 ## F-FLAKE — test_sensitive_trust `git grep` lift subtests fail intermittently on the base (found during P1)
 
 `test_tracked_credential_names_lift_only_as_committed`, subtests `git grep foo agent` and `git grep foo`, in UnscopedPatchTests_unrelated or _refused. On unmodified lane/integrate 3a1bcb4 they failed in 2 of 3 runs per mode (True != False), and similarly on P1. They are not in the baseline. A lift decision that changes between identical runs touches the sensitive-read boundary, so treat it as a defect, not test noise: find the source of nondeterminism (timing, git index state, ordering), and make the test fail every time before the fix. Queue after F-GREP (same module).
+
+## PY39-UNION — lib modules use 3.10-only `X | None` at import (found during T1 r3)
+
+lib/ctxengine/calls.py:55 (class Answer) and lib/localdocs/lock.py:23 (class Pin) evaluate `str | None` annotations at class creation, so importing them under the system /usr/bin/python3 (3.9.6) raises TypeError. Four test modules are baseline "_FailedTest" because of it, and any hook or tool that imports these under 3.9 fails. Same class as P1. Fix: `from __future__ import annotations` or Optional[...], plus a sweep of lib/ and bin/ for other 3.10+ syntax (match, `|` unions, parenthesised context managers) under /usr/bin/python3 with a compileall-and-import check, and a test that imports every lib module under the system interpreter.

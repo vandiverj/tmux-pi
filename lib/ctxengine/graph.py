@@ -32,6 +32,7 @@ folders above it (`_guarded_roots`).
 
 The scanner is a tokenizer, not a parser: it skips comments, strings, template literals and regular-expression literals, so an
 `import` inside any of them is not an edge, then matches the import and re-export forms on the tokens."""
+import contextlib
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import errno
@@ -46,6 +47,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import threading
 import time
 from urllib.parse import unquote
@@ -1395,10 +1397,42 @@ def make_own_folder(parent, prefix):
         os.close(fd)
 
 
+REMOVE_DEPTH = 64  # folders deep the fallback goes: one open descriptor per level, so a hostile tree cannot use up descriptors
+
+
+def _rmtree_at(parent_fd, name, depth=0):
+    """Remove folder `name` of the folder open on `parent_fd`, and what is in it, by descriptor only (no path is joined): the
+    folder is opened with `O_NOFOLLOW`, so a link put there is not opened; anything in it that is not a real folder (a link
+    included, whatever it points at) is unlinked, never followed; real folders are entered the same way. Bounded by
+    `REMOVE_DEPTH` levels (a deeper folder is left, not followed on) and by what the tree holds. Errors are ignored."""
+    try:
+        fd = os.open(name, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=parent_fd)  # not a folder we can open (a link, a file swapped in): take the name away
+        return
+    try:
+        if depth < REMOVE_DEPTH:
+            with os.scandir(fd) as entries:
+                children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+            for child, is_folder in children:
+                if is_folder:
+                    _rmtree_at(fd, child, depth + 1)
+                else:
+                    with contextlib.suppress(OSError):
+                        os.unlink(child, dir_fd=fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=parent_fd)
+
+
 def remove_own_folder(path):
     """Remove a folder `make_own_folder` made, and what is in it, relative to a descriptor on its parent opened with no link on the
-    way (`shutil.rmtree` with `dir_fd`, which follows no link inside): a parent swapped for a link since is not removed through
-    (the folder is left where it was made). Errors are ignored."""
+    way (`shutil.rmtree` with `dir_fd` where it has it, Python 3.11 on; else `_rmtree_at`, which follows no link inside either):
+    a parent swapped for a link since is not removed through (the folder is left where it was made). Errors are ignored."""
     parent, name = os.path.split(path)
     try:
         fd = os.open(parent, DIR_FLAGS | NOFOLLOW_ANY)
@@ -1406,7 +1440,10 @@ def remove_own_folder(path):
         return
     try:
         if _opened_path(fd) == parent:
-            shutil.rmtree(name, dir_fd=fd, ignore_errors=True)
+            if sys.version_info >= (3, 11) and shutil.rmtree.avoids_symlink_attacks:
+                shutil.rmtree(name, dir_fd=fd, ignore_errors=True)
+            else:
+                _rmtree_at(fd, name)
     finally:
         os.close(fd)
 

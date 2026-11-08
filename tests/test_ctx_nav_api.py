@@ -9,6 +9,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -53,6 +54,28 @@ def stub_allow(project):
 def project_cache(project, name="index.json"):
     """The default cache folder of a project (inside it, where the guard allows it), and a file in it."""
     return Path(project) / ".tmux-pi" / "ctx-cache" / name
+
+
+@contextlib.contextmanager
+def no_logs(case, level="DEBUG"):
+    """`assertNoLogs` (Python 3.10+) where there is one; on older Pythons, a handler on the root logger that must stay empty."""
+    if hasattr(case, "assertNoLogs"):
+        with case.assertNoLogs(level=level):
+            yield
+        return
+    seen = []
+    handler = logging.Handler(level=level)
+    handler.emit = seen.append
+    root = logging.getLogger()
+    before = root.level
+    root.addHandler(handler)
+    root.setLevel(level)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(before)
+    case.assertEqual(seen, [], "logged")
 
 
 def write(path, text=""):
@@ -2488,7 +2511,7 @@ class BoundedReadCase(Tree):
                         if ast.unparse(callee) == "os.read" or (ast.unparse(callee) == "os.open"
                                                                 and all(f in ast.unparse(node.args[1]) for f in ("O_NOFOLLOW", "O_NONBLOCK"))):
                             continue
-                    if owner in ("open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder") and ast.unparse(callee) == "os.open" \
+                    if owner in ("open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder", "_rmtree_at") and ast.unparse(callee) == "os.open" \
                             and ast.unparse(node.args[1]).startswith("DIR_FLAGS"):
                         continue  # a descriptor on a folder (O_DIRECTORY): listed or written in, never read from
                     if owner == "write_new" and called == "open" and isinstance(callee, ast.Attribute) \
@@ -3119,6 +3142,11 @@ class PathRuleCase(Tree):
         ("graph.py", "make_own_folder", "os.mkdir"): "dir_fd-relative to that descriptor, a new random name",
         ("graph.py", "remove_own_folder", "os.open"): "the parent of an own folder, folder descriptor, NOFOLLOW_ANY; kernel path checked",
         ("graph.py", "remove_own_folder", "shutil.rmtree"): "dir_fd-relative to that descriptor: the own folder's name",
+        ("graph.py", "_rmtree_at", "os.open"): "the fallback for Python < 3.11: a child folder by name, dir_fd-relative, DIR_FLAGS|O_NOFOLLOW",
+        ("graph.py", "_rmtree_at", "os.scandir"): "the folder descriptor just opened; the names are listed, never joined into a path",
+        ("graph.py", "_rmtree_at", "entry.is_dir"): "follow_symlinks=False: a link is not a folder, so it is unlinked, not entered",
+        ("graph.py", "_rmtree_at", "os.unlink"): "dir_fd-relative: a link or file is taken away by name, never followed",
+        ("graph.py", "_rmtree_at", "os.rmdir"): "dir_fd-relative to the parent descriptor, by name",
         ("graph.py", "prove_reach", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex.__init__", "os.path.realpath"): "the boundary itself",
         ("graph.py", "ImportIndex._walk", "os.open"): "a judged folder, NOFOLLOW_ANY; kernel path checked",
@@ -5562,7 +5590,7 @@ class MonorepoCase(Tree):
         deno = self.fake_deno(f'echo "$@" >> {log}\ngrep -rIl SECRET_ "$PWD" >> {hits} 2>/dev/null\ncase "$1" in\n --version) echo "deno 9.9.9";;\n'
                               f' doc) sed "s|{MIRROR}|$PWD|g" {self.dir / "doc.json"};;\n info) sed "s|{MIRROR}|$PWD|g" {self.dir / "info.json"};;\nesac')
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.assertNoLogs(level="DEBUG"):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), no_logs(self):
             nav = self.nav(project, deno=deno)
             answers = [nav.importers("../../lib/shared/util.ts"), nav.imports("src/uses_lib.ts", source="index"), nav.imports("src/uses_lib.ts"),
                        nav.symbols("src/uses_lib.ts"), nav.forward_graph("src/uses_lib.ts"), nav.status(), nav.symbols("src/uses_lib.ts")]

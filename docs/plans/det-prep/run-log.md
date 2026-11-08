@@ -151,3 +151,4 @@
 ## 2026-11-08: F1 round 9 (owner: "use your recommendation for F1"), final round
 - Recommendation taken: (a). Only the task creator creates a task dir; every other writer writes through a directory fd and refuses if the dir is gone (late writes land in the archive, which is valid because records are location-free). The footer names omitted rows by their real state. No lock.
 - Retry `coder-32886e6158` (pane %94), brief `fixes/f1-round9.md`. If rejected, F1 is left out of this campaign.
+- 2026-11-08: X1 design written (inventory: tp-bench not built, so X1 is blocked on J1; tmux-pi has no battle-soccer runs yet, so friction is mined from pi-improvement-workbench + det-prep; acceptance/budgets/promotion frozen in the plan).

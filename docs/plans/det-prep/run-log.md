@@ -252,3 +252,14 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - **N2** (`coder-151123d131`) stopped on lane ownership and asked for context. That was the correct behaviour.
   - Main's ruling: lane-facts and local-model have no open step and are merged; status-cleanup is parked; T1 does not touch `test_failing_tests`, `fixtures` or `tp-spawn`.
   - Edits granted; the merge order is T1, then N2. Retried as `coder-deee9cfdd0`.
+- **J1 review round 3: REQUEST_CHANGES.**
+  - F1: a second failed attempt overwrites `<n>.cleanup.json` (session-ownership family);
+  - F2: a failed arm `git status` is recorded as `dirty: false`;
+  - F3: a test waits on `sleep(5)`.
+  - Round 4 (`coder-75b8f67dfe`, rule-first): exclusive-create records numbered across every record kind; a tolerated failure feeding a record becomes null, with every site listed; tests wait on events.
+- **N2 review: REQUEST_CHANGES** (entry-validation family):
+  - unbulleted `test:` fields still create an entry;
+  - `- test: none` and `- command: pytest` count as entries;
+  - `- no.test_x fails` is dropped;
+  - `- all tests passed` counts as an entry.
+  - Root cause: negative-word matching. Round 2 (`coder-45e00e9e96`) removes the negative-word set. An entry now needs a bullet plus a `TEST_ID` token (a dotted unittest id, `test_x`, `TestX`, a test path, or a pytest `::` id).

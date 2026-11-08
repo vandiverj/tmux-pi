@@ -148,3 +148,7 @@ A hook denied coder-eead542ff6's scope request nine times. The worker could only
 ## PY39-UNION — lib modules use 3.10-only `X | None` at import (found during T1 r3)
 
 lib/ctxengine/calls.py:55 (class Answer) and lib/localdocs/lock.py:23 (class Pin) evaluate `str | None` annotations at class creation, so importing them under the system /usr/bin/python3 (3.9.6) raises TypeError. Four test modules are baseline "_FailedTest" because of it, and any hook or tool that imports these under 3.9 fails. Same class as P1. Fix: `from __future__ import annotations` or Optional[...], plus a sweep of lib/ and bin/ for other 3.10+ syntax (match, `|` unions, parenthesised context managers) under /usr/bin/python3 with a compileall-and-import check, and a test that imports every lib module under the system interpreter.
+
+## F-PATHNAMES — Glob/Grep `filenames` lists pass unredacted (owner decision; found in F-GREP r3)
+
+The Claude PostToolUse hook keeps `filenames` (Glob, Grep files_with_matches) unchanged by design (docs/sensitive-read-redaction-design.md:339; tests/test_claude_redact_hook.py:225-227). A folder or file name shaped like a secret is therefore shown to the model there, while F-GREP r3 hides the same segment in grep line heads and pointers. Redacting the list would make ordinary hex-named folders (session ids, hashes) placeholders the model cannot open. Options: leave as designed; redact only known secret formats (verified token shapes) in names; or redact and let safe_* tools accept placeholder paths. Needs the owner.

@@ -386,3 +386,17 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - 68973cb merges lane/failing-tests 63bb424. No conflict: git combined T1's first-line `import session_env` in tests/test_failing_tests.py with N2's changes (still line 4, first import).
 - Both modes: test_failing_tests 25 OK, test_preamble 40 OK. test_docs_wiring has 6 failures, the same as the baseline.
 - test_session_env: 3 failures on the merged tree, which also happen on a git-archive export of 155ae8d (T1 merge, before N2). So they come from T1 and J1 together, not from N2. T1's lane branched before J1 (f1c341d) landed, so T1's guards never saw tests/test_bench_{cli,runner,score,shell}.py (no `import session_env` first) or the 7 TP_BENCH_* names that lib/bin read (not classified). Follow-up T1b: a tests-only fix. It is not on the baseline because it is a real regression on integrate.
+
+## 2026-11-08 H10 repros (Main, Sonnet 5.5, --permission-mode auto, tmux session h10)
+- A, redaction on, normal tp-claude: `pwd` (allow-listed) denied, "auto mode's check had no usable answer"; `mkdir -p` ran.
+- B, redaction off: both ran. The rewrite is the trigger.
+- C, redact hook moved from the plugin into --settings: `pwd` still denied: "The server-side auto mode classifier gave no verdict for Bash: a hook changed this call's input after auto mode reviewed it, so the review does not cover what would run." The docs' exemption for command hooks in settings did not hold for us.
+- D, A without the inherited CLAUDE_* env: same denial.
+- E, order swapped (mkdir, pwd, git status): mkdir ran; pwd and git status (both allow-listed) denied. So the denials follow the allow rules, not the call order: the rewritten `X || echo exit-code: nonzero` no longer fully matches the allow rule for X.
+- F, claude/settings.json plus allow rule `Bash(echo exit-code: nonzero)`: pwd, git status, mkdir ran; a second trial (pwd, ls config, git log, wc -l) all ran. A call that still needs the classifier (`ls /nonexistent-h10-dir`, a path outside the project) was denied, twice, while `ls config` beside it ran.
+- G, the model sends the wrapped form itself (`ls /nonexistent-h10-dir || echo exit-code: nonzero`): ran. The hook leaves an already-wrapped command alone (no updatedInput), so the classifier reviewed exactly what ran. The output arrived through PostToolUse (exit 0), so redaction still covers it.
+- Fix proposal, keeping the suffix and so the no-leak property of design row 8: (1) add `Bash(echo exit-code: nonzero)` to claude/settings.json allow; (2) tell Claude workers and Main in the preamble to append ` || echo exit-code: nonzero` to Bash commands themselves, so the hook rewrites nothing and the classifier sees the real command; the hook rewrite stays as the fallback. Open: whether to deny-with-instruction instead of rewrite for calls that need the classifier.
+- Cleanup: tmux session h10 killed; .tmux-pi/h10-A..F removed. Launchers in scratch h10c/, h10f/.
+
+## 2026-11-08 T1b and M2 unblocked
+- Both gpt-6.1-sol coders returned blocked: closed lanes test-env (claimed all of tests/) and bench still owned their paths. Both lanes' tips are in lane/integrate; collected their finished reviewers, then `lane remove test-env` and `lane remove bench` (archived; restore: `git branch lane/test-env 4d2108d`, `git branch lane/bench f1c341d`). Messaged both coders: ownership granted, two-mode run defined.

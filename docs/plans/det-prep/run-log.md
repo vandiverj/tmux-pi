@@ -231,3 +231,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - absence is proven by `list-sessions`, and any other outcome is `unknown`, so nothing is stopped or removed;
   - `Shell.run` checks the exit code by default, and every opt-out carries a reason;
   - after each reset the tree is checked positively, and if that fails the remaining tasks are recorded `not_run: reset-failed`.
+
+## 2026-11-08: N2, owner report: `FAILING_TESTS: none` starts false investigations
+- **Cause.** `failing_tests.parse` only recognises an exact inline `none`. Variants such as `none.`, `None (all pass)`, `none (nothing was run).`, `none` on the next line and `**none**` all parse as a block. The hook then tells Main to dispatch `--investigate-failure`.
+- **Rule** (brief `fixes/n2-failing-tests-none.md`): a report exists only if it has a bulleted entry that names a test. The header text is a note. The worker prompt says to leave the block out when nothing fails. There are negative and positive table tests plus an end-to-end index test.
+- **Dispatched** as lane failing-tests (`coder-151123d131`, Sonnet).

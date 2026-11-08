@@ -140,3 +140,7 @@ A hook denied coder-eead542ff6's scope request nine times. The worker could only
 ## H25 — answering a worker request by message replaces its result (signal from P1)
 
 `tp-agent message` is the only way to answer a capability request. The worker's next reply becomes result.md, so its one-line "ack" overwrote a full round-1 report (restored by asking again). The P1 coder also lost a result.md it had written itself. Rule: `tp-agent message` on a task whose result is already complete keeps that result (as result.prev.md, or by refusing to overwrite it unless the reply ends with RESULT_STATUS), and the worker packet says that the final reply is result.md and must not be written by hand.
+
+## F-FLAKE — test_sensitive_trust `git grep` lift subtests fail intermittently on the base (found during P1)
+
+`test_tracked_credential_names_lift_only_as_committed`, subtests `git grep foo agent` and `git grep foo`, in UnscopedPatchTests_unrelated or _refused. On unmodified lane/integrate 3a1bcb4 they failed in 2 of 3 runs per mode (True != False), and similarly on P1. They are not in the baseline. A lift decision that changes between identical runs touches the sensitive-read boundary, so treat it as a defect, not test noise: find the source of nondeterminism (timing, git index state, ordering), and make the test fail every time before the fix. Queue after F-GREP (same module).

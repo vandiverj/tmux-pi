@@ -321,3 +321,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Main slip: answering the request by message made the worker's "ack" overwrite result.md; restored by asking again (H25).
 - review-coder-256b4dd5bc-215052: REQUEST_CHANGES F1. The glob budget counts matches, not entries visited, as the brief's wording asked. Main's ruling (in the r2 brief, for the reviewer to judge): a glob that matches nothing cannot name the store; the deadline, now checked per entry, bounds the walk; the budget counts matches, as it did on 3.11. Owed check: the intermittent test_sensitive_trust `git grep` subtests. Main is running the unmodified integrate tree 3× per mode.
 - Round 2: coder-ff55f5cdc7 (Opus, pane %132), brief p1-r2.md.
+
+## 2026-11-08 04:03Z — P1 round 2 in review
+
+- coder-ff55f5cdc7: comments state the rule (the budget counts matches; the deadline is checked per visited entry) and one test row pins a nonmatching glob as allowed while time remains. A mutation that spends the budget per entry fails it. Main's two-mode run: trust_guard 310 OK and OK, trust_record 69 OK and OK, sensitive_trust OK outside and 2 git grep subtests inside.
+- Owed check done: test_sensitive_trust on unmodified integrate 3x per mode. The git grep subtests failed in runs 2 and 3 in both modes, so they predate P1 (F-FLAKE). Baseline line 446 (test_rg_is_taken...) fails on every base run and passes with P1.
+- Review: review-coder-ff55f5cdc7-220259.

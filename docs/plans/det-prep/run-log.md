@@ -129,3 +129,10 @@
 ## 2026-11-08 02:20Z: F1 unparked for one owner-approved round
 - Owner: "use your recommendation for F1". Recommendation: make records location-free by construction, not a lock. Remove `write_record`'s `relative` parameter so every in-task path is written by name. Readers resolve relative links against the record directory, and legacy absolute links still read. A parity test checks the caller table against `git grep`.
 - Retry `coder-dd5117f3c0` (rule-first): `fixes/f1-round8.md`. If it is rejected, F1 parks again; there is no round 9.
+
+## 2026-11-08 02:40Z: RTK eval started; M1 queued
+- Owner: "run an eval on whether RTK would be useful … set it up for claude and pi in the test branch".
+- RTK v1.1.0 release binary, sha256-verified, is at `~/.local/rtk-eval/bin`. It is not on PATH; no `-g` init and no brew install were used, and telemetry is off.
+- On branch `rtk-eval` (worktree `tmux-pi-wt-rtk-eval`, from `5ea21ba`), `TP_RTK=1` adds RTK's hook to `tp-claude` and its extension, loaded last, to `tp-pi` (`24d7bc5`). Both smoke tests rewrote commands, and both answers were correct.
+- Plan and decision rule are in `docs/plans/rtk-eval/plan.md` (`25e2de2`). A background agent is running phases 0–3 (ceiling, replay fidelity, guard compatibility, live A/B).
+- Owner proposed model-specific worker profiles, citing arXiv:2609.20804. The brief is `m1-model-profiles.md`, queued after the RTK eval and before J1.

@@ -23,6 +23,7 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 | H14 | **RTK command-output compression** (`rtk-eval` branch; eval running 2026-11-08, plan `docs/plans/rtk-eval/plan.md`). | tokens_per_accepted at equal code_pass | owner (2026-11-08) | low | running |
 | H15 | **Model-specific worker profiles** (guided vs expert instructions, planning scaffold, tool surface per model group; `m1-model-profiles.md`, arXiv:2609.20804). | code_pass, rounds_to_approve, tokens_per_accepted | owner (2026-11-08) | medium | open |
 | H16 | **OpenTelemetry usage monitoring** (Claude Code built-in OTel; Pi matched by an extension emitting the same event shape). Per-request tokens/cost, per-tool result sizes and durations, permission decisions, API errors, joined to tmux-pi task ids. Eval measures what it reveals and what it costs before any adoption. | orient_waste, tokens_per_accepted (attribution), wall_s overhead | owner (2026-11-08) | medium | open |
+| H17 | **Strong-model traces → smaller-model harness aids (X1).** Mine verified Sonnet/Opus traces on Battle Soccer for packet facts, tool/schema fixes, deterministic helpers, hooks and short skills; A/B/C/D ablation on the small model with a sealed holdout. Plan: `../x1-trace-distillation.md`. | accepted completion w/o escalation, first-call validity, tokens/cost per accepted | owner (2026-11-08) | high | queued |
 
 Research runs append below this table with their ids.
 

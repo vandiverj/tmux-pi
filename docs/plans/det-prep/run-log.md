@@ -146,3 +146,4 @@
   - F2 (new): `lib/tp_window.py:190-207` footer counts escalated/other omitted tasks as "finished".
 - Per the agreed rule there is no round 9. Worktree `tmux-pi-wt-status-cleanup` is kept uncommitted for the owner. Owner decision needed: (a) one more round with "write_record never creates a task dir" (closes the ghost-dir family by construction) + F2 fix, (b) a lock, or (c) leave F1 out of this campaign. V-F stays blocked.
 - Process note: another missed-site round in the same family; a candidate replay case for H13 (ast-grep cannot express the cross-process ordering, so this one also tests H13's limits).
+- 2026-11-08: owner added experiment X1 (strong-model traces → smaller-model harness aids; A/B/C/D arms, sealed holdout, stop before adoption). Requirements recorded in `x1-trace-distillation.md`; loop idea H17. Design pending harness inventory.

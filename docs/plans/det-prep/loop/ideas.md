@@ -25,6 +25,9 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 | H16 | **OpenTelemetry usage monitoring** (Claude Code built-in OTel; Pi matched by an extension emitting the same event shape). Per-request tokens/cost, per-tool result sizes and durations, permission decisions, API errors, joined to tmux-pi task ids. Eval measures what it reveals and what it costs before any adoption. | orient_waste, tokens_per_accepted (attribution), wall_s overhead | owner (2026-11-08) | medium | open |
 | H17 | **Strong-model traces → smaller-model harness aids (X1).** Mine verified Sonnet/Opus traces on Battle Soccer for packet facts, tool/schema fixes, deterministic helpers, hooks and short skills; A/B/C/D ablation on the small model with a sealed holdout. Plan: `../x1-trace-distillation.md`. | accepted completion w/o escalation, first-call validity, tokens/cost per accepted | owner (2026-11-08) | high | queued |
 | H18 | **pi-hashline-readmap for the Pi coder** (hash-anchored read/edit, structural map/symbol reads, ast_search), plus which ideas port to Claude Code (MCP tool or existing ctx tools). Plan: `../hl1-hashline-readmap.md`. Guard parity and Pi 1.1.0 compat are gating. | edit first-try success, silent wrong edits, output tokens per edit, tokens_per_accepted | owner (2026-11-08) | medium | queued |
+| H19 | **Requirement-change handling.** Mid-case, an acceptance criterion changes; the harness must find and invalidate the work, evidence and reviews that depended on the old criterion, and redo only those. | stale-evidence accepted (must be 0), rework scope precision, rounds | owner (2026-11-08, "things to think about") | high | future |
+| H20 | **Semantic integration conflicts.** Two lanes each pass on their own but disagree about a shared API or business rule; the merge is textually clean. Does integration catch it before `lane/integrate` accepts both? | conflicts caught before merge, false alarms | owner (2026-11-08) | high | future |
+| H21 | **External-state reconciliation.** An MR/deployment succeeds but the response is lost (crash, timeout); on resume the harness must detect the action already happened and not repeat it. | duplicate side effects (must be 0), correct resume state | owner (2026-11-08) | high | future |
 
 Research runs append below this table with their ids.
 
@@ -94,3 +97,19 @@ Eval design:
 4. **Storage/privacy.** JSONL size per task; grep the stored events for secrets with the redact rules (must be zero hits).
 
 Adopt (default-on for evals, and optionally for normal runs) if: no measurable overhead (wall_s within noise, no stalls with receiver down), fidelity within 2%, zero secret hits, and at least 2 actionable findings. Otherwise keep it as an opt-in `TP_OTEL=1` for evals only, or drop it.
+
+## H19–H21: future robustness experiments (owner, 2026-11-08, "somethings to think about")
+These build on J1. Each becomes a new bench task kind, a reviewed bench change of its own per PROTOCOL "Adding an eval", once `tp-bench` exists. They are scenario tests of the harness, not of one model.
+- **H19 requirement change.** Scenario: a lane step is mid-flight, or already reviewed, when the brief's acceptance criterion changes (for example, a rule threshold in battle-soccer `src/game`).
+  - What exists: B1 gate records bind test evidence to a tree fingerprint. Nothing binds evidence, reviews or lane steps to the version of the *criterion*.
+  - Probable mechanism: record each step's brief hash with its evidence and review. A brief change marks every dependent record stale, and `tp-agent` lists exactly what to redo.
+  - Score: no stale evidence or review accepted after the change; redo set equals the truly affected set (precision/recall); extra rounds.
+- **H20 semantic integration conflict.** Scenario: lane A changes a shared helper's contract (units, sign or rounding of a score rule) while lane B adds a caller that assumes the old contract. Each passes its own tests, and the textual merge is clean.
+  - What exists: lane-overlap warnings by declared paths (seen today on `bench`/`test-env`) and `lane/integrate` module runs after each merge. Nothing checks contract agreement across lanes.
+  - Probable mechanism: run the union of affected tests of both lanes after every merge, plus a cross-lane review of shared symbols that both lanes touch or call (symbol-level overlap, possibly with H13 ast-grep).
+  - Score: conflicts caught before acceptance, and false alarms.
+- **H21 external-state reconciliation.** Scenario: a step creates an external effect (MR, deploy, or a stubbed tracker comment), and the effect succeeds. The harness crashes or times out before recording it, then resumes.
+  - What exists: in campaigns, tmux-pi never merges to main or pushes, so test this against a local stub service that records calls.
+  - Probable mechanism: an intent record written before the call, with an idempotency key. On resume, query the external state by that key before retrying.
+  - Score: duplicate effects (must be 0), correct resume state, and time to reconcile.
+- Order: after J1, M1 and X1 pilot. H20 is the cheapest to stage, since it needs only two lanes on battle-soccer. H21 needs the stub service.

@@ -473,3 +473,7 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Main: before the fix (main f5ac3f8 + new test) 3.9.6 fails the kernel test ("followed an intermediate link"), 3.14.5 passes it. After: 829 tests, 3.9.6 and 3.14.5, both modes: only r9 (deno) fails; both r8 PathRuleCase link tests pass on 3.9. Main removed those two baseline lines. Logs in tasks/coder-653e1a5433/main-evidence/.
 - Review review-coder-653e1a5433-111035 (Claude Sonnet 5.5): APPROVED_WITH_NOTES, no defects (N1 pre-macOS-11 kernel not covered, out of scope; N2 non-EINVAL probe error makes graph unimportable, fail-closed by design; N3 covered by Main's runs). All other NOFOLLOW_ANY users checked; ELOOP/ENOTDIR mappings already accept both.
 - Committed on the lane, `lane close nofollow-any U3`, merged into main (tree identical to the reviewed tip). Not pushed.
+
+## 2026-11-08 Finished lanes removed
+- Main checked every open lane: merged into main, worktree clean, steps closed. Removed (`tp-agent lane remove`, records archived under .git/tmux-pi/lanes/archive/ with restore commands): evidence, guard-py39, h10-fix, lane-facts, local-model, measure, review-order, safe-source, test-env-bench, tools-template (plus py39-union, gpt61, py39-rmtree, nofollow-any earlier). Four needed their finished, uncollected reviewers collected first.
+- Left open: status-cleanup (F1): no closed step, 21 uncommitted files in its worktree on base f1a0ad3. Unfinished work; owner/Main to decide whether to resume or abandon.

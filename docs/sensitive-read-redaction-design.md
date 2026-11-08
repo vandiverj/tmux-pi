@@ -83,6 +83,8 @@ Method:
 | 7 | pi `tool_result` rewrite | Not run (optional). It is covered by pi's docs and will be tested in Phase 5. |
 | – | `ask` plus `updatedInput` showing the rewritten command | Skipped. The design uses `tp-secret-exec`, so it doesn't depend on this. |
 
+**Auto mode interaction (H10).** A hook's `updatedInput` rewrite invalidates Claude's earlier auto-mode review: allow-listed calls need `Bash(echo exit-code: nonzero)` as well, while classifier-reviewed calls can still be denied after a rewrite. `tp-claude` therefore always adds one standing system instruction (in off/shadow/on, for Main and workers) to have the model append the exact ` || echo exit-code: nonzero` suffix itself, subject to `wrap()`'s exclusions. It merges caller inline/file prompt values in order into one inline prompt. An already-wrapped command is unchanged by `wrap()`, so no `updatedInput` invalidates the review; the hook's fallback suffix remains necessary to keep failing output on the redactable PostToolUse path (rows 8–9).
+
 Design changes from these results, folded into §4.3, §4.4 and §4.6:
 - **Failing Bash output (row 8): new `||` suffix wrapper in PreToolUse** (§4.3).
 - **Saved large-output files (row 4): PostToolUse also redacts the saved file in place.** It rewrites the file at `persistedOutputPath` with the redacted text and sets mode 0600.

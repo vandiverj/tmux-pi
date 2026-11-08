@@ -204,3 +204,17 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - branch `rtk-eval`;
   - `~/.local/rtk-eval`, the binary and downloads;
   - `~/Library/Application Support/rtk`, holding `history.db` and `recall.db`, with raw run output including the dummy fixture values.
+
+## 2026-11-08: J1 review, round 1: REQUEST_CHANGES
+- **Tests.** Main ran all four bench modules in both modes: 45 tests, all OK. `tp-bench verify` checked 15 tasks.
+- **Review findings** (`review-coder-550a178817-194749`):
+  - F1: the fallback `kill-session` runs without a fresh ownership check.
+  - F2: transcripts the record cites are deleted along with the project copy.
+  - F3: a terminal result seen after the deadline is still scored.
+  - F4: a review that times out drops out of the catch-rate denominator.
+- **Round 2** (`coder-3a0d4cbc7c`, brief `j1-r2.md`) applies family rules:
+  - one ownership-checked helper for every destructive tmux action;
+  - every path a record names survives cleanup (artifacts are copied into the results dir);
+  - the budget is checked on every observation;
+  - denominators come from the specs.
+- **Owed.** The owner runs `bin/tp-claude-bootstrap ~/.local/share/tp-bench/work`, then Main does the live control runs from a plain terminal.

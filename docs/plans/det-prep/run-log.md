@@ -375,3 +375,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - U1: wait for H10, then retry on Claude.
 - Pushed main 2e0e19c..d8a18a7 (docs only). Deleted ~/.local/hl1-eval (360M, nothing running from it).
 - Merge integrate->main approved. Main merges after the P1 baseline check and N2, shows the diff summary, and does not push that merge without asking.
+
+## 2026-11-08 P1 baseline check
+- Integrate 155ae8d (P1 + T1): the 14 baseline modules, run twice in both modes (4 runs per module).
+- 60 baseline lines passed in all 4 runs: 58 test_trust_guard, test_trust_record.test_expiry, and the test_sensitive_trust rg lift. Removed 59; kept the rg lift because it is intermittent in T1's runs (F-FLAKE). Baseline went from 488 to 429 lines.
+- Off-baseline: 2 test_sensitive_trust UnscopedPatchTests_unrelated `git grep` lift subtests failed in 1 of 4 runs (inside, second pass). Same intermittent family. Logged under F-FLAKE, not added to the baseline.
+- H10 re-decided with the owner: dropping the suffix reopens design row 8 (PostToolUseFailure still cannot replace output, per the current hooks docs). The owner chose to investigate first: why do workers get the auto-mode denial when the docs exempt plugin command hooks that change Bash?

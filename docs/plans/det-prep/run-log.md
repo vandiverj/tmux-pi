@@ -381,3 +381,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - 60 baseline lines passed in all 4 runs: 58 test_trust_guard, test_trust_record.test_expiry, and the test_sensitive_trust rg lift. Removed 59; kept the rg lift because it is intermittent in T1's runs (F-FLAKE). Baseline went from 488 to 429 lines.
 - Off-baseline: 2 test_sensitive_trust UnscopedPatchTests_unrelated `git grep` lift subtests failed in 1 of 4 runs (inside, second pass). Same intermittent family. Logged under F-FLAKE, not added to the baseline.
 - H10 re-decided with the owner: dropping the suffix reopens design row 8 (PostToolUseFailure still cannot replace output, per the current hooks docs). The owner chose to investigate first: why do workers get the auto-mode denial when the docs exempt plugin command hooks that change Bash?
+
+## 2026-11-08 N2 merged into integrate
+- 68973cb merges lane/failing-tests 63bb424. No conflict: git combined T1's first-line `import session_env` in tests/test_failing_tests.py with N2's changes (still line 4, first import).
+- Both modes: test_failing_tests 25 OK, test_preamble 40 OK. test_docs_wiring has 6 failures, the same as the baseline.
+- test_session_env: 3 failures on the merged tree, which also happen on a git-archive export of 155ae8d (T1 merge, before N2). So they come from T1 and J1 together, not from N2. T1's lane branched before J1 (f1c341d) landed, so T1's guards never saw tests/test_bench_{cli,runner,score,shell}.py (no `import session_env` first) or the 7 TP_BENCH_* names that lib/bin read (not classified). Follow-up T1b: a tests-only fix. It is not on the baseline because it is a real regression on integrate.

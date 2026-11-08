@@ -327,3 +327,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - coder-ff55f5cdc7: comments state the rule (the budget counts matches; the deadline is checked per visited entry) and one test row pins a nonmatching glob as allowed while time remains. A mutation that spends the budget per entry fails it. Main's two-mode run: trust_guard 310 OK and OK, trust_record 69 OK and OK, sensitive_trust OK outside and 2 git grep subtests inside.
 - Owed check done: test_sensitive_trust on unmodified integrate 3x per mode. The git grep subtests failed in runs 2 and 3 in both modes, so they predate P1 (F-FLAKE). Baseline line 446 (test_rg_is_taken...) fails on every base run and passes with P1.
 - Review: review-coder-ff55f5cdc7-220259.
+
+## 2026-11-08 04:08Z — P1 approved and merged into lane/integrate
+
+- review-coder-ff55f5cdc7-220259: APPROVED, no findings. It accepts Main's ruling on F1 and the base evidence for the git grep flake.
+- Committed in the lane as b4dc3cd (3 files); lane step P1 closed; merged into integrate as 0cb5400. In integrate, both modes: trust_guard 310, sensitive_trust 192, trust_record 69, all OK.
+- Still owed: the baseline lines P1 fixes (about 60, test_trust_guard, test_trust_record 425, test_sensitive_trust 446). Main removes them after T1 merges, because test-env owns the baseline file.
+- The live hook runs from the main checkout's bin/, so workers keep hitting the 3.9 denial until P1 reaches main. That needs the owner.

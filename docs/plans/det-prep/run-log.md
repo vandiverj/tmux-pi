@@ -368,3 +368,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Main's two-mode run: 140 modules x 2 = 280 runs; 246 OK, 24 FAILED, 10 no result (U1 imports, test_retry_packet). 481 distinct failing names, 0 off-baseline. Evidence in scratch evidence-t1-r4.txt.
 - Committed 4d2108d in the lane, `lane close test-env t1` recorded, merged into integrate 155ae8d.
 - Baseline: removed exactly the 4 test_orchestration lines (old 422-424, 442); 492 -> 488 lines.
+
+## 2026-11-08 Owner decisions (morning)
+- H10: stop rewriting Bash; failing output handled in PostToolUse only. Done as a normal lane. It goes first, because the rewrite blocks Claude workers. Author: Pi worker (local Qwen if it can, else OpenAI). Review: a different provider.
+- F-GREP: one small round. Fail closed when any parser limit is reached; add 65 and 10,000 assignment rows. After H10.
+- U1: wait for H10, then retry on Claude.
+- Pushed main 2e0e19c..d8a18a7 (docs only). Deleted ~/.local/hl1-eval (360M, nothing running from it).
+- Merge integrate->main approved. Main merges after the P1 baseline check and N2, shows the diff summary, and does not push that merge without asking.

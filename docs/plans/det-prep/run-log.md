@@ -218,3 +218,4 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - the budget is checked on every observation;
   - denominators come from the specs.
 - **Owed.** The owner runs `bin/tp-claude-bootstrap ~/.local/share/tp-bench/work`, then Main does the live control runs from a plain terminal.
+- 2026-11-08: the owner ran `tp-claude-bootstrap` on `~/.local/share/tp-bench/work` and approved trust. Main created the folder first, because bootstrap refuses a missing dir. Running it through `!` failed: with no TTY, Claude fell into `--print` mode. Both points were sent to the J1 coder for `docs/bench.md`.

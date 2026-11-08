@@ -1,3 +1,4 @@
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import importlib.machinery
 import importlib.util

@@ -31,6 +31,171 @@ Next paragraph, not part of the block.
 """
 
 
+INC = "entry {} has no "
+
+# Every row of the two parse tables, shared with the before/after script: NEGATIVE texts are no block; POSITIVE rows are
+# (text, tests named, malformed).
+NEGATIVE = (
+    "FAILING_TESTS: none.", "FAILING_TESTS: None (all pass)", "FAILING_TESTS: none (nothing was run).",
+    "FAILING_TESTS:\nnone", "FAILING_TESTS: **none**", "FAILING_TESTS: `none`", "FAILING_TESTS: none — every module passed",
+    "FAILING_TESTS: No failures", "FAILING_TESTS: 0", "**FAILING_TESTS:** none", "FAILING_TESTS:\n\nAll the tests passed.",
+    "FAILING_TESTS: tests.test_inline fails", "FAILING_TESTS:\ntests.test_old fails, not mine",
+    "FAILING_TESTS:\n- none", "FAILING_TESTS:\n- n/a", "FAILING_TESTS:\n* **None**", "FAILING_TESTS:\n- no failures",
+    "FAILING_TESTS:\n- Nothing failed.", "FAILING_TESTS: none\n- `n/a`", "FAILING_TESTS:\n- 0 failures",
+    # round 2: no bullet, no entry; an entry must name a test
+    "FAILING_TESTS:\ntest: tests.a\ncommand: c", "FAILING_TESTS:\n- test: none", "FAILING_TESTS:\n- command: pytest",
+    "FAILING_TESTS:\n- all tests passed", "FAILING_TESTS:\n- every test passed", "FAILING_TESTS:\n- 0 tests failed",
+    "FAILING_TESTS:\n- tests: all green",
+    # round 3: a bullet whose first token is another key: label is a note; no other field supplies the id
+    "FAILING_TESTS:\n- note: tests.test_a passed", "FAILING_TESTS:\n- reason: see tests/test_x.py",
+    "FAILING_TESTS:\n- command: python3 -m unittest tests.test_a",
+    "FAILING_TESTS:\n- command: python3 -m unittest tests.test_a\n  unmodified_base: not checked",
+    "FAILING_TESTS:\n- note: x\n  test: tests.a",
+    # round 4: a bare `label:` bullet other than test: is a note, even when the label or value looks like a test (the trade)
+    "FAILING_TESTS:\n- test_case: tests.test_a passed", "FAILING_TESTS:\n- test_foo: AssertionError",
+    # round 4, my own adversarial shapes: each tries to get a note, an emphasis form or a field to start or keep an entry
+    "FAILING_TESTS:\n- **test**: none",  # emphasised label, no id
+    "FAILING_TESTS:\n- tests.a failed\ntest: none",  # the explicit test: replaces the provisional id, and names nothing
+    "FAILING_TESTS:\n- note: x\ntest: tests.a",  # a note closes the entry, so the unbulleted test: has none open
+    "FAILING_TESTS:\n- note: see\n  tests.test_a",  # a wrapped line after a note continues nothing
+    "FAILING_TESTS:\n- _note_: tests.test_a",  # underscore emphasis around another label
+    "FAILING_TESTS:\n- Reason: tests/test_x.py::test_y failed",  # capitalised label with a pytest node id
+    "FAILING_TESTS:\n- test: n/a\n  command: tests.test_a",  # a command naming a test never supplies the id
+    # round 5: a continuation line after test: is a note, so it never supplies the id
+    "FAILING_TESTS:\n- test: none\n  tests.test_a",
+)
+
+# round 6 (review-coder-58d858934d-204736 F1): a continuation right after a test: field is a note, even when the entry has
+# another field before it; FIELD_VALUES checks that the command keeps its own text
+REVIEW_R6_PROVISIONAL = ("FAILING_TESTS:\n- tests.a failed\n  command: pytest\n  test: tests.b\n  more text\n", ["tests.b"],
+                         [INC.format(1) + "unmodified_base"])
+REVIEW_R6_DUPLICATE = ("FAILING_TESTS:\n- test: tests.a\n  command: pytest\n  test: tests.b\n  more text\n", ["tests.a"],
+                       ["entry 1 has no unmodified_base and more than one test: field"])
+
+POSITIVE = (
+    ("FAILING_TESTS:\n- `tests.test_x.T.test_y` fails with `20 != 16`.\n", ["`tests.test_x.T.test_y` fails with `20 != 16`."],
+     [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- test: tests.test_a\n  command: python3 -m unittest tests.test_a\n  unmodified_base: not checked\n",
+     ["tests.test_a"], []),
+    ("FAILING_TESTS:\n- test: tests.test_a\n  command: c\n- test: tests.test_b\n  command: d\n  unmodified_base: yes\n",
+     ["tests.test_a", "tests.test_b"], [INC.format(1) + "unmodified_base"]),
+    ("FAILING_TESTS:\n* tests.test_a.T.test_one\n* tests.test_a.T.test_two - flaky\n",
+     ["tests.test_a.T.test_one", "tests.test_a.T.test_two - flaky"],
+     [INC.format(1) + "command, unmodified_base", INC.format(2) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- no.test_x fails\n", ["no.test_x fails"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- no_such_test fails\n", ["no_such_test fails"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- **src/game.test.ts** fails\n", ["**src/game.test.ts** fails"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- a/b.py::test_c\n", ["a/b.py::test_c"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- TestFoo.test_bar errors\n", ["TestFoo.test_bar errors"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- test_trial_session.TrialSessionTests.test_x: 20 != 16\n",
+     ["test_trial_session.TrialSessionTests.test_x: 20 != 16"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- `tests.test_retry_packet` (module does not import)\n",
+     ["`tests.test_retry_packet` (module does not import)"], [INC.format(1) + "command, unmodified_base"]),
+    # round 3: a second test: field is one malformed entry, never a second entry
+    ("FAILING_TESTS:\n- test: tests.a\n  command: c\n  test: tests.b\n", ["tests.a"],
+     ["entry 1 has no unmodified_base and more than one test: field"]),
+    # a note: field on an entry never supplies the id, and never ends the entry
+    ("FAILING_TESTS:\n- test: tests.a\n  note: tests.b passed\n", ["tests.a"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS: see below\n- test: tests.test_a\n  command: c\n  unmodified_base: not checked\n", ["tests.test_a"], []),
+    # round 4: the first explicit test: replaces a bullet's provisional id and is not a duplicate; a second one is
+    ("FAILING_TESTS:\n- tests.a failed\n  test: tests.b\n", ["tests.b"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- tests.a failed\n  test: tests.b\n  test: tests.c\n", ["tests.b"],
+     ["entry 1 has no command, unmodified_base and more than one test: field"]),
+    # round 4, my own adversarial shapes: each must still be one entry
+    ("FAILING_TESTS:\n- _test_: tests.a\n", ["tests.a"], [INC.format(1) + "command, unmodified_base"]),  # emphasised label
+    ("FAILING_TESTS:\n- Test: tests.a\n", ["tests.a"], [INC.format(1) + "command, unmodified_base"]),  # label case
+    ("FAILING_TESTS:\n- (tests.test_a) fails\n", ["(tests.test_a) fails"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- tests.a failed\n  note: tests.b passed\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- note: x\n- tests.a failed\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- tests.a failed\n- none\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- test: tests.a\n- test: none\n", ["tests.a"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- test:tests.a\n", ["test:tests.a"], [INC.format(1) + "command, unmodified_base"]),  # no space: not a label
+    # round 5: a continuation after the id (a test: line or a bullet's first token) is a note and never changes the id
+    ("FAILING_TESTS:\n- test: tests.a\n  tests.b\n", ["tests.a"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- tests.a failed\n  more text\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+    REVIEW_R6_PROVISIONAL, REVIEW_R6_DUPLICATE,
+    # round 6: the I5 exception pinned. A prose or continuation note closes the entry, so a later test: is a note too
+    ("FAILING_TESTS:\n- tests.a failed\nprose\n  test: tests.b\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+    ("FAILING_TESTS:\n- tests.a failed\n  more text\n  test: tests.b\n", ["tests.a failed"], [INC.format(1) + "command, unmodified_base"]),
+)
+
+# (text, entry index, field, value): what one field of one entry holds after wrapped (continuation) lines
+FIELD_VALUES = (
+    ("**FAILING_TESTS:**\n- test: tests.a\n  command: python3 -m unittest\n    tests.a\n  unmodified_base: not checked\n",
+     0, "command", "python3 -m unittest tests.a"),
+    (REVIEW_R6_PROVISIONAL[0], 0, "command", "pytest"),
+    (REVIEW_R6_DUPLICATE[0], 0, "command", "pytest"),
+)
+
+# The exhaustive check: one or two concrete lines of each line kind, every block of 1 to 4 of them. (line, kind, the id the
+# line names, or None). The kinds are written here, not imported, so the check does not trust the parser's classifier.
+KIND_LINES = (
+    ("- test: tests.a", "BULLET_TEST", "tests.a"),
+    ("- test: none", "BULLET_TEST", "none"),
+    ("- note: tests.b passed", "BULLET_LABEL", None),
+    ("- tests.c failed", "BULLET_TEXT", "tests.c failed"),
+    ("- nothing failed", "BULLET_TEXT", None),
+    ("  test: tests.d", "FIELD_TEST", "tests.d"),
+    ("  test: none", "FIELD_TEST", "none"),
+    ("  command: python3 -m unittest tests.e", "FIELD_OTHER", None),
+    ("  wrapped tests.f", "CONTINUATION", None),
+    ("tests.g in prose", "OTHER", None),
+    ("", "BLANK", None),
+)
+WRAPPED = "wrapped tests.f"
+
+
+def invariant_violations(parse, limit=None):
+    """(block lines, invariant, detail) for every block of 1-4 KIND_LINES that breaks I1-I5 under `parse`."""
+    import itertools
+
+    def ids(lines):
+        found = parse("FAILING_TESTS:\n" + "\n".join(lines) + "\n")
+        return found, ([e["test"] for e in found["entries"]] if found else [])
+
+    out = []
+    for size in range(1, 5):
+        for combo in itertools.product(KIND_LINES, repeat=size):
+            read = list(itertools.dropwhile(lambda row: row[1] == "BLANK", combo))  # leading blank lines are skipped
+            read = list(itertools.takewhile(lambda row: row[1] != "BLANK", read))  # the first blank line after ends the block
+            block = [row[0] for row in combo]
+            found, got = ids(block)
+            named = [row[2] for row in read if row[2] is not None]
+            bad = []
+            if any(i not in named for i in got):  # I1: an id is exactly the value of one id-naming line
+                bad.append(("I1", got))
+            if any(not failing_tests.TEST_ID.search(i) for i in got):  # I2: a counted id matches TEST_ID
+                bad.append(("I2", got))
+            if not any(failing_tests.TEST_ID.search(n) for n in named) and found is not None:  # I3: no valid id, no block
+                bad.append(("I3", got))
+            if any(row[1] == "CONTINUATION" for row in combo):
+                other = ids([("  other words" if row[1] == "CONTINUATION" else row[0]) for row in combo])[1]
+                if other != got:  # I4: a continuation's text never changes an id
+                    bad.append(("I4", (got, other)))
+                # I4: and it extends only the field whose FIELD_OTHER line (or a continuation of it) is right before it
+                allowed, head = 0, None
+                for row in read:
+                    head = head if row[1] == "CONTINUATION" else row[1]
+                    allowed += row[1] == "CONTINUATION" and head == "FIELD_OTHER"
+                used = sum(v.count(WRAPPED) for e in (found or {"entries": []})["entries"] for k, v in e.items() if k != "test")
+                if used > allowed:
+                    bad.append(("I4", f"continuation text in {used} field(s), {allowed} allowed"))
+            stripped = ids([row[0] for row in read if row[1] not in ("CONTINUATION", "OTHER", "BLANK")])[1]
+            if stripped != got:  # I5: notes never change the ids (one exception, below)
+                kinds = [row[1] for row in read]
+                # A CONTINUATION or OTHER note closes the entry, so a later `test:` field can no longer replace a bullet's
+                # provisional id. With the note removed it does. The ids differ only by those two values.
+                closed = any(kinds[i] == "BULLET_TEXT" and read[i][2] and kinds[j] in ("CONTINUATION", "OTHER")
+                             and kinds[k] == "FIELD_TEST" for i, j, k in itertools.combinations(range(len(read)), 3))
+                if not (closed and set(got) - set(stripped) <= {r[2] for r in read if r[1] == "BULLET_TEXT"}
+                        and set(stripped) - set(got) <= {r[2] for r in read if r[1] == "FIELD_TEST"}):
+                    bad.append(("I5", (got, stripped)))
+            out.extend((block, name, detail) for name, detail in bad)
+            if limit and len(out) >= limit:
+                return out
+    return out
+
+
 class ParseTests(unittest.TestCase):
     def test_a_block_gives_its_entries_and_stops_at_the_blank_line(self):
         found = failing_tests.parse(BLOCK)
@@ -46,20 +211,42 @@ class ParseTests(unittest.TestCase):
                 self.assertIsNone(failing_tests.parse(text))
 
     def test_a_decorated_header_and_a_wrapped_value_are_read(self):
-        found = failing_tests.parse("**FAILING_TESTS:**\n- test: a.b\n  command: python3 -m unittest\n    a.b\n  unmodified_base: not checked\n")
-        self.assertEqual(found["entries"][0]["command"], "python3 -m unittest a.b")
+        found = failing_tests.parse(FIELD_VALUES[0][0])
+        self.assertEqual(found["entries"][0]["test"], "tests.a")  # round 5: only a non-id field takes a continuation
         self.assertEqual(found["malformed"], [])
+        for text, number, field, value in FIELD_VALUES:  # round 6: and only right after that field's own line
+            with self.subTest(text=text):
+                self.assertEqual(failing_tests.parse(text)["entries"][number][field], value)
 
-    def test_prose_and_missing_fields_are_kept_as_text_and_named_never_raised(self):
-        found = failing_tests.parse("FAILING_TESTS:\ntests.test_old fails, not mine\n")
+    def test_every_block_of_up_to_four_kinds_of_line_keeps_the_invariants(self):
+        """N2 round 6: I1-I5 over every block of 1-4 KIND_LINES (16104 blocks); and parse's docstring is TABLE."""
+        violations = invariant_violations(failing_tests.parse, limit=5)
+        self.assertEqual(violations, [])
+        doc = [row.strip().strip("|").split("|") for row in failing_tests.parse.__doc__.splitlines() if row.strip().startswith("| ")]
+        self.assertEqual([tuple(cell.strip() for cell in row[:3]) for row in doc[1:]],
+                         [tuple(row[:3]) for row in failing_tests.TABLE])
+
+    def test_bulleted_prose_and_missing_fields_are_kept_as_text_and_named_never_raised(self):
+        found = failing_tests.parse("FAILING_TESTS:\n- tests.test_old fails, not mine\n")
         self.assertEqual(found["entries"][0]["test"], "tests.test_old fails, not mine")
         self.assertIn("entry 1 has no command, unmodified_base", found["malformed"][0])
         self.assertIn("tests.test_old fails", found["text"])
-        found = failing_tests.parse("FAILING_TESTS: tests.test_inline\n")
-        self.assertEqual(found["entries"][0]["test"], "tests.test_inline")
+
+    def test_no_failures_in_any_wording_is_no_block(self):
+        """N2: decided by structure: only a bulleted entry that names a test (or test:/command: fields) is a report."""
+        for text in NEGATIVE:
+            with self.subTest(text=text):
+                self.assertIsNone(failing_tests.parse(text))
+
+    def test_real_entry_shapes_still_give_entries_and_the_same_malformed_list(self):
+        for text, names, malformed in POSITIVE:
+            with self.subTest(text=text):
+                found = failing_tests.parse(text)
+                self.assertEqual([e.get("test") for e in found["entries"] if "test" in e], names)
+                self.assertEqual(found["malformed"], malformed)
 
     def test_a_heading_or_another_status_line_ends_the_block(self):
-        found = failing_tests.parse("FAILING_TESTS:\n- test: a\n  command: c\n  unmodified_base: not checked\nRESULT_STATUS: complete\n")
+        found = failing_tests.parse("FAILING_TESTS:\n- test: tests.a\n  command: c\n  unmodified_base: not checked\nRESULT_STATUS: complete\n")
         self.assertEqual(len(found["entries"]), 1)
         self.assertNotIn("RESULT_STATUS", found["text"])
 
@@ -107,8 +294,19 @@ class CollectTests(InvestigateCase):
         self.assertNotIn("failing_tests", json.loads(run.stdout))
         self.assertEqual(run.stderr, "")
 
+    def test_a_task_saying_none_was_run_gets_no_failing_tests_row_or_notice(self):
+        """N2: the index row (what the hook hint reads) carries no failing_tests, so the hint is the plain collect one."""
+        item, task = self.dispatch(self.repo)
+        self.settle(task, result="RESULT_STATUS: complete\nFAILING_TESTS: none (nothing was run).\n")
+        ident = item["id"]
+        index = self.cli("index", "--no-tick")
+        self.assertNotIn("failing_tests", [r for r in index["pending"] if r["id"] == ident][0])
+        run = self.raw("collect", ident)
+        self.assertNotIn("failing_tests", json.loads(run.stdout))
+        self.assertEqual(run.stderr, "")
+
     def test_a_malformed_block_is_shown_as_text_and_collect_still_succeeds(self):
-        ident, _ = self.start("RESULT_STATUS: complete\nFAILING_TESTS:\nthe thing in tests/test_old is red\n")
+        ident, _ = self.start("RESULT_STATUS: complete\nFAILING_TESTS:\n- tests/test_old is red\n")
         run = self.raw("collect", ident)
         self.assertEqual(run.returncode, 0, run.stderr)
         value = json.loads(run.stdout)

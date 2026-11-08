@@ -51,7 +51,7 @@ failure recurs, add a row.
 | A commit lacked the Co-Authored-By trailer; the coder cannot amend | Put the trailer text in the brief's commit instruction; a miss gets a note, never an amend. |
 | A worker dropped a stash by an off-by-one index | Workers do not use `git stash`; the brief says so. |
 | Read-only reviewers on a lane diff from the main checkout got sensitive-read denials | Run as a lane step or give the diff as a file (`04`). |
-| The plugin's `failing_tests` flag fired on prose ("none.", "does not own") several times | Write the "Failing tests" section as a literal list or the single word `none`. |
+| The plugin's `failing_tests` flag fired on prose ("none.", "does not own") several times | Leave the `FAILING_TESTS:` block out when nothing fails that you do not own; when something fails, write one `- test:` bullet per test (with `command:` and `unmodified_base:`). Never write `FAILING_TESTS: none`. |
 | `<mr-cli>` bracket fields posted anchored MR comments as general ones | JSON body (`06` outward step 2). |
 | Story-point write refused on a Task and a Spike | Points only on a User Story (`06` outward step 4). |
 | Auto-mode classifier denied `<tracker>` comments until `<owner>` said OK | Wait for their OK in the session, then post (`06`). |

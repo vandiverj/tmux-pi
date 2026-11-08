@@ -293,3 +293,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - J1 r6 review (review-coder-13239f5437-203344): APPROVED_WITH_NOTES. All three notes are checks: the live run, without-change coverage for acceptance items 2–5, and the historical sweep rows; the reviewer's report.md covers that sweep.
 - Committed as `f1c341d` (39 files, the exact reviewed set). Lane step j1 closed; merged into lane/integrate as `3a1bcb4`. In integrate, the four bench modules pass in both modes (8/22/28/7) and verify checks 15.
 - Owed by Main: the live local-only control run (main and lane/integrate, `--repeat 2`) with before/after `tmux ls` and `git worktree list`. It is held until no worker pane is live, because the previous live run killed two coder panes.
+
+## 2026-11-08 04:50Z — N2 r4–r6, T1 r2 in review
+
+- N2 r4 (exact grammar plus the docs that taught "none"): REQUEST_CHANGES. The author added a continuation-line rule outside the grammar, which let `test: none` + an indented id become an entry.
+- N2 r5 (continuation lines never touch ids): REQUEST_CHANGES. The parser inferred the previous field from the last dict key, so a continuation after `test:` reached `command:`. That is a correctness gap, not a false trigger.
+- N2 r6 (coder-eaeccd4686, escalated to Opus): the parser is now an explicit transition table, with an exhaustive test over every block of 1–4 lines checking invariants I1–I5, and the exhaustive failure count shown on r5. Signal for H22: in a free-text parser, state must be explicit, and the test must enumerate combinations, not list cases.
+- T1 r2 two-mode run done: 44 modules OK in both modes. The only failures are the baseline 6 docs_wiring and 1 trial_session, matched by name. test_orchestration is 41/41, so baseline lines 422–424 and 442 are to be removed at merge. Under review as review-coder-cb6b537bac-204849.

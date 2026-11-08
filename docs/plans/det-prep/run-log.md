@@ -335,3 +335,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Still owed: the baseline lines P1 fixes (about 60, test_trust_guard, test_trust_record 425, test_sensitive_trust 446). Main removes them after T1 merges, because test-env owns the baseline file.
 - The live hook runs from the main checkout's bin/, so workers keep hitting the 3.9 denial until P1 reaches main. That needs the owner.
 - 04:09Z F-GREP dispatched: brief fg-safe-grep-source.md, coder-51390d04c9 (Opus, lane safe-source, step FGREP, pane %134). Main granted the tests/ paths up front, given test-env's claim on tests/, to avoid P1's blocked request.
+
+## 2026-11-08 04:19Z — P1 on main (owner request)
+
+- Owner: "merge P1 to main so the live hook is fixed". Cherry-picked the P1 commit b4dc3cd onto main as 8eaa6f2 (-x). It is not a merge of lane/guard-py39, which would also bring the 19 integrate commits. The three files were identical on main and at P1's base 3a1bcb4, so it applied clean.
+- On main, both modes: trust_guard 310, sensitive_trust 184, trust_record 69, all OK. The live hook bin/tp-trust-guard under /usr/bin/python3 allows `ls tests/test_*.py` and the T1 r3 request shape, and still denies a literal store path. Not pushed.
+- When integrate later merges to main, git sees the same change on both sides (no conflict expected).

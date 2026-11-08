@@ -70,14 +70,16 @@ Each decision is a single `if` carrying a `check:<name>` marker so a mutation ru
 see a test fail.
 """
 import collections
-import glob
+import fnmatch
 import json
 import os
 import posixpath
 import pwd
 import re
 import signal
+import sys
 import time
+import traceback
 import unicodedata
 
 import sensitive_read as sr
@@ -158,7 +160,8 @@ PARAM_BUDGET = Why("the tool call holds more values than can be checked against 
 PARAM_KEY = Why("the tool call holds a parameter name that could not be read", "Use plain text for parameter names.")
 PARAM_VALUE = Why("the tool call holds a value that could not be read", "Use text, numbers, lists and objects only.")
 ANALYSIS_FAILED = Why("the tool call could not be analysed",
-                      "Try the call again; if it keeps failing the guard is broken and the owner should be told.")
+                      "This is a fault in the guard, not in the call, so the same call will fail again: do not retry it. "
+                      "Tell the owner (the fault is written to the hook's stderr), or reach the goal with a different call.")
 ANALYSIS_TIMED = Why("the tool call could not be analysed in time",
                      "Make the call smaller (fewer paths, a narrower directory, a shorter command) and try again.")
 _FALLBACK_REMEDY = "Make the call smaller or simpler, or ask the owner."
@@ -334,6 +337,59 @@ class _OutOfTime(BaseException):
     `except OSError: continue` in a walk and no catch-all can swallow it and let the judgement run on without a limit."""
 
 
+class _Spent(Exception):
+    """A glob used up the matches or the time it may spend (`Guard._glob`, `Guard._glob_step`)."""
+
+
+def _iglob(pattern, step, dironly=False):
+    """The paths `pattern` matches, as Python 3.11's `glob.iglob(pattern, include_hidden=True)` finds them: a wildcard
+    matches a leading `.` too, `**` is `*`, and a pattern that ends in `/` matches directories only. Written out here
+    because the hooks run under whatever `python3` is first on PATH (3.9 on macOS), and `include_hidden` is 3.11 only.
+    `step()` is called once per directory entry or path looked at, before it is used; it may raise to stop the glob.
+    `dironly` is set for the part in front of a `/`: only directories (and links to them) are matched there."""
+    dirname, basename = posixpath.split(pattern)
+    if not _MAGIC.search(pattern):
+        step()
+        if posixpath.lexists(pattern) if basename else posixpath.isdir(dirname):
+            yield pattern
+        return
+    parents = _iglob(dirname, step, True) if dirname != pattern and _MAGIC.search(dirname) else [dirname]
+    for parent in parents:
+        for name in _glob_names(parent, basename, step, dironly):
+            yield posixpath.join(parent, name)
+
+
+def _glob_names(parent, basename, step, dironly):
+    """Names in `parent` that `basename` matches; with `dironly`, only those that are (or lead to) directories."""
+    if not _MAGIC.search(basename):
+        step()
+        if basename:
+            if posixpath.lexists(posixpath.join(parent, basename)):
+                yield basename
+        elif posixpath.isdir(parent):
+            yield basename
+        return
+    try:
+        with os.scandir(parent or os.curdir) as entries:
+            names = []
+            for entry in entries:
+                step()
+                if dironly:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                if fnmatch.fnmatchcase(entry.name, basename):
+                    names.append(entry.name)
+    except OSError:
+        return
+    yield from names
+
+
+_MAGIC = sr._GLOB    # what makes a word a pattern, for the guard and for `_iglob` alike
+
+
 class _Run:
     """What one judgement has seen across a command and the commands nested in it."""
 
@@ -360,7 +416,9 @@ class Guard:
         self.chain = {i for d in self.dirs for i in self._ids(posixpath.dirname(d))}
         # A cwd that is not an absolute path cannot be placed: relative words are then unresolved.
         self.cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") else (os.getcwd() if cwd is None else None)
-        # What one judgement may spend looking through trees for links that lead into the store.
+        # What one judgement may spend looking through trees for links that lead into the store. `entries` counts what
+        # must be judged: each entry a walk visits, and each path a glob matches (not the entries a glob only looks at,
+        # which yield nothing that could name the store). `deadline` bounds the time of both, checked per entry visited.
         self.entries = _WALK_ENTRIES
         self.deadline = time.monotonic() + _WALK_SECONDS
         # Why the guard could not look through a tree far from the store; the call is `ask` if nothing denies it.
@@ -529,14 +587,15 @@ class Guard:
         if ".." in pattern.split("/"):                                      # check:glob_dotdot
             root = None
         try:
-            for hit in glob.iglob(pattern, include_hidden=True):
-                self.entries -= 1
+            for hit in _iglob(pattern, self._glob_step):    # `_glob_step` checks the deadline per entry visited
+                self.entries -= 1                           # the budget counts matches: each is a path to judge
                 if self.entries < 0 or time.monotonic() > self.deadline:        # check:glob_budget
-                    reason = self._ran_out(root, GLOB_REASON)
-                    if reason:
-                        raise _Deny(reason)
-                    break
+                    raise _Spent()
                 found.append(hit)
+        except _Spent:
+            reason = self._ran_out(root, GLOB_REASON)
+            if reason:
+                raise _Deny(reason)
         except _OutOfTime:
             if self.timed_out:                                              # check:second_expiry_glob
                 raise
@@ -544,6 +603,13 @@ class Guard:
             if reason:
                 raise _Deny(reason)
         return found
+
+    def _glob_step(self):
+        """One directory entry or path a glob visited. Only the deadline is checked here, on every entry visited, so a
+        large directory with few or no matches still stops in time. The entry budget counts matches, not visits, and is
+        spent in `_glob`: an entry that does not match yields no path, so it cannot name the store."""
+        if time.monotonic() > self.deadline:                                # check:glob_time
+            raise _Spent()
 
     def _globstar(self, prefix, rest, shell):
         """`**` goes down any number of levels (zsh, bash with globstar, every glob tool): it is a walk of the tree."""
@@ -1147,8 +1213,24 @@ def _decide(tool, params, cwd, home, worker, held):
         return guard._closing(run)
     except _Deny as stop:
         return stop.args[0]
-    except Exception:   # a guard that cannot judge the call must not wave it through
+    except Exception as error:   # a guard that cannot judge the call must not wave it through
+        _report_fault(error)
         return ANALYSIS_FAILED
+
+
+def _report_fault(error):
+    """One stderr line for the owner: the exception class and the innermost guard file:line it came through. Never the
+    message, the command or a path from it (an exception's text can quote any of them)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        where = "unknown"
+        for frame in traceback.extract_tb(error.__traceback__):
+            if os.path.dirname(os.path.abspath(frame.filename)) == here:
+                where = "lib/%s:%d" % (os.path.basename(frame.filename), frame.lineno)
+        sys.stderr.write("tmux-pi trust guard fault: %s at %s (python %d.%d)\n"
+                         % (type(error).__name__, where, sys.version_info[0], sys.version_info[1]))
+    except Exception:
+        pass
 
 
 def _out_of_time(_signum, _frame):

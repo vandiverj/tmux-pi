@@ -194,7 +194,8 @@ def tree_of(path):
 
 
 def _parse_expiry(value):
-    when = datetime.datetime.fromisoformat(value)
+    # `fromisoformat` takes a trailing `Z` only from 3.11; the hooks run under whatever python3 is on PATH (3.9 on macOS).
+    when = datetime.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
     if when.tzinfo is None:
         if len(value) != 10:        # a bare date means that day, UTC; a time without a zone is refused
             raise ValueError("no zone")

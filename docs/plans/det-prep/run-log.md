@@ -421,3 +421,11 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Integrate d496bdd, both modes: the five routing modules, test_tp_claude_suffix 16, test_claude_launcher_settings 8, test_session_env 13 (1 skip), bench cli/runner/score/shell 7/22/28/8: all OK. The test_session_env T1 gap is closed.
 - F-GREP r6 (coder-4d766446d8) asked for lib/redact_hook.py (py39-union claims lib/) and three safe-source test files (gpt61 claims tests): Main authorized the cap logic only (U1 touches only import headers) and those three test files.
 - Full suite on d496bdd, both modes, started for the integrate->main gate.
+
+## 2026-11-08 F-GREP round 6 and merge into integrate
+- coder-4d766446d8 (gpt-6-sol): the wrapper operand cap returns "search" past 64 operands instead of slicing; 65/10,000-assignment rows on Claude post_result and Pi tp-redact --command, plus a direct cap/depth test. Fail-before: 2 tests, 7 failures.
+- Worker hit a second permission prompt (rg over its own after.log read as a recursive sensitive search): escaped, task parked, worker wrote its report without running more.
+- Main's nine-module both-mode run: all OK except the new test's "under the limit" row (63 assignments = 65 operands, an off-by-one in the test, not the fix). Main changed it to 62 and added 63 as a fail-closed row; module OK both modes.
+- Review review-coder-4d766446d8-074323 (Sonnet 5.5): APPROVED_WITH_NOTES, no defects. Round-5 F1 fixed; depth limit, shlex failure and UNREADABLE all fail closed; no other cap in the detector. N1 (later): wrappers missing from WRAPPERS (setsid, busybox, ssh, script -c, flock) are not detected. N2: >64-operand non-search wrapper commands are over-redacted (accepted).
+- Committed 2a1e56f (rounds 1-6), `lane close safe-source FGREP`, merged into integrate 421b4c1 with no conflict. test_session_env then caught test_safe_source_redaction (written before T1) without the scrub import; Main added it on integrate df8753e.
+- Integrate df8753e, both modes: test_session_env 13, the nine F-GREP modules, test_tp_claude_suffix 16: all OK. test_docs_wiring 6 failures = baseline.

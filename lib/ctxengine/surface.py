@@ -17,6 +17,8 @@ missing or will not load is replaced by nav_stub, whose every answer is `unavail
 refusal is shown with the reason it gave. Which navigator serves a path comes from the nearest deno.json (api) or tsconfig.json
 (web) above it.
 """
+from __future__ import annotations
+
 import argparse
 import importlib
 import json

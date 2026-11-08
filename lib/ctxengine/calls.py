@@ -24,6 +24,8 @@ A line: {ts, tool, args_hash, args, status, bytes, ms, notes_returned, index_age
 Statuses: ok, invalid (bad arguments), refused (a screen said no), no_project, stale_index, unavailable (a navigator or
 reader is missing), error (a bug; the text says so without a traceback).
 """
+from __future__ import annotations
+
 import fcntl
 import hashlib
 import json

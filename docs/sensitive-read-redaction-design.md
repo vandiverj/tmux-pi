@@ -212,6 +212,10 @@ B as the universal layer, plus a **narrow, file-based PreToolUse gate** for actu
 | Glob | nothing (`filenames` only) |
 | MCP | `text` of each list entry |
 
+**Plain-text grep lines** (Grep `content`, Bash output of a search command, pi `grep`, pi `bash` running a search, and pi's second pass over `safe_grep`) are judged by the file each line came from, read from its head (`PostRedactor.head`). The line is split at every `:` and `-` before the OS path limit. A prefix is a head candidate only if it names an existing regular file **and** a decimal (ASCII) line number follows it in a shape a search tool prints: `path:N:` on a match line, `path-N-` on a context line; a following rg `--column` or grep `-b` field (`N:`) belongs to the head too. A prefix followed by anything else (no `-n`, a word, `0x4`, another script's digits, a directory) is not a head, so an ordinary file's name cannot claim a line it did not print. When several candidates survive, the strictest rules among them apply. A line with no candidate is unsourced: it is judged by the strictest rules (`STRICTEST_RULES`, the env-file rules), with its body also taken to start after each `:` or `-`: it fails closed, never to ordinary rules. This holds even when the command names one file (`cat f | grep -n`): that file is a guess from the command text (`cat list | xargs grep -h` prints other files' lines). The NUL-delimited `safe_grep` route is unchanged: such a line is withheld.
+
+**Which Bash output is grep output** is decided by one function, `redact_hook.bash_searches`, for Claude Bash (`post_result`) and pi `bash` (`tp-redact --command`). It parses the command with `shlex`, splits it at `|`, `||`, `&&`, `;`, `&`, parentheses and newlines, drops redirections, leading `VAR=value` words and shell keywords, and reads the command word by basename. A search is `grep`, `egrep`, `fgrep`, `rg`, `ag`, `ack`, any name ending in `grep`, or `git` with its global options (`-C DIR`, `-c K=V`, `--no-pager`, ...) skipped and `grep` as the subcommand. Wrappers (`env`, `command`, `nice`, `ionice`, `timeout`, `time`, `xargs`, `sudo`, `nohup`, `stdbuf`, ...) are looked through by trying each later non-option word as the command, `sh`/`bash`/`zsh -c STRING` and `find -exec` are parsed recursively. It fails closed (grep mode) when it cannot be certain: the text does not split as shell words, or holds command or process substitution, backticks, a here-doc, a function definition, `eval` or `alias`, a command word from a variable, a git subcommand that may be an alias, or a shell reading commands from its input. Over-redaction of such output is accepted. Claude's `BashOutput`/`TaskOutput` (a background shell's output) carry no command, so they are read as grep output too. Any other command (`ls`, `git status`) keeps ordinary rules, from the one file it reads if any (`bash_source`, on both routes).
+
 Shapes are pinned by `tests/fixtures/tool_shapes/*.json` (captured in Phase 0). Failed tool calls fire PostToolUseFailure, which can't be rewritten; §4.3 keeps failing Bash output on this path instead.
 
 **Fail-open hazards and fixes:**
@@ -417,7 +421,7 @@ Shapes are pinned by `tests/fixtures/tool_shapes/*.json` (captured in Phase 0). 
 
 *Status: done 2026-10-06.*
 - **pi redaction:** `agent/extensions/sensitive.ts` has a `tool_result` handler.
-  - In `on` mode every text block goes through `bin/tp-redact --stdin` (grep mode for `grep`, `--source` for the read path).
+  - In `on` mode every text block goes through `bin/tp-redact --stdin` (grep mode for `grep` and `safe_grep`, `--command` for `bash`, which is grep mode when the command runs a search tool, `--source` for the read path).
   - `structuredContent` is nulled, and a redactor failure or timeout withholds the output.
   - `tp-redact --mode` reports the mode. Qwen budget is 20 s per call with a 60 s hook timeout.
   - Test: `tests/test_pi_redaction.py`.

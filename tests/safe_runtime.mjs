@@ -67,6 +67,29 @@ const text = (result) => result.content.map((block) => block.text).join('\n');
 const read = (tools, input) => tools.safe_read.execute('id', input, undefined, undefined, ctx).then(text);
 const grep = (tools, input) => tools.safe_grep.execute('id', input, undefined, undefined, ctx).then(text);
 
+// tests/test_safe_source_redaction.py: run its table of calls in each redaction mode, write what each returned, stop.
+if (process.env.SAFE_SOURCE_TABLE) {
+  const spec = JSON.parse(fs.readFileSync(process.env.SAFE_SOURCE_TABLE, 'utf8'));
+  if (spec.agent_dir) process.env.PI_CODING_AGENT_DIR = spec.agent_dir; // its ../bin/tp-redact is the redactor
+  const results = [];
+  for (const mode of spec.modes) {
+    process.env.TP_REDACTION = mode;
+    const { tools, handlers } = load();
+    for (const call of spec.calls) {
+      // A call with `result` is a tool's output given to sensitive.ts's tool_result pass (Pi grep, safe_grep's second pass).
+      const ran = call.result !== undefined
+        ? async () => handlers.tool_result({ type: 'tool_result', toolName: call.tool, input: call.input, isError: false,
+          content: [{ type: 'text', text: call.result }] }) ?? { content: [{ type: 'text', text: call.result }] }
+        : () => tools[call.tool].execute('id', call.input, undefined, undefined, { cwd: spec.cwd });
+      try { results.push({ mode, ok: true, text: text(await ran()) }); }
+      catch (e) { results.push({ mode, ok: false, text: String(e?.message ?? e) }); }
+    }
+  }
+  fs.writeFileSync(process.env.SAFE_SOURCE_OUT, JSON.stringify(results));
+  fs.rmSync(tmp, { recursive: true, force: true });
+  process.exit(0);
+}
+
 {
   const { tools, handlers } = load();
   assert.deepEqual(Object.keys(tools).sort(), ['safe_grep', 'safe_read']); // no reveal

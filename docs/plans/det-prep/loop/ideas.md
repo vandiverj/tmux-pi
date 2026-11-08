@@ -128,3 +128,11 @@ Rule to brief: a redaction source rule matches on the resolved real path of each
 ## H22 — free-text parser briefs give an exact grammar first (signal from N2 rounds 1–3)
 
 N2 needed three review rounds in the same `entry-validation` family. Each brief closed the cases it was given, and the reviewer then found the next one. Rule: when a lane parses worker free text, the first brief states the parser as an explicit transition table (state × line kind → action) that covers every line kind and resolves ambiguity explicitly; ambiguous text never triggers. State is kept explicitly, never inferred from the output being built. The test enumerates every short combination of line kinds against stated invariants instead of listing cases, and must fail on the old parser. Rounds 4–5 showed that a grammar given only in prose, even with adversarial rows, still leaks combinations. Check: count review rounds per parser lane before and after.
+
+## H23 — a baseline entry names its cause; a cluster in a guard module is triaged before it is accepted (signal from P1)
+
+About 60 lines of `baseline-failing.txt` were one live defect: `lib/trust_guard.py:532` uses `glob.iglob(include_hidden=True)`, which exists only from Python 3.11, and the hooks run under the system 3.9. Every glob in a worker call was denied, and the baseline recorded the test failures as "already failing", so no lane looked at them. Rule: each baseline line, or each group of lines, carries a one-line cause. More than 3 lines in one module of the trust guard, redaction or hook path are a defect to fix, not a baseline. Check: once P1 merges, the baseline shrinks by the lines P1 reports, and no remaining group lacks a cause.
+
+## H24 — a worker whose `tp-agent request` is refused has no way to reach Main (signal from T1 r3)
+
+A hook denied coder-eead542ff6's scope request nine times. The worker could only describe it in result.md and finish as incomplete. Rule: when the guard cannot analyse a call (`ANALYSIS_FAILED`), it lets a fixed-form `tp-agent request` through, or tp-agent records a refused request in the task record so Main sees it at once. Decide after P1; P1 removes the cause seen here.

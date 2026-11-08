@@ -301,3 +301,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - N2 r6 (coder-eaeccd4686, escalated to Opus): the parser is now an explicit transition table, with an exhaustive test over every block of 1–4 lines checking invariants I1–I5, and the exhaustive failure count shown on r5. Signal for H22: in a free-text parser, state must be explicit, and the test must enumerate combinations, not list cases.
 - T1 r2 two-mode run done: 44 modules OK in both modes. The only failures are the baseline 6 docs_wiring and 1 trial_session, matched by name. test_orchestration is 41/41, so baseline lines 422–424 and 442 are to be removed at merge. Under review as review-coder-cb6b537bac-204849.
 - T1 r2 review: REQUEST_CHANGES (family inherited-tmux). The scrub runs only when the `tests` package is imported, so `discover -s tests` and `python3 tests/test_x.py` still inherit TMUX. Reproduced on test_lane_writer. T1 r3 (coder-eead542ff6) must isolate under every runner: a runner-matrix test plus an import-first check over every test file.
+
+## 2026-11-08 05:05Z — N2 approved (round 6)
+
+- review-coder-eaeccd4686-210047: APPROVED_WITH_NOTES. The notes: the exhaustive test does not sample the END and BULLET_TEXT_ID kinds by name, and its table check does not compare the action column (the actions match on inspection); merge coordination with test-env. Main ruled on I5: a note closes the open entry.
+- Committed in the lane as `63bb424`; lane step N2 closed. The merge into lane/integrate waits for T1 (merge order T1 then N2), because both touch tests/test_failing_tests.py.
+- N2 took 6 review rounds, 5 of them in the entry-validation family. H22 records the lesson.

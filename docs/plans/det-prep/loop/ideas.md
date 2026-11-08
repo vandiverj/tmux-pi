@@ -152,3 +152,11 @@ lib/ctxengine/calls.py:55 (class Answer) and lib/localdocs/lock.py:23 (class Pin
 ## F-PATHNAMES — Glob/Grep `filenames` lists pass unredacted (owner decision; found in F-GREP r3)
 
 The Claude PostToolUse hook keeps `filenames` (Glob, Grep files_with_matches) unchanged by design (docs/sensitive-read-redaction-design.md:339; tests/test_claude_redact_hook.py:225-227). A folder or file name shaped like a secret is therefore shown to the model there, while F-GREP r3 hides the same segment in grep line heads and pointers. Redacting the list would make ordinary hex-named folders (session ids, hashes) placeholders the model cannot open. Options: leave as designed; redact only known secret formats (verified token shapes) in names; or redact and let safe_* tools accept placeholder paths. Needs the owner.
+
+## F-BASHOUT — non-search command output keeps ordinary rules (owner decision; found in F-GREP r4/r5)
+
+Claude Bash and Pi bash output from a command that is not a search (e.g. `sh -c 'cat cfg/local.json'`, `python -c` reading a protected file) is redacted under ordinary rules unless `bash_source` names the one file read. A protected file's low-entropy value can then show. Options: make all command output strict (heavy over-redaction of ordinary output), extend `bash_source` to interpreters and `sh -c`, or rely on the PreToolUse gate that asks before such reads. Needs the owner; pairs with F-PATHNAMES.
+
+## H26 — a detector over display or command text needs a fail-closed default from round 1 (signal from F-GREP)
+
+F-GREP took five review rounds in one finding family (source-path-redaction): each round fixed the cited head or command shape and the next review found another. It converged only when round 4/5 set the rule "uncertain → strictest". Rule for briefs: any fix that decides a security rule from parsing text (display heads, command lines, file names) must state its fail-closed default in the first brief, and the reviewer checks the default, not the parser's coverage.

@@ -9,7 +9,6 @@ lead near the store).
 """
 import ast
 import contextlib
-import glob
 import io
 import json
 import os
@@ -926,8 +925,13 @@ class TreeWalks(Fixture):
             self.assertAsk("cat {PLAIN}/a/*", reason=trust_guard.GLOB_REASON)
             self.assertHardDeny("cat {PLAIN}/a/*/../*", reason=trust_guard.GLOB_REASON)
             self.assertAllowed("cat {PLAIN}/a/*.txt")               # one match: all of them were looked at
+            # The budget counts matches, not entries visited: a/ holds two entries, more than the budget, and a pattern
+            # that matches none of them names no path, so it is allowed while time remains (the deadline row is below).
+            self.assertAllowed("cat {PLAIN}/a/nothing*")
         with mock.patch.object(trust_guard, "_WALK_SECONDS", -1):
             self.assertAsk("cat {PLAIN}/a/*.txt", reason=trust_guard.GLOB_REASON)
+            # The time is checked on every entry looked at, not only on matches: a listing with none still stops.
+            self.assertAsk("cat {PLAIN}/a/nothing*", reason=trust_guard.GLOB_REASON)
         self.assertAllowed("cat {PLAIN}/a/*")
 
     def test_a_recursive_glob_is_a_walk_of_the_tree_it_starts_in(self):
@@ -1057,6 +1061,57 @@ class TreeWalks(Fixture):
 BRACE_ASKS = ["echo {1..100000}", "echo {a,b}{1..3000}", "touch {SCRATCH}/f{1..100000}.txt",
               "for i in {1..100000}; do echo $i; done", "cat {PLAIN}/{1..100000}.txt", "echo {1..100000} {1..100000}",
               "echo {a..z}{a..z}{a..z}{a..z}", "echo {1..100000..2}"]
+
+
+# Pattern (under the tree below) -> what it matches, written out, as Python 3.11's glob.iglob(include_hidden=True) finds
+# it. The tree: a.txt b.txt ab.txt c.py .x .d/h n/b n/p/b n/q/b n/r, and link -> n.
+GLOB_PARITY = [
+    ("*", [".d", ".x", "a.txt", "ab.txt", "b.txt", "c.py", "link", "n"]),
+    ("?.txt", ["a.txt", "b.txt"]),
+    ("[ab].txt", ["a.txt", "b.txt"]),
+    ("[!a].txt", ["b.txt"]),
+    ("*x", [".x"]),                                      # a hidden file, matched from a leading wildcard
+    (".?", [".d", ".x"]),
+    (".d/*", [".d/h"]),                                  # inside a hidden directory
+    ("n/*/b", ["n/p/b", "n/q/b"]),                        # nested: `*` in front of a `/` matches directories only
+    ("a.txt", ["a.txt"]),                                # no wildcard
+    ("zz.txt", []),
+    ("nope/*", []),                                      # a missing directory
+    ("n/*/", ["n/p/", "n/q/"]),                           # ending in `/`: directories only
+    ("link/*", ["link/b", "link/p", "link/q", "link/r"]),   # through a link to a directory
+    ("*/p", ["link/p", "n/p"]),
+    ("n/*/../r", ["n/p/../r", "n/q/../r"]),               # `..` after a wildcard
+    ("n/**", ["n/b", "n/p", "n/q", "n/r"]),               # `**` without globstar is `*` (`_globstar` does the walk)
+    ("a[", []),                                          # an unclosed `[` is a literal
+]
+
+
+class GlobParity(unittest.TestCase):
+    """The guard's glob finds the same paths under any python3: the hooks run `#!/usr/bin/env python3`, 3.9 on macOS."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = os.path.realpath(tempfile.mkdtemp(prefix="globparity-"))
+        cls.home = os.path.join(cls.tmp, "home")
+        cls.root = os.path.join(cls.tmp, "t")
+        os.makedirs(cls.home)
+        for d in (".d", "n/p", "n/q"):
+            os.makedirs(os.path.join(cls.root, d))
+        for f in ("a.txt", "b.txt", "ab.txt", "c.py", ".x", ".d/h", "n/b", "n/p/b", "n/q/b", "n/r"):
+            open(os.path.join(cls.root, f), "w").close()
+        os.symlink(os.path.join(cls.root, "n"), os.path.join(cls.root, "link"))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, True)
+
+    def test_a_glob_matches_what_the_table_says(self):
+        for pattern, expected in GLOB_PARITY:
+            with self.subTest(pattern=pattern):
+                guard = trust_guard.Guard(home=self.home, worker=True, cwd=self.root)
+                found = guard._glob(os.path.join(self.root, pattern))
+                self.assertEqual(sorted(p[len(self.root) + 1:] for p in found), expected)
+                self.assertEqual(guard.asks, [])
 
 
 class AskTests(Fixture):
@@ -1266,13 +1321,14 @@ class AskTests(Fixture):
 
     @staticmethod
     def slow_glob(pause=0.5):
-        real = glob.iglob
+        """Each match a glob finds takes `pause`: the guard's own glob (`trust_guard._iglob`), not the interpreter's."""
+        real = trust_guard._iglob
 
         def iglob(*args, **kw):
             for hit in real(*args, **kw):
                 time.sleep(pause)
                 yield hit
-        return mock.patch.object(glob, "iglob", iglob)
+        return mock.patch.object(trust_guard, "_iglob", iglob)
 
     def test_the_time_limit_in_the_middle_of_a_walk_far_from_the_store_asks(self):
         started = time.monotonic()
@@ -1633,6 +1689,18 @@ class ReasonRemedies(Fixture):
         self.assertIn("CDPATH", trust_guard.CDPATH.remedy)
         self.assertIn("Split", trust_guard.BRACE_REASON.remedy)
         self.assertIn("narrower", trust_guard.WALK_REASON.remedy)
+
+    def test_an_analysis_failure_is_not_to_be_retried_and_names_its_cause_on_stderr(self):
+        self.assertIn("do not retry", trust_guard.ANALYSIS_FAILED.remedy)
+        self.assertNotIn("Try the call again", trust_guard.ANALYSIS_FAILED.remedy)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            answer = self.answer(dict(REASON_CALLS["ANALYSIS_FAILED"], params={"command": "cat /secret/place/x.txt"}))
+        self.assertIs(answer.reason, trust_guard.ANALYSIS_FAILED)
+        self.assertRegex(err.getvalue(),
+                         r"^tmux-pi trust guard fault: ValueError at lib/trust_guard\.py:\d+ \(python \d+\.\d+\)\n$")
+        self.assertNotIn("secret", err.getvalue())         # never the command or a path from it
+        self.assertNotIn("broken", err.getvalue())         # nor the exception's message, which can quote either
 
     def test_no_reason_is_a_bare_string(self):
         # Every `return`/`raise` of a reason in the guard names one of the constants, so each carries its remedy.
@@ -2040,6 +2108,20 @@ class CliTests(Fixture):
         for name in ("PostToolUse", "PermissionDenied", "UserPromptSubmit"):
             ran = self.run_cli(self.event("tp-trust grant .", name=name), "--claude-hook", "--home", self.home)
             self.assertEqual((ran.returncode, ran.stdout), (0, ""), name)
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/python3"), "no /usr/bin/python3 to run the hook under")
+    def test_a_glob_under_the_system_python(self):
+        # The hook runs `#!/usr/bin/env python3`: 3.9 on macOS, where `glob.iglob` has no `include_hidden`.
+        os.makedirs(os.path.join(self.proj, "tests"))
+        open(os.path.join(self.proj, "tests", "test_a.py"), "w").close()
+        hook = ("/usr/bin/python3", CLI, "--claude-hook", "--home", self.home)
+        ran = self.run_cli(self.event("ls tests/test_*.py"), *hook[1:], script=hook[0], env={"TP_TASK_ID": "t1"})
+        self.assertEqual((ran.returncode, ran.stdout, ran.stderr), (0, "", ""))
+        ran = self.run_cli(self.event("cat {HOME}/.config/tmux-p?/tr*/rec.json"), *hook[1:], script=hook[0],
+                           env={"TP_TASK_ID": "t1"})
+        out = json.loads(ran.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("reaches the trust store", out["permissionDecisionReason"])
 
     def test_unreadable_input_exits_non_zero(self):
         for raw in ("", "not json", "[1]", "3"):

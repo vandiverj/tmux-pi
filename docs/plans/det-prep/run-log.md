@@ -308,7 +308,7 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Committed in the lane as `63bb424`; lane step N2 closed. The merge into lane/integrate waits for T1 (merge order T1 then N2), because both touch tests/test_failing_tests.py.
 - N2 took 6 review rounds, 5 of them in the entry-validation family. H22 records the lesson.
 
-## 2026-11-08 05:40Z — T1 r3 returned incomplete; P1 found and dispatched
+## 2026-11-08 03:29Z (from date -u; the 05:05Z heading above is mislabelled) — T1 r3 returned incomplete; P1 found and dispatched
 
 - coder-eead542ff6 (T1 r3): `tests/session_env.py` scrubs on import, `tests/__init__.py` aliases it, and 108 test modules import it first. A runner-matrix test over five runners and the reviewer's lane_writer repro pass. Fail-before is shown. RESULT_STATUS incomplete: 22 modules owned by other open lanes did not get the import line. They are listed in `NOT_YET_TAKEN` in test_session_env.py, and the check fails if that list goes stale.
 - The coder's `tp-agent request` for those 22 was denied nine times: "trust store guard ... could not be analysed". Main reproduced it with the hook: `lib/trust_guard.py:532` `glob.iglob(..., include_hidden=True)` raises TypeError on the system Python 3.9.6, so any call with a glob word is denied. This confirms the E2-noted 3.9 risk. About 60 baseline lines are this defect (H23).

@@ -1348,7 +1348,10 @@ class UnscopedPatchTests(unittest.TestCase):
         os.utime(mcp, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         self.assertEqual(os.stat(mcp).st_size, stamp.st_size)
         judge(True, False)
-        git(top, "checkout", "-q", "--", "agent/mcp.json")
+        # git checkout would trust the unchanged size and mtime and leave "bar" on disk whenever the index entry
+        # is not racily clean, so the committed bytes are written back directly.
+        mcp.write_text("foo\n")
+        self.assertEqual(mcp.read_text(), "foo\n")
         judge(False)
         mcp.write_text("x" * ((1 << 20) + 1))  # over the size cap
         judge(True, False)

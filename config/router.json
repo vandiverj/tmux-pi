@@ -27,7 +27,7 @@
     },
     {
       "worker": "pi",
-      "model": "openai/gpt-6-sol",
+      "model": "openai/gpt-6.1-sol",
       "thinking": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
     },
     {
@@ -54,8 +54,8 @@
   "routes": {
     "simple": {"model": "slotstream/qwen3.8-flash-next:4bit", "thinking": "off"},
     "standard": {"model": "slotstream/qwen3.8-flash-next:4bit", "thinking": "low"},
-    "coding": {"model": "openai/gpt-6-sol", "thinking": "medium"},
-    "complex": {"model": "openai/gpt-6-sol", "thinking": "high"},
+    "coding": {"model": "openai/gpt-6.1-sol", "thinking": "medium"},
+    "complex": {"model": "openai/gpt-6.1-sol", "thinking": "high"},
     "expert": {"model": "claude-opus-5-5", "thinking": "high"}
   },
   "claude_preference": {

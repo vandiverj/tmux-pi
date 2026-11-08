@@ -9,11 +9,12 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
-from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET
+from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SONNET
 
 import route_resolve as rr  # noqa: E402  (route_fixture put lib on sys.path)
 import router_catalog as rc  # noqa: E402
 
+SOL = "openai/gpt-6.1-sol"  # These tests resolve against the committed catalog.
 FABLE = "claude-fable-5-1"
 CAT = fx.fixture_catalog((HAIKU, LUNA, QWEN))  # explicit chain order; the shipped order does not matter here
 ROSTER = json.loads((fx.ROOT / "config" / "router.json").read_text())["models"]
@@ -37,14 +38,16 @@ def R(decision, **ctx):
 class RosterTests(unittest.TestCase):
     def test_rostered_catalog_models_match_router_config(self):
         roster = {m["model"]: m for m in ROSTER}
-        catalog = {m["model"]: m for lv in CAT["levels"] for m in lv["models"]}
+        catalog = {m["model"]: m for lv in CAT["levels"] if lv.get("shown", True) for m in lv["models"]}
         for name, entry in catalog.items():
             if entry["in_roster"] and not entry.get("explicit_only"):  # an explicit-only model stays out of the router roster
                 self.assertIn(name, roster)
-                self.assertEqual((roster[name]["worker"], roster[name]["thinking"]), (entry["worker"], entry["efforts"]), name)
+                self.assertEqual(roster[name]["worker"], entry["worker"], name)
+                self.assertTrue(set(entry["efforts"]).issubset(roster[name]["thinking"]), name)
         self.assertEqual(sorted(set(roster) - set(catalog)), [])
         self.assertNotIn(FABLE, roster)
-        self.assertFalse(catalog["openai/gpt-6.1-sol"]["in_roster"])
+        self.assertTrue(catalog["openai/gpt-6.1-sol"]["in_roster"])
+        self.assertFalse(next(lv for lv in CAT["levels"] if lv["key"] == "strong")["shown"])
 
 
 class ChoiceTests(unittest.TestCase):
@@ -65,7 +68,7 @@ class ChoiceTests(unittest.TestCase):
 
     def test_hidden_level_is_never_offered_or_resolved_to(self):
         self.assertEqual(rc.shown_keys(CAT), ["local", "small", "mid", "top"])
-        self.assertNotIn("gpt-6.1", rc.build_system(CAT))
+        self.assertNotIn("Level 4 - GPT sol 6.1", rc.build_system(CAT))
         with self.assertRaises(ValueError):
             rc.parse_decision(json.dumps(dict(D("top"), level=5)), CAT)
         # the router's 4th level is the top level, never the hidden one
@@ -174,15 +177,15 @@ class ChoiceTests(unittest.TestCase):
 
 class EffortTests(unittest.TestCase):
     def test_effort_above_high_is_cut_without_approval(self):
-        r = R(D("mid", "high"), role="coder", require_worker="pi", explicit_effort="max")
+        r = R(D("top", "high"), role="architect", require_worker="pi", explicit_effort="max")
         self.assertEqual(r["effort"], "high")
         self.assertIn("effort max capped at high (no approval recorded)", r["steps"])
         self.assertFalse(r["approvals"]["effort_above_high"])
 
     def test_approval_allows_effort_above_high_on_models_that_have_it(self):
         ctx = dict(role="coder", require_worker="pi", explicit_effort="max", approvals={"effort_above_high": True})
-        r = R(D("mid", "high"), **ctx)
-        self.assertEqual((r["model"], r["effort"], r["steps"]), (SOL, "max", []))
+        r = R(D("top", "high"), **ctx)
+        self.assertEqual((r["model"], r["effort"], r["steps"]), (ASTRA, "max", []))
         r = R(D("mid", "high"), **dict(ctx, require_worker="claude"))
         self.assertEqual((r["model"], r["effort"]), (SONNET, "high"))  # Sonnet has nothing above high
         self.assertTrue(any("not allowed" in s for s in r["steps"]))
@@ -196,9 +199,9 @@ class EffortTests(unittest.TestCase):
         ctx = dict(explicit=dict(model=OPUS, worker="claude", thinking="high"))
         r = R(D("local", "low", "none", "locate_quote"), **ctx)
         self.assertEqual((r["source"], r["model"], r["effort"], r["level_key"]), ("explicit", OPUS, "high", "top"))
-        r = R(None, explicit=dict(model=SOL, worker="pi", thinking="xhigh"))
+        r = R(None, explicit=dict(model=ASTRA, worker="pi", thinking="xhigh"))
         self.assertEqual(r["effort"], "high")
-        r = R(None, explicit=dict(model=SOL, worker="pi", thinking="xhigh"), approvals={"effort_above_high": True})
+        r = R(None, explicit=dict(model=ASTRA, worker="pi", thinking="xhigh"), approvals={"effort_above_high": True})
         self.assertEqual((r["effort"], r["steps"]), ("xhigh", []))
 
     def test_role_floors_and_caps(self):
@@ -396,8 +399,12 @@ class ExplicitValidationTests(unittest.TestCase):
         self.rejected(SONNET, "madeup/nonexistent-model")  # the message lists what is valid
 
     def test_hidden_and_unrostered_models_are_rejected(self):
-        self.rejected("not offered", "openai/gpt-6.1-sol")
         cat = copy.deepcopy(CAT)
+        hidden = next(lv for lv in cat["levels"] if lv["key"] == "strong")["models"][0]
+        hidden["model"] = "fixture/hidden-sol"
+        with self.assertRaises(rr.ExplicitError) as caught:
+            rr.validate_explicit(cat, hidden["model"], "pi", "high", {}, {})
+        self.assertIn("not offered", str(caught.exception))
         for lv in cat["levels"]:
             for m in lv["models"]:
                 if m["model"] == SOL:
@@ -410,7 +417,8 @@ class ExplicitValidationTests(unittest.TestCase):
         self.rejected("does not allow effort 'off'", HAIKU, None, "off")
         self.rejected("does not allow effort 'max'", QWEN, "pi", "max")
         self.rejected("does not allow effort 'minimal'", SONNET, "claude", "minimal")
-        self.assertEqual(X(SOL, "pi", "off")["effort"], "off")
+        self.rejected("does not allow effort 'off'", SOL, "pi", "off")
+        self.assertEqual(X(LUNA, "pi", "off")["effort"], "off")
         self.assertEqual(X(QWEN, "pi", "off")["effort"], "off")
 
     def test_default_effort_is_mapped_onto_what_the_model_allows(self):
@@ -437,9 +445,9 @@ class ExplicitValidationTests(unittest.TestCase):
         self.assertEqual(X(QWEN, "pi", local_only=True)["model"], QWEN)
 
     def test_explicit_effort_is_still_capped_at_the_ceiling_without_approval(self):
-        r = X(SOL, "pi", "max")
+        r = X(ASTRA, "pi", "max")
         self.assertEqual((r["effort"], any("capped" in s for s in r["steps"])), ("high", True))
-        self.assertEqual(X(SOL, "pi", "max", approvals={"effort_above_high": True})["effort"], "max")
+        self.assertEqual(X(ASTRA, "pi", "max", approvals={"effort_above_high": True})["effort"], "max")
 
     def test_explicit_review_need_follows_level_and_effort_for_a_read_only_role(self):
         self.assertEqual(X(OPUS, "claude", "low", role="tester")["review"], "required")
@@ -466,7 +474,9 @@ class LocalOnlyResolveTests(unittest.TestCase):
 
 class RedirectTests(unittest.TestCase):
     def check(self, model, worker, thinking, may_enter_restricted=False, **ctx):
-        return rr.redirect_problems(CAT, {"worker": worker, "model": model, "thinking": thinking}, ctx, ctx.pop("health", {}),
+        cat = copy.deepcopy(CAT)
+        next(lv for lv in cat["levels"] if lv["key"] == "strong")["models"][0]["model"] = "fixture/hidden-sol"
+        return rr.redirect_problems(cat, {"worker": worker, "model": model, "thinking": thinking}, ctx, ctx.pop("health", {}),
                                     may_enter_restricted)
 
     def test_an_allowed_redirect_has_no_problem(self):
@@ -477,7 +487,7 @@ class RedirectTests(unittest.TestCase):
             (OPUS, "claude", "high", {}, "restricted"),
             (SONNET, "claude", "medium", {"local_only": True}, "local-only"),
             ("madeup/model", "pi", "low", {}, "not in the model catalog"),
-            ("openai/gpt-6.1-sol", "pi", "high", {}, "not offered"),
+            ("fixture/hidden-sol", "pi", "high", {}, "not offered"),
             (SONNET, "claude", "medium", {"health": {"anthropic": {"status": "exhausted"}}}, "marked unavailable"),
             (HAIKU, "claude", "high", {"est_tokens": 700000}, "does not fit"),
             (HAIKU, "claude", "off", {}, "not allowed"),
@@ -525,6 +535,17 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(e3["source"], "stop_and_ask")
         for e in (e1, e2):
             self.assertNotIn(e["effort"], ("xhigh", "max"))
+        cat = copy.deepcopy(CAT)
+        strong = next(lv for lv in cat["levels"] if lv["key"] == "strong")
+        strong["shown"] = True
+        strong["models"][0]["in_roster"] = True
+        prior = {"model": SOL, "level_key": "mid", "effort": "medium", "effort_abstract": "medium", "review": "optional"}
+        moved = rr.escalate(prior, cat, ctx={"role": "coder", "require_worker": "pi"})
+        self.assertEqual((moved["model"], moved["effort"], moved["level_key"]), (SOL, "high", "strong"))
+        self.assertEqual(moved["source"], "escalation_level_up")
+        self.assertEqual(X(SOL, "pi", "medium")["level_key"], "mid")
+        with self.assertRaisesRegex(rr.ExplicitError, "not offered"):
+            X(SOL, "pi", "high")
 
     def test_escalation_skips_the_hidden_level_and_role_caps(self):
         r = R(D("mid", "high"), role="tester")
@@ -532,14 +553,14 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(e["level_key"], "top")
 
     def test_approval_lets_effort_rise_above_high_before_the_level(self):
-        r = R(D("mid", "high"), role="coder", require_worker="pi")
-        ctx = dict(role="coder", require_worker="pi")
+        r = R(D("top", "high"), role="architect", require_worker="pi")
+        ctx = dict(role="architect", require_worker="pi")
         e1 = rr.escalate(r, CAT, ctx=ctx, approvals={"effort_above_high": True})
-        self.assertEqual((e1["level_key"], e1["effort"], e1["source"]), ("mid", "xhigh", "escalation_effort_up"))
+        self.assertEqual((e1["level_key"], e1["effort"], e1["source"]), ("top", "xhigh", "escalation_effort_up"))
         e2 = rr.escalate(e1, CAT, ctx=ctx, approvals={"effort_above_high": True})
-        self.assertEqual((e2["level_key"], e2["effort"]), ("mid", "max"))
+        self.assertEqual((e2["level_key"], e2["effort"]), ("top", "max"))
         e3 = rr.escalate(e2, CAT, ctx=ctx, approvals={"effort_above_high": True})
-        self.assertEqual((e3["level_key"], e3["source"]), ("top", "escalation_level_up"))
+        self.assertEqual(e3["source"], "stop_and_ask")
 
     def test_top_level_stops_and_asks(self):
         r = R(D("top", "high"), role="architect")

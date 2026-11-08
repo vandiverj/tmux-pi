@@ -220,9 +220,9 @@
           "efforts": ["low", "medium", "high"], "context_window": 1000000, "max_output": 128000, "in_roster": true
         },
         {
-          "provider": "openai", "worker": "pi", "model": "openai/gpt-6-sol",
-          "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-          "context_window": 272000, "max_output": 128000, "in_roster": true
+          "provider": "openai", "worker": "pi", "model": "openai/gpt-6.1-sol",
+          "efforts": ["low", "medium"],
+          "context_window": 500000, "max_output": 128000, "in_roster": true
         }
       ],
       "effort_map": {"low": "low", "medium": "medium", "high": "high"}
@@ -242,11 +242,10 @@
       "models": [
         {
           "provider": "openai", "worker": "pi", "model": "openai/gpt-6.1-sol",
-          "efforts": ["low", "medium", "high"], "context_window": 272000, "max_output": 128000, "in_roster": false,
-          "unverified": "listed by pi, not in config/router.json yet; efforts assumed to match gpt-6-sol"
+          "efforts": ["high"], "context_window": 500000, "max_output": 128000, "in_roster": false
         }
       ],
-      "effort_map": {"low": "low", "medium": "medium", "high": "high"}
+      "effort_map": {"low": "high", "medium": "high", "high": "high"}
     },
     {
       "key": "top",

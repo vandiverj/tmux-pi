@@ -13,11 +13,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
 from fake_tools import fake_tmux  # noqa: E402
-from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET, reply
+from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SONNET, reply
 
 import model_router  # noqa: E402
 
 ROOT = fx.ROOT
+SOL = "openai/gpt-6.1-sol"  # These tests resolve against the committed catalog.
 TASK = "Add pagination to the /orders endpoint with tests. Do not edit the billing module."
 
 
@@ -119,9 +120,9 @@ class TpRouteTests(Base):
     def test_explicit_level_and_approval_flags(self):
         out = json.loads(self.tp_route("--level", "top").stdout)
         self.assertEqual((out["model"], out["source"]), (OPUS, "explicit_level"))
-        out = json.loads(self.tp_route("--model", SOL, "--thinking", "max").stdout)
+        out = json.loads(self.tp_route("--model", ASTRA, "--thinking", "max").stdout)
         self.assertEqual(out["thinking"], "high")
-        out = json.loads(self.tp_route("--model", SOL, "--thinking", "max", "--approve-effort").stdout)
+        out = json.loads(self.tp_route("--model", ASTRA, "--thinking", "max", "--approve-effort").stdout)
         self.assertEqual(out["thinking"], "max")
         self.assertEqual(self.stubs.calls(), [])
 
@@ -226,9 +227,9 @@ class DispatchTests(Base):
         self.assert_no_laya()
 
     def test_effort_above_high_is_cut_unless_approved(self):
-        item = self.dispatch("--model", SOL, "--thinking", "xhigh")
+        item = self.dispatch("--model", ASTRA, "--thinking", "xhigh")
         self.assertEqual(self.meta(item)["thinking"], "high")
-        item = self.dispatch("--model", SOL, "--thinking", "xhigh", "--approve-effort")
+        item = self.dispatch("--model", ASTRA, "--thinking", "xhigh", "--approve-effort")
         self.assertEqual((self.meta(item)["thinking"], self.meta(item)["route_info"]["approvals"]), ("xhigh", {"effort_above_high": True}))
 
     def test_the_pair_is_valid_even_when_every_router_fails(self):
@@ -426,7 +427,6 @@ class ExplicitValidationCommandTests(Base):
         big.write_text("x" * 40000)  # about 10000 tokens: over the 32k Slotstream model's packet limit
         slot = "slotstream/qwen3.8-flash-next:4bit"
         cases = [(("--model", "madeup/nonexistent-model"), "not in the model catalog"),
-                 (("--model", "openai/gpt-6.1-sol"), "not offered"),
                  (("--model", "claude-opus-9"), "not in the model catalog"),
                  (("--model", HAIKU, "--thinking", "off"), "does not allow effort"),
                  (("--model", QWEN, "--thinking", "max"), "does not allow effort"),
@@ -522,11 +522,30 @@ class LocalRuleConstraintTests(Base):
         self.assertTrue(any("dropped" in s and "marked unavailable" in s for s in out["steps"]), out["steps"])
 
     def test_an_allowed_redirect_still_applies_and_its_effort_is_clamped(self):
-        out = self.route(self.rule(SONNET, SOL, "max"))
-        self.assertEqual((out["model"], out["thinking"]), (SOL, "high"))
+        out = self.route(self.rule(SONNET, SOL, "medium"))
+        self.assertEqual((out["model"], out["thinking"]), (SOL, "medium"))
         self.assertIn(f"local rule redirected {SONNET} to {SOL}", out["steps"])
-        out = self.route(self.rule(SONNET, SOL, "max"), "--approve-effort")
-        self.assertEqual(out["thinking"], "max")
+        import router_catalog as rc
+        cat = rc.load_catalog()
+        strong = next(lv for lv in cat["levels"] if lv["key"] == "strong")
+        strong["shown"] = True
+        strong["models"][0]["in_roster"] = True
+        config = json.loads((ROOT / "config" / "router.json").read_text())
+        config["local"] = {"rules": [{"pattern": ".", "from": [SOL], "to": {"model": SOL, "thinking": "high"}}]}
+        rec = {"_cat": cat, "model": SOL, "worker": "pi", "effort": "medium", "level_key": "mid",
+               "steps": [], "source": "router", "review": "optional"}
+        model_router._local_rule(rec, {"task": TASK}, config, {"role": "coder"}, {})
+        self.assertEqual((rec["model"], rec["effort"], rec["level_key"]), (SOL, "high", "strong"))
+        self.assertIn("local rule redirected", rec["steps"][-1])
+        count = len(rec["steps"])
+        model_router._local_rule(rec, {"task": TASK}, config, {"role": "coder"}, {})
+        self.assertEqual(len(rec["steps"]), count)
+        self.assertEqual(model_router.level_effort_of_task({"model": SOL, "thinking": "high"}, cat), ("strong", "high"))
+        strong["shown"] = False
+        rec.update(effort="medium", level_key="mid")
+        model_router._local_rule(rec, {"task": TASK}, config, {"role": "coder"}, {})
+        self.assertEqual((rec["effort"], rec["level_key"]), ("medium", "mid"))
+        self.assertIn("not offered", rec["steps"][-1])
 
     def test_a_redirect_to_qwen_never_carries_a_reasoning_effort(self):
         # Qwen accepts low/medium/high only on an explicit --model; a machine-local rule must not reach them.
@@ -779,14 +798,14 @@ class ReviewPlanTests(Base):
 
     def test_top_level_author_does_not_pull_the_reviewer_to_the_top_level(self):
         plan = self.plan(self.author("claude", OPUS, level="top", effort="high"))
-        self.assertEqual((plan["reviewer"]["level"], plan["reviewer"]["thinking"]), ("mid", "high"))
+        self.assertEqual((plan["reviewer"]["level"], plan["reviewer"]["thinking"]), ("mid", "medium"))
 
     def test_explicit_reviewer_level_and_effort(self):
         plan = self.plan(self.author("claude", SONNET), level="top", thinking="high")
         self.assertEqual((plan["reviewer"]["model"], plan["reviewer"]["thinking"]), (ASTRA, "high"))
-        plan = self.plan(self.author("claude", SONNET), thinking="max")
+        plan = self.plan(self.author("claude", SONNET), level="top", thinking="max")
         self.assertEqual(plan["reviewer"]["thinking"], "high")
-        plan = self.plan(self.author("claude", SONNET), thinking="max", approve_effort=True)
+        plan = self.plan(self.author("claude", SONNET), level="top", thinking="max", approve_effort=True)
         self.assertEqual(plan["reviewer"]["thinking"], "max")
         with self.assertRaises(ValueError):
             self.plan(self.author("claude", SONNET), level="strong")

@@ -281,7 +281,7 @@ class ContractTests(unittest.TestCase):
 
     def test_dynamic_terms_and_escalation_target(self):
         brief = dynamic_terms("task", {"route": "standard", "scope": "brief", "model": "mlx/qwen"})
-        strong = dynamic_terms("task", {"route": "complex", "scope": "multi_step", "model": "openai/gpt-6-sol"})
+        strong = dynamic_terms("task", {"route": "complex", "scope": "multi_step", "model": "openai/gpt-6.1-sol"})
         self.assertLess(duration(brief["budget"]["time"]), duration(strong["budget"]["time"]))
         self.assertEqual(brief["profile"]["source"], "dynamic")
         roster = load_config(ROOT / "config/router.json", local_path=False)["models"]
@@ -289,7 +289,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(select_escalation({"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"}, roster,
                                            preferred=preferred), preferred)
         target = select_escalation({"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "medium"}, roster)
-        self.assertEqual(target["model"], "openai/gpt-6-sol")
+        self.assertEqual(target["model"], "openai/gpt-6.1-sol")
         self.assertNotIn(target["thinking"], ("off", "minimal"))
         local_preferred = {"worker": "pi", "model": "openai/gpt-6-luna", "thinking": "low"}
         for local_model in ("slotstream/qwen3.8-flash-next:4bit", "lmstudio/qwen/qwen3.6-35b-a3b"):
@@ -509,7 +509,7 @@ class ContractTests(unittest.TestCase):
                                "--reason", "structured reporter error", "--evidence", "state.json:error"],
                               env=env, text=True, capture_output=True, check=True)
         out = json.loads(plan.stdout)
-        self.assertEqual(out["target"]["model"], "openai/gpt-6-sol")
+        self.assertEqual(out["target"]["model"], "openai/gpt-6.1-sol")
         self.assertFalse((task / "escalation.json").exists())
         failed = subprocess.run([str(ROOT / "bin/tp-contract"), "escalated", "task-1", "--outcome", "failed",
                                  "--record-json", json.dumps(out["record"]), "--message", "spawn failed"],
@@ -545,7 +545,7 @@ class ContractTests(unittest.TestCase):
         task = state / "tasks" / "task-2"
         task.mkdir(parents=True)
         meta = {"id": "task-2", "created": iso(T0), "pane": "%1", "worker": "pi",
-                "model": "openai/gpt-6-sol", "thinking": "medium",
+                "model": "openai/gpt-6.1-sol", "thinking": "medium",
                 "escalated_from": {"id": "task-1", "trigger": "model_error"}}
         (task / "meta.json").write_text(json.dumps(meta))
         env = dict(outside_session(), TP_STATE_DIR=str(state))

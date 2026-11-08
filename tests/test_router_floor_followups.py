@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
-from route_fixture import HAIKU, LUNA, QWEN, SOL, SONNET
+from route_fixture import HAIKU, LUNA, QWEN, SONNET
+
+SOL = "openai/gpt-6.1-sol"  # CAT reads the committed model catalog.
 
 import route_resolve as rr  # noqa: E402  (route_fixture put lib on sys.path)
 
@@ -133,8 +135,10 @@ class ExplicitLevelTableTests(unittest.TestCase):
     def test_strong_available_and_unavailable_with_the_level_offered(self):
         # strong has one model, on openai. For an anthropic author it is usable; for an openai author it is the
         # author's own provider, so it is excluded in both routes and the level behaves as unavailable.
+        # Health is per provider:model, and strong's model is mid's gpt-6.1-sol at a higher effort: when it is out,
+        # mid's only other-provider model is out too, so an anthropic author's required review stops and asks.
         for author, available, expected in [
-            ("anthropic", True, (False, "strong", None, 2)), ("anthropic", False, (False, "mid", "down", 2)),
+            ("anthropic", True, (False, "strong", None, 2)), ("anthropic", False, (True, None, None, 2)),
             ("openai", True, (False, "mid", "down", 2)), ("openai", False, (False, "mid", "down", 2)),
         ]:
             with self.subTest(author=author, available=available):

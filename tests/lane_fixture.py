@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds s
 from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 TMUX = shutil.which("tmux")
 GIT_ENV = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}

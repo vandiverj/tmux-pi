@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds s
 from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 REAL = "tmux-pi-0123456789ab-cdef01234567"
 
 # Two sessions: the real workspace and a legacy 'tmux-pi' with its own state dir, main pane and cwd.

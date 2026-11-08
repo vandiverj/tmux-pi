@@ -11,7 +11,7 @@ import unittest
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 WAITING = '{"state":"waiting"}'
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))

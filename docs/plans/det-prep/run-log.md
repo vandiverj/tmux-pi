@@ -156,3 +156,11 @@
 - 2026-11-08: owner: "run phase 0 and 1 of HL1 now". Background agent started: worktree `tmux-pi-wt-hl1-eval` (branch hl1-eval from lane/integrate), extension pinned under `~/.local/hl1-eval`, results in `docs/plans/hl1-eval/results.md` on that branch. Haiku capped at 24 runs.
 - 2026-11-08 01:15Z: owner: "start building J1 tp-bench now". Brief amended (start before E2: null tokens where unavailable; transcript paths, `--env`, runtime versions, random order for X1/HL1). Lane `bench` created from lane/integrate; coder `coder-c28f7b48f3` (claude-sonnet-5-5). Overlap warning: `tests/test_bench.py` vs lane test-env (T1's parity test will need it converted or exempt; resolve at merge).
 - 2026-11-08: owner's future experiments recorded as loop ideas H19 requirement change, H20 semantic integration conflicts, H21 external-state reconciliation (bench task kinds after J1).
+
+## 2026-11-08: F1 round 9 rejected; F1 out of this campaign
+- Main ran 15 modules, all passing (evidence14). Review `review-coder-32886e6158-192417`: REQUEST_CHANGES. All earlier cases (rounds 1–8) are confirmed fixed, and the ghost-dir race and footer from round 8 are closed.
+- Two new defects were introduced by round 9's single-creator change (family retirement-dependency-order):
+  - F1: when two spawns race on one id, `create_task_dir` returns False but `write-many` still prints `owned`, so `tp-spawn:613` adopts, overwrites and can delete the other task.
+  - F2: `tp-contract build` no longer creates a nested parent for a custom artifact path (`<task_dir>/reports/out.md`).
+- Per the owner-approved rule there is no round 10. F1 is left out of this campaign. Worktree `tmux-pi-wt-status-cleanup` is kept uncommitted (rounds 1–9) as evidence and as a starting point if the owner revisits it. V-F stays unrun.
+- Lesson for H13/X1: 9 rounds, each fixing the cited site while the family stayed open. Round 9's fix opened new sites in the creator path. Candidate replay case for H13 and an X1 "incomplete scope" example.

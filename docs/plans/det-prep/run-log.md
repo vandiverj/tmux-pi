@@ -436,3 +436,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - F-FLAKE again: test_tracked_credential_names_lift_only_as_committed in test_sensitive_read and test_sensitive_trust (outside mode only).
 - test_ctx_nav_api hit the 900s bound in both modes (its 358 baseline names unconfirmed this run; likely slower under 3-way parallelism).
 - Follow-up M2b (docs/plans/det-prep/m2b-fixtures.md, list m2b-off-baseline.txt): lane gpt61, coder-f6352fbb8b. Main pre-authorized model-id/effort literals in files other lanes own.
+
+## 2026-11-08 M2b merged into integrate; off-baseline modules clean
+- M2b (lane gpt61, coder-f6352fbb8b, gpt-6.1-sol): fixture/example model ids gpt-6-sol -> gpt-6.1-sol (tests/lane_fixture.py, local MODEL constants in main_notify/orchestration/session_resolution, t9 dispatch, contract escalation, router_floor SOL; README, subagents.ts description, settings.example.json). Worker ended incomplete with three leftovers; Main classified them: lane_recovery hand-over (baseline-failing.txt:378) and trial_session shipped config (:426) are baseline.
+- The third was real: router_floor `test_strong_available_and_unavailable...` (anthropic, unavailable). Health is keyed provider:model and strong's model is mid's gpt-6.1-sol at high, so a strong outage also removes mid's only other-provider reviewer; stop_and_ask is the correct answer. Main changed that row with a comment. Consequence of M2's shared model, worth knowing for the strong decision (M2 F1).
+- Main's both-mode run of the 19 named modules: all OK except the two baseline names. Remaining gpt-6-sol ids are synthetic or absence assertions, left on purpose.
+- Review review-coder-f6352fbb8b-085811 (Sonnet 5.5): APPROVED_WITH_NOTES, no defects (N1 two SOL constants could drift; N3 synthetic ids). Committed 5ac69b9, `lane close gpt61 M2b`, merged into integrate 46704c9.
+- Re-run of the gate's 20 off-baseline modules on 46704c9, both modes, 4 in parallel: all OK except lane_recovery's baseline name. F-FLAKE did not recur. test_ctx_nav_api again hit 900s (dots almost all E, as in the baseline); a solo run with a 2400s bound checks its names.

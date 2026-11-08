@@ -19,6 +19,10 @@ Status: open | running | kept | discarded | refuted (by data, no run). Fingerpri
 
 | H11 | **Reviewers stop on the sensitive-read prompt.** Four of eight reviewers so far asked for a recursive search of agent/, config/ or tools/agent and waited on "Authorize sensitive read?" until Main denied it. Tell reviewers in the packet which paths are secret stores and to search named files or subfolders, or make the guard exclude known secret files from the search instead of asking. | wall_s, Main turns | Main (observed 2026-11-07) | low | open |
 
+| H13 | **Structural sweep with ast-grep.** When a review finding names a family, Main or the coder writes an ast-grep rule (pattern with metavariables, or YAML rule) for the defect shape; `ast-grep scan` lists every site in `bin/`, `lib/`, `agent/extensions/`, `tests/` before the fix, the same rule runs after the fix and must return zero (or only allowlisted) hits, and the rule file is kept as the parity check. Targets the F1/D1/K1 pattern of 5–8 rounds where each round fixed only the cited site. | rounds_to_approve, review_catch, tokens_per_accepted | owner (2026-11-08) | medium | open |
+| H14 | **RTK command-output compression** (`rtk-eval` branch; eval running 2026-11-08, plan `docs/plans/rtk-eval/plan.md`). | tokens_per_accepted at equal code_pass | owner (2026-11-08) | low | running |
+| H15 | **Model-specific worker profiles** (guided vs expert instructions, planning scaffold, tool surface per model group; `m1-model-profiles.md`, arXiv:2609.20804). | code_pass, rounds_to_approve, tokens_per_accepted | owner (2026-11-08) | medium | open |
+
 Research runs append below this table with their ids.
 
 ## H12: fix briefs ask for the rule, not the sample (2026-11-07)
@@ -34,3 +38,26 @@ Fix A (instruction, bin/tp-review): search the repository with safe_grep, or use
 Fix B (system, lib/sensitive_read.py): a plain `git grep` clears a credential-dir root when `git ls-files` under that root lists no credential-named file. Plain means no --untracked, --no-index, --recurse-submodules or revision. This is security code, so it gets its own lane and a security review.
 
 Eval: reviews that stop on a prompt, per review. 8 of 17 before the fix.
+
+## H13: ast-grep for whole-family sweeps (owner, 2026-11-08)
+Owner: "this could possibly help with the issue of not finding all the places a defect happens and then we have to do 5 rounds of single file changes instead of one".
+Evidence from det-prep:
+- F1 took 8 rounds and D1 took 7. K1 and C2 took 3 each.
+- Several rejections were a "new missed sweep site" in the same family. One example is F1 r7, where `tp-contract` called `write_record` without `relative=True`.
+- Coders' sweep tables come from text grep. Text grep misses call forms, for example a call wrapped across lines or a keyword passed through `**kwargs`. It also floods results with comments and strings.
+
+How ast-grep could close this:
+- ast-grep (https://ast-grep.github.io/) matches tree-sitter syntax, not text. It has built-in Python, TypeScript/JavaScript, Bash, JSON and YAML, which covers everything tmux-pi has.
+- `bin/tp-*` scripts have no extension. `sgconfig.yml` therefore needs `languageGlobs` to map them to python or bash by shebang group, and the eval must check this.
+- Patterns use metavariables, for example `write_record($$$ARGS)` with a `not: has: relative=True` constraint. YAML rules support `inside`/`has`/`not` relations and `--rewrite` fixes. `ast-grep test` checks rules against valid/invalid snippets.
+
+Eval design:
+1. **Replay (no new runs).** For each det-prep finding family that needed more than one round (F1 retirement-dependency-order, D1 diff-scope states, K1 option allowlist / committed check, C2 heading parse, E1 git option forms, G1 unload order), write the rule a reviewer could have written from the round-1 finding. Run it at the round-1 commit.
+   - Measure: did it list the sites later rounds found (recall), and how many false hits did it return (precision)? Compare with the text-grep sweep the coder actually produced.
+   - Rule-writing cost: time and tokens per rule, written by Sonnet and separately by the local Qwen.
+2. **Live A/B (tp-bench review-loop tasks).** Fix-brief arm A is the H12 rule-first brief, which is what we use today. Arm B is the H12 brief plus an ast-grep rule file that the reviewer or Main supplies. The coder must run it before and after, and attach both outputs. The parity test then runs the rule.
+   - Metrics: rounds_to_approve, review_catch, tokens per accepted step.
+3. **Where it fails.** Note families that ast-grep cannot express, such as ordering across processes, concurrency races and semantic invariants. Those still need H12 tests.
+
+Install for the eval: one pinned release binary, checksum-verified, in an isolated dir, the same way as RTK. Don't use global installs without the owner.
+Adopt if: replay recall beats the text-grep sweep on at least 4 of the 6 families, live rounds_to_approve drops, and tokens per accepted step don't rise.

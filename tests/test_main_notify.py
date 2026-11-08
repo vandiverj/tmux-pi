@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
 from session_env import outside_session  # noqa: E402
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 
 
 class MainNotifyTests(unittest.TestCase):

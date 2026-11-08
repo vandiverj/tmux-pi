@@ -362,3 +362,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - U1 coder-62fe70c08d PARKED after two auto-mode prompts (first: a long chain reverting lib/ for the before-fix run, redirected to a git-archive export; second: `mkdir -p $TP_TASK_DIR/base`). Both say a hook changed the call after auto mode reviewed it: the H10 rewrite (lib/redact_hook.py:27 SUFFIX). Escape both times, never approved; task stopped.
   State left: tmux-pi-wt-py39-union has `from __future__ import annotations` in lib/ctxengine/{calls,surface}.py and lib/localdocs/{calls,lock}.py plus new tests/test_lib_imports_py39.py, uncommitted. Task dir has before.log (9 FAIL lines, TypeError on `|`), sweep.txt; after.log empty. No before/after test run, no review.
   H10 raised to high: it blocks Claude workers in auto mode. Owner decision on the H10 fix (stop rewriting, or exempt workers) before more Claude coders are dispatched.
+
+## 2026-11-08 T1 merged
+- Round-4 review review-coder-c51414607f-011734 (gpt-6-sol): APPROVED_WITH_NOTES. The only owed item was Main's baseline edit.
+- Main's two-mode run: 140 modules x 2 = 280 runs; 246 OK, 24 FAILED, 10 no result (U1 imports, test_retry_packet). 481 distinct failing names, 0 off-baseline. Evidence in scratch evidence-t1-r4.txt.
+- Committed 4d2108d in the lane, `lane close test-env t1` recorded, merged into integrate 155ae8d.
+- Baseline: removed exactly the 4 test_orchestration lines (old 422-424, 442); 492 -> 488 lines.

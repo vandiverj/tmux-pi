@@ -282,3 +282,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - Found a real bug on main: the safe_grep `.env` leak, logged as F-GREP in loop/ideas.md.
 - J1 r5 coder done. Main's two-mode run: shell 8, runner 22, score 28, cli 7, all OK; verify checks 15. Under review as review-coder-379e83dc48-202806.
 - N2 r3 coder done. Main's two-mode run: test_failing_tests 24 OK, test_preamble 40 OK; 11 spot shapes correct. Under review as review-coder-22c8e8dfa7-203045.
+
+## 2026-11-08 03:35Z — J1 r6 in review, N2 r4 dispatched
+
+- J1 r5 review: REQUEST_CHANGES. A loaded model with an unreadable context length was recorded as {} instead of null. Fixed as r6 (coder-13239f5437) with the rule "partly understood means null, never empty or partial". Main's two-mode run is all OK and verify checks 15. Under review as review-coder-13239f5437-203344.
+- N2 r3 review: REQUEST_CHANGES with two more entry-validation cases (a `test_case:` label; explicit `test:` taking precedence over the bullet token). Also found that `docs/prompt-examples/07-known-failures.md:54` tells workers to write "none", which is the likely source of the owner's issue. N2 r4 (coder-2103c620cb) implements an exact line grammar, fixes that doc, sweeps for similar text, and produces a scripted before/after table. Loop signal H22 logged.

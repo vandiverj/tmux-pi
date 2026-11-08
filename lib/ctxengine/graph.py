@@ -489,9 +489,29 @@ def lexical_path(base, path):
     return os.path.relpath(full, base).replace(os.sep, "/")
 
 
-NOFOLLOW_ANY = getattr(os, "O_NOFOLLOW_ANY", 0) or os.O_NOFOLLOW  # macOS: no link anywhere on the path; else the last name only
 DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)  # a descriptor on a folder, to list it or
 # to make and rename in it: no bytes of a file are read through one
+
+
+def _nofollow_any_flag():
+    flag = getattr(os, "O_NOFOLLOW_ANY", 0)
+    if flag:
+        return flag
+    if sys.platform != "darwin":
+        return os.O_NOFOLLOW
+    # macOS SDK sys/fcntl.h; supported since macOS 11, but absent from Apple's Python 3.9.
+    flag = 0x20000000
+    try:
+        fd = os.open(os.sep, DIR_FLAGS | flag)
+    except OSError as error:
+        if error.errno == errno.EINVAL:  # older kernel: retain the last-name-only fallback
+            return os.O_NOFOLLOW
+        raise
+    os.close(fd)
+    return flag
+
+
+NOFOLLOW_ANY = _nofollow_any_flag()  # macOS: no link anywhere on the path; else the last name only
 MAX_LINK_HOPS = 40
 
 

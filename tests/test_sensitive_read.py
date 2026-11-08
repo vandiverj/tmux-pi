@@ -4,10 +4,12 @@ Sensitive file names are assembled from pieces so this source can be searched an
 without itself looking like a credential read. Every row is judged with an explicit working
 directory inside a throwaway project tree, so the table does not depend on where it is run.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import atexit
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import subprocess
@@ -1223,6 +1225,210 @@ class UnscopedPatchTests(unittest.TestCase):
                             "git log -p -1 -- agent", "git log -p -- ."], True)
         self.verdicts(top, ["git diff --check lib", "git diff -- lib README.md", "git log -p -1 -- lib"], False)
         self.verdicts(top, ["git diff --check"], True, str(top / "lib"))
+
+    def test_plain_git_grep_is_judged_by_tracked_files(self):
+        # K1: a plain git grep reads only tracked files, so a credential directory or the repository root whose
+        # tracked files have plain names does not prompt; every wider search and every unknown keeps the prompt.
+        top = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-grep-")))
+        self.addCleanup(shutil.rmtree, str(top), True)
+        git(top, "init", "-q", "-b", "main", ".")
+        for name in ("agent/x.md", "config/a.json", "sub/b.md", "agent/" + AUTH, LOCAL):
+            (top / name).parent.mkdir(parents=True, exist_ok=True)
+            (top / name).write_text("foo\n")
+        (top / ".gitignore").write_text(f"agent/{AUTH}\n{LOCAL}\n")
+        git(top, "add", ".")
+        git(top, "commit", "-q", "-m", "first")
+
+        def judge(rows, cwd=top):
+            for command, prompts in rows:
+                with self.subTest(command=command, cwd=str(cwd)):
+                    self.assertEqual(bash(command, str(cwd))["sensitive"], prompts, command)
+
+        judge([("git grep -n foo -- agent config", False), ("git grep foo agent/", False), ("git grep foo", False),
+               ("git grep -e foo -- .", False), ("git grep foo agent | head", False),
+               ("cd sub && git grep foo ../agent", False),
+               ("git grep --untracked foo agent", True), ("git grep --no-index foo agent", True),
+               ("git grep --untrack foo agent", True), ("git grep --no-exclude-standard foo agent", True),
+               ("git grep --recurse-submodules foo agent", True), ("git grep -nOless foo agent", True),
+               ("git grep foo HEAD -- agent", True), ("git grep foo HEAD", True),
+               ("grep -rn foo agent", True), ("rg foo config", True),
+               ("git grep -f agent/patterns.token -- agent", True), ("git grep -nf p -- agent", True),
+               ("git grep --textconv foo agent", True), ("git grep --textcon foo agent", True),
+               ("git grep -O foo agent", True), ("git grep --no-textconv foo agent", True),
+               ("git grep -efoo agent", True), ("git grep --c foo agent", True),
+               ("git grep -nie foo -- agent", False), ("git grep -A3 --context 2 foo agent", False),
+               ("git grep --line-n --ignore-case -m5 foo agent", False),
+               ("git -C sub grep foo ../agent", True), ("git add -A && git grep foo agent", True),
+               ("echo $(git grep foo agent)", True), ("git grep foo agent/" + AUTH, True)])
+        judge([("git grep foo ../agent", False), ("git grep foo ..", False)], top / "sub")
+        # A folder on the way to a tracked file that is a link on disk is followed by git grep.
+        elsewhere = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-grep-out-")))
+        self.addCleanup(shutil.rmtree, str(elsewhere), True)
+        (top / "sub").rename(top / "sub.real")
+        (top / "sub").symlink_to(elsewhere)
+        judge([("git grep foo", True), ("git grep foo agent", False)])
+        (top / "sub").unlink()
+        (top / "sub.real").rename(top / "sub")
+        # A submodule entry may be read through when `submodule.recurse` is set.
+        head = git(top, "rev-parse", "HEAD")
+        git(top, "update-index", "--add", "--cacheinfo", f"160000,{head},agent/mod")
+        judge([("git grep foo agent", True), ("git grep foo config", False)])
+        git(top, "rm", "-q", "--cached", "agent/mod")
+        # A tracked credential file keeps the prompt.
+        git(top, "add", "-f", LOCAL)
+        judge([("git grep foo config", True), ("git grep foo", True), ("git grep foo agent", False)])
+        # A failing listing keeps the prompt.
+        with self.on_path(self.fake_git("exit 1")):
+            judge([("git grep foo agent", True)])
+        with self.on_path(self.fake_git(f'case "$*" in *ls-files*) exit 1;; esac; exec {GIT} "$@"')):
+            judge([("git grep foo agent", True)])
+        # A broken `.git` keeps the prompt.
+        (top / ".git").rename(top / ".git.real")
+        (top / ".git").write_text("gitdir: /nonexistent\n")
+        judge([("git grep foo agent", True), ("git grep foo", True)])
+
+    def test_tracked_credential_names_lift_only_as_committed(self):
+        # K1, owner's decision: a tracked credential-named file lifts a plain git grep only while it is a regular
+        # file equal in HEAD, the index and the work tree.
+        top = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-grep-named-")))
+        self.addCleanup(shutil.rmtree, str(top), True)
+        git(top, "init", "-q", "-b", "main", ".")
+        for name in ("agent/mcp.json", "agent/x.md", "config/tp-secret-exec", "sub/b.md"):
+            (top / name).parent.mkdir(parents=True, exist_ok=True)
+            (top / name).write_text("foo\n")
+        git(top, "add", ".")
+        git(top, "commit", "-q", "-m", "first")
+
+        def judge(expected, bin_=None):
+            # `bin` holds only a committed `*secret*` name; `agent` and the root hold `mcp.json` too.
+            rows = [("git grep foo agent", expected), ("git grep foo", expected),
+                    ("git grep foo config", expected if bin_ is None else bin_)]
+            for command, prompts in rows:
+                with self.subTest(command=command):
+                    self.assertEqual(bash(command, str(top))["sensitive"], prompts, command)
+
+        judge(False)  # clean: committed `mcp.json` and a `*secret*` name
+        self.assertFalse(bash("git grep foo ../agent", str(top / "sub"))["sensitive"])
+        mcp = top / "agent" / "mcp.json"
+        mcp.write_text("changed\n")  # unstaged edit
+        judge(True, False)
+        git(top, "add", "agent/mcp.json")  # staged edit
+        judge(True, False)
+        git(top, "checkout", "-q", "HEAD", "--", "agent/mcp.json")
+        judge(False)
+        mcp.unlink()  # replaced on disk by a link
+        mcp.symlink_to(top / "agent" / "x.md")
+        judge(True, False)
+        mcp.unlink()
+        git(top, "checkout", "-q", "--", "agent/mcp.json")
+        judge(False)
+        os.chmod(mcp, 0o755)  # a changed mode
+        judge(True, False)
+        os.chmod(mcp, 0o644)
+        judge(False)
+        # Round 3: git's change detection is never trusted. Each edit below is hidden from `git diff HEAD`.
+        for flag, undo in (("--assume-unchanged", "--no-assume-unchanged"), ("--skip-worktree", "--no-skip-worktree")):
+            git(top, "update-index", flag, "agent/mcp.json")
+            judge(True, False)  # still the committed bytes, but the flag keeps the prompt
+            mcp.write_text("changed\n")
+            self.assertEqual(git(top, "diff", "--raw", "HEAD", "--", "agent/mcp.json"), "")
+            judge(True, False)
+            git(top, "update-index", undo, "agent/mcp.json")
+            git(top, "checkout", "-q", "--", "agent/mcp.json")
+            judge(False)
+        git(top, "config", "core.filemode", "false")  # a mode change that git is told to ignore
+        os.chmod(mcp, 0o755)
+        self.assertEqual(git(top, "diff", "--raw", "HEAD", "--", "agent/mcp.json"), "")
+        judge(True, False)
+        os.chmod(mcp, 0o644)
+        git(top, "config", "--unset", "core.filemode")
+        judge(False)
+        stamp = os.stat(mcp)  # an edit of the same size, with the same mtime
+        mcp.write_text("bar\n")
+        os.utime(mcp, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertEqual(os.stat(mcp).st_size, stamp.st_size)
+        judge(True, False)
+        # git checkout would trust the unchanged size and mtime and leave "bar" on disk whenever the index entry
+        # is not racily clean, so the committed bytes are written back directly.
+        mcp.write_text("foo\n")
+        self.assertEqual(mcp.read_text(), "foo\n")
+        judge(False)
+        mcp.write_text("x" * ((1 << 20) + 1))  # over the size cap
+        judge(True, False)
+        git(top, "checkout", "-q", "--", "agent/mcp.json")
+        judge(False)
+        # A failing ls-files -v, ls-tree or object-format query keeps the prompt.
+        for query in ("ls-files -v", "ls-tree", "rev-parse --show-object-format"):
+            with self.on_path(self.fake_git(f'case "$*" in *"{query}"*) exit 1;; esac; exec {GIT} "$@"')):
+                judge(True)
+        # A content filter is never run to compare.
+        git(top, "config", "filter.x.clean", "cat")
+        judge(True)
+        git(top, "config", "--unset", "filter.x.clean")
+        judge(False)
+        # No commit to compare with.
+        (top / "agent" / AUTH).write_text("foo\n")
+        git(top, "add", "-f", f"agent/{AUTH}")
+        self.assertTrue(bash("git grep foo agent", str(top))["sensitive"])
+
+    def test_committed_credential_name_lifts_in_a_sha256_repository(self):
+        # K1 round 3: the blob id is computed with the repository's own hash.
+        top = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-grep-sha256-")))
+        self.addCleanup(shutil.rmtree, str(top), True)
+        made = subprocess.run([GIT, "init", "-q", "-b", "main", "--object-format=sha256", "."], cwd=top,
+                              capture_output=True, env=GIT_ENV)
+        if made.returncode:
+            self.skipTest("this git cannot create a sha256 repository")
+        (top / "agent").mkdir()
+        (top / "agent" / "mcp.json").write_text("foo\n")
+        git(top, "add", ".")
+        git(top, "commit", "-q", "-m", "first")
+        self.assertFalse(bash("git grep foo agent", str(top))["sensitive"])
+        (top / "agent" / "mcp.json").write_text("bar\n")
+        self.assertTrue(bash("git grep foo agent", str(top))["sensitive"])
+
+    def test_git_grep_options_outside_the_allowlist_keep_the_prompt(self):
+        # K1 round 2: parity with the options this git knows (`git grep -h`). Each is tried over a folder that is
+        # otherwise lifted; only the allowlisted ones may lift it, and the allowlist names only options git knows.
+        usage = subprocess.run([GIT, "grep", "-h"], capture_output=True, text=True, env=GIT_ENV)
+        known_long, known_short = set(), set()
+        for line in (usage.stdout + usage.stderr).splitlines():
+            if not line.startswith("    "):
+                continue
+            for token in re.split(r",\s*", re.split(r"\s{2,}", line.strip())[0]):
+                token = token.split(" ")[0]
+                if token.startswith("--"):
+                    name = re.sub(r"\[=.*", "", token[2:])
+                    if name.startswith("[no-]"):
+                        known_long.update((name[5:], "no-" + name[5:]))
+                    else:
+                        known_long.add(name)
+                elif re.fullmatch(r"-[A-Za-z]", token):
+                    known_short.add(token[1:])
+        self.assertTrue({"textconv", "untracked", "open-files-in-pager", "no-textconv"} <= known_long, known_long)
+        self.assertTrue(set("fOe") <= known_short and not (set("fO") & set(sensitive_read._GIT_GREP_FLAGS)), known_short)
+        self.assertLessEqual(sensitive_read._GIT_GREP_LONG_PLAIN, known_long)
+        self.assertLessEqual(set(sensitive_read._GIT_GREP_FLAGS + sensitive_read._GIT_GREP_VALUED), known_short)
+
+        top = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-grep-opts-")))
+        self.addCleanup(shutil.rmtree, str(top), True)
+        git(top, "init", "-q", "-b", "main", ".")
+        (top / "agent").mkdir()
+        (top / "agent" / "x.md").write_text("foo\n")
+        git(top, "add", ".")
+        git(top, "commit", "-q", "-m", "first")
+        needs_value = {"max-depth", "max-count", "threads", "context", "before-context", "after-context"}
+        for name in sorted(known_long):
+            option = f"--{name}=1" if name in needs_value else f"--{name}"
+            with self.subTest(option=option):
+                lifted = name in sensitive_read._GIT_GREP_LONG_PLAIN
+                self.assertEqual(bash(f"git grep {option} foo agent", str(top))["sensitive"], not lifted, option)
+        for letter in sorted(known_short):
+            option = f"-{letter} 1" if letter in "ABCmf" else f"-{letter}"
+            command = f"git grep {option} agent" if letter in "ef" else f"git grep {option} foo agent"
+            with self.subTest(option=option):
+                lifted = letter in sensitive_read._GIT_GREP_FLAGS + sensitive_read._GIT_GREP_VALUED + "e"
+                self.assertEqual(bash(command, str(top))["sensitive"], not lifted, command)
 
     def test_stash(self):
         top = self.repo()

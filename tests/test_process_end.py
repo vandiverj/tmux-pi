@@ -1,6 +1,7 @@
 """A worker's process ends with its task (T3) and its report.md survives the final reply (T5).
 
 Panes are real, on a private tmux server (-L socket); only the calls that would launch a worker are stubbed."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

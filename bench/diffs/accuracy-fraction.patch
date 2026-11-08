@@ -1,0 +1,26 @@
+diff --git a/src/components/StatusPanel.tsx b/src/components/StatusPanel.tsx
+index 2283504..481eb87 100644
+--- a/src/components/StatusPanel.tsx
++++ b/src/components/StatusPanel.tsx
+@@ -226,7 +226,7 @@ export function StatusPanel({ state, remainingCount, isComputerThinking = false,
+           </div>
+           <div>
+             <dt>Accuracy</dt>
+-            <dd>{accuracy === null ? '--' : `${accuracy}%`}</dd>
++            <dd title="Share of shots that missed">{accuracy === null ? '--' : `${Math.round(accuracy * 100)}%`}</dd>
+           </div>
+           <div>
+             <dt>Streak</dt>
+diff --git a/src/game/gameState.ts b/src/game/gameState.ts
+index f8ec300..72790ca 100644
+--- a/src/game/gameState.ts
++++ b/src/game/gameState.ts
+@@ -143,7 +143,7 @@ export const getShotAccuracy = (state: GameState): number | null => {
+     return null;
+   }
+ 
+-  return Math.round((getHitCount(state) / state.shotCount) * 100);
++  return Math.round((getHitCount(state) / state.shotCount) * 100) / 100;
+ };
+ 
+ export const getHumanMissCount = (state: GameState): number =>

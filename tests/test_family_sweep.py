@@ -1,4 +1,5 @@
 """lib/family_sweep.py: the generated sweep.md (site extraction, findings, the required table, an unparseable finding kept)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import sys
 import tempfile

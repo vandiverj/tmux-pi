@@ -1,4 +1,5 @@
 """pi tool_result redaction in agent/extensions/sensitive.ts; runs the real tp-redact, no models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 import subprocess
 import unittest

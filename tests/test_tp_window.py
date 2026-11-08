@@ -1,5 +1,6 @@
 """The status pane's window (lib/tp_window.py) and the usage summary it keeps (lib/tp_usage.py): which tasks are loaded, that
 a refresh does not read every record, that memory is bounded, and that the summary says what the old jq program said."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import io
 import json

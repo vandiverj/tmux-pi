@@ -1,6 +1,7 @@
 """TP_DOCS_TOOLS wiring: bin/tp-pi and bin/tp-claude argv stay byte-identical when it is unset, gain the docs tools when it is 1
 (bin/tp-pi only for a task, TP_TASK_DIR set: L3 integration item 7); the Claude MCP server and the pi extension carry the same two
 tools. Stub pi/claude binaries; no model, no network."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import re
@@ -13,6 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures" / "localdocs"))
 from project import FIXTURES, ROOT, ProjectCase  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from session_env import outside_session  # noqa: E402
 
 GOLDEN = json.loads((FIXTURES / "golden_argv.json").read_text())
 NODE = shutil.which("node")
@@ -35,7 +38,7 @@ class LauncherCase(unittest.TestCase):
         for stub in fake.iterdir():
             stub.chmod(0o755)
         self.rec = self.tmp / "rec"
-        self.env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "REC": str(self.rec), "TP_PI_NODE": "",
+        self.env = {**outside_session(), "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "REC": str(self.rec), "TP_PI_NODE": "",
                     "TP_CLAUDE_CONFIG_DIR": str(self.tmp / "cfg")}
         for name in ("TP_TASK_DIR", "TP_TASK_ID", "TP_MODE", "TP_DOCS_TOOLS", "TP_CTX_TOOLS"):
             self.env.pop(name, None)

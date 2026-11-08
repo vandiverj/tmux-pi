@@ -1,0 +1,12 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "local-summarize-importers",
+  "kind": "local",
+  "title": "summarize_files: which components use formatBoardCoordinate",
+  "budget_s": 600,
+  "question": "Read-only question; change no files. Which files in src/components import formatBoardCoordinate? List their file names (not paths), sorted alphabetically. Write the final line of your reply as: ANSWER: <name>,<name>,... with no spaces after 'ANSWER: '.",
+  "answer": {
+    "file": "local-summarize-importers.json",
+    "sha256": "70da7e63f4b399513e4f27b20ba591061df112a2ad0f2832924b6d4cf6409402"
+  }
+}

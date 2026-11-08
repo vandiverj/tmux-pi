@@ -1,4 +1,5 @@
 """Pi reporter strips a leading <think> block from result.md; mock API, synthetic data."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import subprocess
 import unittest
 from pathlib import Path

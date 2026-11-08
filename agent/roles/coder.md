@@ -26,7 +26,7 @@ Stay inside the brief. When the work needs a file, symbol or case the brief does
 
 Fix a cause, not a site: find every writer, reader and caller that shares the defect, and fix or report each.
 
-In the report, copy counts as the log shows them and give the log path, and the wall seconds of each test file you ran (the `Ran N tests in Xs` line, or the `tp-agent test-run` record). Add a `SLOW_TESTS:` block as below. Include a Self-review section with evidence: the writers, readers and callers of each symbol you changed; the opposite or repeat of each action; other paths to the same rule; and the consumers of changed behavior. Report anything outside the task as a note, not a change.
+In the report, copy counts as the log shows them and give the log path, and the wall seconds of each test file you ran (the `Ran N tests in Xs` line, or the `seconds` of the record that `tools/agent/test-run.sh` writes to `$TP_TASK_DIR/test-runs/<n>.json`). Add a `SLOW_TESTS:` block as below. Include a Self-review section with evidence: the writers, readers and callers of each symbol you changed; the opposite or repeat of each action; other paths to the same rule; and the consumers of changed behavior. Report anything outside the task as a note, not a change.
 
 
 `SLOW_TESTS:` (only if any). One line per file: `file, seconds, tests, processes per test (estimate or measured), likely cause`. Include any file over 60 s, any check over 5 s, any run that hit its time bound, and any run you repeated. This is a finding for the developer, not something to wait out. Never keep rerunning a run that timed out.

@@ -1,4 +1,5 @@
 """tests/tp_agent_inproc.run gives the same rc, stdout and stderr as a bin/tp-agent subprocess (five commands, one per exit path)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import io
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tp_agent_inproc  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 AGENT = tp_agent_inproc.AGENT
 COMMANDS = {
@@ -32,7 +34,7 @@ def stable(text):
 class InProcessMatchesSubprocess(unittest.TestCase):
     def test_same_rc_stdout_stderr(self):
         with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as cwd:
-            env = {**os.environ, "TP_STATE_DIR": state}
+            env = {**outside_session(), "TP_STATE_DIR": state}
             env.pop("TMUX", None)
             times = []
             for name, argv in COMMANDS.items():

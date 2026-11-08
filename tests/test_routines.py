@@ -1,3 +1,4 @@
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import builtins
 import json
 import os
@@ -20,6 +21,8 @@ GITLEAKS = "gitleaks run"
 PRETTIER_PROBE = "prettier --check/--write"
 COMMIT = "git add+commit"
 LANE_COMMON = "Read: lane/brief common brief (lane-common/brief-common)"
+BUNDLE = "pre-commit gate bundle (prettier|eslint|gitleaks|tsc|deno check)"
+LANE_BASE = "lane base / merge-base / origin base"
 
 
 def build_project(root, tasks):
@@ -295,20 +298,21 @@ class Report(unittest.TestCase):
 
             second = self.report(self.RUN2, out)
         self.assertFalse(second["baseline"])
-        grew = by(second["grew"], "probe")
-        self.assertEqual((grew[("coder", GITLEAKS)]["previous"], grew[("coder", GITLEAKS)]["tasks"]), (3, 5))
-        self.assertEqual((grew[("coder", PRETTIER_PROBE)]["previous"], grew[("coder", PRETTIER_PROBE)]["tasks"]), (2, 4))
-        self.assertEqual((grew[("review", PRETTIER_PROBE)]["previous"], grew[("review", PRETTIER_PROBE)]["tasks"]), (1, 2))
-        self.assertNotIn(("coder", COMMIT), grew)
-        self.assertNotIn(("coder", LANE_COMMON), grew)
+        # growth is judged on shares: coder went 4 -> 8 tasks, so gitleaks rose 3 -> 5 but fell from 75% to 62.5%;
+        # prettier went 2 of 4 -> 4 of 8 (50% both); review prettier went 1 of 1 -> 2 of 2 (100% both)
+        self.assertEqual(second["grew"], [])
         # docker compose: 2 tasks before, 7 now, no probe -> new. kubectl get was already at 3+ -> not new again.
         new = by(second["new_leads"], "lead")
         self.assertEqual(set(new), {("coder", "docker compose")})
         self.assertEqual(new[("coder", "docker compose")]["tasks"], 7)
-        # git commit went 1 -> 0 (absent now); lane-common read went 2 -> 1
+        # git commit went 1 -> 0 (absent now); lane-common read went 2 -> 1; gitleaks and the bundle fell with the share
         dropped = by(second["dropped"], "probe")
         self.assertEqual({k: (v["previous"], v["tasks"]) for k, v in dropped.items()},
-                         {("coder", COMMIT): (1, 0), ("coder", LANE_COMMON): (2, 1)})
+                         {("coder", GITLEAKS): (3, 5), ("coder", BUNDLE): (3, 5), ("coder", COMMIT): (1, 0),
+                          ("coder", LANE_COMMON): (2, 1)})
+        gitleaks = dropped[("coder", GITLEAKS)]
+        self.assertEqual((gitleaks["previous_share"], gitleaks["share"]), (0.75, 0.625))
+        self.assertEqual((gitleaks["previous_role_tasks"], gitleaks["role_tasks"]), (4, 8))
 
     def test_counts_file_is_rewritten_each_run_and_roles_not_analysed_are_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,6 +321,7 @@ class Report(unittest.TestCase):
             counts = Path(str(out) + ".counts.json")
             first = json.loads(counts.read_text())
             self.assertEqual(first["roles"]["review"]["probes"][PRETTIER_PROBE], 1)
+            self.assertEqual((first["roles"]["coder"]["tasks"], first["roles"]["review"]["tasks"]), (4, 1))  # denominators
             self.report(self.RUN2, out, "--role", "coder")
             second = json.loads(counts.read_text())
         self.assertEqual(second["roles"]["coder"]["probes"][GITLEAKS], 5)
@@ -395,7 +400,7 @@ class Report(unittest.TestCase):
         self.assertEqual(list(second["summary"]), ["review"])
         for key in ("grew", "new_leads", "dropped"):
             self.assertEqual({e["role"] for e in second[key]}, {"review"} if second[key] else set(), key)
-        self.assertIn(("review", PRETTIER_PROBE), by(second["grew"], "probe"))
+        self.assertEqual(second["grew"], [])  # review went 1 of 1 -> 2 of 2 tasks: its share did not change
 
     def test_since_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -406,6 +411,13 @@ class Report(unittest.TestCase):
             newer = json.loads(out.read_text())
             res = run_cli("routines", "--project", tmp, "--json", "--min-tasks", "1")
             everything = json.loads(res.stdout)
+            # --until keeps tasks on or before the date: t1, t2 (coder) and t5 (review); with --since, t3 only
+            earlier = json.loads(run_cli("routines", "--project", tmp, "--until", "2026-10-15", "--json", "--min-tasks", "1").stdout)
+            window = json.loads(run_cli("routines", "--project", tmp, "--since", "2026-10-15", "--until", "2026-10-20",
+                                        "--json", "--min-tasks", "1").stdout)
+        self.assertEqual({r: v["tasks"] for r, v in earlier["summary"].items()}, {"coder": 2, "review": 1})
+        self.assertEqual(earlier["until"], "2026-10-15")
+        self.assertEqual({r: v["tasks"] for r, v in window["summary"].items()}, {"coder": 1})
         # t3 and t4 are on or after 2026-10-15; t1, t2, t5 are not
         self.assertEqual(newer["summary"], {"coder": {"tasks": 2, "calls": 11}})
         self.assertEqual(newer["since"], "2026-10-15")
@@ -429,6 +441,12 @@ class Report(unittest.TestCase):
         for heading in ("(a) probes in more tasks", "(b) new Bash lead commands", "(c) probes in fewer tasks"):
             self.assertIn(heading, res.stdout)
         self.assertIn("kubectl get", res.stdout)
+        # per-role denominators and ratios: gitleaks is in 3 of the coder role's 4 tasks (no previous run: was 0/0)
+        self.assertIn("coder: 4 tasks", res.stdout)
+        self.assertIn("calls per task", res.stdout)
+        self.assertIn("tasks 3/4 (was 0/0)", res.stdout)
+        self.assertIn("any", res.stdout)
+        self.assertIn("excl", res.stdout)
         self.assertFalse(os.path.exists(os.path.join(tmp, "x")))
 
     def test_no_out_writes_nothing(self):
@@ -452,9 +470,114 @@ class Report(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             build_project(tmp, self.RUN1)
             self.assertEqual(run_cli("routines", "--project", tmp, "--since", "yesterday").returncode, 2)
+            self.assertEqual(run_cli("routines", "--project", tmp, "--until", "yesterday").returncode, 2)
             self.assertEqual(run_cli("routines", "--project", tmp, "--min-tasks", "0").returncode, 2)
             self.assertEqual(run_cli("routines", "--project", os.path.join(tmp, "none")).returncode, 2)
         self.assertNotEqual(run_cli("routines").returncode, 0)  # --project is required
+
+
+class FirstMatch(unittest.TestCase):
+    """Calls are claimed by their first probe (exclusive) and also counted under every probe (any); repeats
+    of one normalised command count once as distinct; the tp-agent and git fetch probes are split out."""
+
+    @staticmethod
+    def mine_calls(calls):
+        """Bash calls [(command, result text)] of one coder task, mined from a Claude-format transcript."""
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = []
+            for i, (cmd, result) in enumerate(calls):
+                lines.append(json.dumps({"message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "u%d" % i, "name": "Bash", "input": {"command": cmd}}]}}))
+                lines.append(json.dumps({"message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "u%d" % i, "content": result}]}}))
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text("\n".join(lines) + "\n")
+            return routines.mine([({"id": "t1", "role": "coder"}, str(transcript))])["coder"]
+
+    def test_a_call_matching_two_probes_counts_its_tokens_once_exclusive_and_twice_any(self):
+        probes = self.mine_calls([("gitleaks detect --source .", "x" * 400)])["probes"]  # 400 bytes = 100 tokens
+        self.assertEqual(set(probes), {GITLEAKS, BUNDLE})  # the gitleaks probe and the bundle that contains it
+        self.assertEqual(probes[GITLEAKS]["result_tokens"] + probes[BUNDLE]["result_tokens"], 200)  # any: twice
+        self.assertEqual(probes[GITLEAKS]["exclusive"]["result_tokens"], 100)  # first match claims it
+        self.assertEqual(probes[BUNDLE]["exclusive"]["result_tokens"], 0)  # and nothing is left for the bundle
+
+    def test_identical_normalised_commands_in_one_task_count_once_as_distinct(self):
+        same = self.mine_calls([("sed -n 1,40p x", "a" * 8), ("sed -n 1,40p x", "a" * 8)])["leads"]["sed -n"]
+        self.assertEqual((same["calls"], same["distinct"], same["tasks"]), (2, 1, 1))
+        different = self.mine_calls([("sed -n 1,40p x", "a" * 8), ("sed -n 1,40p y", "a" * 8)])["leads"]["sed -n"]
+        self.assertEqual((different["calls"], different["distinct"]), (2, 2))
+
+    def test_tp_agent_help_and_request_are_different_probes_and_git_fetch_is_not_lane_base(self):
+        probes = lambda cmd: routines.keys_for({"name": "Bash", "bytes": 0, "input": {"command": cmd}})[0]
+        help_probes, request_probes = probes("tp-agent --help"), probes("tp-agent request --kind review --file x")
+        self.assertEqual(routines.first_probe(help_probes), "tp-agent --help/-h/help")
+        self.assertEqual(routines.first_probe(request_probes), "tp-agent request")
+        self.assertIn("tp-agent (any)", help_probes)  # the general probe still sees every tp-agent call
+        self.assertNotIn("tp-agent request", help_probes)
+        self.assertNotIn("tp-agent --help/-h/help", request_probes)
+        self.assertIn("git fetch", probes("git fetch origin"))
+        self.assertNotIn(LANE_BASE, probes("git fetch origin"))
+        self.assertIn(LANE_BASE, probes("git merge-base HEAD origin/develop"))
+        # a lookup of a tool is the lookup probe, not the tool's own probe
+        self.assertEqual(routines.first_probe(probes("which prettier")), "node_modules/.bin lookup (ls/which)")
+
+    @staticmethod
+    def fetch_probes(cmd):
+        return routines.keys_for({"name": "Bash", "bytes": 0, "input": {"command": cmd}})[0]
+
+    def test_git_fetch_is_found_by_parsing_git_options_not_by_matching_text(self):
+        for cmd in ("git fetch", "git fetch origin/develop", "git -C x fetch o/develop",
+                    "git -C 'a b' fetch \"origin/develop\"", "git -c protocol.version=2 fetch origin/develop",
+                    "git -C x -c a=b fetch --prune origin/DMP-1", "git --no-pager fetch o/develop",
+                    "git -p fetch o/develop", "git --git-dir=.git fetch o/develop",
+                    "git --git-dir .git --work-tree . fetch o/develop", "git --namespace=n fetch o/develop",
+                    "git --bare fetch o/develop", "git --exec-path=/x fetch o/develop",
+                    "git --config-env=a.b=ENV fetch o/develop", "FOO=1 git fetch o/develop",
+                    "/usr/bin/git fetch o/develop", "cd x && git fetch origin/develop", "git fetch o/develop | tail -3"):
+            found = self.fetch_probes(cmd)
+            self.assertEqual(routines.first_probe(found), "git fetch", cmd)
+            self.assertNotIn(LANE_BASE, found, cmd)
+        self.assertEqual(self.fetch_probes("git merge-base HEAD origin/develop") & {LANE_BASE, "git fetch"}, {LANE_BASE})
+        self.assertNotIn("git fetch", self.fetch_probes("git log origin/develop"))
+        self.assertEqual(self.fetch_probes("git -c a=b merge-base HEAD origin/develop") & {LANE_BASE, "git fetch"}, {LANE_BASE})
+        both = self.fetch_probes("git fetch origin && git merge-base HEAD origin/develop")  # the merge-base still counts
+        self.assertLessEqual({LANE_BASE, "git fetch"}, both)
+        self.assertNotIn("git fetch", self.fetch_probes('echo "git fetch origin/develop"'))
+        self.fetch_probes("git fetch 'unterminated")  # no exception
+
+    def test_every_value_taking_git_global_option_is_skipped_before_the_subcommand(self):
+        # the value-taking global options of `git --help`: -C and -c take the next token; the long ones take
+        # `=value` or the next token (--exec-path only as `=value`; alone it is a flag)
+        for opt in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--exec-path"):
+            forms = [] if opt in ("-C", "-c") else ["git %s=v fetch o/develop" % opt]
+            if opt != "--exec-path":
+                forms.append("git %s v fetch o/develop" % opt)
+            for cmd in forms:
+                self.assertEqual([s for s, _ in routines.git_subcommands(cmd)], ["fetch"], cmd)
+                self.assertNotIn(LANE_BASE, self.fetch_probes(cmd), cmd)
+
+    def test_growth_and_drop_are_judged_on_the_share_of_the_role_tasks(self):
+        def stat(tasks):
+            return {"tasks": tasks, "calls": tasks, "distinct": tasks, "result_tokens": 0, "exclusive": {"calls": 0, "result_tokens": 0}}
+        before = {"roles": {"coder": {"tasks": 10, "probes": {"X": 5}, "leads": {}}}}
+        # raw count falls 5 -> 3, but the role's tasks fall 10 -> 4: the share rises 50% -> 75%
+        lists = routines.compare(before, {"coder": {"tasks": 4, "probes": {"X": stat(3)}, "leads": {}}}, 3)
+        self.assertEqual([e["probe"] for e in lists["grew"]], ["X"])
+        self.assertEqual(lists["dropped"], [])
+        # raw count rises 5 -> 6, but the role's tasks rise 10 -> 20: the share falls 50% -> 30%
+        lists = routines.compare(before, {"coder": {"tasks": 20, "probes": {"X": stat(6)}, "leads": {}}}, 3)
+        self.assertEqual(lists["grew"], [])
+        self.assertEqual([e["probe"] for e in lists["dropped"]], ["X"])
+
+    def test_a_dropped_probe_shows_its_token_columns_in_the_text_report(self):
+        stat = {"tasks": 1, "calls": 7, "distinct": 5, "result_tokens": 300, "exclusive": {"calls": 4, "result_tokens": 120}}
+        before = {"roles": {"coder": {"tasks": 4, "probes": {"X": 3}, "leads": {}}}}
+        roles = {"coder": {"tasks": 4, "calls": 9, "probes": {"X": stat}, "leads": {}}}
+        report = routines.build_report(roles, before, 3, now="2026-11-07T00:00:00Z")
+        entry = report["dropped"][0]
+        self.assertEqual((entry["calls"], entry["distinct"], entry["result_tokens"], entry["exclusive_result_tokens"]), (7, 5, 300, 120))
+        line = [l for l in routines.render_text(report).splitlines() if l.rstrip().endswith(" X") and "75.0%" in l][0]
+        self.assertRegex(line, r"calls\s+7 distinct\s+5 tok\s+300 any\s+120 excl")
 
 
 class ExistingReportUnchanged(unittest.TestCase):

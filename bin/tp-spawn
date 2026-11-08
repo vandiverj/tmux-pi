@@ -21,7 +21,7 @@
 #   --route-json <json>      routing recommendation and actual selection
 #   -f, --file <path>        read the task from a file
 #   -c, --context <path>     add a file to the context packet; repeatable.
-#                            path[:start-end] adds only those lines.
+#                            path[:start-end] adds only those lines; path#Heading adds that markdown section.
 #                            Relative paths are from the workdir.
 #   -N, --note <text>        add a note to the context packet; repeatable
 #   -C, --conversation <path>  add the user's recent conversation with main
@@ -59,8 +59,10 @@
 #   --other-lane-paths <text> the packet section `Paths other lanes own` (derived from the other open lanes' declared
 #                            and measured paths; advice, not a lock). Omitted when empty. A shadow trial run (bin/tp-trial)
 #                            has no lane and passes the section the task it copies was given
+#   --lane-facts-file <path> the packet section `## Lane` (lib/lane_commands.py lane_facts), read from this file and placed right
+#                            after `Working directory:`, before any context file; counted against the packet limit
 #   --worker-env KEY=VAL     export KEY=VAL in the worker's run.sh (the worker's window does not inherit the caller's
-#                            environment); repeatable. Only TP_DOCS_TOOLS and TP_TRIAL_ID are accepted, once each, and a value
+#                            environment); repeatable. Only TP_DOCS_TOOLS, TP_TRIAL_ID and LANE_BASE are accepted, once each, and a value
 #                            has no line break. Without the flag run.sh is exactly what it was before the flag existed
 #   --preamble-role <role>   pick the preamble section of this role without loading the role's
 #                            instructions (tp-review passes the reviewer's); default is --role
@@ -93,7 +95,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths=""
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths="" lane_facts_file=""
 words=() contexts=() notes=() worker_env=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -131,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --lane-replaces) lane_replaces="${2:?}"; shift 2 ;;
     --preamble-from) preamble_from="${2:?}"; shift 2 ;;
     --other-lane-paths) other_lane_paths="${2:?}"; shift 2 ;;
+    --lane-facts-file) lane_facts_file="${2:?}"; shift 2 ;;
     --worker-env)  worker_env+=("${2:?}"); shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
@@ -156,8 +159,8 @@ seen_env=" "
 for pair in ${worker_env[@]+"${worker_env[@]}"}; do
   [[ "$pair" == *=* ]] || die "bad --worker-env (want KEY=VAL): $pair"
   case "${pair%%=*}" in
-    TP_DOCS_TOOLS|TP_TRIAL_ID) ;;
-    *) die "--worker-env key not allowed: ${pair%%=*} (allowed: TP_DOCS_TOOLS, TP_TRIAL_ID)" ;;
+    TP_DOCS_TOOLS|TP_TRIAL_ID|LANE_BASE) ;;
+    *) die "--worker-env key not allowed: ${pair%%=*} (allowed: TP_DOCS_TOOLS, TP_TRIAL_ID, LANE_BASE)" ;;
   esac
   [[ "$seen_env" != *" ${pair%%=*} "* ]] || die "--worker-env ${pair%%=*} given twice"
   seen_env+="${pair%%=*} "
@@ -245,12 +248,36 @@ file_fingerprints() {
     for i in "$@"; do fp_out+=(""); done
   fi
 }
+# split_context <spec> — the one place a --context spec gets its form, in this order (docs/legacy-workflow.md lists it):
+#   1. heading spec: the first '#' (not at the start) whose left side is an existing file; everything after it is the heading, so
+#      file.md#Rules:2-3 is the heading "Rules:2-3" and a#b.md#H is the heading "H" of a#b.md;
+#   2. line-range spec: the spec ends in :a-b and the left side is an existing file (a#b.md:2-3);
+#   3. plain path (a file literally named x:2-3).
+# Sets c_path (absolute), c_range ("a-b"), c_heading (leading #s dropped, whitespace trimmed, all else kept) and c_has_heading.
+# screen_contexts and read_context share it.
+split_context() {
+  local spec="$1" i p h
+  c_path="$spec" c_range="" c_heading="" c_has_heading=""
+  for (( i = 1; i < ${#spec}; i++ )); do
+    [[ "${spec:i:1}" == "#" ]] || continue
+    p="${spec:0:i}"; [[ "$p" == /* ]] || p="$workdir/$p"
+    if [[ -f "$p" ]]; then
+      h="${spec:i+1}"; h="${h#"${h%%[!#]*}"}"
+      h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"
+      c_path="$p" c_heading="$h" c_has_heading=1
+      return 0
+    fi
+  done
+  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
+    p="${BASH_REMATCH[1]}"; [[ "$p" == /* ]] || p="$workdir/$p"
+    if [[ -f "$p" ]]; then c_path="$p" c_range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"; return 0; fi
+  fi
+  c_path="$spec"; [[ "$c_path" == /* ]] || c_path="$workdir/$c_path"
+}
 screen_contexts() {
   local spec p i ok listed=() verdicts reply v fps=()
   for spec in ${contexts[@]+"${contexts[@]}"}; do
-    p="$spec"
-    if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then p="${BASH_REMATCH[1]}"; fi
-    [[ "$p" == /* ]] || p="$workdir/$p"
+    split_context "$spec"; p="$c_path"
     if [[ -f "$p" ]]; then listed+=("$p"); fi
   done
   (( ${#listed[@]} > 0 )) || return 0
@@ -314,21 +341,72 @@ print(last or "")
 PY
 }
 
+# section_range <path> <heading> — the markdown section of an ATX heading, by the CommonMark rules (4.2 headings: 0-3 spaces,
+# 1-6 '#', then space or end of line, an optional closing '#' run after a space dropped, text trimmed; 4.5 fences: 3+ backticks or
+# tildes, closed only by the same character at least as long, 0-3 spaces of indent, nothing after; unclosed runs to the end;
+# setext headings are ignored). The query is the heading text split_context already cleaned, compared case-insensitively. Prints "start end"
+# (to the line before the next heading of the same or higher level, or the end of the file), "empty", "missing", or "ambiguous"
+# then one "line: heading" per match.
+section_range() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+path, query = sys.argv[1], sys.argv[2]
+lines = __import__("pathlib").Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+heads, fence = [], None
+for number, line in enumerate(lines, 1):
+    if fence:
+        close = re.match(r"^ {0,3}(%s{%d,})[ \t]*$" % (re.escape(fence[0]), len(fence)), line)
+        if close:
+            fence = None
+        continue
+    opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+    if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+        fence = opening.group(1)
+        continue
+    found = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*))?$", line)
+    if found:
+        text = re.sub(r"(?:^|[ \t]+)#+[ \t]*$", "", (found.group(2) or "").strip()).strip()
+        heads.append((number, len(found.group(1)), text))
+if not query:
+    print("empty")
+    sys.exit()
+hits = [h for h in heads if h[2].casefold() == query.casefold()]
+if not hits:
+    print("missing")
+elif len(hits) > 1:
+    print("ambiguous")
+    for number, level, text in hits:
+        print(f"{number}: {'#' * level} {text}")
+else:
+    number, level, _ = hits[0]
+    after = [h[0] for h in heads if h[0] > number and h[1] <= level]
+    print(number, (after[0] - 1) if after else len(lines))
+PY
+}
+
 # read_context <spec> — sets path, range, body and label for one --context spec and returns 0; returns 1 for a sensitive
 # file (nothing is read); dies for a missing, binary or too large one. A body over the cap is refused with the cap, the size
 # and the largest range from the same first line that fits. tp-spawn --check runs it too, so dispatch refuses a spec before
 # routing instead of at the launch.
 read_context() {
-  local spec="$1" start end fit lines
-  path="$spec" range="" body="" label=""
-  if [[ "$spec" =~ ^(.+):([0-9]+)-([0-9]+)$ ]]; then
-    path="${BASH_REMATCH[1]}" range="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-  fi
-  [[ "$path" == /* ]] || path="$workdir/$path"
+  local spec="$1" start end fit lines heading found
+  split_context "$spec"
+  path="$c_path" range="$c_range" heading="$c_heading" body="" label=""
   [[ -f "$path" ]] || die "context file not found: $spec"
   secret_file "$path" && return 1
   if grep -Iq . "$path" 2>/dev/null || [[ ! -s "$path" ]]; then :; else die "not a text file: $spec"; fi
-  if [[ -n "$range" ]]; then
+  if [[ -n "$c_has_heading" ]]; then
+    # lines "start end" for one match; "missing", or "ambiguous" then one "line: heading" per match
+    found="$(section_range "$path" "$heading")"
+    case "${found%%$'\n'*}" in
+      empty) die "context heading is empty: $spec names no heading in ${path#"$workdir"/}" ;;
+      missing) die "context heading not found: no heading \"$heading\" in ${path#"$workdir"/} ($spec)" ;;
+      ambiguous) die "context heading is ambiguous: \"$heading\" matches more than one heading in ${path#"$workdir"/} ($spec):"$'\n'"${found#*$'\n'}"$'\n'"Use a line range with path:start-end" ;;
+    esac
+    start="${found% *}" end="${found#* }" range="$start-$end"
+    body="$(sed -n "${start},${end}p" "$path")"
+    label="${path#"$workdir"/} (section \"$heading\", lines $start-$end)"
+  elif [[ -n "$range" ]]; then
     start="${range%-*}" end="${range#*-}"
     (( start >= 1 && end >= start )) || die "bad line range: $spec"
     body="$(sed -n "${start},${end}p" "$path")"
@@ -364,7 +442,7 @@ python3 "$ROOT/lib/autonomy.py" gate --state-dir "$state_dir" --role "$role" --p
 
 # LM Studio can unload a model (restart, manual unload); load it again before the worker starts.
 if [[ "$worker" == pi && "$model" == lmstudio/* ]]; then
-  "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
+  TP_STATE_DIR="$state_dir" "$ROOT/bin/tp-lmstudio" ensure "${model#lmstudio/}" >&2 ||
     echo "tp-spawn: warning: ${model#lmstudio/} is not loaded in LM Studio; the worker may fail" >&2
 fi
 
@@ -476,7 +554,7 @@ packet+="Begin with one short sentence stating the assignment you understood, un
 packet+=$'\n\n'
 packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
 packet+=$'\n\n'
-packet+="If you see a test fail that you believe is not caused by your change, do not edit or skip the test. Report it in a block that starts with a line FAILING_TESTS: then, for each test, lines '- test: NAME', '  command: THE EXACT COMMAND', '  unmodified_base: yes, with the evidence, or not checked' (yes only if you reproduced the failure on an unmodified checkout in this run). The main agent sends an investigator; your belief that the failure predates your change is not taken as the answer."
+packet+="If you see a test fail that you believe is not caused by your change, do not edit or skip the test. Report it in a block that starts with a line FAILING_TESTS: then, for each test, lines '- test: NAME', '  command: THE EXACT COMMAND', '  unmodified_base: yes, with the evidence, or not checked' (yes only if you reproduced the failure on an unmodified checkout in this run). The main agent sends an investigator; your belief that the failure predates your change is not taken as the answer. When no test fails that you do not own, leave the block out entirely; do not write FAILING_TESTS: none."
 # Classify only the main-owned worker task, never conversation/context documents.
 # This is instruction disclosure, not a capability or edit grant. Pi and Claude
 # workers receive the same bounded instructions; neither loads a global skill tree.
@@ -503,10 +581,21 @@ if [[ -n "$conversation" ]]; then
   packet+="What the user and the main agent said before this task, for intent and constraints. The task above is what to do."$'\n\n'
   packet+="$f"$'\n'"$body"$'\n'"$f"$'\n'
 fi
-if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file" || -n "$other_lane_paths" ]]; then
+lane_facts=""
+if [[ -n "$lane_facts_file" ]]; then
+  [[ -f "$lane_facts_file" ]] || die "--lane-facts-file not found: $lane_facts_file"
+  # the same screening as a --context file (secret_file); a sensitive one is left out, with the note a sensitive context gets
+  if secret_file "$lane_facts_file"; then
+    notes+=("Sensitive context $lane_facts_file was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")
+  else
+    lane_facts="$(cat "$lane_facts_file")"
+  fi
+fi
+if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file" || -n "$other_lane_paths" || -n "$lane_facts" ]]; then
   packet+=$'\n\n# Context\n\n'"Working directory: $workdir."
   if [[ ${#contexts[@]} -gt 0 ]]; then packet+=" The files below were chosen for this task; read others only if the task needs them."; fi
   packet+=$'\n'
+  if [[ -n "$lane_facts" ]]; then packet+=$'\n'"$lane_facts"$'\n'; fi
 fi
 screen_contexts
 for spec in ${contexts[@]+"${contexts[@]}"}; do

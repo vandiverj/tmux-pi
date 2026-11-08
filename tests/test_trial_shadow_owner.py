@@ -1,6 +1,7 @@
 """lib/trial_shadow.py: what a run owns: the worktree it made (proved before each git command and removal) and the identities it
 recorded for its run dir, state dir, session and panes. Fixtures: trial_shadow_case.py.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

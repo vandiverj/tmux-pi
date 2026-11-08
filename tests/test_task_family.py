@@ -1,5 +1,6 @@
 """Task families linked from meta.json (fixtures in tests/fixtures/task_family; no model or network)."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import argparse
 import io
 import json

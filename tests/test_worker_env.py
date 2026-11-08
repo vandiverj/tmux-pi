@@ -4,6 +4,7 @@ preamble of a task with a parent. Real tp-spawn, fake tmux, no model.
 
 Every successful spawn is slow, so the tests that only read what a spawn wrote share it: SharedSpawnTests makes its spawns once in
 setUpClass. Tests that need a fresh state dir (refusals leave no task) or different tree/manifest state make their own."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import concurrent.futures
 import json
 import os
@@ -14,6 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = ROOT / "tests" / "fixtures" / "trial_shadow" / "run.sh.golden"
+PACKET_GOLDEN = ROOT / "tests" / "fixtures" / "trial_shadow" / "packet_context.golden"
 
 
 def build_fixture(target, cleanup):
@@ -80,7 +82,13 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
             "equals": (("--worker-env", "TP_TRIAL_ID=a=b", "--worker-env", "TP_DOCS_TOOLS="), None),
             "gold-1": ((), None),
             "lane": (("--other-lane-paths", cls.LANE_BODY), None),
+            "facts": (("--lane-facts-file", str(cls.base / "facts.md"), "--worker-env", "LANE_BASE=0123abc", "--note", "n"), None),
+            "gold-ctx": (("--context", "ctx.txt", "--note", "a note"), None),
+            "facts-secret": (("--lane-facts-file", str(cls.base / ".env")), None),
         }
+        (cls.base / "facts.md").write_text("## Lane (facts)\nlane: x\n")
+        (cls.base / ".env").write_text("API_KEY=hunter2-not-for-workers\n")
+        (cls.project / "ctx.txt").write_text("hello\nworld\n")
         for value, _ in cls.CTX:
             jobs["ctx-" + (value or "empty")] = ((), {**cls.env, "TP_CTX_TOOLS": value})
         # independent processes with distinct task ids: start them together, wait for all
@@ -157,6 +165,31 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
     def test_no_section_without_the_option(self):
         self.assertEqual(self.runs["gold-1"].returncode, 0)
         self.assertNotIn(self.SECTION, (self.task("gold-1") / "packet.md").read_text())
+        self.assertNotIn("## Lane", (self.task("gold-1") / "packet.md").read_text())
+
+    def test_lane_facts_file_goes_right_after_the_working_directory_and_lane_base_is_allowed(self):
+        run = self.runs["facts"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        packet = (self.task("facts") / "packet.md").read_text()
+        self.assertRegex(packet, r"Working directory: [^\n]*\.\n\n## Lane \(facts\)\nlane: x\n")
+        self.assertIn("export LANE_BASE=0123abc\n", self.run_sh("facts"))
+        self.assertLess(packet.index("## Lane"), packet.index("## Notes"))
+
+    def test_a_sensitive_lane_facts_file_is_screened_like_a_context_file(self):
+        run = self.runs["facts-secret"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        packet = (self.task("facts-secret") / "packet.md").read_text()
+        self.assertNotIn("hunter2", packet)
+        self.assertIn("Sensitive context ", packet)
+
+    def test_a_spawn_without_a_lane_writes_the_context_section_it_always_wrote(self):
+        """Byte-identical (the golden was rendered by the tp-spawn before --lane-facts-file existed): context, note, no lane code path."""
+        run = self.runs["gold-ctx"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        packet = (self.task("gold-ctx") / "packet.md").read_text()
+        for value, name in ((str(self.task("gold-ctx")), "@TASK_DIR@"), (str(self.state), "@STATE@"), (str(self.project), "@WORKDIR@")):
+            packet = packet.replace(value, name)
+        self.assertEqual(packet[packet.index("# Context"):], PACKET_GOLDEN.read_text())
 
 
 class WorkerEnvRefusalTests(WorkerEnvCase):

@@ -1,4 +1,5 @@
 """Isolated status-pane repaint checks; fake tmux, never a live session."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

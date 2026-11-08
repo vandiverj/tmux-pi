@@ -1,4 +1,5 @@
 """bin/tp-docs as a subprocess: answers, exit codes, call logging, offline operation, and the separate fetch step."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import base64
 import hashlib
 import io

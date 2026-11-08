@@ -123,6 +123,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ],
@@ -136,6 +138,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ],
@@ -149,6 +153,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ],
@@ -162,6 +168,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ],
@@ -175,6 +183,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ],
@@ -188,6 +198,8 @@
    "{ROOT}/claude/mcp.json",
    "--plugin-dir",
    "{ROOT}/claude/plugins",
+   "--append-system-prompt",
+   "Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.",
    "--extra",
    "value"
   ]

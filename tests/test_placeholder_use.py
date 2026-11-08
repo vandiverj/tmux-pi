@@ -3,6 +3,7 @@
 Hooks run through the real redact.sh with TP_REDACTION_LLM_URL at a closed port, so nothing touches a model.
 Fake secrets are generated at runtime; placeholder text is built, never written as a literal.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ EXEC = ROOT / "bin/tp-secret-exec"
 sys.path.insert(0, str(ROOT / "lib"))
 import placeholders
 from redaction_store import Store, sweep
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 
 def fake(prefix, n=32, seed=0):
@@ -44,7 +47,7 @@ class PlaceholderUseTests(unittest.TestCase):
         self.env_file.write_text("NEXT_PUBLIC_X=1\nCLERK_SECRET_KEY={}\n".format(SECRET))
         self.other_file = self.proj / "apps/web/.env.test"
         self.other_file.write_text("STRIPE_SECRET_KEY={}\n".format(OTHER))
-        self.env = {**os.environ, "HOME": str(self.home), "TP_REDACTION_DIR": str(self.store),
+        self.env = {**outside_session(), "HOME": str(self.home), "TP_REDACTION_DIR": str(self.store),
                     "CLAUDE_CONFIG_DIR": str(self.home / ".claude"), "TP_TASK_DIR": str(self.task), "TP_REDACTION": "on",
                     "TP_REDACTION_LLM_URL": "http://127.0.0.1:9"}
         self.env.pop("TP_REDACTION_LAUNCH", None)

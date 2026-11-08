@@ -1,0 +1,13 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "review-shots-left",
+  "kind": "review",
+  "title": "review: shots-left label helper",
+  "budget_s": 900,
+  "request": "Add a helper that reports how many shots a player has left and a label for it, with a test.",
+  "diff": "diffs/shots-left.patch",
+  "answer": {
+    "file": "review-shots-left.json",
+    "sha256": "c41ffccd2de604d3dd5ffa1473113827086714f60e6c0becede39ea28d8597cf"
+  }
+}

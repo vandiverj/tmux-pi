@@ -12,6 +12,7 @@ checks on every row that
 Every combination is included, including ones that cannot occur in practice (an exit file with a live
 pane, a pause event on a task whose state.json says "paused"): a paused record must not satisfy --after
 whichever other facts the files hold. Unknown and unreadable predecessor ids refuse at both."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -30,6 +31,8 @@ ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(ROOT / "lib"))
 import contract
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 
 def load(name, path):
@@ -277,10 +280,10 @@ class PauseClassificationTests(unittest.TestCase):
         self.assertIs(rows["plain"]["capability_pending"], False)
         self.assertIsNone(rows["dep"]["capability_request"])
         out = subprocess.run([sys.executable, str(ROOT / "bin/tp-agent"), "index", "--no-tick"], capture_output=True, text=True,
-                             env=dict(os.environ, TP_STATE_DIR=str(self.base)), check=True).stdout
+                             env=dict(outside_session(), TP_STATE_DIR=str(self.base)), check=True).stdout
         self.assertIs({r["id"]: r for r in json.loads(out)["paused"]}["dep"]["capability_pending"], True)
         out = subprocess.run([sys.executable, str(ROOT / "bin/tp-agent"), "list"], capture_output=True, text=True,
-                             env=dict(os.environ, TP_STATE_DIR=str(self.base)), check=True).stdout
+                             env=dict(outside_session(), TP_STATE_DIR=str(self.base)), check=True).stdout
         self.assertIs({r["id"]: r for r in json.loads(out)}["dep"]["capability_pending"], True)
 
     def test_a_stopped_task_reads_stopped_in_both_tools(self):

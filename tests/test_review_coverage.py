@@ -3,6 +3,7 @@
 One test per consumer of a verdict: lib/review_verdict.py itself, tp-agent (record / inspect / collect, the injected index,
 escalation evidence), lib/task_record.py (the approval gate), lib/routing_evals.py, the dispatcher (tests/test_dispatcher_runtime.py,
 scenarios no-coverage and empty-coverage), the Claude MCP collect_result and bin/tp-review's instructions to the reviewer."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import hashlib
 import importlib.machinery
 import importlib.util

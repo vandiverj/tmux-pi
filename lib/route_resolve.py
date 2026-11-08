@@ -129,7 +129,9 @@ def candidates_at(cat, level, ctx, health):
 def validate_explicit(cat, model, worker, thinking, ctx, health):
     """(level, model entry, effort, notes) for an explicit model choice, or ExplicitError. An explicit choice wins
     only among valid, rostered, shown models whose effort and context fit; the worker/model pair must match."""
-    level, entry = level_of(cat, model)
+    level, entry = level_of(cat, model, thinking)
+    if not entry:
+        level, entry = level_of(cat, model)
     if not entry:
         raise ExplicitError("model {} is not in the model catalog; choose one of: {}".format(
             model, ", ".join(m["model"] for lv in cat["levels"] if lv.get("shown", True) for m in lv["models"] if m["in_roster"])))
@@ -164,7 +166,10 @@ def redirect_problems(cat, target, ctx, health, may_enter_restricted, bound=None
 
     bound is the route's effective lower bound, the (level index, reason) that resolve recorded as rec["route_bound"]
     (lowered by an explicit level). Without it the bound is recomputed from the role's full floor, the stricter way."""
-    level, entry = level_of(cat, target["model"])
+    effort, note = clamp_effort(cat, target["thinking"], bool(ctx.get("approvals", {}).get("effort_above_high")))
+    level, entry = level_of(cat, target["model"], effort)
+    if not entry:
+        level, entry = level_of(cat, target["model"])
     if not entry:
         return ["{} is not in the model catalog".format(target["model"])], target["thinking"]
     problems = []
@@ -182,7 +187,6 @@ def redirect_problems(cat, target, ctx, health, may_enter_restricted, bound=None
     reason = unusable_reason(cat, entry, ctx, health)
     if reason:
         problems.append(reason)
-    effort, note = clamp_effort(cat, target["thinking"], bool(ctx.get("approvals", {}).get("effort_above_high")))
     # A redirect is a machine choice, not an explicit one: the effort must be one the level's own map would give, so
     # efforts a model accepts only on an explicit request (those its effort_map folds away) are never reached this way.
     if effort not in entry["efforts"] or level["effort_map"].get(effort, effort) != effort:
@@ -458,9 +462,14 @@ def escalate(rec, cat, health=None, ctx=None, approvals=None):
     vocab, order, ceiling = cat["effort"]["vocabulary"], cat["effort"]["order"], cat["effort"]["ceiling"]
     keys, shown = level_keys(cat), shown_keys(cat)
     level_key, eff = rec["level_key"], rec["effort_abstract"]
-    model = (level_of(cat, rec.get("model"))[1] or {"efforts": order}) if rec.get("model") else {"efforts": order}
+    model = (level_of(cat, rec.get("model"), rec.get("effort") or eff)[1] or {"efforts": order}) if rec.get("model") else {"efforts": order}
     if eff in vocab and effort_rank(cat, eff) < effort_rank(cat, ceiling):
         new_eff, new_key, how = vocab[vocab.index(eff) + 1], level_key, "effort up"
+        if not any(effort_rank(cat, e) > effort_rank(cat, rec.get("effort") or eff) for e in model["efforts"]):
+            above = [k for k in shown if keys.index(k) > keys.index(level_key)]
+            if not above:
+                return dict(rec, source="stop_and_ask", reason="no higher level or effort available")
+            new_key, how = above[0], "level up"
     elif approved and any(effort_rank(cat, e) > effort_rank(cat, eff) for e in model["efforts"]):
         new_eff = next(e for e in model["efforts"] if effort_rank(cat, e) > effort_rank(cat, eff))
         new_key, how = level_key, "effort up (approved)"

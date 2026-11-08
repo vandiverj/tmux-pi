@@ -1,5 +1,6 @@
 """tp-agent retry: a retry that carries its fix brief (--reason naming an .md file) in the request it starts with, and the
 gate on a finding family a reviewer names twice. The fixture is the orchestration one (fake tmux, no model runs)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import os

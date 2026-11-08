@@ -3,6 +3,7 @@ file (review 8: the worker is not hostile but makes mistakes). The same matrix a
 every read of a task, reviewer or transcript file is a read_plain read, and a FIFO, a link, a directory or a huge file reads as no file.
 
 Split from test_trial_shadow_worker_files.py so that each file is well under the 300 s bound. Fixtures: trial_shadow_case.py."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import io
 import sys
 from pathlib import Path

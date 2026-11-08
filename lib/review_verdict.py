@@ -26,6 +26,7 @@ usage: review_verdict.py <result.md>   prints {"verdict": ..., "notes": ..., "co
        review_verdict.py briefs <request.md>   prints {"briefs": [path, ...]}: the absolute .md paths the request names (bin/tp-review)
        review_verdict.py supplied <flag> <file>   prints why a file Main supplies is refused and exits 1, or prints nothing (bin/tp-review)
        review_verdict.py acceptance <file>...   prints {"items": [n, ...]}: the acceptance criteria numbers in those files (bin/tp-review)
+       review_verdict.py acceptance-text <file>   prints the Done means / Acceptance criteria sections of the file as written, nothing when it has none (bin/tp-review)
 """
 import json
 import os
@@ -257,6 +258,36 @@ def acceptance_items(*texts):
     return sorted(found)
 
 
+def acceptance_text(text):
+    """The `Done means` / `Acceptance criteria` sections of `text` that hold a numbered list, as written (heading to the next
+    heading, a fenced block kept whole), blank-line separated; "" when `text` has no such list. bin/tp-review attaches it ahead
+    of the diff when the criteria are in the reviewer contract, whose file is read later."""
+    sections, current, inside, fence = [], [], False, None
+
+    def close():
+        nonlocal current
+        if current and acceptance_items("\n".join(current)):
+            sections.append("\n".join(current).strip("\n"))
+        current = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        match = FENCE.match(line)
+        if fence is not None:
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
+                fence = None
+        elif match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+            fence = match.group(1)
+        elif _LIST_HEADING.match(line):
+            close()
+            inside = True
+        elif _ANY_HEADING.match(line):
+            close()
+            inside = False
+        if inside:
+            current.append(line)
+    close()
+    return "\n\n".join(sections)
+
+
 # An absolute path ending in .md in a request ("Read and carry out the brief /abs/path.md"): no space, quote, bracket or comma in it
 _NAMED_BRIEF = re.compile(r"(?<![\w.~/-])(/[^\s`'\"<>()\[\]|,;]+\.md)(?![\w/-]|\.\w)")
 
@@ -452,6 +483,13 @@ if __name__ == "__main__":
         problem = supplied_problem(sys.argv[2], sys.argv[3])
         if problem:
             print(problem)
+            sys.exit(1)
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "acceptance-text":  # for bin/tp-review: the contract's acceptance list, to attach ahead of the diff
+        try:
+            print(acceptance_text(open(sys.argv[2], encoding="utf-8", errors="replace").read()))
+        except OSError as exc:
+            print(f"review_verdict: {exc}", file=sys.stderr)
             sys.exit(1)
         sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "acceptance":  # for bin/tp-review: the item numbers of the brief and contract files

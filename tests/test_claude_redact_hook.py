@@ -3,6 +3,7 @@
 Tool result shapes follow tests/fixtures/tool_shapes (captured from Claude Code 2.1.289).
 Fake secrets are generated at runtime.
 """
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -183,7 +184,12 @@ class RedactHookTests(unittest.TestCase):
         out = self.hook("PostToolUse", "Read", {"file_path": str(self.env_file)}, read)
         self.assertShape(out["updatedToolOutput"], self.shape("read"))
         self.assertIn("CLERK_SECRET_KEY=<REDACTED:clerk_secret_key_1>", out["updatedToolOutput"]["file"]["content"])
-        self.assertIn("<REDACTED:clerk_secret_key_1> ({}:2)".format(self.env_file), out["additionalContext"])
+        # The pointer shows the path as PostRedactor.shown makes it, in the same session (a random-looking temp folder
+        # in it may be a placeholder): never the path itself.
+        with mock.patch.dict(os.environ, {"TP_REDACTION_DIR": str(self.store)}):
+            shown = redact_hook.PostRedactor(Redactor(Store(redact_hook.store_name({"session_id": "sess-1"}))),
+                                             str(self.proj)).shown(str(self.env_file))
+        self.assertIn("<REDACTED:clerk_secret_key_1> ({}:2)".format(shown), out["additionalContext"])
 
         grep = {"mode": "content", "numFiles": 0, "filenames": [], "numLines": 3, "totalLines": 3,
                 "content": "apps/web/.env.local:2:CLERK_SECRET_KEY={}\nconfig/values.yaml:3:  password: {}\nsrc/a.ts:1:ok".format(

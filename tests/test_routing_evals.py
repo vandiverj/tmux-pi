@@ -1,5 +1,6 @@
 """Experimental Claude preference and routing eval logging (fake Laya; no live model or frozen set)."""
 
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import http.server
 import json
@@ -75,9 +76,12 @@ class ClaudePreferenceTests(unittest.TestCase):
         pref = config["claude_preference"]
         self.assertEqual((pref["ordinary"]["model"], pref["ordinary"]["thinking"]), ("claude-sonnet-5-5", "medium"))
         self.assertEqual((pref["heavy"]["model"], pref["heavy"]["thinking"]), ("claude-opus-5-5", "high"))
-        # The shared route table is unchanged: GPT-6 routes stay GPT-6, expert stays Opus/high.
-        self.assertEqual(config["routes"]["coding"]["model"], "openai/gpt-6-sol")
-        self.assertEqual(config["routes"]["complex"]["model"], "openai/gpt-6-sol")
+        # Coding routes use GPT-6.1 Sol; expert stays Opus/high.
+        for route, effort in (("coding", "medium"), ("complex", "high")):
+            with self.subTest(route=route):
+                self.assertEqual(config["routes"][route], {"model": "openai/gpt-6.1-sol", "thinking": effort})
+        self.assertIn("openai/gpt-6.1-sol", [m["model"] for m in config["models"]])
+        self.assertNotIn("openai/gpt-6-sol", (ROOT / "config/router.json").read_text())
         self.assertEqual(config["routes"]["expert"], {"model": "claude-opus-5-5", "thinking": "high"})
 
     def test_ordinary_claude_recommendation_prefers_sonnet(self):
@@ -114,7 +118,7 @@ class ClaudePreferenceTests(unittest.TestCase):
             decision, trace = self.run_dispatch(config, tools=tools, difficulty=3, risk=0.9, sensitive=0.9)
             self.assertEqual(decision["worker"], "pi")
             self.assertIsNone(trace["preference"])
-        self.assertEqual(decision["model"], "openai/gpt-6-sol")
+        self.assertEqual(decision["model"], "openai/gpt-6.1-sol")
 
     def test_preference_changes_only_model_and_effort(self):
         with tempfile.TemporaryDirectory() as other:
@@ -131,9 +135,9 @@ class ClaudePreferenceTests(unittest.TestCase):
         reply = self.h.laya_reply(tools=0.9, difficulty=1, risk=0.1, sensitive=0.1)
         self.assertEqual(route_task(TASK, self.config, opener=opener_for(reply))["model"], "claude-sonnet-5-5")
         config = dict(self.config, local={"rules": [{"pattern": "payroll", "from": ["claude-sonnet-5-5"],
-                                                      "to": {"model": "openai/gpt-6-sol", "thinking": "high"}}]})
+                                                      "to": {"model": "openai/gpt-6.1-sol", "thinking": "high"}}]})
         trace = {}
-        self.assertEqual(route_task(TASK, config, opener=opener_for(reply), trace=trace)["model"], "openai/gpt-6-sol")
+        self.assertEqual(route_task(TASK, config, opener=opener_for(reply), trace=trace)["model"], "openai/gpt-6.1-sol")
         self.assertTrue(trace["rule_applied"])
 
     def test_invalid_preference_is_rejected(self):

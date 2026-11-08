@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "review-remaining-shots-clean",
+  "kind": "review",
+  "title": "review: clean diff (false-positive probe)",
+  "budget_s": 900,
+  "clean": true,
+  "request": "Add a helper that reports the shots remaining and a singular/plural label for it, with tests.",
+  "diff": "diffs/remaining-shots-clean.patch",
+  "answer": {
+    "file": "review-remaining-shots-clean.json",
+    "sha256": "9ab70c78e94c4777423b52d88063024484a03bf1ce0b823387c40641e061f771"
+  }
+}

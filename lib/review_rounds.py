@@ -6,7 +6,10 @@ tp-review records the working tree it reviewed as reviewed-state.json in the rev
 tree object made from a throwaway index, so the repository's index and files are untouched); the diff for the
 next round is the change from that tree to the tree now.
 
-  review_rounds.py scope <workdir> [<lane> [<list-file> [<budget>]]]
+  review_rounds.py scope <workdir> [<lane> [<list-file> [<budget>]]] [--input <scope-input.json>]
+      (--input: the file prepare wrote beside the diffs. The listed paths are exactly the paths of the attached diffs (the main diff
+      and every held section), never recomputed against HEAD or anything else; without it the round-1 computation is made. When
+      HEAD does not resolve (no commit yet) every printed command names the empty tree instead.)
       (<budget>: most characters the text may have; the inline list shrinks to fit. <lane> may be "" for a non-lane task; the full changed-file list is written to <list-file> (atomically, replacing a link there), which the assignment names, when it is longer than the assignment lists (200 paths or 16 KB); it is not attached to the packet)
       prints {"text": the changed-file list and scoped git commands for the reviewer's assignment, "withheld": [paths]};
       always exits 0 (a workdir that is not a git repository, or a list that cannot be made, is said in one line)
@@ -22,10 +25,13 @@ next round is the change from that tree to the tree now.
       line(s); 1 listed as path:line without their text`, or `...: none found`); the first 300 carry text (cut at 400 characters with a mark), the rest
       are path:line only.
 
-  review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir>
-      writes the earlier findings files and the diff into out-dir and prints
-      {"contexts": [paths, in order], "rounds": N, "families": [the Family: names of each attached round, [] for none], "snapshot": {...} | null}
+  review_rounds.py prepare <state-dir> <task-id> <workdir> <out-dir> [<lane>]
+      writes the diff and the earlier findings files into out-dir and prints
+      {"contexts": [paths, in the order a reviewer reads them: the diff first, then the earlier findings oldest first], "rounds": N, "families": [the Family: names of each attached round, [] for none], "snapshot": {...} | null}
       exits 1 and says why when recorded state exists but cannot be used (nothing is guessed)
+      The diff is always of the tree now: from the last reviewed state when a round recorded one, else (round 1, or a round with
+      no usable state) against the review base (diff_now: a lane's last closed step, else the lane base, else HEAD for a task
+      outside a lane); it gets the same sensitive-path and redaction checks either way. <lane> is the author's lane ("" for none).
 
 Nothing written to out-dir carries a credential: a changed path the sensitive-read rule flags (lib/sensitive_read.py,
 the rule bin/tp-sensitive-read applies) is named in the diff with its contents withheld, whether it was added, modified,
@@ -36,6 +42,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -157,7 +164,8 @@ def snapshot(workdir):
         tree = git(top, "write-tree", env=env)
         if tree.returncode:
             raise Refused(f"git write-tree failed: {tree.stderr.strip()}")
-    return {"workdir": str(Path(workdir).resolve()), "top": top, "tree": tree.stdout.strip()}
+    head = git(top, "rev-parse", "--verify", "-q", "HEAD")  # the commit HEAD was at: what "committed since" is measured from in a later round
+    return {"workdir": str(Path(workdir).resolve()), "top": top, "tree": tree.stdout.strip(), "head": head.stdout.strip() if head.returncode == 0 else ""}
 
 
 def sensitive_checker():
@@ -305,8 +313,8 @@ def gate(text, safe_paths, withheld_paths):
 GENERATED = re.compile(r"(^|/)drizzle/meta/[^/]+_snapshot\.json$")
 
 
-def safe_diff(top, old, new):
-    """(text, withheld paths): git diff old..new without the contents of any path the sensitive-read rule flags.
+def safe_diff(top, old, new, only=None):
+    """(text, withheld paths): git diff old..new (just the paths in `only` when it is given) without the contents of any path the sensitive-read rule flags.
 
     Renames are split into a deletion and an addition (--no-renames) so each side is judged by its own path.
     The listing is of leaf entries (blobs, links, submodules) with their blob ids; each safe entry's patch is made from
@@ -339,6 +347,8 @@ def safe_diff(top, old, new):
         if not path or path.startswith("/") or "\0" in path:
             raise Refused(f"a changed path is not a repository-relative path: {path!r}")
         record = match.groups()
+        if only is not None and path not in only:
+            continue
         if check(top, path):
             withheld.append((path, record))
         elif GENERATED.search(path):
@@ -359,7 +369,122 @@ def write(path, text):
     return safe_write.write_atomic(path, text, errors="surrogateescape", root=safe_write.task_root(Path(path).parent))
 
 
-def prepare(state_dir, task_id, workdir, out_dir):
+def diff_now(now, lane, red):
+    """(text, withheld paths, redaction count, plan): the diff of the tree as it is now (`now` is snapshot(): the working tree with
+    staged, unstaged and untracked files) against the review base (review_base: a lane's last closed step, else the lane base,
+    else HEAD), with the same checks the later rounds' diff gets: safe_diff withholds sensitive paths, redact_diff the secrets.
+    The text starts with a line saying which base it is measured from. A base that cannot be worked out is said in the text, not
+    guessed; a diff that cannot be checked raises Refused."""
+    top = now["top"]
+    try:
+        base, basis = review_base(top, lane)
+    except Refused as exc:
+        return f"No diff: the base to measure the change from could not be worked out ({' '.join(str(exc).split())[:200]}). Inspect the working tree directly.\n", [], 0, None
+    label = basis[len("base: "):] if basis else ("HEAD" if base == "HEAD" else "the empty tree (the repository has no commit yet)")
+    head = (f"[Change in the working tree against {label} (git diff, {base[:12]} to the files as they are now; untracked files included). "
+            f"{SECTIONS_NOTE}]\n\n")
+    diff, withheld = safe_diff(top, base, now["tree"])
+    diff, count = redact_diff(red, diff)
+    text = head + (diff if diff.strip() else f"(empty: the working tree is identical to {label})\n")
+    extra, more, found, held = held_sections(top, base, now["tree"], red)
+    return text + extra, withheld + [p for p in more if p not in withheld], count + found, make_plan(top, base, basis, now["tree"], held)
+
+
+STAGED_HEAD = "Staged, not in the working files:"
+COMMITTED_HEAD = "Committed since the base, not in the working files:"
+SECTIONS_NOTE = (f"A change that HEAD or the index holds and the files do not have follows, per path, under '{COMMITTED_HEAD}' "
+                 f"(base to HEAD) and '{STAGED_HEAD}' (HEAD to index).")
+
+
+def changed_paths(top, old, new):
+    """The set of paths whose entry differs between the trees (or HEAD) `old` and `new`."""
+    run = git(top, "diff", "--name-only", "-z", "--no-renames", old, new, "--")
+    if run.returncode:
+        raise Refused(f"cannot list the changes between {old[:12]} and {new[:12]}: {run.stderr.strip()}")
+    return {p for p in run.stdout.split("\0") if p}
+
+
+def head_name(top):
+    """HEAD, or the empty tree when HEAD does not resolve (no commit yet): every command and comparison that names HEAD uses it."""
+    if git(top, "rev-parse", "--verify", "-q", "HEAD").returncode == 0:
+        return "HEAD"
+    return git(top, "hash-object", "-t", "tree", "/dev/null").stdout.strip()  # sha1 or sha256 per the repository's object format
+
+
+def held_plan(top, base, tree):
+    """(note, [(title, old, new, paths)]): the sections held_sections shows, as the paths each one covers. The one computation of
+    which paths a section has: the four states of a path are base, HEAD (the empty tree when there is no commit), the index and
+    the working tree `tree`; for every path where HEAD or the index differs from `tree`, COMMITTED_HEAD is base to HEAD and
+    STAGED_HEAD is HEAD to index, each only if it changes that path. `note` is a line instead when the index cannot be read."""
+    with tempfile.TemporaryDirectory() as tmp:  # a copy, so the author's index file is not rewritten (write-tree stores a cache tree in it)
+        real = git(top, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        copy = Path(tmp) / "index"
+        if real.returncode == 0 and Path(real.stdout.strip()).is_file():
+            shutil.copyfile(real.stdout.strip(), copy)
+        index = git(top, "write-tree", env={**os.environ, "GIT_INDEX_FILE": str(copy)})
+    if index.returncode:  # an unmerged index has no tree
+        return f"\n{STAGED_HEAD} not shown: the index cannot be read as a tree ({' '.join(index.stderr.split())[:150]}).\n", []
+    index = index.stdout.strip()
+    head = head_name(top)
+    only = changed_paths(top, head, tree) | changed_paths(top, index, tree)
+    found = []
+    for title, old, new in ((COMMITTED_HEAD, base, head), (STAGED_HEAD, head, index)):
+        paths = only & changed_paths(top, old, new) if only else set()
+        if paths:
+            found.append((title, old, new, paths))
+    return "", found
+
+
+def held_sections(top, base, tree, red):
+    """(text, withheld paths, redaction count, paths): a path has four states, base, HEAD, index and the working tree `tree` (see
+    snapshot); the main diff is base to `tree`. For every path where HEAD or the index differs from `tree`, a section for each
+    comparison that is not empty: COMMITTED_HEAD (base to HEAD) and STAGED_HEAD (HEAD to index), with the same withholding and
+    redaction as the main diff. Without them a change the files no longer have (committed then undone, staged and then
+    restored, removed, or edited again) would be missing from the packet. One rule for round 1 and later rounds (`base` is
+    then the previous round's tree). "" when there is none. `paths` is every path in a section (held_plan).
+    Whether a section appears depends only on those four states: no other condition (not where HEAD was at the previous
+    round, not any field of a reviewed-state record) applies."""
+    note, sections = held_plan(top, base, tree)
+    if note:
+        return note, [], 0, []
+    text, withheld, total, paths = "", [], 0, set()
+    for title, old, new, only in sections:
+        diff, more = safe_diff(top, old, new, only)
+        diff, count = redact_diff(red, diff)
+        withheld += [p for p in more if p not in withheld]
+        total += count
+        paths |= only
+        text += f"\n{title}\n{diff}" if diff.strip() else ""
+    return text, withheld, total, sorted(paths)
+
+
+def make_plan(top, base, basis, tree, held, previous=0):
+    """The scope's input, from the same computation that built the attached diffs: `paths` is exactly the union of the paths of
+    the main diff (`base` to `tree`) and of every held section (`held`, from held_sections or held_plan). `base` is what the main
+    diff compares against (in a later round, `previous` > 0 is that round, the tree it reviewed); `basis` says which review base
+    a lane's round 1 used; `head` is what scoped commands name as HEAD (the empty tree when there is no commit);
+    `untracked` the paths no commit or index holds."""
+    paths = sorted(changed_paths(top, base, tree) | set(held))
+    others = git(top, "ls-files", "--others", "--exclude-standard", "-z")
+    if others.returncode:
+        raise Refused(f"git could not list the untracked files: {others.stderr.strip()}")
+    new = {p for p in others.stdout.split("\0") if p}
+    return {"top": top, "base": base, "basis": basis, "previous": previous, "head": head_name(top),
+            "has_head": git(top, "rev-parse", "--verify", "-q", "HEAD").returncode == 0,
+            "paths": paths, "untracked": [p for p in paths if p in new]}
+
+
+def plan_for(now, lane):
+    """The plan for the change against the review base without making any diff text (what a round-1 prepare gives); raises Refused."""
+    base, basis = review_base(now["top"], lane)
+    note, sections = held_plan(now["top"], base, now["tree"])
+    return make_plan(now["top"], base, basis, now["tree"], set().union(*[s[3] for s in sections]) if sections else set())
+
+
+def prepare(state_dir, task_id, workdir, out_dir, lane=""):
+    """Writes the diff then the earlier findings into out_dir; `contexts` lists them in the order a reviewer reads them: the diff
+    of the tree against the review base first (diff_now; from the last reviewed state instead when an earlier round recorded one),
+    then the earlier findings, oldest first. `lane` is the author's lane name ("" for none) and picks the base of diff_now."""
     out = Path(out_dir)
     rows = chain_labels(state_dir, task_id)
     now = snapshot(workdir)
@@ -391,40 +516,54 @@ def prepare(state_dir, task_id, workdir, out_dir):
             last_state, last_round = value, number
         else:
             last_state, last_round = None, number
+    diff_file, plan = None, None
     if earlier:
         label = f"diff-since-round-{last_round}.md"
-        if last_state is None:
+        head = (f"[Change in the working tree since the state review round {last_round} reviewed (git diff, round {last_round} tree to the files as they are now). "
+                f"{SECTIONS_NOTE}]\n\n")
+        if now is None and last_state is None:
             body = (f"No diff: review round {last_round} recorded no reviewed state (it ran before states were recorded, "
                     "or its working directory was not a git repository). Inspect the working tree directly.\n")
         elif now is None:
             raise Refused(f"round {last_round} recorded a reviewed state but {workdir} is not in a git repository now")
-        elif last_state["workdir"] != now["workdir"]:
-            body = (f"No diff: round {last_round} reviewed {last_state['workdir']} and this review is of {now['workdir']}. "
-                    "Inspect the working tree directly.\n")
+        elif last_state is None or last_state["workdir"] != now["workdir"]:
+            # no state to start from: the diff of the tree against the review base instead (diff_now), after the reason
+            why = (f"review round {last_round} recorded no reviewed state (it ran before states were recorded, or its working directory "
+                   "was not a git repository)" if last_state is None else
+                   f"round {last_round} reviewed {last_state['workdir']} and this review is of {now['workdir']}")
+            body, withheld, count, plan = diff_now(now, lane, red)
+            redactions += count
+            head = f"[No diff since the last round: {why}. The change against the review base follows instead.]\n\n"
         else:
             diff, withheld = safe_diff(now["top"], last_state["tree"], now["tree"])
             diff, count = redact_diff(red, diff)
-            redactions += count
+            extra, more, found, held = held_sections(now["top"], last_state["tree"], now["tree"], red)
+            plan = make_plan(now["top"], last_state["tree"], "", now["tree"], held, last_round)
+            diff += extra
+            withheld = withheld + [p for p in more if p not in withheld]
+            redactions += count + found
             body = diff if diff.strip() else "(empty: the working tree is identical to the one round " \
                 f"{last_round} reviewed)\n"
-        head = f"[Change in the working tree since the state review round {last_round} reviewed (git diff, round {last_round} tree to now).]\n\n"
-        contexts.append(write(out / label, head + body))
-    return {"contexts": contexts, "rounds": len(earlier), "families": [names for _, _, names, _ in earlier], "snapshot": now, "skipped": [review for _, review, _, _ in skipped],
-            "withheld": withheld, "redactions": redactions}
+        diff_file = write(out / label, head + body)
+    elif now is not None:  # round 1: no earlier state, so the tree against the review base
+        body, withheld, count, plan = diff_now(now, lane, red)
+        redactions += count
+        diff_file = write(out / "diff-now.md", body)
+    # the scope's input, written beside the diffs it was computed with (scope and timers read it with --input)
+    scope_input = write(out / "scope-input.json", json.dumps(plan)) if plan else None
+    return {"contexts": ([diff_file] if diff_file else []) + contexts, "rounds": len(earlier), "families": [names for _, _, names, _ in earlier], "snapshot": now, "scope_input": scope_input,
+            "skipped": [review for _, review, _, _ in skipped], "withheld": withheld, "redactions": redactions}
 
 
 MAX_SCOPE_PATHS = 200  # changed paths named in the assignment (safe and withheld together); the rest go to the list file
 MAX_SCOPE_BYTES = 16384  # and at most this many bytes of them, so long names cannot crowd out the packet's author evidence
 
 
-def scope_lines(workdir, lane=""):
-    """(base, top, safe paths [(path, untracked)], withheld paths, basis) for the author's change, or None outside git; raises
-    Refused. basis says which base a lane review diffs from and why ("" for a task outside a lane): the last closed step's
-    commit when the lane has closed steps and that commit is an ancestor of HEAD, else the lane base."""
-    top = git(workdir, "rev-parse", "--show-toplevel")
-    if top.returncode:
-        return None
-    top = top.stdout.strip()
+def review_base(top, lane=""):
+    """(base, basis) the change under review is measured from, in the repository at `top`; raises Refused. For a lane task: the
+    lane's last closed step when that commit is an ancestor of HEAD, else the lane base (basis says which and why); for a task
+    outside a lane: HEAD (the empty tree when there is no commit yet), basis "". The one rule scope_lines (the changed-file list
+    and scoped commands), the timer waits and diff_now (the round-1 diff) share, so the three always name the same base."""
     basis = ""
     if git(top, "rev-parse", "--verify", "-q", "HEAD").returncode:
         base = git(top, "hash-object", "-t", "tree", "/dev/null").stdout.strip()  # no commit yet: everything is new
@@ -447,15 +586,34 @@ def scope_lines(workdir, lane=""):
             basis += f" (closed step {closed} at {last[:12]} is not an ancestor of HEAD)"
     else:
         base = "HEAD"
-    # The working tree and the index each against the base: a staged change that the working tree undoes (MM) is in the
-    # second only, and any path where the two differ from each other is in one of them.
-    working = git(top, "diff", "--name-only", "-z", "--no-renames", base, "--")
-    staged = git(top, "diff", "--cached", "--name-only", "-z", "--no-renames", base, "--")
-    untracked = git(top, "ls-files", "--others", "--exclude-standard", "-z")
-    if working.returncode or staged.returncode or untracked.returncode:
-        raise Refused(f"git could not list the changed files: {(working.stderr or staged.stderr or untracked.stderr).strip()}")
-    new = {p for p in untracked.stdout.split("\0") if p}
-    paths = sorted({p for run in (working, staged) for p in run.stdout.split("\0") if p} | new)
+    return base, basis
+
+
+def load_plan(source):
+    """A plan (make_plan) from a dict or the path of the JSON file prepare wrote; raises Refused when it cannot be used."""
+    if isinstance(source, (str, os.PathLike)):
+        source = read_json(Path(source))
+    keys = {"top": str, "base": str, "basis": str, "previous": int, "head": str, "has_head": bool, "paths": list, "untracked": list}
+    if not isinstance(source, dict) or any(not isinstance(source.get(k), t) for k, t in keys.items()):
+        raise Refused("the scope input written with the diffs is unreadable")
+    return source
+
+
+def scope_lines(workdir, lane="", plan=None):
+    """(base, top, safe paths [(path, untracked)], withheld paths, basis, plan) for the author's change, or None outside git;
+    raises Refused. The paths are the plan's: the paths of the attached diffs (see make_plan), never recomputed here; without a
+    `plan` the round-1 plan is made (plan_for). basis says which base a lane review diffs from and why ("" for a task outside a
+    lane and in a later round): see review_base."""
+    if plan is None:
+        top = git(workdir, "rev-parse", "--show-toplevel")
+        if top.returncode:
+            return None
+        plan = plan_for(snapshot(workdir), lane)
+    else:
+        plan = load_plan(plan)
+    base, top, basis = plan["base"], plan["top"], plan["basis"]
+    new = set(plan["untracked"])
+    paths = list(plan["paths"])
     check = sensitive_checker()
     flagged = {path for path in paths if check(top, path)}
     # git matches even a literal pathspec as a directory prefix, so a path above a withheld one (a file that became a
@@ -463,7 +621,7 @@ def scope_lines(workdir, lane=""):
     withheld = [path for path in paths if path in flagged or any(f.startswith(path + "/") for f in flagged)]
     held = set(withheld)
     safe = [(path, path in new) for path in paths if path not in held]
-    return base, top, safe, withheld, basis
+    return base, top, safe, withheld, basis, plan
 
 
 def literal(text):
@@ -487,7 +645,7 @@ def write_list_file(path, text):
     safe_write.write_atomic(path, text, mode=0o644, root=safe_write.task_root(Path(path).parent))
 
 
-def scope_text(workdir, lane="", list_file=None, budget=None):
+def scope_text(workdir, lane="", list_file=None, budget=None, plan=None):
     """(assignment text, withheld paths): the changed files and the scoped git commands a reviewer may use. Never raises:
     when the list cannot be made it says so in one line and the review goes on as it did before. At most MAX_SCOPE_PATHS paths
     and MAX_SCOPE_BYTES bytes of path lines (safe and withheld together) are named in the assignment; when more changed and
@@ -495,7 +653,7 @@ def scope_text(workdir, lane="", list_file=None, budget=None):
     is given the text never exceeds it: the inline list shrinks to fit, down to the pointer line alone, and when even that does not
     fit (or the list file cannot be written) the one-line unavailable text is returned."""
     try:
-        found = scope_lines(workdir, lane)
+        found = scope_lines(workdir, lane, plan)
     except Refused as exc:
         return f"Diff scope: the changed-file list could not be computed ({' '.join(str(exc).split())[:200]}); inspect the files you need directly.", []
     if found is None:
@@ -517,13 +675,22 @@ def scope_text(workdir, lane="", list_file=None, budget=None):
 
 def render_scope(found, lane, list_file, max_bytes):
     """(text, bytes of path lines used, False when the text is the unavailable line) for found = scope_lines(...) with at most max_bytes of path lines inline."""
-    base, top, safe, withheld, basis = found
+    base, top, safe, withheld, basis, plan = found
+    head, previous = plan["head"], plan["previous"]
     since = "since its last closed step" if basis.startswith("base: last closed step") else "since its base"
     kinds = f"committed on the lane {since}, staged, unstaged and untracked" if lane else "staged, unstaged and untracked"
-    out = [f"Diff scope: {len(safe)} file(s) changed relative to {base[:12] if lane else 'HEAD'} ({kinds}) in the repository at {literal(top)}:"]
+    if previous:  # a later round: the main diff is against the tree that round reviewed
+        relative, kinds = f"the tree review round {previous} reviewed ({base[:12]})", "committed, staged, unstaged and untracked"
+    else:
+        relative = base[:12] if lane else "HEAD"  # with no commit yet HEAD is the empty tree (the commands below name it)
+    out = [f"Diff scope: {len(safe)} file(s) changed relative to {relative} ({kinds}) in the repository at {literal(top)}:"]
     if basis:  # a lane task: which base the list and the commands below use, and what that leaves out of scope
         closed = " Closed steps are out of scope except where the new lines change or call them." if "closed step" in basis else ""
         out.insert(0, f"{basis}.{closed}")
+    out.append(f"What the attached diff covers: the main diff compares the working tree (the files as they are now, untracked included) against "
+               f"{base[:12] if lane or basis or previous else relative}; a later round compares it against the tree the previous round reviewed. For a path where HEAD "
+               f"or the index differs from the files, up to two sections follow: '{COMMITTED_HEAD}' is the base against HEAD, and '{STAGED_HEAD}' is HEAD "
+               "against the index (only the staged change, not the base against the index).")
     count, size = 0, 0
 
     def room(line):
@@ -564,10 +731,13 @@ def render_scope(found, lane, list_file, max_bytes):
         out.append(f"Withheld (sensitive paths; never diff, show or read them): {', '.join(literal(p) for p in shown_withheld) or '(see the list file)'}"
                    + (f" and {more_withheld} more" if shown_withheld and more_withheld else ""))
     git = f"GIT_LITERAL_PATHSPECS=1 git -C {literal(top)}"
+    # `head` names HEAD, or the empty tree when the repository has no commit yet, so every printed command runs
+    committed = f"`{git} diff {base} {head} -- <path> [<path> ...]` (base against {'HEAD' if plan['has_head'] else 'the empty tree'}), " if base != head else ""
     out.append(f"Scoped commands (keep the GIT_LITERAL_PATHSPECS=1 prefix: it makes each path a literal file name, never a glob or pathspec magic): "
-               f"`{git} diff {base} -- <path> [<path> ...]` (working tree), `{git} diff --cached {base} -- <path> [<path> ...]` (staged), "
-               f"`{git} diff --stat {base} -- <path> ...`. Run both the working-tree and the staged command for a path: a staged change "
-               "the working tree undoes shows only in the staged one. "
+               f"`{git} diff {base} -- <path> [<path> ...]` (working tree against the base), {committed}"
+               f"`{git} diff --cached {head} -- <path> [<path> ...]` (staged: the index against {'HEAD' if plan['has_head'] else 'the empty tree'}), "
+               f"`{git} diff --stat {base} -- <path> ...`. Run {'the working-tree, the base-against-HEAD and the staged commands' if committed else 'both the working-tree and the staged command'} for a path: a change "
+               "the working tree undoes shows only in the others. "
                "Every `git diff`, `git show` and `git log -p` you run must keep that prefix and must name explicit file paths from the list above; never run them "
                "unscoped, with a bare directory, or on a path that is withheld. Write each path literally in the command; never put paths in a "
                "shell variable or array (`$p`, `\"${p[@]}\"`): the sensitive-read guard cannot see them and stops for permission. Split a long list "
@@ -619,7 +789,7 @@ def timer_waits(workdir, lane=""):
         found = scope_lines(workdir, lane)
         if found is None:
             return head + "Not computed: the working directory is not a git repository.\n"
-        base, top, safe, _, _ = found
+        base, top, safe = found[:3]
         rows, seen = [], set()
         for path, untracked in safe:
             if not TEST_PATH.search(path):
@@ -654,11 +824,14 @@ def main(argv):
             print(f"review_rounds: cannot write {argv[4]}: {exc}", file=sys.stderr)
             sys.exit(1)
         return
+    plan = None
+    if len(argv) > 3 and argv[-2] == "--input" and argv[1] == "scope":  # scope ... --input <scope-input.json written by prepare>
+        plan, argv = argv[-1], argv[:-2]
     if len(argv) in (3, 4, 5, 6) and argv[1] == "scope":
-        text, withheld = scope_text(*argv[2:5], budget=int(argv[5]) if len(argv) == 6 else None)
+        text, withheld = scope_text(*argv[2:5], budget=int(argv[5]) if len(argv) == 6 else None, plan=plan)
         print(json.dumps({"text": text, "withheld": withheld}))
         return
-    if len(argv) != 6 or argv[1] != "prepare":
+    if len(argv) not in (6, 7) or argv[1] != "prepare":
         sys.exit(__doc__)
     try:
         print(json.dumps(prepare(*argv[2:])))

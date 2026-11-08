@@ -199,21 +199,21 @@ def _local_rule(rec, req, config, ctx, health):
     except router.RouterError as exc:
         rec["steps"].append("local rule ignored: {}".format(str(exc)[:160]))
         return
-    if target["model"] == rec["model"]:
+    if (target["model"], target["thinking"]) == (rec["model"], rec["effort"]):
         return
     if req.get("worker") and target["worker"] != req["worker"]:
         rec["steps"].append("local rule redirect of {} to {} dropped: it runs on {}, and --worker {} was required".format(
             rec["model"], target["model"], target["worker"], req["worker"]))
         return
-    here = rc.level_of(cat, rec["model"])[0]
+    here = rc.level_of(cat, rec["model"], rec["effort"])[0]
     entering = rec.get("source") in ("explicit_level", "escalation") or bool(here and here.get("restricted"))
     problems, effort = rr.redirect_problems(cat, target, ctx, health, entering, rec.get("route_bound"))
     if problems:
         rec["steps"].append("local rule redirect of {} to {} dropped: {}".format(rec["model"], target["model"], "; ".join(problems)))
         return
     rec["steps"].append("local rule redirected {} to {}".format(rec["model"], target["model"]))
-    level = rc.level_of(cat, target["model"])[0]
-    rec.update(worker=target["worker"], model=target["model"], effort=effort, provider=rc.provider_of(cat, target["worker"], target["model"]),
+    level = rc.level_of(cat, target["model"], effort)[0]
+    rec.update(worker=target["worker"], model=target["model"], effort=effort, provider=rc.provider_of(cat, target["worker"], target["model"], effort),
                level_key=level["key"])
     rec["review"] = rr.review_max(rec.get("review") or "none", rr.review_policy(cat, ctx.get("role"), level["key"], effort, ctx.get("files_touched")))
     rec["source"] = "router_resolved" if rec["source"] == "router" else rec["source"]
@@ -336,7 +336,7 @@ def level_effort_of_task(meta, cat):
     route = meta.get("route_info") or {}
     level = route.get("level") if route.get("level") in rc.level_keys(cat) else None
     if not level:
-        found = rc.level_of(cat, meta.get("model"))[0]
+        found = rc.level_of(cat, meta.get("model"), meta.get("thinking") or route.get("effort_abstract"))[0]
         level = found["key"] if found else cat["default_level"]
     effort = route.get("effort_abstract") or meta.get("thinking") or cat["effort"]["default"]
     if effort not in cat["effort"]["order"]:
@@ -421,7 +421,7 @@ def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort
     if force:
         plan["review"] = "forced"
     # A worker started without a model (the harness default) is placed by its harness: every provider that uses it is excluded.
-    author_provider = rc.provider_of(cat, worker, model) if model else tuple(
+    author_provider = rc.provider_of(cat, worker, model, meta.get("thinking")) if model else tuple(
         name for name, spec in cat["providers"].items() if spec["worker"] == worker)
     effort = thinking or (cat["effort"]["ceiling"] if author_effort == cat["effort"]["ceiling"] else cat["reviewer"]["default_effort"])
     ctx = {"explicit_effort": effort, "approvals": {"effort_above_high": bool(approve_effort)},

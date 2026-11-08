@@ -9,6 +9,7 @@ changed:
   F4  conditions 4 and 5: a row counts only when it carries this attempt's id; a row an earlier attempt with the run id left never does.
 
 Fixtures: trial_shadow_case.py and test_trial_shadow_outcomes.py."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import sys
 from pathlib import Path
 

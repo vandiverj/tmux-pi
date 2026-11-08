@@ -1,0 +1,13 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "review-history-limit",
+  "kind": "review",
+  "title": "review: ShotHistory limit prop",
+  "budget_s": 900,
+  "request": "Make the number of shots ShotHistory lists a required `limit` prop (both panels show the last 5 shots) instead of the hard-coded 5.",
+  "diff": "diffs/history-limit.patch",
+  "answer": {
+    "file": "review-history-limit.json",
+    "sha256": "8aeaa3f66ecb9bb291cfa558ac9aeec5c93ddf60cb62933c0930cc038b6f8ce4"
+  }
+}

@@ -1,4 +1,5 @@
 """Durable work store (Phase A): ids, frontmatter, atomic writes, lock, archive, permissions, isolation, trust guard."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
 from pathlib import Path
 import stat

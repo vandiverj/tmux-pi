@@ -1,0 +1,12 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "local-count-exports",
+  "kind": "local",
+  "title": "count_enumerate: the exports of placement.ts",
+  "budget_s": 600,
+  "question": "Read-only question; change no files. Count the exported declarations in src/game/placement.ts (lines that start with 'export') and list their names in file order. Write the final line of your reply as: ANSWER: <count>:<name>,<name>,... with no spaces anywhere in that line after 'ANSWER: '.",
+  "answer": {
+    "file": "local-count-exports.json",
+    "sha256": "00c1ab1dd6186e5642ae9691d8f3606fd4fce20f97ea06762b1795b1c1aecd83"
+  }
+}

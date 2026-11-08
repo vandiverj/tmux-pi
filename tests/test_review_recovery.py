@@ -1,4 +1,5 @@
 """Durable review recovery and follow-up regressions (fake tmux, no MCP)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import hashlib
 import json
 import os
@@ -11,6 +12,8 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 from task_record import approved_delegated_review, unresolved_review  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 
 class ReviewRecoveryTests(unittest.TestCase):
@@ -21,7 +24,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         (self.state / "tasks").mkdir()
         (self.state / "archive").mkdir()
         self.cmd = [str(ROOT / "bin/tp-task"), "--state-dir", str(self.state)]
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state)}
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state)}
         self.env.pop("TP_TASK_DIR", None)
 
     def cli(self, *args, env=None):

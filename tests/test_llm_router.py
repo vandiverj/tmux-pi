@@ -1,6 +1,7 @@
 """The router call chain (lib/llm_router.py via lib/model_router.select) with stub `claude` and `pi` on PATH.
 No live model is called. Covers the chain order, failover, the invalid-reply retry, the Qwen cap, local-only work,
 the all-fail fallback and what each router is (and is not) given."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 import json
 import os
@@ -12,11 +13,14 @@ from unittest import mock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_fixture as fx
-from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SOL, SONNET, reply
+from route_fixture import ASTRA, HAIKU, LUNA, OPUS, QWEN, SONNET, reply
+
+SOL = "openai/gpt-6.1-sol"  # These tests resolve against the committed catalog.
 
 import model_router  # noqa: E402
 import llm_router  # noqa: E402
 import router_catalog as rc  # noqa: E402
+from session_env import outside_session  # noqa: E402
 
 CAT = fx.catalog()
 TASK = ("Add pagination to the /orders endpoint with tests, following the existing list endpoints. "
@@ -255,7 +259,7 @@ class DirectChatTests(ChainTestCase):
         local = self.base / "local.json"
         local.write_text(json.dumps({"followup": {"base_url": self.stubs.chat.url, "model": "configured/model", "ask_between": [0.25, 0.9],
                                                   "extra_body": {"reasoning_effort": "high", "top_p": 0.3}}}))
-        env = dict(os.environ, TP_LOCAL_CONFIG=str(local))
+        env = dict(outside_session(), TP_LOCAL_CONFIG=str(local))
         env.pop("TP_ROUTER_LLM_URL")
         with mock.patch.dict(os.environ, env, clear=True):
             r = self.ask_local()
@@ -513,14 +517,14 @@ class ExplicitChoiceTests(ChainTestCase):
                 with self.assertRaises(model_router.RouteStop):
                     self.select(role=role, local_only=True)  # and --local-only stops rather than run a local model
     def test_explicit_effort_above_high_needs_approval(self):
-        r = self.select(model=SOL, thinking="xhigh")
+        r = self.select(model=ASTRA, thinking="xhigh")
         self.assertEqual((r["thinking"], r["approvals"]), ("high", {"effort_above_high": False}))
         self.assertTrue(any("capped at high" in s for s in r["steps"]))
-        r = self.select(model=SOL, thinking="xhigh", approve_effort=True)
+        r = self.select(model=ASTRA, thinking="xhigh", approve_effort=True)
         self.assertEqual((r["thinking"], r["approvals"]), ("xhigh", {"effort_above_high": True}))
         self.script(claude=text((3, "high")))
         r = self.select(thinking="max", worker="pi", approve_effort=True)
-        self.assertEqual((r["model"], r["thinking"]), (SOL, "max"))
+        self.assertEqual((r["model"], r["thinking"]), (SOL, "medium"))
 
     def test_bad_explicit_requests(self):
         for req in ({"model": SONNET, "worker": "pi"}, {"model": "gpt-x", "worker": "pi"}, {"level": "strong"}, {"level": "nope"},

@@ -1,0 +1,16 @@
+# Standing rules
+
+Every Bash call is one plain command: no heredocs, no `$(...)`, no shell arrays or loops.
+Commit with the exact line from the brief.
+
+Run the tests that cover your change and no others.
+
+## Tools
+
+Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).
+Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.
+tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON
+tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.
+- lane-info: orient in a lane: $TP_ROOT/tools/agent/lane-info.sh WORKTREE [BASE_REF] [--fetch] -> branch, base, diff, dirty files; last line exit=N log=PATH
+- pre-commit-gate: prettier, eslint, typecheck, gitleaks: $TP_ROOT/tools/agent/pre-commit-gate.sh WORKTREE [BASE_REF] -> one 'name exit' line per check; last line exit=N log=PATH
+- web-jest: run web jest tests: $TP_ROOT/tools/agent/web-jest.sh WORKTREE [--repeat N] TEST_PATH... -> per-file counts; last line exit=N log=PATH

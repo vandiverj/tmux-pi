@@ -25,6 +25,8 @@ Neither main harness auto-loads a project's `AGENTS.md` or `CLAUDE.md`. Give wor
 
 Local model services are loaded only when a worker is routed to them. Failure to start an optional local model does not prevent the workspace from opening.
 
+The LM Studio models are loaded at a bounded size and lifetime, set under `local_model` in `config/local-model.json`: `context` (optional; default the model's `contextWindow` in `agent/models.json`), `ttl_seconds` (default 1800: LM Studio unloads a model after that much idle time), `reload_if_larger` (default true: `tp-lmstudio ensure` unloads and reloads a model loaded more than 10% above its context, unless a local worker of this session is live; otherwise it prints the command that does it), and `unload_on_exit` (default false: `tp-exit` unloads the models when no other tmux-pi session has a live local worker). `tp-lmstudio status` shows each loaded model's context, its actual TTL as `lms ps` reports it (`ttl none` when it was loaded without one, which `ensure` does not change on a model already loaded at the right size) and the LM Studio engine's RSS.
+
 ## Dispatch and inspect
 
 The main agent uses `tp-agent`, a shared command used by both harnesses. In Pi, `dispatch_role`, `task_index`, and `task_collect` are native bindings to it.
@@ -35,7 +37,7 @@ tp-agent dispatch --role researcher --task "Find the cache invalidation rule" --
 tp-agent list
 tp-agent inspect <id>
 tp-agent collect <id>
-tp-agent retry <id> --reason "The first attempt misread the task" --worker pi --model openai/gpt-6-sol
+tp-agent retry <id> --reason "The first attempt misread the task" --worker pi --model openai/gpt-6.1-sol
 tp-agent retry <id> --reason "Two attempts failed" --escalate
 tp-agent review <id>
 tp-agent message <id> --text "Please check the empty input case"

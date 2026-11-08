@@ -1,13 +1,17 @@
 """Session resolution without TMUX: TP_STATE_DIR selects the session, never a decoy legacy 'tmux-pi'."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
+from session_env import outside_session  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 REAL = "tmux-pi-0123456789ab-cdef01234567"
 
 # Two sessions: the real workspace and a legacy 'tmux-pi' with its own state dir, main pane and cwd.
@@ -56,7 +60,7 @@ class SessionResolutionTests(unittest.TestCase):
         (fake / "tmux").write_text(TMUX)
         (fake / "tmux").chmod(0o755)
         self.log = self.base / "tmux.log"
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_WORKDIR": str(self.project),
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state), "TP_WORKDIR": str(self.project),
                     "TP_MAIN_HARNESS": "claude", "FAKE_LOG": str(self.log), "FAKE_REAL": REAL,
                     "FAKE_REAL_STATE": str(self.state), "FAKE_DECOY_STATE": str(self.decoy_state),
                     "FAKE_REAL_CWD": str(self.project), "FAKE_DECOY_CWD": str(self.decoy_project),

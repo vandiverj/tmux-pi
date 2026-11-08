@@ -1,0 +1,7 @@
+{
+  "local_model": {
+    "ttl_seconds": 1800,
+    "reload_if_larger": true,
+    "unload_on_exit": false
+  }
+}

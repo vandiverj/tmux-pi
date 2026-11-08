@@ -3,6 +3,7 @@ fix rounds 1 to 3, family false-completed-trial): the worker was ended, the work
 verdict, exactly one Qwen row of the run is in records.jsonl, the normal arm's row is there or its absence is one the rule allows and names,
 and the cleanup ended the session and removed the worktree. Otherwise the outcome names the first condition that does not hold, the Qwen row
 says the same, and `tp-trial run` exits non-zero. Fixtures: trial_shadow_case.py."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import importlib.machinery
 import importlib.util
 import subprocess

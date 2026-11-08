@@ -1,4 +1,5 @@
 """lib/preamble.py with lib/agent_tools.py: the Tools block rendered from <workdir>/.tmux-pi/agent-tools.json."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import shutil
@@ -16,6 +17,13 @@ import preamble  # noqa: E402
 
 TOOL = {"name": "demo", "path": "$TP_ROOT/tools/agent/lane-info.sh", "roles": ["coder"], "use": "orient",
         "usage": "WORKTREE", "output": "a summary"}
+EXAMPLE = ROOT / "templates" / "agent-tools.example.json"
+STANDING_LINES = (
+    "Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).",
+    "Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.",
+    "tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON",
+    "tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.",
+)
 
 
 class Base(unittest.TestCase):
@@ -48,6 +56,14 @@ class GoldenTests(Base):
             with self.subTest(role=role or "none"):
                 expected = (FIXTURES / f"golden-{role or 'none'}.txt").read_bytes()
                 self.assertEqual(preamble.load(self.work, role).encode(), expected)
+
+    def test_coder_block_with_the_fixture_manifest_is_byte_identical(self):
+        # golden-coder-with-tools.txt holds the full Tools block (the four standing lines and the entries);
+        # $TP_ROOT stands for this checkout's path so the fixture does not depend on where the repo lives.
+        self.preamble_file()
+        self.manifest(json.loads((FIXTURES / "manifest.json").read_text()))
+        text = preamble.load(self.work, "coder").replace(str(ROOT), "$TP_ROOT")
+        self.assertEqual(text.encode(), (FIXTURES / "golden-coder-with-tools.txt").read_bytes())
 
     def test_no_manifest_cli_is_byte_identical(self):
         self.preamble_file()
@@ -97,13 +113,44 @@ class RenderTests(Base):
         reviewer = preamble.load(self.work, "code-reviewer")
         self.assertNotIn("- lane-info", reviewer)
 
-    def test_every_role_gets_the_two_standing_lines(self):
+    def test_every_role_gets_the_four_standing_lines_byte_for_byte(self):
         self.manifest([TOOL])
         for role in ("coder", "researcher", "code-reviewer", ""):
             with self.subTest(role=role):
                 text = preamble.load(self.work, role)
-                self.assertIn("Read a file once and keep notes; re-read only after you edit it.", text)
-                self.assertIn("tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON", text)
+                self.assertTrue(text.startswith("## Tools\n\n" + "\n".join(STANDING_LINES)))
+                self.assertNotIn("Read a file once", text)
+
+    def test_the_example_manifest_loads_for_every_role_and_names_the_four_tools(self):
+        self.manifest(json.loads(EXAMPLE.read_text()))
+        roles = sorted(p.stem for p in (ROOT / "agent" / "roles").glob("*.md"))
+        self.assertTrue(roles)
+        for role in roles:
+            with self.subTest(role=role):
+                text = preamble.load(self.work, role)
+                self.assertLess(len(text.encode()), preamble.MAX_BYTES)
+                print(f"example block bytes {role}: {len(text.encode())}", file=sys.stderr)
+        coder = preamble.load(self.work, "coder")
+        for name in ("lane-info", "pre-commit-gate", "web-jest", "test-run"):
+            self.assertIn(f"- {name}: ", coder)
+        self.assertIn(f"{ROOT}/tools/agent/test-run.sh WORKTREE [--timeout S] -- CMD...", coder)
+
+    def test_every_entry_of_the_example_manifest_is_within_the_size_limit(self):
+        for entry in json.loads(EXAMPLE.read_text())["tools"]:
+            size = sum(len(entry[k].encode()) for k in ("name", "use", "usage", "output"))
+            self.assertLessEqual(size, agent_tools.ENTRY_MAX, entry["name"])
+
+    def test_the_listed_test_run_script_is_the_real_one_and_no_role_names_tp_agent_test_run(self):
+        script = ROOT / "tools" / "agent" / "test-run.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        out = subprocess.run([str(script), str(self.work), "--", "true"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)  # not a git worktree: refused with the exit line last, not "not implemented"
+        self.assertNotIn("not implemented", out.stdout)
+        self.assertEqual(out.stdout.splitlines()[-1], "exit=2 log=-")
+        for role in (ROOT / "agent" / "roles").glob("*.md"):
+            self.assertNotIn("tp-agent test-run", role.read_text(), role.name)
+        for role in ("coder", "tester"):
+            self.assertIn("tools/agent/test-run.sh", (ROOT / "agent" / "roles" / f"{role}.md").read_text())
 
     def test_manifest_without_a_preamble_file_still_renders(self):
         self.manifest([TOOL])

@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-parse-coordinate",
+  "kind": "code",
+  "title": "pure function: parse a board label back into a cell",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "Add and export `parseBoardCoordinate(label: string): Coordinate | null` to src/game/placement.ts. It is the inverse of the existing `formatBoardCoordinate`: 'A1' is { row: 0, col: 0 } and 'C4' is { row: 3, col: 2 }. Accept upper and lower case letters. Return null for anything that is not one letter for a column of the board followed by one digit for a row of the board (for example '', 'A', 'A0', 'A9', 'I1', '11', 'A10'). Keep the change small and run the project's tests when you are done.",
+  "test_path": "src/game/bench-code-parse-coordinate.test.ts",
+  "answer": {
+    "file": "code-parse-coordinate.test.ts",
+    "sha256": "8fdd3cb2a9b0c92b1240767508bd1888ec0c99bc57d86191f25f1345cfe19993"
+  }
+}

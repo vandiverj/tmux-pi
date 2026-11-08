@@ -2,6 +2,7 @@
 temp directory per test class; the real `typescript` is linked in from the machine's airtera-monorepo checkout (or $TP_CTX_TEST_TYPESCRIPT).
 Tests that need typescript skip with that reason when it is missing; the protocol, restart and guard tests need only node. Nothing here
 touches the network, a model, or the real monorepo (the link is read-only)."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

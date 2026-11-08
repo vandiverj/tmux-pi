@@ -116,7 +116,15 @@ its checkpoint state and when its artifact was last written. Settled work also s
 ### Context packets
 
 A worker's first message is its `packet.md`: the task, then each file passed with
-`-c path` or `-c path:start-end` (in a code fence, labelled with its path and range),
+`-c path`, `-c path:start-end` or `-c path#Heading text` (in a code fence, labelled with its path and range;
+a heading spec takes the markdown section from that heading, case-insensitive, nested headings included, to the line
+before the next heading of the same or higher level, and the label names the resolved range, for example
+`docs/x.md (section "Rules", lines 12-30)`; a missing, empty or repeated heading is refused; a spec's form is decided in
+this order: (1) a heading spec if it has a `#` whose left side is an existing file (the first such `#`; everything after it is
+the heading, even `:2-3`, and its leading `#`s and surrounding whitespace are dropped, any other character, including a
+trailing `#`, is kept); (2) otherwise a line range if it ends in `:a-b` and the left side is an existing file (so `a#b.md:2-3`
+is a range); (3) otherwise a plain path; headings are `#` (ATX) headings read by the CommonMark rules, so
+headings inside code fences are skipped, `## C#` is the heading `C#`, and underlined (setext) headings are not recognised),
 then the `-N` notes. Workers load no `AGENTS.md` or `CLAUDE.md` and never see
 main's conversation, so the packet is all the project context they start with;
 they can still read other files with their tools. Limits: 60k characters per file

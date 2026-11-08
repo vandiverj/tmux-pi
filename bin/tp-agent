@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -641,8 +642,20 @@ def other_lane_paths(item):
         return ""
 
 
+def lane_facts_for(item):
+    """(packet section, base commit) for the lane task `item`, worked out when it starts: lane_commands.lane_facts from the lane's
+    record and its tree now. A record that cannot be read gives the one-line unavailable form and no base ("": LANE_BASE is not
+    set); this never refuses the dispatch."""
+    try:
+        record = lanes.read_lane(lanes.git_common_dir(item["workdir"]), item["lane"])
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        return "lane facts unavailable: " + " ".join(str(error).split())[:300], ""
+    return lane_commands.lane_facts(record, item["lane_step"]), record["base"]["commit"]
+
+
 def launch(base, item):
     item = queue_item(item)  # every field below comes from the validator's return value
+    facts_file = None
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
             "--worker", item["worker"], "--model", item["model"], "--thinking", item["thinking"],
             "--route-json", json.dumps(item["route_info"]), "--tests", item["tests"]]
@@ -656,6 +669,10 @@ def launch(base, item):
         owned = other_lane_paths(item)
         if owned:
             args += ["--other-lane-paths", owned]
+        facts, lane_base = lane_facts_for(item)
+        with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="tp-lane-facts-", delete=False) as facts_file:  # a file, not the shell line
+            facts_file.write(facts + "\n")
+        args += ["--lane-facts-file", facts_file.name] + (["--worker-env", f"LANE_BASE={lane_base}"] if lane_base else [])
     for spec in item["context"]:
         args += ["--context", spec]
     for note in item["notes"]:
@@ -666,7 +683,11 @@ def launch(base, item):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
     args += ["--", item["task"]]
     started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
-    run = subprocess.run(args, text=True, capture_output=True)
+    try:
+        run = subprocess.run(args, text=True, capture_output=True)
+    finally:
+        if facts_file:
+            Path(facts_file.name).unlink(missing_ok=True)
     if run.returncode:
         raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
     # Record what the packet actually admitted so retry never replays an omitted sensitive input.

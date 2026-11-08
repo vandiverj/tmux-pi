@@ -1,4 +1,5 @@
 """Lanes L2: `lane create` and `lanes` (lib/lane_commands.py, bin/tp-agent). Every repository here is a temporary one."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

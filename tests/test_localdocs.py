@@ -1,4 +1,5 @@
 """lib/localdocs: lockfile pins, allowlisted reads, api_signature, the docs index, call logging. No network, no models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import ast
 import contextlib
 import hashlib

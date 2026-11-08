@@ -3,6 +3,7 @@ repository's common git directory, taken as one reservation by tp-spawn for disp
 untagged-tree backstop across nested repositories. Repositories are temporary; tmux is the private fixture server. Races are
 ordered by a held lane lock, never by sleeping: the test holds the lock, starts the process, and changes the lease inside the
 lock, so the process cannot have looked before the change."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

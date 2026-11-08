@@ -1,6 +1,7 @@
 """Autonomy gate condition 2 (Phase D2): an open `blocking` decision of an attached workspace refuses the dispatch its `Affects` covers,
 and only a `--by user` answer (or a withdrawal) closes it. Same fixtures as tests/test_autonomy.py: temporary repositories, work store
 and state directories, no model."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from pathlib import Path
 import os

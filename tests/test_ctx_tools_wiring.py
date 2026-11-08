@@ -1,6 +1,7 @@
 """CX4 wiring: the pi extension and the MCP server carry the same five tools, load only when TP_CTX_TOOLS=1, open no socket and read no
 files themselves, and give the same text as `tp-ctx` for the same input. Stub navigators (tests/fixtures/ctx_surface/fake_navs.py);
 no model, no network. The pi extension runs under node against the installed pi package and is skipped when there is none."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import re

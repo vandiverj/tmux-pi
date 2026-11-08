@@ -1,6 +1,8 @@
 """lib/review_rounds.py: earlier review rounds along the retry lineage, and the diff since the last reviewed tree."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,11 +44,58 @@ class RoundsTests(unittest.TestCase):
     def prepare(self, ident):
         return review_rounds.prepare(self.state, ident, str(self.work), self.out)
 
-    def test_no_earlier_review_gives_no_contexts(self):
+    def test_no_earlier_review_gives_no_findings_and_only_the_diff_against_the_review_base(self):
+        # a plain task (no lane): round 1 carries the working tree against HEAD, staged, unstaged and untracked together
+        (self.work / "a.txt").write_text("one\n")
+        (self.work / "b.txt").write_text("keep\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        (self.work / "a.txt").write_text("two\n")
+        (self.work / "staged.txt").write_text("s\n")
+        self.git("add", "staged.txt")
+        (self.work / "new.txt").write_text("fresh\n")
         self.task("w1")
         got = self.prepare("w1")
-        self.assertEqual((got["contexts"], got["rounds"]), ([], 0))
+        self.assertEqual((got["rounds"], [Path(p).name for p in got["contexts"]]), (0, ["diff-now.md"]))
         self.assertIn("tree", got["snapshot"])
+        text = Path(got["contexts"][0]).read_text()
+        self.assertIn("against HEAD", text)
+        for line in ("-one", "+two", "+s", "+fresh"):
+            self.assertIn(line + "\n", text)
+        self.assertNotIn("keep", text)  # an unchanged committed file is not in it
+
+    def test_a_retried_task_nobody_reviewed_gets_the_change_against_head_not_a_diff_since_a_round(self):
+        (self.work / "a.txt").write_text("one\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        (self.work / "a.txt").write_text("two\n")  # the first attempt's edit
+        self.task("w0")
+        (self.work / "b.txt").write_text("retry\n")  # the retry's edit
+        self.task("w1", parent="w0")
+        got = self.prepare("w1")
+        self.assertEqual((got["rounds"], [Path(p).name for p in got["contexts"]]), (0, ["diff-now.md"]))
+        text = Path(got["contexts"][0]).read_text()
+        for line in ("-one", "+two", "+retry"):
+            self.assertIn(line + "\n", text)
+
+    def test_a_repository_with_no_commit_is_diffed_against_the_empty_tree(self):
+        (self.work / "a.txt").write_text("one\n")
+        self.task("w1")
+        text = Path(self.prepare("w1")["contexts"][0]).read_text()
+        self.assertIn("the empty tree", text)
+        self.assertIn("+one\n", text)
+
+    def test_the_first_round_diff_withholds_a_sensitive_path_and_redacts_a_secret_like_value(self):
+        (self.work / ".env").write_text("DB_PASSWORD=madeup-ENVFILE-55kd\n")
+        (self.work / "notes.txt").write_text("DB_PASSWORD=madeup-NOTES-31mv\n")
+        self.task("w1")
+        got = self.prepare("w1")
+        text = Path(got["contexts"][0]).read_text()
+        self.assertEqual(got["withheld"], [".env"])
+        self.assertIn(".env", text)
+        self.assertNotIn("madeup-ENVFILE-55kd", text)
+        self.assertNotIn("madeup-NOTES-31mv", text)
+        self.assertGreaterEqual(got["redactions"], 1)
 
     def test_the_snapshot_sees_untracked_files_and_leaves_the_index_alone(self):
         (self.work / "new.txt").write_text("x")
@@ -84,7 +133,8 @@ class RoundsTests(unittest.TestCase):
         self.task("w1")
         plain = self.work.parent / "plain"
         plain.mkdir()
-        self.assertIsNone(review_rounds.prepare(self.state, "w1", str(plain), self.out)["snapshot"])
+        got = review_rounds.prepare(self.state, "w1", str(plain), self.out)
+        self.assertEqual((got["snapshot"], got["contexts"]), (None, []))  # no tree, so no round-1 diff either
 
     def test_findings_come_oldest_first_across_ancestors_and_rereviews(self):
         self.review("r-a", "FIRST")
@@ -94,8 +144,9 @@ class RoundsTests(unittest.TestCase):
         self.task("w1", parent="w0", reviews=["r-b", "r-c"])
         got = self.prepare("w1")
         names = [Path(p).name for p in got["contexts"]]
-        self.assertEqual(names[:3], ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md", "earlier-findings-03-r-c.md"])
-        self.assertEqual([Path(p).read_text().split("]\n\n", 1)[1] for p in got["contexts"][:3]], ["FIRST", "SECOND", "THIRD"])
+        self.assertEqual(names[0], "diff-since-round-3.md")  # the diff comes before the findings
+        self.assertEqual(names[1:], ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md", "earlier-findings-03-r-c.md"])
+        self.assertEqual([Path(p).read_text().split("]\n\n", 1)[1] for p in got["contexts"][1:]], ["FIRST", "SECOND", "THIRD"])
         self.assertEqual(got["rounds"], 3)
 
     def test_chain_labels_give_the_verdict_and_family_names_of_each_review_oldest_first(self):
@@ -139,12 +190,15 @@ class RoundsTests(unittest.TestCase):
         (self.work / "a.txt").write_text("two\n")
         (self.work / "b.txt").write_text("new\n")
         self.task("w1", reviews=["r-a"])
-        text = Path(self.prepare("w1")["contexts"][-1]).read_text()
+        text = Path(self.prepare("w1")["contexts"][0]).read_text()
         self.assertIn("-one", text)
         self.assertIn("+two", text)
         self.assertIn("b.txt", text)
 
     def review_state(self):
+        # the reviewed tree is committed, so HEAD holds it: the four states of every path start out alike
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", "reviewed")
         self.task("probe")
         return review_rounds.prepare(self.state, "probe", str(self.work), self.out)["snapshot"]
 
@@ -152,12 +206,15 @@ class RoundsTests(unittest.TestCase):
         (self.work / "a.txt").write_text("one\n")
         self.review("r-a", "RC", self.review_state())
         self.task("w1", reviews=["r-a"])
-        self.assertIn("identical", Path(self.prepare("w1")["contexts"][-1]).read_text())
+        self.assertIn("identical", Path(self.prepare("w1")["contexts"][0]).read_text())
 
-    def test_a_round_with_no_recorded_state_says_so_instead_of_guessing(self):
+    def test_a_round_with_no_recorded_state_says_so_and_falls_back_to_the_change_against_the_review_base(self):
+        (self.work / "a.txt").write_text("one\n")
         self.review("r-a", "RC")
         self.task("w1", reviews=["r-a"])
-        self.assertIn("recorded no reviewed state", Path(self.prepare("w1")["contexts"][-1]).read_text())
+        text = Path(self.prepare("w1")["contexts"][0]).read_text()
+        self.assertIn("recorded no reviewed state", text)
+        self.assertIn("+one\n", text)  # the diff against the review base, not nothing
 
     def test_unusable_recorded_state_refuses(self):
         self.review("r-a", "RC", {"workdir": str(self.work.resolve()), "tree": "0" * 40})
@@ -170,10 +227,13 @@ class RoundsTests(unittest.TestCase):
         with self.assertRaises(review_rounds.Refused):
             self.prepare("w2")
 
-    def test_a_different_workdir_is_named_not_diffed(self):
+    def test_a_different_workdir_is_named_and_the_change_is_diffed_against_the_review_base_instead(self):
+        (self.work / "a.txt").write_text("one\n")
         self.review("r-a", "RC", {"workdir": "/elsewhere", "tree": "0" * 40})
         self.task("w1", reviews=["r-a"])
-        self.assertIn("/elsewhere", Path(self.prepare("w1")["contexts"][-1]).read_text())
+        text = Path(self.prepare("w1")["contexts"][0]).read_text()
+        self.assertIn("/elsewhere", text)
+        self.assertIn("+one\n", text)
 
     def test_a_review_that_never_replied_is_skipped_and_reported(self):
         self.task("r-a")
@@ -202,7 +262,7 @@ class RoundsTests(unittest.TestCase):
     def test_a_long_lineage_is_walked_to_its_root(self):
         got = self.prepare(self.chain(40))
         self.assertEqual(got["rounds"], 40)
-        self.assertTrue(Path(got["contexts"][0]).name.startswith("earlier-findings-01-r0"))
+        self.assertTrue(Path(got["contexts"][1]).name.startswith("earlier-findings-01-r0"))  # [0] is the diff
 
     def test_a_lineage_past_the_safety_limit_refuses_and_says_so(self):
         newest = self.chain(review_rounds.MAX_ANCESTORS + 2)
@@ -400,6 +460,211 @@ def run_git(directory, *args):
     return subprocess.run(["git", "-C", str(directory), "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+class FourStateTests(unittest.TestCase):
+    """The packet sections for a path whose HEAD or index differs from the files: base, HEAD, index and files, every way they can differ."""
+    setUp, git, task, review = RoundsTests.setUp, RoundsTests.git, RoundsTests.task, RoundsTests.review
+
+    @staticmethod
+    def partitions(n=4):
+        """Every way n states can be equal or different: 15 for four (restricted growth strings)."""
+        def grow(prefix, top):
+            if len(prefix) == n:
+                yield tuple(prefix)
+                return
+            for value in range(top + 1):
+                yield from grow(prefix + [value], max(top, value + 1))
+        return list(grow([0], 1))
+
+    def four_states(self, base, head, index, wt):
+        """A fresh repository where a.txt is `base` in the base commit, `head` in HEAD, `index` in the index and `wt` in the files
+        (bytes, or None for absent). Returns (the base commit, the working tree snapshot at the base)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name) / "w"
+        self.work.mkdir()
+        self.git("init", "-q")
+
+        def put(content):
+            if content is None:
+                (self.work / "a.txt").unlink(missing_ok=True)
+            else:
+                (self.work / "a.txt").write_bytes(content)
+        (self.work / "keep.txt").write_text("k\n")
+        put(base)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        commit = subprocess.run(["git", "-C", str(self.work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        at_base = review_rounds.snapshot(str(self.work))
+        put(head)
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", "head")
+        put(index)
+        self.git("add", "-A")
+        put(wt)
+        return commit, at_base
+
+    def sections_of(self, text):
+        found, current = {}, None
+        for line in text.split("\n"):
+            if line in (review_rounds.COMMITTED_HEAD, review_rounds.STAGED_HEAD):
+                current = found[line] = []
+            elif current is not None:
+                current.append(line)
+        return {k: "\n".join(v) for k, v in found.items()}
+
+    def assert_sections(self, text, base, head, index, wt):
+        """The rule: when HEAD or the index differs from the files, base to HEAD and HEAD to index each appear if not empty."""
+        C, S = review_rounds.COMMITTED_HEAD, review_rounds.STAGED_HEAD
+        lacks = head != wt or index != wt
+        want = {}
+        if lacks and base != head:
+            want[C] = (base, head)
+        if lacks and head != index:
+            want[S] = (head, index)
+        got = self.sections_of(text)
+        self.assertEqual(set(got), set(want), text)
+        for title, (old, new) in want.items():
+            section = got[title]
+            changed = [line for line in section.split("\n") if line and line[0] in "+-" and line[:3] not in ("+++", "---")]
+            if any(c is not None and c.startswith(b"\0") for c in (old, new)):
+                self.assertIn("Binary files a/a.txt and b/a.txt differ", section)
+                self.assertEqual(changed, [])
+                continue
+            self.assertEqual(changed, ([] if old is None else ["-" + old.decode().strip()]) + ([] if new is None else ["+" + new.decode().strip()]), (title, text))
+            self.assertEqual("new file mode" in section, old is None)
+            self.assertEqual("deleted file mode" in section, new is None)
+
+    def state_rows(self):
+        """(name, base, head, index, wt): the 15 partitions of the four states, then deleted and binary rows."""
+        rows = [("partition " + "".join(map(str, p)),) + tuple(f"v{k}\n".encode() for k in p) for p in self.partitions()]
+        a, b = b"\0A", b"\0B"
+        return rows + [("committed deletion, files restored", b"v0\n", None, None, b"v0\n"),
+                       ("staged deletion, files restored", b"v0\n", b"v0\n", None, b"v0\n"),
+                       ("added in HEAD, files removed", None, b"v0\n", b"v0\n", None),
+                       ("binary committed, files restored", a, b, b, a),
+                       ("binary staged, files restored", a, a, b, a)]
+
+    @staticmethod
+    def diff_paths(text):
+        """The paths of the diff sections in text (main diff and held sections alike)."""
+        return set(re.findall(r"^diff --git a/(.+) b/\1$", text, re.M))
+
+    @staticmethod
+    def listed_paths(scope):
+        """The paths the scope lists (the `- path` lines before the commands)."""
+        return {line[2:].split(" (untracked")[0] for line in scope.split("\n") if line.startswith("- ") and line != "- (none)"}
+
+    def assert_scope(self, attached, plan, states=None):
+        """The scope's path list equals the set of paths in the attached diff sections, and (when the four states are given) names
+        a.txt exactly when they are not all alike: scope and sections are asserted together, from the plan the diffs were made with."""
+        scope = review_rounds.scope_text(str(self.work), plan=plan)[0]
+        self.assertEqual(self.listed_paths(scope), self.diff_paths(attached), scope + attached)
+        if states is not None:
+            self.assertEqual("a.txt" in self.listed_paths(scope), len(set(states)) > 1, scope)
+        return scope
+
+    def run_scope_commands(self, scope, repo=None):
+        """Every scoped command the scope prints is run (with a.txt as the path) and must exit 0."""
+        commands = re.findall(r"`(GIT_LITERAL_PATHSPECS=1 git [^`]*)`", scope)
+        self.assertGreaterEqual(len(commands), 3, scope)
+        for command in commands:
+            command = re.sub(r"<path>(?: \[<path> \.\.\.\])?(?: \.\.\.)?", "a.txt", command)
+            run = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=repo or self.work)
+            self.assertEqual(run.returncode, 0, (command, run.stderr))
+
+    def test_round_one_sections_follow_the_four_state_rule_for_every_way_base_head_index_and_files_can_differ(self):
+        self.assertEqual(len(self.partitions()), 15)
+        red = review_rounds.redactor()
+        for name, *states in self.state_rows():
+            with self.subTest(name):
+                commit, _ = self.four_states(*states)
+                now = review_rounds.snapshot(str(self.work))
+                main, _ = review_rounds.safe_diff(now["top"], commit, now["tree"])
+                text, _, _, held = review_rounds.held_sections(str(self.work), commit, now["tree"], red)
+                self.assert_sections(text, *states)
+                plan = review_rounds.make_plan(now["top"], commit, "", now["tree"], held)
+                self.assert_scope(main + text, plan, states)
+
+    def test_a_later_round_follows_the_same_rule_whatever_the_record_says_about_head(self):
+        # the previous round's tree is the base. Its record holds: the head at that time (HEAD has moved since for most rows), the
+        # head HEAD is at now (HEAD has not moved since the previous review), or no head at all (an older record). The sections
+        # depend on the four states alone, so all three must give the same packet.
+        for variant in ("head then", "head now", "no head"):
+            for number, (name, *states) in enumerate(self.state_rows()):
+                with self.subTest(variant=variant, row=name):
+                    commit, at_base = self.four_states(*states)
+                    keep = {k: at_base[k] for k in ("workdir", "tree")}
+                    if variant == "head then":
+                        keep["head"] = at_base["head"]
+                    elif variant == "head now":
+                        keep["head"] = run_git(self.work, "rev-parse", "HEAD")
+                    ident = f"{variant.replace(' ', '-')}-{number}"
+                    self.review(f"r-{ident}", "REQUEST_CHANGES\n", state=keep)
+                    self.task(f"w-{ident}", reviews=[f"r-{ident}"])
+                    got = review_rounds.prepare(self.state, f"w-{ident}", str(self.work), self.out)
+                    text = Path(got["contexts"][0]).read_text()
+                    self.assert_sections(text, *states)
+                    self.assert_scope(text, got["scope_input"], states)  # the real resolution: the plan prepare wrote, no patched base
+                    main = text.split("\n" + review_rounds.COMMITTED_HEAD + "\n")[0].split("\n" + review_rounds.STAGED_HEAD + "\n")[0]
+                    self.assertEqual("diff --git a/a.txt b/a.txt" in main, states[0] != states[3], main)
+
+
+    def test_the_scope_names_each_comparison_of_the_sections(self):
+        self.four_states(b"v0\n", b"v1\n", b"v2\n", b"v0\n")
+        scope = review_rounds.scope_text(str(self.work))[0]
+        self.assertIn(f"'{review_rounds.COMMITTED_HEAD}' is the base against HEAD", scope)
+        self.assertIn(f"'{review_rounds.STAGED_HEAD}' is HEAD against the index", scope)
+        self.assertIn("diff --cached HEAD -- <path> [<path> ...]` (staged: the index against HEAD)", scope)
+        self.assertIn("- a.txt\n", scope)
+
+    def test_every_scope_command_runs_in_a_round_one_and_a_later_round_scope(self):
+        commit, at_base = self.four_states(b"v0\n", b"v1\n", b"v2\n", b"v0\n")
+        self.run_scope_commands(review_rounds.scope_text(str(self.work))[0])
+        self.review("r-cmd", "REQUEST_CHANGES\n", state={k: at_base[k] for k in ("workdir", "tree")})
+        self.task("w-cmd", reviews=["r-cmd"])
+        got = review_rounds.prepare(self.state, "w-cmd", str(self.work), self.out)
+        scope = review_rounds.scope_text(str(self.work), plan=got["scope_input"])[0]
+        self.assertIn("review round 1 reviewed", scope)
+        self.run_scope_commands(scope)
+
+    def test_a_repository_with_no_commit_follows_the_rule_with_the_empty_tree_as_head(self):
+        # (index, files) with no commit: HEAD is the empty tree, the base of round 1 too; a later round's base is the tree it reviewed
+        rows = [(None, b"v1\n"), (b"v1\n", b"v1\n"), (b"v1\n", None), (b"v1\n", b"v2\n"), (None, None)]
+        for number, (index, wt) in enumerate(rows):
+            for later in (False, True):
+                with self.subTest(index=index, files=wt, later=later):
+                    tmp = tempfile.TemporaryDirectory()
+                    self.addCleanup(tmp.cleanup)
+                    self.work = Path(tmp.name) / "w"
+                    self.work.mkdir()
+                    self.git("init", "-q")
+                    (self.work / "a.txt").write_bytes(b"v0\n")
+                    at_base = review_rounds.snapshot(str(self.work))
+                    self.assertEqual(at_base["head"], "")
+                    for content, staged in ((index, True), (wt, False)):
+                        if content is None:
+                            (self.work / "a.txt").unlink(missing_ok=True)
+                        else:
+                            (self.work / "a.txt").write_bytes(content)
+                        if staged:
+                            self.git("add", "-A")
+                    ident = f"nc-{number}-{later}"
+                    if later:
+                        self.review(f"r-{ident}", "REQUEST_CHANGES\n", state={k: at_base[k] for k in ("workdir", "tree")})
+                        self.task(f"w-{ident}", reviews=[f"r-{ident}"])
+                    else:
+                        self.task(f"w-{ident}")
+                    got = review_rounds.prepare(self.state, f"w-{ident}", str(self.work), self.out)
+                    text = Path(got["contexts"][0]).read_text()
+                    scope = self.assert_scope(text, got["scope_input"])
+                    sections = self.sections_of(text)
+                    # HEAD is the empty tree: the staged section exists when the index holds the file, the committed one (the
+                    # reviewed tree against the empty tree) in a later round whenever the index or the files hold it
+                    self.assertEqual(review_rounds.STAGED_HEAD in sections, index is not None, text)
+                    self.assertEqual(review_rounds.COMMITTED_HEAD in sections, later and not (index is None and wt is None), text)
+                    self.run_scope_commands(scope)
+
+
 class StepBaseTests(unittest.TestCase):
     """R6: a lane task is scoped from the last closed step's commit when it is an ancestor of HEAD, else from the lane base."""
 
@@ -486,6 +751,60 @@ class StepBaseTests(unittest.TestCase):
         self.assertIn(f"closed step s1 at {stray[:12]} is not an ancestor of HEAD", text)
         self.assertIn(f"relative to {self.base[:12]}", text)
         self.assertNotIn("base: last closed step", text)
+
+    def round_one_diff(self):
+        state, out = self.wt.parent / "state", self.wt.parent / "out"
+        (state / "tasks" / "w1").mkdir(parents=True)
+        out.mkdir()
+        (state / "tasks" / "w1" / "meta.json").write_text(json.dumps({"id": "w1"}))
+        got = review_rounds.prepare(state, "w1", str(self.wt), out, "alpha")
+        self.assertEqual([Path(p).name for p in got["contexts"]], ["diff-now.md"])
+        return Path(got["contexts"][0]).read_text()
+
+    def test_a_lane_round_one_diff_is_against_the_last_closed_step(self):
+        s1 = self.commit("s1.txt")
+        self.commit("n1.txt")
+        (self.wt / "dirty.txt").write_text("uncommitted\n")
+        self.record([("s1", s1)])
+        text = self.round_one_diff()
+        self.assertIn(f"last closed step s1 at {s1[:12]}", text)
+        for line in ("+++ b/n1.txt", "+++ b/dirty.txt", "+uncommitted"):
+            self.assertIn(line, text)
+        self.assertNotIn("s1.txt", text)  # the closed step is out of the diff
+
+    def test_a_lane_round_one_diff_with_no_closed_step_is_against_the_lane_base(self):
+        self.commit("n1.txt")
+        self.record([])
+        text = self.round_one_diff()
+        self.assertIn(f"lane base {self.base[:12]}", text)
+        self.assertIn("+++ b/n1.txt", text)
+
+    def test_a_lane_commit_the_files_undo_and_a_staged_change_each_show_under_their_own_comparison(self):
+        # base a.txt=one; HEAD two (committed), index three (staged), files one again: the main diff is empty
+        self.record([])
+        self.commit("a.txt", "two\n")
+        (self.wt / "a.txt").write_text("three\n")
+        run_git(self.wt, "add", "a.txt")
+        (self.wt / "a.txt").write_text("one\n")
+        text = self.round_one_diff()
+        committed, staged = text.split(review_rounds.COMMITTED_HEAD + "\n")[1].split(review_rounds.STAGED_HEAD + "\n")
+        self.assertIn("-one\n+two\n", committed)
+        self.assertIn("-two\n+three\n", staged)
+        self.assertNotIn("+three", committed)
+        scope = self.scope()
+        self.assertIn("- a.txt\n", scope)
+        self.assertIn(f"diff {self.base} HEAD -- <path> [<path> ...]` (base against HEAD)", scope)
+        self.assertIn("diff --cached HEAD -- <path> [<path> ...]` (staged: the index against HEAD)", scope)
+
+    def test_a_lane_commit_the_files_undo_is_shown_when_the_index_equals_head(self):
+        self.record([])
+        self.commit("a.txt", "two\n")
+        (self.wt / "a.txt").write_text("one\n")
+        text = self.round_one_diff()
+        self.assertIn(review_rounds.COMMITTED_HEAD + "\n", text)
+        self.assertIn("-one\n+two\n", text)
+        self.assertNotIn(review_rounds.STAGED_HEAD + "\n", text)
+        self.assertIn("- a.txt\n", self.scope())
 
     def test_a_non_lane_scope_is_unchanged(self):
         text = review_rounds.scope_text(str(self.main), "")[0]

@@ -70,6 +70,28 @@ def exact_variants(value):
         yield encoded
 
 
+# A source name whose rules are the strictest there are (env-file and dotenv rules, not a lockfile). Text whose file
+# cannot be established where it must be (a plain-text grep line) is judged by it. Only ever a rules argument: it is
+# never stored as a placeholder's source or shown as a pointer.
+STRICTEST_RULES = ".env"
+
+
+def strictness(source):
+    """How strict the rules for text from `source` are; a larger value is stricter."""
+    if not source:
+        return (False, False, False)
+    return bool(ENV_LIKE.search(str(source))), bool(DOTENV.search(str(source))), not LOCKFILE.search(str(source))
+
+
+def rules_source(named, real):
+    """The source to judge text by: the real file it came from (`real`, links resolved) wherever its rules are stricter
+    than those of the name the tool was given, else that name. So a link called notes.txt to .env is the env file, a
+    link called .env to an ordinary file stays an env file, and an equal pair keeps the given name for pointers."""
+    if not real:
+        return named
+    return real if not named or strictness(real) > strictness(named) else named
+
+
 def kind_for(name):
     tokens = [t for t in name_tokens(name) if t not in {"next", "vite", "react", "app", "export"}]
     return re.sub(r"[^a-z0-9_]", "", "_".join(tokens))[:40] or "secret"
@@ -86,14 +108,16 @@ class Redactor:
         added = {v for value in values for v in exact_variants(value) if len(v) >= 4}
         self.exact = sorted(set(self.exact) | added, key=len, reverse=True)
 
-    def spans(self, text, source=None):
-        """Yield (start, end, rank, kind, confirmed); a lower rank names overlapping spans."""
-        for value in self.exact:
+    def spans(self, text, source=None, pairs_at_start=False):
+        """Yield (start, end, rank, kind, confirmed); a lower rank names overlapping spans.
+
+        `pairs_at_start`: only the KEY=value / key: value pair that starts `text` (the rules that need a line start)."""
+        for value in () if pairs_at_start else self.exact:
             start = text.find(value)
             while start != -1:
                 yield start, start + len(value), 2, "env_secret", True
                 start = text.find(value, start + len(value))
-        for kind, pattern in FORMATS:
+        for kind, pattern in () if pairs_at_start else FORMATS:
             for match in pattern.finditer(text):
                 group = 1 if pattern.groups and match.group(1) is not None and kind != "private_key" else 0
                 if kind in {"url_password", "password"} and not secret_value(match.group(group)):
@@ -104,9 +128,11 @@ class Redactor:
         env_source = bool(source and ENV_LIKE.search(str(source)))
         dotenv = bool(source and DOTENV.search(str(source)))
         pairs = [ENV_LINE, QUOTED_PAIR, XML_PAIR] + ([YAML_PAIR] if env_source else [])
+        if pairs_at_start:
+            pairs = [ENV_LINE] + ([YAML_PAIR] if env_source else [])
         public = []
         for pattern in pairs:
-            for match in pattern.finditer(text):
+            for match in filter(None, [pattern.match(text)]) if pairs_at_start else pattern.finditer(text):
                 name, raw = match.group(1), match.group(2)
                 if PUBLIC_TOKENS & set(name_tokens(name)):
                     public.append((match.start(2), match.end(2)))
@@ -127,6 +153,8 @@ class Redactor:
                     continue
                 start = match.start(2) + raw.find(value)
                 yield start, start + len(value), 0, kind_for(name), True
+        if pairs_at_start:
+            return
         for match in CANDIDATE.finditer(text):
             token = match.group(0).rstrip("=")
             if (NOT_CANDIDATE.match(token) or PUBLIC_VALUE.match(token) or SEQUENCE.search(token) or
@@ -139,10 +167,16 @@ class Redactor:
                 continue
             yield match.start(), match.start() + len(token), 3, "unverified", False
 
-    def plan(self, text, source=None):
-        """Merged (start, end, rank, kind, confirmed) spans; confirmed=False spans await review."""
+    def plan(self, text, source=None, views=()):
+        """Merged (start, end, rank, kind, confirmed) spans; confirmed=False spans await review.
+
+        `views` are extra (start, end) slices of `text` where a line may begin as well (where a grep line's body may
+        begin): the rules that need a line start (KEY=value, key: value) also find a pair that starts there."""
         protected = [(m.start(), m.end()) for m in PLACEHOLDER.finditer(text)]
-        found = sorted(s for s in self.spans(text, source)
+        spans = set(self.spans(text, source))
+        for start, end in views:
+            spans.update((a + start, b + start, *rest) for a, b, *rest in self.spans(text[start:end], source, True))
+        found = sorted(s for s in spans
                        if s[1] > s[0] and not any(s[0] < b and a < s[1] for a, b in protected))
         merged = []
         for start, end, rank, kind, confirmed in found:

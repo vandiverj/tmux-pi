@@ -1,3 +1,4 @@
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
 from capabilities import (REGISTRY_VERSION, disclosure_note, handle_capability_request, registry,  # noqa: E402
                           select_capabilities)
+from session_env import outside_session  # noqa: E402
 
 
 class CapabilityRegistryTests(unittest.TestCase):
@@ -113,7 +115,7 @@ class CapabilityRegistryTests(unittest.TestCase):
             (task / "meta.json").write_text(json.dumps({"id": "worker-1", "worker": "pi", "pane": "%1"}))
             (task / "request.md").write_text("Plan complex tradeoffs\n")
             fake_tmux(root, 'echo "$*" >> "$TMUX_LOG"\n')
-            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get("PATH", ""), TMUX_LOG=str(root / "signals"))
+            env = dict(outside_session(), PATH=str(root) + os.pathsep + os.environ.get("PATH", ""), TMUX_LOG=str(root / "signals"))
             for key in ("TP_TASK_DIR", "TP_TASK_ID", "TMUX", "TMUX_PANE"):
                 env.pop(key, None)
             cmd = [str(ROOT / "bin/tp-task"), "--state-dir", str(root), "capability-resolve", "worker-1"]

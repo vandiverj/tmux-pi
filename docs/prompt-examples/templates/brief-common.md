@@ -117,7 +117,7 @@ listed and restore `meta/_journal.json`, then stop and report); table registered
 - The break-it change and result for each new or changed test.
 - Check results (lint, Prettier, typecheck, gitleaks, Semgrep with triage).
 - Commit sha(s), clean worktree, anything not done and why.
-- Any failing test you don't own, under `FAILING_TESTS:` with the command and whether you checked it on the base.
+- Any failing test you don't own, under `FAILING_TESTS:` as `- test:` bullets with the command and whether you checked it on the base. When none fails, leave the block out; do not write `FAILING_TESTS: none`.
 - A **Self-review** section. Each line gives evidence, or "none found, checked by <command>":
   1. Symbols: for every function, type, route, field or file you changed, its writers, readers and callers
      (`git -C <wt> grep -n`, command shown) and what each does now.

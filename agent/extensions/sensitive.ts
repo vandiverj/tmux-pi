@@ -29,7 +29,10 @@ export default function (pi: ExtensionAPI) {
 	const redactText = (text: string, toolName: string, input: Record<string, unknown>): string => {
 		const args = ["--stdin", "--session", session];
 		const path = typeof input?.path === "string" ? input.path : typeof input?.file_path === "string" ? input.file_path : "";
-		if (toolName === "grep") args.push("--grep");
+		// safe_grep prints the same `path:line:text` lines (already redacted at the source); read them as grep lines too.
+		if (toolName === "grep" || toolName === "safe_grep") args.push("--grep");
+		// bash output from a search tool holds grep lines too; tp-redact reads them so when the command is one.
+		else if (toolName === "bash" && typeof input?.command === "string") args.push("--command", input.command);
 		else if (path) args.push("--source", path);
 		const run = spawnSync(redactor, args, { input: text, encoding: "utf8", timeout: 60000, maxBuffer: 256 * 1024 * 1024 });
 		return run.status === 0 && typeof run.stdout === "string" ? run.stdout : withheld("failed");

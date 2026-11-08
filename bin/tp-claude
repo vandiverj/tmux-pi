@@ -48,9 +48,50 @@ mcp_args=(--mcp-config "$CLAUDE_DIR/mcp.json")
 # call there and answers nothing without it) with TP_CTX_TOOLS=1, which bin/tp-spawn passes on to a worker when main has it.
 [[ "${TP_CTX_TOOLS:-}" != 1 || -z "${TP_TASK_DIR:-}" ]] || mcp_args+=(--mcp-config "$CLAUDE_DIR/mcp.ctx.json")
 
+# Always include this, including off/shadow: mode can change during a session.
+# Keep the suffix and exclusions aligned with lib/redact_hook.py wrap(). The local
+# claude --help does not promise repeatable/mixable append flags, so compose one.
+suffix_instruction='Append ` || echo exit-code: nonzero` to every Bash command you run, once on the final line. Do not append to empty commands, commands containing <<, background commands (including run_in_background), commands whose final line ends in a backslash, ||, &&, |, &, {, (, do, then or else, commands with an explicit exit, or commands whose final line has a shell comment or unmatched quotes. Strip trailing whitespace and trailing semicolons first (but not ;;). The tmux-pi redaction hook adds it otherwise, and auto mode refuses a command a hook changed.'
+launch_args=()
+append_prompt=""
+while (( $# )); do
+  case "$1" in
+    --append-system-prompt|--append-system-prompt-file)
+      flag="$1"
+      (( $# >= 2 )) || { echo "tp-claude: $flag needs a value" >&2; exit 2; }
+      value="$2"
+      shift 2
+      ;;
+    --append-system-prompt=*|--append-system-prompt-file=*)
+      flag="${1%%=*}"
+      value="${1#*=}"
+      shift
+      ;;
+    --)
+      launch_args+=("$@")
+      break
+      ;;
+    *)
+      launch_args+=("$1")
+      shift
+      continue
+      ;;
+  esac
+  if [[ "$flag" == --append-system-prompt-file ]]; then
+    [[ -f "$value" && -r "$value" ]] || { echo "tp-claude: cannot read append-system-prompt-file: $value" >&2; exit 2; }
+    # read rather than command substitution: preserve the file's trailing newlines.
+    value_from_file=""
+    IFS= read -r -d '' value_from_file < "$value" || :
+    value="$value_from_file"
+  fi
+  append_prompt+="$value"$'\n'
+done
+append_prompt+="$suffix_instruction"
+
 exec claude \
   --setting-sources "" \
   --settings "$settings" \
   --strict-mcp-config "${mcp_args[@]}" \
   --plugin-dir "$CLAUDE_DIR/plugins" \
-  "$@"
+  --append-system-prompt "$append_prompt" \
+  ${launch_args[@]+"${launch_args[@]}"}

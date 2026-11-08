@@ -1,6 +1,7 @@
 """Autonomy recovery gate (Phase D1): lib/autonomy.py through bin/tp-spawn, bin/tp-agent (dispatch, tick, autonomy on|off|status,
 work recovered) and the index's `autonomy` entry. Repositories, the work store and the state directories are temporary; tmux is the
 private fixture server of tests/lane_fixture.py, and no model runs."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

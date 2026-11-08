@@ -1,4 +1,5 @@
 """Shared task interface and sensitive-read boundary without launching models."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -10,12 +11,13 @@ import unittest
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = "openai/gpt-6-sol"
+MODEL = "openai/gpt-6.1-sol"
 WAITING = '{"state":"waiting"}'
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
 from sensitive_read import classify, hook_response
+from session_env import isolate_session, outside_session  # noqa: E402
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -37,9 +39,9 @@ class OrchestrationTests(unittest.TestCase):
  *) exit 0 ;;
 esac
 ''')
-        self.env = {**os.environ, "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
+        isolate_session(self)  # the in-process load of bin/tp-agent reads os.environ too
+        self.env = {**outside_session(), "TP_STATE_DIR": str(self.state), "TP_SESSION": "fixture", "TP_WORK_DIR": str(self.root / "work-store"),
                     "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
-        self.env.pop("TMUX", None)
 
     def raw(self, *args, env=None, timeout=25):
         return subprocess.run([str(ROOT / "bin/tp-agent"), *args], env=env or self.env, text=True,
@@ -410,6 +412,19 @@ esac
         for stem in entries:  # stop removes any queued id, whatever its content
             self.assertEqual(self.cli("stop", stem), {"id": stem, "status": "stopped"})
         self.assertEqual([entry.name for entry in queue.iterdir()], [])
+
+    def test_main_is_recorded_from_an_explicit_id_and_absent_without_one(self):
+        """The optional-main path: a main id set in the env is recorded (direct and queued); with none set nothing is
+        recorded, so the "main missing" refusals above do not depend on the caller's session."""
+        args = ["dispatch", "--role", "coder", "--task", "t", "--worker", "pi", "--model", MODEL, "--thinking", "medium",
+                "--workdir", str(self.project), "--deliverable", "Report"]
+        with_main = {**self.env, "TP_MAIN_ID": "main-x"}
+        first = json.loads(self.raw(*args, env=with_main).stdout)
+        self.assertEqual(json.loads((self.task_dir(first) / "dispatch.json").read_text())["main"], "main-x")
+        queued = json.loads(self.raw(*args, "--after", first["id"], env=with_main).stdout)
+        self.assertEqual(json.loads((self.state / "queue" / f"{queued['id']}.json").read_text())["main"], "main-x")
+        bare = self.cli(*args)
+        self.assertNotIn("main", json.loads((self.task_dir(bare) / "dispatch.json").read_text()))
 
     def test_readers_cannot_be_handed_an_unchecked_queue_item(self):
         from importlib.machinery import SourceFileLoader
@@ -919,7 +934,7 @@ class SensitiveReadTests(unittest.TestCase):
                 event = {"hook_event_name": name, "tool_name": "Read", "tool_input": {"file_path": path}}
                 return subprocess.run([str(ROOT / "bin/tp-sensitive-read"), "--claude-hook"],
                                       input=json.dumps(event), text=True, capture_output=True,
-                                      env={**os.environ, "TP_TASK_DIR": folder, "TP_REDACTION": "shadow"}, check=True)
+                                      env={**outside_session(), "TP_TASK_DIR": folder, "TP_REDACTION": "shadow"}, check=True)
             asked = hook("PreToolUse", ".env")
             self.assertEqual(json.loads(asked.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
             request = Path(folder) / "permission-request.json"
@@ -931,7 +946,7 @@ class SensitiveReadTests(unittest.TestCase):
     def test_claude_main_hook_asks_without_worker_task_directory(self):
         event = {"hook_event_name": "PreToolUse", "tool_name": "Read",
                  "tool_input": {"file_path": ".env"}}
-        env = {**os.environ, "TP_REDACTION": "shadow"}  # in "on" mode tp-redact gates instead
+        env = {**outside_session(), "TP_REDACTION": "shadow"}  # in "on" mode tp-redact gates instead
         env.pop("TP_TASK_DIR", None)
         run = subprocess.run([str(ROOT / "claude/plugins/tmux-pi/hooks/sensitive-read.sh")],
                              input=json.dumps(event), text=True, capture_output=True,

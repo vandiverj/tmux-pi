@@ -1,0 +1,15 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "local-docs-states",
+  "kind": "local",
+  "title": "count_enumerate: states in a frozen tmux-pi doc excerpt",
+  "budget_s": 600,
+  "fixtures": [
+    "lifecycle-notes.md"
+  ],
+  "question": "Read-only question; change no files. The file lifecycle-notes.md in the project root lists lifecycle states and terminal states. Which listed lifecycle states are NOT named in its 'Terminal states' paragraph? Write the final line of your reply as: ANSWER: <name>,<name> in the order the states are listed, with no spaces after 'ANSWER: '.",
+  "answer": {
+    "file": "local-docs-states.json",
+    "sha256": "492ab32a7901ba6893e16bfedfc0c9d4027f86210482705f749aea6aa89d848b"
+  }
+}

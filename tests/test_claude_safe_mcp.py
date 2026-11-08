@@ -1,4 +1,5 @@
 """claude/mcp/safe.mjs over stdio: redacted reads and searches, and reveal. Synthetic env; no model, tmux or credentials."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

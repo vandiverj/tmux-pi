@@ -1,4 +1,5 @@
 """Isolated adaptive-goal ledger tests. No tmux session or worker is launched."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib

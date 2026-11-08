@@ -5,7 +5,7 @@
 // reveal returns one real value. Claude Code prompts for it on every call (requiresUserInteraction), and the
 // PreToolUse hook adds the placeholder, its file:line and the reason to that prompt; the value is never shown there.
 import { execFile } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,14 @@ const where = (p) => {
 };
 const clip = (text) => (text.length > MAX_CHARS ? `${text.slice(0, MAX_CHARS)}\n…(truncated)` : text);
 const str = (description) => ({ type: "string", description });
+// The operand is resolved once, before the read or search; that real path is what is read or searched and what tp-redact
+// judges (`--real`, never resolved again). If the name leads elsewhere once the output is ready, the file changed during
+// the call and nothing is returned.
+const unchanged = (name, real) => {
+  let now;
+  try { now = realpathSync(name); } catch { now = undefined; }
+  if (now !== real) throw new Error(`${name} changed during the call; output withheld`);
+};
 
 const TOOLS = {
   safe_read: {
@@ -51,12 +59,16 @@ const TOOLS = {
     },
     async run(p) {
       const file = where(String(p.path ?? ""));
-      const info = statSync(file);
+      statSync(file); // a missing file fails here, under the name the call gave
+      let real;
+      try { real = realpathSync(file); } catch { throw new Error(`${file} changed during the call; output withheld`); }
+      const info = statSync(real);
       if (!info.isFile()) throw new Error(`${file} is not a file`);
       if (info.size > MAX_FILE) throw new Error(`${file} is larger than ${MAX_FILE} bytes`);
-      const raw = readFileSync(file);
+      const raw = readFileSync(real);
       if (raw.includes(0)) throw new Error(`${file} looks binary`);
-      const lines = (await redact(raw.toString("utf8"), ["--source", file])).split("\n");
+      const lines = (await redact(raw.toString("utf8"), ["--source", file, "--real", real])).split("\n");
+      unchanged(file, real);
       const first = Math.max(1, Math.floor(Number(p.offset) || 1));
       const count = Math.max(1, Math.min(10000, Math.floor(Number(p.limit) || 2000)));
       const shown = lines.slice(first - 1, first - 1 + count).map((l, i) => `${String(first + i).padStart(6)}\t${l}`);
@@ -80,15 +92,20 @@ const TOOLS = {
       const pattern = String(p.pattern ?? "");
       if (!pattern) throw new Error("pattern is required");
       const target = where(String(p.path ?? "."));
+      let real;
+      try { real = realpathSync(target); } catch { throw new Error("search failed"); }
       const have = await run("rg", ["--version"]);
+      // `--null` ends each path with a NUL, so tp-redact takes every line's source from the path the search printed (F-GREP).
+      // The search runs on the resolved root; tp-redact shows its lines under the name the call gave.
       const args = have.code === 0
-        ? ["--no-config", "--no-follow", "--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
+        ? ["--no-config", "--no-follow", "--null", "--line-number", "--no-heading", "--color", "never", "--with-filename", "--hidden", "-g", "!.git",
            ...(p.include_ignored ? ["--no-ignore"] : []), ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? ["-g", String(p.glob)] : []),
-           "-e", pattern, "--", target]
-        : ["-rnIE", ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? [`--include=${p.glob}`] : []), "-e", pattern, "--", target];
+           "-e", pattern, "--", real]
+        : ["--null", "-rnIE", ...(p.ignore_case ? ["-i"] : []), ...(p.glob ? [`--include=${p.glob}`] : []), "-e", pattern, "--", real];
       const found = await run(have.code === 0 ? "rg" : "grep", args);
       if (found.code > 1) throw new Error("search failed");
-      const redacted = await redact(found.stdout, ["--grep", "--cwd", process.cwd()]);
+      const redacted = await redact(found.stdout, ["--grep", "--null", "--source", target, "--real", real, "--cwd", process.cwd()]);
+      unchanged(target, real);
       const max = Math.max(1, Math.min(2000, Math.floor(Number(p.max_lines) || 200)));
       const lines = redacted.split("\n").filter(Boolean);
       const body = lines.slice(0, max).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l)).join("\n");

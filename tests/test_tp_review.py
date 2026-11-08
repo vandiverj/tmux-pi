@@ -1,5 +1,6 @@
 """tp-review gates, the reviewer chosen by the review plan, and the oversized-packet boundary (stubbed tmux/tp-spawn/tp-route;
 no models). The plan itself is tested in test_model_routing."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 SECRET = "SECRET-REQUEST-BODY"
+# The round-1 context list, claims last (packet_order claims-last:v1): the request (a), the scope (b), the diff (c), the other
+# independent evidence, then the author's account under its heading file, and task.md last. Outside git there is no diff.
+CLAIMS_LAST_NO_GIT = ["request.md", "diff-scope.md", "timer-waits.md", "author-account.md", "packet.md", "result.md", "task.md"]
+CLAIMS_LAST_IN_GIT = ["request.md", "diff-scope.md", "diff-now.md", "timer-waits.md", "author-account.md", "packet.md", "result.md", "task.md"]
 PLAN = {"review": "required", "policy": "required",
         "reviewer": {"worker": "pi", "model": "openai/gpt-6-sol", "thinking": "medium", "independence": "different_provider"}}
 
@@ -273,6 +278,12 @@ echo review-1
             self.assertNotIn("review round", task)  # a first review does not claim earlier rounds
             self.assertRegex(task, r"RESULT_STATUS: complete\|empty\|blocked\|incomplete on the second line")
         self.assertIn("report.md", research)
+        # D1: claims last. The reviewer forms its findings from the diff and the tree before it reads the author's account
+        self.assertIn("Form your findings from the diff and the tree first. Then read the author's account and Main's frame and check each "
+                      "claim against what you found; a claim you could not verify is 'Closes by: check'.", generic)
+        # and nothing before it tells the reviewer to read the author's account first
+        self.assertNotIn("Inspect the supplied task, context packet, and result, then inspect the working tree", generic)
+        self.assertIn("the author's packet, result and task.md come last, under the heading 'Author's account (read after forming your own findings)'", generic)
 
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.work), "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True, capture_output=True)
@@ -290,13 +301,15 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         names = [Path(p).name for p in self.spawn_contexts()]
-        self.assertEqual(names, ["task.md", "packet.md", "result.md", "timer-waits.md"])  # the computed timer file is the only addition
+        self.assertEqual(names, CLAIMS_LAST_NO_GIT)  # no diff outside git; the timer file is the only computed addition
         self.assertFalse((self.state / "tasks" / "review-1" / "reviewed-state.json").exists())
         meta = json.loads((self.task / "meta.json").read_text())
         self.assertEqual(meta["reviews"], ["review-1"])
 
     def task_text(self):
-        return self.log.read_text().split("TASK ", 1)[1]
+        """The assignment, then the scope file (b) that it points to: where the scope tests look for the changed-file list."""
+        scope = Path(str(self.log) + ".copies") / "diff-scope.md"
+        return self.log.read_text().split("TASK ", 1)[1] + (scope.read_text() if scope.exists() else "")
 
     def test_a_non_lane_review_lists_changed_and_untracked_files_and_the_scoped_commands(self):
         self.git("init", "-q")
@@ -345,18 +358,24 @@ echo review-1
         self.assertEqual(len(listed), 205)
         self.assertIn("f204.txt (untracked)", listed)
 
-    def test_a_list_larger_than_the_packet_budget_still_starts_the_review(self):
+    def test_a_large_round_one_diff_is_split_into_segments_and_one_that_cannot_fit_refuses_the_review(self):
+        # D1: round 1 carries the diff like the later rounds do: segmented when it is large, never trimmed, refused when the packet
+        # cannot hold it
         self.git("init", "-q")
-        long = "d" * 120
-        for i in range(2000):
-            (self.work / f"{long}{i:04d}.txt").write_text("x\n")
+        (self.work / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(12000)) + "DIFF-TAIL-MARKER\n")  # about 130000 chars
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
-        full = self.task / "review-changed-files.txt"
-        self.assertGreater(full.stat().st_size, 200000)
-        self.assertEqual(len(full.read_text().splitlines()), 2000)
-        self.assertIn(str(full.resolve()), self.task_text())
-        self.assertTrue(all("changed-files" not in Path(p).name for p in self.spawn_contexts()))
+        segs = [p for p in self.spawn_contexts() if Path(p).name.startswith("diff-now-")]
+        self.assertEqual([Path(p).name for p in segs], ["diff-now-01-of-03.md", "diff-now-02-of-03.md", "diff-now-03-of-03.md"])
+        self.assertTrue(all(len(self.copy(p).read_text()) <= 60000 for p in segs))
+        self.assertIn("DIFF-TAIL-MARKER", self.copy(segs[-1]).read_text())
+        self.assertIn("Review segment 1 of 3 of diff-now", self.copy(segs[0]).read_text())
+        (self.work / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(30000)))  # about 330000 chars: over the packet budget
+        self.log.unlink()
+        r = self.review()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("without dropping author evidence", r.stderr)
+        self.assertFalse(self.log.exists())  # nothing was started, and no part of the diff was dropped to make it fit
 
     def test_the_suggested_commands_are_literal_so_a_magic_file_name_cannot_select_a_withheld_file(self):
         self.git("init", "-q")
@@ -399,7 +418,8 @@ echo review-1
         for i in range(200):
             (self.work / f"{i:03d}{'n' * 237}.txt"[:240]).write_text("x\n")
         (self.work / ".env").write_text("TOKEN=x\n")
-        (self.task / "packet.md").write_text("p" * 95000)
+        # the packet also carries the round-1 diff of these 200 files (about 190000 chars), so the author's part is smaller than it was
+        (self.task / "packet.md").write_text("p" * 40000)
         (self.task / "result.md").write_text("r" * 35000 + "\nRESULT_STATUS: complete\n")
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -469,9 +489,12 @@ echo review-1
         top = os.path.realpath(self.work)
         self.assertIn("Diff scope: 1 file(s) changed relative to HEAD", task)
         self.assertIn("- a.txt\n", task)
-        self.assertIn(f"`GIT_LITERAL_PATHSPECS=1 git -C {top} diff --cached HEAD -- <path> [<path> ...]` (staged)", task)
+        self.assertIn(f"`GIT_LITERAL_PATHSPECS=1 git -C {top} diff --cached HEAD -- <path> [<path> ...]` (staged: the index against HEAD)", task)
         staged = subprocess.run(["git", "-C", top, "diff", "--cached", "HEAD", "--", "a.txt"], text=True, capture_output=True).stdout
         self.assertIn("+two", staged)
+        diff = self.copy("diff-now.md").read_text()  # the attached diff carries the staged change itself, under its own heading
+        self.assertIn("\nStaged, not in the working files:\n", diff)
+        self.assertIn("-one\n+two\n", diff)
 
     def test_an_overflow_list_that_cannot_be_written_gives_the_one_line_fallback(self):
         self.git("init", "-q")
@@ -545,13 +568,34 @@ echo review-1
         gone = subprocess.run([sys.executable, str(self.root / "lib/review_rounds.py"), "scope", work, "nope"], text=True, capture_output=True)
         self.assertEqual(gone.returncode, 0)
         self.assertIn("could not be computed", json.loads(gone.stdout)["text"])
+        # D1: the same lane task, reviewed through tp-review, gets its round-1 diff against the lane base, not against HEAD
+        meta = json.loads((self.task / "meta.json").read_text())
+        meta.update({"workdir": wt, "lane": "alpha", "lane_step": "s1"})
+        (self.task / "meta.json").write_text(json.dumps(meta))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        diff = self.copy("diff-now.md").read_text()
+        self.assertIn(f"lane base {base[:12]}", diff)
+        for line in ("+committed", "+untracked"):
+            self.assertIn(line + "\n", diff)
+        self.assertNotIn("a.txt", diff)
 
     def test_a_first_review_in_a_repository_records_the_reviewed_tree_and_no_rounds(self):
         self.git("init", "-q")
         (self.work / "a.txt").write_text("one\n")
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md", "timer-waits.md"])
+        # D1: the round-1 list file is in reading order, claims last: request, the change, timer waits, then the author's account
+        # under its heading (packet, result) and task.md last; the diff of the tree against HEAD is there in round 1 too
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], CLAIMS_LAST_IN_GIT)
+        copies = Path(str(self.log) + ".copies")
+        self.assertIn("+one\n", (copies / "diff-now.md").read_text())
+        # (b) is a file of the list, between the request and the diff; the assignment text only points to it
+        self.assertIn("Diff scope: 1 file(s) changed relative to HEAD", (copies / "diff-scope.md").read_text())
+        self.assertNotIn("Diff scope:", self.log.read_text().split("TASK ", 1)[1])
+        self.assertIn("context file headed 'Scope of the change'", self.log.read_text())
+        self.assertTrue((copies / "author-account.md").read_text().startswith("# Author's account (read after forming your own findings)\n"))
+        self.assertEqual(json.loads((self.state / "tasks" / "review-1" / "meta.json").read_text())["packet_order"], "claims-last:v1")
         state = json.loads((self.state / "tasks" / "review-1" / "reviewed-state.json").read_text())
         self.assertRegex(state["tree"], r"^[0-9a-f]{40,64}$")
         self.assertEqual(Path(state["workdir"]).resolve(), self.work.resolve())
@@ -576,12 +620,13 @@ echo review-1
         r = subprocess.run([str(self.root / "bin/tp-review"), "w2"], text=True, capture_output=True, env=self.env)
         self.assertEqual(r.returncode, 0, r.stderr)
         names = [Path(p).name for p in self.spawn_contexts()]
-        self.assertEqual(names[:3], ["task.md", "packet.md", "result.md"])
-        self.assertEqual(names[3], "earlier-findings-01-review-1.md")
-        self.assertEqual(names[4], "diff-since-round-1.md")
+        # the diff since the last reviewed state, then the earlier findings, both before the author's account
+        self.assertEqual(names, ["request.md", "diff-scope.md", "diff-since-round-1.md", "earlier-findings-01-review-1.md", "timer-waits.md",
+                                 "author-account.md", "packet.md", "result.md", "task.md"])
+        names = [n for n in names if n != "diff-scope.md"]   # the indexes below name the other files
         copies = Path(str(self.log) + ".copies")
-        self.assertIn("A-FIRST-FINDING", (copies / names[3]).read_text())
-        diff = (copies / names[4]).read_text()
+        self.assertIn("A-FIRST-FINDING", (copies / names[2]).read_text())
+        diff = (copies / names[1]).read_text()
         self.assertIn("-one", diff)
         self.assertIn("+two", diff)
         self.assertIn("This is review round 2 of this work", self.log.read_text())
@@ -653,12 +698,13 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         names = [Path(p).name for p in self.spawn_contexts() if "earlier-findings" in p or "diff-since" in p]
-        self.assertEqual(names, ["earlier-findings-01-old-1.md", "earlier-findings-02-old-2.md", "diff-since-round-2.md"])
+        self.assertEqual(names, ["diff-since-round-2.md", "earlier-findings-01-old-1.md", "earlier-findings-02-old-2.md"])
         copies = Path(str(self.log) + ".copies")
-        self.assertIn("OLDEST", (copies / names[0]).read_text())
-        self.assertIn("MIDDLE", (copies / names[1]).read_text())
-        # no recorded state for round 2: said so, not guessed
-        self.assertIn("recorded no reviewed state", (copies / names[2]).read_text())
+        self.assertIn("OLDEST", (copies / names[1]).read_text())
+        self.assertIn("MIDDLE", (copies / names[2]).read_text())
+        # no recorded state for round 2: said so, not guessed; the change against the review base (HEAD) is attached instead
+        self.assertIn("recorded no reviewed state", (copies / names[0]).read_text())
+        self.assertIn("+one\n", (copies / names[0]).read_text())
         self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviews"], ["old-2", "review-1"])
 
     def lineage(self, old1, old2):
@@ -750,7 +796,7 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         paths = self.spawn_contexts()
-        segs = [p for p in paths if "author-" in Path(p).name]
+        segs = [p for p in paths if "author-packet" in Path(p).name or "author-result" in Path(p).name]  # not the author-account heading file
         self.assertEqual(len(segs), 4)
         for p in segs:
             self.assertLessEqual(len(self.copy(p).read_text()), 60000)
@@ -880,6 +926,9 @@ echo review-1
         self.assertLess(body.index("BBB-TEXT"), body.index("Evidence supplied by Main: a.txt"))
         self.assertLess(body.index("Evidence supplied by Main: a.txt"), body.index("AAA-TEXT"))
         self.assertIn("2 evidence file(s)", self.task_text())
+        # the evidence is in the list before the author's account, and the task text says so
+        self.assertIn("evidence file(s) before the author's account", self.task_text())
+        self.assertNotIn("after the author's material", self.task_text())
 
     def test_a_contract_is_attached_and_the_task_says_to_judge_against_it(self):
         c = self.supplied("c.md", "The reviewer must check X.\n")
@@ -992,8 +1041,8 @@ echo review-1
     def test_without_the_new_flags_the_packet_and_the_task_text_have_nothing_of_them(self):
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([Path(p).name for p in self.spawn_contexts()], ["task.md", "packet.md", "result.md", "timer-waits.md"])
-        for word in ("Main", "evidence file", "Reviewer contract", "Dispositions", "Acceptance criteria"):
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()], CLAIMS_LAST_NO_GIT)
+        for word in ("supplied by Main", "evidence file", "Reviewer contract", "Dispositions", "Acceptance criteria"):
             self.assertNotIn(word, self.task_text())
 
     def test_tp_agent_review_passes_both_flags_to_tp_review(self):
@@ -1043,6 +1092,23 @@ echo review-1
         self.assertEqual(r.returncode, 0, r.stderr)
         body = Path(str(self.log) + ".body").read_text()
         self.assertLess(body.index("CONTRACT-TEXT"), body.index("DISPOSITION-TEXT"))
+
+    def test_every_independent_item_comes_before_the_authors_account_in_the_list_file(self):
+        # D1, all of (a) to (i) in one run: the request, the brief it names and the follow-ups; the change; the earlier findings;
+        # the timer waits; what Main supplied (evidence, contract, dispositions, sweep); then the heading, packet, result and task.md
+        self.lineage("REQUEST_CHANGES\nF1 A\n", "REQUEST_CHANGES\nF1 B\n")
+        brief = self.supplied("brief.md", "## Done means\n1. a\n")
+        self.set_brief(f"Read and carry out the brief {brief}\n")
+        (self.task / "followups.md").write_text("also do Y\n")
+        r = self.review("--evidence", self.supplied("e.txt", "EVID\n"), "--contract", self.supplied("c.md", "CONTRACT-TEXT\n## Acceptance criteria\n1. CONTRACT-ITEM\n"),
+                        "--dispositions", self.supplied("d.md", "DISPOSITION-TEXT\n"), "--sweep", self.sweep())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([Path(p).name for p in self.spawn_contexts()],
+                         ["request.md", "brief.md", "followups.md", "contract-acceptance.md", "diff-scope.md",
+                          "diff-since-round-2.md", "earlier-findings-01-old-1.md", "earlier-findings-02-old-2.md",
+                          "timer-waits.md",
+                          "main-evidence-01.md", "main-contract.md", "main-dispositions.md", "sweep-review.md",
+                          "author-account.md", "packet.md", "result.md", "task.md"])
 
     def test_a_bad_dispositions_file_is_refused_naming_it_and_no_reviewer_starts(self):
         folder = self.work / "dir.txt"
@@ -1126,6 +1192,52 @@ echo review-1
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("section headed Acceptance criteria", self.task_text())
         self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2]})
+        # the criteria text is given with the request, before the scope and the diff; the contract itself stays after them
+        self.set_brief("do it\n")  # a request with no list of its own
+        self.git("init", "-q")
+        (self.work / "a.txt").write_text("one\n")
+        self.log.unlink()
+        self.assertEqual(self.review("--contract", self.supplied("c2.md", "Judge hard.\n**Acceptance criteria**\n1. must handle X\n2. must handle Y\n")).returncode, 0)
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertEqual(names[:4], ["request.md", "contract-acceptance.md", "diff-scope.md", "diff-now.md"])
+        self.assertLess(names.index("diff-now.md"), names.index("main-contract.md"))
+        early = self.copy("contract-acceptance.md").read_text()
+        self.assertIn("Acceptance criteria (from the reviewer contract supplied by Main)", early)
+        self.assertIn("1. must handle X\n2. must handle Y", early)
+        self.assertNotIn("Judge hard.", early)
+        self.assertIn("Judge hard.", self.copy("main-contract.md").read_text())  # the whole contract is still at (f)
+
+    def test_a_task_record_without_request_md_gives_the_request_first_and_keeps_task_md_last(self):
+        # a record from before request.md existed: task.md is the raw request (or a canonical record whose fenced summary is it)
+        shutil.copy(ROOT / "lib/task_record.py", self.root / "lib/task_record.py")
+        canonical = "<!-- tmux-pi-task-record:v1 -->\n# Task\n\n## Request summary\n\n```\nLEGACY-REQUEST: add the thing\n```\n\n## Orient\nMAIN-FRAME\n"
+        for name, task_md, want in (("raw request", "LEGACY-REQUEST: add the thing\n", "LEGACY-REQUEST: add the thing"),
+                                    ("canonical record", canonical, "LEGACY-REQUEST: add the thing")):
+            with self.subTest(name):
+                (self.task / "request.md").unlink(missing_ok=True)
+                (self.task / "task.md").write_text(task_md)
+                self.log.unlink(missing_ok=True)
+                r = self.review()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual([Path(p).name for p in self.spawn_contexts()], CLAIMS_LAST_NO_GIT)
+                request = self.copy("request.md").read_text()
+                self.assertIn(want, request)
+                self.assertNotIn("MAIN-FRAME", request)  # Main's frame stays with the author's account
+                self.assertIn(task_md.strip(), self.copy("task.md").read_text())
+
+    def test_a_task_record_without_request_md_gets_its_acceptance_list_and_named_brief_from_task_md(self):
+        # round 2 F1 (legacy-request-order): the legacy request is searched for briefs and a Done means list like request.md is
+        shutil.copy(ROOT / "lib/task_record.py", self.root / "lib/task_record.py")
+        brief = self.supplied("legacy-brief.md", "# Brief\n\n## Done means\n1. b-one\n2. b-two\n")
+        (self.task / "request.md").unlink(missing_ok=True)
+        (self.task / "task.md").write_text(f"Read and carry out the brief {brief}.\n\n## Done means\n3. own-three\n")
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3]})
+        self.assertIn("section headed Acceptance criteria", self.task_text())
+        names = [Path(p).name for p in self.spawn_contexts()]
+        self.assertEqual(names[:2], ["request.md", "legacy-brief.md"])  # the brief with its list is in (a), before the author's account
+        self.assertIn("b-one", self.copy("legacy-brief.md").read_text())
 
     def test_a_request_that_names_a_brief_gets_its_list_and_the_reply_is_held_to_it(self):
         brief = self.supplied("brief.md", "# Brief\n\n## Done means\n1. a\n2. b\n3. c\n")
@@ -1208,18 +1320,18 @@ echo review-1
         r = self.review()
         self.assertEqual(r.returncode, 0, r.stderr)
         names = [Path(p).name for p in self.spawn_contexts()]
-        self.assertEqual(names, ["task.md", "packet.md", "result.md", "timer-waits.md"])
-        timer = self.copy(self.spawn_contexts()[-1]).read_text()
+        self.assertEqual(names, CLAIMS_LAST_IN_GIT)
+        timer = self.copy("timer-waits.md").read_text()
         self.assertIn("Timer waits in added test lines", timer)
         self.assertIn("x_test.ts:1: await sleep(50)", timer)
-        for word in ("Main", "Reviewer contract", "Dispositions", "Acceptance criteria"):
+        for word in ("supplied by Main", "Reviewer contract", "Dispositions", "Acceptance criteria"):
             self.assertNotIn(word, self.task_text())
 
     def test_with_no_timer_lines_the_file_says_none_were_found(self):
         self.git("init", "-q")
         (self.work / "x.ts").write_text("await sleep(50)\n")
         self.assertEqual(self.review().returncode, 0)
-        self.assertIn("none were found", self.copy(self.spawn_contexts()[-1]).read_text())
+        self.assertIn("none were found", self.copy("timer-waits.md").read_text())
 
 
     # F4: a task with a sweep.md is reviewed against its table

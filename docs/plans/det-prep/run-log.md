@@ -147,3 +147,7 @@
 - Per the agreed rule there is no round 9. Worktree `tmux-pi-wt-status-cleanup` is kept uncommitted for the owner. Owner decision needed: (a) one more round with "write_record never creates a task dir" (closes the ghost-dir family by construction) + F2 fix, (b) a lock, or (c) leave F1 out of this campaign. V-F stays blocked.
 - Process note: another missed-site round in the same family; a candidate replay case for H13 (ast-grep cannot express the cross-process ordering, so this one also tests H13's limits).
 - 2026-11-08: owner added experiment X1 (strong-model traces → smaller-model harness aids; A/B/C/D arms, sealed holdout, stop before adoption). Requirements recorded in `x1-trace-distillation.md`; loop idea H17. Design pending harness inventory.
+
+## 2026-11-08: F1 round 9 (owner: "use your recommendation for F1"), final round
+- Recommendation taken: (a). Only the task creator creates a task dir; every other writer writes through a directory fd and refuses if the dir is gone (late writes land in the archive, which is valid because records are location-free). The footer names omitted rows by their real state. No lock.
+- Retry `coder-32886e6158` (pane %94), brief `fixes/f1-round9.md`. If rejected, F1 is left out of this campaign.

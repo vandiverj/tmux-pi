@@ -33,6 +33,13 @@ CONFIG = {
     "TP_REDACTION_SECRET_FILES", "TP_LMS", "TP_AGENT", "TP_PS", "TP_LAYA_DEVICE", "TP_STATUS_WINDOW", "TP_STATUS_CLOCK",
     "TP_STATUS_POLL", "TP_MAIN_HARNESS",  # launcher choice of harness, not who the caller is
     "TP_MAIN",  # TP_MAIN is the stem of shell variable names in bin/tp
+    "TP_BENCH_ANSWERS",  # lib/bench/answers.py:19: answer-directory override, not caller identity
+    "TP_BENCH_HOME",  # lib/bench/answers.py:15: benchmark data-home override, not caller identity
+    "TP_BENCH_PROJECT",  # bin/tp-bench:155: --project default, not caller identity
+    "TP_BENCH_RESULTS",  # bin/tp-bench:156: --results-dir default, not caller identity
+    "TP_BENCH_WORK",  # bin/tp-bench:157: --work-root default, not caller identity
+    "TP_HL1",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
+    "TP_X1_ARM",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
     "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_POLICY_SKILLS", "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
 }
 NAME = re.compile(r"TP_[A-Z0-9_]+|CLAUDE_CODE_[A-Z_]+|TMUX_PANE|TMUX")

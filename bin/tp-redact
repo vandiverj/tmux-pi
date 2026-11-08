@@ -2,7 +2,14 @@
 """Redact secrets from text on stdin; placeholders are stable per session.
 
 Usage: tp-redact --stdin [--source PATH] [--session ID | --no-store] [--secret-file F]... [--json]
-       tp-redact --stdin --grep [--cwd DIR]   (grep-style `path:line:text` output; each path is the source of its lines)
+       tp-redact --stdin --command CMD [--cwd DIR]   (CMD printed the text; a search tool's output is read as --grep)
+       tp-redact --stdin --grep [--cwd DIR]   (grep-style `path:line:text` output; each path is the source of its lines,
+                 and a line whose file cannot be established is judged by the strictest rules)
+       tp-redact --stdin --grep --null [--source NAME --real REAL] [--cwd DIR]   (`path<NUL>line:text` from
+                 rg/grep --null; the real file behind each path is the source of its line, and a line with no file is
+                 withheld. With --real, lines under REAL, the root the caller resolved and searched, show as NAME)
+--source is judged by the real file behind it as well (lib/redact.py rules_source). --real REAL is that real file as the
+caller resolved it before reading; it is taken as given and the name is not resolved again.
        tp-redact --claude-hook   (Claude Code hook event on stdin; see lib/redact_hook.py)
        tp-redact --mode   (prints off, shadow or on)
        tp-redact --reveal PLACEHOLDER   (prints the real value; only the reveal MCP tool calls this, after the user approved)
@@ -16,7 +23,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
-from redact import Redactor, exact_values
+from redact import Redactor, exact_values, rules_source
 from redaction_store import Store, current_session, store_holding
 import placeholders
 import redact_hook
@@ -28,7 +35,7 @@ def secret_files(extra):
     return files + [Path(f) for f in extra]
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--stdin", action="store_true")
@@ -38,11 +45,16 @@ def main():
     parser.add_argument("--source", help="file the text came from; enables config-file rules and path:line pointers")
     parser.add_argument("--session", default=current_session() or "default")
     parser.add_argument("--grep", action="store_true", help="treat stdin as grep -n output")
+    parser.add_argument("--command", help="the shell command that printed stdin; a search tool's output is read as grep "
+                        "lines (as --grep), with the one file the command reads, if any, as --source")
+    parser.add_argument("--null", action="store_true",
+                        help="with --grep: each path ends at a NUL (rg/grep --null); a line without one is withheld")
+    parser.add_argument("--real", help="with --source: the real path the caller resolved and read; not resolved again")
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--no-store", action="store_true", help="number placeholders for this call only")
     parser.add_argument("--secret-file", action="append", default=[])
     parser.add_argument("--json", action="store_true", help="print {text, findings} instead of text")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.mode:
         print(redact_hook.mode())
         return
@@ -61,13 +73,28 @@ def main():
     text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
     store = Store(persist=False) if args.no_store else Store(args.session)
     redactor = Redactor(store, exact_values(files=secret_files(args.secret_file)))
-    if args.grep:
+    if args.command and not args.grep and redact_hook.bash_searches(args.command):
+        # As the Claude hook does for Bash: grep lines judged by their own files, the rest by the strictest rules.
         post = redact_hook.PostRedactor(redactor, args.cwd)
-        post.collect(text)
+        source = redact_hook.bash_source(args.command, args.cwd)
+        post.collect(text, source and (post.source(source) or source), grep=True)
+        post.resolve()
+        redacted, findings = post.render(post.entries[0]), post.findings
+    elif args.grep:
+        post = redact_hook.PostRedactor(redactor, args.cwd)
+        post.collect_sourced(text, args.source, args.real) if args.null else post.collect(text, grep=True)
         post.resolve()
         redacted, findings = post.render(post.entries[0]), post.findings
     else:
-        redacted, findings = redactor.redact(text, args.source)
+        # The rules follow the file the text came from: a link with an ordinary name to an env file is that env file.
+        # The caller's --real is the file it read; only without one is the name resolved (now, so stricter-of).
+        real = args.real
+        if args.command and not args.source:  # as the Claude hook does for Bash: the one file a reader command prints
+            args.source = redact_hook.bash_source(args.command, args.cwd)
+        if not real and args.source:
+            resolved = redact_hook.resolve(args.source, args.cwd)
+            real = str(resolved) if resolved and resolved.is_file() else None
+        redacted, findings = redactor.redact(text, rules_source(args.source, real))
     if args.json:
         sys.stdout.write(json.dumps({"text": redacted, "findings": findings}) + "\n")
     else:

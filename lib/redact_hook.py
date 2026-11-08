@@ -17,7 +17,7 @@ import time
 
 import safe_write
 from placeholders import find, rehydrate, resolve_all
-from redact import Redactor, exact_values
+from redact import STRICTEST_RULES, Redactor, exact_values, rules_source, strictness
 from redact_llm import LocalClassifier
 from redact_rules import DOTENV, PLACEHOLDER, is_secret_name
 from redaction_store import Store, default_root, sweep
@@ -380,67 +380,333 @@ def bash_source(command, cwd):
     return files.pop() if len(files) == 1 else None
 
 
-PREFIX = re.compile(r"^([^\s:][^:\n]{0,300}?)[:-](?:(\d+)[:-])?")
+SEARCHERS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
+# Programs that run the command in their arguments. Each later word that is not an option is tried as that command, so an
+# option that takes a value (`timeout -s KILL 5 rg`) is never needed in a table here: a missed one only adds a try.
+WRAPPERS = {"env", "command", "builtin", "exec", "nice", "ionice", "timeout", "time", "xargs", "sudo", "doas", "nohup",
+            "stdbuf", "chrt", "taskset", "caffeinate", "watch", "parallel"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"}
+SHELL_VALUED = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--init-command"}
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "[[", "]]", "fi", "done", "esac"}
+# git options before the subcommand that take the next word as their value (any other leading option takes none).
+GIT_VALUED = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--exec-path"}
+# git subcommands known not to be aliases. Any other name may be a `git config alias.NAME grep`: not known statically.
+GIT_COMMANDS = set(
+    "add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-mailmap "
+    "check-ref-format checkout cherry cherry-pick clean clone commit commit-graph commit-tree config count-objects "
+    "describe diff diff-files diff-index diff-tree fetch for-each-ref format-patch fsck gc hash-object help init "
+    "log ls-files ls-remote ls-tree maintenance merge merge-base merge-file mv name-rev notes pull push range-diff "
+    "read-tree rebase reflog remote repack replace reset restore rev-list rev-parse revert rm shortlog show "
+    "show-branch show-ref sparse-checkout stash status submodule switch symbolic-ref tag update-index update-ref "
+    "var verify-commit version whatchanged worktree write-tree".split())
+# Text whose effect on what runs cannot be read statically: command or process substitution, a here-doc (not a <<<
+# here-string), a function definition.
+UNREADABLE = re.compile(r"\$\(|`|<\(|>\(|<<(?!<)|(?:^|[\s;&|(])function\s|[\w.-]\s*\(\s*\)\s*[{(]")
+SEARCH_DEPTH = 8
+# Claude tools that return a background shell's output later; their input names the shell, not the command it ran.
+LATER_OUTPUT = {"BashOutput", "TaskOutput"}
+
+
+def command_segments(command):
+    """The words of each simple command in `command` (split at |, ||, &&, ;, &, (, ), newlines), redirections removed.
+
+    Raises ValueError when the text does not split as shell words (an open quote)."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace, lex.commenters, lex.whitespace_split = " \t\r", "", True
+    segments, current, skip = [], [], False
+    for token in lex:
+        if token.strip(";&|()<>\n") == "" and set(token) & set(";|()\n") or token in ("&", "&&"):
+            segments.append(current)
+            current, skip = [], False
+        elif token.strip("<>&") == "" and set(token) & set("<>"):
+            if current and current[-1].isdigit():
+                current.pop()  # the fd of `2>`
+            skip = True  # the next word is the redirection's target, not an argument
+        elif skip:
+            skip = False
+        else:
+            current.append(token)
+    return segments + [current]
+
+
+def bash_searches(command, depth=0):
+    """Whether a shell command's output is read as plain-text grep lines (a line with no established file fails closed).
+
+    The one detector for Claude Bash (post_result) and Pi bash (tp-redact --command). True when any simple command runs a
+    search program (grep, egrep, fgrep, rg, ag, ack, any name ending in grep, `git [global options] grep`), directly or
+    under a wrapper (env, timeout, xargs, nice, ...) or `sh -c STRING`; and whenever what runs cannot be read for certain:
+    the text does not split as shell words, or holds command substitution, a here-doc, eval, an alias or function
+    definition, a git alias, a command word from a variable, or a shell reading commands from its input. Over-redacting
+    such a command's output is accepted; reading a search's output as ordinary text is not."""
+    if depth > SEARCH_DEPTH or UNREADABLE.search(command):
+        return True
+    try:
+        segments = command_segments(command)
+    except ValueError:
+        return True
+    return any(runs_search(words, depth) for words in segments)
+
+
+def runs_search(words, depth):
+    """Whether one simple command (its words) runs a search, or runs something that cannot be read for certain."""
+    if depth > SEARCH_DEPTH:
+        return True
+    words = list(words)
+    while words and (words[0] in KEYWORDS or re.match(r"^[A-Za-z_]\w*\+?=", words[0])):
+        words.pop(0)  # `if`, `!`, `{` and VAR=value before the command word
+    if not words:
+        return False
+    word = os.path.basename(words[0])
+    args = words[1:]
+    if "$" in words[0] or word in ("eval", "alias", "unalias", "hash"):
+        return True
+    if word in SEARCHERS or word.endswith("grep"):
+        return True
+    if word == "git":
+        while args and args[0].startswith("-"):
+            option = args.pop(0)
+            if option in GIT_VALUED and args:
+                args.pop(0)
+        return bool(args) and (args[0] == "grep" or args[0] not in GIT_COMMANDS)
+    if word in SHELLS:
+        for i, arg in enumerate(args):
+            if arg[:1] == "-" and arg[:2] != "--" and "c" in arg[1:]:
+                return i + 1 >= len(args) or bash_searches(args[i + 1], depth + 1)
+        # A script file operand runs as `./script.sh` does; with none, the shell reads commands from its input: unknown.
+        return not [a for i, a in enumerate(args) if a[:1] not in ("-", "+") and not (i and args[i - 1] in SHELL_VALUED)]
+    if word == "find":
+        return any(arg in ("-exec", "-execdir", "-ok", "-okdir") and runs_search(args[i + 1:], depth + 1)
+                   for i, arg in enumerate(args))
+    if word in WRAPPERS:
+        # An argument holding a space may be a whole command line (env -S, watch, parallel): read it as one too. Each
+        # later non-option word is tried as the command; a wrapper word is skipped, its own tries being among these.
+        if len(args) > 64:  # the command word may be beyond the scan limit: uncertainty is a search
+            return True
+        return any(bash_searches(arg, depth + 1) for arg in args if " " in arg) or any(
+            runs_search(args[i:], depth + 1) for i, arg in enumerate(args)
+            if not arg.startswith("-") and os.path.basename(arg) not in WRAPPERS)
+    return False
+
+
+def path_limit():
+    """The longest path the OS opens (PATH_MAX). A search tool cannot print a line from a file with a longer path."""
+    try:
+        return max(int(os.pathconf("/", "PC_PATH_MAX")), 1)
+    except (OSError, ValueError, TypeError):
+        return 4096
+
+
+PATH_LIMIT = path_limit()
+# What follows the path of a grep head: a decimal line number, `:N:` on a match line, `-N-` on a context line (grep -n,
+# rg -n). After it, rg --column's column or grep -b's byte offset may add one more `N:` (`N-` on a context line), which
+# is part of the head too. Only ASCII digits: `\d` would take other scripts' digits that no search tool prints.
+NUMBERED = re.compile(r":([0-9]+):|-([0-9]+)-")
+OFFSET = re.compile(r"[0-9]+[:-]")
+WITHHELD_LINE = "[line withheld: the file it came from could not be established]"
+
+
+# Where a KEY=value or key: value pair (the rules that need the start of a line) could begin.
+PAIR_START = re.compile(r"[ \t]*-?[ \t]*(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*[=:]")
+
+
+def unsourced_views(lines):
+    """(start, end) views of the text `lines` joins with newlines: each line from just after every `:` or `-` that a pair
+    follows, so a line whose head was not recognised is also judged as if its body started there. No length bound: a head
+    of any length (even past the OS path limit) is covered. The other rules do not need a line start; the whole text has them."""
+    views, at = [], 0
+    for line in lines:
+        end = at + len(line)
+        views += [(at + i + 1, end) for i, c in enumerate(line) if c in ":-" and PAIR_START.match(line, i + 1)]
+        at = end + 1
+    return views
 
 
 class PostRedactor:
     """Redacts every string of one tool result with a single candidate review.
 
-    grep-style `path:line:` lines use that path as their source, so config-file rules apply.
+    grep-style `path:line:` lines use the real file behind that path as their source, so config-file rules apply.
     Pass 1 plans all pieces, the classifier reviews every candidate at once (outside the
     store lock), pass 2 writes placeholders under one lock.
     """
 
     def __init__(self, redactor, cwd):
-        self.redactor, self.cwd, self.files, self.entries, self.findings = redactor, cwd, {}, [], []
+        self.redactor, self.cwd, self.files, self.dirs, self.entries, self.findings = redactor, cwd, {}, {}, [], []
+        self.paths = {}  # path from tool output -> [planned spans, displayed text once rendered]
 
-    def is_file(self, value):
+    def want(self, path):
+        """Plan how `path` is displayed (pass 1); its candidates are reviewed with the rest of the result."""
+        if path and path not in self.paths:
+            self.paths[path] = [self.redactor.plan(path), None]
+
+    def shown(self, path, line=None):
+        """The text a path drawn from tool output is displayed as: the one place that text is made.
+
+        A grep line head, the plain-text route, and the file:line pointers in Claude's hook message all show this, so a
+        segment hidden in one is hidden in all. It is redacted as text with the same rules and review as the rest of the
+        result (a secret-shaped or random-looking directory name becomes a placeholder); a path not planned in pass 1
+        keeps every candidate. Rendered once per path and reused; its own findings are recorded at `line` that once."""
+        if path not in self.paths:
+            self.want(path)
+        entry = self.paths[path]
+        if entry[1] is None:
+            entry[1], found = self.redactor.apply(path, entry[0])
+            self.findings += [{**f, "source": None, "line": line} for f in found]
+        return entry[1]
+
+    def real_file(self, value):
+        """The resolved real path of the file `value` names (from `cwd`), or None if it names no file."""
         if value not in self.files:
             resolved = resolve(value, self.cwd)
-            self.files[value] = bool(resolved and resolved.is_file())
+            self.files[value] = str(resolved) if resolved and resolved.is_file() else None
         return self.files[value]
 
-    def collect(self, text, source=None):
-        """Split text into [prefix, body, source, first line, spans] pieces and plan each."""
+    def source(self, value):
+        """What a line from the file `value` names is judged by (lib/redact.py rules_source), or None if no file."""
+        real = self.real_file(value)
+        return real and rules_source(value, real)
+
+    def is_dir(self, value):
+        if value not in self.dirs:
+            resolved = resolve(value, self.cwd)
+            self.dirs[value] = bool(resolved and resolved.is_dir())
+        return self.dirs[value]
+
+    def head(self, line):
+        """(end of the path, end of the `path:line:` head, source, line number) of a display-text grep line, or None.
+
+        A path may hold `:`, `-` and `-N-`, so the line is split at every `:` and `-` before the OS path limit. A prefix is
+        a candidate only if it names an existing regular file AND a decimal line number follows it in a shape a search
+        tool prints (`prefix:N:`, `prefix-N-`; see NUMBERED). A prefix followed by anything else (no -n, a word, `0x4`, a
+        non-ASCII digit) is not a head, so an ordinary file's name cannot claim a line it did not print. If more than one
+        candidate survives, the line is judged by the strictest of them (the shortest such head on a tie): which one the
+        tool meant cannot be told from the text. With none, the line is unsourced (collect: strictest rules). A path
+        longer than the limit, or one that cannot be stat'ed, names no file."""
+        if not line or line[0].isspace() or line[0] == ":":
+            return None
+        best = None
+        for i in range(1, min(len(line), PATH_LIMIT)):
+            if line[i] not in ":-":
+                continue
+            mark = NUMBERED.match(line, i)
+            if not mark:
+                continue  # no line number after it: not a head (checked first; it costs no stat)
+            path = line[:i]
+            folder = path.rpartition("/")[0]
+            if folder and not self.is_dir(folder):
+                continue  # nothing under a folder that is not there; saves a stat per separator
+            source = self.source(path)
+            if not source:
+                continue
+            end, number = mark.end(), int(mark.group(1) or mark.group(2))
+            if best is None or strictness(source) > strictness(best[2]):
+                best = (i, end, source, number)
+        return best
+
+    def collect(self, text, source=None, grep=False):
+        """Split text into [path, separator, body, source, first line, pointer path, rules, views] pieces and plan each.
+
+        A text without grep heads is one piece from `source`; its pointer path is that source. A head inside text from
+        `source` never weakens its rules. With `grep` (the text is plain-text grep output), a line with no recognised head
+        is unsourced: it is judged by the strictest rules (STRICTEST_RULES), even when the command named one file (that
+        file is a guess from the command text: `cat list | xargs grep -h` prints other files' lines), and its body is
+        also taken to start after any `:` or `-`, since where a head ends is not known (`grep -n` on stdin prints
+        `4:  key: value`). It fails closed, never ordinary."""
         pieces, block, start = [], [], 1
+
+        def flush():
+            body = "\n".join(block)
+            rules, views = source, ()
+            if grep:
+                rules, views = STRICTEST_RULES, unsourced_views(block)
+            pieces.append(["", "", body, source, start, source, rules, views])
+
         for number, line in enumerate(text.split("\n"), 1):
-            match = PREFIX.match(line)
-            if match and self.is_file(match.group(1)):
+            head = self.head(line)
+            if head:
                 if block:
-                    pieces.append(["", "\n".join(block), source, start])
+                    flush()
                     block = []
-                pieces.append([line[:match.end()], line[match.end():], match.group(1),
-                               int(match.group(2)) if match.group(2) else None])
+                path, body = line[:head[0]], line[head[1]:]
+                found = rules_source(head[2], source) if source else head[2]
+                offset = OFFSET.match(body) if grep else None  # -b: a byte offset may come first
+                pieces.append([path, line[head[0]:head[1]], body, found, head[3], path, found,
+                               ((offset.end(), len(body)),) if offset else ()])
                 start = number + 1
             else:
                 block.append(line)
         if block or not pieces:
-            pieces.append(["", "\n".join(block), source, start])
+            flush()
+        return self.plan(pieces, text)
+
+    def collect_sourced(self, text, shown=None, real=None):
+        """Plan grep output that carries each line's path before a NUL (`rg --null`, `grep --null`).
+
+        The source of a line is the real file behind the path the search tool printed for it; nothing is parsed out
+        of the text. A line without a path, or whose path is not a file now, is withheld (fail closed).
+
+        `real` is the search root the caller resolved once and searched (links already resolved), `shown` the name it
+        was given. A line from `real` itself is judged by `real` and `shown`, never by resolving a name again; a line
+        from a file under `real` (never a link: the search does not follow them) by its own path, what that resolves
+        to now, and its name under `shown`, whichever is strictest. Those lines are shown under `shown`."""
+        pieces = []
+        under = real and (real if real.endswith("/") else real + "/")
+        for line in text.split("\n"):
+            path, nul, rest = line.partition("\0")
+            number, colon, body = rest.partition(":")
+            source, display = None, path
+            if not (nul and path and colon and number.isdigit()):
+                pass
+            elif real and shown and path == real:
+                source, display = rules_source(shown, real), shown
+            elif under and shown and path.startswith(under):
+                display = shown.rstrip("/") + "/" + path[len(under):]
+                found = self.source(path)
+                source = found and rules_source(display, found)
+            else:
+                source = self.source(path)
+            if source:
+                pieces.append([display, ":" + number + ":", body, source, int(number), display, source, ()])
+            else:
+                pieces.append(["", "", WITHHELD_LINE if line else "", None, None, None, None, ()])
+        return self.plan(pieces, text)
+
+    def plan(self, pieces, text):
+        """Plan the body of each piece by its rules, and the paths it shows (its line head, its pointer) through
+        `want`: a path is shown to the model too, so a secret-shaped directory name is redacted like any other text (the
+        source is decided from the unredacted path before this)."""
         for piece in pieces:
-            piece.append(self.redactor.plan(piece[1], piece[2]))
+            piece.append(self.redactor.plan(piece[2], piece[6], piece[7]))
+            self.want(piece[0])
+            if isinstance(piece[5], str):
+                self.want(piece[5])
         self.entries.append(pieces)
         return text
 
     def resolve(self):
-        """Drop candidates the classifier clears. Next to a private key, every candidate stays."""
-        refs = [(piece, span) for pieces in self.entries for piece in pieces for span in piece[4] if not span[4]]
+        """Drop candidates the classifier clears, in bodies and paths alike. Next to a private key, every candidate stays."""
+        refs = [(spans, span, (piece[2], piece[3])) for pieces in self.entries for piece in pieces
+                for spans in piece[8:9] for span in spans if not span[4]]
+        refs += [(entry[0], span, (path, None)) for path, entry in self.paths.items() for span in entry[0] if not span[4]]
         if not refs:
             return
-        if any(span[3] == "private_key" for pieces in self.entries for piece in pieces for span in piece[4]):
+        if any(span[3] == "private_key" for pieces in self.entries for piece in pieces for span in piece[8]) or \
+                any(span[3] == "private_key" for entry in self.paths.values() for span in entry[0]):
             return
-        keep = self.redactor.review([(piece[1], (span[0], span[1]), piece[2]) for piece, span in refs])
-        for i, (piece, span) in enumerate(refs):
+        keep = self.redactor.review([(text, (span[0], span[1]), source) for _, span, (text, source) in refs])
+        for i, (spans, span, _) in enumerate(refs):
             if i not in keep:
-                piece[4].remove(span)
+                spans.remove(span)
 
     def render(self, pieces):
         lines = []
-        for prefix, body, source, first, spans in pieces:
+        for path, separator, body, source, first, where, _, _, spans in pieces:
             text, found = self.redactor.apply(body, spans, source)
-            lines.append(prefix + text)
+            lines.append((self.shown(path, first) if path else "") + separator + text)
             for f in found:
-                line = first if prefix else (first or 1) + f["line"] - 1
-                self.findings.append({**f, "source": source, "line": line})
+                line = first if path else (first or 1) + f["line"] - 1
+                # The pointer shows the path as the line head does (or the file the text came from): through shown().
+                at = self.shown(where, line) + ":" + str(line) if isinstance(where, str) and where else None
+                self.findings.append({**f, "source": source, "line": line, "at": at})
         return "\n".join(lines)
 
     def walk(self, value, fn, key=None):
@@ -492,12 +758,17 @@ def post_result(event, redactor, current_mode):
         source = (response.get("file") or {}).get("filePath") or params.get("file_path")
     elif tool == "Bash":
         source = bash_source(str(params.get("command") or ""), cwd)
+    # Grep output, and Bash output from a search command, are plain-text grep lines: one whose file is unknown fails
+    # closed. A background shell's output carries no command to read, so whether it is a search cannot be known: same.
+    grep = tool == "Grep" or tool in LATER_OUTPUT or (tool == "Bash" and bash_searches(str(params.get("command") or "")))
     post = PostRedactor(redactor, cwd)
-    post.walk(response, lambda text: post.collect(text, source))
+    if isinstance(source, str) and source:
+        source = post.source(source) or source  # the file behind a link decides too
+    post.walk(response, lambda text: post.collect(text, source, grep))
     persisted = response.get("persistedOutputPath") if isinstance(response, dict) else None
     raw = Path(persisted).read_text(errors="surrogateescape") if persisted and os.path.isfile(persisted) else None
     if raw is not None:
-        post.collect(raw, source)
+        post.collect(raw, source, grep)
     post.resolve()
     entries = iter(post.entries)
     with redactor.store.locked():
@@ -514,8 +785,8 @@ def post_result(event, redactor, current_mode):
         os.chmod(persisted, 0o600)
     unique = {}
     for f in post.findings:
-        where = f"{f['source']}:{f['line']}" if f.get("source") else f"line {f['line']}"
-        unique.setdefault(f["placeholder"], where)
+        # The pointer is the path as the output shows it (PostRedactor.shown), never the path itself.
+        unique.setdefault(f["placeholder"], f.get("at") or f"line {f['line']}")
     listed = ", ".join(f"{p} ({w})" for p, w in list(unique.items())[:10])
     note = (f"tmux-pi redacted {len(unique)} value(s). Placeholders stand for values you cannot see. Use one "
             "as-is in a Bash command (the user is asked once; the real value is substituted locally and never shown), or in "

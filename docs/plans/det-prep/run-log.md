@@ -269,3 +269,16 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - J1 round 4 review (review-coder-75b8f67dfe-202132): REQUEST_CHANGES with one new defect. `lmstudio_context` crashes on a successful but malformed reply (family metadata-unknown). All earlier findings are fixed at their sites. The live control run is still owed by Main. Retried as coder-379e83dc48 (rule-first): every metadata reader turns any reply it does not fully understand into null, with a table of malformed shapes.
 - N2 round 2 review (review-coder-45e00e9e96-202316): REQUEST_CHANGES (family entry-validation). A repeated unbulleted `test:` field starts a second entry, and a `note:` value naming a test counts as an entry. Retried as coder-22c8e8dfa7 (rule-first). New rule: only a bullet starts an entry; the id comes only from `test:` or else the bullet's first token; a second `test:` field makes the entry malformed. The end-to-end run against the base parser is owed.
 - Main slip: a stray `tp-agent retry` with an empty reason was refused. No duplicate record was created (checked).
+
+## 2026-11-08 03:05Z — HL1 phases 0–1 done; J1 r5 and N2 r3 in review
+
+- HL1 (agent a80e35ac229990d3d): the Phase 1 gate FAILS for both hashline arms against stock Pi on Qwen.
+  - Pass rates: P0 100% / P1 79% / P2 82%.
+  - Silent wrong edits: 0 / 7 / 2.
+  - First-try edit success fell about 31 pp; edit tokens rose 247–308%.
+  - Phase 2 is not worth running on LM Studio Qwen with Pi 1.1.0.
+  - Branch `hl1-eval` (104f879, b30c387, 7a4e08e), not merged; write-up in `docs/plans/hl1-eval/results.md` on that branch.
+  - The isolated install `~/.local/hl1-eval/src` is still present; ask the owner about cleanup at the end.
+  - Found a real bug on main: the safe_grep `.env` leak, logged as F-GREP in loop/ideas.md.
+- J1 r5 coder done. Main's two-mode run: shell 8, runner 22, score 28, cli 7, all OK; verify checks 15. Under review as review-coder-379e83dc48-202806.
+- N2 r3 coder done. Main's two-mode run: test_failing_tests 24 OK, test_preamble 40 OK; 11 spot shapes correct. Under review as review-coder-22c8e8dfa7-203045.

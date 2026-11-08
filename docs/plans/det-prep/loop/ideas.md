@@ -119,3 +119,8 @@ These build on J1. Each becomes a new bench task kind, a reviewed bench change o
 - **Rule.** An explicit `TP_SESSION` either wins, or the script refuses when it disagrees with the TMUX session. The destructive scripts (`tp-exit`, `tp-reset`, `tp-clean`) must refuse.
 - **Test.** A table covering every `bin/` script that calls `tp_session`, run with conflicting `TMUX` and `TP_SESSION`.
 - **Status.** Queued after T1, which supplies the session-key list.
+
+## F-GREP — safe_grep leaks .env content (found by HL1 phase 0, 2026-11-08)
+
+`safe_grep` over `.env` leaked the decoy token in both arms (stock and hashline) and both modes. Part of its absolute-path prefix is redacted as "unverified", so the `.env` source rule never matches. Source: `tmux-pi-wt-hl1-eval/docs/plans/hl1-eval/results.md:70-72`.
+Rule to brief: a redaction source rule matches on the resolved real path of each matched file, never on display text. A test table runs every read/search tool (safe_read, safe_grep, ...) over `.env*` and `config/local.json` with absolute, relative and `./` paths, and fails without the fix. Priority: queued ahead of F-SESS, because it is a secret leak.

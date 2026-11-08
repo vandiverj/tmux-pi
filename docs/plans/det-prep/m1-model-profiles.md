@@ -5,7 +5,7 @@ Owner, 2026-11-08: "this could lead to version specific subagents depending on t
 Source: Fan et al., *An Empirical Study of Harness Design for Coding Agents*, arXiv:2609.20804 (2026-09-17). There are 176 matched settings on SWE-Bench Verified and Terminal-Bench 2.1, with four models. Findings that matter here:
 - Planning is an accuracy scaffold for weaker models and a cost saver for stronger ones, with little accuracy change. This supports a step-by-step profile for the local Qwen and a terse one for frontier models.
 - Predefined tools help models that are weak at bash. Bash-capable models can work bash-only at much lower cost. So the profile should set the tool surface, not only the prose.
-- Context management pays off more as the budget tightens. Rule-based elision before LLM summarization was the most efficient. Recoverable elision added machinery models rarely used and gained no accuracy (relevant to the RTK eval, `rtk-eval` branch).
+- Context management pays off more as the budget tightens. Rule-based elision before LLM summarization was the most efficient. Recoverable elision added machinery models rarely used and gained no accuracy (relevant to the RTK eval, `docs/plans/rtk-eval/results.md`).
 - The authors call for "model- and budget-aware harness design".
 
 ## What a profile is

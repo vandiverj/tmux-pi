@@ -194,3 +194,13 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
     - T1 is now `coder-cb6b537bac` (%102), restart brief only.
     - J1 is now `coder-550a178817` (%103). Its brief adds: no live runs from a worker pane; one env builder that strips the session keys from every child, with a parity test that must fail without it; a session-ownership guard before stopping; folder trust done the supported way, never by answering the dialog.
 - **New finding F-SESS.** When `TMUX` is set, `tp_session` ignores an explicit `TP_SESSION`. Any tmux-pi script run from a pane with `TP_SESSION=<other>` acts on the caller's own session. The candidate rule: an explicit `TP_SESSION` wins, or the script refuses when they disagree. This touches every bin script, so it needs its own lane after T1. It is added to the fix queue.
+
+## 2026-11-08: RTK cleanup (owner-approved)
+- **Kept.** `plan.md` and `results.md` were copied to `docs/plans/rtk-eval/` on main. The raw `data/` and `scripts/` were not kept.
+  - Earlier references to branch rtk-eval at commit f846a00 now point to that copy.
+  - The `TP_RTK=1` hook commit (24d7bc5) is dropped with the branch.
+- **Removed.**
+  - worktree `tmux-pi-wt-rtk-eval`;
+  - branch `rtk-eval`;
+  - `~/.local/rtk-eval`, the binary and downloads;
+  - `~/Library/Application Support/rtk`, holding `history.db` and `recall.db`, with raw run output including the dummy fixture values.

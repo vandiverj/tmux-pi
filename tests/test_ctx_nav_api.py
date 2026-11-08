@@ -2511,7 +2511,7 @@ class BoundedReadCase(Tree):
                         if ast.unparse(callee) == "os.read" or (ast.unparse(callee) == "os.open"
                                                                 and all(f in ast.unparse(node.args[1]) for f in ("O_NOFOLLOW", "O_NONBLOCK"))):
                             continue
-                    if owner in ("open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder", "_rmtree_at") and ast.unparse(callee) == "os.open" \
+                    if owner in ("_nofollow_any_flag", "open_folder_below", "_walk", "_look", "make_own_folder", "remove_own_folder", "_rmtree_at") and ast.unparse(callee) == "os.open" \
                             and ast.unparse(node.args[1]).startswith("DIR_FLAGS"):
                         continue  # a descriptor on a folder (O_DIRECTORY): listed or written in, never read from
                     if owner == "write_new" and called == "open" and isinstance(callee, ast.Attribute) \
@@ -2582,7 +2582,7 @@ class FsTracer:
             pairs = [(target, kwargs.get("dir_fd"))]
             if name == "open":
                 flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
-                anywhere = getattr(os, "O_NOFOLLOW_ANY", 0)
+                anywhere = graph.NOFOLLOW_ANY if graph.NOFOLLOW_ANY != os.O_NOFOLLOW else 0
                 follows = "none" if anywhere and flags & anywhere == anywhere else False if flags & os.O_NOFOLLOW else True
             if kwargs.get("follow_symlinks") is False:
                 follows = False
@@ -3114,6 +3114,7 @@ class PathRuleCase(Tree):
 
     FS_CALLS = {  # (file, owner, call): the check it passes. A call added anywhere, or moved, fails the test until it is listed here.
         ("graph.py", "resolve", "isfile"): "the caller's judge (`ImportIndex._verdicts`): judged_realpath, then lstat_nofollow",
+        ("graph.py", "_nofollow_any_flag", "os.open"): "the root folder only, DIR_FLAGS; probe kernel flag support, no bytes read",
         ("graph.py", "_look", "os.open"): "folder descriptor, NOFOLLOW_ANY; the caller judged the name (judged_realpath, lstat_nofollow)",
         ("graph.py", "_look", "os.lstat"): "dir_fd-relative to that descriptor",
         ("graph.py", "_look", "os.readlink"): "dir_fd-relative to that descriptor",

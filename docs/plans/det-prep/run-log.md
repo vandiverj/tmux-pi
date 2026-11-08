@@ -165,3 +165,18 @@
 - Per the owner-approved rule there is no round 10. F1 is left out of this campaign. Worktree `tmux-pi-wt-status-cleanup` is kept uncommitted (rounds 1–9) as evidence and as a starting point if the owner revisits it. V-F stays unrun.
 - Lesson for H13/X1: 9 rounds, each fixing the cited site while the family stayed open. Round 9's fix opened new sites in the creator path. Candidate replay case for H13 and an X1 "incomplete scope" example.
 - 2026-11-08: T1 review `review-coder-47ae1f2cac-192701` REQUEST_CHANGES (F1 baseline edit = Main at merge; F2 regex parity satisfied by any mention; F3 exemption without run; N1 in-process TMUX). Round 2 `coder-91e90cad04`, brief `fixes/t1-round2.md`: `tests/__init__.py` scrubs session keys at package import (closes subprocess and in-process routes), runtime parity replaces regex + EXEMPT. Main ruling on criterion 5: identical baseline-listed failures in both modes are accepted.
+
+## 2026-11-08: RTK eval (H14) verdict: do not adopt
+Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-eval, commit f846a00, not merged). There were 28 Sonnet runs, 4 of them discarded. The rest of the 71 runs were on the local Qwen via Pi.
+1. **Fidelity fails.** 19 of 98 replayed commands lost information: diffs lost hunks, grep capped matches per file at 25, git log subjects were cut, and ls/find/branch -a hid entries.
+2. **Guards fail.**
+   - Redaction misses secrets that RTK cuts mid-line; a dummy key leaked live on Pi.
+   - `recall.db` keeps raw output for 30 days.
+   - `rtk run`/`rtk bypass` gets past kill-guard.
+   - On Claude, RTK and the redact hook overwrite each other's rewrite.
+3. **Accuracy fails.** The Pi git-log task fell from 5/5 to 1/5. Claude needed extra turns.
+4. **Savings fail.** Median billed input went up: Claude +2.2%, Pi +14.6%. RTK could only touch 13–18% of input.
+- Side finding: under macOS `/usr/bin/python3` (3.9) the trust guard denies every glob. This may explain part of the `test_trust_guard` baseline failures; check before E2.
+- Open owner questions:
+  - Remove `~/.local/rtk-eval` and RTK's local databases, which still hold raw output from these runs including dummy secrets?
+  - Keep or remove the rtk-eval worktree and branch?

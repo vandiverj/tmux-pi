@@ -400,3 +400,13 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 
 ## 2026-11-08 T1b and M2 unblocked
 - Both gpt-6.1-sol coders returned blocked: closed lanes test-env (claimed all of tests/) and bench still owned their paths. Both lanes' tips are in lane/integrate; collected their finished reviewers, then `lane remove test-env` and `lane remove bench` (archived; restore: `git branch lane/test-env 4d2108d`, `git branch lane/bench f1c341d`). Messaged both coders: ownership granted, two-mode run defined.
+
+## 2026-11-08 H10 fixed and merged into integrate
+- Lane h10-fix: coder-f2f7dc5d9d (gpt-6.1-sol) wrote 16 tests first (failed before), then: allow `Bash(echo exit-code: nonzero)`; bin/tp-claude merges caller --append-system-prompt / -file values into one inline prompt plus a standing instruction to append the suffix (wrap()'s exclusions spelled out); golden_argv claude entries; design-doc paragraph. No lib/ changes (py39-union owns lib/).
+- Escaped one worker prompt (authorize `git diff` patch output) and redirected; no second prompt.
+- Main: git diff --check clean; both modes: test_tp_claude_suffix 16 OK, test_claude_launcher_settings 8 OK, test_settings_template 2 OK, test_claude_redact_hook 16 OK, test_redact 13 OK, test_docs_wiring 6 baseline failures.
+- Review review-coder-f2f7dc5d9d-031022 (Sonnet 5.5): APPROVED_WITH_NOTES, no defects; notes: instruction text must track wrap() if it changes (F3).
+- Committed df63b5e, `lane close h10-fix h1`, merged into integrate 908b535. Integrate: same results; test_session_env 3 failures (the T1b gap).
+- Live check from integrate's bin/tp-claude, Sonnet 5.5 auto mode: pwd, git status, `ls /nonexistent-h10-dir` (denied in every earlier repro) and `ls /tmp/claude-501` all ran; Sonnet appended the suffix itself; redaction still masked 6 lines.
+- Lanes removed after integration (stale path claims blocked T1b, M2, H10): test-env, bench, sensitive-grep, failing-tests (restore commands in their archives).
+- Local config: my 6.1 sed listed gpt-6.1-sol at mid and strong; router_catalog refuses duplicates, which broke review dispatch. Local mid restored to gpt-6-sol; M2 must settle it.

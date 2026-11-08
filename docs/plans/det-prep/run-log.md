@@ -125,3 +125,7 @@
 - The 5 `unittest.loader._FailedTest` entries are not session-env-caused. They come from a full-suite discover run and don't show up when modules run by name.
 - Real failures, unchanged without the session env: 483. Among them are the ctx/docs modules (test_ctx_nav_api 357 errors, test_ctx_cli, test_docs_cli, test_docs_wiring), test_trust_guard 58, and one each in test_sensitive_trust (`test_rg_…`), test_lane_recovery, test_lane_records, test_run_bounded, test_trial_session, test_trust_record and the trial_shadow modules.
 - T1 lane `test-env` opened from lane/integrate (`5ea21ba`). Brief `t1-test-session-env.md`: a shared `tests/session_env.py` helper, a parity test over modules that copy `os.environ`, and a positive optional-main case. Coder `coder-47ae1f2cac` (claude-sonnet-5-5).
+
+## 2026-11-08 02:20Z: F1 unparked for one owner-approved round
+- Owner: "use your recommendation for F1". Recommendation: make records location-free by construction, not a lock. Remove `write_record`'s `relative` parameter so every in-task path is written by name. Readers resolve relative links against the record directory, and legacy absolute links still read. A parity test checks the caller table against `git grep`.
+- Retry `coder-dd5117f3c0` (rule-first): `fixes/f1-round8.md`. If it is rejected, F1 parks again; there is no round 9.

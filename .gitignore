@@ -37,3 +37,4 @@ credentials*
 .mcp.json
 .pi/
 .claude/settings.local.json
+bench/answers-src/

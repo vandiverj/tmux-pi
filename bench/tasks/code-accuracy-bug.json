@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-accuracy-bug",
+  "kind": "code",
+  "title": "bug fix: shot accuracy above 100 percent",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "Bug: the accuracy shown for a match can be more than 100%. Find where the accuracy is computed in src/game and fix it so that it is the percentage (rounded to a whole number) of the cells fired so far that were hits, and null when no cell has been fired yet. A single normal shot must keep giving the same numbers as before. Run the project's tests when you are done.",
+  "test_path": "src/game/bench-code-accuracy-bug.test.ts",
+  "answer": {
+    "file": "code-accuracy-bug.test.ts",
+    "sha256": "5c7877b455f8b7a04374d256c5c1f842842bd3fcf7960028cec2107661b1b490"
+  }
+}

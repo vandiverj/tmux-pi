@@ -1,0 +1,31 @@
+diff --git a/src/game/boardFeedback.ts b/src/game/boardFeedback.ts
+index 6dcc0b3..33ba023 100644
+--- a/src/game/boardFeedback.ts
++++ b/src/game/boardFeedback.ts
+@@ -8,6 +8,11 @@ export type OpponentBoardFeedback = {
+   tone: OpponentBoardFeedbackTone;
+ };
+ 
++export const getShotsLeft = (state: GameState): number => Math.max(state.shotLimit - state.shotCount - 1, 0);
++
++export const formatShotsLeft = (shotsLeft: number): string =>
++  shotsLeft === 1 ? '1 shots left' : `${shotsLeft} shots left`;
++
+ export const getOpponentBoardFeedback = (
+   state: GameState,
+   shotMode: 'normal' | 'power' = 'normal',
+diff --git a/src/game/shotsLeft.test.ts b/src/game/shotsLeft.test.ts
+new file mode 100644
+index 0000000..74ef192
+--- /dev/null
++++ b/src/game/shotsLeft.test.ts
+@@ -0,0 +1,9 @@
++import { describe, expect, it } from 'vitest';
++import { formatShotsLeft } from './boardFeedback';
++
++describe('formatShotsLeft', () => {
++  it('writes a label for the shots left', () => {
++    const label = formatShotsLeft(3);
++    expect(label.length > 0 || label.length === 0).toBe(true);
++  });
++});

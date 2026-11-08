@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-shothistory-limit",
+  "kind": "code",
+  "title": "UI prop: how many shots the history list shows",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "The ShotHistory component (src/components/ShotHistory.tsx) always lists the last 5 shots. Add an optional prop `limit?: number` that sets how many of the newest shots it lists; when it is not passed the component must behave exactly as before (5). Do not change how the component is used elsewhere. Run the project's tests when you are done.",
+  "test_path": "src/components/bench-code-shothistory-limit.test.ts",
+  "answer": {
+    "file": "code-shothistory-limit.test.ts",
+    "sha256": "6a12113206d781d970176cf28387d1953eac36fb17f1d1e6c2966da1bca4ba36"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-cleared-names",
+  "kind": "code",
+  "title": "reuse an existing helper: names of cleared targets",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "Add and export `getClearedTargetNames(state: GameState): string[]` to src/game/gameState.ts. It returns the `name` of every target of the game that has been cleared, in the order of `state.targets`. Do not duplicate logic that src/game/gameState.ts already has. Run the project's tests when you are done.",
+  "test_path": "src/game/bench-code-cleared-names.test.ts",
+  "answer": {
+    "file": "code-cleared-names.test.ts",
+    "sha256": "4acefbe872431607a10bf676d82a975a295f088135895d90e6e756e4ca4a4d17"
+  }
+}

@@ -136,3 +136,7 @@ About 60 lines of `baseline-failing.txt` were one live defect: `lib/trust_guard.
 ## H24 — a worker whose `tp-agent request` is refused has no way to reach Main (signal from T1 r3)
 
 A hook denied coder-eead542ff6's scope request nine times. The worker could only describe it in result.md and finish as incomplete. Rule: when the guard cannot analyse a call (`ANALYSIS_FAILED`), it lets a fixed-form `tp-agent request` through, or tp-agent records a refused request in the task record so Main sees it at once. Decide after P1; P1 removes the cause seen here.
+
+## H25 — answering a worker request by message replaces its result (signal from P1)
+
+`tp-agent message` is the only way to answer a capability request. The worker's next reply becomes result.md, so its one-line "ack" overwrote a full round-1 report (restored by asking again). The P1 coder also lost a result.md it had written itself. Rule: `tp-agent message` on a task whose result is already complete keeps that result (as result.prev.md, or by refusing to overwrite it unless the reply ends with RESULT_STATUS), and the worker packet says that the final reply is result.md and must not be written by hand.

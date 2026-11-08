@@ -314,3 +314,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - The coder's `tp-agent request` for those 22 was denied nine times: "trust store guard ... could not be analysed". Main reproduced it with the hook: `lib/trust_guard.py:532` `glob.iglob(..., include_hidden=True)` raises TypeError on the system Python 3.9.6, so any call with a glob word is denied. This confirms the E2-noted 3.9 risk. About 60 baseline lines are this defect (H23).
 - P1 brief `docs/plans/det-prep/p1-guard-python39.md`. Dispatched coder-256b4dd5bc (Opus, lane guard-py39, step P1, pane %130).
 - T1 r3: full two-mode run under way. Main's ruling for the review: the 22 modules get their import line once their lanes merge (a follow-up step in integrate). The stale-list check enforces it.
+
+## 2026-11-08 03:55Z — P1 round 1 reviewed, round 2 dispatched
+
+- coder-256b4dd5bc: `_iglob` replaces `glob.iglob(include_hidden=True)`; `_report_fault` puts a single line on stderr; `lib/trust.py` `_parse_expiry` accepts `Z` (sweep row 2). The capability request to edit tests/test_trust_guard.py (lane test-env owns tests/) was granted by Main, who copied the coder's proposed file in unchanged. Main's two-mode run: trust_guard 310, sensitive_trust 192, trust_record 69, all OK. Hook spot checks under /usr/bin/python3: globs allowed, literal store paths denied. The coder maps 58 of the 60 baseline lines in these modules to passing, and all 60 with the tests applied.
+- Main slip: answering the request by message made the worker's "ack" overwrite result.md; restored by asking again (H25).
+- review-coder-256b4dd5bc-215052: REQUEST_CHANGES F1. The glob budget counts matches, not entries visited, as the brief's wording asked. Main's ruling (in the r2 brief, for the reviewer to judge): a glob that matches nothing cannot name the store; the deadline, now checked per entry, bounds the walk; the budget counts matches, as it did on 3.11. Owed check: the intermittent test_sensitive_trust `git grep` subtests. Main is running the unmodified integrate tree 3× per mode.
+- Round 2: coder-ff55f5cdc7 (Opus, pane %132), brief p1-r2.md.

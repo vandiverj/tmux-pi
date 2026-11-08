@@ -139,3 +139,10 @@
 
 - 2026-11-08: owner added ast-grep structural sweeps as loop idea H13 (replay on F1/D1/K1/C2/E1/G1 families, then A/B on review-loop tasks); RTK eval and M1 registered as H14/H15.
 - 2026-11-08: owner added OpenTelemetry usage monitoring as loop idea H16 (Claude built-in OTel + Pi extension, local stdlib receiver, overhead/fidelity/insight eval before adoption).
+
+## 2026-11-08 01:05Z: F1 round 8 rejected, F1 parked
+- Main's 8 modules all passed (evidence13). Review `review-coder-dd5117f3c0-183947`: REQUEST_CHANGES, rounds 1–7 cases confirmed fixed.
+  - F1 (retirement-dependency-order, still open): an in-flight `tp-contract status` that writes after `archive_task` renames the task recreates `tasks/<id>` as a ghost dir without `meta.json`. The round-8 race test only covers a write before the rename. Location-free paths do not stop this; it needs either a writer that refuses to create a missing task dir, or a lock.
+  - F2 (new): `lib/tp_window.py:190-207` footer counts escalated/other omitted tasks as "finished".
+- Per the agreed rule there is no round 9. Worktree `tmux-pi-wt-status-cleanup` is kept uncommitted for the owner. Owner decision needed: (a) one more round with "write_record never creates a task dir" (closes the ghost-dir family by construction) + F2 fix, (b) a lock, or (c) leave F1 out of this campaign. V-F stays blocked.
+- Process note: another missed-site round in the same family; a candidate replay case for H13 (ast-grep cannot express the cross-process ordering, so this one also tests H13's limits).

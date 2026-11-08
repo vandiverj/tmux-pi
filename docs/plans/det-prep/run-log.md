@@ -359,3 +359,6 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 ## 2026-11-08 U1 (PY39-UNION) dispatched
 - Brief `u1-py39-union.md` (eac6300). Lane `py39-union`, step U1, base lane/integrate; coder-62fe70c08d (claude, level mid -> claude-sonnet-5-5).
 - T1 round 4 two-mode run still going when U1 started; no overlap (U1 touches lib/, T1 touches tests/ only, except the new tests/test_lib_imports_py39.py).
+- U1 coder-62fe70c08d PARKED after two auto-mode prompts (first: a long chain reverting lib/ for the before-fix run, redirected to a git-archive export; second: `mkdir -p $TP_TASK_DIR/base`). Both say a hook changed the call after auto mode reviewed it: the H10 rewrite (lib/redact_hook.py:27 SUFFIX). Escape both times, never approved; task stopped.
+  State left: tmux-pi-wt-py39-union has `from __future__ import annotations` in lib/ctxengine/{calls,surface}.py and lib/localdocs/{calls,lock}.py plus new tests/test_lib_imports_py39.py, uncommitted. Task dir has before.log (9 FAIL lines, TypeError on `|`), sweep.txt; after.log empty. No before/after test run, no review.
+  H10 raised to high: it blocks Claude workers in auto mode. Owner decision on the H10 fix (stop rewriting, or exempt workers) before more Claude coders are dispatched.

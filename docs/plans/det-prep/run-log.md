@@ -334,3 +334,4 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Committed in the lane as b4dc3cd (3 files); lane step P1 closed; merged into integrate as 0cb5400. In integrate, both modes: trust_guard 310, sensitive_trust 192, trust_record 69, all OK.
 - Still owed: the baseline lines P1 fixes (about 60, test_trust_guard, test_trust_record 425, test_sensitive_trust 446). Main removes them after T1 merges, because test-env owns the baseline file.
 - The live hook runs from the main checkout's bin/, so workers keep hitting the 3.9 denial until P1 reaches main. That needs the owner.
+- 04:09Z F-GREP dispatched: brief fg-safe-grep-source.md, coder-51390d04c9 (Opus, lane safe-source, step FGREP, pane %134). Main granted the tests/ paths up front, given test-env's claim on tests/, to avoid P1's blocked request.

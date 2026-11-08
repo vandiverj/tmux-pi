@@ -287,3 +287,9 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 
 - J1 r5 review: REQUEST_CHANGES. A loaded model with an unreadable context length was recorded as {} instead of null. Fixed as r6 (coder-13239f5437) with the rule "partly understood means null, never empty or partial". Main's two-mode run is all OK and verify checks 15. Under review as review-coder-13239f5437-203344.
 - N2 r3 review: REQUEST_CHANGES with two more entry-validation cases (a `test_case:` label; explicit `test:` taking precedence over the bullet token). Also found that `docs/prompt-examples/07-known-failures.md:54` tells workers to write "none", which is the likely source of the owner's issue. N2 r4 (coder-2103c620cb) implements an exact line grammar, fixes that doc, sweeps for similar text, and produces a scripted before/after table. Loop signal H22 logged.
+
+## 2026-11-08 03:55Z — J1 approved and merged into lane/integrate
+
+- J1 r6 review (review-coder-13239f5437-203344): APPROVED_WITH_NOTES. All three notes are checks: the live run, without-change coverage for acceptance items 2–5, and the historical sweep rows; the reviewer's report.md covers that sweep.
+- Committed as `f1c341d` (39 files, the exact reviewed set). Lane step j1 closed; merged into lane/integrate as `3a1bcb4`. In integrate, the four bench modules pass in both modes (8/22/28/7) and verify checks 15.
+- Owed by Main: the live local-only control run (main and lane/integrate, `--repeat 2`) with before/after `tmux ls` and `git worktree list`. It is held until no worker pane is live, because the previous live run killed two coder panes.

@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-describe-target",
+  "kind": "code",
+  "title": "two files to read: describe a target with its board labels",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "Add and export `describeTarget(target: PlacedTarget): string` to src/game/boardFeedback.ts. It returns '<short name> (<length>): <cells>' where <cells> are the labels the app shows for the target's cells (the same labels the shot history shows), in the order the target lists its cells, separated by single spaces. Example shape: 'Rovers (4): A1 B1 C1 D1'. Run the project's tests when you are done.",
+  "test_path": "src/game/bench-code-describe-target.test.ts",
+  "answer": {
+    "file": "code-describe-target.test.ts",
+    "sha256": "80b3c633a940af89f684bb829c7caa5e17678492551ff18835d3bc0bc45c47e5"
+  }
+}

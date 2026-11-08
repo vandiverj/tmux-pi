@@ -1,0 +1,36 @@
+diff --git a/src/components/ShotHistory.tsx b/src/components/ShotHistory.tsx
+index ab0ae7a..11be339 100644
+--- a/src/components/ShotHistory.tsx
++++ b/src/components/ShotHistory.tsx
+@@ -8,16 +8,17 @@ type ShotHistoryProps = {
+   side: ShotSide;
+   title: string;
+   emptyText: string;
++  limit: number;
+ };
+ 
+ type ShotFilter = 'all' | ShotHistoryEntry['outcome'];
+ 
+-export function ShotHistory({ state, side, title, emptyText }: ShotHistoryProps) {
++export function ShotHistory({ state, side, title, emptyText, limit }: ShotHistoryProps) {
+   const [filter, setFilter] = useState<ShotFilter>('all');
+   const allShots = useMemo(() => getShotHistory(state, side), [side, state]);
+   const shots = allShots
+     .filter((shot) => filter === 'all' || shot.outcome === filter)
+-    .slice(-5)
++    .slice(-(limit - 1))
+     .reverse();
+   const counts = allShots.reduce(
+     (summary, shot) => ({
+diff --git a/src/components/StatusPanel.tsx b/src/components/StatusPanel.tsx
+index 2283504..7c0b98b 100644
+--- a/src/components/StatusPanel.tsx
++++ b/src/components/StatusPanel.tsx
+@@ -207,6 +207,7 @@ export function StatusPanel({ state, remainingCount, isComputerThinking = false,
+             side="human"
+             title="Your recent shots"
+             emptyText="Your first shot will appear here."
++            limit={5}
+           />
+           <ShotHistory
+             state={state}

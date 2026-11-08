@@ -1,0 +1,14 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "code-shot-clock",
+  "kind": "code",
+  "title": "trap next door: shot clock label",
+  "budget_s": 900,
+  "level": "small",
+  "brief": "Add and export `formatShotClock(state: GameState): string` to src/game/boardFeedback.ts. It returns the shots used and the shot limit of the game as '<used>/<limit>', for example '7/26'. Run the project's tests when you are done.",
+  "test_path": "src/game/bench-code-shot-clock.test.ts",
+  "answer": {
+    "file": "code-shot-clock.test.ts",
+    "sha256": "aeabfc64796856d95fb527382d2dbd8fe365ac4b979b3e33f9be96418d065b21"
+  }
+}

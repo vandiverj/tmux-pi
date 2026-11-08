@@ -1,0 +1,13 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "review-accuracy-fraction",
+  "kind": "review",
+  "title": "review: accuracy as a fraction",
+  "budget_s": 900,
+  "request": "Make getShotAccuracy return a 0-1 fraction instead of a percent and show it in the match details as the share of shots that hit.",
+  "diff": "diffs/accuracy-fraction.patch",
+  "answer": {
+    "file": "review-accuracy-fraction.json",
+    "sha256": "990d246a3d0a68a6f4f4c9438f8ea2d4f37743f4e475a8eec377e5cc411aef57"
+  }
+}

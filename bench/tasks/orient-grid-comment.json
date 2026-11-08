@@ -1,0 +1,9 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "orient-grid-comment",
+  "kind": "orient",
+  "title": "orientation cost of a one-line change",
+  "budget_s": 600,
+  "level": "small",
+  "brief": "In src/game/targets.ts add the comment line `// The board is GRID_SIZE x GRID_SIZE cells.` directly above `export const GRID_SIZE = 8;`. Change nothing else and do not run any tests."
+}

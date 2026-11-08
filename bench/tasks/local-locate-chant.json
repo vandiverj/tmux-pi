@@ -1,0 +1,12 @@
+{
+  "schema": "tp-bench-task:v1",
+  "id": "local-locate-chant",
+  "kind": "local",
+  "title": "locate_quote: the chant of one target",
+  "budget_s": 600,
+  "question": "Read-only question; change no files. In src/game/targets.ts, find the target whose shortName is 'Metro' and quote its chant text exactly (without the surrounding quote marks). Write the final line of your reply as: ANSWER: <the chant text>",
+  "answer": {
+    "file": "local-locate-chant.json",
+    "sha256": "7c08d712d98ec898b13447ab94fb758ae9600318acbc9254199b085a5d234e9c"
+  }
+}

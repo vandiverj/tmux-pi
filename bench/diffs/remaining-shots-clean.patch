@@ -1,0 +1,48 @@
+diff --git a/src/game/boardFeedback.ts b/src/game/boardFeedback.ts
+index 6dcc0b3..582e479 100644
+--- a/src/game/boardFeedback.ts
++++ b/src/game/boardFeedback.ts
+@@ -8,6 +8,11 @@ export type OpponentBoardFeedback = {
+   tone: OpponentBoardFeedbackTone;
+ };
+ 
++export const getRemainingShots = (state: GameState): number => Math.max(state.shotLimit - state.shotCount, 0);
++
++export const formatRemainingShots = (remaining: number): string =>
++  remaining === 1 ? '1 shot remaining' : `${remaining} shots remaining`;
++
+ export const getOpponentBoardFeedback = (
+   state: GameState,
+   shotMode: 'normal' | 'power' = 'normal',
+diff --git a/src/game/remainingShots.test.ts b/src/game/remainingShots.test.ts
+new file mode 100644
+index 0000000..96dcc7a
+--- /dev/null
++++ b/src/game/remainingShots.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from 'vitest';
++import { formatRemainingShots, getRemainingShots } from './boardFeedback';
++import type { GameState } from './types';
++
++const stateWith = (shotCount: number, shotLimit: number) => ({ shotCount, shotLimit }) as GameState;
++
++describe('getRemainingShots', () => {
++  it('subtracts the shots used from the limit', () => {
++    expect(getRemainingShots(stateWith(4, 26))).toBe(22);
++  });
++
++  it('never goes below zero', () => {
++    expect(getRemainingShots(stateWith(30, 26))).toBe(0);
++  });
++});
++
++describe('formatRemainingShots', () => {
++  it('uses the singular for one shot', () => {
++    expect(formatRemainingShots(1)).toBe('1 shot remaining');
++  });
++
++  it('uses the plural otherwise', () => {
++    expect(formatRemainingShots(0)).toBe('0 shots remaining');
++    expect(formatRemainingShots(3)).toBe('3 shots remaining');
++  });
++});

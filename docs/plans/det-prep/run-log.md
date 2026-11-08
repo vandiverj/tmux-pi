@@ -136,3 +136,5 @@
 - On branch `rtk-eval` (worktree `tmux-pi-wt-rtk-eval`, from `5ea21ba`), `TP_RTK=1` adds RTK's hook to `tp-claude` and its extension, loaded last, to `tp-pi` (`24d7bc5`). Both smoke tests rewrote commands, and both answers were correct.
 - Plan and decision rule are in `docs/plans/rtk-eval/plan.md` (`25e2de2`). A background agent is running phases 0–3 (ceiling, replay fidelity, guard compatibility, live A/B).
 - Owner proposed model-specific worker profiles, citing arXiv:2609.20804. The brief is `m1-model-profiles.md`, queued after the RTK eval and before J1.
+
+- 2026-11-08: owner added ast-grep structural sweeps as loop idea H13 (replay on F1/D1/K1/C2/E1/G1 families, then A/B on review-loop tasks); RTK eval and M1 registered as H14/H15.

@@ -236,3 +236,19 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - **Cause.** `failing_tests.parse` only recognises an exact inline `none`. Variants such as `none.`, `None (all pass)`, `none (nothing was run).`, `none` on the next line and `**none**` all parse as a block. The hook then tells Main to dispatch `--investigate-failure`.
 - **Rule** (brief `fixes/n2-failing-tests-none.md`): a report exists only if it has a bulleted entry that names a test. The header text is a note. The worker prompt says to leave the block out when nothing fails. There are negative and positive table tests plus an end-to-end index test.
 - **Dispatched** as lane failing-tests (`coder-151123d131`, Sonnet).
+
+## 2026-11-08 ~02:15Z: status
+- **J1 round 3** (`coder-fe9731bcf3`):
+  - added `probe_session` (absence must be proven, otherwise `unknown`);
+  - `Shell.run` raises on a non-zero exit unless the call carries `tolerate="reason"`;
+  - after each reset the tree is checked, and if that fails later tasks are recorded `reset-failed`.
+  - Main ran 60 tests in both modes, all OK. No `has-session` remains. Review `review-coder-fe9731bcf3-200950` is running.
+- **T1 round 2** (`coder-cb6b537bac`) is complete:
+  - `tests/__init__.py` scrubs the session keys;
+  - runtime checks plus a mutation check (3 failures with `__init__` removed);
+  - `test_docs_wiring` (6 failures) and `test_trial_session` (1 failure) fail the same in both modes, with names matching the baseline;
+  - `test_retry_packet` has its baseline import error.
+  - Main's own two-mode run is in progress; the review follows.
+- **N2** (`coder-151123d131`) stopped on lane ownership and asked for context. That was the correct behaviour.
+  - Main's ruling: lane-facts and local-model have no open step and are merged; status-cleanup is parked; T1 does not touch `test_failing_tests`, `fixtures` or `tp-spawn`.
+  - Edits granted; the merge order is T1, then N2. Retried as `coder-deee9cfdd0`.

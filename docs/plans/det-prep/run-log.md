@@ -429,3 +429,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Review review-coder-4d766446d8-074323 (Sonnet 5.5): APPROVED_WITH_NOTES, no defects. Round-5 F1 fixed; depth limit, shlex failure and UNREADABLE all fail closed; no other cap in the detector. N1 (later): wrappers missing from WRAPPERS (setsid, busybox, ssh, script -c, flock) are not detected. N2: >64-operand non-search wrapper commands are over-redacted (accepted).
 - Committed 2a1e56f (rounds 1-6), `lane close safe-source FGREP`, merged into integrate 421b4c1 with no conflict. test_session_env then caught test_safe_source_redaction (written before T1) without the scrub import; Main added it on integrate df8753e.
 - Integrate df8753e, both modes: test_session_env 13, the nine F-GREP modules, test_tp_claude_suffix 16: all OK. test_docs_wiring 6 failures = baseline.
+
+## 2026-11-08 Full-suite gate before integrate->main: M2 regression found
+- Main ran all 136 test modules in both modes on a detached copy of integrate d496bdd (M2 + T1b + H10), 3 in parallel, 900s bound per module. 448 distinct failing names; 387 outside the baseline in 20 modules.
+- Cause of all but the F-FLAKE pair: fixtures dispatch through the committed catalog with `openai/gpt-6-sol` (tests/lane_fixture.py:18 and others), which M2 removed. M2's worker and review covered only the five routing modules. The integrate->main merge is held.
+- F-FLAKE again: test_tracked_credential_names_lift_only_as_committed in test_sensitive_read and test_sensitive_trust (outside mode only).
+- test_ctx_nav_api hit the 900s bound in both modes (its 358 baseline names unconfirmed this run; likely slower under 3-way parallelism).
+- Follow-up M2b (docs/plans/det-prep/m2b-fixtures.md, list m2b-off-baseline.txt): lane gpt61, coder-f6352fbb8b. Main pre-authorized model-id/effort literals in files other lanes own.

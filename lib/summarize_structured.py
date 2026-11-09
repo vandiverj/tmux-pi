@@ -405,54 +405,26 @@ def _root_name(node):
     return node.id if isinstance(node, ast.Name) else None
 
 
-_Index = collections.namedtuple("_Index", "events star dynamic mentions")
-
-
-def _spelled(node):
-    """The identifiers one node spells itself (not those of its children)."""
-    if isinstance(node, ast.Name):
-        return (node.id,)
-    if isinstance(node, ast.Attribute):
-        return (node.attr,)
-    if isinstance(node, ast.arg):
-        return (node.arg,)
-    if isinstance(node, ast.keyword):
-        return (node.arg,) if node.arg else ()
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return (node.name,)
-    if isinstance(node, ast.alias):
-        return tuple(node.name.split(".")) + ((node.asname,) if node.asname else ())
-    if isinstance(node, ast.ImportFrom):
-        return tuple((node.module or "").split("."))
-    if isinstance(node, ast.ExceptHandler):
-        return (node.name,) if node.name else ()
-    if isinstance(node, (ast.Global, ast.Nonlocal)):
-        return tuple(node.names)
-    if isinstance(node, ast.Constant):
-        return tuple(re.findall(r"\w+", node.value)) if isinstance(node.value, str) else ()
-    return tuple(n for n in (getattr(node, "name", None), getattr(node, "rest", None)) if isinstance(n, str))  # a match capture
+_Index = collections.namedtuple("_Index", "events star dynamic")
 
 
 def _binding_index(tree):
-    """_Index(events, star, dynamic, mentions): every way the file binds or writes a name, read once and kept on the tree.
+    """_Index(events, star, dynamic): every way the file binds or writes a name, read once and kept on the tree.
     events is {name: [(kind, node, statement, scope)]}.
     kind is "name" (a Store or Del target of any form, an import alias, an except name, a match capture), "def" (a def, async def or
     class), "arg" (a parameter), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
     or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. star: some
-    `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import). mentions: every identifier
-    the file spells anywhere (a name, an attribute, a parameter or keyword, a def or class, each segment of an imported module and
-    alias, each word of a string), so that a name not in it is not in the file at all."""
+    `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import)."""
     cached = getattr(tree, "_binding_index", None)
     if cached:
         return cached
-    events, star, dynamic, mentions = {}, False, False, set()
+    events, star, dynamic = {}, False, False
     stack = [(tree, None, None)]
     while stack:
         node, scope, stmt = stack.pop()
         if isinstance(node, ast.stmt):
             stmt = node
         found = []  # (name, kind)
-        mentions.update(_spelled(node))
         if isinstance(node, ast.Name) and node.id in _DYNAMIC or isinstance(node, ast.Attribute) and node.attr in _DYNAMIC:
             dynamic = True
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -483,8 +455,14 @@ def _binding_index(tree):
             events.setdefault(name, []).append((kind, node, stmt, scope))
         inner = node if isinstance(node, _SCOPE_NODES) else scope
         stack.extend((child, inner, stmt) for child in ast.iter_child_nodes(node))
-    tree._binding_index = _Index(events, star, dynamic, frozenset(mentions))
+    tree._binding_index = _Index(events, star, dynamic)
     return tree._binding_index
+
+
+def _star(tree):
+    """True when the file has a `from m import *`: it then binds names no statement shows. The one test of it, used by _binds, the
+    use scan (_use_lines) and the absence check (_no_path_to)."""
+    return _binding_index(tree).star
 
 
 def _binds(tree, name, owner, shadow):
@@ -492,11 +470,11 @@ def _binds(tree, name, owner, shadow):
     module); None when the file uses a dynamic form (_DYNAMIC) or, in the module scope, has a star import. In the module scope every Store of the name counts
     wherever it sits in the file (a function's `global` or a local of the same name too); a def or class counts when it is in that
     scope, or anywhere when shadow. A parameter counts only when shadow. Attribute and subscript writes always count."""
-    events, star, dynamic, _mentions = _binding_index(tree)
-    if dynamic or (owner is None and star):
+    index = _binding_index(tree)
+    if index.dynamic or (owner is None and _star(tree)):
         return None
     counted = []
-    for event in events.get(name, ()):
+    for event in index.events.get(name, ()):
         kind, scope = event[0], event[3]
         if kind == "write" or (kind == "arg" and shadow) or (kind == "def" and (shadow or scope is owner)) \
                 or (kind in ("name", "global") and (owner is None or scope is owner)):
@@ -722,24 +700,87 @@ def _inside(dotted, module):
     return dotted == module or dotted.startswith(module + ".")
 
 
-def _no_path_to(tree, path, name, module):
-    """True when the source proves the file has no path to the name defined in the dotted module `module`, so that "does not use" may
-    be said: through the binding index, no star import of any module, no dynamic form (_DYNAMIC), and the name spelled nowhere in the
-    file (_spelled); and no import that resolves to the target module (or a package or submodule of it, as `import pkg` for pkg.t) or that cannot be resolved
-    (a relative import with no package above the run root). Anything else gives no absence line."""
-    index = _binding_index(tree)
-    if index.star or index.dynamic or name in index.mentions:
-        return False
+# A file whose text holds one of these words can reach a name it does not spell (getattr(m, chr(81)), vars(m), importlib.import_module,
+# inspect.getmembers, a class from object.__subclasses__()): "does not use" is not said of it. The words are matched in the raw text,
+# comments and strings too, on identifier boundaries; a false hit only loses a line. The last six are beyond the brief's list.
+_DYNAMIC_ACCESS = ("getattr", "__getattribute__", "__import__", "importlib", "import_module", "sys.modules", "eval", "exec", "compile",
+                   "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
+                   "pkgutil", "pickle", "marshal",
+                   "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc")
+_DYNAMIC_ACCESS_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(w) for w in _DYNAMIC_ACCESS) + r")(?![A-Za-z0-9_])")
+
+
+def _imports_of(path, tree):
+    """(dotted names the file imports, whether every import resolved): `import a.b` names a.b; `from a.b import c` names a.b and a.b.c
+    (c may be a module); a relative import is resolved as in _imported_module, and one that does not resolve makes the second False."""
+    names, resolved = set(), True
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
             source = _imported_module(path, node)
-            if source is None or _inside(source, module) or any(_inside(source + "." + a.name if source else a.name, module) for a in node.names):
-                return False
-        elif isinstance(node, ast.Import):
-            # `import pkg.t` imports the target; `import pkg` or `import pkg.other` binds the package that holds it (pkg.t by attribute)
-            if any(_inside(a.name, module) or _inside(module, a.name if a.asname else a.name.split(".")[0]) for a in node.names):
-                return False
-    return True
+            if source is None:
+                resolved = False
+                continue
+            names.add(source)
+            names.update(source + "." + a.name for a in node.names if a.name != "*")
+    return names, resolved
+
+
+def _import_graph(files, parsed):
+    """{dotted module: (imports, resolved) or None} for every .py file of the run root (_imports_of); None for one that does not parse
+    (or when one of two files of the same module name does not)."""
+    graph = {}
+    for f in files:
+        if f["path"].endswith(".py"):
+            module, tree = _module_name(f["path"]), parsed[f["path"]]
+            found = _imports_of(f["path"], tree) if tree is not None else None
+            if module in graph:  # pkg.py and pkg/__init__.py: either may run, so the module holds the imports of both
+                found = None if found is None or graph[module] is None else (found[0] | graph[module][0], found[1] and graph[module][1])
+            graph[module] = found
+    return graph
+
+
+def _reaches(imports, resolved, module, graph):
+    """True when code that imports the dotted names `imports` may reach the dotted module `module` through the run root's import graph.
+    An import counts when it can name the target: it is equal to it, an ancestor package of it or a descendant of it. A name may name a
+    run-root module by its full path or by the path below a directory on sys.path (`worker` for src/worker.py). Importing a module runs
+    the modules of its ancestor packages, and each module it loads is followed through its own imports (transitively). An import that
+    cannot be resolved (a relative one above the run root), a file that does not parse, and a name that is not a run-root module or
+    package but whose top-level name is one all count as a path."""
+    if not resolved:
+        return True
+    tops = {m.split(".")[0] for m in graph}
+    seen, todo = set(), list(imports)
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        named = {name} | {m for m in graph if m.endswith("." + name)}
+        if any(_inside(n, module) or _inside(module, n) for n in named):
+            return True
+        if len(named) == 1 and not any(_inside(m, name) or _inside(name, m) for m in graph) and name.split(".")[0] in tops:
+            return True
+        for m in {m for m in graph if any(_inside(n, m) for n in named)}:
+            if graph[m] is None or not graph[m][1]:
+                return True
+            todo.extend(graph[m][0])
+    return False
+
+
+def _no_path_to(source, tree, path, name, module, graph):
+    """True when the file's text and the run root's import graph prove the file has no path to the name defined in the dotted module
+    `module`, so that "does not use" may be said. All of these hold; none is a list of syntax cases:
+    - the bare name occurs nowhere in the raw text (code, strings, bytes, comments, docstrings), on identifier boundaries;
+    - the text holds none of _DYNAMIC_ACCESS;
+    - no star import (_star);
+    - no path through the import graph to the module (_reaches): none of its imports, nor those of any run-root module it loads,
+      is the target module, an ancestor package or a submodule of it, or cannot be resolved.
+    Anything else gives no absence line."""
+    if _star(tree) or _DYNAMIC_ACCESS_RE.search(source) or re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source):
+        return False
+    return not _reaches(*_imports_of(path, tree), module, graph)
 
 
 def _use_lines(f, tree, target, kind, module, others, members, dup):
@@ -750,7 +791,7 @@ def _use_lines(f, tree, target, kind, module, others, members, dup):
     target's dotted module name from the run root, others those of the other files that define the same name. An import counts as
     the target's only when its module resolves to `module` by full dotted path (a basename alone never does). A call, a creation or
     a use is attributed only through a name that _single_binding proves bound once, by that import: a name that is bound again,
-    written (`t.Q = x`), shadowed, or in a file with a star import gives the import line at most. dup (the name is defined in more
+    written (`t.Q = x`), shadowed, or in a file with a star import (_star: a parameter attribution too) gives the import line at most. dup (the name is defined in more
     than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
     this module."""
     if _binding_index(tree).dynamic:
@@ -789,6 +830,10 @@ def _use_lines(f, tree, target, kind, module, others, members, dup):
                     other_modules.add(code)
     if set(direct) & other_direct or set(modules) & other_modules:
         return [], [], [], True
+    if _star(tree):
+        # a star import binds names no statement shows: the import line is a fact, no call, creation or attribute use is (a parameter
+        # included: whatever `q` is, it may be a name the star import brought)
+        return sorted(imports, key=lambda item: item[0]), [], [], True
     valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
     valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
     if valid_direct != set(direct) or valid_modules != set(modules):
@@ -845,12 +890,13 @@ def use_scan(task, files):
     call, and the attribute uses through a variable bound once from T(...) or a parameter (only of a name the class defines, dunder
     methods too), each only through an import of the target by its full dotted path whose name nothing else binds, writes or
     shadows (see _use_lines); `from m import *` attributes nothing. A file with none of these gives `<base> does not use <T> [path:1]`,
-    unless the source does not prove it has no path to the name (_no_path_to: a star import, a dynamic form (_DYNAMIC), the name spelled
-    anywhere, an import of the target's module or one that cannot be resolved): then it gives nothing. When more than one file
+    unless the file's text and the run root's import graph do not prove it has no path to the name (_no_path_to: a star import, a word of
+    _DYNAMIC_ACCESS, the name anywhere in the text, a path through the imports to the target's module): then it gives nothing. When more than one file
     defines the name, each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself,
     or whose binding of the name is ambiguous, gives nothing for it."""
     out = []
     parsed = {f["path"]: _parse(f["path"], f["text"]) for f in files}
+    graph = _import_graph(files, parsed)
     for f in files:
         for line, kind, name, owner in outline(f["path"], f["text"]):
             if kind not in ("class", "function") or owner or not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", task):
@@ -870,7 +916,7 @@ def use_scan(task, files):
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)
-                elif not undecided and _no_path_to(parsed[g["path"]], g["path"], name, module):
+                elif not undecided and _no_path_to(_source(g["text"]), parsed[g["path"]], g["path"], name, module, graph):
                     out.append("- {} does not use {} [{}:1]".format(_base(g), "{}.{}".format(module, name) if len(definers) > 1 else name, g["path"]))
     return list(dict.fromkeys(out))
 

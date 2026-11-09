@@ -207,6 +207,13 @@ class UseScanTests(unittest.TestCase):
         # a star import that does not export the name is not a use of it
         hidden = self.TARGET + '__all__ = ["run_it"]\n'
         self.assertEqual(self.scan("from t import *\nQ()\n", hidden), [])
+        # round 5 F2: no emitter of a "uses" line (a parameter, a variable bound from Q(), a call) goes past a star import, whatever it is for
+        self.assertEqual(self.scan("from other import *\ndef f(q):\n    q.pop()\n"), [])
+        self.assertEqual(self.scan("from other import *\ndef f(q):\n    q.pop()\n", self.TARGET.replace("Q", "W"), "W"), [])
+        self.assertEqual(self.scan("def f(q):\n    q.pop()\nfrom other import *\n"), [])
+        self.assertEqual(self.scan("from t import Q\nfrom other import *\nx = Q()\nx.pop()\ndef f(q):\n    q.pop()\n"), ["- u.py imports Q [u.py:1]"])
+        self.assertEqual(self.scan("import t\nfrom other import *\nx = t.Q()\nx.pop()\n"), [])
+        self.assertEqual(self.scan("def f(q):\n    q.pop()\n"), ["- u.py uses Q.pop on q [u.py:2]"])  # without the star import, the same parameter is a use
 
     def test_undecided_gives_no_absence_line(self):
         for label, user in (("a bare Name no import explains", "class Sub(Q):\n    pass\n"),
@@ -235,9 +242,22 @@ class UseScanTests(unittest.TestCase):
                             ("the name as a keyword", "f(Q=1)\n"),
                             ("the name inside a string", "x = 'make a Q now'\n"),
                             ("the name as a parameter", "def f(Q):\n    pass\n"),
-                            ("an alias of the name", "from pkg import X as Q\n")):
+                            ("an alias of the name", "from pkg import X as Q\n"),
+                            # round 5 F3: absence is a test on the raw text, so any spelling of the name blocks it
+                            ("the name in a comment", "x = 1  # TODO move Q\n"),
+                            ("the name in a docstring", '"""Uses Q."""\nx = 1\n'),
+                            ("the name in bytes", 'x = b"Q"\n'),
+                            ("the name in a longer bytes", "x = b'make Q now'\n"),
+                            ("the name in an f-string", "x = f'{1} Q'\n"),
+                            ("the name in a dotted path", "x = 'pkg.t.Q'\n"),
+                            ("the name in a type comment", "x = []  # type: list[Q]\n")):
             with self.subTest(label):
                 self.assertEqual(self.scan(user), [])
+        if MATCH:  # the keyword of a class pattern is stored in MatchClass.kwd_attrs, which no walk of names reaches
+            self.assertEqual(self.scan("match obj:\n    case C(Q=x):\n        pass\n"), [])
+        # a different identifier is not the name: the line stays
+        for user in ("x = Q2\n", "x = QQ\n", "x = _Q\n", "x = qQ\n", "x = b'Q2'\n", "x = 1  # q\n", "def f(q):\n    pass\n"):
+            self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
         # the review's second reproduction, and a file with nothing that reaches the target still gets its line
         self.assertEqual(self.scan("from t import *\n"), [])
         self.assertEqual(self.scan("import json\nx = json.dumps(1)\n"), ["- u.py does not use Q [u.py:1]"])
@@ -257,6 +277,77 @@ class UseScanTests(unittest.TestCase):
         # the same imports one level down resolve
         self.assertEqual(ss.use_scan("Who uses Q?", [num("pkg/t.py", "class Q:\n    pass\n"), num("pkg/sub/u.py", "from ..t import Q\nQ()\n")]),
                          ["- u.py imports Q [pkg/sub/u.py:1]", "- u.py creates a Q [pkg/sub/u.py:2]"])
+
+    def test_each_dynamic_access_word_blocks_the_absence_line(self):
+        """Round 5: a file whose text holds one of these words can reach a name it does not spell. One row per word, inserted into an
+        otherwise clean file; the table must equal ss._DYNAMIC_ACCESS, so a word added there needs its row here."""
+        words = ("getattr", "__getattribute__", "__import__", "importlib", "import_module", "sys.modules", "eval", "exec", "compile",
+                 "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
+                 "pkgutil", "pickle", "marshal", "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc")
+        self.assertEqual(set(words), set(ss._DYNAMIC_ACCESS))
+        self.assertEqual(self.scan("x = 1\n"), ["- u.py does not use Q [u.py:1]"])
+        for word in words:
+            with self.subTest(word):
+                self.assertEqual(self.scan("x = 1\ny = {}\n".format(word)), [])
+                self.assertEqual(self.scan("x = 1  # {}\n".format(word)), [])  # the raw text: a comment holds it too
+        # the word is matched on identifier boundaries: a longer identifier is not the word
+        for user in ("x = execute\n", "y = evaluate(1)\n", "z = my_vars\n", "g = gcd(1, 2)\n", "i = inspector\n"):
+            self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
+        # the review's reproduction (F3): the name is built, never spelled
+        files = [num("pkg/sub/t.py", "class Q:\n    pass\n"), num("pkg/sub/__init__.py", "from . import t\n"), num("pkg/__init__.py", ""),
+                 num("u.py", "from pkg import sub\ngetattr(sub.t, chr(81))()\n")]
+        self.assertEqual([l for l in ss.use_scan("Who uses Q?", files) if l.startswith("- u.py")], [])  # (the empty pkg/__init__.py does say it)
+
+    def test_absence_needs_no_path_through_the_import_graph(self):
+        """Round 5: the run root's import graph, with full dotted paths and relative imports resolved as Python does. An import that is
+        the target module, an ancestor package of it or a submodule of it blocks the line, and so does any run-root module that reaches
+        it (transitively); an ancestor package's __init__ reaches its submodules only if it imports them."""
+        target = num("pkg/sub/t.py", "class Q:\n    pass\n")
+        none = ["- u.py does not use Q [u.py:1]"]
+
+        def scan(user, *others):
+            files = [target] + [num(path, text) for path, text in others] + [num("u.py", user)]
+            return [line for line in ss.use_scan("Who uses Q?", files) if line.startswith("- u.py")]
+
+        for label, user, others in (
+                ("the target by full path", "import pkg.sub.t\n", ()),
+                ("the target from its package", "from pkg.sub import t\n", ()),
+                ("an ancestor, from-import (review F3)", "from pkg import sub\nx = sub.t.make()\n", ()),
+                ("an ancestor package", "import pkg\n", ()),
+                ("an ancestor, dotted", "import pkg.sub\n", ()),
+                ("a submodule of the target", "import pkg.sub.t.deeper\n", ()),
+                ("another module of the ancestor", "import pkg.other\n", ()),
+                ("two hops: u, h, t", "import h\n", (("h.py", "from pkg.sub import t\n"),)),
+                ("three hops: u, h, g, t", "import h\n", (("h.py", "import g\n"), ("g.py", "import pkg.sub.t\n"))),
+                ("through a from-import of a module", "from h import x\n", (("h.py", "import pkg.sub.t\nx = 1\n"),)),
+                ("through a star import in h", "import h\n", (("h.py", "from pkg.sub.t import *\n"),)),
+                ("through an import inside a function of h", "import h\n", (("h.py", "def f():\n    import pkg.sub.t\n"),)),
+                ("through the __init__ of a package, which imports it", "import lib.x\n",
+                 (("lib/__init__.py", "from pkg.sub import t\n"), ("lib/x.py", "y = 1\n"))),
+                ("by the path below a directory on sys.path", "import worker\n", (("src/worker.py", "import pkg.sub.t\n"),)),
+                ("a bare name that can be the target", "import t\n", ()),
+                ("a relative import that cannot be resolved, in u", "from . import t\n", ()),
+                ("a relative import above the root, in h", "import h\n", (("h.py", "from .. import z\n"),)),
+                ("a module that does not parse", "import h\n", (("h.py", "def (:\n"),)),
+                ("two files of one module name, the later harmless", "import h\n", (("h/__init__.py", "import pkg.sub.t\n"), ("h.py", "import os\n"))),
+                ("a name no module accounts for, in a run-root package", "from pkg import zzz\n", ())):
+            with self.subTest(label):
+                self.assertEqual(scan(user, *others), [])
+        for label, user, others in (
+                ("nothing imported", "x = 1\n", ()),
+                ("the standard library", "import os\nfrom collections import OrderedDict\n", ()),
+                ("a package that only looks alike", "import pkg2\nfrom other.pkg import sub\n", ()),
+                ("a module of its own", "import h\n", (("h.py", "import os\n"),)),
+                ("two hops that end elsewhere", "import h\n", (("h.py", "import g\n"), ("g.py", "import json\n"))),
+                ("a package whose __init__ does not import the target", "import lib.x\n",
+                 (("lib/__init__.py", "import os\n"), ("lib/x.py", "y = 1\n"))),
+                ("an import cycle that ends nowhere", "import h\n", (("h.py", "import u\n"),)),
+                ("by the path below a directory on sys.path, ending elsewhere", "import worker\n", (("src/worker.py", "import os\n"),)),
+                ("a relative import that resolves, to a file that imports elsewhere", "import pkg.o\n",
+                 (("pkg/o.py", "from . import p\n"), ("pkg/p.py", "y = 1\n")))):
+            with self.subTest(label):
+                expected = [] if label.startswith("a relative import that resolves") else none  # pkg is an ancestor of pkg.sub.t
+                self.assertEqual(scan(user, *others), expected)
 
     def test_a_rebound_name_keeps_only_the_import(self):
         imp = "- u.py imports Q [u.py:1]"

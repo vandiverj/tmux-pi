@@ -552,3 +552,14 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   (coder-ff2c8ee9c3, brief g2/g2b-lane-cap.md).
 - Held: sensitive_trust rg lift (FG-N1's area, after merge); ctx_nav_api r9 (owner decision on Deno); the
   order-dependent group (whole-module repeat runs in progress).
+- ~19:20 CST: G2-A/G2-B first dispatch started from stale lane/integrate (a0aa3e6; Main omitted --base main).
+  Stopped, collected, lanes abandoned (G2-A's 3 changed files stashed in its worktree, then removed). Briefs updated:
+  base main; no lane edits baseline-failing.txt (Main removes the lines at merge). Re-dispatched with --base main:
+  G2-A g2-py39 coder-f32fa5e4d8, G2-B g2-lane-cap coder-f7f5d0d555, G2-C g2-trial-runid coder-d2f1cdad52 (default
+  trial run id stamped to the second collides; branches whole-module fails 2/2 on 3.14), G2-D g2-handover
+  coder-c8a5cd505f (lane_recovery whole-module fails 4/4: a second writer without --lane-replaces is not refused).
+  trial_shadow_end_path passed 4/4 whole-module; folded into G2-C to find its cause.
+- LS1 r4 review (review-coder-636cd4b784-185851): REQUEST_CHANGES F1 completeness (signature-only passes), F2 unknown
+  extension heading, F3 body/docstring citations rejected, F4 table separator. Main's probe confirmed by the reviewer
+  (24/24, 0/144). Round 5 by route design (fixes/ls1-round5.md): support as line sets with anchors, behaviour regexes
+  matched with citations removed, any filename-like heading sets context. coder-10744b0248.

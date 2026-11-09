@@ -305,9 +305,11 @@ class UseScanTests(unittest.TestCase):
         target = num("pkg/sub/t.py", "class Q:\n    pass\n")
         none = ["- u.py does not use Q [u.py:1]"]
 
-        def scan(user, *others):
-            files = [target] + [num(path, text) for path, text in others] + [num("u.py", user)]
+        def scan(user, *others, at="u.py"):
+            files = [target] + [num(path, text) for path, text in others] + [num(at, user)]
             return [line for line in ss.use_scan("Who uses Q?", files) if line.startswith("- u.py")]
+
+        h_pkg, h_mod = ("h/__init__.py", "x = 1\n"), ("h.py", "x = 1\n")
 
         for label, user, others in (
                 ("the target by full path", "import pkg.sub.t\n", ()),
@@ -330,9 +332,39 @@ class UseScanTests(unittest.TestCase):
                 ("a relative import above the root, in h", "import h\n", (("h.py", "from .. import z\n"),)),
                 ("a module that does not parse", "import h\n", (("h.py", "def (:\n"),)),
                 ("two files of one module name, the later harmless", "import h\n", (("h/__init__.py", "import pkg.sub.t\n"), ("h.py", "import os\n"))),
-                ("a name no module accounts for, in a run-root package", "from pkg import zzz\n", ())):
+                ("a name no module accounts for, in a run-root package", "from pkg import zzz\n", ()),
+                # round 6 F1: a name whose prefix is a run-root package or module but which is no module there cannot be resolved; a
+                # known ancestor does not resolve it. The same at every hop.
+                ("a missing submodule of a known package", "import h.missing\n", (h_pkg,)),
+                ("a missing submodule of a known module", "import h.missing\n", (h_mod,)),
+                ("a missing member of a known package (from-import)", "from h import missing\n", (h_pkg,)),
+                ("a missing member of a known module (from-import)", "from h import missing\n", (h_mod,)),
+                ("a missing dotted module of a known package, from-import", "from h.missing import f\n", (h_pkg,)),
+                ("a member of a module that uses a dynamic form", "from h import x\n", (("h/__init__.py", "x = 1\nsetattr(a, 'b', 1)\n"),)),
+                ("transitive: u, helper, a missing submodule", "import helper\n", (h_pkg, ("helper.py", "import h.missing\n"))),
+                ("transitive: u, helper, a missing member", "import helper\n", (h_pkg, ("helper.py", "from h import missing\n"))),
+                ("transitive: u, helper, helper2, a missing submodule", "from helper import f\n",
+                 (h_pkg, ("helper.py", "import helper2\nf = 1\n"), ("helper2.py", "import h.missing\n"))),
+                ("a missing submodule below a path on sys.path", "import worker.missing\n", (("src/worker.py", "x = 1\n"),)),
+                # round 6 (Main): a module the walk visits is held to the same closed checks as the file: a star import or a dynamic word
+                ("a module it imports uses importlib", "import h\n", (("h.py", "import importlib\nx = 1\n"),)),
+                ("a module it imports uses getattr", "import h\n", (("h.py", "x = getattr(a, 'b')\n"),)),
+                ("a member that a star import may bring", "from h import missing\n", (("h/__init__.py", "from os import *\n"),)),
+                ("a module it imports has a star import", "import h\n", (("h.py", "from os import *\n"),)),
+                ("a dynamic word in a comment of a module it imports", "import h\n", (("h.py", "x = 1  # exec\n"),)),
+                ("a module it imports from, which uses importlib", "from h import x\n", (("h.py", "import importlib\nx = 1\n"),)),
+                ("the package __init__ it loads has a star import", "import h.real\n", (("h/__init__.py", "from os import *\n"), ("h/real.py", "y = 1\n"))),
+                ("two hops: the second module uses getattr", "import h\n", (("h.py", "import g\n"), ("g.py", "x = getattr(a, 'b')\n"))),
+                ("two hops: the second module has a star import", "import h\n", (("h.py", "import g\n"), ("g.py", "from os import *\n")))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others), [])
+        # the relative form: a module of a package that imports a sibling the package does not have
+        for label, user, others in (("a missing relative module", "from .missing import x\n", (("pkg2/__init__.py", ""),)),
+                                    ("a missing relative member", "from . import missing\n", (("pkg2/__init__.py", "x = 1\n"),)),
+                                    ("transitive: a relative missing module in a sibling", "from . import helper\n",
+                                     (("pkg2/__init__.py", ""), ("pkg2/helper.py", "from .missing import y\n")))):
+            with self.subTest(label):
+                self.assertEqual(scan(user, *others, at="pkg2/u.py"), [])
         for label, user, others in (
                 ("nothing imported", "x = 1\n", ()),
                 ("the standard library", "import os\nfrom collections import OrderedDict\n", ()),
@@ -343,6 +375,17 @@ class UseScanTests(unittest.TestCase):
                  (("lib/__init__.py", "import os\n"), ("lib/x.py", "y = 1\n"))),
                 ("an import cycle that ends nowhere", "import h\n", (("h.py", "import u\n"),)),
                 ("by the path below a directory on sys.path, ending elsewhere", "import worker\n", (("src/worker.py", "import os\n"),)),
+                # round 6 F1: an import that resolves to a run-root module keeps the line, whatever hops it takes
+                ("a clean module it imports, words that only look alike", "import h\n", (("h.py", "x = execute(evaluate(my_vars))\n"),)),
+                ("two clean hops", "import h\n", (("h.py", "import g\n"), ("g.py", "x = 1\n"))),
+                ("a submodule that exists", "import h.real\n", (h_pkg, ("h/real.py", "y = 1\n"))),
+                ("a member that is a submodule", "from h import real\n", (h_pkg, ("h/real.py", "y = 1\n"))),
+                ("a member the package binds", "from h import x\n", (h_pkg,)),
+                ("a member a module binds", "from h import x\n", (h_mod,)),
+                ("a member from a module of a package", "from h.real import y\n", (h_pkg, ("h/real.py", "y = 1\n"))),
+                ("a member of one of two files of one module name", "from h import y\n", (h_pkg, ("h.py", "y = 2\n"))),
+                ("transitive: a submodule that exists", "import helper\n", (h_pkg, ("h/real.py", "y = 1\n"), ("helper.py", "import h.real\n"))),
+                ("transitive: a member that exists", "import helper\n", (h_pkg, ("helper.py", "from h import x\n"))),
                 ("a relative import that resolves, to a file that imports elsewhere", "import pkg.o\n",
                  (("pkg/o.py", "from . import p\n"), ("pkg/p.py", "y = 1\n")))):
             with self.subTest(label):

@@ -711,9 +711,10 @@ _DYNAMIC_ACCESS_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(w) 
 
 
 def _imports_of(path, tree):
-    """(dotted names the file imports, whether every import resolved): `import a.b` names a.b; `from a.b import c` names a.b and a.b.c
-    (c may be a module); a relative import is resolved as in _imported_module, and one that does not resolve makes the second False."""
-    names, resolved = set(), True
+    """(names, members, whether every import resolved): `import a.b` puts a.b in names; `from a.b import c` puts a.b in names and
+    (a.b, c) in members (c may be a module of a.b or an attribute a.b binds: _resolve_import says which). A relative import is resolved
+    as in _imported_module, and one that does not resolve makes the third False."""
+    names, members, resolved = set(), set(), True
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(a.name for a in node.names)
@@ -723,49 +724,89 @@ def _imports_of(path, tree):
                 resolved = False
                 continue
             names.add(source)
-            names.update(source + "." + a.name for a in node.names if a.name != "*")
-    return names, resolved
+            members.update((source, a.name) for a in node.names if a.name != "*")
+    return names, members, resolved
+
+
+def _bound_names(tree):
+    """The names a module can hold as attributes once it has run: the set of names it binds or writes in its module scope (or declares
+    global in a function). A module with a star import or a dynamic word is opaque (_opaque) and blocks on its own."""
+    return frozenset(name for name, events in _binding_index(tree).events.items()
+                     if any(e[0] in ("write", "global") or e[3] is None for e in events))
+
+
+def _opaque(source, tree):
+    """True when the file's raw text holds a word of _DYNAMIC_ACCESS or the file has a star import: what it loads is then not shown by
+    its imports. The one test of it, for the file scanned (_no_path_to) and for every module the graph walk visits (_reaches)."""
+    return _star(tree) or bool(_DYNAMIC_ACCESS_RE.search(source))
 
 
 def _import_graph(files, parsed):
-    """{dotted module: (imports, resolved) or None} for every .py file of the run root (_imports_of); None for one that does not parse
-    (or when one of two files of the same module name does not)."""
+    """{dotted module: (names, members, resolved, bound, opaque) or None} for every .py file of the run root (_imports_of, _bound_names,
+    _opaque); None for one that does not parse (or when one of two files of the same module name does not)."""
     graph = {}
     for f in files:
         if f["path"].endswith(".py"):
             module, tree = _module_name(f["path"]), parsed[f["path"]]
-            found = _imports_of(f["path"], tree) if tree is not None else None
+            found = (*_imports_of(f["path"], tree), _bound_names(tree), _opaque(_source(f["text"]), tree)) if tree is not None else None
             if module in graph:  # pkg.py and pkg/__init__.py: either may run, so the module holds the imports of both
-                found = None if found is None or graph[module] is None else (found[0] | graph[module][0], found[1] and graph[module][1])
+                other = graph[module]
+                if found is not None and other is not None:
+                    found = (found[0] | other[0], found[1] | other[1], found[2] and other[2], found[3] | other[3], found[4] or other[4])
+                else:
+                    found = None
             graph[module] = found
     return graph
 
 
-def _reaches(imports, resolved, module, graph):
-    """True when code that imports the dotted names `imports` may reach the dotted module `module` through the run root's import graph.
-    An import counts when it can name the target: it is equal to it, an ancestor package of it or a descendant of it. A name may name a
-    run-root module by its full path or by the path below a directory on sys.path (`worker` for src/worker.py). Importing a module runs
-    the modules of its ancestor packages, and each module it loads is followed through its own imports (transitively). An import that
-    cannot be resolved (a relative one above the run root), a file that does not parse, and a name that is not a run-root module or
-    package but whose top-level name is one all count as a path."""
+def _resolve_import(name, graph, attribute=False):
+    """THE one rule for what a dotted import name is against the run root: (named, unresolved). named is the set of dotted names it can
+    be: itself, and every run-root module whose dotted path ends in it (`worker` for src/worker.py: the path below a directory on
+    sys.path). The name is resolved when it is a run-root module, a name of one (that ending), or an ancestor package of one. The name
+    of a `from m import c` member (attribute) is resolved too when it is an attribute some run-root module m binds. A name that is not
+    resolved but has a proper prefix that is (`import h.missing` with a run-root h, `from h import missing` when h binds no missing,
+    `from .missing import x` in a package) is unresolved: it names no module of the run root and may be one nobody gave us, so it
+    counts as a path to every module. A name none of whose prefixes is in the run root is outside it and is not unresolved."""
+    named = {name} | {m for m in graph if m.endswith("." + name)}
+
+    def known(dotted):
+        return dotted in graph or any(m.endswith("." + dotted) or _inside(m, dotted) for m in graph)
+
+    if known(name):
+        return named, False
+    parent, _dot, last = name.rpartition(".")
+    if attribute and parent:
+        owners = [graph[m] for m in graph if m == parent or m.endswith("." + parent)]
+        if owners and all(o is not None and last in o[3] for o in owners):
+            return named, False
+    parts = name.split(".")
+    return named, any(known(".".join(parts[:i])) for i in range(1, len(parts)))
+
+
+def _reaches(names, members, resolved, module, graph):
+    """True when code that imports the dotted names `names` and the (module, member) pairs `members` may reach the dotted module `module`
+    through the run root's import graph. An import counts when it can name the target: it is equal to it, an ancestor package of it or
+    a descendant of it. A name may name a run-root module by its full path or by the path below a directory on sys.path (`worker` for
+    src/worker.py). Importing a module runs the modules of its ancestor packages, and each module it loads is followed through its own
+    imports (transitively), and one that is opaque (_opaque: a star import or a _DYNAMIC_ACCESS word in its text) counts as a path, as the
+    file's own text does in _no_path_to. An import that cannot be resolved (a relative one above the run root; a name under a run-root package or
+    module that names no module there, _resolve_import), a file that does not parse, all count as a path. The unresolved test is made on
+    every import, the file's own and those of each module it loads."""
     if not resolved:
         return True
-    tops = {m.split(".")[0] for m in graph}
-    seen, todo = set(), list(imports)
+    seen, todo = set(), [(n, False) for n in names] + [(s + "." + c, True) for s, c in members]
     while todo:
-        name = todo.pop()
-        if name in seen:
+        item = todo.pop()
+        if item in seen:
             continue
-        seen.add(name)
-        named = {name} | {m for m in graph if m.endswith("." + name)}
-        if any(_inside(n, module) or _inside(module, n) for n in named):
-            return True
-        if len(named) == 1 and not any(_inside(m, name) or _inside(name, m) for m in graph) and name.split(".")[0] in tops:
+        seen.add(item)
+        named, unresolved = _resolve_import(item[0], graph, item[1])
+        if unresolved or any(_inside(n, module) or _inside(module, n) for n in named):
             return True
         for m in {m for m in graph if any(_inside(n, m) for n in named)}:
-            if graph[m] is None or not graph[m][1]:
+            if graph[m] is None or not graph[m][2] or graph[m][4]:  # a module that is opaque (_opaque) may load the target unseen
                 return True
-            todo.extend(graph[m][0])
+            todo.extend([(n, False) for n in graph[m][0]] + [(s + "." + c, True) for s, c in graph[m][1]])
     return False
 
 
@@ -776,9 +817,10 @@ def _no_path_to(source, tree, path, name, module, graph):
     - the text holds none of _DYNAMIC_ACCESS;
     - no star import (_star);
     - no path through the import graph to the module (_reaches): none of its imports, nor those of any run-root module it loads,
-      is the target module, an ancestor package or a submodule of it, or cannot be resolved.
+      is the target module, an ancestor package or a submodule of it, or cannot be resolved, and none of those modules is itself opaque
+      (_opaque: the same two checks above, made on each module the walk visits).
     Anything else gives no absence line."""
-    if _star(tree) or _DYNAMIC_ACCESS_RE.search(source) or re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source):
+    if _opaque(source, tree) or re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source):
         return False
     return not _reaches(*_imports_of(path, tree), module, graph)
 

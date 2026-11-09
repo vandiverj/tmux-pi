@@ -353,30 +353,68 @@ class HookTriggerTest(Base):
                         self.assertEqual((self.task / "permission-request.json").read_bytes(), before, "left exactly as it was")
 
     def test_a_late_answer_overtakes_a_declined_request(self):
-        """Stop marked the request declined, then the tool call's own PostToolUse, PostToolUseFailure or PermissionDenied arrives: that is the
-        real outcome. Another call's answer, and a request that was already authorized or denied, stay as they are."""
+        """The turn (SubagentStop for a subagent's ask, Stop for the main agent's) marked the request declined, then the tool call's own
+        PostToolUse, PostToolUseFailure or PermissionDenied arrives: that is the real outcome, in on, shadow and off. Another call's answer,
+        and a request that was already authorized or denied, stay as they are. PostToolUseFailure is heard by redact.sh in every mode
+        (sensitive-read.sh is not registered on it); the other two by the hook that asked."""
         response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
         late = (("PostToolUse", "authorized", "toolu_g3hook"), ("PostToolUseFailure", "authorized", "toolu_g3hook"),
-                ("PermissionDenied", "denied", "toolu_g3hook"), ("PostToolUse", "declined", "toolu_other"))
-        for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
-            for name, expected, call in late:
-                if name == "PostToolUseFailure" and mode != "on":
-                    continue  # no hook settles a failure in shadow or off (sensitive-read.sh is not on PostToolUseFailure)
-                with self.subTest(mode=mode, event=name, call=call), mock.patch.dict(os.environ, self.env(mode)):
-                    self.ask(mode, asker, agent_id="X")
-                    self.decide("redact", {**self.turn("SubagentStop"), "agent_id": "X"})
-                    self.assertEqual(self.request()["status"], "declined")
-                    answer = {**self.event(name), "tool_use_id": call, "agent_id": "X", "tool_response": response}
-                    self.decide(asker, answer)
-                    settled = self.request()
-                    self.assertEqual(settled["status"], expected)
-                    self.assertEqual((settled.get("call"), settled.get("agent_id")), ("toolu_g3hook", "X"))
-                    before = (self.task / "permission-request.json").read_bytes()
-                    self.decide("redact", {**self.turn("SubagentStop"), "agent_id": "X"})
-                    self.decide(asker, {**self.event("PostToolUse"), "tool_response": response})
-                    self.decide(asker, self.event("PermissionDenied"))
-                    if expected != "declined":
-                        self.assertEqual((self.task / "permission-request.json").read_bytes(), before, "authorized and denied are final")
+                ("PermissionDenied", "denied", "toolu_g3hook"), ("PostToolUse", "declined", "toolu_other"),
+                ("PostToolUseFailure", "declined", "toolu_other"), ("PermissionDenied", "declined", "toolu_other"))
+        for who, ending in (({"agent_id": "X"}, {**self.turn("SubagentStop"), "agent_id": "X"}), ({}, self.turn("Stop"))):
+            for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+                for name, expected, call in late:
+                    answerer = "redact" if name == "PostToolUseFailure" else asker
+                    with self.subTest(mode=mode, ended=ending["hook_event_name"], event=name, call=call), mock.patch.dict(os.environ, self.env(mode)):
+                        self.ask(mode, asker, **who)
+                        self.decide("redact", ending)
+                        self.assertEqual(self.request()["status"], "declined")
+                        self.assertIsNone(self.decide(answerer, {**self.event(name), "tool_use_id": call, **who, "tool_response": response,
+                                                                 "error": "boom"}), "a late answer never blocks or prints a decision")
+                        settled = self.request()
+                        self.assertEqual(settled["status"], expected)
+                        self.assertEqual((settled.get("call"), settled.get("agent_id")), ("toolu_g3hook", who.get("agent_id")))
+                        before = (self.task / "permission-request.json").read_bytes()
+                        self.decide("redact", ending)
+                        self.decide(asker, {**self.event("PostToolUse"), "tool_response": response})
+                        self.decide(asker, self.event("PermissionDenied"))
+                        self.decide("redact", {**self.event("PostToolUseFailure"), "error": "boom"})
+                        if expected != "declined":
+                            self.assertEqual((self.task / "permission-request.json").read_bytes(), before, "authorized and denied are final")
+
+    def test_a_failure_in_shadow_and_off_settles_only_a_request_that_names_its_call(self):
+        """redact_hook.handle settles PostToolUseFailure in shadow and off by `call` alone: a request with no call, an unreadable one and none
+        at all are not touched, and a declined or pending one with another call stays."""
+        failure = {**self.event("PostToolUseFailure"), "error": "boom"}
+        path = self.task / "permission-request.json"
+        for mode in ("shadow", "off"):
+            for status, call, expected in (("pending", None, "pending"), ("declined", None, "declined"), ("pending", "toolu_other", "pending"),
+                                           ("declined", "toolu_g3hook", "authorized"), ("pending", "toolu_g3hook", "authorized")):
+                with self.subTest(mode=mode, status=status, call=call), mock.patch.dict(os.environ, self.env(mode)):
+                    path.write_text(json.dumps({"status": status, "target": "t", "reason": "r", "updated": "u", **({"call": call} if call else {})}))
+                    self.assertIsNone(self.decide("redact", failure))
+                    self.assertEqual(self.request()["status"], expected)
+            with self.subTest(mode=mode, unreadable=True), mock.patch.dict(os.environ, self.env(mode)):
+                for text in (b"{not json", b"[]", b""):
+                    path.write_bytes(text)
+                    self.assertIsNone(self.decide("redact", failure))
+                    self.assertEqual(path.read_bytes(), text)
+                path.unlink()
+                self.assertIsNone(self.decide("redact", failure))
+                self.assertFalse(path.exists(), "no request is made up")
+
+    def test_bin_tp_redact_hears_a_late_failure_in_shadow_and_off(self):
+        """The real process: SubagentStop declined X's ask, then X's PostToolUseFailure for the same call records the outcome. Exit 0, nothing
+        printed."""
+        for mode in ("shadow", "off"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, self.env(mode)):
+                self.ask(mode, "sensitive", agent_id="X")
+                self.assertEqual(self.hook_process(mode, {**self.turn("SubagentStop"), "agent_id": "X"}).returncode, 0)
+                self.assertEqual(self.request()["status"], "declined")
+                for call, expected in (("toolu_other", "declined"), ("toolu_g3hook", "authorized")):
+                    run = self.hook_process(mode, {**self.event("PostToolUseFailure"), "tool_use_id": call, "agent_id": "X", "error": "boom"})
+                    self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                    self.assertEqual(self.request()["status"], expected, call)
 
     def test_bin_tp_redact_hears_a_subagent_stop_in_every_mode(self):
         """The real process for SubagentStop: exit 0, nothing printed, and only that subagent's request settles."""

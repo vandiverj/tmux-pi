@@ -841,20 +841,30 @@ def save_request(target, reason, status, **extra):
     safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
 
 
-def settle(event, decision):
-    """PostToolUse, PostToolUseFailure or PermissionDenied for the call that asked: record the real outcome. A request the turn
-    branch already marked `declined` is overtaken by a late answer for the same call (authorized or denied); authorized,
-    denied and declined-without-a-matching-call are never changed."""
+def settle(event, decision=None):
+    """PostToolUse, PostToolUseFailure or PermissionDenied for the call that asked: record the real outcome (authorized; denied for
+    PermissionDenied). A request the turn branch already marked `declined` is overtaken by a late answer for the same call;
+    authorized and denied are never changed. Without `decision` only a request that records its `call` is settled, and only by that
+    call's own event (a request with no call is not touched).
+
+    Who settles a late answer, by mode (the event is the same call's `tool_use_id`):
+      on          PostToolUse, PostToolUseFailure, PermissionDenied: `handle`, here (hooks/redact.sh), with `decision`.
+      shadow/off  PostToolUse, PermissionDenied: bin/tp-sensitive-read (hooks/sensitive-read.sh), which wrote the request.
+                  PostToolUseFailure: `handle`, here, before the off check, with no `decision`. sensitive-read.sh is not
+                  registered on it (it exits 2 on failure, which would turn a failed tool call into a blocked one)."""
     path = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
     try:
         prior = json.loads(path.read_text())
     except (OSError, ValueError):
         return
+    if not isinstance(prior, dict):
+        return
     call, denied = prior.get("call"), event.get("hook_event_name") == "PermissionDenied"
     if call:
         same = call == event.get("tool_use_id")
     else:
-        same = decision["decision"] == "ask" and prior.get("target") == decision["target"] and prior.get("status") == "pending"
+        same = bool(decision) and decision["decision"] == "ask" and prior.get("target") == decision["target"] \
+            and prior.get("status") == "pending"
     if prior.get("status") in ("pending", "declined") and same:
         save_request(prior["target"], prior.get("reason"), "denied" if denied else "authorized",
                      **{k: prior.get(k) for k in ("placeholder", "source", "scope", "call", "agent_id")})
@@ -925,6 +935,11 @@ def handle(event):
             settle_declined(event)  # in every mode: this is the one hook that hears a turn end
         return None
     current = mode()
+    if name == "PostToolUseFailure" and current != "on":
+        try:
+            settle(event)  # shadow and off: no other hook hears a failure; mode on settles below. Never blocks, prints or raises.
+        except Exception:
+            pass
     if current == "off":
         return None
     started = time.monotonic()

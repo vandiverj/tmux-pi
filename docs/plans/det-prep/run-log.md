@@ -895,3 +895,22 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   an exclusion glob as a read.
 - Checkpoint ce4caf5, `lane close trust-visible TV1`, merged e1e1b4f (code identical to the reviewed tip), lane removed.
   Not pushed. F4 (index and notifier do not show the trust needs_input) stays a follow-up.
+
+## 2026-11-09 DS1 rounds 3 and 4; FC1 round 1 reviewed
+- DS1 round 3 (251656b) scoped `settle_declined` by `agent_id` and added `SubagentStop`. Review: REQUEST_CHANGES. F1: in
+  shadow and off a late `PostToolUseFailure` after `declined` was not recorded. F2: after 200 newer main-agent calls, the
+  trimmed `calls` let the main agent's Stop delete a subagent's live grant (approving it then exits 126). F3: the fail-before
+  runs were not kept. The reviewer's rg over `bin/` raised the sensitive-read prompt (tp-secret-exec); Main declined it with
+  Escape and redirected.
+- DS1 round 4 (fixes/ds1-round4.md, checkpoint 289e2ba): the late failure settles in shadow and off; `trim_calls` keeps
+  calls with a recorded run and the newest 200 that use a pending name (calls/agents ≤ 600, runs ≤ 200); a grant with an
+  unknown owner is kept. Fail-before: the round 3 tests fail 5/6 on 620764d (one guard), the round 4 tests 7/7 on 251656b.
+  Main's four cells over the same 13 modules: 489 OK in each. In review (review-coder-51f93f6064-115631).
+- FC1 round 1 (checkpoint 321568c). Main's four cells showed 11 failures per cell, all from tests that need an ambient tmux
+  server under an empty `TMUX_TMPDIR`; they passed with a private server (environment, not FC1). Review: REQUEST_CHANGES.
+  F1: `gate()` read the hunk lines `-- a/copy` / `++ b/copy` as a file header pair and refused an ordinary edit. F2 note:
+  Git calls per copy and a 73 s test file. F3: the logs were named without their paths. Round 2 is running
+  (fixes/fc1-round2.md, coder-6b53f61929).
+- S2 started from a plain shell. LM Studio was up the whole time (probed). Earlier estimates wrongly listed it as something the
+  owner had to start. Runs: route-only ×3 on all 24, tune ×3 with the live prompt and ×3 with the draft from
+  config/local.example.json (bench-results/s2-2026-11-09/).

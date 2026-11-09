@@ -66,6 +66,17 @@ GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@inv
 MARKER = "@g3_run"      # the tmux session option that says which run made a session (set in the same tmux call that creates it)
 FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
 FOREIGN_LANE = {"state": "open", "note": "someone else's lane record; the smoke run must leave it exactly as it is"}
+TRUST_SCREEN = """ Accessing workspace:
+
+ {folder}
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own
+ code, a well-known open source project, or work from your team). If not, take a
+ moment to review what's in this folder first.
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+"""      # Claude Code's folder-trust screen, as the first live runs showed it (--tamper trust-dialog prints it in the worker's pane)
 PLAN = {"review": "required", "policy": "required",   # the --fake tp-route: what `tp-route --review-plan` prints
         "reviewer": {"worker": "pi", "model": "openai/gpt-6-sol", "thinking": "low", "independence": "different_provider"}}
 FAKE_REVIEW = """APPROVED
@@ -85,7 +96,7 @@ TAMPERS = {
     "lane-record-exists": "setup", "worktree-exists": "setup", "session-exists": "setup",
     "dispatch-id": "dispatch", "dispatch-queued": "dispatch", "dispatch-meta": "dispatch", "dispatch-pane": "dispatch",
     "dispatch-lane": "dispatch", "dispatch-worktree": "dispatch",
-    "no-prompt": "prompt", "prompt-no-reason": "prompt",
+    "no-prompt": "prompt", "prompt-no-reason": "prompt", "trust-dialog": "prompt",
     "still-pending": "decline", "authorized": "decline", "no-redirect-record": "decline", "first-never-settles": "decline",
     "first-complete": "decline", "first-changed": "decline",
     "first-not-stopped": "retry", "retry-same-id": "retry", "retry-meta": "retry", "task-state": "retry", "retry-incomplete": "retry",
@@ -323,7 +334,16 @@ class Smoke:
             return default
 
     def inspect(self, ident):
-        return self.agent_json("inspect", ident)
+        """`tp-agent inspect`, which every wait on a task polls. A worker stopped at Claude Code's folder-trust dialog (inspect reports
+        needs_input and trust_dialog: {dir}) writes nothing a wait is looking for, so it fails the step now, not at the wait's timeout.
+        The dialog is the owner's to answer: nothing here sends a key to it."""
+        record = self.agent_json("inspect", ident)
+        found = record.get("trust_dialog") if isinstance(record, dict) else None
+        if found:
+            where = str((found.get("dir") if isinstance(found, dict) else None) or self.facts.get("worktree") or self.lane_worktree)
+            raise SmokeError(self.step_name, f"worker stopped at Claude Code's folder-trust dialog for {where}; "
+                                             f"the owner runs bin/tp-claude-bootstrap {where} once, then reruns")
+        return record
 
     def lane_path(self):
         return Path(self.facts["common"]) / "tmux-pi" / "lanes" / self.name / "lane.json"
@@ -499,7 +519,9 @@ class Smoke:
 
     def step_prompt(self):
         first = self.ids["first"]
-        if self.fake and not self.tamper("no-prompt"):
+        if self.fake and self.tamper("trust-dialog"):     # the worker's pane shows Claude Code's folder-trust screen for the lane worktree, as in the first live runs
+            self.write(self.tmp / "trust-screen.txt", TRUST_SCREEN.format(folder=self.facts["worktree"]))
+        elif self.fake and not self.tamper("no-prompt"):
             reason = "" if self.tamper("prompt-no-reason") else "This command reads a secret environment variable; its form means output cannot be redacted."
             self.write(self.task_dir(first) / "permission-request.json",
                        json.dumps({"status": "pending", "target": "a secret environment variable", "reason": reason, "call": "toolu_g3", "updated": now()}) + "\n")
@@ -511,6 +533,7 @@ class Smoke:
         record = self.wait("permission prompt (status needs_input with a pending permission request)", probe, self.args.prompt_wait,
                            dead=DEAD + ("settled",))   # a worker that finished without asking will not ask
         permission = record["permission"]
+        self.check("task record: no folder-trust dialog stopped the worker (trust_dialog absent from inspect)", "trust_dialog" not in record, record.get("trust_dialog"))
         self.check("task record: permission-request.json is pending and carries a reason", permission.get("status") == "pending" and bool(permission.get("reason")), permission)
 
     def step_decline(self):
@@ -789,16 +812,19 @@ class Smoke:
             raise SmokeError("setup", "tmux is not installed; --fake still needs a (private) tmux server")
         assert self.tmux_cmd[1:] == ["-L", self.sock] and self.env()["TMUX_TMPDIR"] == str(self.tmux_tmp)   # set by the constructor
         wrapper = fakebin / "tmux"
+        screen = self.tmp / "trust-screen.txt"
+        # a worker pane is a sleeper; with --tamper trust-dialog it first waits for the fake trust screen (written by the prompt step) and prints it
+        pane_script = f"until [ -f {screen} ]; do sleep 0.05; done; cat {screen}; sleep 300; :" if self.tamper("trust-dialog") else "sleep 300; :"
         # Belt and braces: whatever calls this wrapper, it reaches the private server only (its own TMUX_TMPDIR, -L socket, no TMUX).
         wrapper.write_text(f'''#!/bin/sh
 TMUX_TMPDIR='{self.tmux_tmp}'; export TMUX_TMPDIR; unset TMUX TMUX_PANE
 case "$1" in
- new-session|list-panes|kill-pane|kill-session|has-session|send-keys|list-sessions) exec {tmux} -L {self.sock} "$@" ;;
+ new-session|list-panes|kill-pane|kill-session|has-session|send-keys|list-sessions|capture-pane) exec {tmux} -L {self.sock} "$@" ;;
  display-message) case "$*" in *pane_current_path*) printf '%s\\n' "$TP_MAIN_CWD"; exit 0 ;; esac; exec {tmux} -L {self.sock} "$@" ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window)
    name=; prev=; for last; do [ "$prev" = -n ] && name=$last; prev=$last; done
-   pane=$({tmux} -L {self.sock} new-window -d -P -t "={self.name}:" -n "$name" -F '#{{pane_id}}' "sh -c 'sleep 300; :' sleeper $last") || exit 1
+   pane=$({tmux} -L {self.sock} new-window -d -P -t "={self.name}:" -n "$name" -F '#{{pane_id}}' "sh -c '{pane_script}' sleeper $last") || exit 1
    printf '%s\\n' "$pane" ;;
  *) exit 0 ;;
 esac

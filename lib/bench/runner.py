@@ -13,6 +13,7 @@ from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
+import trust_dialog  # lib/trust_dialog.py: the one detector of Claude Code's folder-trust prompt, shared with tp-agent and the status views
 from . import answers, match, project, record, specs as specs_mod, trace
 from .shell import SESSION_KEYS, ShellError
 
@@ -26,7 +27,6 @@ DEFAULT_MAX_WORKER_RUNS = 40
 LMSTUDIO = "http://localhost:1234/api/v0/models"
 STUB_MODEL = "lmstudio/qwen/qwen3.6-35b-a3b"  # a local author, so the router picks a frontier reviewer
 ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-TRUST_DIALOG = re.compile(r"trust (?:this|the files in this) folder|do you trust", re.I)  # Claude Code's folder-trust prompt
 SESSION_PREFIX = "bench-"
 NEVER_COPY = (".env*", ".claude.json", ".credentials.json")  # secrets and the Claude profile's trust store stay where they are
 
@@ -207,7 +207,7 @@ class Runner:
         for pane in listed.stdout.split() if listed.returncode == 0 else []:
             seen = self.shell.run(["tmux", "capture-pane", "-p", "-t", pane], timeout=30,
                                   tolerate="a pane that vanished shows no dialog; every poll looks again")
-            if seen.returncode == 0 and TRUST_DIALOG.search(seen.stdout):
+            if seen.returncode == 0 and trust_dialog.shown(seen.stdout):
                 return True
         return False
 

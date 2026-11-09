@@ -20,6 +20,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import request_file  # noqa: E402
+import trust_dialog  # noqa: E402
 
 SEP = "\x1f"
 LINE = 65536
@@ -174,6 +175,7 @@ def main(tasks, lifecycle_text, current=None):
         if parts and parts[0] and parts[0] not in life:
             life[parts[0]] = (parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
     out = []
+    scanner = trust_dialog.Scanner()   # one for every row: after a capture times out no other row waits for one
     for line in sys.stdin.read().split("\n"):
         if not line:
             continue
@@ -198,6 +200,14 @@ def main(tasks, lifecycle_text, current=None):
                 detail = found + " · " + detail
                 if status in ("working", "starting", "needs_input"):
                     status = "needs_input"
+        if status in ("starting", "working") and len(fields) > 1 and fields[1] == "claude":
+            # a claude worker stopped at Claude Code's folder-trust dialog writes nothing before any hook loads: look at its pane (read-only, bounded)
+            meta = read_json(os.path.join(d, "meta.json"))
+            meta = meta if isinstance(meta, dict) else {}
+            found = scanner.dialog(meta.get("pane"), meta["workdir"] if isinstance(meta.get("workdir"), str) else "")
+            if found:
+                detail = trust_dialog.message(found["dir"]) + " · " + detail
+                status = "needs_input"
         broken = unreadable(d)
         if broken:   # never dropped, whatever the task's state: the owner has to look at it
             detail = broken + " · " + detail

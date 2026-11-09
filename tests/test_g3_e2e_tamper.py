@@ -34,6 +34,7 @@ TAMPER_EXPECT = {
     "dispatch-worktree": ("dispatch", "the lane worktree exists"),
     "no-prompt": ("prompt", "permission prompt"),
     "prompt-no-reason": ("prompt", "carries a reason"),
+    "trust-dialog": ("prompt", "folder-trust dialog"),
     "still-pending": ("decline", "to leave pending after Escape"),
     "authorized": ("decline", "declined request is not authorized"),
     "no-redirect-record": ("decline", "messages.jsonl holds the redirect"),
@@ -146,6 +147,20 @@ class TamperTest(Base):
                 if name in UNCLEANABLE:       # something the run did not make: the cleanup cannot know to remove it, so it reports it
                     self.assertTrue(any(piece in line for line in summary["cleanup"]["leftovers"] + summary["cleanup"]["errors"]), summary["cleanup"])
                     self.assertIn("cleanup:", err)
+
+    def test_a_worker_at_the_trust_dialog_fails_the_prompt_step_at_once_naming_the_folder_and_the_fix(self):
+        """TV1: the fake worker pane shows Claude Code's folder-trust screen for the lane worktree. Step prompt fails with the owner's fix, not
+        with "no permission prompt ... within N s", the dialog is never answered (no key sent to the pane), and the cleanup leaves nothing."""
+        rc, summary, err, _ = results()["tamper-trust-dialog"]
+        worktree = summary["names"]["lane_worktree"]
+        self.assertEqual(summary["failed_step"], "prompt")
+        self.assertIn(f"worker stopped at Claude Code's folder-trust dialog for {worktree}; the owner runs bin/tp-claude-bootstrap {worktree} once, then reruns", summary["error"])
+        self.assertNotIn("within", summary["error"])
+        step = summary["steps"][-1]
+        self.assertEqual(step["name"], "prompt")
+        self.assertLess(step["seconds"], 4, "--prompt-wait was 4 s: failing at once is faster than waiting it out")
+        self.assertFalse([c for c in records() if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"] and "send-keys" in c["argv"]], "the dialog is the owner's to answer")
+        self.assert_clean(summary)
 
     def test_a_session_left_alive_is_named(self):
         _, summary, _, _ = results()["tamper-session-kept"]

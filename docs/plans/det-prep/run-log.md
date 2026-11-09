@@ -580,3 +580,25 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - The one breach is a test: ctx_nav_api r9 reach-walk calls the real deno with no NEEDS_DENO gate. G2-E (brief g2/g2e-deno-optional.md)
   fakes it so both branches are still proven, sweeps the five Deno-touching test modules, and adds a guard so no test
   reaches a real deno ungated.
+
+## 2026-11-08 — G2-C merged (6aa2480); baseline 11 -> 9
+- Cause: default trial run id stamped to the second; two default prepares of one task in one second collided ("already exists").
+  Fix: a default id moves on to -2, -3 (also on a lost mkdir race); an explicit --run is still refused when taken.
+- Review 1 APPROVED_WITH_NOTES (docstring said task part is cut; it is the stamp). Main fixed the docstring, then by mistake merged
+  before the edited tree had a review (`lane close` refused; the && chain did not stop because of `| tail`). Review 2 of fe47bd9:
+  APPROVED; step closed after. Lesson: never pipe a gating command into tail inside an && chain.
+- Main's 4-way matrix: 274 tests; py3.14 OK both modes; py3.9 only the 4 record_files deep-JSON baseline errors (G2-A).
+- Removed lines: trial_shadow_branches HEAD-garbage subtest; trial_shadow_end_path inconclusive first review.
+- Open: worker stash `g2c-tmp` (identical to the merged diff) left for the owner to drop; auto-mode denied Main's drop.
+
+## 2026-11-08 — LS1 round 5 REQUEST_CHANGES -> round 6 by design
+- Same three families for the 4th time (fact completeness, citation support coverage, citation file validation).
+- Design change (fixes/ls1-round6.md): answers are fact lines `- claim [path:line]`, parsed exactly; no headings or neighbours supply
+  files or citations; behaviour facts matched with fixture identifiers removed. Retry coder-d50afe8142.
+- Tool bug found: review_rounds' round diff counted the lane's never-committed files twice (as added and as deleted), doubling the
+  packet (434k > 300k). Worked around by committing the lane (dec49d3). Follow-up lane: token waste.
+
+## Follow-ups recorded
+- Over-deep JSON family: 150 json.load(s) sites / 71 files, 29 catch RecursionError. One shared reader + guard, after open lanes merge.
+- review_rounds untracked-files double count (above).
+- test_retry_packet RepeatedFamilyGateTests: 1 in 6 flake (state digest coder-1 vs coder-0), checking on clean main.

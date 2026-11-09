@@ -638,3 +638,17 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Follow-ups added: (1) unclosed socket at exit in the FG-N1 module set on 3.14 (main too); (2) conservative false
   positives on main: `timeout 5 echo rg` (search), `nohup sh -c "$CMD" &` (search), `xargs -I{} sh -c 'echo {}'` (sensitive);
   (3) lane close names a lane's steps `1` when dispatched without a session step name: check with `tp-agent lanes NAME`.
+
+## 2026-11-08 — G2-D merged; FG-N1 round 5
+- G2-D F1 (owed check) closed. Every LaneCase user was run x4: 186 tests (first run), 300 tests (remove, refusal_remedies,
+  autonomy, failing_tests, other_paths, deps, state_symlinks) and 21 tests (decisions_gate, a transitive user). Re-review
+  APPROVED. Committed 5a2bf44, closed (step G2D), merged f48c51b, lane removed.
+  Baseline 9 -> 8: test_lane_recovery hand-over line removed.
+- FG-N1 r4 review REQUEST_CHANGES. Main reproduced F1-F3 on 3.9:
+  - a `sudo -h HOST` table error hides `su -c '$X'`;
+  - string splitting drops the following words;
+  - `$1`/`$@`/`$?` are not treated as unresolved.
+  F4: the depth-two product is still partial and 3,290 read assertions are disabled.
+  Fourth round in the same two families, so round 5 (fixes/fg-n1-round5.md) makes the uncertainty floor table-free,
+  keeps word order when flattening, and requires fail-before on a real base worktree.
+  Retry coder-d68351c236.

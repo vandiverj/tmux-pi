@@ -534,6 +534,45 @@ its bracket items is `reference_spans()` (the references of `references()` witho
 conditions first and a chore file's whole path is looked up in a set. The result is the same (300000 random texts: items and references equal to round 13's); the shape takes
 about 1.5 s CPU on py3.9 (1.8 s before), 1.0 s on py3.14.
 
+Round 15 (Main ruling 27, review 12 F1). Inside a matched pair the delimiter decides: PATH is the text from just after the opener to the line part, white space
+trimmed, and there is no known-file exception. Rounds 12-14 tried the chore file written whole (`untrail(head, s)` and a set) before the delimiter, so
+`(junk src/cli.py:6)` and `( src/cli.py.:6)` were read as the good file `src/cli.py` (zero bad citations) although rules 24 and 26 say the paths are `junk src/cli.py` and
+`src/cli.py.` (`unknown_file`); the reverse form `line 6 of (junk src/cli.py)` was right, and the oracle's model repeated the shortcut, so nothing generated
+the shape. Fix: the shortcut is removed, not moved. Outside a delimiter it was a second reader (for a chore file written whole `span(head, s, False)` gives the same
+cut), so a delimiter's text is tried first and everything else goes through `span()`; the oracle's model has no shortcut of its own either. A new generated family
+("prefixes") puts extra path text before the file, inside each of the 9 delimiters and with none: 3 prefixes (`junk`, `a/`, `.`) x 5 separators (space, two spaces, tab, line
+break, no-break space) x 3 suffixes before `:N` (none, `.`, `,`) x forward / reverse / forward fact line x 24 chores = 29160 cases, so the oracle has 327456 + 29160 = 356616
+cases. The round-12 checker (`c8f96f5`): 17280 of the 29160 prefix cases differ (8640 forward on prose and 8640 forward on a fact line in the 8 delimiters; the reverse
+form and no delimiter agree); this tree: 0 of 356616 (py3.9 and py3.14), the old 327456 unchanged. Changed readings (flagged for Main): `<!-- src/x.py:6 -->` is an angle pair, its path
+`!-- src/x.py` (`unknown_file`, counted as fabricated; it was a good target), and `[see, src/cache.py:6]` / `(see src/cache.py:6)` give the path with the leading words
+(`unknown_file`; `[see, src/cli.py:6]` was `src/cli.py`). When the delimited text is not path-shaped at all (`( cli.py.:6)`) rule 18's fallback still reads the token outside the pair.
+(Round 16 below supersedes the last two statements: rule 29 gives `[see, src/cli.py:6]` back as `src/cli.py`, and rule 30 removes the fallback.) No new benign flag:
+references 24/24, corpora A, B and C byte-identical to round 14, counts per kind 20038 / 20738 as before, and the worst rule 20 shape (one line of `[a:1,b:2,c:3] `) is 1.43-1.44 s CPU alone on py3.9,
+1.50-1.55 s with 4 copies, 0.92 s on py3.14.
+
+Round 16 (Main rulings 1 to 5 of `ls1-round13-rulings.md`). Flag 1 accepted: `<!-- src/x.py:6 -->` is an angle pair, path `!-- src/x.py`, `unknown_file`.
+**Rule 29 (list separator inside a pair):** inside a matched pair ONE list separator (`,` or `;`) splits off a lead-in. It splits only when non-empty text stands before
+it and that text does not itself end in a separator; the path starts after the separator and any white space; a doubled separator means no split (fails closed, the
+path is as written); text before a split that has no line part is prose. So `[see, src/cli.py:6]` and `[see,src/cli.py:6]` read `src/cli.py`, `[see, a:6, b:7-9]` keeps its two
+exact items, `[,src/cli.py:6]` and `(;src/cli.py:6)` read `,src/cli.py` and `;src/cli.py` (`unknown_file`), `[see,, src/cli.py:6]` has no split (`unknown_file`), and `(see src/cli.py:6)`
+with no separator is still `see src/cli.py`. **Rule 30:** a forward line part inside a matched pair is read only by that pair (rules 24, 27, 29), with no rule-18
+fallback outside it; text that is not path-shaped is still the path as written, a bare name included (`( cli.py.:6)` is `cli.py.`, `unknown_file`; `(Note:3)` is prose: a bare word with no slash
+and no extension is no reference). `shaped()` is unchanged; the in-pair test applies it to the text, or its last word, after the trailing sentence punctuation is taken off, which is what lets a bare
+name with an extension count. The oracle model has both rules; it grew two families, "leadins" (3 lead-ins: a word, two words, a path fragment x 4 separators `,` `;` `,,` none x 3 white
+spaces after it: none, space, line break x 9 delimiters x forward / reverse / forward fact line x 24 chores = 23328 cases) and "bare" (the name, and the name plus `.`, `,` or `;`, x 9
+delimiters x both orders x 24 chores = 2592), so it has 356616 + 23328 + 2592 = **382536 cases**; current checker: 0 mismatches (py3.9 and py3.14). Against the round-12 checker
+(`c8f96f5`) 33792 of the 382536 fail the model's expectation. What rules 29 and 30 change in the earlier families (flagged for Main, not tuned away): 4800 characters
+cases (`,` `;` `[` `<` inside the path: brackets 768, parentheses 672, angle 768, backticks 672, each of the four quote pairs 480, no delimiter 0; for example `x[sr,c/cli.py:29]` was `sr,c/cli.py`, now
+`c/cli.py`, and `x[src/cli.py[:29]` now has no reference at all), 0 separator cases, and the 17280 prefix cases of Round 15 (accepted then). Main's ruling 4 condition, a test assertion over
+the whole product (`PathOracleTests.product_condition`, `oracle_mismatches(stats=...)`): no case that failed under the old model now passes, and no case with a bad citation under the old model has none
+now unless the reply still fails on rule 21 or rule 15: 0 of 382536 break either, and the 4800 are asserted by delimiter (`CHANGED_BY_RULES_29_30`). Ruling 5: the 17 `l path character`
+mutations that now leave no path (`src/no,file`, `src/no;file`, `src/no[file`, `src/no<file` inside a pair) each fail the reply on rule 21 with no bad citation; the count 17 and "every mutation fails" are asserted.
+Measured with the real round-12 checker (not the model) over the same cases: no case that failed there passes now (0), and **72** line-level cases lose their bad citation without failing on rule 21 or 15: all are
+`- ok [see,src/cli.py:N]` (a `,` with no white space after the lead-in, 3 lead-ins x 24 chores), which are now the real file by ruling 2 and fail on rule 2 (uncited) alone. They are reported to Main. Final figures:
+references 24/24 and corpora A, B and C byte-identical to round 15; counts per kind 20038 / 20738 as before, but the 17 `l` mutations moved from caught to "wrong" (fail on rule 21, not as stated) and none is accepted; the sweep table
+differs only in the `[see, src/cli.py:29]` row (the path is `src/cli.py` again); the worst rule 20 shape (one line of `[a:1,b:2,c:3] `, which now also scans for separators) is 1.52-1.56 s CPU alone on py3.9 (1.43-1.44 s in round 15) and
+1.61-1.64 s with 4 copies (1.50-1.55 s), 0.93-0.94 s on py3.14 (1.03-1.05 s with 4 copies; worst there short fact lines 0.93 / 1.07). Bound 2 s unchanged.
+
 ### Audit of the required facts (round 6)
 
 Each chore against its text and fixtures: what the chore asks for, the required fact that covers each (F1 is the first in

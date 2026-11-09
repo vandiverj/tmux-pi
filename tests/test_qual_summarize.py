@@ -284,7 +284,9 @@ def mutations(answer):
                     turn += 1
                     ref = reference_text(shape, tfile, ta, tb, at, BREAKS[turn % len(BREAKS)])
                     exact = at is None and wrapper == "brackets" and shape in ("path:N", "path:N-M")
-                    yield "j " + target, reply(extra=[template.format(ref)]), {STRAY} if exact else {NONCANON}, False
+                    # round 13 (rule 27): every shape is a forward reference, and in "<!-- ... -->" (an angle pair) the path is everything from the "<",
+                    # the file "!-- src/x.py": unknown_file whatever the target, so these are their own kind
+                    yield "j html comment" if wrapper == "html comment" else "j " + target, reply(extra=[template.format(ref)]), {STRAY} if exact else {NONCANON}, False
     # k. rule 16: a line number is its value; ASCII leading zeros of any length do not change a reference that passes. Rule 17: other Unicode
     # zeros are read as the same value but earn no credit (the reply is judged as written): the fact line is uncited and noncanonical.
     for zero in ZEROS:
@@ -375,14 +377,21 @@ def grammar_mutations(answer, turn=None):
     def wrap(text):
         return pick(list(GRAMMAR_WRAPPERS.values())).format(text)
 
-    def made(text, problem, forward=True):
+    def made(text, problem, forward=True, split=""):
         """(reply, problem): the reply with the reference appended in a wrapper. A wrapper that puts characters in front of the path outside a pair
         of delimiters ("**", or "(" when a "(" inside it takes the ")") makes a path that comes first the path as written, a file no chore has (rule 23):
         unknown_file, whatever the target. In a reverse reference the path comes last, and the wrapper stands in front of the line word."""
         wrapped = wrap(text)
         # "(path(line 6)" has two openers and one closer: the closer takes the inner one, and the outer is no delimiter
         unmatched = wrapped.startswith(("(", "[see](")) and wrapped.count("(") > wrapped.count(")")
-        return reply(wrapped), "unknown_file" if forward and (wrapped.startswith("**") or unmatched) else problem
+        # round 13 (rule 27): "<!-- path:N -->" is an angle pair, whose path is everything from the "<" (the file "!-- src/x.py"): unknown_file
+        # round 13 (rule 29): inside a pair ONE "," or ";" in a forward path splits off a lead-in, and what is left of "src/no,file" is the bare word
+        # "file": no path (rule 18 shape), so no reference was read, and the number after it is the floor's (unparsed_reference; no bad citation)
+        # rule 30: a "[" or "<" in the path inside the same kind of pair makes the inner one the pair, and what it holds is "file ..." (no fallback)
+        if split and not unmatched and (wrapped.startswith(("[", "(", "`", '"', "'", "<", "\u201c", "\u2018")) if split in ",;" else
+                                        wrapped.startswith(split) and not wrapped.startswith("[see](")):
+            return reply(wrapped), "unread"
+        return reply(wrapped), "unknown_file" if forward and (wrapped.startswith(("**", "<!--")) or unmatched) else problem
 
     def reply(extra):
         return "\n".join(texts + [extra])
@@ -395,9 +404,11 @@ def grammar_mutations(answer, turn=None):
             name = "nonexistent file"
             if pick([True, False]):
                 text = forward(path, name, pick(FWD_SEPS), pick(LINE_WORDS))
+                lead = char if char in ",;[<" and path.startswith("src/") else ""
             else:
                 text = reverse(path, name, pick(REVERSE_WORDS), pick(REVERSE_TAILS))
-            yield ("l path character",) + made(text, PROBLEMS[name])
+                lead = ""
+            yield ("l path character",) + made(text, PROBLEMS[name], split=lead)
     # m. the forward order: every separator x every line word, over the targets
     for sep in FWD_SEPS:
         for word in LINE_WORDS:
@@ -953,19 +964,20 @@ class DataTests(unittest.TestCase):
 
     def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked(self):
         # Rules 13 to 15, kind j: 11 shapes x 6 wrappers x (no break, then a break at each separator, rotating through \n, \r\n, U+2028 and
-        # U+00A0) x 4 targets (a valid line, a line past the end, a range past the end, a file that is not the chore's) x 24 chores.
+        # U+00A0) x 4 targets (a valid line, a line past the end, a range past the end, a file that is not the chore's) x 24 chores. The HTML
+        # comment wrapper is an angle pair (rule 27), whose path is "!-- src/x.py": its mutations are all unknown_file, kind "j html comment".
         # Each must fail: for rule 15 (or rule 10 for the exact bracket alone on a line), and for rule 3 when the target is bad.
         # Four tests (a valid line, a line past the end, a range past the end, a file that is not the chore's) to keep each under 5 s.
-        self.assertJ({"j valid": 24 * 11 * 6 * 3})
+        self.assertJ({"j valid": 24 * 11 * 5 * 3})
 
     def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_past_the_end_of_a_file(self):
-        self.assertJ({"j line past end": 24 * 11 * 6 * 3})
+        self.assertJ({"j line past end": 24 * 11 * 5 * 3})
 
     def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_bad_ranges(self):
-        self.assertJ({"j range past end": 24 * 5 * 6 * 4})
+        self.assertJ({"j range past end": 24 * 5 * 5 * 4})
 
     def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_bad_files(self):
-        self.assertJ({"j nonexistent file": 24 * 11 * 6 * 3})
+        self.assertJ({"j nonexistent file": 24 * 11 * 5 * 3, "j html comment": 24 * 11 * 3 * 3})
 
     def assertJ(self, floors):
         counts = self.attack(lambda kind: kind in floors)
@@ -979,6 +991,11 @@ class DataTests(unittest.TestCase):
         # either order, with a rotating separator, line word, digit set and wrapper, over all 24 chores. The path names no file.
         counts = self.grammar_attack(lambda kind: kind == "l path character")
         self.assertEqual(counts["l path character"]["mutations"], (32 + 20) * 2 * 24)
+        # rules 29 and 30: 17 of them leave no path (a "," or ";" in "src/no,file" splits off "src/no" and the bare word "file" is no path; a "[" or "<" in
+        # the path inside a "[" or "<" pair makes the inner one the pair): the floor fails the reply, and there is no bad citation (see report.md)
+        self.assertEqual(counts["l path character"]["unread"], 17)
+        # Main's ruling 5: each of the 17 still fails the reply (grammar_attack asserts it and rule 21 for each); so does every other mutation
+        self.assertEqual(counts["l path character"]["failed"], counts["l path character"]["mutations"])
 
     def test_generated_grammar_both_orders_with_every_separator_and_line_word(self):
         # Kinds m (forward: 18 separators x 10 line words incl. none) and n (reverse: 7 line words x 8 tails), each over a rotating target
@@ -1058,6 +1075,12 @@ class DataTests(unittest.TestCase):
                 where = "{} / {}: {!r}".format(chore["id"], kind, reply if len(reply) < 600 else reply[:200] + " ... " + reply[-200:])
                 found = rules(result)
                 self.assertFalse(result["pass"], where)
+                if problem == "unread":  # rule 29 left no path: the reply fails on the floor alone, and nothing is a bad citation
+                    self.assertIn(UNPARSED, found, where)
+                    self.assertEqual(result["bad_citations"], [], where)
+                    count["unread"] = count.get("unread", 0) + 1
+                    count["failed"] += 1
+                    continue
                 self.assertTrue(found & {NONCANON, STRAY}, "{} -> {}".format(where, sorted(found, key=str)))
                 self.assertEqual(bool(result["bad_citations"]), problem is not None, where + " " + str(result["bad_citations"]))
                 if problem:
@@ -1093,7 +1116,7 @@ class DataTests(unittest.TestCase):
                 if kind.startswith("h "):
                     self.assertTrue(result["bad_citations"], where)  # rule 10: counted in bad_citations, so in the run's fabricated count
                 if kind.startswith("j "):  # rules 14 and 15: a bad target is counted and named; a valid one is not counted as fabricated
-                    problem = {"j line past end": "range", "j range past end": "range", "j nonexistent file": "unknown_file"}.get(kind)
+                    problem = {"j line past end": "range", "j range past end": "range", "j nonexistent file": "unknown_file", "j html comment": "unknown_file"}.get(kind)
                     self.assertEqual(bool(result["bad_citations"]), problem is not None, where + " " + str(result["bad_citations"]))
                     if problem:
                         self.assertIn((3, problem), rules(result), where)
@@ -1570,7 +1593,7 @@ class CheckerTests(unittest.TestCase):
         base = "- alpha {c}\n- beta {c}".format(c=c)
         for extra in ("See src/cache.py:6 for more.", "(src/cache.py#L6)", "src/cache.py lines 6-8", "[src/cache.py: 6]", "[src/cache.py:6 - 7]",
                       "`src/cache.py:6`", "src/cache.py:\n6", "src/cache.py#L6-L7", "src/cache.py, line 6", "src/cache.py (line 6)", "src/cache.py LINE 6",
-                      "<!-- src/cache.py:6 -->", "```\nsrc/cache.py:6\n```", "# src/cache.py:6", "> src/cache.py:6"):
+                      "```\nsrc/cache.py:6\n```", "# src/cache.py:6", "> src/cache.py:6"):  # ("<!-- src/cache.py:6 -->" is rule 27's: an angle pair)
             result = self.check(base + "\n" + extra)
             self.assertFalse(result["pass"], extra)
             self.assertEqual(rules(result), {NONCANON}, extra)
@@ -1674,11 +1697,14 @@ class CheckerTests(unittest.TestCase):
                 for body in ("[src/nonexistent{g}file line 999]", "(src/nonexistent{g}file:999)", "`src/nonexistent{g}file#L999`", "[src/a{g}b.rs, line 999]"):
                     result = self.appended(body.format(g=fill * gap))
                     self.assertEqual((result["pass"], (3, "unknown_file") in rules(result), len(result["bad_citations"])), (False, True, 1), (body, fill, gap))
-        # a chore file written whole wins over a delimiter that holds more: "(see src/cache.py:6)" is a good target, noncanonical only
-        for extra in ("(see src/cache.py:6)", "[see src/cache.py line 6]", "\"src/cache.py:6\""):
+        # round 13 (rule 27): a chore file written whole no longer wins over a delimiter that holds more. "(see src/cache.py:6)" is the file
+        # "see src/cache.py": unknown_file, counted (test_rule_27 has the whole table). A pair that holds only the file is a good target.
+        for extra, path in (("(see src/cache.py:6)", "see src/cache.py"), ("[see src/cache.py line 6]", "see src/cache.py")):
             result = self.appended(extra)
-            self.assertEqual((result["pass"], rules(result), result["bad_citations"]), (False, {NONCANON}, []), extra)
-        # but inside a delimiter that is no part of the file name the path runs from the delimiter (rule 18): a listed false positive
+            self.assertEqual((result["pass"], rules(result), result["bad_citations"]), (False, {NONCANON, (3, "unknown_file")}, [path + (":6" if ":" in extra else " line 6") + " (unknown_file)"]), extra)
+        result = self.appended("\"src/cache.py:6\"")
+        self.assertEqual((result["pass"], rules(result), result["bad_citations"]), (False, {NONCANON}, []))
+        # inside a delimiter that is no part of the file name the path runs from the delimiter (rule 18): a listed false positive
         result = self.appended("<a href=src/cache.py#L6>")
         self.assertEqual((rules(result), result["bad_citations"]), ({NONCANON, (3, "unknown_file")}, ["a href=src/cache.py#L6 (unknown_file)"]))
 
@@ -1881,12 +1907,106 @@ class CheckerTests(unittest.TestCase):
         for text in ("Also [src/nofile.py#:6]", "Also (src/nofile.py#:6)", "Also `src/nofile.py#:6`", "Also src/nofile.py#:6"):
             self.assertEqual(self.appended(text)["bad_citations"], ["src/nofile.py#:6 (unknown_file)"], text)
         # the exact item stays one: [path:N] and [path:N-M] among others in a bracket, and a name that is no path (nothing for the grammar to read)
+        self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[src/cache.py:6, src/cache.py:7-9]", ["src/cache.py"])], ["src/cache.py"] * 2)
+        # round 13 (rule 29, Main's ruling 2): ONE "," in the pair splits off the lead-in "see", so both items are exact, as in round 12
         self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[see, src/cache.py:6, src/cache.py:7-9]", ["src/cache.py"])], ["src/cache.py"] * 2)
         result = self.appended("Also [nofile:9]")
         self.assertEqual((rules(result) & {STRAY, NONCANON, (3, "unknown_file")}, len(result["bad_citations"])), ({STRAY, (3, "unknown_file")}, 1))
         # a comma in front of the path is part of it (rule 24, ruling 3), so the item is not exact either
         result = self.appended("Also [,src/cache.py:6]")
         self.assertEqual((rules(result) & {STRAY, NONCANON, (3, "unknown_file")}, len(result["bad_citations"])), ({NONCANON, (3, "unknown_file")}, 1))
+
+    def test_rule_27_inside_a_delimiter_the_delimiter_decides_and_a_known_file_never_rewrites_it(self):
+        # review-coder-e245072fca-015025 F1: "(junk src/cli.py:6)" and "( src/cli.py.:6)" were read as the good file src/cli.py, because the whole
+        # file was looked for before the delimiter was. Inside a pair the path is the text from the opener to the line part (rule 24), whatever it
+        # holds: unknown_file, counted. The same with a line break for the space, in the other order of rule 19 (the reverse control: it was right
+        # already), in every pair, on a line of prose and on a fact line.
+        files = ["src/cli.py"]
+        answer = dict(self.ANSWER, cite_files=files)
+        pairs = (("(", ")"), ("[", "]"), ("<", ">"), ("`", "`"), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+        for inner, path in (("junk src/cli.py", "junk src/cli.py"), (" src/cli.py.", "src/cli.py."), ("junk\nsrc/cli.py", "junk\nsrc/cli.py"),
+                            ("a/ src/cli.py", "a/ src/cli.py"), ("junk  src/cli.py", "junk  src/cli.py"), ("junk\tsrc/cli.py", "junk\tsrc/cli.py")):
+            for opener, closer in pairs:
+                for lead in ("Also ", "- alpha "):  # a line of prose; a fact line with no citation list of its own
+                    for order, text in (("forward", lead + opener + inner + ":6" + closer), ("reverse", lead + "line 6 of " + opener + inner + closer)):
+                        where = repr(text)
+                        self.assertEqual([r[2] for r in summarize_check.references(text, files)[0]], [path], where)
+                        result = summarize_check.check(text, answer, FIXTURES)
+                        self.assertIn((3, "unknown_file"), rules(result), where)
+                        self.assertEqual(len(result["bad_citations"]), 1, where)
+                        self.assertTrue(result["bad_citations"][0].endswith("(unknown_file)"), where)
+                        if (opener, inner, order) == ("[", " src/cli.py.", "forward"):  # the one exact item, path "src/cli.py." (rule 10): a citation to a bad file
+                            self.assertEqual(rules(result) & {NONCANON, STRAY, UNCITED}, {STRAY} if lead == "Also " else set(), where)
+                        else:  # a reference the grammar reads but that is no exact item: noncanonical; on a fact line also uncited
+                            self.assertEqual(rules(result) & {NONCANON, STRAY, UNCITED}, {NONCANON} | ({UNCITED} if lead == "- alpha " else set()), where)
+        # a pair that holds only the file is the good file, with the white space around it trimmed; outside a pair the run is the path (rule 18)
+        for text in ("(src/cli.py:6)", "( src/cli.py:6 )", "(\nsrc/cli.py:6\n)", "[src/cli.py line 6]", "line 6 of (src/cli.py)", "junk src/cli.py:6",
+                     "src/cli.py.:6", "junk (src/cli.py:6)", "line 6 of `src/cli.py`"):
+            self.assertEqual([r[2] for r in summarize_check.references("Also " + text, files)[0]], ["src/cli.py"], text)
+            self.assertEqual(summarize_check.check("Also " + text, answer, FIXTURES)["bad_citations"], [], text)
+        # the next reference of a list starts after ONE separator: its own front text is part of its path
+        self.assertEqual([r[2] for r in summarize_check.references("(src/cli.py:6; junk src/cli.py:7)", files)[0]], ["src/cli.py", "junk src/cli.py"])
+        # "<!-- src/cli.py:6 -->" is an angle pair, so its path is "!-- src/cli.py": a listed false positive of rule 27 (experiments.md, round 15)
+        self.assertEqual([r[2] for r in summarize_check.references("<!-- src/cli.py:6 -->", files)[0]], ["!-- src/cli.py"])
+        self.assertEqual(summarize_check.check("<!-- src/cli.py:6 -->", answer, FIXTURES)["bad_citations"], ["!-- src/cli.py:6 (unknown_file)"])
+
+    PAIRS = (("(", ")"), ("[", "]"), ("<", ">"), ("`", "`"), ('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019"))
+
+    def test_rule_29_inside_a_pair_one_list_separator_splits_off_a_lead_in(self):
+        # Main's ruling 2 (round 13): "[see, src/cli.py:6]" is the good file, because the ONE "," (or ";") ends the lead-in "see". Where there is nothing to
+        # split (no separator, a doubled one, nothing in front of it) rule 24 stands: the path is everything in the pair, unknown_file, counted. It holds
+        # in every pair, in both orders of rule 19, on a line of prose and on a fact line.
+        files = ["src/cli.py"]
+        answer = dict(self.ANSWER, cite_files=files)
+        split = ("see, src/cli.py", "see,src/cli.py", "see; src/cli.py", "see also, src/cli.py", "a/, src/cli.py", "see,\nsrc/cli.py", "see ;src/cli.py")
+        whole = (("see src/cli.py", "see src/cli.py"), ("junk src/cli.py", "junk src/cli.py"), (",src/cli.py", ",src/cli.py"), (";src/cli.py", ";src/cli.py"),
+                 ("see,, src/cli.py", "see,, src/cli.py"), ("see;; src/cli.py", "see;; src/cli.py"), ("see,;src/cli.py", "see,;src/cli.py"),
+                 (", src/cli.py", ", src/cli.py"))
+        for opener, closer in self.PAIRS:
+            for lead in ("Also ", "- alpha "):
+                for inner, path in [(i, "src/cli.py") for i in split] + list(whole):
+                    for order, text in (("forward", lead + opener + inner + ":6" + closer), ("reverse", lead + "line 6 of " + opener + inner + closer)):
+                        where = repr(text)
+                        self.assertEqual([r[2] for r in summarize_check.references(text, files)[0]], [path], where)
+                        result = summarize_check.check(text, answer, FIXTURES)
+                        self.assertEqual(len(result["bad_citations"]), 0 if path == "src/cli.py" else 1, where)
+                        self.assertEqual((3, "unknown_file") in rules(result), path != "src/cli.py", where)
+        # the exact bracket item (rule 10) is one only when it is CITATION-shaped and its path is the grammar's: the lead-in is no part of it
+        self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[see, src/cli.py:6]", files)], ["src/cli.py"])
+        self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[see,src/cli.py:6]", files)], ["src/cli.py"])
+        self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[see, a:6, b:7-9]", ["a", "b"])], ["a", "b"])
+        for text in ("[,src/cli.py:6]", "[see,, src/cli.py:6]", "[see src/cli.py:6]", "[junk src/cli.py:6]"):
+            self.assertEqual(summarize_check.citation_items(text, files), [], text)
+        result = summarize_check.check("(;src/cli.py:6)", answer, FIXTURES)
+        self.assertEqual(result["bad_citations"], [";src/cli.py:6 (unknown_file)"])
+        # a lead-in is prose and is no reference: nothing in the pair before the separator has a line part
+        self.assertEqual(summarize_check.references("Also [see, junk]", files)[0], [])
+        # a separator with nothing after it up to the line part ends the path and splits nothing off ("cli.py;")
+        self.assertEqual([r[2] for r in summarize_check.references("Also (see; cli.py;:6)", files)[0]], ["cli.py;"])
+        # the list of rule 24 still reads: each reference of a list starts after ONE separator, and a lead-in splits within it
+        self.assertEqual([r[2] for r in summarize_check.references("(src/cli.py:6; see, src/cli.py:7)", files)[0]], ["src/cli.py", "src/cli.py"])
+        # outside a pair nothing splits (rule 18 reads the run of non-space characters)
+        self.assertEqual([r[2] for r in summarize_check.references("Also see,src/cli.py:6", files)[0]], ["see,src/cli.py"])
+
+    def test_rule_30_a_forward_line_part_in_a_pair_is_read_by_the_pair_alone_with_no_fallback(self):
+        # Main's ruling 3 (round 13): "( cli.py.:6)" is the name as written, "cli.py.", unknown_file: not the "cli.py" that rule 18 would cut outside a
+        # pair (that is the F1 family again). A bare name counts; so does one ending in "," or ";" (what the line part's separators leave).
+        files = ["src/cli.py"]
+        answer = dict(self.ANSWER, cite_files=files)
+        for opener, closer in self.PAIRS:
+            for lead in ("Also ", "- alpha "):
+                for text, path in ((" cli.py.:6", "cli.py."), ("cli.py:6", "cli.py"), ("cli.py;:6", "cli.py;"), ("cli.py..:6", "cli.py.."),
+                                   (" cli.py.;:6", "cli.py.;")):
+                    for form in ("{o}{t}{c}", "line 6 of {o}{p}{c}"):
+                        text_here = lead + form.format(o=opener, c=closer, t=text, p=path)
+                        got = [r[2] for r in summarize_check.references(text_here, files)[0]]
+                        self.assertEqual(got, [path], repr(text_here))
+                        self.assertEqual(len(summarize_check.check(text_here, answer, FIXTURES)["bad_citations"]), 1, repr(text_here))
+        # a "," with text after it before the line part is rule 29's: "(cli.py,.:6)" splits at it, and "." is no path
+        self.assertEqual(summarize_check.references("Also (cli.py,.:6)", files)[0], [])
+        # outside a pair rule 18 still takes the sentence punctuation off the end, and only that
+        for text, path in (("Also cli.py.:6", "cli.py"), ("Also src/cli.py.:6", "src/cli.py"), ("Also cli.py;:6", "cli.py")):
+            self.assertEqual([r[2] for r in summarize_check.references(text, files)[0]], [path], text)
 
     def test_every_citation_is_checked_and_the_unvouched_are_counted(self):
         # A good citation counts through the support of a fact the line states; one on a line that states no fact, or that matches no

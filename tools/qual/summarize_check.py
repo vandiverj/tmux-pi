@@ -76,8 +76,9 @@ of FACT LINES, and only fact lines state facts:
           trailing citation is not the canonical form (`noncanonical_citation`, and the line is `uncited`).
   Rule 18 A path has no character list. Outside a delimiter PATH is a maximal run of non-whitespace characters less trailing sentence
           punctuation; it is a path when it holds "/" or "\\", ends in ".<letters>" or is a chore file's path or bare name. Inside a
-          delimiter ([] () <> backticks quotes) PATH is everything from the opener to the line part (rule 24); when that is not
-          path-shaped, the token outside the delimiter is used.
+          delimiter ([] () <> backticks quotes) PATH is what the pair says (rules 24, 27, 29 and 30), never the token outside it: when
+          that is not path-shaped (the same test, applied to it or its last word, without its trailing sentence punctuation) the pair
+          holds no reference at all.
   Rule 19 A line part comes in both orders. Forward: a run of separators (": # , (" and "·", whitespace, line breaks), optionally
           L, l., ln, line or lines (any case), then a number or a range. Reverse: line, lines or L + number or range, then of, in or
           at, then PATH.
@@ -97,7 +98,8 @@ of FACT LINES, and only fact lines state facts:
   Rule 24 No rewriting inside a delimiter. Inside a matched pair PATH is exactly the text from just after the opener to the line part, only
           the white space around it (line breaks included) trimmed: no punctuation is taken off either end, so "(;src/cli.py:6)" is the
           file ";src/cli.py" (`unknown_file`). Outside a pair only rule 18's trailing punctuation is removed. A reference that follows
-          another in a list starts after the previous one and ONE separator, "," or ";".
+          another in a list starts after the previous one and ONE separator, "," or ";". Rule 27 says what that means for a file name,
+          and rule 29 what one separator inside the text does.
   Rule 25 Quotes and apostrophes. A quote (' " and the typographic forms) opens a delimiter only at the start of the reply or after
           white space or an opening bracket, and closes one only before the end, white space or rule 18's trailing punctuation; any other
           quote is an apostrophe, a letter of the word ("don't"). Brackets and backticks are delimiters wherever they stand. So
@@ -106,6 +108,25 @@ of FACT LINES, and only fact lines state facts:
           path is the text as written: the NFKC copy of rule 17 only finds the reference, it is never the path that is looked up or
           reported (a fullwidth slash or an ellipsis in a path makes another file). There is no other reader: rule 10 asks references() too, so
           the same text gives the same path in every delimiter ("[src/cli.py#:29]" and "(src/cli.py#:29)" are both the file "src/cli.py").
+  Rule 27 Inside a matched pair the delimiter decides. PATH is the text from just after the opener to the line part, white space trimmed,
+          whatever stands in front of a file name and whatever the text is: there is no known-file exception (a chore file written
+          whole does not win over the rest of the text). "(junk src/cli.py:6)" is the file "junk src/cli.py" and "( src/cli.py.:6)" is the
+          file "src/cli.py." (both `unknown_file`), with a line break for the space too, in every delimiter, in both orders and on a fact
+          line. Outside a pair the run of rule 18 is the path, cut by the same function (_span): a chore file written whole is just such a
+          run, so there is no second reader. So "<!-- src/cli.py:6 -->" is an angle pair and the file "!-- src/cli.py" (`unknown_file`).
+  Rule 29 A lead-in before ONE list separator. Inside a matched pair ONE "," or ";" splits the text into items: when non-empty text
+          stands before it (and that text does not itself end in a separator) the path starts after the separator and the white space
+          after it, and the text before it is prose, not a reference. So "[see, src/cli.py:6]" and "[see,src/cli.py:6]" are the file
+          "src/cli.py" (exact in rule 10 only if CITATION-shaped and its path is the grammar's), "[see, a:6, b:7-9]" has two exact items,
+          "[,src/cli.py:6]" and "(;src/cli.py:6)" (nothing before the separator) are ",src/cli.py" and ";src/cli.py", "[see,, src/cli.py:6]"
+          (a doubled separator) is one path "see,, src/cli.py", and "(see src/cli.py:6)" (white space is no separator) is "see src/cli.py":
+          the last three `unknown_file`. A separator with nothing but white space after it up to the line part ends the path and splits
+          nothing off ("(cli.py;:6)" is "cli.py;"). In every pair, in both orders and on a fact line; outside a pair nothing splits.
+  Rule 30 No fallback outside a pair. A forward line part inside a matched pair is read only by that pair (rules 24, 27 and 29): the
+          path is the text as written, and it counts as a path when it, or its last word, is path-shaped with its trailing sentence
+          punctuation ignored, so a bare name is one: "( cli.py.:6)" is "cli.py." and "(cli.py;:6)" is "cli.py;" (`unknown_file`), not
+          the "cli.py" that rule 18 would cut outside a pair. Text that is not path-shaped is no reference (the floor, rule 21, still fails
+          the number).
 
 answer (a line of tests/calibration/summarize/answers.jsonl):
   required     list of facts; a fact is a list of alternative regexes for ONE thing (case-insensitive, matched against ONE claim),
@@ -164,6 +185,7 @@ DELIMITERS = re.compile(r"`+|[\[\]()<>\"'\u201c\u201d\u2018\u2019]")
 CLOSES = {"]": "[", ")": "(", ">": "<", "\u201d": "\u201c", "\u2019": "\u2018"}  # a closer -> the opener it closes
 QUOTES = frozenset("\"'\u201c\u201d\u2018\u2019")
 QUOTE_OPENERS, QUOTE_CLOSERS = frozenset("\"'\u201c\u2018"), frozenset("\"'\u201d\u2019")  # " and ' do both (rule 25)
+LIST_SEPARATOR = re.compile(r"[,;]")
 LIST_SEPARATORS = ",;"  # ONE of them between two references of a list (a.py:1,b.py:2) ends the first: it does not start the second path
 TRAILING = frozenset(".,;:!?)]}>'\"`*\u201d\u2019")  # sentence punctuation: not part of a path at its end (rule 18)
 # rule 21: a number preceded, with only separators between, by a path token or a line word. A separator is a space or any character that is
@@ -481,6 +503,18 @@ def _scan(text, files, canonical=()):
     names = whole | {Path(f).name for f in files}
     longest = max((len(name) for name in names), default=0)
     positions, tops, closer = _delimiters(scan)
+    splits, splits_from = [], []  # rule 29: where in a pair ONE list separator splits off a lead-in, and where the text before it ends
+    if positions:
+        for m in LIST_SEPARATOR.finditer(scan):
+            i = m.start()
+            if i + 1 < n and scan[i + 1] in LIST_SEPARATORS:
+                continue  # a doubled separator is malformed: no split (ruling 3)
+            j = i - 1
+            while j >= 0 and scan[j] == " ":
+                j -= 1
+            if j >= 0 and scan[j] not in LIST_SEPARATORS:  # non-empty text before it, and that text does not end in a separator
+                splits.append(i)
+                splits_from.append(j)
 
     def written(i):
         """scan[i] is the character it was written as (and not a piece of a compatibility form, such as "..." for U+2026)."""
@@ -506,16 +540,30 @@ def _scan(text, files, canonical=()):
         return b
 
     def span(a, b, delimited):
-        """The one place a path is cut out of the scan (rules 24 and 26): (a, b, delimited) when scan[a:b] is a path, else None. Inside a delimiter
-        only the white space around it is trimmed; outside, only the sentence punctuation written at its end is. Nothing is taken off the front."""
+        """The one place a path is cut out of the scan (rules 24, 26, 27, 29 and 30): (a, b, delimited) when scan[a:b] is a path, else None.
+        Inside a delimiter the path is the text from the start, after a lead-in that ONE list separator splits off (rule 29), to the line part,
+        only the white space around it trimmed (it is the path as written, whatever is in it); it is a path when it, or its last word, is path-shaped
+        once the sentence punctuation at its end is not counted (rule 30: the text stays as written). Outside, only the sentence punctuation
+        written at the end is taken off. Nothing is taken off the front."""
         if delimited:
+            k = bisect.bisect_left(splits, b) - 1
+            if k >= 0:  # a separator with nothing but white space after it, up to the line part, splits nothing off: it ends the path ("cli.py;")
+                j = b - 1
+                while j > splits[k] and scan[j] == " ":
+                    j -= 1
+                if j == splits[k]:
+                    k -= 1
+            if k >= 0 and splits_from[k] >= a:
+                a = splits[k] + 1
             while a < b and scan[a] == " ":
                 a += 1
             while b > a and scan[b - 1] == " ":
                 b -= 1
-        else:
-            b = untrail(a, b)
-        return (a, b, delimited) if shaped(a, b) else None
+            e = untrail(a, b)
+            word = max(a, scan.rfind(" ", a, e) + 1)
+            return (a, b, True) if shaped(a, e) or (word > a and shaped(word, e)) else None
+        b = untrail(a, b)
+        return (a, b, False) if shaped(a, b) else None
 
     def after_list_separator(i):
         """i moved past the white space and the ONE list separator that stand between two references of a list."""
@@ -534,17 +582,12 @@ def _scan(text, files, canonical=()):
             head = max(head, run_starts[bisect.bisect_right(run_starts, s - 1) - 1])
         if last_end and head == last_end and head < s and scan[head] in LIST_SEPARATORS:
             head += 1  # a.py:1,b.py:2: the comma ends the first reference
-        chosen = None
-        ce = untrail(head, s)
-        if head < ce and ce - head <= longest and scan[head:ce] in whole:
-            chosen = (head, ce, False)  # a chore file, written whole
-        else:
-            k = bisect.bisect_left(positions, s) - 1
-            top = tops[k] if k >= 0 else -1
-            if top >= 0:  # inside a delimiter: everything from it to the line part
-                chosen = span(top if top > last_end else after_list_separator(last_end), s, True)
-            if chosen is None:
-                chosen = span(head, s, False)
+        k = bisect.bisect_left(positions, s) - 1
+        top = tops[k] if k >= 0 else -1
+        if top >= 0:  # inside a delimiter only the delimiter reads the line part (rules 27, 29, 30): no other reading of the same text
+            chosen = span(top if top > last_end else after_list_separator(last_end), s, True)
+        else:  # outside one (rule 18): the run of non-space characters, by the one cutter
+            chosen = span(head, s, False)
         if chosen:
             found.append((chosen[0], m.end(), chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a")))
             last_end = m.end()
@@ -573,7 +616,7 @@ def _scan(text, files, canonical=()):
 
 
 def references(text, files, canonical=()):
-    """Rules 17 to 26. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
+    """Rules 17 to 30. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
     a reference; every pass is linear.
 
     The scan is text in NFKC form (rule 17) with the spans in canonical (a fact line's own citation list) blanked: it is used to FIND references
@@ -584,9 +627,10 @@ def references(text, files, canonical=()):
     path is the path AS WRITTEN (rules 24 and 26): the characters of text, never of the scan, from the start of the PATH to its end, by ONE
     function (_span below). Outside a delimiter a PATH is the run of non-space characters before the line part, whatever stands in front of it,
     minus the sentence punctuation at its end (rule 18), and it counts as a path when it holds / or \\, ends in ".<letters>" or is a chore file's
-    path or name. Inside a delimiter it is exactly the text from just after the opener to the line part, with only the white space (line
-    breaks included) around it trimmed: no punctuation is taken off either end. A chore file, written whole, wins over that. A reference that
-    follows another in a list (a.py:1, b.py:2) starts after the previous one and ONE list separator, "," or ";".
+    path or name. Inside a delimiter it is exactly the text from just after the opener to the line part (after a lead-in that ONE list
+    separator splits off, rule 29), with only the white space (line breaks included) around it trimmed: no punctuation is taken off either
+    end, and no other reading is tried (rule 30). A reference that follows another in a list (a.py:1, b.py:2) starts after the previous one
+    and ONE list separator, "," or ";".
 
     unparsed is [(start, end, written)]: every number left once the references are removed that is directly preceded by a path token or
     a line word (line, lines, L, l., ln, #) with only separators between them (rule 21)."""

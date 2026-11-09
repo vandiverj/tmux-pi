@@ -326,7 +326,7 @@ def read_jsonl(path):
             continue
         try:
             value = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # a line nested too deep is a bad line
             bad += 1
             continue
         if isinstance(value, dict):
@@ -414,7 +414,7 @@ def _read_json(path):
             return None
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else None
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):  # RecursionError: JSON nested past the interpreter's limit is unreadable
         return None
 
 

@@ -172,7 +172,8 @@ def review_text(*families, verdict="REQUEST_CHANGES"):
     if verdict != "REQUEST_CHANGES":
         return f"{verdict}\nRESULT_STATUS: complete\n\nCoverage\nI read the changed files and their callers.\n"
     labels = "".join(f"F{n} [defect] one cell of the matrix is wrong.\nFamily: {name}\nCloses by: code\n\n" for n, name in enumerate(families, 1))
-    return (f"REQUEST_CHANGES\nRESULT_STATUS: complete\n{labels or 'F1 [defect] wrong.\nCloses by: code\n'}\n"
+    labels = labels or "F1 [defect] wrong.\nCloses by: code\n"  # no backslash inside an f-string expression: Python < 3.12
+    return (f"REQUEST_CHANGES\nRESULT_STATUS: complete\n{labels}\n"
             "Coverage\nI read the changed files and their callers.\n")
 
 

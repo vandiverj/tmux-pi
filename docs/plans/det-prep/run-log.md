@@ -515,3 +515,16 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - M2-F1 review: second credential-directory prompt (`config/`), so it was parked as the rule says. Re-dispatched with an
   evidence note to read config files by exact path and never search config/ or agent/ recursively:
   review-coder-76b4f649f5-182739.
+
+## 2026-11-08 M2-F1 (strong shown) merged into main
+- coder-76b4f649f5 (lane strong-shown): strong `shown: true`, gpt-6.1-sol `in_roster: true` at efforts ["high"]. The
+  router prompt now offers 5 levels (4 = strong, 5 = top); a top author's reviewer walks down to gpt-6.1-sol at
+  strong/high. tests/route_fixture.py defaults strong_shown=False (scope deviation, accepted by review).
+- Main's four-mode run (10 modules): 433 OK in each. Review review-coder-76b4f649f5-182739 (gpt-6.1-sol):
+  APPROVED_WITH_NOTES, no defects. F1 note: test_model_routing enables strong before its redirect test instead of
+  using the shipped flags (other tests pin them). F2 owed: the worker reported aggregate durations only; per-file
+  timings were not collected (acknowledged).
+- Committed 4e01e1f, `lane close strong-shown F1`, merged 2798974. Main's local openai-codex/ prefix edits saved,
+  reverted, re-applied after the merge (one conflict on the strong row, resolved to openai-codex/gpt-6.1-sol with
+  in_roster true); validate_catalog passes. Lane removed.
+- With strong in the roster, a strong outage also takes out mid's gpt-6.1-sol (health keyed provider:model).

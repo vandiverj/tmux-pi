@@ -1,0 +1,6 @@
+- lanes.py defines the lane lock, a file lock that makes another thread or process wait its turn [real/lib/lanes.py:463]
+- create_lane takes the lane lock while it creates the lane's branch, worktree and record [real/lib/lane_commands.py:358-359]
+- reserve takes the lane lock so that the stale holders are dropped and the new one added in the same step [real/lib/lane_lease.py:206-207]
+- release takes the lane lock and drops the task's holder from the lane [real/lib/lane_lease.py:232]
+- activate takes the lane lock to turn the task's reservation into the worker's own holder [real/lib/lane_lease.py:248]
+- unshare_lane takes the lane lock to switch the lane's recorded dependency state to its own after it unlinks [real/lib/lane_deps.py:218-221]

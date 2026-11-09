@@ -1,21 +1,19 @@
 """The summarize_files qualification kit: tests/calibration/summarize/ (chores, answers, fixtures), tools/qual/summarize_check.py
 (the scorer) and tools/qual/summarize_run.py (the runner). No model is run: the worker is a stub script."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
-import contextlib
 import functools
 import itertools
 import json
 import os
 import re
-import signal
 import stat
 import string
 import subprocess
 import sys
 import tempfile
-import time
 import unicodedata
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +25,8 @@ import summarize_run
 DATA = ROOT / "tests" / "calibration" / "summarize"
 FIXTURES = DATA / "fixtures"
 MODEL = "lmstudio/qwen/qwen3.6-35b-a3b"
+REAL = "real"  # the split of the chores over files frozen from tmux-pi (fixtures/real/)
+MANIFEST = "frozen-copies.json"  # FC1: names the frozen copies so the review packet can leave them out
 
 
 # What bin/tp-route really prints, captured 2026-11-08 with `tp-route --no-log --local-only "<task>"` (the first from a run with the
@@ -462,10 +462,13 @@ def grammar_mutations(answer, turn=None):
 
 
 class DataTests(unittest.TestCase):
+    """The 24 synthetic chores (splits tune and holdout). The real split (12 chores over frozen tmux-pi files) is RealSplitTests: its
+    fixtures are full size, so the generated attacks below (thousands of mutations of every reference reply, with line numbers of
+    the small fixtures) would cost minutes there and are not repeated for it."""
     @classmethod
     def setUpClass(cls):
-        cls.chores = jsonl("chores.jsonl")
-        cls.answers = {a["id"]: a for a in jsonl("answers.jsonl")}
+        cls.chores = [c for c in jsonl("chores.jsonl") if c["split"] != REAL]
+        cls.answers = {a["id"]: a for a in jsonl("answers.jsonl") if a["id"] in {c["id"] for c in cls.chores}}
 
     def facts(self):
         """(chore id, answer, k) for every required fact of every chore."""
@@ -744,7 +747,7 @@ class DataTests(unittest.TestCase):
     def test_a_fact_line_citing_a_file_that_is_not_the_chores_fails_rule_3(self):
         # Main's probe, for every fact line of every chore: the same line with its file changed to a fixture file the chore did not
         # name, or to one that does not exist, fails as unknown_file and nothing earlier in the reply supplies another.
-        every = sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.rglob("*") if p.is_file())
+        every = sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.rglob("*") if p.is_file() and p.relative_to(FIXTURES).parts[0] != REAL)
         count = 0
         for chore in self.chores:
             answer = self.answers[chore["id"]]
@@ -1148,6 +1151,225 @@ class DataTests(unittest.TestCase):
         for table in re.findall(r"(?:^\|.*\n)+", text, re.M):
             widths = [len(re.findall(r"(?<!\\)\|", row)) for row in table.splitlines()]
             self.assertEqual(len(set(widths)), 1, table.splitlines()[0])
+
+
+class RealSplitTests(unittest.TestCase):
+    """LS1b: the 12 chores of split `real`, over 10 files frozen from tmux-pi at commit 109948a (fixtures/real/, SOURCES.md).
+    The checks of DataTests that are cheap per chore are repeated here for them; the generated mutation attacks are not (see DataTests)."""
+    COMMIT = "109948a"
+    FROZEN = FIXTURES / REAL
+
+    @classmethod
+    def setUpClass(cls):
+        cls.chores = [c for c in jsonl("chores.jsonl") if c["split"] == REAL]
+        cls.answers = {a["id"]: a for a in jsonl("answers.jsonl") if a["id"] in {c["id"] for c in cls.chores}}
+
+    def facts(self):
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            for k in range(len(answer["required"])):
+                yield chore["id"], answer, k
+
+    def check(self, reply, chore_id):
+        return summarize_check.check(reply, self.answers[chore_id], FIXTURES)
+
+    def test_twelve_chores_pair_with_answers_and_the_splits_add_up(self):
+        ids = [c["id"] for c in self.chores]
+        self.assertEqual((len(ids), len(set(ids))), (12, 12))
+        self.assertEqual(set(ids), set(self.answers))
+        self.assertTrue(all(i.startswith("real-") for i in ids))
+        every = jsonl("chores.jsonl")  # the split is a split: 12 + 12 + 12, each id once, and every answer has its chore
+        self.assertEqual(sorted(Counter(c["split"] for c in every).items()), [("holdout", 12), ("real", 12), ("tune", 12)])
+        self.assertEqual(sorted(a["id"] for a in jsonl("answers.jsonl")), sorted(c["id"] for c in every))
+        self.assertEqual(len({c["id"] for c in every}), 36)
+
+    def test_every_named_fixture_exists_and_is_a_frozen_file(self):
+        used = set()
+        for chore in self.chores:
+            self.assertEqual(self.answers[chore["id"]]["cite_files"], chore["files"], chore["id"])
+            for name in chore["files"]:
+                self.assertTrue(name.startswith(REAL + "/"), name)
+                self.assertTrue((FIXTURES / name).is_file(), "{}: {}".format(chore["id"], name))
+                self.assertIn(name, chore["task"], chore["id"])
+                used.add(name)
+        on_disk = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md", REAL + "/" + MANIFEST}
+        self.assertEqual(used, on_disk)  # every frozen file is read by a chore, and every chore file is frozen
+        self.assertTrue(8 <= len(on_disk) <= 12, len(on_disk))
+
+    def test_frozen_files_are_data_not_code_and_name_no_private_path(self):
+        # Nothing may treat a copy as live code: unittest discovery only descends into packages (tests/__init__.py exists, the
+        # calibration folders have none) and run_parallel globs tests/test_*.py without recursing; a bin/ copy keeps no exec bit.
+        for folder in (ROOT / "tests" / "calibration", DATA, FIXTURES, self.FROZEN):
+            self.assertFalse((folder / "__init__.py").exists(), folder)
+        for path in self.FROZEN.rglob("*"):
+            relative = path.relative_to(self.FROZEN)
+            self.assertNotIn("__init__.py", relative.parts)
+            self.assertFalse({"config", "agent", ".tmux-pi"} & set(relative.parts), relative)
+            self.assertFalse(any(part.startswith(".env") for part in relative.parts), relative)
+            if path.is_file():
+                self.assertEqual(path.stat().st_mode & 0o111, 0, "{} is executable".format(relative))
+        self.assertTrue((self.FROZEN / "bin" / "tp-spawn").is_file())
+
+    def test_sources_names_the_commit_and_path_of_each_frozen_file(self):
+        rows = {}
+        for line in (self.FROZEN / "SOURCES.md").read_text(encoding="utf-8").splitlines():
+            cells = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
+            if line.startswith("|") and len(cells) == 3 and cells[0].startswith(REAL + "/"):
+                self.assertNotIn(cells[0], rows)
+                rows[cells[0]] = cells[1:]
+        frozen = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md", REAL + "/" + MANIFEST}
+        self.assertEqual(set(rows), frozen)
+        for name, (source, commit) in rows.items():
+            self.assertEqual((source, commit), (name[len(REAL) + 1:], self.COMMIT), name)  # the same relative path, in the source tree
+
+    def test_frozen_copies_manifest_lists_every_frozen_file_at_its_source(self):
+        # The review packet leaves a copy out only when frozen-copies.json names it (FC1, docs/lanes.md); every frozen file is
+        # listed with the same source path and the full id of the commit SOURCES.md names, and nothing else is listed.
+        manifest = json.loads((self.FROZEN / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(set(manifest), {"copies"})
+        frozen = {str(p.relative_to(self.FROZEN)) for p in self.FROZEN.rglob("*") if p.is_file()} - {"SOURCES.md", MANIFEST}
+        listed = {}
+        for entry in manifest["copies"]:
+            self.assertEqual(set(entry), {"path", "source", "commit"}, entry)
+            self.assertNotIn(entry["path"], listed)
+            listed[entry["path"]] = entry
+            self.assertEqual(entry["source"], entry["path"], entry)
+            self.assertRegex(entry["commit"], "^[0-9a-f]{40}$", entry)
+            self.assertTrue(entry["commit"].startswith(self.COMMIT), entry)
+        self.assertEqual(set(listed), frozen)
+
+    def test_support_is_a_set_of_lines_and_every_anchor_is_on_its_line(self):
+        for chore_id, answer, k in self.facts():
+            where = "{} fact {}".format(chore_id, k)
+            self.assertEqual((len(answer["support_lines"]), len(answer["anchors"])), (len(answer["required"]),) * 2, chore_id)
+            sets = summarize_check.support_sets(answer["support_lines"][k])
+            anchors = answer["anchors"][k]
+            self.assertTrue(sets, where)
+            self.assertEqual(set(anchors), set(sets), where)
+            for name, lines in sets.items():
+                self.assertIn(name, answer["cite_files"], where)
+                self.assertLessEqual(max(lines), len(fixture_lines(name)), where)
+                self.assertEqual({int(n) for n in anchors[name]}, lines, where)
+                for n, text in anchors[name].items():
+                    self.assertTrue(text.strip() and text in fixture_lines(name)[int(n) - 1], "{} {}:{} {!r}".format(where, name, n, text))
+
+    def test_reference_replies_pass_and_the_committed_samples_are_them(self):
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            self.assertTrue(len(answer["required"]) >= 2 and len(answer["forbidden"]) >= 2, chore["id"])
+            for fact in answer["required"]:
+                for alternative in fact:
+                    re.compile(alternative)
+            for pattern in answer["forbidden"]:
+                re.compile(pattern)
+            for sentence in answer["reference"]:
+                claim, cites, kind = summarize_check.parse_fact_line(sentence["text"])
+                self.assertEqual((kind, len(cites or [])), (None, 1), sentence["text"])
+                self.assertNotIn("`", sentence["text"])
+            result = self.check(reference(answer), chore["id"])
+            self.assertTrue(result["pass"], "{}: {}".format(chore["id"], result))
+            self.assertEqual((result["unchecked"], result["failures"], result["uncited"], result["forbidden_hit"]), (0, [], [], []), chore["id"])
+            sample = (DATA / "samples" / (chore["id"] + ".txt")).read_text(encoding="utf-8")
+            self.assertEqual(sample, reference(answer) + "\n", chore["id"])
+            self.assertTrue(self.check(sample, chore["id"])["pass"], chore["id"])
+            empty = self.check("", chore["id"])
+            self.assertFalse(empty["pass"], chore["id"])
+            self.assertEqual((len(empty["missing"]), rules(empty)), (len(answer["required"]), {MISSING}), chore["id"])
+
+    def test_every_fact_is_needed_and_a_wrong_line_does_not_stand_in_for_it(self):
+        for chore_id, answer, k in self.facts():
+            labels = labels_of(answer)
+            kept = [s for s in answer["reference"] if k not in s["facts"]]
+            gone = [n for n in range(len(labels)) if not any(n in s["facts"] for s in kept)]
+            result = summarize_check.check("\n".join(s["text"] for s in kept), answer, FIXTURES)
+            where = "{} without fact {}: {}".format(chore_id, k, result)
+            self.assertFalse(result["pass"], where)
+            self.assertIn(labels[k], failed(result), where)
+            self.assertTrue(set(labels[n] for n in gone) <= set(failed(result)), where)
+            self.assertEqual((result["order"] if "order" not in answer else [], result["forbidden_hit"], result["bad_citations"], result["uncited"]),
+                             ([], [], [], []), where)
+            self.assertTrue(rules(result) <= {MISSING, (3, "unsupported"), (3, "missing_citation")}, where)
+            # the same fact line citing the line before or after the evidence (when there is one) is unsupported, not accepted
+            for name, lines in summarize_check.support_sets(answer["support_lines"][k]).items():
+                for n in {min(lines) - 1, max(lines) + 1}:
+                    if not 1 <= n <= len(fixture_lines(name)) or n in lines:
+                        continue
+                    for i in stating(answer, k):
+                        text = cited(answer["reference"][i]["text"], "{}:{}".format(name, n))
+                        moved = summarize_check.check(reply_with(answer, {i: text}), answer, FIXTURES)
+                        self.assertFalse(moved["pass"], "{} fact {} cites {}:{}".format(chore_id, k, name, n))
+                        self.assertIn(labels[k], moved["unsupported"], "{} fact {} cites {}:{}".format(chore_id, k, name, n))
+
+    def test_a_fabricated_claim_added_to_the_reference_fails(self):
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            self.assertTrue(answer["fabricated"], chore["id"])  # lines that state a plausible thing the files do not say
+            hit = set()
+            for line in answer["fabricated"]:
+                claim, cites, kind = summarize_check.parse_fact_line(line)
+                self.assertEqual((kind, len(cites or [])), (None, 1), line)  # a well-formed, cited fact line: only its content is wrong
+                result = self.check(reference(answer) + "\n" + line, chore["id"])
+                self.assertFalse(result["pass"], "{}: {}".format(chore["id"], line))
+                self.assertTrue(result["forbidden_hit"], "{}: {}".format(chore["id"], line))
+                self.assertEqual((result["missing"], result["bad_citations"]), ([], []), line)  # the reference still states every fact
+                hit.update(result["forbidden_hit"])
+            self.assertEqual(hit, set(answer["forbidden"]), chore["id"])  # every forbidden pattern of the chore is shown to fire
+
+    def test_a_behaviour_fact_is_met_by_words_and_names_alone_fail_rule_5(self):
+        count = 0
+        for chore_id, answer, k in self.facts():
+            behaviour = answer.get("behaviour", {}).get(str(k))
+            if behaviour is None:
+                continue
+            count += 1
+            names = summarize_check.names_in_code(FIXTURES, answer["cite_files"])
+            for i in stating(answer, k):
+                claim = summarize_check.parse_fact_line(answer["reference"][i]["text"])[0]
+                self.assertTrue(claim.startswith(behaviour["name"]), "{} fact {}: {}".format(chore_id, k, claim))
+                self.assertEqual(summarize_check.subject_of(claim, names, answer["cite_files"]), Path(behaviour["name"]).name, claim)
+                self.assertTrue(any(re.search(a, summarize_check.without_names(claim, names), re.I) for a in answer["required"][k]),
+                                "{} fact {}: {}".format(chore_id, k, claim))
+            sig_file, sig_line = behaviour["sig"].rsplit(":", 1)
+            self.assertIn(sig_file, answer["cite_files"], chore_id)
+            signature = fixture_lines(sig_file)[int(sig_line) - 1].strip()
+            for form in ("- {name} [{at}]", "- {sig} [{at}]", "- {name}: {sig} [{at}]"):
+                line = form.format(name=behaviour["name"], at=behaviour["sig"], sig=signature)
+                result = summarize_check.check(reply_with(answer, {i: line for i in stating(answer, k)}), answer, FIXTURES)
+                self.assertFalse(result["pass"], "{} fact {} {}".format(chore_id, k, line))
+                self.assertIn(labels_of(answer)[k], failed(result), line)
+        self.assertGreaterEqual(count, 16)
+
+    def test_ordered_chores_fail_when_the_order_is_changed(self):
+        ordered = sorted(c["id"] for c in self.chores if "order" in self.answers[c["id"]])
+        self.assertEqual(ordered, ["real-plan-s2-additions", "real-remaining-work", "real-remove-steps", "real-reporter-states"])
+        for chore_id in ordered:
+            answer = self.answers[chore_id]
+            self.assertEqual(answer["order"], list(range(len(answer["required"]))), chore_id)
+            self.assertIn("order", next(c for c in self.chores if c["id"] == chore_id)["task"], chore_id)  # the task asks for one
+            lines = [s["text"] for s in answer["reference"]]
+            for name, shuffled in (("reversed", lines[::-1]), ("first two swapped", lines[1::-1] + lines[2:])):
+                result = summarize_check.check("\n".join(shuffled), answer, FIXTURES)
+                self.assertTrue(result["order"], "{} {}".format(chore_id, name))
+                self.assertFalse(result["pass"], "{} {}".format(chore_id, name))
+                self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"], result["unsupported"]),
+                                 ([], [], [], []), "{} {}".format(chore_id, name))
+
+    def test_the_set_covers_the_kinds_and_the_hard_cases_the_brief_asks_for(self):
+        ids = {c["id"] for c in self.chores}
+        for fragment in ("lock-users", "spawn-lease-calls", "exports-", "plan-s2", "remove-steps", "diff-", "sum-"):  # use, exports, steps, diff, summary
+            self.assertTrue(any(fragment in i for i in ids), fragment)
+        many = [c["id"] for c in self.chores if len(c["files"]) > 1]
+        self.assertGreaterEqual(len(many), 4, many)  # facts that need more than one file
+        deep = []
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            at = {(name, n) for entry in answer["support_lines"] for name, lines in summarize_check.support_sets(entry).items() for n in lines}
+            if any(n > 400 and len(fixture_lines(name)) > 400 for name, n in at):
+                deep.append(chore["id"])
+        self.assertGreaterEqual(len(deep), 3, deep)  # facts from deep inside a large file
+        for chore in many:
+            names = {name for entry in self.answers[chore]["support_lines"] for name in summarize_check.support_sets(entry)}
+            self.assertGreater(len(names), 1, chore)  # a chore that names several files really needs facts from more than one of them
 
 
 class CheckerTests(unittest.TestCase):
@@ -1740,108 +1962,8 @@ class CheckerTests(unittest.TestCase):
                     self.assertEqual((result["pass"], (3, "unknown_file") in rules(result), result["bad_citations"]),
                                      (False, True, [shown.format(o=opener, c=closer) + " (unknown_file)"]), (body, k, opener))
 
-    def test_rule_20_a_megabyte_of_words_references_and_brackets_is_read_in_linear_time(self):
-        self.megabyte({"words": "The queue evicts after 128 entries and retries 3 times. ", "line breaks": "\n", "open brackets": "[",
-                       "dense references": "src/cache.py:6 ", "line of": "line 6 of src/cache.py ", "floor": "src/a.py;7 ", "compatibility forms": "ﬁ "})
-
-    def test_rule_20_a_megabyte_of_numbers_is_read_in_linear_time(self):
-        # the shapes with the most numbers (one for each two characters): the floor reads each, ASCII and fullwidth
-        self.megabyte({"numbers": "7 ", "unicode digits": "９ "})
-
-    def test_rule_20_a_megabyte_of_bracket_items_on_one_line_is_read_in_linear_time(self):
-        # rule 10 reads the items of a line through the one path reader (references), so a line of bracket items costs a second reading of the line;
-        # the comma lists are the worst shape (three items for 14 characters)
-        self.megabyte({"comma lists one line": "[a:1,b:2,c:3] ", "hash items one line": "[src/cache.py#:6] ", "unknown-name items one line": "[nofile:9] "})
-
-    def test_rule_20_a_megabyte_of_bracket_items_on_many_lines_is_read_in_linear_time(self):
-        self.megabyte({"short fact lines": "- x [y:1]\n", "bracket-with-hash lines": "[x#:1]\n", "bracket items, many lines": "- x [src/cache.py:6]\n"})
-
-    # ---- round 14 (review-coder-b69bae86e7-032459 F1): nested pairs, read in linear time at any depth ----
-    MB = 1000000
-
-    def reverse_nest(self, opener, closer, k=16000, tail=".py"):
-        """1 MB: k nested "line 1 of <opener>" (reverse order), one long word, tail, k closers. The k candidates share one tail."""
-        lead = "line 1 of " + opener
-        return lead * k + "x" * (self.MB - (len(lead) + len(closer)) * k - len(tail)) + tail + closer * k
-
-    def forward_nest(self, opener, closer, k=16000, tail=".py:6"):
-        """1 MB: k nested openers, one long word, tail (path and line part), k closers."""
-        return opener * k + "x" * (self.MB - (len(opener) + len(closer)) * k - len(tail)) + tail + closer * k
-
-    def backtick_nest(self, lead, tail, depth=600):
-        """1 MB: backtick runs of length 1 to depth (the only way backticks nest), each after lead, one long word, tail, the closers from depth to 1."""
-        opens = "".join(lead + "`" * i for i in range(1, depth + 1))
-        closes = " ".join("`" * i for i in range(depth, 0, -1))
-        return opens + "x" * (self.MB - len(opens) - len(closes) - len(tail)) + tail + closes
-
-    def test_rule_20_a_megabyte_of_nested_reverse_pairs_is_read_in_linear_time(self):
-        # the reviewer's shape (k = 8000 took 4.4 s CPU in round 13, 13.4 s at 16000): each of k nested candidates walked the same tail again.
-        # The last shape has no path: every candidate fails, and the old reader walked the 900000 letters of its tail for each (88 s at k = 1000).
-        self.megabyte({"reverse in ( )": lambda: self.reverse_nest("(", ")"), "reverse in [ ]": lambda: self.reverse_nest("[", "]"),
-                       "reverse in < >": lambda: self.reverse_nest("<", ">"), "reverse in quotes": lambda: self.reverse_nest('"', '"'),
-                       "reverse in backticks": lambda: self.backtick_nest("line 1 of ", ".py"),
-                       "reverse in ( ), no path": lambda: self.reverse_nest("(", ")", tail=""),
-                       "reverse in ( ), path with spaces": lambda: self.reverse_nest("(", ")", tail=" end.py")})
-
-    def test_rule_20_a_megabyte_of_nested_forward_pairs_is_read_in_linear_time(self):
-        # the forward loop: nested pairs around one path and line part, and many line parts that each fail inside one pair (a long word, or a long
-        # run of spaces, in front of them: each failed candidate must not read it again)
-        self.megabyte({"forward in ( )": lambda: self.forward_nest("(", ")"), "forward in [ ]": lambda: self.forward_nest("[", "]"),
-                       "forward in < >": lambda: self.forward_nest("<", ">"), "forward in backticks": lambda: self.backtick_nest("", ".py:6"),
-                       "forward in ( ), no path": lambda: self.forward_nest("(", ")", tail=":6"),
-                       "forward in ( ), 250000 failed line parts after a word": lambda: "(" + "x" * 500000 + ":6" * 250000,
-                       "forward in ( ), 200000 failed line parts after spaces": lambda: "(" + " " * 500000 + "x" + ":6" * 200000 + ")"})
-
-    def test_rule_20_a_megabyte_of_mixed_nested_pairs_and_code_spans_is_read_in_linear_time(self):
-        def padded(head, tail):
-            return head + "x" * (self.MB - len(head) - len(tail)) + tail
-        self.megabyte({"reverse then forward": lambda: padded("line 1 of (" * 8000 + "(" * 8000, ".py:6" + ")" * 16000),
-                       "alternating bracket types": lambda: padded("line 1 of (line 1 of [" * 8000, ".py" + "])" * 8000),
-                       "forward and reverse alternating": lambda: padded("(line 1 of [" * 8000, ".py:6" + "])" * 8000),
-                       # a claim: unmatched backtick runs of every length from 600 down to 2 each looked for a closer through all the runs after it
-                       "unmatched backtick runs in a claim": lambda: "- " + "".join("`" * i + "x" for i in range(600, 1, -1)) + "`x" * 400000 + " " + self.C})
-
-    def test_rule_20_nesting_depth_does_not_change_the_cpu_for_the_same_size(self):
-        """The reviewer's shape at the same 1 MB with 1000 pairs and with 16000: a linear reader takes the same time plus a little for the 15000
-        extra pairs (each is a match of the forward grammar and two delimiters): the ratio of the best of 3 runs, 5 times over, was 1.56 to 1.60
-        on py3.9 and 1.44 to 1.48 on py3.14 (earlier runs of the same code: 1.60 to 1.71 and 1.45 to 1.51). The round-13 reader took 0.35 s at k = 1000 and 12.6 s at k = 16000 (36 times). The bound is 2.5:
-        about 1.5 times the linear ratio and a fourteenth of the quadratic one."""
-        def cpu(k):
-            best = None
-            for _ in range(3):
-                reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=self.reverse_nest("(", ")", k))
-                with self.cpu_bound("k = {}".format(k), 8):
-                    start = time.process_time()
-                    self.check(reply)
-                    best = min(best or 99, time.process_time() - start)
-            return best
-        few, many = cpu(1000), cpu(16000)
-        self.assertLess(many, 2.5 * few, (few, many))
-
-    @contextlib.contextmanager
-    def cpu_bound(self, name, seconds=2):
-        """Stops a check that has used `seconds` of CPU (SIGPROF, raised at the next bytecode): a quadratic reader fails in 2 s, not in minutes."""
-        def stop(signum, frame):
-            raise AssertionError("{}: more than {} CPU seconds".format(name, seconds))
-        previous = signal.signal(signal.SIGPROF, stop)
-        signal.setitimer(signal.ITIMER_PROF, seconds)
-        try:
-            yield
-        finally:
-            signal.setitimer(signal.ITIMER_PROF, 0)
-            signal.signal(signal.SIGPROF, previous)
-
-    def megabyte(self, unit):
-        """A 1 MB reply is read in about a second, whatever its shape: the bound is 2 CPU seconds (time.process_time, the CPU time of this process,
-        so a loaded machine does not fail it) on py3.9, where the slowest shape takes about 1.5 s. Each shape has a reference to a missing file at
-        its end, which is found whatever comes before it. A value is a piece repeated up to 1 MB, or a function that returns the 1 MB body."""
-        for name, piece in unit.items():
-            reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=piece() if callable(piece) else piece * (1000000 // len(piece)))
-            with self.cpu_bound(name):
-                start = time.process_time()
-                result = self.check(reply)
-            self.assertLess(time.process_time() - start, 2, name)
-            self.assertIn((3, "unknown_file"), rules(result), name)
+    # The megabyte tests of rule 20 (every shape, nested pairs and nesting depth) are in tests/test_qual_summarize_linear.py: they bound the
+    # work by a deterministic count of steps, not by CPU time, and run in a file of their own to keep each file well under 60 s.
 
     def test_rule_21_a_number_after_a_path_or_a_line_word_that_no_grammar_placed_fails(self):
         # (text, what the floor reports). The reference grammar places "path:N", "path line N" ...; what is left is the floor's
@@ -2297,9 +2419,9 @@ class RunnerTests(unittest.TestCase):
     def example(self):
         return reference(next(a for a in jsonl("answers.jsonl") if a["id"] == self.CHORE))
 
-    def run_main(self, *extra, command="pi"):
+    def run_main(self, *extra, command="pi", split="tune", only=None):
         out = self.dir / "out.jsonl"
-        argv = ["--model", MODEL, "--split", "tune", "--only", self.CHORE, "--out", str(out), "--prompt-file", str(self.prompt),
+        argv = ["--model", MODEL, "--split", split, "--only", only or self.CHORE, "--out", str(out), "--prompt-file", str(self.prompt),
                 "--pi-command", str(self.bin / command), "--route-command", str(self.bin / "route"), *extra]
         with mock.patch("builtins.print"):
             rc = summarize_run.main(argv, env=self.env)
@@ -2428,6 +2550,28 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             summarize_run.main(["--model", MODEL, "--out", out, "--only", "nope"], env=self.env)
         self.assertIn("nope", str(caught.exception.code))
+
+    def test_split_real_selects_the_frozen_file_chores_and_copies_them_with_their_paths(self):
+        # LS1b: --split real is the 12 chores over the files frozen under fixtures/real; the worker finds them at real/<path>.
+        real = summarize_run.load_chores("real")
+        self.assertEqual(len(real), 12)
+        self.assertEqual({c["split"] for c, _ in real}, {"real"})
+        for split in ("tune", "holdout"):  # the synthetic splits do not gain them
+            self.assertEqual(len(summarize_run.load_chores(split)), 12)
+            self.assertFalse({c["id"] for c, _ in summarize_run.load_chores(split)} & {c["id"] for c, _ in real})
+        self.assertEqual(len(summarize_run.load_chores("all")), 36)
+        self.script("pi_tree", 'find . -type f | sort >> "$QUAL_LOG"; cat "$QUAL_REPLY"\n')
+        chore = "real-diff-lease-test"  # facts from two files, one of them a test module
+        self.reply.write_text(reference(answer_of(chore)))
+        rc, records, summary = self.run_main(split="real", only=chore, command="pi_tree")
+        self.assertEqual(rc, 0)
+        self.assertEqual([(r["chore"], r["split"], r["pass"], r["error"]) for r in records], [(chore, "real", True, None)])
+        self.assertEqual((summary["total"], summary["passed"], summary["fabricated_citations"]), (1, 1, 0))
+        self.assertEqual(sorted(re.findall(r"^\./.*$", self.log.read_text(), re.M)), ["./real/lib/lane_lease.py", "./real/tests/test_lane_lease.py"])
+        self.assert_clean()
+        with self.assertRaises(SystemExit) as caught:  # a real chore is not in the tune split
+            self.run_main(split="tune", only=chore, command="pi_tree")
+        self.assertIn(chore, str(caught.exception.code))
 
     def test_system_prompt_comes_from_the_machine_config(self):
         local = self.dir / "local.json"

@@ -1,0 +1,54 @@
+{
+  "copies": [
+    {
+      "path": "README.md",
+      "source": "README.md",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "bin/tp-spawn",
+      "source": "bin/tp-spawn",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "docs/plans/det-prep/README.md",
+      "source": "docs/plans/det-prep/README.md",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "docs/plans/det-prep/ls1-local-summarizer.md",
+      "source": "docs/plans/det-prep/ls1-local-summarizer.md",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "lib/lane_commands.py",
+      "source": "lib/lane_commands.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "lib/lane_deps.py",
+      "source": "lib/lane_deps.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "lib/lane_lease.py",
+      "source": "lib/lane_lease.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "lib/lane_remove.py",
+      "source": "lib/lane_remove.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "lib/lanes.py",
+      "source": "lib/lanes.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
+      "path": "tests/test_lane_lease.py",
+      "source": "tests/test_lane_lease.py",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    }
+  ]
+}

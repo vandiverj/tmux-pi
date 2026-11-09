@@ -1,0 +1,5 @@
+- 1. real-work split: add split real with 12 chores over real tmux-pi files frozen at a pinned commit, with no env files, no config or agent trees and nothing private [real/docs/plans/det-prep/ls1-local-summarizer.md:55]
+- 2. bar: with the prompt chosen on the tune split, run holdout and real five times each and require at least 57/60 on both, with zero fabricated citations [real/docs/plans/det-prep/ls1-local-summarizer.md:61]
+- 3. routing: run route-only on all 36 chores, at least 34 must give the summarize_files shape, and three runs must agree [real/docs/plans/det-prep/ls1-local-summarizer.md:67]
+- 4. full path: after the flip, dispatch 3 real summarize tasks through tp-agent dispatch and score each with the checker, and each must pass [real/docs/plans/det-prep/ls1-local-summarizer.md:70]
+- 5. if the bar is missed: record the numbers and the failure classes, keep candidate, write a fix round and do not lower the bar [real/docs/plans/det-prep/ls1-local-summarizer.md:73]

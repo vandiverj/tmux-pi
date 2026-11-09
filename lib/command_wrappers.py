@@ -31,18 +31,20 @@ from collections import namedtuple
 # operands: words before the command.  rest: the words from the command on are one command line (ssh, sg, watch).
 # append: the rest of the words are added to the string's words (`env -S 'sudo -n' rg x`).
 # ifnext: options that take the next word when there is one and mean "help" alone (`sudo -h HOST`, `sudo -h`).
+# shell: options after which the words that follow are one command line run by a shell (`sudo -s CMD`, `sudo -i CMD`); with no word
+# after them nothing is run.
 # words: the command may be given as words.  digits: `-5` is an option (`nice -5 cmd`).  anylong: every `--name[=value]` is a
 # flag (firejail has no option that takes its value as the next word).  stop: words that end the command (`parallel ... :::`).
-Spec = namedtuple("Spec", "flags valued string operands fills none numeric rest words digits anylong stop append ifnext")
+Spec = namedtuple("Spec", "flags valued string operands fills none numeric rest words digits anylong stop append ifnext shell")
 
 UNKNOWN = ("unknown", None)
 
 
 def _spec(flags="", valued="", string="", operands=0, fills="", none="", numeric="", rest=False, words=True, digits=False,
-          anylong=False, stop="", append=False, ifnext=""):
+          anylong=False, stop="", append=False, ifnext="", shell=""):
     return Spec(frozenset(flags.split()), frozenset(valued.split()), frozenset(string.split()), operands,
                 frozenset(fills.split()), frozenset(none.split()), frozenset(numeric.split()), rest, words, digits, anylong,
-                tuple(stop.split()), append, frozenset(ifnext.split()))
+                tuple(stop.split()), append, frozenset(ifnext.split()), frozenset(shell.split()))
 
 
 _HELP = "-h --help -V --version"
@@ -60,11 +62,12 @@ SPECS = {
     "ionice": _spec("-t --ignore", "-c --class -n --classdata", none="-p --pid -P --pgid -u --uid " + _HELP),
     "timeout": _TIMEOUT,
     "gtimeout": _TIMEOUT,
-    "sudo": _spec("-A -B -b -E -H -i -k -n -P -S -s --askpass --bell --background --preserve-env --set-home --login "
-                  "--reset-timestamp --non-interactive --preserve-groups --stdin --shell",
+    "sudo": _spec("-A -B -b -E -H -k -n -P -S --askpass --bell --background --preserve-env --set-home "
+                  "--reset-timestamp --non-interactive --preserve-groups --stdin",
                   "-a -C -c -D -g -p -R -r -T -t -U -u --auth-type --close-from --login-class --chdir --group --prompt "
                   "--chroot --role --type --command-timeout --user --other-user --host",
-                  none="--help -V --version -K --remove-timestamp -v --validate -l --list", ifnext="-h"),
+                  none="--help -V --version -K --remove-timestamp -v --validate -l --list", ifnext="-h",
+                  shell="-s -i --shell --login"),   # `sudo -s CMD ...`: the words are a command line for the target user's shell
     "doas": _spec("-L -n -s", "-C -u"),
     "nohup": _spec(none="--help --version"),
     "stdbuf": _spec(valued="-i -o -e --input --output --error", none="--help --version"),
@@ -139,13 +142,14 @@ def unwrap(name, args):
     """Where the command of `name args...` starts: ("words", [command, ...]), ("line", "a command line"), None or UNKNOWN.
 
     "line" is the value of a command-string option (`su -c 'cmd'`, `su --command=cmd`, `su -ccmd`), or the joined words after
-    the operands for a wrapper whose remote shell takes one string (ssh, sg, watch). A wrapper given both -c and words runs the
-    string. `--` ends the options; the operands after it are still taken, then the command starts. An option the row does not
-    list gives UNKNOWN."""
+    the operands for a wrapper whose remote shell takes one string (ssh, sg, watch), or the words after a shell option
+    (`sudo -s CMD ...`, `sudo -i CMD ...`: Spec.shell). A wrapper given both -c and words runs the string. `--` ends the options;
+    the operands after it are still taken, then the command starts. An option the row does not list gives UNKNOWN; so does a long
+    option that is not the abbreviation of exactly one of the row's (`--spl` is `--split-string`)."""
     spec = SPECS[name]
     args = list(args)
-    n, i, operands, line, ended = len(args), 0, spec.operands, None, False
-    known = spec.flags | spec.valued | spec.string | spec.none | spec.numeric | spec.ifnext
+    n, i, operands, line, ended, shell = len(args), 0, spec.operands, None, False, False
+    known = spec.flags | spec.valued | spec.string | spec.none | spec.numeric | spec.ifnext | spec.shell
     while i < n:
         arg = args[i]
         if arg == "--" and not ended:  # ends the options, not the operands: `flock -- LOCK cmd`, `ssh -- host cmd`
@@ -167,13 +171,17 @@ def unwrap(name, args):
         if arg.startswith("--"):
             flag, equals, attached = arg.partition("=")
             if flag not in known and not spec.anylong:
-                return UNKNOWN
+                full = [long for long in known if long.startswith("--") and long.startswith(flag)] if len(flag) > 2 else []
+                if len(full) != 1:  # getopt takes an abbreviation of one long option; an ambiguous or unknown one is not understood
+                    return UNKNOWN
+                flag = full[0]
             steps = [(flag, attached if equals else None)]
         elif arg in known:
             steps = [(arg, None)]
         else:  # a bundle of short options; a letter that takes a value takes the rest of the bundle, else the next word
             steps = [("-" + c, arg[2 + k:] or None) for k, c in enumerate(arg[1:])]
         for flag, attached in steps:
+            shell = shell or flag in spec.shell
             if flag in spec.none or (flag in spec.ifnext and not attached and i >= n):
                 return None
             if flag in spec.valued or flag in spec.string or flag in spec.ifnext or (
@@ -195,7 +203,7 @@ def unwrap(name, args):
         return ("line", line)
     if i >= n:
         return None
-    if spec.rest:
+    if spec.rest or shell:  # the words from the command on are one command line (ssh, sg, watch, `sudo -s`)
         rest = args[i:]
         for k, word in enumerate(rest):
             if word in spec.stop:
@@ -265,17 +273,42 @@ def string_option(spec, word):
     return None
 
 
-def inside(word):
-    """The text an option word carries inside it as a command line (`-Srg`, `-qcSTR`, `--command=STR`), or None. Read from the string
-    options of every row (`string_option`): `flatten` does not know which wrapper a word belongs to, so a word is a string when any
-    row says it is. That can add a look at the value of another program's option (`sort -S1G`), never hide one."""
-    if not word.startswith("-"):
-        return None
-    for spec in SPECS.values():
-        found = string_option(spec, word) if spec.string else None
-        if found and found[0]:
-            return found[0]
-    return None
+def shell_option(spec, word):
+    """Whether the option word `word` of a wrapper with the row `spec` is one of its shell options (`Spec.shell`: `sudo -s`, `sudo -i`,
+    `--shell`, `--login`, alone or in a cluster of flags: `-Es`). Read like `string_option`: a letter that takes a value ends the word
+    (`sudo -us` gives `s` to -u: that is a user), and an abbreviated long form is one."""
+    if not spec.shell or len(word) < 2 or not word.startswith("-"):
+        return False
+    if word.startswith("--"):
+        flag = word.partition("=")[0]
+        return len(flag) > 2 and any(long.startswith(flag) for long in spec.shell if long.startswith("--"))
+    for letter in word[1:]:
+        flag = "-" + letter
+        if flag in spec.shell:
+            return True
+        if flag in spec.valued or flag in spec.string or flag in spec.ifnext:
+            return False
+    return False
+
+
+def readings(word):
+    """Every text the option word `word` can hand on as a command line, sorted: what each row with a string option reads inside
+    it (`string_option`: `-Srg` is env's `rg`, `-crg x` is su's `rg x`), and the word itself when it holds white space, a quote or
+    an operator and no row claims it (a quoted string is one word to the shell that read the outer line and is split again by the
+    shell that runs it).
+    `flatten` does not know which wrapper a word belongs to, so a word is read the way EVERY row reads it, not the first row that
+    claims it: `su -c'rg x -Sls'` is su's `rg x -Sls` and env's `ls`, and a reading may add a look, never remove one. That can add a
+    look at the value of another program's option (`sort -S1G`). The order of the rows changes nothing."""
+    found = set()
+    if word.startswith("-"):
+        for spec in SPECS.values():
+            if spec.string:
+                text = string_option(spec, word)
+                if text and text[0]:
+                    found.add(text[0])
+    if not found and _STRUCTURE.search(word):
+        found.add(word)  # a word no row claims; one a row claims is read as its value (the word split again would invent an option)
+    return sorted(found)
 
 
 def _join(parts, depth):
@@ -291,29 +324,38 @@ def _join(parts, depth):
     return flat, ends, deep
 
 
+MAX_WORDS = 5000  # the flat list of one command; more is "too deep" (readings multiply, so adversarial text could grow it)
+
+
 def flatten(words, depth=0):
     """(flat, ends, too_deep): `words` in order, each word that is a string put through the shell's split and the words of it
     placed right after it, and so on to SPLIT_DEPTH (SEP stands between the commands of a split). A word is a string when it
     holds white space, a quote, an operator or a backslash (a quoted `'rg --hidden x'` is one word to the shell that read the outer
     line; the shell that runs it splits it again), or when it is a string option of a wrapper with its value inside the word
-    (`-Srg`, `-qcSTR`, `--command=STR`: `inside`). The words after a string stay after its words, so
-    `env -S 'rg --hidden' TOKEN .` reads `rg --hidden TOKEN .`.
+    (`-Srg`, `-qcSTR`, `--command=STR`: `readings`), and then in every reading of it. The words after a string stay after its words,
+    so `env -S 'rg --hidden' TOKEN .` reads `rg --hidden TOKEN .`.
 
     `ends[i]` is where the words that follow flat[i] start: i + 1, or the end of the words of flat[i] when it is a string (the
     program `'/tmp/a b/rg'` is the basename of the whole word, and its arguments are the words after it)."""
     flat, ends, deep = [], [], False
     for word in words:
+        if len(flat) > MAX_WORDS:
+            return flat, ends, True
         at = len(flat)
         flat.append(word)
         ends.append(at + 1)
-        text = inside(word) or (word if _STRUCTURE.search(word) else None)
-        if not text:
+        texts = readings(word)
+        if not texts:
             continue
         if depth >= SPLIT_DEPTH:
             deep = True
             continue
-        parts = _commands(text)
-        if parts == [[word]]:
+        parts = []
+        for text in texts:
+            for part in _commands(text):
+                if part != [word] and part not in parts:
+                    parts.append(part)
+        if not parts:
             continue
         sub, sub_ends, sub_deep = _join(parts, depth + 1)
         flat += sub
@@ -323,12 +365,30 @@ def flatten(words, depth=0):
     return flat, ends, deep
 
 
-def bag(tail):
+def _once(flat, ends, i):
+    """The words after flat[i], each word of the line once: a string is kept and the words `flatten` made from it are skipped."""
+    rest, k = [], ends[i]
+    while k < len(flat):
+        rest.append(flat[k])
+        k = ends[k]
+    return rest
+
+
+def bag(tail, once=()):
     """(entries, too_deep) for the words after a wrapper: each entry is (name, words after it) for one word of the flat list
-    from `flatten`. The name is the word's base name lower-cased; option words (`-x`) are not names."""
+    from `flatten`. The name is the word's base name lower-cased; option words (`-x`) are not names.
+
+    The words after an entry include the words `flatten` made from every string among them (`ssh host 'git grep foo'` is
+    `host`, `git grep foo`, `git`, `grep`, `foo`): the words of the string are looked at too, as commands of their own. A program
+    that joins its words back into one command line (`ssh`, `eval`: the names in `once`) must not be handed both, or it
+    reads `git grep foo git grep foo` and takes `git` for a path. Their entries get the words once (`_once`)."""
     flat, ends, deep = flatten(tail)
-    return [(os.path.basename(word).lower(), flat[ends[i]:]) for i, word in enumerate(flat)
-            if word and word != SEP and not word.startswith("-")], deep
+    entries = []
+    for i, word in enumerate(flat):
+        if word and word != SEP and not word.startswith("-"):
+            name = os.path.basename(word).lower()
+            entries.append((name, _once(flat, ends, i) if name in once else flat[ends[i]:]))
+    return entries, deep
 
 
 def starts_with_wrapper(words, assignments, keywords):
@@ -367,12 +427,32 @@ def uncertain(line):
     return deep or _uncertain_words(flat)
 
 
+def _shell_text(spec, flat, ends, start):
+    """The words after the shell option of a wrapper (`sudo -s`, `sudo -i`) whose own words start at `start`, or None. Where the
+    wrapper's options end is not asked of its table: the options are the leading words that start with `-`, and the one word
+    after each of them (the value it may take). The run stops at the first other word. Looking further would read the `-s` of
+    `sudo du -s DIR` as sudo's."""
+    j, value = start, False
+    while j < len(flat) and flat[j] != SEP:
+        word = flat[j]
+        if word.startswith("-") and len(word) > 1 and word != "--":
+            if shell_option(spec, word):
+                return flat[j + 1:]
+            value = True
+        elif value:
+            value = False
+        else:
+            break
+        j = ends[j]
+    return None
+
+
 def handed_text(name, flat, ends, start):
     """The words of `flat` that the wrapper `name`, whose own words start at `start`, hands on as text: everything after it for a
     wrapper that runs the rest of its words as one line (ssh, sg, watch, parallel); for any wrapper with a command-string option
     among its words (`su -c STR`, `flock --command=STR`, `script -qcSTR`, `env -S STR`) that string, and for `env -S` the words
-    after it too. Found in the words by the wrapper's name, not through the option table of whatever stands before it.
-    Returns a list of word lists."""
+    after it too; for a wrapper with a shell option (`sudo -s`, `sudo -i`) the words after the option. Found in the words by the
+    wrapper's name, not through the option table of whatever stands before it. Returns a list of word lists."""
     spec = SPECS.get(name)
     if spec is None:
         return []
@@ -388,6 +468,10 @@ def handed_text(name, flat, ends, start):
         texts.append(flat[j:end] if inline else flat[j + 1:end])
         if spec.append:
             texts.append(flat[j:])
+    if spec.shell:
+        shell = _shell_text(spec, flat, ends, start)
+        if shell:
+            texts.append(shell)
     return texts
 
 

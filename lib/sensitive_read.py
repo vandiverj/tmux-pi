@@ -1955,6 +1955,9 @@ def _unresolved(line):
 
 # Programs the floor looks for in a wrapper's tail: every one that _command_hit judges by name.
 _FLOOR = _INNER | {"xargs", "find", "fd", "fdfind", "git", "eval", "curl", "wget", "ssh", "tar"}
+# Programs `_command_hit` joins the words after them into one command line for (`ssh host LINE`, `eval LINE`): the floor hands them each
+# word once (command_wrappers.bag), not a string and then the words made from it.
+_JOINED = ("ssh", "eval")
 
 
 def _floor_hit(words, cmd, base, depth):
@@ -1965,7 +1968,7 @@ def _floor_hit(words, cmd, base, depth):
     wrapped = command_wrappers.starts_with_wrapper(words, _ASSIGN, _KEYWORDS)
     if not wrapped:
         return None
-    entries, too_deep = command_wrappers.bag(wrapped[1])
+    entries, too_deep = command_wrappers.bag(wrapped[1], once=_JOINED)
     if too_deep:
         return wrapped[0], "command nesting is too deep to verify"
     if command_wrappers.floor_uncertain(*wrapped):  # text a wrapper hands on that cannot be read for certain, found by name

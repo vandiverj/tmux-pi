@@ -97,7 +97,7 @@ def form_kind(form):
 def way_kind(way):
     kind, flag = way
     if not kind.startswith("string"):
-        return kind
+        return kind  # words, rest words, rest string, shell words, shell string, shell cluster
     if flag.startswith("--"):
         return "string long =" if kind.endswith("=STR") else "string long apart"
     return "string short apart" if kind.endswith(" STR") else "string short attached"
@@ -108,7 +108,7 @@ def option_forms(name):
     flag, each valued option (apart, attached, `=`)."""
     spec = table.SPECS[name]
     forms = [("none", [], 0, False), ("--", ["--"], 0, True)]
-    forms += [("flag " + flag, [flag], 0, False) for flag in sorted(spec.flags)]
+    forms += [("flag " + flag, [flag], 0, False) for flag in sorted(spec.flags - spec.shell)]
     for flag in sorted(spec.valued - spec.string):
         filled = int(flag in spec.fills)
         if flag.startswith("--"):
@@ -131,6 +131,12 @@ def ways(name):
         found += [("rest words", None), ("rest string", None)]
     elif spec.words:
         found.append(("words", None))
+    # round 7: a shell option makes the words after it one command line (`sudo -s CMD`); as words, as one string, and the short ones
+    # as the last letter of a cluster of the row's flags (`-Es`)
+    for flag in sorted(spec.shell):
+        found += [("shell words", flag), ("shell string", flag)]
+        if len(flag) == 2:
+            found.append(("shell cluster", flag))
     for flag in sorted(spec.string):
         if flag.startswith("--"):
             found += [("string " + flag + "=STR", flag), ("string " + flag + " STR", flag)]
@@ -143,8 +149,8 @@ def invoke(name, form, way, command):
     """The text of `name` with these options, given `command` this way."""
     _, options, filled, dashes = form
     kind, flag = way
-    if kind == "rest words" and re.search("['\"]", command):
-        kind = "rest string"  # a remote or `watch` line given as words is the words joined: quotes inside it would be gone
+    if kind in ("rest words", "shell words") and re.search("['\"]", command):
+        kind = kind[:-5] + "string"  # a remote, `watch` or `sudo -s` line given as words is the words joined: quotes inside would be gone
     spec = table.SPECS[name]
     operands = [OPERAND] * max(spec.operands - filled, 0)
     quoted = shlex.quote(command)
@@ -157,8 +163,11 @@ def invoke(name, form, way, command):
         else:
             lead += [shlex.quote(flag + command)]
         return " ".join(lead + (["--"] if dashes else []) + operands)
+    if kind.startswith("shell"):
+        letters = sorted(f[1] for f in spec.flags if len(f) == 2)
+        lead += [("-" + letters[0] + flag[1]) if kind == "shell cluster" else flag]
     lead += ["--"] if dashes else []
-    return " ".join(lead + operands + [quoted if kind == "rest string" else command])
+    return " ".join(lead + operands + [quoted if kind in ("rest string", "shell string") else command])
 
 
 def is_string(way):
@@ -213,8 +222,10 @@ def takes_string_by_option(name, words):
     option: the floor finds a wrapper's string option among all the words after it, by its letter (`-c`, `-qc`, `-cv`) or its long
     name. That is the over-approximation the floor is built on (a stray `-c` of `exec -c` after `flock L` is read as flock's)."""
     spec = table.SPECS[name]
-    letters = {flag[1] for flag in spec.string if not flag.startswith("--")}
-    longs = {flag for flag in spec.string if flag.startswith("--")}
+    # (a shell option of the row, `sudo -s`, is looked for too: the floor reads the leading option words of a wrapper without asking
+    # the table where its options end, so `sudo -E nsenter -i CMD` has a `-i` it takes for sudo's)
+    letters = {flag[1] for flag in spec.string | spec.shell if not flag.startswith("--")}
+    longs = {flag for flag in spec.string | spec.shell if flag.startswith("--")}
     return any((word.partition("=")[0] in longs) if word.startswith("--") else
                (len(word) > 1 and word.startswith("-") and bool(letters & set(word[1:]))) for word in words)
 

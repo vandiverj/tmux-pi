@@ -10,6 +10,7 @@ here opens a real credential file: the names are created empty in a temp tree.
 """
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import contextlib
+from collections import Counter
 import re
 import shlex
 import shutil
@@ -77,6 +78,11 @@ FORMS = [
 # `sh -c` does, so tabs separate its words as spaces do.
 STRING_FORMS = [form for form in FORMS if "'{C}'" in form]
 STRING_FORMS += ["su -c'{C}' nobody", "su -l nobody --command '{C}'", "flock /tmp/l -c'{C}'", "script -qc'{C}' /dev/null"]
+# Round 7: the floor reads the leading option words of `sudo` without asking its table where they end (a wrong row must not hide
+# `sudo -u root -s "$X"`), and the word after an option may be its value. So after a flag of the stack, the `-s` of a program is taken
+# for sudo's shell option and what follows it is looked at as a command line: `sudo -E su -s /bin/sh nobody -c ls` reads `/bin/sh` as
+# a shell with no command string. Reported to Main (an extra look, never a hidden command); these stacked forms are pinned as such.
+OVER_READ = {("sudo -E {C}", "su -s /bin/sh nobody -c '{C}'")}
 # A wrapper inside another, so the inner one's string is not the outer's own argument.
 STACKS = ["setsid {C}", "env {C}", "setsid env nice {C}", "timeout 5 {C}", "sudo -E {C}",
           "setsid flock -- /tmp/l {C}", "nice setsid unbuffer {C}"]
@@ -170,8 +176,9 @@ class WrapperFormTests(WrapperTreeCase):
                 with self.subTest(stack=stack, form=form):
                     self.assertTrue(redact_hook.bash_searches(run(stack, run(form, SEARCH))))
                     self.assertTrue(self.reads(run(stack, run(form, HIDDEN))))
-                    self.assertFalse(redact_hook.bash_searches(run(stack, run(form, "ls -la"))))
-                    self.assertFalse(self.reads(run(stack, run(form, "ls -la"))))
+                    over = (stack, form) in OVER_READ
+                    self.assertEqual(redact_hook.bash_searches(run(stack, run(form, "ls -la"))), over)
+                    self.assertEqual(self.reads(run(stack, run(form, "ls -la"))), over)
 
     def test_a_command_the_remote_or_inner_shell_chooses_fails_closed(self):
         for form in (f for f in STRING_FORMS if f.startswith(("ssh", "su ", "sg ", "flock", "script", "runuser", "env", "watch", "parallel"))):
@@ -236,7 +243,7 @@ class TableTests(unittest.TestCase):
     def test_every_option_the_table_lists_is_known(self):
         # a listed option never gives UNKNOWN, alone or before the command; and it matters which take a value
         for name, spec in sorted(table.SPECS.items()):
-            for flag in sorted(spec.flags | spec.valued | spec.string):
+            for flag in sorted(spec.flags | spec.valued | spec.string | spec.shell):
                 args = [flag] + (["v"] if flag in spec.valued | spec.string and "=" not in flag else []) + ["rg", "x"]
                 with self.subTest(wrapper=name, option=flag):
                     self.assertIsNot(table.unwrap(name, args), table.UNKNOWN)
@@ -293,7 +300,22 @@ class TableTests(unittest.TestCase):
                 ("sudo", ["--host", "localhost", "rg", "x"], ("words", ["rg", "x"])),
                 ("sudo", ["-hlocalhost", "rg", "x"], ("words", ["rg", "x"])),
                 ("sudo", ["--help"], None),
-                ("sudo", ["-V"], None)):
+                ("sudo", ["-V"], None),
+                # round 7 rule 4: sudo's shell mode runs its arguments as one command line; bare, it runs a shell and nothing else
+                ("sudo", ["-s"], None), ("sudo", ["-i"], None), ("sudo", ["--shell"], None), ("sudo", ["--login"], None),
+                ("sudo", ["-Es"], None), ("sudo", ["-u", "root", "-s"], None),
+                ("sudo", ["-s", "rg", "--hidden", "x"], ("line", "rg --hidden x")),
+                ("sudo", ["-i", "rg", "a b"], ("line", "rg a b")),  # joined by spaces like ssh: more words, never fewer
+                ("sudo", ["--shell", "rg x"], ("line", "rg x")),
+                ("sudo", ["--login", "rg", "x"], ("line", "rg x")),
+                ("sudo", ["--sh", "rg", "x"], ("line", "rg x")),  # an unambiguous abbreviation
+                ("sudo", ["-Es", "rg", "x"], ("line", "rg x")), ("sudo", ["-Ei", "rg", "x"], ("line", "rg x")),
+                ("sudo", ["-u", "root", "-s", "rg", "x"], ("line", "rg x")),
+                ("sudo", ["-h", "localhost", "-i", "rg", "x"], ("line", "rg x")),
+                ("sudo", ["-us", "rg", "x"], ("words", ["rg", "x"])),  # `-us` is -u with the user `s`: not shell mode
+                ("sudo", ["--us", "root", "rg", "x"], ("words", ["rg", "x"])),  # --user is the only option that starts so
+                ("sudo", ["--pre", "rg", "x"], table.UNKNOWN),  # --preserve-env or --preserve-groups: fail closed
+                ):
             with self.subTest(wrapper=name, args=args):
                 self.assertEqual(table.unwrap(name, args), expected)
 
@@ -394,6 +416,23 @@ class WrapperFloorTests(WrapperTreeCase):
                 self.assertEqual(redact_hook.bash_searches(command), command == "git grep foo")
                 self.assertFalse(self.reads(command))
 
+    def test_a_wrapper_before_ssh_or_eval_reads_what_the_bare_command_reads(self):
+        # Main's ruling on round 7: the floor handed ssh and eval the string and then the words made from it, so
+        # `sudo ssh host 'git grep foo'` was read as `git grep foo git grep foo` (`git` a path) and was a read, while the bare command
+        # and `sudo git grep foo` were not. A wrapper adds no read of its own; a credential read behind it is still a read.
+        outers = ["sudo ", "nice ", "sudo -h localhost ", "env ", "nohup ", "sudo nice "]
+        not_reads = ["ssh host 'git grep foo'", "ssh -p 22 host 'git grep -e foo'", "ssh host git grep foo", "eval 'git grep foo'",
+                     "eval git grep foo", "ssh host 'ls -la'", "eval 'ls -la'"]
+        reads = ["ssh host 'cat .env'", "ssh host cat .env", "ssh host 'cat .aws/credentials'", "ssh host 'rg --hidden TOKEN .'",
+                 "ssh host 'git grep foo -- .env'", "ssh host 'git log -p'", "ssh host 'git grep foo bar'", "eval 'cat .env'",
+                 "eval 'rg --hidden x .'", "eval 'git grep foo bar'"]
+        for inner in not_reads + reads:
+            bare = self.reads(inner)
+            self.assertEqual(bare, inner in reads, inner)
+            for outer in outers:
+                with self.subTest(command=outer + inner):
+                    self.assertEqual(self.reads(outer + inner), bare)
+
     def test_a_table_that_is_wrong_cannot_hide_a_search_or_a_read(self):
         # the table says nothing is run, or that only `echo` is: whatever it says, the words after the wrapper are still looked at
         for wrong in (None, ("words", ["echo"]), ("line", "echo")):
@@ -419,6 +458,8 @@ class WrapperFloorTests(WrapperTreeCase):
     def test_every_spelling_of_a_handed_string_reaches_the_floors_whatever_the_table_says(self):
         # round 6 rule 2: every text-handing wrapper x every spelling its row allows x every payload x outer context x wrong table.
         # The spellings are made from the row itself (`Spec.string`, `Spec.flags`), so a row cannot gain an option this skips.
+        # Round 7 rule 3: no read assertion is left out. What the read must be is judged with the correct table, once per command,
+        # and a wrong table may never turn a read into a non-read.
         mixes = list(handing_variants())
         wrapper_names = {name for name, _, _, _ in mixes}
         self.assertEqual(wrapper_names, {name for name, spec in table.SPECS.items() if spec.string or spec.rest})
@@ -427,7 +468,8 @@ class WrapperFloorTests(WrapperTreeCase):
                      "abbreviated separate", "one word", "words"):
             self.assertIn(kind, shapes)
         expected = len(mixes) * len(PAYLOADS) * len(CONTEXTS) * len(WRONG_TABLES)
-        done = read_skipped = 0
+        done = read_checked = read_true = read_false = 0
+        more, lost = Counter(), Counter()  # cells where a wrong table reads and the correct table does not, and the reverse
         for name, kind, frame, make in mixes:
             for payload, how in PAYLOADS:
                 tail = make(payload)
@@ -436,6 +478,10 @@ class WrapperFloorTests(WrapperTreeCase):
                     command = shlex.join(words)
                     outer = context[0] if context else name
                     outer_tail = words[1:]
+                    want = self.reads(command)  # the correct table
+                    read_true, read_false = read_true + want, read_false + (not want)
+                    if payload != "git grep foo":  # `rg --hidden`, shells, expansions: reads whatever the wrapper
+                        self.assertTrue(want, command)
                     # the floors alone, with the real table: the string reaches them
                     if how == "uncertain":
                         self.assertTrue(table.floor_uncertain(outer, outer_tail), command)
@@ -449,14 +495,75 @@ class WrapperFloorTests(WrapperTreeCase):
                             else:
                                 self.assertTrue(has_search(table.bag(outer_tail)[0]), (wrong, command))
                             self.assertTrue(redact_hook.bash_searches(command), (wrong, command))
-                            if payload == "git grep foo":
-                                read_skipped += 1  # a search, not a read of a credential: on the read side main says False too
-                            else:
-                                self.assertTrue(self.reads(command), (wrong, command))
-        print("round 6 wrong-table product: %d wrappers, %d spellings x frames, %d payloads, %d contexts, %d tables = %d cases "
-              "(%d read assertions not made: `git grep foo` is not a read)" % (
-                  len(wrapper_names), len(mixes), len(PAYLOADS), len(CONTEXTS), len(WRONG_TABLES), done, read_skipped))
+                            got = self.reads(command)
+                            read_checked += 1
+                            if want and not got:  # a wrong table never turns a True into a False: none are allowed, see the end
+                                lost[(name, outer, wrong.label, payload)] += 1
+                            elif got and not want:
+                                more[(name, outer, wrong.label)] += 1
+        print("round 7 wrong-table product: %d wrappers, %d spellings x frames, %d payloads, %d contexts, %d tables = %d cases; "
+              "read assertions made %d (none omitted); correct-table reads: %d True, %d False; wrong table reads where the correct "
+              "table does not: %s; correct table reads and a wrong table does not: %s" % (
+                  len(wrapper_names), len(mixes), len(PAYLOADS), len(CONTEXTS), len(WRONG_TABLES), done, read_checked, read_true,
+                  read_false, dict(more), dict(lost)))
         self.assertEqual(done, expected)
+        self.assertEqual(read_checked, expected)
+        self.assertEqual(read_true + read_false, len(mixes) * len(PAYLOADS) * len(CONTEXTS))
+        # The invariant, with no exception: a wrong table never turns a read into a non-read. (Round 7 had 14 cells,
+        # `sudo|nice ssh host 'git grep foo'`: the floor handed the ssh branch `git grep foo git grep foo`, the string and then the words
+        # made from it, so the correct table read `git` as a path. `bag(once=...)` hands it each word once; see
+        # test_a_wrapper_before_ssh_or_eval_reads_what_the_bare_command_reads.)
+        self.assertEqual(dict(lost), {})
+
+    def test_a_string_option_that_two_rows_read_differently_is_read_every_way(self):
+        # round 7 rule 2: `su -c'rg --hidden TOKEN . -Sls'` is su's `rg --hidden TOKEN . -Sls` and env's `ls`; the first row that
+        # claims the word must not hide the other. Every pair of rows with a string option x each row's spelling (the same
+        # spellings as above) x the competing option of the other row (its short option attached, its long form with `=`) placed
+        # before, in the middle of, and after the payload x the payloads. With `unwrap` made to fail, each case is still flagged.
+        rows = sorted(name for name, spec in table.SPECS.items() if spec.string)
+        competing = {name: [flag + "ls" if not flag.startswith("--") else flag + "=ls" for flag in sorted(table.SPECS[name].string)]
+                     for name in rows}
+        for name in rows:  # the competing options are made from the rows: each has a short and a long form here
+            self.assertTrue(competing[name], name)
+        placements = (lambda p, c: c + " " + p, lambda p, c: p.replace(" ", " " + c + " ", 1) if " " in p else p + " " + c,
+                      lambda p, c: p + " " + c)
+        mixes = [(name, kind, frame, make) for name, kind, frame, make in handing_variants() if name in rows]
+        expected = sum(len(competing[other]) for name, *_ in mixes for other in rows if other != name) * len(placements) * len(PAYLOADS)
+        done = reads_true = reads_false = 0
+        lost = Counter()
+        real_unwrap = table.unwrap
+        with mock.patch.object(table, "unwrap", return_value=None):
+            for name, kind, frame, make in mixes:
+                for other in rows:
+                    if other == name:
+                        continue
+                    for option in competing[other]:
+                        for place in placements:
+                            for payload, how in PAYLOADS:
+                                command = shlex.join([name] + make(place(payload, option)))
+                                done += 1
+                                with mock.patch.object(table, "unwrap", real_unwrap):
+                                    want = self.reads(command)  # the correct table
+                                if how == "uncertain":
+                                    self.assertTrue(table.floor_uncertain(name, shlex.split(command)[1:]), command)
+                                else:
+                                    self.assertTrue(has_search(table.bag(shlex.split(command)[1:])[0]), command)
+                                self.assertTrue(redact_hook.bash_searches(command), command)
+                                got = self.reads(command)
+                                reads_true, reads_false = reads_true + want, reads_false + (not want)
+                                if payload != "git grep foo":  # `rg --hidden`, shells, expansions: read whatever the wrapper
+                                    self.assertTrue(want, command)
+                                    self.assertTrue(got, command)
+                                elif want and not got:  # only `git grep foo`, which is no credential read: see below
+                                    lost[name] += 1
+        print("round 7 competing readings: %d rows with a string option, %d ordered pairs, %d spellings of the first row, %d cases; "
+              "correct-table reads %d True, %d False; `git grep foo` read True by the correct table and False without it: %s" % (
+                  len(rows), len(rows) * (len(rows) - 1), len(mixes), done, reads_true, reads_false, dict(lost)))
+        self.assertEqual(done, expected)
+        # The only True -> False cells (listed for Main's ruling): `sg GROUP --split-string=ls git grep foo`. `unwrap` cannot place
+        # an option-looking word after sg's group and answers UNKNOWN, which fails closed to a read; without the table the floor
+        # sees `git grep` at depth 0, which is not a read. The correct table over-reads; no wrong table misses a real read.
+        self.assertEqual(dict(lost), {"sg": 12})
 
     def test_the_floor_reads_strings_inside_strings_whatever_the_wrapper(self):
         for command in ("timeout 5 sh -c \"bash -c 'rg --hidden TOKEN .'\"", "nice -n 5 env -S 'x rg --hidden TOKEN .'",
@@ -488,6 +595,20 @@ class FlattenTests(unittest.TestCase):
         entries, _ = table.bag(["/tmp/a b/rg", "--hidden", "TOKEN", "."])
         self.assertIn(("rg", ["--hidden", "TOKEN", "."]), entries)
 
+    def test_a_program_that_joins_its_words_is_handed_each_word_once(self):
+        # `ssh host 'git grep foo'`: the entry of every other program has the words of the string after the string (they are
+        # commands of their own); an entry named in `once` has the line once
+        tail = ["ssh", "host", "git grep foo", "-q"]
+        every, _ = table.bag(tail)
+        once, _ = table.bag(tail, once=("ssh",))
+        self.assertIn(("ssh", ["host", "git grep foo", "git", "grep", "foo", "-q"]), every)
+        self.assertIn(("ssh", ["host", "git grep foo", "-q"]), once)
+        self.assertEqual([entry for entry in every if entry[0] != "ssh"], [entry for entry in once if entry[0] != "ssh"])
+        # a string inside a string is kept as one word too, and a program inside a string still has the words after its own
+        entries, _ = table.bag(["ssh", "host", "sh -c 'git grep foo'", "x"], once=("ssh",))
+        self.assertIn(("ssh", ["host", "sh -c 'git grep foo'", "x"]), entries)
+        self.assertIn(("git", ["grep", "foo", "x"]), entries)
+
     def test_a_string_inside_a_string_is_placed_in_order(self):
         flat, _, _ = table.flatten(["sh -c 'rg --hidden' TOKEN", "."])
         self.assertEqual(flat[-4:], ["rg", "--hidden", "TOKEN", "."][-4:])
@@ -497,6 +618,11 @@ class FlattenTests(unittest.TestCase):
                         "nice -n 5 env -S 'timeout 5 rg' --hidden TOKEN ."):
             with self.subTest(command=command):
                 self.assertTrue(redact_hook.bash_searches(command))
+
+
+def _subsequence(small, big):
+    words = iter(big)
+    return all(word in words for word in small)
 
 
 class StringOptionTests(unittest.TestCase):
@@ -531,6 +657,61 @@ class StringOptionTests(unittest.TestCase):
                         for letter in sorted(f[1] for f in spec.flags if len(f) == 2):
                             self.assertEqual(table.string_option(spec, "-" + letter + flag[1]), (None, True))
                             self.assertEqual(table.string_option(spec, "-" + letter + flag[1] + "X"), ("X", False))
+
+    def test_the_shell_options_of_sudo(self):
+        sudo = table.SPECS["sudo"]
+        for word, expected in (("-s", True), ("-i", True), ("--shell", True), ("--login", True), ("--sh", True), ("--log", True),
+                               ("-Es", True), ("-Ei", True), ("-ns", True), ("-sE", True),
+                               ("-us", False), ("-u", False), ("-hs", False), ("-Cs", False), ("-H", False), ("-A", False),
+                               ("--user", False), ("--", False), ("-", False), ("x", False), ("", False)):
+            with self.subTest(word=word):
+                self.assertEqual(table.shell_option(sudo, word), expected)
+        for name, spec in sorted(table.SPECS.items()):  # only a row that lists shell options has any
+            for word in ("-s", "-i", "--shell", "--login"):
+                if not spec.shell:
+                    self.assertFalse(table.shell_option(spec, word), (name, word))
+        self.assertEqual({name for name, spec in table.SPECS.items() if spec.shell}, {"sudo"})
+
+    def test_a_word_is_read_every_way_whatever_the_order_of_the_rows(self):
+        # round 7 rule 1: for any word, the bag and the uncertainty with every row's reading are a superset of those with any single
+        # row's reading, and no order of the rows changes a result.
+        rows = sorted(name for name, spec in table.SPECS.items() if spec.string)
+        texts = ("rg --hidden TOKEN . -Sls", "$X", "sh -cls", "ls", "rg --hidden TOKEN . --command=ls", "bash -s")
+        words = set()
+        for name in rows:
+            for flag in table.SPECS[name].string:
+                for text in texts:
+                    words.add(flag + text if not flag.startswith("--") else flag + "=" + text)
+                    words.add(flag + text.split()[0])
+        words |= {"-Sls", "-cls", "--command=ls", "-S", "-c", "x", "-Es", "--split-string=sh"}
+        reversed_rows = dict(reversed(list(table.SPECS.items())))
+        seen = 0
+        for word in sorted(words):
+            tail = [word, "rg", "--hidden", "TOKEN", "."]
+            flat, ends, deep = table.flatten(tail)
+            every = {(name, tuple(args)) for name, args in table.bag(tail)[0]}
+            every_uncertain = table._uncertain_words(flat)
+            with mock.patch.object(table, "SPECS", reversed_rows):
+                self.assertEqual(table.flatten(tail), (flat, ends, deep), word)
+                self.assertEqual(sorted(table.readings(word)), sorted(table.readings(word)))
+            self.assertEqual(table.readings(word), sorted(table.readings(word)))
+            for name in rows:
+                if not (table.string_option(table.SPECS[name], word) or (None,))[0]:
+                    continue  # this row does not read the word; the word split on its own is not a row's reading
+                with mock.patch.object(table, "SPECS", {name: table.SPECS[name]}):
+                    one_flat, _, _ = table.flatten(tail)
+                    one = {(n, tuple(args)) for n, args in table.bag(tail)[0]}
+                    one_uncertain = table._uncertain_words(one_flat)
+                self.assertLessEqual(set(one_flat), set(flat), (word, name))
+                for entry, args in one:  # every look of the single row is in the union (a reading may add words inside the list)
+                    self.assertTrue(any(entry == other and _subsequence(args, rest) for other, rest in every), (word, name, entry))
+                self.assertTrue(every_uncertain or not one_uncertain, (word, name))
+                seen += 1
+        self.assertGreater(seen, len(words))  # every word is read by at least one row, most by two or more
+        # and the reported case: the word is read as su reads it and as env reads it
+        self.assertEqual(table.readings("-c'rg x -Sls'"), sorted(table.readings("-c'rg x -Sls'")))
+        self.assertIn("rg x -Sls", table.readings("-crg x -Sls"))
+        self.assertIn("ls", table.readings("-crg x -Sls") + table.readings("-Sls"))
 
     def test_a_value_attached_to_a_string_option_is_exposed_to_the_floor(self):
         flat, ends, deep = table.flatten(["-Srg", "--hidden", "TOKEN", "."])
@@ -630,6 +811,16 @@ class ReviewReproducers(WrapperTreeCase):
         "script -qc'bash -s' /dev/null",
         "sudo -h localhost env -Ssh",
         "nice -n 5 env -Srg --hidden TOKEN .",
+        # round 7 F1, review-coder-acf3f2f10c-223756 (fgn1r7probe.py), verbatim: two rows read the same word
+        "su -c'rg --hidden TOKEN . -Sls' nobody",
+        "su -c'sh -Sls' nobody",
+        "flock L -c'rg --hidden TOKEN . -Sls'",
+        "script -qc'rg --hidden TOKEN . -Sls' /dev/null",
+        # round 7 F3: sudo shell mode hands its arguments to a shell as one command line
+        "sudo -s \"$X\"", "sudo --shell \"$X\"", "sudo -i \"$X\"", "sudo --login \"$X\"", "sudo -Es \"$X\"", "sudo -Ei \"$X\"",
+        "sudo -s rg --hidden TOKEN .", "sudo -i rg --hidden TOKEN .",
+        "sudo -h localhost sudo -s \"$X\"", "sudo -h localhost sudo -i rg --hidden TOKEN .", "nice -n 5 sudo -s \"$X\"",
+        "sudo -u root -s \"$X\"", "sudo -s -- \"$X\"",
     ]
     # round 6: the probe's third command is a search (git grep) and not a read of a credential, on main too
     SEARCH_ONLY = ["sudo git grep TOKEN"]
@@ -661,6 +852,40 @@ class ReviewReproducers(WrapperTreeCase):
                     with self.subTest(wrong=wrong, command=command):
                         self.assertTrue(redact_hook.bash_searches(command))
                         self.assertTrue(self.reads(command))
+
+    def test_sudo_shell_mode_with_no_arguments_runs_only_a_shell(self):
+        # round 7 rule 4: `sudo -s` and `sudo -i` stay as they are today; so do ordinary commands behind them
+        for command in ("sudo -s", "sudo -i", "sudo --shell", "sudo --login", "sudo -Es", "sudo -h localhost sudo -s", "sudo -u root -i",
+                        "sudo -s ls -la", "sudo -i make install", "sudo -s make -j4", "sudo -s 'echo hi'"):
+            with self.subTest(command=command):
+                self.assertFalse(redact_hook.bash_searches(command))
+                self.assertFalse(self.reads(command))
+
+    def test_sudo_user_cluster_is_a_user_not_shell_mode(self):
+        # `-us` is -u with the user `s`: the table (and only the table: it is not a shell option) reads it as it reads `-u s`
+        for command in ("sudo -us '$X'", "sudo -us 'rg --hidden TOKEN .'"):
+            with self.subTest(command=command):
+                twin = command.replace("-us", "-u s")
+                self.assertEqual(redact_hook.bash_searches(command), redact_hook.bash_searches(twin))
+                self.assertEqual(self.reads(command), self.reads(twin))
+        self.assertTrue(redact_hook.bash_searches("sudo -us 'rg --hidden TOKEN .'"))
+
+    def test_sudo_shell_mode_reads_what_the_floor_cannot_place(self):
+        # The table-free floor cannot tell `-n` (a flag) from `-u` (takes a value), so in `sudo -n du -sh $DIR` it takes `du` for
+        # the value of `-n` and `-sh` for sudo's `-s`: an extra look at `$DIR`, a read. Path: `_floor_hit` -> `floor_uncertain` ->
+        # `handed_text` -> `_shell_text` (stops at `-sh` / `-s`, `shell_option` true) -> the text after it holds `$DIR` (an unresolved
+        # expansion) or `/bin/sh nobody -c ...` (a shell with no `-c` right after it). These four are the known over-reads of the
+        # round 7 scan (accepted by Main as conservative, not to be tuned away), pinned here as what they are, not as wanted answers.
+        # The same commands with no flag before the program (`sudo du -sh $DIR`) are neither a search nor a read.
+        for command in ("sudo -n du -sh $DIR", "sudo -n ls -sh $HOME", "sudo -n rsync -a -s src $DEST",
+                        "sudo -E su -s /bin/sh nobody -c 'ls -la'"):
+            with self.subTest(command=command):
+                self.assertTrue(redact_hook.bash_searches(command))
+                self.assertTrue(self.reads(command))
+        for command in ("sudo du -sh $DIR", "sudo -u root du -sh $DIR"):
+            with self.subTest(command=command):
+                self.assertFalse(redact_hook.bash_searches(command))
+                self.assertFalse(self.reads(command))
 
     def test_every_expansion_form_is_uncertain_in_text_a_wrapper_hands_on(self):
         for form in ("ssh host {Q}", "su -c {Q} nobody", "sudo -h localhost flock /tmp/l -c {Q}", "env -S {Q}"):

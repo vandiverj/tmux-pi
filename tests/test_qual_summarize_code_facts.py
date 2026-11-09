@@ -116,31 +116,26 @@ class VersionDiffTests(unittest.TestCase):
             "- m_v2.py drops the function removed that m.py defines [old/m.py:18]",
             "- m_v2.py drops the constant OLDONLY that m.py defines [old/m.py:26]",
             "- m_v2.py changes LIMIT from 5 to 9 [old/m.py:2, new/m_v2.py:2]",
-            '- m_v2.py changes DEFAULTS["workers"] from 2 to 4 [old/m.py:5, new/m_v2.py:5]',
-            '- m_v2.py adds the key DEFAULTS["extra"] [new/m_v2.py:7]',
-            '- m_v2.py drops the key DEFAULTS["gone"] that m.py defines [old/m.py:7]',
             "- in m_v2.py, keep now calls new_call [new/m_v2.py:16]",
             "- in m_v2.py, keep no longer calls old_call [old/m.py:15]",
         ])
 
     def test_non_literal_and_unchanged_not_compared(self):
         text = "\n".join(self.lines)
-        for absent in ("COMPUTED", "BOTH", "NAME", "helper", "mode"):
+        # DEFAULTS is a dict: mutable, so it is not compared, key by key or otherwise
+        for absent in ("COMPUTED", "BOTH", "NAME", "helper", "mode", "DEFAULTS", "workers"):
             self.assertNotIn(absent, text)
 
     def diff(self, old, new):
         return ss.version_diff(num("a.py", old), num("a2.py", new))
 
     def test_equal_values_give_no_change(self):
-        self.assertEqual(self.diff("D = {'x': {'a': 1, 'b': 2}}", "D = {'x': {'b': 2, 'a': 1}}"), [])
-        self.assertEqual(self.diff("D = {'a': 1, 'b': [1, 2]}", "D = {'b': [1, 2], 'a': 1}"), [])
-        self.assertEqual(self.diff("S = {1, 2}", "S = {2, 1}"), [])
         self.assertEqual(self.diff("T = (1, 'a')", 'T = (1, "a")'), [])
-        # a change is still one, also where == holds (1 and True), or the value is nested, or a list changes order
+        self.assertEqual(self.diff("T = ((1, 2), 'a')", "T = ((1, 2), 'a')"), [])
+        # a change is still one, also where == holds (1 and True), or the value is nested in a tuple
         self.assertEqual(self.diff("X = 1", "X = True"), ["- a2.py changes X from 1 to True [a.py:1, a2.py:1]"])
-        self.assertEqual(self.diff("D = {'x': {'a': 1}}", "D = {'x': {'a': 2}}"),
-                         ['- a2.py changes D["x"] from {\'a\': 1} to {\'a\': 2} [a.py:1, a2.py:1]'])
-        self.assertEqual(self.diff("L = [1, 2]", "L = [2, 1]"), ["- a2.py changes L from [1, 2] to [2, 1] [a.py:1, a2.py:1]"])
+        self.assertEqual(self.diff("T = (1, (2, 'a'))", "T = (1, (2, 'b'))"), ["- a2.py changes T from (1, (2, 'a')) to (1, (2, 'b')) [a.py:1, a2.py:1]"])
+        self.assertEqual(self.diff("T = (1, 2)", "T = (2, 1)"), ["- a2.py changes T from (1, 2) to (2, 1) [a.py:1, a2.py:1]"])
 
     def test_calls_in_a_nested_scope_are_not_the_outer_functions(self):
         nested = "def outer():\n    def inner():\n        {0}()\n    key = lambda: {0}()\n    class C:\n        x = {0}()\n    return inner\n"
@@ -300,6 +295,27 @@ CLASS_FORMS = FORMS + [
     ("global declaration in the class body", "global {n}", False),
     ("self attribute in another method", "def other(self):\n    self.{n} = 1", False),
 ]
+# round 3b: a file that names one of these anywhere can bind, rewrite or delete a name without a binding the source shows
+DYNAMIC_FORMS = [
+    ("globals", "globals()['{n}'] = 7"),
+    ("vars", "vars()['{n}'] = 7"),
+    ("locals", "locals()['{n}'] = 7"),
+    ("setattr", "setattr(sys.modules[__name__], '{n}', 7)"),
+    ("delattr", "delattr(mod, '{n}')"),
+    ("exec", "exec('{n} = 7')"),
+    ("eval", "eval('{n}')"),
+    ("__import__", "__import__('os')"),
+    ("import importlib", "import importlib"),
+    ("import importlib.util", "import importlib.util"),
+    ("from importlib import", "from importlib import import_module"),
+    ("importlib attribute", "importlib.import_module('m')"),
+    ("__dict__ write", "mod.__dict__['{n}'] = 7"),
+    ("__dict__ update", "mod.__dict__.update(d)"),
+    ("__dict__ name", "__dict__"),
+    ("attribute named like a builtin", "builtins.exec('x = 1')"),
+]
+# the same, in a module and inside a function body (the use is anywhere in the file)
+DYNAMIC_PLACES = (("module level", lambda text: text), ("in a function", lambda text: "def dyn():\n" + indented(text, "    ")))
 COMPOUND = {"if": ("if cond:", ""), "try": ("try:", "except ImportError:\n    pass"), "with": ("with ctx():", ""),
             "for": ("for i in items:", ""), "while": ("while cond:", ""), "match": ("match cond:\n    case 1:", "")}
 
@@ -356,7 +372,7 @@ class BindingProofDiffTests(unittest.TestCase):
                 for side in ("old", "new"):
                     if needs_match and not MATCH:
                         continue
-                    if label == "assignment" and (name, side) in (("ADD", "old"), ("GONE", "new")):
+                    if label in ("assignment", "annotated assignment") and (name, side) in (("ADD", "old"), ("GONE", "new")):
                         continue  # one plain `NAME = 7` in the file that lacked it makes the name single in both: a real change
                     with self.subTest(name=name, form=label, side=side):
                         out = pair_diff(side, mod=form_text(snippet, name))
@@ -398,6 +414,52 @@ class BindingProofDiffTests(unittest.TestCase):
         # a definition under an if in the new file only is not an addition either; the same definition at module level is
         self.assertEqual(ss.version_diff(num("a.py", "pass"), num("a2.py", "if cond:\n    def f():\n        pass")), [])
         self.assertEqual(ss.version_diff(num("a.py", "pass"), num("a2.py", "def f():\n    pass")), ["- a2.py adds the function f [a2.py:1]"])
+
+    def test_a_mutable_literal_is_never_compared(self):
+        """A dict, list or set (or a tuple holding one) can be changed by `D.update(...)`, `D.append(...)` or `D[k] = v` in a function,
+        so the file does not show its value: no line, with or without such a write."""
+        values = (("{'a': 1}", "{'a': 2}"), ("[1, 2]", "[2, 1]"), ("{1, 2}", "{1, 3}"), ("(1, [2])", "(1, [3])"), ("(1, {'a': 1})", "(1, {'a': 2})"),
+)
+        writes = (("no write", ""), ("update call", "def mutate():\n    D.update({'a': 3})"), ("append call", "def mutate():\n    D.append(3)"),
+                  ("subscript write", "def mutate():\n    D['k'] = 3"), ("update call at module level", "D.update({'a': 3})"),
+                  ("append call at module level", "D.append(3)"), ("subscript write at module level", "D['k'] = 3"))
+        for old, new in values:
+            for label, write in writes:
+                for side in ("old", "new", "both"):
+                    with self.subTest(old=old, new=new, write=label, side=side):
+                        texts = ["D = " + old + "\n" + (write if side in ("old", "both") else ""),
+                                 "D = " + new + "\n" + (write if side in ("new", "both") else "")]
+                        for text in texts:
+                            ast.parse(text)
+                        out = ss.version_diff(num("a.py", texts[0]), num("a2.py", texts[1]))
+                        self.assertEqual([line for line in out if mentions(line, "D")], [])
+        # annotated too
+        self.assertEqual(ss.version_diff(num("a.py", "D: dict = {'a': 1}"), num("a2.py", "D: dict = {'a': 2}")), [])
+
+    def test_an_immutable_literal_is_compared(self):
+        for old, new, shown in (("1", "2", "1 to 2"), ("-1", "-2", "-1 to -2"), ("'a'", "'b'", "'a' to 'b'"), ("b'a'", "b'b'", "b'a' to b'b'"),
+                                ("None", "'n'", "None to 'n'"), ("True", "False", "True to False"), ("1.5", "2.5", "1.5 to 2.5"),
+                                ("(1, 'a')", "(1, 'b')", "(1, 'a') to (1, 'b')"), ("()", "(1,)", "() to (1,)")):
+            for annotation in ("", ": object"):
+                with self.subTest(old=old, new=new, annotation=annotation):
+                    out = ss.version_diff(num("a.py", "X{} = {}".format(annotation, old)), num("a2.py", "X{} = {}".format(annotation, new)))
+                    self.assertEqual(out, ["- a2.py changes X from {} [a.py:1, a2.py:1]".format(shown)])
+        # a method call on it, or a read, does not change a number
+        self.assertEqual(ss.version_diff(num("a.py", "X = 1\nY = X.bit_length()"), num("a2.py", "X = 2\nY = X.bit_length()")),
+                         ["- a2.py changes X from 1 to 2 [a.py:1, a2.py:1]"])
+
+    def test_a_file_that_uses_a_dynamic_form_states_nothing(self):
+        clean = pair_diff()
+        self.assertTrue(len(clean) >= 9, clean)
+        for label, snippet in DYNAMIC_FORMS:
+            for place, put in DYNAMIC_PLACES:
+                for side in ("old", "new"):
+                    with self.subTest(form=label, place=place, side=side):
+                        self.assertEqual(pair_diff(side, mod=put(form_text(snippet, "X"))), [])
+        # in the class body too (a class attribute is a name of the file)
+        for label, snippet in DYNAMIC_FORMS:
+            with self.subTest(form=label, place="class body"):
+                self.assertEqual(pair_diff("new", cls=form_text(snippet, "take", "    ")), [])
 
     def test_the_review_reproductions(self):
         def diff(old, new):
@@ -486,6 +548,25 @@ class BindingProofUseTests(unittest.TestCase):
                 with self.subTest(form=label, name="x, a variable bound from Q()"):
                     out = self.scan("from pkg.t import Q\n" + form_text(snippet, "x") + "\nx = Q()\nx.pop()\n")
                     self.assertEqual([line for line in out if "uses" in line], [])
+
+    def test_a_file_that_uses_a_dynamic_form_attributes_nothing(self):
+        """The importer, or the file that defines the target, may rebind a name by globals(), setattr, exec, importlib or __dict__: the
+        import line is not stated either, and there is no `does not use` line."""
+        calls = "x = Q()\nx.pop()\n"
+        self.assertEqual(len(self.scan("from pkg.t import Q\n" + calls)), 3)
+        self.assertEqual(self.scan("x = 1\n"), ["- u.py does not use Q [app/u.py:1]"])
+        for label, snippet in DYNAMIC_FORMS:
+            for place, put in DYNAMIC_PLACES:
+                form = put(form_text(snippet, "Q"))
+                with self.subTest(form=label, place=place, file="the importer"):
+                    self.assertEqual(self.scan("from pkg.t import Q\n" + form + "\n" + calls), [])
+                    self.assertEqual(self.scan("import pkg.t as t\n" + form + "\ny = t.Q()\n"), [])
+                with self.subTest(form=label, place=place, file="a file with no use"):
+                    self.assertEqual(self.scan("x = 1\n" + form + "\n"), [])
+                with self.subTest(form=label, place=place, file="the target"):
+                    target = "class Q:\n    def pop(self):\n        return 1\n\n" + form + "\n"
+                    ast.parse(target)
+                    self.assertEqual(ss.use_scan("Who uses Q?", [num("pkg/t.py", target), num("app/u.py", "from pkg.t import Q\n" + calls)]), [])
 
     def test_a_target_bound_twice_is_not_scanned(self):
         for target in ("class Q:\n    pass\nQ = other\n", "if cond:\n    class Q:\n        pass\n"):

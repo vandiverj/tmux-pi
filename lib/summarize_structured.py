@@ -392,6 +392,9 @@ def _base(f):
 
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+# A file that names one of these anywhere can bind, rewrite or delete a name by a path the source does not show (globals()["X"] = 1,
+# setattr(module, "X", 1), exec("X = 1"), module.__dict__.update(...), importlib.import_module): it states nothing about its names.
+_DYNAMIC = frozenset(("globals", "vars", "locals", "setattr", "delattr", "exec", "eval", "__import__", "importlib", "__dict__"))
 
 
 def _root_name(node):
@@ -406,17 +409,19 @@ def _binding_index(tree):
     kind is "name" (a Store or Del target of any form, an import alias, an except name, a match capture), "def" (a def, async def or
     class), "arg" (a parameter), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
     or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. star: some
-    `from m import *` is there."""
+    `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import)."""
     cached = getattr(tree, "_binding_index", None)
     if cached:
         return cached
-    events, star = {}, False
+    events, star, dynamic = {}, False, False
     stack = [(tree, None, None)]
     while stack:
         node, scope, stmt = stack.pop()
         if isinstance(node, ast.stmt):
             stmt = node
         found = []  # (name, kind)
+        if isinstance(node, ast.Name) and node.id in _DYNAMIC or isinstance(node, ast.Attribute) and node.attr in _DYNAMIC:
+            dynamic = True
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             found.append((node.id, "name"))
         elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -428,10 +433,13 @@ def _binding_index(tree):
         elif isinstance(node, ast.ExceptHandler) and node.name:
             found.append((node.name, "name"))
         elif isinstance(node, ast.alias):
+            dynamic = dynamic or node.name.split(".")[0] in _DYNAMIC
             if node.name == "*":
                 star = True
             else:
                 found.append((node.asname or node.name.split(".")[0], "name"))
+        elif isinstance(node, ast.ImportFrom):
+            dynamic = dynamic or (node.module or "").split(".")[0] in _DYNAMIC
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             found.extend((n, "global") for n in node.names)
         elif type(node).__name__ in ("MatchAs", "MatchStar") and node.name:  # absent from ast before Python 3.10
@@ -442,17 +450,17 @@ def _binding_index(tree):
             events.setdefault(name, []).append((kind, node, stmt, scope))
         inner = node if isinstance(node, _SCOPE_NODES) else scope
         stack.extend((child, inner, stmt) for child in ast.iter_child_nodes(node))
-    tree._binding_index = (events, star)
+    tree._binding_index = (events, star, dynamic)
     return tree._binding_index
 
 
 def _binds(tree, name, owner, shadow):
     """The events of _binding_index that can change what name is in the scope of owner (a ClassDef of the module, or None for the
-    module); None when the module scope is asked and the file has a star import. In the module scope every Store of the name counts
+    module); None when the file uses a dynamic form (_DYNAMIC) or, in the module scope, has a star import. In the module scope every Store of the name counts
     wherever it sits in the file (a function's `global` or a local of the same name too); a def or class counts when it is in that
     scope, or anywhere when shadow. A parameter counts only when shadow. Attribute and subscript writes always count."""
-    events, star = _binding_index(tree)
-    if owner is None and star:
+    events, star, dynamic = _binding_index(tree)
+    if dynamic or (owner is None and star):
         return None
     counted = []
     for event in events.get(name, ()):
@@ -467,8 +475,8 @@ def _single_binding(tree, name, cls=None, *, shadow=False, nested=False):
     """THE one predicate for "is this name provably bound once, simply": the statement that binds name, or None when the source does
     not prove it. Proven means: in the module scope (or in the body of the module-level class cls, which must itself pass this test)
     exactly one thing binds or writes the name (see _binds), and it is a `def`, `async def` or `class`, a plain `NAME = value`
-    (one Name target), or an import alias, standing directly in that scope's statements and not under an if, try, with, for, while or
-    match. nested: the statement may be anywhere in the file (a variable bound inside a function). shadow: a parameter or a def in
+    (one Name target; `NAME: type = value` too), or an import alias, standing directly in that scope's statements and not under an if, try, with, for, while or
+    match; a file that uses a dynamic form (_DYNAMIC) proves nothing. nested: the statement may be anywhere in the file (a variable bound inside a function). shadow: a parameter or a def in
     another scope of the same name counts as a binding too (for a name a use scan reads anywhere in the file)."""
     owner = None
     if cls is not None:
@@ -482,6 +490,8 @@ def _single_binding(tree, name, cls=None, *, shadow=False, nested=False):
     if kind == "def":
         result = node
     elif kind == "name" and isinstance(stmt, ast.Assign) and stmt.targets == [node]:
+        result = stmt
+    elif kind == "name" and isinstance(stmt, ast.AnnAssign) and stmt.target is node and stmt.value is not None:
         result = stmt
     elif kind == "name" and isinstance(node, ast.alias):
         result = stmt
@@ -519,37 +529,44 @@ def _defs(tree):
     return found
 
 
+_IMMUTABLE_TYPES = (int, float, complex, str, bytes, bool, type(None))
+
+
+def _immutable(node):
+    """True when a value node is a literal nothing can change afterwards: a number (a leading sign too), a string, bytes, True, False
+    or None, or a tuple of only those. A dict, list or set is mutable (`D.update(...)`, `D.append(...)`, `D[k] = v` in a function would
+    change it without any binding the source shows); a tuple that holds one is mutable too."""
+    if isinstance(node, ast.Constant):
+        return type(node.value) in _IMMUTABLE_TYPES
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float, complex)
+    return isinstance(node, ast.Tuple) and all(_immutable(e) for e in node.elts)
+
+
 def _literal_constants(tree):
-    """{name: (value node, literal value, line)} of the module-level constants that are a plain `NAME = <literal>` whose binding is
-    proven single (_single_binding) and whose value ast.literal_eval reads."""
+    """{name: (literal value, line)} of the module-level constants that are a plain `NAME = <value>` or `NAME: type = <value>`, whose
+    binding is proven single (_single_binding) and whose value is an immutable literal (_immutable)."""
     found = {}
     for node in tree.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            if _single_binding(tree, node.targets[0].id) is not node:
-                continue
-            try:
-                value = ast.literal_eval(node.value)
-            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-                continue
-            found[node.targets[0].id] = (node.value, value, node.lineno)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target = node.target
+        else:
+            continue
+        if not isinstance(target, ast.Name) or _single_binding(tree, target.id) is not node or not _immutable(node.value):
+            continue
+        found[target.id] = (ast.literal_eval(node.value), node.lineno)
     return found
 
 
 def _same(a, b):
-    """True when two literal values are equal and of the same types all the way down: 1 and True, or 1 and 1.0, differ; dict key
-    order and set order do not matter."""
+    """True when two literal values are equal and of the same types all the way down: 1 and True, or 1 and 1.0, differ."""
     if type(a) is not type(b):
         return False
-    if isinstance(a, dict):
-        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
-    if isinstance(a, (list, tuple)):
+    if isinstance(a, tuple):
         return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
     return a == b
-
-
-def _dict_keys(node, value):
-    """{key: (value, line)} of a dict literal, the line being the key's own."""
-    return {ast.literal_eval(k): (value[ast.literal_eval(k)], k.lineno) for k in node.keys}
 
 
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
@@ -588,11 +605,11 @@ def _keyed_names(f):
 
 def version_diff(old, new):
     """Code-made fact lines `- <claim> [path:n, ...]` for what the new file adds, drops or changes against the old one, each citing
-    the line that shows it: names (class, function, method, constant, as name_index skips them), literal constants (a scalar, or a
-    dict key by key), then the plain calls of a function or method both define. A line is stated only on proof: a name is compared
+    the line that shows it: names (class, function, method, constant, as name_index skips them), constants whose value is an immutable
+    literal (a number, string, bytes, True, False, None, or a tuple of those; never a dict, list or set), then the plain calls of a function or method both define. A line is stated only on proof: a name is compared
     only when each file binds it once, simply and directly in its scope (_single_binding), and is added or dropped only when one file
-    proves that and the other proves it does not bind the name at all (_unbound). A constant whose value does not literal_eval is not
-    compared. Order: names, constants, calls, each in line order."""
+    proves that and the other proves it does not bind the name at all (_unbound). A file that uses globals, vars, locals, setattr, delattr,
+    exec, eval, __import__, importlib or __dict__ proves nothing, so it gives no line. Order: names, constants, calls, each in line order."""
     old_tree, new_tree = _parse(old["path"], old["text"]), _parse(new["path"], new["text"])
     if old_tree is None or new_tree is None:
         return []
@@ -609,24 +626,10 @@ def version_diff(old, new):
         if key not in new_names and _unbound(new_tree, key[2], key[1]) and _single_binding(old_tree, key[2], key[1]):
             lines.append("- {} drops the {} {} that {} defines [{}:{}]".format(base, key[0], key[2], obase, op, line))
     old_const, new_const = _literal_constants(old_tree), _literal_constants(new_tree)
-    for name, (node, value, line) in sorted(new_const.items(), key=lambda item: item[1][2]):
-        if name not in old_const:
-            continue
-        onode, ovalue, oline = old_const[name]
-        if isinstance(value, dict) and isinstance(ovalue, dict) and isinstance(node, ast.Dict) and isinstance(onode, ast.Dict):
-            okeys, nkeys = _dict_keys(onode, ovalue), _dict_keys(node, value)
-            label = lambda k: "{}[{}]".format(name, json.dumps(k) if isinstance(k, str) else repr(k))  # noqa: E731
-            for k, (v, kline) in nkeys.items():
-                if k in okeys and not _same(okeys[k][0], v):
-                    lines.append("- {} changes {} from {!r} to {!r} [{}:{}, {}:{}]".format(
-                        base, label(k), okeys[k][0], v, op, okeys[k][1], np, kline))
-                elif k not in okeys:
-                    lines.append("- {} adds the key {} [{}:{}]".format(base, label(k), np, kline))
-            for k, (v, kline) in okeys.items():
-                if k not in nkeys:
-                    lines.append("- {} drops the key {} that {} defines [{}:{}]".format(base, label(k), obase, op, kline))
-        elif not _same(ovalue, value):
-            lines.append("- {} changes {} from {!r} to {!r} [{}:{}, {}:{}]".format(base, name, ovalue, value, op, oline, np, line))
+    for name, (value, line) in sorted(new_const.items(), key=lambda item: item[1][1]):
+        if name in old_const and not _same(old_const[name][0], value):
+            lines.append("- {} changes {} from {!r} to {!r} [{}:{}, {}:{}]".format(
+                base, name, old_const[name][0], value, op, old_const[name][1], np, line))
     old_defs, new_defs = _defs(old_tree), _defs(new_tree)
     added, gone = [], []
     for key, fn in new_defs.items():
@@ -684,7 +687,7 @@ def _imported_module(path, node):
 def _use_lines(f, tree, target, kind, module, others, members, dup):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
-    path, `from m import *`, an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
+    path, `from m import *`, a dynamic form such as globals() or setattr (_DYNAMIC; the file then gives no line at all), an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
     that no import of the target explains, the name as a string) or binds it from two of the definers (ambiguous). module is the
     target's dotted module name from the run root, others those of the other files that define the same name. An import counts as
     the target's only when its module resolves to `module` by full dotted path (a basename alone never does). A call, a creation or
@@ -692,6 +695,8 @@ def _use_lines(f, tree, target, kind, module, others, members, dup):
     written (`t.Q = x`), shadowed, or in a file with a star import gives the import line at most. dup (the name is defined in more
     than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
     this module."""
+    if _binding_index(tree)[2]:
+        return [], [], [], True  # a dynamic form (_DYNAMIC) anywhere: the source does not show what any name in this file is
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
     label = "{}.{}".format(module, target) if dup else target
     direct, modules, imports = {}, {}, []  # local name -> import statement; the dotted name used in code -> (bound name, statement)
@@ -782,7 +787,7 @@ def use_scan(task, files):
     call, and the attribute uses through a variable bound once from T(...) or a parameter (only of a name the class defines, dunder
     methods too), each only through an import of the target by its full dotted path whose name nothing else binds, writes or
     shadows (see _use_lines); `from m import *` attributes nothing. A file with none of these gives `<base> does not use <T> [path:1]`,
-    unless it refers to the name in a way the scan cannot attribute to the target: then it gives nothing. When more than one file
+    unless it refers to the name in a way the scan cannot attribute to the target: then it gives nothing (as does a file that uses a dynamic form, see _DYNAMIC). When more than one file
     defines the name, each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself,
     or whose binding of the name is ambiguous, gives nothing for it."""
     out = []

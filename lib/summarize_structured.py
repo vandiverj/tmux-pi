@@ -217,7 +217,7 @@ def render(facts):
 def outline(path, numbered_text):
     """The names a Python file defines, read with ast from its numbered text (prepare's `{n:>4}\\t{line}`): a list of
     (line, kind, name, owner) in source order. kind is class, function, method, constant (a module-level assignment to a plain
-    name) or parameter (of a function or method, except self and cls; its owner is that function). A method's owner is its class.
+    name) or parameter (every parameter of a function or method in signature order, *args and **kwargs included, except self and cls; its owner is that function). A method's owner is its class.
     Functions inside functions are not walked. A file that is not .py, or does not parse, gives []."""
     if not path.endswith(".py"):
         return []
@@ -236,8 +236,8 @@ def outline(path, numbered_text):
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 found.append((node.lineno, "method" if owner else "function", node.name, owner))
                 args = node.args
-                for arg in args.posonlyargs + args.args + args.kwonlyargs:
-                    if arg.arg not in ("self", "cls"):
+                for arg in args.posonlyargs + args.args + [args.vararg] + args.kwonlyargs + [args.kwarg]:
+                    if arg and arg.arg not in ("self", "cls"):
                         found.append((node.lineno, "parameter", arg.arg, node.name))
             elif owner is None:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []

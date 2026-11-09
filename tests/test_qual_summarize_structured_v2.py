@@ -132,6 +132,21 @@ class OutlineTests(unittest.TestCase):
         self.assertNotIn("SIZE", names)    # only module-level constants
         self.assertNotIn("attr", names)    # not a plain name
 
+    def test_every_parameter_kind_in_signature_order(self):
+        code = ("def collect(first, /, second, *items, key=None, **options):\n    pass\n\n\n"
+                "class K:\n    def m(self, *args, flag, **kw):\n        pass\n\n    @classmethod\n    def n(cls, *rest):\n        pass\n")
+        want = [(1, "function", "collect", None), (1, "parameter", "first", "collect"), (1, "parameter", "second", "collect"),
+                (1, "parameter", "items", "collect"), (1, "parameter", "key", "collect"), (1, "parameter", "options", "collect"),
+                (5, "class", "K", None),
+                (6, "method", "m", "K"), (6, "parameter", "args", "m"), (6, "parameter", "flag", "m"), (6, "parameter", "kw", "m"),
+                (10, "method", "n", "K"), (10, "parameter", "rest", "n")]
+        self.assertEqual(ss.outline("k.py", self.numbered(code)), want)
+        names = "\n".join("- line 1: parameter {} of collect".format(n) for n in ("first", "second", "items", "key", "options"))
+        message = ss.user_message("TASK", [{"path": "k.py", "text": self.numbered(code)}])
+        self.assertIn("- line 1: function collect\n" + names + "\n- line 5: class K\n- line 6: method m\n"
+                      "- line 6: parameter args of m\n- line 6: parameter flag of m\n- line 6: parameter kw of m\n"
+                      "- line 10: method n\n- line 10: parameter rest of n", message)
+
     def test_no_list(self):
         self.assertEqual(ss.outline("notes.txt", self.numbered(CODE)), [])
         self.assertEqual(ss.outline("a.py", self.numbered("def broken(:\n    pass")), [])

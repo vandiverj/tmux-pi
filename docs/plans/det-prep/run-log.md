@@ -984,3 +984,18 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Next levers, all deterministic prep: an ast diff of defined names and values for diff chores; a reference scan
   (imports and call sites per name, and named files with none) for use chores; a check that drops a "not in the files"
   claim whose subject is defined in a named file. A repeatable meaning grader lane follows.
+
+## 2026-11-09 (later): merges AT1, FC1, SE1, S1b, DS1; S1c dispatched
+Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane close` run alone, merge, collect.
+- AT1 (ambient-tmux) 57611f6, APPROVED_WITH_NOTES: no tmux server reads as an empty pane table. Notes closed with the
+  liveness qualification and a fail-before script plus log.
+- FC1 (frozen-copies) 234225d, APPROVED_WITH_NOTES: review diffs name verified frozen copies; the gate reads hunks with
+  bounded git work. The truncated-hunk test is a fail-before test.
+- SE1 (session-env) d63f08c, APPROVED_WITH_NOTES: TP_TRUST_* test hooks classified; g3 tests scrub before import.
+  Preview 148 OK in all four cells; the provenance note closed with preview-provenance.txt. test_session_env passes on main.
+- S1b (structured-v2) b77ad33, APPROVED after round 2 (fixes/ls1c-s1b-round2.md: *args/**kwargs in the outline). Merged
+  tree equals the verified preview tree (d200d6a); 190 OK (skipped=1) in all four cells.
+- DS1 (decline-settles) 9915fd8, APPROVED at round 5: a late answer to a declined request keeps every field of the
+  prior record. Preview (d63f08c + lane) 144 OK in all four cells; the merged DS1 files equal the preview's blobs.
+- S1c (lane code-facts, task coder-f8f92bfdf7) dispatched on b77ad33 with fixes/ls1c-s1c-code-facts.md: version diff,
+  use scan and the false-absence drop computed by code, aimed at the meaning bar's recall misses.

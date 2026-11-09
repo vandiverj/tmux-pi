@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import safe_write
 from sensitive_read import classify, response_for
-from redact_hook import mode as redaction_mode, settle_declined
+from redact_hook import mode as redaction_mode
 
 
 def save_request(result, status):
@@ -71,9 +71,6 @@ def main():
         if redaction_mode() == "on":
             return  # tp-redact --claude-hook owns gating and permission records
         name = event.get("hook_event_name")
-        if name in {"Stop", "UserPromptSubmit"}:
-            settle_declined(event)  # the owner rejected the dialog: Claude Code fires no PermissionDenied for that
-            return
         if name in {"PostToolUse", "PermissionDenied"}:
             old = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
             if old.is_file():

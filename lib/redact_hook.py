@@ -862,7 +862,8 @@ def settle_declined(event):
     belongs to a dialog the owner rejected. Claude Code fires no PermissionDenied for that. Mark it `declined` (not `denied`,
     which is a PermissionDenied event) with the event and the time; every other field stays. A request that is not pending
     (authorized, denied, declined) or cannot be read as one JSON object is left alone. Never raises: the turn is not blocked.
-    The owner is `handle` in mode on and bin/tp-sensitive-read in shadow and off, so exactly one of them settles."""
+    There is one settler in every mode (on, shadow, off): `handle`, run by hooks/redact.sh, registered on both events. Its turn
+    branch runs before any mode check. bin/tp-sensitive-read is not registered on those events and does not settle."""
     task = os.getenv("TP_TASK_DIR")
     if not task:
         return
@@ -907,8 +908,7 @@ def handle(event):
             Store(store_name(event)).drop_pending()
         except Exception:
             pass
-        if mode() == "on":  # in shadow and off bin/tp-sensitive-read owns the permission record
-            settle_declined(event)
+        settle_declined(event)  # in every mode: this is the one hook that hears a new turn
         return None
     current = mode()
     if current == "off":

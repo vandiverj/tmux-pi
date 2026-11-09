@@ -1,11 +1,13 @@
 """The summarize_files qualification kit: tests/calibration/summarize/ (chores, answers, fixtures), tools/qual/summarize_check.py
 (the scorer) and tools/qual/summarize_run.py (the runner). No model is run: the worker is a stub script."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import contextlib
 import functools
 import itertools
 import json
 import os
 import re
+import signal
 import stat
 import string
 import subprocess
@@ -1729,6 +1731,14 @@ class CheckerTests(unittest.TestCase):
                 for extra in ("src/cache.py:{g}9999", "src/cache.py{g}:9999", "line 9999 {g}of src/cache.py", "line 9999 of {g}src/cache.py"):
                     result = self.appended(extra.format(g=g))
                     self.assertEqual((result["pass"], (3, "range") in rules(result), len(result["bad_citations"])), (False, True, 1), (extra, fill, gap))
+        # round 14: k nested pairs are k candidates and ONE reference, the outermost (the inner ones are covered by it and are not read at all)
+        for k in (1, 2, 3, 8):
+            for opener, closer in (("(", ")"), ("[", "]"), ("<", ">")):
+                for body, shown in (("line 1 of {o}" * k + "x.py" + "{c}" * k, "line 1 of {o}" * k + "x.py" + "{c}" * (k - 1)),
+                                    ("{o}" * k + "x.py:6" + "{c}" * k, "x.py:6")):
+                    result = self.appended(body.format(o=opener, c=closer))
+                    self.assertEqual((result["pass"], (3, "unknown_file") in rules(result), result["bad_citations"]),
+                                     (False, True, [shown.format(o=opener, c=closer) + " (unknown_file)"]), (body, k, opener))
 
     def test_rule_20_a_megabyte_of_words_references_and_brackets_is_read_in_linear_time(self):
         self.megabyte({"words": "The queue evicts after 128 entries and retries 3 times. ", "line breaks": "\n", "open brackets": "[",
@@ -1746,14 +1756,90 @@ class CheckerTests(unittest.TestCase):
     def test_rule_20_a_megabyte_of_bracket_items_on_many_lines_is_read_in_linear_time(self):
         self.megabyte({"short fact lines": "- x [y:1]\n", "bracket-with-hash lines": "[x#:1]\n", "bracket items, many lines": "- x [src/cache.py:6]\n"})
 
+    # ---- round 14 (review-coder-b69bae86e7-032459 F1): nested pairs, read in linear time at any depth ----
+    MB = 1000000
+
+    def reverse_nest(self, opener, closer, k=16000, tail=".py"):
+        """1 MB: k nested "line 1 of <opener>" (reverse order), one long word, tail, k closers. The k candidates share one tail."""
+        lead = "line 1 of " + opener
+        return lead * k + "x" * (self.MB - (len(lead) + len(closer)) * k - len(tail)) + tail + closer * k
+
+    def forward_nest(self, opener, closer, k=16000, tail=".py:6"):
+        """1 MB: k nested openers, one long word, tail (path and line part), k closers."""
+        return opener * k + "x" * (self.MB - (len(opener) + len(closer)) * k - len(tail)) + tail + closer * k
+
+    def backtick_nest(self, lead, tail, depth=600):
+        """1 MB: backtick runs of length 1 to depth (the only way backticks nest), each after lead, one long word, tail, the closers from depth to 1."""
+        opens = "".join(lead + "`" * i for i in range(1, depth + 1))
+        closes = " ".join("`" * i for i in range(depth, 0, -1))
+        return opens + "x" * (self.MB - len(opens) - len(closes) - len(tail)) + tail + closes
+
+    def test_rule_20_a_megabyte_of_nested_reverse_pairs_is_read_in_linear_time(self):
+        # the reviewer's shape (k = 8000 took 4.4 s CPU in round 13, 13.4 s at 16000): each of k nested candidates walked the same tail again.
+        # The last shape has no path: every candidate fails, and the old reader walked the 900000 letters of its tail for each (88 s at k = 1000).
+        self.megabyte({"reverse in ( )": lambda: self.reverse_nest("(", ")"), "reverse in [ ]": lambda: self.reverse_nest("[", "]"),
+                       "reverse in < >": lambda: self.reverse_nest("<", ">"), "reverse in quotes": lambda: self.reverse_nest('"', '"'),
+                       "reverse in backticks": lambda: self.backtick_nest("line 1 of ", ".py"),
+                       "reverse in ( ), no path": lambda: self.reverse_nest("(", ")", tail=""),
+                       "reverse in ( ), path with spaces": lambda: self.reverse_nest("(", ")", tail=" end.py")})
+
+    def test_rule_20_a_megabyte_of_nested_forward_pairs_is_read_in_linear_time(self):
+        # the forward loop: nested pairs around one path and line part, and many line parts that each fail inside one pair (a long word, or a long
+        # run of spaces, in front of them: each failed candidate must not read it again)
+        self.megabyte({"forward in ( )": lambda: self.forward_nest("(", ")"), "forward in [ ]": lambda: self.forward_nest("[", "]"),
+                       "forward in < >": lambda: self.forward_nest("<", ">"), "forward in backticks": lambda: self.backtick_nest("", ".py:6"),
+                       "forward in ( ), no path": lambda: self.forward_nest("(", ")", tail=":6"),
+                       "forward in ( ), 250000 failed line parts after a word": lambda: "(" + "x" * 500000 + ":6" * 250000,
+                       "forward in ( ), 200000 failed line parts after spaces": lambda: "(" + " " * 500000 + "x" + ":6" * 200000 + ")"})
+
+    def test_rule_20_a_megabyte_of_mixed_nested_pairs_and_code_spans_is_read_in_linear_time(self):
+        def padded(head, tail):
+            return head + "x" * (self.MB - len(head) - len(tail)) + tail
+        self.megabyte({"reverse then forward": lambda: padded("line 1 of (" * 8000 + "(" * 8000, ".py:6" + ")" * 16000),
+                       "alternating bracket types": lambda: padded("line 1 of (line 1 of [" * 8000, ".py" + "])" * 8000),
+                       "forward and reverse alternating": lambda: padded("(line 1 of [" * 8000, ".py:6" + "])" * 8000),
+                       # a claim: unmatched backtick runs of every length from 600 down to 2 each looked for a closer through all the runs after it
+                       "unmatched backtick runs in a claim": lambda: "- " + "".join("`" * i + "x" for i in range(600, 1, -1)) + "`x" * 400000 + " " + self.C})
+
+    def test_rule_20_nesting_depth_does_not_change_the_cpu_for_the_same_size(self):
+        """The reviewer's shape at the same 1 MB with 1000 pairs and with 16000: a linear reader takes the same time plus a little for the 15000
+        extra pairs (each is a match of the forward grammar and two delimiters): the ratio of the best of 3 runs, 5 times over, was 1.56 to 1.60
+        on py3.9 and 1.44 to 1.48 on py3.14 (earlier runs of the same code: 1.60 to 1.71 and 1.45 to 1.51). The round-13 reader took 0.35 s at k = 1000 and 12.6 s at k = 16000 (36 times). The bound is 2.5:
+        about 1.5 times the linear ratio and a fourteenth of the quadratic one."""
+        def cpu(k):
+            best = None
+            for _ in range(3):
+                reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=self.reverse_nest("(", ")", k))
+                with self.cpu_bound("k = {}".format(k), 8):
+                    start = time.process_time()
+                    self.check(reply)
+                    best = min(best or 99, time.process_time() - start)
+            return best
+        few, many = cpu(1000), cpu(16000)
+        self.assertLess(many, 2.5 * few, (few, many))
+
+    @contextlib.contextmanager
+    def cpu_bound(self, name, seconds=2):
+        """Stops a check that has used `seconds` of CPU (SIGPROF, raised at the next bytecode): a quadratic reader fails in 2 s, not in minutes."""
+        def stop(signum, frame):
+            raise AssertionError("{}: more than {} CPU seconds".format(name, seconds))
+        previous = signal.signal(signal.SIGPROF, stop)
+        signal.setitimer(signal.ITIMER_PROF, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_PROF, 0)
+            signal.signal(signal.SIGPROF, previous)
+
     def megabyte(self, unit):
         """A 1 MB reply is read in about a second, whatever its shape: the bound is 2 CPU seconds (time.process_time, the CPU time of this process,
         so a loaded machine does not fail it) on py3.9, where the slowest shape takes about 1.5 s. Each shape has a reference to a missing file at
-        its end, which is found whatever comes before it."""
+        its end, which is found whatever comes before it. A value is a piece repeated up to 1 MB, or a function that returns the 1 MB body."""
         for name, piece in unit.items():
-            reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=piece * (1000000 // len(piece)))
-            start = time.process_time()
-            result = self.check(reply)
+            reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=piece() if callable(piece) else piece * (1000000 // len(piece)))
+            with self.cpu_bound(name):
+                start = time.process_time()
+                result = self.check(reply)
             self.assertLess(time.process_time() - start, 2, name)
             self.assertIn((3, "unknown_file"), rules(result), name)
 

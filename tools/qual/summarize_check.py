@@ -84,6 +84,9 @@ of FACT LINES, and only fact lines state facts:
           at, then PATH.
   Rule 20 No window, linear time. Detection does not depend on the distance between the parts or on the length of the reply (a
           megabyte takes well under 2 s); every scan starts at the start of a separator run and never looks back over a gap.
+          Nesting is no exception: k nested pairs ("line 1 of (" * k ... ")" * k, or "(" * k + PATH:6 + ")" * k) cost O(k) in all, not O(k) per
+          pair. The boundary work (white space, trailing punctuation, letters) is found once per reply and answered by bisect, and a candidate
+          that starts inside a reference already kept is skipped, not read.
   Rule 21 Table-free floor. After the canonical citations and the references of rules 17 to 19 are removed, a number (any Unicode
           digits) directly preceded by a path token or a line word (line, lines, L, l., ln, #), with only separators between,
           fails the reply: `unparsed_reference`, listed in "unparsed_references" (S2 needs it, with fabricated citations, at zero).
@@ -188,6 +191,12 @@ QUOTE_OPENERS, QUOTE_CLOSERS = frozenset("\"'\u201c\u2018"), frozenset("\"'\u201
 LIST_SEPARATOR = re.compile(r"[,;]")
 LIST_SEPARATORS = ",;"  # ONE of them between two references of a list (a.py:1,b.py:2) ends the first: it does not start the second path
 TRAILING = frozenset(".,;:!?)]}>'\"`*\u201d\u2019")  # sentence punctuation: not part of a path at its end (rule 18)
+TRAILING_RUN = re.compile("[{}]+".format(re.escape("".join(sorted(TRAILING)))))  # a maximal run of it: where untrail() stops, found once (rule 20)
+ALPHA_RUN = re.compile("[A-Za-z]+")
+# A candidate of at most LOCAL characters is looked at directly (a slice, an rfind); a longer one is answered from the tables. Both give the SAME
+# answer for every length, so this is a speed choice and not a window: nothing is missed or read differently past it (rule 20; the tables are what
+# keep k nested pairs linear, the direct look is what keeps the common short candidate cheap).
+LOCAL = 48
 # rule 21: a number preceded, with only separators between, by a path token or a line word. A separator is a space or any character that is
 # no letter, digit, "_", ".", "/", "\" or "-" (those are what paths and numbers are made of)
 FLOOR = re.compile(r"(?<![^\w./\\-])(?P<seps>[^\w./\\-]*)(?P<n>\d+)")
@@ -266,10 +275,15 @@ def without_code_spans(text):
     backticks is a span, the runs and what they hold go. A run with no such closer is literal: its backticks are removed as
     characters and the text after them stays (and may itself open a span)."""
     runs = [m.span() for m in BACKTICK_RUN.finditer(text)]
+    closers, latest = [None] * len(runs), {}  # the next run of the same length, found once from the right (rule 20: not a search for each run)
+    for j in range(len(runs) - 1, -1, -1):
+        size = runs[j][1] - runs[j][0]
+        closers[j] = latest.get(size)
+        latest[size] = j
     out, at, i = [], 0, 0
     while i < len(runs):
         start, end = runs[i]
-        closer = next((j for j in range(i + 1, len(runs)) if runs[j][1] - runs[j][0] == end - start), None)
+        closer = closers[i]
         out.append(text[at:start])
         if closer is None:
             at, i = end, i + 1
@@ -516,9 +530,55 @@ def _scan(text, files, canonical=()):
                 splits.append(i)
                 splits_from.append(j)
 
-    def written(i):
-        """scan[i] is the character it was written as (and not a piece of a compatibility form, such as "..." for U+2026)."""
-        return origin is None or orig[origin[i]] == scan[i]
+    # The boundary work of rules 18 to 30, done once per reply (rule 20): every question a candidate asks about the text around it (where the white
+    # space around it ends, where the sentence punctuation at its end begins, where its last word begins, whether the letters before its end follow
+    # a ".") is answered from a table that one pass over the scan made, in O(log n), never by walking the text again. A walk per candidate is
+    # quadratic in the nesting depth: k nested pairs share their tail, and each candidate walked the whole of it.
+    memo = {}
+    local = LOCAL
+
+    def next_nonspace(i):
+        """The first index >= i that is not a space (n when there is none)."""
+        if i >= n or scan[i] != " ":
+            return i
+        k = bisect.bisect_left(run_starts, i)
+        return run_starts[k] if k < len(run_starts) else n
+
+    def prev_end(i):
+        """The smallest e <= i such that scan[e:i] is all spaces."""
+        if i <= 0 or scan[i - 1] != " ":
+            return i
+        k = bisect.bisect_right(run_starts, i - 1) - 1
+        return run_ends[k] if k >= 0 else 0
+
+    def word_start(a, e):
+        """Where the last word of scan[a:e] starts: just after its last space, or a."""
+        if e <= a:
+            return a
+        if scan[e - 1] == " ":
+            return e
+        if e - a <= local:
+            return scan.rfind(" ", a, e) + 1 or a  # rfind is -1 when there is none: 0 -> a (a space at a - 1 or before is outside the range)
+        return max(a, run_starts[bisect.bisect_right(run_starts, e - 1) - 1])
+
+    def trailing():
+        """(start of each run of sentence punctuation, the positions in those runs that are not written as they are in the scan)."""
+        if "trailing" not in memo:
+            runs = [m.span() for m in TRAILING_RUN.finditer(scan)]
+            unwritten = [] if origin is None else [i for s, e in runs for i in range(s, e) if orig[origin[i]] != scan[i]]
+            memo["trailing"] = ([s for s, _ in runs], unwritten)
+        return memo["trailing"]
+
+    def letters():
+        """(start, end) of each run of letters (str.isalpha) of the scan, as two lists."""
+        if "letters" not in memo:
+            if scan.isascii():
+                runs = ALPHA_RUN.finditer(scan)
+            else:
+                runs = re.finditer("a+", scan.translate({ord(c): "a" if c.isalpha() else " " for c in set(scan)}))
+            found_runs = [m.span() for m in runs]
+            memo["letters"] = ([s for s, _ in found_runs], [e for _, e in found_runs])
+        return memo["letters"]
 
     def shaped(a, b):
         """scan[a:b] is a path (rule 18): it holds / or \\, ends in ".<letters>" or is a chore file's path or name."""
@@ -526,18 +586,34 @@ def _scan(text, files, canonical=()):
             return False
         if b - a <= longest and scan[a:b] in names:
             return True
+        if b - a <= local:  # short: look at it directly
+            text_ = scan[a:b]
+            if "/" in text_ or "\\" in text_:
+                return True
+            i = len(text_)
+            while i and text_[i - 1].isalpha():
+                i -= 1
+            return 0 < i < len(text_) and text_[i - 1] == "."
         k = bisect.bisect_left(slashes, a)
         if k < len(slashes) and slashes[k] < b:
             return True
-        j = b
-        while j > a and scan[j - 1].isalpha():
-            j -= 1
+        starts, ends = letters()
+        k = bisect.bisect_right(starts, b - 1) - 1
+        if k < 0 or ends[k] < b:  # scan[b-1] is no letter
+            return False
+        j = max(a, starts[k])  # the letters that end at b begin here
         return a < j < b and scan[j - 1] == "."
 
     def untrail(a, b):
-        while b > a and scan[b - 1] in TRAILING and written(b - 1):
-            b -= 1
-        return b
+        """b moved back over the sentence punctuation written at the end of scan[a:b] (rule 18)."""
+        if b <= a or scan[b - 1] not in TRAILING:
+            return b
+        starts, unwritten = trailing()
+        start = starts[bisect.bisect_right(starts, b - 1) - 1]  # the run that ends at b begins here, unless a character of it is not written
+        u = bisect.bisect_left(unwritten, b) - 1
+        if u >= 0 and unwritten[u] >= start:
+            start = unwritten[u] + 1
+        return max(a, start)
 
     def span(a, b, delimited):
         """The one place a path is cut out of the scan (rules 24, 26, 27, 29 and 30): (a, b, delimited) when scan[a:b] is a path, else None.
@@ -547,28 +623,23 @@ def _scan(text, files, canonical=()):
         written at the end is taken off. Nothing is taken off the front."""
         if delimited:
             k = bisect.bisect_left(splits, b) - 1
-            if k >= 0:  # a separator with nothing but white space after it, up to the line part, splits nothing off: it ends the path ("cli.py;")
-                j = b - 1
-                while j > splits[k] and scan[j] == " ":
-                    j -= 1
-                if j == splits[k]:
-                    k -= 1
+            if k >= 0 and prev_end(b) == splits[k] + 1:  # a separator with nothing but white space after it, up to the line part, splits nothing off: it ends the path ("cli.py;")
+                k -= 1
             if k >= 0 and splits_from[k] >= a:
                 a = splits[k] + 1
-            while a < b and scan[a] == " ":
-                a += 1
-            while b > a and scan[b - 1] == " ":
-                b -= 1
+            if a < b:
+                a = min(next_nonspace(a), b)
+            if b > a:
+                b = max(prev_end(b), a)
             e = untrail(a, b)
-            word = max(a, scan.rfind(" ", a, e) + 1)
+            word = word_start(a, e)
             return (a, b, True) if shaped(a, e) or (word > a and shaped(word, e)) else None
         b = untrail(a, b)
         return (a, b, False) if shaped(a, b) else None
 
     def after_list_separator(i):
         """i moved past the white space and the ONE list separator that stand between two references of a list."""
-        while i < n and scan[i] == " ":
-            i += 1
+        i = next_nonspace(i)
         return i + 1 if i < n and scan[i] in LIST_SEPARATORS else i
 
     found = []  # (start, end, path start, path end, delimited, first, last), in scan offsets
@@ -579,7 +650,10 @@ def _scan(text, files, canonical=()):
             continue
         head = last_end
         if s and scan[s - 1] != " ":
-            head = max(head, run_starts[bisect.bisect_right(run_starts, s - 1) - 1])
+            if s - head <= local:
+                head = scan.rfind(" ", head, s) + 1 or head  # just after the last space between head and s, else head
+            else:
+                head = max(head, run_starts[bisect.bisect_right(run_starts, s - 1) - 1])
         if last_end and head == last_end and head < s and scan[head] in LIST_SEPARATORS:
             head += 1  # a.py:1,b.py:2: the comma ends the first reference
         k = bisect.bisect_left(positions, s) - 1
@@ -591,9 +665,23 @@ def _scan(text, files, canonical=()):
         if chosen:
             found.append((chosen[0], m.end(), chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a")))
             last_end = m.end()
+    # The references in order of (start, longest first), the first of each overlap kept: a merge of the forward references (already in order and
+    # disjoint) with the reverse candidates in the order they start. A reverse candidate that starts inside a reference kept before it is dropped
+    # in that order whatever it would read as, so it is not read (rule 20: k nested pairs are k candidates, and only the outermost is read).
+    kept, end, fi = [], 0, 0
+
+    def keep(ref):
+        nonlocal end
+        if ref[0] >= end:
+            kept.append(ref)
+            end = ref[1]
+
     for m in REVERSE.finditer(scan):
-        e = m.end()
-        if e >= n:
+        s, e = m.start(), m.end()
+        while fi < len(found) and found[fi][0] < s:
+            keep(found[fi])
+            fi += 1
+        if s < end or e >= n:
             continue
         stop = run_ends[bisect.bisect_right(run_starts, e) - 1]
         chosen = None
@@ -605,19 +693,21 @@ def _scan(text, files, canonical=()):
         if chosen is None:
             chosen = span(e, stop, False)
         if chosen:
-            found.append((m.start(), chosen[1], chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a")))
-    found.sort(key=lambda r: (r[0], -r[1]))
-    kept, end = [], 0
-    for ref in found:
-        if ref[0] >= end:
-            kept.append(ref)
-            end = ref[1]
+            reverse = (s, chosen[1], chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a"))
+            while fi < len(found) and found[fi][0] == s and found[fi][1] >= reverse[1]:  # a forward reference that starts here and is as long: first
+                keep(found[fi])
+                fi += 1
+            keep(reverse)
+    for ref in found[fi:]:
+        keep(ref)
     return kept, at, after, scan, orig
 
 
 def references(text, files, canonical=()):
     """Rules 17 to 30. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
-    a reference; every pass is linear.
+    a reference; every pass is linear, nested pairs included: the questions a candidate asks about its surroundings (the next non-space, the end of
+    the text before it, the start of the word, the run of trailing punctuation) come from tables built once per reply, and forward references
+    and reverse candidates are merged in order so that a reverse candidate inside a reference already kept is not read (rule 20).
 
     The scan is text in NFKC form (rule 17) with the spans in canonical (a fact line's own citation list) blanked: it is used to FIND references
     and nothing else. refs is every line reference of it (rules 18 and 19), [(start, end, path, first, last, written)] in text's offsets and in

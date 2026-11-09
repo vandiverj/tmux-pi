@@ -951,3 +951,36 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - The bar is 57/60 on the holdout and real splits. It is far off.
   - S1b (fixes/ls1c-s1b-structured-v2.md, coder-52af2c36fb) builds the v2 fact form, the name outline and the name index
     properly, with tests, so tuning continues on the real module rather than the scratch copy.
+
+## 2026-11-09 LS1c tune runs re-scored strict vs meaning; the bar moves to meaning
+- Owner asked whether the failures are format rather than missing information, then: "re-score the runs both ways, then
+  grade on meaning". Each tune chore's 9 replies (base run 1, t1-t7, the Pi path) were shuffled, anonymized (key seed
+  20261109) and graded blind by 6 Claude subagents against reference facts, one rubric (plus amendment 1: absence
+  claims graded on truth). Everything is in bench-results/ls1c-2026-11-09/meaning/ (packets, key, grades, scores.txt).
+
+  | run | strict | meaning (all facts, 0 wrong/unsup) | meaning >=80% | recall | wrong | unsup |
+  |---|---|---|---|---|---|---|
+  | base | 2/12 | 4/12 | 4/12 | 64% | 0 | 0 |
+  | t1 | 3/12 | 4/12 | 4/12 | 56% | 2 | 0 |
+  | t2 | 3/12 | 5/12 | 6/12 | 76% | 4 | 1 |
+  | t3 | 2/12 | 7/12 | 8/12 | 85% | 0 | 0 |
+  | t4 | 1/12 | 6/12 | 8/12 | 85% | 0 | 0 |
+  | t5 | 1/12 | 5/12 | 8/12 | 85% | 0 | 0 |
+  | t6 | 2/12 | 3/12 | 7/12 | 84% | 0 | 2 |
+  | t7 | 3/12 | 4/12 | 8/12 | 82% | 3 | 0 |
+  | pi | 0/12 | 1/12 | 1/12 | 45% | 0 | 40 |
+
+  - Format explains much of the strict gap: t3-t5 have zero wrong and zero unsupported lines and 85% recall while
+    strict passed 1-2.
+  - The real gap is cross-file reasoning. steps-*, sum-* and exports-* are near-solved from t3 on; the misses sit in
+    diff-settings (2-4/5: adds/drops), use-jobqueue (3-4/6), use-lrucache (who does not use it) and diff-order F5/F8
+    (lower priority first; JobQueue never evicts). t7's 3 wrong lines are false "not in the files" claims.
+  - The name index (t6/t7) raised strict but not meaning recall; it is true and harmless, not a recall lever.
+  - The Pi path's 40 unsupported lines are off-by-n citations; the structured path's numbered input fixes them.
+  - Caveats: one run per config, one grader per chore, n=12; t3-t5 differences are inside the noise.
+- The bar in ls1c-structured-summarize.md is now the meaning bar: zero wrong, zero unsupported, recall >= 90% overall
+  and >= 80% per chore, judged by a calibrated non-qwen judge. The best run today (t3) misses it on recall (85%;
+  diff-order, diff-settings, use-jobqueue under 80%).
+- Next levers, all deterministic prep: an ast diff of defined names and values for diff chores; a reference scan
+  (imports and call sites per name, and named files with none) for use chores; a check that drops a "not in the files"
+  claim whose subject is defined in a named file. A repeatable meaning grader lane follows.

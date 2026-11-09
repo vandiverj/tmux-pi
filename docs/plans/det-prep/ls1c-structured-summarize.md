@@ -46,11 +46,20 @@ its subject (`wrong_subject`), cover every part the task asks (`missing`). A sch
 `subject` field rendered first) is allowed. Record each iteration's tune numbers. Holdout and real are not looked at
 until the prompt is chosen.
 
-## Bar (unchanged from S2)
-Holdout x5 >= 57/60 and real x5 >= 57/60, zero fabricated citations, zero unparsed replies; Main hand-inspects real
-replies; routing >= 34/36 tagged summarize_files and identical across 3 runs (the locate-and-quote tagging of the 19 chores
-is settled in this lane: either the router's shape text sends them to summarize_files, or the bar's routing item is
-rewritten by the owner, never silently).
+## Bar (meaning bar, owner direction 2026-11-09: "re-score the runs both ways, then grade on meaning")
+The strict checker (`tools/qual/summarize_check.py`) grades format as well as content; on the tune split it passed 1-3
+of 12 where a blind meaning grade passed 4-7 (bench-results/ls1c-2026-11-09/meaning/scores.txt). The bar is now graded
+on meaning, with the rubric in bench-results/ls1c-2026-11-09/meaning/RUBRIC.md (amendment 1 included):
+- **Precision (hard):** zero `wrong` lines and zero `unsupported` lines across every reply (no false claim, no citation
+  that does not show its claim), and zero unparsed replies.
+- **Recall:** overall >= 90% of reference facts met, and every chore >= 80% (`ceil(0.8 n)`) in every run.
+- **Splits:** holdout x5 and real x5 both meet the above; Main hand-inspects real replies.
+- **Grader:** a judge independent of the model under test (never qwen grading qwen), calibrated against the 108 blind
+  grades in bench-results/ls1c-2026-11-09/meaning/ before its numbers count.
+- The strict checker stays as a diagnostic (it finds format drift cheaply) but no longer gates.
+- Routing: >= 34/36 tagged summarize_files and identical across 3 runs (the locate-and-quote tagging of the 19 chores
+  is settled in this lane: either the router's shape text sends them to summarize_files, or the bar's routing item is
+  rewritten by the owner, never silently).
 
 ## Probe artifacts
 bench-results/s2-2026-11-09/: run.sh, run2.sh, run3.sh, run4.sh, pi-prep.py, structured_probe.py, prompt-*.txt, every

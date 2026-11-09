@@ -140,6 +140,31 @@ class PlaceholderUseTests(unittest.TestCase):
         self.hook("Stop", None, {})
         self.assertEqual(self.peek()["grants"][CLERK], "granted")  # an approval the user gave survives the turn
 
+    def test_a_turn_end_drops_only_the_askers_grants_and_commands(self):
+        """The main agent's Stop must not break a background subagent's live ask: its grant and its recorded command stay until its own
+        SubagentStop; the main agent's own rejected ask is dropped by Stop as before."""
+        other = "<REDACTED:" + "stripe_secret_key_1" + ">"
+        theirs_call = self.call()
+        theirs = self.bash("printf %s {} | wc -c".format(CLERK), theirs_call, agent_id="X")
+        self.assertEqual((self.request()["agent_id"], self.request()["call"]), ("X", theirs_call))
+        mine = self.bash("printf %s {} | wc -c".format(other))  # one permission-request.json per task: this overwrites X's
+        self.assertEqual(self.peek()["agents"], {theirs_call: "X"})
+        for ending, extra in (("Stop", {}), ("UserPromptSubmit", {}), ("SubagentStop", {"agent_id": "Y"})):
+            self.assertIsNone(self.hook(ending, None, {}, **extra))
+            self.assertEqual(self.peek()["grants"][CLERK], "pending", ending)
+            self.assertIn(theirs_call, self.peek()["runs"], ending)
+        self.assertNotIn(other, self.peek().get("grants", {}), "the main agent's own rejected ask is dropped by Stop")
+        self.assertIn("exit-code: 126", self.run_wrapped(mine).stdout)
+        self.assertIsNone(self.hook("SubagentStop", None, {}, agent_id="X"))
+        self.assertNotIn(CLERK, self.peek().get("grants", {}))
+        self.assertNotIn(theirs_call, self.peek().get("runs", {}))
+        self.assertIn("exit-code: 126", self.run_wrapped(theirs).stdout)
+
+    def test_a_subagent_stop_without_an_agent_is_ignored(self):
+        self.bash("printf %s {} | wc -c".format(CLERK))
+        self.assertIsNone(self.hook("SubagentStop", None, {}))
+        self.assertEqual(self.peek()["grants"][CLERK], "pending")
+
     def test_wrapper_runs_only_the_recorded_command_once(self):
         call = self.call()
         out = self.bash("printf %s {} | wc -c".format(CLERK), call)

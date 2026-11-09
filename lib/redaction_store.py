@@ -89,11 +89,17 @@ class Store:
         except (OSError, ValueError):
             return self.data
 
-    def record_use(self, call, names, status, command=None):
+    def record_use(self, call, names, status, command=None, agent=None):
         """Note that tool call `call` uses `names`; call inside locked(). Grants never downgrade.
 
-        `command` is the Bash command the hook wrapped: tp-secret-exec runs only a command recorded here, once."""
+        `command` is the Bash command the hook wrapped: tp-secret-exec runs only a command recorded here, once.
+        `agent` is the subagent (agent_id) that made the call; absent for the main agent. drop_pending reads it."""
         grants, calls = self.data.setdefault("grants", {}), self.data.setdefault("calls", {})
+        if agent:
+            agents = self.data.setdefault("agents", {})
+            agents[call] = str(agent)
+            for old in list(agents)[:-200]:
+                del agents[old]
         for name in names:
             if grants.get(name) != "granted":
                 grants[name] = status
@@ -125,6 +131,7 @@ class Store:
             return
         with self.locked():
             self.data.get("runs", {}).pop(call, None)  # ran (and was claimed) or refused: either way it is spent
+            self.data.get("agents", {}).pop(call, None)
             grants = self.data.setdefault("grants", {})
             for name in self.data.get("calls", {}).get(call, []):
                 if grants.get(name) == "pending":
@@ -133,16 +140,26 @@ class Store:
                     else:
                         del grants[name]
 
-    def drop_pending(self):
-        """Drop every pending grant. Call only when no tool call can be awaiting approval (the turn ended, or the
-        user sent a new prompt); this covers a rejected ask that fired no PermissionDenied."""
+    def drop_pending(self, agent=""):
+        """Drop the pending grants and recorded commands of calls made by `agent` ("" is the main agent). Call only when
+        that agent has no tool call awaiting approval (its turn ended, or the user sent a new prompt); this covers a
+        rejected ask that fired no PermissionDenied. A background subagent's own live ask is left alone: its calls are
+        in `agents`. Calls recorded before `agents` existed, and grants no call names, count as the main agent's."""
         data = self.peek()
         if "pending" not in data.get("grants", {}).values() and not data.get("runs"):
             return
+        agent = str(agent or "")
         with self.locked():
-            self.data.pop("runs", None)  # nothing is in flight, so no recorded command may run any more
+            agents, calls, runs = self.data.get("agents", {}), self.data.get("calls", {}), self.data.get("runs", {})
+            mine = lambda call: str(agents.get(call) or "") == agent
+            other_live = {n for call, names in calls.items() if not mine(call) and call in runs for n in names}
+            named = {n for names in calls.values() for n in names}
+            ours = {n for call, names in calls.items() if mine(call) for n in names} | (set() if agent else
+                    set(self.data.get("grants", {})) - named)
+            for call in [c for c in runs if mine(c)]:
+                del runs[call]  # nothing of this agent is in flight, so no command it recorded may run any more
             grants = self.data.setdefault("grants", {})
-            for name in [n for n, status in grants.items() if status == "pending"]:
+            for name in [n for n, status in grants.items() if status == "pending" and n in ours and n not in other_live]:
                 del grants[name]
 
 

@@ -181,6 +181,11 @@ class TpRouteTests(Base):
         out = json.loads(self.tp_route("--role", "coder", stdin="Close one hole in lib/sensitive_read.py and run its tests.").stdout)
         self.assertEqual((out["level"], out["effort"], out["model"]), ("mid", "high", SONNET))
         self.assertTrue(any(step.startswith("protected path lib/sensitive_read.py") for step in out["steps"]), out["steps"])
+        # command_wrappers.py is the sensitive-read rule's wrapper lists, so a task that names it gets the same floor
+        self.stubs.set({"claude": [{"text": reply(2, "low", "none", "small_edit", "small")}]})
+        out = json.loads(self.tp_route("--role", "coder", stdin="Add a wrapper to lib/command_wrappers.py and run its tests.").stdout)
+        self.assertEqual((out["level"], out["effort"], out["model"]), ("mid", "high", SONNET))
+        self.assertIn("protected path lib/command_wrappers.py: effort high", out["steps"])
         # the same small edit elsewhere is held at mid too: the coder floor has no waiver
         self.stubs.set({"claude": [{"text": reply(2, "low", "none", "small_edit", "small")}]})
         out = json.loads(self.tp_route("--role", "coder", stdin="Fix the usage text in bin/tp-list and run its test.").stdout)

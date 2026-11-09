@@ -129,6 +129,7 @@
   },
   "protected_paths": [
     {"pattern": "lib/sensitive_read.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "lib/command_wrappers.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "bin/tp-sensitive-read", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "lib/redact*.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "lib/redaction_store.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},

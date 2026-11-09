@@ -255,7 +255,12 @@ class EffortTests(unittest.TestCase):
         r = R(D("small", "low", shape="small_edit"), role="coder", paths=guard)
         self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
         self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
-        self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
+        # command_wrappers.py decides what counts as a sensitive read, so it is held to the same floor as the guard it was split from.
+        r = R(D("small", "low", shape="small_edit"), role="coder", paths=["lib/command_wrappers.py"])
+        self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
+        self.assertIn("protected path lib/command_wrappers.py: effort high", r["steps"])
+        entries = {e["pattern"]: e for e in CAT["protected_paths"]}
+        self.assertEqual(entries["lib/command_wrappers.py"], dict(entries["lib/sensitive_read.py"], pattern="lib/command_wrappers.py"))
         # An absolute path, a glob pattern and a hooks file all match.
         for path in ("/repo/bin/tp-sensitive-read", "lib/redact_hook.py", "claude/plugins/tmux-pi/hooks/hooks.json"):
             with self.subTest(path=path):

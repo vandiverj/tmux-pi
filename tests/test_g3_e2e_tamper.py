@@ -6,12 +6,15 @@ offers has a row, every row names text that really is in the passing flow's asse
 row (or is in UNTAMPERED with the test that covers it instead). The leftover cases leave something on purpose that the leftover check must name."""
 import g3_e2e_support as support  # first: it imports session_env, which drops the caller's session
 
+import json
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
 from g3_e2e_support import Base, Parallel, g3, records
 
-setUpModule, tearDownModule = support.set_up_module, support.tear_down_module
+setUpModule = support.set_up_module
 
 TAMPER_EXPECT = {
     "not-git": ("setup", "the repository is a git checkout"),
@@ -19,6 +22,9 @@ TAMPER_EXPECT = {
     "on-scratch-branch": ("setup", "is not the scratch branch"),
     "integration-exists": ("setup", "scratch integration branch does not exist yet"),
     "lane-branch-exists": ("setup", "no lane branch of this name exists"),
+    "lane-record-exists": ("setup", "no lane record of this name exists"),
+    "worktree-exists": ("setup", "no worktree of this name exists"),
+    "session-exists": ("setup", "no tmux session of this name exists"),
     "dispatch-id": ("dispatch", "dispatch returned a task id"),
     "dispatch-queued": ("dispatch", "started, not queued"),
     "dispatch-meta": ("dispatch", "meta.json names the lane and step"),
@@ -68,20 +74,32 @@ TAMPER_EXPECT = {
     "session-kept": ("leftovers", "tmux session is gone"),
 }
 LEFT = {      # a thing left on purpose -> how the leftover check must name it
-    "leftover-worktree": "worktree ", "leftover-branch": "branch left-g3-smoke", "leftover-lane-record": "lane record ", "leftover-pane": "sa:g3-left",
+    "leftover-worktree": "worktree ", "leftover-branch": "branch left-g3-", "leftover-lane-record": "lane record ", "leftover-pane": "sa:g3-left",
 }
 UNCLEANABLE = ("leftover-worktree", "leftover-branch", "leftover-lane-record")   # not made by the run's own steps: the cleanup reports them, never removes them
+COLLISIONS = ("integration-exists", "lane-branch-exists", "lane-record-exists", "worktree-exists", "session-exists")   # found, not made: they must survive
 UNTAMPERED = {
     "the leftover probes ran to the end": "tests/test_g3_e2e.py BoundedTest (a probe that hangs is a recorded error, and this check fails on it)",
 }
 WAITS = ["--prompt-wait", "4", "--settle-wait", "4", "--review-wait", "4"]      # the never-settles cases wait this long, not minutes
 CASES = {"flow": []}
-CASES.update({f"tamper-{name}": ["--tamper", name, *WAITS] for name in g3.TAMPERS})
+CASES.update({f"tamper-{name}": ["--tamper", name, *WAITS, *(["--keep"] if name in COLLISIONS else [])] for name in g3.TAMPERS})   # --keep: the temp repo stays, to be inspected
 _PARALLEL = Parallel(CASES, workers=16)
 
 
 def results():
     return _PARALLEL()
+
+
+def tear_down_module():
+    for name in COLLISIONS:       # the collision runs kept their temp directory (--keep) for the survival checks
+        value = _PARALLEL.done.get(f"tamper-{name}")
+        if value and value[1].get("tmp"):
+            shutil.rmtree(value[1]["tmp"], ignore_errors=True)
+    support.tear_down_module()
+
+
+tearDownModule = tear_down_module
 
 
 class TamperTest(Base):
@@ -114,9 +132,9 @@ class TamperTest(Base):
                 self.assertIn(f"step '{step}'", err)
                 self.assertIn(text, summary["error"])
                 self.assertTrue(summary["cleanup"]["ran"])
-                self.assertFalse(Path(summary["repo"]).exists())
+                self.assertEqual(Path(summary["repo"]).exists(), name in COLLISIONS)      # a collision run keeps its repo (--keep) to be inspected
                 self.assertFalse(Path(summary["tmux_tmpdir"]).exists())
-                if name not in UNCLEANABLE:
+                if name not in UNCLEANABLE + COLLISIONS:
                     self.assert_clean(summary)
 
     def test_a_real_leftover_is_named_by_the_check_and_by_the_final_report(self):
@@ -130,7 +148,53 @@ class TamperTest(Base):
 
     def test_a_session_left_alive_is_named(self):
         _, summary, _, _ = results()["tamper-session-kept"]
-        self.assertIn("in session g3-smoke-", summary["error"])
+        self.assertIn(f"in session {summary['run']}", summary["error"])
+
+    def git(self, summary, *args):
+        return subprocess.run(["git", "-C", summary["repo"], *args], text=True, capture_output=True, timeout=60).stdout.strip()
+
+    def test_a_name_already_taken_is_refused_and_what_was_found_survives(self):
+        """F2 (round 3): setup refuses before it makes anything, and the cleanup removes only what the run made, so the colliding resource is
+        still there afterwards, unchanged. The collision runs kept their temp repo (--keep) so this can look."""
+        for name in COLLISIONS:
+            with self.subTest(tamper=name):
+                _, summary, err, _ = results()[f"tamper-{name}"]
+                self.assertEqual(summary["failed_step"], "setup")
+                self.assertEqual(summary["made"], {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None})
+                self.assertEqual(summary["cleanup"]["errors"], [], "the cleanup removed nothing, so there was nothing for it to fail at")
+                self.assertTrue(Path(summary["repo"]).is_dir())
+        # the integration branch that was already there: present, still at the commit it was made at
+        _, summary, _, _ = results()["tamper-integration-exists"]
+        self.assertEqual(self.git(summary, "rev-parse", g3.INTEGRATION), self.git(summary, "rev-parse", "main"))
+        # someone's lane branch holding a commit that is on no other branch: present at that commit
+        _, summary, _, _ = results()["tamper-lane-branch-exists"]
+        branch = f"lane/{summary['run']}"
+        self.assertEqual(self.git(summary, "log", "-1", "--format=%s", branch), g3.FOREIGN_COMMIT)
+        sha = self.git(summary, "rev-parse", branch)
+        self.assertNotEqual(sha, self.git(summary, "rev-parse", "main"))
+        self.assertEqual(self.git(summary, "branch", "--contains", sha, "--format=%(refname:short)").split(), [branch])
+        self.assertTrue(any(f"branch {branch}" in line for line in summary["cleanup"]["leftovers"]), "reported as a leftover, not removed")
+        # someone's lane record: the same file with the same content
+        _, summary, _, _ = results()["tamper-lane-record-exists"]
+        common = (Path(summary["repo"]) / self.git(summary, "rev-parse", "--git-common-dir")).resolve()
+        record = common / ("tmux" + "-pi") / "lanes" / summary["run"] / "lane.json"
+        self.assertEqual(json.loads(record.read_text()), g3.FOREIGN_LANE)
+        self.assertTrue(any("lane record" in line for line in summary["cleanup"]["leftovers"]))
+        # a registered worktree of the name: still registered, its directory still there
+        _, summary, _, _ = results()["tamper-worktree-exists"]
+        foreign = (Path(summary["tmp"]) / f"foreign-{summary['run']}").resolve()
+        self.assertTrue(foreign.is_dir())
+        self.assertIn(f"worktree {foreign}", self.git(summary, "worktree", "list", "--porcelain"))
+        self.assertTrue(any(line.startswith("worktree ") for line in summary["cleanup"]["leftovers"]))
+
+    def test_a_session_of_the_name_that_already_exists_survives_with_its_panes(self):
+        _, summary, err, _ = results()["tamper-session-exists"]
+        self.assertEqual(summary["failed_step"], "setup")
+        self.assertFalse(summary["made"]["session"])
+        calls = [c["argv"] for c in records() if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"]]
+        self.assertFalse([a for a in calls if "kill-session" in a or "kill-pane" in a], "the run killed nothing")
+        # the leftover list is taken after the cleanup's own actions and before the private server is stopped: session and pane were still there
+        self.assertTrue(any(line.startswith("pane ") and f"in session {summary['run']}" in line for line in summary["cleanup"]["leftovers"]), summary["cleanup"])
 
     def test_the_passing_flow_is_clean(self):
         rc, summary, err, _ = results()["flow"]

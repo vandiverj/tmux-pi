@@ -40,8 +40,19 @@ for a in "$@"; do
     [ "$1" = -L ] && case "$2" in g3-*) ;; *) echo "shim: kill-server on $2" >&2; echo violation >> "$G3_SHIM_LOG.bad"; exit 99 ;; esac || { echo "shim: kill-server without -L" >&2; echo violation >> "$G3_SHIM_LOG.bad"; exit 99; }
   fi
 done
-# G3_SHIM_HANG: space-separated subcommands (the word after -L <socket>) that hang instead of running
-case " $G3_SHIM_HANG " in *" $3 "*) exec sleep 600 ;; esac
+# Failure injection. Each variable is a space-separated list of subcommands (the word after -L <socket>); G3_SHIM_MATCH, when set, narrows every
+# one of them to calls whose arguments contain that text (e.g. "-s g3-" is the run's own session, not the "anchor" one).
+#   G3_SHIM_RIVAL: before the call, another party makes a session of the call's -s name, marked @g3_run=rival (a race lost by the run)
+#   G3_SHIM_HANG : the call hangs instead of running
+#   G3_SHIM_AFTER: the call runs (the tmux server did it) and then the client hangs, so the caller sees a timeout
+listed() { [ -n "$1" ] && case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
+M=0; case " $* " in *"$G3_SHIM_MATCH"*) M=1 ;; esac
+if [ $M = 1 ] && listed "$G3_SHIM_RIVAL" "$3"; then
+  name=; prev=; for a in "$@"; do [ "$prev" = -s ] && name=$a; prev=$a; done
+  "$G3_REAL_TMUX" -L "$2" new-session -d -s "$name" "sleep 600" \\; set-option -t "=$name:" @g3_run rival >/dev/null 2>&1
+fi
+if [ $M = 1 ] && listed "$G3_SHIM_HANG" "$3"; then exec sleep 600; fi
+if [ $M = 1 ] && listed "$G3_SHIM_AFTER" "$3"; then "$G3_REAL_TMUX" "$@" >/dev/null 2>&1; exec sleep 600; fi
 exec "$G3_REAL_TMUX" "$@"
 '''
 
@@ -124,6 +135,7 @@ class Base(unittest.TestCase):
         self.assertTrue(summary["cleanup"]["ran"])
         self.assertEqual(summary["cleanup"]["errors"], [])
         self.assertEqual(summary["cleanup"]["leftovers"], [])
+        self.assertEqual(summary["cleanup"]["kept"], [])
         self.assertFalse(Path(summary["repo"]).exists())
         self.assertFalse(Path(summary["tmux_tmpdir"]).exists())
 

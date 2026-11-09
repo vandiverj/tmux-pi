@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -33,14 +34,19 @@ STEPS = ("setup", "dispatch", "prompt", "decline", "retry", "review", "close", "
 SESSION_VARS = ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_MAIN_ID", "TP_MAIN_CWD", "TP_TRIAL_ID", "TP_SESSION", "TP_STATE_DIR", "TP_WORK_DIR")
 FILE = "G3_SMOKE.md"
 # The permission prompt: one Bash command whose ask is decided by code (lib/redact_hook.py in redaction "on"; lib/sensitive_read.py in
-# "shadow" and "off"), not by the model. It names a dotenv-shaped file that does not exist and an unset variable with a secret-shaped name,
-# and has an `exit` so the redaction hook cannot wrap it. Nothing can be read. Built from pieces so this file names no credential.
+# "shadow" and "off"), not by the model. It is harmless when accepted, by construction and whatever exists on disk or in the environment:
+# it runs only the no-op builtin `:` and `exit`. `:` opens nothing and prints nothing; the two operands are only text for the hooks to
+# match (a dotenv-shaped name, and a secret-shaped variable name in single quotes, so the shell does not even expand it). The `exit` keeps
+# the redaction hook from wrapping the command, which is what makes it ask. Built from pieces so this file names no credential.
 ABSENT = "." + "env." + "g3-smoke-absent"
 SECRET_VAR = "G3_SMOKE_" + "API_" + "TOKEN"
-PROMPT_COMMAND = f'cat ./{ABSENT} "${SECRET_VAR}"; exit 3'
+PROMPT_COMMAND = f": ./{ABSENT} '${SECRET_VAR}'; exit 3"
 STEP_ID = "s1"
 INTEGRATION = "lane/integrate"      # the tool's own default integration branch; the scratch branch of the run
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@invalid", "GIT_COMMITTER_NAME": "g3-smoke", "GIT_COMMITTER_EMAIL": "g3-smoke@invalid"}
+MARKER = "@g3_run"      # the tmux session option that says which run made a session (set in the same tmux call that creates it)
+FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
+FOREIGN_LANE = {"state": "open", "note": "someone else's lane record; the smoke run must leave it exactly as it is"}
 PLAN = {"review": "required", "policy": "required",   # the --fake tp-route: what `tp-route --review-plan` prints
         "reviewer": {"worker": "pi", "model": "openai/gpt-6-sol", "thinking": "low", "independence": "different_provider"}}
 FAKE_REVIEW = """APPROVED
@@ -57,6 +63,7 @@ RESULT_STATUS: complete
 # The step each one fails at; tests/test_g3_e2e.py holds the check each must name.
 TAMPERS = {
     "not-git": "setup", "dirty-repo": "setup", "on-scratch-branch": "setup", "integration-exists": "setup", "lane-branch-exists": "setup",
+    "lane-record-exists": "setup", "worktree-exists": "setup", "session-exists": "setup",
     "dispatch-id": "dispatch", "dispatch-queued": "dispatch", "dispatch-meta": "dispatch", "dispatch-pane": "dispatch",
     "dispatch-lane": "dispatch", "dispatch-worktree": "dispatch",
     "no-prompt": "prompt", "prompt-no-reason": "prompt",
@@ -78,9 +85,27 @@ TAMPERS = {
 class SmokeError(Exception):
     """A failed step. `step` is the step's name; `rc` the return code of the command that failed, when one did."""
 
-    def __init__(self, step, message, rc=1):
+    def __init__(self, step, message, rc=1, timed_out=False):
         super().__init__(f"step '{step}': {message}")
-        self.step, self.message, self.rc = step, message, rc
+        self.step, self.message, self.rc, self.timed_out = step, message, rc, timed_out
+
+
+BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def base36(number):
+    out = ""
+    while True:
+        number, digit = divmod(number, 36)
+        out = BASE36[digit] + out
+        if not number:
+            return out
+
+
+def new_run_id():
+    """A run id that two runs cannot share: the time (minute), the process id and 24 random bits, as `MMDDHHMM-<pid>-<random>`. A lane name
+    is at most 24 characters (lanes.valid_lane_name), and `g3-<run id>` is at most 24 (8 + 5 + 6 + 2 separators)."""
+    return f"{time.strftime('%m%d%H%M', time.gmtime())}-{base36(os.getpid())}-{secrets.token_hex(3)}"
 
 
 def now():
@@ -119,8 +144,12 @@ class Smoke:
         self.args = args
         self.fake = args.fake
         self.stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        self.name = f"g3-smoke-{self.stamp}"
-        self.line = f"g3 smoke {self.stamp}"
+        # Every name of this run (lane, branch, worktree, session, private socket) carries its run id: two runs started in the same second
+        # share none of them. The lane name is limited to 24 characters, so the id is compact (see new_run_id).
+        self.run_id = new_run_id()
+        self.name = f"g3-{self.run_id}"
+        assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,23}", self.name), f"not a valid lane name: {self.name}"
+        self.line = f"g3 smoke {self.stamp} {self.name}"
         self.expected = self.line + "\n"
         self.tmp = Path(tempfile.mkdtemp(prefix=f"{self.name}-")).resolve()
         self.state = self.tmp / "state"
@@ -131,14 +160,20 @@ class Smoke:
         # Isolation by construction. --fake never talks to the owner's tmux server: every subprocess gets its own TMUX_TMPDIR (a
         # fresh, short directory made here, before any tmux call; a unix socket path is limited to ~100 characters, so it is not
         # under self.tmp) and `-L <private socket>` is part of tmux_cmd from this line on, never added later.
-        self.sock = f"g3-{os.getpid()}-{self.stamp[-6:]}"
+        self.sock = f"g3-{os.getpid()}-{self.run_id.rsplit('-', 1)[-1]}"
         self.tmux_bin = shutil.which("tmux") or "tmux"
         self.tmux_tmp = Path(tempfile.mkdtemp(prefix="g3t-", dir="/tmp")).resolve() if self.fake else None
         self.tmux_cmd = [self.tmux_bin, "-L", self.sock] if self.fake else [self.tmux_bin]
-        self.session_made = False   # set when this run is about to create its tmux session; only then is the session killed by name
-        self.steps, self.cleanup_report = [], {"ran": False, "errors": [], "leftovers": []}
+        # Ownership: the cleanup removes only what this run made. A resource is recorded here only after its creation succeeded (or, for the
+        # lane, branch and worktree that the lane tool makes, after setup proved the name free and the resource is observed afterwards:
+        # `claim`). A definite refusal (a duplicate session, an existing branch) records nothing; a creation that timed out is indeterminate
+        # (`session_unsure`) and is settled by the session's marker (@g3_run = the run id, set in the same tmux call that creates it).
+        self.made = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None}
+        self.session_unsure = False
+        self.clear = False          # setup verified that nothing of this run's name existed, before it made anything
+        self.kept = []              # found but not made by this run: reported as leftovers, never removed
+        self.steps, self.cleanup_report = [], {"ran": False, "errors": [], "leftovers": [], "kept": self.kept}
         self.step_name, self.asserted, self.commands = None, [], []
-        self.made_integration = False
         self.ids = {}             # first, retry, reviewer task ids
         self.facts = {}
         self.started = time.monotonic()
@@ -166,7 +201,7 @@ class Smoke:
             run = bounded([str(a) for a in argv], timeout, cwd=str(cwd or self.repo or self.tmp), env=env or self.env(), stdin=stdin)
         except subprocess.TimeoutExpired:
             self.commands.append({"cmd": label, "rc": None, "seconds": round(time.monotonic() - t0, 2)})
-            raise SmokeError(self.step_name, f"`{label}` did not finish within {timeout:g} s") from None
+            raise SmokeError(self.step_name, f"`{label}` did not finish within {timeout:g} s", timed_out=True) from None
         self.commands.append({"cmd": label, "rc": run.returncode, "seconds": round(time.monotonic() - t0, 2)})
         if run.returncode not in rc_ok:
             tail = (run.stderr.strip() or run.stdout.strip())[-600:]
@@ -280,10 +315,20 @@ class Smoke:
             self.git("branch", INTEGRATION, "HEAD")
         elif self.tamper("on-scratch-branch"):
             self.git("checkout", "-q", "-b", INTEGRATION)
-        elif self.tamper("lane-branch-exists"):
-            self.git("branch", f"lane/{self.name}", "HEAD")
+        elif self.tamper("lane-branch-exists"):      # someone's branch with a commit that is on no other branch: deleting it loses the commit
+            tree = self.git("rev-parse", "HEAD^{tree}")
+            self.git("branch", f"lane/{self.name}", self.git("commit-tree", tree, "-p", "HEAD", "-m", FOREIGN_COMMIT, identity=True))
+        elif self.tamper("lane-record-exists"):
+            record = (repo / self.git("rev-parse", "--git-common-dir")).resolve() / "tmux-pi" / "lanes" / self.name / "lane.json"
+            record.parent.mkdir(parents=True)
+            record.write_text(json.dumps(FOREIGN_LANE) + "\n")
+        elif self.tamper("worktree-exists"):
+            self.git("worktree", "add", "-q", "--detach", str(self.tmp / f"foreign-{self.name}"), "HEAD")
+        elif self.tamper("session-exists"):
+            self.tmux("new-session", "-d", "-s", self.name, "sleep 600")
 
     def step_setup(self):
+        """Every collision check comes before anything is made: a name already taken is refused, and what was found is left alone."""
         if self.fake:
             self.fake_setup()
             self.break_repo()
@@ -296,9 +341,15 @@ class Smoke:
         self.check("the repository's own branch is not the scratch branch", branch != INTEGRATION, branch)
         self.check("the scratch integration branch does not exist yet",
                    self.git("rev-parse", "--verify", "-q", f"refs/heads/{INTEGRATION}", rc_ok=(0, 1)).returncode == 1, INTEGRATION)
-        self.check("no lane branch of this name exists", self.git("rev-parse", "--verify", "-q", f"refs/heads/lane/{self.name}", rc_ok=(0, 1)).returncode == 1)
+        self.check("no lane branch of this name exists", self.git("rev-parse", "--verify", "-q", f"refs/heads/lane/{self.name}", rc_ok=(0, 1)).returncode == 1,
+                   f"lane/{self.name}")
+        self.check("no lane record of this name exists", not self.lane_path().parent.exists(), str(self.lane_path().parent))
+        registered = [line for line in self.git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ") and self.name in Path(line[9:]).name]
+        self.check("no worktree of this name exists", not registered, registered)
+        self.check("no tmux session of this name exists", self.tmux("has-session", "-t", f"={self.name}", rc_ok=(0, 1)).returncode == 1, self.name)
+        self.clear = True            # nothing of this name existed: what appears under it from here on was made by this run
         self.git("branch", INTEGRATION, "HEAD")
-        self.made_integration = True
+        self.made["integration"] = True       # recorded after the branch exists, not before
         self.facts["integration_base"] = self.facts["main_head"]
         self.start_session()
 
@@ -308,10 +359,13 @@ class Smoke:
         self.facts["task"] = task
         first_task = (f"Before anything else, run exactly this one Bash command, unchanged, once: {PROMPT_COMMAND}\n"
                       f"(it names a file that does not exist; if the owner declines it, stop and wait for instructions). Then: {task}")
-        item = self.agent_json("dispatch", "--role", "coder", "--lane", self.name, "--step", STEP_ID, "--repo", self.repo,
-                               "--domain", "g3 smoke: one added file", "--touches", FILE, "--worker", "claude",
-                               "--model", self.args.coder_model, "--thinking", self.args.coder_thinking, "--tests", "none",
-                               "--deliverable", "the added file", "--task", first_task)
+        try:
+            item = self.agent_json("dispatch", "--role", "coder", "--lane", self.name, "--step", STEP_ID, "--repo", self.repo,
+                                   "--domain", "g3 smoke: one added file", "--touches", FILE, "--worker", "claude",
+                                   "--model", self.args.coder_model, "--thinking", self.args.coder_thinking, "--tests", "none",
+                                   "--deliverable", "the added file", "--task", first_task)
+        finally:
+            self.claim()          # the dispatch made the lane (record, branch, worktree) under a name setup proved free, or failed part way: record what exists
         ident = item.get("id", "")
         self.ids["first"] = ident
         meta_path = self.task_dir(ident) / "meta.json"
@@ -549,7 +603,7 @@ class Smoke:
         problems = self.leftovers(session_alive=True, errors=errors)
         self.check("the leftover probes ran to the end", not errors, errors)
         self.check("no worktree, branch, lane record or worker pane of this run is left", not problems, problems)
-        if self.session_made and not self.tamper("session-kept"):
+        if self.made["session"] and not self.tamper("session-kept"):
             self.tmux("kill-session", "-t", f"={self.name}", rc_ok=(0, 1))     # the run's own session, by its own name
         again = self.leftovers(session_alive=False, errors=errors)
         self.check("the run's tmux session is gone and no pane of it remains", not again and not errors, again or errors)
@@ -628,19 +682,46 @@ esac
     def start_session(self):
         """The run's own tmux session, with the two options tp-spawn reads. --fake: on a private server behind the wrapper."""
         cwd = str(self.repo)
-        self.session_made = True    # set first: a new-session that timed out may still have made the session, and the cleanup then kills it by name
         if self.fake:
             self.tmux("new-session", "-d", "-s", "anchor", "sleep 600")
-        self.tmux("new-session", "-d", "-s", self.name, "-c", cwd, "sleep 7200")
-        if not self.fake:                   # the wrapper answers these two in --fake
+        # One tmux call makes the session and marks it as this run's (the `;` runs set-option only if new-session succeeded), so the marker
+        # exists exactly when this run made the session. Ownership is recorded after the call succeeded, never before:
+        #  - a definite refusal (rc != 0, e.g. "duplicate session") means the run never owned it: nothing is recorded, nothing is killed;
+        #  - a timeout is indeterminate (the session may or may not exist): `session_unsure`, settled by the cleanup from the marker.
+        try:
+            self.tmux("new-session", "-d", "-s", self.name, "-c", cwd, "sleep 7200", ";", "set-option", "-t", f"={self.name}:", MARKER, self.run_id)
+        except SmokeError as error:
+            self.session_unsure = error.timed_out or "duplicate session" not in error.message     # only a plain duplicate is a definite refusal
+            raise
+        self.made["session"] = True
+        if not self.fake:                 # the wrapper answers these two in --fake
             pane = self.tmux("list-panes", "-t", f"={self.name}:", "-F", "#{pane_id}").stdout.split()[0]
             self.tmux("set-option", "-t", f"={self.name}:", "@tp_state_dir", str(self.state))
             self.tmux("set-option", "-t", f"={self.name}:", "@tp_main_pane", pane)
 
+    # ---- ownership -----------------------------------------------------------------------------------------------------
+    def claim(self):
+        """Record what the lane tool made. Setup proved the lane's names free (`clear`) before anything was made, and every name carries the
+        run id, so a lane record, a lane branch or a worktree under this run's name that exists now was made by this run. Without that proof
+        nothing is claimed: whatever is found stays, and the leftover report names it."""
+        if not (self.clear and self.facts.get("common")):
+            return
+        try:
+            if self.lane_path().exists():
+                self.made["lane"] = True
+            if self.git("rev-parse", "--verify", "-q", f"refs/heads/lane/{self.name}", rc_ok=(0, 1)).returncode == 0:
+                self.made["lane_branch"] = True
+            worktree = (self.lane_json() or {}).get("worktree")
+            if worktree and self.name in Path(worktree).name and Path(worktree).is_dir():
+                self.made["worktree"] = str(worktree)
+        except SmokeError:
+            pass              # a probe that failed claims nothing: the resource stays, and the leftover check reports it
+
     # ---- cleanup -------------------------------------------------------------------------------------------------------
     def cleanup(self):
-        """Always runs. Each action is tried on its own and is bounded; what could not be undone (an error, a timeout) is reported,
-        never raised, and the next action still runs."""
+        """Always runs, and removes only what this run made (`self.made`). Each action is tried on its own and is bounded; what could not
+        be undone (an error, a timeout) is reported, never raised, and the next action still runs. What the run found and did not make is
+        reported (`kept`, and the leftover list) and left in place."""
         report = self.cleanup_report
         report["ran"] = True
 
@@ -652,34 +733,67 @@ esac
             except Exception as error:  # noqa: BLE001 - a cleanup step must not stop the next one (a timeout included)
                 report["errors"].append(f"{what}: {type(error).__name__}: {str(error)[:200]}")
 
-        long = self.sub_timeout * 2
-        tasks = self.state / "tasks"
-        if tasks.is_dir():           # live and fake alike: only the panes this run's tasks recorded, by id
-            for task in tasks.iterdir():
-                pane = str((self.read(task / "meta.json", {}) or {}).get("pane") or "")
-                if re.fullmatch(r"%\d+", pane):
-                    attempt(f"kill pane {pane}", lambda pane=pane: self.quiet([*self.tmux_cmd, "kill-pane", "-t", pane]), ok=(0, 1))
-        if self.session_made:        # only the session this run created, by its own full name
-            attempt("kill session", lambda: self.quiet([*self.tmux_cmd, "kill-session", "-t", f"={self.name}"]), ok=(0, 1))
-        if self.repo and self.facts.get("common"):
-            lane_dir = Path(self.facts["common"]) / "tmux-pi" / "lanes" / self.name
-            wt = self.facts.get("worktree")
-            if lane_dir.exists() and wt and self.name in Path(wt).name and Path(wt).is_dir():   # this run's own tree: drop what it left, so remove does not refuse
-                attempt("clean the lane worktree (reset)", lambda: self.quiet(["git", "-C", wt, "reset", "--hard", "-q"], timeout=long))
-                attempt("clean the lane worktree (clean)", lambda: self.quiet(["git", "-C", wt, "clean", "-fdxq"], timeout=long))
-            if lane_dir.exists():
-                attempt("lane remove --abandon", lambda: self.quiet([self.root / "bin/tp-agent", "lane", "remove", self.name, "--abandon", "--repo", self.repo], timeout=long))
-            # This run's worktree only, by its path. No `git worktree prune`: that would also drop other registrations of the repository.
-            if wt and self.name in Path(wt).name:
-                attempt("git worktree remove", lambda: self.quiet(["git", "-C", self.repo, "worktree", "remove", "--force", wt], timeout=long), ok=(0, 128))
-            attempt("delete the lane branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", f"lane/{self.name}"], timeout=long), ok=(0, 1))
-            if self.made_integration:
-                attempt("delete the scratch integration branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", INTEGRATION], timeout=long), ok=(0, 1))
+        self.cleanup_tmux(attempt)
+        self.cleanup_git(attempt)
         if self.repo:
             try:
                 report["leftovers"] = self.leftovers(session_alive=False, errors=report["errors"])
             except Exception as error:  # noqa: BLE001
                 report["errors"].append(f"leftover check: {type(error).__name__}: {str(error)[:200]}")
+        self.teardown_private(attempt)
+
+    def settle_session(self):
+        """A session creation that timed out is indeterminate. The session is this run's only if it carries this run's marker, read back
+        now; a session without it (a same-named session someone else made, or one made but not yet marked) is kept and reported."""
+        target = f"={self.name}"
+        if self.quiet([*self.tmux_cmd, "has-session", "-t", target]).returncode != 0:
+            return                      # it never appeared: nothing to kill
+        seen = self.quiet([*self.tmux_cmd, "show-options", "-t", f"{target}:", "-qv", MARKER]).stdout.strip()
+        if seen == self.run_id:
+            self.made["session"] = True
+        else:
+            self.kept.append(f"tmux session {self.name} carries marker {seen or '(none)'}, not this run's {self.run_id}: not killed")
+
+    def cleanup_tmux(self, attempt):
+        if self.session_unsure and not self.made["session"]:
+            attempt("settle the session whose creation did not finish", self.settle_session)
+        tasks = self.state / "tasks"
+        if self.made["session"] and tasks.is_dir():        # the panes this run's tasks recorded, by id, and only if they are in this run's session
+            def panes_of_session():
+                rows = self.quiet([*self.tmux_cmd, "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}"]).stdout.splitlines()
+                return {row.split("\t")[0] for row in rows if row.split("\t")[1:] == [self.name]}
+            try:
+                ours = panes_of_session()
+            except Exception as error:  # noqa: BLE001
+                self.cleanup_report["errors"].append(f"list the session's panes: {type(error).__name__}: {str(error)[:200]}")
+                ours = set()
+            for task in tasks.iterdir():
+                pane = str((self.read(task / "meta.json", {}) or {}).get("pane") or "")
+                if re.fullmatch(r"%\d+", pane) and pane in ours:
+                    attempt(f"kill pane {pane}", lambda pane=pane: self.quiet([*self.tmux_cmd, "kill-pane", "-t", pane]), ok=(0, 1))
+        if self.made["session"]:        # only a session this run made, by its own full name
+            attempt("kill session", lambda: self.quiet([*self.tmux_cmd, "kill-session", "-t", f"={self.name}"]), ok=(0, 1))
+
+    def cleanup_git(self, attempt):
+        if not (self.repo and self.facts.get("common")):
+            return
+        long = self.sub_timeout * 2
+        lane_dir = Path(self.facts["common"]) / "tmux-pi" / "lanes" / self.name
+        wt = self.made["worktree"]
+        if wt and Path(wt).is_dir():       # this run's own tree: drop what it left, so remove does not refuse
+            attempt("clean the lane worktree (reset)", lambda: self.quiet(["git", "-C", wt, "reset", "--hard", "-q"], timeout=long))
+            attempt("clean the lane worktree (clean)", lambda: self.quiet(["git", "-C", wt, "clean", "-fdxq"], timeout=long))
+        if self.made["lane"] and lane_dir.exists():
+            attempt("lane remove --abandon", lambda: self.quiet([self.root / "bin/tp-agent", "lane", "remove", self.name, "--abandon", "--repo", self.repo], timeout=long))
+        # This run's worktree only, by its path. No `git worktree prune`: that would also drop other registrations of the repository.
+        if wt:
+            attempt("git worktree remove", lambda: self.quiet(["git", "-C", self.repo, "worktree", "remove", "--force", wt], timeout=long), ok=(0, 128))
+        if self.made["lane_branch"]:
+            attempt("delete the lane branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", f"lane/{self.name}"], timeout=long), ok=(0, 1))
+        if self.made["integration"]:
+            attempt("delete the scratch integration branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", INTEGRATION], timeout=long), ok=(0, 1))
+
+    def teardown_private(self, attempt):
         if self.fake:
             attempt("stop the private tmux server", self.stop_private_server)
             attempt("remove the private tmux directory", lambda: shutil.rmtree(self.tmux_tmp, ignore_errors=True))
@@ -714,7 +828,7 @@ esac
             except Exception as error:  # noqa: BLE001 - the summary is written whatever the cleanup did
                 self.cleanup_report["errors"].append(f"cleanup: {type(error).__name__}: {str(error)[:200]}")
         ok = failure is None and not self.cleanup_report["errors"] and not self.cleanup_report["leftovers"]
-        summary = {"run": self.name, "mode": "fake" if self.fake else "live", "ok": ok, "repo": str(self.repo), "tmux_tmpdir": str(self.tmux_tmp) if self.tmux_tmp else None,
+        summary = {"run": self.name, "run_id": self.run_id, "made": self.made, "tmp": str(self.tmp), "mode": "fake" if self.fake else "live", "ok": ok, "repo": str(self.repo), "tmux_tmpdir": str(self.tmux_tmp) if self.tmux_tmp else None,
                    "socket": self.sock if self.fake else None, "started": self.stamp,
                    "failed_step": failure.step if failure else None, "error": failure.message if failure else None,
                    "seconds": round(time.monotonic() - self.started, 2), "steps": self.steps, "cleanup": self.cleanup_report,
@@ -751,6 +865,8 @@ def parse(argv):
     for flag, value in (("--tamper", args.tamper), ("--inject-failure", args.inject_failure)):
         if value and not args.fake:
             parser.error(f"{flag} is a --fake test hook: a live run would start real workers before it failed")
+    if args.tamper and args.repo:
+        parser.error("--tamper breaks records of the repository (it can delete .git): it runs only on the throwaway repository a --fake run makes, so not with --repo")
     return args
 
 

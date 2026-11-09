@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -123,11 +124,43 @@ class HookTriggerTest(Base):
     def request(self):
         return json.loads((self.task / "permission-request.json").read_text())
 
-    def test_the_trigger_names_nothing_that_exists(self):
-        self.assertFalse((self.repo / g3.ABSENT).exists())
-        self.assertNotIn(g3.SECRET_VAR, os.environ)
-        self.assertIn(g3.ABSENT, g3.PROMPT_COMMAND)
-        self.assertIn(g3.SECRET_VAR, g3.PROMPT_COMMAND)
+    def test_the_trigger_is_only_noop_builtins_with_operands(self):
+        """Harmless by construction: it parses to exactly `:` (with the two operands) and `exit 3`, joined by `;`. No other command, no
+        redirection, no substitution, no pipe or list operator."""
+        lex = shlex.shlex(g3.PROMPT_COMMAND, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+        commands, current = [], []
+        for token in tokens:
+            if set(token) <= set(";&|<>()"):
+                self.assertEqual(token, ";", f"an operator other than ';': {tokens}")
+                commands.append(current)
+                current = []
+            else:
+                current.append(token)
+        commands.append(current)
+        self.assertEqual([c[0] for c in commands], [":", "exit"], tokens)
+        self.assertEqual(commands[0][1:], [f"./{g3.ABSENT}", f"${g3.SECRET_VAR}"], "the operands are only text for the hooks to match")
+        self.assertEqual(commands[1], ["exit", "3"])
+        self.assertNotIn("`", g3.PROMPT_COMMAND)
+        self.assertNotIn("$(", g3.PROMPT_COMMAND)
+        self.assertIn(f"'${g3.SECRET_VAR}'", g3.PROMPT_COMMAND, "single quoted: the shell does not even expand it")
+
+    def test_accepting_the_trigger_is_harmless(self):
+        """The owner accepts the dialog: the exact command runs under bash. The dotenv-shaped file exists with sentinel content and the secret-shaped
+        variable is set to the path of another sentinel file; neither content nor path may come out, and the exit code is 3."""
+        file_sentinel, var_sentinel = "SENTINEL-" + "OF-THE-FILE-OPERAND", "SENTINEL-" + "OF-THE-VARIABLE-TARGET"
+        (self.repo / g3.ABSENT).write_text(file_sentinel + "\n")
+        target = self.base / "variable-target.txt"
+        target.write_text(var_sentinel + "\n")
+        env = {**os.environ, g3.SECRET_VAR: str(target)}
+        run = subprocess.run(["bash", "-c", g3.PROMPT_COMMAND], cwd=self.repo, env=env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(run.returncode, 3, run.stderr)
+        for seen in (run.stdout, run.stderr):
+            for secret in (file_sentinel, var_sentinel, str(target), g3.ABSENT):
+                self.assertNotIn(secret, seen)
+        self.assertEqual((run.stdout, run.stderr), ("", ""))
+        self.assertEqual((self.repo / g3.ABSENT).read_text(), file_sentinel + "\n", "the file was not touched")
 
     def test_the_worker_loads_both_hooks_for_every_tool(self):
         hooks = json.loads((ROOT / "claude/plugins/tmux-pi/hooks/hooks.json").read_text())["hooks"]
@@ -199,12 +232,12 @@ class PruneTest(Base):
     def test_an_unrelated_prunable_worktree_survives_a_run(self):
         rc, summary, err, _ = results()["f2"]
         self.assertEqual((rc, err), (0, ""), summary.get("error"))
-        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": []})
+        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
         listing = git(F2_REPO["path"], "worktree", "list", "--porcelain")
         self.assertIn(str(F2_REPO["other"]), listing, "the unrelated registration was pruned")
         block = listing[listing.index(f"worktree {F2_REPO['other']}"):].split("\n\n")[0]
         self.assertIn("prunable", block)
-        self.assertNotIn("g3-smoke", listing)
+        self.assertNotIn(summary["run"], listing)
         self.assertEqual(git(F2_REPO["path"], "branch", "--list", "lane/*").strip(), "")      # the run's lane branch and lane/integrate are gone
 
     def test_the_script_never_calls_prune(self):
@@ -233,6 +266,14 @@ class HookFlagsTest(Base):
                 self.assertEqual(run.returncode, 2)
                 self.assertIn("--fake test hook", run.stderr)
         self.assertEqual(records()[self.mark:], [])
+
+    def test_tamper_is_refused_on_a_repository_that_is_not_the_runs_own(self):
+        """The tampers edit the repository (`not-git` deletes .git): they run only on the throwaway repository a fake run makes."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            g3.parse(["--fake", "--out", "x", "--repo", str(support.WORK), "--tamper", "not-git"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not with --repo", err.getvalue())
 
     def test_accepted_with_fake(self):
         args = g3.parse(["--fake", "--out", "x", "--tamper", "lane-record", "--inject-failure", "close"])
@@ -265,8 +306,9 @@ class BoundedTest(Base):
         self.assertIn("did not finish within 2 s", summary["error"])
         self.assertTrue(summary["cleanup"]["ran"])
         errors = " | ".join(summary["cleanup"]["errors"])
-        self.assertIn("kill session: TimeoutExpired", errors)
         self.assertIn("leftover probe 'tmux list-panes' failed: TimeoutExpired", errors)
+        self.assertEqual(summary["made"]["session"], False, "the run's own session was never made (the call before it hung)")
+        self.assertFalse([c for c in records()[self.mark:] if "kill-session" in c["argv"]], "nothing was made, so nothing is killed")
         self.assertIn("cleanup: ", err)
         self.assertFalse(Path(summary["repo"]).exists(), "the rest of the cleanup ran")
         self.assertFalse(Path(summary["tmux_tmpdir"]).exists())
@@ -285,17 +327,95 @@ class BoundedTest(Base):
         (smoke.state / "tasks" / "coder-x" / "meta.json").write_text(json.dumps({"pane": pane}))
         smoke.facts["common"] = str((smoke.repo / git(smoke.repo, "rev-parse", "--git-common-dir").strip()).resolve())
         git(smoke.repo, "branch", g3.INTEGRATION)
-        smoke.made_integration = True
+        smoke.made["integration"] = True
         repo, tmux_tmp = smoke.repo, smoke.tmux_tmp
+        self.assertTrue(smoke.made["session"])
         with mock.patch.dict(os.environ, {"G3_SHIM_HANG": "kill-pane kill-session list-panes"}):
             smoke.cleanup()
         errors = " | ".join(smoke.cleanup_report["errors"])
-        for expected in (f"kill pane {pane}: TimeoutExpired", "kill session: TimeoutExpired", "leftover probe 'tmux list-panes' failed: TimeoutExpired"):
+        for expected in ("list the session's panes: TimeoutExpired", "kill session: TimeoutExpired", "leftover probe 'tmux list-panes' failed: TimeoutExpired"):
             self.assertIn(expected, errors)
+        self.assertNotIn("kill pane", errors, "a pane that could not be verified as the session's is not killed")
         self.assertNotIn("stop the private tmux server", errors)
         self.assertEqual(git(repo, "branch", "--list", g3.INTEGRATION).strip(), "", "the next cleanup action ran after the timeouts")
         self.assertFalse(tmux_tmp.exists())
         self.assertEqual(len([c for c in records()[self.mark:] if "kill-server" in c["argv"]]), 1)
+
+
+class SessionOwnershipTest(Base):
+    """F1 (round 3): the cleanup kills a tmux session only if this run made it. Fake mode, the recording shim, a real private tmux server.
+    The shim can make a rival session of the run's name (G3_SHIM_RIVAL), hang a call (G3_SHIM_HANG), or let the call succeed and then hang
+    the client (G3_SHIM_AFTER); G3_SHIM_MATCH='-s g3-' aims it at the run's own session and not at the "anchor" one."""
+
+    OWN = {"G3_SHIM_MATCH": "-s g3-"}
+
+    def run_with(self, **env):
+        with mock.patch.dict(os.environ, {**self.OWN, **env}):
+            rc, summary, err = self.smoke("--subprocess-timeout", "2")
+        calls = [c["argv"] for c in records()[self.mark:] if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"]]
+        return rc, summary, err, calls
+
+    @staticmethod
+    def index(calls, word, *needles):
+        return [i for i, argv in enumerate(calls) if word in argv and all(n in argv for n in needles)]
+
+    def test_a_definite_refusal_means_the_run_never_owned_it(self):
+        """A rival makes the session first; new-session answers `duplicate session`. Nothing is recorded, nothing is killed, and the
+        rival's session is still there with its pane afterwards (the leftover list names it; it is reported, not removed)."""
+        rc, summary, err, calls = self.run_with(G3_SHIM_RIVAL="new-session")
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["failed_step"], "setup")
+        self.assertIn("duplicate session", summary["error"])
+        self.assertEqual(summary["made"]["session"], False)
+        self.assertEqual(self.index(calls, "kill-session"), [], calls)
+        self.assertEqual(self.index(calls, "kill-pane"), [])
+        self.assertTrue(any(f"in session {summary['run']}" in line for line in summary["cleanup"]["leftovers"]), summary["cleanup"])
+        self.assertEqual(summary["cleanup"]["errors"], [])
+        self.assertFalse(Path(summary["repo"]).exists())
+
+    def test_a_timeout_with_this_runs_marker_kills_the_session_after_reading_the_marker_back(self):
+        """new-session succeeded in tmux but the client hung: indeterminate. The marker is this run's, so the session is killed; the marker
+        is read back before the kill."""
+        rc, summary, err, calls = self.run_with(G3_SHIM_AFTER="new-session")
+        self.assertEqual(rc, 1)
+        self.assertIn("did not finish within 2 s", summary["error"])
+        self.assertTrue(summary["made"]["session"], "settled as the run's own by its marker")
+        reads, kills = self.index(calls, "show-options", "@g3_run"), self.index(calls, "kill-session")
+        self.assertEqual(len(kills), 1, calls)
+        self.assertTrue(reads and reads[0] < kills[0], "the marker was read before the kill")
+        self.assertEqual(calls[kills[0]][-1], f"={summary['run']}")
+        self.assert_clean(summary)
+
+    def test_a_timeout_with_another_marker_keeps_the_session_and_reports_it(self):
+        """A rival's session of the same name carries another marker and the run's own call hung: the session is kept, with its pane, and
+        reported by name and marker."""
+        rc, summary, err, calls = self.run_with(G3_SHIM_RIVAL="new-session", G3_SHIM_HANG="new-session")
+        self.assertEqual(rc, 1)
+        self.assertIn("did not finish within 2 s", summary["error"])
+        self.assertEqual(summary["made"]["session"], False)
+        self.assertEqual(self.index(calls, "kill-session"), [], calls)
+        self.assertTrue(self.index(calls, "show-options", "@g3_run"), "the marker was read")
+        self.assertTrue(any("carries marker rival" in line and summary["run"] in line for line in summary["cleanup"]["kept"]), summary["cleanup"])
+        self.assertTrue(any(f"in session {summary['run']}" in line for line in summary["cleanup"]["leftovers"]), summary["cleanup"])
+        self.assertEqual(summary["cleanup"]["errors"], [])
+
+    def test_a_timeout_where_no_session_appeared_kills_nothing(self):
+        rc, summary, err, calls = self.run_with(G3_SHIM_HANG="new-session")
+        self.assertEqual(rc, 1)
+        self.assertEqual(summary["made"]["session"], False)
+        self.assertEqual(self.index(calls, "kill-session"), [], calls)
+        self.assertTrue(self.index(calls, "has-session"))
+        self.assert_clean(summary)
+
+    def test_the_session_is_marked_in_the_call_that_creates_it(self):
+        rc, summary, err, _ = results()["flow"]          # the passing flow, started with the module's other full runs
+        self.assertEqual(rc, 0, err)
+        calls = [c["argv"] for c in records() if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"]]
+        creating = [argv for argv in calls if "new-session" in argv and f"{summary['run']}" in argv]
+        self.assertEqual(len(creating), 1)
+        self.assertEqual(creating[0][creating[0].index(";") + 1:], ["set-option", "-t", f"={summary['run']}:", "@g3_run", summary["run_id"]])
+        self.assertTrue(summary["made"]["session"])
+        self.assert_clean(summary)
 
 
 class GuardTest(Base):
@@ -350,26 +470,66 @@ class GuardTest(Base):
 
     def test_live_cleanup_kills_only_the_recorded_panes_and_its_own_session(self):
         smoke = self.make("--repo", str(support.WORK))
-        smoke.session_made = True
-        (smoke.state / "tasks" / "coder-x").mkdir()
-        (smoke.state / "tasks" / "coder-x" / "meta.json").write_text(json.dumps({"pane": "%7"}))
-        (smoke.state / "tasks" / "coder-y").mkdir()
-        (smoke.state / "tasks" / "coder-y" / "meta.json").write_text(json.dumps({"pane": "-a; kill-server"}))
+        smoke.made["session"] = True
+        for task, pane in (("coder-x", "%7"), ("coder-y", "-a; kill-server"), ("coder-z", "%8")):
+            (smoke.state / "tasks" / task).mkdir()
+            (smoke.state / "tasks" / task / "meta.json").write_text(json.dumps({"pane": pane}))
         calls = []
-        with mock.patch.object(g3.Smoke, "quiet", lambda self, argv, **kw: calls.append([str(a) for a in argv]) or mock.Mock(returncode=0, stdout="", stderr="")):
+
+        def quiet(self, argv, **kw):
+            calls.append([str(a) for a in argv])
+            listing = f"%7\t{smoke.name}\n%8\tsomeone-elses-session\n" if "list-panes" in argv else ""
+            return mock.Mock(returncode=0, stdout=listing, stderr="")
+        with mock.patch.object(g3.Smoke, "quiet", quiet):
             smoke.cleanup()
         tmux = [c[1:] for c in calls if c[0] == smoke.tmux_bin]
         self.assertIn(["kill-pane", "-t", "%7"], tmux)
         self.assertIn(["kill-session", "-t", f"={smoke.name}"], tmux)
         self.assertFalse([c for c in tmux if "kill-server" in c or "-a; kill-server" in c], tmux)
-        self.assertEqual([c for c in tmux if c[0] == "kill-pane"], [["kill-pane", "-t", "%7"]])    # a pane id that is not %N is ignored
+        # a pane id that is not %N is ignored, and %8 (recorded, but in another session) is not this run's to kill
+        self.assertEqual([c for c in tmux if c[0] == "kill-pane"], [["kill-pane", "-t", "%7"]])
 
     def test_not_a_live_session_when_the_session_was_never_made(self):
         smoke = self.make("--repo", str(support.WORK))
         calls = []
         with mock.patch.object(g3.Smoke, "quiet", lambda self, argv, **kw: calls.append([str(a) for a in argv]) or mock.Mock(returncode=0, stdout="", stderr="")):
             smoke.cleanup()
-        self.assertFalse([c for c in calls if "kill-session" in c], calls)
+        self.assertFalse([c for c in calls if "kill-session" in c or "kill-pane" in c], calls)
+
+    def test_cleanup_removes_only_what_the_run_recorded(self):
+        """The git half of the cleanup is driven by `made`: with nothing recorded it deletes no branch, removes no lane and no worktree,
+        whatever the names (the F2 rule), and with each record it does exactly that one thing."""
+        smoke = self.make("--repo", str(support.WORK))
+        smoke.facts["common"] = str(support.WORK / "common")
+        (support.WORK / "common" / "tmux-pi" / "lanes" / smoke.name).mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, support.WORK / "common", ignore_errors=True)
+        calls = []
+        with mock.patch.object(g3.Smoke, "quiet", lambda self, argv, **kw: calls.append([str(a) for a in argv]) or mock.Mock(returncode=0, stdout="", stderr="")):
+            smoke.cleanup()
+            self.assertFalse([c for c in calls if c[0] == "git" and ("branch" in c or "worktree" in c) or "abandon" in " ".join(c) or "--abandon" in c], calls)
+            calls.clear()
+            smoke.made.update(lane=True, lane_branch=True)
+            smoke.cleanup()
+        flat = [" ".join(c) for c in calls]
+        self.assertTrue(any(c.endswith(f"branch -D lane/{smoke.name}") for c in flat), flat)
+        self.assertTrue(any("lane remove" in c and "--abandon" in c for c in flat), flat)
+        self.assertFalse(any(c.endswith(f"branch -D {g3.INTEGRATION}") for c in flat), "the integration branch was not recorded")
+        self.assertFalse(any("worktree remove" in c for c in flat), "no worktree was recorded")
+
+    def test_run_ids_cannot_collide_and_every_name_is_a_valid_lane_name(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lanes
+        ids = {g3.new_run_id() for _ in range(200)}
+        self.assertEqual(len(ids), 200, "200 ids in the same second are all different")
+        with mock.patch.object(g3.time, "strftime", return_value="11091200"), mock.patch.object(g3.os, "getpid", return_value=4242):
+            same = {g3.new_run_id() for _ in range(200)}
+        self.assertEqual(len(same), 200, "the random part alone separates two runs with the same time and pid")
+        smokes = [self.make("--fake") for _ in range(5)]
+        self.assertEqual(len({s.name for s in smokes}), 5)
+        for smoke in smokes:
+            self.assertTrue(lanes.valid_lane_name(smoke.name), smoke.name)
+            self.assertIn(g3.base36(os.getpid()), smoke.run_id.split("-"))
+            self.assertTrue(smoke.name.endswith(smoke.run_id) and smoke.sock.endswith(smoke.run_id.rsplit("-", 1)[-1]))
 
     def test_the_audit_compares_with_each_runs_own_socket_and_dir(self):
         """The module audit is not a prefix check: a g3-* socket and a g3t-* dir of ANOTHER run fail it."""

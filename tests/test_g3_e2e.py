@@ -368,11 +368,17 @@ class HookTriggerTest(Base):
                     with self.subTest(mode=mode, ended=ending["hook_event_name"], event=name, call=call), mock.patch.dict(os.environ, self.env(mode)):
                         self.ask(mode, asker, **who)
                         self.decide("redact", ending)
-                        self.assertEqual(self.request()["status"], "declined")
+                        (self.task / "permission-request.json").write_text(json.dumps({**self.request(), "extra": {"unknown": [1, "x"]}}))
+                        prior = self.request()
+                        self.assertEqual(prior["status"], "declined")
                         self.assertIsNone(self.decide(answerer, {**self.event(name), "tool_use_id": call, **who, "tool_response": response,
                                                                  "error": "boom"}), "a late answer never blocks or prints a decision")
                         settled = self.request()
                         self.assertEqual(settled["status"], expected)
+                        # The whole record: only the status, the settling event and the time change; every other field (event aside, an
+                        # unknown `extra` too) is the prior one. A different call's answer leaves it exactly as it was.
+                        self.assertEqual(settled, prior if expected == "declined" else {**prior, "status": expected, "event": name,
+                                                                                         "updated": settled["updated"]})
                         self.assertEqual((settled.get("call"), settled.get("agent_id")), ("toolu_g3hook", who.get("agent_id")))
                         before = (self.task / "permission-request.json").read_bytes()
                         self.decide("redact", ending)
@@ -391,9 +397,13 @@ class HookTriggerTest(Base):
             for status, call, expected in (("pending", None, "pending"), ("declined", None, "declined"), ("pending", "toolu_other", "pending"),
                                            ("declined", "toolu_g3hook", "authorized"), ("pending", "toolu_g3hook", "authorized")):
                 with self.subTest(mode=mode, status=status, call=call), mock.patch.dict(os.environ, self.env(mode)):
-                    path.write_text(json.dumps({"status": status, "target": "t", "reason": "r", "updated": "u", **({"call": call} if call else {})}))
+                    prior = {"status": status, "target": "t", "reason": "r", "updated": "u", "extra": {"k": [1]}, **({"call": call} if call else {})}
+                    path.write_text(json.dumps(prior))
                     self.assertIsNone(self.decide("redact", failure))
-                    self.assertEqual(self.request()["status"], expected)
+                    settled = self.request()
+                    self.assertEqual(settled["status"], expected)
+                    self.assertEqual(settled, prior if expected == status else {**prior, "status": expected, "event": "PostToolUseFailure",
+                                                                                 "updated": settled["updated"]}, "every other field stays")
             with self.subTest(mode=mode, unreadable=True), mock.patch.dict(os.environ, self.env(mode)):
                 for text in (b"{not json", b"[]", b""):
                     path.write_bytes(text)

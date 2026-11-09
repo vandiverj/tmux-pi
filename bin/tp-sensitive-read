@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import safe_write
 from sensitive_read import classify, response_for
-from redact_hook import mode as redaction_mode
+from redact_hook import mode as redaction_mode, settled_record, write_request
 
 
 def save_request(result, status, call=None, agent_id=None):
@@ -83,7 +83,8 @@ def main():
                 waiting = prior.get("status") == "pending" or (
                     prior.get("status") == "declined" and prior.get("call") and prior["call"] == event.get("tool_use_id"))
                 if waiting and current.get("sensitive") and current.get("target") == prior.get("target"):
-                    save_request(prior, "authorized" if name == "PostToolUse" else "denied", prior.get("call"), prior.get("agent_id"))
+                    # The prior record with the outcome: every field stays (event, call, agent_id, any other), not rebuilt from `current`.
+                    write_request(os.environ["TP_TASK_DIR"], settled_record(prior, "authorized" if name == "PostToolUse" else "denied", name))
             return
         if name != "PreToolUse":
             return

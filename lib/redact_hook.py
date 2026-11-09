@@ -834,11 +834,24 @@ def save_request(target, reason, status, **extra):
     task = os.getenv("TP_TASK_DIR")
     if not task:
         return
-    path = Path(task) / "permission-request.json"
-    value = {"status": status, "target": target, "reason": reason,
-             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             **{k: v for k, v in extra.items() if v}}
-    safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
+    write_request(task, {"status": status, "target": target, "reason": reason, "updated": now(),
+                         **{k: v for k, v in extra.items() if v}})
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_request(task, value):
+    """Write a whole permission-request.json record, atomically and under the task root (safe_write's checks). `save_request` makes a
+    new request; `settle_declined`, `settle` and bin/tp-sensitive-read's late answer pass the prior record with a few fields changed."""
+    safe_write.write_atomic(Path(task) / "permission-request.json", json.dumps(value) + "\n",
+                            root=safe_write.task_root(task), keep_mode=False)
+
+
+def settled_record(prior, status, event_name):
+    """The prior record with only the status, the time and the settling event changed; every other field, known or not, stays."""
+    return {**prior, "status": status, "event": event_name, "updated": now()}
 
 
 def settle(event, decision=None):
@@ -866,8 +879,7 @@ def settle(event, decision=None):
         same = bool(decision) and decision["decision"] == "ask" and prior.get("target") == decision["target"] \
             and prior.get("status") == "pending"
     if prior.get("status") in ("pending", "declined") and same:
-        save_request(prior["target"], prior.get("reason"), "denied" if denied else "authorized",
-                     **{k: prior.get(k) for k in ("placeholder", "source", "scope", "call", "agent_id")})
+        write_request(os.environ["TP_TASK_DIR"], settled_record(prior, "denied" if denied else "authorized", event.get("hook_event_name")))
 
 
 def settle_declined(event):
@@ -892,9 +904,7 @@ def settle_declined(event):
         prior = json.loads(path.read_text())
         if not isinstance(prior, dict) or prior.get("status") != "pending" or str(prior.get("agent_id") or "") != asker:
             return
-        value = {**prior, "status": "declined", "event": event.get("hook_event_name"),
-                 "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
+        write_request(task, settled_record(prior, "declined", event.get("hook_event_name")))
     except Exception:
         pass
 

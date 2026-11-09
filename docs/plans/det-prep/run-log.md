@@ -528,3 +528,11 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   reverted, re-applied after the merge (one conflict on the strong row, resolved to openai-codex/gpt-6.1-sol with
   in_roster true); validate_catalog passes. Lane removed.
 - With strong in the roster, a strong outage also takes out mid's gpt-6.1-sol (health keyed provider:model).
+
+## 2026-11-08 LS1 round 3 done; Main found unsupported-citation gap, round 4 sent before review
+- coder-ed25d9ee58: heading file resolution (one allowed file, whole name), all 24 answers regenerated with a hand-written
+  reference per chore and every-fact-needed tests, order check for steps-states/steps-deploy. 128 tests OK in 4 modes.
+- Main's check: use-jobqueue's reference with quotes stripped and all six line numbers changed to wrong in-range lines
+  still passes (no bad citations). The worker had disclosed it. S2's "zero fabricated citations" bar needs this, so
+  round 4 (fixes/ls1-round4.md: per-fact `support` regex on the cited lines, range limit 5) went out before a
+  review: coder-636cd4b784.

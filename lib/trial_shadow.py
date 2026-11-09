@@ -477,9 +477,15 @@ def spawn_args(source, run, worktree, project, trial, request_file, task_id, doc
 
 # ----------------------------------------------------------------------------------------------------------- start a run
 
-def default_run_id(task_id, stamp=None):
+def default_run_id(task_id, stamp=None, n=0):
+    """sh-<task>-<stamp>; the n-th retry within one stamp (n >= 1) ends in -<n+1>. When that would pass 40 characters the END of the
+    id (the stamp's last digits) is cut to make room, so two stamps can give the same id: prepare's mkdir refuses a taken one and moves on."""
     clean = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")[:20].strip("-") or "task"
-    return "sh-{}-{}".format(clean, stamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S"))
+    run = "sh-{}-{}".format(clean, stamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S"))
+    if n:
+        suffix = "-{}".format(n + 1)
+        run = run[:40 - len(suffix)].rstrip("-") + suffix
+    return run
 
 
 def project_of(main_state, source):
@@ -522,18 +528,31 @@ def prepare(main_state, task_id, *, project=None, run=None, pair_id=None, trial=
     project = os.path.realpath(project) if project else project_of(main_state, source)
     if not lanes._git(["rev-parse", "--verify", "-q", source["base_commit"] + "^{commit}"], project, ok=(0, 1))[0] == 0:
         raise ShadowError("the base commit {} of task '{}' does not exist in {}".format(source["base_commit"], task_id, project))
-    run = trial_session.valid_run(run or default_run_id(task_id))
-    rdir = trial_session.run_dir(project, run)
-    if rdir.exists():
-        raise ShadowError("trial run '{}' already exists ({}); choose another --run".format(run, rdir))
+    chosen = run  # an id the caller gave is kept and refused when taken; a default one moves on to the next free id (-2, -3, ...)
+    stamp = None if chosen else datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    attempt = 0
+    while True:
+        run = trial_session.valid_run(chosen or default_run_id(task_id, stamp, attempt))
+        rdir = trial_session.run_dir(project, run)
+        if not rdir.exists():
+            break
+        if chosen:
+            raise ShadowError("trial run '{}' already exists ({}); choose another --run".format(run, rdir))
+        attempt += 1
     ok, reason = trial_session.guard(main_state, project, trial, main_max, trial["model"], env)
     if not ok:
         raise ShadowError("not started: " + reason)
     rdir.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.mkdir(str(rdir))  # this prepare's own run directory: one made by anyone else meanwhile (a racing prepare) is refused here
-    except FileExistsError:
-        raise ShadowError("trial run '{}' already exists ({}); choose another --run".format(run, rdir))
+    while True:
+        try:
+            os.mkdir(str(rdir))  # this prepare's own run directory: one made by anyone else meanwhile (a racing prepare) is refused here
+            break
+        except FileExistsError:
+            if chosen:
+                raise ShadowError("trial run '{}' already exists ({}); choose another --run".format(run, rdir))
+            attempt += 1  # a racing default prepare took this id first: take the next
+            run = default_run_id(task_id, stamp, attempt)
+            rdir = trial_session.run_dir(project, run)
     made_st = os.lstat(str(rdir))
     made_dir = (made_st.st_dev, made_st.st_ino)  # what undo_prepare may remove: this directory, and nothing put at its name later
     made = []  # (id, created) of a session this prepare itself created; undo_prepare ends no other

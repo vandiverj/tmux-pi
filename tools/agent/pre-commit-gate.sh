@@ -407,18 +407,17 @@ done
 
 [ "$APPLIED" != 0 ] || printf 'no check applied\n'
 
-# write_record PATH — the tp-gate:v1 record, written by tp_json_write (python json.dumps; atomic).
-write_record() {
-  local tok
-  tok=(s schema tp-gate:v1 s worktree "$WT" s base.ref "$BASE" s base.sha "$BASE_SHA" s head "$HEAD_SHA" s tree "$TREE")
-  tok+=(a files "${#FILES[@]}" ${FILES[@]+"${FILES[@]}"})
-  tok+=(k checks "$((${#CHECK_TOKENS[@]} / 4))" ${CHECK_TOKENS[@]+"${CHECK_TOKENS[@]}"})
-  tok+=(r exit "$FINAL" s started "$STARTED" s finished "$(tp_now)" s log "$TP_LOG")
-  printf '%s\0' "${tok[@]}" | tp_json_write "$1"
-}
-
+# The tp-gate:v1 record, every field fixed once (the exit and the finish time included) before any copy is written.
+# write_record PATH writes that one token list through tp_json_write (python json.dumps; atomic), so the copies are
+# byte-identical by construction; nothing in it reads the clock, so a second write cannot differ from the first.
 FINAL=0
 [ "$FAILED" = 0 ] || FINAL=1
+REC_TOK=(s schema tp-gate:v1 s worktree "$WT" s base.ref "$BASE" s base.sha "$BASE_SHA" s head "$HEAD_SHA" s tree "$TREE")
+REC_TOK+=(a files "${#FILES[@]}" ${FILES[@]+"${FILES[@]}"})
+REC_TOK+=(k checks "$((${#CHECK_TOKENS[@]} / 4))" ${CHECK_TOKENS[@]+"${CHECK_TOKENS[@]}"})
+REC_TOK+=(r exit "$FINAL" s started "$STARTED" s finished "$(tp_now)" s log "$TP_LOG")
+write_record() { printf '%s\0' "${REC_TOK[@]}" | tp_json_write "$1"; }
+
 write_record "${TP_LOG%.log}.json" || tp_fail "cannot write the record beside the log" 2
 printf 'record: %s\n' "${TP_LOG%.log}.json"
 if [ -n "${TP_TASK_DIR:-}" ]; then

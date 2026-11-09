@@ -413,9 +413,14 @@ class ShippedChainTests(ChainTestCase):
         self.assertEqual((confirmation["asked"], confirmation["confirmed_by"], confirmation["first_level"], confirmation["level"]),
                          (QWEN, HAIKU, 4, 3))
         # Haiku's pick stands even when it is the one that goes up
-        self.script(chat=text((4, "high")), claude=text((4, "high", "required", None, "breadth")))
+        # The shipped router prompt now lists five levels (strong is 4, top is 5); top was 4 while strong was hidden.
+        self.script(chat=text((4, "high")), claude=text((5, "high", "required", None, "breadth")))
         r = self.select(role="architect")
         self.assertEqual((r["decided_by"], r["level"], r["model"]), (HAIKU, "top", OPUS))
+        # and a router that picks the new level 4 gets strong: gpt-6.1-sol at high
+        self.script(chat=text((4, "high")), claude=text((4, "high", "required", None, "big review")))
+        r = self.select(role="architect")
+        self.assertEqual((r["decided_by"], r["level"], r["model"], r["effort"]), (HAIKU, "strong", "openai/gpt-6.1-sol", "high"))
 
     def test_qwen_picks_the_local_level_for_an_unqualified_shape_and_haiku_is_asked(self):
         self.script(chat=text((1, "low", "none", None, "lookup")), claude=text((2, "low", "none", "small_edit", "small")))

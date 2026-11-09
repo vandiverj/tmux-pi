@@ -87,18 +87,8 @@ def _shape(rec):
     return (rec["source"] == "stop_and_ask", rec.get("level_key"), rec.get("degraded"), (rec.get("route_bound") or (None,))[0])
 
 
-def _strong_catalog():
-    """The fixture catalog with the strong level offered and its (openai-only) model rostered, so it is really usable."""
-    cat = copy.deepcopy(CAT)
-    for lv in cat["levels"]:
-        if lv["key"] == "strong":
-            lv["shown"] = True
-            for m in lv["models"]:
-                m["in_roster"] = True
-    return cat
-
-
-STRONG_CAT = _strong_catalog()
+# The committed catalog offers strong (shown, its openai-only model rostered); CAT is the fixture with strong hidden.
+STRONG_CAT = fx.fixture_catalog((HAIKU, LUNA, QWEN), strong_shown=True)
 
 
 def _role(level, cat, health, author, shape=None):
@@ -148,7 +138,14 @@ class ExplicitLevelTableTests(unittest.TestCase):
                 self.assertEqual(_shape(review), expected, review)
                 self.assertEqual(_shape(role), expected, role)
 
-    def test_strong_is_not_offered_in_the_shipped_catalog_so_it_resolves_to_mid(self):
+    def test_strong_is_offered_in_the_shipped_catalog_and_the_hidden_fixture_resolves_it_to_mid(self):
+        # Was: strong not offered, so an explicit strong resolved to (False, "mid", None, 2) for both authors.
+        # Now: the committed catalog offers it. An anthropic author gets strong; an openai author (strong's only
+        # provider is its own) is moved down to mid on the other provider. The hidden fixture keeps the old behaviour.
+        shipped = fx.shipped_catalog()
+        for author, expected in (("anthropic", (False, "strong", None, 2)), ("openai", (False, "mid", "down", 2))):
+            review = rr.pick_reviewer(author, "mid", shipped, {}, "required", {"level_key": "strong"})
+            self.assertEqual(_shape(review), expected, review)
         for author in ("anthropic", "openai"):
             review = rr.pick_reviewer(author, "mid", CAT, {}, "required", {"level_key": "strong"})
             self.assertEqual(_shape(review), (False, "mid", None, 2), review)

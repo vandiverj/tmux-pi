@@ -36,9 +36,11 @@ class ValidationTests(unittest.TestCase):
         # Whatever the router chain's order: the shipped file is valid and every chain entry is complete.
         rc.load_catalog(fx.CATALOG_PATH)
         self.assertEqual([lv["key"] for lv in SHIPPED["levels"]], ["local", "small", "mid", "strong", "top"])
-        self.assertEqual(rc.shown_keys(SHIPPED), ["local", "small", "mid", "top"])
+        # Was ["local", "small", "mid", "top"] (strong hidden); strong is offered now.
+        self.assertEqual(rc.shown_keys(SHIPPED), ["local", "small", "mid", "strong", "top"])
         self.assertTrue(level(SHIPPED, "top").get("restricted"))
-        self.assertIs(level(SHIPPED, "strong")["shown"], False)
+        self.assertIs(level(SHIPPED, "strong")["shown"], True)  # was False
+        self.assertIs(level(SHIPPED, "strong")["models"][0]["in_roster"], True)  # was False
         for key in ("mid", "strong"):
             sol = next(m for m in level(SHIPPED, key)["models"] if m["provider"] == "openai")
             for field, expected in (("model", "openai/gpt-6.1-sol"), ("context_window", 500000)):
@@ -87,6 +89,10 @@ class ValidationTests(unittest.TestCase):
                             SHIPPED, {}, {"role": "coder", "skip_caps": True})
         self.assertEqual(picked["model"], fx.OPUS)
         prior = {"level_key": "mid", "effort_abstract": "high", "model": fx.SONNET, "review": "optional", "decided_by": None}
+        # Escalation from mid@high now stops at strong (gpt-6.1-sol, same model) first; it was opus when strong was hidden.
+        step = rr.escalate(prior, SHIPPED, {}, {"role": "coder"})
+        self.assertEqual((step["level_key"], step["model"], step["effort"]), ("strong", "openai/gpt-6.1-sol", "high"))
+        prior = dict(prior, level_key="strong", model="openai/gpt-6.1-sol")
         self.assertEqual(rr.escalate(prior, SHIPPED, {}, {"role": "coder"})["model"], fx.OPUS)
 
     def test_the_shipped_chain_is_qwen_first_with_the_confirm_rule_and_a_mid_cap(self):

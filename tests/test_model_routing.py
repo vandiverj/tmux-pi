@@ -40,7 +40,7 @@ class Base(unittest.TestCase):
  *) exit 0 ;;
 esac
 ''')
-        self.stubs = fx.Stubs(self.root, {"claude": [{"text": reply(3, "medium", "optional", None, "ordinary")}]})
+        self.stubs = fx.Stubs(self.root, {"claude": [{"text": reply(3, "medium", "optional", None, "ordinary")}]}, strong_shown=True)
         self.addCleanup(self.stubs.close)
         guard, self.hits = fx.laya_guard(self.root)
         self.addCleanup(self.assert_no_laya)  # also covers the real LM Studio port
@@ -111,7 +111,8 @@ class TpRouteTests(Base):
         self.assertEqual(run.stdout, "")
 
     def test_bad_requests_exit_1(self):
-        for args in (("--level", "strong"), ("--model", SONNET, "--level", "top"), ("--model", SONNET, "--worker", "pi")):
+        # ("--level", "strong") was a bad request while strong was hidden; it is accepted now (next test)
+        for args in (("--model", SONNET, "--level", "top"), ("--model", SONNET, "--worker", "pi")):
             with self.subTest(args=args):
                 run = self.tp_route(*args)
                 self.assertEqual(run.returncode, 1, run.stdout)
@@ -120,6 +121,8 @@ class TpRouteTests(Base):
     def test_explicit_level_and_approval_flags(self):
         out = json.loads(self.tp_route("--level", "top").stdout)
         self.assertEqual((out["model"], out["source"]), (OPUS, "explicit_level"))
+        out = json.loads(self.tp_route("--level", "strong").stdout)  # was exit 1, "level 'strong' is not offered"
+        self.assertEqual((out["model"], out["thinking"], out["level"], out["source"]), (SOL, "high", "strong", "explicit_level"))
         out = json.loads(self.tp_route("--model", ASTRA, "--thinking", "max").stdout)
         self.assertEqual(out["thinking"], "high")
         out = json.loads(self.tp_route("--model", ASTRA, "--thinking", "max", "--approve-effort").stdout)
@@ -144,7 +147,7 @@ class TpRouteTests(Base):
     def test_check_validates_config_and_catalog(self):
         run = self.run_cmd("tp-route", "--check")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn("catalog valid: 5 levels (4 shown)", run.stdout)
+        self.assertIn("catalog valid: 5 levels (5 shown)", run.stdout)
 
     def test_selection_record_for_a_routed_choice(self):
         run = self.run_cmd("tp-route", "--role", "coder", stdin=TASK, env={**self.env, "TP_ROUTING_EVAL_DIR": str(self.root / "ev")})
@@ -247,13 +250,17 @@ class DispatchTests(Base):
         self.assertEqual(list((self.state / "tasks").iterdir()), [])
         self.assertEqual(self.selections()[-1]["status"], "stop_and_ask")
 
-    def test_level_hidden_is_rejected(self):
-        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--level", "strong", "--workdir", str(self.project), check=False)
+    def test_level_strong_is_offered_and_an_unknown_level_is_rejected(self):
+        # Was test_level_hidden_is_rejected: --level strong exited 1 "not offered". It dispatches to gpt-6.1-sol at high now.
+        meta = self.meta(self.dispatch("--level", "strong"))
+        self.assertEqual((meta["model"], meta["thinking"]), (SOL, "high"))
+        run = self.agent("dispatch", "--role", "coder", "--task", TASK, "--level", "nope", "--workdir", str(self.project), check=False)
         self.assertEqual(run.returncode, 1)
         self.assertIn("not offered", run.stderr)
 
     def test_the_router_may_choose_the_top_level_but_a_tester_is_capped(self):
-        self.stubs.set({"claude": [{"text": reply(4, "high", "required", None, "architecture")}]})
+        # The router prompt lists five levels now (strong 4, top 5): top is reply level 5 (it was 4).
+        self.stubs.set({"claude": [{"text": reply(5, "high", "required", None, "architecture")}]})
         self.assertEqual(self.meta(self.dispatch(role="architect"))["model"], OPUS)
         self.assertEqual(self.meta(self.dispatch(role="tester"))["model"], SONNET)
 
@@ -277,14 +284,19 @@ class EscalationTests(Base):
         self.assertEqual((self.meta(third)["model"], self.meta(third)["thinking"]), (SONNET, "high"))
         self.assertEqual(self.meta(third)["route_info"]["source"], "escalation_effort_up")
         self.fail(third)
-        fourth = self.retry(third, "--escalate")
+        # Was: the level step went straight to (OPUS, "high"). Strong is offered now, so it first goes to gpt-6.1-sol at high.
+        strong = self.retry(third, "--escalate")
+        self.assertEqual((self.meta(strong)["model"], self.meta(strong)["thinking"]), (SOL, "high"))
+        self.assertEqual(self.meta(strong)["route_info"]["source"], "escalation_level_up")
+        self.fail(strong)
+        fourth = self.retry(strong, "--escalate")
         self.assertEqual((self.meta(fourth)["model"], self.meta(fourth)["thinking"]), (OPUS, "high"))
         self.assertEqual(self.meta(fourth)["route_info"]["source"], "escalation_level_up")
         self.fail(fourth)
         stop = self.retry(fourth, "--escalate", check=False)
         self.assertEqual(stop.returncode, 1)
         self.assertIn("approval needed", stop.stderr)
-        self.assertEqual([r["source"] for r in self.selections()][-3:], ["escalation_effort_up", "escalation_level_up", "stop_and_ask"])
+        self.assertEqual([r["source"] for r in self.selections()][-3:], ["escalation_level_up", "escalation_level_up", "stop_and_ask"])
         self.assert_no_laya()
 
     def review_with(self, item, ident, text):
@@ -798,7 +810,10 @@ class ReviewPlanTests(Base):
 
     def test_top_level_author_does_not_pull_the_reviewer_to_the_top_level(self):
         plan = self.plan(self.author("claude", OPUS, level="top", effort="high"))
-        self.assertEqual((plan["reviewer"]["level"], plan["reviewer"]["thinking"]), ("mid", "medium"))
+        # Was ("mid", "medium") while strong was hidden. Strong is offered now, and the walk down from the author's level
+        # stops at the first shown, non-restricted level: a top author gets a strong reviewer (gpt-6.1-sol at high), still not top.
+        self.assertEqual((plan["reviewer"]["level"], plan["reviewer"]["thinking"]), ("strong", "high"))
+        self.assertEqual(plan["reviewer"]["model"], SOL)
 
     def test_explicit_reviewer_level_and_effort(self):
         plan = self.plan(self.author("claude", SONNET), level="top", thinking="high")
@@ -807,8 +822,11 @@ class ReviewPlanTests(Base):
         self.assertEqual(plan["reviewer"]["thinking"], "high")
         plan = self.plan(self.author("claude", SONNET), level="top", thinking="max", approve_effort=True)
         self.assertEqual(plan["reviewer"]["thinking"], "max")
+        # An explicit reviewer level strong was a ValueError (not offered); it resolves to gpt-6.1-sol at high now.
+        plan = self.plan(self.author("claude", SONNET), level="strong")
+        self.assertEqual((plan["reviewer"]["model"], plan["reviewer"]["level"], plan["reviewer"]["thinking"]), (SOL, "strong", "high"))
         with self.assertRaises(ValueError):
-            self.plan(self.author("claude", SONNET), level="strong")
+            self.plan(self.author("claude", SONNET), level="nope")
 
     def test_stop_and_ask_when_a_required_review_has_no_independent_provider(self):
         (self.state / "provider-health.json").write_text(json.dumps({"openai": {"status": "exhausted"}}))
@@ -861,7 +879,8 @@ class ReviewPlanTests(Base):
         self.assertEqual(json.loads(ok.stdout)["reviewer"]["model"], SOL)
         (self.state / "provider-health.json").write_text(json.dumps({"openai": {"status": "exhausted"}}))
         self.assertEqual(run(self.author("claude", SONNET, role="coder", effort="high")).returncode, 4)
-        self.assertEqual(run(self.author("claude", SONNET), "--level", "strong").returncode, 1)
+        self.assertEqual(run(self.author("claude", SONNET), "--level", "strong").returncode, 0)  # was 1: strong was not offered
+        self.assertEqual(run(self.author("claude", SONNET), "--level", "nope").returncode, 1)
         self.assert_no_laya()
 
 

@@ -47,7 +47,20 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(sorted(set(roster) - set(catalog)), [])
         self.assertNotIn(FABLE, roster)
         self.assertTrue(catalog["openai/gpt-6.1-sol"]["in_roster"])
-        self.assertFalse(next(lv for lv in CAT["levels"] if lv["key"] == "strong")["shown"])
+        # The committed catalog offers strong with gpt-6.1-sol rostered at high (was shown false, in_roster false).
+        shipped = fx.shipped_catalog()
+        strong = next(lv for lv in shipped["levels"] if lv["key"] == "strong")
+        self.assertTrue(strong["shown"])
+        self.assertTrue(strong["models"][0]["in_roster"])
+        self.assertIn("openai/gpt-6.1-sol", {m["model"] for lv in shipped["levels"] if lv.get("shown", True) for m in lv["models"]
+                                             if m["in_roster"]})
+        self.assertFalse(next(lv for lv in CAT["levels"] if lv["key"] == "strong")["shown"])  # the fixture keeps it hidden
+        # An explicit strong request resolves to gpt-6.1-sol at high (it was moved to mid with "level is not offered").
+        picked = rr.resolve(K("strong", "high"), shipped, None, {"role": "coder", "allow_unrostered": False})
+        self.assertEqual((picked["level_key"], picked["model"], picked["effort"]), ("strong", SOL, "high"))
+        self.assertNotIn("level is not offered: used level mid", picked["steps"])
+        explicit = rr.resolve(None, shipped, None, {"role": "coder", "explicit": {"model": SOL, "worker": "pi", "thinking": "high"}})
+        self.assertEqual((explicit["level_key"], explicit["effort"]), ("strong", "high"))  # was refused: "not offered"
 
 
 class ChoiceTests(unittest.TestCase):
@@ -535,10 +548,7 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(e3["source"], "stop_and_ask")
         for e in (e1, e2):
             self.assertNotIn(e["effort"], ("xhigh", "max"))
-        cat = copy.deepcopy(CAT)
-        strong = next(lv for lv in cat["levels"] if lv["key"] == "strong")
-        strong["shown"] = True
-        strong["models"][0]["in_roster"] = True
+        cat = fx.shipped_catalog()  # offers strong (was: the fixture, with strong switched on here)
         prior = {"model": SOL, "level_key": "mid", "effort": "medium", "effort_abstract": "medium", "review": "optional"}
         moved = rr.escalate(prior, cat, ctx={"role": "coder", "require_worker": "pi"})
         self.assertEqual((moved["model"], moved["effort"], moved["level_key"]), (SOL, "high", "strong"))

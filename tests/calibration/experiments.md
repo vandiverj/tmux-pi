@@ -249,7 +249,7 @@ The mlx-lm server for Qwen3.5-4B is no longer run.
 ## Summarize chores
 
 `summarize_files` is `candidate` in the model catalog until chores show Qwen3.6-35B-A3B (LM Studio) does it as reliably as the
-qualified shapes (holdout at least 57/60, 95%, with zero fabricated citations). The chores are in
+qualified shapes (holdout at least 57/60, 95%, with zero fabricated citations and zero unparsed references). The chores are in
 `tests/calibration/summarize/`: 24 over 10 frozen fixture files (12 tune, 12 holdout), each with required facts, forbidden
 fabrications and the files a `path:line` citation may name. `tools/qual/summarize_check.py` scores a reply with no model;
 `tools/qual/summarize_run.py` runs one headless Pi worker per chore and run on a temp copy of its files, with the system
@@ -310,8 +310,35 @@ validation). A reply is a list of FACT LINES and only those count:
     reply order and their ordered-fact indexes must be strictly increasing: a step stated twice is `repeated_step` (rule 7), a step
     out of order is `order`. Reference + reversed copy, reversed copy + reference and reference + reference all fail. A chore without
     `order` allows a repeated line. A restatement counts also when its own citation is wrong: it is still a line that states the step.
+13. A line reference is found in any shape, anywhere, across line breaks (round 9). `PATH:N`, `PATH:N-M` (spaces allowed around `:`
+    and `-`), `PATH#LN`, `PATH#LN-LM`, `PATH#LN-M`, `PATH line N`, `PATH, line N`, `PATH (line N)`, `PATH lines N-M` (any case), also inside
+    `[]`, `()`, backticks, a code block, an HTML comment or nested brackets, with `\n`, `\r\n`, U+2028, U+00A0 or any Unicode space between
+    its parts. PATH is a chore file (in full or by its bare name) or a token with `/` or ending in `.<letters>`; in a bracket or backticks it may hold spaces.
+14. Every line reference is graded by rule 3 (round 9). A bad one is in `bad_citations`, so in the run's `fabricated_citations`, and fails
+    the reply with its kind (`unknown_file`, `range`, `range_too_wide`). A basename is `unknown_file`, as before.
+15. Only the canonical form earns credit (round 9, Main's ruling on F3). The exact `[path:line]` at the end of a fact line is the one
+    form. Any other line reference fails the reply, kind `noncanonical_citation`, also when its target is good (then it is not counted as
+    fabricated). The canonical bracket on a line that is no fact line stays `stray_citation` (rule 10).
+16. Numbers by value (round 9, review 8 F2). Leading zeros (any Unicode decimal zero) are stripped before the cap of 18 significant digits:
+    `000000000000000029` is line 29 at any padding, and 18 or more significant digits are capped (`range`), never converted, so a 5000-digit number cannot crash `int()`.
+17. Normalize, then scan (round 10). The scan reads a copy of the reply in NFKC form in which every Unicode decimal digit is its value
+    and every `isspace` character (line breaks included) is one space. Credit is judged on the text as written: a fullwidth colon or digit
+    in a trailing citation is not the canonical form, so it is `noncanonical_citation` (and the line is `uncited`).
+18. A path has no character list (round 10). Outside a delimiter PATH is the maximal run of non-whitespace characters, less trailing
+    sentence punctuation (`.,;:!?)]}>'"` and the backtick or `*`); it is a path when it holds `/` or `\`, ends in `.<letters>`, or is a chore
+    file's path or bare name. Inside a delimiter (`[]`, `()`, `<>`, backticks, quotes) PATH is everything from the opener to the line part, any
+    character, spaces and line breaks included; if that is not path-shaped the token outside the delimiter is used.
+19. A line part comes in both orders (round 10). Forward: a run of separators (`:` `#` `,` `(` `·`, whitespace, line breaks), then optionally
+    `L`, `l.`, `ln`, `line` or `lines` (any case), then a number or a range. Reverse: `line`, `lines` or `L` + number or range, then `of`, `in`
+    or `at`, then PATH.
+20. No window, linear time (round 10). Detection does not depend on the distance between the parts of a reference or on the reply's length:
+    gaps of 0, 1, 4000, 4001 and 100000 spaces or line breaks are read the same, and a 1 MB reply is checked in under 2 s.
+21. Table-free floor (round 10). After the canonical citations of fact lines and every reference of rules 17 to 19 are removed, a number
+    (any Unicode digits) directly preceded by a path token or by a line word (`line`, `lines`, `L`, `l.`, `ln`, `#`) with only separators
+    between them fails the reply, kind `unparsed_reference`. The runner counts these as `unparsed_references`, beside `fabricated_citations`;
+    S2 needs both to be zero.
 
-The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 12 it
+The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 21 it
 broke. The runner keeps the raw reply. The prompt in `config/local.example.json` states the format with one example.
 
 Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
@@ -378,6 +405,54 @@ copied before any edit) the test fails for 1492 of these 1974 mutations: f 336 p
 | a line with a prefix is read as no list item (review 7 F1) | 11, 2 | The prefix (any `isspace` character, format characters, `>` markers) is stripped before the list marker is looked for, and every bullet of the list is a marker. | `test_rule_11_list_items_by_any_whitespace_and_any_bullet`, `test_review_7_and_mains_round_8_reproducers_fail_for_their_rule`, generated kinds f, g |
 | a citation outside a list item is never read (Main) | 10, 2 | Every bracket of every line is read for citations before the line is classified; a bad one is in `bad_citations`, a line that holds one and is no fact line fails. | `test_rule_10_every_citation_is_checked_wherever_it_is`, `test_failing_reply_is_scored_and_classed` (the runner's count), generated kind h |
 | a step stated twice, or twice in two orders (review 7 F2, Main) | 12, 7 | The order is read on every line that states an ordered fact, not on the owner of each fact. | `test_rule_12_every_line_that_states_an_ordered_fact_counts`, `test_order_is_checked_where_the_chore_asks_for_it`, generated kind i |
+
+Round 9 (review 8: a bracketed citation split over lines, other shapes of a line reference, and a zero-padded number all escaped; the
+same family as round 8, "what the checker reads decides what it can count", so the design changed from a per-line bracket search to
+one scan of the whole reply). Rules 13 to 16 above. `check()` blanks the canonical trailing citation of each fact line, then
+`references()` finds every other line reference by the line part (`:N`, `#LN`, `line N`) and the path before it, on a copy of the reply in which
+every Unicode space and control character is one space, so a line break between the parts does not matter. Each is graded by rule 3
+and, being noncanonical, fails the reply. The generated test (29235 mutations now, 3171 before) gains: j. 11 shapes of a reference x 6
+wrappers (none, `[]`, `()`, backticks, code block, HTML comment) x no break and a break at each separator (rotating through `\n`,
+`\r\n`, U+2028, U+00A0) x 4 targets (valid, line past the end, range past the end for the 5 range shapes, a file that is not the chore's),
+25632, in its own test for its time; h. a range past the end as well as a line (432, was 288); k. every reference line's numbers zero-padded by 4,
+18, 40 and 5000 zeros of three kinds (ASCII, fullwidth, Arabic-Indic), which must pass (288). Run against b7a7489 (`git show`, loaded in
+memory), 24838 of the 26352 mutations of h, j and k escape it (a reply that must fail passes, or, for k, a reply that must pass is
+failed), and 842 more fail it for a rule the mutation is not for: j 24622 of 25632 pass outright, and of its 18432 invalid targets
+18312 were not counted in `bad_citations`; k 216 of 288 are failed (18, 40 and 5000 zeros: 72 each); h 0 of 432 (the old checker
+already read every bracketed citation, so F4 was a gap in the test, not in the checker). The lists: review 8's three split-bracket shapes x four breaks, 8 of 12 pass the old checker, 4 were
+counted (the U+2028 and U+00A0 ones, where `strip()` made a one-line bracket); Main's seven F3 shapes, 7 of 7 pass; padding by 18, 40 and 5000
+zeros is six `range` failures, by 4 passes.
+
+| Family | Rule | Why it cannot recur | Tests |
+|---|---|---|---|
+| a reference the scan does not look at (review 8 F1, Main's F3) | 13, 14, 15 | One scan of the whole reply, on a copy where every space and control character is one space, finds a reference by its line part and its path, wherever it is and however it is wrapped. Each is graded by rule 3 and, unless it is the canonical citation of a fact line, fails the reply. | `test_rule_13_a_line_reference_is_found_in_any_shape_anywhere_across_line_breaks`, `test_rule_15_only_the_canonical_form_earns_credit_and_a_valid_other_form_is_not_fabricated`, `test_rule_13_prose_that_is_not_a_line_reference`, `test_failing_reply_is_scored_and_classed` (the runner's count), generated kinds h, j |
+| a number is its digits, not its value (review 8 F2) | 16 | Leading Unicode zeros are stripped before the 18-digit cap. | `test_rule_16_a_line_number_is_its_value`, generated kind k |
+| a path shaped by a character list, a reference found within a window, a line part by a table of shapes (review 9 F1, F2, Main's F3) | 17, 18, 19, 20, 21 | No list is left to be outside of: a path is any run of non-space characters (or, in a delimiter, everything up to the line part), a line part is a separator run followed by an optional line word and a number, in both orders, found in linear time at any distance; what the grammar still does not place, a number after a path or a line word, fails by itself (`unparsed_reference`). | `test_rule_17_...`, `test_rule_18_...`, `test_rule_19_...`, `test_rule_20_...` (two), `test_rule_21_...`, generated kinds l, m, n, o (`test_generated_grammar_...`, four tests) |
+
+Round 10 (review 9: `$` and `?` in a path, a path or bracket padded by more than the 4000-character window, and Main's four shapes -
+a fullwidth colon, `line N of PATH`, `PATH L999`, `PATH:L9999` - all passed with 0 bad citations; the family is the same as rounds 8 and 9,
+"what the checker reads decides what it can count", and each round had closed a list of shapes and been answered with one outside it, so the
+lists were removed: no character list for a path, no window, no table of line-part shapes). Rules 17 to 21 above. `references()` now reads a
+normalized copy (NFKC, Unicode digits by value, every space one space), finds every line part by a regex that starts only at the start of a
+separator run (so a gap of any length costs the same as the text it covers: linear time, a 1 MB reply 0.1 to 1.3 s on py3.9), in both orders,
+and takes the path as a maximal run of non-space characters or, inside a delimiter, everything from the opener. Whatever
+the grammar does not place is read by the floor (rule 21): a number directly after a path token or a line word fails the reply as
+`unparsed_reference`, so a shape the grammar misses fails for that reason and is counted in the runner as `unparsed_references`. S2 needs
+that and `fabricated_citations` at zero. The generated test (kinds l, m, n, o; 9480 mutations, over the 24 chores) puts all 32 printable ASCII
+punctuation characters and 20 non-ASCII ones inside a path (l), every separator x every line word, forward (m) and in reverse (n), and the
+gaps 0, 1, 4000, 4001 and 100000 of spaces and of line breaks (o), each over the four targets (a valid line, a line past the end, a range
+past the end, a file that is not the chore's). Run against the round-9 tree (`summarize_check.py` as committed in the worktree before this round, loaded in memory), the 9480 mutations: 1856 fail as stated, 7325 pass outright, 189 fail for another rule than the mutation is for, and 110 ran past 3 s and were stopped (the 100000-character gaps: 96 of 144 for spaces, 14 of 24 for line breaks; the round-9 scan is quadratic there). Per kind, passing outright: l 2282 of 2496, m 3090 of 4320, n 1329 of 1344, o 48 to 96 of 144 for each of the gaps 0 to 4001, and none of the gap 100000 (it times out or fails as stated). The new tree catches 9480 of 9480 in 8 s (`scripts/counts_round10.txt`, `scripts/fail_before_round9.txt`). Main and review 9's nine reproducers: 9 of 9 pass on the round-9 tree and 0 of 9 on this one (`scripts/sweep_check_round9_output.txt`).
+
+The floor and the grammar flag these benign lines (Main's ruling is owed; none was tuned away). All 24 references and the saved sample's
+facts pass the grammar (the references pass 24/24; the sample fails as before, now with 15 `unparsed_reference` for its "Line N" headings and
+"(line N)" notes). A prose number after a verb, in a version or a time (`evicts after 128 entries`, `retries 3 times`, `version 2.1`, `at 10:30`,
+`3:1`) is not flagged in any of the 24 per-chore rewrites. Flagged: a "line N" or "Line N" or "#N" with no file, however it is meant
+(`it is line 6 of the story`, `the first line 6 characters long`, `see issue #12`) - `unparsed_reference`; "L2 cache" (the line word `L` + 2) -
+`unparsed_reference`; a file name followed by a number in prose with a separator between (`src/cli.py, 3 retries`, `src/cli.py (3 items)`,
+`the module src/cli.py 3 times`) - `noncanonical_citation`; `e.g.: 5 items` and `a/b 5-6` (a word that ends in `.letters`, or has a `/`, followed by a number) -
+`noncanonical_citation` and `unknown_file`; a file name at the end of a line followed by a numbered list item (`src/cli.py` + newline + `1. first`) -
+`noncanonical_citation`, since line breaks are separators; `<a href=src/cli.py#L6>` (the path is taken from the delimiter) -
+`noncanonical_citation`. `nofile.rs$:999` is not a path (no `/`, ends in `$:999`), so it is not read; the floor does not flag it either.
 
 ### Audit of the required facts (round 6)
 

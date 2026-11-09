@@ -10,8 +10,11 @@ the system prompt tp-spawn gives a worker on M (config/router.json "local" "prom
 tp-spawn does; --prompt-file replaces that text; the temp dir holds no .tmux-pi/worker-preamble.md, so no preamble is added),
 score the reply with summarize_check.check, and append one JSON line to FILE. The record keeps the raw reply. The reply is graded
 as a list of fact lines, `- <claim> [<path>:<line>[-<line>]]` (see summarize_check.py): the record's `failures` name, per failed
-line, the rule (1-12) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations (any bracketed citation of the reply, on a fact line or not: rule 10), unchecked
-citations (good citations no matching fact's support_lines vouch for) and the failure classes (incl. `uncited`, `identifier_only`). The temp dir is always removed.
+line, the rule (1-21) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations (every line reference of the reply, in any
+shape, on a fact line or not, across line breaks: rules 10, 13, 14, 17 to 19; a good one in a noncanonical shape is not fabricated but fails the reply, rule 15),
+unparsed references (a number that follows a file name or a line word and that no reference grammar placed: rule 21; the count that backs the grammar's
+floor), unchecked citations (good citations no matching fact's support_lines vouch for) and the failure classes (incl. `uncited`, `identifier_only`,
+`unparsed_references`). **S2 requires fabricated_citations and unparsed_references to both be zero.** The temp dir is always removed.
 
 --route-only runs `tp-route --no-log --local-only` on each chore's task instead; no worker runs. tp-route's output has no shape
 field (the router's shape tag decides the gate but is not printed or logged), so a record holds what the tool does give: exit
@@ -111,7 +114,7 @@ def summarize(records, **extra):
     for r in scored:
         if r.get("error"):
             classes[r["error"]] = classes.get(r["error"], 0) + 1
-        for key in ("missing", "missing_citation", "unsupported", "order", "forbidden_hit", "bad_citations", "uncited", "identifier_only"):
+        for key in ("missing", "missing_citation", "unsupported", "order", "forbidden_hit", "bad_citations", "unparsed_references", "uncited", "identifier_only"):
             if r.get(key):
                 classes[key] = classes.get(key, 0) + 1
     passed = sum(r["pass"] for r in scored)
@@ -119,7 +122,9 @@ def summarize(records, **extra):
                 pass_rate=round(passed / len(scored), 4) if scored else None,
                 median_seconds=round(statistics.median(r["seconds"] for r in scored), 2) if scored else None,
                 fabricated_citations=sum(len(r["bad_citations"]) for r in scored),
-                unchecked_citations=sum(r["unchecked"] for r in scored), failure_classes=classes)
+                unparsed_references=sum(len(r.get("unparsed_references", ())) for r in scored),
+                unchecked_citations=sum(r["unchecked"] for r in scored), failure_classes=classes,
+                s2_needs_zero=["fabricated_citations", "unparsed_references"])  # the summary says it: S2 needs both counts at 0
 
 
 def run_chores(pairs, *, model, runs, out, prompt, thinking, timeout, pi_command, fixtures, env, label):

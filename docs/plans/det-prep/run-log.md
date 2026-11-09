@@ -652,3 +652,22 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   Fourth round in the same two families, so round 5 (fixes/fg-n1-round5.md) makes the uncertainty floor table-free,
   keeps word order when flattening, and requires fail-before on a real base worktree.
   Retry coder-d68351c236.
+
+## 2026-11-08 — LS1 round 8; G2-A re-review
+- LS1 r7 verify: 177 tests OK x4. Main's probes:
+  - round-6 kinds: only the same 3 harmless passes as round 6;
+  - new probe ls1probe7: 0/975 subject swaps pass;
+  - ref + reversed copy PASSES in order chores, while reversed + ref fails. The verdict depends on the assignment.
+  Review 7 (OpenAI reviewer) REQUEST_CHANGES:
+  - F1: Unicode-indented bullets escape rule 9.
+  - F2 (duplicate order): a decision for Main.
+  The reviewer asked once to search config/ recursively. Main declined and redirected it to config/local.example.json.
+- Main found the wider hole behind F1: a fabricated citation on any non-list line (prose, heading, quote, `•`, `–`) is ignored,
+  and summarize_run's fabricated count misses it. That would blind S2's zero-fabricated bar.
+  Round 8 (fixes/ls1-round8.md):
+  - every citation anywhere is checked (rule 10);
+  - list items by any Unicode space, blockquote and bullet (rule 11);
+  - Main's ruling on F2: order counts every matching line, so repeats and reversals fail (rule 12).
+  Retry coder-1e9a5b5bb0.
+- G2-A re-review APPROVED_WITH_NOTES: F2 closed. F1 asks for the raw clean-main log of the retry_packet flake (the 4/18 run
+  kept only tail lines). Rerunning 18 repeats on clean main f9a719f into rp-clean18.log.

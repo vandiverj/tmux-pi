@@ -760,3 +760,17 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - fail-before on 8560cf6.
 
   The old pane was dead, so this is a retry: coder-3b1dfbedab, pane %252.
+- Incident, about 04:22. The G3 worker's fake-mode cleanup in tools/smoke/g3_e2e.py ran `tmux kill-server` while `tmux_cmd` was still the
+  bare default (its `-L` socket is set later, in the fake setup). That stopped the default tmux server, and every pane died:
+  - LS1 round 14 (coder-3b1dfbedab);
+  - G3 (coder-e9abf0b28a);
+  - the detprep session.
+
+  Edits survived in both worktrees. Main recreated detprep with bin/tp and pointed @tp_state_dir / TP_STATE_DIR back to the
+  dbe2f4f8 state dir; `tp-agent stop` was run on both workers, then each was retried:
+  - LS1: coder-f9e817eb92, fixes/ls1-round14-resume.md;
+  - G3: coder-1469cd1f98, g3/g3-resume-1.md.
+
+  G3 must now isolate tmux by construction: TMUX_TMPDIR set to a temp dir, a private `-L` from the constructor, kill-server
+  guarded, and a PATH-shim test that asserts no call escapes. Follow-up: audit other tests for the same bare-tmux risk; the
+  thousands of stale tp-t3-* sockets under /private/tmp/tmux-501 are already on the list.

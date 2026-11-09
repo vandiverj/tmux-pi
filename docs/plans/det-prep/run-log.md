@@ -628,3 +628,13 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - G2-E review 2 APPROVED. Committed 814d669, closed (step id is `1` for this lane, not G2E), merged 1d38997, lane removed.
   Baseline 10 -> 9: test_r9 reach-walk line removed (now ungated and passes, even with a broken deno on PATH).
   Deno is now optional for tmux-pi's own suite: no test needs a real deno unless marked (14 NEEDS_DENO + 10 NEEDS_SANDBOX).
+
+## 2026-11-08 — LS1 round 7; FG-N1 r4 in review
+- LS1 r6 review REQUEST_CHANGES: F1 subject swap passes, F2 intro line hides order, F3 double-backtick span, F4 bare `- `.
+  Five rounds in required-fact-completeness. Round 7 brief (fixes/ls1-round7.md): subject rule, order on assigned lines,
+  CommonMark code spans, every list item graded, and a GENERATED attack test over all 24 chores (fail-before shown).
+  Retry coder-07bbf506d8.
+- FG-N1 r4 review started. Its 3.14 ResourceWarning (unclosed 127.0.0.1 socket at exit) is pre-existing on main.
+- Follow-ups added: (1) unclosed socket at exit in the FG-N1 module set on 3.14 (main too); (2) conservative false
+  positives on main: `timeout 5 echo rg` (search), `nohup sh -c "$CMD" &` (search), `xargs -I{} sh -c 'echo {}'` (sensitive);
+  (3) lane close names a lane's steps `1` when dispatched without a session step name: check with `tp-agent lanes NAME`.

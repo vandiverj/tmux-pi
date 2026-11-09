@@ -1,7 +1,7 @@
 # G2-B (g2-lane-cap): two tests still expect a lane cap of 16
 
-Lane `g2-lane-cap`, step G2B. Level: `mid` coder. Base: `main`. Touches: `tests/test_lane_records.py`,
-`tests/test_trial_session.py`, `docs/plans/det-prep/baseline-failing.txt` (only these 2 lines).
+Lane `g2-lane-cap`, step G2B. Level: `mid` coder. Base: `main` (cd63870 or later). Touches: `tests/test_lane_records.py`,
+`tests/test_trial_session.py`.
 
 ## Why
 Release gate G2: every baseline failure fixed. Both fail on both interpreters on a clean main (1b1e9fb):
@@ -19,10 +19,11 @@ owner's decision and is not changed here.
    value, not defaults or fixtures that set their own cap on purpose.
 3. Run test_lane_records and test_trial_session plus any module you changed, on `/usr/bin/python3` and
    `/opt/homebrew/bin/python3`, session keys unset and with dummy `TMUX`/`TP_*`.
-4. Remove exactly these 2 lines from `baseline-failing.txt`.
+4. Do not edit `docs/plans/det-prep/baseline-failing.txt` (Main removes the lines at merge). List, verbatim, the 2
+   baseline lines your fix makes pass.
 
 Out of scope: config/ (no change), any other baseline line.
 
 ## Done means
-Both tests pass on both interpreters in both modes, they failed before, the 2 lines are gone, and the grep list is
+Both tests pass on both interpreters in both modes, they failed before, the 2 lines are listed verbatim, and the grep list is
 in the result.

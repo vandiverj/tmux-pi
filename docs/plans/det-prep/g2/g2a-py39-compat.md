@@ -1,9 +1,8 @@
 # G2-A (g2-py39): three Python 3.9 failures in the baseline
 
-Lane `g2-py39`, step G2A. Level: `mid` coder. Base: `main`. Touches: `tests/test_retry_packet.py`,
+Lane `g2-py39`, step G2A. Level: `mid` coder. Base: `main` (cd63870 or later). Touches: `tests/test_retry_packet.py`,
 `tests/run_bounded.py`, `tests/test_run_bounded.py`, `lib/routing_evals.py`, `lib/trial_record.py`,
-`tests/test_trial_shadow_record_files.py`, `tests/test_trial_shadow_worker_files.py`,
-`docs/plans/det-prep/baseline-failing.txt` (only the lines this lane fixes).
+`tests/test_trial_shadow_record_files.py`, `tests/test_trial_shadow_worker_files.py`.
 
 ## Why
 Release gate G2 (docs/plans/det-prep/release-gates.md): every baseline failure gets a found cause and a real fix;
@@ -32,7 +31,8 @@ test run alone, session keys unset. All three fail only on `/usr/bin/python3` (3
 3. Run, on `/usr/bin/python3` and `/opt/homebrew/bin/python3`, session keys unset and with dummy `TMUX`/`TP_*`:
    test_retry_packet, test_run_bounded, test_trial_shadow_record_files, test_trial_shadow_worker_files, and every
    module that imports `routing_evals` or `trial_record` (list them; say how you found them).
-4. Remove from `baseline-failing.txt` exactly the lines your fixes make pass (6 lines), and list them.
+4. Do not edit `docs/plans/det-prep/baseline-failing.txt` (several G2 lanes run at once; Main removes the lines at
+   merge). List, verbatim, the baseline lines your fixes make pass (6 expected).
 
 Out of scope: other baseline lines; the order-dependent failures (another lane); `lib/redact_hook.py`,
 `lib/sensitive_read.py`, `lib/command_wrappers.py` (FG-N1 is open there); `tools/qual/` (LS1 is open there).
@@ -40,4 +40,4 @@ Out of scope: other baseline lines; the order-dependent failures (another lane);
 ## Done means
 1. All three pass on both interpreters in both modes; each failed before the fix (logs).
 2. Every `_read_json` caller is listed with what it now does on over-deep JSON.
-3. The 6 baseline lines are removed and nothing new fails in the modules run.
+3. The 6 baseline lines are listed verbatim and nothing new fails in the modules run.

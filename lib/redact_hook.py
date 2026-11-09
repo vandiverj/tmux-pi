@@ -857,6 +857,27 @@ def settle(event, decision):
                      **{k: prior.get(k) for k in ("placeholder", "source", "scope", "call")})
 
 
+def settle_declined(event):
+    """A new turn (UserPromptSubmit) or the end of one (Stop): no tool call awaits approval now, so a request still `pending`
+    belongs to a dialog the owner rejected. Claude Code fires no PermissionDenied for that. Mark it `declined` (not `denied`,
+    which is a PermissionDenied event) with the event and the time; every other field stays. A request that is not pending
+    (authorized, denied, declined) or cannot be read as one JSON object is left alone. Never raises: the turn is not blocked.
+    The owner is `handle` in mode on and bin/tp-sensitive-read in shadow and off, so exactly one of them settles."""
+    task = os.getenv("TP_TASK_DIR")
+    if not task:
+        return
+    try:
+        path = Path(task) / "permission-request.json"
+        prior = json.loads(path.read_text())
+        if not isinstance(prior, dict) or prior.get("status") != "pending":
+            return
+        value = {**prior, "status": "declined", "event": event.get("hook_event_name"),
+                 "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
+    except Exception:
+        pass
+
+
 def used_values(event):
     """Values this tool call substituted for placeholders, so Post can redact them if the output echoes them."""
     call = event.get("tool_use_id")
@@ -886,6 +907,8 @@ def handle(event):
             Store(store_name(event)).drop_pending()
         except Exception:
             pass
+        if mode() == "on":  # in shadow and off bin/tp-sensitive-read owns the permission record
+            settle_declined(event)
         return None
     current = mode()
     if current == "off":

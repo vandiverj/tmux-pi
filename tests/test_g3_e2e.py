@@ -231,6 +231,68 @@ class HookTriggerTest(Base):
                 self.assertEqual(self.request()["status"], "denied")
                 self.assertFalse((self.repo / g3.ABSENT).exists())
 
+    def test_the_worker_hears_a_new_turn_in_both_hooks(self):
+        """The owner of the permission record settles a declined dialog at the next turn, so both hooks get UserPromptSubmit and Stop."""
+        hooks = json.loads((ROOT / "claude/plugins/tmux-pi/hooks/hooks.json").read_text())["hooks"]
+        for event in ("UserPromptSubmit", "Stop"):
+            commands = [h["command"] for group in hooks[event] for h in group["hooks"]]
+            self.assertTrue(any("sensitive-read.sh" in c for c in commands), (event, commands))
+            self.assertTrue(any("redact.sh" in c for c in commands), (event, commands))
+
+    def life(self):
+        """What inspect and the list read: the lifecycle of a working task that has this permission-request.json."""
+        import contract
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "updated": "2026-11-09T12:00:00Z"}))
+        return contract.task_lifecycle(self.task)[0]
+
+    def turn(self, name):
+        return {"hook_event_name": name, "session_id": "g3hook", "cwd": str(self.repo)}
+
+    def test_a_declined_dialog_settles_at_the_next_turn_in_every_mode(self):
+        """Claude Code fires no PermissionDenied when the owner rejects the dialog; the next prompt or the end of the turn must settle the
+        pending request, and only the hook that owns the record in this mode does."""
+        for mode, owner, other in (("on", "redact", "sensitive"), ("shadow", "sensitive", "redact"), ("off", "sensitive", "redact")):
+            for ending in ("UserPromptSubmit", "Stop"):
+                with self.subTest(mode=mode, ending=ending), mock.patch.dict(os.environ, self.env(mode)):
+                    (self.task / "permission-request.json").unlink(missing_ok=True)
+                    self.assertEqual(self.decide(owner, self.event("PreToolUse")), "ask")
+                    pending = self.request()
+                    self.assertEqual((pending["status"], self.life()), ("pending", "needs_input"))
+                    self.decide(other, self.turn(ending))
+                    self.assertEqual(self.request(), pending, "the hook that does not own the record leaves it")
+                    self.decide(owner, self.turn(ending))
+                    declined = self.request()
+                    self.assertEqual((declined["status"], declined["event"]), ("declined", ending))
+                    self.assertEqual({k: v for k, v in declined.items() if k not in ("status", "event", "updated")},
+                                     {k: v for k, v in pending.items() if k not in ("status", "updated")})
+                    self.assertTrue(declined["updated"])
+                    self.assertNotEqual(self.life(), "needs_input", "a declined request is not an open question")
+                    self.decide(owner, self.turn(ending))
+                    self.assertEqual(self.request(), declined, "a second turn leaves a settled request alone")
+
+    def test_a_turn_changes_only_a_pending_request(self):
+        """An authorized or denied request, an unreadable one and none at all are left as they are by the next prompt and by Stop."""
+        response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        for mode, owner in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            for event, settled_as in (("PostToolUse", "authorized"), ("PermissionDenied", "denied")):
+                with self.subTest(mode=mode, was=settled_as), mock.patch.dict(os.environ, self.env(mode)):
+                    (self.task / "permission-request.json").unlink(missing_ok=True)
+                    self.decide(owner, self.event("PreToolUse"))
+                    self.decide(owner, {**self.event(event), "tool_response": response})
+                    self.assertEqual(self.request()["status"], settled_as)
+                    before = (self.task / "permission-request.json").read_bytes()
+                    for ending in ("UserPromptSubmit", "Stop"):
+                        self.decide(owner, self.turn(ending))
+                        self.assertEqual((self.task / "permission-request.json").read_bytes(), before, ending)
+            with self.subTest(mode=mode, was="unreadable"), mock.patch.dict(os.environ, self.env(mode)):
+                for text in (b"{not json", b"[]", b""):
+                    (self.task / "permission-request.json").write_bytes(text)
+                    self.decide(owner, self.turn("Stop"))
+                    self.assertEqual((self.task / "permission-request.json").read_bytes(), text)
+                (self.task / "permission-request.json").unlink()
+                self.decide(owner, self.turn("UserPromptSubmit"))
+                self.assertFalse((self.task / "permission-request.json").exists(), "no request is made up")
+
     def test_trust_guard_lets_the_trigger_through(self):
         env = {**os.environ, **self.env("on")}
         run = subprocess.run([str(ROOT / "bin" / "tp-trust-guard"), "--claude-hook", "--home", str(self.home)], input=json.dumps(self.event("PreToolUse")),

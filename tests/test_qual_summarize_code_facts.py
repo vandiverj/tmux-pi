@@ -183,8 +183,8 @@ class UseScanTests(unittest.TestCase):
         ])
 
     def test_function_target(self):
+        # user.py imports from tgt (it spells no run_it, but an import that resolves to the target is no proof of absence): no line
         self.assertEqual(ss.use_scan("Who calls run_it?", self.FILES), [
-            "- user.py does not use run_it [user.py:1]",
             "- mod.py imports run_it [mod.py:4]",
             "- mod.py calls run_it [mod.py:4]",
             "- other.py does not use run_it [other.py:1]",
@@ -217,8 +217,46 @@ class UseScanTests(unittest.TestCase):
                             ("the name as a string", "x = getattr(t, 'Q')\n")):
             with self.subTest(label):
                 self.assertEqual([l for l in self.scan(user) if "does not use" in l], [])
-        # decided: no mention of the name at all, even with a star import of another module
-        self.assertEqual(self.scan("from pkg import *\nx = 1\n"), ["- u.py does not use Q [u.py:1]"])
+        # decided: no star import, no dynamic form, no import of the target's module or that cannot be resolved, and the name spelled nowhere
+        for user in ("x = 1\n", "import os\nfrom pkg import helper\nx = os.sep\n", "from other.t import W\nx = W\n"):
+            self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
+
+    def test_absence_needs_positive_proof(self):
+        """Round 4 F2: "does not use" only when the file has no path to the name; each row is one way it might, and gives no line."""
+        for label, user in (("a star import of the target", "from t import *\n"),
+                            ("a star import of another module", "from pkg import *\nx = 1\n"),
+                            ("a relative star import", "from . import *\nx = 1\n"),
+                            ("an import of the target module, a name that is not Q", "from t import W\nx = W\n"),
+                            ("an import of the target module as a whole", "import t\nx = 1\n"),
+                            ("an unresolvable relative import", "from .t import W\nx = W\n"),
+                            ("a dynamic form", "globals()\nx = 1\n"),
+                            ("setattr", "x = 1\nsetattr(x, 'a', 2)\n"),
+                            ("the name as an attribute", "x = cfg.Q\n"),
+                            ("the name as a keyword", "f(Q=1)\n"),
+                            ("the name inside a string", "x = 'make a Q now'\n"),
+                            ("the name as a parameter", "def f(Q):\n    pass\n"),
+                            ("an alias of the name", "from pkg import X as Q\n")):
+            with self.subTest(label):
+                self.assertEqual(self.scan(user), [])
+        # the review's second reproduction, and a file with nothing that reaches the target still gets its line
+        self.assertEqual(self.scan("from t import *\n"), [])
+        self.assertEqual(self.scan("import json\nx = json.dumps(1)\n"), ["- u.py does not use Q [u.py:1]"])
+
+    def test_relative_imports_resolve_only_as_python_does(self):
+        """Round 4 F1: a relative import resolves by the importer's package; a module at the run root has none, and no level climbs
+        above the root. Otherwise it resolves to nothing: no attribution and no absence line."""
+        target = num("t.py", "class Q:\n    pass\n")
+        for label, path, user in (("from .t at the run root", "u.py", "from .t import Q\nQ()\n"),
+                                  ("from ..t from a package of one level", "pkg/u.py", "from ..t import Q\nQ()\n"),
+                                  ("from . import t at the run root", "u.py", "from . import t\nt.Q()\n"),
+                                  ("from .. import t from a package of one level", "pkg/u.py", "from .. import t\nt.Q()\n"),
+                                  ("no name used, from .t at the run root", "u.py", "from .t import W\n"),
+                                  ("no name used, above the root", "pkg/u.py", "from ..t import W\n")):
+            with self.subTest(label):
+                self.assertEqual(ss.use_scan("Who uses Q?", [target, num(path, user)]), [])
+        # the same imports one level down resolve
+        self.assertEqual(ss.use_scan("Who uses Q?", [num("pkg/t.py", "class Q:\n    pass\n"), num("pkg/sub/u.py", "from ..t import Q\nQ()\n")]),
+                         ["- u.py imports Q [pkg/sub/u.py:1]", "- u.py creates a Q [pkg/sub/u.py:2]"])
 
     def test_a_rebound_name_keeps_only_the_import(self):
         imp = "- u.py imports Q [u.py:1]"
@@ -244,8 +282,7 @@ class UseScanTests(unittest.TestCase):
                  num("param2.py", "from t_v2 import Q\n\n\ndef f(q):\n    q.push()\n")]
         self.assertEqual(ss.use_scan("Who uses Q?", files), [
             "- u.py imports t.Q [u.py:1]", "- u.py creates a t.Q [u.py:2]",
-            "- w.py does not use t.Q [w.py:1]", "- z.py does not use t.Q [z.py:1]", "- param2.py does not use t.Q [param2.py:1]",
-            "- u.py does not use t_v2.Q [u.py:1]",
+            "- z.py does not use t.Q [z.py:1]",  # w, param2 and u spell Q (imported from the other definer): the absence is not proven
             "- w.py imports t_v2.Q [w.py:2]", "- w.py creates a t_v2.Q [w.py:2]", "- w.py uses t_v2.Q.push on x [w.py:3]",
             "- z.py does not use t_v2.Q [z.py:1]",
             "- param2.py imports t_v2.Q [param2.py:1]", "- param2.py uses t_v2.Q.push on q [param2.py:5]"])
@@ -496,13 +533,15 @@ class BindingProofUseTests(unittest.TestCase):
                 ("import pkg.t as t", "app/u.py", "import pkg.t as t\nt.Q()\n", 2, 2),
                 ("from pkg import t", "app/u.py", "from pkg import t\nt.Q()\n", 2, 2),
                 ("relative from .t", "pkg/u.py", "from .t import Q\nQ()\n", 1, 2),
-                ("relative from . import t", "pkg/u.py", "from . import t\nt.Q()\n", 2, 2)):
+                ("relative from . import t", "pkg/u.py", "from . import t\nt.Q()\n", 2, 2),
+                ("relative from ..t in a subpackage", "pkg/sub/u.py", "from ..t import Q\nQ()\n", 1, 2)):
             with self.subTest(label):
                 self.assertEqual(self.scan(text, path), [line.format(p=path, i=imp, c=call) for line in both])
         # a module that only ends in t is not pkg.t (F4); neither is a bare t, a relative one from another package, one above the root
         for label, text in (("unrelated.t", "from unrelated.t import Q\nQ()\n"), ("unrelated t attribute", "from unrelated import t\nt.Q()\n"),
                             ("bare from t", "from t import Q\nQ()\n"), ("bare import t", "import t\nt.Q()\n"),
                             ("relative in another package", "from .t import Q\nQ()\n"), ("relative above the root", "from ... import t\nt.Q()\n"),
+                            ("relative above the package", "from ..pkg.t import Q\nQ()\n"),
                             # the dotted import binds pkg: a second import of pkg may be another module
                             ("pkg bound twice", "import pkg.t\nimport pkg.other\npkg.t.Q()\n")):
             with self.subTest(label):

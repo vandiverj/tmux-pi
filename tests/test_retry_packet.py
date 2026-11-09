@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_orchestration  # noqa: E402  (the module, so its own tests are not collected twice)
@@ -177,6 +178,21 @@ def review_text(*families, verdict="REQUEST_CHANGES"):
             "Coverage\nI read the changed files and their callers.\n")
 
 
+def rows(items):
+    """A list of records that each carry an id (a task row of session-index.json)."""
+    return bool(items) and all(isinstance(i, dict) and "id" in i for i in items)
+
+
+def rows_backwards(node):
+    """`node` with every list of rows reversed, as the same index would read if the listing had come in the other order."""
+    if isinstance(node, dict):
+        return {k: rows_backwards(v) for k, v in node.items()}
+    if isinstance(node, list):
+        items = [rows_backwards(v) for v in node]
+        return items[::-1] if rows(items) else items
+    return node
+
+
 class RepeatedFamilyGateTests(RetryCase):
     def attach_review(self, item, review_id, *families):
         """A review task `review_id` with a reply naming `families`, recorded on the author `item` (reviews, as tp-review writes them)."""
@@ -211,11 +227,23 @@ class RepeatedFamilyGateTests(RetryCase):
         """Every file of the state tree by path, with task ids, selection ids and times replaced, so two builds can be compared."""
         metas = {p.parent.name: json.loads(p.read_text()) for p in (self.state / "tasks").glob("*/meta.json")}
 
-        def depth(task):  # an id is named by its role and how many retries it follows, not by its random digits
+        def depth(task):  # how many retries it follows
             return 0 if not metas.get(task, {}).get("parent") else 1 + depth(metas[task]["parent"])
-        order = {r: n for meta in metas.values() for n, r in enumerate(meta.get("reviews", []))}  # the order an author's reviews were recorded in
+        owner = {r: author for author, meta in metas.items() for r in meta.get("reviews", [])}  # the author a review was recorded on
+        place = {r: n for meta in metas.values() for n, r in enumerate(meta.get("reviews", []))}  # its place among that author's reviews
+
+        def key(task):
+            """An id is named by facts both builds share, never by its random digits or where the listing put it: its role, the retries
+            behind it (a review: behind the author it was recorded on), and its place among that author's reviews."""
+            return (str(metas[task].get("role")), depth(owner.get(task, task)), place.get(task, 0))
+        same = {}
+        for task in metas:
+            same.setdefault(key(task), []).append(task)
+        tied = {k: sorted(v) for k, v in same.items() if len(v) > 1}
+        if tied:  # the listing would decide which is which
+            raise AssertionError(f"state_digest cannot tell these tasks apart by role, retries and place among reviews: {tied}")
         names = {}
-        for task in sorted(metas, key=lambda t: (depth(t), order.get(t, 0))):  # two tasks of one role and depth stay two names
+        for task in sorted(metas, key=key):
             role = metas[task].get("role")
             names[task] = f"{role}-{sum(1 for n in names if metas[n].get('role') == role)}"
         out = {}
@@ -228,7 +256,38 @@ class RepeatedFamilyGateTests(RetryCase):
             text = re.sub(r"sel-[0-9a-f]{32}", "SEL", text)
             text = re.sub(r'"seconds":[0-9.]+', '"seconds":0', text)  # the time the router took
             return re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+(?:Z|\+00:00)?", "TIME", text)
-        return {clean(path): clean(text) for path, text in out.items()}
+
+        def tidy(path, text):
+            """tp-agent lists the rows of session-index.json by `updated`, a time to the second, so tasks made in the same second come
+            in the order the directory listing gave them: a list of rows with an id is compared by (cleaned) id, not by position."""
+            if not path.endswith(".json"):
+                return text
+            try:
+                value = json.loads(text)
+            except ValueError:
+                return text
+
+            def by_id(node):
+                if isinstance(node, dict):
+                    return {k: by_id(v) for k, v in node.items()}
+                if isinstance(node, list):
+                    items = [by_id(v) for v in node]
+                    return sorted(items, key=lambda i: (str(i["id"]), json.dumps(i, sort_keys=True))) if rows(items) else items
+                return node
+            return json.dumps(by_id(value), indent=1, sort_keys=True)
+        return {clean(path): tidy(path, clean(text)) for path, text in out.items()}
+
+    def listed(self, order):
+        """While active, `Path.glob` returns what it found in the order `order` gives, as a different file system would list it."""
+        real = Path.glob
+        return mock.patch.object(Path, "glob", lambda path, pattern, *a, **kw: iter(order(list(real(path, pattern, *a, **kw)))))
+
+    def test_the_digest_refuses_two_tasks_it_cannot_tell_apart(self):
+        for name in ("review-x", "review-y"):  # two reviews no author names: nothing but the listing would number them
+            (self.state / "tasks" / name).mkdir()
+            (self.state / "tasks" / name / "meta.json").write_text(json.dumps({"id": name, "role": "reviewer"}))
+        with self.assertRaisesRegex(AssertionError, r"cannot tell these tasks apart.*review-x.*review-y"):
+            self.state_digest()
 
     def tasks(self):
         return sorted(p.name for p in (self.state / "tasks").iterdir())
@@ -246,6 +305,17 @@ class RepeatedFamilyGateTests(RetryCase):
         self.assertEqual(self.tasks(), before)  # no task was spawned
         # the chain this class restores from a copy is the one a real build makes (ids and times aside)
         first = self.state_digest()
+        with self.listed(sorted):  # the two reviews tie on role and depth alone: the names must not follow the listing, whichever way it runs
+            forward = self.state_digest()
+        with self.listed(lambda found: sorted(found, reverse=True)):
+            self.assertEqual(self.state_digest(), forward)
+        self.assertEqual(first, forward)
+        index = self.state / "session-index.json"  # tp-agent lists same-second tasks in listing order: the rows in the other order are the same build
+        written = index.read_text()
+        self.assertTrue(any(len(v) > 1 and rows(v) for v in json.loads(written).values() if isinstance(v, list)), "no list of rows to turn round")
+        index.write_text(json.dumps(rows_backwards(json.loads(written))))
+        self.assertEqual(self.state_digest(), forward)
+        index.write_text(written)
         shutil.rmtree(self.root)
         self.build_root()
         self.chain(["state-matrix"], ["state-matrix"])  # the cache is warm by now: this one is restored

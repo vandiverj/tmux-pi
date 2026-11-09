@@ -671,3 +671,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   Retry coder-1e9a5b5bb0.
 - G2-A re-review APPROVED_WITH_NOTES: F2 closed. F1 asks for the raw clean-main log of the retry_packet flake (the 4/18 run
   kept only tail lines). Rerunning 18 repeats on clean main f9a719f into rp-clean18.log.
+- G2-A re-review 2: APPROVED_WITH_NOTES. It asked for the raw clean-main log, and Main reran 18 repeats on clean f9a719f:
+  8/18 FAIL with the same coder-1/coder-0 digest (rp-clean18.log in G2-A's main-evidence). Re-review 3: APPROVED.
+  Closed (step G2A), merged 16a9eb1, lane removed. Baseline 8 -> 2: G2-A's six lines are removed (the retry_packet
+  loader error, 4 record_files deep reads, run_bounded --durations). Left: the sensitive_trust rg flake and the retry_packet
+  digest flake (G2-F).

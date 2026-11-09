@@ -19,7 +19,7 @@ WATCHED = {NONCANON, UNPARSED, UNCITED, UNKNOWN}
 
 # For every delimiter (each bracket pair, backticks, each quote pair, none), every printable ASCII punctuation character and the 20 non-ASCII ones
 # placed first, last and inside a chore's cited file (in its directory and in its name), a letter, a space or nothing just before the opener, both
-# orders of rule 19, over all 24 chores ("characters"); between the file and its line number, every separator that can sit just before the colon
+# orders of rule 19, over every chore of every split ("characters"); between the file and its line number, every separator that can sit just before the colon
 # ("separators"); and (round 13, rule 27) extra path text in front of the file, inside every delimiter and with none ("prefixes"): a word, a path
 # fragment or a "." and one of five white spaces between it and the file, and nothing, "." or "," just before ":N". Each case is a line of prose and,
 # in the fact-line form, a fact line "- ok [..]" that the checker may or may not accept.
@@ -185,23 +185,43 @@ def oracle_expect(line, files, where, reverse, target, fact, legacy=False):
     return grammar, items, (rules_ | {UNCITED} if fact else rules_)
 
 
-def oracle_cases(answer, delimiter, family="characters", with_legacy=False):
+def oracle_name_at(target):
+    """The index in a cited path of the place "name" of the characters family: where a character goes inside the file's own name. A name with an
+    extension takes it just before the extension (the last "." of the LAST path segment: a "." in a directory name is no extension). A name with no
+    extension (a bin/ script such as bin/tp-spawn) has no such place, and "just before the extension" would be the end of the path, which the place
+    "last" already covers; the place is then just before the last character of the name, which is inside the name and in no other place."""
+    start = target.rfind("/") + 1
+    dot = target.rfind(".", start)
+    return dot if dot >= 0 else len(target) - 1
+
+
+def oracle_target(answer, with_lines=False):
+    """The file the first fact line of the reference reply cites (with_lines: and its line part as written, "29" or "12-14")."""
+    first = base.split_line(answer["reference"][0]["text"])[1].split(",")[0].strip()
+    cited, lines = first.rsplit(":", 1)
+    return (cited, lines) if with_lines else cited
+
+
+def oracle_cases(answer, delimiter, family="characters", with_legacy=False, target=None):
     """(label, reply, line, expected path, expected exact items, expected rules, reverse, fact) for every case of one delimiter over one chore (the
     generator of the oracle). family "characters": a character in the path, as a line of prose in both orders and as a forward fact line;
     "separators": a separator between the path and its line number, as a line of prose and as a fact line; "prefixes": extra text and white space in
     front of the file and a suffix punctuation after it (rule 27), as a line of prose in both orders of rule 19 and as a fact line; "leadins" (rule 29)
-    and "bare" (rule 30) are the lead-in and bare-name families. with_legacy adds a ninth field: (path, exact items, rules) as the reading before rules 29 and 30 expected them."""
+    and "bare" (rule 30) are the lead-in and bare-name families. with_legacy adds a ninth field: (path, exact items, rules) as the reading before rules 29 and 30 expected them.
+    target: the cited file the cases are written around; by default the first file the reference reply cites (any other entry of cite_files may be given)."""
     texts = [s["text"] for s in answer["reference"]]
-    first = base.split_line(texts[0])[1].split(",")[0].strip()
-    target, lines = first.rsplit(":", 1)
+    cited, lines = oracle_target(answer, with_lines=True)
+    target = cited if target is None else target
     number = int(lines.partition("-")[0])
     opener, closer = ORACLE_DELIMITERS[delimiter]
     files = answer["cite_files"]
-    dot = target.rindex(".")
+    dot = oracle_name_at(target)
 
     def case(label, line, where, reverse, fact):
         grammar, items, rules_ = oracle_expect(line, files, where, reverse, target, fact)
-        reply = "\n".join(texts) + "\n" + line if (fact or "nothing" not in label) else line + "\n" + "\n".join(texts)
+        # an ignored line (rule 2) between the reference and the line: rule 13 reads "PATH line N" across line breaks, so a reference claim that ends in a
+        # path-shaped word ("... moved to lanes/archive/NAME-TIMESTAMP [..]") would otherwise take a following "line 8 of ..." as its own line part
+        reply = "\n".join(texts) + "\nNotes\n" + line if (fact or "nothing" not in label) else line + "\nNotes\n" + "\n".join(texts)
         row = (label, reply, line, grammar, items, rules_, reverse, fact)
         return row + (oracle_expect(line, files, where, reverse, target, fact, True),) if with_legacy else row
 
@@ -277,7 +297,7 @@ def oracle_cases(answer, delimiter, family="characters", with_legacy=False):
             yield case("{}/between {}/fact".format(delimiter, repr(between)), line, len("- ok ") + len(opener) + len(target), False, True)
 
 
-def oracle_mismatches(answer, delimiter, family="characters", limit=None, stats=None):
+def oracle_mismatches(answer, delimiter, family="characters", limit=None, stats=None, target=None, first=None):
     """(cases, full, mismatches): every oracle case of one delimiter over one chore, how many of them were also checked as the last or first line of the
     whole reference reply, and the ones where the checker's path, exact items or failures differ from the model's. The failures compared are rules 2
     (uncited), 3 (unknown_file), 15 (a stray bracket, rule 10, counts as 15) and 21 of the line alone; a mismatch is (label, line, expected path,
@@ -292,7 +312,9 @@ def oracle_mismatches(answer, delimiter, family="characters", limit=None, stats=
     cases, full, bad = 0, 0, []
     files = answer["cite_files"]
     legacy = stats is not None and family in ("characters", "separators", "prefixes")
-    for row in oracle_cases(answer, delimiter, family, with_legacy=legacy):
+    for row in oracle_cases(answer, delimiter, family, with_legacy=legacy, target=target):
+        if first is not None and cases >= first:  # first: compare only the first cases (the guard over every cited file; the product tests compare all)
+            break
         label, reply, line, expected, expected_items, expected_rules, reverse, fact = row[:8]
         cases += 1
         reported = [ref[2] for ref in summarize_check.references(line, files)[0]]
@@ -329,15 +351,23 @@ def oracle_mismatches(answer, delimiter, family="characters", limit=None, stats=
     return cases, full, bad
 
 
-class PathOracleTests(unittest.TestCase):
+class OracleCases:
+    """The data and the checks the oracle test classes share (a plain mixin, not a TestCase: the modules that import it run no test twice). The path
+    (characters) oracle is split over tests/test_qual_summarize_oracle_characters_{a,b,c}.py, three delimiters each, so that each file runs in well
+    under 60 s alone; this file holds the other families, the reproducers and the guard over every cited file."""
+
     @classmethod
     def setUpClass(cls):
         cls.chores = base.jsonl("chores.jsonl")
         cls.answers = {a["id"]: a for a in base.jsonl("answers.jsonl")}
 
     # characters family: the cases rules 29 and 30 read differently from the round-12 reading, by delimiter (Main's ruling 4: accepted, on the condition below)
-    CHANGED_BY_RULES_29_30 = {"none": 0, "brackets": 768, "parens": 672, "angle": 768, "backticks": 672, "double quotes": 480, "single quotes": 480,
-                              "curly double": 480, "curly single": 480}  # 4800 in all: "," ";" "[" "<" in the path
+    # per chore whose first cited file has an extension (the 24 chores of Main's ruling 4 had 4800 in all, "," ";" "[" "<" in the path, 200 per chore)
+    CHANGED_BY_RULES_29_30 = {"none": 0, "brackets": 32, "parens": 28, "angle": 32, "backticks": 28, "double quotes": 20, "single quotes": 20,
+                              "curly double": 20, "curly single": 20}
+    # a first cited file with no extension (bin/tp-spawn) has 4 more such cases in the pair delimiters that read a "," or ";" inside the name as a list
+    # separator ("[tp-spaw,n:29]": a lead-in "tp-spaw", rule 29); its place "name" is before the last character, see oracle_name_at
+    CHANGED_EXTRA_WITHOUT_EXTENSION = {"brackets": 4, "parens": 4, "angle": 4}
 
     def product_condition(self, stats, cases, where, family):
         """Main's ruling 4, over the whole product of a family (every case of every chore, in the delimiters the test runs): (a) no case now passes (every
@@ -351,7 +381,7 @@ class PathOracleTests(unittest.TestCase):
 
     def path_oracle(self, delimiter):
         """Rules 24 to 26: the path the checker reads equals the path the generator wrote, and the failures are the model's, for every printable ASCII
-        punctuation character and the 20 non-ASCII ones first, last and inside the cited file of each of the 24 chores (in its directory and in its
+        punctuation character and the 20 non-ASCII ones first, last and inside the cited file of each chore of every split (in its directory and in its
         name), with a letter, a space or nothing before the opener, in both orders of rule 19, inside one kind of delimiter (or none); and, forward,
         as a fact line."""
         cases = full = 0
@@ -361,10 +391,12 @@ class PathOracleTests(unittest.TestCase):
             self.assertEqual(bad, [], chore["id"])
             cases, full = cases + n, full + f
         self.product_condition(stats, cases, delimiter, "characters")
-        self.assertEqual(stats["changed"], self.CHANGED_BY_RULES_29_30[delimiter], "cases read differently from the round-12 reading: " + delimiter)
+        bare = sum(1 for chore in self.chores if "." not in oracle_target(self.answers[chore["id"]]).rpartition("/")[2])
+        self.assertEqual(stats["changed"], self.CHANGED_BY_RULES_29_30[delimiter] * len(self.chores) + self.CHANGED_EXTRA_WITHOUT_EXTENSION.get(delimiter, 0) * bare,
+                         "cases read differently from the round-12 reading: " + delimiter)
         per_chore = len(CHARACTERS) * len(ORACLE_PLACES) * (len(ORACLE_BEFORE) * 2 + 1)
-        self.assertEqual(cases, 24 * per_chore)
-        self.assertEqual(full, 24 * (per_chore // ORACLE_FULL_EVERY))
+        self.assertEqual(cases, len(self.chores) * per_chore)
+        self.assertEqual(full, len(self.chores) * (per_chore // ORACLE_FULL_EVERY))
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("path oracle {:<14} cases {} (whole-reply checks {}) on python {}".format(delimiter, cases, full, sys.version.split()[0]), file=sys.stderr)
 
@@ -380,14 +412,16 @@ class PathOracleTests(unittest.TestCase):
             cases, full = cases + n, full + f
         self.product_condition(stats, cases, delimiter, "separators")
         self.assertEqual(stats["changed"], 0, "rules 29 and 30 change no separator case: " + delimiter)
-        self.assertEqual(cases, 24 * len(ORACLE_BETWEEN) * (len(ORACLE_BEFORE) + 1))
+        self.assertEqual(cases, len(self.chores) * len(ORACLE_BETWEEN) * (len(ORACLE_BEFORE) + 1))
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("separator oracle {:<10} cases {} (whole-reply checks {}) on python {}".format(delimiter, cases, full, sys.version.split()[0]), file=sys.stderr)
 
+
+class PathOracleTests(OracleCases, unittest.TestCase):
     def test_generated_prefix_oracle_for_every_delimiter_and_none(self):
         """Rule 27: extra text in front of the file inside a delimiter is part of the path ("(junk src/cli.py:6)" is the file "junk src/cli.py"), and
         outside one the run of non-white-space characters is the path; the model has no shortcut for a chore file. Every delimiter and none x five
-        white spaces x three prefixes x three suffixes x both orders of rule 19 (forward also as a fact line) x all 24 chores."""
+        white spaces x three prefixes x three suffixes x both orders of rule 19 (forward also as a fact line) x every chore of every split."""
         cases = full = 0
         stats = {}
         for delimiter in ORACLE_DELIMITERS:
@@ -396,7 +430,7 @@ class PathOracleTests(unittest.TestCase):
                 self.assertEqual(bad, [], (delimiter, chore["id"]))
                 cases, full = cases + n, full + f
         self.product_condition(stats, cases, "every delimiter and none", "prefixes")
-        self.assertEqual(cases, len(ORACLE_DELIMITERS) * 24 * len(ORACLE_GAPS) * len(ORACLE_PREFIXES) * len(ORACLE_SUFFIXES) * 3)
+        self.assertEqual(cases, len(ORACLE_DELIMITERS) * len(self.chores) * len(ORACLE_GAPS) * len(ORACLE_PREFIXES) * len(ORACLE_SUFFIXES) * 3)
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("prefix oracle cases {} (whole-reply checks {}) on python {}".format(cases, full, sys.version.split()[0]), file=sys.stderr)
 
@@ -404,7 +438,7 @@ class PathOracleTests(unittest.TestCase):
         """Rule 29: inside a pair ONE list separator splits a lead-in off ("[see, src/cli.py:6]" is the file "src/cli.py"; a doubled or no separator is
         no split: "[see,, src/cli.py:6]" and "(see src/cli.py:6)" are the files as written). A lead-in of a word, of two words and of a path fragment x
         the separators "," ";" ",," and none x no white space, a space and a line break after it x every delimiter and none x both orders of rule 19
-        (forward also as a fact line) x all 24 chores."""
+        (forward also as a fact line) x every chore of every split."""
         cases = full = 0
         stats = {}
         for delimiter in ORACLE_DELIMITERS:
@@ -413,13 +447,13 @@ class PathOracleTests(unittest.TestCase):
                 self.assertEqual(bad, [], (delimiter, chore["id"]))
                 cases, full = cases + n, full + f
         self.product_condition(stats, cases, "every delimiter and none", "leadins")
-        self.assertEqual(cases, len(ORACLE_DELIMITERS) * 24 * len(ORACLE_LEADINS) * len(ORACLE_LEAD_SEPARATORS) * len(ORACLE_LEAD_WHITE) * 3)
+        self.assertEqual(cases, len(ORACLE_DELIMITERS) * len(self.chores) * len(ORACLE_LEADINS) * len(ORACLE_LEAD_SEPARATORS) * len(ORACLE_LEAD_WHITE) * 3)
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("lead-in oracle cases {} (whole-reply checks {}) on python {}".format(cases, full, sys.version.split()[0]), file=sys.stderr)
 
     def test_generated_bare_name_oracle_for_every_delimiter_and_none(self):
         """Rule 30: a line part inside a pair is read by that pair alone, no rule-18 fallback: "( cli.py.:6)" is the file "cli.py." (unknown_file). A bare
-        file name, alone and with a trailing ".", "," or ";" x every delimiter and none x both orders of rule 19 (forward also as a fact line) x all 24
+        file name, alone and with a trailing ".", "," or ";" x every delimiter and none x both orders of rule 19 (forward also as a fact line) x every chore of every split
         chores."""
         cases = full = 0
         stats = {}
@@ -429,36 +463,9 @@ class PathOracleTests(unittest.TestCase):
                 self.assertEqual(bad, [], (delimiter, chore["id"]))
                 cases, full = cases + n, full + f
         self.product_condition(stats, cases, "every delimiter and none", "bare")
-        self.assertEqual(cases, len(ORACLE_DELIMITERS) * 24 * len(ORACLE_BARE_ENDINGS) * 3)
+        self.assertEqual(cases, len(ORACLE_DELIMITERS) * len(self.chores) * len(ORACLE_BARE_ENDINGS) * 3)
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("bare-name oracle cases {} (whole-reply checks {}) on python {}".format(cases, full, sys.version.split()[0]), file=sys.stderr)
-
-    def test_generated_path_oracle_without_a_delimiter(self):
-        self.path_oracle("none")
-
-    def test_generated_path_oracle_in_brackets(self):
-        self.path_oracle("brackets")
-
-    def test_generated_path_oracle_in_parentheses(self):
-        self.path_oracle("parens")
-
-    def test_generated_path_oracle_in_angle_brackets(self):
-        self.path_oracle("angle")
-
-    def test_generated_path_oracle_in_backticks(self):
-        self.path_oracle("backticks")
-
-    def test_generated_path_oracle_in_double_quotes(self):
-        self.path_oracle("double quotes")
-
-    def test_generated_path_oracle_in_single_quotes(self):
-        self.path_oracle("single quotes")
-
-    def test_generated_path_oracle_in_curly_double_quotes(self):
-        self.path_oracle("curly double")
-
-    def test_generated_path_oracle_in_curly_single_quotes(self):
-        self.path_oracle("curly single")
 
     def test_generated_separator_oracle_without_a_delimiter(self):
         self.separator_oracle("none")
@@ -486,6 +493,24 @@ class PathOracleTests(unittest.TestCase):
 
     def test_generated_separator_oracle_in_curly_single_quotes(self):
         self.separator_oracle("curly single")
+
+    def test_every_cited_file_of_every_split_is_handled_by_the_oracle_and_the_checker(self):
+        """Round 3 guard. The generator once assumed that a cited file has an extension (target.rindex(".")) and raised on bin/tp-spawn, which the real
+        split cites. Every file any answer of any split names in cite_files, as the file the cases are written around (not only the first citation of
+        the reference reply), in every family and every delimiter: the generator yields cases, and the checker and the model agree on the first of
+        them. A file whose last segment has no extension, and one with a "." only in a directory, are among them."""
+        owner = {}
+        for answer in self.answers.values():
+            for name in answer["cite_files"]:
+                owner.setdefault(name, answer)
+        self.assertEqual(len({a["id"] for a in self.answers.values()}), len(self.chores))
+        self.assertTrue(any("." not in name.rpartition("/")[2] for name in owner), "the data holds no extensionless cited file: the guard checks nothing")
+        for name, answer in sorted(owner.items()):
+            for family in ("characters", "separators", "prefixes", "leadins", "bare"):
+                for delimiter in ORACLE_DELIMITERS:
+                    cases, _, bad = oracle_mismatches(answer, delimiter, family, limit=3, target=name, first=48)
+                    self.assertEqual(bad, [], (name, family, delimiter))
+                    self.assertGreater(cases, 0, (name, family, delimiter))
 
     def test_path_oracle_generator_holds_the_reproducers_and_reads_them_as_the_rules_do(self):
         # review 11's F1 is a case of the oracle ("(;src/cli.py:29)": the file ";src/cli.py"), and so is F2's apostrophe: a quote after a letter
@@ -546,6 +571,22 @@ class PathOracleTests(unittest.TestCase):
             self.assertEqual((got, expected, expected_rules), (line, path, rules_), label)
         outside = {c[0]: c for c in oracle_cases(answer, "none", "bare")}  # outside a pair rule 18 takes the sentence punctuation off the end
         self.assertEqual(outside["none/name'.'/forward"][3], "cli.py")
+        # round 3: the place "name" of the characters family. With an extension it is just before the extension, the last "." of the LAST segment (a "."
+        # in a directory is none); with none it is before the last character of the name, which "last" ("src/cli.py!") and "directory" do not cover
+        for target, at in (("src/cli.py", 7), ("real/bin/tp-spawn", 16), ("real/v1.2/tool", 13), ("real/v1.2/x.tar.gz", 15), ("a/.gitignore", 2), ("tp-spawn", 7)):
+            self.assertEqual(oracle_name_at(target), at, target)
+        spawn = dict(answer, cite_files=["real/bin/tp-spawn"], reference=[{"text": "- tp-spawn runs it [real/bin/tp-spawn:29]"}])
+        by_label = {c[0]: c for c in oracle_cases(spawn, "none")}
+        self.assertEqual(by_label["none/'!'/name/space/forward"][2], "See real/bin/tp-spaw!n:29 ok")
+        self.assertEqual(by_label["none/'!'/last/space/forward"][2], "See real/bin/tp-spawn!:29 ok")
+        self.assertEqual(by_label["none/'!'/directory/space/forward"][2], "See re!al/bin/tp-spawn:29 ok")
+        # rule 13 reads "PATH line N" across line breaks: a reference claim that ends in a path-shaped word, then a line "line 8 of ...", is a reference
+        # to that word at line 8 (noncanonical) in the checker, and so the generator puts an ignored line between the reference and its own line
+        joined = "- it is moved to lanes/archive/NAME-TIMESTAMP [src/cli.py:29]\nline 8 of x ok"
+        self.assertIn(NONCANON, base.rules(summarize_check.check(joined, answer, base.FIXTURES)))
+        self.assertNotIn(NONCANON, base.rules(summarize_check.check(joined.replace("]\n", "]\nNotes\n"), answer, base.FIXTURES)))
+        row = next(c for c in oracle_cases(spawn, "none") if c[0] == "none/'!'/name/space/forward")
+        self.assertIn("\nNotes\n", row[1])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+- lane_deps.py has a share function [real/lib/lane_deps.py:138]
+- lane_deps.py has a shared_links function [real/lib/lane_deps.py:184]
+- lane_deps.py has an unlink_shared function [real/lib/lane_deps.py:201]
+- lane_deps.py has an unshare_lane function [real/lib/lane_deps.py:210]
+- share links main's installed dependencies into the new lane when the conditions hold, and it never raises [real/lib/lane_deps.py:139-141]
+- shared_links finds the symlinks in a worktree that point into the main checkout, walking the tree without following any link [real/lib/lane_deps.py:185-186]
+- unlink_shared removes every shared link of a worktree without ever going through the link, and returns the paths [real/lib/lane_deps.py:202]
+- unshare_lane is the install guard: it unlinks the shared links and marks the lane as having its own dependencies, to run before npm ci [real/lib/lane_deps.py:211]

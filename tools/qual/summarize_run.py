@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the summarize_files chores (tests/calibration/summarize/) against one local model and score the replies.
 
-    summarize_run.py --model M [--split tune|holdout|all] [--runs N] --out FILE [--prompt-file P] [--only ID,ID]
+    summarize_run.py --model M [--split tune|holdout|real|all] [--runs N] --out FILE [--prompt-file P] [--only ID,ID]
                      [--thinking T] [--timeout SECONDS] [--pi-command CMD] [--route-command CMD]
     summarize_run.py --route-only --out FILE [--split S] [--only ID,ID]
 
@@ -198,7 +198,7 @@ def main(argv=None, env=None):
     env = os.environ if env is None else env
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", help="roster model, e.g. lmstudio/qwen/qwen3.6-35b-a3b")
-    p.add_argument("--split", choices=("tune", "holdout", "all"), default="all")
+    p.add_argument("--split", choices=("tune", "holdout", "real", "all"), default="all")
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--out", required=True)
     p.add_argument("--prompt-file", help="system-prompt text to use instead of the model's config/local.json prompt")

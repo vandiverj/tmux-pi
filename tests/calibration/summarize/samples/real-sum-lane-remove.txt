@@ -1,0 +1,4 @@
+- lane_remove.py removes a lane only when its branch tip is already integrated, unless --abandon is given [real/lib/lane_remove.py:3-6]
+- lane_remove.py refuses to remove a lane that has a live process or queued work [real/lib/lane_remove.py:10-11]
+- lane_remove.py removes the working tree with git, never with a forced removal [real/lib/lane_remove.py:14]
+- lane_remove.py moves the lane's directory into the archive when it is done [real/lib/lane_remove.py:23]

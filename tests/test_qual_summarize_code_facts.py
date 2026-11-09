@@ -152,6 +152,21 @@ class VersionDiffTests(unittest.TestCase):
             "- in a2.py, outer now calls new3 [a2.py:5]", "- in a2.py, outer no longer calls old1 [a.py:2]",
             "- in a2.py, outer no longer calls old2 [a.py:3]", "- in a2.py, outer no longer calls old3 [a.py:5]"])
 
+    def test_a_name_with_no_single_value_or_definition_states_nothing(self):
+        # bound twice, augmented, declared global: the source does not show which value or def is the file's
+        self.assertEqual(self.diff("X = 1\nX = 2", "X = 2"), [])
+        self.assertEqual(self.diff("X = 1\nX += 1", "X = 2"), [])
+        self.assertEqual(self.diff("X = 1\nif c:\n    X = 2", "X = 2"), [])
+        self.assertEqual(self.diff("X = 1\ndef f():\n    global X\n    X = 5\n", "X = 5\ndef f():\n    pass\n"), [])
+        self.assertEqual(self.diff("def f():\n    a()\ndef f():\n    b()", "def f():\n    b()"), [])
+        prop = "class C:\n    @property\n    def x(self):\n        return {0}()\n    @x.setter\n    def x(self, v):\n        pass\n"
+        self.assertEqual(self.diff(prop.format("old"), prop.format("new")), [])
+        # a function the other file defines under an if or try is not dropped or added; one bound once still is
+        self.assertEqual(self.diff("def f():\n    pass\n", "if 1:\n    def f():\n        pass\n"), [])
+        self.assertEqual(self.diff("try:\n    from m import g\nexcept ImportError:\n    g = None\n", "def g():\n    pass\n"), [])
+        self.assertEqual(self.diff("X = 1", "X = 2\ndef f():\n    pass\n"),
+                         ["- a2.py adds the function f [a2.py:2]", "- a2.py changes X from 1 to 2 [a.py:1, a2.py:1]"])
+
 
 class UseScanTests(unittest.TestCase):
     TARGET = "class Q:\n    def __init__(self):\n        self.items = []\n\n    def pop(self):\n        return 1\n\n\ndef run_it():\n    pass\n"
@@ -208,6 +223,19 @@ class UseScanTests(unittest.TestCase):
                 self.assertEqual([l for l in self.scan(user) if "does not use" in l], [])
         # decided: no mention of the name at all, even with a star import of another module
         self.assertEqual(self.scan("from pkg import *\nx = 1\n"), ["- u.py does not use Q [u.py:1]"])
+
+    def test_a_rebound_name_keeps_only_the_import(self):
+        imp = "- u.py imports Q [u.py:1]"
+        for label, user, lines in (("assigned after the import", "from t import Q\nQ = other\nQ()\n", [imp]),
+                                   ("an import fallback", "try:\n    from t import Q\nexcept ImportError:\n    Q = None\nQ()\n",
+                                    ["- u.py imports Q [u.py:2]"]),
+                                   ("a second import of the name", "from t import Q\nfrom mid import Q\nQ()\n", [imp]),
+                                   ("a star import of another module after it", "from t import Q\nfrom mid import *\nQ()\n", [imp]),
+                                   ("two star imports", "from t import *\nfrom mid import *\nQ()\n", []),
+                                   ("a star import, then assigned", "from t import *\nQ = 3\nQ()\n", []),
+                                   ("the module rebound", "import t\nt = other\nt.Q()\n", [])):
+            with self.subTest(label):
+                self.assertEqual(self.scan(user), lines)
 
     def test_duplicate_definitions_keep_the_unambiguous_files(self):
         files = [num("t.py", "class Q:\n    def pop(self):\n        pass\n"),

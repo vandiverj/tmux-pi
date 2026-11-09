@@ -391,21 +391,62 @@ def _base(f):
     return f["path"].rsplit("/", 1)[-1]
 
 
+def _module_bindings(tree):
+    """(count, declared): how many times each name is bound in the module's own scope (a def, class, import, assignment, augmented
+    assignment, for or with target, except name, anywhere in the module's statements but not inside a def, lambda, class or
+    comprehension), and the names any function declares `global`. A name bound more than once, or declared global, has no one
+    value or definition that the source shows."""
+    count, declared = {}, set()
+
+    def bind(name):
+        count[name] = count.get(name, 0) + 1
+
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bind(node.name)
+            continue
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bind(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bind(alias.asname or alias.name.split(".")[0])
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            declared.update(node.names)
+    return count, declared
+
+
 def _defs(tree):
-    """{(owner, name): node} of the functions at module level and the methods of module-level classes."""
-    found = {}
+    """{(owner, name): node} of the functions at module level and the methods of module-level classes, leaving out a name that is
+    bound more than once (in the module, or among a class's methods and attributes: a property getter and setter) or declared
+    global, since the source does not show which one runs."""
+    count, declared = _module_bindings(tree)
+    found, repeated = {}, set()
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            found.setdefault((None, node.name), node)
-        elif isinstance(node, ast.ClassDef):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and count.get(node.name) == 1 and node.name not in declared:
+            found[(None, node.name)] = node
+        elif isinstance(node, ast.ClassDef) and count.get(node.name) == 1:
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    found.setdefault((node.name, sub.name), sub)
-    return found
+                    key = (node.name, sub.name)
+                    if key in found:
+                        repeated.add(key)
+                    found[key] = sub
+    return {key: node for key, node in found.items() if key not in repeated}
 
 
 def _literal_constants(tree):
-    """{name: (value node, literal value)} of the module-level constants whose value ast.literal_eval reads."""
+    """{name: (value node, literal value, line)} of the module-level constants whose value ast.literal_eval reads, leaving out a
+    name that is bound more than once in the module (`X = 1` then `X = 2`, `X += 1`) or declared global."""
+    count, declared = _module_bindings(tree)
     found = {}
     for node in tree.body:
         targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
@@ -416,8 +457,8 @@ def _literal_constants(tree):
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
             continue
         for target in targets:
-            if isinstance(target, ast.Name):
-                found.setdefault(target.id, (node.value, value, node.lineno))
+            if isinstance(target, ast.Name) and count.get(target.id) == 1 and target.id not in declared:
+                found[target.id] = (node.value, value, node.lineno)
     return found
 
 
@@ -484,11 +525,14 @@ def version_diff(old, new):
     obase = _base(old)
     lines = []
     old_names, new_names = _keyed_names(old), _keyed_names(new)
+    old_bound, new_bound = _module_bindings(old_tree)[0], _module_bindings(new_tree)[0]
+    # outline reads only the top-level statements: a name the other file binds inside an if or try is not "absent" from it
+    elsewhere = lambda key, bound: key[0] in ("class", "function", "constant") and key[2] in bound  # noqa: E731
     for key, line in sorted(new_names.items(), key=lambda item: item[1]):
-        if key not in old_names:
+        if key not in old_names and not elsewhere(key, old_bound):
             lines.append("- {} adds the {} {} [{}:{}]".format(base, key[0], key[2], np, line))
     for key, line in sorted(old_names.items(), key=lambda item: item[1]):
-        if key not in new_names:
+        if key not in new_names and not elsewhere(key, new_bound):
             lines.append("- {} drops the {} {} that {} defines [{}:{}]".format(base, key[0], key[2], obase, op, line))
     old_const, new_const = _literal_constants(old_tree), _literal_constants(new_tree)
     for name, (node, value, line) in sorted(new_const.items(), key=lambda item: item[1][2]):
@@ -562,6 +606,26 @@ def _star_exports(tree, name):
     return name in exported if exported is not None else not name.startswith("_")
 
 
+def _rebinds(tree, known, names):
+    """Whether some statement other than an import alias in known binds one of names (assignment, parameter, def, class, except name,
+    another import), so that a later use of the name need not be what the import brought in."""
+    for node in ast.walk(tree):
+        bound = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound = node.id
+        elif isinstance(node, ast.arg):
+            bound = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound = node.name
+        elif isinstance(node, ast.ExceptHandler):
+            bound = node.name
+        elif isinstance(node, ast.alias) and id(node) not in known and node.name != "*" and (node.asname or "." not in node.name):
+            bound = node.asname or node.name
+        if bound in names:
+            return True
+    return False
+
+
 def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from some other module, `from m import *` that may re-export
@@ -573,36 +637,47 @@ def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
     label = "{}.{}".format(stem, target) if dup else target
     direct, modules, imports = set(), set(), []
     other_direct, other_modules, unexplained = set(), set(), False
+    known, star_other = set(), False  # the import aliases explained below; whether another module is star-imported
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             last = (node.module or "").rsplit(".", 1)[-1]
             for alias in node.names:
                 local = alias.asname or alias.name
                 if alias.name == "*":
+                    star_other = star_other or last != stem
+                    known.add(id(alias))
                     if last == stem and star:
                         direct.add(target)
                 elif alias.name == target:
                     if last == stem:
+                        known.add(id(alias))
                         direct.add(local)
                         shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
                                       if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
                         imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
                     elif last in others:
+                        known.add(id(alias))
                         other_direct.add(local)
                     else:
                         unexplained = True
                 elif alias.name == stem:
+                    known.add(id(alias))
                     modules.add(local)
                 elif alias.name in others:
+                    known.add(id(alias))
                     other_modules.add(local)
         elif isinstance(node, ast.Import):
             for a in node.names:
                 if a.name.rsplit(".", 1)[-1] == stem:
+                    known.add(id(a))
                     modules.add(a.asname or a.name)
                 elif a.name.rsplit(".", 1)[-1] in others:
+                    known.add(id(a))
                     other_modules.add(a.asname or a.name)
     if direct & other_direct or modules & other_modules:
         return [], [], [], True
+    if _rebinds(tree, known, direct | {m.split(".")[0] for m in modules}) or (direct and star_other):
+        return sorted(imports, key=lambda item: item[0]), [], [], True  # the import is a fact; what the name then is, is not shown
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == target:
             unexplained = unexplained or node.id not in other_direct  # a use of this module's name is a line, or else (a star import) undecided

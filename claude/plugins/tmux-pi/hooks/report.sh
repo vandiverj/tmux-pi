@@ -82,11 +82,14 @@ if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]
   if [[ -z "$usage" ]]; then usage='null'; fi
 fi
 
-# The submit record lib/pane_send.py waits on: a count (higher than before the send means submitted), the time, and a
-# short hash of the prompt text. Only a UserPromptSubmit writes them.
+# The submit record lib/pane_send.py waits on. Only a UserPromptSubmit writes it: promptSubmits (a count), promptSubmitted
+# (time), promptHash, and promptLog, the last 8 records {n, hash, at} in order, so two quick submits cannot hide each other.
+# The hash rule is the one lib/pane_send.py prompt_hash() uses: sha1 of the prompt with every whitespace character removed
+# (no trailing newline), first 12 hex chars. The hook's `prompt` is not documented as byte-identical to what was typed (a
+# paste may be expanded, edges trimmed), so whitespace is dropped on both sides.
 phash=""
 if [[ "$event" == UserPromptSubmit ]]; then
-  phash="$(jq -r '.prompt // ""' <<<"$input" 2>/dev/null | shasum | cut -c1-12)"
+  phash="$(jq -j '(.prompt // "" | tostring) | gsub("\\s+"; "")' <<<"$input" 2>/dev/null | shasum | cut -c1-12)"
 fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
@@ -105,7 +108,8 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then
         { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
-          promptSubmits: (($prev.promptSubmits // 0) + 1), promptSubmitted: $now, promptHash: $phash }
+          promptSubmits: (($prev.promptSubmits // 0) + 1), promptSubmitted: $now, promptHash: $phash,
+          promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), hash: $phash, at: $now }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
       elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }

@@ -1,7 +1,6 @@
 """Simulated Claude hooks and the real tp-review settlement guard (no live session)."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import concurrent.futures
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +11,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "lib"))
+import pane_send  # noqa: E402
 from fake_tools import fake_tmux  # noqa: E402
 from session_env import outside_session  # noqa: E402
 HOOK = ROOT / "claude/plugins/tmux-pi/hooks/report.sh"
@@ -55,16 +56,31 @@ class ClaudeReportTests(unittest.TestCase):
             self.assertNotEqual(run.returncode, 0)
             self.assertTrue("has no result yet" in run.stderr or "has not completed successfully" in run.stderr, run.stderr)
 
+    def test_submit_log_keeps_the_last_records_and_hashes_by_the_senders_rule(self):
+        # The hook's prompt may differ from the typed text in whitespace; both sides drop it (lib/pane_send.py prompt_hash).
+        sent = "Use the local renderer\nfor the evidence"
+        self.hook("UserPromptSubmit", prompt="  Use the local renderer \t for\n the   evidence\n")
+        self.assertEqual(self.state()["promptHash"], pane_send.prompt_hash(pane_send.flatten(sent)))
+        self.hook("UserPromptSubmit", prompt="Use the local renderer for the evidence!")  # other text: other hash
+        self.assertNotEqual(self.state()["promptHash"], pane_send.prompt_hash(sent))
+        for i in range(3, 11):
+            self.hook("UserPromptSubmit", prompt="p{}".format(i))
+        log = self.state()["promptLog"]
+        self.assertEqual([r["n"] for r in log], list(range(3, 11)))  # the last 8 of 10, oldest first
+        self.assertEqual(log[-1]["hash"], pane_send.prompt_hash("p10"))
+        self.assertEqual(self.state()["promptSubmits"], 10)
+
     def test_late_tool_does_not_reopen_stop_but_new_prompt_does(self):
         self.hook("SessionStart", model="claude-opus-5-5")
         self.assertNotIn("promptSubmits", self.state())  # SessionStart is not a submit
         self.hook("UserPromptSubmit", prompt="first")
         submit = self.state()  # the record lib/pane_send.py waits on: count, time, short hash of the prompt
         self.assertEqual((submit["promptSubmits"], submit["promptSubmitted"], submit["promptHash"]),
-                         (1, submit["updated"], hashlib.sha1(b"first\n").hexdigest()[:12]))
+                         (1, submit["updated"], pane_send.prompt_hash("first")))
+        self.assertEqual(submit["promptLog"], [{"n": 1, "hash": pane_send.prompt_hash("first"), "at": submit["updated"]}])
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "fixture.txt"})
-        self.assertEqual({k: self.state()[k] for k in ("promptSubmits", "promptSubmitted", "promptHash")},
-                         {k: submit[k] for k in ("promptSubmits", "promptSubmitted", "promptHash")})  # other events leave it
+        self.assertEqual({k: self.state()[k] for k in ("promptSubmits", "promptSubmitted", "promptHash", "promptLog")},
+                         {k: submit[k] for k in ("promptSubmits", "promptSubmitted", "promptHash", "promptLog")})  # other events leave it
         self.hook("Stop", last_assistant_message="first reply\nRESULT_STATUS: complete")
         self.assertEqual(self.state()["state"], "waiting")
         self.review(accepted=True)
@@ -81,7 +97,9 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual(self.state()["state"], "working")
         self.assertEqual(self.state()["promptTurn"], 2)
         self.assertEqual((self.state()["promptSubmits"], self.state()["promptHash"]),
-                         (2, hashlib.sha1(b"confirm\n").hexdigest()[:12]))
+                         (2, pane_send.prompt_hash("confirm")))
+        self.assertEqual([(r["n"], r["hash"]) for r in self.state()["promptLog"]],
+                         [(1, pane_send.prompt_hash("first")), (2, pane_send.prompt_hash("confirm"))])  # in order
         self.assertFalse((self.task / "result.md").exists())
         self.review()  # old answer cannot be reviewed for the new prompt
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})

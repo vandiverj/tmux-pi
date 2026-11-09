@@ -42,5 +42,31 @@
     "selector": "claude-sonnet-5-5"
   },
   "_redaction": "Secret redaction for tool output (docs/sensitive-read-redaction-design.md). shadow (default) keeps the per-call sensitive-read prompts and logs what redaction would do to ~/.config/tmux-pi/state/redaction/shadow.log; on redacts output with placeholders and prompts only for credential stores; off disables it. TP_REDACTION overrides.",
-  "redaction": {"mode": "shadow"}
+  "redaction": {"mode": "shadow"},
+  "_summarize_structured": "summarize_files without a tool loop (docs/plans/det-prep/ls1c-structured-summarize.md): lib/summarize_structured.py numbers the named files, asks the local endpoint once with this system prompt and JSON schema (response_format json_schema, temperature 0), drops every fact whose citation does not check out, and renders the rest as fact lines. tools/qual/summarize_run.py --path structured uses it. budget_chars (optional, 1000 to 2000000) is the most numbered text it will send; without it 60000. The text is a draft from the S2 probe, to be tuned on the tune split.",
+  "summarize_structured": {
+    "system": "You summarize named files. State only what the files say. Each fact is one claim about one thing, with the one line (or at most 5 adjacent lines) that shows it, taken from the line numbers given. Start each claim with the name it is about (function, variable, class, setting or file; for a method, its own name), then say in words what it does or is; a name or signature alone is not a claim. Split a sentence with several facts into several facts. Never write a file path or line number inside a claim. If the files do not show something the task asks, add a fact whose claim says 'not in the files' and cite the closest line you checked.",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["facts"],
+      "properties": {
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim", "path", "line_start", "line_end"],
+            "properties": {
+              "claim": {"type": "string"},
+              "path": {"type": "string"},
+              "line_start": {"type": "integer"},
+              "line_end": {"type": "integer"}
+            }
+          }
+        }
+      }
+    },
+    "budget_chars": 60000
+  }
 }

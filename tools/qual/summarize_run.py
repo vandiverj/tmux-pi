@@ -3,6 +3,7 @@
 
     summarize_run.py --model M [--split tune|holdout|all] [--runs N] --out FILE [--prompt-file P] [--only ID,ID]
                      [--thinking T] [--timeout SECONDS] [--pi-command CMD] [--route-command CMD]
+    summarize_run.py --path structured --model M --out FILE [--endpoint URL] [--budget-chars N] [--split S] [--runs N] [--only ID,ID]
     summarize_run.py --route-only --out FILE [--split S] [--only ID,ID]
 
 Per chore and run: copy the chore's fixture files into a fresh temp dir, run one Pi worker headless there (bin/tp-pi -p) with
@@ -15,6 +16,11 @@ shape, on a fact line or not, across line breaks: rules 10, 13, 14, 17 to 19; a 
 unparsed references (a number that follows a file name or a line word and that no reference grammar placed: rule 21; the count that backs the grammar's
 floor), unchecked citations (good citations no matching fact's support_lines vouch for) and the failure classes (incl. `uncited`, `identifier_only`,
 `unparsed_references`). **S2 requires fabricated_citations and unparsed_references to both be zero.** The temp dir is always removed.
+
+--path structured (the product path of LS1c) runs no worker: lib/summarize_structured numbers the chore's fixture files and makes one
+JSON-schema call to --endpoint (system prompt and schema: the "summarize_structured" key of the local config, else of
+config/local.example.json); facts whose citation does not check out are dropped and listed in the record's `drops`. Records, scoring
+and the summary are the same; the summary adds `dropped_facts`. A refused file or a failed call is the record's `error`.
 
 --route-only runs `tp-route --no-log --local-only` on each chore's task instead; no worker runs. tp-route's output has no shape
 field (the router's shape tag decides the gate but is not printed or logged), so a record holds what the tool does give: exit
@@ -156,6 +162,38 @@ def run_chores(pairs, *, model, runs, out, prompt, thinking, timeout, pi_command
     return records, summary
 
 
+def run_structured(pairs, *, model, runs, out, timeout, fixtures, endpoint, settings, budget_chars, label):
+    """--path structured: the same chores through lib/summarize_structured.summarize (the product path, not a copy). Nothing is
+    copied or spawned: the module reads the fixture files itself, so there is no temp dir, no worker and no git call."""
+    sys.path.insert(0, str(ROOT / "lib"))
+    import summarize_structured as ss
+    records = []
+    with open(out, "w", encoding="utf-8") as handle:
+        for chore, answer in pairs:
+            for n in range(1, runs + 1):
+                started = time.monotonic()
+                reply, drops, error = "", [], None
+                try:
+                    reply, info = ss.summarize(fixtures, chore["files"], chore["task"], endpoint=endpoint, model=model,
+                                               settings=settings, budget_chars=budget_chars, timeout=timeout)
+                    drops = info["drops"]
+                except (ss.PrepareError, ss.AskError) as exc:
+                    error = "{}: {}".format(type(exc).__name__, exc)
+                seconds = time.monotonic() - started
+                scored = check(reply, answer, fixtures)
+                record = dict(chore=chore["id"], split=chore["split"], run=n, model=model, prompt=label, seconds=round(seconds, 2),
+                              rc=None, error=error, reply=reply, drops=drops, **scored)
+                if error:
+                    record["pass"] = False
+                records.append(record)
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+        summary = summarize(records, model=model, prompt=label, runs=runs, path="structured",
+                            dropped_facts=sum(len(r["drops"]) for r in records))
+        handle.write(json.dumps(summary) + "\n")
+    return records, summary
+
+
 def classify_route(rc, out, err):
     """The record fields for one tp-route run, from what the tool really gives: on exit 0 one JSON line (worker, model, thinking,
     level, provider, source, reason, steps, ... but no shape); on a stop, "tp-route: stop and ask the user: <reason>" on stderr
@@ -205,6 +243,10 @@ def main(argv=None, env=None):
     p.add_argument("--only", default="", help="comma-separated chore ids")
     p.add_argument("--thinking", default="off")
     p.add_argument("--timeout", type=float, default=300)
+    p.add_argument("--path", choices=("pi", "structured"), default="pi",
+                   help="pi: one Pi worker per chore (default); structured: lib/summarize_structured (numbered files, one JSON-schema call)")
+    p.add_argument("--endpoint", help="structured: base URL of the OpenAI-compatible server (default: the LM Studio base_url of the local config)")
+    p.add_argument("--budget-chars", type=int, help="structured: refuse files whose numbered text exceeds this (default: the config's budget_chars, else 60000)")
     p.add_argument("--route-only", action="store_true")
     p.add_argument("--pi-command", default=str(ROOT / "bin" / "tp-pi"))
     p.add_argument("--route-command", default=str(ROOT / "bin" / "tp-route"))
@@ -217,6 +259,19 @@ def main(argv=None, env=None):
     pairs = load_chores(args.split, [x for x in args.only.split(",") if x], args.chores_dir)
     if args.route_only:
         summary = route_chores(pairs, out=args.out, timeout=args.timeout, route_command=args.route_command, env=env)
+    elif args.path == "structured":
+        sys.path.insert(0, str(ROOT / "lib"))
+        import summarize_structured as ss
+        local = env.get("TP_LOCAL_CONFIG")
+        settings = dict(ss.load_settings(ROOT, local))
+        if args.prompt_file:
+            settings["system"] = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+        # the roster names a model with its provider (lmstudio/qwen/...); the server knows it without the provider
+        served = args.model.split("/", 1)[1] if args.model.startswith("lmstudio/") else args.model
+        _, summary = run_structured(pairs, model=served, runs=args.runs, out=args.out, timeout=args.timeout,
+                                    fixtures=Path(args.chores_dir) / "fixtures", settings=settings,
+                                    budget_chars=args.budget_chars or settings.get("budget_chars", ss.DEFAULT_BUDGET_CHARS),
+                                    endpoint=args.endpoint or ss.default_endpoint(ROOT, local), label=args.prompt_file or "config")
     else:
         label = args.prompt_file or "config"
         _, summary = run_chores(pairs, model=args.model, runs=args.runs, out=args.out,

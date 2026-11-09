@@ -107,7 +107,7 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction", "summarize_structured"}
 
 
 def load_local(path, config):
@@ -211,6 +211,18 @@ def load_local(path, config):
         selector = packet_files["selector"]
         if not isinstance(selector, str) or not re.fullmatch(r"claude-[a-z0-9.-]+", selector):
             raise RouterError("packet_files selector must be a Claude model id")
+    structured = local.get("summarize_structured")
+    if structured is not None:
+        if not isinstance(structured, dict) or not {"system", "schema"} <= set(structured) or \
+                set(structured) - {"system", "schema", "budget_chars"}:
+            raise RouterError("summarize_structured needs system and schema, and may set budget_chars")
+        if not isinstance(structured["system"], str) or not structured["system"].strip():
+            raise RouterError("summarize_structured system must be a nonempty string")
+        if not isinstance(structured["schema"], dict) or not structured["schema"]:
+            raise RouterError("summarize_structured schema must be a nonempty JSON schema object")
+        budget = structured.get("budget_chars", 1000)
+        if isinstance(budget, bool) or not isinstance(budget, int) or not 1000 <= budget <= 2000000:
+            raise RouterError("summarize_structured budget_chars must be an integer from 1000 to 2000000")
     return local
 
 

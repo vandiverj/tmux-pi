@@ -33,6 +33,9 @@ next round is the change from that tree to the tree now.
       no usable state) against the review base (diff_now: a lane's last closed step, else the lane base, else HEAD for a task
       outside a lane); it gets the same sensitive-path and redaction checks either way. <lane> is the author's lane ("" for none).
 
+A modified text file whose hunks are longer than the file shown whole (a rewrite) is attached as the file itself, every line
+marked +, after a one-line note with both sizes and the scoped git command that prints the real diff (entry_patch); a tie keeps the hunks.
+
 Nothing written to out-dir carries a credential: a changed path the sensitive-read rule flags (lib/sensitive_read.py,
 the rule bin/tp-sensitive-read applies) is named in the diff with its contents withheld, whether it was added, modified,
 deleted or renamed; and the diff and the earlier findings then go through the redaction pass (lib/redact.py) as context
@@ -266,8 +269,46 @@ def blob_patch(top, oldid, newid):
     return text[at + 1:]
 
 
-def entry_patch(top, empty, entry):
-    """The diff text of one checked entry, with a header this code writes from the entry's own path and modes."""
+def blob_text(top, blobid):
+    """The text of a blob, decoded the way blob_patch decodes a diff."""
+    run = subprocess.run(["git", "-C", top, "cat-file", "blob", blobid], capture_output=True)
+    if run.returncode:
+        raise Refused(f"cannot read blob {blobid}: {run.stderr.decode('utf-8', 'replace').strip()}")
+    return run.stdout.decode("utf-8", "surrogateescape")
+
+
+def whole_file_section(top, path, label, old, new, hunks, text):
+    """The section lines after the `diff --git` header for a modified file shown whole: a one-line note (the sizes of its hunks and of
+    the file, and the scoped command that prints the real diff between the trees or commits `old` and `new`), then the file as it is
+    now with every line prefixed `+`, the way an added file is shown. A line of the file that begins `diff --git ` is therefore
+    `+diff --git ...` and cannot pass for a header (gate), and redact_diff sees the same line shapes as in a diff (the `@@` line
+    opens its hunk)."""
+    command = f"GIT_LITERAL_PATHSPECS=1 git -C {literal(top)} diff {old} {new} -- {literal(path)}"
+    lines = text.split("\n")
+    missing_newline = bool(lines[-1])
+    if not missing_newline:
+        lines.pop()
+    out = [f"[Whole file shown instead of the hunks: its hunks are {len(hunks)} chars and the file as it is now is {len(text)} chars. "
+           f"Every line below is the file as it is now, marked +; the lines it replaced are not shown. The real diff: `{command}`]\n",
+           f"--- a/{label}\n+++ b/{label}\n@@ whole file, {len(lines)} line(s) @@\n"]
+    out.extend(f"+{line}\n" for line in lines)
+    if missing_newline:
+        out.append("\\ No newline at end of file\n")
+    return "".join(out)
+
+
+def entry_patch(top, empty, entry, old, new):
+    """The diff text of one checked entry, with a header this code writes from the entry's own path and modes. `old` and `new` are
+    the trees (or commits) the entry was listed between; the note of a whole-file section names them in the command that prints the
+    real diff.
+
+    A modified text file whose hunk section (the `---`/`+++` lines and the hunks) is longer than its whole-file section (the note, the
+    same two lines, an `@@` line and the file as it is now, marked +; whole_file_section) is shown whole: a rewrite's hunks repeat
+    every old line as `-` and every new line as `+`. The two are compared as they would be attached, in characters, and whole needs to
+    be strictly shorter (equal keeps the hunks), so the rule never makes a section longer, and a small edit to a small file, where the
+    note alone would outweigh the hunks, keeps its hunks and shows the removed lines.
+    Every other kind of entry (added, deleted, mode change, type change, binary, submodule) keeps its diff. This is the one place
+    that rule is applied: the round diff, the base diff and the held sections all come through here via safe_diff."""
     path, (oldmode, newmode, oldid, newid, status) = entry
     label = shown(path)
     out = [f"diff --git a/{label} b/{label}\n"]
@@ -284,8 +325,14 @@ def entry_patch(top, empty, entry):
     if hunks is None:
         out.append(f"Binary files a/{label} and b/{label} differ\n")
     elif hunks:
-        out.append(f"--- {'/dev/null' if status == 'A' else 'a/' + label}\n+++ {'/dev/null' if status == 'D' else 'b/' + label}\n")
-        out.append(hunks if hunks.endswith("\n") else hunks + "\n")
+        hunks = hunks if hunks.endswith("\n") else hunks + "\n"
+        plain = (f"--- {'/dev/null' if status == 'A' else 'a/' + label}\n+++ {'/dev/null' if status == 'D' else 'b/' + label}\n"
+                 + hunks)
+        if status == "M" and oldmode == newmode:
+            whole = whole_file_section(top, path, label, old, new, hunks, blob_text(top, newid))
+            if len(whole) < len(plain):
+                plain = whole
+        out.append(plain)
     return "".join(out)
 
 
@@ -355,7 +402,7 @@ def safe_diff(top, old, new, only=None):
             generated.append((path, record))
         else:
             safe.append((path, record))
-    body = "".join(entry_patch(top, empty, entry) for entry in safe)
+    body = "".join(entry_patch(top, empty, entry, old, new) for entry in safe)
     labels = {"A": "added", "M": "modified", "D": "deleted", "T": "type changed"}
     notes = "".join(f"{json.dumps(p)} ({labels[r[4]]}): sensitive path, its contents were withheld from this diff\n"
                     for p, r in withheld)

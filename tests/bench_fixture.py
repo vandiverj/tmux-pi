@@ -59,8 +59,10 @@ class Clock:
 class FakeShell(Shell):
     """Records every call as (argv, effective env, cwd). `sessions` maps a tmux session name to its @tp_state_dir."""
 
-    def __init__(self, root, running=False, pane_text="", sessions=None, on_inspect=None, on_exit=None, settle_after=None, inject=None):
-        """`running` keeps every task unfinished (until its `settle_after`-th inspect, when set). `on_inspect(shell)` runs on each
+    def __init__(self, root, running=False, pane_text="", sessions=None, on_inspect=None, on_exit=None, settle_after=None, inject=None,
+                 trust_inspect=False):
+        """`running` keeps every task unfinished (until its `settle_after`-th inspect, when set). `trust_inspect` makes inspect answer as
+        tp-agent does for a Claude worker stopped at the folder-trust dialog: status needs_input with trust_dialog {dir}, until it settles. `on_inspect(shell)` runs on each
         inspect; `on_exit(shell, env)` replaces tp-exit (return a Result, or None for the default). `inject(shell, argv)` runs before
         every call and may return a Result to stand in for it (a failure, a raise by raising). Task dirs and transcripts are
         made inside the project copy, as a real workspace's are, so they vanish with it unless the runner kept them.
@@ -69,6 +71,7 @@ class FakeShell(Shell):
         self.on_exit, self.settle_after, self.inspects, self.inject = on_exit, settle_after, 0, inject
         self.sessions, self.calls, self.dispatched, self.made, self.last_copy = dict(sessions or {}), [], [], 0, None
         self.raised, self.tolerated, self.failed = [], [], []
+        self.trust_inspect = trust_inspect
 
     def names(self):
         return [(Path(argv[0]).name, argv[1] if len(argv) > 1 else "") for argv, _, _ in self.calls]
@@ -163,6 +166,9 @@ class FakeShell(Shell):
 
     def inspect(self, ident):
         self.inspects += 1
+        if self.trust_inspect and not (self.settle_after and self.inspects >= self.settle_after):
+            return {"status": "needs_input", "task_dir": str(self.task_dir(ident)), "trust_dialog": {"dir": "/work"},
+                    "detail": "worker stopped at Claude Code's folder-trust dialog for /work; the owner trusts it once: bin/tp-claude-bootstrap /work"}
         if self.running and not (self.settle_after and self.inspects >= self.settle_after):
             return {"status": "running", "task_dir": str(self.task_dir(ident))}
         text = FINDINGS if ident == "review-1" else (f"ANSWER: {EXPECTED}\n" if dict(self.dispatched).get(ident) == "researcher" else "done\n")

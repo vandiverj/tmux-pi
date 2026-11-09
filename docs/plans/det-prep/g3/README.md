@@ -12,6 +12,15 @@ From a tmux-pi checkout that has this script, inside the tmux server that Main u
 
     python3 tools/smoke/g3_e2e.py --repo ~/Documents/Projects/battle-soccer --out .tmux-pi/g3/live-$(date -u +%Y%m%d%H%M%S).json
 
+**Before a live run: the target repository must be trusted in tmux-pi's Claude profile.** Claude Code asks "Is this a project you created or one you trust?" the first time it
+starts in a folder, and a lane worktree is a new folder every run. The dialog shows before any hook loads, so the worker writes no permission request and waits for an answer nobody gives.
+tmux-pi never answers it; folder trust is the owner's decision. The first two live runs (2026-11-09) died at step `prompt` this way. Now `tp-agent inspect` (and `tp-agent list`, `tp-list`, the status pane)
+report such a worker as `needs_input` with `trust_dialog: {dir}` and the fix, and the script fails at once, not after `--prompt-wait`:
+`worker stopped at Claude Code's folder-trust dialog for <dir>; the owner runs bin/tp-claude-bootstrap <dir> once, then reruns` (`<dir>` is shell-quoted in the command, so a folder with a space pastes whole).
+A pane that cannot be captured in time (a hung tmux, or a list whose scan budget of 15 s is spent) is not guessed clear: `tp-agent list` and `inspect` mark that row `trust_dialog_check: "not checked"`, and a later row is still looked at. The owner runs `bin/tp-claude-bootstrap <repo>`
+(approve the prompt, type `/exit`) so tmux-pi's Claude profile trusts the repository. Whether trust given to the repository also covers its new worktrees depends on Claude Code;
+if the message names the worktree, trust that folder as the message says and rerun.
+
 Exit 0: every step and the cleanup passed. Exit 1: stderr says `FAILED at step '<name>': <what>`, and `cleanup: ...` / `left behind: ...` lines.
 `--out` gets the JSON summary (run, run_id, mode, ok, failed_step, error, `made` (what the run recorded as its own), socket and tmux_tmpdir (fake only), per-step name / rc / seconds / asserted list / commands,
 cleanup report (errors, leftovers, kept), task ids). Useful flags: `--keep` (keep the temp state dir), `--coder-model` (default `claude-haiku-5-5`), `--prompt-wait 240`,
@@ -107,7 +116,7 @@ the passing flow makes has no case.
   the branch at the same sha (holding a commit no other branch has), the lane record with the same content, the worktree still registered, the session's pane still listed and no `kill-session` or `kill-pane` recorded by the shim.
 - dispatch: a `coder-` task id (`dispatch-id`); started, not queued (`dispatch-queued`); `meta.json` names the lane and step `s1` (`dispatch-meta`); a pane is recorded (`dispatch-pane`);
   the lane record is `open`, on the configured lane branch, based on the scratch integration branch (`dispatch-lane`); the lane worktree exists at the path the config's `worktree_pattern` gives (`dispatch-worktree`).
-- prompt: task state `needs_input` with a pending permission request (`no-prompt`); `permission-request.json` is `pending` and carries a reason (`prompt-no-reason`).
+- prompt: task state `needs_input` with a pending permission request (`no-prompt`); `permission-request.json` is `pending` and carries a reason (`prompt-no-reason`); inspect reports no `trust_dialog` (`trust-dialog`: the worker's pane shows Claude Code's folder-trust screen, and the step fails at once with the message above).
 - decline: after `Escape` the request leaves `pending` (`still-pending`) and is not `authorized` (`authorized`); the redirect is recorded in `messages.jsonl` (`no-redirect-record`);
   the task settles (`first-never-settles`) with `result_status: incomplete` (`first-complete`); the lane worktree is still unchanged (`first-changed`).
 - retry: the first task is stopped (`first-not-stopped`; a lane allows one writer); `retry` starts a new task (`retry-same-id`) that keeps the lane and step (`retry-meta`);

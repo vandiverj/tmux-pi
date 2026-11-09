@@ -28,6 +28,7 @@ import owner_confirm  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
+import trust_dialog  # noqa: E402
 import work  # noqa: E402
 import work_commands  # noqa: E402
 import work_find  # noqa: E402
@@ -115,6 +116,22 @@ def task_dir(base, ident):
 def lifecycle(path):
     # tp-agent does not look at panes: contract.lifecycle reads an unobserved pane as present.
     return task_lifecycle(path)[0]
+
+
+def with_trust_dialog(row, scanner):
+    """A claude worker row that is starting or working, whose recorded pane shows Claude Code's folder-trust dialog, as needs_input
+    (a new row: status, a detail first, and trust_dialog {dir}). The dialog shows before any hook loads, so nothing on disk says so.
+    Read-only: the pane is captured (lib/trust_dialog.py, bounded), never answered; any other row, and a capture that fails or
+    times out, is returned as it was, except that a pane that could not be looked at (a timeout, or the list's scan budget spent) adds
+    trust_dialog_check: "not checked", so a row that was not looked at never reads as clear. tp-agent's lifecycle still does not look
+    at panes: only inspect and list ask for this."""
+    if row.get("harness") != "claude" or row.get("status") not in ("starting", "working") or not row.get("task_dir"):
+        return row
+    meta = read_json(Path(row["task_dir"]) / "meta.json")
+    found = scanner.dialog(meta.get("pane"), meta.get("workdir") if isinstance(meta.get("workdir"), str) else "")
+    if not found:
+        return row if scanner.checked else {**row, "trust_dialog_check": trust_dialog.NOT_CHECKED}
+    return {"detail": trust_dialog.message(found["dir"]), **row, "status": "needs_input", "trust_dialog": found}
 
 
 def usage_fields(state):
@@ -1593,6 +1610,8 @@ def _main(argv):
             value = work_index.bounded(value)
     elif args.command == "list":
         value = main_rows(base, args.main) if args.main else all_records(base)
+        scanner = trust_dialog.Scanner()
+        value = [with_trust_dialog(row, scanner) for row in value]
     elif args.command == "objective":
         atomic_text(base / "session-objective.md", args.text.strip() + "\n", base)
         value = write_index(base)
@@ -1625,7 +1644,7 @@ def _main(argv):
             return
         path = task_dir(base, args.id)
         if args.command == "inspect":
-            value = record(path, include_result=True)
+            value = with_trust_dialog(record(path, include_result=True), trust_dialog.Scanner())
             if value.get("review_notice"):
                 value = {"notice": value["review_notice"], **value}
         elif args.command == "collect":

@@ -536,3 +536,19 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   still passes (no bad citations). The worker had disclosed it. S2's "zero fabricated citations" bar needs this, so
   round 4 (fixes/ls1-round4.md: per-fact `support` regex on the cited lines, range limit 5) went out before a
   review: coder-636cd4b784.
+
+## 2026-11-08 ~19:10 CST: G2 started in parallel with the FG-N1/LS1 reviews
+- Owner asked whether failing tests can be worked in parallel in other areas. Yes: G2 lanes touching areas FG-N1 and
+  LS1 do not.
+- Main reproduced every baseline name on a clean detached checkout of 1b1e9fb (each test alone, keys unset, 3.9 and 3.14).
+  Causes: test_retry_packet f-string backslash (3.9 SyntaxError, test-only); run_bounded passes unittest `--durations`
+  (3.12+); trial_record deep-JSON RecursionError escapes `routing_evals._read_json` on 3.9; lane cap tests expect 16
+  but owner's 899551c set 20; ctx_nav_api r9 needs Deno (not installed); sensitive_trust rg lift,
+  trial_shadow_branches HEAD, trial_shadow_end_path inconclusive and lane_recovery hand-over pass alone.
+- FG-N1 r3 evidence (734 tests x4 OK; 26-command false-positive probe identical to main) -> review-coder-b9c961eade-185926.
+- LS1 r4 evidence (159 tests x4 OK; Main probe: 0/144 shifted-line replies pass, 24/24 right-line pass) ->
+  review-coder-636cd4b784-185851.
+- Dispatched G2-A lane g2-py39 (coder-be0acf43be, brief g2/g2a-py39-compat.md) and G2-B lane g2-lane-cap
+  (coder-ff2c8ee9c3, brief g2/g2b-lane-cap.md).
+- Held: sensitive_trust rg lift (FG-N1's area, after merge); ctx_nav_api r9 (owner decision on Deno); the
+  order-dependent group (whole-module repeat runs in progress).

@@ -1,0 +1,718 @@
+{
+ "chore": "diff-settings",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met",
+    "F3": "not_met",
+    "F4": "met",
+    "F5": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "unsupported",
+     "note": "workers 2 is true but cites settings.py:8, which is log_level; value is at line 6"
+    },
+    {
+     "n": 2,
+     "verdict": "unsupported",
+     "note": "workers 4 is true but cites settings_v2.py:8 (log_level); value is at line 6"
+    },
+    {
+     "n": 3,
+     "verdict": "unsupported",
+     "note": "state_file is true but cites settings.py:11, a blank line; it is at line 9"
+    },
+    {
+     "n": 4,
+     "verdict": "unsupported",
+     "note": "absence part (state_file absent from v2) is true and ok under Amendment 1, but the max_payload_bytes part cites settings_v2.py:11, a blank line (it is at line 9)"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "unsupported",
+     "note": "calls validate_settings before returning is true but cites settings_v2.py:30 (env lookup); the call is at line 33"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct explicit diff; F2 met by the true absence claim in line 4 (Amendment 1); F1/F3/F5 not_met because their citations point at wrong or blank lines (the uncited summary also states them)."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate side-by-side listing; F1 met as a value change; F4 met via the true absence claim in line 6 (Amendment 1) with v2 defining it in line 12; F2/F3 not_met because drop/add is never stated."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All lines true and cited; it lists both files side by side without stating any add/drop, so F2/F3/F4 are not_met (validate_settings appears only as a v2 behaviour, never as an addition)."
+  },
+  "R4": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "wrong",
+     "note": "load_settings is defined in settings.py at line 15"
+    },
+    {
+     "n": 17,
+     "verdict": "wrong",
+     "note": "validate_settings is defined in settings_v2.py at line 15"
+    }
+   ],
+   "note": "Side-by-side listing with no explicit add/drop; two false absence claims at the end, one of which contradicts F4. Under Amendment 1 lines 16-17 stay wrong: both functions are present in the files named."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    },
+    {
+     "n": 25,
+     "verdict": "ok"
+    },
+    {
+     "n": 26,
+     "verdict": "wrong",
+     "note": "state_file is in the files (src/settings.py:9); only absent from v2"
+    },
+    {
+     "n": 27,
+     "verdict": "wrong",
+     "note": "validate_settings is in the files (src/settings_v2.py:15)"
+    }
+   ],
+   "note": "Name list plus values; the two closing 'not in the files' claims are false as stated, so F2 is not met, and F3/F4 are never stated as differences. Under Amendment 1 lines 26-27 stay wrong: state_file is in settings.py and validate_settings is in settings_v2.py, and the claims name 'the files'."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All lines true and cited; side-by-side listing without stating that v2 drops state_file or adds max_payload_bytes/validate_settings."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All lines true; true absence claims 23-24 meet F2/F3 under Amendment 1; F4 not_met because nothing says v1 lacks validate_settings."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All lines true and cited (docstring lines count); no explicit add/drop statements, so F2/F3/F4 are not_met."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All lines true; F4 met via the true absence claim in line 14 (Amendment 1); F2/F3 not_met (no drop/add stated)."
+  }
+ }
+}

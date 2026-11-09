@@ -457,6 +457,19 @@ class RouterTests(unittest.TestCase):
             with self.assertRaises(RouterError):
                 load_local(self.write_local({"packet_files": bad}), self.config)
 
+    def test_summarize_structured_config_validation(self):
+        good = {"system": "Summarize.", "schema": {"type": "object"}}
+        self.assertEqual(load_local(self.write_local({"summarize_structured": good}), self.config)["summarize_structured"], good)
+        with_budget = {**good, "budget_chars": 1000}
+        self.assertEqual(load_local(self.write_local({"summarize_structured": with_budget}), self.config)["summarize_structured"], with_budget)
+        for bad in ("text", [], {"system": "x"}, {"schema": {"a": 1}}, {**good, "system": " "}, {**good, "system": 3},
+                    {**good, "schema": {}}, {**good, "schema": "{}"}, {**good, "extra": 1}, {**good, "budget_chars": 999},
+                    {**good, "budget_chars": 2000001}, {**good, "budget_chars": True}, {**good, "budget_chars": "5000"},
+                    {**good, "budget_chars": 5000.5}):
+            with self.subTest(bad=bad), self.assertRaises(RouterError) as caught:
+                load_local(self.write_local({"summarize_structured": bad}), self.config)
+            self.assertIn("summarize_structured", str(caught.exception))
+
     def pick_workdir(self):
         from tempfile import TemporaryDirectory
         directory = TemporaryDirectory()

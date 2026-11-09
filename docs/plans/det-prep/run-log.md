@@ -799,3 +799,22 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - 3 tasks through the full `tp-agent dispatch` path after the flip.
 - G4 now waits for the LS1 flip and includes the summarize task. The locate-chant routing disagreement is settled under
   S2 step 3.
+
+## 2026-11-09 G1 rerun on clean 2fac25a (after FG-N1b): green
+- Four cells, 4735 tests each, 0 failures and 0 errors. Logs are in Main's job tmp g1-main2/.
+
+  | cell | tests | time | skipped |
+  |---|---|---|---|
+  | py3.9 out | 4735 | 2168 s | 77 |
+  | py3.9 in | 4735 | 2293 s | 77 |
+  | py3.14 out | 4735 | 2261 s | 78 |
+  | py3.14 in | 4735 | 2339 s | 78 |
+
+- The baseline stays empty. G1 holds on 2fac25a.
+- The next full run is on main after the G3 merge. That run also covers the LS1 merge 6ec27a8.
+- Follow-ups found in the warnings. They are not failures, but are to be fixed under "all failures fixed in the end":
+  - **py3.14 only, 9 ResourceWarnings per run.** Most are "Implicitly cleaning up <HTTPError 500 ...>": a test or the code
+    under test leaves an HTTPError unclosed. One is an unclosed 127.0.0.1 socket at exit, the known test_redact_llm item.
+  - **Leaked shell loops.** tests/test_process_end.py leaves orphaned `trap '' HUP TERM; while true; do sleep 1; done`
+    loops (ppid 1) running after full-suite runs.
+  - **Stale tmux sockets.** Full-suite runs leave tp-t3-<pid>-* and tp-ts-<pid>-* sockets in /private/tmp/tmux-501.

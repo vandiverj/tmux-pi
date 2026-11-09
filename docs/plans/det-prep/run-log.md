@@ -563,3 +563,7 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   extension heading, F3 body/docstring citations rejected, F4 table separator. Main's probe confirmed by the reviewer
   (24/24, 0/144). Round 5 by route design (fixes/ls1-round5.md): support as line sets with anchors, behaviour regexes
   matched with citations removed, any filename-like heading sets context. coder-10744b0248.
+- FG-N1 r3 review (review-coder-b9c961eade-185926): REQUEST_CHANGES F1 sudo -h / script -F arity, F2 env -S drops
+  trailing args, F3 five remote-uncertainty shapes, F4 generated product sampled (1,296 of 46,656 triples). Round 4
+  by route design (fixes/fg-n1-round4.md): bag-of-words floor over wrapper tails; uncertain handed-on text is
+  sensitive; 41-command false-positive check; full product at depth 1-2, triples with option none. coder-8b20c9cf68.

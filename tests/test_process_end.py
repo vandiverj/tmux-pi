@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lane_fixture import MODEL, ROOT, TMUX, TmuxCase  # noqa: E402
@@ -312,6 +313,33 @@ class ProcessEndTests(TmuxCase):
                              env=env, text=True, capture_output=True)
         self.assertEqual(run.returncode, 1)
         self.assertIn("cannot read tmux panes", run.stderr)
+
+    def test_no_tmux_server_is_an_empty_pane_table_and_any_other_failure_refuses(self):
+        """No server means no live pane (AT1): {} and so "not alive", whatever the ambient server. A tmux that fails for another
+        reason still refuses."""
+        sys.path.insert(0, str(ROOT / "lib"))
+        import worker_process
+        empty = self.root / "empty-tmpdir"
+        empty.mkdir()
+        stubs = self.root / "stubs"
+        stubs.mkdir()
+
+        def stub(stderr):
+            (stubs / "tmux").write_text(f"#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n")
+            (stubs / "tmux").chmod(0o755)
+
+        with mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(empty)}):
+            os.environ.pop("TMUX", None)
+            self.assertEqual(worker_process.pane_table(), {}, "real tmux, empty TMUX_TMPDIR, no server")
+            with mock.patch.dict(os.environ, {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}"}):
+                for says in ("no server running on /x/default", "error connecting to /x/default (No such file or directory)",
+                             "error connecting to /x/default (Connection refused)"):
+                    stub(says)
+                    self.assertEqual(worker_process.pane_table(), {}, says)
+                for says in ("error connecting to /x/default (Permission denied)", "protocol version mismatch", ""):
+                    stub(says)
+                    with self.assertRaisesRegex(RuntimeError, "cannot read tmux panes"):
+                        worker_process.pane_table()
 
     # --- T3: reap ----------------------------------------------------------------------------
 

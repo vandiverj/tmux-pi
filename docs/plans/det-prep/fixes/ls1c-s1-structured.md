@@ -1,7 +1,7 @@
 # LS1c step S1: structured summarize_files module (Main, 2026-11-09)
 
 Read docs/plans/det-prep/ls1c-structured-summarize.md (the design and why) and
-bench-results/s2-2026-11-09/structured_probe.py (Main's probe; reuse its ideas, not its code paths). Build steps 1-4 and 6
+/Users/jerrickvandiver/Documents/Projects/tmux-pi/bench-results/s2-2026-11-09/structured_probe.py (Main's probe; reuse its ideas, not its code paths). Build steps 1-4 and 6
 of the design. Step 5 (routing `summarize_files` dispatches here) is a later step: do not change tp-route, tp-spawn or the
 router in this step.
 

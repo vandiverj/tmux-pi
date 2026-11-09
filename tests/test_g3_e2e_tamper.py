@@ -4,7 +4,8 @@
 must fail, a piece of the check's description that the error must contain). Two cross-checks keep the table honest: every tamper the script
 offers has a row, every row names text that really is in the passing flow's assertions, and every assertion of the passing flow is covered by a
 row (or is in UNTAMPERED with the test that covers it instead). The leftover cases leave something on purpose that the leftover check must name."""
-import g3_e2e_support as support  # first: it imports session_env, which drops the caller's session
+import session_env  # noqa: F401  first: drops the caller's session (g3_e2e_support, once cached, no longer does)
+import g3_e2e_support as support
 
 import json
 import shlex

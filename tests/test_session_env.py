@@ -40,6 +40,8 @@ CONFIG = {
     "TP_BENCH_WORK",  # bin/tp-bench:157: --work-root default, not caller identity
     "TP_HL1",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
     "TP_X1_ARM",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
+    "TP_TRUST_CAPTURE_TIMEOUT",  # lib/trust_dialog.py:22,37: capture-timeout test hook, read at each call, not caller identity
+    "TP_TRUST_SCAN_BUDGET",  # lib/trust_dialog.py:24,95: scan-budget test hook, read when a Scanner starts, not caller identity
     "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_POLICY_SKILLS", "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
 }
 NAME = re.compile(r"TP_[A-Z0-9_]+|CLAUDE_CODE_[A-Z_]+|TMUX_PANE|TMUX")

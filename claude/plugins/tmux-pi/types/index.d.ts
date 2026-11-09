@@ -20,7 +20,12 @@ export type TaskSummary = {
   failed: number
   refused: number
   needsInput: string[]
+  // Lines under the counts: a poll that fails, a wake that cannot be sent, workers of another main.
+  notes: string[]
 }
+
+// A row of this session that `tp-agent list --main` left out because another main's id is on it.
+export type OtherRow = { id: string; status: string; main: string }
 
 export type NotifierState = {
   epoch: number

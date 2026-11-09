@@ -4,13 +4,19 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
-import type { NotifierState, TaskRow, TaskSummary } from '../types'
+import type { NotifierState, OtherRow, TaskRow, TaskSummary } from '../types'
 
 const TP_AGENT_TIMEOUT_MS = 20000
 const POLL_MS = 5000
 const INDEX_CHARS = 6000
 const NOTABLE = new Set(['needs_input', 'settled', 'paused', 'failed'])
 const WAKE_TRIES = 3
+// After a failed submit the rows stay held and the next try waits this long, doubling per failure in a row (to 8x): a main that
+// cannot take a turn is not asked every poll, and is asked again for as long as the row is still waiting.
+const WAKE_BACKOFF_MS = 15000
+// Failed reads of `tp-agent list` in a row before the band says the notices are paused.
+const READ_FAILURES_PAUSED = 2
+const OTHER_IDS_SHOWN = 5
 const UNREAD_EPOCH = 1e15
 // tp-agent's own id pattern (IDENT in bin/tp-agent): no leading dash, so never an option.
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
@@ -22,10 +28,10 @@ const MAIN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 let isActive = false
 
 // Notifier state.
-// - `delivered`: `id:status` keys already announced, dropped when the task leaves that
-//   status, so a second permission prompt on the same task notifies again.
-// - `held`: rows found but not yet in a submit; `inFlight`: the batch of a submit that has
-//   not resolved (it resolves when its turn starts, which waits for the main to be idle).
+// - `delivered`: `id:status` keys whose submit SUCCEEDED (or that the injected index showed), dropped when the task leaves that
+//   status, so a second permission prompt on the same task notifies again. A key is never in it before its submit resolved.
+// - `held`: rows found but not yet delivered, kept and retried (WAKE_BACKOFF_MS) for as long as the row is still in that status;
+//   `inFlight`: the batch of a submit that has not resolved (it resolves when its turn starts, which waits for the main to be idle).
 // The rows the main actually read in the index appended at start are the baseline and wake
 // nobody. Anything it was not shown (no index, a refused append, rows cut for length)
 // stays eligible and is announced by the first poll.
@@ -39,6 +45,14 @@ let delivered = new Set<string>()
 let held: TaskRow[] = []
 let inFlight: TaskRow[] = []
 let wakeFailures = 0
+let retryAt = 0
+let isStuck = false
+let readFailures = 0
+let readFailure: string | undefined
+let hasToastedPause = false
+let other: OtherRow[] = []
+let seenOther = new Set<string>()
+let lastSummary: TaskSummary | undefined
 let isSubmitting = false
 let isPolling = false
 let isLoaded = false
@@ -94,12 +108,26 @@ async function runTpAgent($: EngineInterface, args: readonly string[]): Promise<
   }
 }
 
+// What one read of `tp-agent list` came to: the rows (and the rows of this session another main owns), or why it failed.
+type Read = { rows: TaskRow[]; other: OtherRow[] } | { failure: string }
+
 // `tp-agent list` is read-only: no tick, no index write. `--main ID` adds this main's tasks in the other sessions of the
-// workspace and leaves out another main's tasks in this one; a main with no identity lists its own session as before.
-async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
+// workspace and leaves out another main's tasks in this one, reporting those left out beside the rows (`other_main`); a main
+// with no identity lists its own session as before. A failure is never silent: poll counts it and the band says so.
+async function readTasks($: EngineInterface): Promise<Read> {
   const main = await readMainId($)
-  const rows = await runTpAgent($, main === undefined ? ['list'] : ['list', '--main', main])
-  if (!Array.isArray(rows)) return undefined
+  const ran = await runTool($, 'tp-agent', main === undefined ? ['list'] : ['list', '--main', main])
+  if (ran === undefined) return { failure: 'timed out' }
+  if (ran.exitCode !== 0) return { failure: `exit ${ran.exitCode}` }
+  let parsed: any
+  try {
+    parsed = JSON.parse(ran.stdout)
+  } catch {
+    return { failure: 'bad output' }
+  }
+  // An array is an older tp-agent (or no --main); an object carries the rows and what was left out.
+  const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.rows) ? parsed.rows : undefined
+  if (rows === undefined) return { failure: 'bad output' }
   const found: TaskRow[] = []
   for (const row of rows) {
     if (typeof row?.id !== 'string' || typeof row.status !== 'string') continue
@@ -116,11 +144,17 @@ async function readTasks($: EngineInterface): Promise<TaskRow[] | undefined> {
       ...(typeof row.failing_tests === 'object' && row.failing_tests !== null ? { failing_tests: true as const } : {}),
     })
   }
-  return found
+  const left = Array.isArray(parsed?.other_main?.rows) ? parsed.other_main.rows : []
+  const others: OtherRow[] = []
+  for (const row of left) {
+    if (typeof row?.id !== 'string') continue
+    others.push({ id: row.id, status: typeof row.status === 'string' ? row.status : '?', main: typeof row.main === 'string' ? row.main : '?' })
+  }
+  return { rows: found, other: others }
 }
 
 function summarize(rows: readonly TaskRow[]): TaskSummary {
-  const summary: TaskSummary = { active: 0, toCollect: 0, paused: 0, pausedWithStatus: 0, failed: 0, refused: 0, needsInput: [] }
+  const summary: TaskSummary = { active: 0, toCollect: 0, paused: 0, pausedWithStatus: 0, failed: 0, refused: 0, needsInput: [], notes: [] }
   for (const row of rows) {
     if (row.status === 'needs_input') summary.needsInput.push(row.id)
     else if (row.status === 'settled') summary.toCollect += 1
@@ -203,20 +237,42 @@ function baseline(rows: readonly unknown[]) {
   }
 }
 
-// The rows that entered a notable status since the last read, each marked delivered
-// before anything is sent. A key leaves `delivered` when its task leaves that status,
-// so a second permission prompt on the same task notifies again.
+// The rows that entered a notable status since the last read and are not already waiting in `held` or `inFlight`. They are NOT
+// marked delivered here: only a submit that succeeded does that (wake). A key leaves `delivered` when its task leaves that
+// status, so a second permission prompt on the same task notifies again.
 function transitions(rows: readonly TaskRow[]): TaskRow[] {
   const now = new Set(rows.map(noticeKey))
   for (const key of delivered) if (!now.has(key)) delivered.delete(key)
+  const waiting = new Set([...held, ...inFlight].map(noticeKey))
   const fresh: TaskRow[] = []
   for (const row of rows) {
     const key = noticeKey(row)
-    if (key === undefined || delivered.has(key)) continue
-    delivered.add(key)
+    if (key === undefined || delivered.has(key) || waiting.has(key)) continue
+    waiting.add(key)
     fresh.push(row)
   }
   return fresh
+}
+
+// The lines under the counts in the band: what the main would otherwise not learn. None while all is well.
+function bandNotes(): string[] {
+  const notes: string[] = []
+  if (readFailures >= READ_FAILURES_PAUSED) notes.push(`worker notices paused: tp-agent list ${readFailure}`)
+  if (isStuck) {
+    const ids = [...inFlight, ...held].map(row => row.id)
+    notes.push(`main could not be woken: ${ids.length} worker notice${ids.length === 1 ? '' : 's'} held (${ids.join(', ')}); retrying`)
+  }
+  if (other.length > 0) {
+    const ids = other.slice(0, OTHER_IDS_SHOWN).map(row => `${row.id} (${row.main})`).join(', ')
+    notes.push(`${other.length} worker${other.length === 1 ? ' in this session belongs' : 's in this session belong'} to another main: ${ids}${other.length > OTHER_IDS_SHOWN ? ', …' : ''}; tp-agent list`)
+  }
+  return notes
+}
+
+// The band's value: the counts of the last good read and the notes now. Never throws.
+async function publish($: EngineInterface) {
+  const summary: TaskSummary = { ...(lastSummary ?? summarize([])), notes: bandNotes() }
+  await update($, tasks, () => summary).catch(() => undefined)
 }
 
 // Mirrors the notifier state into session state in one write. Never throws: a failed
@@ -247,7 +303,8 @@ async function restore($: EngineInterface) {
     epoch = stored.epoch + 1
     isIndexed = stored.isIndexed
     delivered = new Set(stored.delivered)
-    held = stored.pending.filter(row => delivered.has(noticeKey(row) ?? ''))
+    // Rows its submit had not acknowledged; poll drops those whose task has left that status.
+    held = stored.pending
   } catch {
     // The saved value could not be read, so its epoch is unknown. Claim far above any counter
     // a readable store holds, plus the time, so this module is never taken for a replaced one
@@ -262,40 +319,84 @@ async function restore($: EngineInterface) {
   await persist($)
 }
 
+async function nowMs($: EngineInterface): Promise<number> {
+  return $.clock.now().catch(() => 0)
+}
+
 // One wake at a time: `$.prompt.submit` resolves when its turn starts, and the engine
-// does not dedupe, so items found meanwhile are held and ride the next submit.
+// does not dedupe, so items found meanwhile are held and ride the next submit. A row is marked
+// delivered only when its submit succeeded. A failed one keeps its rows held and is tried again
+// after WAKE_BACKOFF_MS (doubling), for as long as the row is still in that status; after
+// WAKE_TRIES failures in a row it says so once (toast and band) and goes on trying.
 async function wake($: EngineInterface) {
   if (isSubmitting || isSuperseded || held.length === 0) return
+  if ((await nowMs($)) < retryAt) return
   inFlight = held
   held = []
   isSubmitting = true
   try {
     await $.prompt.submit({ text: `tmux-pi workers changed state:\n${inFlight.map(hint).join('\n')}` })
+    for (const row of inFlight) delivered.add(noticeKey(row) ?? '')
     wakeFailures = 0
+    isStuck = false
   } catch {
-    // Put the batch back for the next tick, a few times at most: a missed wake, never a loop.
     wakeFailures += 1
-    if (wakeFailures < WAKE_TRIES && !isSuperseded) held = [...inFlight, ...held]
-    else wakeFailures = 0
+    if (!isSuperseded) held = [...inFlight, ...held]
+    retryAt = (await nowMs($)) + WAKE_BACKOFF_MS * 2 ** Math.min(wakeFailures - 1, 3)
+    if (wakeFailures === WAKE_TRIES && !isSuperseded) {
+      isStuck = true
+      $.ui.toast(`tmux-pi could not wake main with ${held.length} worker notice${held.length === 1 ? '' : 's'} (${held.map(row => row.id).join(', ')}); they stay held and are retried`)
+    }
   } finally {
     inFlight = []
     isSubmitting = false
     await persist($)
+    await publish($)
   }
+}
+
+// A read of `tp-agent list` that failed: counted, never silent. From the second in a row the band says why and one toast is shown;
+// the next good read clears it. Polling goes on.
+async function readFailed($: EngineInterface, why: string) {
+  readFailures += 1
+  readFailure = why
+  if (readFailures >= READ_FAILURES_PAUSED && !hasToastedPause) {
+    hasToastedPause = true
+    $.ui.toast(`worker notices paused: tp-agent list ${why}`)
+  }
+  await publish($)
 }
 
 async function poll($: EngineInterface) {
   if (!isActive || isPolling || isSuperseded) return
   isPolling = true
   try {
-    const rows = await readTasks($)
+    const read = await readTasks($)
     // The gate can close while the read is out (a later session.start): do nothing then.
-    if (rows === undefined || !isActive || isSuperseded) return
-    const summary = summarize(rows)
-    await update($, tasks, () => summary).catch(() => undefined)
+    if (!isActive || isSuperseded) return
+    if ('failure' in read) return await readFailed($, read.failure)
+    const { rows } = read
+    readFailures = 0
+    readFailure = undefined
+    hasToastedPause = false
+    other = read.other
+    // Another main's rows are shown, never woken on: a live second main may own them. One toast per newly seen row.
+    const now = new Set(other.map(row => `${row.id}:${row.main}`))
+    for (const row of other) {
+      if (!seenOther.has(`${row.id}:${row.main}`)) $.ui.toast(`${row.id} (${row.status}) belongs to another main (${row.main}); not woken: tp-agent list`)
+    }
+    seenOther = now
+    lastSummary = summarize(rows)
     const fresh = transitions(rows)
     // A row whose task left its status while waiting for a submit is no longer news.
-    held = [...held, ...fresh].filter(row => delivered.has(noticeKey(row) ?? ''))
+    const current = new Set(rows.map(noticeKey))
+    held = [...held, ...fresh].filter(row => current.has(noticeKey(row)))
+    // Nothing is waiting any more (the rows left that status): the warning about a main that could not be woken is over.
+    if (held.length === 0 && inFlight.length === 0) {
+      isStuck = false
+      wakeFailures = 0
+    }
+    await publish($)
     for (const row of fresh) $.ui.toast(hint(row))
     await persist($)
     // Not awaited: the submit resolves only when its turn starts, and polling (the band,
@@ -685,24 +786,29 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!isActive || e.props.hasSurvey) return next(e)
     const summary = await read($, tasks)
-    if (summary === null || isQuiet(summary)) return next(e)
+    if (summary === null) return next(e)
+    const lines = [...(isQuiet(summary) ? [] : [{ key: 'tp-band', text: bandText(summary) }]), ...(summary.notes ?? []).map((text, i) => ({ key: `tp-note-${i}`, text }))]
+    if (lines.length === 0) return next(e)
     const { Box, Text } = $.ui.resolve(e)
 
     return (
-      <Box>
-        <Text key="tp-band" dimColor>
-          {clip(bandText(summary), e.props.bodyColumns)}
-        </Text>
+      <Box flexDirection="column">
+        {lines.map(line => (
+          <Text key={line.key} dimColor>
+            {clip(line.text, e.props.bodyColumns)}
+          </Text>
+        ))}
       </Box>
     )
   })
 
   on('command.run', { command: 'workers' }, async ($, e, next) => {
     if (!isActive) return next(e)
-    const rows = await readTasks($)
-    if (rows === undefined) return { text: 'tp-agent list failed.' }
-    if (rows.length === 0) return { text: 'No tasks in this session.' }
-    return { text: ['id  role  status', ...rows.map(row => `${row.id}  ${row.role ?? '-'}  ${row.status}`)].join('\n') }
+    const read = await readTasks($)
+    if ('failure' in read) return { text: `tp-agent list failed: ${read.failure}.` }
+    const left = read.other.length === 0 ? [] : [`${read.other.length} in this session belong to another main: ${read.other.map(row => `${row.id} (${row.main})`).join(', ')}`]
+    if (read.rows.length === 0) return { text: ['No tasks in this session.', ...left].join('\n') }
+    return { text: ['id  role  status', ...read.rows.map(row => `${row.id}  ${row.role ?? '-'}  ${row.status}`), ...left].join('\n') }
   })
 
   on('command.run', { command: 'worker-view' }, async ($, e, next) => {

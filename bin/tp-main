@@ -10,6 +10,30 @@ if [[ -n "${TP_WORKDIR:-}" ]]; then
   cd -- "$TP_WORKDIR"
 fi
 export TP_MODE=orchestrator
+# A main's identity, recorded on every task it dispatches (tp-agent main_id) and matched by `tp-agent list --main`. The harness's
+# own session id is not it: Claude Code starts a new one on /clear and on --resume, which cut a main off from its workers.
+# Made here, not in bin/tp, because this is what a relaunch runs, and kept in the session's state directory, which every
+# relaunch in the same tmux session shares (bin/tp exports TP_STATE_DIR to the pane and the session): the same main keeps its id
+# across /clear, --resume, compaction and a second tp-main. Inherited by everything the harness starts (Bash tool, claude -p,
+# subagents, background shells). A TP_MAIN_ID already set and valid is kept.
+if ! [[ "${TP_MAIN_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  main_id=""
+  idfile="${TP_STATE_DIR:+$TP_STATE_DIR/main-id}"
+  if [[ -n "$idfile" && -d "$TP_STATE_DIR" ]]; then
+    main_id="$(cat "$idfile" 2>/dev/null || true)"
+    if ! [[ "$main_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+      fresh="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
+      # ln fails when the file exists: of two launches racing, the first id wins and both read it back.
+      [[ -z "$main_id" ]] || rm -f "$idfile"  # a file with a bad id in it is replaced
+      printf '%s\n' "$fresh" > "$idfile.$$" && { ln "$idfile.$$" "$idfile" 2>/dev/null || true; }
+      rm -f "$idfile.$$"
+      main_id="$(cat "$idfile" 2>/dev/null || echo "$fresh")"
+    fi
+  else
+    main_id="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
+  fi
+  export TP_MAIN_ID="$main_id"
+fi
 core="$(cat "$ROOT/agent/orchestrator.md")"
 case "$harness" in
   pi)

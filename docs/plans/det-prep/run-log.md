@@ -602,3 +602,5 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Over-deep JSON family: 150 json.load(s) sites / 71 files, 29 catch RecursionError. One shared reader + guard, after open lanes merge.
 - review_rounds untracked-files double count (above).
 - test_retry_packet RepeatedFamilyGateTests: 1 in 6 flake (state digest coder-1 vs coder-0), checking on clean main.
+- retry_packet flake confirmed on clean main 64cc2f9: 4/18 fail. Added to baseline (9 -> 10) as pre-existing; brief g2/g2f-retry-packet-digest.md,
+  dispatched after G2-A merges (same test file). Suspected: state_digest names tied tasks in glob order.

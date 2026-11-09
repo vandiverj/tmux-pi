@@ -207,6 +207,19 @@ class HandOverAndPreambleTests(RecoveryCase):
         run = self.spawn("--lane-replaces", item["id"], env=env, task="coder-third0001")
         self.refused(run, "coder-next00001")
 
+    def test_a_second_live_writer_is_refused_however_often_the_class_has_dispatched_before(self):
+        (self.state / "live-window").write_text("")
+        self.lane_ok()
+        self.clear_server()  # the end of that test: its panes go
+        self.reset_fixture()  # what the next test of the class starts from (LeaseCase.setUp also lays out the second session)
+        (self.state2 / "tasks").mkdir(parents=True)
+        (self.state / "live-window").write_text("")
+        item, _ = self.lane_ok()  # never a copy of the first test's lease, whose pane the fixture ended with that test
+        [holder] = self.lease()
+        self.assertEqual(holder["task"], item["id"])
+        self.assertIn(holder["pid"], worker_process._ps())
+        self.refused(self.spawn(), item["id"])
+
     def test_a_hand_over_is_only_for_the_caller_itself_and_only_with_a_lane(self):
         (self.state / "live-window").write_text("")
         item, _ = self.lane_ok()

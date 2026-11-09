@@ -337,8 +337,16 @@ validation). A reply is a list of FACT LINES and only those count:
     (any Unicode digits) directly preceded by a path token or by a line word (`line`, `lines`, `L`, `l.`, `ln`, `#`) with only separators
     between them fails the reply, kind `unparsed_reference`. The runner counts these as `unparsed_references`, beside `fabricated_citations`;
     S2 needs both to be zero.
+22. A digit is any character with a Unicode numeric value (round 11). For the floor and the grammar a digit is any character for which
+    `unicodedata.numeric(c, None)` is not None (Nd, Nl, No: `፩`, `Ⅰ`, `①`, `½`, `²`). A number made only of Nd digits is read by value (rule 16).
+    Any other numeric character in a line-number position fails the reply as `noncanonical_citation`, or as `unparsed_reference` where rule 21
+    applies. There is no list of digit ranges; the interpreter's database decides (1862 such characters on py3.9, 2002 on py3.14).
+23. Delimiters are exactly the rule-18 pairs (round 11). `[]`, `()`, `<>`, backticks and `'` / `"` with their typographic forms, each only as
+    a matched pair. Any other leading character (`{`, `|`, a letter) and an opener with no closer is part of the path as written, so
+    `{src/cli.py:6` is a reference to the file `{src/cli.py` (`unknown_file`, counted in `fabricated_citations`). Only the trailing punctuation of
+    rule 18 is removed (U+201D and U+2019 join it, as the closers of the typographic quotes).
 
-The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 21 it
+The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 23 it
 broke. The runner keeps the raw reply. The prompt in `config/local.example.json` states the format with one example.
 
 Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
@@ -428,6 +436,7 @@ zeros is six `range` failures, by 4 passes.
 | a reference the scan does not look at (review 8 F1, Main's F3) | 13, 14, 15 | One scan of the whole reply, on a copy where every space and control character is one space, finds a reference by its line part and its path, wherever it is and however it is wrapped. Each is graded by rule 3 and, unless it is the canonical citation of a fact line, fails the reply. | `test_rule_13_a_line_reference_is_found_in_any_shape_anywhere_across_line_breaks`, `test_rule_15_only_the_canonical_form_earns_credit_and_a_valid_other_form_is_not_fabricated`, `test_rule_13_prose_that_is_not_a_line_reference`, `test_failing_reply_is_scored_and_classed` (the runner's count), generated kinds h, j |
 | a number is its digits, not its value (review 8 F2) | 16 | Leading Unicode zeros are stripped before the 18-digit cap. | `test_rule_16_a_line_number_is_its_value`, generated kind k |
 | a path shaped by a character list, a reference found within a window, a line part by a table of shapes (review 9 F1, F2, Main's F3) | 17, 18, 19, 20, 21 | No list is left to be outside of: a path is any run of non-space characters (or, in a delimiter, everything up to the line part), a line part is a separator run followed by an optional line word and a number, in both orders, found in linear time at any distance; what the grammar still does not place, a number after a path or a line word, fails by itself (`unparsed_reference`). | `test_rule_17_...`, `test_rule_18_...`, `test_rule_19_...`, `test_rule_20_...` (two), `test_rule_21_...`, generated kinds l, m, n, o (`test_generated_grammar_...`, four tests) |
+| a numeric character that is not `\d`, and an unlisted leading character dropped from the path (review 10 F1, F2) | 22, 23 | A digit is whatever `unicodedata.numeric` accepts (Nd read by value, the rest fails as `noncanonical_citation` or `unparsed_reference`); a delimiter is a matched rule-18 pair only, so any other leading character stays in the path. | `test_rule_22_...`, `test_rule_23_...`, generated kinds p, q, r (`test_generated_grammar_a_character_in_front_of_...`, `test_generated_numeric_characters_...`, two) |
 
 Round 10 (review 9: `$` and `?` in a path, a path or bracket padded by more than the 4000-character window, and Main's four shapes -
 a fullwidth colon, `line N of PATH`, `PATH L999`, `PATH:L9999` - all passed with 0 bad citations; the family is the same as rounds 8 and 9,
@@ -453,6 +462,24 @@ facts pass the grammar (the references pass 24/24; the sample fails as before, n
 `noncanonical_citation` and `unknown_file`; a file name at the end of a line followed by a numbered list item (`src/cli.py` + newline + `1. first`) -
 `noncanonical_citation`, since line breaks are separators; `<a href=src/cli.py#L6>` (the path is taken from the delimiter) -
 `noncanonical_citation`. `nofile.rs$:999` is not a path (no `/`, ends in `$:999`), so it is not read; the floor does not flag it either.
+
+Round 11 (review 10: `line ፩`, `src/nonexistent.rs:፩` and `line Ⅰ` passed 24/24 with 0 unparsed references because the floor and the grammar used `\d`;
+`{src/cli.py:6` counted 0 bad citations because `{` was read as an opener that rule 18 does not list - the same family again: a
+hand-written class, `\d` and the `LEADING` set, decided what could be read). Rules 22 and 23 above. Both classes are gone:
+`_Normal` maps a decimal digit to its value and any other character with a `unicodedata.numeric` value to a digit that is not a decimal one
+(its integer value, or 0), so a line number made of such characters is read and fails as `noncanonical_citation`, and the floor sees it as a
+number; `LEADING` is deleted and `_delimiters` pairs only the rule-18 delimiters (with proper nesting for the same kind), so the path of
+`{src/cli.py:6` is `{src/cli.py` (`unknown_file`). Counts (`scripts/counts_round11.py`; chores x targets; same module on py3.9 and py3.14):
+l 2496, m 4320, n 1344, o 1176 (nine gap rows), p 1248 (each of the 32 printable ASCII punctuation characters and the same 20 non-ASCII ones in front of the
+path, for each of the 24 chores, the wrapper, order and target rotating), and q and r from every character the running
+interpreter's `unicodedata.numeric` accepts: 1862 on py3.9 (unicodedata 13.0.0), 2002 on py3.14 (16.0.0), in five forms (after a line word,
+after a path, as a line number, in reverse, as the end of a range). Current tree: 20038 of 20038 caught as stated on py3.9, 20738 of 20738 on py3.14.
+Against the round-10 tree (`743f3c7`, loaded in memory, py3.9): 14528 caught as stated, 4280 accepted outright (1070 characters x four forms:
+the floor and the line number do not see them), 1230 fail for another kind than the mutation is for; per kind: l 105, m 737, n 144 and p 183 wrong
+kind (a leading or typographic character), q/r 1070 accepted per form. Changed expectations (flagged for Main): an unclosed opener now belongs to the path
+(`test_citations`, the unclosed-list row: `unknown_file`, not a citation), and a bolded line (`**x [p:1]`) is a bad line in
+`test_lines_that_are_not_fact_lines_count_for_nothing`. No new benign flag: corpus A 24/24 pass, the references 24/24, corpus B
+identical to round 10, corpus C (braces, fractions, superscripts, circled digits, f-strings) with the same two `no_subject` lines as round 10.
 
 ### Audit of the required facts (round 6)
 

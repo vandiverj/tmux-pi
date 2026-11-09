@@ -10,7 +10,7 @@ the system prompt tp-spawn gives a worker on M (config/router.json "local" "prom
 tp-spawn does; --prompt-file replaces that text; the temp dir holds no .tmux-pi/worker-preamble.md, so no preamble is added),
 score the reply with summarize_check.check, and append one JSON line to FILE. The record keeps the raw reply. The reply is graded
 as a list of fact lines, `- <claim> [<path>:<line>[-<line>]]` (see summarize_check.py): the record's `failures` name, per failed
-line, the rule (1-21) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations (every line reference of the reply, in any
+line, the rule (1-23) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations (every line reference of the reply, in any
 shape, on a fact line or not, across line breaks: rules 10, 13, 14, 17 to 19; a good one in a noncanonical shape is not fabricated but fails the reply, rule 15),
 unparsed references (a number that follows a file name or a line word and that no reference grammar placed: rule 21; the count that backs the grammar's
 floor), unchecked citations (good citations no matching fact's support_lines vouch for) and the failure classes (incl. `uncited`, `identifier_only`,

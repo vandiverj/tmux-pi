@@ -82,6 +82,14 @@ of FACT LINES, and only fact lines state facts:
   Rule 21 Table-free floor. After the canonical citations and the references of rules 17 to 19 are removed, a number (any Unicode
           digits) directly preceded by a path token or a line word (line, lines, L, l., ln, #), with only separators between,
           fails the reply: `unparsed_reference`, listed in "unparsed_references" (S2 needs it, with fabricated citations, at zero).
+  Rule 22 A digit is any character with a Unicode numeric value: unicodedata.numeric(c, None) is not None (categories Nd, Nl and No:
+          Ethiopic, Roman numerals, circled digits, fractions, superscripts). A number made only of Nd digits is read by value (rule 16).
+          Any other numeric character in a line-number position fails the reply as `noncanonical_citation`, or as `unparsed_reference`
+          where rule 21 applies. No hand list of digit ranges; the interpreter's own database decides (1862 characters on py3.9, 2002 on py3.14).
+  Rule 23 Delimiters are exactly the rule-18 pairs: [] () <> backticks and ' " with their typographic forms, each only as a matched pair.
+          Any other leading character (a brace, a pipe, a letter) and an opener with no closer is part of the path as written, so
+          "{src/cli.py:6" is a reference to the file "{src/cli.py" (`unknown_file`, counted as fabricated). Only the trailing punctuation of
+          rule 18 is removed.
 
 answer (a line of tests/calibration/summarize/answers.jsonl):
   required     list of facts; a fact is a list of alternative regexes for ONE thing (case-insensitive, matched against ONE claim),
@@ -136,10 +144,11 @@ FORWARD = re.compile(r"(?<!{s}){s}+(?:{w}\.?[ :#,(·=]*)?(?P<a>\d+){r}".format(s
 REVERSE = re.compile(r"(?<!\w){w}\.?[ :#,(·=]*(?P<a>\d+){r}[ ,)\]]*(?:of|in|at)(?!\w)[ ]+".format(w=_LINE_WORD, r=_RANGE), re.I)
 NON_SPACE = re.compile(r"\S+")
 SLASHES = re.compile(r"[/\\]")
-DELIMITERS = re.compile(r"`+|[\[\]()<>\"']")
-OPENERS = frozenset("[(<\"'`")
-LEADING = frozenset("([{<'\"`*,;")  # what may stand in front of a path outside a delimiter
-TRAILING = frozenset(".,;:!?)]}>'\"`*")  # sentence punctuation: not part of a path at its end (rule 18)
+DELIMITERS = re.compile(r"`+|[\[\]()<>\"'\u201c\u201d\u2018\u2019]")
+OPENERS = frozenset("[(<\"'`\u201c\u2018")
+CLOSES = {"]": "[", ")": "(", ">": "<", "\u201d": "\u201c", "\u2019": "\u2018"}  # a closer -> the opener it closes
+LIST_SEPARATORS = ",;"  # between two references written without a space (a.py:1,b.py:2): not the first character of the second path
+TRAILING = frozenset(".,;:!?)]}>'\"`*\u201d\u2019")  # sentence punctuation: not part of a path at its end (rule 18)
 # rule 21: a number preceded, with only separators between, by a path token or a line word. A separator is a space or any character that is
 # no letter, digit, "_", ".", "/", "\" or "-" (those are what paths and numbers are made of)
 FLOOR = re.compile(r"(?<![^\w./\\-])(?P<seps>[^\w./\\-]*)(?P<n>\d+)")
@@ -307,29 +316,37 @@ def citations_in(text):
 
 
 class _Normal(dict):
-    """str.translate table for rule 17: each character in NFKC form, every Unicode space (str.isspace) as one space, every Unicode decimal
-    digit as the ASCII digit of its value. A control or format character that is no space stays (a path may hold one). `odd` holds the
-    characters that give more or fewer than one character, which the offset map must follow."""
+    """str.translate table for rules 17 and 22: each character in NFKC form, every Unicode space (str.isspace) as one space, every Unicode
+    decimal digit as the ASCII digit of its value, and every other character that has a numeric value (unicodedata.numeric: Ethiopic, Roman,
+    circled, vulgar-fraction, CJK numerals ...) as its value in ASCII digits, unless NFKC already gives ASCII digits and nothing else
+    (U+2467 is "10"). A fraction or a negative number is "0": a line no file has. A control or format
+    character that is no space stays (a path may hold one). `odd` holds the characters that give more or fewer than one character, which the
+    offset map must follow."""
     def __init__(self):
         super().__init__()
         self.odd = set()
 
     def __missing__(self, code):
+        char = chr(code)
         out = []
-        for char in unicodedata.normalize("NFKC", chr(code)):
-            digit = unicodedata.decimal(char, -1)
-            out.append(" " if char.isspace() else str(digit) if digit >= 0 else char)
-        self[code] = "".join(out)
-        if len(self[code]) != 1:
+        for c in unicodedata.normalize("NFKC", char):
+            digit = unicodedata.decimal(c, -1)
+            out.append(" " if c.isspace() else str(digit) if digit >= 0 else c)
+        mapped = "".join(out)
+        value = unicodedata.numeric(char, None)
+        if value is not None and not (mapped.isascii() and mapped.isdigit()):  # "(1)", "1.", "1⁄4", "XII", or no digit at all: one number
+            mapped = str(int(value)) if value >= 0 and value == int(value) else "0"
+        self[code] = mapped
+        if len(mapped) != 1:
             self.odd.add(code)
-        return self[code]
+        return mapped
 
 
 _NORMAL = _Normal()
 
 
 def _normalize(text):
-    """(scan, origin): text in the form rules 17 to 21 read. origin[i] is the index in text of the character scan[i] came from, or None when the
+    """(scan, origin): text in the form rules 17 to 23 read. origin[i] is the index in text of the character scan[i] came from, or None when the
     two have the same length and character for character (almost always: all of ASCII)."""
     scan = text.translate(_NORMAL)
     if len(scan) == len(text) and (text.isascii() or not any(chr(c) in text for c in _NORMAL.odd)):
@@ -351,35 +368,41 @@ def _blank(text, spans):
 
 
 def _delimiters(scan):
-    """What rule 18 calls a delimiter: [] () <> backticks (a run of N closes at the next run of N) and quotes. Returns (positions, tops, closer):
-    tops[i] is the text start of the innermost delimiter still open after the one at positions[i] (-1 for none), and closer[p] is
-    (text start, position of the closer) for the delimiter opened at p. One pass; a closer that matches nothing open is literal."""
-    positions, tops, closer, stack, count = [], [], {}, [], {}
+    """What rules 18 and 23 call a delimiter: a MATCHED pair of [] () <> backticks (a run of N closes at the next run of N) or quotes (" ' and
+    the typographic forms U+201C/D, U+2018/9). An opener with no closer is no delimiter: it is part of the path as written. Returns
+    (positions, tops, closer): tops[i] is the text start of the innermost matched delimiter still open after the one at positions[i] (-1 for
+    none), and closer[p] is (text start, position of the closer) for the delimiter opened at p. A closer that matches nothing open is literal."""
+    positions, closer, stack, count = [], {}, [], {}
     n = len(scan)
     for m in DELIMITERS.finditer(scan):
         p, token = m.start(), m.group()
         char = token[0]
         if char == "`":
             kind = token
-        elif char in "[(<":
+            close = bool(count.get(kind))
+        elif char in "[(<\u201c\u2018":
             if char == "<" and (p + 1 >= n or scan[p + 1] in " =\t"):
                 continue  # "a < b", "a <= b"
-            kind = char
-        elif char in "])>":
-            kind = {"]": "[", ")": "(", ">": "<"}[char]
-            if not count.get(kind):
+            if char == "\u2018" and p and scan[p - 1].isalnum():
                 continue
+            kind, close = char, False
+        elif char in "])>\u201d\u2019":
+            kind = CLOSES[char]
+            if not count.get(kind) or (char == "\u2019" and p + 1 < n and scan[p + 1].isalnum()):  # U+2019 followed by a letter: an apostrophe
+                continue
+            close = True
         elif char == '"':
             kind = char
+            close = bool(count.get(kind))
         elif count.get(char):  # "'" closes unless a letter or digit follows it (an apostrophe); it opens only after a non-word character
             if p + 1 < n and scan[p + 1].isalnum():
                 continue
-            kind = char
+            kind, close = char, True
         elif p == 0 or not scan[p - 1].isalnum():
-            kind = char
+            kind, close = char, False
         else:
             continue
-        if count.get(kind):
+        if close:
             while True:
                 entry = stack.pop()
                 count[entry[0]] -= 1
@@ -390,7 +413,14 @@ def _delimiters(scan):
             stack.append((kind, p + len(token), p))
             count[kind] = count.get(kind, 0) + 1
         positions.append(p)
-        tops.append(stack[-1][1] if stack else -1)
+    ends = {c[1] for c in closer.values()}
+    tops, inner = [], []
+    for p in positions:  # only a delimiter that was closed is one (rule 23)
+        if p in closer:
+            inner.append(closer[p][0])
+        elif p in ends:
+            inner.pop()
+        tops.append(inner[-1] if inner else -1)
     return positions, tops, closer
 
 
@@ -401,15 +431,15 @@ def _shown(text, start, end):
 
 
 def references(text, files, canonical=()):
-    """Rules 17 to 21. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
+    """Rules 17 to 23. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
     a reference; every pass is linear.
 
     The scan is text in NFKC form (rule 17) with the spans in canonical (a fact line's own citation list) blanked. refs is every line
     reference of it (rules 18 and 19), [(start, end, path, first, last, written)] in text's offsets and in order, written being the
     reference as text has it: a PATH tied to a line number by a separator run from : # , ( · and spaces, then optionally L, l., ln, line
     or lines, then a number or a range, or the reverse (line / lines / L, a number, then of, in or at, then a PATH). Outside a delimiter a
-    PATH is the run of non-space characters before the line part (minus sentence punctuation at its end, and a delimiter in front of
-    it), and it counts as a path when it holds / or \\, ends in ".<letters>" or is a chore file's path or name. Inside a delimiter it is
+    PATH is the run of non-space characters before the line part, as written (minus sentence punctuation at its end: a character in front of
+    it, an opener with no closer included, is part of it, rule 23), and it counts as a path when it holds / or \\, ends in ".<letters>" or is a chore file's path or name. Inside a delimiter it is
     everything from the opening one to the line part, spaces and line breaks included. A chore file, written whole, wins over that.
 
     unparsed is [(start, end, written)]: every number left once the references are removed that is directly preceded by a path token or
@@ -432,17 +462,6 @@ def references(text, files, canonical=()):
     names = set(files) | {Path(f).name for f in files}
     longest = max((len(name) for name in names), default=0)
     positions, tops, closer = _delimiters(scan)
-    lead_from = {}
-
-    def lead(a, b):
-        """The first index in [a, b) that does not hold a LEADING character (b when there is none). Memoized per a."""
-        k = lead_from.get(a)
-        if k is None:
-            k = a
-            while k < n and scan[k] in LEADING:
-                k += 1
-            lead_from[a] = k
-        return min(k, b)
 
     def trail(a, b):
         while b > a and scan[b - 1] in TRAILING:
@@ -471,8 +490,10 @@ def references(text, files, canonical=()):
         head = last_end
         if s and scan[s - 1] != " ":
             head = max(head, run_starts[bisect.bisect_right(run_starts, s - 1) - 1])
+        while last_end and head == last_end and head < s and scan[head] in LIST_SEPARATORS:
+            head += 1  # a.py:1,b.py:2: the comma ends the first reference
         ce = trail(head, s)
-        cs = lead(head, ce)
+        cs = head  # a leading character is part of the path as written (rule 23)
         chosen = None
         if cs < ce and ce - cs <= longest and scan[cs:ce] in files:
             chosen = (cs, ce, False)  # a chore file, written whole
@@ -501,7 +522,7 @@ def references(text, files, canonical=()):
         if chosen is None:
             stop = run_ends[bisect.bisect_right(run_starts, e) - 1]
             ce = trail(e, stop)
-            cs = lead(e, ce)
+            cs = e
             if shaped(cs, ce):
                 chosen = (cs, ce, False)
         if chosen:
@@ -538,7 +559,7 @@ def _floor(text, scan, kept, at, after, files):
             k = bisect.bisect_right(run_starts, q - 1) - 1
             if k >= 0 and spans[k][1] >= q:
                 token = rest[max(spans[k][0], previous):q]
-                core = token.lstrip("".join(LEADING)).rstrip("".join(TRAILING))
+                core = token.rstrip("".join(TRAILING))
                 if core and not core.isdigit() and (SLASHES.search(core) or re.search(r"\.[^\W\d_]+\Z", core) or core in files or any(core == Path(f).name for f in files)):
                     start = q - len(token)
                     out.append((at(start), after(m.end()), _shown(text, at(start), after(m.end()))))

@@ -999,3 +999,31 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   prior record. Preview (d63f08c + lane) 144 OK in all four cells; the merged DS1 files equal the preview's blobs.
 - S1c (lane code-facts, task coder-f8f92bfdf7) dispatched on b77ad33 with fixes/ls1c-s1c-code-facts.md: version diff,
   use scan and the false-absence drop computed by code, aimed at the meaning bar's recall misses.
+
+## 2026-11-09 (evening): LS1b and MG1 merged; G3 decline cause found; checkpoint-1; owner's production issues
+- LS1b (ls1-real) db29594, APPROVED: real-work split, frozen copies with manifest, oracle extensionless targets.
+- G3 live runs 4 and 5 (battle-soccer) failed at `decline`. Run 5's pane captures showed the redirect typed but never
+  submitted: `tp-agent message` sends Enter straight after the text, and Claude Code takes the burst as a paste. tp-contract
+  and tp-task wait 0.3 s first, but none of the three confirms the submit, and tp-agent still reports `sent: true`.
+  Lane msg-submit (MS1, fixes/ms1-message-submit.md) is building a shared sender that confirms the submit. Lane g3-decline
+  waits for it.
+- Checkpoint 1 (release-gates.md): a production cut without the local summarizer. Gates: MS1 and MN1 merged, a G3 live run
+  passing, G1 on the cut, G5 port rehearsal, then a local tag and port notes.
+- Owner's production issues: (1) "messages to workers not getting sent" is MS1. (2) "workers no longer sending messages
+  ack to main agent", which the owner thinks happens when several side tasks break the linking.
+  - Traced with two read-only agents and reproduced by Main: the Claude-main notifier links tasks by
+    CLAUDE_CODE_SESSION_ID. `tp-agent list --main` silently drops same-session tasks tagged with another id, so workers
+    started from another Claude session never reach main.
+  - Failed wakes and failed polls also drop notices silently.
+  - A pi orchestrator main has no notifier at all, by design.
+  - Lane main-notify (MN1, fixes/mn1-main-notify.md) dispatched.
+- MG1 (meaning-grader) f503858, APPROVED at round 2: packets chosen by shape, and a fact mismatch is an invalid grade. The
+  merged tree equals the preview; 184 OK in all four cells. Live calibration against the 108 hand grades is running.
+- S1c (code-facts) round 2 closed F1-F7 and F9. Its preview with main failed one guard test on the real split rows that
+  LS1b added, so round 2b covered every row.
+  - The review packet was then 762k, then 1.2M after a rebuild, because a later round diffs against the previous round's
+    tree, which predates main's merges.
+  - The lane was rebuilt on f503858 as one commit, b1f06fc (equal to 3245236, kept as backup/code-facts-3245236). A
+    fresh check task (fixes/ls1c-s1c-check.md) gives it a first review against main.
+  - Follow-up: a later-round packet should leave out what came from main (diff against the previous round's tree merged
+    with the new base).

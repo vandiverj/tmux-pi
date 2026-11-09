@@ -40,6 +40,8 @@ import subprocess
 import tempfile
 import time
 
+import command_wrappers
+
 # Names that are credential files wherever they appear, names that are only key material as a
 # file suffix, and names that are only sensitive when a command actually reads that file.
 _STRONG = (r"\.env(?:[._-].*)?|\.envrc|\.netrc|\.npmrc|\.pypirc|auth\.json|mcp-auth\.json|\.?mcp\.json|"
@@ -92,7 +94,6 @@ _BRACE_LIST = re.compile(r"\{([^{}]*,[^{}]*)\}")
 _VARIABLE = re.compile(r"\$\{?\w+\}?")
 _PIECES = re.compile(r"[=:,]")
 _ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
-_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _HEREDOC = re.compile(r"""<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([\w.+-]+))""")
 _ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|[0-7]{1,3}|.)", re.S)
 _REVISION = re.compile(r"^(?:HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD|main|master|stash|origin/.*|[0-9a-f]{7,40}|.*[~^@].*|.*\.\..*)$")
@@ -122,11 +123,13 @@ _SCRATCH_VARS = ("TMPDIR", "TP_TASK_DIR")
 
 _OPERATORS = ("<<<", "<<-", "&&", "||", "|&", ";;", ">>", "<<", ">&", "<&", "&>", "|", "&", ";", "(", ")", "<", ">")
 _REDIRECTS = {"<<<", "<<-", ">>", "<<", ">&", "<&", "&>", "<", ">"}
-_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"}
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
 _SYNTAX = {"done", "fi", "esac", "}", "in"}
-_WRAPPERS = {"sudo", "doas", "env", "command", "exec", "builtin", "nohup", "nice", "ionice", "timeout", "gtimeout",
-             "stdbuf", "caffeinate", "noglob", "nocorrect"}
-_WRAPPER_VALUES = {"-u", "-g", "-n", "-k", "-s"}
+# Programs that run the command after them: one table (lib/command_wrappers.py), read by redact_hook too. `_program` replaces
+# each of `_UNWRAPPED` by the command it runs, found with that wrapper's own option table (an option the table does not list
+# makes the command unknown: a hit, _OPAQUE). `command_wrappers.OWN` are not replaced: ssh and xargs have branches of their own.
+_UNWRAPPED = set(command_wrappers.NAMES - command_wrappers.OWN)
+_OPAQUE = "\0wrapper with an option that cannot be read"
 _ALIASES = {"gfind": "find", "ggrep": "grep", "gegrep": "egrep", "gfgrep": "fgrep", "gcat": "cat", "gzcat": "zcat",
             "ghead": "head", "gtail": "tail", "gtac": "tac", "gsort": "sort", "gcut": "cut", "gtar": "tar",
             "bsdtar": "tar", "gcp": "cp", "gdiff": "diff", "ripgrep": "rg"}
@@ -152,15 +155,13 @@ _CREDENTIAL_DIR = "a directory known to hold credentials"
 _ROOT_REASON = "the repository root"
 _BULK = _READERS | _GREPS | _SCRIPT_FIRST | _SHELLS | _INTERPRETERS
 _INNER = _BULK - {".", "source"}
-# Programs whose arguments are another command line; elsewhere a reader name only counts after run/exec/--.
-_FRONT_ENDS = {"docker", "podman", "nerdctl", "kubectl", "oc", "watch", "parallel", "npx", "bunx", "pnpx", "uvx",
-               "chroot", "flock", "script", "su", "runuser", "arch", "setsid", "entr", "strace", "dtruss", "xcrun",
-               "sandbox-exec", "firejail", "lima", "vagrant"}
+# Programs whose arguments are another command line; elsewhere a reader name only counts after run/exec/--. (The wrappers of
+# lib/command_wrappers.py are not here: `_program` already returns the command they run.)
+_FRONT_ENDS = {"docker", "podman", "nerdctl", "kubectl", "oc", "npx", "bunx", "pnpx", "uvx",
+               "entr", "strace", "dtruss", "xcrun", "lima", "vagrant"}
 _RUN_WORDS = {"run", "exec", "--"}
 _FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
 _FD_EXEC = {"-x", "-X", "--exec", "--exec-batch"}
-_XARGS_VALUES = {"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "-J", "-R", "-S", "--max-args", "--max-procs",
-                 "--delimiter", "--arg-file", "--max-lines", "--max-chars"}
 _CURL_FILES = {"-T", "--upload-file", "-K", "--config", "-E", "--cert", "--key", "--cacert", "--netrc-file",
                "--post-file", "--body-file", "--input-file", "--load-cookies", "--certificate", "--private-key",
                "--ca-certificate"}
@@ -1038,21 +1039,28 @@ def _commands(command):
     return items
 
 
+class _Line(str):
+    """A command line a wrapper hands to a shell (`su -c`, `flock -c`, an ssh remote command): its text is not the user's own
+    `sh -c` string, so a command word it leaves to the shell's expansion is unknown, not ignored (_unresolved)."""
+
+
 def _program(words):
-    i, wrapped = 0, False
+    """The program a simple command runs, and its arguments, looking through the wrappers of lib/command_wrappers.py."""
+    i = 0
     while i < len(words):
         word = words[i]
         name = posixpath.basename(word).lower()
         if _ASSIGN.match(word) or word in _KEYWORDS:
             i += 1
-        elif name in _WRAPPERS:
-            if name == "command" and words[i + 1:i + 2] in (["-v"], ["-V"]):
-                return None, []  # looks a command up without running it
-            wrapped, i = True, i + 1
-        elif wrapped and word in _WRAPPER_VALUES:
-            i += 2
-        elif wrapped and (word.startswith("-") or _DURATION.match(word)):
-            i += 1
+        elif name in _UNWRAPPED:
+            found = command_wrappers.unwrap(name, words[i + 1:])
+            if found is None:
+                return None, []  # nothing follows the wrapper to run
+            if found is command_wrappers.UNKNOWN:
+                return _OPAQUE, words[i + 1:]  # where its command starts is not known
+            if found[0] == "line":
+                return "sh", ["-c", _Line(found[1])]  # `su -c 'cmd'`, `script -c 'cmd'`, `flock FILE -c 'cmd'`: a shell reads it
+            words, i = found[1], 0
         else:
             return _ALIASES.get(name, name), words[i + 1:]
     return None, []
@@ -1932,12 +1940,56 @@ def _tar_hit(args, base):
         _roots_hit("archive", roots, base, _BULK_REASON) if create else None)
 
 
+def _unresolved(line):
+    """A hit when a command line a wrapper hands on cannot be read for certain (command_wrappers.uncertain): an expansion that is
+    not resolved, a shell with no command string or with anything but `-c` before it, a program that runs other words
+    (`find -exec`, `docker exec`, `xargs`, `eval`, ...), anywhere in it, in any shell or line nested inside it.
+
+    What runs there is chosen by a shell that is not this one, so an unknown command is treated as a read, as
+    redact_hook.bash_searches treats it as a search. The text stays the wrapper's whatever shells nest inside it, because the
+    whole of it is read; the user's own top-level `sh -c '$X'` never comes here."""
+    if command_wrappers.uncertain(line):
+        return line, "the command it runs is chosen by the shell at run time and cannot be checked"
+    return None
+
+
+# Programs the floor looks for in a wrapper's tail: every one that _command_hit judges by name.
+_FLOOR = _INNER | {"xargs", "find", "fd", "fdfind", "git", "eval", "curl", "wget", "ssh", "tar"}
+
+
+def _floor_hit(words, cmd, base, depth):
+    """The floor under every wrapper: when the command in `words` starts with a wrapper (at any depth), each word after it and
+    each word of every string inside them is tried as the command, over the words that follow it (command_wrappers.bag). This
+    does not depend on the wrapper's option table, so a table that is wrong about an option cannot hide a read. The table
+    (`_program`) only ever adds to what this finds."""
+    wrapped = command_wrappers.starts_with_wrapper(words, _ASSIGN, _KEYWORDS)
+    if not wrapped:
+        return None
+    entries, too_deep = command_wrappers.bag(wrapped[1])
+    if too_deep:
+        return wrapped[0], "command nesting is too deep to verify"
+    if command_wrappers.floor_uncertain(*wrapped):  # text a wrapper hands on that cannot be read for certain, found by name
+        return wrapped[0], "the command it runs is chosen by the shell at run time and cannot be checked"
+    unplaced = dict(cmd, settled=False)
+    for name, rest in entries:
+        name = _ALIASES.get(name, name)
+        if name in _FLOOR:
+            hit = _command_hit(name, rest, unplaced, base, depth)
+            if hit:
+                return hit
+    return None
+
+
 def _command_hit(prog, args, cmd, base, depth, bulk=False):
+    if prog == _OPAQUE:
+        return " ".join(args[:1]) or "a wrapper", "an option of the wrapper is not known, so the command it runs cannot be found"
     if prog == "xargs":
-        i = 0
-        while i < len(args) and args[i].startswith("-"):
-            i += 2 if args[i] in _XARGS_VALUES else 1
-        sub, rest = _program(args[i:])
+        found = command_wrappers.unwrap("xargs", args)
+        if found is None:
+            return None
+        if found is command_wrappers.UNKNOWN:
+            return _command_hit(_OPAQUE, args, cmd, base, depth)
+        sub, rest = _program(found[1])
         if sub is None:
             return None
         return (_producer_hit(cmd, base) if sub in _BULK else None) or _command_hit(sub, rest, cmd, base, depth, True)
@@ -1947,15 +1999,19 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
             if arg in _FIND_EXEC:
                 end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args))
                 sub, rest = _program(args[i + 1:end])
-                hit = (_roots_hit("bulk read", roots, base, _BULK_REASON) if sub in _BULK else None) or (
+                hit = _floor_hit(args[i + 1:end], cmd, base, depth) or (_roots_hit("bulk read", roots, base, _BULK_REASON) if sub in _BULK else None) or (
                     _command_hit(sub, rest, cmd, base, depth, True) if sub else None)
                 if hit:
                     return hit
         return None
     if prog in ("fd", "fdfind"):
         for i, arg in enumerate(args):
-            if arg in _FD_EXEC and _program(args[i + 1:])[0] in _BULK:
-                return "bulk shell read", _BULK_REASON
+            if arg in _FD_EXEC:
+                if _program(args[i + 1:])[0] in _BULK:
+                    return "bulk shell read", _BULK_REASON
+                hit = _floor_hit(args[i + 1:], cmd, base, depth)
+                if hit:
+                    return hit
         return None
     if prog == "git":
         sub, rest, base = _git_sub(args, base)
@@ -1992,7 +2048,8 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
     if prog in _SHELLS:
         for i, arg in enumerate(args[:-1]):
             if re.fullmatch(r"-[A-Za-z]*c", arg):
-                return _shell_hit(args[i + 1], base, depth + 1)
+                return (_unresolved(args[i + 1]) if isinstance(args[i + 1], _Line) else None) or _shell_hit(
+                    args[i + 1], base, depth + 1)
         return _other_hit(args, base, True)
     if prog == "eval":
         return _shell_hit(" ".join(args), base, depth + 1)
@@ -2019,10 +2076,12 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
                 files.append(value if equals else "".join(args[i + 1:i + 2]))
         return _first(_read_hit(name, base) for name in files if name)
     if prog == "ssh":
-        _, before, after, values, _ = _split_args(args, *_SSH_ARGS)
-        remote = (before + (after or []))[1:]
+        _, _, _, values, _ = _split_args(args, *_SSH_ARGS)
+        remote = command_wrappers.unwrap("ssh", args)  # what follows the host, options included, is the remote command line
+        if remote is command_wrappers.UNKNOWN:
+            return _command_hit(_OPAQUE, args, cmd, base, depth)
         return _first(_read_hit(word, base) for word in values) or (
-            _shell_hit(" ".join(remote), "", depth + 1) if remote else None)
+            (_unresolved(remote[1]) or _shell_hit(remote[1], "", depth + 1)) if remote else None)
     if prog in _SCRIPT_FIRST:
         _, before, after, values, has_script = _split_args(args, *_SCRIPT_ARGS)
         operands = before + (after or [])
@@ -2178,7 +2237,8 @@ def _shell_hit(command, base="", depth=0):
                 listed = listed or _listing_hit(inner, base)
         if listed and prog != "for":
             return listed
-        hit = _first(_read_hit(word, base) for word in cmd["inputs"]) or _document_hit(prog, cmd, base, depth)
+        hit = _first(_read_hit(word, base) for word in cmd["inputs"]) or _document_hit(prog, cmd, base, depth) or _floor_hit(
+            cmd["words"], cmd, base, depth)
         if hit:
             return hit
         if cmd["words"][:1] in (["while"], ["until"]):

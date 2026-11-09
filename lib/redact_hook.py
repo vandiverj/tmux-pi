@@ -16,6 +16,7 @@ import signal
 import time
 
 import safe_write
+import command_wrappers
 from placeholders import find, rehydrate, resolve_all
 from redact import STRICTEST_RULES, Redactor, exact_values, rules_source, strictness
 from redact_llm import LocalClassifier
@@ -381,10 +382,9 @@ def bash_source(command, cwd):
 
 
 SEARCHERS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}
-# Programs that run the command in their arguments. Each later word that is not an option is tried as that command, so an
-# option that takes a value (`timeout -s KILL 5 rg`) is never needed in a table here: a missed one only adds a try.
-WRAPPERS = {"env", "command", "builtin", "exec", "nice", "ionice", "timeout", "time", "xargs", "sudo", "doas", "nohup",
-            "stdbuf", "chrt", "taskset", "caffeinate", "watch", "parallel"}
+# Programs that run the command in their arguments (lib/command_wrappers.py, shared with sensitive_read). Where the command
+# starts is read from each wrapper's own option table; an option it does not list leaves the command unknown, which is a search.
+WRAPPERS = set(command_wrappers.NAMES)
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"}
 SHELL_VALUED = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--init-command"}
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "[[", "]]", "fi", "done", "esac"}
@@ -478,13 +478,29 @@ def runs_search(words, depth):
         return any(arg in ("-exec", "-execdir", "-ok", "-okdir") and runs_search(args[i + 1:], depth + 1)
                    for i, arg in enumerate(args))
     if word in WRAPPERS:
-        # An argument holding a space may be a whole command line (env -S, watch, parallel): read it as one too. Each
-        # later non-option word is tried as the command; a wrapper word is skipped, its own tries being among these.
-        if len(args) > 64:  # the command word may be beyond the scan limit: uncertainty is a search
+        if len(args) > 64:  # the command may be beyond the scan limit: uncertainty is a search
             return True
-        return any(bash_searches(arg, depth + 1) for arg in args if " " in arg) or any(
-            runs_search(args[i:], depth + 1) for i, arg in enumerate(args)
-            if not arg.startswith("-") and os.path.basename(arg) not in WRAPPERS)
+        # The floor, whatever the wrapper's option table says: a search program anywhere in the words after the wrapper, or in
+        # a string inside them, is a search (lib/command_wrappers.py `bag`). The table below can only add to it.
+        names, too_deep = command_wrappers.bag(args)
+        if too_deep or any(not name.startswith("-") and (name in SEARCHERS or name.endswith("grep")) for name, _ in names):
+            return True
+        # Text a wrapper in the words hands on (`su -c`, `flock -c`, `ssh host`, `env -S`) that cannot be read for certain is a
+        # search, found by name over the words after it, so a wrong row of THIS wrapper (`sudo -h HOST`) cannot hide it.
+        if command_wrappers.floor_uncertain(word.lower(), args):
+            return True
+        # The command starts where this wrapper's own option table says it does. An option the table does not list leaves it
+        # unknown, and unknown is a search.
+        found = command_wrappers.unwrap(word, args)
+        if found is None:
+            return False
+        if found is command_wrappers.UNKNOWN:
+            return True
+        if found[0] == "line":  # a `-c` string, `env -S`, the rest of a remote or `watch` command line
+            return bash_searches(found[1], depth + 1) or command_wrappers.uncertain(found[1])
+        # (a command word holding white space is read as a line too: it cannot run as a name, so a shell must be meant)
+        first = found[1][0]
+        return runs_search(found[1], depth + 1) or (re.search(r"\s", first) is not None and bash_searches(first, depth + 1))
     return False
 
 

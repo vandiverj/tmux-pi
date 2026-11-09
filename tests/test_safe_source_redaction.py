@@ -546,6 +546,18 @@ class PlainTextHeads(unittest.TestCase):
                 ("find . -type f -exec grep -Hn api_key {} +", "held"), ("git -c alias.s=grep s -n api_key", "held"),
                 ("echo grep -rn api_key . | sh", "held"), ("2>/dev/null grep -rn api_key .", "held"),
                 ("grep -rn 'api_key", "held"),
+                # wrappers added in FG-N1 (every form: tests/test_wrapper_lists.py): the search behind them is still a search
+                ("setsid rg -n api_key .", "held"), ("busybox grep -rn api_key .", "held"),
+                ("flock /tmp/l -c 'rg -n api_key'", "held"), ("script -q -c 'rg -n api_key .' /dev/null", "held"),
+                ("ssh host rg -n api_key .", "held"), ("su - nobody -c 'grep -rn api_key .'", "held"),
+                ("flock /tmp/l ls", "plain"), ("ssh host", "plain"),
+                ("setsid su --command='grep\t-r\tapi_key\t.' nobody", "held"), ("flock -- /tmp/l rg -n api_key .", "held"),
+                ("ssh host '$REMOTE_COMMAND'", "held"), ("su -c 'ls' nobody", "plain"),
+                # round 3: each wrapper's own option table, not a guess about which options take a value
+                ("env -u su setsid su --command='rg\t--hidden\tapi_key\t.' nobody", "held"),
+                ("env -u su setsid su -c'rg --hidden api_key .' nobody", "held"),
+                ("sudo -n rg --hidden api_key .", "held"), ("timeout --no-such-option 5 echo hi", "held"),
+                ("sudo -n echo hi", "plain"), ("env -u su echo hi", "plain"),
                 *(("env " + " ".join("X{}=1".format(i) for i in range(count)) + " rg -n api_key .", "held")
                   for count in (65, 10_000)),
                 ("ls", "plain"), ("git status", "plain")]
@@ -579,6 +591,9 @@ class PlainTextHeads(unittest.TestCase):
             with self.subTest(assignments=count):
                 self.assertTrue(bash_searches("env " + "X=1 " * count + "echo ok"))
         self.assertTrue(bash_searches("echo ok", depth=9))  # the recursion limit also fails closed
+        self.assertFalse(bash_searches("setsid " + "a " * 62 + "echo ok"))  # the same limit for the wrappers added in FG-N1
+        self.assertTrue(bash_searches("setsid " + "a " * 63 + "echo ok"))
+        self.assertTrue(bash_searches("flock /tmp/l " + "a " * 63 + "echo ok"))
 
     def test_a_command_reading_one_file_uses_its_rules(self):
         # The file a non-search command reads decides the rules on both routes (Pi bash gained it in round 5). A search's

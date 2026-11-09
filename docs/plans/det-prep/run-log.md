@@ -727,3 +727,36 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - rule 30: no fallback outside a pair;
   - flag 1 (HTML comment -> unknown_file) accepted.
   F2 (provenance): the deleted 1.10 s experiment is marked unaudited and nothing relies on it.
+
+## 2026-11-09 — G1 done; FG-N1b merged; LS1 round 14
+- G1 final, all 4 cells at dc4ad17: 4729 tests per cell. The only failures are the same 25 FAIL + 1 ERROR in test_tp_review, in
+  every cell. Nothing else fails.
+- FG-N1b (coder-019dc91a62) adds:
+  - `command_wrappers.py` in `TEMPLATE_LIBS`;
+  - tests/lib_closure.py and test_lib_closure.py (the import closure of a partial install: names the missing module and its importer);
+  - lib/command_wrappers.py in protected_paths, with the sensitive_read floor;
+  - routing tests in test_route_resolve and test_model_routing.
+
+  Sweep: 14 sites checked; only test_tp_review needed a fix.
+
+  Main's checks:
+  - Fail-before on a dc4ad17 export (3 tests fail; the closure test names command_wrappers <- sensitive_read).
+  - Matrix: 489 tests, OK in all 4 cells.
+
+  Review review-coder-019dc91a62-035915: APPROVED_WITH_NOTES.
+  - F1 (follow-up): the closure reduces `import pkg.child` to `pkg`, so a package installed without its child is not caught.
+  - F2: the report says 28 libs; it is 29.
+
+  Committed 4a8537c, closed F1, merged 2fac25a, lane removed. Full suite on clean 2fac25a started (G1 rerun).
+- Budget follow-ups: test_tp_review takes about 115 s alone; test_model_routing about 71 s under load.
+- LS1 round 13 review (review-coder-b69bae86e7-032459): REQUEST_CHANGES.
+  - F1: nested reverse references are quadratic. Main reproduced it with ls1probe17: 1 MB, k=8000 nested `line 1 of (` pairs
+    took 4.06 s CPU at round 13, 0.12 s at c8f96f5 and 2.48 s at 9e2a680.
+  - F2: report rows 6/13/21/32.
+
+  Main checkpointed round 13 as 8560cf6 (worktree). Round 14 (fixes/ls1-round14.md) asks for:
+  - a linear reader;
+  - a nesting family in the rule-20 tests, with a linearity ratio;
+  - fail-before on 8560cf6.
+
+  The old pane was dead, so this is a retry: coder-3b1dfbedab, pane %252.

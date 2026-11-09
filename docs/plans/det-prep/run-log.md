@@ -857,3 +857,15 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - LS1b: round 2 (step-count bound) is checkpointed as eb8661a. Main's verify found test_qual_summarize_oracle failing with
   21 errors in every cell. The oracle generator assumes a file extension, and the real split cites `bin/tp-spawn`.
   Round 3 brief: fixes/ls1b-round3.md.
+
+## 2026-11-09 G3 live run 3: trust fixed; the decline does not settle the request
+- The owner trusted battle-soccer (`tp-claude-bootstrap`, from a terminal). `hasTrustDialogAccepted` is now true in
+  tmux-pi's Claude profile.
+- Steps setup, dispatch and prompt passed: the ask was raised 4 s after dispatch.
+- Step `decline` failed. After Escape the pane read "Interrupted · What should Claude do instead?", but
+  permission-request.json stayed `pending` for 240 s. Cleanup was complete.
+- Cause: Claude Code fires no PermissionDenied event when the owner rejects the dialog. `redact_hook` drops pending grants
+  on Stop and UserPromptSubmit, but leaves the task's request file pending. So every real decline leaves a task showing
+  `needs_input`. Fix lane DS1 (fixes/ds1-decline-settles.md).
+- The G3 script waits for the request to settle before it sends the redirect, so it must send the redirect first. That
+  change comes in a G3 round after TV1 and DS1 merge, along with the README's PermissionDenied claim.

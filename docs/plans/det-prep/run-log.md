@@ -572,3 +572,11 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Owner asked why Deno at all: tmux-pi runs on Python; Deno is only used by the context engine's navigation of a
   Deno/TypeScript target project (nav_api: `deno doc`/`deno info`) and by pre-commit-gate's `deno check` when the
   target has deno.json. Without Deno those answer `unavailable`; importers/imports still work.
+
+## 2026-11-08 — Deno decision; G2-E dispatched
+- Owner: "just do not require it on machines not using it." Deno is used only when the target project has deno.json/deno.lock,
+  to improve checking the work projects; tmux-pi never needs Deno to run or to pass its own suite. Product code already
+  works this way (pre-commit-gate, lane-info, lane_deps, localdocs, ctxengine all trigger on the project's Deno files).
+- The one breach is a test: ctx_nav_api r9 reach-walk calls the real deno with no NEEDS_DENO gate. G2-E (brief g2/g2e-deno-optional.md)
+  fakes it so both branches are still proven, sweeps the five Deno-touching test modules, and adds a guard so no test
+  reaches a real deno ungated.

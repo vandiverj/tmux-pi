@@ -552,3 +552,63 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   (coder-ff2c8ee9c3, brief g2/g2b-lane-cap.md).
 - Held: sensitive_trust rg lift (FG-N1's area, after merge); ctx_nav_api r9 (owner decision on Deno); the
   order-dependent group (whole-module repeat runs in progress).
+- ~19:20 CST: G2-A/G2-B first dispatch started from stale lane/integrate (a0aa3e6; Main omitted --base main).
+  Stopped, collected, lanes abandoned (G2-A's 3 changed files stashed in its worktree, then removed). Briefs updated:
+  base main; no lane edits baseline-failing.txt (Main removes the lines at merge). Re-dispatched with --base main:
+  G2-A g2-py39 coder-f32fa5e4d8, G2-B g2-lane-cap coder-f7f5d0d555, G2-C g2-trial-runid coder-d2f1cdad52 (default
+  trial run id stamped to the second collides; branches whole-module fails 2/2 on 3.14), G2-D g2-handover
+  coder-c8a5cd505f (lane_recovery whole-module fails 4/4: a second writer without --lane-replaces is not refused).
+  trial_shadow_end_path passed 4/4 whole-module; folded into G2-C to find its cause.
+- LS1 r4 review (review-coder-636cd4b784-185851): REQUEST_CHANGES F1 completeness (signature-only passes), F2 unknown
+  extension heading, F3 body/docstring citations rejected, F4 table separator. Main's probe confirmed by the reviewer
+  (24/24, 0/144). Round 5 by route design (fixes/ls1-round5.md): support as line sets with anchors, behaviour regexes
+  matched with citations removed, any filename-like heading sets context. coder-10744b0248.
+- FG-N1 r3 review (review-coder-b9c961eade-185926): REQUEST_CHANGES F1 sudo -h / script -F arity, F2 env -S drops
+  trailing args, F3 five remote-uncertainty shapes, F4 generated product sampled (1,296 of 46,656 triples). Round 4
+  by route design (fixes/fg-n1-round4.md): bag-of-words floor over wrapper tails; uncertain handed-on text is
+  sensitive; 41-command false-positive check; full product at depth 1-2, triples with option none. coder-8b20c9cf68.
+- G2-B merged (838589b): review-coder-f7f5d0d555-190752 APPROVED_WITH_NOTES (owed F1 reporting gap closed by Main
+  in main-evidence). baseline-failing.txt 13 -> 11 lines.
+- Owner asked why Deno at all: tmux-pi runs on Python; Deno is only used by the context engine's navigation of a
+  Deno/TypeScript target project (nav_api: `deno doc`/`deno info`) and by pre-commit-gate's `deno check` when the
+  target has deno.json. Without Deno those answer `unavailable`; importers/imports still work.
+
+## 2026-11-08 — Deno decision; G2-E dispatched
+- Owner: "just do not require it on machines not using it." Deno is used only when the target project has deno.json/deno.lock,
+  to improve checking the work projects; tmux-pi never needs Deno to run or to pass its own suite. Product code already
+  works this way (pre-commit-gate, lane-info, lane_deps, localdocs, ctxengine all trigger on the project's Deno files).
+- The one breach is a test: ctx_nav_api r9 reach-walk calls the real deno with no NEEDS_DENO gate. G2-E (brief g2/g2e-deno-optional.md)
+  fakes it so both branches are still proven, sweeps the five Deno-touching test modules, and adds a guard so no test
+  reaches a real deno ungated.
+
+## 2026-11-08 — G2-C merged (6aa2480); baseline 11 -> 9
+- Cause: default trial run id stamped to the second; two default prepares of one task in one second collided ("already exists").
+  Fix: a default id moves on to -2, -3 (also on a lost mkdir race); an explicit --run is still refused when taken.
+- Review 1 APPROVED_WITH_NOTES (docstring said task part is cut; it is the stamp). Main fixed the docstring, then by mistake merged
+  before the edited tree had a review (`lane close` refused; the && chain did not stop because of `| tail`). Review 2 of fe47bd9:
+  APPROVED; step closed after. Lesson: never pipe a gating command into tail inside an && chain.
+- Main's 4-way matrix: 274 tests; py3.14 OK both modes; py3.9 only the 4 record_files deep-JSON baseline errors (G2-A).
+- Removed lines: trial_shadow_branches HEAD-garbage subtest; trial_shadow_end_path inconclusive first review.
+- Open: worker stash `g2c-tmp` (identical to the merged diff) left for the owner to drop; auto-mode denied Main's drop.
+
+## 2026-11-08 — LS1 round 5 REQUEST_CHANGES -> round 6 by design
+- Same three families for the 4th time (fact completeness, citation support coverage, citation file validation).
+- Design change (fixes/ls1-round6.md): answers are fact lines `- claim [path:line]`, parsed exactly; no headings or neighbours supply
+  files or citations; behaviour facts matched with fixture identifiers removed. Retry coder-d50afe8142.
+- Tool bug found: review_rounds' round diff counted the lane's never-committed files twice (as added and as deleted), doubling the
+  packet (434k > 300k). Worked around by committing the lane (dec49d3). Follow-up lane: token waste.
+
+## Follow-ups recorded
+- Over-deep JSON family: 150 json.load(s) sites / 71 files, 29 catch RecursionError. One shared reader + guard, after open lanes merge.
+- review_rounds untracked-files double count (above).
+- test_retry_packet RepeatedFamilyGateTests: 1 in 6 flake (state digest coder-1 vs coder-0), checking on clean main.
+- retry_packet flake confirmed on clean main 64cc2f9: 4/18 fail. Added to baseline (9 -> 10) as pre-existing; brief g2/g2f-retry-packet-digest.md,
+  dispatched after G2-A merges (same test file). Suspected: state_digest names tied tasks in glob order.
+
+## 2026-11-08 — LS1 round 6 done; review packet over the limit; RV-1
+- LS1 r6 (coder-d50afe8142): fact-line parser, old prose code deleted. Main matrix 170 x4 OK. Main mutation probe
+  (ls1probe6.py): reference 24/24; shift, next-line cite, heading file, basename, generic claim, one-line, drop-line,
+  wide range, extra bad cite, star bullets all 0 passes; 3 passes inspected, none a defect. Committed c249ce3 on the lane.
+- tp-agent review refused: packet ~341k > 300k. Round diff 230k, of which answers.jsonl 101k (rewritten ~2k-char lines).
+  Smaller of diff/file per file = 145k. No bypass used (no --override-review). Product fix: RV-1 (brief rv/rv1-rewrite-whole-file.md),
+  dispatched coder-2d2c9997c1. LS1 review waits for RV-1's merge.

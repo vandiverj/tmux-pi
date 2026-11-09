@@ -143,7 +143,62 @@ def _subject(subject, files):
     return subject
 
 
-def _validate_v2(fact, files):
+# The agreed phrases for "this name is absent" (case-insensitive). A claim that says one of them about a name a named file
+# defines is false_absence. "not in <path or base>" is added per named file in _absence_scope. Code decides this, never a model.
+ABSENCE_PHRASES = (r"\bnot in the files\b", r"\bis not defined\b", r"\bdoes not define\b", r"\bdoes not exist\b",
+                   r"\bis absent\b")
+_WORD = re.compile(r"[A-Za-z_]\w*")
+
+
+def _file_mentions(text, paths):
+    """(paths named in text by path or base name, text with those mentions removed)."""
+    hit = []
+    for path in sorted(paths, key=len, reverse=True):
+        for form in {path, path.rsplit("/", 1)[-1]}:
+            pattern = re.compile(r"(?<![\w/.])" + re.escape(form) + r"(?![\w])")
+            if pattern.search(text):
+                hit.append(path)
+                text = pattern.sub(" ", text)
+    return hit, text
+
+
+# Ordinary words that are never taken for a defined name unless the claim backticks them. With them, a bare lowercase word of one or
+# two characters is not a name either. A bare word that is a defined name and in neither group (`Q`, `attempt`) is.
+_STOP_WORDS = frozenset("""a an and any anywhere are as at be by define defined defines do does exist exists file files for found from has
+have here in is it its missing name names never no not of on or present absent that the there this to use used uses was with""".split())
+
+
+def _is_name_word(token):
+    return token not in _STOP_WORDS and not (token.islower() and len(token) < 3)
+
+
+def _false_absence(subject, claim, defined):
+    """True when claim says a name is absent and a named file defines that name. defined maps each named path to the set of names
+    outline() finds in it. The files that count: the subject's when it names a file (`cli.py` does not define `pop` is false only if
+    cli.py defines pop), else those the claim names (`not in cli.py`), else all of them. A name is a backticked word, a one-word
+    subject, or a bare word of the claim that passes _is_name_word."""
+    named, rest = _file_mentions(claim, defined)
+    absent = any(re.search(p, claim, re.I) for p in ABSENCE_PHRASES)
+    if not absent:
+        absent = any(re.search(r"\bnot in\s+[`'\"(]*" + re.escape(form) + r"(?![\w])", claim, re.I)
+                     for path in named for form in {path, path.rsplit("/", 1)[-1]})
+    if not absent:
+        return False
+    subject_files, subject_rest = _file_mentions(subject, defined) if subject else ([], "")
+    scope = set().union(*(defined[p] for p in (subject_files or named or defined)))
+    candidates = set()
+    words = _WORD.findall(subject_rest)
+    if len(words) == 1 and subject_rest.strip() == words[0]:
+        candidates.update(words)
+    else:
+        candidates.update(w for w in words if _is_name_word(w))
+    for span in re.findall(r"`([^`]+)`", rest):
+        candidates.update(_WORD.findall(span))
+    candidates.update(w for w in _WORD.findall(rest) if _is_name_word(w))
+    return bool(candidates & scope)
+
+
+def _validate_v2(fact, files, defined=None):
     """(kept fact, None) or (None, reason) for a fact {"subject", "claim", "path", "lines"}."""
     subject, claim, path, lines = (fact.get(k) for k in ("subject", "claim", "path", "lines"))
     if not (isinstance(subject, str) and isinstance(claim, str) and isinstance(path, str) and isinstance(lines, list)
@@ -156,19 +211,23 @@ def _validate_v2(fact, files):
         return None, "range_outside_file"
     if not claim.strip():
         return None, "empty_claim"
-    return {"claim": "{} {}".format(_subject(subject, files), claim.strip()), "path": path, "lines": sorted(set(lines))}, None
+    subject = _subject(subject, files)
+    if defined and _false_absence(subject, claim, defined):
+        return None, "false_absence"
+    return {"claim": "{} {}".format(subject, claim.strip()), "path": path, "lines": sorted(set(lines))}, None
 
 
-def validate(facts, files):
+def validate(facts, files, defined=None):
     """(kept, drops). files maps each named path to its line count. A fact is {subject, claim, path, lines}, lines being 1 to
     MAX_LINES separate line numbers; or the older {claim, path, line_start, line_end}. It is dropped when it is malformed (a lines
     list that is empty, longer than MAX_LINES or holds a non-integer or a bool), its path is not a named file, a line is outside the
     file, or it has no claim; an older fact also when its range is reversed or spans more than MAX_SPAN lines. A line number is
-    never changed (a v2 fact's lines are only de-duplicated and sorted). Each drop is {"fact": <the fact as given>, "reason": ...}."""
+    never changed (a v2 fact's lines are only de-duplicated and sorted). With defined (path -> set of names the file defines), a fact whose
+    claim says a name is absent (ABSENCE_PHRASES) that a named file defines is dropped as false_absence. Each drop is {"fact": <the fact as given>, "reason": ...}."""
     kept, drops = [], []
     for fact in facts:
         if isinstance(fact, dict) and "lines" in fact:
-            good, reason = _validate_v2(fact, files)
+            good, reason = _validate_v2(fact, files, defined)
             if good:
                 kept.append(good)
             else:
@@ -192,6 +251,8 @@ def validate(facts, files):
             reason = "range_too_long"
         elif not claim.strip():
             reason = "empty_claim"
+        elif defined and _false_absence("", claim, defined):
+            reason = "false_absence"
         else:
             kept.append({"claim": claim, "path": path, "line_start": a, "line_end": b})
             continue
@@ -214,6 +275,21 @@ def render(facts):
     return "\n".join(lines)
 
 
+def _source(numbered_text):
+    """The file's text from prepare's numbered text (`{n:>4}\\t{line}`)."""
+    return "\n".join(line.split("\t", 1)[1] if "\t" in line else "" for line in numbered_text.split("\n"))
+
+
+def _parse(path, numbered_text):
+    """The ast of a .py file's numbered text, or None (not .py, or it does not parse)."""
+    if not path.endswith(".py"):
+        return None
+    try:
+        return ast.parse(_source(numbered_text))
+    except (SyntaxError, ValueError):
+        return None
+
+
 def outline(path, numbered_text):
     """The names a Python file defines, read with ast from its numbered text (prepare's `{n:>4}\\t{line}`): a list of
     (line, kind, name, owner) in source order. kind is class, function, method, constant (a module-level assignment to a plain
@@ -221,10 +297,8 @@ def outline(path, numbered_text):
     Functions inside functions are not walked. A file that is not .py, or does not parse, gives []."""
     if not path.endswith(".py"):
         return []
-    source = "\n".join(line.split("\t", 1)[1] if "\t" in line else "" for line in numbered_text.split("\n"))
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    tree = _parse(path, numbered_text)
+    if tree is None:
         return []
     found = []
 
@@ -260,6 +334,358 @@ def name_index(files):
     return lines
 
 
+_VERSION_SUFFIX = (re.compile(r"_v(\d+)$"), re.compile(r"(\d+)$"))
+# A directory named like one of these tells the version of the files in it: (family, rank). Only ranks of one family are compared.
+_VERSION_DIRS = {"old": ("rel", 0), "before": ("rel", 0), "new": ("rel", 1), "after": ("rel", 1)}
+
+
+def _version_key(path):
+    """(group key, (directory rank, file number), suffixed) of a .py path. The group key holds the directories (the first one that is
+    a version directory replaced by its family), the stem without its version suffix and that family. The file number is that of a
+    trailing `_v<digits>` or `<digits>`, else 0, and suffixed says there was one."""
+    parts = path.split("/")
+    directory, stem = parts[:-1], parts[-1][:-3]
+    family, rank = None, 0
+    for i, part in enumerate(directory):
+        marker = _VERSION_DIRS.get(part) or (("v", int(part[1:])) if re.fullmatch(r"v\d+", part) else None)
+        if marker:
+            family, rank = marker
+            directory = directory[:i] + [""] + directory[i + 1:]
+            break
+    number, suffixed = 0, False
+    for pattern in _VERSION_SUFFIX:
+        found = pattern.search(stem)
+        if found and found.start() > 0:
+            stem, number, suffixed = stem[:found.start()], int(found.group(1)), True
+            break
+    return (tuple(directory), stem, family), (rank, number), suffixed
+
+
+def version_pairs(files):
+    """(old, new) pairs of the named .py files that are two versions of one file. Two files are versions when, in the same directory
+    or in directories that differ only by a version directory (`old/` and `new/`, `before/` and `after/`, `v1/` and `v2/`), their
+    stems are equal once one trailing `_v<digits>` or `<digits>` is removed (settings.py and settings_v2.py; a.py and a2.py;
+    old/a.py and new/a2.py). The one with the higher directory rank and file number is the new one; a file without a suffix has
+    number 0. A pair whose two orders disagree (old/a2.py and new/a.py) is not a pair. Equal orders pair only in one reading: a group
+    of exactly an unsuffixed file and one suffixed with number 0 (a.py and a_v0.py), the unsuffixed one being the older. Three
+    versions pair neighbours. A file that pairs with nothing gives no pair."""
+    groups = {}
+    for f in files:
+        if f["path"].endswith(".py"):
+            key, order, suffixed = _version_key(f["path"])
+            groups.setdefault(key, []).append((order, suffixed, f))
+    pairs = []
+    for versions in groups.values():
+        versions.sort(key=lambda item: item[:2])
+        for a, b in zip(versions, versions[1:]):
+            if a[0] == b[0]:
+                ok = len(versions) == 2 and not a[1] and b[1]
+            else:
+                ok = a[0][0] <= b[0][0] and a[0][1] <= b[0][1]
+            if ok:
+                pairs.append((a[2], b[2]))
+    return pairs
+
+
+def _base(f):
+    return f["path"].rsplit("/", 1)[-1]
+
+
+def _defs(tree):
+    """{(owner, name): node} of the functions at module level and the methods of module-level classes."""
+    found = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.setdefault((None, node.name), node)
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found.setdefault((node.name, sub.name), sub)
+    return found
+
+
+def _literal_constants(tree):
+    """{name: (value node, literal value)} of the module-level constants whose value ast.literal_eval reads."""
+    found = {}
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if getattr(node, "value", None) is None:
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                found.setdefault(target.id, (node.value, value, node.lineno))
+    return found
+
+
+def _same(a, b):
+    """True when two literal values are equal and of the same types all the way down: 1 and True, or 1 and 1.0, differ; dict key
+    order and set order do not matter."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _dict_keys(node, value):
+    """{key: (value, line)} of a dict literal, the line being the key's own."""
+    return {ast.literal_eval(k): (value[ast.literal_eval(k)], k.lineno) for k in node.keys}
+
+
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _scope_header(node):
+    """The parts of a nested def, lambda or class that run in the enclosing scope: decorators, default values, bases."""
+    if isinstance(node, ast.ClassDef):
+        return node.decorator_list + node.bases + [k.value for k in node.keywords]
+    head = node.args.defaults + [d for d in node.args.kw_defaults if d]
+    return head if isinstance(node, ast.Lambda) else head + node.decorator_list
+
+
+def _calls(fn):
+    """{callee name: first line} of the plain calls (a Name or an Attribute func) that run in the function's own scope. A call in a
+    nested def, lambda or class body belongs to that inner scope and is left out."""
+    found = {}
+
+    def visit(node):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else None
+            if name and (name not in found or node.lineno < found[name]):
+                found[name] = node.lineno
+        for child in (_scope_header(node) if isinstance(node, _SCOPES) else ast.iter_child_nodes(node)):
+            visit(child)
+
+    for statement in fn.body:
+        visit(statement)
+    return found
+
+
+def _keyed_names(f):
+    skipped = lambda kind, name: kind == "parameter" or name == "__init__" or (name.startswith("_") and not name.startswith("__"))  # noqa: E731
+    return {(kind, owner, name): line for line, kind, name, owner in outline(f["path"], f["text"]) if not skipped(kind, name)}
+
+
+def version_diff(old, new):
+    """Code-made fact lines `- <claim> [path:n, ...]` for what the new file adds, drops or changes against the old one, each citing
+    the line that shows it: names (class, function, method, constant, as name_index skips them), literal constants (a scalar, or a
+    dict key by key), then the plain calls of a function or method both define. A constant whose value does not literal_eval is not
+    compared. Order: names, constants, calls, each in line order."""
+    old_tree, new_tree = _parse(old["path"], old["text"]), _parse(new["path"], new["text"])
+    if old_tree is None or new_tree is None:
+        return []
+    base, op, np = _base(new), old["path"], new["path"]
+    obase = _base(old)
+    lines = []
+    old_names, new_names = _keyed_names(old), _keyed_names(new)
+    for key, line in sorted(new_names.items(), key=lambda item: item[1]):
+        if key not in old_names:
+            lines.append("- {} adds the {} {} [{}:{}]".format(base, key[0], key[2], np, line))
+    for key, line in sorted(old_names.items(), key=lambda item: item[1]):
+        if key not in new_names:
+            lines.append("- {} drops the {} {} that {} defines [{}:{}]".format(base, key[0], key[2], obase, op, line))
+    old_const, new_const = _literal_constants(old_tree), _literal_constants(new_tree)
+    for name, (node, value, line) in sorted(new_const.items(), key=lambda item: item[1][2]):
+        if name not in old_const:
+            continue
+        onode, ovalue, oline = old_const[name]
+        if isinstance(value, dict) and isinstance(ovalue, dict) and isinstance(node, ast.Dict) and isinstance(onode, ast.Dict):
+            okeys, nkeys = _dict_keys(onode, ovalue), _dict_keys(node, value)
+            label = lambda k: "{}[{}]".format(name, json.dumps(k) if isinstance(k, str) else repr(k))  # noqa: E731
+            for k, (v, kline) in nkeys.items():
+                if k in okeys and not _same(okeys[k][0], v):
+                    lines.append("- {} changes {} from {!r} to {!r} [{}:{}, {}:{}]".format(
+                        base, label(k), okeys[k][0], v, op, okeys[k][1], np, kline))
+                elif k not in okeys:
+                    lines.append("- {} adds the key {} [{}:{}]".format(base, label(k), np, kline))
+            for k, (v, kline) in okeys.items():
+                if k not in nkeys:
+                    lines.append("- {} drops the key {} that {} defines [{}:{}]".format(base, label(k), obase, op, kline))
+        elif not _same(ovalue, value):
+            lines.append("- {} changes {} from {!r} to {!r} [{}:{}, {}:{}]".format(base, name, ovalue, value, op, oline, np, line))
+    old_defs, new_defs = _defs(old_tree), _defs(new_tree)
+    added, gone = [], []
+    for key, fn in new_defs.items():
+        if key in old_defs:
+            was, now = _calls(old_defs[key]), _calls(fn)
+            added.extend((line, "- in {}, {} now calls {} [{}:{}]".format(base, key[1], callee, np, line)) for callee, line in now.items() if callee not in was)
+            gone.extend((line, "- in {}, {} no longer calls {} [{}:{}]".format(base, key[1], callee, op, line)) for callee, line in was.items() if callee not in now)
+    return lines + [text for _, text in sorted(added, key=lambda item: item[0])] + [text for _, text in sorted(gone, key=lambda item: item[0])]
+
+
+def _dotted(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted(node.value)
+        return head + "." + node.attr if head else None
+    return None
+
+
+def _members(tree, cls):
+    """The names a class defines: its methods (dunder ones too), its class-level assignments and the self.<name> attributes its methods
+    assign."""
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.add(sub.name)
+                    names.update(n.attr for n in ast.walk(sub) if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)
+                                 and isinstance(n.value, ast.Name) and n.value.id == "self")
+                else:
+                    names.update(t.id for t in (sub.targets if isinstance(sub, ast.Assign) else [sub.target] if isinstance(sub, ast.AnnAssign) else [])
+                                 if isinstance(t, ast.Name))
+    return names
+
+
+def _star_exports(tree, name):
+    """Whether `from <this module> import *` brings name in: True or False, or None when `__all__` is there but not a literal list."""
+    exported = None
+    for node in tree.body:
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == "__all__":
+            return None
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            try:
+                exported = ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError, AttributeError):
+                return None
+            if not isinstance(exported, (list, tuple)):
+                return None
+    return name in exported if exported is not None else not name.startswith("_")
+
+
+def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
+    """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
+    the target name in a way this scan cannot attribute (an import of it from some other module, `from m import *` that may re-export
+    it, a use of the bare name or of `x.<name>` that no import of the target explains, the name as a string) or binds it from two
+    of the definers (ambiguous). stem is the target module's name, others the module names of the other files that define the same
+    name, star what _star_exports says. dup (the name is defined in more than one file) names the target `<stem>.<T>` in each line
+    and takes a use through a parameter only from a file that imports this module."""
+    base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
+    label = "{}.{}".format(stem, target) if dup else target
+    direct, modules, imports = set(), set(), []
+    other_direct, other_modules, unexplained = set(), set(), False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            last = (node.module or "").rsplit(".", 1)[-1]
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if alias.name == "*":
+                    if last == stem and star:
+                        direct.add(target)
+                elif alias.name == target:
+                    if last == stem:
+                        direct.add(local)
+                        shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+                                      if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
+                        imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
+                    elif last in others:
+                        other_direct.add(local)
+                    else:
+                        unexplained = True
+                elif alias.name == stem:
+                    modules.add(local)
+                elif alias.name in others:
+                    other_modules.add(local)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.rsplit(".", 1)[-1] == stem:
+                    modules.add(a.asname or a.name)
+                elif a.name.rsplit(".", 1)[-1] in others:
+                    other_modules.add(a.asname or a.name)
+    if direct & other_direct or modules & other_modules:
+        return [], [], [], True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == target:
+            unexplained = unexplained or node.id not in other_direct  # a use of this module's name is a line, or else (a star import) undecided
+        elif isinstance(node, ast.Attribute) and node.attr == target:
+            unexplained = unexplained or _dotted(node.value) not in modules | other_modules
+        elif isinstance(node, ast.Constant) and node.value == target:
+            unexplained = True
+
+    def is_ref(func):
+        if isinstance(func, ast.Name):
+            return func.id in direct
+        return isinstance(func, ast.Attribute) and func.attr == target and _dotted(func.value) in modules
+
+    first_module_ref = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and is_ref(node) and (first_module_ref is None or node.lineno < first_module_ref):
+            first_module_ref = node.lineno
+    if first_module_ref:
+        imports.append((first_module_ref, "- {} imports {} [{}:{}]".format(base, label, path, first_module_ref)))
+    verb = "creates a" if kind == "class" else "calls"
+    creates, bound = [], set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and is_ref(node.func):
+            creates.append((node.lineno, "- {} {} {} [{}:{}]".format(base, verb, label, path, node.lineno)))
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call) and is_ref(node.value.func):
+            bound.update(t.id for t in (node.targets if isinstance(node, ast.Assign) else [node.target]) if isinstance(t, ast.Name))
+    uses = []
+    if kind == "class" and members:
+        def visit(node, params):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                params = {x.arg for x in a.posonlyargs + a.args + [a.vararg] + a.kwonlyargs + [a.kwarg] if x} - {"self", "cls"}
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.attr in members \
+                    and (node.value.id in bound or node.value.id in params):
+                uses.append((node.lineno, "- {} uses {}.{} on {} [{}:{}]".format(base, label, node.attr, node.value.id, path, node.lineno)))
+            for child in ast.iter_child_nodes(node):
+                visit(child, params)
+        visit(tree, set())
+    if dup and uses and not (direct or modules):
+        uses, unexplained = [], True
+    key = lambda item: item[0]  # noqa: E731
+    return sorted(imports, key=key), sorted(creates, key=key), sorted(uses, key=key), unexplained
+
+
+def use_scan(task, files):
+    """Code-made fact lines about who uses a class or top-level function (the target) that the task names as a whole word and a named
+    .py file defines. Per other .py file: its import, creation or call, and the attribute uses through a variable bound from T(...)
+    or a parameter (only of a name the class defines, dunder methods too); `from m import *` of the target's module followed by T()
+    counts as an import of T. A file with none of these gives `<base> does not use <T> [path:1]`, unless it refers to the name in a
+    way the scan cannot attribute to the target (see _use_lines): then it gives nothing. When more than one file defines the name,
+    each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself, or whose binding
+    of the name is ambiguous, gives nothing for it."""
+    out = []
+    parsed = {f["path"]: _parse(f["path"], f["text"]) for f in files}
+    for f in files:
+        for line, kind, name, owner in outline(f["path"], f["text"]):
+            if kind not in ("class", "function") or owner or not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", task):
+                continue
+            definers = {g["path"] for g in files for _l, k, n, o in outline(g["path"], g["text"]) if k in ("class", "function") and n == name and not o}
+            stem = f["path"].rsplit("/", 1)[-1][:-3]
+            others = {p.rsplit("/", 1)[-1][:-3] for p in definers if p != f["path"]}
+            if stem in others:
+                continue
+            members = _members(parsed[f["path"]], name) if kind == "class" else set()
+            star = _star_exports(parsed[f["path"]], name)
+            for g in files:
+                if g["path"] in definers or parsed[g["path"]] is None:
+                    continue
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, stem, others, members, star, len(definers) > 1)
+                found = [text for _n, text in imports + creates + uses]
+                if found:
+                    out.extend(found)
+                elif not undecided:
+                    out.append("- {} does not use {} [{}:1]".format(_base(g), "{}.{}".format(stem, name) if len(definers) > 1 else name, g["path"]))
+    return list(dict.fromkeys(out))
+
+
+def code_facts(task, files):
+    """(diff lines, use lines) made by code for this task and these files."""
+    diff = [line for old, new in version_pairs(files) for line in version_diff(old, new)]
+    return list(dict.fromkeys(diff)), use_scan(task, files)
+
+
 def user_message(task, files):
     parts = []
     for f in files:
@@ -270,25 +696,36 @@ def user_message(task, files):
                 "- line {}: {}".format(line, "parameter {} of {}".format(name, owner) if kind == "parameter" else "{} {}".format(kind, name))
                 for line, kind, name, owner in names))
         parts.append(part)
-    return "# Task\n\n{}\n\n# Files (numbered; take line numbers from here)\n\n{}".format(task, "\n\n".join(parts))
+    message = "# Task\n\n{}\n\n# Files (numbered; take line numbers from here)\n\n{}".format(task, "\n\n".join(parts))
+    diff, uses = code_facts(task, files)
+    if diff:
+        message += "\n\nDifferences found by code:\n" + "\n".join(diff)
+    if uses:
+        message += "\n\nUses found by code:\n" + "\n".join(uses)
+    if diff or uses:
+        message += "\n\nExplain what each difference or use means for the task; these lines are added to your answer for you."
+    return message
 
 
 def summarize(root, paths, task, *, endpoint, model, settings, budget_chars=DEFAULT_BUDGET_CHARS, timeout=600):
-    """(text, record). settings is {"system": ..., "schema": ...} (see load_settings). The text is name_index(files), made by code,
-    then the rendered facts. Raises PrepareError or AskError; a reply whose JSON lacks a facts list is an AskError too. The record:
-    files (path, lines, chars), chars, drops, kept, indexed (the index lines), seconds, model."""
+    """(text, record). settings is {"system": ..., "schema": ...} (see load_settings). The text is name_index(files), version_diff and use_scan lines (all made
+    by code), then the rendered facts, deduplicated by exact text. Raises PrepareError or AskError; a reply whose JSON lacks a facts list is an AskError too. The record:
+    files (path, lines, chars), chars, drops, kept, indexed (the index lines), code_facts (the diff and use lines), seconds, model."""
     started = time.monotonic()
     files = prepare(root, paths, budget_chars)
     reply = ask(endpoint, model, settings["system"], user_message(task, files), settings["schema"], timeout)
     facts = json.loads(reply).get("facts") if isinstance(json.loads(reply), dict) else None
     if not isinstance(facts, list):
         raise AskError("reply has no facts list", _completions(endpoint), 200)
-    kept, drops = validate(facts, {f["path"]: f["lines"] for f in files})
+    defined = {f["path"]: {name for _l, _k, name, _o in outline(f["path"], f["text"])} for f in files}
+    kept, drops = validate(facts, {f["path"]: f["lines"] for f in files}, defined)
     index = name_index(files)
+    diff, uses = code_facts(task, files)
     record = {"files": [{k: f[k] for k in ("path", "lines", "chars")} for f in files],
-              "chars": sum(f["chars"] for f in files), "kept": len(kept), "drops": drops, "indexed": len(index),
+              "chars": sum(f["chars"] for f in files), "kept": len(kept), "drops": drops, "indexed": len(index), "code_facts": len(diff) + len(uses),
               "seconds": round(time.monotonic() - started, 2), "model": model}
-    return "\n".join(index + ([render(kept)] if kept else [])), record
+    answer = index + diff + uses + (render(kept).split("\n") if kept else [])
+    return "\n".join(dict.fromkeys(answer)), record
 
 
 def load_settings(root, local_path=None):

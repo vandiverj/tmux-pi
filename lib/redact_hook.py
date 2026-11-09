@@ -834,27 +834,79 @@ def save_request(target, reason, status, **extra):
     task = os.getenv("TP_TASK_DIR")
     if not task:
         return
-    path = Path(task) / "permission-request.json"
-    value = {"status": status, "target": target, "reason": reason,
-             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             **{k: v for k, v in extra.items() if v}}
-    safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
+    write_request(task, {"status": status, "target": target, "reason": reason, "updated": now(),
+                         **{k: v for k, v in extra.items() if v}})
 
 
-def settle(event, decision):
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_request(task, value):
+    """Write a whole permission-request.json record, atomically and under the task root (safe_write's checks). `save_request` makes a
+    new request; `settle_declined`, `settle` and bin/tp-sensitive-read's late answer pass the prior record with a few fields changed."""
+    safe_write.write_atomic(Path(task) / "permission-request.json", json.dumps(value) + "\n",
+                            root=safe_write.task_root(task), keep_mode=False)
+
+
+def settled_record(prior, status, event_name):
+    """The prior record with only the status, the time and the settling event changed; every other field, known or not, stays."""
+    return {**prior, "status": status, "event": event_name, "updated": now()}
+
+
+def settle(event, decision=None):
+    """PostToolUse, PostToolUseFailure or PermissionDenied for the call that asked: record the real outcome (authorized; denied for
+    PermissionDenied). A request the turn branch already marked `declined` is overtaken by a late answer for the same call;
+    authorized and denied are never changed. Without `decision` only a request that records its `call` is settled, and only by that
+    call's own event (a request with no call is not touched).
+
+    Who settles a late answer, by mode (the event is the same call's `tool_use_id`):
+      on          PostToolUse, PostToolUseFailure, PermissionDenied: `handle`, here (hooks/redact.sh), with `decision`.
+      shadow/off  PostToolUse, PermissionDenied: bin/tp-sensitive-read (hooks/sensitive-read.sh), which wrote the request.
+                  PostToolUseFailure: `handle`, here, before the off check, with no `decision`. sensitive-read.sh is not
+                  registered on it (it exits 2 on failure, which would turn a failed tool call into a blocked one)."""
     path = Path(os.getenv("TP_TASK_DIR", "/nonexistent")) / "permission-request.json"
     try:
         prior = json.loads(path.read_text())
     except (OSError, ValueError):
         return
+    if not isinstance(prior, dict):
+        return
     call, denied = prior.get("call"), event.get("hook_event_name") == "PermissionDenied"
     if call:
         same = call == event.get("tool_use_id")
     else:
-        same = decision["decision"] == "ask" and prior.get("target") == decision["target"]
-    if prior.get("status") == "pending" and same:
-        save_request(prior["target"], prior.get("reason"), "denied" if denied else "authorized",
-                     **{k: prior.get(k) for k in ("placeholder", "source", "scope", "call")})
+        same = bool(decision) and decision["decision"] == "ask" and prior.get("target") == decision["target"] \
+            and prior.get("status") == "pending"
+    if prior.get("status") in ("pending", "declined") and same:
+        write_request(os.environ["TP_TASK_DIR"], settled_record(prior, "denied" if denied else "authorized", event.get("hook_event_name")))
+
+
+def settle_declined(event):
+    """A new turn (UserPromptSubmit), the end of one (Stop) or the end of a subagent (SubagentStop): the asker has no tool call
+    awaiting approval now, so its request still `pending` belongs to a dialog the owner rejected. Claude Code fires no
+    PermissionDenied for that. Mark it `declined` (not `denied`, which is a PermissionDenied event) with the event and the time;
+    every other field stays. Only the asker's own request: Stop and UserPromptSubmit are the main agent's (no agent_id on the
+    event) and settle a request with no agent_id; SubagentStop with agent_id X settles one with agent_id X. A background
+    subagent's live ask survives the main agent's Stop (Stop also fires while a background subagent still works). A request
+    written before agent_id was recorded counts as the main agent's. A request that is not pending (authorized, denied,
+    declined) or cannot be read as one JSON object is left alone. Never raises: the turn is not blocked.
+    There is one settler in every mode (on, shadow, off): `handle`, run by hooks/redact.sh, registered on all three events. Its
+    turn branches run before any mode check. bin/tp-sensitive-read is not registered on those events and does not settle."""
+    task = os.getenv("TP_TASK_DIR")
+    if not task:
+        return
+    asker = str(event.get("agent_id") or "")
+    if event.get("hook_event_name") == "SubagentStop" and not asker:
+        return
+    try:
+        path = Path(task) / "permission-request.json"
+        prior = json.loads(path.read_text())
+        if not isinstance(prior, dict) or prior.get("status") != "pending" or str(prior.get("agent_id") or "") != asker:
+            return
+        write_request(task, settled_record(prior, "declined", event.get("hook_event_name")))
+    except Exception:
+        pass
 
 
 def used_values(event):
@@ -879,15 +931,25 @@ def handle(event):
     if name == "SessionEnd":
         sweep(session=store_name(event))  # runs in every mode: a store should not outlive its session
         return None
-    if name in {"Stop", "UserPromptSubmit"}:
-        # Nothing awaits approval now, so a pending grant here belongs to a rejected ask; tp-secret-exec must not
-        # accept it. A failure only leaves the grant until the next turn; it never blocks the turn.
-        try:
-            Store(store_name(event)).drop_pending()
-        except Exception:
-            pass
+    if name in {"Stop", "UserPromptSubmit", "SubagentStop"}:
+        # Nothing of the asker's awaits approval now, so its pending grant and request belong to a rejected ask;
+        # tp-secret-exec must not accept the grant. The asker is the event's agent_id (none: the main agent), so a
+        # background subagent's live ask survives the main agent's Stop. A failure only leaves the grant until the next
+        # turn; it never blocks the turn. SubagentStop without an agent_id names no one.
+        asker = str(event.get("agent_id") or "")
+        if name != "SubagentStop" or asker:
+            try:
+                Store(store_name(event)).drop_pending(asker)
+            except Exception:
+                pass
+            settle_declined(event)  # in every mode: this is the one hook that hears a turn end
         return None
     current = mode()
+    if name == "PostToolUseFailure" and current != "on":
+        try:
+            settle(event)  # shadow and off: no other hook hears a failure; mode on settles below. Never blocks, prints or raises.
+        except Exception:
+            pass
     if current == "off":
         return None
     started = time.monotonic()
@@ -911,14 +973,14 @@ def handle(event):
                     if decision["decision"] == "ask":
                         save_request(decision["target"], decision["reason"], "pending",
                                      placeholder=", ".join(decision["placeholders"]), source=decision["source"],
-                                     scope=decision["scope"], call=event.get("tool_use_id"))
+                                     scope=decision["scope"], call=event.get("tool_use_id"), agent_id=event.get("agent_id"))
                 if decision["input"] and decision["decision"] != "deny":
                     out["updatedInput"] = decision["input"]
                     if decision["placeholders"] and event.get("tool_use_id"):
                         store = Store(store_name(event))
                         with store.locked():
                             store.record_use(event["tool_use_id"], decision["placeholders"], decision["record"],
-                                             decision.get("command"))
+                                             decision.get("command"), agent=event.get("agent_id"))
                 output = {"hookSpecificOutput": out} if len(out) > 1 else None
         elif name == "PostToolUse":
             redactor = make_redactor(event, persist=current == "on", review=current == "on")

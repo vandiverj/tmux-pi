@@ -10,6 +10,7 @@ import re
 import secrets
 
 SESSION_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+RECENT = 200  # calls (and run records) kept by recency; see Store.trim_calls for what else is kept and the bound
 
 
 def default_root():
@@ -89,22 +90,49 @@ class Store:
         except (OSError, ValueError):
             return self.data
 
-    def record_use(self, call, names, status, command=None):
+    def record_use(self, call, names, status, command=None, agent=None):
         """Note that tool call `call` uses `names`; call inside locked(). Grants never downgrade.
 
-        `command` is the Bash command the hook wrapped: tp-secret-exec runs only a command recorded here, once."""
+        `command` is the Bash command the hook wrapped: tp-secret-exec runs only a command recorded here, once.
+        `agent` is the subagent (agent_id) that made the call; absent for the main agent. drop_pending reads it."""
         grants, calls = self.data.setdefault("grants", {}), self.data.setdefault("calls", {})
         for name in names:
             if grants.get(name) != "granted":
                 grants[name] = status
+        calls.pop(call, None)  # a repeat of the id is the newest call
         calls[call] = sorted(names)
-        for old in list(calls)[:-200]:
-            del calls[old]
+        if agent:
+            self.data.setdefault("agents", {})[call] = str(agent)
+        else:
+            self.data.get("agents", {}).pop(call, None)
         if command is not None:
             runs = self.data.setdefault("runs", {})
+            runs.pop(call, None)
             runs[call] = command_hash(command)
-            for old in list(runs)[:-200]:
+            for old in list(runs)[:-RECENT]:
                 del runs[old]
+        self.trim_calls()
+
+    def trim_calls(self):
+        """Bound `calls` and `agents` without losing who owns an outstanding call; call inside locked().
+
+        A call is outstanding while it has a recorded run, or uses a name whose grant is still pending: drop_pending and
+        settle_use need its names and its agent. Kept: the last RECENT calls, every call with a run (`runs` is itself cut
+        to its last RECENT), and the newest RECENT calls that use a pending name. So `calls` and `agents` hold at most
+        3 * RECENT entries, `runs` RECENT. `agents` is cut with `calls`, never by its own count: its entry says who owns the
+        call's names. A call that falls out (more than RECENT pending-name calls) leaves its pending grants of unknown
+        owner, which drop_pending keeps."""
+        calls, runs = self.data.get("calls", {}), self.data.get("runs", {})
+        if len(calls) > RECENT:
+            pending = {n for n, status in self.data.get("grants", {}).items() if status == "pending"}
+            order = list(calls)
+            waiting = [c for c in order[:-RECENT] if c not in runs and pending.intersection(calls[c])]
+            keep = set(order[-RECENT:]) | {c for c in order if c in runs} | set(waiting[-RECENT:])
+            for call in [c for c in order if c not in keep]:
+                del calls[call]
+        agents = self.data.get("agents", {})
+        for call in [c for c in agents if c not in calls]:
+            del agents[call]
 
     def claim_run(self, command):
         """tp-secret-exec: consume the hook's record of exactly this command; False if there is none."""
@@ -133,16 +161,27 @@ class Store:
                     else:
                         del grants[name]
 
-    def drop_pending(self):
-        """Drop every pending grant. Call only when no tool call can be awaiting approval (the turn ended, or the
-        user sent a new prompt); this covers a rejected ask that fired no PermissionDenied."""
+    def drop_pending(self, agent=""):
+        """Drop the pending grants and recorded commands of calls made by `agent` ("" is the main agent). Call only when
+        that agent has no tool call awaiting approval (its turn ended, or the user sent a new prompt); this covers a
+        rejected ask that fired no PermissionDenied. A background subagent's own live ask is left alone: its calls are
+        in `agents`. A call recorded before `agents` existed counts as the main agent's. A pending grant that no call in
+        `calls` names has an owner that cannot be told, and is kept (nobody's turn end proves it was rejected): it is
+        cleared by the next use of its placeholder (the ask sets it again and the call settles it), or by SessionEnd's
+        sweep. It authorizes nothing by itself: tp-secret-exec runs only a command recorded in `runs`."""
         data = self.peek()
         if "pending" not in data.get("grants", {}).values() and not data.get("runs"):
             return
+        agent = str(agent or "")
         with self.locked():
-            self.data.pop("runs", None)  # nothing is in flight, so no recorded command may run any more
+            agents, calls, runs = self.data.get("agents", {}), self.data.get("calls", {}), self.data.get("runs", {})
+            mine = lambda call: str(agents.get(call) or "") == agent
+            other_live = {n for call, names in calls.items() if not mine(call) and call in runs for n in names}
+            ours = {n for call, names in calls.items() if mine(call) for n in names}
+            for call in [c for c in runs if mine(c)]:
+                del runs[call]  # nothing of this agent is in flight, so no command it recorded may run any more
             grants = self.data.setdefault("grants", {})
-            for name in [n for n, status in grants.items() if status == "pending"]:
+            for name in [n for n, status in grants.items() if status == "pending" and n in ours and n not in other_live]:
                 del grants[name]
 
 

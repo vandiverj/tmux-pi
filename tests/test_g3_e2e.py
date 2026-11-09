@@ -232,6 +232,211 @@ class HookTriggerTest(Base):
                 self.assertEqual(self.request()["status"], "denied")
                 self.assertFalse((self.repo / g3.ABSENT).exists())
 
+    def test_the_worker_hears_a_new_turn_in_both_hooks(self):
+        """One hook settles a declined dialog in every mode: redact.sh, registered on UserPromptSubmit, Stop and SubagentStop. sensitive-read.sh is not
+        registered there: it fails closed (exit 2 blocks the owner's prompt, or makes Claude continue after Stop) and costs a process a turn."""
+        hooks = json.loads((ROOT / "claude/plugins/tmux-pi/hooks/hooks.json").read_text())["hooks"]
+        for event in ("UserPromptSubmit", "Stop", "SubagentStop"):
+            commands = [h["command"] for group in hooks[event] for h in group["hooks"]]
+            self.assertFalse(any("sensitive-read.sh" in c for c in commands), (event, commands))
+            self.assertTrue(any("redact.sh" in c for c in commands), (event, commands))
+
+    def life(self):
+        """What inspect and the list read: the lifecycle of a working task that has this permission-request.json."""
+        import contract
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "updated": "2026-11-09T12:00:00Z"}))
+        return contract.task_lifecycle(self.task)[0]
+
+    def turn(self, name):
+        return {"hook_event_name": name, "session_id": "g3hook", "cwd": str(self.repo)}
+
+    def test_a_declined_dialog_settles_at_the_next_turn_in_every_mode(self):
+        """Claude Code fires no PermissionDenied when the owner rejects the dialog; the next prompt or the end of the turn must settle the
+        pending request. Whichever hook asked in this mode, redact_hook.handle (hooks/redact.sh) settles it, in on, shadow and off."""
+        for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            for ending in ("UserPromptSubmit", "Stop"):
+                with self.subTest(mode=mode, ending=ending), mock.patch.dict(os.environ, self.env(mode)):
+                    (self.task / "permission-request.json").unlink(missing_ok=True)
+                    self.assertEqual(self.decide(asker, self.event("PreToolUse")), "ask")
+                    pending = self.request()
+                    self.assertEqual((pending["status"], self.life()), ("pending", "needs_input"))
+                    self.assertIsNone(self.decide("redact", self.turn(ending)), "a turn is never blocked")
+                    declined = self.request()
+                    self.assertEqual((declined["status"], declined["event"]), ("declined", ending))
+                    self.assertEqual({k: v for k, v in declined.items() if k not in ("status", "event", "updated")},
+                                     {k: v for k, v in pending.items() if k not in ("status", "updated")})
+                    self.assertTrue(declined["updated"])
+                    self.assertNotEqual(self.life(), "needs_input", "a declined request is not an open question")
+                    self.decide("redact", self.turn(ending))
+                    self.assertEqual(self.request(), declined, "a second turn leaves a settled request alone")
+
+    def test_a_turn_changes_only_a_pending_request(self):
+        """An authorized or denied request, an unreadable one and none at all are left as they are by the next prompt and by Stop."""
+        response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        for mode, owner in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            for event, settled_as in (("PostToolUse", "authorized"), ("PermissionDenied", "denied")):
+                with self.subTest(mode=mode, was=settled_as), mock.patch.dict(os.environ, self.env(mode)):
+                    (self.task / "permission-request.json").unlink(missing_ok=True)
+                    self.decide(owner, self.event("PreToolUse"))
+                    self.decide(owner, {**self.event(event), "tool_response": response})
+                    self.assertEqual(self.request()["status"], settled_as)
+                    before = (self.task / "permission-request.json").read_bytes()
+                    for ending in ("UserPromptSubmit", "Stop"):
+                        self.decide("redact", self.turn(ending))
+                        self.assertEqual((self.task / "permission-request.json").read_bytes(), before, ending)
+            with self.subTest(mode=mode, was="unreadable"), mock.patch.dict(os.environ, self.env(mode)):
+                for text in (b"{not json", b"[]", b""):
+                    (self.task / "permission-request.json").write_bytes(text)
+                    self.decide("redact", self.turn("Stop"))
+                    self.assertEqual((self.task / "permission-request.json").read_bytes(), text)
+                (self.task / "permission-request.json").unlink()
+                self.decide("redact", self.turn("UserPromptSubmit"))
+                self.assertFalse((self.task / "permission-request.json").exists(), "no request is made up")
+
+    def hook_process(self, mode, event):
+        """The hook as Claude Code runs it: bin/tp-redact --claude-hook with the event on stdin."""
+        return subprocess.run([str(ROOT / "bin" / "tp-redact"), "--claude-hook"], input=json.dumps(event), text=True, capture_output=True,
+                              env={**os.environ, **self.env(mode)}, cwd=self.repo, timeout=30)
+
+    def test_tp_redact_process_settles_a_declined_dialog_in_every_mode(self):
+        """The real process reaches the turn branch before any mode check: shadow and off settle exactly as on, and nothing blocks."""
+        for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, self.env(mode)):
+                (self.task / "permission-request.json").unlink(missing_ok=True)
+                self.assertEqual(self.decide(asker, self.event("PreToolUse")), "ask")
+                pending = self.request()
+                run = self.hook_process(mode, self.turn("Stop"))
+                self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                settled = self.request()
+                self.assertEqual((settled["status"], settled["event"], settled["target"]), ("declined", "Stop", pending["target"]))
+
+    def test_a_broken_request_never_blocks_a_turn(self):
+        """An invalid-JSON or a directory permission-request.json at Stop: the process exits 0 and prints nothing, so the turn goes on."""
+        path = self.task / "permission-request.json"
+        for label in ("invalid json", "directory"):
+            with self.subTest(label):
+                shutil.rmtree(path, ignore_errors=True)
+                path.unlink(missing_ok=True)
+                path.mkdir() if label == "directory" else path.write_text("{not json")
+                run = self.hook_process("shadow", self.turn("Stop"))
+                self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                self.assertTrue(path.is_dir() if label == "directory" else path.read_text() == "{not json", "left as it was")
+
+    def ask(self, mode, asker, **who):
+        """The asker's PreToolUse ask in this mode; `who` (agent_id) is what Claude Code adds to a subagent's hook events."""
+        (self.task / "permission-request.json").unlink(missing_ok=True)
+        self.assertEqual(self.decide(asker, {**self.event("PreToolUse"), **who}), "ask")
+        return self.request()
+
+    def test_a_turn_settles_only_the_askers_own_request(self):
+        """Stop and UserPromptSubmit are the main agent's turn: a background subagent X's live ask survives them (Stop also fires while a
+        background subagent still works, and UserPromptSubmit also carries its report back). SubagentStop X settles X's ask only."""
+        # (who asked: agent_id or "" for main or None for a request written before agent_id existed), the event, its agent_id, the result
+        rows = [("X", "Stop", "", "pending"), ("X", "UserPromptSubmit", "", "pending"), ("X", "SubagentStop", "X", "declined"),
+                ("X", "SubagentStop", "Y", "pending"), ("X", "SubagentStop", "", "pending"), ("", "Stop", "", "declined"),
+                ("", "UserPromptSubmit", "", "declined"), ("", "SubagentStop", "X", "pending"), (None, "Stop", "", "declined"),
+                (None, "SubagentStop", "X", "pending")]
+        for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            for agent, ending, ends_agent, expected in rows:
+                with self.subTest(mode=mode, asked_by=agent, event=ending, agent_id=ends_agent), mock.patch.dict(os.environ, self.env(mode)):
+                    pending = self.ask(mode, asker, **({"agent_id": agent} if agent else {}))
+                    self.assertEqual(pending.get("call"), "toolu_g3hook", "the writer records which call asked")
+                    self.assertEqual(pending.get("agent_id"), agent or None, "the writer records who asked")
+                    if agent is None:
+                        (self.task / "permission-request.json").write_text(json.dumps({k: v for k, v in pending.items() if k != "agent_id"}))
+                    before = (self.task / "permission-request.json").read_bytes()
+                    self.assertIsNone(self.decide("redact", {**self.turn(ending), **({"agent_id": ends_agent} if ends_agent else {})}))
+                    now = self.request()
+                    self.assertEqual(now["status"], expected)
+                    if expected == "declined":
+                        self.assertEqual(now["event"], ending)
+                    else:
+                        self.assertEqual((self.task / "permission-request.json").read_bytes(), before, "left exactly as it was")
+
+    def test_a_late_answer_overtakes_a_declined_request(self):
+        """The turn (SubagentStop for a subagent's ask, Stop for the main agent's) marked the request declined, then the tool call's own
+        PostToolUse, PostToolUseFailure or PermissionDenied arrives: that is the real outcome, in on, shadow and off. Another call's answer,
+        and a request that was already authorized or denied, stay as they are. PostToolUseFailure is heard by redact.sh in every mode
+        (sensitive-read.sh is not registered on it); the other two by the hook that asked."""
+        response = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        late = (("PostToolUse", "authorized", "toolu_g3hook"), ("PostToolUseFailure", "authorized", "toolu_g3hook"),
+                ("PermissionDenied", "denied", "toolu_g3hook"), ("PostToolUse", "declined", "toolu_other"),
+                ("PostToolUseFailure", "declined", "toolu_other"), ("PermissionDenied", "declined", "toolu_other"))
+        for who, ending in (({"agent_id": "X"}, {**self.turn("SubagentStop"), "agent_id": "X"}), ({}, self.turn("Stop"))):
+            for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+                for name, expected, call in late:
+                    answerer = "redact" if name == "PostToolUseFailure" else asker
+                    with self.subTest(mode=mode, ended=ending["hook_event_name"], event=name, call=call), mock.patch.dict(os.environ, self.env(mode)):
+                        self.ask(mode, asker, **who)
+                        self.decide("redact", ending)
+                        (self.task / "permission-request.json").write_text(json.dumps({**self.request(), "extra": {"unknown": [1, "x"]}}))
+                        prior = self.request()
+                        self.assertEqual(prior["status"], "declined")
+                        self.assertIsNone(self.decide(answerer, {**self.event(name), "tool_use_id": call, **who, "tool_response": response,
+                                                                 "error": "boom"}), "a late answer never blocks or prints a decision")
+                        settled = self.request()
+                        self.assertEqual(settled["status"], expected)
+                        # The whole record: only the status, the settling event and the time change; every other field (event aside, an
+                        # unknown `extra` too) is the prior one. A different call's answer leaves it exactly as it was.
+                        self.assertEqual(settled, prior if expected == "declined" else {**prior, "status": expected, "event": name,
+                                                                                         "updated": settled["updated"]})
+                        self.assertEqual((settled.get("call"), settled.get("agent_id")), ("toolu_g3hook", who.get("agent_id")))
+                        before = (self.task / "permission-request.json").read_bytes()
+                        self.decide("redact", ending)
+                        self.decide(asker, {**self.event("PostToolUse"), "tool_response": response})
+                        self.decide(asker, self.event("PermissionDenied"))
+                        self.decide("redact", {**self.event("PostToolUseFailure"), "error": "boom"})
+                        if expected != "declined":
+                            self.assertEqual((self.task / "permission-request.json").read_bytes(), before, "authorized and denied are final")
+
+    def test_a_failure_in_shadow_and_off_settles_only_a_request_that_names_its_call(self):
+        """redact_hook.handle settles PostToolUseFailure in shadow and off by `call` alone: a request with no call, an unreadable one and none
+        at all are not touched, and a declined or pending one with another call stays."""
+        failure = {**self.event("PostToolUseFailure"), "error": "boom"}
+        path = self.task / "permission-request.json"
+        for mode in ("shadow", "off"):
+            for status, call, expected in (("pending", None, "pending"), ("declined", None, "declined"), ("pending", "toolu_other", "pending"),
+                                           ("declined", "toolu_g3hook", "authorized"), ("pending", "toolu_g3hook", "authorized")):
+                with self.subTest(mode=mode, status=status, call=call), mock.patch.dict(os.environ, self.env(mode)):
+                    prior = {"status": status, "target": "t", "reason": "r", "updated": "u", "extra": {"k": [1]}, **({"call": call} if call else {})}
+                    path.write_text(json.dumps(prior))
+                    self.assertIsNone(self.decide("redact", failure))
+                    settled = self.request()
+                    self.assertEqual(settled["status"], expected)
+                    self.assertEqual(settled, prior if expected == status else {**prior, "status": expected, "event": "PostToolUseFailure",
+                                                                                 "updated": settled["updated"]}, "every other field stays")
+            with self.subTest(mode=mode, unreadable=True), mock.patch.dict(os.environ, self.env(mode)):
+                for text in (b"{not json", b"[]", b""):
+                    path.write_bytes(text)
+                    self.assertIsNone(self.decide("redact", failure))
+                    self.assertEqual(path.read_bytes(), text)
+                path.unlink()
+                self.assertIsNone(self.decide("redact", failure))
+                self.assertFalse(path.exists(), "no request is made up")
+
+    def test_bin_tp_redact_hears_a_late_failure_in_shadow_and_off(self):
+        """The real process: SubagentStop declined X's ask, then X's PostToolUseFailure for the same call records the outcome. Exit 0, nothing
+        printed."""
+        for mode in ("shadow", "off"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, self.env(mode)):
+                self.ask(mode, "sensitive", agent_id="X")
+                self.assertEqual(self.hook_process(mode, {**self.turn("SubagentStop"), "agent_id": "X"}).returncode, 0)
+                self.assertEqual(self.request()["status"], "declined")
+                for call, expected in (("toolu_other", "declined"), ("toolu_g3hook", "authorized")):
+                    run = self.hook_process(mode, {**self.event("PostToolUseFailure"), "tool_use_id": call, "agent_id": "X", "error": "boom"})
+                    self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                    self.assertEqual(self.request()["status"], expected, call)
+
+    def test_bin_tp_redact_hears_a_subagent_stop_in_every_mode(self):
+        """The real process for SubagentStop: exit 0, nothing printed, and only that subagent's request settles."""
+        for mode, asker in (("on", "redact"), ("shadow", "sensitive"), ("off", "sensitive")):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, self.env(mode)):
+                self.ask(mode, asker, agent_id="X")
+                for agent, expected in (("Y", "pending"), ("X", "declined")):
+                    run = self.hook_process(mode, {**self.turn("SubagentStop"), "agent_id": agent})
+                    self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                    self.assertEqual(self.request()["status"], expected, agent)
+
     def test_trust_guard_lets_the_trigger_through(self):
         env = {**os.environ, **self.env("on")}
         run = subprocess.run([str(ROOT / "bin" / "tp-trust-guard"), "--claude-hook", "--home", str(self.home)], input=json.dumps(self.event("PreToolUse")),

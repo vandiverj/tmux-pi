@@ -20,7 +20,10 @@ HOOK = ROOT / "claude/plugins/tmux-pi/hooks/redact.sh"
 EXEC = ROOT / "bin/tp-secret-exec"
 sys.path.insert(0, str(ROOT / "lib"))
 import placeholders
+import redaction_store
 from redaction_store import Store, sweep
+
+RECENT = 200  # the store's bound on recent calls (redaction_store.RECENT; the bound test checks they agree)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # tests/ holds session_env
 from session_env import outside_session  # noqa: E402
 
@@ -33,6 +36,10 @@ def fake(prefix, n=32, seed=0):
 SECRET = fake("sk_test_")
 OTHER = fake("sk_test_", 32, 1)
 CLERK = "<REDACTED:" + "clerk_secret_key_1" + ">"
+
+
+def ph(name):
+    return "<REDACTED:" + name + ">"
 
 
 class PlaceholderUseTests(unittest.TestCase):
@@ -139,6 +146,101 @@ class PlaceholderUseTests(unittest.TestCase):
         self.post_bash(call, "echo", "ok\n")
         self.hook("Stop", None, {})
         self.assertEqual(self.peek()["grants"][CLERK], "granted")  # an approval the user gave survives the turn
+
+    def test_a_turn_end_drops_only_the_askers_grants_and_commands(self):
+        """The main agent's Stop must not break a background subagent's live ask: its grant and its recorded command stay until its own
+        SubagentStop; the main agent's own rejected ask is dropped by Stop as before."""
+        other = "<REDACTED:" + "stripe_secret_key_1" + ">"
+        theirs_call = self.call()
+        theirs = self.bash("printf %s {} | wc -c".format(CLERK), theirs_call, agent_id="X")
+        self.assertEqual((self.request()["agent_id"], self.request()["call"]), ("X", theirs_call))
+        mine = self.bash("printf %s {} | wc -c".format(other))  # one permission-request.json per task: this overwrites X's
+        self.assertEqual(self.peek()["agents"], {theirs_call: "X"})
+        for ending, extra in (("Stop", {}), ("UserPromptSubmit", {}), ("SubagentStop", {"agent_id": "Y"})):
+            self.assertIsNone(self.hook(ending, None, {}, **extra))
+            self.assertEqual(self.peek()["grants"][CLERK], "pending", ending)
+            self.assertIn(theirs_call, self.peek()["runs"], ending)
+        self.assertNotIn(other, self.peek().get("grants", {}), "the main agent's own rejected ask is dropped by Stop")
+        self.assertIn("exit-code: 126", self.run_wrapped(mine).stdout)
+        self.assertIsNone(self.hook("SubagentStop", None, {}, agent_id="X"))
+        self.assertNotIn(CLERK, self.peek().get("grants", {}))
+        self.assertNotIn(theirs_call, self.peek().get("runs", {}))
+        self.assertIn("exit-code: 126", self.run_wrapped(theirs).stdout)
+
+    def test_a_main_stop_keeps_a_subagents_grant_after_the_bounded_history_is_trimmed(self):
+        """X has a pending ask with a recorded command; then 205 calls by the main agent (or by another subagent) fill the bounded call history.
+        X's call, its names and its owner must outlive the trim: the main agent's Stop leaves X's grant, and approving X's command runs it."""
+        other = ph("stripe_secret_key_1")
+        for label, who in (("main", None), ("subagent Y", "Y")):
+            with self.subTest(label):
+                theirs_call = self.call()
+                theirs = self.bash("printf %s {} | wc -c".format(CLERK), theirs_call, agent_id="X")
+                store = Store("sess-1", self.store)
+                for i in range(205):
+                    busy = "busy_{}_{}".format(label[-1], i)
+                    with store.locked():
+                        store.record_use(busy, [other], "pending", "echo {}".format(i), agent=who)
+                    store.settle_use(busy, True)
+                self.assertIsNone(self.hook("Stop", None, {}))
+                self.assertEqual(self.peek()["grants"][CLERK], "pending", "the main agent's Stop left X's grant")
+                run = self.run_wrapped(theirs)
+                self.assertNotIn("exit-code: 126", run.stdout, "approving X's command runs it")
+                self.assertIn("exit-code: 0", run.stdout)
+                self.assertEqual((self.peek()["agents"][theirs_call], self.peek()["calls"][theirs_call]), ("X", [CLERK]), "owner and names survived")
+
+    def test_the_call_history_stays_bounded_and_keeps_every_outstanding_call(self):
+        """record_use keeps the last RECENT calls, every call with a recorded run and the newest RECENT calls that use a pending name: a
+        bound of 3 * RECENT calls and agents, RECENT runs. A call that falls out leaves its owner unknown, never the main agent's."""
+        store = Store("bounded", self.store, persist=False)
+        store.record_use("x0", [ph("x_1")], "pending", "echo x0", agent="X")
+        for i in range(2 * RECENT + 50):  # settled calls: each is spent at once and never outstanding
+            store.record_use("m{}".format(i), [ph("m_1")], "pending", "echo {}".format(i))
+            store.settle_use("m{}".format(i), True)
+        self.assertEqual((store.data["calls"]["x0"], store.data["agents"]["x0"], "x0" in store.data["runs"]), ([ph("x_1")], "X", True))
+        self.assertLessEqual(len(store.data["calls"]), RECENT + 1)
+        for i in range(5 * RECENT):  # unsettled calls with distinct pending names: the worst case for the bound
+            store.record_use("p{}".format(i), [ph("p_{}".format(i))], "pending", "echo p{}".format(i), agent="Y" if i % 2 else None)
+        data = store.data
+        self.assertLessEqual(len(data["calls"]), 3 * RECENT)
+        self.assertLessEqual(len(data["agents"]), len(data["calls"]))
+        self.assertLessEqual(len(data["runs"]), RECENT)
+        self.assertTrue(set(data["runs"]) <= set(data["calls"]), "a command that can run has its call, so its owner")
+        self.assertTrue(set(data["agents"]) <= set(data["calls"]))
+        self.assertIn("p{}".format(5 * RECENT - 1), data["calls"])
+        self.assertNotIn("x0", data["calls"], "past the bound the oldest call goes, with its owner")
+        self.assertNotIn("x0", data["agents"])
+        self.assertEqual(redaction_store.RECENT, RECENT)
+
+    def test_a_subagents_running_call_is_not_taken_for_the_main_agents_by_an_earlier_one(self):
+        """X's earlier call with the same placeholder was refused (its grant dropped); X's next ask is running (its command claimed). The main
+        agent's Stop must not delete that grant because the earlier call looks ownerless."""
+        name = ph("x_1")
+        store = Store("owner", self.store, persist=False)
+        store.record_use("a", [name], "pending", "echo a", agent="X")
+        store.settle_use("a", False)
+        store.record_use("b", [name], "pending", "echo b", agent="X")
+        self.assertTrue(store.claim_run("echo b"))
+        store.drop_pending("")
+        self.assertEqual(store.data["grants"][name], "pending")
+        store.drop_pending("X")
+        self.assertNotIn(name, store.data["grants"], "X's own turn end drops it")
+
+    def test_a_pending_grant_whose_owner_is_unknown_survives_a_turn_end_until_session_end(self):
+        """No call in the history names the grant, so nobody's Stop proves it was rejected: it stays. SessionEnd's sweep clears it."""
+        name = ph("x_1")
+        store = Store("sess-1", self.store)
+        with store.locked():
+            store.data.setdefault("grants", {})[name] = "pending"
+        for ending, extra in (("Stop", {}), ("UserPromptSubmit", {}), ("SubagentStop", {"agent_id": "X"})):
+            self.assertIsNone(self.hook(ending, None, {}, **extra))
+            self.assertEqual(self.peek()["grants"][name], "pending", ending)
+        self.assertIsNone(self.hook("SessionEnd", None, {}))
+        self.assertFalse((self.store / "sess-1.json").exists())
+
+    def test_a_subagent_stop_without_an_agent_is_ignored(self):
+        self.bash("printf %s {} | wc -c".format(CLERK))
+        self.assertIsNone(self.hook("SubagentStop", None, {}))
+        self.assertEqual(self.peek()["grants"][CLERK], "pending")
 
     def test_wrapper_runs_only_the_recorded_command_once(self):
         call = self.call()

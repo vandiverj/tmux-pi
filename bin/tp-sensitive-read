@@ -10,16 +10,17 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import safe_write
 from sensitive_read import classify, response_for
-from redact_hook import mode as redaction_mode
+from redact_hook import mode as redaction_mode, settled_record, write_request
 
 
-def save_request(result, status):
+def save_request(result, status, call=None, agent_id=None):
     task = os.getenv("TP_TASK_DIR")
     if not task:
         return
     path = Path(task) / "permission-request.json"
     value = {"status": status, "target": result.get("target"), "reason": result.get("reason"),
-             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+             "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             **{k: v for k, v in (("call", call), ("agent_id", agent_id)) if v}}
     safe_write.write_atomic(path, json.dumps(value) + "\n", root=safe_write.task_root(task), keep_mode=False)
 
 
@@ -77,14 +78,19 @@ def main():
                 prior = json.loads(old.read_text())
                 current = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd,
                                    resolver(args, quiet=True))
-                if prior.get("status") == "pending" and current.get("sensitive") and current.get("target") == prior.get("target"):
-                    save_request(prior, "authorized" if name == "PostToolUse" else "denied")
+                # A request the turn branch (redact_hook.settle_declined) marked `declined` is overtaken by a late answer for
+                # the same call; authorized and denied are final.
+                waiting = prior.get("status") == "pending" or (
+                    prior.get("status") == "declined" and prior.get("call") and prior["call"] == event.get("tool_use_id"))
+                if waiting and current.get("sensitive") and current.get("target") == prior.get("target"):
+                    # The prior record with the outcome: every field stays (event, call, agent_id, any other), not rebuilt from `current`.
+                    write_request(os.environ["TP_TASK_DIR"], settled_record(prior, "authorized" if name == "PostToolUse" else "denied", name))
             return
         if name != "PreToolUse":
             return
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
         if result["sensitive"]:
-            save_request(result, "pending")
+            save_request(result, "pending", event.get("tool_use_id"), event.get("agent_id"))
             print(json.dumps(response_for(result)))
     else:
         print(json.dumps(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))))

@@ -47,6 +47,32 @@ holdout >= 57/60 (95%) with zero fabricated citations. If met: Main copies the p
 small lane flips `summarize_files` to `qualified` with that evidence and adjusts the router's shape text if tagging
 was weak. If not met: record the numbers, keep `candidate`, report the failure classes.
 
+## S2 additions (owner decision J1-D1, 2026-11-09)
+Owner: "go with your recommendations as long as they ensure we get a local model summarization built well and fully
+tested with best chance of success to be used on real world work". The 24 chores use small synthetic fixtures, so S2 adds
+the following before any flip:
+
+1. **Real-work split.** Add `split: real` with 12 chores over real files frozen from tmux-pi at a pinned commit:
+   - full-size modules and docs (for example lib/lanes.py, lib/lane_remove.py, bin/tp-spawn, a det-prep plan, the README);
+   - no `.env*`, no config/ or agent/ trees, nothing private;
+   - the same chore kinds and the same answer format (required facts, forbidden claims, citable files).
+
+   This is a small lane, step S1b. Its brief carries the same rules as S1. It is reviewed cross-provider before S2 runs.
+2. **Bar.** Pick the prompt on the tune split only. Then run each of the following x5 with that prompt:
+   - holdout: at least 57/60;
+   - real: at least 57/60.
+
+   Both need zero fabricated citations and zero unparsed replies. Main inspects every failed and every passed real reply by
+   hand for facts the checker cannot see.
+3. **Routing.** `--route-only` on all 36 chores must give the shape `summarize_files` for at least 34. The same text gives
+   the same answer on every run: run it 3 times and require identical results. The local-only path and plain `tp-route`
+   must agree. This is also where the locate-chant disagreement from J1 is settled.
+4. **Full path, after the flip.** Dispatch 3 real summarize tasks through `tp-agent dispatch` (not the headless runner), so
+   the tp-spawn prompt, the router and the worker are all exercised. Score them with the checker and inspect them by hand.
+   Each must pass.
+5. **If the bar is missed:** record the numbers and the failure classes, keep `candidate`, and write a fix round (prompt,
+   chunking, or the router's shape text). Do not lower the bar.
+
 ## Done means (S1)
 1. 24 chores with deterministic answers; the checker and runner exist and are tested with stubs.
 2. The runner leaves no temp dir, tmux session or worktree behind (tested).

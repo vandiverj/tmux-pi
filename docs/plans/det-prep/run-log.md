@@ -783,3 +783,19 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   Follow-up: the rule-20 margin is thin. The worst shape takes 1.66–1.73 s against a 2 s limit.
   Next for LS1: S2 live qualification (at least 57/60, fabricated 0, unparsed 0, every hit inspected by hand), then the flip lane.
 - G1 rerun on clean 2fac25a: py39-out ran 4735 tests, OK (skipped 77). The other three cells are still running.
+
+## 2026-11-09 Owner decision J1-D1
+- Owner: "go with your recommendations as long as they ensure we get a local model summarization built well and fully
+  tested with best chance of success to be used on real world work".
+- Decided:
+  - (a) bench local tasks dispatch with a role that has no strict floor. The catalog floor is unchanged.
+  - (b) each task is reworded to the qualified form of its shape.
+  - (c) summarize-importers is replaced for now, then re-added after the LS1 flip.
+- LS1 S2 is tightened so the qualification reflects real work (ls1-local-summarizer.md, "S2 additions"):
+  - a real-work split of 12 chores over full-size tmux-pi files (lane step S1b);
+  - at least 57/60 on both holdout and real, with no fabricated citations and no unparsed replies;
+  - every real reply inspected by hand;
+  - routing deterministic and in agreement, at least 34 of 36 chores tagged summarize_files;
+  - 3 tasks through the full `tp-agent dispatch` path after the flip.
+- G4 now waits for the LS1 flip and includes the summarize task. The locate-chant routing disagreement is settled under
+  S2 step 3.

@@ -38,7 +38,12 @@ Claims each gate allows:
 - **What:** the same small task set on `d8a18a7` (last pushed commit before this campaign) and on the new `main`.
   Measure first-try approval rate, review rounds, tokens per task, and answer completeness checked by a deterministic
   checker (reuse LS1's `tools/qual/summarize_check.py` pattern).
-- **Needs first:** the owner's J1-D1 decision on the local bench tasks (they were refused at routing).
+- **Needs first:** LS1 flipped (`summarize_files` qualified per ls1-local-summarizer.md "S2 additions").
+- **J1-D1, decided 2026-11-09:**
+  - (a) bench local tasks dispatch with a role that has no strict mid floor. The catalog floor stays as it is.
+  - (b) each task is reworded to the form its shape was qualified with.
+  - (c) summarize-importers is replaced by a task of a qualified shape for now, then re-added in the qualified summarize
+    form once LS1 is flipped. G4 runs with it included.
 - **Done when:** the numbers are recorded with the task set and commits; "improves" is claimed only where the numbers
   show it.
 
@@ -48,4 +53,4 @@ Claims each gate allows:
 - **Done when:** G1 and G3 pass in the fresh clone; any setup step it needed is written into the port notes.
 
 ## Order
-G1 after the merges; G2 and G3 in parallel as lanes; G4 after the J1-D1 decision; G5 last.
+G1 after the merges; G2 and G3 in parallel as lanes; G4 after the LS1 flip (J1-D1 decided); G5 last.

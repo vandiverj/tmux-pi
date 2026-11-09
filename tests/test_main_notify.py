@@ -77,6 +77,20 @@ class MainNotifyTests(unittest.TestCase):
         item = self.dispatch(TP_TASK_DIR=str(self.here / "tasks" / "x"), CLAUDE_CODE_SESSION_ID="sess-1")
         self.assertNotIn("main", self.ids()[item["id"]])
 
+    def test_a_worker_with_its_mains_id_records_it_on_what_it_dispatches(self):
+        item = self.dispatch(TP_TASK_DIR=str(self.here / "tasks" / "x"), CLAUDE_CODE_SESSION_ID="sess-1", TP_MAIN_ID="main-a")
+        self.assertEqual(self.ids()[item["id"]]["main"], "main-a")
+
+    def test_a_dispatched_worker_exports_the_dispatching_mains_id_only_when_there_is_a_valid_one(self):
+        """tp-spawn writes it into the worker's run.sh (the worker window does not inherit the caller's environment); with none, or a
+        bad one, run.sh has no TP_MAIN_ID line. A Claude session id alone is the main the task was recorded under, so it follows too."""
+        def run_sh(item):
+            return (self.here / "tasks" / item["id"] / "run.sh").read_text()
+        self.assertIn("export TP_MAIN_ID=main-a\n", run_sh(self.dispatch(TP_MAIN_ID="main-a")))
+        self.assertNotIn("TP_MAIN_ID", run_sh(self.dispatch()))
+        self.assertNotIn("TP_MAIN_ID", run_sh(self.dispatch(TP_MAIN_ID="has space")))
+        self.assertIn("export TP_MAIN_ID=sess-1\n", run_sh(self.dispatch(CLAUDE_CODE_SESSION_ID="sess-1")))
+
     def test_a_queued_task_keeps_its_main(self):
         queued = self.here / "queue"
         queued.mkdir()
@@ -182,15 +196,35 @@ class MainLauncherIdentityTests(unittest.TestCase):
         other.mkdir()
         self.assertNotEqual(self.launch(state=other), first)
 
-    def test_a_launcher_id_already_set_is_kept_and_a_bad_one_or_file_is_replaced(self):
+    def test_an_id_given_at_launch_is_kept_and_recorded_for_a_later_launch_without_it(self):
         self.assertEqual(self.launch(TP_MAIN_ID="main-given"), "main-given")
-        self.assertFalse((self.state / "main-id").exists())
+        self.assertEqual((self.state / "main-id").read_text().strip(), "main-given")
+        self.assertEqual(self.launch(), "main-given")  # no TP_MAIN_ID this time: the same state dir, the same main
+        (self.state / "main-id").write_text("main-old\n")
+        self.assertEqual(self.launch(TP_MAIN_ID="main-new"), "main-new")  # a given id replaces what was there
+        self.assertEqual(self.launch(), "main-new")
+
+    def test_a_bad_id_given_at_launch_is_not_exported_or_recorded(self):
         bad = self.launch(TP_MAIN_ID="has space")
         self.assertRegex(bad, r"^main-[0-9a-f]{16}$")
-        (self.state / "main-id").write_text("not valid!\n")
-        fixed = self.launch()
-        self.assertRegex(fixed, r"^main-[0-9a-f]{16}$")
-        self.assertEqual(self.launch(), fixed)
+        self.assertEqual((self.state / "main-id").read_text().strip(), bad)
+
+    def test_an_empty_or_bad_main_id_file_is_replaced_with_a_fresh_valid_id_that_a_second_launch_reads_back(self):
+        for content in ("", "\n", "not valid!\n", "two\nlines\n"):
+            with self.subTest(content=content):
+                (self.state / "main-id").write_text(content)
+                fresh = self.launch()
+                self.assertRegex(fresh, r"^main-[0-9a-f]{16}$")  # never an empty TP_MAIN_ID
+                self.assertEqual((self.state / "main-id").read_text().strip(), fresh)
+                self.assertEqual(self.launch(), fresh)
+
+    def test_an_id_that_cannot_be_read_back_is_still_exported_and_said_on_stderr(self):
+        (self.state / "main-id").mkdir()  # a directory where the file goes: it cannot be removed as a file or read
+        run = subprocess.run([str(self.root / "bin/tp-main")], text=True, capture_output=True, timeout=25, cwd=str(self.root), env={
+            **outside_session(), "TP_MAIN_HARNESS": "claude", "TP_STATE_DIR": str(self.state)})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertRegex(run.stdout.strip(), r"^main-[0-9a-f]{16}$")
+        self.assertIn("could not read the main id back", run.stderr)
 
     def test_with_no_state_directory_the_main_still_gets_an_id(self):
         self.assertRegex(self.launch(state=None), r"^main-[0-9a-f]{16}$")

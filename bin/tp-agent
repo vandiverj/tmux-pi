@@ -308,9 +308,12 @@ def main_id():
     """The identity of the main agent that runs this command, or None: TP_MAIN_ID if the launcher set one, else the Claude
     session id. A worker (TP_TASK_DIR set) has none: it never dispatches for a main. Recorded on each task it dispatches so
     the main's notifier can tell its tasks from another main's, in whichever session state directory they live."""
+    explicit = os.getenv("TP_MAIN_ID") or ""
+    if MAIN_ID.fullmatch(explicit):  # a worker carries its main's id (tp-spawn exports it): what it dispatches is tagged to that main
+        return explicit
     if os.getenv("TP_TASK_DIR"):
         return None
-    value = os.getenv("TP_MAIN_ID") or os.getenv("CLAUDE_CODE_SESSION_ID") or ""
+    value = os.getenv("CLAUDE_CODE_SESSION_ID") or ""
     return value if MAIN_ID.fullmatch(value) else None
 
 
@@ -706,8 +709,12 @@ def launch(base, item):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
     args += ["--", item["task"]]
     started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
+    # The worker carries the main that dispatched it, whichever process runs the start (a queued task is started by a later tick).
+    spawn_env = {key: value for key, value in os.environ.items() if key != "TP_MAIN_ID"}
+    if item.get("main"):
+        spawn_env["TP_MAIN_ID"] = item["main"]
     try:
-        run = subprocess.run(args, text=True, capture_output=True)
+        run = subprocess.run(args, text=True, capture_output=True, env=spawn_env)
     finally:
         if facts_file:
             Path(facts_file.name).unlink(missing_ok=True)

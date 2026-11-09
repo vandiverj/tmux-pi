@@ -125,8 +125,8 @@ for (const [name, env, isInteractive] of [
   })
 }
 
-test('a worker environment never notifies, even with a main identity and the orchestrator mode', async ($, on) => {
-  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1', CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_HARNESS: 'claude' })
+test('a worker environment never notifies, even with a main identity (tp-spawn gives workers their main\'s TP_MAIN_ID) and the orchestrator mode', async ($, on) => {
+  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1', CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_ID: 'main-a', TP_MAIN_HARNESS: 'claude' })
   w.rows = [{ id: 'coder-2', status: 'settled' }]
   await $.session.start(start(true))
   await w.clock.advance(30000)

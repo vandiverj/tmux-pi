@@ -15,22 +15,33 @@ export TP_MODE=orchestrator
 # Made here, not in bin/tp, because this is what a relaunch runs, and kept in the session's state directory, which every
 # relaunch in the same tmux session shares (bin/tp exports TP_STATE_DIR to the pane and the session): the same main keeps its id
 # across /clear, --resume, compaction and a second tp-main. Inherited by everything the harness starts (Bash tool, claude -p,
-# subagents, background shells). A TP_MAIN_ID already set and valid is kept.
-if ! [[ "${TP_MAIN_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
-  main_id=""
-  idfile="${TP_STATE_DIR:+$TP_STATE_DIR/main-id}"
-  if [[ -n "$idfile" && -d "$TP_STATE_DIR" ]]; then
+# subagents, background shells). The id exported always matches the pattern: a TP_MAIN_ID given at launch and valid is kept
+# and written to the file (a later launch without it keeps it); an empty or bad file is replaced with a fresh id.
+id_pattern='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+idfile="${TP_STATE_DIR:+$TP_STATE_DIR/main-id}"
+have_dir=0
+[[ -n "$idfile" && -d "$TP_STATE_DIR" ]] && have_dir=1
+if [[ "${TP_MAIN_ID:-}" =~ $id_pattern ]]; then
+  if [[ "$have_dir" == 1 ]]; then
+    { printf '%s\n' "$TP_MAIN_ID" > "$idfile.$$" && mv -f "$idfile.$$" "$idfile"; } 2>/dev/null ||
+      { rm -f "$idfile.$$"; echo "tp-main: could not record TP_MAIN_ID in $idfile; a later launch without it will not keep this id" >&2; }
+  fi
+else
+  fresh="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
+  main_id="$fresh"
+  if [[ "$have_dir" == 1 ]]; then
     main_id="$(cat "$idfile" 2>/dev/null || true)"
-    if ! [[ "$main_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
-      fresh="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
+    if ! [[ "$main_id" =~ $id_pattern ]]; then
+      rm -f "$idfile" 2>/dev/null || true  # an empty file, or one with a bad id in it, is replaced
       # ln fails when the file exists: of two launches racing, the first id wins and both read it back.
-      [[ -z "$main_id" ]] || rm -f "$idfile"  # a file with a bad id in it is replaced
-      printf '%s\n' "$fresh" > "$idfile.$$" && { ln "$idfile.$$" "$idfile" 2>/dev/null || true; }
-      rm -f "$idfile.$$"
-      main_id="$(cat "$idfile" 2>/dev/null || echo "$fresh")"
+      printf '%s\n' "$fresh" > "$idfile.$$" 2>/dev/null && { ln "$idfile.$$" "$idfile" 2>/dev/null || true; }
+      rm -f "$idfile.$$" 2>/dev/null || true
+      main_id="$(cat "$idfile" 2>/dev/null || true)"
+      if ! [[ "$main_id" =~ $id_pattern ]]; then
+        main_id="$fresh"
+        echo "tp-main: could not read the main id back from $idfile; using $fresh for this launch only" >&2
+      fi
     fi
-  else
-    main_id="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
   fi
   export TP_MAIN_ID="$main_id"
 fi

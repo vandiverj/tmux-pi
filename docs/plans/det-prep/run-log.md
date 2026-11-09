@@ -707,3 +707,23 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   fixtures dispatch openai/gpt-6.1-sol). It is not a code regression, and the end-of-session config revert clears it.
 - Baseline 1 -> 0: baseline-failing.txt is now empty. The G1 full suite on main is the check that nothing outside it fails.
 - Follow-ups: bin/tp-agent:287 index tie-break; test_retry_packet ~65 s per file (over the 60 s budget, pre-existing).
+
+## 2026-11-09 — G1 full suite on main; FG-N1b dispatched; LS1 round 13
+- G1 full suite, clean worktree at dc4ad17, 4729 tests per cell. Every cell finished so far (py39-out, py39-in, py314-out)
+  has the same 25 FAIL + 1 ERROR, all in tests/test_tp_review.py. The baseline is empty, so all of them are new.
+  - Cause: FG-N1 (a924a5b) made lib/sensitive_read.py import the new lib/command_wrappers.py. TpReviewTests.TEMPLATE_LIBS copies a
+    fixed lib/ list into a temp install and does not have it, so bin/tp-review exits 1 ("No module named 'command_wrappers'").
+  - Proof: with command_wrappers.py added to the tuple (scratch, reverted), test_tp_review gave 96 OK.
+  - Why it was missed: FG-N1's post-merge check ran only the affected modules (425 tests), not the full suite.
+  - Second gap from the same split: config/model-catalog.json protected_paths has lib/sensitive_read.py but not lib/command_wrappers.py.
+- FG-N1b (fg-n1b-wrappers-followup.md, lane fgn1b-followup F1, coder-019dc91a62): the template fix, an import-closure test so
+  the class fails loudly, a sweep of other partial-install templates, and the protected path plus a routing test.
+- test_tp_review took 116 s alone under load: over the 60 s budget. Added to the budget follow-ups.
+- LS1 round 12 review (review-coder-e245072fca-015025) was REQUEST_CHANGES. F1: the known-file shortcut rewrote delimited paths,
+  e.g. `(junk src/cli.py:6)` was read as src/cli.py. Main reproduced it and checkpointed round 12 as c8f96f5. Round 13 is
+  coder-b69bae86e7 (fixes/ls1-round13.md, then ls1-round13-rulings.md):
+  - rule 27: inside a pair, the pair decides;
+  - rule 29: one list separator splits off a lead-in;
+  - rule 30: no fallback outside a pair;
+  - flag 1 (HTML comment -> unknown_file) accepted.
+  F2 (provenance): the deleted 1.10 s experiment is marked unaudited and nothing relies on it.

@@ -500,3 +500,18 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - Owner: "I want all failures fixed in the end so they should be determined and fixed". G2 now means
   baseline-failing.txt goes to empty with each cause found and fixed; no skips or "explained" entries.
 - Plan: G1 first (it fixes the full failing list on merged main), then G2 lanes grouped by cause.
+
+## 2026-11-08 ~14:00-18:30 CST: four hours lost to broken watchers; three lanes redispatched
+- Main's watcher loops were written for bash but ran in zsh (no word splitting), so they never fired. Fixed with a
+  bash script that checks its arguments and exits if a pane disappears.
+- LS1: the "round 3" retry (coder-2d4df36f35) actually ran round 2 again. Main passed `--reason` as a relative
+  path; tp-agent makes a brief the instruction only when the path is absolute (recorded as a note otherwise). Re-sent
+  with the absolute path: coder-ed25d9ee58.
+- FG-N1 round 2 review (review-coder-50e09c1158-143214): REQUEST_CHANGES, families stacked-wrapper-strings and
+  remote-command-uncertainty (option values hide stacked strings; nested sh -c loses remote uncertainty).
+  tp-agent refused a plain retry (second REQUEST_CHANGES); round 3 sent as `--route design`
+  (fixes/fg-n1-round3.md: a table per wrapper, fail closed on unknown options, flag kept through nesting, generated
+  test): coder-b9c961eade.
+- M2-F1 review: second credential-directory prompt (`config/`), so it was parked as the rule says. Re-dispatched with an
+  evidence note to read config files by exact path and never search config/ or agent/ recursively:
+  review-coder-76b4f649f5-182739.

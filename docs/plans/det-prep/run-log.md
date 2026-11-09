@@ -840,3 +840,20 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   (shared fake-run batches). Each file is under 60 s.
 - New follow-up: /private/tmp/tmux-501 holds 7237 sockets. Most are stale, from test runs, and are part of the stale-socket
   follow-up.
+
+## 2026-11-09 G3 live run on battle-soccer: blocked by Claude's folder-trust dialog
+- Two live runs (`tools/smoke/g3_e2e.py --repo ~/Documents/Projects/battle-soccer`; the second with `--keep` and pane
+  captures). Both failed at step `prompt`: "no permission prompt within 240 s (last seen: starting)". Cleanup was complete
+  both times: no errors, no leftovers, no session, branch or worktree left. Main removed the kept temp state dir.
+- Cause, from the pane captures at 30, 60, 120 and 200 s:
+  - the coder sat at Claude Code's folder-trust screen for the new worktree `battle-soccer-wt-g3-<run id>`;
+  - tmux-pi's Claude profile trusts tmux-pi but not battle-soccer. That is why tmux-pi lane worktrees never ask; Main
+    confirms this once battle-soccer is trusted.
+- Main did not answer the dialog. Folder trust is the owner's decision: `bin/tp-claude-bootstrap ~/Documents/Projects/battle-soccer`
+  from a real terminal, once.
+- Product gap: `tp-agent inspect` shows `starting` for a worker stuck at the trust screen, so every waiter times out
+  without a reason. The bench detects that screen; task inspection does not. Fix lane TV1 (g3/trust-visible.md).
+- G3 stays open until a live run passes after the owner trusts battle-soccer.
+- LS1b: round 2 (step-count bound) is checkpointed as eb8661a. Main's verify found test_qual_summarize_oracle failing with
+  21 errors in every cell. The oracle generator assumes a file extension, and the real split cites `bin/tp-spawn`.
+  Round 3 brief: fixes/ls1b-round3.md.

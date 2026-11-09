@@ -914,3 +914,40 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - S2 started from a plain shell. LM Studio was up the whole time (probed). Earlier estimates wrongly listed it as something the
   owner had to start. Runs: route-only ×3 on all 24, tune ×3 with the live prompt and ×3 with the draft from
   config/local.example.json (bench-results/s2-2026-11-09/).
+
+## 2026-11-09 LS1c S1 merged; live tuning; SE1, S1b and AT1 under way
+- LS1c S1 (checkpoint 48d603b). The review review-coder-dc15a6aff4-134510 returned APPROVED_WITH_NOTES: 163 scoped tests
+  were rerun independently under 3.9 and 3.14. Its F1 note says SE1 still owes evidence that the session-env failures
+  reproduce on the base. Main then closed the lane step, merged it as 711cd79 and removed the lane.
+- Main's run of test_session_env on main fails 4 cases. The log is
+  /Users/jerrickvandiver/.claude/jobs/6061f696/tmp/main-session-env.log. The causes:
+  - TP_TRUST_CAPTURE_TIMEOUT and TP_TRUST_SCAN_BUDGET were never classified;
+  - test_g3_e2e and test_g3_e2e_tamper lack `import session_env`;
+  - test_lane_writer needs a tmux server, so the filtered-discover test and reviewers_repro both trip on it.
+
+  TV1 and G3 merged without running this guard. Rule from now on: every lane verify adds tests.test_session_env. SE1
+  (fixes/se1-session-env.md, coder-295d3a9910) fixes the first three causes. AT1 fixes the test_lane_writer part.
+- AT1's four-cell rerun used a short private TMUX_TMPDIR. The first run's 51 setUpClass errors came from a socket path
+  over macOS's limit. The rerun shows only 3 test_session_env failures, the same as main minus the lane_writer one, which
+  AT1 fixes.
+- Live structured-path tuning ran on the tune split, ×1 each, deterministic at temperature 0. Prompts and runs are in
+  bench-results/ls1c-2026-11-09/.
+
+  | Run | Passed | Notes |
+  |---|---|---|
+  | S1 base (×3) | 6/36 | 60 range_too_long drops |
+  | t1 (wording) | 3/12 | |
+  | t2 (`lines` list of 1-3) | 3/12 | 0 drops, 34 missing |
+  | t3 (+ subject field) | 2/12 | |
+  | t4 | 1/12 | |
+  | t5 (+ ast name outline in the prompt) | 1/12 | 41 failures |
+  | t6 (+ name index in the output) | 2/12 | 36 failures |
+  | t7 (+ parameters in the outline) | 3/12 | 28 failures |
+
+  - **What helped**: forcing structure through the schema and adding the list of names from `ast` (deterministic)
+    helped more than prompt wording did.
+  - **What remains**: compound claims ("waits 1 s, 5 s and 30 s"); the class-vs-method subject; "use" chores that skip
+    what the caller does; and absent-use or negative facts.
+  - The bar is 57/60 on the holdout and real splits. It is far off.
+  - S1b (fixes/ls1c-s1b-structured-v2.md, coder-52af2c36fb) builds the v2 fact form, the name outline and the name index
+    properly, with tests, so tuning continues on the real module rather than the scratch copy.

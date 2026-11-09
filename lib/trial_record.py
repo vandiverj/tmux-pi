@@ -185,7 +185,7 @@ def read_docs_calls(path):
             continue
         try:
             row = json.loads(line) if len(line) <= MAX_DOCS_LINE else None
-        except ValueError:
+        except (ValueError, RecursionError):  # nested past the interpreter's limit: a bad line
             row = None
         if not isinstance(row, dict):
             out["bad_lines"] += 1

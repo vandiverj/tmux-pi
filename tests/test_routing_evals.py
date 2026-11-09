@@ -320,6 +320,14 @@ class AppendTests(unittest.TestCase):
         (self.dir / "t.jsonl").write_text('{"a":1}\n{"b":\n[1]\n')
         self.assertEqual(routing_evals.read_jsonl(self.dir / "t.jsonl"), ([{"a": 1}], 2))
 
+    def test_json_nested_past_the_recursion_limit_is_unreadable_not_a_crash(self):
+        self.dir.mkdir()
+        deep = "[" * 200000 + "]" * 200000  # RecursionError from the json module on every interpreter we run
+        (self.dir / "t.jsonl").write_text('{"a":1}\n' + deep + "\n")
+        self.assertEqual(routing_evals.read_jsonl(self.dir / "t.jsonl"), ([{"a": 1}], 1))
+        (self.dir / "meta.json").write_text(deep)
+        self.assertIsNone(routing_evals._read_json(self.dir / "meta.json"))
+
 
 class FakeLaya:
     """A loopback typed-decisions endpoint that returns a fixed reply (or HTTP 503)."""

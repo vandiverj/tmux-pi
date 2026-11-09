@@ -774,3 +774,12 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   G3 must now isolate tmux by construction: TMUX_TMPDIR set to a temp dir, a private `-L` from the constructor, kill-server
   guarded, and a PATH-shim test that asserts no call escapes. Follow-up: audit other tests for the same bare-tmux risk; the
   thousands of stale tp-t3-* sockets under /private/tmp/tmux-501 are already on the list.
+- LS1 round 14 (coder-f9e817eb92) reviewed by review-coder-f9e817eb92-045736: APPROVED, no findings.
+  - Nested pairs are read with boundary tables and an in-order merge. At 1 MB, k=16000 now takes 0.140 s CPU (round 13: over 8 s).
+  - 20,000 differential texts and 12,744 oracle samples give the same readings as 8560cf6.
+  - The 4 new rule-20 tests fail on 8560cf6 and pass now. The matrix is green: py39 and py3.14, inside and outside tmux.
+
+  Committed 11b038b, closed S1, merged 6ec27a8, lane removed (archive local-summarizer-20261109T110935Z).
+  Follow-up: the rule-20 margin is thin. The worst shape takes 1.66–1.73 s against a 2 s limit.
+  Next for LS1: S2 live qualification (at least 57/60, fabricated 0, unparsed 0, every hit inspected by hand), then the flip lane.
+- G1 rerun on clean 2fac25a: py39-out ran 4735 tests, OK (skipped 77). The other three cells are still running.

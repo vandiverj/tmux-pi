@@ -879,3 +879,19 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - No limit raise and no override. Product fix FC1 (fixes/fc1-frozen-copies.md): a `frozen-copies.json` manifest. Verified
   copies are named in the review diff with their blob id and their contents left out; anything not verified keeps its full
   diff. After FC1 merges, LS1b adds the manifest and goes to review.
+
+## 2026-11-09 TV1 merged (folder-trust dialog shown as needs_input)
+- Round 2 (tv1-round2.md) fixed review 1's F1 (the bench again gives `error: trust-dialog` and stops the worker), F2 (a per-capture
+  timeout plus a 15 s scan budget; rows not looked at say "not checked") and F3 (the G3 script quotes the bootstrap folder
+  with a local helper, because test_g3_e2e's allow-list forbids `shlex`). F5's provenance logs are in the task dir.
+- Main's four cells over round 1's 13 files: 320 OK in three cells. In py39-in, `test_status_repaint.test_mouse_tracking_lifecycle`
+  failed once (an empty tail within its fixed 5 s wait after SIGTERM). TV1 cannot reach it: the trust scan runs only for
+  claude rows and that test's jobs are pi. Alone in the same cell it passed 5/5 and the whole file 40 OK. Follow-up: a
+  load-sensitive test to fix.
+- Review review-coder-b8fd822d83-100331: APPROVED_WITH_NOTES. The reviewer ran 103 tests and checked 22,621 quoting cases
+  against `shlex.quote`. Its one note (files over 60 s) is the tracked slow-file follow-up.
+- During the review Main declined two sensitive-read prompts with Escape (both recorded `denied`): a recursive rg that
+  included agent/, then an rg whose exclusion glob `-g '!*.env*'` alone raised the prompt. Follow-up: the classifier treats
+  an exclusion glob as a read.
+- Checkpoint ce4caf5, `lane close trust-visible TV1`, merged e1e1b4f (code identical to the reviewed tip), lane removed.
+  Not pushed. F4 (index and notifier do not show the trust needs_input) stays a follow-up.

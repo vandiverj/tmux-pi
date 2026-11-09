@@ -697,3 +697,13 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   module: 12/12 OK alone (6 per interpreter); 24/24 OK under 4-way concurrent load (3 rounds x 4 per interpreter). It also did
   not fail in the 3 completed G2-F full-suite runs (4678 tests each, main-based tree). The G1 full suite on main is the final check.
   Baseline 2 -> 1 (the retry_packet digest line goes with G2-F).
+- G2-F (g2/g2f-retry-packet-digest.md, lane g2-retry-digest, coder-3e7e4cb2b7). Main's runs: repeats 40/40 on py3.9 and 40/40 on
+  py3.14. Full suite on the lane tree, 4678 tests x 4: three OK; py39-out had 1 failure, the gate-record timestamp bug, which
+  became F-GATE-TS and is merged (4713181). RepeatedFamilyGateTests passed in all 4. Review review-coder-3e7e4cb2b7-011254:
+  APPROVED_WITH_NOTES. F1 (owed: sweep rows left out, work_find/trial_shadow_case/state_symlinks/tp_window/lane_writer
+  snapshots) was answered in Main's evidence: all are sorted unique paths, no tie. Committed 0b75268, closed G2F, merged
+  8748ee2, lane removed. Clean worktree at 8748ee2: test_retry_packet (both modes) and test_agent_tools OK on 3.9 and 3.14.
+  In the main checkout, test_retry_packet fails 54 subtests only because of Main's uncommitted openai-codex/ config diff (the
+  fixtures dispatch openai/gpt-6.1-sol). It is not a code regression, and the end-of-session config revert clears it.
+- Baseline 1 -> 0: baseline-failing.txt is now empty. The G1 full suite on main is the check that nothing outside it fails.
+- Follow-ups: bin/tp-agent:287 index tie-break; test_retry_packet ~65 s per file (over the 60 s budget, pre-existing).

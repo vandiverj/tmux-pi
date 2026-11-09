@@ -1,6 +1,7 @@
 """The summarize_files qualification kit: tests/calibration/summarize/ (chores, answers, fixtures), tools/qual/summarize_check.py
 (the scorer) and tools/qual/summarize_run.py (the runner). No model is run: the worker is a stub script."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import itertools
 import json
 import os
 import re
@@ -84,6 +85,149 @@ def rules(result):
 
 def answer_of(chore_id):
     return next(a for a in jsonl("answers.jsonl") if a["id"] == chore_id)
+
+
+# ---- the generated attack (round 7): every mutation of the reference reply of a chore, built from the reference, not listed by hand ----
+MISSING, UNCITED, NOT_FACT = (4, "missing"), (2, "uncited"), (2, "not_a_fact_line")
+SUBJECT_RULES = {(6, "wrong_subject"), (6, "no_subject")}
+IDENT = re.compile(r"[A-Za-z_]\w*")
+# round 8, written here and not read from the checker: what may precede a list marker, and every bullet rule 11 names
+PREFIXES = ["\u00a0", "\u2003", "\u3000", "\u2009", ">", "> ", ">>"]
+BULLET_CHARS = ["-", "*", "+", "\u2022", "\u2023", "\u25e6", "\u2043", "\u2013", "\u2014", "\u00b7"]
+NUMBERED = ["1.", "2)", "10."]
+STRAY, REPEATED, ORDER = (2, "stray_citation"), (7, "repeated_step"), (None, "order")
+
+
+def split_line(text):
+    """(claim, citation list) of a reference fact line."""
+    m = CITE.search(text)
+    return text[2:m.start()].rstrip(), m.group(1)
+
+
+def subjects(answer):
+    return {int(k): Path(v["name"]).name for k, v in answer.get("behaviour", {}).items()}
+
+
+def behaviour_words(answer, k, claim):
+    """(start, end) of each word of the claim that the regexes of behaviour fact k match, with the chore's names masked first."""
+    names = summarize_check.names_in_code(FIXTURES, answer["cite_files"])
+    masked = IDENT.sub(lambda m: " " * len(m.group(0)) if m.group(0) in names else m.group(0), claim)
+    spans = set()
+    for alternative in answer["required"][k]:
+        for m in re.finditer(alternative, masked, re.I):
+            for word in IDENT.finditer(masked):
+                if word.start() < m.end() and m.start() < word.end() and m.end() > m.start():
+                    spans.add(word.span())
+    return sorted(spans)
+
+
+def wrap_words(claim, spans, before, after):
+    for start, end in reversed(spans):
+        claim = claim[:start] + before + claim[start:end] + after + claim[end:]
+    return claim
+
+
+def mutations(answer):
+    """Every mutation of the reference reply of a chore: (kind, reply, any_of, expect_pass). A mutated reply must fail and the failures
+    must include one of any_of ((rule, kind) pairs); expect_pass is True for the few that change nothing the rules look at."""
+    ref = answer["reference"]
+    texts = [s["text"] for s in ref]
+    parts = [split_line(t) for t in texts]
+    support = [summarize_check.support_sets(entry) for entry in answer["support_lines"]]
+    subject = subjects(answer)
+    size = {name: len(fixture_lines(name)) for name in answer["cite_files"]}
+    outside = next(f for f in ("src/jobq.py", "docs/limits.md", "src/utils.py") if f not in answer["cite_files"])
+
+    def reply(changes=None, extra=(), first=()):
+        return "\n".join(list(first) + [(changes or {}).get(i, t) for i, t in enumerate(texts) if (changes or {}).get(i, t) is not None] + list(extra))
+
+    def lines_of(k):
+        return [i for i, s in enumerate(ref) if k in s["facts"]]
+
+    def cite_text(name, a, b=None):
+        return "{}:{}".format(name, a) if b is None or b == a else "{}:{}-{}".format(name, a, b)
+
+    def each(f):  # f(claim, cite) -> the mutated line, for every line at once
+        return {i: f(claim, cite) for i, (claim, cite) in enumerate(parts)}
+
+    def line(claim, cite):
+        return "- {} [{}]".format(claim, cite)
+
+    # a. subject swap: the subject tokens of the lines of two behaviour facts with different subjects trade places
+    for k1, k2 in itertools.combinations(sorted(subject), 2):
+        i, j = lines_of(k1)[0], lines_of(k2)[0]
+        if subject[k1] != subject[k2] and i != j:
+            (c1, q1), (c2, q2) = parts[i], parts[j]
+            assert c1.startswith(subject[k1]) and c2.startswith(subject[k2]), (answer["id"], k1, k2)
+            yield ("a subject swap", reply({i: line(subject[k2] + c1[len(subject[k1]):], q1), j: line(subject[k1] + c2[len(subject[k2]):], q2)}),
+                   SUBJECT_RULES | {(3, "unsupported")}, False)
+    # b. an intro line naming every fact (all claims, all citations) before the rest, in order and reversed, in a chore with an order
+    if answer.get("order"):
+        intro = "- {} [{}]".format("; ".join(c for c, _ in parts), ", ".join(q for _, q in parts))
+        yield "b intro line, rest in order", reply(first=[intro]), {(1, "several_in_one_line")}, False
+        yield "b intro line, rest reversed", "\n".join([intro] + texts[::-1]), {(1, "several_in_one_line")}, False
+    # c. code spans around the behaviour words of a behaviour line
+    for k in sorted(subject):
+        for i in lines_of(k):
+            claim, cite = parts[i]
+            spans = behaviour_words(answer, k, claim)
+            assert spans, (answer["id"], k, claim)
+            for n in (1, 2, 3):
+                tick = "`" * n
+                yield "c code span of %d" % n, reply({i: line(wrap_words(claim, spans, tick, tick), cite)}), {MISSING}, False
+                yield "c code span of %d with spaces" % n, reply({i: line(wrap_words(claim, spans, tick + " ", " " + tick), cite)}), {MISSING}, False
+            yield "c unmatched backtick", reply({i: line("` " + wrap_words(claim, spans, "``", "``"), cite)}), {MISSING}, False
+    # d. list items appended: bare and indented, starred and numbered
+    ok = "[{}]".format(parts[0][1])
+    for item in ("-", "- ", "-\t", "- \t", "  - x " + ok, "* x " + ok, "1. x " + ok):
+        yield "d list item", reply(extra=[item]), {UNCITED, NOT_FACT}, False
+    # e. Main's round-6 kinds
+    for n in (-3, -2, -1, 1, 2, 3):  # every citation moved by n lines
+        moved, fine = {}, True
+        for i, (claim, cite) in enumerate(parts):
+            name, lines = cite.rsplit(":", 1)
+            a, _, b = lines.partition("-")
+            a2, b2 = int(a) + n, int(b or a) + n
+            moved[i] = line(claim, cite_text(name, a2, b2))
+            rng = set(range(a2, b2 + 1))
+            fine = fine and 1 <= a2 and b2 <= size[name] and all(rng & support[k].get(name, set()) for k in ref[i]["facts"])
+        yield "e shift %+d" % n, reply(moved), {(3, "unsupported"), (3, "range")}, fine
+    yield "e citation on the next line", "\n".join(l for t in parts for l in ("- " + t[0], "[" + t[1] + "]")), {UNCITED}, False
+    yield "e heading file", "\n".join(l for claim, cite in parts for l in ("### " + cite.rsplit(":", 1)[0], "- {} (Line {})".format(claim, cite.rsplit(":", 1)[1]))), {UNCITED}, False
+    yield "e basename", reply(each(lambda c, q: line(c, Path(q.rsplit(":", 1)[0]).name + ":" + q.rsplit(":", 1)[1]))), {(3, "unknown_file")}, False
+    yield "e generic claim", reply(each(lambda c, q: line("This part of the code is relevant to the question", q))), {MISSING}, False
+    yield "e one line", "- {} [{}]".format("; ".join(c for c, _ in parts), ", ".join(q for _, q in parts)), {(1, "shared_line"), (1, "several_in_one_line"), MISSING}, False
+    for i in range(len(texts)):
+        yield "e drop a line", reply({i: None}), {MISSING, (3, "unsupported")}, False
+    yield "e wide range", reply(each(lambda c, q: line(c, cite_text(q.rsplit(":", 1)[0], 1, size[q.rsplit(":", 1)[0]])))), {(3, "range_too_wide")}, False
+    yield "e extra non-chore cite", reply(each(lambda c, q: line(c, q + ", " + outside + ":1"))), {(3, "unknown_file")}, False
+    yield "e star bullets", reply({i: "* " + t[2:] for i, t in enumerate(texts)}), {NOT_FACT}, False
+    # f. a prefix in front of "- x [cite]" and "- x" (round 8, rule 11), and in front of every reference line
+    for prefix in PREFIXES:
+        yield "f prefix, with a citation", reply(extra=[prefix + "- x " + ok]), {NOT_FACT}, False
+        yield "f prefix, no citation", reply(extra=[prefix + "- x"]), {NOT_FACT}, False
+        yield "f prefix on every line", reply(each(lambda c, q: prefix + line(c, q))), {NOT_FACT}, False
+    # g. each bullet of rule 11 in place of "- ": appended with a citation, appended bare, and on every reference line
+    for bullet in [b for b in BULLET_CHARS if b != "-"] + NUMBERED:
+        yield "g bullet, with a citation", reply(extra=[bullet + " x " + ok]), {NOT_FACT}, False
+        yield "g bullet, no citation", reply(extra=[bullet + " x"]), {NOT_FACT}, False
+        yield "g bullet, bare", reply(extra=[bullet]), {NOT_FACT}, False
+        yield "g bullet on every line", reply({i: bullet + " " + t[2:] for i, t in enumerate(texts)}), {NOT_FACT}, False
+    # h. a fabricated citation (rule 10) on a prose line, a heading, a quote, inside a code span and inside a code block
+    past = "[{}:{}]".format(parts[0][1].rsplit(":", 1)[0], size[parts[0][1].rsplit(":", 1)[0]] + 50)
+    for fab, kind in (("[src/nonexistent.rs:999]", (3, "unknown_file")), (past, (3, "range"))):
+        for where, wrap in (("prose", "Also see {}"), ("heading", "### {}"), ("quote", "> {}"), ("code span", "`{}`"), ("code block", "```\n{}\n```"),
+                            ("sentence", "Note: " + parts[0][0] + " {}")):
+            yield "h fabricated citation, " + where, reply(extra=[wrap.format(fab)]), {kind}, False
+    # i. in a chore with an order: every line that meets an ordered fact counts, in reply order (rule 12)
+    if answer.get("order"):
+        yield "i reference + reversed", "\n".join(texts + texts[::-1]), {REPEATED}, False
+        yield "i reversed + reference", "\n".join(texts[::-1] + texts), {REPEATED}, False
+        yield "i reference + reference", "\n".join(texts + texts), {REPEATED}, False
+        yield "i reversed", "\n".join(texts[::-1]), {ORDER}, False
+        for i in range(len(texts)):
+            yield "i one step repeated", reply(extra=[texts[i]]), {REPEATED}, False
+            yield "i one step repeated in place", "\n".join(texts[:i + 1] + texts[i:]), {REPEATED}, False
 
 
 class DataTests(unittest.TestCase):
@@ -284,7 +428,8 @@ class DataTests(unittest.TestCase):
             self.assertEqual(rules(result), {(3, "unsupported")}, moved)
         # the reversed one-liner: no fact line of its own for any fact but one -- rule 1 (and not a fact line without its "- ")
         one = "dead, retrying, succeeded, running, pending"
-        for text, expected in (("- {} [docs/lifecycle.md:5-9]".format(one), (1, "shared_line")), ("{} (docs/lifecycle.md:5-9).".format(one), (4, "missing"))):
+        for text, expected in (("- {} [docs/lifecycle.md:5-9]".format(one), (1, "several_in_one_line")),
+                               ("{} (docs/lifecycle.md:5-9).".format(one), (4, "missing"))):
             for words in (one, ", ".join(one.split(", ")[::-1])):
                 result = summarize_check.check(text.replace(one, words), states, FIXTURES)
                 self.assertFalse(result["pass"], text)
@@ -385,30 +530,49 @@ class DataTests(unittest.TestCase):
         self.assertGreater(count, 300)
 
     def test_lines_that_are_not_fact_lines_count_for_nothing(self):
-        # Rule 2, for every chore: headings, bold lines, prose, blank lines, indented bullets and numbered or starred items, with
-        # citations and file names in them, are ignored: adding them changes nothing (the reference still passes, nothing is
-        # unchecked, nothing is bad); and a reply made only of them states nothing.
+        # Rule 2, for every chore: headings, bold lines, prose, blank lines and quotes, with citations and file names in them, are
+        # no list items: they are ignored, adding them changes nothing (the reference still passes, nothing is unchecked, nothing
+        # is bad); and a reply made only of them states nothing. A list item that is not a fact line (rule 9) supplies nothing
+        # either, and fails the reply.
         noise = ["# Summary", "", "### src/cache.py", "**src/jobq.py**", "Line 6 -- this is not a fact line (src/cache.py:6).",
-                 "  - indented bullet [src/cache.py:6]", "* starred bullet [src/cache.py:6]", "1. numbered [src/cache.py:6]",
-                 "-no space after the dash [src/cache.py:6]", "> quote [src/cache.py:6]", "The files hold it: src/cache.py:6, Lines 1-99.",
-                 "- Line 6", "### archive.7z", "Not in the files."]
+                 "-no space after the dash (src/cache.py:6)", "> quote (src/cache.py:6)", "The files hold it: src/cache.py:6, Lines 1-99.",
+                 "### archive.7z", "Not in the files.", "---", "*emphasis* (src/cache.py:6)", "1.5 is a number (src/cache.py:6)"]
+        # with the citation in brackets such a line is no longer ignored (rule 10): it holds a citation and is no fact line
+        strays = [line.replace("(src/cache.py:6)", "[src/cache.py:6]") for line in noise if "(src/cache.py:6)" in line and "Line 6" not in line]
+        items = ["  - indented bullet [src/cache.py:6]", "* starred bullet [src/cache.py:6]", "+ plus bullet [src/cache.py:6]",
+                 "1. numbered [src/cache.py:6]", "2) numbered [src/cache.py:6]", "-\ttab bullet [src/cache.py:6]"]
         for chore in self.chores:
             answer = self.answers[chore["id"]]
-            ignorable = [n for n in noise if not n.startswith("- ")]
             lines = [s["text"] for s in answer["reference"]]
             spread = []
             for n, line in enumerate(lines):
-                spread += [ignorable[n % len(ignorable)], line]
-            result = self.check("\n".join(ignorable + spread + ignorable), chore["id"])
+                spread += [noise[n % len(noise)], line]
+            result = self.check("\n".join(noise + spread + noise), chore["id"])
             self.assertTrue(result["pass"], "{}: {}".format(chore["id"], result))
             self.assertEqual((result["unchecked"], result["failures"], result["bad_citations"], result["uncited"]), (0, [], [], []), chore["id"])
-            only = self.check("\n".join(ignorable), chore["id"])
+            only = self.check("\n".join(noise), chore["id"])
             self.assertEqual((only["bad_citations"], only["uncited"], only["unchecked"]), ([], [], 0), chore["id"])
             self.assertEqual(len(only["missing"]), len(answer["required"]), chore["id"])
+            for stray in strays:
+                result = self.check("\n".join(lines + [stray]), chore["id"])
+                self.assertFalse(result["pass"], (chore["id"], stray))
+                self.assertEqual((result["missing"], result["uncited"], rules(result) & {STRAY}), ([], [stray], {STRAY}), (chore["id"], stray))
+            for item in items:  # states nothing, and the reply fails for it
+                result = self.check("\n".join(lines + [item]), chore["id"])
+                self.assertFalse(result["pass"], (chore["id"], item))
+                self.assertEqual((result["missing"], result["uncited"], result["unchecked"], rules(result)),
+                                 ([], [item], 0, {(2, "not_a_fact_line")} | ({(3, "unknown_file")} if "src/cache.py" not in answer["cite_files"] else set())),
+                                 (chore["id"], item))  # a citation of a file the chore does not name is bad wherever it is (rule 10)
             # the reference as a list of anything but "- " lines states nothing
             for mark in ("* ", "1. ", "  - ", "", "-"):
                 other = "\n".join(mark + t[2:] if mark != "-" else "-" + t[2:] for t in lines)
-                self.assertEqual(len(self.check(other, chore["id"])["missing"]), len(answer["required"]), (chore["id"], mark))
+                result = self.check(other, chore["id"])
+                self.assertEqual(len(result["missing"]), len(answer["required"]), (chore["id"], mark))
+                # every such line holds a bracketed citation and is no fact line: a list item of another kind is not_a_fact_line (rules 9, 11),
+                # any other line is a stray_citation (rule 10); a step that starts "1. pending" is a numbered item once the dash is gone
+                self.assertEqual(len(result["uncited"]), len(lines), (chore["id"], mark))
+                self.assertTrue(rules(result) & {NOT_FACT, STRAY}, (chore["id"], mark))
+                self.assertLessEqual({f["kind"] for f in result["failures"] if f["rule"] == 2}, {"not_a_fact_line", "stray_citation"}, (chore["id"], mark))
 
     def test_a_reply_with_only_the_first_required_fact_fails(self):
         # Each item of a list chore (steps, states, exports, usages) is its own fact, so one item cannot satisfy the chore.
@@ -435,6 +599,142 @@ class DataTests(unittest.TestCase):
                 self.assertFalse(result["pass"], where)
                 self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"]), ([], [], []), where)
                 self.assertEqual({r for r, _ in rules(result)}, {None}, where)  # the order is no rule of the fact-line format
+
+    def test_the_references_start_with_their_subject(self):
+        # Rule 6: every reference line of a behaviour fact starts with the name that fact is about (answer["behaviour"][k]["name"]),
+        # and the checker reads that name as the subject. The sig line is where the name is declared.
+        count = 0
+        for chore_id, answer, k in self.facts():
+            behaviour = answer.get("behaviour", {}).get(str(k))
+            if behaviour is None:
+                continue
+            names = summarize_check.names_in_code(FIXTURES, answer["cite_files"])
+            for i in stating(answer, k):
+                claim = summarize_check.parse_fact_line(answer["reference"][i]["text"])[0]
+                self.assertTrue(claim.startswith(behaviour["name"]), "{} fact {}: {}".format(chore_id, k, claim))
+                self.assertEqual(summarize_check.subject_of(claim, names, answer["cite_files"]), Path(behaviour["name"]).name, claim)
+                count += 1
+            sig_file, sig_line = behaviour["sig"].rsplit(":", 1)
+            self.assertIn(sig_file, answer["cite_files"], chore_id)
+            if behaviour["name"].endswith(".py"):
+                self.assertEqual(Path(sig_file).name, behaviour["name"], chore_id)  # a file subject: the sig line is in that file
+            else:
+                self.assertIn(behaviour["name"], fixture_lines(sig_file)[int(sig_line) - 1], "{} fact {}".format(chore_id, k))
+        self.assertGreaterEqual(count, 65)
+
+    def test_review_6_reproducers_fail_for_their_rule(self):
+        # review-coder-d50afe8142-204331 reproduce.py, F1 to F4, as replies with the rule and kind each must fail.
+        worker, states = self.answers["exports-worker"], self.answers["steps-states"]
+        right = reference(worker)
+        echo = worker["reference"][8]["text"]
+        self.assertEqual(echo, "- echo returns its payload unchanged [src/worker.py:22]")
+        # F1: sleep_job's name on echo's claim and line, and echo's on sleep_job's: the subject is not the fact's (rule 6)
+        swapped = right.replace("- echo returns", "- sleep_job returns").replace("- sleep_job sleeps", "- echo sleeps")
+        result = self.check(swapped, "exports-worker")
+        self.assertFalse(result["pass"])
+        self.assertEqual(rules(result), {(4, "missing"), (6, "wrong_subject")})
+        self.assertEqual(result["missing"], [labels_of(worker)[8], labels_of(worker)[9]])
+        # the pairs the reviewer named: Job and JobQueue, parse_duration and chunked, get and put
+        for chore_id, one, other in (("exports-jobq", "- Job holds", "- JobQueue holds"), ("exports-utils", "- parse_duration converts", "- chunked yields"),
+                                     ("exports-cache", "- get returns", "- put stores")):
+            answer = self.answers[chore_id]
+            words = [(s["text"], s["text"].split(" ", 2)) for s in answer["reference"] if s["text"].startswith((one, other))]
+            self.assertEqual(len(words), 2, chore_id)
+            (t1, (_, n1, _)), (t2, (_, n2, _)) = words
+            both = reference(answer).replace(t1, "\0").replace(t2, t1.replace(n1, n2, 1)).replace("\0", t2.replace(n2, n1, 1))
+            result = self.check(both, chore_id)
+            self.assertFalse(result["pass"], chore_id)
+            self.assertTrue(rules(result) & (SUBJECT_RULES | {(3, "unsupported")}), (chore_id, rules(result)))
+            self.assertEqual(len(result["missing"]) + len(result["unsupported"]), 2, chore_id)
+        # F2: a line that names every state before the states in reverse order (and before them in order): rule 1, several_in_one_line
+        lines = [s["text"] for s in states["reference"]]
+        intro = "- The states are dead, retrying, succeeded, running, pending [docs/lifecycle.md:5-9]"
+        for name, tail in (("reversed", lines[::-1]), ("in order", lines)):
+            result = self.check("\n".join([intro] + tail), "steps-states")
+            self.assertFalse(result["pass"], name)
+            self.assertIn((1, "several_in_one_line"), rules(result), name)
+            self.assertEqual(result["uncited"], [intro], name)
+        result = self.check("\n".join(lines[::-1]), "steps-states")  # without the intro line the order is the order of the lines that met the facts
+        self.assertEqual((result["order"], rules(result)), (labels_of(states)[1:], {(None, "order")}))
+        # F3: double backticks hide a behaviour word as single backticks do (rule 8, then rule 5): the fact is missing
+        for ticks in ("`", "``", "```", "````"):
+            result = self.check(right.replace(echo, "- echo {t}returns{t} [src/worker.py:22]".format(t=ticks)), "exports-worker")
+            self.assertFalse(result["pass"], ticks)
+            self.assertIn(MISSING, rules(result), ticks)
+            self.assertEqual(result["missing"], [labels_of(worker)[8]], ticks)
+        # F4: a bare bullet, "- " and "- <tab>" are list items that are no fact line: rule 2, and the reply fails
+        for bare in ("-", "- ", "-\t", "- \t", "- \t "):
+            result = self.check(right + "\n" + bare, "exports-worker")
+            self.assertFalse(result["pass"], repr(bare))
+            self.assertEqual(result["uncited"], [bare], repr(bare))
+            self.assertTrue(rules(result) <= {UNCITED, NOT_FACT} and rules(result), repr(bare))
+            self.assertEqual(result["missing"], [], repr(bare))
+
+    def test_review_7_and_mains_round_8_reproducers_fail_for_their_rule(self):
+        # review-coder-07bbf506d8-210919 F1 and the lines Main appended to a passing reference (use-jobqueue): each fails for its rule and
+        # kind, and a fabricated citation on any of them is counted in bad_citations
+        right = reference(self.answers["use-jobqueue"])
+        self.assertTrue(self.check(right, "use-jobqueue")["pass"])
+        fake = "[src/nonexistent.rs:999]"
+        bad = ["src/nonexistent.rs:999 (unknown_file)"]
+        cases = [("review F1: em space, no citation", "\u2003- no citation", NOT_FACT, []),
+                 ("review F1: nbsp, fabricated", "\u00a0- fabricated " + fake, NOT_FACT, bad),
+                 ("Main: also see", "Also see " + fake, STRAY, bad),
+                 ("Main: note", "Note: cli.py creates a JobQueue " + fake, STRAY, bad),
+                 ("Main: bullet dot", "\u2022 x " + fake, NOT_FACT, bad), ("Main: en dash", "\u2013 x " + fake, NOT_FACT, bad),
+                 ("Main: quote bullet", "> - x " + fake, NOT_FACT, bad), ("Main: ideographic space", "\u3000- x", NOT_FACT, []),
+                 ("Main: one space, no citation", " - no citation", NOT_FACT, []), ("Main: one space, fabricated", " - fabricated " + fake, NOT_FACT, bad)]
+        for name, extra, expected, bad_citations in cases:
+            result = self.check(right + "\n" + extra, "use-jobqueue")
+            self.assertFalse(result["pass"], name)
+            self.assertIn(expected, rules(result), name)
+            self.assertEqual(result["bad_citations"], bad_citations, name)
+            self.assertEqual(result["uncited"], [extra], name)
+            self.assertEqual((result["missing"], result["unsupported"], result["order"]), ([], [], []), name)
+
+    def test_generated_attack_every_mutation_of_every_reference_fails(self):
+        # Not a list of examples: for each of the 24 chores every mutation of its reference reply is built (mutations(), above) and
+        # must fail with a failure naming one of the rules it is for. A mutation that changes nothing the rules look at (a citation
+        # shifted onto another line of the same evidence) must pass: the oracle and the checker agree. Counts per kind are printed
+        # when QUAL_ATTACK_COUNTS is set.
+        counts = {}
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            self.assertTrue(self.check(reference(answer), chore["id"])["pass"], chore["id"])
+            for kind, reply, any_of, expect_pass in mutations(answer):
+                result = self.check(reply, chore["id"])
+                count = counts.setdefault(kind, {"mutations": 0, "failed": 0, "passed": 0, "rule_6": 0})
+                count["mutations"] += 1
+                where = "{} / {}: {!r}".format(chore["id"], kind, reply)
+                if expect_pass:
+                    self.assertTrue(result["pass"], where + " " + str(result["failures"]))
+                    count["passed"] += 1
+                    continue
+                self.assertFalse(result["pass"], where)
+                self.assertTrue(any_of & rules(result), "{} -> {}".format(where, sorted(rules(result), key=str)))
+                if kind.startswith("h "):
+                    self.assertTrue(result["bad_citations"], where)  # rule 10: counted in bad_citations, so in the run's fabricated count
+                count["failed"] += 1
+                count["rule_6"] += bool(SUBJECT_RULES & rules(result))
+        if os.environ.get("QUAL_ATTACK_COUNTS"):
+            for kind in sorted(counts):
+                print("attack {:<28} {}".format(kind, counts[kind]), file=sys.stderr)
+        self.assertEqual(sum(c["passed"] for c in counts.values()), sum(c["passed"] for k, c in counts.items() if k.startswith("e shift")))
+        floors = {"a subject swap": 95, "b intro line, rest in order": 2, "b intro line, rest reversed": 2, "c code span of 1": 65, "c code span of 2": 65,
+                  "c code span of 3": 65, "c code span of 1 with spaces": 65, "c code span of 2 with spaces": 65, "c code span of 3 with spaces": 65,
+                  "c unmatched backtick": 65, "d list item": 24 * 7, "e shift -3": 24, "e shift +3": 24, "e citation on the next line": 24,
+                  "e heading file": 24, "e basename": 24, "e generic claim": 24, "e one line": 24, "e drop a line": 100, "e wide range": 24,
+                  "e extra non-chore cite": 24, "e star bullets": 24,
+                  "f prefix, with a citation": 24 * 7, "f prefix, no citation": 24 * 7, "f prefix on every line": 24 * 7,
+                  "g bullet, with a citation": 24 * 12, "g bullet, no citation": 24 * 12, "g bullet, bare": 24 * 12, "g bullet on every line": 24 * 12,
+                  "h fabricated citation, prose": 48, "h fabricated citation, heading": 48, "h fabricated citation, quote": 48,
+                  "h fabricated citation, code span": 48, "h fabricated citation, code block": 48, "h fabricated citation, sentence": 48,
+                  "i reference + reversed": 2, "i reversed + reference": 2, "i reference + reference": 2, "i reversed": 2, "i one step repeated": 11,
+                  "i one step repeated in place": 11}
+        for kind, floor in floors.items():
+            self.assertGreaterEqual(counts[kind]["mutations"], floor, kind)
+        self.assertGreater(counts["a subject swap"]["rule_6"], 0)
+        self.assertEqual({k for k in counts if k.startswith("e shift")}, {"e shift %+d" % n for n in (-3, -2, -1, 1, 2, 3)})
 
     def test_the_audit_table_covers_every_chore_and_fact(self):
         # tests/calibration/experiments.md: one row per chore, naming each of its required facts as F1..Fn and its support lines.
@@ -558,22 +858,33 @@ class CheckerTests(unittest.TestCase):
 
     def test_rule_2_other_lines_are_ignored_and_an_uncited_bullet_fails(self):
         c = self.C
-        ignored = [("a sentence", "alpha and beta {}".format(c)), ("a heading", "### alpha beta {}".format(c)),
-                   ("a bold line", "**alpha beta** {}".format(c)), ("a starred bullet", "* alpha beta {}".format(c)),
-                   ("a numbered item", "1. alpha beta {}".format(c)), ("an indented bullet", "  - alpha beta {}".format(c)),
-                   ("no space", "-alpha beta {}".format(c)), ("a tab", "-\talpha beta {}".format(c)),
-                   ("a quote", "> alpha beta {}".format(c))]
+        ignored = [("a sentence", "alpha and beta (src/cache.py:6)"), ("a heading", "### alpha beta (src/cache.py:6)"),
+                   ("a bold line", "**alpha beta** (src/cache.py:6)"), ("no space", "-alpha beta (src/cache.py:6)"),
+                   ("a quote", "> alpha beta (src/cache.py:6)")]
         for name, reply in ignored:
             result = self.check(reply)
             self.assertEqual((result["pass"], result["missing"], result["uncited"], result["bad_citations"]),
                              (False, ["alpha", "beta"], [], []), name)
             self.assertEqual((rules(result), result["unchecked"]), ({(4, "missing")}, 0), name)  # no claim, no citation, nothing to check
+            # the same line with a citation in brackets is not ignored (rule 10): it holds a citation and is no fact line
+            result = self.check(reply.replace("(src/cache.py:6)", c))
+            self.assertEqual((result["pass"], result["missing"], result["uncited"], result["bad_citations"], result["unchecked"]),
+                             (False, ["alpha", "beta"], [reply.replace("(src/cache.py:6)", c)], [], 0), name)
+            self.assertEqual(rules(result), {(2, "stray_citation"), (4, "missing")}, name)
+        # a list item that is no fact line (rule 9) states nothing and fails the reply
+        for name, reply in [("a starred bullet", "* alpha beta {}".format(c)), ("a numbered item", "1. alpha beta {}".format(c)),
+                            ("an indented bullet", "  - alpha beta {}".format(c)), ("a tab", "-\talpha beta {}".format(c)),
+                            ("a plus bullet", "+ alpha beta {}".format(c)), ("a numbered item with a bracket", "2) alpha beta {}".format(c))]:
+            result = self.check(reply)
+            self.assertEqual((result["pass"], result["missing"], result["uncited"], result["bad_citations"]),
+                             (False, ["alpha", "beta"], [reply], []), name)
+            self.assertEqual((rules(result), result["unchecked"]), ({(2, "not_a_fact_line"), (4, "missing")}, 0), name)
         # the neighbours supply nothing, in either direction
         cases = [("heading above", "### src/cache.py\n- alpha beta", ["- alpha beta"]),
                  ("the line above", "- alpha {}\n- beta".format(c), ["- beta"]),
                  ("the line below", "- alpha\n- beta {}".format(c), ["- alpha"]),
-                 ("a wrapped bullet", "- alpha\n  beta {}".format(c), ["- alpha"]),
-                 ("a lazy continuation", "- alpha\nbeta {}".format(c), ["- alpha"]),
+                 ("a wrapped bullet", "- alpha\n  beta {}".format(c), ["- alpha", "  beta " + c]),  # the second line holds a citation (rule 10)
+                 ("a lazy continuation", "- alpha\nbeta {}".format(c), ["- alpha", "beta " + c]),
                  ("a citation in running text", "- alpha beta\nsee src/cache.py:6", ["- alpha beta"]),
                  ("a path with no line", "- alpha beta [src/cache.py]", ["- alpha beta [src/cache.py]"]),
                  ("a Line N", "- alpha beta (Line 6)", ["- alpha beta (Line 6)"]),
@@ -625,6 +936,217 @@ class CheckerTests(unittest.TestCase):
                 self.check("- alpha {}".format(self.C), dict(answer, support_lines=[{"src/cache.py": [spec]}, {"src/cache.py": ["6"]}]))
         self.assertEqual(summarize_check.support_sets({"src/cache.py": ["6", "20-22", "21"], "a": []}),
                          {"src/cache.py": {6, 20, 21, 22}, "a": set()})
+
+    def test_rule_6_a_behaviour_fact_is_met_only_by_a_line_about_its_subject(self):
+        put = self.line("def put(self, key, value):")
+        answer = dict(self.ANSWER, required=[[r"\bholds?\b"], [r"\bstores?\b"]], support_lines=[{"src/cache.py": ["6"]}, {"src/cache.py": [str(put)]}],
+                      behaviour={"0": {"name": "LRUCache", "sig": "src/cache.py:6"}, "1": {"name": "put", "sig": "src/cache.py:{}".format(put)}})
+        tail = "\n- put stores a value [src/cache.py:{}]".format(put)
+        cases = [  # (name, the line for fact 0, passes, kind of the line's failure)
+            ("the subject first", "- LRUCache holds items [src/cache.py:6]", True, None),
+            ("the subject in backticks", "- `LRUCache` holds items [src/cache.py:6]", True, None),
+            ("a subject in double backticks", "- ``LRUCache`` holds items [src/cache.py:6]", True, None),
+            ("a word before it that is no name", "- Here LRUCache holds items [src/cache.py:6]", True, None),
+            ("the file's name is not the class", "- cache.py holds items [src/cache.py:6]", False, "wrong_subject"),
+            ("another name first", "- put holds items [src/cache.py:6]", False, "wrong_subject"),
+            ("a name of the code first, as a plain word", "- The key LRUCache holds items [src/cache.py:6]", False, "wrong_subject"),
+            ("no name at all", "- It holds items [src/cache.py:6]", False, "no_subject"),
+            ("a name that is not in the code", "- Cache holds items [src/cache.py:6]", False, "no_subject"),
+            ("the dotted form takes its first part", "- LRUCache.put holds items [src/cache.py:6]", True, None),
+            ("a longer name that starts the same", "- LRUCacheX holds items [src/cache.py:6]", False, "no_subject"),
+        ]
+        for name, fact_line, ok, kind in cases:
+            result = self.check(fact_line + tail, answer)
+            self.assertEqual(result["pass"], ok, "{}: {}".format(name, result))
+            self.assertEqual(rules(result), set() if ok else {(4, "missing"), (6, kind)}, "{}: {}".format(name, result))
+            self.assertEqual(result["missing"], [] if ok else [r"\bholds?\b"], name)
+        # a line about the wrong subject is not wrong when it meets another fact: only a line that meets none is named
+        both = self.check("- LRUCache holds items [src/cache.py:6]\n- LRUCache stores a value [src/cache.py:{}]".format(put), answer)
+        self.assertEqual((both["pass"], both["missing"], rules(both)), (False, [r"\bstores?\b"], {(4, "missing"), (6, "wrong_subject")}))
+        # a file's name is a subject, in full or bare, as the chore names it; another file's name is not
+        by_file = dict(answer, behaviour={"0": {"name": "cache.py", "sig": "src/cache.py:6"}, "1": {"name": "put", "sig": "src/cache.py:1"}})
+        for text, ok in (("- cache.py holds items", True), ("- src/cache.py holds items", True), ("- In cache.py, it holds items", True),
+                         ("- jobq.py holds items", False), ("- src/cache.py.bak holds items", False)):
+            self.assertEqual(self.check(text + " [src/cache.py:6]" + tail, by_file)["pass"], ok, text)
+        names, files = summarize_check.names_in_code(FIXTURES, ["src/cache.py"]), ["src/cache.py"]
+        for claim, subject in (("put stores", "put"), ("`put` stores", "put"), ("the put and the get", "put"), ("src/cache.py has put", "cache.py"),
+                               ("see cache.py:6", "cache.py"), ("nothing here", None), ("", None), ("a b c", None)):
+            self.assertEqual(summarize_check.subject_of(claim, names, files), subject, claim)
+
+    def test_rule_7_order_is_read_on_the_lines_that_met_the_facts(self):
+        c = self.C
+        ordered = dict(self.ANSWER, order=[0, 1])
+        self.assertTrue(self.check("- alpha {c}\n- beta {c}".format(c=c), ordered)["pass"])
+        late = self.check("- beta {c}\n- alpha {c}".format(c=c), ordered)
+        self.assertEqual((late["pass"], late["order"], rules(late)), (False, ["beta"], {(None, "order")}))
+        # a line that states both ordered facts is no line of either (rule 1), whatever follows it
+        for reply in ("- alpha and beta {c}\n- beta {c}\n- alpha {c}", "- alpha and beta {c}\n- alpha {c}\n- beta {c}", "- alpha {c}\n- beta {c}\n- alpha and beta {c}"):
+            result = self.check(reply.format(c=c), ordered)
+            self.assertFalse(result["pass"], reply)
+            self.assertIn((1, "several_in_one_line"), rules(result), reply)
+            self.assertEqual(result["uncited"], [next(l for l in reply.format(c=c).split("\n") if "and" in l)], reply)
+        # where the chore asks for no order such a line is only an extra line, as before
+        self.assertTrue(self.check("- alpha and beta {c}\n- beta {c}\n- alpha {c}".format(c=c))["pass"])
+        # one of the two ordered facts in a line with an unordered one is fine
+        three = dict(ordered, forbidden=[], required=ordered["required"] + [["gamma"]], support_lines=ordered["support_lines"] + [{"src/cache.py": ["1-36"]}])
+        self.assertTrue(self.check("- alpha and gamma {c}\n- beta {c}\n- gamma {c}".format(c=c), three)["pass"])
+
+    def test_rule_8_every_code_span_is_removed_as_commonmark_reads_it(self):
+        cases = [("a `b` c", "a   c"), ("a ``b`` c", "a   c"), ("a ```b``` c", "a   c"), ("a ` b ` c", "a   c"), ("a `` b ` c `` d", "a   d"),
+                 ("a `b c", "a  b c"), ("a ``b` c", "a  b c"), ("a `b`` c", "a  b`` c".replace("``", " ")), ("` ``b`` c", "  c"),
+                 ("`a` `b`", "  "), ("```a`b``c```", " "), ("a ```b`` c ```d`` e", "a d e"), ("a ``b ``` c ``` d ``", "a  "),
+                 ("no ticks", "no ticks"), ("`", " "), ("``", " "), ("a`b`c", "a c")]
+        for text, expected in cases:
+            self.assertEqual(" ".join(summarize_check.without_code_spans(text).split()), " ".join(expected.split()), text)
+        answer = dict(self.ANSWER, required=[[r"\bholds?\b"], [r"\bbeta\b"]], behaviour={"0": {"name": "LRUCache", "sig": "src/cache.py:6"}})
+        tail = "\n- beta {}".format(self.C)
+        for ticks in ("`", "``", "```", "````"):  # the word between a run and the next run of the same length is code: it supplies nothing
+            for pad in ("", " "):
+                result = self.check("- LRUCache {t}{p}holds{p}{t} items [src/cache.py:6]{tail}".format(t=ticks, p=pad, tail=tail), answer)
+                self.assertFalse(result["pass"], ticks + pad)
+                self.assertIn((4, "missing"), rules(result), ticks + pad)
+        for text in ("- LRUCache `holds items [src/cache.py:6]", "- LRUCache ``holds` items [src/cache.py:6]", "- LRUCache holds` items [src/cache.py:6]",
+                     "- LRUCache holds ``` items [src/cache.py:6]"):  # no closing run of the same length: the backtick is a character and the words stay
+            self.assertTrue(self.check(text + tail, answer)["pass"], text)
+        # a stray run does not stop a later span from being removed
+        self.assertFalse(self.check("- LRUCache ` ``holds`` items [src/cache.py:6]" + tail, answer)["pass"])
+        self.assertFalse(self.check("- LRUCache ``` ``holds`` items [src/cache.py:6]" + tail, answer)["pass"])  # runs of 3, 2 and 2: the 3 is literal
+        self.assertTrue(self.check("- LRUCache ```x`` ``holds`` items [src/cache.py:6]" + tail, answer)["pass"])  # the 2 and 2 around x close on each other
+
+    def test_rule_9_every_list_item_is_graded_as_it_is_written(self):
+        c = self.C
+        base = "- alpha {c}\n- beta {c}".format(c=c)
+        self.assertTrue(self.check(base)["pass"])
+        cases = [("bare dash", "-", NOT_FACT), ("dash space", "- ", UNCITED), ("dash tab", "-\t", NOT_FACT), ("dash space tab", "- \t", UNCITED),
+                 ("dash two spaces", "-  ", UNCITED), ("dash nbsp", "-\u00a0", NOT_FACT), ("dash crlf", "-\r", NOT_FACT), ("indented bare", "  -", NOT_FACT),
+                 ("indented", "  - x " + c, NOT_FACT), ("tab indented", "\t- x " + c, NOT_FACT), ("star", "* x " + c, NOT_FACT),
+                 ("bare star", "*", NOT_FACT), ("plus", "+ x " + c, NOT_FACT), ("number", "1. x " + c, NOT_FACT), ("number paren", "12) x " + c, NOT_FACT),
+                 ("bare number", "3.", NOT_FACT), ("dash with no citation", "- x", UNCITED), ("dash with a Line N", "- x (Line 6)", UNCITED),
+                 ("dash with a bad list", "- x [src/cache.py:six]", UNCITED), ("dash tab claim", "-\tx " + c, NOT_FACT)]
+        for name, item, expected in cases:
+            for where, reply in (("last", base + "\n" + item), ("first", item + "\n" + base), ("between", "- alpha {c}\n{i}\n- beta {c}".format(c=c, i=item))):
+                result = self.check(reply)
+                self.assertFalse(result["pass"], "{} {}: {!r}".format(name, where, reply))
+                self.assertEqual((result["missing"], rules(result)), ([], {expected}), "{} {}".format(name, where))
+                self.assertEqual(result["uncited"], [item.rstrip("\r")], "{} {}".format(name, where))
+        for name, item in (("a dash with no space", "-x"), ("a rule", "---"), ("bold", "**x**"), ("emphasis", "*x*"), ("a decimal", "1.5 x"),
+                           ("a quote", "> x"), ("a heading", "# - x"), ("a year", "2026-11-08"), ("a dash in the text", "see - x"), ("a blank", ""),
+                           ("blank spaces", "   "), ("a bullet glued to its text", "\u2022x"), ("a dash glued to a word", "\u2013x"),
+                           ("a path with a line, no bracket", "see src/cache.py:6")):
+            self.assertTrue(self.check(base + "\n" + item)["pass"], name)  # not list items, no citation in brackets: ignored
+        # the failure says the line number and the line
+        result = self.check(base + "\n- \t")
+        self.assertEqual(result["failures"], [{"rule": 2, "kind": "uncited", "line": 3, "text": "- \t"}])
+
+    def test_rule_10_every_citation_is_checked_wherever_it_is(self):
+        c, base = self.C, "- alpha {c}\n- beta {c}".format(c=self.C)
+        self.assertTrue(self.check(base)["pass"])
+        fake = "[src/nonexistent.rs:999]"
+        # (name, the line added to a passing reply, the failure kind of the line itself)
+        cases = [("prose", "Also see " + fake, STRAY), ("a sentence", "Note: cli.py creates a JobQueue " + fake, STRAY),
+                 ("a heading", "### " + fake, STRAY), ("a quote", "> " + fake, STRAY), ("a quote bullet", "> - x " + fake, NOT_FACT),
+                 ("a code span", "see `" + fake + "`", STRAY), ("a code block", "```\n" + fake + "\n```", STRAY),
+                 ("a bullet dot", "\u2022 x " + fake, NOT_FACT), ("an en dash bullet", "\u2013 x " + fake, NOT_FACT),
+                 ("an ideographic space", "\u3000- x " + fake, NOT_FACT), ("an indented bullet", " - fabricated " + fake, NOT_FACT),
+                 ("an em space", "\u2003- fabricated " + fake, NOT_FACT), ("a star", "* x " + fake, NOT_FACT),
+                 ("a bold line", "**x** " + fake, STRAY), ("no space after the dash", "-x " + fake, STRAY),
+                 ("a mixed list", "see [src/nonexistent.rs:999, foo]", STRAY), ("a second list", "see [foo] and " + fake, STRAY),
+                 ("a range past the end", "see [src/cache.py:6-9999]", STRAY), ("an absolute path", "see [/tmp/x.py:3]", STRAY),
+                 ("fullwidth digits", "see [src/nonexistent.rs:\uff19\uff19\uff19]", STRAY),
+                 ("a huge number", "see [src/cache.py:" + "9" * 5000 + "]", STRAY)]
+        for name, extra, (rule, kind) in cases:
+            result = self.check(base + "\n" + extra)
+            self.assertFalse(result["pass"], name)
+            self.assertEqual(len(result["bad_citations"]), 1, "{}: {}".format(name, result))  # counted: the run's fabricated count reads this
+            self.assertEqual((result["missing"], result["unchecked"]), ([], 0), name)
+            line = extra.split("\n")[1] if extra.startswith("```") else extra
+            self.assertIn({"rule": rule, "kind": kind, "line": 3 + (extra.startswith("```")), "text": line}, result["failures"], name)
+            self.assertTrue({(3, "unknown_file"), (3, "range")} & rules(result), name)
+            self.assertEqual(result["uncited"], [line], name)
+        # the exact counts for the two lines of Main's check: one bad citation each, in bad_citations
+        for extra, bad in (("Also see " + fake, "src/nonexistent.rs:999 (unknown_file)"), ("see [src/cache.py:6-9999]", "src/cache.py:6-9999 (range)")):
+            self.assertEqual(self.check(base + "\n" + extra)["bad_citations"], [bad])
+        # a good citation that is not on a fact line is no fact line's: it still fails the reply, and is bad_citations-free
+        for extra in ("see " + c, "> " + c, "# " + c, "see `" + c + "`", "1.5 is a number " + c):
+            result = self.check(base + "\n" + extra)
+            self.assertEqual((result["pass"], result["bad_citations"], result["uncited"], rules(result)), (False, [], [extra], {STRAY}), extra)
+        # a fabricated citation is counted once per distinct citation however often it is written
+        twice = self.check(base + "\nsee {f}\nsee {f}".format(f=fake))
+        self.assertEqual(twice["bad_citations"], ["src/nonexistent.rs:999 (unknown_file)"])
+        # on a fact line the citation is the line's own: the claim holds no other citation list, a mixed one included
+        for extra in ("- gamma {f} {c}".format(f=fake, c=c), "- gamma [src/nonexistent.rs:999, foo] " + c, "- gamma {c} {c}".format(c=c)):
+            result = self.check("- alpha {c}\n- beta {c}\n{e}".format(c=c, e=extra))
+            self.assertEqual((result["pass"], result["uncited"], (1, "two_citation_lists") in rules(result)), (False, [extra], True), extra)
+        self.assertEqual(self.check("- alpha {c}\n- beta {c}\n- gamma {f} {c}".format(c=c, f=fake))["bad_citations"], ["src/nonexistent.rs:999 (unknown_file)"])
+        # a bracket that holds no citation-shaped item is not a citation: ignored on a line that is no list item
+        for extra in ("see [note] and [1] and [a b: c]", "[x:y]", "dict[str, int]"):
+            self.assertTrue(self.check(base + "\n" + extra)["pass"], extra)
+
+    def test_rule_11_list_items_by_any_whitespace_and_any_bullet(self):
+        c = self.C
+        base = "- alpha {c}\n- beta {c}".format(c=c)
+        self.assertTrue(self.check(base)["pass"])
+        prefixes = ["", " ", "  ", "\t", "\u00a0", "\u2003", "\u3000", "\u2009", "\u200b", "\ufeff", "\u202a", "\x00", "\x1b", "\x0b", ">", "> ", ">>", "> >", ">\u00a0", " > ", "\u3000>\u2003"]
+        for prefix in prefixes:
+            for bullet in BULLET_CHARS + NUMBERED:
+                for tail in (" x " + c, " x", "", "\u2003x", "\tx"):
+                    item = prefix + bullet + tail
+                    if item.startswith("- ") and tail.startswith(" x"):
+                        continue  # "- x [cite]" is a fact line; "- x" is rule 9's (uncited)
+                    result = self.check(base + "\n" + item)
+                    where = repr(item)
+                    self.assertFalse(result["pass"], where)
+                    self.assertEqual((result["uncited"], result["missing"], result["bad_citations"]), ([item], [], []), where)
+                    self.assertEqual(rules(result), {NOT_FACT}, where)
+        # "- x" at column 0 is an uncited fact line, not a not_a_fact_line; "- " + a bullet is a fact line whose claim is the rest
+        self.assertEqual(rules(self.check(base + "\n- x")), {UNCITED})
+        # only "- " + claim + citation list at column 0 is a fact line: a prefix or another bullet in front of the reference never is
+        for prefix in ("\u00a0", "\u2003", "\u3000", "\u2009", ">", "> ", ">>", " "):
+            result = self.check("\n".join(prefix + t for t in base.split("\n")))
+            self.assertEqual((result["pass"], result["missing"], rules(result)), (False, ["alpha", "beta"], {NOT_FACT, (4, "missing")}), repr(prefix))
+        for bullet in BULLET_CHARS[1:] + NUMBERED:
+            result = self.check("\n".join(bullet + " " + t[2:] for t in base.split("\n")))
+            self.assertEqual((result["pass"], result["missing"], rules(result)), (False, ["alpha", "beta"], {NOT_FACT, (4, "missing")}), bullet)
+        # not list items (a bullet glued to its text, no marker), so ignored when they hold no bracketed citation
+        for item in ("\u2022x", "\u2013x", "\u00b7x", "1.5", "1x", ">x", "> x", "\u200bx", "\u3000x", "a - b", "2026-11-08"):
+            self.assertTrue(self.check(base + "\n" + item)["pass"], repr(item))
+        # unprefixed and is_list_item agree with str.isspace for every Unicode space
+        spaces = [chr(i) for i in range(0x3100) if chr(i).isspace()]  # the last Unicode space is U+3000
+        self.assertGreater(len(spaces), 20)
+        self.assertFalse(summarize_check.is_list_item("-x"))
+        for space in spaces:
+            self.assertTrue(summarize_check.is_list_item(space + "- x"), repr(space))
+            self.assertTrue(summarize_check.is_list_item("-" + space + "x"), repr(space))
+
+    def test_rule_12_every_line_that_states_an_ordered_fact_counts(self):
+        c = self.C
+        ordered = dict(self.ANSWER, order=[0, 1])
+        ab, ba = ["- alpha " + c, "- beta " + c], ["- beta " + c, "- alpha " + c]
+        self.assertTrue(self.check("\n".join(ab), ordered)["pass"])
+        cases = [  # (name, the lines, the failures as (rule, kind))
+            ("reference + reversed copy", ab + ba, {REPEATED}), ("reversed copy + reference", ba + ab, {REPEATED, ORDER}),
+            ("reference + reference", ab + ab, {REPEATED}), ("one step repeated at the end", ab + ab[:1], {REPEATED}),
+            ("one step repeated in place", ab[:1] + ab, {REPEATED}), ("the later step twice", ab + ab[1:], {REPEATED}),
+            ("reversed once", ba, {ORDER}), ("three times", ab + ab + ab, {REPEATED}),
+            ("a restatement with other citations", ab + ["- alpha again [src/cache.py:20]"], {REPEATED}),
+            ("a restatement with no valid citation", ab + ["- alpha again [src/cache.py:9999]"], {REPEATED, (3, "range")}),
+        ]
+        for name, lines, expected in cases:
+            result = self.check("\n".join(lines), ordered)
+            self.assertFalse(result["pass"], name)
+            self.assertEqual(rules(result), expected, "{}: {}".format(name, result["failures"]))
+            self.assertEqual((result["missing"], result["unsupported"]), ([], []), name)
+        # the failure names the repeated line, and "order" lists the fact
+        result = self.check("\n".join(ab + ba), ordered)
+        self.assertEqual(sorted((f for f in result["failures"] if f["kind"] == "repeated_step"), key=lambda f: f["line"]),
+                         [{"rule": 7, "kind": "repeated_step", "line": 3, "text": ba[0]}, {"rule": 7, "kind": "repeated_step", "line": 4, "text": ba[1]}])
+        self.assertEqual(sorted(result["order"]), ["alpha", "beta"])
+        # the other lines of the reply do not count: an unrelated line, and an ordered fact's line next to an unordered fact's
+        three = dict(ordered, forbidden=[], required=ordered["required"] + [["gamma"]], support_lines=ordered["support_lines"] + [{"src/cache.py": ["1-36"]}])
+        self.assertTrue(self.check("- alpha {c}\n- an aside {c}\n- beta {c}\n- gamma {c}\n- gamma again {c}".format(c=c), three)["pass"])
+        # where the chore asks for no order a repeated line is allowed, as in round 7
+        for lines in (ab + ab, ab + ba, ba + ab):
+            self.assertTrue(self.check("\n".join(lines))["pass"], lines)
 
     def test_every_citation_is_checked_and_the_unvouched_are_counted(self):
         # A good citation counts through the support of a fact the line states; one on a line that states no fact, or that matches no
@@ -747,12 +1269,13 @@ class CheckerTests(unittest.TestCase):
         answer = answer_of("use-jobqueue")
         result = summarize_check.check(reply, answer, FIXTURES)
         bullets = [line for line in reply.splitlines() if line.startswith("- ")]
+        nested = [line for line in reply.splitlines() if line.startswith("  - ")]  # list items too (rule 9), but not fact lines
         self.assertFalse(result["pass"])
         self.assertEqual(result["missing"], labels_of(answer))
-        self.assertEqual(result["uncited"], bullets)
-        self.assertEqual(len(bullets), 9)
+        self.assertEqual(sorted(result["uncited"]), sorted(bullets + nested))
+        self.assertEqual((len(bullets), len(nested)), (9, 5))
         self.assertEqual((result["bad_citations"], result["unsupported"], result["missing_citation"], result["unchecked"]), ([], [], [], 0))
-        self.assertEqual(rules(result), {(2, "uncited"), (4, "missing")})
+        self.assertEqual(rules(result), {(2, "uncited"), (2, "not_a_fact_line"), (4, "missing")})
         # the same facts in the format, with the smoke reply's own wrong numbers, are caught by rule 3
         wrong = "\n".join(["- jobq.py defines the JobQueue class [src/jobq.py:19]", "- worker.py pops the next job [src/worker.py:31]",
                            "- cli.py creates a JobQueue [src/cli.py:29]", "- cli.py pushes a job onto the queue [src/cli.py:31]"])
@@ -769,6 +1292,8 @@ class CheckerTests(unittest.TestCase):
         self.assertEqual((kind, len(cites)), (None, 1), example.group(1))
         self.assertIn("- <claim> [path:line]", prompt)
         self.assertIn("at most 5 lines", prompt)
+        self.assertIn("Start each fact line with the name it is about", prompt)  # rule 6: the subject comes first
+        self.assertEqual(summarize_check.subject_of(example.group(1)[2:], {"load_config"}, ["src/config.py"]), "load_config")
         self.assertEqual(summarize_check.MAX_RANGE, 5)
 
 
@@ -861,6 +1386,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((records[0]["pass"], len(records[0]["unsupported"]), records[0]["unchecked"]), (False, 1, 2))  # cache.py:1 and worker.py:30
         self.assertEqual(summary["failure_classes"], {"unsupported": 1})
         self.assertEqual((summary["fabricated_citations"], summary["unchecked_citations"]), (0, 2))
+        # a fabricated citation on a prose line is counted like one on a fact line (rule 10), and the line is a failure of its own
+        self.reply.write_text(self.example() + "\nAlso see [src/nonexistent.rs:999]\n> [src/cache.py:9999]")
+        _, records, summary = self.run_main()
+        self.assertEqual((records[0]["pass"], records[0]["bad_citations"]), (False, ["src/nonexistent.rs:999 (unknown_file)", "src/cache.py:9999 (range)"]))
+        self.assertEqual({(f["rule"], f["kind"]) for f in records[0]["failures"]}, {(3, "unknown_file"), (3, "range"), (2, "stray_citation")})
+        self.assertEqual((summary["passed"], summary["fabricated_citations"]), (0, 2))
+        self.assertEqual(summary["failure_classes"], {"bad_citations": 1, "uncited": 1})
         self.assert_clean()
 
     def test_timeout_kills_the_worker_and_removes_the_temp_dir(self):

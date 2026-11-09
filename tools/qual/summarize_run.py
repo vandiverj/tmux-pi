@@ -10,7 +10,7 @@ the system prompt tp-spawn gives a worker on M (config/router.json "local" "prom
 tp-spawn does; --prompt-file replaces that text; the temp dir holds no .tmux-pi/worker-preamble.md, so no preamble is added),
 score the reply with summarize_check.check, and append one JSON line to FILE. The record keeps the raw reply. The reply is graded
 as a list of fact lines, `- <claim> [<path>:<line>[-<line>]]` (see summarize_check.py): the record's `failures` name, per failed
-line, the rule (1-5) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations, unchecked
+line, the rule (1-12) it broke. The last line is the summary: pass rate, median seconds, fabricated (bad) citations (any bracketed citation of the reply, on a fact line or not: rule 10), unchecked
 citations (good citations no matching fact's support_lines vouch for) and the failure classes (incl. `uncited`, `identifier_only`). The temp dir is always removed.
 
 --route-only runs `tp-route --no-log --local-only` on each chore's task instead; no worker runs. tp-route's output has no shape

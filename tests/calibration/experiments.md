@@ -273,26 +273,50 @@ validation). A reply is a list of FACT LINES and only those count:
 1. One fact per line: it starts with `- `, the claim is words, and it ends with one bracketed citation list. The path is a chore
    file written in full. No heading, bold line, earlier bullet or `Line N` supplies a file, and a line with two bracketed lists
    is not a fact line (it is `two_citation_lists`, rule 1).
-2. Any other line (heading, sentence, blank, an indented `  - ` line) is ignored, for facts and for citations. A `- ` line with no
-   valid trailing citation list is `uncited` and fails the reply: no partial credit, nothing is borrowed from its neighbours.
+2. A line that is not a list item (heading, sentence, blank) states no fact and is ignored, unless it holds a bracketed citation
+   (round 8, rule 10: `stray_citation`). Every LIST ITEM is graded on the raw line (rules 9 and 11): a list item that is not a valid
+   fact line fails the reply: `uncited` for a `- ` line with no valid trailing citation list, `not_a_fact_line` for any other list item
+   (indented, any other bullet, numbered, a bare `-`, `-\t`). Nothing is borrowed from neighbours.
 3. A citation is valid only if its file is a chore file, the range is inside the file and at most 5 lines (`range_too_wide`
    otherwise), and the range covers one of that fact's `support_lines`. Not valid: `unknown_file`, `range`, `range_too_wide`
    (a bad citation); on a line that states the fact but cites other lines: `unsupported`; no good citation at all:
    `missing_citation`.
 4. A required fact is met only by ONE fact line whose claim matches AND whose citations support it (same line). Facts are met by
    different lines (bipartite matching), so a one-line list of everything satisfies one fact (`shared_line`, rule 1).
-5. A behaviour fact is matched against the claim with every backticked span, every `path:line`, and every identifier of the
-   cited files' symbol table removed. The symbol table is computed from the fixture with `ast` (functions, classes, parameters,
-   names, attributes, keyword arguments, imports and aliases, `except` names, identifier-like strings), so it is a superset of
-   "names defined or parameters"; no list is kept by hand. A claim of only names and signature text has nothing left to match
-   and, when no fact needs it, is `identifier_only` (rule 5). Python keywords are stripped for that test only, never for matching.
+5. A behaviour fact is matched against the claim with every code span, every `path:line`, and every identifier of the cited files'
+   symbol table removed. Code spans are removed as CommonMark reads them (round 7, rule 8): a run of N backticks up to the next run of
+   exactly N backticks, so ``` ``returns`` ``` is removed too; a backtick with no closing run is removed as a character. The symbol
+   table is computed from the fixture with `ast` (functions, classes, parameters, names, attributes, keyword arguments, imports and
+   aliases, `except` names, identifier-like strings), so it is a superset of "names defined or parameters"; no list is kept by hand.
+   A claim of only names and signature text has nothing left to match and, when no fact needs it, is `identifier_only` (rule 5).
+   Python keywords are stripped for that test only, never for matching.
+6. Subject (round 7). Each behaviour fact has a subject, `behaviour[k].name` in `answers.jsonl` (a symbol or a file name). The claim's
+   subject is the FIRST token of the claim (code-span backticks removed for this step) that is a name in the cited files' symbol
+   table or one of the chore's file names, in full or bare. A behaviour fact is met only when that token is the fact's subject. A
+   claim with no such token has no subject and meets no behaviour fact. Failures: rule 6, `wrong_subject` or `no_subject`, reported
+   for a line that meets no fact. The prompt tells the model to start each fact line with the name the fact is about.
+7. Order (round 7, rule 12 in round 8). A fact line whose claim matches two or more of the ordered facts fails as
+   `several_in_one_line` (rule 1): an intro line that lists every state cannot give each state the same position.
+8. Code spans: see rule 5. 9. List items: see rule 2 and rule 11.
+10. Every citation is checked, wherever it is (round 8). Any bracket of the reply with an item of the CITATION shape (`path:N`,
+    `path:N-M`) is checked by rule 3, on any line: list or not, heading, quote, prose, inside or outside a code span or block. A bad
+    one is in `bad_citations`, so in the run's `fabricated_citations`. A line that holds a citation and is no valid fact line fails
+    the reply: `stray_citation` (rule 2) when it is no list item, `not_a_fact_line` / `uncited` / `two_citation_lists` when it is.
+11. List items by any whitespace and any bullet (round 8). A line is unprefixed first: leading whitespace as `str.isspace` has it
+    (U+00A0, U+2003, U+3000 ...), control and format characters (U+0000, U+200B, U+FEFF ...) and any number of `>` blockquote markers. It is a list item
+    when it then starts with `-`, `*`, `+`, `•`, `‣`, `◦`, `⁃`, `–`, `—`, `·` or `<digits>.` / `<digits>)`, followed by whitespace of
+    any kind or the end of the line. Only a line that is exactly `- ` + claim + citation list at column 0 is a fact line.
+12. Order counts every line (round 8, Main's ruling). In a chore with `order`, every fact line that states an ordered fact is read in
+    reply order and their ordered-fact indexes must be strictly increasing: a step stated twice is `repeated_step` (rule 7), a step
+    out of order is `order`. Reference + reversed copy, reversed copy + reference and reference + reference all fail. A chore without
+    `order` allows a repeated line. A restatement counts also when its own citation is wrong: it is still a line that states the step.
 
-The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 5 it
+The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 12 it
 broke. The runner keeps the raw reply. The prompt in `config/local.example.json` states the format with one example.
 
 Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
 alternation over the items. Where the task asks for an order (the states, the deploy steps) `order` lists the facts and the
-position of the first match of each must be greater than the one before. Each answer carries a hand-written `reference` reply, one
+line that states each must come after the lines of the one before, and none twice (rule 12). Each answer carries a hand-written `reference` reply, one
 fact line per fact (`facts` says which); the tests check that it passes (24 of 24), that dropping the line for one fact fails with
 that fact among the failed ones, and that every line of every reference shifted by one line passes none.
 
@@ -309,6 +333,51 @@ Main's saved smoke reply (use-jobqueue; "### src/<file>" headings, "- **Line 29*
 have no trailing citation list (`uncited`), the headings and prose count for nothing, and no fact is stated (rule 4). Round 5
 scored it as 11 bad citations; the model is now told the format by the prompt, and the live runs show whether it follows it.
 
+
+Round 7 (review 6 found four holes in the format, not new prose shapes: a subject swap, an intro line hiding a reversed order,
+a double-backtick span supplying a behaviour word, and a bare `- ` bullet read as nothing). The rules are 6 to 9 above, 2 and 5
+tightened, and `check()` reads the raw line before any stripping. The test that stands behind them is generated, not a list of
+examples: `test_generated_attack_every_mutation_of_every_reference_fails` builds, for each of the 24 chores, every mutation of the
+reference below and asserts each one fails and names a rule of the expected set (1197 mutations; `QUAL_ATTACK_COUNTS=1` prints the
+counts per kind to stderr). a. subject swap: every pair of behaviour facts with different subjects, subject tokens swapped (99);
+b. an intro line that names every fact, the rest in order and reversed (2 order chores); c. each behaviour word of each behaviour
+line in a code span of 1, 2 and 3 backticks, with and without inner spaces, and an unmatched backtick (65 each); d. an appended
+`-`, `- `, `-\t`, `- \t`, `  - x [cite]`, `* x [cite]`, `1. x [cite]` (168); e. round 6's kinds: shift -3..+3, citation on the
+next line, heading file, basename, generic claim, one line, drop a line, wide range, extra non-chore cite, `*` bullets. The
+references pass 24 of 24. Run against round 6's checker (c249ce3) the same mutations pass: subject swap 96 of 99, intro line 2 of 2
+and 2 of 2, code span of 2 62 of 65 (plain and spaced), list items 168 of 168; the other kinds already failed there.
+
+| Family | Rule | Why it cannot recur | Tests |
+|---|---|---|---|
+| a fact met by a line about another subject (review 6 F1) | 6 | The first name or file token of the claim must be the fact's `behaviour[k].name`; no token is `no_subject`. | `test_rule_6_a_behaviour_fact_is_met_only_by_a_line_about_its_subject`, `test_the_references_start_with_their_subject`, `test_review_6_reproducers_fail_for_their_rule`, generated kind a |
+| order read on first matches (F2) | 7, 1 | Order uses the line that met each fact; a line stating two ordered facts is `several_in_one_line`. | `test_rule_7_order_is_read_on_the_lines_that_met_the_facts`, `test_order_is_checked_where_the_chore_asks_for_it`, `test_review_6_reproducers_fail_for_their_rule`, generated kind b |
+| a code span other than one backtick supplies a behaviour word (F3) | 8, 5 | Every code span is removed as CommonMark reads it; an unmatched backtick is removed as a character. | `test_rule_8_every_code_span_is_removed_as_commonmark_reads_it`, `test_review_6_reproducers_fail_for_their_rule`, generated kind c |
+| a list item the parser does not read as a fact line (F4) | 9, 2 | Every list item is classified on the raw line; one that is not a valid fact line is `uncited` or `not_a_fact_line`. | `test_rule_9_every_list_item_is_graded_as_it_is_written`, `test_rule_2_other_lines_are_ignored_and_an_uncited_bullet_fails`, `test_lines_that_are_not_fact_lines_count_for_nothing`, `test_review_6_reproducers_fail_for_their_rule`, generated kind d |
+
+The cost of rule 6 is in the references: 27 reference lines were reworded to start with their subject (a file name or a symbol),
+and four facts changed subject in `answers.jsonl` (diff-order facts 3, 4 and 7 to `JobQueue`, sum-cache fact 1 to `put`). A model that
+opens a fact with a word that is not a name ("The handler echo returns ...", "Past the table ...", "It raises ValueError") has
+no subject or the wrong one, and fails that fact by rule 6; "When a handler raises, run_one ..." is read as about `handler`.
+The prompt in `config/local.example.json` says to start each fact line with the name it is about, with the one example it has.
+
+Round 8 (review 7: whitespace-indented bullets escaped rule 9, and Main found that a fabricated citation outside a list item was
+invisible to `fabricated_citations`, which counts only graded lines; both are one family, the prefix of a line decides whether it
+is read at all). Rules 10 to 12 above; the checker reads every line for a bracketed citation first, then classifies the line.
+`test_generated_attack_every_mutation_of_every_reference_fails` gains four kinds over the 24 chores (3171 mutations now, 1197
+before): f. each of U+00A0, U+2003, U+3000, U+2009, `>`, `> `, `>>` in front of `- x [cite]`, of `- x`, and of every reference line
+(504); g. each bullet of rule 11 (and `1.`, `2)`, `10.`) in place of `- `, appended with a citation, appended with no citation,
+appended bare, and on every reference line (1152); h. a fabricated citation (`[src/nonexistent.rs:999]`, and a range past the
+file's end) on a prose line, a heading, a quote, inside a code span, inside a code block, and in a sentence that repeats a claim
+(288, and each has a bad citation); i. in the 2 order chores, reference + reversed, reversed + reference, reference + reference,
+reversed alone, and each step repeated at the end and in place (30). Run against round 7's checker (the uncommitted tree reviewed,
+copied before any edit) the test fails for 1492 of these 1974 mutations: f 336 pass and 168 fail for another rule, g 504 pass and
+168 fail for another rule, h 288 pass, i 26 pass and 2 fail for another rule; kinds a to e (1197) are unchanged.
+
+| Family | Rule | Why it cannot recur | Tests |
+|---|---|---|---|
+| a line with a prefix is read as no list item (review 7 F1) | 11, 2 | The prefix (any `isspace` character, format characters, `>` markers) is stripped before the list marker is looked for, and every bullet of the list is a marker. | `test_rule_11_list_items_by_any_whitespace_and_any_bullet`, `test_review_7_and_mains_round_8_reproducers_fail_for_their_rule`, generated kinds f, g |
+| a citation outside a list item is never read (Main) | 10, 2 | Every bracket of every line is read for citations before the line is classified; a bad one is in `bad_citations`, a line that holds one and is no fact line fails. | `test_rule_10_every_citation_is_checked_wherever_it_is`, `test_failing_reply_is_scored_and_classed` (the runner's count), generated kind h |
+| a step stated twice, or twice in two orders (review 7 F2, Main) | 12, 7 | The order is read on every line that states an ordered fact, not on the owner of each fact. | `test_rule_12_every_line_that_states_an_ordered_fact_counts`, `test_order_is_checked_where_the_chore_asks_for_it`, generated kind i |
 
 ### Audit of the required facts (round 6)
 

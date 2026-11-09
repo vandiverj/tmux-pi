@@ -4,7 +4,8 @@ no repo-wide worktree prune (F2), test hooks refused in a live run (F3), every s
 Round 5: no process starts outside bounded() (statically, and at run time through the imported lib code too), a hung git in the config load
 times out by name, and every collision and leftover check is on the exact worktree path (ExactWorktreePathTest).
 The tampered-record cases are in tests/test_g3_e2e_tamper.py. The shim and the audit are in tests/g3_e2e_support.py."""
-import g3_e2e_support as support  # first: it imports session_env, which drops the caller's session
+import session_env  # noqa: F401  first: drops the caller's session (g3_e2e_support, once cached, no longer does)
+import g3_e2e_support as support
 
 import ast
 import contextlib

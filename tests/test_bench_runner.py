@@ -440,13 +440,23 @@ class Evidence(RunnerCase):
 
 class TrustDialog(RunnerCase):
     def test_a_worker_at_the_trust_dialog_is_marked_error_and_the_dialog_is_never_answered(self):
-        shell, work, _ = self.build(running=True, pane_text="Do you trust the files in this folder?\n 1. Yes, proceed\n")
-        paths = work.run(self.only("local-q", "code-f"), 1)
-        tasks = json.loads(paths[0].read_text())["tasks"]
-        self.assertEqual([(t["status"], t["detail"]["error"]) for t in tasks], [("error", "trust-dialog")] * 2)
-        self.assertNotIn("send-keys", [sub for _, sub in shell.names()])
-        self.assertIn(("tp-agent", "stop"), shell.names())
-        self.assert_cleaned(shell)
+        """Three ways the bench learns of the dialog: its own capture of the pane (inspect says running), the inspect field alone (tp-agent
+        inspect now answers needs_input + trust_dialog {dir}, and needs_input is terminal), and both. All give error: trust-dialog with the
+        remediation, and a worker that never finished is stopped, not collected (TV1 round 2: the second row read "fail: worker ended needs_input")."""
+        screen = "Do you trust the files in this folder?\n 1. Yes, proceed\n"
+        for label, shell_args in (("capture", dict(running=True, pane_text=screen)), ("inspect field", dict(trust_inspect=True)),
+                                  ("inspect field and capture", dict(trust_inspect=True, pane_text=screen))):
+            with self.subTest(label):
+                shell, work, _ = self.build(**shell_args)
+                paths = work.run(self.only("local-q", "code-f", "review-r"), 1)
+                tasks = json.loads(paths[0].read_text())["tasks"]
+                self.assertEqual([(t["status"], t["detail"]["error"]) for t in tasks], [("error", "trust-dialog")] * 3)
+                self.assertIn("bin/tp-claude-bootstrap", tasks[0]["detail"]["reason"])
+                self.assertNotIn("send-keys", [sub for _, sub in shell.names()])
+                self.assertEqual([ident for (program, sub), (argv, _, _) in zip(shell.names(), shell.calls) if (program, sub) == ("tp-agent", "stop")
+                                  for ident in argv[2:3]], ["t1", "t2", "review-1"])
+                self.assertNotIn(("tp-agent", "collect"), shell.names(), "an unfinished worker is stopped, not collected")
+                self.assert_cleaned(shell)
 
 
 class Arguments(unittest.TestCase):

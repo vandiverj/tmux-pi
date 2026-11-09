@@ -112,6 +112,11 @@ TAMPERS = {
 }
 
 
+def shell_quote(text):
+    """`text` as one shell word, as shlex.quote does (this script imports only what its static test allows): the owner pastes what it prints."""
+    return text if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", text) else "'" + text.replace("'", "'\"'\"'") + "'"
+
+
 class SmokeError(Exception):
     """A failed step. `step` is the step's name; `rc` the return code of the command that failed, when one did."""
 
@@ -342,7 +347,7 @@ class Smoke:
         if found:
             where = str((found.get("dir") if isinstance(found, dict) else None) or self.facts.get("worktree") or self.lane_worktree)
             raise SmokeError(self.step_name, f"worker stopped at Claude Code's folder-trust dialog for {where}; "
-                                             f"the owner runs bin/tp-claude-bootstrap {where} once, then reruns")
+                                             f"the owner runs bin/tp-claude-bootstrap {shell_quote(where)} once, then reruns")   # a command the owner pastes: its operand is quoted
         return record
 
     def lane_path(self):

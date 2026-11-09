@@ -251,6 +251,8 @@ class Runner:
             self.agent("tick", tolerate="tick only nudges the scheduler; the status read by the checked inspect below decides the task")
             info = self.agent_json("inspect", ident)
             late = self.clock() >= deadline  # the time of this first look at the result
+            if info.get("trust_dialog"):  # inspect says so itself (status needs_input + trust_dialog {dir}): not a finished worker, an unfinished one
+                return info, "trust-dialog"
             if info.get("status") in TERMINAL:
                 return info, "timeout" if late else None
             if self.trust_dialog_shown():
@@ -352,7 +354,7 @@ class Runner:
         """A worker the runner gave up on while it still ran is stopped; one that already finished (even if late) is collected.
         A stop or collect that fails is written into the task's detail, never dropped."""
         try:
-            if stopped is not None and info.get("status") not in TERMINAL:
+            if stopped is not None and (stopped == "trust-dialog" or info.get("status") not in TERMINAL):   # a worker at the dialog never finished, whatever inspect calls it
                 self.agent("stop", ident)
             else:
                 self.agent("collect", ident)

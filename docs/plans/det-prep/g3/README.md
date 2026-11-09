@@ -16,7 +16,8 @@ From a tmux-pi checkout that has this script, inside the tmux server that Main u
 starts in a folder, and a lane worktree is a new folder every run. The dialog shows before any hook loads, so the worker writes no permission request and waits for an answer nobody gives.
 tmux-pi never answers it; folder trust is the owner's decision. The first two live runs (2026-11-09) died at step `prompt` this way. Now `tp-agent inspect` (and `tp-agent list`, `tp-list`, the status pane)
 report such a worker as `needs_input` with `trust_dialog: {dir}` and the fix, and the script fails at once, not after `--prompt-wait`:
-`worker stopped at Claude Code's folder-trust dialog for <dir>; the owner runs bin/tp-claude-bootstrap <dir> once, then reruns`. The owner runs `bin/tp-claude-bootstrap <repo>`
+`worker stopped at Claude Code's folder-trust dialog for <dir>; the owner runs bin/tp-claude-bootstrap <dir> once, then reruns` (`<dir>` is shell-quoted in the command, so a folder with a space pastes whole).
+A pane that cannot be captured in time (a hung tmux, or a list whose scan budget of 15 s is spent) is not guessed clear: `tp-agent list` and `inspect` mark that row `trust_dialog_check: "not checked"`, and a later row is still looked at. The owner runs `bin/tp-claude-bootstrap <repo>`
 (approve the prompt, type `/exit`) so tmux-pi's Claude profile trusts the repository. Whether trust given to the repository also covers its new worktrees depends on Claude Code;
 if the message names the worktree, trust that folder as the message says and rerun.
 

@@ -4,29 +4,37 @@ Claude Code asks "Is this a project you created or one you trust?" before any ho
 permission request and its task reads "starting" for ever. Folder trust is the owner's decision (bin/tp-claude-bootstrap,
 docs/bench.md step 3): tmux-pi never answers the dialog. It only makes it visible.
 
-Everything here is read-only: `capture` runs `tmux capture-pane -p` and nothing else, bounded by a timeout, in its own process
+Everything here is read-only: `read` runs the tmux pane capture (`capture-pane -p -J`) and nothing else, bounded by a timeout, in its own process
 group so a hung tmux (and anything it started) is killed with it. A capture that fails or times out is "nothing seen"; the
-caller's status stays what it was.
+caller's status stays what it was, and a row whose capture timed out is reported as "not checked" (NOT_CHECKED), never as clear.
 """
 import os
 import re
 import shlex
 import signal
 import subprocess
+import time
 
 TRUST_DIALOG = re.compile(r"trust (?:this|the files in this) folder|do you trust", re.I)  # the dialog's own words, not the word "trust"
 WORKSPACE = re.compile(r"accessing workspace:", re.I)
 BOX = " \t│┃|╎╏║"  # the frame some Claude Code versions draw around the screen
-DEFAULT_TIMEOUT = 5.0
-TIMEOUT_ENV = "TP_TRUST_CAPTURE_TIMEOUT"  # seconds; a test hook, read at each call
+DEFAULT_TIMEOUT = 5.0   # seconds one capture may take
+TIMEOUT_ENV = "TP_TRUST_CAPTURE_TIMEOUT"  # a test hook, read at each call
+DEFAULT_BUDGET = 15.0   # seconds one Scanner may spend on all its captures together
+BUDGET_ENV = "TP_TRUST_SCAN_BUDGET"  # a test hook, read when a Scanner starts
+NOT_CHECKED = "not checked"   # what a row says when its pane could not be looked at (timed out, or the scan's budget was spent)
+
+
+def seconds_from(name, default):
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def timeout():
-    try:
-        value = float(os.environ.get(TIMEOUT_ENV, ""))
-    except ValueError:
-        return DEFAULT_TIMEOUT
-    return value if value > 0 else DEFAULT_TIMEOUT
+    return seconds_from(TIMEOUT_ENV, DEFAULT_TIMEOUT)
 
 
 def shown(text):
@@ -75,15 +83,30 @@ def read(pane, seconds=None):
 
 
 class Scanner:
-    """Looks at panes for the dialog. After one capture times out it looks no more (a hung tmux would otherwise cost the
-    timeout once per row of a list)."""
+    """Looks at the panes of a list of rows, one `dialog` call per row.
 
-    def __init__(self, seconds=None):
-        self.seconds, self.hung = seconds, False
+    The bound: each capture is cut at `seconds` (5 s by default), and one Scanner spends at most `budget` (15 s by default) on all
+    its captures together, however many panes hang. A pane that hangs does not stop the rows after it from being looked at: they
+    are captured as long as budget remains. A row whose capture timed out, or that came after the budget was spent, was not
+    checked: `checked` is False for it and its caller says so (NOT_CHECKED) instead of leaving it looking clear."""
+
+    def __init__(self, seconds=None, budget=None):
+        self.seconds = seconds
+        self.budget = budget if budget else seconds_from(BUDGET_ENV, DEFAULT_BUDGET)
+        self.started = None
+        self.checked = True     # of the last `dialog` call: False when its pane could not be looked at
 
     def dialog(self, pane, workdir=""):
-        """{"dir": folder} when pane `pane` shows the dialog, else None."""
-        if self.hung or not isinstance(pane, str) or not pane:
+        """{"dir": folder} when pane `pane` shows the dialog, else None. Sets `checked`."""
+        self.checked = True
+        if not isinstance(pane, str) or not pane:
+            return None     # no pane was recorded: nothing to look at
+        now = time.monotonic()
+        self.started = now if self.started is None else self.started
+        left = self.budget - (now - self.started)
+        if left <= 0:
+            self.checked = False
             return None
-        text, self.hung = read(pane, self.seconds)
+        text, timed_out = read(pane, min(self.seconds or timeout(), left))
+        self.checked = not timed_out
         return {"dir": folder(text, workdir)} if shown(text) else None

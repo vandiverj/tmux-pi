@@ -175,7 +175,7 @@ def main(tasks, lifecycle_text, current=None):
         if parts and parts[0] and parts[0] not in life:
             life[parts[0]] = (parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
     out = []
-    scanner = trust_dialog.Scanner()   # one for every row: after a capture times out no other row waits for one
+    scanner = trust_dialog.Scanner()   # one for every row: the whole pass spends at most its budget on captures (lib/trust_dialog.py)
     for line in sys.stdin.read().split("\n"):
         if not line:
             continue
@@ -208,6 +208,8 @@ def main(tasks, lifecycle_text, current=None):
             if found:
                 detail = trust_dialog.message(found["dir"]) + " · " + detail
                 status = "needs_input"
+            elif not scanner.checked:   # a pane that could not be looked at is not shown as clear
+                detail = "folder-trust dialog " + trust_dialog.NOT_CHECKED + " · " + detail
         broken = unreadable(d)
         if broken:   # never dropped, whatever the task's state: the owner has to look at it
             detail = broken + " · " + detail

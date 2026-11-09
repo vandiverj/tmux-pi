@@ -7,6 +7,7 @@ import session_env  # noqa: F401  first: removes the caller's session, however t
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -27,9 +28,12 @@ import trust_dialog  # noqa: E402
 
 SOCKET = "tptrust"
 SHIM = """#!/bin/sh
-# every call is logged; capture-pane hangs (a grandchild holds the pipe) when TRUST_TEST_HANG is set; the server is always the private one
+# every call is logged; capture-pane hangs (a grandchild holds the pipe) for the panes TRUST_TEST_HANG lists ("all" for every pane); the server is always the private one
 printf '%s\\n' "$*" >> "$TRUST_TEST_LOG"
-if [ "$1" = capture-pane ] && [ -n "$TRUST_TEST_HANG" ]; then sleep 60; fi
+if [ "$1" = capture-pane ] && [ -n "$TRUST_TEST_HANG" ]; then
+  for pane; do :; done   # the target is the last argument
+  case " $TRUST_TEST_HANG " in *" all "*|*" $pane "*) sleep 60 ;; esac
+fi
 exec "$TRUST_TEST_REAL_TMUX" -L {socket} "$@"
 """
 DIALOG = """ Accessing workspace:
@@ -140,11 +144,15 @@ class Base(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         return next(row for row in json.loads(out) if row["id"] == ident)
 
-    def detail_rows(self, ident, status, listing=False, worker="claude"):
+    def detail_rows(self, ident, status, listing=False, worker="claude", env=None):
         """What lib/tp_detail.py (the status pane; with listing, bin/tp-list) prints for one row."""
+        return self.detail_many([(ident, status)], listing, worker, env)
+
+    def detail_many(self, rows, listing=False, worker="claude", env=None):
+        """The same for several rows, in one process: they share a Scanner, as the status pane's rows do."""
         args = ["--list", str(self.state / "tasks"), "", ""] if listing else [str(self.state / "tasks"), ""]
-        row = "\x1f".join((ident, worker, status, "", "", "", "m")) + "\n"
-        run = subprocess.run([sys.executable, str(ROOT / "lib" / "tp_detail.py"), *args], input=row, text=True, capture_output=True, env=self.env, timeout=60)
+        text = "".join("\x1f".join((ident, worker, status, "", "", "", "m")) + "\n" for ident, status in rows)
+        run = subprocess.run([sys.executable, str(ROOT / "lib" / "tp_detail.py"), *args], input=text, text=True, capture_output=True, env=env or self.env, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
 
@@ -169,6 +177,9 @@ class DetectorTest(unittest.TestCase):
         message = trust_dialog.message("/a b/c")
         self.assertIn("/a b/c", message)
         self.assertIn("the owner trusts it once: bin/tp-claude-bootstrap '/a b/c'", message)
+        for directory in ("/a b/c", "/tmp/$HOME/`id` 'q' \"d\";x", "/plain"):   # the command, run through a shell's splitting, is the directory as one argument
+            command = trust_dialog.message(directory).split("the owner trusts it once: ", 1)[1]
+            self.assertEqual(shlex.split(command), ["bin/tp-claude-bootstrap", directory])
 
 
 class InspectTest(Base):
@@ -197,6 +208,17 @@ class InspectTest(Base):
         self.task("old-dialog", "old", workdir="/tmp/old-dir")
         self.assertEqual(self.inspect("old-dialog")["trust_dialog"]["dir"], "/tmp/old-dir")
 
+    def test_the_command_in_every_view_is_the_folder_as_one_argument(self):
+        """A workdir with a space and a `$`: the printed command, split as a shell would, is exactly the folder (bootstrap-command-quoting)."""
+        odd = "/tmp/my project/$HOME/it's"
+        self.task("odd-dir", "nofolder", workdir=odd)
+        views = {"inspect": self.inspect("odd-dir")["detail"], "list": self.listed("odd-dir")["detail"],
+                 "status pane": self.detail_rows("odd-dir", "working"), "tp-list": self.detail_rows("odd-dir", "working", listing=True)}
+        for view, text in views.items():
+            with self.subTest(view):
+                command = text.split("the owner trusts it once: ", 1)[1].split(" · ", 1)[0].strip()
+                self.assertEqual(shlex.split(command), ["bin/tp-claude-bootstrap", odd])
+
     def test_ordinary_output_that_says_trust_changes_nothing(self):
         self.task("ordinary", "ordinary", state="working")
         got = self.inspect("ordinary")
@@ -220,10 +242,11 @@ class InspectTest(Base):
     def test_a_hanging_capture_is_bounded_and_leaves_the_status_alone(self):
         self.task("hang", "dialog")
         t0 = time.monotonic()
-        got = self.inspect("hang", self.with_timeout(0.5, TRUST_TEST_HANG="1"))
+        got = self.inspect("hang", self.with_timeout(0.5, TRUST_TEST_HANG="all"))
         took = time.monotonic() - t0
         self.assertEqual(got["status"], "working")
         self.assertNotIn("trust_dialog", got)
+        self.assertEqual(got["trust_dialog_check"], "not checked", "a pane that could not be looked at never reads as clear")
         self.assertLess(took, 10, "the shim sleeps 60 s; the capture must be cut at its timeout")
 
     def test_the_worker_is_never_sent_anything(self):
@@ -265,8 +288,9 @@ class ListTest(Base):
 
     def test_a_hanging_capture_leaves_every_row_as_it_was(self):
         self.task("l-hang", "dialog")
-        env = self.with_timeout(0.5, TRUST_TEST_HANG="1")
-        self.assertEqual(self.listed("l-hang", env)["status"], "working")
+        env = self.with_timeout(0.5, TRUST_TEST_HANG="all")
+        hung = self.listed("l-hang", env)
+        self.assertEqual((hung["status"], hung["trust_dialog_check"]), ("working", "not checked"))
         t0 = time.monotonic()
         row = "\x1f".join(("l-hang", "claude", "working", "", "", "", "m")) + "\n"
         run = subprocess.run([sys.executable, str(ROOT / "lib" / "tp_detail.py"), str(self.state / "tasks"), ""], input=row, text=True,
@@ -274,7 +298,51 @@ class ListTest(Base):
         took = time.monotonic() - t0
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertTrue(run.stdout.startswith("working\x1f"), run.stdout)
+        self.assertIn("folder-trust dialog not checked", run.stdout)
         self.assertLess(took, 10)
+
+
+class ScanBoundTest(Base):
+    """TV1 round 2 (scan-starvation): one hung pane must not hide a later dialog, and the whole scan stays inside its budget."""
+
+    def hang(self, *names, timeout=0.5, **more):
+        return self.with_timeout(timeout, TRUST_TEST_HANG=" ".join(self.panes[n] for n in names), **more)
+
+    def test_a_hung_first_pane_does_not_hide_the_dialog_in_the_next_row_of_list_or_status(self):
+        self.task("aa-hang", "ordinary")
+        self.task("zz-dialog", "dialog")
+        env = self.hang("ordinary")
+        rc, out, err = tp_agent_inproc.run(["list"], env, str(self.tmp))
+        self.assertEqual(rc, 0, err)
+        rows = {row["id"]: row for row in json.loads(out)}
+        self.assertEqual([r["id"] for r in json.loads(out)], ["aa-hang", "zz-dialog"], "the hung row comes first")
+        self.assertEqual((rows["aa-hang"]["status"], rows["aa-hang"]["trust_dialog_check"]), ("working", "not checked"))
+        self.assertEqual((rows["zz-dialog"]["status"], rows["zz-dialog"]["trust_dialog"]["dir"]), ("needs_input", DIALOG_FOLDER))
+        self.assertNotIn("trust_dialog_check", rows["zz-dialog"])
+        for listing in (False, True):
+            with self.subTest(listing=listing):
+                lines = self.detail_many([("aa-hang", "working"), ("zz-dialog", "working")], listing, env=env)
+                self.assertIn("folder-trust dialog not checked", lines)
+                self.assertIn(f"bin/tp-claude-bootstrap {DIALOG_FOLDER}", lines)
+                self.assertEqual(lines.count("needs_input"), 1, lines)
+                self.assertEqual(lines.count("working"), 1, lines)
+
+    def test_the_whole_list_stays_inside_the_budget_however_many_panes_hang_and_says_which_rows_were_not_looked_at(self):
+        count = 10
+        for n in range(count):
+            self.task(f"hang-{n:02d}", "ordinary")
+        self.task("zz-dialog", "dialog")
+        env = self.hang("ordinary", timeout=0.5, TP_TRUST_SCAN_BUDGET="1.0")   # unbounded: 10 x 0.5 s = 5 s of hung captures
+        t0 = time.monotonic()
+        rc, out, err = tp_agent_inproc.run(["list"], env, str(self.tmp))
+        took = time.monotonic() - t0
+        self.assertEqual(rc, 0, err)
+        rows = json.loads(out)
+        self.assertLess(took, 3.5, "budget 1 s: the scan stops looking when it is spent")
+        self.assertLessEqual(len([c for c in self.tmux_calls() if c.startswith("capture-pane")]), 4, "rows after the budget were not captured")
+        self.assertEqual([r["status"] for r in rows if r["id"].startswith("hang-")], ["working"] * count)
+        self.assertEqual([r.get("trust_dialog_check") for r in rows if r["id"].startswith("hang-")], ["not checked"] * count)
+        self.assertEqual(next(r for r in rows if r["id"] == "zz-dialog").get("trust_dialog_check"), "not checked", "the budget was spent before this row: it says so, it does not look clear")
 
 
 if __name__ == "__main__":

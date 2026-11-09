@@ -122,13 +122,15 @@ def with_trust_dialog(row, scanner):
     """A claude worker row that is starting or working, whose recorded pane shows Claude Code's folder-trust dialog, as needs_input
     (a new row: status, a detail first, and trust_dialog {dir}). The dialog shows before any hook loads, so nothing on disk says so.
     Read-only: the pane is captured (lib/trust_dialog.py, bounded), never answered; any other row, and a capture that fails or
-    times out, is returned as it was. tp-agent's lifecycle still does not look at panes: only inspect and list ask for this."""
+    times out, is returned as it was, except that a pane that could not be looked at (a timeout, or the list's scan budget spent) adds
+    trust_dialog_check: "not checked", so a row that was not looked at never reads as clear. tp-agent's lifecycle still does not look
+    at panes: only inspect and list ask for this."""
     if row.get("harness") != "claude" or row.get("status") not in ("starting", "working") or not row.get("task_dir"):
         return row
     meta = read_json(Path(row["task_dir"]) / "meta.json")
     found = scanner.dialog(meta.get("pane"), meta.get("workdir") if isinstance(meta.get("workdir"), str) else "")
     if not found:
-        return row
+        return row if scanner.checked else {**row, "trust_dialog_check": trust_dialog.NOT_CHECKED}
     return {"detail": trust_dialog.message(found["dir"]), **row, "status": "needs_input", "trust_dialog": found}
 
 

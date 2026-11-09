@@ -7,10 +7,12 @@ row (or is in UNTAMPERED with the test that covers it instead). The leftover cas
 import g3_e2e_support as support  # first: it imports session_env, which drops the caller's session
 
 import json
+import shlex
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from g3_e2e_support import Base, NOTHING_MADE, Parallel, g3, records
 
@@ -161,6 +163,23 @@ class TamperTest(Base):
         self.assertLess(step["seconds"], 4, "--prompt-wait was 4 s: failing at once is faster than waiting it out")
         self.assertFalse([c for c in records() if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"] and "send-keys" in c["argv"]], "the dialog is the owner's to answer")
         self.assert_clean(summary)
+
+    def test_the_bootstrap_command_the_trust_dialog_failure_prints_is_one_quoted_argument(self):
+        """TV1 round 2 (bootstrap-command-quoting): the owner pastes `bin/tp-claude-bootstrap <dir>`; a folder with a space or a shell character
+        must come back from shlex.split as exactly that one argument. Smoke.inspect is called in-process with a canned reply: no tmux, no process."""
+        smoke = g3.Smoke(g3.parse(["--fake", "--out", str(self.out)]))
+        self.addCleanup(shutil.rmtree, smoke.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, smoke.tmux_tmp, ignore_errors=True)
+        smoke.step_name = "prompt"
+        for folder in ("/plain/dir", "/tmp/my project", "/tmp/a$HOME `id` 'q' \"d\" ;rm -rf x", "/tmp/$(touch pwned)/w", "/tmp/it's"):
+            with self.subTest(folder=folder):
+                reply = {"status": "needs_input", "trust_dialog": {"dir": folder}}
+                with mock.patch.object(smoke, "agent_json", return_value=reply), self.assertRaises(g3.SmokeError) as raised:
+                    smoke.inspect("coder-x")
+                message = raised.exception.message
+                self.assertTrue(message.startswith(f"worker stopped at Claude Code's folder-trust dialog for {folder}; the owner runs "), message)
+                command = message.split("; the owner runs ", 1)[1].rsplit(" once, then reruns", 1)[0]
+                self.assertEqual(shlex.split(command), ["bin/tp-claude-bootstrap", folder])
 
     def test_a_session_left_alive_is_named(self):
         _, summary, _, _ = results()["tamper-session-kept"]

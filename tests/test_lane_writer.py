@@ -113,6 +113,8 @@ class LaneCase(TmuxCase):
         are always real dispatches."""
         if not (snapshot and self.snapshot_lane) or self.lane_args(**kw) != self.lane_args():
             return None
+        if (self.state / "live-window").exists():
+            return None  # the dispatch started a real pane whose process the fixture ends with the test: a copy would hold a dead writer
         return (self.fingerprint(), sorted(self.env.items()))
 
     def lane_item(self, stdout):
@@ -624,8 +626,8 @@ class LaneSnapshotTests(LaneCase):
         self.assertEqual(self.snapshot_key(step="s1", role="coder", name="alpha"), key)  # defaults spelled out are the default call
         for other in ({"name": "beta"}, {"role": "code-reviewer"}, {"step": "s2"}, {"extra": ()}, {"tests": "unit"}):
             self.assertIsNone(self.snapshot_key(**other), f"{other} is not the default call: it is never cached or restored")
-        (self.state / "live-window").touch()  # a flag file
-        self.assertNotEqual(self.snapshot_key(), key)
+        (self.state / "live-window").touch()  # a flag file: the dispatch would start a real pane, and a copy of its lease names a process that is gone
+        self.assertIsNone(self.snapshot_key())
         (self.state / "live-window").unlink()
         self.assertEqual(self.snapshot_key(), key, "the same tree again is the same key")
         (self.repo / "lib/x.py").write_text("edited\n")  # a repository edit
@@ -678,6 +680,13 @@ class LaneSnapshotTests(LaneCase):
         self.reset_fixture()
         self.lane_ok()  # the snapshot is still the first default call's
         self.assertEqual(len(counted), 3)
+        self.forget_snapshot()
+        for _ in range(2):  # a dispatch that starts a real pane is never cached or restored: its lease would name a process the test ended
+            self.reset_fixture()
+            (self.state / "live-window").touch()
+            self.lane_ok()
+        self.assertEqual(len(counted), 5)
+        self.assertIsNone(self._lane_snapshot)
 
 
 class LeaseShapedSnapshotTests(LaneCase):

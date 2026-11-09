@@ -376,6 +376,28 @@ class GateTests(ScriptCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(json.loads(kept[0].read_text())["schema"], "tp-gate:v1")
 
+    def test_the_two_copies_of_the_record_are_byte_identical_even_when_the_clock_moves_between_the_writes(self):
+        # A `date` stub on PATH: every ISO-8601 reading is one second later than the last (a counter in a file), anything else is the real date.
+        # Every reading the gate takes is therefore different; before the fix `finished` was read once per write, so the copies differed.
+        stub = self.bin / "date"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'if [ "$*" = "-u +%Y-%m-%dT%H:%M:%SZ" ]; then\n'
+            f'  n=$(($(cat "{self.tmp}/ticks" 2>/dev/null || echo 0) + 1)); echo "$n" > "{self.tmp}/ticks"\n'
+            '  printf "2030-01-01T00:00:%02dZ\\n" "$n"; exit 0\n'
+            "fi\n"
+            'exec /bin/date "$@"\n')
+        stub.chmod(0o755)
+        repo = self.repo()
+        task = self.tmp / "task"
+        out = self.run_script("pre-commit-gate.sh", repo, "main", env={"TP_TASK_DIR": str(task)})
+        beside = Path(self.last_line(out)[1]).with_suffix(".json")
+        self.assertEqual((task / "gate.json").read_text(), beside.read_text())
+        record = json.loads(beside.read_text())
+        self.assertEqual(record["started"], "2030-01-01T00:00:01Z")
+        self.assertEqual(record["finished"], "2030-01-01T00:00:02Z")  # read once, for both copies
+        self.assertEqual(int((self.tmp / "ticks").read_text()), 2)
+
     def test_require_fails_a_missing_check_and_without_the_flag_the_exit_is_unchanged(self):
         repo = self.lane_with_web_app()
         for tool in ("prettier", "eslint", "tsc"):

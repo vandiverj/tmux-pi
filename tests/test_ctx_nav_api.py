@@ -30,7 +30,21 @@ from ctxengine import nav_api  # noqa: E402
 FIXTURE = ROOT / "tests" / "fixtures" / "ctx_api" / "project"
 MIRROR = "@ROOT@"  # in a fake deno's canned output: the directory the fake runs in, which is the mirror Deno was given
 HAVE_DENO = shutil.which("deno") is not None
-NEEDS_DENO = unittest.skipUnless(HAVE_DENO, "deno is not on PATH")
+
+def real_deno_gate(condition, reason):
+    """`unittest.skipUnless` that also marks the test as one whose point is a real Deno: `Tree` lets only a marked test look for the
+    real `deno` (the guard of G2-E). The mark is set before the skip wrapper is made, and `functools.wraps` carries it over."""
+    skip = unittest.skipUnless(condition, reason)
+
+    def mark(test):
+        test.needs_real_deno = True
+        return skip(test)
+    return mark
+
+
+NEEDS_DENO = real_deno_gate(HAVE_DENO, "deno is not on PATH")
+REAL_DENO_EXE = nav_api.NavApi._deno_exe  # captured before any test patches it
+MACHINE_PATH =frozenset(folder for folder in os.environ.get("PATH", os.defpath).split(os.pathsep) if folder)  # where a real deno would be
 
 
 # The fake `deno` scripts of these tests are shell scripts that run `sed`, `find` and write their logs next to the test: they need
@@ -112,6 +126,28 @@ class Tree(unittest.TestCase):
             patch = mock.patch.object(nav_api, "SANDBOX_PROFILE", self.profile)
             patch.start()
             self.addCleanup(patch.stop)
+        if not self.wants_real_deno():
+            self.forbid_real_deno()
+
+    def forbid_real_deno(self):
+        """G2-E: no tmux-pi test needs a real Deno. A test that does not carry NEEDS_DENO / NEEDS_SANDBOX fails, naming itself, when a
+        NavApi looks for `deno` by name in a PATH that still holds a folder of the machine's own PATH (a fake in a folder of its own, a
+        path with a separator, or a PATH with nothing of the machine's in it is fine). The lookup raises, and the cleanup fails the test
+        too, so a navigator that swallows the error cannot hide the call."""
+        real = REAL_DENO_EXE
+        seen = []
+
+        def guarded(nav):
+            folders = os.environ.get("PATH", os.defpath).split(os.pathsep)
+            if os.sep not in nav.deno and MACHINE_PATH.intersection(folders):
+                seen.append(nav.deno)
+                raise AssertionError(f"{self.id()} looks for the real `{nav.deno}` and is not marked NEEDS_DENO / NEEDS_SANDBOX: "
+                                     "give NavApi a fake (scripted_deno) or gate the test")
+            return real(nav)
+        patch = mock.patch.object(nav_api.NavApi, "_deno_exe", guarded)
+        patch.start()
+        self.addCleanup(lambda: self.assertEqual(seen, [], f"{self.id()} reached the real deno ungated (mark it NEEDS_DENO or give it a scripted_deno)"))
+        self.addCleanup(patch.stop)
 
     def project(self, name="proj"):
         target = self.dir / name
@@ -125,7 +161,15 @@ class Tree(unittest.TestCase):
         return str(path)
 
     def nav(self, project, **kw):
-        return nav_api.NavApi(str(project), **kw)  # the cache is the default one, inside the project
+        """A NavApi with the default cache (inside the project). A test that gives no `deno` gets one that is not there, so tmux-pi's
+        own logic is tested the same on a machine with Deno and without; only a NEEDS_DENO / NEEDS_SANDBOX test keeps the default name
+        (and a test of the lookup by name passes `deno="deno"`)."""
+        if "deno" not in kw and not self.wants_real_deno():
+            kw["deno"] = str(self.dir / "no-deno" / "deno")
+        return nav_api.NavApi(str(project), **kw)
+
+    def wants_real_deno(self):
+        return bool(getattr(getattr(self, self._testMethodName), "needs_real_deno", False))
 
 
 class ScannerCase(unittest.TestCase):
@@ -575,7 +619,7 @@ class NavCase(Tree):
 
     def test_no_deno_is_unavailable_for_deno_operations_and_the_index_still_answers(self):
         project = self.project()
-        for nav in (self.nav(project, deno=str(self.dir / "no" / "such" / "deno")), self.nav(project)):
+        for nav in (self.nav(project, deno=str(self.dir / "no" / "such" / "deno")), self.nav(project, deno="deno")):  # by path, and by name on an empty PATH
             with mock.patch.dict(os.environ, {"PATH": str(self.dir / "empty")}) if nav.deno == "deno" else mock.patch.dict(os.environ):
                 for answer in (nav.symbols("src/main.ts"), nav.forward_graph("src/main.ts"), nav.imports("src/main.ts", source="deno")):
                     self.assertEqual(answer["status"], "unavailable", answer)
@@ -583,6 +627,46 @@ class NavCase(Tree):
                 self.assertEqual(nav.importers("src/app/run.ts")["status"], "ok")
                 self.assertEqual(nav.imports("src/main.ts")["status"], "ok")
                 self.assertIsNone(nav.status()["deno"])
+
+    def test_g2e_a_test_that_reaches_the_real_deno_without_a_gate_fails_naming_itself(self):
+        """The guard of `Tree.forbid_real_deno`: the r9 reach-walk test called `imports(source="deno")` with the default `deno` and no
+        NEEDS_DENO, so on a machine without Deno it errored. Probes run as their own tests; only the ungated real lookup fails."""
+        outer = self
+
+        class Probe(Tree):
+            def look_for_real(self):
+                return self.nav(self.project(), deno="deno")._deno_exe()  # the default name: what a NavApi uses on a machine's own PATH
+
+            def test_ungated(self):
+                self.look_for_real()
+
+            def test_swallowed(self):  # a caller that catches the error still fails the test: the cleanup reports the lookup
+                try:
+                    self.look_for_real()
+                except AssertionError:
+                    pass
+
+            @real_deno_gate(True, "")
+            def test_gated(self):
+                self.look_for_real()
+
+            def test_a_fake_by_path(self):
+                self.assertEqual(self.nav(self.project(), deno=outer.fake_deno("echo '{\"modules\": []}'")).imports("src/main.ts", source="deno")["status"], "ok")
+
+            def test_a_fake_by_name_on_a_path_of_its_own(self):
+                fake = Path(outer.fake_deno("echo '{\"modules\": []}'")).parent
+                with mock.patch.dict(os.environ, {"PATH": str(fake)}):
+                    self.assertEqual(self.nav(self.project(), deno="deno").imports("src/main.ts", source="deno")["status"], "ok")
+
+        result = unittest.TestResult()
+        with mock.patch.object(nav_api.NavApi, "_deno_exe", REAL_DENO_EXE):  # this test's own guard is not the probes'
+            unittest.TestSuite(Probe(name) for name in ("test_ungated", "test_swallowed", "test_gated", "test_a_fake_by_path",
+                                                        "test_a_fake_by_name_on_a_path_of_its_own")).run(result)
+        failed = {case.id().rsplit(".", 1)[1]: text for case, text in result.failures + result.errors}
+        self.assertEqual(sorted(failed), ["test_swallowed", "test_ungated"], failed)
+        for name, text in failed.items():
+            self.assertIn(f"Probe.{name} ", text)  # named
+            self.assertIn("NEEDS_DENO", text)  # and the gate to use
 
     def test_deno_runs_offline_with_a_minimal_environment_and_never_writes_the_lock(self):
         project = self.project()
@@ -1637,7 +1721,7 @@ def sandbox_works():
     return probe._check_sandbox() is None and bool(probe.deno_version())
 
 
-NEEDS_SANDBOX = unittest.skipUnless(sandbox_works(), "deno or a usable sandbox-exec is missing")
+NEEDS_SANDBOX = real_deno_gate(sandbox_works(), "deno or a usable sandbox-exec is missing")
 
 
 class SandboxCase(Tree):
@@ -2929,7 +3013,7 @@ class PathRuleCase(Tree):
         write(ssh_bin / "deno", Path(self.deno_that_marks()).read_text()).chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": f"{ssh_bin}{os.pathsep}{self.dir / 'linked-bin'}{os.pathsep}relative"}):
             tracer = FsTracer(self)
-            nav = self.nav(project)
+            nav = self.nav(project, deno="deno")
             self.assertIsNone(nav._deno_exe())
             self.assertEqual(nav.symbols("src/main.ts")["status"], "unavailable")
             tracer.on = False
@@ -2939,7 +3023,7 @@ class PathRuleCase(Tree):
         (plain_bin / "deno").symlink_to(ssh_bin / "deno")  # a deno on PATH that is a link into .ssh
         with mock.patch.dict(os.environ, {"PATH": str(plain_bin)}):
             tracer = FsTracer(self)
-            nav = self.nav(project)
+            nav = self.nav(project, deno="deno")
             answer = nav.symbols("src/main.ts")
             tracer.on = False
         self.assertEqual((answer["status"], answer.get("reason")), ("refused", "sandbox_grant_sensitive"))
@@ -3242,6 +3326,8 @@ class IncompleteIndexCase(Tree):
     of the family sweep is a test here; each failed against a83d75b (see the report)."""
 
     needs_user = unittest.skipIf(os.geteuid() == 0, "root can read a file with mode 0")
+    scripted_deno = ReviewFixesCase.scripted_deno
+    deno_calls = ReviewFixesCase.deno_calls
 
     def denied(self, path):
         path = Path(path)
@@ -3674,7 +3760,8 @@ class IncompleteIndexCase(Tree):
                 self.blocked(self.nav(project).imports("src/main.ts", source="index"), "error", "index_incomplete", code, label)
 
     def test_r9_the_reach_walk_takes_nothing_there_as_nothing_and_a_file_it_cannot_look_at_as_unproven(self):
-        """`prove_reach` (the Deno side) has its own `continue`: a file gone is nothing; one that cannot be looked at is not."""
+        """`prove_reach` (the Deno side) has its own `continue`: a file gone is nothing; one that cannot be looked at is not. The walk is
+        tmux-pi's own, so Deno is a scripted fake (no real Deno needed): it answers when the walk passes and is not started when it does not."""
         project = self.project().resolve()
         real = graph.lstat_nofollow
 
@@ -3684,12 +3771,14 @@ class IncompleteIndexCase(Tree):
             return real(path)
         for patched, ok in ((real, True), (look, False)):
             with mock.patch.object(graph, "lstat_nofollow", patched):
-                nav = self.nav(project)
+                nav = self.nav(project, deno=self.scripted_deno(info={"modules": []}))
                 answer = nav.imports("src/main.ts", source="deno")
                 if ok:
-                    self.assertEqual(answer["status"], "ok", answer)
+                    self.assertEqual((answer["status"], answer["source"]), ("ok", "deno_info"), answer)
+                    self.assertEqual(len(self.deno_calls("info")), 1)
                 else:
                     self.assertEqual((answer["status"], answer.get("reason")), ("refused", "unreadable_file"), answer)
+                    self.assertEqual(len(self.deno_calls("info")), 1)  # still the one call of the first pass: the second did not start Deno
 
     def test_r9_a_target_that_is_not_there_is_missing_and_not_a_gap(self):
         project = self.project().resolve()

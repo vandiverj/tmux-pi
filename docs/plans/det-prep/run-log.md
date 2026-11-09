@@ -567,3 +567,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   trailing args, F3 five remote-uncertainty shapes, F4 generated product sampled (1,296 of 46,656 triples). Round 4
   by route design (fixes/fg-n1-round4.md): bag-of-words floor over wrapper tails; uncertain handed-on text is
   sensitive; 41-command false-positive check; full product at depth 1-2, triples with option none. coder-8b20c9cf68.
+- G2-B merged (838589b): review-coder-f7f5d0d555-190752 APPROVED_WITH_NOTES (owed F1 reporting gap closed by Main
+  in main-evidence). baseline-failing.txt 13 -> 11 lines.
+- Owner asked why Deno at all: tmux-pi runs on Python; Deno is only used by the context engine's navigation of a
+  Deno/TypeScript target project (nav_api: `deno doc`/`deno info`) and by pre-commit-gate's `deno check` when the
+  target has deno.json. Without Deno those answer `unavailable`; importers/imports still work.

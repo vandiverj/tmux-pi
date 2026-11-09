@@ -245,3 +245,109 @@ Kept: Qwen3.6-35B-A3B from LM Studio for the `standard` route, escalation,
 packet files and the follow-up judge, with prompt E; the counting rule to
 Slotstream is dropped (prompt E gets counts right at about 1 s against 13 s).
 The mlx-lm server for Qwen3.5-4B is no longer run.
+
+## Summarize chores
+
+`summarize_files` is `candidate` in the model catalog until chores show Qwen3.6-35B-A3B (LM Studio) does it as reliably as the
+qualified shapes (holdout at least 57/60, 95%, with zero fabricated citations). The chores are in
+`tests/calibration/summarize/`: 24 over 10 frozen fixture files (12 tune, 12 holdout), each with required facts, forbidden
+fabrications and the files a `path:line` citation may name. `tools/qual/summarize_check.py` scores a reply with no model;
+`tools/qual/summarize_run.py` runs one headless Pi worker per chore and run on a temp copy of its files, with the system
+prompt tp-spawn would build (`--prompt-file` replaces the model's `config/local.json` prompt). `--route-only` runs
+`tp-route --no-log --local-only` on each chore text and records what the tool really prints: exit code, level, model, source and
+reason of a route, or the stderr of a stop, with an outcome (`routed`, `shape_not_qualified` for "outside the qualified local
+shapes", `stop`, `error`, `timeout`). `tp-route` does not print or log the router's shape tag, so tagging accuracy is read from
+the outcome: routed local once the shape is qualified, `shape_not_qualified` while it is a candidate.
+
+Protocol (run from a plain shell with LM Studio up): `--route-only` on all 24; tune split x3 without and with the draft rule in
+`config/local.example.json`; choose the prompt on tune only; holdout x5 with the chosen prompt. Results: not run yet.
+
+The checker is lenient on wording (a fact is any of a few regexes for one thing) and strict on completeness and evidence.
+
+Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
+alternation over the items; a fact about a file is tied to it (the file name and the words on one line, either order, or the file
+alone on a heading, a bold line or a bullet with the words in the lines below it). Where the task asks for an order (the states, the
+deploy steps) `order` lists the facts and the position of the first match of each must be greater than the one before; a fact that
+comes too early is listed under `order` and fails the reply. Each answer carries a hand-written `reference` reply, one cited
+sentence or bullet per fact (`facts` says which); the tests check that it passes, with its quotes and without, and that dropping the
+sentence that states one fact fails with that fact among the failed ones (`missing` when nothing else names it; `unsupported` when
+another sentence names it, an export's name in the sentence on what it does, but cites other lines than the evidence of the name).
+
+Round 5 (a design change; rounds 2 to 4 had patched one regex at a time):
+
+1. Behaviour is matched without the citations. Before `required` is matched, every citation is removed from the reply text: the
+   line numbers of `path:N` and `Line N`, the quote next to them, and the bracket the removal leaves empty. The path stays when the
+   citation is not inside brackets, so `cli.py:29 creates` still says `cli.py`. ``chunked (src/utils.py:16 `def chunked(items, size):`)``
+   leaves `chunked` and nothing else, so a name with a quoted signature can no longer stand for "what it does". Each exports fact is
+   split into the name and, where the chore asks what each does, the behaviour (the `behaviour` field of an answer gives the
+   name and the signature line, for the tests). A behaviour regex needs a word that says it (`returns`, `stores`, `evicts`,
+   `at most`, ...) near the name, and not one an identifier or a parameter name can supply: `\bLRU\b` and not `LRU` (`LRUCache`),
+   no bare `size`, `default`, `payload` or `3`; a word inside a name (`BACKOFF_SECONDS`, `sleep_job`) is not a word, as `\b` does not
+   split at `_`.
+2. Evidence is a set of lines. `support_lines` (one entry per fact) is `{"src/x.py": ["14", "20-22"]}`: the fixture lines that
+   are evidence of the fact. For what code does it is the lines that do it (body, return, raise, a docstring that states it), the
+   signature only if it alone shows it; for a name, its definition line. At least one good citation on the fact's sentence or bullet
+   must overlap the set (ranges are at most 5 lines), or the fact is `unsupported`, quote or no quote. `anchors` records a short exact
+   substring of each accepted line, and `test_support_is_a_set_of_lines_and_every_anchor_is_on_its_line` fails when a fixture edit
+   moves one. The same set accepts `src/worker.py:22 `return payload`` for echo and the docstring `src/cache.py:14` for get, and
+   refuses the lines next to them (the signatures).
+3. Any file-like heading sets the context. `Line N` / `Lines a-b` takes the file from the nearest of its own line and the headings
+   and bullets above it that names a file-like token: `name.ext` with any extension, or any token with a `/`. That line must name
+   exactly one file and it must be one of the chore's files, whole (`cache.py.bak` is not `cache.py`): two files is
+   `ambiguous_context`, a file that is not the chore's (`nonexistent.xyz`, `notes.txt`, `README.md`, `config.json`, `src/nothing`)
+   `unknown_file`, none anywhere `no_context`; each is a bad citation, and the check never falls back to an earlier heading. Code
+   with a space, a bracket or a quote in backticks, a call (`queue.pop(now)`), `e.g.` and a version (`3.12`) are not files.
+   The price: a dotted identifier outside such code (`queue.dead`, `LRUCache.get`) reads as a file with an unknown extension, so
+   a `Line N` under a heading or bullet that mentions one is a bad citation (Main's smoke reply, below, has three). This is the
+   rule the review asked for; if the live runs show it costing real passes, S2 can name the allowed dotted identifiers per chore.
+4. The packet picker table's separator is back to three columns.
+
+Citations: every required fact needs a good citation on its line or in its bullet: `path:line` or `path:a-b` (any extension or
+none, also a bare file name), or `Line N` / `Lines a-b` as above. A fact without a good citation is `missing_citation`; a citation
+of a file outside the chore's files, a missing file, a line out of range, a range wider than 5 lines (`range_too_wide`: a model
+cannot cite a whole file) or a quote that is not on the cited lines is a bad citation and fails the reply. A citation without a
+quote that no fact's support vouched for (on a line with no required fact, or overlapping no support set there) is `unchecked`:
+counted per run (`unchecked` in the record, `unchecked_citations` in the summary) and not a failure; S2 reports the count.
+It does not count bullets. A correct reply that merely mentions a forbidden claim to deny it can be scored as a hit; read the
+failing replies before changing a prompt for them.
+
+Main's saved smoke reply (use-jobqueue, 15 line numbers, 12 wrong) now scores: fails; 11 bad citations (the 8 with a wrong quote or
+range, the 21-line "Lines 18-38", and worker.py "Line 35", "Line 40" and "Line 45", which are `unknown_file`: the bullet of Line 35
+mentions `queue.dead`); facts 3 to 6 (jobq.py defines it; worker.py receives the queue, pops, handles failure) have no good
+citation; 2 `unchecked` (cli.py 9 and 34); the right cli.py 29 and 31 support their facts. Round 4 scored it 9 bad, 2
+`missing_citation`, 2 `unsupported` and 4 `unchecked`; the three bad citations added are lines that were wrong anyway (the
+fixture's worker.py pops at 32 and fails the job at 44).
+
+### Audit of the required facts (round 5)
+
+Each chore against its text and fixtures: what the chore asks for, the required fact that covers each (F1 is the first in
+`answers.jsonl`), the lines of the fixtures that are evidence of it (`file:lines`, from `support_lines`), and which facts are
+behaviour facts, matched on words that say what the code does (the others are names, steps, states or values).
+`tests/test_qual_summarize.py` checks that every chore has one row that names each of its facts and its support sets.
+
+| Chore | What the chore asks for | Required facts | Support lines | Behaviour facts |
+|---|---|---|---|---|
+| use-jobqueue | which files use JobQueue (cli.py, jobq.py, worker.py) and what each uses it for | F1 cli.py creates a JobQueue; F2 cli.py pushes a job; F3 jobq.py defines JobQueue; F4 worker.py receives the queue as an argument; F5 worker.py pops jobs; F6 worker.py fails or retries a job | F1 cli.py:29; F2 cli.py:31; F3 jobq.py:23; F4 worker.py:30,48; F5 worker.py:31-32; F6 worker.py:38,42-44 | F1, F2, F4, F5, F6 |
+| use-load-settings | which files call load_settings (cli.py, worker.py) and what each does with the result | F1 cli.py calls load_settings; F2 cli.py passes the result to run_forever; F3 worker.py calls load_settings; F4 worker.py reads poll_seconds | F1 cli.py:25; F2 cli.py:34; F3 worker.py:50; F4 worker.py:49,53 | F1, F2, F3, F4 |
+| use-lrucache | which files use LRUCache (none) and where it lives | F1 no other file uses it; F2 cache.py defines LRUCache | F1 cli.py:6-8, worker.py:2-3,5, jobq.py:2-3; F2 cache.py:6 | none |
+| use-utils | which files use parse_duration, chunked, slugify (none) and where they live | F1 no file uses the helpers; F2 utils.py defines the helpers | F1 cli.py:6-8, worker.py:2-3,5, settings.py:2-3; F2 utils.py:1,8,16,22 | none |
+| use-worker-imports | each import of worker.py (logging, time, load_settings) and what it is used for | F1 imports logging; F2 logging is used to log errors; F3 imports time; F4 time is used to sleep; F5 imports load_settings; F6 load_settings gives run_forever its default settings | F1 worker.py:2; F2 worker.py:7,37,43; F3 worker.py:3; F4 worker.py:27,52-53; F5 worker.py:5; F6 worker.py:50 | F2, F4, F6 |
+| exports-jobq | each export of jobq.py (Job, JobQueue, MAX_RETRIES, BACKOFF_SECONDS, backoff_for): its name and its job | F1 exports Job; F2 exports JobQueue; F3 exports MAX_RETRIES; F4 exports BACKOFF_SECONDS; F5 exports backoff_for; F6 Job holds name, payload, priority, attempts; F7 JobQueue has push, pop, fail and a dead list; F8 MAX_RETRIES is the retry limit; F9 BACKOFF_SECONDS are the waits; F10 backoff_for returns the wait; F11 the last backoff repeats | F1 jobq.py:15; F2 jobq.py:23; F3 jobq.py:5; F4 jobq.py:6; F5 jobq.py:9; F6 jobq.py:16-20; F7 jobq.py:25,27,29-30,33-34,39-40; F8 jobq.py:5,40,42; F9 jobq.py:6,10-12,45; F10 jobq.py:10-12; F11 jobq.py:10-11 | F6, F7, F8, F9, F10, F11 |
+| exports-utils | each function of utils.py (parse_duration, chunked, slugify): its name and what it does, and the units and error of parse_duration | F1 exports parse_duration; F2 exports chunked; F3 exports slugify; F4 parse_duration converts a duration string to seconds; F5 chunked yields lists of at most size items; F6 slugify lowercases and joins with hyphens; F7 the accepted suffixes are s, m, h; F8 anything else raises ValueError | F1 utils.py:8; F2 utils.py:16; F3 utils.py:22; F4 utils.py:9-10,13; F5 utils.py:17-19; F6 utils.py:23-24; F7 utils.py:4-5,9; F8 utils.py:9,11-12 | F4, F5, F6, F7, F8 |
+| exports-cache | each method of cache.py (LRUCache.get, put, clear, __len__): its name and its job, and the ttl and capacity | F1 exports LRUCache; F2 has get; F3 has put; F4 has clear; F5 has __len__; F6 get returns the cached value and marks it used; F7 put stores a value and evicts when over capacity; F8 clear empties the cache; F9 len gives the number of entries; F10 an optional ttl makes entries expire; F11 the capacity limits how many entries it keeps | F1 cache.py:6; F2 cache.py:13; F3 cache.py:25; F4 cache.py:32; F5 cache.py:35; F6 cache.py:14,17,21-23; F7 cache.py:26-30; F8 cache.py:33; F9 cache.py:36; F10 cache.py:1,9,19-20; F11 cache.py:8,26,29-30 | F6, F7, F8, F9, F10, F11 |
+| exports-settings | the exports of settings.py (DEFAULTS, ENV_PREFIX, load_settings) and the prefix value | F1 exports DEFAULTS; F2 exports ENV_PREFIX; F3 exports load_settings; F4 the prefix is JOBQ_ | F1 settings.py:5; F2 settings.py:12; F3 settings.py:15; F4 settings.py:12 | none |
+| exports-worker | each name worker.py exports (HANDLERS, handler, echo, sleep_job, run_one, run_forever): its name and its job | F1 exports HANDLERS; F2 exports handler; F3 exports echo; F4 exports sleep_job; F5 exports run_one; F6 exports run_forever; F7 HANDLERS maps job names to functions; F8 handler is the registering decorator; F9 echo returns its payload; F10 sleep_job sleeps for the seconds in its payload; F11 run_one pops and runs one ready job; F12 run_forever loops and sleeps when idle | F1 worker.py:9; F2 worker.py:12; F3 worker.py:21; F4 worker.py:26; F5 worker.py:30; F6 worker.py:48; F7 worker.py:9,13,15,35; F8 worker.py:13,15; F9 worker.py:22; F10 worker.py:27; F11 worker.py:31-32,41; F12 worker.py:49,51-53 | F7, F8, F9, F10, F11, F12 |
+| steps-states | the five states, in the order the doc lists them | F1 state 1 pending; F2 state 2 running; F3 state 3 succeeded; F4 state 4 retrying; F5 state 5 dead | F1 lifecycle.md:5; F2 lifecycle.md:6; F3 lifecycle.md:7; F4 lifecycle.md:8; F5 lifecycle.md:9 | none |
+| steps-dead | what happens to a dead job (sits in queue.dead, never run again) and whether it survives a restart (memory only, dropped) | F1 it sits in queue.dead; F2 it is never run again; F3 dead jobs are kept in memory only; F4 a restart drops them | F1 lifecycle.md:9; F2 lifecycle.md:9; F3 lifecycle.md:13; F4 lifecycle.md:13 | none |
+| steps-deploy | the six deploy steps, in order | F1 step 1 run the unit tests; F2 step 2 tag the release; F3 step 3 build the image; F4 step 4 push the image; F5 step 5 roll the workers; F6 step 6 roll back if the dead count rises | F1 deploy.md:3; F2 deploy.md:4; F3 deploy.md:5; F4 deploy.md:6; F5 deploy.md:7; F6 deploy.md:8 | none |
+| steps-watch | what to watch after rolling the workers (the dead count), for how long (ten minutes), and what to do if it rises (roll back) | F1 watch the dead count; F2 for ten minutes; F3 roll back to the previous tag | F1 deploy.md:7; F2 deploy.md:7; F3 deploy.md:8 | none |
+| steps-retries | the retry limit (at most 3) and the three waits (1 s, 5 s, 30 s) | F1 at most 3 retries; F2 wait of 1 s; F3 wait of 5 s; F4 wait of 30 s | F1 limits.md:3; F2 limits.md:3; F3 limits.md:3; F4 limits.md:3 | none |
+| diff-settings | how settings.py and settings_v2.py differ (workers 2 -> 4, state_file dropped, max_payload_bytes and validate_settings added, load_settings validates) | F1 v2 default workers is 4 (v1: 2); F2 v2 drops state_file; F3 v2 adds max_payload_bytes; F4 v2 adds validate_settings; F5 v2 load_settings validates | F1 settings_v2.py:6, settings.py:6; F2 settings.py:9, settings_v2.py:5,10; F3 settings_v2.py:9; F4 settings_v2.py:15; F5 settings_v2.py:33 | F5 |
+| diff-load | whether load_settings behaves differently between settings.py and settings_v2.py, and how (validates, workers below 1, poll_seconds not positive, ValueError; v1 unchecked) | F1 yes, it differs; F2 v2 validates; F3 a workers value below 1 is rejected; F4 a poll_seconds that is not positive is rejected; F5 it raises ValueError; F6 v1 returns the settings unchecked | F1 settings.py:15,25, settings_v2.py:23,33; F2 settings_v2.py:33; F3 settings_v2.py:16-18; F4 settings_v2.py:16,19-20; F5 settings_v2.py:16,18,20; F6 settings.py:16-25 | F2, F3, F4, F5, F6 |
+| diff-order | how the ordering and the removal rules of cache.py and jobq.py differ (cache: recency, eviction, ttl; queue: ready_at, priority, push order, pop, dead list) | F1 the cache orders by recency of use; F2 the cache evicts over capacity; F3 cache entries expire by ttl; F4 the queue orders by ready_at first; F5 then by priority, lower first; F6 then by push order; F7 pop removes the next due job; F8 the queue never evicts; failures go to the dead list | F1 cache.py:11,22,28; F2 cache.py:26,29-30; F3 cache.py:19-21; F4 jobq.py:30-31; F5 jobq.py:30-31; F6 jobq.py:26,30-31; F7 jobq.py:34-36; F8 jobq.py:40,42-43 | F1, F2, F3, F4, F5, F6, F7, F8 |
+| diff-nohandler | whether worker.py's handling of a job with no handler agrees with the doc (logs an error, moves it to queue.dead; the doc says dead) | F1 yes, it agrees; F2 worker.py logs an error; F3 worker.py appends the job to queue.dead; F4 the doc says no handler means dead | F1 worker.py:36-38, lifecycle.md:9; F2 worker.py:37; F3 worker.py:38; F4 lifecycle.md:9 | F2, F3 |
+| sum-worker | 3 to 5 bullets on worker.py (handler registry, run_one pops a job, failure retried, no handler -> dead, run_forever loop) | F1 a registry of handlers; F2 run_one pops a ready job; F3 a failing job is retried; F4 a job with no handler is dead; F5 run_forever loops and sleeps | F1 worker.py:9,13,15; F2 worker.py:31-32; F3 worker.py:42-44; F4 worker.py:37-38; F5 worker.py:49,51-53 | F1, F2, F3, F4, F5 |
+| sum-cache | 3 to 5 bullets on cache.py (an LRU cache, capacity, optional ttl, injectable clock) | F1 it is an LRU cache; F2 a capacity limit; F3 an optional ttl expires entries; F4 an injectable clock | F1 cache.py:1,11,22,28,30; F2 cache.py:8,26,29-30; F3 cache.py:1,9,19-21; F4 cache.py:7,10,19,27 | F1, F2, F3, F4 |
+| sum-lifecycle | 3 to 5 bullets on lifecycle.md (five states, retrying with a backoff, dead after the third retry or no handler, dead is final, memory only) | F1 five states; F2 retrying with a backoff; F3 dead after the third retry or no handler; F4 dead is final; F5 dead jobs are in memory only | F1 lifecycle.md:3; F2 lifecycle.md:8; F3 lifecycle.md:9; F4 lifecycle.md:9; F5 lifecycle.md:13 | none |
+| sum-cli | 3 to 5 bullets on cli.py (run, enqueue, handlers, --config, enqueue is in this process only) | F1 the run command; F2 the enqueue command; F3 the handlers command; F4 the --config option; F5 enqueue is in this process only | F1 cli.py:1,15,34; F2 cli.py:1,16,31; F3 cli.py:19,27; F4 cli.py:13,25; F5 cli.py:1,29 | F1, F2, F3, F4, F5 |
+| sum-limits | 3 to 5 bullets on limits.md (3 retries, in memory, 2 workers, log level, no authentication) | F1 at most 3 retries; F2 the queue is in memory; F3 default 2 workers; F4 log level info; F5 no authentication | F1 limits.md:3; F2 limits.md:4; F3 limits.md:5; F4 limits.md:6; F5 limits.md:7 | none |

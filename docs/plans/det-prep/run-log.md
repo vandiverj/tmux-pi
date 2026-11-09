@@ -612,3 +612,16 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - tp-agent review refused: packet ~341k > 300k. Round diff 230k, of which answers.jsonl 101k (rewritten ~2k-char lines).
   Smaller of diff/file per file = 145k. No bypass used (no --override-review). Product fix: RV-1 (brief rv/rv1-rewrite-whole-file.md),
   dispatched coder-2d2c9997c1. LS1 review waits for RV-1's merge.
+
+## 2026-11-08 — RV-1 merged; LS1 r6 review started
+- RV-1 (coder-2d2c9997c1): review 1 APPROVED_WITH_NOTES (F1: keep raw size and fail-before evidence); Main kept both prepare
+  outputs (229931 -> 148555) and re-ran fail-before itself (6/8 fail on unfixed code); review 2 APPROVED. Worker's deviation
+  accepted: compare the sections as attached, tie keeps hunks (the literal rule would make small edits whole).
+  Main probe: a forged `diff --git` line and two secret-like values in a rewritten file stay `+` lines and are redacted.
+  Closed (lane close records review 1's verdict, not the later APPROVED; noted), merged d352a8b, lane removed.
+- LS1 r6 review now fits and started (review-coder-d50afe8142-204331).
+- G2-E review 1 APPROVED_WITH_NOTES (F1 names table, F2 probe logs: Main's first probe log was empty, a redirect-order slip);
+  re-run with -v, table of 24 gated tests (14 deno + 10 sandbox), all 9 broken-deno failures gated. Re-review running.
+- G2-A verify on its old base: 3 failures, all fixed on main or baselined (retry_packet flake; cap 16 vs 20 from G2-B;
+  run-id collision from G2-C). G2-A committed ff1c47b, main merged into the lane, full set queued on the merged tree.
+- FG-N1 r4 verify OK x4; 3.14 prints an unclosed-socket ResourceWarning at exit, being traced on main vs lane.

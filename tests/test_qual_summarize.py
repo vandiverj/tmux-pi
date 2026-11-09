@@ -955,14 +955,17 @@ class DataTests(unittest.TestCase):
         # Rules 13 to 15, kind j: 11 shapes x 6 wrappers x (no break, then a break at each separator, rotating through \n, \r\n, U+2028 and
         # U+00A0) x 4 targets (a valid line, a line past the end, a range past the end, a file that is not the chore's) x 24 chores.
         # Each must fail: for rule 15 (or rule 10 for the exact bracket alone on a line), and for rule 3 when the target is bad.
-        # Three tests (a valid line, then a line past the end, then the others) to keep each well under 5 s.
+        # Four tests (a valid line, a line past the end, a range past the end, a file that is not the chore's) to keep each under 5 s.
         self.assertJ({"j valid": 24 * 11 * 6 * 3})
 
     def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_past_the_end_of_a_file(self):
         self.assertJ({"j line past end": 24 * 11 * 6 * 3})
 
-    def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_bad_ranges_and_files(self):
-        self.assertJ({"j range past end": 24 * 5 * 6 * 4, "j nonexistent file": 24 * 11 * 6 * 3})
+    def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_bad_ranges(self):
+        self.assertJ({"j range past end": 24 * 5 * 6 * 4})
+
+    def test_generated_attack_every_shape_of_a_line_reference_is_found_and_checked_bad_files(self):
+        self.assertJ({"j nonexistent file": 24 * 11 * 6 * 3})
 
     def assertJ(self, floors):
         counts = self.attack(lambda kind: kind in floors)
@@ -1700,6 +1703,8 @@ class CheckerTests(unittest.TestCase):
                 for extra in ("src/cache.py:{g}9999", "src/cache.py{g}:9999", "line 9999 {g}of src/cache.py", "line 9999 of {g}src/cache.py"):
                     result = self.appended(extra.format(g=g))
                     self.assertEqual((result["pass"], (3, "range") in rules(result), len(result["bad_citations"])), (False, True, 1), (extra, fill, gap))
+
+    def test_rule_20_a_megabyte_of_words_references_and_brackets_is_read_in_linear_time(self):
         self.megabyte({"words": "The queue evicts after 128 entries and retries 3 times. ", "line breaks": "\n", "open brackets": "[",
                        "dense references": "src/cache.py:6 ", "line of": "line 6 of src/cache.py ", "floor": "src/a.py;7 ", "compatibility forms": "ﬁ "})
 
@@ -1707,14 +1712,23 @@ class CheckerTests(unittest.TestCase):
         # the shapes with the most numbers (one for each two characters): the floor reads each, ASCII and fullwidth
         self.megabyte({"numbers": "7 ", "unicode digits": "９ "})
 
+    def test_rule_20_a_megabyte_of_bracket_items_on_one_line_is_read_in_linear_time(self):
+        # rule 10 reads the items of a line through the one path reader (references), so a line of bracket items costs a second reading of the line;
+        # the comma lists are the worst shape (three items for 14 characters)
+        self.megabyte({"comma lists one line": "[a:1,b:2,c:3] ", "hash items one line": "[src/cache.py#:6] ", "unknown-name items one line": "[nofile:9] "})
+
+    def test_rule_20_a_megabyte_of_bracket_items_on_many_lines_is_read_in_linear_time(self):
+        self.megabyte({"short fact lines": "- x [y:1]\n", "bracket-with-hash lines": "[x#:1]\n", "bracket items, many lines": "- x [src/cache.py:6]\n"})
+
     def megabyte(self, unit):
-        """A 1 MB reply is read in about a second, whatever its shape (the limit is 2 s on py3.9). Each shape has a reference to a missing file at
+        """A 1 MB reply is read in about a second, whatever its shape: the bound is 2 CPU seconds (time.process_time, the CPU time of this process,
+        so a loaded machine does not fail it) on py3.9, where the slowest shape takes about 1.5 s. Each shape has a reference to a missing file at
         its end, which is found whatever comes before it."""
         for name, piece in unit.items():
             reply = "- alpha {c}\n- beta {c}\n{body}\nsrc/nonexistent.rs:999".format(c=self.C, body=piece * (1000000 // len(piece)))
-            start = time.monotonic()
+            start = time.process_time()
             result = self.check(reply)
-            self.assertLess(time.monotonic() - start, 2, name)
+            self.assertLess(time.process_time() - start, 2, name)
             self.assertIn((3, "unknown_file"), rules(result), name)
 
     def test_rule_21_a_number_after_a_path_or_a_line_word_that_no_grammar_placed_fails(self):
@@ -1787,6 +1801,92 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual((result["pass"], rules(result), result["bad_citations"]), (False, {NONCANON}, []), text)
         result = self.appended("Also src/cache.py:6,src/nonexistent.rs:7")
         self.assertEqual(result["bad_citations"], ["src/nonexistent.rs:7 (unknown_file)"])
+
+    # ---- round 12: rules 24 to 26 (review-coder-9ea22c07bd-233606 F1, F2 and Main's ls1probe14) ----
+    def paths_of(self, text):
+        """The paths the checker reads from text as the only reply, as references() reports them."""
+        return [ref[2] for ref in summarize_check.references(text, self.ANSWER["cite_files"])[0]]
+
+    def test_rule_24_nothing_inside_a_delimiter_is_rewritten(self):
+        # F1: leading punctuation inside a pair is part of the path, as it is outside one: the file ";src/cache.py", unknown_file, counted
+        for text, path in (("(;src/cache.py:6)", ";src/cache.py"), ("(,src/cache.py:6)", ",src/cache.py"), ("`;src/cache.py:6`", ";src/cache.py"),
+                           ("[;src/cache.py:6]", ";src/cache.py"), (";src/cache.py:6", ";src/cache.py"), ("<;src/cache.py:6>", ";src/cache.py"),
+                           ("';src/cache.py:6'", ";src/cache.py"), ("(;src/cache.py line 6)", ";src/cache.py"), ("(;src/cache.py#L6)", ";src/cache.py"),
+                           ("line 6 of (;src/cache.py)", ";src/cache.py"), ("line 6 of `,src/cache.py`", ",src/cache.py")):
+            result = self.appended("Also " + text)
+            self.assertEqual(self.paths_of("Also " + text), [path], text)
+            self.assertIn((3, "unknown_file"), rules(result), text)
+            self.assertEqual(len(result["bad_citations"]), 1, text)
+        # nor is anything taken off the end: only the white space around the path is trimmed (a line break included)
+        for text, path, bad in (("(src/cache.py.:6)", "src/cache.py.", True), ("(src/cache.py*:6)", "src/cache.py*", True), ("`src/cache.py;:6`", "src/cache.py;", True),
+                                ("( src/cache.py:6 )", "src/cache.py", False), ("(\nsrc/cache.py:6\n)", "src/cache.py", False),
+                                ("(src/ca\nche.py:6)", "src/ca\nche.py", True), ("(src/ca  che.py:6)", "src/ca  che.py", True),
+                                ("src/cache.py.:6", "src/cache.py", False), ("src/cache.py);:6", "src/cache.py", False)):  # outside a pair rule 18 is unchanged
+            result = self.appended("Also " + text)
+            self.assertEqual((self.paths_of("Also " + text), bool(result["bad_citations"])), ([path], bad), text)
+        # a list in a pair: ONE separator ends a reference, a second character is the front of the next path
+        self.assertEqual(self.paths_of("(src/cache.py:6; src/cache.py:7)"), ["src/cache.py", "src/cache.py"])
+        self.assertEqual(self.paths_of("(src/cache.py:6, ;src/cache.py:7)"), ["src/cache.py", ";src/cache.py"])
+        self.assertEqual(self.paths_of("(src/cache.py:6,, src/missing.py:7)"), ["src/cache.py", ", src/missing.py"])
+        self.assertEqual(self.paths_of("(src/cache.py:6, src/missing.py:7)"), ["src/cache.py", "src/missing.py"])
+
+    def test_rule_25_a_quote_opens_after_a_space_or_a_bracket_and_closes_before_a_space_or_punctuation(self):
+        # F2: after a letter a quote is an apostrophe and part of the word, so these are the files "x'src/cache.py" and "x\u2018src/cache.py"; x(...) is a delimiter
+        for text, path, bad in (("x\u2018src/cache.py:6\u2019", "x\u2018src/cache.py", True), ("x'src/cache.py:6'", "x'src/cache.py", True),
+                                ('x"src/cache.py:6"', 'x"src/cache.py', True), ("x\u201csrc/cache.py:6\u201d", "x\u201csrc/cache.py", True),
+                                ("x(src/cache.py:6)", "src/cache.py", False), ("x[src/cache.py:6]", "src/cache.py", False), ("x<src/cache.py:6>", "src/cache.py", False),
+                                ("x`src/cache.py:6`", "src/cache.py", False), ("don't src/cache.py:6", "src/cache.py", False),
+                                ("'src/cache.py:6'", "src/cache.py", False), ("see 'src/cache.py:6'.", "src/cache.py", False),
+                                ("(\u2018src/cache.py:6\u2019)", "src/cache.py", False), ("<\"src/cache.py:6\">", "src/cache.py", False),
+                                ("'src/cache.py:6'x", "'src/cache.py", True), ("'src/cache.py:6", "'src/cache.py", True),
+                                ("\u2018;src/cache.py:6\u2019", ";src/cache.py", True), ("x\u2018;src/cache.py:6\u2019", "x\u2018;src/cache.py", True)):
+            result = self.appended("Also " + text)
+            self.assertEqual((self.paths_of("Also " + text), bool(result["bad_citations"])), ([path], bad), text)
+            self.assertTrue(rules(result) & {NONCANON, STRAY}, text)
+        # the same in the other order, and at the start of the reply
+        for text, path in (("line 6 of x(src/cache.py)", "src/cache.py"), ("line 6 of x'src/cache.py'", "x'src/cache.py"), ("line 6 of 'src/cache.py'", "src/cache.py"),
+                           ("line 6 of x\u2018src/cache.py\u2019", "x\u2018src/cache.py"), ("line 6 of (;src/cache.py)", ";src/cache.py")):
+            self.assertEqual(self.paths_of("Also " + text), [path], text)
+        self.assertEqual(self.paths_of("'src/cache.py:6'"), ["src/cache.py"])
+        self.assertEqual(self.paths_of("\u2018src/cache.py:6\u2019"), ["src/cache.py"])
+
+    def test_rule_26_one_path_reader_returns_the_path_as_written(self):
+        # the NFKC copy only finds the reference: the path looked up and reported is the original text, so a compatibility form in it is another file
+        for text, path in (("src\uff0fcache.py:6", "src\uff0fcache.py"), ("src/cache.py\u2026:6", "src/cache.py\u2026"), ("(src\uff0fcache.py:6)", "src\uff0fcache.py"),
+                           ("line 6 of src\uff0fcache.py", "src\uff0fcache.py"), ("src/cache.py\ufb01:6", "src/cache.py\ufb01"), ("src/cache.py\u00b9:6", "src/cache.py\u00b9"),
+                           ("src/cache.py\uff1a6", "src/cache.py"), ("\u2192src/cache.py:6", "\u2192src/cache.py")):
+            result = self.appended("Also " + text)
+            self.assertEqual(self.paths_of("Also " + text), [path], text)
+            self.assertEqual(bool(result["bad_citations"]), path != "src/cache.py", text)
+        # a delimiter is found in the NFKC copy too (a fullwidth bracket is a bracket), but the path inside it is cut from the original text
+        self.assertEqual(self.paths_of("Also \uff3bsrc\uff0fcache.py:7\uff3d"), ["src\uff0fcache.py"])
+
+    def test_rule_26_every_delimiter_gives_the_same_path_for_the_same_text_and_rule_10_has_no_reader_of_its_own(self):
+        # Main's ruling 5 (sweep row 28): [src/cache.py#:6] was "src/cache.py#" to rule 10 and "src/cache.py" to rules 18 and 24 in (...) or
+        # `...`. Rule 19 starts the line part at the "#" (a run of separators), rule 24 makes the path the text before it: src/cache.py, in all of
+        # them, and the item is no exact path:N (rule 15 knows only the exact trailing [path:N]), so it is a noncanonical reference, not a citation
+        for between in ("#", " ", "\u00b7", "#:", ": ", "\u00a0", "\t", " #"):
+            for opener, closer in (("[", "]"), ("(", ")"), ("<", ">"), ("`", "`"), ("", "")):
+                text = "Also {}src/cache.py{}:6{}".format(opener, between, closer)
+                self.assertEqual(self.paths_of(text), ["src/cache.py"], repr(text))
+                result = self.appended(text)
+                self.assertEqual((rules(result) & {STRAY, NONCANON, (3, "unknown_file")}, result["bad_citations"]), ({NONCANON}, []), repr(text))
+            self.assertEqual(summarize_check.citation_items("Also [src/cache.py{}:6]".format(between), ["src/cache.py"]), [], repr(between))
+        # on a fact line the same item is no citation list: uncited, and still the one noncanonical reference
+        for text in ("- alpha [src/cache.py#:6]", "- alpha [src/cache.py :6]", "- alpha [src/cache.py\u00a0:6]"):
+            result = self.check("{}\n- beta {}".format(text, self.C))
+            self.assertTrue({UNCITED, NONCANON} <= rules(result), text)
+            self.assertEqual(result["bad_citations"], [], text)
+        # a bad file is counted once, as written, the same in every delimiter
+        for text in ("Also [src/nofile.py#:6]", "Also (src/nofile.py#:6)", "Also `src/nofile.py#:6`", "Also src/nofile.py#:6"):
+            self.assertEqual(self.appended(text)["bad_citations"], ["src/nofile.py#:6 (unknown_file)"], text)
+        # the exact item stays one: [path:N] and [path:N-M] among others in a bracket, and a name that is no path (nothing for the grammar to read)
+        self.assertEqual([c[1] for c, _ in summarize_check.citation_items("[see, src/cache.py:6, src/cache.py:7-9]", ["src/cache.py"])], ["src/cache.py"] * 2)
+        result = self.appended("Also [nofile:9]")
+        self.assertEqual((rules(result) & {STRAY, NONCANON, (3, "unknown_file")}, len(result["bad_citations"])), ({STRAY, (3, "unknown_file")}, 1))
+        # a comma in front of the path is part of it (rule 24, ruling 3), so the item is not exact either
+        result = self.appended("Also [,src/cache.py:6]")
+        self.assertEqual((rules(result) & {STRAY, NONCANON, (3, "unknown_file")}, len(result["bad_citations"])), ({NONCANON, (3, "unknown_file")}, 1))
 
     def test_every_citation_is_checked_and_the_unvouched_are_counted(self):
         # A good citation counts through the support of a fact the line states; one on a line that states no fact, or that matches no

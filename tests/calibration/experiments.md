@@ -326,13 +326,13 @@ validation). A reply is a list of FACT LINES and only those count:
     in a trailing citation is not the canonical form, so it is `noncanonical_citation` (and the line is `uncited`).
 18. A path has no character list (round 10). Outside a delimiter PATH is the maximal run of non-whitespace characters, less trailing
     sentence punctuation (`.,;:!?)]}>'"` and the backtick or `*`); it is a path when it holds `/` or `\`, ends in `.<letters>`, or is a chore
-    file's path or bare name. Inside a delimiter (`[]`, `()`, `<>`, backticks, quotes) PATH is everything from the opener to the line part, any
-    character, spaces and line breaks included; if that is not path-shaped the token outside the delimiter is used.
+    file's path or bare name. Inside a delimiter (`[]`, `()`, `<>`, backticks, quotes) PATH is everything from the opener to the line part
+    (exactly, see rule 24); if that is not path-shaped the token outside the delimiter is used.
 19. A line part comes in both orders (round 10). Forward: a run of separators (`:` `#` `,` `(` `·`, whitespace, line breaks), then optionally
     `L`, `l.`, `ln`, `line` or `lines` (any case), then a number or a range. Reverse: `line`, `lines` or `L` + number or range, then `of`, `in`
     or `at`, then PATH.
 20. No window, linear time (round 10). Detection does not depend on the distance between the parts of a reference or on the reply's length:
-    gaps of 0, 1, 4000, 4001 and 100000 spaces or line breaks are read the same, and a 1 MB reply is checked in under 2 s.
+    gaps of 0, 1, 4000, 4001 and 100000 spaces or line breaks are read the same, and a 1 MB reply is checked in under 2 CPU seconds on py3.9.
 21. Table-free floor (round 10). After the canonical citations of fact lines and every reference of rules 17 to 19 are removed, a number
     (any Unicode digits) directly preceded by a path token or by a line word (`line`, `lines`, `L`, `l.`, `ln`, `#`) with only separators
     between them fails the reply, kind `unparsed_reference`. The runner counts these as `unparsed_references`, beside `fabricated_citations`;
@@ -345,8 +345,25 @@ validation). A reply is a list of FACT LINES and only those count:
     a matched pair. Any other leading character (`{`, `|`, a letter) and an opener with no closer is part of the path as written, so
     `{src/cli.py:6` is a reference to the file `{src/cli.py` (`unknown_file`, counted in `fabricated_citations`). Only the trailing punctuation of
     rule 18 is removed (U+201D and U+2019 join it, as the closers of the typographic quotes).
+24. No rewriting inside a delimiter (round 12). Inside a matched pair PATH is exactly the text from just after the opener to the line part,
+    with only the white space around it (line breaks included) trimmed. No punctuation is taken off either end, so `(;src/cli.py:6)` is the
+    file `;src/cli.py` (`unknown_file`), like `[;src/cli.py:6]` and a bare `;src/cli.py:6`. Outside a pair only rule 18's trailing punctuation
+    is removed. A reference that follows another in a list starts after the previous one and ONE separator (`,` or `;`).
+25. Quotes and apostrophes (round 12, Main's ruling on review 11's F2). A quote (`'`, `"`, `‘ ’`, `“ ”`) opens a delimiter only at the start
+    of the reply or after white space or an opening bracket, and closes one only before the end, white space or rule-18 trailing punctuation.
+    Any other quote is an apostrophe and part of the word, as in `don't`. Brackets (`[]`, `()`, `<>`) and backticks are delimiters wherever
+    they stand. So `x‘src/cli.py:6’` and `x'src/cli.py:6'` are the file `x‘src/cli.py` / `x'src/cli.py` (`unknown_file`), and `x(src/cli.py:6)`
+    is the file `src/cli.py`. (The `<` of `a < b` or `<=` is no longer an exception: `<` opens a pair wherever it stands, and a pair needs its `>`.)
+26. One path reader (round 12). Delimited and bare references, in either order, take their path from one function (`references()`), and the
+    path is the text as written. The NFKC copy of rule 17 only finds the reference; the path that is looked up and reported is cut from the
+    original text, so a fullwidth slash (`src／cli.py`) or an ellipsis (`src/cli.py…`) in a path is another file, as it is on disk. There is no
+    other reader (round 13): rule 10 asks `references()` too. A `[bracket]` item is an exact `path:N` citation only when the reader reads it as
+    one reference that starts and ends where the item does and has the item's own path. `[src/cli.py#:29]` and `(src/cli.py#:29)` are therefore
+    both the file `src/cli.py` (rule 19 starts the line part at the `#`, rule 24 makes the path the text before it), neither is an exact item,
+    and both are a noncanonical reference (rule 15); on a fact line the first is also `uncited`. An item with no reference overlapping it
+    (`[nofile:9]`) is read as written.
 
-The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 23 it
+The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 26 it
 broke. The runner keeps the raw reply. The prompt in `config/local.example.json` states the format with one example.
 
 Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
@@ -480,6 +497,42 @@ kind (a leading or typographic character), q/r 1070 accepted per form. Changed e
 (`test_citations`, the unclosed-list row: `unknown_file`, not a citation), and a bolded line (`**x [p:1]`) is a bad line in
 `test_lines_that_are_not_fact_lines_count_for_nothing`. No new benign flag: corpus A 24/24 pass, the references 24/24, corpus B
 identical to round 10, corpus C (braces, fractions, superscripts, circled digits, f-strings) with the same two `no_subject` lines as round 10.
+
+Round 12 (review 11: `(;src/cli.py:6)`, `(,src/cli.py:6)` and `` `;src/cli.py:6` `` counted 0 bad citations because a second strip took leading `" ,;"` off a
+path inside a delimiter while `[;src/cli.py:6]` and a bare `;src/cli.py:6` did not; `x‘src/cli.py:6’` and `x'src/cli.py:6'` were `unknown_file` while
+`x(src/cli.py:6)` was not - the same family once more: the path was rewritten between what the text says and what is looked up, and each round
+found one more place). Rules 24 to 26 above. The second strip is deleted; `references()` cuts every path with one function (`span`) from the original
+text (the NFKC copy only finds the references), and `_delimiters` lets a quote open and close only where rule 25 says. The test now compares the path
+the checker read with the path a plain model of the rules reads from the text the generator wrote (`oracle_cases` / `oracle_mismatches` in
+`tests/test_qual_summarize_oracle.py` since round 13, with its own pair matcher and its own list of trailing punctuation): 9 delimiters (each bracket pair, backticks, each of
+the four quote pairs, none) x 52 characters (32 printable ASCII punctuation, 20 non-ASCII) x 4 positions (first, last, inside the directory, inside the name)
+x 3 before the opener (a letter, a space, nothing) x both orders of rule 19 x all 24 chores = 269568 cases, each asserted for the path and for the failures
+(`unknown_file` only when the path is not the chore's file, `noncanonical_citation`, or `unparsed_reference` when the model reads no path), and every 32nd
+also inside the whole reference reply. Round 11's tree (`9e2a680`, loaded in memory): 67512 of the 269568 differ; the current tree: 0 (py3.9 and py3.14).
+Changed readings (flagged for Main): a compatibility form in a path is now the path as written (`src／cli.py` is `unknown_file`, as is `src/cli.py…`),
+a `<` is always an opener, and a list continues after ONE separator. No new benign flag: the references 24/24, corpus A 24/24, B and C byte-identical to round 11.
+
+Round 13 (Main's rulings on the round-12 flags; accepted as they stand: a compatibility form in a path is the path as written, `<` opens a pair, a
+doubled separator in a list is malformed and fails closed, `x“src/cli.py:6”` is `unknown_file`. Not accepted: sweep row 28. `[src/cli.py#:29]` was the file
+`src/cli.py#` to rule 10 and `(src/cli.py#:29)` the file `src/cli.py` to rules 18 and 24, so there were two path readers, which rule 26 forbids.) Rule 19
+says the line part is "a run of separators (`: # , (` and `·`, white space, line breaks), optionally L, l., ln, line or lines, then a number", so in
+`[src/cli.py#:29]` it starts at the `#`, and rule 24 says PATH is "exactly the text from just after the opener to the line part": the file is `src/cli.py`
+in every delimiter. Rule 10 now asks `references()` instead of cutting the path itself (`citation_items`): a `[bracket]` item is an exact `path:N` citation
+only when the reader reads it as one reference that starts and ends where the item does and has the item's own path; an item with no reference
+overlapping it (`[nofile:9]`) is read as written. `[src/cli.py#:29]` is therefore a noncanonical reference (rule 15, bad 0), and on a fact line it is also
+`uncited`. The oracle moved to `tests/test_qual_summarize_oracle.py` (each test file under 60 s alone) and grew to 327456 cases: the 269568 of round 12
+(non-fact lines) + 44928 of the same characters as a forward fact line `- ok <opener>path:N<closer>` + 12960 of every separator that can stand
+before the colon (15: none, spaces, no-break space, tab, `#`, `(`, `·`, `,`, `:`, `#:`, ` #`, `# `, `: `, `,,`) on a line of prose (3 places before the opener) and on a
+fact line, over 9 delimiters x 24 chores; the model decides which items are exact from the grammar's path, not from the item's own cut. The round-12
+tree: 768 of the 327456 differ (all in brackets: 480 character cases, 288 separator cases); the current tree: 0 (py3.9 and py3.14). Cost of the
+reader: `citation_items` is computed once per line and cached, and `_floor` builds its name set once; a 1 MB reply of 66k `[a:1,b:2,c:3]` on one line takes
+1.8 s (round 12: 1.6 s).
+
+Round 14 (Main ruling 8). The Rule 20 test measures CPU seconds (`time.process_time()`), not wall-clock, so a loaded machine does not fail it; the bound stays 2 s,
+on py3.9. The comma-list shape is in the tests (`test_rule_20_a_megabyte_of_bracket_items_on_one_line_...`). To make rule 10's reading cheaper, the reading of a line for
+its bracket items is `reference_spans()` (the references of `references()` without their numbers, their written text and the floor), `shaped()` tests the cheap
+conditions first and a chore file's whole path is looked up in a set. The result is the same (300000 random texts: items and references equal to round 13's); the shape takes
+about 1.5 s CPU on py3.9 (1.8 s before), 1.0 s on py3.14.
 
 ### Audit of the required facts (round 6)
 

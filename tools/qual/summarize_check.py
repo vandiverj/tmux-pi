@@ -43,7 +43,11 @@ of FACT LINES, and only fact lines state facts:
   Rule 10 Every citation is checked, wherever it is. Any bracket of the reply with an item of the CITATION shape (path:N or path:N-M)
           is checked by rule 3: on any line, list or not, a heading, a quote, prose, inside or outside a code span or block. A bad
           one is in bad_citations (so in a run's fabricated count). A line that holds a citation and is no valid fact line fails the
-          reply: `stray_citation` (rule 2) when it is no list item, and what rules 9 and 11 say when it is one.
+          reply: `stray_citation` (rule 2) when it is no list item, and what rules 9 and 11 say when it is one. An item is a citation
+          only when the one path reader (rule 26) reads it as that: one reference that starts and ends where the item does and has the
+          item's own path. So "[src/cli.py#:29]" is no citation: rule 19 starts its line part at the "#", the path is "src/cli.py" (as in
+          "(src/cli.py#:29)"), and it is a noncanonical reference (rule 15). An item with no path-shaped text for the grammar to read
+          ("[nofile:9]") is read as written, since there is no other reading of it.
   Rule 11 List items by any whitespace and any bullet. A line is unprefixed first: leading whitespace as str.isspace has it (U+00A0,
           U+2003, U+3000 ...), control and format characters (U+0000, U+200B, U+FEFF ...) and any number of blockquote markers ">". It is a list item
           when it then starts with - * + a bullet (U+2022, U+2023, U+25E6, U+2043, U+2013, U+2014, U+00B7) or digits and . or ),
@@ -72,8 +76,8 @@ of FACT LINES, and only fact lines state facts:
           trailing citation is not the canonical form (`noncanonical_citation`, and the line is `uncited`).
   Rule 18 A path has no character list. Outside a delimiter PATH is a maximal run of non-whitespace characters less trailing sentence
           punctuation; it is a path when it holds "/" or "\\", ends in ".<letters>" or is a chore file's path or bare name. Inside a
-          delimiter ([] () <> backticks quotes) PATH is everything from the opener to the line part, whitespace and line breaks
-          included; when that is not path-shaped, the token outside the delimiter is used.
+          delimiter ([] () <> backticks quotes) PATH is everything from the opener to the line part (rule 24); when that is not
+          path-shaped, the token outside the delimiter is used.
   Rule 19 A line part comes in both orders. Forward: a run of separators (": # , (" and "·", whitespace, line breaks), optionally
           L, l., ln, line or lines (any case), then a number or a range. Reverse: line, lines or L + number or range, then of, in or
           at, then PATH.
@@ -90,6 +94,18 @@ of FACT LINES, and only fact lines state facts:
           Any other leading character (a brace, a pipe, a letter) and an opener with no closer is part of the path as written, so
           "{src/cli.py:6" is a reference to the file "{src/cli.py" (`unknown_file`, counted as fabricated). Only the trailing punctuation of
           rule 18 is removed.
+  Rule 24 No rewriting inside a delimiter. Inside a matched pair PATH is exactly the text from just after the opener to the line part, only
+          the white space around it (line breaks included) trimmed: no punctuation is taken off either end, so "(;src/cli.py:6)" is the
+          file ";src/cli.py" (`unknown_file`). Outside a pair only rule 18's trailing punctuation is removed. A reference that follows
+          another in a list starts after the previous one and ONE separator, "," or ";".
+  Rule 25 Quotes and apostrophes. A quote (' " and the typographic forms) opens a delimiter only at the start of the reply or after
+          white space or an opening bracket, and closes one only before the end, white space or rule 18's trailing punctuation; any other
+          quote is an apostrophe, a letter of the word ("don't"). Brackets and backticks are delimiters wherever they stand. So
+          "x'src/cli.py:6'" is the file "x'src/cli.py" (`unknown_file`) and "x(src/cli.py:6)" is the file "src/cli.py".
+  Rule 26 One path reader. Every reference, delimited or bare, in either order, takes its path from one function (references()), and the
+          path is the text as written: the NFKC copy of rule 17 only finds the reference, it is never the path that is looked up or
+          reported (a fullwidth slash or an ellipsis in a path makes another file). There is no other reader: rule 10 asks references() too, so
+          the same text gives the same path in every delimiter ("[src/cli.py#:29]" and "(src/cli.py#:29)" are both the file "src/cli.py").
 
 answer (a line of tests/calibration/summarize/answers.jsonl):
   required     list of facts; a fact is a list of alternative regexes for ONE thing (case-insensitive, matched against ONE claim),
@@ -145,9 +161,10 @@ REVERSE = re.compile(r"(?<!\w){w}\.?[ :#,(·=]*(?P<a>\d+){r}[ ,)\]]*(?:of|in|at)
 NON_SPACE = re.compile(r"\S+")
 SLASHES = re.compile(r"[/\\]")
 DELIMITERS = re.compile(r"`+|[\[\]()<>\"'\u201c\u201d\u2018\u2019]")
-OPENERS = frozenset("[(<\"'`\u201c\u2018")
 CLOSES = {"]": "[", ")": "(", ">": "<", "\u201d": "\u201c", "\u2019": "\u2018"}  # a closer -> the opener it closes
-LIST_SEPARATORS = ",;"  # between two references written without a space (a.py:1,b.py:2): not the first character of the second path
+QUOTES = frozenset("\"'\u201c\u201d\u2018\u2019")
+QUOTE_OPENERS, QUOTE_CLOSERS = frozenset("\"'\u201c\u2018"), frozenset("\"'\u201d\u2019")  # " and ' do both (rule 25)
+LIST_SEPARATORS = ",;"  # ONE of them between two references of a list (a.py:1,b.py:2) ends the first: it does not start the second path
 TRAILING = frozenset(".,;:!?)]}>'\"`*\u201d\u2019")  # sentence punctuation: not part of a path at its end (rule 18)
 # rule 21: a number preceded, with only separators between, by a path token or a line word. A separator is a space or any character that is
 # no letter, digit, "_", ".", "/", "\" or "-" (those are what paths and numbers are made of)
@@ -290,29 +307,44 @@ def _number(digits):
     return int(digits) if len(digits) < NUMBER_CAP else 10 ** NUMBER_CAP
 
 
-def _citation(item):
-    """(text, path, first, last) when the bracket item has the CITATION shape (path:N or path:N-M), else None."""
-    text = item.strip()
-    c = CITATION.match(text)
-    return None if c is None else (text, c.group("path"), _number(c.group("a")), _number(c.group("b") or c.group("a")))
+def citation_items(text, files=()):
+    return list(_citation_items(text, tuple(files)))
 
 
-def citation_items(text):
-    """[(citation, offset of its end in text)] for every citation-shaped item of every bracket of a line, wherever it is on it (rule 10):
-    in the claim, in prose, in a heading, a quote, a code span. A bracket that holds one such item among others is read for that item."""
-    found = []
+@functools.lru_cache(maxsize=2)  # a line is asked twice in a row (parse_fact_line, then check): the second ask is free, and the cost stays linear
+def _citation_items(text, files):
+    """[(citation, offset of its end in text)] for every item of every bracket of a line, wherever it is on it (rule 10): in the claim, in
+    prose, in a heading, a quote, a code span, that is exactly path:N or path:N-M AND that the one path reader (references, rules 24 and 26)
+    reads as that: one reference that starts and ends where the item does and has the item's own path. The path of a citation is therefore
+    never the item's own cut of the text: `[src/cli.py#:29]` is read by references() as the file src/cli.py and the line part "#:29", as
+    `(src/cli.py#:29)` is, so it is no exact path:N item (it is a noncanonical reference, rule 15). An item with no reference overlapping
+    it (`[nofile:9]`, nothing path-shaped for the grammar to read) is read as written, since there is no other reading of it. files are the
+    chore's files (what makes a bare file name a path). The reading of a line is reference_spans() (references() without its numbers and its floor: only
+    where each reference is and its path matter to rule 10), and is made only for a line that has an item of the CITATION shape."""
+    found, readings = [], None
     for bracket in BRACKETS.finditer(text):
         at = bracket.start() + 1
         for item in bracket.group(0)[1:-1].split(","):
-            c = _citation(item)
+            shown = item.strip()
+            c = CITATION.match(shown)  # the numbers are read only for an item that is taken
             if c:
-                found.append((c, at + len(item.rstrip())))
+                if shown is item or shown == item:
+                    start, end = at, at + len(item)
+                else:
+                    start, end = at + len(item) - len(item.lstrip()), at + len(item.rstrip())
+                if readings is None:
+                    refs = reference_spans(text, files)
+                    readings = ([r[0] for r in refs], [r[1] for r in refs], [r[2] for r in refs])
+                starts, ends, paths = readings
+                i = bisect.bisect_right(ends, start)  # the first reference that ends after the item starts
+                if i >= len(starts) or starts[i] >= end or (starts[i], ends[i], paths[i]) == (start, end, c.group("path")):
+                    found.append(((shown, c.group("path"), _number(c.group("a")), _number(c.group("b") or c.group("a"))), end))
             at += len(item) + 1
-    return found
+    return tuple(found)
 
 
-def citations_in(text):
-    return [c for c, _ in citation_items(text)]
+def citations_in(text, files=()):
+    return [c for c, _ in citation_items(text, files)]
 
 
 class _Normal(dict):
@@ -346,7 +378,7 @@ _NORMAL = _Normal()
 
 
 def _normalize(text):
-    """(scan, origin): text in the form rules 17 to 23 read. origin[i] is the index in text of the character scan[i] came from, or None when the
+    """(scan, origin): text in the form rules 17 to 23 find references in. origin[i] is the index in text of the character scan[i] came from, or None when the
     two have the same length and character for character (almost always: all of ASCII)."""
     scan = text.translate(_NORMAL)
     if len(scan) == len(text) and (text.isascii() or not any(chr(c) in text for c in _NORMAL.odd)):
@@ -368,40 +400,35 @@ def _blank(text, spans):
 
 
 def _delimiters(scan):
-    """What rules 18 and 23 call a delimiter: a MATCHED pair of [] () <> backticks (a run of N closes at the next run of N) or quotes (" ' and
-    the typographic forms U+201C/D, U+2018/9). An opener with no closer is no delimiter: it is part of the path as written. Returns
-    (positions, tops, closer): tops[i] is the text start of the innermost matched delimiter still open after the one at positions[i] (-1 for
-    none), and closer[p] is (text start, position of the closer) for the delimiter opened at p. A closer that matches nothing open is literal."""
+    """What rules 18, 23 and 25 call a delimiter: a MATCHED pair of [] () <> backticks (a run of N closes at the next run of N) or quotes
+    (" ' and the typographic forms U+201C/D, U+2018/9). Brackets and backticks are delimiters wherever they stand. A quote opens one only at
+    the start of the reply or after whitespace or an opening bracket, and closes one only before the end, whitespace or rule-18 trailing
+    punctuation; anywhere else it is an apostrophe, a letter of the word (rule 25). An opener with no closer is no delimiter: it is part of the
+    path as written. Returns (positions, tops, closer): tops[i] is the text start of the innermost matched delimiter still open after the one
+    at positions[i] (-1 for none), and closer[p] is (text start, position of the closer) for the delimiter opened at p. A closer that matches
+    nothing open is literal."""
     positions, closer, stack, count = [], {}, [], {}
     n = len(scan)
     for m in DELIMITERS.finditer(scan):
         p, token = m.start(), m.group()
         char = token[0]
-        if char == "`":
+        if char in QUOTES:
+            kind = CLOSES.get(char, char)
+            at_close = p + 1 >= n or scan[p + 1] == " " or scan[p + 1] in TRAILING
+            at_open = p == 0 or scan[p - 1] == " " or scan[p - 1] in "[(<"
+            close = char in QUOTE_CLOSERS and at_close and bool(count.get(kind))
+            if not close and not (char in QUOTE_OPENERS and at_open):
+                continue  # an apostrophe: part of the word, as in "don't" or "x'src/cli.py:6'"
+        elif char == "`":
             kind = token
             close = bool(count.get(kind))
-        elif char in "[(<\u201c\u2018":
-            if char == "<" and (p + 1 >= n or scan[p + 1] in " =\t"):
-                continue  # "a < b", "a <= b"
-            if char == "\u2018" and p and scan[p - 1].isalnum():
-                continue
-            kind, close = char, False
-        elif char in "])>\u201d\u2019":
-            kind = CLOSES[char]
-            if not count.get(kind) or (char == "\u2019" and p + 1 < n and scan[p + 1].isalnum()):  # U+2019 followed by a letter: an apostrophe
-                continue
-            close = True
-        elif char == '"':
-            kind = char
-            close = bool(count.get(kind))
-        elif count.get(char):  # "'" closes unless a letter or digit follows it (an apostrophe); it opens only after a non-word character
-            if p + 1 < n and scan[p + 1].isalnum():
-                continue
-            kind, close = char, True
-        elif p == 0 or not scan[p - 1].isalnum():
+        elif char in "[(<":
             kind, close = char, False
         else:
-            continue
+            kind = CLOSES[char]
+            if not count.get(kind):
+                continue
+            close = True
         if close:
             while True:
                 entry = stack.pop()
@@ -430,24 +457,15 @@ def _shown(text, start, end):
     return written if len(written) <= 200 else written[:100] + " ... " + written[-95:]
 
 
-def references(text, files, canonical=()):
-    """Rules 17 to 23. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
-    a reference; every pass is linear.
-
-    The scan is text in NFKC form (rule 17) with the spans in canonical (a fact line's own citation list) blanked. refs is every line
-    reference of it (rules 18 and 19), [(start, end, path, first, last, written)] in text's offsets and in order, written being the
-    reference as text has it: a PATH tied to a line number by a separator run from : # , ( · and spaces, then optionally L, l., ln, line
-    or lines, then a number or a range, or the reverse (line / lines / L, a number, then of, in or at, then a PATH). Outside a delimiter a
-    PATH is the run of non-space characters before the line part, as written (minus sentence punctuation at its end: a character in front of
-    it, an opener with no closer included, is part of it, rule 23), and it counts as a path when it holds / or \\, ends in ".<letters>" or is a chore file's path or name. Inside a delimiter it is
-    everything from the opening one to the line part, spaces and line breaks included. A chore file, written whole, wins over that.
-
-    unparsed is [(start, end, written)]: every number left once the references are removed that is directly preceded by a path token or
-    a line word (line, lines, L, l., ln, #) with only separators between them (rule 21)."""
-    scan, origin = _normalize(_blank(text, canonical))
+def _scan(text, files, canonical=()):
+    """The reading shared by references() and reference_spans(): (kept, at, after, scan, orig). kept is the references found in the scan, in scan
+    offsets [(start, end, path start, path end, delimited, first, last)]; at and after map a scan offset back to text's (None when there is no
+    reference to map); scan is text in NFKC form with canonical blanked and orig is text with canonical blanked."""
+    orig = _blank(text, canonical)
+    scan, origin = _normalize(orig)
     n = len(scan)
     if not any(char.isdigit() for char in scan):  # a reference needs a number
-        return [], []
+        return [], None, None, scan, orig
 
     def at(i):
         return i if origin is None else origin[i]
@@ -459,27 +477,51 @@ def references(text, files, canonical=()):
     run_starts = [a for a, _ in spans]
     run_ends = [b for _, b in spans]
     slashes = [m.start() for m in SLASHES.finditer(scan)]
-    names = set(files) | {Path(f).name for f in files}
+    whole = set(files)
+    names = whole | {Path(f).name for f in files}
     longest = max((len(name) for name in names), default=0)
     positions, tops, closer = _delimiters(scan)
 
-    def trail(a, b):
-        while b > a and scan[b - 1] in TRAILING:
-            b -= 1
-        return b
+    def written(i):
+        """scan[i] is the character it was written as (and not a piece of a compatibility form, such as "..." for U+2026)."""
+        return origin is None or orig[origin[i]] == scan[i]
 
     def shaped(a, b):
         """scan[a:b] is a path (rule 18): it holds / or \\, ends in ".<letters>" or is a chore file's path or name."""
         if a >= b:
             return False
-        if bisect.bisect_left(slashes, b) > bisect.bisect_left(slashes, a):
+        if b - a <= longest and scan[a:b] in names:
+            return True
+        k = bisect.bisect_left(slashes, a)
+        if k < len(slashes) and slashes[k] < b:
             return True
         j = b
         while j > a and scan[j - 1].isalpha():
             j -= 1
-        if a < j < b and scan[j - 1] == ".":
-            return True
-        return b - a <= longest and scan[a:b] in names
+        return a < j < b and scan[j - 1] == "."
+
+    def untrail(a, b):
+        while b > a and scan[b - 1] in TRAILING and written(b - 1):
+            b -= 1
+        return b
+
+    def span(a, b, delimited):
+        """The one place a path is cut out of the scan (rules 24 and 26): (a, b, delimited) when scan[a:b] is a path, else None. Inside a delimiter
+        only the white space around it is trimmed; outside, only the sentence punctuation written at its end is. Nothing is taken off the front."""
+        if delimited:
+            while a < b and scan[a] == " ":
+                a += 1
+            while b > a and scan[b - 1] == " ":
+                b -= 1
+        else:
+            b = untrail(a, b)
+        return (a, b, delimited) if shaped(a, b) else None
+
+    def after_list_separator(i):
+        """i moved past the white space and the ONE list separator that stand between two references of a list."""
+        while i < n and scan[i] == " ":
+            i += 1
+        return i + 1 if i < n and scan[i] in LIST_SEPARATORS else i
 
     found = []  # (start, end, path start, path end, delimited, first, last), in scan offsets
     last_end = 0
@@ -490,23 +532,19 @@ def references(text, files, canonical=()):
         head = last_end
         if s and scan[s - 1] != " ":
             head = max(head, run_starts[bisect.bisect_right(run_starts, s - 1) - 1])
-        while last_end and head == last_end and head < s and scan[head] in LIST_SEPARATORS:
+        if last_end and head == last_end and head < s and scan[head] in LIST_SEPARATORS:
             head += 1  # a.py:1,b.py:2: the comma ends the first reference
-        ce = trail(head, s)
-        cs = head  # a leading character is part of the path as written (rule 23)
         chosen = None
-        if cs < ce and ce - cs <= longest and scan[cs:ce] in files:
-            chosen = (cs, ce, False)  # a chore file, written whole
+        ce = untrail(head, s)
+        if head < ce and ce - head <= longest and scan[head:ce] in whole:
+            chosen = (head, ce, False)  # a chore file, written whole
         else:
             k = bisect.bisect_left(positions, s) - 1
             top = tops[k] if k >= 0 else -1
             if top >= 0:  # inside a delimiter: everything from it to the line part
-                low = max(top, last_end)
-                high = trail(low, s)
-                if shaped(low, high):
-                    chosen = (low, high, True)
-            if chosen is None and shaped(cs, ce):
-                chosen = (cs, ce, False)
+                chosen = span(top if top > last_end else after_list_separator(last_end), s, True)
+            if chosen is None:
+                chosen = span(head, s, False)
         if chosen:
             found.append((chosen[0], m.end(), chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a")))
             last_end = m.end()
@@ -514,17 +552,15 @@ def references(text, files, canonical=()):
         e = m.end()
         if e >= n:
             continue
+        stop = run_ends[bisect.bisect_right(run_starts, e) - 1]
         chosen = None
-        if scan[e] in OPENERS and e in closer:
-            low, high = closer[e]
-            if shaped(low, trail(low, high)):
-                chosen = (low, trail(low, high), True)
+        k = bisect.bisect_left(positions, e)
+        while k < len(positions) and positions[k] < stop and positions[k] not in closer:
+            k += 1
+        if k < len(positions) and positions[k] < stop:  # the first matched delimiter that opens in the word (rule 25: wherever it stands)
+            chosen = span(closer[positions[k]][0], closer[positions[k]][1], True)
         if chosen is None:
-            stop = run_ends[bisect.bisect_right(run_starts, e) - 1]
-            ce = trail(e, stop)
-            cs = e
-            if shaped(cs, ce):
-                chosen = (cs, ce, False)
+            chosen = span(e, stop, False)
         if chosen:
             found.append((m.start(), chosen[1], chosen[0], chosen[1], chosen[2], m.group("a"), m.group("b") or m.group("a")))
     found.sort(key=lambda r: (r[0], -r[1]))
@@ -533,18 +569,46 @@ def references(text, files, canonical=()):
         if ref[0] >= end:
             kept.append(ref)
             end = ref[1]
-    refs = []
-    for start, stop, ps, pe, delimited, a, b in kept:
-        written = _shown(text, at(start), after(stop))
-        while delimited and ps < pe and scan[ps] in " ,;":
-            ps += 1
-        refs.append((at(start), after(stop), " ".join(scan[ps:pe].split()), _number(a), _number(b), written))
+    return kept, at, after, scan, orig
+
+
+def references(text, files, canonical=()):
+    """Rules 17 to 26. Returns (refs, unparsed). Nothing in it depends on a character list for paths or on the distance between the parts of
+    a reference; every pass is linear.
+
+    The scan is text in NFKC form (rule 17) with the spans in canonical (a fact line's own citation list) blanked: it is used to FIND references
+    and nothing else. refs is every line reference of it (rules 18 and 19), [(start, end, path, first, last, written)] in text's offsets and in
+    order, written being the reference as text has it: a PATH tied to a line number by a separator run from : # , ( · and spaces, then
+    optionally L, l., ln, line or lines, then a number or a range, or the reverse (line / lines / L, a number, then of, in or at, then a PATH).
+
+    path is the path AS WRITTEN (rules 24 and 26): the characters of text, never of the scan, from the start of the PATH to its end, by ONE
+    function (_span below). Outside a delimiter a PATH is the run of non-space characters before the line part, whatever stands in front of it,
+    minus the sentence punctuation at its end (rule 18), and it counts as a path when it holds / or \\, ends in ".<letters>" or is a chore file's
+    path or name. Inside a delimiter it is exactly the text from just after the opener to the line part, with only the white space (line
+    breaks included) around it trimmed: no punctuation is taken off either end. A chore file, written whole, wins over that. A reference that
+    follows another in a list (a.py:1, b.py:2) starts after the previous one and ONE list separator, "," or ";".
+
+    unparsed is [(start, end, written)]: every number left once the references are removed that is directly preceded by a path token or
+    a line word (line, lines, L, l., ln, #) with only separators between them (rule 21)."""
+    kept, at, after, scan, orig = _scan(text, files, canonical)
+    if at is None:
+        return [], []
+    refs = [(at(start), after(stop), orig[at(ps):after(pe)], _number(a), _number(b), _shown(text, at(start), after(stop)))
+            for start, stop, ps, pe, delimited, a, b in kept]
     return refs, _floor(text, scan, kept, at, after, files)
+
+
+def reference_spans(text, files):
+    """[(start, end, path)] of references(text, files)[0], without the numbers, the written text and the floor: what rule 10 needs to know of the
+    one path reader (citation_items)."""
+    kept, at, after, scan, orig = _scan(text, files)
+    return [] if at is None else [(at(start), after(stop), orig[at(ps):after(pe)]) for start, stop, ps, pe, delimited, a, b in kept]
 
 
 def _floor(text, scan, kept, at, after, files):
     """Rule 21: [(start, end, written)] for each number of scan, outside the references in kept, that follows a path token or a line word."""
     rest = _blank(scan, [(r[0], r[1]) for r in kept])
+    names = set(files) | {Path(f).name for f in files}
     spans = [m.span() for m in NON_SPACE.finditer(rest)]
     run_starts = [a for a, _ in spans]
     out, previous = [], 0
@@ -560,7 +624,7 @@ def _floor(text, scan, kept, at, after, files):
             if k >= 0 and spans[k][1] >= q:
                 token = rest[max(spans[k][0], previous):q]
                 core = token.rstrip("".join(TRAILING))
-                if core and not core.isdigit() and (SLASHES.search(core) or re.search(r"\.[^\W\d_]+\Z", core) or core in files or any(core == Path(f).name for f in files)):
+                if core and not core.isdigit() and (SLASHES.search(core) or re.search(r"\.[^\W\d_]+\Z", core) or core in names):
                     start = q - len(token)
                     out.append((at(start), after(m.end()), _shown(text, at(start), after(m.end()))))
         previous = m.end()
@@ -582,20 +646,26 @@ def is_list_item(line):
     return bool(LIST_ITEM.match(unprefixed(line)))
 
 
-def parse_fact_line(line):
+def parse_fact_line(line, files=()):
     """(claim, [(text, path, first, last)], None) for a fact line; (None, None, kind) when "- " has no valid trailing citation list
-    (uncited, rule 2) or the claim holds a second one (two_citation_lists, rule 1)."""
-    m = FACT_LINE.match(line.rstrip())
+    (uncited, rule 2: every item exactly path:N, and read as that by the one path reader, see citation_items) or the claim holds a
+    second one (two_citation_lists, rule 1)."""
+    line = line.rstrip()
+    m = FACT_LINE.match(line)
     cites = []
-    for item in (m.group("cites").split(",") if m else ()):
-        c = _citation(item)
-        if c is None:
-            m = None
-            break
-        cites.append(c)
+    if m:
+        exact = {end: c for c, end in citation_items(line, files)}
+        at = m.start("cites")
+        for item in m.group("cites").split(","):
+            c = exact.get(at + len(item.rstrip()))
+            at += len(item) + 1
+            if c is None:
+                m = None
+                break
+            cites.append(c)
     if m is None or not cites:
         return None, None, "uncited"
-    if citations_in(m.group("claim")):
+    if citations_in(m.group("claim"), files):
         return None, None, "two_citation_lists"
     return m.group("claim"), cites, None
 
@@ -635,20 +705,20 @@ def check(reply, answer, root):
                 good.append((text, path, first, last))
         return good
 
-    rows, canonical, at = [], [], 0  # rows: (number, line, claim, cites, kind, offset of the line in the reply)
+    rows, canonical, at = [], [], 0  # rows: (number, line, claim, cites, kind, offset of the line in the reply, the citation items of a line that is no fact line)
     for number, raw in enumerate(reply.split("\n"), 1):
         line = raw.rstrip("\r")
         if line.startswith("- "):
-            claim, cites, kind = parse_fact_line(line)
+            claim, cites, kind = parse_fact_line(line, files)
         else:  # rule 11: a list item by any whitespace and bullet is graded and is no fact line; any other line is ignored
             claim, cites, kind = None, None, "not_a_fact_line" if is_list_item(line) else "ignored"
         if not kind:  # a fact line's own citation list is the one canonical reference (rule 15); it is graded by parse_fact_line's cites
             canonical.append((at + line.rstrip().rindex("["), at + len(line.rstrip())))
-        rows.append((number, line, claim, cites, kind, at))
+        rows.append((number, line, claim, cites, kind, at, citation_items(line, files) if kind else ()))
         at += len(raw) + 1
     # rule 13: the exact bracketed citation items of lines that are no fact line are read by rule 10; every other line reference of
     # the reply is noncanonical (rule 15), and every number the grammar cannot place is unparsed (rule 21)
-    exact = {row[5] + end for row in rows if row[4] for _, end in citation_items(row[1])}
+    exact = {row[5] + end for row in rows for _, end in row[6]}
     line_at = [row[5] for row in rows]
     noncanonical, unparsed = {}, {}  # reply line number -> its references / its unparsed numbers
     found, left = references(reply, files, canonical)
@@ -660,10 +730,10 @@ def check(reply, answer, root):
             unparsed.setdefault(bisect.bisect_right(line_at, ref[0]), []).append(ref)
 
     facts = []  # one dict per fact line: n (reply line number), line, claim, stripped (names removed), good (valid citations)
-    for number, line, claim, cites, kind, _ in rows:
+    for number, line, claim, cites, kind, _, items in rows:
         flagged = False
         if kind:
-            stray = citations_in(line)
+            stray = [c for c, _ in items]
             grade(stray, number)  # rule 10: a line that is no fact line vouches for nothing, but a bad citation on it is still counted
             if kind != "ignored" or stray:
                 flagged = True

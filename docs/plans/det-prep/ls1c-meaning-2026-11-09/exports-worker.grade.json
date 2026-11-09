@@ -1,0 +1,777 @@
+{
+ "chore": "exports-worker",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "not_met",
+    "F7": "met",
+    "F8": "not_met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "not_met",
+    "F12": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate but stops after sleep_job: run_one and run_forever are never covered; handler itself is only mentioned as the parent of register (cited 14-16, no def line), so F2 and F8 are judged not_met (borderline for F8, since register keyed by name is described)."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "not_met",
+    "F11": "met",
+    "F12": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete and correct; F10 not_met (borderline) because sleep_job is said to pause 'for a specified number of seconds' without saying the duration comes from the payload."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met",
+    "F12": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "unsupported",
+     "note": "cites only line 52 (the idle check); the sleep is on line 53"
+    }
+   ],
+   "note": "Near complete; F7 not_met because HANDLERS is only 'a dictionary that stores registered job handlers' citing line 9, never keyed by job name; F12 not_met because the sleep line cites only 52 and does not name poll_seconds."
+  },
+  "R4": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met",
+    "F12": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    },
+    {
+     "n": 25,
+     "verdict": "ok"
+    },
+    {
+     "n": 26,
+     "verdict": "ok"
+    },
+    {
+     "n": 27,
+     "verdict": "ok"
+    },
+    {
+     "n": 28,
+     "verdict": "ok"
+    },
+    {
+     "n": 29,
+     "verdict": "ok"
+    },
+    {
+     "n": 30,
+     "verdict": "ok"
+    },
+    {
+     "n": 31,
+     "verdict": "ok"
+    },
+    {
+     "n": 32,
+     "verdict": "ok"
+    },
+    {
+     "n": 33,
+     "verdict": "ok"
+    },
+    {
+     "n": 34,
+     "verdict": "ok"
+    },
+    {
+     "n": 35,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete and correct, including parameter names; F12 met via 'configured number of seconds' citing line 53."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "not_met",
+    "F7": "not_met",
+    "F8": "not_met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "not_met",
+    "F12": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct lines but omits handler entirely, never says run_one pops/runs a job, and never cites the run_one/run_forever def lines (F5/F6 judged not_met, borderline: the names appear only with body-line citations); F12 met though the loop is implicit."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met",
+    "F12": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete and correct."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "met",
+    "F6": "not_met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "not_met",
+    "F10": "not_met",
+    "F11": "met",
+    "F12": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "unsupported",
+     "note": "echo cited at 17-19, which are 'return register' and blank lines; echo is at 20-22"
+    },
+    {
+     "n": 4,
+     "verdict": "unsupported",
+     "note": "sleep_job cited at 21-23, which show echo; sleep_job is at 25-27"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "unsupported",
+     "note": "run_forever cited at 39-44, which are run_one's body; run_forever is at 48-53"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok",
+     "note": "Amendment 1 absence claim (uncited prose after the table, numbered after the 8 cited rows): no JobQueue/Job class is defined in worker.py and the settings module is not shown; true, so ok. Meets no reference fact."
+    }
+   ],
+   "note": "Content is correct but citations are shifted by about 3 lines, so echo, sleep_job and run_forever rows cite unrelated lines (F3,F4,F6,F9,F10,F12 not_met); F7 met via the handler row whose range includes line 15."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "met",
+    "F9": "not_met",
+    "F10": "not_met",
+    "F11": "met",
+    "F12": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Brief and correct; never says HANDLERS maps names to functions, what echo returns or how long sleep_job sleeps; F12 not_met because the poll_seconds claim cites 48/50/52 but not line 53 (borderline)."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met",
+    "F12": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete and correct; F12 met via 'specified poll duration' citing 52-53."
+  }
+ }
+}

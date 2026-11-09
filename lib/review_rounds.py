@@ -36,6 +36,12 @@ next round is the change from that tree to the tree now.
 A modified text file whose hunks are longer than the file shown whole (a rewrite) is attached as the file itself, every line
 marked +, after a one-line note with both sizes and the scoped git command that prints the real diff (entry_patch); a tie keeps the hunks.
 
+An added or modified file that a frozen-copies.json beside or above it declares a byte-identical copy of `commit:source` is named in a
+note and left out of the diff (frozen_copies, in safe_diff, so round 1, later rounds and held sections all get it) only when the
+manifest lists it, the commit is an ancestor of the old side (of the HEAD recorded with the last reviewed state when the old side is a
+tree, else of the review base), the blob and the regular-file mode equal the source's, and neither path is sensitive. Any failed check
+or unusable manifest keeps the full diff and adds a one-line reason; gate() refuses a body with a section for a left-out path.
+
 Nothing written to out-dir carries a credential: a changed path the sensitive-read rule flags (lib/sensitive_read.py,
 the rule bin/tp-sensitive-read applies) is named in the diff with its contents withheld, whether it was added, modified,
 deleted or renamed; and the diff and the earlier findings then go through the redaction pass (lib/redact.py) as context
@@ -336,37 +342,193 @@ def entry_patch(top, empty, entry, old, new):
     return "".join(out)
 
 
-def gate(text, safe_paths, withheld_paths):
+def gate(text, safe_paths, withheld_paths, left_out=()):
     """Last check before attaching: every entry header in text names a checked, unflagged path, once. Anything else refuses.
 
+    `left_out` are the paths whose contents were left out because they are verified copies (frozen_copies): none may have a
+    section, by its header or by its ---/+++ lines.
     Hunk lines always begin with a space, +, - or backslash, so a line that begins `diff --git ` is a header."""
     allowed = {f"diff --git a/{shown(p)} b/{shown(p)}": p for p in safe_paths}
     flagged = {shown(p) for p in withheld_paths}
+    left = {shown(p) for p in left_out}
+    left_headers = {f"a/{p} b/{p}" for p in left}
     seen = []
     for line in text.split("\n"):
         if line.startswith("diff --git "):
+            if line[11:] in left_headers:
+                raise Refused(f"the diff has a section for a path whose contents were left out: {line[11:]!r}")
             if line not in allowed:
                 raise Refused(f"the diff names a path that was not checked as safe: {line[11:]!r}")
             seen.append(line)
     if len(seen) != len(set(seen)) or set(seen) != set(allowed):
         raise Refused("the diff's entries are not the checked safe entries")
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    for at, line in enumerate(lines):
         if line[:4] in ("--- ", "+++ ") and line[4:6] in ("a/", "b/") and line[6:] in flagged \
                 and f"diff --git a/{line[6:]} b/{line[6:]}" not in allowed:
             raise Refused(f"the diff has a section for a flagged path: {line[4:]!r}")
+        # a left-out path's file header pair (a lone `--- a/x` line can be a removed line that reads `-- a/x`)
+        if line.startswith("--- a/") and line[6:] in left and lines[at + 1:at + 2] == [f"+++ b/{line[6:]}"]:
+            raise Refused(f"the diff has a section for a path whose contents were left out: {line[4:]!r}")
 
 
 # Machine-generated files whose contents are named but left out of a review diff (drizzle-kit schema snapshots).
 GENERATED = re.compile(r"(^|/)drizzle/meta/[^/]+_snapshot\.json$")
 
 
-def safe_diff(top, old, new, only=None):
+FROZEN = "frozen-copies.json"  # in a directory D: {"copies": [{"path": relative to D, "source": repo path, "commit": sha}]}
+REGULAR = ("100644", "100755")
+MAX_MANIFEST = 1 << 20  # bytes of a manifest read; a larger one is not parsed
+
+
+def commit_of(top, name):
+    """The full id of the commit `name` names (a commit id, ref or HEAD), or None when it names no commit (a tree, or nothing)."""
+    run = subprocess.run(["git", "-C", top, "rev-parse", "--verify", "-q", f"{name}^{{commit}}"], capture_output=True, text=True)
+    return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None
+
+
+def tree_files(top, treeish, path=None, named=None):
+    """{path: (mode, blob id)} of the file entries of the tree or commit `treeish`: the one at `path`, else every one (those whose
+    last name is `named`, when that is given); empty when git cannot list it. Read from the object database, never from the working files."""
+    args = ["ls-tree", "-z", "--full-tree", *(["-r"] if path is None else []), treeish, *(["--", path] if path is not None else [])]
+    try:
+        run = subprocess.run(["git", "-C", top, *args], capture_output=True, env={**os.environ, "GIT_LITERAL_PATHSPECS": "1"})
+    except (ValueError, UnicodeEncodeError):  # a path with a NUL, or one that cannot be encoded
+        return {}
+    found = {}
+    for record in run.stdout.split(b"\0") if run.returncode == 0 else []:
+        head, _, name = record.partition(b"\t")
+        fields = head.decode("ascii", "replace").split(" ")
+        text = name.decode("utf-8", "surrogateescape")
+        if len(fields) == 3 and fields[1] == "blob" and (named is None or text.rpartition("/")[2] == named):
+            found[text] = (fields[0], fields[2])
+    return found
+
+
+def read_manifest(top, blobid):
+    """({copy path: [entries]}, None) from the manifest blob, or (None, why it cannot be used). Any entry of the wrong shape (not an
+    object with text `path`, `source` and `commit`) makes the whole manifest unusable: a manifest is read whole or not at all."""
+    run = subprocess.run(["git", "-C", top, "cat-file", "blob", blobid], capture_output=True)
+    if run.returncode:
+        return None, "it cannot be read"
+    if len(run.stdout) > MAX_MANIFEST:
+        return None, f"it is larger than {MAX_MANIFEST} bytes"
+    try:
+        value = json.loads(run.stdout.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None, "it is not valid JSON"
+    copies = value.get("copies") if isinstance(value, dict) else None
+    if not isinstance(copies, list) or not all(
+            isinstance(c, dict) and all(isinstance(c.get(k), str) and c[k] for k in ("path", "source", "commit")) for c in copies):
+        return None, 'it is not {"copies": [{"path": ..., "source": ..., "commit": ...}]} with text values'
+    found = {}
+    for c in copies:
+        found.setdefault(c["path"], []).append(c)
+    return found, None
+
+
+def verify_copy(top, anchor, path, record, copy, check):
+    """(blob id, None) when the added or modified entry `path` is a verified copy, else (None, the reason, one line). The checks, in
+    this order: the commit is a commit that is an ancestor of `anchor`; the source is a file of that commit; neither the source
+    nor the path is flagged by `check`; the blob of commit:source is the entry's new blob; the mode is the source's and a regular
+    file's. Text taken from the manifest is named in a reason only once it is known to be a commit id or a path of that commit."""
+    commit, source = copy["commit"], copy["source"]
+    if not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+        return None, "cannot be left out: its commit is not a commit id (7 to 64 hex digits)"
+    full = commit_of(top, commit)
+    if full is None:
+        return None, f"cannot be left out: commit {commit} does not resolve to a commit in this repository"
+    if anchor is None:
+        return None, f"cannot be left out: there is no commit on the old side to check that {commit} is an ancestor of"
+    run = subprocess.run(["git", "-C", top, "merge-base", "--is-ancestor", full, anchor], capture_output=True)
+    if run.returncode == 1:
+        return None, f"cannot be left out: commit {commit} is not an ancestor of {anchor[:12]}"
+    if run.returncode:
+        return None, f"cannot be left out: commit {commit} cannot be checked against {anchor[:12]}"
+    if source.startswith("/") or "\0" in source:
+        return None, "cannot be left out: its source is not a repository-relative path"
+    found = tree_files(top, full, source).get(source)
+    if found is None:
+        return None, f"cannot be left out: the source is not a file of commit {commit}"
+    where = f"{commit}:{shown(source)}"
+    if check(top, source):
+        return None, f"cannot be left out: {where} is a sensitive path"
+    mode, blob = found
+    if blob != record[3]:
+        return None, f"does not match {where}"
+    if mode != record[1] or mode not in REGULAR:
+        return None, f"has mode {record[1]} but {where} has mode {mode}"
+    return blob, None
+
+
+def frozen_copies(top, new, kept, listed, anchor, check):
+    """(entries still to be shown, [(path, record, commit, source, blob id)] left out, [one-line notes]) for the added or modified
+    entries `kept` of a diff whose new side is `new`. `listed` maps the path of each manifest the --raw listing shows as added or
+    modified to its record. The manifest that governs an entry is the nearest `frozen-copies.json` in a directory above it; its blob
+    id comes from that listing, else from the tree `new` (the reviewed tree, never a path on disk). An entry the manifest does not
+    list is an ordinary change. One that it lists and that fails a check, or any entry under a manifest that cannot be used, is
+    shown in full with a note saying why; nothing here refuses the packet."""
+    manifests, tree = {}, None
+
+    def manifest(directory):
+        nonlocal tree
+        if directory not in manifests:
+            name = f"{directory}/{FROZEN}" if directory else FROZEN
+            record = listed.get(name)
+            if record is not None:
+                found = (record[1], record[3]) if record[1] in REGULAR else None
+            else:
+                tree = tree_files(top, new, named=FROZEN) if tree is None else tree
+                found = tree.get(name)
+            if found is None or found[0] not in REGULAR or check(top, name):
+                manifests[directory] = None
+            else:
+                manifests[directory] = (name, *read_manifest(top, found[1]))
+        return manifests[directory]
+    out, left, notes, said = [], [], [], set()
+    for path, record in kept:
+        governing, directory = None, ""
+        parts = path.split("/")[:-1]
+        for count in range(len(parts), -1, -1) if record[4] in "AM" and path.rpartition("/")[2] != FROZEN else ():
+            directory = "/".join(parts[:count])  # nearest first, the repository root last
+            governing = manifest(directory)
+            if governing is not None:
+                break
+        if governing is None:
+            out.append((path, record))
+            continue
+        name, copies, why = governing
+        if copies is None:
+            if name not in said:
+                said.add(name)
+                notes.append(f"{FROZEN}: {json.dumps(name)} cannot be used ({why}); every entry under {json.dumps(directory or '.')} is shown in full\n")
+            out.append((path, record))
+            continue
+        listing = copies.get(path[len(directory) + 1 if directory else 0:])
+        if not listing:
+            out.append((path, record))
+            continue
+        blob, why = (None, "is listed more than once") if len(listing) > 1 else verify_copy(top, anchor, path, record, listing[0], check)
+        if blob is None:
+            notes.append(f"{FROZEN}: {json.dumps(path)} {why}; its full diff follows\n")
+            out.append((path, record))
+        else:
+            left.append((path, record, listing[0]["commit"], listing[0]["source"], blob))
+    return out, left, notes
+
+
+def safe_diff(top, old, new, only=None, anchor=None):
     """(text, withheld paths): git diff old..new (just the paths in `only` when it is given) without the contents of any path the sensitive-read rule flags.
 
     Renames are split into a deletion and an addition (--no-renames) so each side is judged by its own path.
     The listing is of leaf entries (blobs, links, submodules) with their blob ids; each safe entry's patch is made from
     its own two blob ids, never from a path given to git, so a path that turned into a directory (or the reverse) cannot
     pull in entries that were not checked. gate() then verifies the finished text.
+
+    An added or modified file that a `frozen-copies.json` manifest declares a byte-identical copy of a file of an older commit, and
+    that passes every check (frozen_copies), is named in a note with its commit, source and blob id and left out of the body. The
+    commit must be an ancestor of the old side when that is a commit, else of `anchor`, the commit the caller says the old side
+    came from (a later round's old side is a tree: the HEAD its reviewed state recorded). With neither, nothing is left out.
     """
     listing = subprocess.run(["git", "-C", top, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", old, new],
                              capture_output=True)
@@ -382,7 +544,7 @@ def safe_diff(top, old, new, only=None):
         raise Refused("cannot work out the empty blob id")
     empty = empty.stdout.decode().strip()
     check = sensitive_checker()
-    safe, withheld, generated = [], [], []
+    safe, withheld, generated, listed = [], [], [], {}
     for info, name in zip(fields[::2], fields[1::2]):
         try:
             path, meta = name.decode("utf-8"), info.decode("ascii")
@@ -394,6 +556,8 @@ def safe_diff(top, old, new, only=None):
         if not path or path.startswith("/") or "\0" in path:
             raise Refused(f"a changed path is not a repository-relative path: {path!r}")
         record = match.groups()
+        if path.rpartition("/")[2] == FROZEN and record[4] in "AM":
+            listed[path] = record  # a manifest is read from its blob in this listing, whatever `only` selects
         if only is not None and path not in only:
             continue
         if check(top, path):
@@ -402,13 +566,18 @@ def safe_diff(top, old, new, only=None):
             generated.append((path, record))
         else:
             safe.append((path, record))
+    anchor = commit_of(top, old) or (commit_of(top, anchor) if anchor else None)
+    safe, left, problems = frozen_copies(top, new, safe, listed, anchor, check)
     body = "".join(entry_patch(top, empty, entry, old, new) for entry in safe)
     labels = {"A": "added", "M": "modified", "D": "deleted", "T": "type changed"}
     notes = "".join(f"{json.dumps(p)} ({labels[r[4]]}): sensitive path, its contents were withheld from this diff\n"
                     for p, r in withheld)
     notes += "".join(f"{json.dumps(p)} ({labels[r[4]]}): generated file, its contents were left out of this diff; open it if needed\n"
                      for p, r in generated)
-    gate(body, [p for p, _ in safe], [p for p, _ in withheld])
+    notes += "".join(f"{json.dumps(p)} ({labels[r[4]]}): byte-identical to {commit}:{shown(source)} (blob {blob}), contents left out; "
+                     f"check with git cat-file -p {blob} or open the file\n" for p, r, commit, source, blob in left)
+    notes += "".join(problems)
+    gate(body, [p for p, _ in safe], [p for p, _ in withheld], [entry[0] for entry in left])
     return notes + body, [p for p, _ in withheld]
 
 
@@ -482,7 +651,7 @@ def held_plan(top, base, tree):
     return "", found
 
 
-def held_sections(top, base, tree, red):
+def held_sections(top, base, tree, red, anchor=None):
     """(text, withheld paths, redaction count, paths): a path has four states, base, HEAD, index and the working tree `tree` (see
     snapshot); the main diff is base to `tree`. For every path where HEAD or the index differs from `tree`, a section for each
     comparison that is not empty: COMMITTED_HEAD (base to HEAD) and STAGED_HEAD (HEAD to index), with the same withholding and
@@ -490,13 +659,14 @@ def held_sections(top, base, tree, red):
     restored, removed, or edited again) would be missing from the packet. One rule for round 1 and later rounds (`base` is
     then the previous round's tree). "" when there is none. `paths` is every path in a section (held_plan).
     Whether a section appears depends only on those four states: no other condition (not where HEAD was at the previous
-    round, not any field of a reviewed-state record) applies."""
+    round, not any field of a reviewed-state record) applies. `anchor` is what safe_diff takes: the commit a verified copy's
+    commit must be an ancestor of when `base` is not itself a commit (a later round)."""
     note, sections = held_plan(top, base, tree)
     if note:
         return note, [], 0, []
     text, withheld, total, paths = "", [], 0, set()
     for title, old, new, only in sections:
-        diff, more = safe_diff(top, old, new, only)
+        diff, more = safe_diff(top, old, new, only, anchor)
         diff, count = redact_diff(red, diff)
         withheld += [p for p in more if p not in withheld]
         total += count
@@ -526,6 +696,19 @@ def plan_for(now, lane):
     base, basis = review_base(now["top"], lane)
     note, sections = held_plan(now["top"], base, now["tree"])
     return make_plan(now["top"], base, basis, now["tree"], set().union(*[s[3] for s in sections]) if sections else set())
+
+
+def reviewed_history(top, state, lane):
+    """The commit a later round's verified copies must descend from: the old side of that round's diff is the tree the last round
+    reviewed, not a commit, so it is the HEAD that round's reviewed state recorded (everything up to it was in front of that
+    reviewer); None when the state recorded no commit. A state with no `head` field (older records) uses the review base."""
+    head = state.get("head")
+    if isinstance(head, str):
+        return commit_of(top, head) if head else None
+    try:
+        return commit_of(top, review_base(top, lane)[0])
+    except Refused:
+        return None
 
 
 def prepare(state_dir, task_id, workdir, out_dir, lane=""):
@@ -582,9 +765,10 @@ def prepare(state_dir, task_id, workdir, out_dir, lane=""):
             redactions += count
             head = f"[No diff since the last round: {why}. The change against the review base follows instead.]\n\n"
         else:
-            diff, withheld = safe_diff(now["top"], last_state["tree"], now["tree"])
+            anchor = reviewed_history(now["top"], last_state, lane)
+            diff, withheld = safe_diff(now["top"], last_state["tree"], now["tree"], anchor=anchor)
             diff, count = redact_diff(red, diff)
-            extra, more, found, held = held_sections(now["top"], last_state["tree"], now["tree"], red)
+            extra, more, found, held = held_sections(now["top"], last_state["tree"], now["tree"], red, anchor)
             plan = make_plan(now["top"], last_state["tree"], "", now["tree"], held, last_round)
             diff += extra
             withheld = withheld + [p for p in more if p not in withheld]

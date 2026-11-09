@@ -387,6 +387,31 @@ echo review-1
         self.assertIn("without dropping author evidence", r.stderr)
         self.assertFalse(self.log.exists())  # nothing was started, and no part of the diff was dropped to make it fit
 
+    def test_a_large_verified_copy_keeps_the_packet_under_the_limit_and_the_same_lane_without_the_manifest_is_refused(self):
+        # FC1: a copy of a committed file that frozen-copies.json vouches for is named, not repeated; without the manifest the
+        # same 330000-char copy is refused as before (the limit is not raised and nothing is dropped)
+        self.git("init", "-q")
+        (self.work / "vendor").mkdir()
+        (self.work / "vendor" / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(30000)))
+        self.git("add", "-A")
+        self.git("commit", "-qm", "first")
+        head = subprocess.run(["git", "-C", str(self.work), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+        (self.work / "fx").mkdir()
+        shutil.copyfile(self.work / "vendor" / "big.txt", self.work / "fx" / "big.txt")
+        r = self.review()  # no manifest: the copy is an ordinary 330000-char addition
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("without dropping author evidence", r.stderr)
+        self.assertFalse(self.log.exists())
+        manifest = {"copies": [{"path": "big.txt", "source": "vendor/big.txt", "commit": head}]}
+        (self.work / "fx" / "frozen-copies.json").write_text(json.dumps(manifest))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        packet = "".join(self.copy(p).read_text() for p in self.spawn_contexts()) + self.task_text()
+        self.assertLess(len(packet), 100000)
+        self.assertIn(f'"fx/big.txt" (added): byte-identical to {head}:vendor/big.txt (blob ', packet)
+        self.assertIn("fx/frozen-copies.json", packet)  # the manifest itself is an ordinary changed file, shown in full
+        self.assertNotIn("line 29999", packet)
+
     def test_the_suggested_commands_are_literal_so_a_magic_file_name_cannot_select_a_withheld_file(self):
         self.git("init", "-q")
         (self.work / ":(glob)*").write_text("one\n")

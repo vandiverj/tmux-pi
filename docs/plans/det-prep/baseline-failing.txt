@@ -1,2 +1,1 @@
-FAIL: test_rg_is_taken_to_read_git_when_anything_could_make_it (test_sensitive_trust.RootLiftTests)
 FAIL: test_a_family_named_in_two_rounds_refuses_a_plain_retry (test_retry_packet.RepeatedFamilyGateTests)

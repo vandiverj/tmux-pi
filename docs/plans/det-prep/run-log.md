@@ -692,3 +692,8 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   wrong-table product; the reviewer's 4,752-case sudo product passed) is a follow-up. F2 (owed: which commit each copied
   tree is) was answered by blob-hash comparison: base-tree = dbb101c, r6-tree = 019e07e, main-tree = 7014c87. Committed
   93013ee, closed N1, merged a924a5b.
+- Baseline: the sensitive_trust rg line was removed. Its cause (F-FLAKE: K1's same-stat restore of agent/mcp.json) was fixed
+  in a0aa3e6, and the line was kept only because T1's runs were intermittent. On main 00a7883, test_sensitive_trust as a whole
+  module: 12/12 OK alone (6 per interpreter); 24/24 OK under 4-way concurrent load (3 rounds x 4 per interpreter). It also did
+  not fail in the 3 completed G2-F full-suite runs (4678 tests each, main-based tree). The G1 full suite on main is the final check.
+  Baseline 2 -> 1 (the retry_packet digest line goes with G2-F).

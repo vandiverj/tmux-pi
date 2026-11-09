@@ -59,7 +59,7 @@ G1 after the merges; G2 and G3 in parallel as lanes; G4 after the LS1 flip (J1-D
 Owner: "can we get to a point for improvements to use on production without the sumarrizer ... a checkpoint we can use and
 you would continue the other work".
 
-- **Scope:** main as it stands once MS1, MN1 and G3 round 6 are merged. `summarize_files` stays `candidate` in
+- **Scope:** main as it stands once MS1, MN1, RO1 and G3 round 6 are merged. `summarize_files` stays `candidate` in
   config/model-catalog.json, so nothing routes summaries to the local model. The LS1c lanes (S1c, MG1) may merge before
   the cut. They only add tools/qual, lib/summarize_structured.py and tests, and nothing on the production path calls them.
 - **Gates for the cut (in order):**
@@ -68,6 +68,10 @@ you would continue the other work".
   1b. **MN1 merged** (docs/plans/det-prep/fixes/mn1-main-notify.md). Worker state changes reach the Claude main: a stable
      main id, no silent hiding of rows, and no silently dropped notice. This is the owner's second named production issue
      ("workers no longer sending messages ack to main agent", 2026-11-09).
+  1c. **RO1 merged** (docs/plans/det-prep/fixes/ro1-result-kept.md). A worker's report is not replaced by a later turn it did
+     not get from outside (for example its own background task finishing). Found by Main on 2026-11-09, when MS1's report
+     was lost this way. `report.sh` is unchanged since d8a18a7, so production has it, and it is one way the owner's second
+     issue shows up. The owner confirmed their main is Claude Code and their side tasks are subagents.
   2. **G3 round 6 merged and a live run passing.** This is the end-to-end flow on battle-soccer: dispatch, permission,
      decline plus redirect, retry, cross-provider review, close, merge, collect, remove.
   3. **G1 on the cut commit:** the full suite in 4 cells, zero failures (the baseline is empty).

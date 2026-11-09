@@ -12,7 +12,9 @@ cleans up even after a failure. A JSON summary (step name, rc, seconds, what was
   --fake            : no model, no real worker. The tools are the real ones; only the tmux calls that would start a worker, the
                       worker's replies, the reviewer's verdict and tp-route's review plan are stubbed (see README.md).
 
-Every subprocess has a timeout. Python 3.9, standard library only. Exit 0: every step and the cleanup passed. Exit 1: a step or the
+Every subprocess has a timeout and runs in its own process group, killed whole on a timeout. The repository's lane config is read in a bounded
+child process, not by importing lib/ here. Every collision and leftover check compares the exact computed resource (the lane branch, the
+worktree path, the lane record path, the session name), never a name fragment. Python 3.9, standard library only. Exit 0: every step and the cleanup passed. Exit 1: a step or the
 cleanup failed (stderr names it).
 """
 import argparse
@@ -21,6 +23,8 @@ import os
 import re
 import secrets
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,8 +47,21 @@ SECRET_VAR = "G3_SMOKE_" + "API_" + "TOKEN"
 PROMPT_COMMAND = f": ./{ABSENT} '${SECRET_VAR}'; exit 3"
 STEP_ID = "s1"
 # No branch name or worktree path is written in this file: the integration branch (the run's scratch branch), the lane branch prefix and the
-# worktree pattern are the repository's own lane config (<repo>/.tmux-pi/lanes.json, defaults when absent), read with lanes.load_repo_config
-# in Smoke.load_config. The lane tools read the same config, so the script and the tools always agree on the names.
+# worktree pattern are the repository's own lane config (<repo>/.tmux-pi/lanes.json, defaults when absent), computed by the lane tools' own
+# functions (lanes.load_repo_config, lane_branch, lane_worktree) in a bounded child process (CONFIG_CHILD, run by Smoke.load_config). The lane
+# tools read the same config, so the script and the tools always agree on the names. This process imports nothing from lib/.
+CONFIG_CHILD = """\
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import lanes
+repo, name = sys.argv[2], sys.argv[3]
+try:
+    cfg = lanes.load_repo_config(repo)
+    print(json.dumps({"integration_branch": cfg["integration_branch"], "lane_branch": lanes.lane_branch(cfg, name),
+                      "lane_worktree": lanes.lane_worktree(cfg, repo, name)}))
+except ValueError as error:      # the lanes module's own refusal of a config (a git timeout inside it is a ValueError too)
+    print(json.dumps({"refused": str(error)}))
+"""
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@invalid", "GIT_COMMITTER_NAME": "g3-smoke", "GIT_COMMITTER_EMAIL": "g3-smoke@invalid"}
 MARKER = "@g3_run"      # the tmux session option that says which run made a session (set in the same tmux call that creates it)
 FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
@@ -114,6 +131,27 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def worktree_paths(listing):
+    """The paths in the output of `git worktree list --porcelain`."""
+    return [line[len("worktree "):] for line in listing.splitlines() if line.startswith("worktree ")]
+
+
+def same_path(listed, path):
+    """Whether a path git lists is exactly `path` (the canonical path lanes.lane_worktree computed): equal, or equal after resolving
+    symlinks in the listed one. Never a name or basename comparison."""
+    return listed == path or os.path.realpath(listed) == path
+
+
+def missing_parents(path):
+    """The directories above `path` that do not exist (outermost first): what making `path` would also make. Ends at the first existing
+    ancestor (the root exists), so it is bounded by the path's depth."""
+    missing, parent = [], Path(path).parent
+    while not os.path.lexists(parent):
+        missing.append(parent)
+        parent = parent.parent
+    return missing[::-1]
+
+
 def provider_of(worker, model):
     """The model's provider: a claude worker is Anthropic, 'provider/model' names its own, anything else is its worker."""
     if worker == "claude" or str(model).startswith(("claude", "anthropic")):
@@ -122,14 +160,18 @@ def provider_of(worker, model):
 
 
 def bounded(argv, timeout, cwd=None, env=None, stdin=None):
-    """subprocess.run with a hard bound. On timeout the child is killed and TimeoutExpired is raised; output a grandchild still holds
-    open is given up after 2 s (subprocess.run would wait for it without end)."""
+    """subprocess.run with a hard bound. The child leads its own process group. On timeout the whole group is killed (a grandchild that
+    hangs, such as the git a hung config-load child started, dies with it) and TimeoutExpired is raised; output a grandchild still holds
+    open is given up after 2 s (subprocess.run would wait for it without end). The only place this script starts a process."""
     proc = subprocess.Popen(argv, text=True, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, cwd=cwd, env=env)
+                            stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True)
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)       # pid == pgid: start_new_session made the child its group's leader
+        except OSError:
+            proc.kill()
         try:
             proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
@@ -170,8 +212,11 @@ class Smoke:
         # lane, branch and worktree that the lane tool makes, after setup proved the name free and the resource is observed afterwards:
         # `claim`). A definite refusal (a duplicate session, an existing branch) records nothing; a creation that timed out is indeterminate
         # (`session_unsure`) and is settled by the session's marker (@g3_run = the run id, set in the same tmux call that creates it).
-        self.made = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None}
+        # "dirs": the parent directories of the worktree path that did not exist when setup looked and do now (outermost first): the pattern
+        # `{repo}-{name}/checkout` makes `{repo}-{name}`, and `lane remove` leaves it. A directory that was already there is never listed.
+        self.made = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None, "dirs": []}
         self.session_unsure = False
+        self.new_dirs = []          # the parents setup found missing (candidates for made["dirs"], decided by claim)
         # The repository's lane config, and the three names it gives (set by load_config; None until then, and the cleanup acts on
         # a name only when `made` says the run created it, which is after load_config).
         self.cfg, self.integration, self.lane_branch, self.lane_worktree = None, None, None, None
@@ -264,9 +309,16 @@ class Smoke:
     def task_dir(self, ident):
         return self.state / "tasks" / ident
 
+    def text(self, path):
+        """The text of a regular file. Anything else (a FIFO, a device, a directory) is an OSError: opening a FIFO for reading blocks
+        until a writer comes, and this script has no unbounded wait. Every read of a record or of the worker's file goes through here."""
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        return Path(path).read_text()
+
     def read(self, path, default=None):
         try:
-            return json.loads(Path(path).read_text())
+            return json.loads(self.text(path))
         except (OSError, ValueError):
             return default
 
@@ -312,21 +364,25 @@ class Smoke:
 
     def load_config(self):
         """The repository's lane config, once: the integration branch (the run's scratch branch), the lane branch of this run and its
-        worktree path, exactly as the lane tools (lib/lanes.py) compute them. A config the tools would refuse fails the step."""
+        worktree path, exactly as the lane tools (lib/lanes.py) compute them. The lane functions run in a child process (CONFIG_CHILD)
+        through bounded(), with the run's env and --subprocess-timeout: they start git (`check-ref-format`) with no timeout of their own,
+        and a hung one must not hang this process. A config the tools would refuse, or a child that does not finish, fails the step."""
         if self.cfg is not None:
             return
-        lib = str(self.root / "lib")
-        if lib not in sys.path:
-            sys.path.insert(0, lib)
-        import lanes          # lib/lanes.py: the lane tools' own loader and name functions
+        label = "the repository's lane config load (lanes.load_repo_config, lane_branch, lane_worktree in a child process)"
+        out = self.run([sys.executable, "-I", "-c", CONFIG_CHILD, str(self.root / "lib"), str(self.repo), self.name],
+                       timeout=self.sub_timeout, what=label).stdout
         try:
-            self.cfg = lanes.load_repo_config(str(self.repo))
-            self.integration = self.cfg["integration_branch"]
-            self.lane_branch = lanes.lane_branch(self.cfg, self.name)
-            self.lane_worktree = lanes.lane_worktree(self.cfg, str(self.repo), self.name)
-        except ValueError as error:
-            self.cfg = None
-            raise SmokeError(self.step_name, f"the repository's lane config (lanes.load_repo_config) is not usable: {error}") from None
+            got = json.loads(out)
+        except ValueError:
+            raise SmokeError(self.step_name, f"{label} printed no JSON: {out[:300]!r}") from None
+        if not isinstance(got, dict) or "refused" in got:
+            raise SmokeError(self.step_name, f"the repository's lane config (lanes.load_repo_config) is not usable: {got.get('refused') if isinstance(got, dict) else got!r}")
+        names = [got.get(key) for key in ("integration_branch", "lane_branch", "lane_worktree")]
+        if not all(isinstance(name, str) and name for name in names):
+            raise SmokeError(self.step_name, f"{label} gave no usable names: {got!r}")
+        self.cfg = got
+        self.integration, self.lane_branch, self.lane_worktree = names
         self.asserted.append("the repository's lane config loads and gives the integration branch, the lane branch and the worktree path")
 
     def break_repo(self):
@@ -352,8 +408,9 @@ class Smoke:
             record = (repo / self.git("rev-parse", "--git-common-dir")).resolve() / "tmux-pi" / "lanes" / self.name / "lane.json"
             record.parent.mkdir(parents=True)
             record.write_text(json.dumps(FOREIGN_LANE) + "\n")
-        elif self.tamper("worktree-exists"):
-            self.git("worktree", "add", "-q", "--detach", str(self.tmp / f"foreign-{self.name}"), "HEAD")
+        elif self.tamper("worktree-exists"):       # someone's registered worktree at the exact path the lane would get
+            self.load_config()
+            self.git("worktree", "add", "-q", "--detach", self.lane_worktree, "HEAD")
         elif self.tamper("session-exists"):
             self.tmux("new-session", "-d", "-s", self.name, "sleep 600")
 
@@ -380,8 +437,16 @@ class Smoke:
         self.check("no lane branch of this name exists", self.git("rev-parse", "--verify", "-q", f"refs/heads/{self.lane_branch}", rc_ok=(0, 1)).returncode == 1,
                    self.lane_branch)
         self.check("no lane record of this name exists", not self.lane_path().parent.exists(), str(self.lane_path().parent))
-        registered = [line for line in self.git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ") and self.name in Path(line[9:]).name]
-        self.check("no worktree of this name exists", not registered, registered)
+        # The exact path lanes.lane_worktree gives this run's name (not a name fragment): registered in git, or anything at all there (a
+        # directory, a file, a symlink even if dangling), is a collision. Refused here, before anything is made, and left exactly as found.
+        taken = []
+        if any(same_path(listed, self.lane_worktree) for listed in worktree_paths(self.git("worktree", "list", "--porcelain"))):
+            taken.append("registered in git worktree list")
+        if os.path.lexists(self.lane_worktree):
+            taken.append("exists on disk")
+        self.check("nothing is registered or exists at the configured worktree path", not taken, f"{self.lane_worktree}: {', '.join(taken)}",
+                   hint="Nothing was changed; the path is left as it is")
+        self.new_dirs = missing_parents(self.lane_worktree)
         self.check("no tmux session of this name exists", self.tmux("has-session", "-t", f"={self.name}", rc_ok=(0, 1)).returncode == 1, self.name)
         self.clear = True            # nothing of this name existed: what appears under it from here on was made by this run
         self.git("branch", self.integration, "HEAD")
@@ -467,8 +532,10 @@ class Smoke:
         self.tool("tp-agent", "message", first, "--text", redirect)
         if self.tamper("no-redirect-record"):
             (self.task_dir(first) / "messages.jsonl").unlink()
-        sent = [json.loads(line).get("text") for line in (self.task_dir(first) / "messages.jsonl").read_text().splitlines()] \
-            if (self.task_dir(first) / "messages.jsonl").exists() else []
+        try:
+            sent = [json.loads(line).get("text") for line in self.text(self.task_dir(first) / "messages.jsonl").splitlines()]
+        except FileNotFoundError:
+            sent = []
         self.check("task record: messages.jsonl holds the redirect message sent to the worker", redirect in sent, sent)
         if self.fake and not self.tamper("first-never-settles"):
             result = "RESULT_STATUS: complete" if self.tamper("first-complete") else "RESULT_STATUS: incomplete"
@@ -509,7 +576,7 @@ class Smoke:
         record = self.wait_settled(second, "the retry to settle", self.args.settle_wait)
         self.check("task record: result_status complete", record.get("result_status") == "complete", record.get("result_status"))
         self.check("the worktree holds exactly the one new file", self.git("status", "--porcelain", "--untracked-files=all", cwd=wt) == f"?? {FILE}")
-        self.check("the file holds exactly the requested line", (Path(wt) / FILE).read_text() == self.expected)
+        self.check("the file holds exactly the requested line", self.text(Path(wt) / FILE) == self.expected)
 
     def step_review(self):
         second = self.ids["retry"]
@@ -528,7 +595,7 @@ class Smoke:
             self.edit(self.task_dir(second) / "meta.json", lambda m: m["reviewer"].update(independence="same_provider"))
         if self.tamper("reviewed-tree"):
             self.edit(review_dir / "reviewed-state.json", lambda m: m.pop("tree", None))
-        self.check("review record: review-of names the reviewed task", (review_dir / "review-of").read_text().strip() == second)
+        self.check("review record: review-of names the reviewed task", self.text(review_dir / "review-of").strip() == second)
         author, rmeta = self.read(self.task_dir(second) / "meta.json", {}), self.read(review_dir / "meta.json", {})
         planned = (author.get("reviewer") or {})
         author_provider = provider_of(author.get("worker"), author.get("model"))
@@ -623,16 +690,28 @@ class Smoke:
         archived = self.lane_json()
         if self.tamper("lane-back"):           # the record the check reads is still there
             archived = before
+        self.drop_dirs([])                      # `lane remove` leaves the parent directories the worktree's creation made: they are this run's
         self.check("lane remove: removed, not abandoned, integrated in the scratch branch",
                    result.get("removed") is True and not result.get("abandoned") and self.integration in str(result.get("integrated_in")), result)
         self.check("the lane's worktree directory is gone", not Path(self.facts["worktree"]).exists(), self.facts["worktree"])
         self.check("lane record: archived, no longer listed", archived is None, archived)
 
+    def drop_dirs(self, errors):
+        """Remove the directories this run made (`made["dirs"]`, innermost first), each only if it is empty (os.rmdir refuses anything
+        else): a directory that is not empty holds something that is not this run's, and stays. A failure is added to `errors`."""
+        for directory in reversed(self.made["dirs"]):
+            try:
+                os.rmdir(directory)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                errors.append(f"remove the directory {directory} this run made: {type(error).__name__}: {str(error)[:120]}")
+
     def step_leftovers(self):
-        if self.tamper("leftover-worktree"):
-            self.git("worktree", "add", "-q", "--detach", str(self.tmp / f"left-{self.name}"), "HEAD")
-        if self.tamper("leftover-branch"):
-            self.git("branch", f"left-{self.name}", "HEAD")
+        if self.tamper("leftover-worktree"):      # at the exact path the lane had
+            self.git("worktree", "add", "-q", "--detach", self.lane_worktree, "HEAD")
+        if self.tamper("leftover-branch"):        # the exact lane branch
+            self.git("branch", self.lane_branch, "HEAD")
         if self.tamper("leftover-lane-record"):
             self.lane_path().parent.mkdir(parents=True)
         if self.tamper("leftover-pane"):
@@ -646,10 +725,19 @@ class Smoke:
         again = self.leftovers(session_alive=False, errors=errors)
         self.check("the run's tmux session is gone and no pane of it remains", not again and not errors, again or errors)
 
-    def leftovers(self, session_alive, errors):
-        """What of this run is still there (empty list: nothing). Read-only; also used after the cleanup. A probe that does not
-        finish within --subprocess-timeout is added to `errors` and the next probe still runs."""
-        found = []
+    def leftovers(self, session_alive, errors, final=False):
+        """What of this run is still there (empty list: nothing): the exact resources the run's names compute to, never a name fragment.
+        Read-only; also used after the cleanup. `final`: the cleanup's own pass, which also expects the scratch integration branch (if
+        this run made it) to be gone. A probe that does not finish within --subprocess-timeout is added to `errors` and the next probe
+        still runs. The broader scan for look-alike names is `scan`'s second list: reported by the cleanup, never a failure."""
+        return self.scan(session_alive, errors, final)[0]
+
+    def scan(self, session_alive, errors, final=False):
+        """(exact leftovers, look-alikes). Exact: a worktree registered at, or anything on disk at, the path lanes.lane_worktree gave; the
+        lane branch; the integration branch when `final` and this run made it; the directories this run made; the lane record's
+        directory; a pane in the run's own session (exact session name; the window prefix `sa:` only tells the session's own anchor window
+        from the workers' windows). Look-alikes: other worktrees and branches whose names merely contain the run's name."""
+        found, similar = [], []
 
         def probe(label, argv):
             try:
@@ -658,21 +746,29 @@ class Smoke:
                 errors.append(f"leftover probe '{label}' failed: {type(error).__name__}: {str(error)[:120]}")
                 return ""
 
-        repo = self.repo
+        repo, path = self.repo, self.lane_worktree
         if repo and (repo / ".git").exists():
-            listing = probe("git worktree list", ["git", "-C", repo, "worktree", "list", "--porcelain"])
-            found += [f"worktree {line[9:]}" for line in listing.splitlines() if line.startswith("worktree ") and self.name in Path(line[9:]).name]
-            branches = probe("git branch", ["git", "-C", repo, "branch", "--list", f"*{self.name}*"]).split()
-            found += [f"branch {b}" for b in branches if b != "*"]
+            listed = worktree_paths(probe("git worktree list", ["git", "-C", repo, "worktree", "list", "--porcelain"]))
+            if path:
+                registered = [p for p in listed if same_path(p, path)]
+                found += [f"worktree {p}" for p in registered]
+                if not registered and os.path.lexists(path):
+                    found.append(f"path {path} exists on disk")
+            similar += [f"worktree {p}" for p in listed if self.name in Path(p).name and not (path and same_path(p, path))]
+            heads = [ref[len("refs/heads/"):] for ref in probe("git branch", ["git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/heads/"]).split()]
+            exact = [b for b in (self.lane_branch, self.integration if final and self.made["integration"] else None) if b]
+            found += [f"branch {b}" for b in heads if b in exact]
+            similar += [f"branch {b}" for b in heads if self.name in b and b not in exact]
             lanes_dir = Path(self.facts.get("common") or "") / "tmux-pi" / "lanes" / self.name
             if self.facts.get("common") and lanes_dir.exists():
                 found.append(f"lane record {lanes_dir}")
+        found += [f"directory {d}" for d in self.made["dirs"] if os.path.lexists(d)]
         rows = probe("tmux list-panes", [*self.tmux_cmd, "list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_id}"])
         for row in rows.splitlines():
             session, window, pane = (row.split("\t") + ["", "", ""])[:3]
             if session == self.name and (window.startswith("sa:") or not session_alive):
                 found.append(f"pane {pane} ({window}) in session {session}")
-        return found
+        return found, similar
 
     # ---- fake backend --------------------------------------------------------------------------------------------------
     def fake_setup(self):
@@ -752,6 +848,8 @@ esac
             worktree = (self.lane_json() or {}).get("worktree")
             if worktree and worktree == self.lane_worktree and Path(worktree).is_dir():       # the path the config gives this run's name
                 self.made["worktree"] = str(worktree)
+            # The parents setup found missing and that exist now were made by the worktree's creation (setup proved they were absent).
+            self.made["dirs"] = [str(d) for d in self.new_dirs if d.is_dir()]
         except SmokeError:
             pass              # a probe that failed claims nothing: the resource stays, and the leftover check reports it
 
@@ -775,7 +873,9 @@ esac
         self.cleanup_git(attempt)
         if self.repo:
             try:
-                report["leftovers"] = self.leftovers(session_alive=False, errors=report["errors"])
+                report["leftovers"], similar = self.scan(session_alive=False, errors=report["errors"], final=True)
+                # look-alikes (a name that merely contains the run's name) are reported with what was kept, and fail nothing
+                self.kept += [f"similar name, not this run's exact resource: {x}" for x in similar if f"similar name, not this run's exact resource: {x}" not in self.kept]
             except Exception as error:  # noqa: BLE001
                 report["errors"].append(f"leftover check: {type(error).__name__}: {str(error)[:200]}")
         self.teardown_private(attempt)
@@ -826,6 +926,7 @@ esac
         # This run's worktree only, by its path. No `git worktree prune`: that would also drop other registrations of the repository.
         if wt:
             attempt("git worktree remove", lambda: self.quiet(["git", "-C", self.repo, "worktree", "remove", "--force", wt], timeout=long), ok=(0, 128))
+        attempt("remove the directories this run made", lambda: self.drop_dirs(self.cleanup_report["errors"]))     # empty ones only
         if self.made["lane_branch"]:
             attempt("delete the lane branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", self.lane_branch], timeout=long), ok=(0, 1))
         if self.made["integration"]:

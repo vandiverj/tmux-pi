@@ -37,7 +37,9 @@ and removes nothing (the cleanup deletes the integration branch only if this run
 **The run only removes what it made.** The run id is `MMDDHHMM-<pid in base 36>-<6 random hex digits>` (time, process id and 24 random bits, so two runs
 started in the same second never share a name; `g3-` plus the id is at most 24 characters, the limit of a lane name). Setup checks every name before it
 makes anything, and refuses (step `setup`, the error names the collision) if any of these already exists: the integration branch or the lane branch,
-a lane record of that name, a worktree of that name, a tmux session of that name. The cleanup then removes only resources recorded as made by this run, and a
+a lane record of that name, a tmux session of that name, or anything at the exact worktree path `lanes.lane_worktree` computes (registered in `git worktree list`,
+or an existing file, directory or symlink there). Every one of these tests is on the exact computed resource, never on a name fragment: a worktree whose folder merely
+contains the run's name is not a collision; it is reported in `cleanup.kept` as "similar name, not this run's exact resource" and left alone. The cleanup then removes only resources recorded as made by this run, and a
 resource is recorded only after its creation succeeded:
 - the scratch branch: recorded after `git branch` succeeded; the lane record, lane branch and worktree: made by `tp-agent dispatch`, recorded after the call
   (also when it failed part way) because setup had proved the names free and they carry the run id;
@@ -127,8 +129,13 @@ delete the lane branch and the integration branch, each only if recorded as made
 prunable or not, are never touched (`PruneTest` runs against a repo that has an unrelated prunable worktree). Every wait is bounded, with an error that names what was waited for.
 
 Every subprocess has a timeout: steps use their own (git 60 s, tools 120 s, `tp-review` 180 s), every tmux call, leftover probe and cleanup command uses `--subprocess-timeout` (cleanup git and lane commands: twice that).
-A command that times out is killed (a grandchild that holds its pipes is given up after 2 s). In a step it fails the step; in the cleanup or a leftover probe it is added to `cleanup.errors`, the remaining cleanup actions
-still run and the JSON summary is still written (`BoundedTest`, with a tmux shim that hangs).
+That includes work that library code would start: the script imports no `lib/` module. It reads the repository's lane config (and computes the branch and worktree names, which run `git check-ref-format`) in a
+`python -I` child run through `bounded()` with the run's scrubbed env and timeout; a hung git there ends the run with a summary that names the config-load timeout and leaves nothing behind.
+A command that times out is killed together with its process group (a grandchild that holds its pipes is given up after 2 s). In a step it fails the step; in the cleanup or a leftover probe it is added to `cleanup.errors`, the remaining cleanup actions
+still run and the JSON summary is still written (`BoundedTest`, with a tmux shim that hangs and a git shim that hangs in the config load). `BoundedTest` also holds the guard that no
+process is started outside `bounded()`: an AST check of the script, and a run of `main()` with `subprocess.Popen` and `subprocess.run` patched to record any `run` and any `Popen` made outside a `bounded()` frame (imported library code included; the guard is first shown to fire on a `lib/lanes.py` call).
+A configured `worktree_pattern` with a nested path (`{repo}-{name}/checkout`) is covered by `ExactWorktreePathTest`: a registered worktree, a plain directory, a file or a symlink at the path is refused at setup and survives;
+a parent directory that already exists is not a collision and is never removed; a parent the run made is removed with the worktree.
 
 Session ownership is tested in fake mode with the shim (`SessionOwnershipTest`; the shim reads `G3_SHIM_RIVAL`, `G3_SHIM_HANG`, `G3_SHIM_AFTER` and `G3_SHIM_MATCH`): a rival session of the same name makes
 `new-session` answer `duplicate session` (nothing killed, the rival and its pane remain, reported); the creation succeeds in tmux and then the client hangs (timeout, marker is the run's, marker read back, then

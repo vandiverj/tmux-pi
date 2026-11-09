@@ -12,7 +12,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from g3_e2e_support import Base, Parallel, g3, records
+from g3_e2e_support import Base, NOTHING_MADE, Parallel, g3, records
 
 setUpModule = support.set_up_module
 
@@ -24,7 +24,7 @@ TAMPER_EXPECT = {
     "integration-exists": ("setup", "scratch integration branch does not exist yet"),
     "lane-branch-exists": ("setup", "no lane branch of this name exists"),
     "lane-record-exists": ("setup", "no lane record of this name exists"),
-    "worktree-exists": ("setup", "no worktree of this name exists"),
+    "worktree-exists": ("setup", "nothing is registered or exists at the configured worktree path"),
     "session-exists": ("setup", "no tmux session of this name exists"),
     "dispatch-id": ("dispatch", "dispatch returned a task id"),
     "dispatch-queued": ("dispatch", "started, not queued"),
@@ -75,9 +75,9 @@ TAMPER_EXPECT = {
     "session-kept": ("leftovers", "tmux session is gone"),
 }
 LEFT = {      # a thing left on purpose -> how the leftover check must name it
-    "leftover-worktree": "worktree ", "leftover-branch": "branch left-g3-", "leftover-lane-record": "lane record ", "leftover-pane": "sa:g3-left",
-}
-UNCLEANABLE = ("leftover-worktree", "leftover-branch", "leftover-lane-record")   # not made by the run's own steps: the cleanup reports them, never removes them
+    "leftover-worktree": "worktree /", "leftover-branch": "branch lane/g3-", "leftover-lane-record": "lane record ", "leftover-pane": "sa:g3-left",
+}      # the worktree and the branch are at the exact path and name the lane had: the run made those, so its cleanup removes them again
+UNCLEANABLE = ("leftover-lane-record",)   # a record directory without a lane.json: the cleanup reports it (lane remove --abandon cannot take it), never deletes it
 COLLISIONS = ("integration-exists", "lane-branch-exists", "lane-record-exists", "worktree-exists", "session-exists")   # found, not made: they must survive
 UNTAMPERED = {
     "the leftover probes ran to the end": "tests/test_g3_e2e.py BoundedTest (a probe that hangs is a recorded error, and this check fails on it)",
@@ -161,7 +161,7 @@ class TamperTest(Base):
             with self.subTest(tamper=name):
                 _, summary, err, _ = results()[f"tamper-{name}"]
                 self.assertEqual(summary["failed_step"], "setup")
-                self.assertEqual(summary["made"], {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None})
+                self.assertEqual(summary["made"], NOTHING_MADE)
                 self.assertEqual(summary["cleanup"]["errors"], [], "the cleanup removed nothing, so there was nothing for it to fail at")
                 self.assertTrue(Path(summary["repo"]).is_dir())
         # the integration branch that was already there: present, still at the commit it was made at
@@ -186,10 +186,11 @@ class TamperTest(Base):
         self.assertTrue(any("lane record" in line for line in summary["cleanup"]["leftovers"]))
         # a registered worktree of the name: still registered, its directory still there
         _, summary, _, _ = results()["tamper-worktree-exists"]
-        foreign = (Path(summary["tmp"]) / f"foreign-{summary['run']}").resolve()
+        foreign = Path(summary["names"]["lane_worktree"])        # the exact path the lane would have had
+        self.assertEqual(foreign.name, f"{Path(summary['repo']).name}-wt-{summary['run']}")
         self.assertTrue(foreign.is_dir())
         self.assertIn(f"worktree {foreign}", self.git(summary, "worktree", "list", "--porcelain"))
-        self.assertTrue(any(line.startswith("worktree ") for line in summary["cleanup"]["leftovers"]))
+        self.assertIn(f"worktree {foreign}", summary["cleanup"]["leftovers"])
 
     def test_a_session_of_the_name_that_already_exists_survives_with_its_panes(self):
         _, summary, err, _ = results()["tamper-session-exists"]

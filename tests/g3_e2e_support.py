@@ -58,6 +58,7 @@ exec "$G3_REAL_TMUX" "$@"
 
 CONFIG_DIR = ".tmux" + "-pi"          # where a repository keeps its lane config (lanes.json)
 WORK = DECOY = LOG = PATCH = None
+NOTHING_MADE = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None, "dirs": []}
 RUNS = []          # the JSON summary of every run the module made (parallel or in-process)
 
 
@@ -143,7 +144,12 @@ class Base(unittest.TestCase):
 
 class Parallel:
     """Full fake runs started together as subprocesses (one run is ~11 s, almost all of it the real tools; the runs share nothing: each has its own
-    temp repo, state, TMUX_TMPDIR and private tmux server). Memoised per case table."""
+    temp repo, state, TMUX_TMPDIR and private tmux server). Memoised per case table. A case is a list of extra arguments, or a dict
+    {"args": [...], "run_id": "..."}: the run then gets that run id (so the test knows its lane name, and so the paths the config gives it,
+    before the run starts)."""
+
+    PINNED = ("import os, sys; sys.path.insert(0, os.environ['G3_TOOLS']); import g3_e2e; "
+              "g3_e2e.new_run_id = lambda: os.environ['G3_RUN_ID']; sys.exit(g3_e2e.main(sys.argv[1:]))")
 
     def __init__(self, cases, workers=8):
         self.cases, self.workers, self.done = cases, workers, {}
@@ -153,8 +159,11 @@ class Parallel:
             def one(item):
                 label, extra = item
                 out = WORK / f"{label}.json"
-                run = subprocess.run([sys.executable, str(ROOT / "tools" / "smoke" / "g3_e2e.py"), "--fake", "--out", str(out), *extra],
-                                     text=True, capture_output=True, timeout=300)
+                env, argv = None, [sys.executable, str(ROOT / "tools" / "smoke" / "g3_e2e.py")]
+                if isinstance(extra, dict):
+                    env = {**os.environ, "G3_TOOLS": str(ROOT / "tools" / "smoke"), "G3_RUN_ID": extra["run_id"]}
+                    argv, extra = [sys.executable, "-c", self.PINNED], extra["args"]
+                run = subprocess.run([*argv, "--fake", "--out", str(out), *extra], text=True, capture_output=True, timeout=300, env=env)
                 return label, (run.returncode, json.loads(out.read_text()) if out.exists() else {}, run.stderr, run.stdout)
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
                 self.done.update(pool.map(one, self.cases.items()))

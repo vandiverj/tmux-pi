@@ -1,9 +1,12 @@
 """tools/smoke/g3_e2e.py in --fake mode on a tiny temp repo (never battle-soccer, never a model): the whole flow, a failure injected at each step
 (cleanup ran, the error names the step), the permission-prompt trigger shown to ask in every redaction mode by the real hooks, and the guards:
 no repo-wide worktree prune (F2), test hooks refused in a live run (F3), every subprocess bounded (F4), and the tmux isolation (resume-1).
+Round 5: no process starts outside bounded() (statically, and at run time through the imported lib code too), a hung git in the config load
+times out by name, and every collision and leftover check is on the exact worktree path (ExactWorktreePathTest).
 The tampered-record cases are in tests/test_g3_e2e_tamper.py. The shim and the audit are in tests/g3_e2e_support.py."""
 import g3_e2e_support as support  # first: it imports session_env, which drops the caller's session
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -20,14 +23,18 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
-from g3_e2e_support import Base, Parallel, ROOT, g3, records
+from g3_e2e_support import Base, NOTHING_MADE, Parallel, ROOT, g3, records
 
 setUpModule, tearDownModule = support.set_up_module, support.tear_down_module
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@invalid"}
 _PARALLEL = Parallel({})
 F2_REPO = {}
+NEAR = {}
 CONFIG_REPO = {}      # the repositories with their own lane config: "ok" (a full run) and "taken" (its integration branch already exists)
 CONFIG = {"branch_prefix": "g3p/", "integration_branch": "g3int/scratch", "worktree_pattern": "{repo}-g3trees-{name}"}
+NESTED = {**CONFIG, "worktree_pattern": "{repo}-{name}/checkout"}      # the worktree is one level below a directory the lane tool makes
+RUN_IDS = {"nested": "11091200-nest-aa1111", "near": "11091200-near-bb2222"}      # pinned, so the test knows the paths before the run starts
+STDLIB = {"argparse", "json", "os", "re", "secrets", "shutil", "signal", "stat", "subprocess", "sys", "tempfile", "time", "datetime", "pathlib"}
 HOOK = """#!/bin/sh
 # every ref update that was committed in this repository (and its worktrees): "<old> <new> <ref>" per line
 if [ "$1" = committed ]; then cat >> '%s'; else cat > /dev/null; fi
@@ -39,7 +46,7 @@ def git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=True, env={**os.environ, **GIT_ENV}, timeout=60).stdout
 
 
-def config_repo(label, existing_integration=False):
+def config_repo(label, existing_integration=False, config=None):
     """A disposable repository whose committed lane config sets another integration_branch, branch_prefix and worktree_pattern than the
     defaults. A reference-transaction hook logs every ref update, so a test can say what was (never) created. `existing_integration`: the
     configured integration branch is already there, as another run's would be."""
@@ -48,7 +55,7 @@ def config_repo(label, existing_integration=False):
     git(repo, "init", "-q", "-b", "main")
     (repo / "README.md").write_text("tiny\n")
     (repo / support.CONFIG_DIR).mkdir()
-    (repo / support.CONFIG_DIR / "lanes.json").write_text(json.dumps(CONFIG) + "\n")
+    (repo / support.CONFIG_DIR / "lanes.json").write_text(json.dumps(config or CONFIG) + "\n")
     git(repo, "add", ".")
     git(repo, "commit", "-q", "-m", "init")
     if existing_integration:
@@ -81,6 +88,14 @@ def results():
         _PARALLEL.cases["f2"] = ["--repo", str(repo)]
         _PARALLEL.cases["config-ok"] = ["--repo", str(config_repo("ok"))]
         _PARALLEL.cases["config-taken"] = ["--repo", str(config_repo("taken", existing_integration=True))]
+        # `{repo}-{name}/checkout`: the first run makes the parent `{repo}-{name}` itself (and must remove it); in the second the parent is
+        # already there, with a file of someone else's in it, and only the path below it is free.
+        _PARALLEL.cases["config-nested"] = {"args": ["--repo", str(config_repo("nested", config=NESTED))], "run_id": RUN_IDS["nested"]}
+        near = config_repo("near", config=NESTED)
+        NEAR["parent"] = near.parent / f"{near.name}-g3-{RUN_IDS['near']}"
+        NEAR["parent"].mkdir()
+        (NEAR["parent"] / "keep.txt").write_text("not the run's\n")
+        _PARALLEL.cases["config-near"] = {"args": ["--repo", str(near)], "run_id": RUN_IDS["near"]}
     return _PARALLEL()
 
 
@@ -316,16 +331,115 @@ class HookFlagsTest(Base):
 class BoundedTest(Base):
     """F4: every subprocess has a timeout; a timeout is a cleanup error and neither the rest of the cleanup nor the summary is skipped."""
 
-    def test_bounded_gives_up_on_a_grandchild_that_holds_the_pipes(self):
+    @staticmethod
+    def gone(pid, limit=10):
+        """Whether the process is gone (not even a zombie) within `limit` s: waits on the event, bounded."""
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], text=True, capture_output=True, timeout=10).stdout.strip().startswith("Z"):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_bounded_gives_up_on_a_grandchild_that_holds_the_pipes_and_kills_it(self):
+        pidfile = support.WORK / "grandchild.pid"
         t0 = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):
-            g3.bounded(["sh", "-c", "sleep 6 & sleep 6"], 1)
+            g3.bounded(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], 1)
         self.assertLess(time.monotonic() - t0, 5)
+        self.assertTrue(self.gone(int(pidfile.read_text())), "the grandchild of the timed-out command was left running")
 
-    def test_every_subprocess_call_in_the_script_passes_a_timeout(self):
-        source = (ROOT / "tools/smoke/g3_e2e.py").read_text()
-        self.assertEqual(source.count("subprocess.run("), 0)
-        self.assertEqual(source.count("subprocess.Popen("), 1)     # inside bounded(), which always calls communicate(timeout=...)
+    def test_the_script_starts_processes_only_inside_bounded_and_imports_nothing_from_lib(self):
+        """Static: every call that can start a process is the one Popen inside bounded(); the imports are the standard library (the lane
+        functions run in the child CONFIG_CHILD, a string, not in this process)."""
+        tree = ast.parse((ROOT / "tools/smoke/g3_e2e.py").read_text())
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        starters = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = ".".join(reversed([func.attr] + ([func.value.id] if isinstance(func.value, ast.Name) else []))) if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in ("subprocess.Popen", "subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.getoutput",
+                            "subprocess.getstatusoutput") or name.startswith(("os.system", "os.popen", "os.spawn", "os.posix_spawn", "os.exec", "os.fork")) or name in ("__import__", "import_module"):
+                    owner = node
+                    while owner in parents and not isinstance(owner, ast.FunctionDef):
+                        owner = parents[owner]
+                    starters.append((name, getattr(owner, "name", "<module>")))
+        self.assertEqual(starters, [("subprocess.Popen", "bounded")])
+        imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        self.assertEqual(imported - STDLIB, set())
+
+    def test_a_run_starts_processes_only_through_bounded_with_the_runs_env_imported_code_included(self):
+        """Run time: subprocess.Popen and subprocess.run are replaced for a real fake run (setup, the config load, the cleanup, up to a step
+        injected to fail). Any process started by a frame that is not inside bounded() is an offender, and that covers calls made by imported
+        library code. bounded() itself is wrapped to see its timeout and env. The guard is shown to fire on a lib call first."""
+        real_popen, real_run, real_bounded = subprocess.Popen, subprocess.run, g3.bounded
+        offenders, calls = [], []
+
+        def inside_bounded():
+            frame = sys._getframe(2)
+            while frame:
+                if frame.f_code is real_bounded.__code__:
+                    return True
+                frame = frame.f_back
+            return False
+
+        def popen(*args, **kw):
+            if not inside_bounded():
+                offenders.append(("Popen", args[0] if args else kw.get("args")))
+            return real_popen(*args, **kw)
+
+        def run(*args, **kw):
+            offenders.append(("run", args[0] if args else kw.get("args")))
+            return real_run(*args, **kw)
+
+        def checked(argv, timeout, cwd=None, env=None, stdin=None):
+            calls.append({"argv": argv, "timeout": timeout, "env": env})
+            return real_bounded(argv, timeout, cwd=cwd, env=env, stdin=stdin)
+
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lanes
+        with mock.patch.object(subprocess, "Popen", popen), mock.patch.object(subprocess, "run", run):
+            lanes.valid_branch("x")         # lib code that starts git on its own, no timeout
+        self.assertEqual([name for name, _ in offenders], ["run", "Popen"], offenders)      # run() itself, then the Popen it opened
+        offenders.clear()
+        with mock.patch.object(subprocess, "Popen", popen), mock.patch.object(subprocess, "run", run), mock.patch.object(g3, "bounded", checked):
+            rc, summary, err = self.smoke("--inject-failure", "dispatch")
+        self.assertEqual((rc, summary["failed_step"]), (1, "dispatch"), err)
+        self.assertEqual(offenders, [], "a process was started outside bounded()")
+        self.assertGreater(len(calls), 20)
+        self.assertTrue(any(g3.CONFIG_CHILD in call["argv"] for call in calls), "the config load ran in a bounded child")
+        for call in calls:
+            self.assertTrue(call["timeout"] and call["timeout"] > 0, call["argv"])
+            env = call["env"]
+            self.assertIsInstance(env, dict, f"no scrubbed env: {call['argv']}")
+            self.assertEqual({"TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_MAIN_ID", "TP_TRIAL_ID"} & set(env), set(), call["argv"])
+            self.assertEqual((env["TMUX_TMPDIR"], env["TP_SESSION"], env["TP_STATE_DIR"]), (summary["tmux_tmpdir"], summary["run"], f"{summary['tmp']}/state"))
+
+    def test_a_hung_git_in_the_config_load_times_out_by_name_leaves_nothing_and_kills_the_git(self):
+        """`git check-ref-format`, which lanes.load_repo_config starts with no timeout, hangs: the run fails at setup naming the config load,
+        in about --subprocess-timeout, with the summary written, nothing made, and the hung git killed too."""
+        shim = Path(tempfile.mkdtemp(dir=support.WORK))
+        pidfile = shim / "pids"
+        (shim / "git").write_text(f'#!/bin/sh\ncase "$*" in *check-ref-format*) echo $$ >> {pidfile}; exec sleep 600 ;; esac\nexec {shutil.which("git")} "$@"\n')
+        (shim / "git").chmod(0o755)
+        t0 = time.monotonic()
+        with mock.patch.dict(os.environ, {"PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}):
+            rc, summary, err = self.smoke("--subprocess-timeout", "2")
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertEqual((rc, summary["failed_step"]), (1, "setup"))
+        self.assertIn("lane config load", summary["error"])
+        self.assertIn("did not finish within 2 s", summary["error"])
+        self.assertEqual(summary["made"], NOTHING_MADE)
+        self.assert_clean(summary)
+        pids = [int(pid) for pid in pidfile.read_text().split()]
+        self.assertTrue(pids, "the shim was reached")
+        self.assertTrue(all(self.gone(pid) for pid in pids), "the hung git of the config load was left running")
 
     def test_a_hanging_tmux_fails_the_step_and_still_writes_the_summary(self):
         """The first tmux call hangs (a shim that sleeps): the step fails by name after --subprocess-timeout, the cleanup's tmux calls and the
@@ -359,7 +473,9 @@ class BoundedTest(Base):
         (smoke.state / "tasks" / "coder-x").mkdir()
         (smoke.state / "tasks" / "coder-x" / "meta.json").write_text(json.dumps({"pane": pane}))
         smoke.facts["common"] = str((smoke.repo / git(smoke.repo, "rev-parse", "--git-common-dir").strip()).resolve())
+        smoke.sub_timeout = 10          # the config load is bounded too: not the 1 s this test gives the cleanup
         smoke.load_config()
+        smoke.sub_timeout = 1
         git(smoke.repo, "branch", smoke.integration)
         smoke.made["integration"] = True
         repo, tmux_tmp = smoke.repo, smoke.tmux_tmp
@@ -483,7 +599,7 @@ class ConfiguredNamesTest(Base):
         self.assertEqual((rc, summary["failed_step"]), (1, "setup"))
         for piece in ("g3int/scratch", "integration branch", "wait for the other run", "remove the branch yourself"):
             self.assertIn(piece, summary["error"])
-        self.assertEqual(summary["made"], {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None})
+        self.assertEqual(summary["made"], NOTHING_MADE)
         self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
         self.assertEqual(git(repo, "rev-parse", "g3int/scratch"), git(repo, "rev-parse", "main"), "the branch is still there, unmoved")
         self.assertEqual(self.refs("taken"), [], "setup refused before it made or removed any ref (and never the default lane/integrate)")
@@ -493,6 +609,111 @@ class ConfiguredNamesTest(Base):
         for line in code:
             self.assertNotRegex(line, r"lane/integrate|refs/heads/lane/|f\"lane/\{|-wt-", line)
         self.assertNotIn("INTEGRATION", "\n".join(code))
+
+
+class ExactWorktreePathTest(Base):
+    """Round 5 F2: the worktree collision check and the leftover report are on the exact path lanes.lane_worktree gives (here the pattern
+    `{repo}-{name}/checkout`), never a name fragment. Something at the path is refused at setup, before anything is made, and survives;
+    leftovers name the exact path; a path whose parent only exists proceeds."""
+
+    def setup_case(self, label):
+        rid = f"11091200-{label}-cc3333"
+        repo = config_repo(label, config=NESTED)
+        name = f"g3-{rid}"
+        return rid, name, repo, repo.parent / f"{repo.name}-{name}" / "checkout"
+
+    def refused(self, label, make, leftover_text):
+        rid, name, repo, path = self.setup_case(label)
+        make(repo, path)
+        refs = CONFIG_REPO[label]["log"].read_text()
+        with mock.patch.object(g3, "new_run_id", return_value=rid):
+            rc, summary, err = self.smoke("--repo", str(repo))
+        self.assertEqual((rc, summary["failed_step"]), (1, "setup"), summary.get("error"))
+        self.assertEqual(summary["names"]["lane_worktree"], str(path), f"the test made the thing at the path the config computes: {summary.get('error')}")
+        self.assertIn(f"nothing is registered or exists at the configured worktree path (saw: {path}", summary["error"])
+        self.assertEqual(summary["made"], NOTHING_MADE)
+        self.assertEqual(summary["cleanup"]["errors"], [])
+        self.assertIn(leftover_text.format(path=path), summary["cleanup"]["leftovers"], "the leftover report names the exact path")
+        self.assertEqual(CONFIG_REPO[label]["log"].read_text(), refs, "no ref was made or removed")
+        self.assertEqual(git(repo, "branch", "--list").split(), ["*", "main"])
+        self.assertFalse([c for c in records()[self.mark:] if "new-session" in c["argv"]], "refused before the session was made")
+        return repo, path, summary
+
+    def test_a_registered_worktree_at_the_path_is_refused_and_survives(self):
+        repo, path, _ = self.refused("reg", lambda repo, path: git(repo, "worktree", "add", "-q", "--detach", str(path), "HEAD"), "worktree {path}")
+        self.assertIn(f"worktree {path}\n", git(repo, "worktree", "list", "--porcelain"))
+        self.assertTrue((path / "README.md").is_file())
+
+    def test_a_registered_worktree_whose_directory_is_gone_is_refused_and_stays_registered(self):
+        def make(repo, path):
+            git(repo, "worktree", "add", "-q", "--detach", str(path), "HEAD")
+            shutil.rmtree(path)
+        repo, path, _ = self.refused("gone", make, "worktree {path}")
+        self.assertIn(f"worktree {path}\n", git(repo, "worktree", "list", "--porcelain"))
+        self.assertFalse(path.exists())
+
+    def test_a_plain_directory_at_the_path_is_refused_and_survives(self):
+        def make(repo, path):
+            path.mkdir(parents=True)
+            (path / "keep.txt").write_text("someone's\n")
+        repo, path, _ = self.refused("dir", make, "path {path} exists on disk")
+        self.assertEqual((path / "keep.txt").read_text(), "someone's\n")
+
+    def test_a_file_at_the_path_is_refused_and_survives(self):
+        def make(repo, path):
+            path.parent.mkdir()
+            path.write_text("someone's file\n")
+        repo, path, _ = self.refused("file", make, "path {path} exists on disk")
+        self.assertEqual(path.read_text(), "someone's file\n")
+
+    def test_a_dangling_symlink_at_the_path_is_refused_by_the_config_load_and_survives(self):
+        """lanes.load_repo_config itself refuses a configured worktree that goes through a symlink, so the run stops at the config load
+        (before setup) with nothing made; the symlink is not touched."""
+        rid, name, repo, path = self.setup_case("link")
+        path.parent.mkdir()
+        os.symlink("/nonexistent-g3-target", path)
+        with mock.patch.object(g3, "new_run_id", return_value=rid):
+            rc, summary, err = self.smoke("--repo", str(repo))
+        self.assertEqual(rc, 1, summary.get("error"))
+        self.assertIn("not a canonical path", summary["error"])
+        self.assertEqual(summary["made"], NOTHING_MADE)
+        self.assertEqual(summary["cleanup"]["errors"], [])
+        self.assertEqual(os.readlink(path), "/nonexistent-g3-target")
+        self.assertEqual(git(repo, "branch", "--list").split(), ["*", "main"])
+
+    def test_a_look_alike_worktree_is_not_a_collision_it_is_reported_and_left_alone(self):
+        """The old check refused any worktree whose folder name contained the run's name. Now only the exact path counts: setup proceeds (the
+        failure comes from the step injected after it), the look-alike is reported as kept (not a failure of its own) and survives."""
+        rid, name, repo, path = self.setup_case("frag")
+        look_alike = support.WORK / f"frag-{name}"
+        git(repo, "worktree", "add", "-q", "--detach", str(look_alike), "HEAD")
+        with mock.patch.object(g3, "new_run_id", return_value=rid):
+            rc, summary, err = self.smoke("--repo", str(repo), "--inject-failure", "dispatch")
+        self.assertEqual((rc, summary["failed_step"]), (1, "dispatch"), summary.get("error"))
+        self.assertEqual(summary["cleanup"]["errors"], [])
+        self.assertEqual(summary["cleanup"]["leftovers"], [], "the exact resources are all gone")
+        self.assertEqual(summary["cleanup"]["kept"], [f"similar name, not this run's exact resource: worktree {look_alike}"])
+        self.assertIn(f"worktree {look_alike}\n", git(repo, "worktree", "list", "--porcelain"))
+
+    def test_a_parent_directory_that_exists_is_not_a_collision_and_is_never_removed(self):
+        rc, summary, err, _ = results()["config-near"]
+        parent = NEAR["parent"]
+        self.assertEqual((rc, err), (0, ""), summary.get("error"))
+        self.assertEqual(summary["names"]["lane_worktree"], str(parent / "checkout"))
+        self.assertEqual(summary["made"]["dirs"], [], "the run made no directory: the parent was already there")
+        self.assertEqual((parent / "keep.txt").read_text(), "not the run's\n")
+        self.assertEqual(sorted(p.name for p in parent.iterdir()), ["keep.txt"], "the worktree below it is gone")
+        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
+
+    def test_a_parent_directory_the_run_made_is_removed_with_the_worktree(self):
+        """`lane remove` takes the checkout and leaves `{repo}-{name}`: the run made it, so the run removes it, and it is empty."""
+        rc, summary, err, _ = results()["config-nested"]
+        parent = CONFIG_REPO["nested"]["path"].parent / f"cfg-nested-g3-{RUN_IDS['nested']}"
+        self.assertEqual((rc, err), (0, ""), summary.get("error"))
+        self.assertEqual(summary["names"]["lane_worktree"], str(parent / "checkout"))
+        self.assertEqual(summary["made"]["dirs"], [str(parent)])
+        self.assertFalse(parent.exists())
+        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
 
 
 class GuardTest(Base):

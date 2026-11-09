@@ -59,12 +59,15 @@ G1 after the merges; G2 and G3 in parallel as lanes; G4 after the LS1 flip (J1-D
 Owner: "can we get to a point for improvements to use on production without the sumarrizer ... a checkpoint we can use and
 you would continue the other work".
 
-- **Scope:** main as it stands once MS1 and G3 round 6 are merged. `summarize_files` stays `candidate` in
+- **Scope:** main as it stands once MS1, MN1 and G3 round 6 are merged. `summarize_files` stays `candidate` in
   config/model-catalog.json, so nothing routes summaries to the local model. The LS1c lanes (S1c, MG1) may merge before
   the cut. They only add tools/qual, lib/summarize_structured.py and tests, and nothing on the production path calls them.
 - **Gates for the cut (in order):**
   1. **MS1 merged.** `tp-agent message` submits and confirms. This is the cause of G3 live runs 4 and 5, and a production
-     defect.
+     defect. It is also the owner's first named production issue ("messages to workers not getting sent").
+  1b. **MN1 merged** (docs/plans/det-prep/fixes/mn1-main-notify.md). Worker state changes reach the Claude main: a stable
+     main id, no silent hiding of rows, and no silently dropped notice. This is the owner's second named production issue
+     ("workers no longer sending messages ack to main agent", 2026-11-09).
   2. **G3 round 6 merged and a live run passing.** This is the end-to-end flow on battle-soccer: dispatch, permission,
      decline plus redirect, retry, cross-provider review, close, merge, collect, remove.
   3. **G1 on the cut commit:** the full suite in 4 cells, zero failures (the baseline is empty).

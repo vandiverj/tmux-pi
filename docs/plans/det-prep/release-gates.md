@@ -54,3 +54,23 @@ Claims each gate allows:
 
 ## Order
 G1 after the merges; G2 and G3 in parallel as lanes; G4 after the LS1 flip (J1-D1 decided); G5 last.
+
+## Checkpoint 1: a production cut without the local summarizer (owner 2026-11-09)
+Owner: "can we get to a point for improvements to use on production without the sumarrizer ... a checkpoint we can use and
+you would continue the other work".
+
+- **Scope:** main as it stands once MS1 and G3 round 6 are merged. `summarize_files` stays `candidate` in
+  config/model-catalog.json, so nothing routes summaries to the local model. The LS1c lanes (S1c, MG1) may merge before
+  the cut. They only add tools/qual, lib/summarize_structured.py and tests, and nothing on the production path calls them.
+- **Gates for the cut (in order):**
+  1. **MS1 merged.** `tp-agent message` submits and confirms. This is the cause of G3 live runs 4 and 5, and a production
+     defect.
+  2. **G3 round 6 merged and a live run passing.** This is the end-to-end flow on battle-soccer: dispatch, permission,
+     decline plus redirect, retry, cross-provider review, close, merge, collect, remove.
+  3. **G1 on the cut commit:** the full suite in 4 cells, zero failures (the baseline is empty).
+  4. **G5 port rehearsal:** a fresh clone set up like the work Mac (no config/local.json, no LM Studio, Apple Python
+     3.9), then G1 and G3 in it. The work Mac itself stays untouched.
+- **Then:** tag the commit `checkpoint-1` (local tag). Write port notes: what changed since d8a18a7, setup steps, how to
+  roll back to d8a18a7. Push only with the owner's approval.
+- **G4 (before/after numbers)** is not a gate for this cut. It can run on `checkpoint-1` with the J1-D1 task set (no
+  summarize task), so any "improves" claim comes with numbers.

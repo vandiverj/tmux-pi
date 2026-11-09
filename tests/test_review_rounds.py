@@ -1385,9 +1385,128 @@ class FrozenCopiesTests(unittest.TestCase):
             with self.assertRaises(review_rounds.Refused) as ctx:
                 review_rounds.gate(bad, ["ok"], [], ["fx/copy.txt"])
             self.assertIn("left out", str(ctx.exception))
-        review_rounds.gate(good + "--- a/fx/copy.txt\n", ["ok"], [], ["fx/copy.txt"])  # a lone removed line that reads `-- a/fx/copy.txt` is not a section
+        review_rounds.gate(good + "--- a/fx/copy.txt\n", ["ok"], [], ["fx/copy.txt"])  # a lone line outside a hunk, with no `+++` line after it, is not a section
         with self.assertRaises(review_rounds.Refused):  # a path that is both safe and left out
             review_rounds.gate(good, ["ok"], [], ["ok"])
+
+    def test_the_gate_reads_hunks_so_text_in_a_hunk_is_not_a_header_and_a_real_header_still_is(self):
+        """Family frozen-gate-hunk-confusion: a removed line `-- a/x` and an added line `++ b/x` read `--- a/x` / `+++ b/x` in a hunk."""
+        good = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        for name, safe, withheld, left in (("a left-out path", ["ok"], [], ["fx/copy.txt"]), ("a flagged path", ["ok"], [".env"], [])):
+            path = left[0] if left else withheld[0]
+            hunk_text = f"diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n--- a/{path}\n+++ b/{path}\n"  # removed `-- a/x`, added `++ b/x`
+            real_pair = f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-a\n+b\n"
+            with self.subTest(name):
+                review_rounds.gate(hunk_text, safe, withheld, left)  # (fails on 321568c: it read the two lines as a header pair)
+                review_rounds.gate(hunk_text + "\\ No newline at end of file\n", safe, withheld, left)
+                for what, body in (("a real header pair for it after a whole hunk", good + real_pair),
+                                   ("a real header pair after a hunk cut short", good + "@@ -1,3 +1,3 @@\n-a\n+b\n" + real_pair.split("@@")[0]),
+                                   ("a real header pair under a header that is not checked", "diff --git a/other b/other\n" + real_pair)):
+                    with self.assertRaises(review_rounds.Refused, msg=what):  # (these refuse on 321568c too)
+                        review_rounds.gate(body, safe, withheld, left)
+
+    def test_a_diff_whose_hunks_cannot_be_followed_is_refused_not_attached(self):
+        head = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n"
+        for text in (head + "@@ -1,3 +1,3 @@\n-a\n+b\n",                                  # a hunk cut short by the end of the text
+                     head + "@@ -1,3 +1,3 @@\n-a\n+b\ndiff --git a/ok b/ok\n",             # cut short by a header
+                     head + "@@ -1,3 +1,3 @@\n-a\n+b\n\n c\n d\n",                        # an empty line is not a diff line
+                     head + "@@ -0,0 +1 @@\n-a\n+b\n",                                    # more old lines than the header says
+                     head + "@@ -1 +1 @@\n+a\n+b\n",                                      # more new lines than the header says
+                     head + "@@ nonsense @@\n+a\n", head + "@@ -1 +1\n-a\n+b\n", head + "@@ whole file, x line(s) @@\n"):  # not hunk headers
+            with self.subTest(text=text[len(head):]), self.assertRaises(review_rounds.Refused):
+                review_rounds.gate(text, ["ok"], [])
+        # what is followed: a missing count is 1, a backslash line uses neither count (mid-hunk or after), and the whole-file header
+        for text in (head + "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a\n\\ No newline at end of file\n",
+                     head + "@@ -1,2 +1,2 @@\n a\n-b\n+c\n@@ -9 +9 @@\n-x\n+y\n",
+                     head + "@@ -0,0 +1,2 @@\n+a\n+b\n@@ whole file, 1 line(s) @@\n+z\n", head + "@@ -1 +1 @@\n-a\n+b\n"):
+            with self.subTest(text=text[len(head):]):
+                review_rounds.gate(text, ["ok"], [])
+
+    def test_a_removed_line_and_an_added_line_that_read_like_headers_do_not_make_safe_diff_refuse(self):
+        """The reviewer's case at 321568c: another file's hunk changes `-- a/copy` to `++ b/copy`, and `copy` is a verified copy."""
+        self.put("later.txt", "-- a/copy\n")
+        old = review_rounds.snapshot(self.work)["tree"]
+        self.put("later.txt", "++ b/copy\n")
+        self.put("copy", self.LANES)
+        self.manifest([self.copy("copy", "lib/lanes.py")], directory="")
+        new = review_rounds.snapshot(self.work)["tree"]
+        text, withheld = review_rounds.safe_diff(self.top, old, new, anchor=self.c2)
+        self.assertEqual(withheld, [])
+        self.assertShown(text, "later.txt")
+        self.assertIn("\n@@ -1 +1 @@\n--- a/copy\n+++ b/copy\n", text)  # the other file's hunk, shown as it is
+        self.assertIn(self.left_out_note("copy", "lib/lanes.py"), text)
+        self.assertLeftOut(text, "copy")
+
+    def test_the_same_for_the_name_of_a_withheld_path_in_hunk_text(self):
+        self.put("later.txt", "-- a/fx/k.pem\n")
+        old = review_rounds.snapshot(self.work)["tree"]
+        self.put("later.txt", "++ b/fx/k.pem\n")
+        self.put("fx/k.pem", "-----MADEUP-KEY-----\n")  # a flagged path, changed in the same diff, so its name is the flagged name
+        new = review_rounds.snapshot(self.work)["tree"]
+        text, withheld = review_rounds.safe_diff(self.top, old, new)
+        self.assertEqual(withheld, ["fx/k.pem"])
+        self.assertShown(text, "later.txt")
+        self.assertIn("\n@@ -1 +1 @@\n--- a/fx/k.pem\n+++ b/fx/k.pem\n", text)
+        self.assertIn('"fx/k.pem" (added): sensitive path, its contents were withheld from this diff\n', text)
+        self.assertNotIn("MADEUP-KEY", text)
+
+    def git_calls(self, old="HEAD"):
+        """({git subcommand: count}, [ls-tree argument lists], [cat-file argument lists]) of one safe_diff of the tree against `old`."""
+        argvs, real = [], subprocess.Popen
+
+        class Counting(real):  # subprocess.run starts its process through Popen, so this sees every call once
+            def __init__(inner, argv, *args, **kwargs):
+                if isinstance(argv, list) and argv[:2] == ["git", "-C"]:
+                    argvs.append(argv[3:])
+                super().__init__(argv, *args, **kwargs)
+        tree = review_rounds.snapshot(self.work)["tree"]
+        with mock.patch.object(subprocess, "Popen", Counting):
+            text, _ = review_rounds.safe_diff(self.top, old, tree)
+        counts = {}
+        for argv in argvs:
+            counts[argv[0]] = counts.get(argv[0], 0) + 1
+        return counts, [a for a in argvs if a[0] == "ls-tree"], [a for a in argvs if a[0] == "cat-file"], text
+
+    def test_git_work_follows_the_manifests_and_distinct_commits_not_the_copies(self):
+        """rev-parse (old side, then each distinct commit) + merge-base + ls-tree (each commit's sources) once per commit, the manifests
+        the diff does not show in one targeted ls-tree, and `cat-file -s` then `cat-file blob` per manifest."""
+        sources = [("lanes.py", "lib/lanes.py", self.LANES), ("tool", "bin/tool", "#!/bin/sh\necho tool\n"),
+                   ("é y.txt", "docs/é x.txt", "unicode name\n" * 5), ("plain.txt", "plain.txt", "A=madeup-value\n")]
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        one, ls, cat, text = self.git_calls()
+        self.assertEqual(text.count("byte-identical"), 1)
+        for many in (sources, sources + [(f"again{i}/{name}", source, body) for i, (name, source, body) in enumerate(sources)]):
+            for name, _, body in many:
+                self.put(f"fx/{name}", body, 0o755 if name.endswith("tool") else None)
+            self.manifest([self.copy(name, source) for name, source, _ in many])
+            counts, ls, cat, text = self.git_calls()
+            with self.subTest(copies=len(many)):
+                self.assertEqual(text.count("byte-identical"), len(many))
+                for name in ("rev-parse", "merge-base", "ls-tree", "cat-file"):
+                    self.assertEqual(counts.get(name), one.get(name), (name, counts, one))  # the same for 1 copy and for 8
+        self.assertEqual({k: one[k] for k in ("rev-parse", "merge-base", "ls-tree", "cat-file")},
+                         {"rev-parse": 2, "merge-base": 1, "ls-tree": 2, "cat-file": 2})
+        self.assertTrue(all("-r" not in args for args in ls), ls)  # no whole-tree listing
+        self.assertEqual(cat[0][1], "-s")  # the size is asked before the blob is read
+
+    def test_no_whole_tree_listing_without_a_manifest_and_an_oversized_manifest_is_not_read(self):
+        self.put("fx/a.txt", "a\n")
+        self.put("b/c/d.txt", "d\n")
+        counts, ls, cat, text = self.git_calls()
+        self.assertEqual((counts.get("ls-tree"), counts.get("cat-file"), counts.get("merge-base")), (1, None, None))
+        self.assertEqual(len(ls), 1)
+        self.assertNotIn("-r", ls[0])  # asked for the manifest names of the touched directories only, never the tree
+        self.assertEqual(sorted(a for a in ls[0] if a.endswith("frozen-copies.json")),
+                         ["b/c/frozen-copies.json", "b/frozen-copies.json", "frozen-copies.json", "fx/frozen-copies.json"])
+        self.assertEqual(text.count("diff --git "), 2)
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        with mock.patch.object(review_rounds, "MAX_MANIFEST", 20):
+            counts, ls, cat, text = self.git_calls()
+        self.assertEqual([a[1] for a in cat], ["-s"])  # the size was asked and the blob was not read
+        self.assertIn('frozen-copies.json: "fx/frozen-copies.json" cannot be used (it is larger than 20 bytes); every entry under "fx" is shown in full\n', text)
+        self.assertShown(text, "fx/lanes.py")
 
 if __name__ == "__main__":
     unittest.main()

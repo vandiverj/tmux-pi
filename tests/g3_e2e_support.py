@@ -56,6 +56,7 @@ if [ $M = 1 ] && listed "$G3_SHIM_AFTER" "$3"; then "$G3_REAL_TMUX" "$@" >/dev/n
 exec "$G3_REAL_TMUX" "$@"
 '''
 
+CONFIG_DIR = ".tmux" + "-pi"          # where a repository keeps its lane config (lanes.json)
 WORK = DECOY = LOG = PATCH = None
 RUNS = []          # the JSON summary of every run the module made (parallel or in-process)
 

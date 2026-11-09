@@ -42,7 +42,9 @@ ABSENT = "." + "env." + "g3-smoke-absent"
 SECRET_VAR = "G3_SMOKE_" + "API_" + "TOKEN"
 PROMPT_COMMAND = f": ./{ABSENT} '${SECRET_VAR}'; exit 3"
 STEP_ID = "s1"
-INTEGRATION = "lane/integrate"      # the tool's own default integration branch; the scratch branch of the run
+# No branch name or worktree path is written in this file: the integration branch (the run's scratch branch), the lane branch prefix and the
+# worktree pattern are the repository's own lane config (<repo>/.tmux-pi/lanes.json, defaults when absent), read with lanes.load_repo_config
+# in Smoke.load_config. The lane tools read the same config, so the script and the tools always agree on the names.
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@invalid", "GIT_COMMITTER_NAME": "g3-smoke", "GIT_COMMITTER_EMAIL": "g3-smoke@invalid"}
 MARKER = "@g3_run"      # the tmux session option that says which run made a session (set in the same tmux call that creates it)
 FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
@@ -62,7 +64,7 @@ RESULT_STATUS: complete
 # --tamper NAME (--fake only): break one record, or one tool answer, just before the check that reads it, to show that check fails by name.
 # The step each one fails at; tests/test_g3_e2e.py holds the check each must name.
 TAMPERS = {
-    "not-git": "setup", "dirty-repo": "setup", "on-scratch-branch": "setup", "integration-exists": "setup", "lane-branch-exists": "setup",
+    "not-git": "setup", "bad-lane-config": "setup", "dirty-repo": "setup", "on-scratch-branch": "setup", "integration-exists": "setup", "lane-branch-exists": "setup",
     "lane-record-exists": "setup", "worktree-exists": "setup", "session-exists": "setup",
     "dispatch-id": "dispatch", "dispatch-queued": "dispatch", "dispatch-meta": "dispatch", "dispatch-pane": "dispatch",
     "dispatch-lane": "dispatch", "dispatch-worktree": "dispatch",
@@ -170,7 +172,10 @@ class Smoke:
         # (`session_unsure`) and is settled by the session's marker (@g3_run = the run id, set in the same tmux call that creates it).
         self.made = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None}
         self.session_unsure = False
-        self.clear = False          # setup verified that nothing of this run's name existed, before it made anything
+        # The repository's lane config, and the three names it gives (set by load_config; None until then, and the cleanup acts on
+        # a name only when `made` says the run created it, which is after load_config).
+        self.cfg, self.integration, self.lane_branch, self.lane_worktree = None, None, None, None
+        self.clear = False         # setup verified that nothing of this run's name existed, before it made anything
         self.kept = []              # found but not made by this run: reported as leftovers, never removed
         self.steps, self.cleanup_report = [], {"ran": False, "errors": [], "leftovers": [], "kept": self.kept}
         self.step_name, self.asserted, self.commands = None, [], []
@@ -226,10 +231,10 @@ class Smoke:
     def tmux(self, *args, rc_ok=(0,)):
         return self.run([*self.tmux_cmd, *args], rc_ok=rc_ok, timeout=self.sub_timeout)
 
-    def check(self, description, ok, detail=""):
-        """Record an assertion; a false one fails the step with the description and what was seen."""
+    def check(self, description, ok, detail="", hint=""):
+        """Record an assertion; a false one fails the step with the description, what was seen and, when given, what the operator can do."""
         if not ok:
-            raise SmokeError(self.step_name, f"{description}" + (f" (saw: {detail})" if detail != "" else ""))
+            raise SmokeError(self.step_name, f"{description}" + (f" (saw: {detail})" if detail != "" else "") + (f". {hint}" if hint else ""))
         self.asserted.append(description)
 
     def wait(self, description, probe, timeout, interval=None, dead=DEAD):
@@ -305,19 +310,44 @@ class Smoke:
         finally:
             entry["seconds"] = round(time.monotonic() - t0, 2)
 
+    def load_config(self):
+        """The repository's lane config, once: the integration branch (the run's scratch branch), the lane branch of this run and its
+        worktree path, exactly as the lane tools (lib/lanes.py) compute them. A config the tools would refuse fails the step."""
+        if self.cfg is not None:
+            return
+        lib = str(self.root / "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        import lanes          # lib/lanes.py: the lane tools' own loader and name functions
+        try:
+            self.cfg = lanes.load_repo_config(str(self.repo))
+            self.integration = self.cfg["integration_branch"]
+            self.lane_branch = lanes.lane_branch(self.cfg, self.name)
+            self.lane_worktree = lanes.lane_worktree(self.cfg, str(self.repo), self.name)
+        except ValueError as error:
+            self.cfg = None
+            raise SmokeError(self.step_name, f"the repository's lane config (lanes.load_repo_config) is not usable: {error}") from None
+        self.asserted.append("the repository's lane config loads and gives the integration branch, the lane branch and the worktree path")
+
     def break_repo(self):
         repo = self.repo
         if self.tamper("not-git"):
             shutil.rmtree(repo / ".git")
+        elif self.tamper("bad-lane-config"):
+            (repo / ".tmux-pi").mkdir(exist_ok=True)
+            (repo / ".tmux-pi" / "lanes.json").write_text(json.dumps({"integration_branch": 5}) + "\n")
         elif self.tamper("dirty-repo"):
             (repo / "README.md").write_text("changed\n")
         elif self.tamper("integration-exists"):
-            self.git("branch", INTEGRATION, "HEAD")
+            self.load_config()
+            self.git("branch", self.integration, "HEAD")
         elif self.tamper("on-scratch-branch"):
-            self.git("checkout", "-q", "-b", INTEGRATION)
+            self.load_config()
+            self.git("checkout", "-q", "-b", self.integration)
         elif self.tamper("lane-branch-exists"):      # someone's branch with a commit that is on no other branch: deleting it loses the commit
+            self.load_config()
             tree = self.git("rev-parse", "HEAD^{tree}")
-            self.git("branch", f"lane/{self.name}", self.git("commit-tree", tree, "-p", "HEAD", "-m", FOREIGN_COMMIT, identity=True))
+            self.git("branch", self.lane_branch, self.git("commit-tree", tree, "-p", "HEAD", "-m", FOREIGN_COMMIT, identity=True))
         elif self.tamper("lane-record-exists"):
             record = (repo / self.git("rev-parse", "--git-common-dir")).resolve() / "tmux-pi" / "lanes" / self.name / "lane.json"
             record.parent.mkdir(parents=True)
@@ -334,21 +364,27 @@ class Smoke:
             self.break_repo()
         repo = self.repo
         self.check("the repository is a git checkout", (repo / ".git").exists(), str(repo))
+        self.load_config()
         self.facts["common"] = str((repo / self.git("rev-parse", "--git-common-dir")).resolve())     # from here the cleanup knows the repository
         self.check("the repository has no uncommitted tracked change", self.git("status", "--porcelain", "--untracked-files=no") == "")
         branch = self.git("rev-parse", "--abbrev-ref", "HEAD")
         self.facts.update(main_branch=branch, main_head=self.git("rev-parse", "HEAD"))
-        self.check("the repository's own branch is not the scratch branch", branch != INTEGRATION, branch)
+        self.check("the repository's own branch is not the scratch branch", branch != self.integration, branch)
+        # The integration branch is the one name that cannot carry the run id: the lane tools take it from the repository's lane config
+        # (and `lane remove` checks ancestry against it). So it is shared by every run on this repository, and a second run refuses here.
         self.check("the scratch integration branch does not exist yet",
-                   self.git("rev-parse", "--verify", "-q", f"refs/heads/{INTEGRATION}", rc_ok=(0, 1)).returncode == 1, INTEGRATION)
-        self.check("no lane branch of this name exists", self.git("rev-parse", "--verify", "-q", f"refs/heads/lane/{self.name}", rc_ok=(0, 1)).returncode == 1,
-                   f"lane/{self.name}")
+                   self.git("rev-parse", "--verify", "-q", f"refs/heads/{self.integration}", rc_ok=(0, 1)).returncode == 1, self.integration,
+                   hint=f"The repository's integration branch '{self.integration}' (integration_branch in .tmux-pi/lanes.json) is shared by every run: "
+                        f"wait for the other run to finish, or remove the branch yourself if no run uses it (git branch -D {self.integration}). "
+                        f"Nothing was changed")
+        self.check("no lane branch of this name exists", self.git("rev-parse", "--verify", "-q", f"refs/heads/{self.lane_branch}", rc_ok=(0, 1)).returncode == 1,
+                   self.lane_branch)
         self.check("no lane record of this name exists", not self.lane_path().parent.exists(), str(self.lane_path().parent))
         registered = [line for line in self.git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ") and self.name in Path(line[9:]).name]
         self.check("no worktree of this name exists", not registered, registered)
         self.check("no tmux session of this name exists", self.tmux("has-session", "-t", f"={self.name}", rc_ok=(0, 1)).returncode == 1, self.name)
         self.clear = True            # nothing of this name existed: what appears under it from here on was made by this run
-        self.git("branch", INTEGRATION, "HEAD")
+        self.git("branch", self.integration, "HEAD")
         self.made["integration"] = True       # recorded after the branch exists, not before
         self.facts["integration_base"] = self.facts["main_head"]
         self.start_session()
@@ -358,7 +394,8 @@ class Smoke:
                 f"newline. Change nothing else, do not commit, and finish with RESULT_STATUS: complete.")
         self.facts["task"] = task
         first_task = (f"Before anything else, run exactly this one Bash command, unchanged, once: {PROMPT_COMMAND}\n"
-                      f"(it names a file that does not exist; if the owner declines it, stop and wait for instructions). Then: {task}")
+                      f"(it is a no-op that opens no file and prints nothing; its only effect is that the owner may be asked to confirm it, and if "
+                      f"the owner declines, stop and wait for instructions). Then: {task}")
         try:
             item = self.agent_json("dispatch", "--role", "coder", "--lane", self.name, "--step", STEP_ID, "--repo", self.repo,
                                    "--domain", "g3 smoke: one added file", "--touches", FILE, "--worker", "claude",
@@ -389,10 +426,11 @@ class Smoke:
         if self.tamper("dispatch-worktree"):
             lane["worktree"] = str(lane.get("worktree")) + "-moved"
         self.facts.update(worktree=lane.get("worktree"), branch=lane.get("branch"), base=(lane.get("base") or {}).get("commit"))
-        self.check("lane record: open, on branch lane/<name>, based on the scratch integration branch",
-                   lane.get("state") == "open" and lane.get("branch") == f"lane/{self.name}" and self.facts["base"] == self.facts["integration_base"],
+        self.check("lane record: open, on the configured lane branch, based on the scratch integration branch",
+                   lane.get("state") == "open" and lane.get("branch") == self.lane_branch and self.facts["base"] == self.facts["integration_base"],
                    {k: lane.get(k) for k in ("state", "branch")})
-        self.check("the lane worktree exists", Path(self.facts["worktree"] or "/nonexistent").is_dir(), self.facts["worktree"])
+        self.check("the lane worktree exists at the configured worktree path",
+                   self.facts["worktree"] == self.lane_worktree and Path(self.facts["worktree"] or "/nonexistent").is_dir(), self.facts["worktree"])
 
     def step_prompt(self):
         first = self.ids["first"]
@@ -530,7 +568,7 @@ class Smoke:
 
     def step_merge(self):
         """A merge commit on the scratch integration branch, made without a checkout: the lane's tree, parents (branch, lane tip)."""
-        tip, base = self.facts["tip"], self.git("rev-parse", f"refs/heads/{INTEGRATION}")
+        tip, base = self.facts["tip"], self.git("rev-parse", f"refs/heads/{self.integration}")
         tree, parents = self.git("rev-parse", f"{tip}^{{tree}}"), ["-p", base, "-p", tip]
         rows = [row for row in self.git("ls-tree", tip).splitlines()]
         if self.tamper("scratch-commit"):        # a tree whose file holds different content
@@ -542,16 +580,16 @@ class Smoke:
             tree = self.git("mktree", stdin="\n".join(rows + [f"100644 blob {blob}\tEXTRA.md"]) + "\n")
         if self.tamper("merge-parents"):
             parents = ["-p", tip]
-        merge = self.git("commit-tree", tree, *parents, "-m", f"g3 smoke: merge lane/{self.name}", identity=True)
-        self.git("update-ref", f"refs/heads/{INTEGRATION}", merge, base)
+        merge = self.git("commit-tree", tree, *parents, "-m", f"g3 smoke: merge {self.lane_branch}", identity=True)
+        self.git("update-ref", f"refs/heads/{self.integration}", merge, base)
         if self.tamper("main-moved"):
             self.git("update-ref", f"refs/heads/{self.facts['main_branch']}", tip)
         self.facts["merge"] = merge
         found = self.git("rev-list", "--parents", "-n", "1", merge).split()[1:]
         self.check("scratch commit: a merge of the previous branch tip and the lane tip", found == [base, tip], found)
         self.check("scratch commit: the branch changed exactly one file, added",
-                   self.git("diff", "--name-status", f"{base}..{INTEGRATION}") == f"A\t{FILE}", self.git("diff", "--name-status", f"{base}..{INTEGRATION}"))
-        self.check("scratch commit: the added file holds exactly the requested line", self.git("show", f"{INTEGRATION}:{FILE}") == self.line)
+                   self.git("diff", "--name-status", f"{base}..{self.integration}") == f"A\t{FILE}", self.git("diff", "--name-status", f"{base}..{self.integration}"))
+        self.check("scratch commit: the added file holds exactly the requested line", self.git("show", f"{self.integration}:{FILE}") == self.line)
         self.check("the repository's own branch did not move", self.git("rev-parse", self.facts["main_branch"]) == self.facts["main_head"])
 
     def step_collect(self):
@@ -586,7 +624,7 @@ class Smoke:
         if self.tamper("lane-back"):           # the record the check reads is still there
             archived = before
         self.check("lane remove: removed, not abandoned, integrated in the scratch branch",
-                   result.get("removed") is True and not result.get("abandoned") and INTEGRATION in str(result.get("integrated_in")), result)
+                   result.get("removed") is True and not result.get("abandoned") and self.integration in str(result.get("integrated_in")), result)
         self.check("the lane's worktree directory is gone", not Path(self.facts["worktree"]).exists(), self.facts["worktree"])
         self.check("lane record: archived, no longer listed", archived is None, archived)
 
@@ -709,10 +747,10 @@ esac
         try:
             if self.lane_path().exists():
                 self.made["lane"] = True
-            if self.git("rev-parse", "--verify", "-q", f"refs/heads/lane/{self.name}", rc_ok=(0, 1)).returncode == 0:
+            if self.git("rev-parse", "--verify", "-q", f"refs/heads/{self.lane_branch}", rc_ok=(0, 1)).returncode == 0:
                 self.made["lane_branch"] = True
             worktree = (self.lane_json() or {}).get("worktree")
-            if worktree and self.name in Path(worktree).name and Path(worktree).is_dir():
+            if worktree and worktree == self.lane_worktree and Path(worktree).is_dir():       # the path the config gives this run's name
                 self.made["worktree"] = str(worktree)
         except SmokeError:
             pass              # a probe that failed claims nothing: the resource stays, and the leftover check reports it
@@ -789,9 +827,9 @@ esac
         if wt:
             attempt("git worktree remove", lambda: self.quiet(["git", "-C", self.repo, "worktree", "remove", "--force", wt], timeout=long), ok=(0, 128))
         if self.made["lane_branch"]:
-            attempt("delete the lane branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", f"lane/{self.name}"], timeout=long), ok=(0, 1))
+            attempt("delete the lane branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", self.lane_branch], timeout=long), ok=(0, 1))
         if self.made["integration"]:
-            attempt("delete the scratch integration branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", INTEGRATION], timeout=long), ok=(0, 1))
+            attempt("delete the scratch integration branch", lambda: self.quiet(["git", "-C", self.repo, "branch", "-D", self.integration], timeout=long), ok=(0, 1))
 
     def teardown_private(self, attempt):
         if self.fake:
@@ -828,7 +866,7 @@ esac
             except Exception as error:  # noqa: BLE001 - the summary is written whatever the cleanup did
                 self.cleanup_report["errors"].append(f"cleanup: {type(error).__name__}: {str(error)[:200]}")
         ok = failure is None and not self.cleanup_report["errors"] and not self.cleanup_report["leftovers"]
-        summary = {"run": self.name, "run_id": self.run_id, "made": self.made, "tmp": str(self.tmp), "mode": "fake" if self.fake else "live", "ok": ok, "repo": str(self.repo), "tmux_tmpdir": str(self.tmux_tmp) if self.tmux_tmp else None,
+        summary = {"run": self.name, "run_id": self.run_id, "made": self.made, "names": {"integration_branch": self.integration, "lane_branch": self.lane_branch, "lane_worktree": self.lane_worktree}, "tmp": str(self.tmp), "mode": "fake" if self.fake else "live", "ok": ok, "repo": str(self.repo), "tmux_tmpdir": str(self.tmux_tmp) if self.tmux_tmp else None,
                    "socket": self.sock if self.fake else None, "started": self.stamp,
                    "failed_step": failure.step if failure else None, "error": failure.message if failure else None,
                    "seconds": round(time.monotonic() - self.started, 2), "steps": self.steps, "cleanup": self.cleanup_report,

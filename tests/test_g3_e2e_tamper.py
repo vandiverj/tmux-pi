@@ -18,6 +18,7 @@ setUpModule = support.set_up_module
 
 TAMPER_EXPECT = {
     "not-git": ("setup", "the repository is a git checkout"),
+    "bad-lane-config": ("setup", "lane config"),
     "dirty-repo": ("setup", "no uncommitted tracked change"),
     "on-scratch-branch": ("setup", "is not the scratch branch"),
     "integration-exists": ("setup", "scratch integration branch does not exist yet"),
@@ -165,7 +166,10 @@ class TamperTest(Base):
                 self.assertTrue(Path(summary["repo"]).is_dir())
         # the integration branch that was already there: present, still at the commit it was made at
         _, summary, _, _ = results()["tamper-integration-exists"]
-        self.assertEqual(self.git(summary, "rev-parse", g3.INTEGRATION), self.git(summary, "rev-parse", "main"))
+        self.assertEqual(self.git(summary, "rev-parse", "lane/integrate"), self.git(summary, "rev-parse", "main"))      # the default config's name
+        for piece in ("lane/integrate", "wait for the other run", "remove the branch yourself"):         # the refusal names the branch and says what to do
+            self.assertIn(piece, summary["error"])
+        self.assertEqual(summary["names"]["integration_branch"], "lane/integrate")
         # someone's lane branch holding a commit that is on no other branch: present at that commit
         _, summary, _, _ = results()["tamper-lane-branch-exists"]
         branch = f"lane/{summary['run']}"

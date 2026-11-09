@@ -17,13 +17,26 @@ Exit 0: every step and the cleanup passed. Exit 1: stderr says `FAILED at step '
 cleanup report (errors, leftovers, kept), task ids). Useful flags: `--keep` (keep the temp state dir), `--coder-model` (default `claude-haiku-5-5`), `--prompt-wait 240`,
 `--settle-wait 600`, `--review-wait 600`, `--subprocess-timeout 30`.
 
-What it makes, all named `g3-<run id>`: a tmux session, a lane (worktree and branch `lane/g3-<run id>` of battle-soccer), and one scratch
-integration branch `lane/integrate` (created at battle-soccer's current HEAD). battle-soccer's own branch never moves (asserted). The state dir
-(task records) is a temp dir of the run, not Main's.
+What it makes: a tmux session, a lane (a worktree and a branch) and one scratch integration branch (created at battle-soccer's current HEAD).
+battle-soccer's own branch never moves (asserted). The state dir (task records) is a temp dir of the run, not Main's.
+
+**Where each name comes from.** The script writes no branch name, prefix or worktree path of its own. It reads the repository's lane config with
+`lanes.load_repo_config(repo)` (`<repo>/.tmux-pi/lanes.json`; a key that is absent takes the tool's default) and computes the names with the lane tools' own
+functions (`lanes.lane_branch`, `lanes.lane_worktree`), so the script and `tp-agent dispatch` / `lane close` / `lane remove` always agree. With no config file that is:
+the lane branch `lane/g3-<run id>`, the worktree `<parent>/battle-soccer-wt-g3-<run id>`, and the integration branch `lane/integrate`. With a config, it is whatever the config says
+(a test runs the whole flow on a repository with another `branch_prefix`, `worktree_pattern` and `integration_branch`, and the default names are never created). The summary's `names`
+block shows the three names the run used. A config the lane tools would refuse fails step `setup`, naming the problem.
+
+**The integration branch is the one shared name.** Every other name carries the run id (`g3-<run id>`: the tmux session, the lane, its branch and worktree, the private socket). The integration
+branch cannot: `tp-agent dispatch` takes the lane's base from it and `lane remove` checks ancestry against it, both from the repository's `integration_branch`. A per-run name would mean editing
+the target repository's lane config, which the smoke run never does. So all runs on one checkout share it, and **concurrent runs on one checkout do not work by design**: the second run's setup finds
+the branch, fails step `setup` with
+`... scratch integration branch does not exist yet (saw: <branch>). The repository's integration branch '<branch>' (integration_branch in .tmux-pi/lanes.json) is shared by every run: wait for the other run to finish, or remove the branch yourself if no run uses it (git branch -D <branch>). Nothing was changed`,
+and removes nothing (the cleanup deletes the integration branch only if this run created it). Runs on different checkouts do not interact.
 
 **The run only removes what it made.** The run id is `MMDDHHMM-<pid in base 36>-<6 random hex digits>` (time, process id and 24 random bits, so two runs
 started in the same second never share a name; `g3-` plus the id is at most 24 characters, the limit of a lane name). Setup checks every name before it
-makes anything, and refuses (step `setup`, the error names the collision) if any of these already exists: the branch `lane/integrate` or `lane/g3-<run id>`,
+makes anything, and refuses (step `setup`, the error names the collision) if any of these already exists: the integration branch or the lane branch,
 a lane record of that name, a worktree of that name, a tmux session of that name. The cleanup then removes only resources recorded as made by this run, and a
 resource is recorded only after its creation succeeded:
 - the scratch branch: recorded after `git branch` succeeded; the lane record, lane branch and worktree: made by `tp-agent dispatch`, recorded after the call
@@ -86,12 +99,12 @@ What is still not 100% deterministic (live only): the worker model must follow t
 Each assertion below has a tampered-record case in `tests/test_g3_e2e_tamper.py` (`TAMPER_EXPECT`: tamper name -> step and the check it must name); a cross-check there fails if a check
 the passing flow makes has no case.
 
-- setup: the repo is a git checkout (`not-git`) with no uncommitted tracked change (`dirty-repo`); its own branch is not `lane/integrate` (`on-scratch-branch`); `lane/integrate` (`integration-exists`),
-  `lane/<name>` (`lane-branch-exists`, with an unmerged commit on it), a lane record of the name (`lane-record-exists`), a worktree of the name (`worktree-exists`) and a tmux session of the name
+- setup: the repo is a git checkout (`not-git`) with no uncommitted tracked change (`dirty-repo`); its own branch is not the integration branch (`on-scratch-branch`); the repository's lane config loads (`bad-lane-config`: a config the lane tools refuse fails here); the integration branch (`integration-exists`),
+  the lane branch (`lane-branch-exists`, with an unmerged commit on it), a lane record of the name (`lane-record-exists`), a worktree of the name (`worktree-exists`) and a tmux session of the name
   (`session-exists`, with a pane) do not exist yet; the tmux session starts. Each collision tamper is also run with `--keep` and the test asserts the colliding resource survived unchanged:
   the branch at the same sha (holding a commit no other branch has), the lane record with the same content, the worktree still registered, the session's pane still listed and no `kill-session` or `kill-pane` recorded by the shim.
 - dispatch: a `coder-` task id (`dispatch-id`); started, not queued (`dispatch-queued`); `meta.json` names the lane and step `s1` (`dispatch-meta`); a pane is recorded (`dispatch-pane`);
-  the lane record is `open`, branch `lane/<name>`, based on the scratch integration branch (`dispatch-lane`); the lane worktree exists (`dispatch-worktree`).
+  the lane record is `open`, on the configured lane branch, based on the scratch integration branch (`dispatch-lane`); the lane worktree exists at the path the config's `worktree_pattern` gives (`dispatch-worktree`).
 - prompt: task state `needs_input` with a pending permission request (`no-prompt`); `permission-request.json` is `pending` and carries a reason (`prompt-no-reason`).
 - decline: after `Escape` the request leaves `pending` (`still-pending`) and is not `authorized` (`authorized`); the redirect is recorded in `messages.jsonl` (`no-redirect-record`);
   the task settles (`first-never-settles`) with `result_status: incomplete` (`first-complete`); the lane worktree is still unchanged (`first-changed`).
@@ -102,15 +115,15 @@ the passing flow makes has no case.
   independence is `different_provider` (`independence`); `reviewed-state.json` names the reviewed tree (`reviewed-tree`); the reviewer settles (`reviewer-never-settles`) with an approving verdict
   (`APPROVED` / `APPROVED_WITH_NOTES`, `review-verdict`) and a complete review (Coverage section, `review-incomplete`).
 - close: the file is committed on the lane branch and the tree is clean (`close-dirty`); after `tp-agent lane close` the lane record lists step `s1` as closed (`lane-record`).
-- merge: a merge commit on `lane/integrate` (made with `commit-tree`, no checkout) with parents (previous tip, lane tip) (`merge-parents`); the branch changed exactly one file, added (`merge-extra-file`);
+- merge: a merge commit on the integration branch (made with `commit-tree`, no checkout) with parents (previous tip, lane tip) (`merge-parents`); the branch changed exactly one file, added (`merge-extra-file`);
   that file holds exactly the requested line (`scratch-commit`); the repository's own branch did not move (`main-moved`).
 - collect: `collect` of the retry and of the reviewer returns their records (`collect-id`), the tasks are `completed` (`collect-state`) and have `reaped.json` (`collect-reaped`); the panes of all three tasks are gone (`pane-alive`).
-- remove: `lane remove` says removed, not abandoned, integrated in `lane/integrate` (`remove-abandoned`); the lane worktree directory is gone (`worktree-back`); the lane record is archived (`lane-back`).
+- remove: `lane remove` says removed, not abandoned, integrated in the integration branch (`remove-abandoned`); the lane worktree directory is gone (`worktree-back`); the lane record is archived (`lane-back`).
 - leftovers: no worktree, branch, lane record or pane of the run is left (`leftover-worktree`, `leftover-branch`, `leftover-lane-record`, `leftover-pane`: each leaves that thing on purpose and the check must name it);
   after killing the run's session, no session and no pane of it remains (`session-kept`). A probe that cannot finish is an error, not a pass.
 
 A `finally` block always runs the cleanup (kill the run's recorded panes and, if it made it, its own session by name; `lane remove --abandon`, `git worktree remove --force <this run's worktree path>`,
-delete `lane/<name>` and `lane/integrate`, each only if recorded as made by this run; remove the temp dir), then re-checks the leftovers. There is no repository-wide `git worktree prune`: other worktrees of the repository,
+delete the lane branch and the integration branch, each only if recorded as made by this run; remove the temp dir), then re-checks the leftovers. There is no repository-wide `git worktree prune`: other worktrees of the repository,
 prunable or not, are never touched (`PruneTest` runs against a repo that has an unrelated prunable worktree). Every wait is bounded, with an error that names what was waited for.
 
 Every subprocess has a timeout: steps use their own (git 60 s, tools 120 s, `tp-review` 180 s), every tmux call, leftover probe and cleanup command uses `--subprocess-timeout` (cleanup git and lane commands: twice that).
@@ -122,6 +135,11 @@ Session ownership is tested in fake mode with the shim (`SessionOwnershipTest`; 
 the session is killed and the run is clean); the creation hangs while a rival session with another marker exists (timeout, marker differs, session kept and reported in `cleanup.kept`); the creation hangs and
 no session appears (nothing killed). `GuardTest` adds that the cleanup runs no `branch -D`, `worktree remove` or `lane remove --abandon` with nothing recorded, kills a recorded pane only if it is in the run's
 session, and that run ids never collide and every name is a valid lane name.
+
+Configured names are tested by `ConfiguredNamesTest` (`tests/test_g3_e2e.py`) on disposable repositories whose committed lane config sets `branch_prefix` `g3p/`, `integration_branch` `g3int/scratch` and
+`worktree_pattern` `{repo}-g3trees-{name}`, with a `reference-transaction` git hook that logs every ref update: the whole fake flow passes using those names; the only branches that came into being are
+`g3int/scratch` and `g3p/<run>` (both deleted again) and nothing named `lane/...` ever appeared; with `g3int/scratch` already present, setup refuses naming it, with the advice above, the branch is unmoved and
+no ref was touched. A source scan fails if the script spells a `lane/` branch or a `-wt-` path again.
 
 ## `--fake` and the tmux isolation rules
 

@@ -26,10 +26,40 @@ setUpModule, tearDownModule = support.set_up_module, support.tear_down_module
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@invalid"}
 _PARALLEL = Parallel({})
 F2_REPO = {}
+CONFIG_REPO = {}      # the repositories with their own lane config: "ok" (a full run) and "taken" (its integration branch already exists)
+CONFIG = {"branch_prefix": "g3p/", "integration_branch": "g3int/scratch", "worktree_pattern": "{repo}-g3trees-{name}"}
+HOOK = """#!/bin/sh
+# every ref update that was committed in this repository (and its worktrees): "<old> <new> <ref>" per line
+if [ "$1" = committed ]; then cat >> '%s'; else cat > /dev/null; fi
+exit 0
+"""
 
 
 def git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=True, env={**os.environ, **GIT_ENV}, timeout=60).stdout
+
+
+def config_repo(label, existing_integration=False):
+    """A disposable repository whose committed lane config sets another integration_branch, branch_prefix and worktree_pattern than the
+    defaults. A reference-transaction hook logs every ref update, so a test can say what was (never) created. `existing_integration`: the
+    configured integration branch is already there, as another run's would be."""
+    repo = support.WORK / f"cfg-{label}"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "README.md").write_text("tiny\n")
+    (repo / support.CONFIG_DIR).mkdir()
+    (repo / support.CONFIG_DIR / "lanes.json").write_text(json.dumps(CONFIG) + "\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "init")
+    if existing_integration:
+        git(repo, "branch", CONFIG["integration_branch"])
+    log = support.WORK / f"cfg-{label}-refs.log"
+    log.write_text("")
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(HOOK % log)
+    hook.chmod(0o755)
+    CONFIG_REPO[label] = {"path": repo, "log": log}
+    return repo
 
 
 def results():
@@ -49,6 +79,8 @@ def results():
         _PARALLEL.cases.update({"flow": []})
         _PARALLEL.cases.update({f"inject-{step}": ["--inject-failure", step] for step in g3.STEPS if step != "setup"})
         _PARALLEL.cases["f2"] = ["--repo", str(repo)]
+        _PARALLEL.cases["config-ok"] = ["--repo", str(config_repo("ok"))]
+        _PARALLEL.cases["config-taken"] = ["--repo", str(config_repo("taken", existing_integration=True))]
     return _PARALLEL()
 
 
@@ -76,7 +108,8 @@ class FlowTest(Base):
         self.assertEqual(len({s["socket"] for s in summaries}), len(runs), "one private socket per run")
         stopped = support.audit(calls, support.RUNS)
         for summary in summaries:
-            self.assertEqual(stopped.get(summary["tmux_tmpdir"]), 1, f"{summary['run']}: each run stopped its own server once")
+            started = any(c["TMUX_TMPDIR"] == summary["tmux_tmpdir"] and "new-session" in c["argv"] for c in calls)   # a run refused at setup starts none
+            self.assertEqual(stopped.get(summary["tmux_tmpdir"], 0), 1 if started else 0, f"{summary['run']}: each run stopped its own server once")
 
 
 class HookTriggerTest(Base):
@@ -326,7 +359,8 @@ class BoundedTest(Base):
         (smoke.state / "tasks" / "coder-x").mkdir()
         (smoke.state / "tasks" / "coder-x" / "meta.json").write_text(json.dumps({"pane": pane}))
         smoke.facts["common"] = str((smoke.repo / git(smoke.repo, "rev-parse", "--git-common-dir").strip()).resolve())
-        git(smoke.repo, "branch", g3.INTEGRATION)
+        smoke.load_config()
+        git(smoke.repo, "branch", smoke.integration)
         smoke.made["integration"] = True
         repo, tmux_tmp = smoke.repo, smoke.tmux_tmp
         self.assertTrue(smoke.made["session"])
@@ -337,7 +371,7 @@ class BoundedTest(Base):
             self.assertIn(expected, errors)
         self.assertNotIn("kill pane", errors, "a pane that could not be verified as the session's is not killed")
         self.assertNotIn("stop the private tmux server", errors)
-        self.assertEqual(git(repo, "branch", "--list", g3.INTEGRATION).strip(), "", "the next cleanup action ran after the timeouts")
+        self.assertEqual(git(repo, "branch", "--list", smoke.integration).strip(), "", "the next cleanup action ran after the timeouts")
         self.assertFalse(tmux_tmp.exists())
         self.assertEqual(len([c for c in records()[self.mark:] if "kill-server" in c["argv"]]), 1)
 
@@ -416,6 +450,49 @@ class SessionOwnershipTest(Base):
         self.assertEqual(creating[0][creating[0].index(";") + 1:], ["set-option", "-t", f"={summary['run']}:", "@g3_run", summary["run_id"]])
         self.assertTrue(summary["made"]["session"])
         self.assert_clean(summary)
+
+
+class ConfiguredNamesTest(Base):
+    """Round 4 F1: the integration branch, the lane branch prefix and the worktree pattern are the repository's own lane config, not constants of
+    the script. The integration branch is the one shared name: a second run refuses at setup (it cannot carry a run id, the lane tools read it
+    from the config), and nothing is removed."""
+
+    def refs(self, label):
+        return [line.split() for line in CONFIG_REPO[label]["log"].read_text().splitlines()]
+
+    def test_a_flow_with_a_configured_integration_branch_prefix_and_worktree_pattern(self):
+        rc, summary, err, _ = results()["config-ok"]
+        self.assertEqual((rc, err), (0, ""), summary.get("error"))
+        repo, run = CONFIG_REPO["ok"]["path"], summary["run"]
+        self.assertEqual(summary["names"], {"integration_branch": "g3int/scratch", "lane_branch": f"g3p/{run}",
+                                            "lane_worktree": f"{repo}-g3trees-{run}"})
+        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
+        branches = [row for row in self.refs("ok") if row[2].startswith("refs/heads/")]
+        made = {ref for old, new, ref in branches if set(old) == {"0"}}          # branches that came into being
+        deleted = {ref for old, new, ref in branches if set(new) == {"0"}}
+        self.assertEqual(made, {"refs/heads/g3int/scratch", f"refs/heads/g3p/{run}"})
+        self.assertEqual(deleted, made, "the run removed what it made, and only that")
+        self.assertFalse([ref for _, _, ref in self.refs("ok") if "lane/" in ref], "the default names were never created, not even briefly")
+        self.assertEqual(git(repo, "branch", "--list").split(), ["*", "main"])
+        self.assertFalse(Path(f"{repo}-g3trees-{run}").exists())
+        self.assertEqual(git(repo, "worktree", "list").count("\n"), 1)
+
+    def test_a_configured_integration_branch_that_exists_is_refused_by_name_and_survives(self):
+        rc, summary, err, _ = results()["config-taken"]
+        repo = CONFIG_REPO["taken"]["path"]
+        self.assertEqual((rc, summary["failed_step"]), (1, "setup"))
+        for piece in ("g3int/scratch", "integration branch", "wait for the other run", "remove the branch yourself"):
+            self.assertIn(piece, summary["error"])
+        self.assertEqual(summary["made"], {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None})
+        self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
+        self.assertEqual(git(repo, "rev-parse", "g3int/scratch"), git(repo, "rev-parse", "main"), "the branch is still there, unmoved")
+        self.assertEqual(self.refs("taken"), [], "setup refused before it made or removed any ref (and never the default lane/integrate)")
+
+    def test_the_script_writes_no_branch_prefix_or_worktree_path_of_its_own(self):
+        code = [line for line in (ROOT / "tools/smoke/g3_e2e.py").read_text().splitlines() if not line.lstrip().startswith("#")]
+        for line in code:
+            self.assertNotRegex(line, r"lane/integrate|refs/heads/lane/|f\"lane/\{|-wt-", line)
+        self.assertNotIn("INTEGRATION", "\n".join(code))
 
 
 class GuardTest(Base):
@@ -501,6 +578,7 @@ class GuardTest(Base):
         whatever the names (the F2 rule), and with each record it does exactly that one thing."""
         smoke = self.make("--repo", str(support.WORK))
         smoke.facts["common"] = str(support.WORK / "common")
+        smoke.load_config()
         (support.WORK / "common" / "tmux-pi" / "lanes" / smoke.name).mkdir(parents=True)
         self.addCleanup(shutil.rmtree, support.WORK / "common", ignore_errors=True)
         calls = []
@@ -513,7 +591,7 @@ class GuardTest(Base):
         flat = [" ".join(c) for c in calls]
         self.assertTrue(any(c.endswith(f"branch -D lane/{smoke.name}") for c in flat), flat)
         self.assertTrue(any("lane remove" in c and "--abandon" in c for c in flat), flat)
-        self.assertFalse(any(c.endswith(f"branch -D {g3.INTEGRATION}") for c in flat), "the integration branch was not recorded")
+        self.assertFalse(any(c.endswith(f"branch -D {smoke.integration}") for c in flat), "the integration branch was not recorded")
         self.assertFalse(any("worktree remove" in c for c in flat), "no worktree was recorded")
 
     def test_run_ids_cannot_collide_and_every_name_is_a_valid_lane_name(self):

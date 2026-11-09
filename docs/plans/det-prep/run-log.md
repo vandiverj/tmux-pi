@@ -818,3 +818,25 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   - **Leaked shell loops.** tests/test_process_end.py leaves orphaned `trap '' HUP TERM; while true; do sleep 1; done`
     loops (ppid 1) running after full-suite runs.
   - **Stale tmux sockets.** Full-suite runs leave tp-t3-<pid>-* and tp-ts-<pid>-* sockets in /private/tmp/tmux-501.
+
+## 2026-11-09 G3 smoke script merged (fake mode); live run still owed
+- Lane g3-smoke, five rounds:
+  - every review was cross-provider (openai-codex);
+  - round 5 coder-2797d9c567, review review-coder-2797d9c567-072159: APPROVED_WITH_NOTES;
+  - closed at d0bb8b6, merged into main as 256e332, lane removed (archive g3-smoke-20261109T132934Z).
+- Round 5 fixes:
+  - Rule A: the lane config is loaded in a bounded `python -I` child, so the script imports nothing from lib/. `bounded()`
+    kills the child's whole process group.
+  - Rule B: collision and leftover checks use the exact worktree path from `lanes.lane_worktree`. Look-alike names are
+    reported only. The nested `{repo}-{name}/checkout` pattern is supported; only empty directories the run made are
+    removed.
+- Main's isolated four-cell verify: 56 tests per cell, all OK. Default tmux sessions, sockets (7237 entries), worktrees and
+  `lane/*` branches were identical before and after; the private TMUX_TMPDIR was empty afterwards.
+- The review notes are answered in Main's evidence addendum (task coder-2797d9c567/main-evidence):
+  - F1: the per-test timing file is attached and the historical mapping corrected.
+  - F3: socket equality shown, and the orphan loops dated to before the run.
+  - F2: the live battle-soccer run is G3's remaining done condition. Main runs it.
+- Over 5 s alone: 9 TamperTest tests at 41-43 s (one shared batch of 56 tamper runs), and 9 test_g3_e2e tests at 26-27 s
+  (shared fake-run batches). Each file is under 60 s.
+- New follow-up: /private/tmp/tmux-501 holds 7237 sockets. Most are stale, from test runs, and are part of the stale-socket
+  follow-up.

@@ -604,3 +604,11 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - test_retry_packet RepeatedFamilyGateTests: 1 in 6 flake (state digest coder-1 vs coder-0), checking on clean main.
 - retry_packet flake confirmed on clean main 64cc2f9: 4/18 fail. Added to baseline (9 -> 10) as pre-existing; brief g2/g2f-retry-packet-digest.md,
   dispatched after G2-A merges (same test file). Suspected: state_digest names tied tasks in glob order.
+
+## 2026-11-08 — LS1 round 6 done; review packet over the limit; RV-1
+- LS1 r6 (coder-d50afe8142): fact-line parser, old prose code deleted. Main matrix 170 x4 OK. Main mutation probe
+  (ls1probe6.py): reference 24/24; shift, next-line cite, heading file, basename, generic claim, one-line, drop-line,
+  wide range, extra bad cite, star bullets all 0 passes; 3 passes inspected, none a defect. Committed c249ce3 on the lane.
+- tp-agent review refused: packet ~341k > 300k. Round diff 230k, of which answers.jsonl 101k (rewritten ~2k-char lines).
+  Smaller of diff/file per file = 145k. No bypass used (no --override-review). Product fix: RV-1 (brief rv/rv1-rewrite-whole-file.md),
+  dispatched coder-2d2c9997c1. LS1 review waits for RV-1's merge.

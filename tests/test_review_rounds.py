@@ -1113,5 +1113,400 @@ class TimerWaitsTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("src/foo_test.ts:1: await sleep(50)", out.read_text())
 
+class FrozenCopiesTests(unittest.TestCase):
+    """FC1: a file a `frozen-copies.json` manifest declares a byte-identical copy of an older commit's file is named, not repeated.
+
+    One repository, built once: C1 holds the sources, C2 (HEAD, a child of C1) adds fx/old.txt and later.txt, and SIDE is a child of
+    C1 that HEAD does not contain. Each test makes working-file changes (undone afterwards) and diffs the tree against HEAD."""
+    LANES = "".join(f"lanes line {i} " + "x" * 40 + "\n" for i in range(40))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.work = Path(cls.tmp.name) / "work"
+        cls.work.mkdir()
+        run_git(cls.work, "init", "-q")
+        for name, text in {"lib/lanes.py": cls.LANES, "bin/tool": "#!/bin/sh\necho tool\n", "docs/é x.txt": "unicode name\n" * 5,
+                           "server.pem": "-----MADEUP-KEY-----\n", "plain.txt": "A=madeup-value\n"}.items():
+            (cls.work / name).parent.mkdir(exist_ok=True)
+            (cls.work / name).write_text(text)
+        (cls.work / "bin/tool").chmod(0o755)
+        run_git(cls.work, "add", "-A")
+        run_git(cls.work, "commit", "-q", "-m", "c1")
+        cls.c1 = run_git(cls.work, "rev-parse", "HEAD")
+        run_git(cls.work, "checkout", "-q", "-b", "side")
+        (cls.work / "side.txt").write_text("side only\n")
+        run_git(cls.work, "add", "-A")
+        run_git(cls.work, "commit", "-q", "-m", "side")
+        cls.side = run_git(cls.work, "rev-parse", "HEAD")
+        run_git(cls.work, "checkout", "-q", "-b", "main2", cls.c1)
+        (cls.work / "fx").mkdir()
+        (cls.work / "fx/old.txt").write_text("something else\n")
+        (cls.work / "later.txt").write_text("later\n")
+        run_git(cls.work, "add", "-A")
+        run_git(cls.work, "commit", "-q", "-m", "c2")
+        cls.c2 = run_git(cls.work, "rev-parse", "HEAD")
+        cls.orphan = run_git(cls.work, "commit-tree", "-m", "orphan", run_git(cls.work, "hash-object", "-t", "tree", "/dev/null"))  # a root: C1 is no ancestor of it
+        cls.top = str(cls.work.resolve())
+
+    def setUp(self):
+        self.addCleanup(lambda: (run_git(self.work, "reset", "-q", "--hard"), run_git(self.work, "clean", "-fdq")))
+
+    def put(self, name, text, mode=None):
+        target = self.work / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        if mode:
+            target.chmod(mode)
+
+    def manifest(self, copies, directory="fx", raw=None):
+        self.put(f"{directory}/frozen-copies.json" if directory else "frozen-copies.json", raw if raw is not None else json.dumps({"copies": copies}))
+
+    def copy(self, path, source, commit=None):
+        return {"path": path, "source": source, "commit": commit or self.c1[:7]}
+
+    def diff(self, old="HEAD", anchor=None):
+        tree = review_rounds.snapshot(self.work)["tree"]
+        extra = {"anchor": anchor} if anchor else {}  # only the anchor tests need the new keyword
+        return review_rounds.safe_diff(self.top, old, tree, **extra)
+
+    def blob(self, source, commit=None):
+        return run_git(self.work, "rev-parse", f"{commit or self.c1}:{source}")
+
+    def left_out_note(self, path, source, label="added", commit=None):
+        blob = self.blob(source)
+        return (f'{json.dumps(path)} ({label}): byte-identical to {commit or self.c1[:7]}:{source} (blob {blob}), contents left out; '
+                f"check with git cat-file -p {blob} or open the file\n")
+
+    def assertShown(self, text, path):
+        self.assertIn(f"diff --git a/{path} b/{path}\n", text)
+
+    def assertLeftOut(self, text, path):
+        self.assertNotIn(f"diff --git a/{path} b/{path}", text)
+
+    def test_a_verified_copy_is_named_with_its_commit_source_and_blob_and_its_contents_left_out(self):
+        self.put("fx/lanes.py", self.LANES)
+        self.put("fx/tool", "#!/bin/sh\necho tool\n", 0o755)
+        self.put("fx/old.txt", self.LANES)  # an existing file replaced by a copy: modified
+        self.manifest([self.copy("lanes.py", "lib/lanes.py"), self.copy("tool", "bin/tool", self.c1),
+                       self.copy("old.txt", "lib/lanes.py")])
+        text, withheld = self.diff()
+        self.assertEqual(withheld, [])
+        self.assertIn(self.left_out_note("fx/lanes.py", "lib/lanes.py"), text)
+        self.assertIn(self.left_out_note("fx/tool", "bin/tool", commit=self.c1), text)
+        self.assertIn(self.left_out_note("fx/old.txt", "lib/lanes.py", "modified"), text)
+        for path in ("fx/lanes.py", "fx/tool", "fx/old.txt"):
+            self.assertLeftOut(text, path)
+        self.assertNotIn("lanes line 3 ", text)
+        self.assertShown(text, "fx/frozen-copies.json")  # the manifest is an ordinary changed file, shown in full
+        self.assertIn('+{"copies": [{"path": "lanes.py"', text)
+        self.assertEqual(text.count("diff --git "), 1)
+
+    def test_a_copy_edited_by_one_byte_gets_its_full_diff_and_a_mismatch_note(self):
+        self.put("fx/lanes.py", self.LANES.replace("lanes line 3 ", "lanes line 4 "))
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        text, _ = self.diff()
+        self.assertShown(text, "fx/lanes.py")
+        self.assertIn("+lanes line 4 ", text)
+        self.assertIn(f'frozen-copies.json: "fx/lanes.py" does not match {self.c1[:7]}:lib/lanes.py; its full diff follows\n', text)
+        self.assertNotIn("byte-identical", text)
+
+    def test_a_copy_with_the_wrong_mode_gets_its_full_diff_and_a_note(self):
+        self.put("fx/tool", "#!/bin/sh\necho tool\n")  # same bytes, 100644 here and 100755 in the source
+        self.manifest([self.copy("tool", "bin/tool")])
+        text, _ = self.diff()
+        self.assertShown(text, "fx/tool")
+        self.assertIn(f'frozen-copies.json: "fx/tool" has mode 100644 but {self.c1[:7]}:bin/tool has mode 100755; its full diff follows\n', text)
+
+    def test_a_commit_that_is_not_an_ancestor_or_does_not_exist_or_is_not_a_commit_id_gets_the_full_diff_and_a_note(self):
+        self.put("fx/lanes.py", self.LANES)
+        self.put("fx/side.txt", "side only\n")
+        for path, source, commit, why in (
+                ("lanes.py", "lib/lanes.py", "d" * 40, f"cannot be left out: commit {'d' * 40} does not resolve to a commit in this repository"),
+                ("side.txt", "side.txt", self.side, f"cannot be left out: commit {self.side} is not an ancestor of {self.c2[:12]}"),
+                ("lanes.py", "lib/lanes.py", "not-a-sha", "cannot be left out: its commit is not a commit id (7 to 64 hex digits)"),
+                ("lanes.py", "lib/lanes.py", "HEAD", "cannot be left out: its commit is not a commit id (7 to 64 hex digits)"),
+                ("lanes.py", "no/such/file", self.c1, f"cannot be left out: the source is not a file of commit {self.c1}"),
+                ("lanes.py", "lib", self.c1, f"cannot be left out: the source is not a file of commit {self.c1}"),  # a directory is not a file
+                ("lanes.py", "/lib/lanes.py", self.c1, "cannot be left out: its source is not a repository-relative path")):
+            with self.subTest(commit=commit, source=source):
+                self.manifest([self.copy(path, source, commit)])
+                text, _ = self.diff()
+                self.assertShown(text, f"fx/{path}")
+                self.assertIn(f'frozen-copies.json: "fx/{path}" {why}; its full diff follows\n', text)
+                self.assertNotIn("byte-identical", text)
+
+    def test_the_commit_is_checked_against_the_commit_old_side_or_the_anchor_and_without_either_nothing_is_left_out(self):
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        tree = run_git(self.work, "rev-parse", "HEAD^{tree}")  # a later round's old side: a tree, not a commit
+        text, _ = self.diff(old=tree)
+        self.assertShown(text, "fx/lanes.py")
+        self.assertIn(f"frozen-copies.json: \"fx/lanes.py\" cannot be left out: there is no commit on the old side to check that {self.c1[:7]} is an ancestor of; its full diff follows\n", text)
+        text, _ = self.diff(old=tree, anchor=self.c2)  # the caller names the commit the old tree came from
+        self.assertLeftOut(text, "fx/lanes.py")
+        self.assertIn(self.left_out_note("fx/lanes.py", "lib/lanes.py"), text)
+        text, _ = self.diff(old=tree, anchor=self.orphan)  # C1 is not an ancestor of the anchor
+        self.assertShown(text, "fx/lanes.py")
+        self.assertIn(f"cannot be left out: commit {self.c1[:7]} is not an ancestor of {self.orphan[:12]}; its full diff follows\n", text)
+        text, _ = self.diff(old=self.c1)  # the old side is a commit: C2's own files are not an ancestor question here, C1 is its own ancestor
+        self.assertLeftOut(text, "fx/lanes.py")
+
+    def test_a_flagged_source_keeps_the_full_diff_and_a_flagged_path_keeps_its_withholding(self):
+        self.put("fx/pem.txt", "-----MADEUP-KEY-----\n")
+        self.put("fx/.env", "A=madeup-value\n")  # byte-identical to plain.txt, but a flagged path
+        self.manifest([self.copy("pem.txt", "server.pem"), self.copy(".env", "plain.txt")])
+        text, withheld = self.diff()
+        self.assertEqual(withheld, ["fx/.env"])
+        self.assertIn('"fx/.env" (added): sensitive path, its contents were withheld from this diff\n', text)
+        self.assertNotIn("madeup-value", text)
+        self.assertNotIn("byte-identical", text)
+        self.assertShown(text, "fx/pem.txt")  # as without a manifest
+        self.assertIn(f'frozen-copies.json: "fx/pem.txt" cannot be left out: {self.c1[:7]}:server.pem is a sensitive path; its full diff follows\n', text)
+
+    def test_an_entry_the_manifest_does_not_list_is_an_ordinary_change_beside_a_listed_one(self):
+        self.put("fx/lanes.py", self.LANES)
+        self.put("fx/other.py", self.LANES)  # the same bytes, but not listed
+        self.put("elsewhere/lanes.py", self.LANES)  # not under the manifest's directory
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        text, _ = self.diff()
+        self.assertLeftOut(text, "fx/lanes.py")
+        self.assertShown(text, "fx/other.py")
+        self.assertShown(text, "elsewhere/lanes.py")
+        self.assertEqual(text.count("byte-identical"), 1)
+        self.assertNotIn("frozen-copies.json: \"fx/other.py\"", text)
+
+    def test_a_manifest_that_cannot_be_used_gives_full_diffs_and_a_note_and_never_raises(self):
+        self.put("fx/lanes.py", self.LANES)
+        good = self.copy("lanes.py", "lib/lanes.py")
+        for raw, why in (("{not json", "it is not valid JSON"), ("[]", "it is not {"), ('{"copies": 3}', "it is not {"),
+                         ('{"copies": [{"path": "lanes.py"}]}', "it is not {"), ('{"copies": [{"path": 1, "source": "a", "commit": "b"}]}', "it is not {"),
+                         (json.dumps({"copies": [good, {"path": "x", "source": "", "commit": "c"}]}), "it is not {"),
+                         ("[" * 200000, "it is not valid JSON"), ("\xff\xfe", "it is not valid JSON")):
+            with self.subTest(raw=raw[:20]):
+                self.manifest([], raw=raw)
+                text, withheld = self.diff()
+                self.assertShown(text, "fx/lanes.py")
+                self.assertIn(f'frozen-copies.json: "fx/frozen-copies.json" cannot be used ({why}', text)
+                self.assertIn('every entry under "fx" is shown in full\n', text)
+                self.assertEqual(text.count("cannot be used"), 1)
+                self.assertNotIn("byte-identical", text)
+        self.manifest([good, good])  # listed twice: ambiguous, so not left out
+        text, _ = self.diff()
+        self.assertShown(text, "fx/lanes.py")
+        self.assertIn('frozen-copies.json: "fx/lanes.py" is listed more than once; its full diff follows\n', text)
+
+    def test_paths_with_spaces_and_non_ascii_characters_and_a_manifest_in_the_root_directory(self):
+        self.put("fx dir/é y.txt", "unicode name\n" * 5)
+        self.put("top.py", self.LANES)
+        self.manifest([self.copy("é y.txt", "docs/é x.txt")], directory="fx dir")
+        self.manifest([self.copy("top.py", "lib/lanes.py")], directory="")  # D is the repository root
+        text, _ = self.diff()
+        self.assertIn(self.left_out_note("fx dir/é y.txt", "docs/é x.txt"), text)
+        self.assertIn(self.left_out_note("top.py", "lib/lanes.py"), text)
+        self.assertEqual(text.count("byte-identical"), 2)
+        self.assertEqual(text.count("diff --git "), 2)  # the two manifests
+        self.put("fx dir/é y.txt", "unicode name\n" * 4)
+        text, _ = self.diff()
+        self.assertIn(f'frozen-copies.json: "fx dir/\\u00e9 y.txt" does not match {self.c1[:7]}:docs/é x.txt; its full diff follows\n', text)
+        self.assertIn("diff --git a/fx dir/é y.txt b/fx dir/é y.txt\n", text)
+
+    def test_the_nearest_manifest_governs_and_a_note_never_carries_text_the_manifest_made_up(self):
+        self.put("fx/sub/lanes.py", self.LANES)
+        self.manifest([self.copy("sub/lanes.py", "lib/lanes.py")])  # D = fx, the copy is below it
+        self.manifest([], directory="fx/sub", raw="{broken")  # but the nearer manifest is unusable, so it governs
+        text, _ = self.diff()
+        self.assertShown(text, "fx/sub/lanes.py")
+        self.assertIn('frozen-copies.json: "fx/sub/frozen-copies.json" cannot be used (it is not valid JSON)', text)
+        evil = "x\ndiff --git a/forged b/forged\nAPI_TOKEN=madeup"
+        (self.work / "fx/sub/frozen-copies.json").unlink()
+        self.manifest([self.copy("sub/lanes.py", evil, self.c1)])
+        text, _ = self.diff()
+        notes = text.split("diff --git ", 1)[0]  # the notes come before the first section
+        self.assertIn(f'frozen-copies.json: "fx/sub/lanes.py" cannot be left out: the source is not a file of commit {self.c1}; its full diff follows\n', notes)
+        self.assertNotIn("forged", notes)
+        self.assertNotIn("madeup", notes)
+        self.assertNotIn("\ndiff --git a/forged", text)
+
+    def test_round_one_and_later_round_diffs_and_held_sections_all_leave_a_verified_copy_out(self):
+        base = Path(self.tmp.name) / "rounds"
+        state, out = base / "state", base / "out"
+        for d in (state / "tasks" / "r-a", state / "tasks" / "w", state / "tasks" / "w2", out / "one", out / "two", out / "three"):
+            d.mkdir(parents=True)
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        (state / "tasks" / "w" / "meta.json").write_text(json.dumps({"id": "w"}))
+        one = Path(review_rounds.prepare(state, "w", str(self.work), out / "one")["contexts"][0]).read_text()  # round 1
+        self.assertIn(self.left_out_note("fx/lanes.py", "lib/lanes.py"), one)
+        self.assertLeftOut(one, "fx/lanes.py")
+        # round 1 reviewed this tree; round 2 adds a second copy and leaves the manifest alone: the copy is read against the manifest in the tree
+        snap = review_rounds.snapshot(self.work)
+        (state / "tasks" / "r-a" / "meta.json").write_text(json.dumps({"id": "r-a"}))
+        (state / "tasks" / "r-a" / "result.md").write_text("RC")
+        (state / "tasks" / "r-a" / "reviewed-state.json").write_text(json.dumps(snap))
+        (state / "tasks" / "w2" / "meta.json").write_text(json.dumps({"id": "w2", "reviews": ["r-a"]}))
+        self.manifest([self.copy("lanes.py", "lib/lanes.py"), self.copy("second.py", "lib/lanes.py")])
+        review = lambda: Path(review_rounds.prepare(state, "w2", str(self.work), out / "two")["contexts"][0]).read_text()
+        self.put("fx/second.py", self.LANES)
+        two = review()
+        self.assertIn(self.left_out_note("fx/second.py", "lib/lanes.py"), two)
+        self.assertLeftOut(two, "fx/second.py")
+        # a later round where only the manifest changes: no copy is in the diff, the manifest is shown, nothing raises
+        run_git(self.work, "clean", "-fdq")
+        run_git(self.work, "reset", "-q", "--hard")
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        snap = review_rounds.snapshot(self.work)
+        (state / "tasks" / "r-a" / "reviewed-state.json").write_text(json.dumps(snap))
+        self.manifest([self.copy("lanes.py", "lib/lanes.py"), self.copy("later.py", "lib/lanes.py")])
+        three = review()
+        main = three.split(f"\n{review_rounds.COMMITTED_HEAD}\n")[0]  # the main diff, before the held section for the files HEAD lacks
+        self.assertEqual(main.count("diff --git "), 1)
+        self.assertShown(main, "fx/frozen-copies.json")
+        self.assertNotIn("byte-identical", three)
+        # a held section: the copy is committed on top of C2, so base C2 to HEAD names it, and a later edit of the file keeps the section
+        run_git(self.work, "add", "-A")
+        run_git(self.work, "commit", "-q", "-m", "c3")
+        self.addCleanup(lambda: run_git(self.work, "reset", "-q", "--hard", self.c2))
+        self.put("fx/lanes.py", self.LANES + "edited\n")
+        now = review_rounds.snapshot(self.work)
+        text, _, _, held = review_rounds.held_sections(self.top, self.c2, now["tree"], review_rounds.redactor())
+        self.assertEqual(held, ["fx/lanes.py"])
+        self.assertIn(self.left_out_note("fx/lanes.py", "lib/lanes.py"), text)
+        self.assertNotIn("diff --git a/fx/lanes.py", text)
+
+    def test_the_gate_refuses_a_body_that_has_a_section_for_a_left_out_path(self):
+        good = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        review_rounds.gate(good, ["ok"], [], ["fx/copy.txt"])
+        for bad in (good + "diff --git a/fx/copy.txt b/fx/copy.txt\n+x\n",
+                    good + "diff --git a/fx/copy.txt b/fx/copy.txt\n--- /dev/null\n+++ b/fx/copy.txt\n",
+                    good + "--- a/fx/copy.txt\n+++ b/fx/copy.txt\n@@ -1 +1 @@\n"):  # a header pair under a checked header
+            with self.assertRaises(review_rounds.Refused) as ctx:
+                review_rounds.gate(bad, ["ok"], [], ["fx/copy.txt"])
+            self.assertIn("left out", str(ctx.exception))
+        review_rounds.gate(good + "--- a/fx/copy.txt\n", ["ok"], [], ["fx/copy.txt"])  # a lone line outside a hunk, with no `+++` line after it, is not a section
+        with self.assertRaises(review_rounds.Refused):  # a path that is both safe and left out
+            review_rounds.gate(good, ["ok"], [], ["ok"])
+
+    def test_the_gate_reads_hunks_so_text_in_a_hunk_is_not_a_header_and_a_real_header_still_is(self):
+        """Family frozen-gate-hunk-confusion: a removed line `-- a/x` and an added line `++ b/x` read `--- a/x` / `+++ b/x` in a hunk."""
+        good = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        for name, safe, withheld, left in (("a left-out path", ["ok"], [], ["fx/copy.txt"]), ("a flagged path", ["ok"], [".env"], [])):
+            path = left[0] if left else withheld[0]
+            hunk_text = f"diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n--- a/{path}\n+++ b/{path}\n"  # removed `-- a/x`, added `++ b/x`
+            real_pair = f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-a\n+b\n"
+            with self.subTest(name):
+                review_rounds.gate(hunk_text, safe, withheld, left)  # (fails on 321568c: it read the two lines as a header pair)
+                review_rounds.gate(hunk_text + "\\ No newline at end of file\n", safe, withheld, left)
+                for what, body in (("a real header pair for it after a whole hunk", good + real_pair),
+                                   ("a real header pair after a hunk cut short", good + "@@ -1,3 +1,3 @@\n-a\n+b\n" + real_pair.split("@@")[0]),
+                                   ("a real header pair under a header that is not checked", "diff --git a/other b/other\n" + real_pair)):
+                    with self.assertRaises(review_rounds.Refused, msg=what):  # (these refuse on 321568c too)
+                        review_rounds.gate(body, safe, withheld, left)
+
+    def test_a_diff_whose_hunks_cannot_be_followed_is_refused_not_attached(self):
+        head = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n"
+        for text in (head + "@@ -1,3 +1,3 @@\n-a\n+b\n",                                  # a hunk cut short by the end of the text
+                     head + "@@ -1,3 +1,3 @@\n-a\n+b\ndiff --git a/ok b/ok\n",             # cut short by a header
+                     head + "@@ -1,3 +1,3 @@\n-a\n+b\n\n c\n d\n",                        # an empty line is not a diff line
+                     head + "@@ -0,0 +1 @@\n-a\n+b\n",                                    # more old lines than the header says
+                     head + "@@ -1 +1 @@\n+a\n+b\n",                                      # more new lines than the header says
+                     head + "@@ nonsense @@\n+a\n", head + "@@ -1 +1\n-a\n+b\n", head + "@@ whole file, x line(s) @@\n"):  # not hunk headers
+            with self.subTest(text=text[len(head):]), self.assertRaises(review_rounds.Refused):
+                review_rounds.gate(text, ["ok"], [])
+        # what is followed: a missing count is 1, a backslash line uses neither count (mid-hunk or after), and the whole-file header
+        for text in (head + "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a\n\\ No newline at end of file\n",
+                     head + "@@ -1,2 +1,2 @@\n a\n-b\n+c\n@@ -9 +9 @@\n-x\n+y\n",
+                     head + "@@ -0,0 +1,2 @@\n+a\n+b\n@@ whole file, 1 line(s) @@\n+z\n", head + "@@ -1 +1 @@\n-a\n+b\n"):
+            with self.subTest(text=text[len(head):]):
+                review_rounds.gate(text, ["ok"], [])
+
+    def test_a_removed_line_and_an_added_line_that_read_like_headers_do_not_make_safe_diff_refuse(self):
+        """The reviewer's case at 321568c: another file's hunk changes `-- a/copy` to `++ b/copy`, and `copy` is a verified copy."""
+        self.put("later.txt", "-- a/copy\n")
+        old = review_rounds.snapshot(self.work)["tree"]
+        self.put("later.txt", "++ b/copy\n")
+        self.put("copy", self.LANES)
+        self.manifest([self.copy("copy", "lib/lanes.py")], directory="")
+        new = review_rounds.snapshot(self.work)["tree"]
+        text, withheld = review_rounds.safe_diff(self.top, old, new, anchor=self.c2)
+        self.assertEqual(withheld, [])
+        self.assertShown(text, "later.txt")
+        self.assertIn("\n@@ -1 +1 @@\n--- a/copy\n+++ b/copy\n", text)  # the other file's hunk, shown as it is
+        self.assertIn(self.left_out_note("copy", "lib/lanes.py"), text)
+        self.assertLeftOut(text, "copy")
+
+    def test_the_same_for_the_name_of_a_withheld_path_in_hunk_text(self):
+        self.put("later.txt", "-- a/fx/k.pem\n")
+        old = review_rounds.snapshot(self.work)["tree"]
+        self.put("later.txt", "++ b/fx/k.pem\n")
+        self.put("fx/k.pem", "-----MADEUP-KEY-----\n")  # a flagged path, changed in the same diff, so its name is the flagged name
+        new = review_rounds.snapshot(self.work)["tree"]
+        text, withheld = review_rounds.safe_diff(self.top, old, new)
+        self.assertEqual(withheld, ["fx/k.pem"])
+        self.assertShown(text, "later.txt")
+        self.assertIn("\n@@ -1 +1 @@\n--- a/fx/k.pem\n+++ b/fx/k.pem\n", text)
+        self.assertIn('"fx/k.pem" (added): sensitive path, its contents were withheld from this diff\n', text)
+        self.assertNotIn("MADEUP-KEY", text)
+
+    def git_calls(self, old="HEAD"):
+        """({git subcommand: count}, [ls-tree argument lists], [cat-file argument lists]) of one safe_diff of the tree against `old`."""
+        argvs, real = [], subprocess.Popen
+
+        class Counting(real):  # subprocess.run starts its process through Popen, so this sees every call once
+            def __init__(inner, argv, *args, **kwargs):
+                if isinstance(argv, list) and argv[:2] == ["git", "-C"]:
+                    argvs.append(argv[3:])
+                super().__init__(argv, *args, **kwargs)
+        tree = review_rounds.snapshot(self.work)["tree"]
+        with mock.patch.object(subprocess, "Popen", Counting):
+            text, _ = review_rounds.safe_diff(self.top, old, tree)
+        counts = {}
+        for argv in argvs:
+            counts[argv[0]] = counts.get(argv[0], 0) + 1
+        return counts, [a for a in argvs if a[0] == "ls-tree"], [a for a in argvs if a[0] == "cat-file"], text
+
+    def test_git_work_follows_the_manifests_and_distinct_commits_not_the_copies(self):
+        """rev-parse (old side, then each distinct commit) + merge-base + ls-tree (each commit's sources) once per commit, the manifests
+        the diff does not show in one targeted ls-tree, and `cat-file -s` then `cat-file blob` per manifest."""
+        sources = [("lanes.py", "lib/lanes.py", self.LANES), ("tool", "bin/tool", "#!/bin/sh\necho tool\n"),
+                   ("é y.txt", "docs/é x.txt", "unicode name\n" * 5), ("plain.txt", "plain.txt", "A=madeup-value\n")]
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        one, ls, cat, text = self.git_calls()
+        self.assertEqual(text.count("byte-identical"), 1)
+        for many in (sources, sources + [(f"again{i}/{name}", source, body) for i, (name, source, body) in enumerate(sources)]):
+            for name, _, body in many:
+                self.put(f"fx/{name}", body, 0o755 if name.endswith("tool") else None)
+            self.manifest([self.copy(name, source) for name, source, _ in many])
+            counts, ls, cat, text = self.git_calls()
+            with self.subTest(copies=len(many)):
+                self.assertEqual(text.count("byte-identical"), len(many))
+                for name in ("rev-parse", "merge-base", "ls-tree", "cat-file"):
+                    self.assertEqual(counts.get(name), one.get(name), (name, counts, one))  # the same for 1 copy and for 8
+        self.assertEqual({k: one[k] for k in ("rev-parse", "merge-base", "ls-tree", "cat-file")},
+                         {"rev-parse": 2, "merge-base": 1, "ls-tree": 2, "cat-file": 2})
+        self.assertTrue(all("-r" not in args for args in ls), ls)  # no whole-tree listing
+        self.assertEqual(cat[0][1], "-s")  # the size is asked before the blob is read
+
+    def test_no_whole_tree_listing_without_a_manifest_and_an_oversized_manifest_is_not_read(self):
+        self.put("fx/a.txt", "a\n")
+        self.put("b/c/d.txt", "d\n")
+        counts, ls, cat, text = self.git_calls()
+        self.assertEqual((counts.get("ls-tree"), counts.get("cat-file"), counts.get("merge-base")), (1, None, None))
+        self.assertEqual(len(ls), 1)
+        self.assertNotIn("-r", ls[0])  # asked for the manifest names of the touched directories only, never the tree
+        self.assertEqual(sorted(a for a in ls[0] if a.endswith("frozen-copies.json")),
+                         ["b/c/frozen-copies.json", "b/frozen-copies.json", "frozen-copies.json", "fx/frozen-copies.json"])
+        self.assertEqual(text.count("diff --git "), 2)
+        self.put("fx/lanes.py", self.LANES)
+        self.manifest([self.copy("lanes.py", "lib/lanes.py")])
+        with mock.patch.object(review_rounds, "MAX_MANIFEST", 20):
+            counts, ls, cat, text = self.git_calls()
+        self.assertEqual([a[1] for a in cat], ["-s"])  # the size was asked and the blob was not read
+        self.assertIn('frozen-copies.json: "fx/frozen-copies.json" cannot be used (it is larger than 20 bytes); every entry under "fx" is shown in full\n', text)
+        self.assertShown(text, "fx/lanes.py")
+
 if __name__ == "__main__":
     unittest.main()

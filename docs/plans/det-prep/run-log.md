@@ -869,3 +869,13 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   `needs_input`. Fix lane DS1 (fixes/ds1-decline-settles.md).
 - The G3 script waits for the request to settle before it sends the redirect, so it must send the redirect first. That
   change comes in a G3 round after TV1 and DS1 merge, along with the README's PermissionDenied claim.
+
+## 2026-11-09 LS1b round 3 verified; review packet over the limit; FC1
+- Main's four cells for LS1b round 3 (all test_qual_summarize* modules, test_router_catalog, test_route_resolve): 228 OK in
+  every cell. Checkpointed as 9889bd4 in tmux-pi-wt-ls1-real.
+- `tp-agent review coder-622ab09870` refused: the packet is ~480k against the 300k limit. LS1b had not been reviewed before
+  (rounds 1–3 were retries). Of the 420k lane diff, 288k is the ten frozen fixtures under fixtures/real/. All ten are
+  byte-identical to `109948a:<src>` (cmp), and 109948a is an ancestor of main.
+- No limit raise and no override. Product fix FC1 (fixes/fc1-frozen-copies.md): a `frozen-copies.json` manifest. Verified
+  copies are named in the review diff with their blob id and their contents left out; anything not verified keeps its full
+  diff. After FC1 merges, LS1b adds the manifest and goes to review.

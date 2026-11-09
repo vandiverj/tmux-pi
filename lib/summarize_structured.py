@@ -7,6 +7,7 @@ fact lines (render). summarize() ties the four together. No line number is ever 
 The system prompt and the JSON schema are not here: they are the "summarize_structured" key of config/local.json (the
 template is config/local.example.json), read by load_settings through lib/router.load_config.
 """
+import ast
 import json
 import os
 import re
@@ -24,6 +25,8 @@ KEY = "summarize_structured"
 MAX_SPAN = 5
 DEFAULT_BUDGET_CHARS = 60000
 _SUFFIX = re.compile(r":\d+(?:-\d+)?$")
+MAX_LINES = 3
+_DOTTED = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+(\(\))?")
 
 
 class PrepareError(Exception):
@@ -130,12 +133,47 @@ def normalize_path(path):
     return path.strip()
 
 
+def _subject(subject, files):
+    """A fact's subject as a bare name: no space or backticks; a dotted name (`A.b`, `A.b()`) that is not a named file's path or
+    base name keeps only its last part."""
+    subject = subject.strip().strip("`").strip()
+    names = set(files) | {name.rsplit("/", 1)[-1] for name in files}
+    if subject not in names and _DOTTED.fullmatch(subject):
+        subject = subject.rstrip("()").rsplit(".", 1)[-1]
+    return subject
+
+
+def _validate_v2(fact, files):
+    """(kept fact, None) or (None, reason) for a fact {"subject", "claim", "path", "lines"}."""
+    subject, claim, path, lines = (fact.get(k) for k in ("subject", "claim", "path", "lines"))
+    if not (isinstance(subject, str) and isinstance(claim, str) and isinstance(path, str) and isinstance(lines, list)
+            and 1 <= len(lines) <= MAX_LINES and all(isinstance(n, int) and not isinstance(n, bool) for n in lines)):
+        return None, "malformed"
+    path = normalize_path(path)
+    if path not in files:
+        return None, "unnamed_file"
+    if any(not 1 <= n <= files[path] for n in lines):
+        return None, "range_outside_file"
+    if not claim.strip():
+        return None, "empty_claim"
+    return {"claim": "{} {}".format(_subject(subject, files), claim.strip()), "path": path, "lines": sorted(set(lines))}, None
+
+
 def validate(facts, files):
-    """(kept, drops). files maps each named path to its line count. A fact is dropped when its path is not a named file, its
-    range is outside the file or reversed, it spans more than MAX_SPAN lines, or it has no claim. A line number is never changed.
-    Each drop is {"fact": <the fact as given>, "reason": ...}."""
+    """(kept, drops). files maps each named path to its line count. A fact is {subject, claim, path, lines}, lines being 1 to
+    MAX_LINES separate line numbers; or the older {claim, path, line_start, line_end}. It is dropped when it is malformed (a lines
+    list that is empty, longer than MAX_LINES or holds a non-integer or a bool), its path is not a named file, a line is outside the
+    file, or it has no claim; an older fact also when its range is reversed or spans more than MAX_SPAN lines. A line number is
+    never changed (a v2 fact's lines are only de-duplicated and sorted). Each drop is {"fact": <the fact as given>, "reason": ...}."""
     kept, drops = [], []
     for fact in facts:
+        if isinstance(fact, dict) and "lines" in fact:
+            good, reason = _validate_v2(fact, files)
+            if good:
+                kept.append(good)
+            else:
+                drops.append({"fact": fact, "reason": reason})
+            continue
         try:
             claim, path = fact["claim"], fact["path"]
             a, b = fact["line_start"], fact["line_end"]
@@ -162,23 +200,83 @@ def validate(facts, files):
 
 
 def render(facts):
-    """One `- <claim> [path:a]` or `- <claim> [path:a-b]` per fact (the form tools/qual/summarize_check.FACT_LINE parses)."""
+    """One `- <claim> [path:a]` or `- <claim> [path:a-b]` per older fact, `- <claim> [path:n, path:m]` per v2 fact (the forms
+    tools/qual/summarize_check.FACT_LINE parses)."""
     lines = []
     for fact in facts:
         claim = " ".join(fact["claim"].split()).rstrip(".").rstrip()
-        a, b = fact["line_start"], fact["line_end"]
-        lines.append("- {} [{}:{}]".format(claim, fact["path"], a if a == b else "{}-{}".format(a, b)))
+        if "lines" in fact:
+            cites = ", ".join("{}:{}".format(fact["path"], n) for n in fact["lines"])
+        else:
+            a, b = fact["line_start"], fact["line_end"]
+            cites = "{}:{}".format(fact["path"], a if a == b else "{}-{}".format(a, b))
+        lines.append("- {} [{}]".format(claim, cites))
     return "\n".join(lines)
 
 
+def outline(path, numbered_text):
+    """The names a Python file defines, read with ast from its numbered text (prepare's `{n:>4}\\t{line}`): a list of
+    (line, kind, name, owner) in source order. kind is class, function, method, constant (a module-level assignment to a plain
+    name) or parameter (of a function or method, except self and cls; its owner is that function). A method's owner is its class.
+    Functions inside functions are not walked. A file that is not .py, or does not parse, gives []."""
+    if not path.endswith(".py"):
+        return []
+    source = "\n".join(line.split("\t", 1)[1] if "\t" in line else "" for line in numbered_text.split("\n"))
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    found = []
+
+    def walk(body, owner):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                found.append((node.lineno, "class", node.name, None))
+                walk(node.body, node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found.append((node.lineno, "method" if owner else "function", node.name, owner))
+                args = node.args
+                for arg in args.posonlyargs + args.args + args.kwonlyargs:
+                    if arg.arg not in ("self", "cls"):
+                        found.append((node.lineno, "parameter", arg.arg, node.name))
+            elif owner is None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+                found.extend((node.lineno, "constant", t.id, None) for t in targets if isinstance(t, ast.Name))
+
+    walk(tree.body, None)
+    return found
+
+
+def name_index(files):
+    """Code-made fact lines `- <base name> defines the <kind> <name> [<path>:<line>]`, one per class, function, method and constant
+    of outline(), in file then line order; not parameters, __init__ or a name that starts with a single underscore."""
+    lines = []
+    for f in files:
+        base = f["path"].rsplit("/", 1)[-1]
+        for line, kind, name, _owner in outline(f["path"], f["text"]):
+            if kind == "parameter" or name == "__init__" or (name.startswith("_") and not name.startswith("__")):
+                continue
+            lines.append("- {} defines the {} {} [{}:{}]".format(base, kind, name, f["path"], line))
+    return lines
+
+
 def user_message(task, files):
-    parts = ["## {}\n```\n{}\n```".format(f["path"], f["text"]) for f in files]
+    parts = []
+    for f in files:
+        part = "## {}\n```\n{}\n```".format(f["path"], f["text"])
+        names = outline(f["path"], f["text"])
+        if names:
+            part += "\nNames defined in {} (cover each one the task is about):\n{}".format(f["path"], "\n".join(
+                "- line {}: {}".format(line, "parameter {} of {}".format(name, owner) if kind == "parameter" else "{} {}".format(kind, name))
+                for line, kind, name, owner in names))
+        parts.append(part)
     return "# Task\n\n{}\n\n# Files (numbered; take line numbers from here)\n\n{}".format(task, "\n\n".join(parts))
 
 
 def summarize(root, paths, task, *, endpoint, model, settings, budget_chars=DEFAULT_BUDGET_CHARS, timeout=600):
-    """(text, record). settings is {"system": ..., "schema": ...} (see load_settings). Raises PrepareError or AskError; a reply
-    whose JSON lacks a facts list is an AskError too. The record: files (path, lines, chars), chars, drops, kept, seconds, model."""
+    """(text, record). settings is {"system": ..., "schema": ...} (see load_settings). The text is name_index(files), made by code,
+    then the rendered facts. Raises PrepareError or AskError; a reply whose JSON lacks a facts list is an AskError too. The record:
+    files (path, lines, chars), chars, drops, kept, indexed (the index lines), seconds, model."""
     started = time.monotonic()
     files = prepare(root, paths, budget_chars)
     reply = ask(endpoint, model, settings["system"], user_message(task, files), settings["schema"], timeout)
@@ -186,10 +284,11 @@ def summarize(root, paths, task, *, endpoint, model, settings, budget_chars=DEFA
     if not isinstance(facts, list):
         raise AskError("reply has no facts list", _completions(endpoint), 200)
     kept, drops = validate(facts, {f["path"]: f["lines"] for f in files})
+    index = name_index(files)
     record = {"files": [{k: f[k] for k in ("path", "lines", "chars")} for f in files],
-              "chars": sum(f["chars"] for f in files), "kept": len(kept), "drops": drops,
+              "chars": sum(f["chars"] for f in files), "kept": len(kept), "drops": drops, "indexed": len(index),
               "seconds": round(time.monotonic() - started, 2), "model": model}
-    return render(kept), record
+    return "\n".join(index + ([render(kept)] if kept else [])), record
 
 
 def load_settings(root, local_path=None):

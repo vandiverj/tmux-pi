@@ -82,9 +82,16 @@ if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]
   if [[ -z "$usage" ]]; then usage='null'; fi
 fi
 
+# The submit record lib/pane_send.py waits on: a count (higher than before the send means submitted), the time, and a
+# short hash of the prompt text. Only a UserPromptSubmit writes them.
+phash=""
+if [[ "$event" == UserPromptSubmit ]]; then
+  phash="$(jq -r '.prompt // ""' <<<"$input" 2>/dev/null | shasum | cut -c1-12)"
+fi
+
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --arg phash "$phash" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -97,7 +104,8 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + $prev
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then
-        { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled }
+        { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
+          promptSubmits: (($prev.promptSubmits // 0) + 1), promptSubmitted: $now, promptHash: $phash }
       elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
       elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }

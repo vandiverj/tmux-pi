@@ -25,6 +25,7 @@ import family_sweep  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
 import owner_confirm  # noqa: E402
+import pane_send  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
@@ -1685,20 +1686,27 @@ def _main(argv):
                                  f"start it again with: `tp-agent retry {args.id} --reason \"say what changed\"`")
             if (path / "reaped.json").exists():
                 raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
-            subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            sent = pane_send.send(pane, args.text, task_dir=path)
+            submit = {"submitted": sent["submitted"], "attempts": sent["attempts"]}
             (path / "collected.json").unlink(missing_ok=True)
-            value = {"id": args.id, "sent": True}
+            value = {"id": args.id, "sent": True, **submit}
             try:
-                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text}) + "\n", root=base)
+                # Written even when not confirmed: the text may be sitting in the worker's input box.
+                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text, **submit}) + "\n",
+                                       root=base)
                 requested = path / "capability-request.json"
-                if requested.exists():
+                if requested.exists() and sent["submitted"]:  # unconfirmed: the worker has not read the answer
                     pending = read_json(requested)
                     if pending.get("status") == "pending":
                         pending.update({"status": "answered", "answered": now()})
                         atomic_json(requested, pending, base)
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
+            if not sent["submitted"]:
+                print(json.dumps(value, indent=2))
+                raise RuntimeError(f"message to {args.id} was typed but not confirmed submitted after {sent['attempts']} Enter(s); "
+                                   "the text may be sitting in the worker's input box. Look at the pane, press Enter there "
+                                   "or clear the box, then send again if needed")
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))

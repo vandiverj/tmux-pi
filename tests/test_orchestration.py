@@ -793,8 +793,31 @@ esac
         self.assertEqual(asked.returncode, 0, asked.stderr)
         self.assertEqual(self.cli("inspect", item["id"])["status"], "needs_input")
         self.assertEqual(self.cli("index")["active"][0]["capability_request"]["what"], "browser")
-        self.cli("message", item["id"], "--text", "Use the local HTML renderer.")
+        sent = self.cli("message", item["id"], "--text", "Use the local HTML renderer.")
+        self.assertEqual((sent["sent"], sent["submitted"], sent["attempts"]), (True, True, 1))
+        line = json.loads((task / "messages.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((line["text"], line["submitted"], line["attempts"]), ("Use the local HTML renderer.", True, 1))
         self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "answered")
+
+    def test_message_that_is_never_submitted_exits_nonzero_and_leaves_the_request_pending(self):
+        from private_tmux import PrivateTmux
+        server = PrivateTmux()
+        self.addCleanup(server.close)
+        item = self.dispatch()
+        task = self.task_dir(item)
+        pane, log, raw = server.worker("never")  # a worker whose box never submits (the G3 live-run failure)
+        meta = json.loads((task / "meta.json").read_text())
+        (task / "meta.json").write_text(json.dumps({**meta, "pane": pane}))
+        (task / "capability-request.json").write_text(json.dumps({"status": "pending", "kind": "tool", "what": "browser"}))
+        run = self.raw("message", item["id"], "--text", "carry on", env={**self.env, **server.env(), "TP_SEND_CONFIRM_SECONDS": "0.5"}, timeout=30)
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("not confirmed submitted", run.stderr)
+        self.assertIn("press Enter there", run.stderr)  # what to do
+        self.assertEqual((json.loads(run.stdout)["submitted"], json.loads(run.stdout)["attempts"]), (False, 3))
+        line = json.loads((task / "messages.jsonl").read_text().splitlines()[-1])  # still written: the text is in the box
+        self.assertEqual((line["text"], line["submitted"], line["attempts"]), ("carry on", False, 3))
+        self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "pending")
+        self.assertEqual(server.typed(raw, "carry on"), 1)
 
     def test_retry_links_prior_attempt_and_records_reason(self):
         first = self.dispatch()

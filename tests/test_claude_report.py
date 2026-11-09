@@ -1,6 +1,7 @@
 """Simulated Claude hooks and the real tp-review settlement guard (no live session)."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import concurrent.futures
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,8 +57,14 @@ class ClaudeReportTests(unittest.TestCase):
 
     def test_late_tool_does_not_reopen_stop_but_new_prompt_does(self):
         self.hook("SessionStart", model="claude-opus-5-5")
+        self.assertNotIn("promptSubmits", self.state())  # SessionStart is not a submit
         self.hook("UserPromptSubmit", prompt="first")
+        submit = self.state()  # the record lib/pane_send.py waits on: count, time, short hash of the prompt
+        self.assertEqual((submit["promptSubmits"], submit["promptSubmitted"], submit["promptHash"]),
+                         (1, submit["updated"], hashlib.sha1(b"first\n").hexdigest()[:12]))
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "fixture.txt"})
+        self.assertEqual({k: self.state()[k] for k in ("promptSubmits", "promptSubmitted", "promptHash")},
+                         {k: submit[k] for k in ("promptSubmits", "promptSubmitted", "promptHash")})  # other events leave it
         self.hook("Stop", last_assistant_message="first reply\nRESULT_STATUS: complete")
         self.assertEqual(self.state()["state"], "waiting")
         self.review(accepted=True)
@@ -73,6 +80,8 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("UserPromptSubmit", prompt="confirm")
         self.assertEqual(self.state()["state"], "working")
         self.assertEqual(self.state()["promptTurn"], 2)
+        self.assertEqual((self.state()["promptSubmits"], self.state()["promptHash"]),
+                         (2, hashlib.sha1(b"confirm\n").hexdigest()[:12]))
         self.assertFalse((self.task / "result.md").exists())
         self.review()  # old answer cannot be reviewed for the new prompt
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})

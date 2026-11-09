@@ -737,6 +737,39 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "pause")
         self.assertEqual(self.recorded_state(), "paused")
 
+    def nudge(self, box_keeps_text):
+        """Enforce a reminder with a tmux that records keys; capture-pane shows the typed text while the box keeps it."""
+        import contextlib
+        import io
+        from unittest import mock
+        calls = []
+
+        def run(command, *args, **kwargs):
+            calls.append(command[1:])
+            typed = [c for c in calls if c[0] == "send-keys" and "-l" in c]
+            shown = typed[-1][-1] if box_keeps_text and typed else ""
+            return subprocess.CompletedProcess(command, 0, stdout=shown, stderr="")
+        decision = {"action": ("nudge-draft", "draft due"), "status": None, "elapsed": 60, "turns": 3}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_SEND_CONFIRM_SECONDS": "0.05"}), \
+                mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
+                mock.patch.object(self.tool, "evaluate", return_value=decision), \
+                mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.tool.time, "sleep"), contextlib.redirect_stderr(err):
+            self.tool.cmd_enforce(None)
+        return calls, err.getvalue()
+
+    def test_a_reminder_goes_through_the_submit_helper_and_says_when_it_is_not_confirmed(self):
+        calls, err = self.nudge(box_keeps_text=False)
+        keys = [c for c in calls if c[0] == "send-keys"]
+        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True])  # typed once, one Enter, confirmed from the pane
+        self.assertEqual(err, "")
+        calls, err = self.nudge(box_keeps_text=True)
+        keys = [c for c in calls if c[0] == "send-keys"]
+        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True, True, True])  # typed once, 1 + 2 Enters, never retyped
+        self.assertIn("not confirmed submitted after 3 Enter(s)", err)
+        self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "nudge-draft")
+
 
 if __name__ == "__main__":
     unittest.main()

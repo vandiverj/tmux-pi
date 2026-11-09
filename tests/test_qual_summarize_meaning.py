@@ -233,6 +233,30 @@ class JudgeTest(Tmp):
         self.assertEqual([x["error"] is None for x in r["log"]], [False, True])
         self.assertEqual(r["grade"]["chore"], "diff-order")
 
+    def test_the_committed_calibration_directory_judges_exactly_its_12_packets(self):
+        """F1: RUBRIC.md and README.md sit beside the packets; they have no `## Replies` section and are not packets."""
+        self.assertTrue((MEANING / "RUBRIC.md").exists() and (MEANING / "README.md").exists())
+        out = self.tmp()
+        env = {"MG_MODE": "good", "MG_LOG": str(out / "stub"), "PATH": os.environ.get("PATH", "")}
+        rc, stdout, stderr = run_main(["judge", "--packets", str(MEANING), "--model", "openai-codex/gpt-6-sol", "--out", str(out / "grades"),
+                                       "--pi-command", "{} {}".format(sys.executable, self.root / "stub.py")], env)
+        self.assertEqual((rc, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["packets"], 12)
+        calls = [json.loads(x) for x in (out / "stub.calls").read_text().splitlines()]
+        self.assertEqual(sorted(c["prompt"].split("# Chore ", 1)[1].split("\n", 1)[0] for c in calls), CHORES)
+        self.assertEqual(sorted(p.name for p in (out / "grades").iterdir()), sorted(["judge.jsonl"] + [c + ".grade.json" for c in CHORES]))
+        self.assertEqual(len((out / "grades" / "judge.jsonl").read_text().splitlines()), 12)
+
+    def test_only_a_file_with_the_replies_section_is_a_packet_whatever_its_name(self):
+        d = self.tmp()
+        shutil.copy(MEANING / "diff-order.md", d / "notes.md")  # a packet under another name is still a packet
+        (d / "diff-order.md").write_text("# Not a packet\n\n## Task\nnone\n")  # a packet's name without the shape is not
+        self.assertEqual([c for c, _ in sm.packet_files(d)], ["notes"])
+        self.assertEqual([c for c, _ in sm.packet_files(d, ["notes"])], ["notes"])
+        self.assertEqual([c for c, _ in sm.packet_files(d, ["diff-order"])], [])
+        self.assertFalse(sm.is_packet((MEANING / "RUBRIC.md").read_text() + (MEANING / "README.md").read_text()))
+        self.assertFalse(sm.is_packet("x\n### Replies\n"))
+
     def test_a_local_provider_or_qwen_model_is_refused_before_any_call(self):
         cat = self.tmp() / "catalog.json"
         cat.write_text(json.dumps({"providers": {"local": {"worker": "pi", "kind": "local"}}, "levels": [
@@ -295,6 +319,28 @@ class ScoreTest(Tmp):
         rc, text, _ = run_main(["score", "--grades", str(MEANING), *run_args(["base", "t3"], d)])
         rows = {ln.split()[0]: ln.split() for ln in text.splitlines()[1:]}
         self.assertEqual((rows["base"][1], rows["t3"][1]), ("6/12", "12/12"))
+
+    def test_packets_make_a_grade_that_lacks_a_packet_fact_an_invalid_grade_not_a_smaller_denominator(self):
+        d = self.tmp()
+        for chore in CHORES:
+            shutil.copy(MEANING / (chore + ".grade.json"), d)
+        path = d / "sum-worker.grade.json"
+        grade = json.loads(path.read_text())
+        for rep in grade["replies"].values():  # F1 gone from every reply: the grade is still self-consistent
+            del rep["facts"]["F1"]
+        path.write_text(json.dumps(grade))
+        base = ["score", "--grades", str(d), "--key", str(MEANING / "key.json"), "--json"]
+        rc, text, _ = run_main(base + ["--packets", str(MEANING)])
+        out = json.loads(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(list(out["errors"]), ["sum-worker"])
+        self.assertIn("facts", out["errors"]["sum-worker"])
+        self.assertIn("!= packet facts", out["errors"]["sum-worker"])
+        self.assertFalse(any(s["bar"] for s in out["runs"].values()))
+        self.assertEqual(out["runs"]["base"]["graded"], 11)
+        rc, _, err = run_main(base + ["--packets", str(self.tmp())])
+        self.assertEqual(rc, 2)
+        self.assertIn("--packets has no packet for chore(s)", err)
 
     def perfect(self, n_facts=10):
         key = {"c1": {"R1": "a", "R2": "b"}, "c2": {"R1": "b", "R2": "a"}}
@@ -448,6 +494,37 @@ class CalibrateTest(Tmp):
         self.assertFalse(r["checks"]["judged_every_chore"])
         self.assertEqual(r["fact_agreement"]["agree"], 9 * 80 - 72)  # diff-order's 9 replies x 8 facts count as disagreements
         self.assertEqual(r["judge_errors"]["diff-order"], "judge_error: timeout")
+
+    def test_a_judge_grade_that_lacks_or_adds_a_fact_the_reference_has_is_an_invalid_grade_never_a_keyerror(self):
+        """F2: the judge's grade is checked against the reference's facts, and reported as a judge_error-like invalid grade
+        (which fails `judged_every_chore`); its facts and lines count as disagreements."""
+        def drop(rids):
+            def edit(chore, grade):
+                if chore == "diff-order":
+                    for rid in rids:
+                        del grade["replies"][rid]["facts"]["F1"]
+            return edit
+
+        def add_fact(chore, grade):
+            if chore == "diff-order":
+                for rep in grade["replies"].values():
+                    rep["facts"]["F9"] = "met"
+        rows = (("F1 removed from every reply", drop(["R%d" % i for i in range(1, 10)])), ("F1 removed from R1 only", drop(["R1"])),
+                ("F9 added to every reply", add_fact))
+        for name, edit in rows:
+            rc, r = self.calibrate(self.mutate(edit))
+            self.assertEqual(rc, 1, name)
+            self.assertFalse(r["passed"], name)
+            self.assertEqual(list(r["judge_errors"]), ["diff-order"], name)
+            self.assertIn("facts", r["judge_errors"]["diff-order"], name)
+            self.assertFalse(r["checks"]["judged_every_chore"], name)
+            self.assertEqual(r["fact_agreement"]["total"], 9 * 80, name)
+            self.assertEqual(r["fact_agreement"]["agree"], 9 * 80 - 72, name)  # diff-order's 9 replies x 8 facts: all disagreements
+        judge = self.mutate(drop(["R%d" % i for i in range(1, 10)]))
+        rc, text, _ = run_main(["calibrate", "--judge", str(judge), "--reference", str(MEANING), "--key", str(MEANING / "key.json")])
+        self.assertEqual(rc, 1)
+        self.assertIn("JUDGE ERROR diff-order: unparsed:", text)
+        self.assertIn("CALIBRATION FAIL", text)
 
     def test_cli_exit_code_and_an_invalid_reference_is_refused(self):
         args = ["calibrate", "--judge", str(MEANING), "--reference", str(MEANING), "--key", str(MEANING / "key.json")]

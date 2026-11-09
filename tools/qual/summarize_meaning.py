@@ -3,7 +3,7 @@
 
     summarize_meaning.py packet --run NAME=FILE.jsonl [--run ...] (--seed N | --key FILE) --out DIR [--only ID,ID]
     summarize_meaning.py judge --packets DIR --model M --out DIR [--only ID,ID] [--timeout S] [--pi-command CMD]
-    summarize_meaning.py score --grades DIR [--key FILE] [--run NAME=FILE.jsonl ...] [--json]
+    summarize_meaning.py score --grades DIR [--key FILE] [--packets DIR] [--run NAME=FILE.jsonl ...] [--json]
     summarize_meaning.py calibrate --judge DIR --reference DIR --key FILE [--json]
 
 packet   One packet per chore from run files (summarize_run records; a chore's first record per run): the task, the numbered
@@ -15,7 +15,8 @@ judge    Grade each packet through `bin/tp-pi -p` the way summarize_run runs a w
          contains "qwen", is refused before any call: the judge is never the model under test. The reply must be the grade JSON of
          RUBRIC.md, complete and in shape; anything else is a judge_error for that chore (one retry), never a pass.
          Writes <chore>.grade.json per chore and judge.jsonl (one line per call).
-score    The aggregate per run from grade files plus the key: strict pass (when run records are given), meaning pass, meaning >= 80%,
+score    (--packets DIR: a grade that lacks a packet fact, or adds one, is an invalid grade like a judge_error.) The aggregate per
+         run from grade files plus the key: strict pass (when run records are given), meaning pass, meaning >= 80%,
          recall, wrong, unsupported, and the bar verdict (zero wrong, zero unsupported, zero unparsed or judge_error, recall >= 90%
          overall, every chore >= ceil(0.8 n)).
 calibrate Compare one judge's grade files with a reference set over the same packets and key; print every disagreement and the pass
@@ -166,6 +167,22 @@ def cmd_packet(args):
 
 # ---------------------------------------------------------------- grade shape
 
+def is_packet(text):
+    """True when text has the shape of a packet: a `## Replies` section. RUBRIC.md, README.md and any other Markdown without it
+    are not packets, whatever they are named."""
+    return re.search(r"^## Replies$", text, re.M) is not None
+
+
+def packet_files(directory, only=()):
+    """[(chore id, text)] of the packets in a directory, sorted by chore id: only the *.md files that have the packet shape."""
+    out = []
+    for path in sorted(Path(directory).glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if is_packet(text) and (not only or path.stem in only):
+            out.append((path.stem, text))
+    return out
+
+
 def packet_shape(text):
     """(fact ids, {reply id: number of cited lines}) of a packet text."""
     facts = re.findall(r"^(F\d+):", text.split("## Replies")[0], re.M)
@@ -204,8 +221,12 @@ def validate_grade(grade, chore, facts, replies):
     return None
 
 
-def load_grades(directory, key):
-    """({chore: grade or None}, {chore: reason}) for every chore of key: a missing, unreadable or malformed file is unparsed."""
+def load_grades(directory, key, expect=None):
+    """({chore: grade or None}, {chore: reason}) for every chore of key: a missing, unreadable or malformed file is unparsed.
+    expect {chore: fact ids} (from the packets or from the reference grades) is the fact set every reply must have: a grade that
+    lacks one of them, or adds one, is an invalid grade ("unparsed: ... facts ... != packet facts ..."), reported like a judge_error
+    (it fails the bar and fails calibration); it is never a KeyError and never a smaller denominator for recall. Without expect
+    the grade's own first reply is the fact set (every reply must still agree with it)."""
     grades, errors = {}, {}
     for chore, order in key.items():
         path = Path(directory) / "{}.grade.json".format(chore)
@@ -218,8 +239,8 @@ def load_grades(directory, key):
             grades[chore], errors[chore] = None, "judge_error: {}".format(grade["judge_error"])
             continue
         reps = {rid: None for rid in order}
-        facts = None
-        if isinstance(grade, dict) and isinstance(grade.get("replies"), dict) and grade["replies"]:
+        facts = sorted(expect[chore]) if expect and chore in expect else None
+        if facts is None and isinstance(grade, dict) and isinstance(grade.get("replies"), dict) and grade["replies"]:
             first = next(iter(grade["replies"].values()))
             facts = sorted(first.get("facts", {})) if isinstance(first, dict) and isinstance(first.get("facts"), dict) else None
         reason = validate_grade(grade, chore, facts or [], reps) if facts else "unparsed: no facts"
@@ -305,7 +326,15 @@ def table(stats):
 
 def cmd_score(args):
     key = json.loads(Path(args.key or Path(args.grades) / "key.json").read_text(encoding="utf-8"))
-    grades, errors = load_grades(args.grades, key)
+    expect = None
+    if args.packets:
+        expect = {}
+        for chore, text in packet_files(args.packets):
+            expect[chore] = packet_shape(text)[0]
+        absent = sorted(set(key) - set(expect))
+        if absent:
+            raise ToolError("--packets has no packet for chore(s): " + ", ".join(absent))
+    grades, errors = load_grades(args.grades, key, expect)
     strict = load_strict(parse_named(args.run, "--run")) if args.run else None
     stats = run_stats(grades, errors, key, strict)
     if args.json:
@@ -323,7 +352,9 @@ def cmd_score(args):
 # ---------------------------------------------------------------- calibrate
 
 def compare(judge, reference, key, judge_errors, reference_errors):
-    """The calibration numbers and every disagreement, plus the pass verdict (CALIBRATION_RULE)."""
+    """The calibration numbers and every disagreement, plus the pass verdict (CALIBRATION_RULE). A judge grade that lacks a fact
+    the reference has never gets here: load_grades makes it an invalid grade (a judge_error-like entry in judge_errors, which
+    fails `judged_every_chore`), and all of that chore's reference facts and lines count as disagreements with "missing"."""
     fact_total = fact_agree = 0
     line_total = line_agree = 0
     ref_bad = found = added = 0
@@ -337,7 +368,7 @@ def compare(judge, reference, key, judge_errors, reference_errors):
             jrep = jg["replies"][rid] if jg else None
             for fid, rv in rrep["facts"].items():
                 fact_total += 1
-                jv = jrep["facts"][fid] if jrep else "missing"
+                jv = jrep["facts"].get(fid, "missing") if jrep else "missing"
                 fact_agree += jv == rv
                 if jv != rv:
                     disagreements.append(dict(kind="fact", chore=chore, reply=rid, run=run, item=fid, reference=rv, judge=jv,
@@ -386,10 +417,11 @@ def compare(judge, reference, key, judge_errors, reference_errors):
 
 def cmd_calibrate(args):
     key = json.loads(Path(args.key).read_text(encoding="utf-8"))
-    judge, jerr = load_grades(args.judge, key)
     reference, rerr = load_grades(args.reference, key)
     if rerr:
         raise ToolError("the reference set is not valid: " + "; ".join("{}: {}".format(c, w) for c, w in sorted(rerr.items())))
+    # the reference's facts are the packet's facts: a judge grade that lacks one (or adds one) is an invalid grade, in jerr
+    judge, jerr = load_grades(args.judge, key, {c: list(g["replies"][next(iter(g["replies"]))]["facts"]) for c, g in reference.items()})
     result = compare(judge, reference, key, jerr, rerr)
     if args.json:
         print(json.dumps(result, indent=1))
@@ -483,16 +515,14 @@ def cmd_judge(args, env):
         raise ToolError(why)
     rubric = Path(args.rubric).read_text(encoding="utf-8")
     only = [x for x in args.only.split(",") if x]
-    packets = sorted(p for p in Path(args.packets).glob("*.md") if not only or p.stem in only)
+    packets = packet_files(args.packets, only)
     if not packets:
         raise ToolError("no packets in {}".format(args.packets))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     failed = 0
     with open(out / "judge.jsonl", "w", encoding="utf-8") as log:
-        for path in packets:
-            chore = path.stem
-            text = path.read_text(encoding="utf-8")
+        for chore, text in packets:
             facts, replies = packet_shape(text)
             prompt = judge_prompt(rubric, text)
             grade, error = None, None
@@ -537,6 +567,7 @@ def main(argv=None, env=None):
     s = sub.add_parser("score")
     s.add_argument("--grades", required=True)
     s.add_argument("--key")
+    s.add_argument("--packets", help="the packets the grades are for: every reply must grade exactly their facts F1..Fn")
     s.add_argument("--run", action="append", default=[], metavar="NAME=FILE.jsonl")
     s.add_argument("--json", action="store_true")
     c = sub.add_parser("calibrate")

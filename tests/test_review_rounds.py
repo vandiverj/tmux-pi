@@ -812,6 +812,190 @@ class StepBaseTests(unittest.TestCase):
         self.assertNotIn("base:", text)
 
 
+class WholeFileTests(unittest.TestCase):
+    """RV-1: a modified text file whose hunks are longer than the file shown whole is attached whole (entry_patch, the one site).
+
+    One repository, built once: the base commit is reviewed (round 1 state), then every kind of change is made in the files. The
+    packet of round 1 (diff-now.md, against HEAD) and of round 2 (diff-since-round-1.md, against the reviewed tree) are read
+    from it; both come from safe_diff, so every assertion about a section is made on both."""
+    SECRET = "madeup-WHOLE-90qz"
+
+    @staticmethod
+    def lines(word, count=30):
+        return "".join(f"{word} line {i} " + "x" * 60 + "\n" for i in range(count))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        base = Path(cls.tmp.name)
+        cls.state, cls.work, cls.out = base / "state", base / "work", base / "out"
+        for d in (cls.state / "tasks", cls.work, cls.out / "probe", cls.out / "one", cls.out / "two"):
+            d.mkdir(parents=True)
+        run_git(cls.work, "init", "-q")
+        old = cls.lines("old")
+        files = {"small-change.txt": cls.lines("keep", 60), "rewritten.txt": old, "no-newline.txt": old.rstrip("\n"),
+                 "to-empty.txt": old, "forged.txt": old, "notes.txt": old, "mode-and-rewrite.sh": old, "deleted.txt": old,
+                 "binary.bin": b"\0" + b"A" * 600}
+        for name, content in files.items():
+            (cls.work / name).write_bytes(content if isinstance(content, bytes) else content.encode())
+        run_git(cls.work, "add", "-A")
+        run_git(cls.work, "commit", "-q", "-m", "base")
+        # round 1 reviewed this commit
+        cls.review = cls.state / "tasks" / "r-a"
+        cls.review.mkdir()
+        (cls.review / "meta.json").write_text(json.dumps({"id": "r-a"}))
+        (cls.review / "result.md").write_text("RC")
+        got = review_rounds.prepare(cls.state, cls.task("probe"), str(cls.work), cls.out / "probe")
+        (cls.review / "reviewed-state.json").write_text(json.dumps(got["snapshot"]))
+        cls.reviewed_tree = got["snapshot"]["tree"]
+        # the changes
+        small = cls.lines("keep", 60).replace("keep line 7 ", "KEEP line 7 ")
+        (cls.work / "small-change.txt").write_text(small)
+        (cls.work / "rewritten.txt").write_text(cls.lines("new"))
+        (cls.work / "no-newline.txt").write_text(cls.lines("new").rstrip("\n"))
+        (cls.work / "to-empty.txt").write_text("")
+        (cls.work / "forged.txt").write_text(cls.lines("new") + "diff --git a/.env b/.env\n+++ b/.env\n--- a/.env\n")
+        (cls.work / "notes.txt").write_text(cls.lines("new", 12) + f"DB_PASSWORD={cls.SECRET}\n" + cls.lines("new", 12))
+        (cls.work / "mode-and-rewrite.sh").write_text(cls.lines("new"))
+        (cls.work / "mode-and-rewrite.sh").chmod(0o755)
+        (cls.work / "deleted.txt").unlink()
+        (cls.work / "binary.bin").write_bytes(b"\0" + b"B" * 600)
+        (cls.work / "added.txt").write_text(cls.lines("add"))
+        cls.round1 = cls.packet(cls.task("w-fresh"), cls.out / "one")  # no earlier review: the tree against HEAD
+        cls.round2 = cls.packet(cls.task("w-again", reviews=["r-a"]), cls.out / "two")  # the tree against the reviewed tree
+
+    @classmethod
+    def task(cls, ident, **meta):
+        directory = cls.state / "tasks" / ident
+        directory.mkdir(exist_ok=True)
+        (directory / "meta.json").write_text(json.dumps({"id": ident, **meta}))
+        return ident
+
+    @classmethod
+    def packet(cls, ident, out):
+        got = review_rounds.prepare(cls.state, ident, str(cls.work), out)
+        return {"text": Path(got["contexts"][0]).read_text(), "got": got}
+
+    def texts(self):
+        """The diff text of round 1 (against HEAD) and of round 2 (since the reviewed tree)."""
+        return [self.round1["text"], self.round2["text"]]
+
+    @staticmethod
+    def section(text, path):
+        """The lines of the section for path (from its diff --git header to the next one)."""
+        found = re.search(rf"^diff --git a/{re.escape(path)} b/{re.escape(path)}\n(.*?)(?=^diff --git |\Z)", text, re.M | re.S)
+        return found.group(1) if found else None
+
+    def test_a_small_change_to_a_big_file_keeps_its_hunks(self):
+        for text in self.texts():
+            section = self.section(text, "small-change.txt")
+            self.assertNotIn("Whole file", section)
+            self.assertIn("-keep line 7 ", section)
+            self.assertIn("+KEEP line 7 ", section)
+            self.assertIn("@@ -", section)
+
+    def test_a_rewritten_file_is_shown_whole_with_every_line_marked_plus_and_the_old_lines_left_out(self):
+        for text in self.texts():
+            section = self.section(text, "rewritten.txt")
+            body = section.split("\n@@ whole file, 30 line(s) @@\n", 1)[1]
+            self.assertEqual(body, self.lines("new").replace("new line", "+new line"))
+            self.assertTrue(section.startswith("[Whole file shown instead of the hunks: its hunks are "), section[:80])
+            self.assertEqual([l for l in section.split("\n") if l.startswith("-") and not l.startswith("--- ")], [])
+            self.assertEqual(section.count("\n--- a/rewritten.txt\n+++ b/rewritten.txt\n"), 1)
+            # the section is shorter than the hunks it replaced, and the note says both sizes
+            note = section.split("\n", 1)[0]
+            hunks, size = (int(n) for n in re.search(r"its hunks are (\d+) chars and the file as it is now is (\d+) chars", note).groups())
+            self.assertEqual(size, len(self.lines("new")))
+            self.assertLess(len(section), hunks + len("--- a/rewritten.txt\n+++ b/rewritten.txt\n"))
+
+    def test_the_note_names_a_command_that_prints_the_real_diff(self):
+        for name, text in (("round 1", self.round1["text"]), ("round 2", self.round2["text"])):
+            note = self.section(text, "rewritten.txt").split("\n", 1)[0]
+            command = re.search(r"`(GIT_LITERAL_PATHSPECS=1 git [^`]*)`", note).group(1)
+            self.assertNotIn("\n", note)
+            run = subprocess.run(command, shell=True, capture_output=True, text=True, cwd="/")
+            self.assertEqual(run.returncode, 0, (name, command, run.stderr))
+            self.assertIn("diff --git a/rewritten.txt b/rewritten.txt", run.stdout)
+            for i in (0, 29):
+                self.assertIn(f"-old line {i} ", run.stdout)
+                self.assertIn(f"+new line {i} ", run.stdout)
+            # the command's tree names are the ones the diff was made between
+            self.assertEqual(command.split(" diff ")[1].split(" -- ")[0].split()[0], "HEAD" if name == "round 1" else self.reviewed_tree)
+
+    def test_a_file_without_a_final_newline_and_a_file_made_empty_are_shown_whole_as_they_are(self):
+        for text in self.texts():
+            section = self.section(text, "no-newline.txt")
+            self.assertTrue(section.endswith("+new line 29 " + "x" * 60 + "\n\\ No newline at end of file\n"), section[-120:])
+            self.assertIn("@@ whole file, 30 line(s) @@", section)
+            empty = self.section(text, "to-empty.txt")
+            self.assertIn("is 0 chars", empty)
+            self.assertTrue(empty.endswith("@@ whole file, 0 line(s) @@\n"), empty)
+
+    def test_a_line_of_a_rewritten_file_that_looks_like_a_header_cannot_forge_one(self):
+        for text in self.texts():
+            section = self.section(text, "forged.txt")
+            self.assertIn("\n+diff --git a/.env b/.env\n++++ b/.env\n+--- a/.env\n", section)
+            headers = [l for l in text.split("\n") if l.startswith("diff --git ")]
+            self.assertNotIn("diff --git a/.env b/.env", headers)
+            self.assertEqual(len(headers), len(set(headers)))
+        # and the final gate still checks a whole-file section like any other: the same text under an unchecked or flagged path
+        whole = self.section(self.round1["text"], "forged.txt")
+        review_rounds.gate(f"diff --git a/ok b/ok\n{whole}", ["ok"], [".env"])
+        for header, safe, withheld in (("diff --git a/other b/other\n", ["ok"], []),            # not a checked path
+                                       ("diff --git a/.env b/.env\n", ["ok"], [".env"]),         # a flagged path
+                                       ("diff --git a/ok b/ok\n", [], [])):                      # a safe path that is not there
+            with self.assertRaises(review_rounds.Refused, msg=header):
+                review_rounds.gate(header + whole, safe, withheld)
+        with self.assertRaises(review_rounds.Refused):  # a flagged path's section by its ---/+++ lines alone, under a checked header
+            review_rounds.gate("diff --git a/ok b/ok\n--- a/.env\n+++ b/.env\n@@ whole file, 1 line(s) @@\n+x\n", ["ok"], [".env"])
+
+    def test_a_secret_like_value_in_a_whole_file_section_is_redacted(self):
+        for text in self.texts():
+            self.assertIn("Whole file shown", self.section(text, "notes.txt"))
+            self.assertNotIn(self.SECRET, text)
+        self.assertGreaterEqual(self.round1["got"]["redactions"], 1)
+        self.assertGreaterEqual(self.round2["got"]["redactions"], 1)
+        for f in self.out.rglob("*"):
+            if f.is_file():
+                self.assertNotIn(self.SECRET, f.read_text(), f)
+
+    def test_every_other_kind_of_entry_keeps_its_diff(self):
+        for text in self.texts():
+            added = self.section(text, "added.txt")
+            self.assertTrue(added.startswith("new file mode 100644\n--- /dev/null\n+++ b/added.txt\n@@ -0,0 +1,30 @@\n"), added[:120])
+            deleted = self.section(text, "deleted.txt")
+            self.assertTrue(deleted.startswith("deleted file mode 100644\n--- a/deleted.txt\n+++ /dev/null\n@@ -1,30 +0,0 @@\n"), deleted[:120])
+            self.assertEqual(self.section(text, "binary.bin"), "Binary files a/binary.bin and b/binary.bin differ\n")
+            moded = self.section(text, "mode-and-rewrite.sh")  # a mode change with a rewrite: not a plain modification
+            self.assertTrue(moded.startswith("old mode 100644\nnew mode 100755\n--- a/mode-and-rewrite.sh\n"), moded[:120])
+            self.assertIn("-old line 0 ", moded)
+            self.assertEqual(text.count("Whole file shown"), 5)  # rewritten, no-newline, to-empty, forged and secret: nothing else
+
+    def test_the_boundary_a_tie_keeps_the_hunks_and_one_char_shorter_goes_whole(self):
+        # entry_patch compares the hunk section with the whole-file section as attached, in characters. Git is stubbed (two blob
+        # readers) so the hunks can be made exactly as long as the whole-file section.
+        text = "a\nb\n"
+        entry = ("p.txt", ("100644", "100644", "o" * 40, "n" * 40, "M"))
+        whole = review_rounds.whole_file_section("/repo", "p.txt", "p.txt", "OLD", "NEW", "H" * 300, text)
+        head = "--- a/p.txt\n+++ b/p.txt\n"
+
+        def attach(hunks_len):
+            hunks = ("@@ -1 +1 @@\n" + "-" * 2000)[:hunks_len - 1] + "\n"
+            with mock.patch.object(review_rounds, "blob_patch", return_value=hunks), \
+                    mock.patch.object(review_rounds, "blob_text", return_value=text):
+                return review_rounds.entry_patch("/repo", "e" * 40, entry, "OLD", "NEW"), hunks
+        tie = len(whole) - len(head)  # the hunks' length at which the two sections are equally long (the note's digits do not change here)
+        self.assertEqual(len(review_rounds.whole_file_section("/repo", "p.txt", "p.txt", "OLD", "NEW", "H" * tie, text)), len(whole))
+        patch, hunks = attach(tie)
+        self.assertEqual(len(head + hunks), len(whole))
+        self.assertEqual(patch, "diff --git a/p.txt b/p.txt\n" + head + hunks)  # equal: the hunks
+        patch, hunks = attach(tie + 1)
+        self.assertEqual(patch, "diff --git a/p.txt b/p.txt\n" + review_rounds.whole_file_section("/repo", "p.txt", "p.txt", "OLD", "NEW", hunks, text))  # one longer: whole
+        patch, hunks = attach(tie - 1)
+        self.assertEqual(patch, "diff --git a/p.txt b/p.txt\n" + head + hunks)  # shorter: the hunks
+
+
 class TimerWaitsTests(unittest.TestCase):
     """T2: added lines in test files that wait on a clock are listed as facts for the reviewer."""
 

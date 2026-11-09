@@ -202,8 +202,9 @@ class UseScanTests(unittest.TestCase):
     def scan(self, user, target=TARGET, name="Q"):
         return ss.use_scan("Who uses {}?".format(name), [num("t.py", target), num("u.py", user)])
 
-    def test_star_import_and_dunder_methods(self):
-        self.assertEqual(self.scan("from t import *\nQ()\n"), ["- u.py creates a Q [u.py:2]"])
+    def test_star_import_attributes_nothing_and_dunder_methods(self):
+        # a star import proves nothing about what Q is (a later write or another star import could replace it)
+        self.assertEqual(self.scan("from t import *\nQ()\n"), [])
         self.assertEqual(self.scan("def use(q):\n    q.__init__()\n"), ["- u.py uses Q.__init__ on q [u.py:2]"])
         enter = "class Q:\n    def __enter__(self):\n        return self\n"
         self.assertEqual(self.scan("from t import Q\nc = Q()\nc.__enter__()\n", enter),
@@ -253,6 +254,243 @@ class UseScanTests(unittest.TestCase):
             "- w.py imports t_v2.Q [w.py:2]", "- w.py creates a t_v2.Q [w.py:2]", "- w.py uses t_v2.Q.push on x [w.py:3]",
             "- z.py does not use t_v2.Q [z.py:1]",
             "- param2.py imports t_v2.Q [param2.py:1]", "- param2.py uses t_v2.Q.push on q [param2.py:5]"])
+
+
+# ---- LS1c S1c round 3: a fact is stated only when the code proves the binding is single and simple -----------------------------
+# Each row is one more way a file can bind or write a name ({n} is the name): the forms of the brief, one by one, so a missing form shows.
+# The last field says the form needs `match` (Python 3.10+; older parsers read the file as not parseable and say nothing anyway).
+MATCH = sys.version_info >= (3, 10)
+FORMS = [
+    ("assignment", "{n} = 7", False),
+    ("attribute write to it", "{n}.field = 7", False),
+    ("attribute with its name", "obj.{n} = 7", False),
+    ("subscript write to it", "{n}['k'] = 7", False),
+    ("augmented assignment", "{n} += 1", False),
+    ("annotated assignment", "{n}: int = 7", False),
+    ("annotation only", "{n}: int", False),
+    ("tuple target", "{n}, other = 7, 8", False),
+    ("starred target", "first, *{n} = [7, 8]", False),
+    ("walrus", "({n} := 7)", False),
+    ("for target", "for {n} in [1]:\n    pass", False),
+    ("with as", "with ctx() as {n}:\n    pass", False),
+    ("except as", "try:\n    pass\nexcept Exception as {n}:\n    pass", False),
+    ("match capture", "match 1:\n    case {n}:\n        pass", True),
+    ("match star pattern", "match 1:\n    case [1, *{n}]:\n        pass", True),
+    ("match mapping rest", "match 1:\n    case {{'k': 1, **{n}}}:\n        pass", True),
+    ("match as", "match 1:\n    case int() as {n}:\n        pass", True),
+    ("import", "import {n}", False),
+    ("import as", "import other as {n}", False),
+    ("from import", "from m import {n}", False),
+    ("dotted import", "import {n}.child", False),
+    ("del", "del {n}", False),
+    ("def", "def {n}():\n    pass", False),
+    ("async def", "async def {n}():\n    pass", False),
+    ("class", "class {n}:\n    pass", False),
+    ("under if", "if cond:\n    {n} = 7", False),
+    ("under try", "try:\n    {n} = 7\nexcept ValueError:\n    pass", False),
+]
+# a global or nonlocal in a function reaches the module's name; a star import is not about a name at all
+MODULE_FORMS = FORMS + [
+    ("global declaration", "def g():\n    global {n}", False),
+    ("nonlocal declaration", "def g():\n    {n} = 1\n    def h():\n        nonlocal {n}", False),
+    ("star import", "from m import *", False),
+]
+# a class member is bound in the class body: a declaration there, or a write through self or the class, reaches it
+CLASS_FORMS = FORMS + [
+    ("global declaration in the class body", "global {n}", False),
+    ("self attribute in another method", "def other(self):\n    self.{n} = 1", False),
+]
+COMPOUND = {"if": ("if cond:", ""), "try": ("try:", "except ImportError:\n    pass"), "with": ("with ctx():", ""),
+            "for": ("for i in items:", ""), "while": ("while cond:", ""), "match": ("match cond:\n    case 1:", "")}
+
+
+def indented(text, pad):
+    return "\n".join(pad + line for line in text.split("\n"))
+
+
+def form_text(snippet, name, pad=""):
+    return indented(snippet.format(n=name), pad)
+
+
+def under(head, text):
+    """text as the body of a compound statement."""
+    opening, closing = COMPOUND[head]
+    return opening + "\n" + indented(text, " " * (8 if head == "match" else 4)) + ("\n" + closing if closing else "")
+
+
+def mentions(line, name):
+    return re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", line) is not None
+
+
+# the clean pair: constants X (changed), ADD (added), GONE (dropped); functions f (calls changed), add, gone; methods put (calls
+# changed), take, give. {cls} is the end of the class body, {mod} the end of the module.
+PAIR = {
+    "old": "X = 1\nGONE = 1\n\n\ndef f():\n    a()\n\n\ndef gone():\n    pass\n\n\nclass C:\n    def put(self):\n        a()\n\n    def give(self):\n        pass\n{cls}\n{mod}\n",
+    "new": "X = 2\nADD = 1\n\n\ndef f():\n    b()\n\n\ndef add():\n    pass\n\n\nclass C:\n    def put(self):\n        b()\n\n    def take(self):\n        pass\n{cls}\n{mod}\n",
+}
+PAIR_NAMES = ("X", "ADD", "GONE", "f", "add", "gone", "put", "take", "give")
+
+
+def pair_diff(side=None, cls="", mod=""):
+    """version_diff of the clean pair, with the text cls added to the class body and mod to the module of one side ("old" or "new")."""
+    texts = {s: PAIR[s].format(cls=cls if s == side else "", mod=mod if s == side else "") for s in PAIR}
+    for text in texts.values():
+        ast.parse(text)  # a form that is a syntax error would test nothing
+    return ss.version_diff(num("a.py", texts["old"]), num("a2.py", texts["new"]))
+
+
+class BindingProofDiffTests(unittest.TestCase):
+    """A name is compared across two versions only when each file proves it bound once, simply (_single_binding), and added or
+    dropped only when one file proves it bound once and the other proves it not bound at all."""
+
+    def test_the_clean_pair_states_every_claim(self):
+        clean = pair_diff()
+        for name in PAIR_NAMES:
+            with self.subTest(name):
+                self.assertTrue(any(mentions(line, name) for line in clean), clean)
+
+    def test_each_extra_binding_of_a_module_name_silences_it(self):
+        for name in ("X", "ADD", "GONE", "f", "add", "gone", "C"):
+            about = ("put", "take", "give") if name == "C" else (name,)  # a class that is rebound says nothing about its methods
+            for label, snippet, needs_match in MODULE_FORMS:
+                for side in ("old", "new"):
+                    if needs_match and not MATCH:
+                        continue
+                    if label == "assignment" and (name, side) in (("ADD", "old"), ("GONE", "new")):
+                        continue  # one plain `NAME = 7` in the file that lacked it makes the name single in both: a real change
+                    with self.subTest(name=name, form=label, side=side):
+                        out = pair_diff(side, mod=form_text(snippet, name))
+                        self.assertEqual([line for line in out if any(mentions(line, w) for w in about)], [])
+
+    def test_each_extra_binding_of_a_class_member_silences_it(self):
+        for name in ("put", "take", "give"):
+            for label, snippet, needs_match in CLASS_FORMS + [("write through the class", "C.{n} = other", False)]:
+                for side in ("old", "new"):
+                    if needs_match and not MATCH:
+                        continue
+                    with self.subTest(name=name, form=label, side=side):
+                        if label == "write through the class":
+                            out = pair_diff(side, mod=form_text(snippet, name))
+                        else:
+                            out = pair_diff(side, cls=form_text(snippet, name, "    "))
+                        self.assertEqual([line for line in out if mentions(line, name)], [])
+
+    def test_a_binding_under_a_compound_statement_is_not_single_and_simple(self):
+        plain = {"X": ("X = 1", "X = 2"), "f": ("def f():\n    a()", "def f():\n    b()")}
+        for head in COMPOUND:
+            if head == "match" and not MATCH:
+                continue
+            for name, (old, new) in plain.items():
+                for side in ("old", "new"):
+                    with self.subTest(name=name, head=head, side=side):
+                        texts = (under(head, old), new) if side == "old" else (old, under(head, new))
+                        for text in texts:
+                            ast.parse(text)
+                        out = ss.version_diff(num("a.py", texts[0]), num("a2.py", texts[1]))
+                        self.assertEqual([line for line in out if mentions(line, name)], [])
+            with self.subTest(name="put", head=head):  # a method under a compound statement of its class body
+                method = "def put(self):\n    {}()"
+                wrapped = "class C:\n" + indented(under(head, method.format("b")), "    ")
+                plain_old = "class C:\n" + indented(method.format("a"), "    ")
+                ast.parse(wrapped)
+                self.assertEqual(ss.version_diff(num("a.py", plain_old), num("a2.py", wrapped)), [])
+                self.assertEqual(ss.version_diff(num("a.py", wrapped), num("a2.py", plain_old)), [])
+        # a definition under an if in the new file only is not an addition either; the same definition at module level is
+        self.assertEqual(ss.version_diff(num("a.py", "pass"), num("a2.py", "if cond:\n    def f():\n        pass")), [])
+        self.assertEqual(ss.version_diff(num("a.py", "pass"), num("a2.py", "def f():\n    pass")), ["- a2.py adds the function f [a2.py:1]"])
+
+    def test_the_review_reproductions(self):
+        def diff(old, new):
+            return ss.version_diff(num("a.py", old), num("a2.py", new))
+        # F2: a method rewritten by a class attribute, and a method moved under a class-level if
+        self.assertEqual(diff("class C:\n    def f(self):\n        old()\n    f = None", "class C:\n    def f(self):\n        new()\n    f = None"), [])
+        self.assertEqual(diff("class C:\n    def f(self):\n        pass", "class C:\n    if True:\n        def f(self):\n            pass"), [])
+        # F3: a star import, a match capture and a subscript write change what the constant is
+        self.assertEqual(diff("X = 1\nfrom m import *", "X = 2\nfrom m import *"), [])
+        self.assertEqual(diff('D = {"x": 1}\nD["x"] = 2', 'D = {"x": 2}'), [])
+        if MATCH:
+            self.assertEqual(diff("X = 1\nmatch 2:\n    case X:\n        pass", "X = 2"), [])
+        # the clean cases still give their lines
+        self.assertEqual(diff("X = 1", "X = 2"), ["- a2.py changes X from 1 to 2 [a.py:1, a2.py:1]"])
+        self.assertEqual(diff("def f():\n    a()", "def f():\n    b()"),
+                         ["- in a2.py, f now calls b [a2.py:2]", "- in a2.py, f no longer calls a [a.py:2]"])
+        self.assertEqual(diff("class C:\n    def f(self):\n        a()", "class C:\n    def f(self):\n        b()"),
+                         ["- in a2.py, f now calls b [a2.py:3]", "- in a2.py, f no longer calls a [a.py:3]"])
+
+
+class BindingProofUseTests(unittest.TestCase):
+    """A call, creation or use is attributed to the target only through an import that resolves to it by its full dotted path and a
+    name nothing else binds, writes or shadows."""
+    FILES = [num("pkg/t.py", "class Q:\n    def pop(self):\n        return 1\n")]
+
+    def scan(self, text, path="app/u.py"):
+        return ss.use_scan("Who uses Q?", self.FILES + [num(path, text)])
+
+    def test_resolution_by_full_dotted_path(self):
+        both = ["- u.py imports Q [{p}:{i}]", "- u.py creates a Q [{p}:{c}]"]
+        for label, path, text, imp, call in (
+                ("from pkg.t import Q", "app/u.py", "from pkg.t import Q\nQ()\n", 1, 2),
+                ("import pkg.t", "app/u.py", "import pkg.t\npkg.t.Q()\n", 2, 2),
+                ("import pkg.t as t", "app/u.py", "import pkg.t as t\nt.Q()\n", 2, 2),
+                ("from pkg import t", "app/u.py", "from pkg import t\nt.Q()\n", 2, 2),
+                ("relative from .t", "pkg/u.py", "from .t import Q\nQ()\n", 1, 2),
+                ("relative from . import t", "pkg/u.py", "from . import t\nt.Q()\n", 2, 2)):
+            with self.subTest(label):
+                self.assertEqual(self.scan(text, path), [line.format(p=path, i=imp, c=call) for line in both])
+        # a module that only ends in t is not pkg.t (F4); neither is a bare t, a relative one from another package, one above the root
+        for label, text in (("unrelated.t", "from unrelated.t import Q\nQ()\n"), ("unrelated t attribute", "from unrelated import t\nt.Q()\n"),
+                            ("bare from t", "from t import Q\nQ()\n"), ("bare import t", "import t\nt.Q()\n"),
+                            ("relative in another package", "from .t import Q\nQ()\n"), ("relative above the root", "from ... import t\nt.Q()\n"),
+                            # the dotted import binds pkg: a second import of pkg may be another module
+                            ("pkg bound twice", "import pkg.t\nimport pkg.other\npkg.t.Q()\n")):
+            with self.subTest(label):
+                self.assertEqual(self.scan(text), [])
+
+    def test_the_review_reproductions(self):
+        # F1: the module overwritten by a star import, the name by a dotted import, the attribute by a write
+        self.assertEqual(self.scan("import pkg.t as t\nfrom mid import *\nt.Q()\n"), [])
+        self.assertEqual(self.scan("from pkg.t import Q\nimport Q.child\nQ()\n"), ["- u.py imports Q [app/u.py:1]"])
+        self.assertEqual(self.scan("import pkg.t as t\nt.Q = other\nt.Q()\n"), [])
+        self.assertEqual(self.scan("import pkg.t\npkg.t.Q = other\npkg.t.Q()\n"), [])
+        self.assertEqual(self.scan("from pkg.t import Q\nQ.pop = other\nQ()\n"), ["- u.py imports Q [app/u.py:1]"])
+
+    def test_an_import_under_a_compound_statement_or_shadowed_in_a_function_attributes_no_call(self):
+        for head in COMPOUND:
+            if head == "match" and not MATCH:
+                continue
+            with self.subTest(head):
+                text = under(head, "from pkg.t import Q") + "\nQ()\n"
+                ast.parse(text)
+                out = self.scan(text)
+                self.assertEqual([line for line in out if "imports" not in line], [])
+        for label, text in (("a parameter", "from pkg.t import Q\n\n\ndef f(Q):\n    Q()\n"),
+                            ("a lambda parameter", "from pkg.t import Q\ng = lambda Q: Q()\n"),
+                            ("a def in a function", "from pkg.t import Q\n\n\ndef f():\n    def Q():\n        pass\n    Q()\n")):
+            with self.subTest(label):
+                self.assertEqual([line for line in self.scan(text) if "imports" not in line], [])
+
+    def test_each_extra_binding_silences_the_calls_through_a_name(self):
+        # with no extra binding every line is there
+        self.assertEqual(self.scan("from pkg.t import Q\nx = Q()\nx.pop()\n"), [
+            "- u.py imports Q [app/u.py:1]", "- u.py creates a Q [app/u.py:2]", "- u.py uses Q.pop on x [app/u.py:3]"])
+        self.assertEqual(self.scan("import pkg.t as t\ny = t.Q()\n"), ["- u.py imports Q [app/u.py:2]", "- u.py creates a Q [app/u.py:2]"])
+        for label, snippet, needs_match in MODULE_FORMS:
+            if needs_match and not MATCH:
+                continue
+            with self.subTest(form=label, name="Q, from an import"):  # the import line stays: the import itself is proven
+                out = self.scan("from pkg.t import Q\n" + form_text(snippet, "Q") + "\nx = Q()\nx.pop()\n")
+                self.assertEqual([line for line in out if "imports" not in line], [])
+            with self.subTest(form=label, name="t, a module alias"):
+                self.assertEqual(self.scan("import pkg.t as t\n" + form_text(snippet, "t") + "\ny = t.Q()\n"), [])
+            if label != "star import":  # which already silences Q, and with it the use through x
+                with self.subTest(form=label, name="x, a variable bound from Q()"):
+                    out = self.scan("from pkg.t import Q\n" + form_text(snippet, "x") + "\nx = Q()\nx.pop()\n")
+                    self.assertEqual([line for line in out if "uses" in line], [])
+
+    def test_a_target_bound_twice_is_not_scanned(self):
+        for target in ("class Q:\n    pass\nQ = other\n", "if cond:\n    class Q:\n        pass\n"):
+            with self.subTest(target):
+                self.assertEqual(ss.use_scan("Who uses Q?", [num("pkg/t.py", target), num("app/u.py", "from pkg.t import Q\nQ()\n")]), [])
 
 
 class FalseAbsenceTests(unittest.TestCase):

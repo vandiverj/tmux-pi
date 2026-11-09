@@ -391,74 +391,147 @@ def _base(f):
     return f["path"].rsplit("/", 1)[-1]
 
 
-def _module_bindings(tree):
-    """(count, declared): how many times each name is bound in the module's own scope (a def, class, import, assignment, augmented
-    assignment, for or with target, except name, anywhere in the module's statements but not inside a def, lambda, class or
-    comprehension), and the names any function declares `global`. A name bound more than once, or declared global, has no one
-    value or definition that the source shows."""
-    count, declared = {}, set()
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
-    def bind(name):
-        count[name] = count.get(name, 0) + 1
 
-    stack = list(reversed(tree.body))
+def _root_name(node):
+    """The name at the root of `a.b[c].d` (a), or None when the chain starts with something else."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _binding_index(tree):
+    """({name: [(kind, node, statement, scope)]}, star): every way the file binds or writes a name, read once and kept on the tree.
+    kind is "name" (a Store or Del target of any form, an import alias, an except name, a match capture), "def" (a def, async def or
+    class), "arg" (a parameter), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
+    or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. star: some
+    `from m import *` is there."""
+    cached = getattr(tree, "_binding_index", None)
+    if cached:
+        return cached
+    events, star = {}, False
+    stack = [(tree, None, None)]
     while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bind(node.name)
-            continue
-        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            continue
+        node, scope, stmt = stack.pop()
+        if isinstance(node, ast.stmt):
+            stmt = node
+        found = []  # (name, kind)
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            bind(node.id)
+            found.append((node.id, "name"))
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            found.extend((n, "write") for n in {getattr(node, "attr", None), _root_name(node.value)} - {None})
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.append((node.name, "def"))
+        elif isinstance(node, ast.arg):
+            found.append((node.arg, "arg"))
         elif isinstance(node, ast.ExceptHandler) and node.name:
-            bind(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                if alias.name != "*":
-                    bind(alias.asname or alias.name.split(".")[0])
-        stack.extend(reversed(list(ast.iter_child_nodes(node))))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Global):
-            declared.update(node.names)
-    return count, declared
+            found.append((node.name, "name"))
+        elif isinstance(node, ast.alias):
+            if node.name == "*":
+                star = True
+            else:
+                found.append((node.asname or node.name.split(".")[0], "name"))
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            found.extend((n, "global") for n in node.names)
+        elif type(node).__name__ in ("MatchAs", "MatchStar") and node.name:  # absent from ast before Python 3.10
+            found.append((node.name, "name"))
+        elif type(node).__name__ == "MatchMapping" and node.rest:
+            found.append((node.rest, "name"))
+        for name, kind in found:
+            events.setdefault(name, []).append((kind, node, stmt, scope))
+        inner = node if isinstance(node, _SCOPE_NODES) else scope
+        stack.extend((child, inner, stmt) for child in ast.iter_child_nodes(node))
+    tree._binding_index = (events, star)
+    return tree._binding_index
+
+
+def _binds(tree, name, owner, shadow):
+    """The events of _binding_index that can change what name is in the scope of owner (a ClassDef of the module, or None for the
+    module); None when the module scope is asked and the file has a star import. In the module scope every Store of the name counts
+    wherever it sits in the file (a function's `global` or a local of the same name too); a def or class counts when it is in that
+    scope, or anywhere when shadow. A parameter counts only when shadow. Attribute and subscript writes always count."""
+    events, star = _binding_index(tree)
+    if owner is None and star:
+        return None
+    counted = []
+    for event in events.get(name, ()):
+        kind, scope = event[0], event[3]
+        if kind == "write" or (kind == "arg" and shadow) or (kind == "def" and (shadow or scope is owner)) \
+                or (kind in ("name", "global") and (owner is None or scope is owner)):
+            counted.append(event)
+    return counted
+
+
+def _single_binding(tree, name, cls=None, *, shadow=False, nested=False):
+    """THE one predicate for "is this name provably bound once, simply": the statement that binds name, or None when the source does
+    not prove it. Proven means: in the module scope (or in the body of the module-level class cls, which must itself pass this test)
+    exactly one thing binds or writes the name (see _binds), and it is a `def`, `async def` or `class`, a plain `NAME = value`
+    (one Name target), or an import alias, standing directly in that scope's statements and not under an if, try, with, for, while or
+    match. nested: the statement may be anywhere in the file (a variable bound inside a function). shadow: a parameter or a def in
+    another scope of the same name counts as a binding too (for a name a use scan reads anywhere in the file)."""
+    owner = None
+    if cls is not None:
+        owner = _single_binding(tree, cls)
+        if not isinstance(owner, ast.ClassDef):
+            return None
+    found = _binds(tree, name, owner, shadow)
+    if not found or len(found) != 1:
+        return None
+    kind, node, stmt, _scope = found[0]
+    if kind == "def":
+        result = node
+    elif kind == "name" and isinstance(stmt, ast.Assign) and stmt.targets == [node]:
+        result = stmt
+    elif kind == "name" and isinstance(node, ast.alias):
+        result = stmt
+    else:
+        return None
+    body = owner.body if owner else tree.body
+    return result if nested or any(s is result for s in body) else None
+
+
+def _unbound(tree, name, cls=None):
+    """True when the source proves the module (or the body of the module-level class cls) does not bind name at all: no binding or
+    write of any kind, no star import, and the class, if cls is given, is absent or itself proven."""
+    owner = None
+    if cls is not None:
+        if _unbound(tree, cls):
+            return True
+        owner = _single_binding(tree, cls)
+        if not isinstance(owner, ast.ClassDef):
+            return False
+    found = _binds(tree, name, owner, False)
+    return found is not None and not found
 
 
 def _defs(tree):
-    """{(owner, name): node} of the functions at module level and the methods of module-level classes, leaving out a name that is
-    bound more than once (in the module, or among a class's methods and attributes: a property getter and setter) or declared
-    global, since the source does not show which one runs."""
-    count, declared = _module_bindings(tree)
-    found, repeated = {}, set()
+    """{(owner, name): node} of the functions at module level and the methods of module-level classes whose binding is proven single
+    (_single_binding); a name bound more than once, under an if or try, rewritten, a property getter and setter, is left out."""
+    found = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and count.get(node.name) == 1 and node.name not in declared:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _single_binding(tree, node.name) is node:
             found[(None, node.name)] = node
-        elif isinstance(node, ast.ClassDef) and count.get(node.name) == 1:
+        elif isinstance(node, ast.ClassDef) and _single_binding(tree, node.name) is node:
             for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    key = (node.name, sub.name)
-                    if key in found:
-                        repeated.add(key)
-                    found[key] = sub
-    return {key: node for key, node in found.items() if key not in repeated}
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and _single_binding(tree, sub.name, node.name) is sub:
+                    found[(node.name, sub.name)] = sub
+    return found
 
 
 def _literal_constants(tree):
-    """{name: (value node, literal value, line)} of the module-level constants whose value ast.literal_eval reads, leaving out a
-    name that is bound more than once in the module (`X = 1` then `X = 2`, `X += 1`) or declared global."""
-    count, declared = _module_bindings(tree)
+    """{name: (value node, literal value, line)} of the module-level constants that are a plain `NAME = <literal>` whose binding is
+    proven single (_single_binding) and whose value ast.literal_eval reads."""
     found = {}
     for node in tree.body:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-        if getattr(node, "value", None) is None:
-            continue
-        try:
-            value = ast.literal_eval(node.value)
-        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name) and count.get(target.id) == 1 and target.id not in declared:
-                found[target.id] = (node.value, value, node.lineno)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if _single_binding(tree, node.targets[0].id) is not node:
+                continue
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                continue
+            found[node.targets[0].id] = (node.value, value, node.lineno)
     return found
 
 
@@ -516,7 +589,9 @@ def _keyed_names(f):
 def version_diff(old, new):
     """Code-made fact lines `- <claim> [path:n, ...]` for what the new file adds, drops or changes against the old one, each citing
     the line that shows it: names (class, function, method, constant, as name_index skips them), literal constants (a scalar, or a
-    dict key by key), then the plain calls of a function or method both define. A constant whose value does not literal_eval is not
+    dict key by key), then the plain calls of a function or method both define. A line is stated only on proof: a name is compared
+    only when each file binds it once, simply and directly in its scope (_single_binding), and is added or dropped only when one file
+    proves that and the other proves it does not bind the name at all (_unbound). A constant whose value does not literal_eval is not
     compared. Order: names, constants, calls, each in line order."""
     old_tree, new_tree = _parse(old["path"], old["text"]), _parse(new["path"], new["text"])
     if old_tree is None or new_tree is None:
@@ -525,14 +600,13 @@ def version_diff(old, new):
     obase = _base(old)
     lines = []
     old_names, new_names = _keyed_names(old), _keyed_names(new)
-    old_bound, new_bound = _module_bindings(old_tree)[0], _module_bindings(new_tree)[0]
-    # outline reads only the top-level statements: a name the other file binds inside an if or try is not "absent" from it
-    elsewhere = lambda key, bound: key[0] in ("class", "function", "constant") and key[2] in bound  # noqa: E731
+    # a name is added or dropped only when one file proves it bound once and the other proves it not bound at all (no star import,
+    # no write under an if or try)
     for key, line in sorted(new_names.items(), key=lambda item: item[1]):
-        if key not in old_names and not elsewhere(key, old_bound):
+        if key not in old_names and _unbound(old_tree, key[2], key[1]) and _single_binding(new_tree, key[2], key[1]):
             lines.append("- {} adds the {} {} [{}:{}]".format(base, key[0], key[2], np, line))
     for key, line in sorted(old_names.items(), key=lambda item: item[1]):
-        if key not in new_names and not elsewhere(key, new_bound):
+        if key not in new_names and _unbound(new_tree, key[2], key[1]) and _single_binding(old_tree, key[2], key[1]):
             lines.append("- {} drops the {} {} that {} defines [{}:{}]".format(base, key[0], key[2], obase, op, line))
     old_const, new_const = _literal_constants(old_tree), _literal_constants(new_tree)
     for name, (node, value, line) in sorted(new_const.items(), key=lambda item: item[1][2]):
@@ -589,107 +663,86 @@ def _members(tree, cls):
     return names
 
 
-def _star_exports(tree, name):
-    """Whether `from <this module> import *` brings name in: True or False, or None when `__all__` is there but not a literal list."""
-    exported = None
-    for node in tree.body:
-        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == "__all__":
-            return None
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
-            try:
-                exported = ast.literal_eval(node.value)
-            except (ValueError, TypeError, SyntaxError, AttributeError):
-                return None
-            if not isinstance(exported, (list, tuple)):
-                return None
-    return name in exported if exported is not None else not name.startswith("_")
+def _module_name(path):
+    """The dotted module a .py path names from the run root: pkg/t.py is pkg.t, pkg/__init__.py is pkg."""
+    parts = path[:-3].split("/") if path.endswith(".py") else path.split("/")
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
 
-def _rebinds(tree, known, names):
-    """Whether some statement other than an import alias in known binds one of names (assignment, parameter, def, class, except name,
-    another import), so that a later use of the name need not be what the import brought in."""
-    for node in ast.walk(tree):
-        bound = None
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            bound = node.id
-        elif isinstance(node, ast.arg):
-            bound = node.arg
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bound = node.name
-        elif isinstance(node, ast.ExceptHandler):
-            bound = node.name
-        elif isinstance(node, ast.alias) and id(node) not in known and node.name != "*" and (node.asname or "." not in node.name):
-            bound = node.asname or node.name
-        if bound in names:
-            return True
-    return False
+def _imported_module(path, node):
+    """The full dotted module a `from <module> import` statement names: a relative one is resolved from the importing file's
+    package; None when it climbs above the run root."""
+    if not node.level:
+        return node.module or ""
+    package = path.split("/")[:-1]
+    if node.level - 1 > len(package):
+        return None
+    package = package[:len(package) - (node.level - 1)]
+    return ".".join(package + ([node.module] if node.module else []))
 
 
-def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
+def _use_lines(f, tree, target, kind, module, others, members, dup):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
-    the target name in a way this scan cannot attribute (an import of it from some other module, `from m import *` that may re-export
-    it, a use of the bare name or of `x.<name>` that no import of the target explains, the name as a string) or binds it from two
-    of the definers (ambiguous). stem is the target module's name, others the module names of the other files that define the same
-    name, star what _star_exports says. dup (the name is defined in more than one file) names the target `<stem>.<T>` in each line
-    and takes a use through a parameter only from a file that imports this module."""
+    the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
+    path, `from m import *`, an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
+    that no import of the target explains, the name as a string) or binds it from two of the definers (ambiguous). module is the
+    target's dotted module name from the run root, others those of the other files that define the same name. An import counts as
+    the target's only when its module resolves to `module` by full dotted path (a basename alone never does). A call, a creation or
+    a use is attributed only through a name that _single_binding proves bound once, by that import: a name that is bound again,
+    written (`t.Q = x`), shadowed, or in a file with a star import gives the import line at most. dup (the name is defined in more
+    than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
+    this module."""
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
-    label = "{}.{}".format(stem, target) if dup else target
-    direct, modules, imports = set(), set(), []
+    label = "{}.{}".format(module, target) if dup else target
+    direct, modules, imports = {}, {}, []  # local name -> import statement; the dotted name used in code -> (bound name, statement)
     other_direct, other_modules, unexplained = set(), set(), False
-    known, star_other = set(), False  # the import aliases explained below; whether another module is star-imported
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            last = (node.module or "").rsplit(".", 1)[-1]
+            source_module = _imported_module(path, node)
             for alias in node.names:
                 local = alias.asname or alias.name
+                joined = (source_module + "." + alias.name if source_module else alias.name) if source_module is not None else None
                 if alias.name == "*":
-                    star_other = star_other or last != stem
-                    known.add(id(alias))
-                    if last == stem and star:
-                        direct.add(target)
-                elif alias.name == target:
-                    if last == stem:
-                        known.add(id(alias))
-                        direct.add(local)
-                        shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
-                                      if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
-                        imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
-                    elif last in others:
-                        known.add(id(alias))
-                        other_direct.add(local)
-                    else:
-                        unexplained = True
-                elif alias.name == stem:
-                    known.add(id(alias))
-                    modules.add(local)
-                elif alias.name in others:
-                    known.add(id(alias))
+                    continue
+                if source_module == module and alias.name == target:
+                    direct[local] = node
+                    shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+                                  if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
+                    imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
+                elif joined == module:
+                    modules[local] = (local, node)
+                elif source_module in others and alias.name == target:
+                    other_direct.add(local)
+                elif joined in others:
                     other_modules.add(local)
+                elif alias.name == target:
+                    unexplained = True
         elif isinstance(node, ast.Import):
             for a in node.names:
-                if a.name.rsplit(".", 1)[-1] == stem:
-                    known.add(id(a))
-                    modules.add(a.asname or a.name)
-                elif a.name.rsplit(".", 1)[-1] in others:
-                    known.add(id(a))
-                    other_modules.add(a.asname or a.name)
-    if direct & other_direct or modules & other_modules:
+                code, bound = a.asname or a.name, a.asname or a.name.split(".")[0]
+                if a.name == module:
+                    modules[code] = (bound, node)
+                elif a.name in others:
+                    other_modules.add(code)
+    if set(direct) & other_direct or set(modules) & other_modules:
         return [], [], [], True
-    if _rebinds(tree, known, direct | {m.split(".")[0] for m in modules}) or (direct and star_other):
-        return sorted(imports, key=lambda item: item[0]), [], [], True  # the import is a fact; what the name then is, is not shown
+    valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
+    valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
+    if valid_direct != set(direct) or valid_modules != set(modules):
+        # the import is a fact; what the name then is, is not shown. Nothing is attributed through a name that may not be the import.
+        return sorted(imports, key=lambda item: item[0]), [], [], True
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == target:
             unexplained = unexplained or node.id not in other_direct  # a use of this module's name is a line, or else (a star import) undecided
         elif isinstance(node, ast.Attribute) and node.attr == target:
-            unexplained = unexplained or _dotted(node.value) not in modules | other_modules
+            unexplained = unexplained or _dotted(node.value) not in set(modules) | other_modules
         elif isinstance(node, ast.Constant) and node.value == target:
             unexplained = True
 
     def is_ref(func):
         if isinstance(func, ast.Name):
-            return func.id in direct
-        return isinstance(func, ast.Attribute) and func.attr == target and _dotted(func.value) in modules
+            return func.id in valid_direct
+        return isinstance(func, ast.Attribute) and func.attr == target and _dotted(func.value) in valid_modules
 
     first_module_ref = None
     for node in ast.walk(tree):
@@ -702,8 +755,9 @@ def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and is_ref(node.func):
             creates.append((node.lineno, "- {} {} {} [{}:{}]".format(base, verb, label, path, node.lineno)))
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call) and is_ref(node.value.func):
-            bound.update(t.id for t in (node.targets if isinstance(node, ast.Assign) else [node.target]) if isinstance(t, ast.Name))
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and is_ref(node.value.func):
+            bound.update(t.id for t in node.targets
+                         if isinstance(t, ast.Name) and _single_binding(tree, t.id, shadow=True, nested=True) is node)
     uses = []
     if kind == "class" and members:
         def visit(node, params):
@@ -716,42 +770,44 @@ def _use_lines(f, tree, target, kind, stem, others, members, star, dup):
             for child in ast.iter_child_nodes(node):
                 visit(child, params)
         visit(tree, set())
-    if dup and uses and not (direct or modules):
+    if dup and uses and not (valid_direct or valid_modules):
         uses, unexplained = [], True
     key = lambda item: item[0]  # noqa: E731
     return sorted(imports, key=key), sorted(creates, key=key), sorted(uses, key=key), unexplained
 
 
 def use_scan(task, files):
-    """Code-made fact lines about who uses a class or top-level function (the target) that the task names as a whole word and a named
-    .py file defines. Per other .py file: its import, creation or call, and the attribute uses through a variable bound from T(...)
-    or a parameter (only of a name the class defines, dunder methods too); `from m import *` of the target's module followed by T()
-    counts as an import of T. A file with none of these gives `<base> does not use <T> [path:1]`, unless it refers to the name in a
-    way the scan cannot attribute to the target (see _use_lines): then it gives nothing. When more than one file defines the name,
-    each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself, or whose binding
-    of the name is ambiguous, gives nothing for it."""
+    """Code-made fact lines about who uses a class or top-level function (the target) that the task names as a whole word, that a
+    named .py file defines, and whose binding there is proven single (_single_binding). Per other .py file: its import, creation or
+    call, and the attribute uses through a variable bound once from T(...) or a parameter (only of a name the class defines, dunder
+    methods too), each only through an import of the target by its full dotted path whose name nothing else binds, writes or
+    shadows (see _use_lines); `from m import *` attributes nothing. A file with none of these gives `<base> does not use <T> [path:1]`,
+    unless it refers to the name in a way the scan cannot attribute to the target: then it gives nothing. When more than one file
+    defines the name, each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself,
+    or whose binding of the name is ambiguous, gives nothing for it."""
     out = []
     parsed = {f["path"]: _parse(f["path"], f["text"]) for f in files}
     for f in files:
         for line, kind, name, owner in outline(f["path"], f["text"]):
             if kind not in ("class", "function") or owner or not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", task):
                 continue
+            if not isinstance(_single_binding(parsed[f["path"]], name), (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
             definers = {g["path"] for g in files for _l, k, n, o in outline(g["path"], g["text"]) if k in ("class", "function") and n == name and not o}
-            stem = f["path"].rsplit("/", 1)[-1][:-3]
-            others = {p.rsplit("/", 1)[-1][:-3] for p in definers if p != f["path"]}
-            if stem in others:
+            module = _module_name(f["path"])
+            others = {_module_name(p) for p in definers if p != f["path"]}
+            if module in others:
                 continue
             members = _members(parsed[f["path"]], name) if kind == "class" else set()
-            star = _star_exports(parsed[f["path"]], name)
             for g in files:
                 if g["path"] in definers or parsed[g["path"]] is None:
                     continue
-                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, stem, others, members, star, len(definers) > 1)
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1)
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)
                 elif not undecided:
-                    out.append("- {} does not use {} [{}:1]".format(_base(g), "{}.{}".format(stem, name) if len(definers) > 1 else name, g["path"]))
+                    out.append("- {} does not use {} [{}:1]".format(_base(g), "{}.{}".format(module, name) if len(definers) > 1 else name, g["path"]))
     return list(dict.fromkeys(out))
 
 

@@ -26,6 +26,7 @@ DATA = ROOT / "tests" / "calibration" / "summarize"
 FIXTURES = DATA / "fixtures"
 MODEL = "lmstudio/qwen/qwen3.6-35b-a3b"
 REAL = "real"  # the split of the chores over files frozen from tmux-pi (fixtures/real/)
+MANIFEST = "frozen-copies.json"  # FC1: names the frozen copies so the review packet can leave them out
 
 
 # What bin/tp-route really prints, captured 2026-11-08 with `tp-route --no-log --local-only "<task>"` (the first from a run with the
@@ -1191,7 +1192,7 @@ class RealSplitTests(unittest.TestCase):
                 self.assertTrue((FIXTURES / name).is_file(), "{}: {}".format(chore["id"], name))
                 self.assertIn(name, chore["task"], chore["id"])
                 used.add(name)
-        on_disk = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md"}
+        on_disk = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md", REAL + "/" + MANIFEST}
         self.assertEqual(used, on_disk)  # every frozen file is read by a chore, and every chore file is frozen
         self.assertTrue(8 <= len(on_disk) <= 12, len(on_disk))
 
@@ -1216,10 +1217,26 @@ class RealSplitTests(unittest.TestCase):
             if line.startswith("|") and len(cells) == 3 and cells[0].startswith(REAL + "/"):
                 self.assertNotIn(cells[0], rows)
                 rows[cells[0]] = cells[1:]
-        frozen = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md"}
+        frozen = {str(p.relative_to(FIXTURES)) for p in self.FROZEN.rglob("*") if p.is_file()} - {REAL + "/SOURCES.md", REAL + "/" + MANIFEST}
         self.assertEqual(set(rows), frozen)
         for name, (source, commit) in rows.items():
             self.assertEqual((source, commit), (name[len(REAL) + 1:], self.COMMIT), name)  # the same relative path, in the source tree
+
+    def test_frozen_copies_manifest_lists_every_frozen_file_at_its_source(self):
+        # The review packet leaves a copy out only when frozen-copies.json names it (FC1, docs/lanes.md); every frozen file is
+        # listed with the same source path and the full id of the commit SOURCES.md names, and nothing else is listed.
+        manifest = json.loads((self.FROZEN / MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(set(manifest), {"copies"})
+        frozen = {str(p.relative_to(self.FROZEN)) for p in self.FROZEN.rglob("*") if p.is_file()} - {"SOURCES.md", MANIFEST}
+        listed = {}
+        for entry in manifest["copies"]:
+            self.assertEqual(set(entry), {"path", "source", "commit"}, entry)
+            self.assertNotIn(entry["path"], listed)
+            listed[entry["path"]] = entry
+            self.assertEqual(entry["source"], entry["path"], entry)
+            self.assertRegex(entry["commit"], "^[0-9a-f]{40}$", entry)
+            self.assertTrue(entry["commit"].startswith(self.COMMIT), entry)
+        self.assertEqual(set(listed), frozen)
 
     def test_support_is_a_set_of_lines_and_every_anchor_is_on_its_line(self):
         for chore_id, answer, k in self.facts():

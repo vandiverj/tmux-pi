@@ -1,6 +1,11 @@
 {
   "copies": [
     {
+      "path": "README.md",
+      "source": "README.md",
+      "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"
+    },
+    {
       "path": "bin/tp-spawn",
       "source": "bin/tp-spawn",
       "commit": "109948afc2f9a5e3b60102e310a85ad86cc5524d"

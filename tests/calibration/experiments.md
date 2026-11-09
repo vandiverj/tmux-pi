@@ -262,63 +262,55 @@ the outcome: routed local once the shape is qualified, `shape_not_qualified` whi
 Protocol (run from a plain shell with LM Studio up): `--route-only` on all 24; tune split x3 without and with the draft rule in
 `config/local.example.json`; choose the prompt on tune only; holdout x5 with the chosen prompt. Results: not run yet.
 
-The checker is lenient on wording (a fact is any of a few regexes for one thing) and strict on completeness and evidence.
+The checker is lenient on wording (a fact is any of a few regexes for one thing) and strict on form, completeness and evidence.
+
+Round 6 (the format is fixed and parsed exactly; rounds 2 to 5 graded free prose with regexes and each round's review found a
+new prose shape that slipped through the same three gaps: required-fact completeness, citation-support coverage, citation-file
+validation). A reply is a list of FACT LINES and only those count:
+
+    - <claim> [<path>:<line>[-<line>]][, <path>:<line>...]
+
+1. One fact per line: it starts with `- `, the claim is words, and it ends with one bracketed citation list. The path is a chore
+   file written in full. No heading, bold line, earlier bullet or `Line N` supplies a file, and a line with two bracketed lists
+   is not a fact line (it is `two_citation_lists`, rule 1).
+2. Any other line (heading, sentence, blank, an indented `  - ` line) is ignored, for facts and for citations. A `- ` line with no
+   valid trailing citation list is `uncited` and fails the reply: no partial credit, nothing is borrowed from its neighbours.
+3. A citation is valid only if its file is a chore file, the range is inside the file and at most 5 lines (`range_too_wide`
+   otherwise), and the range covers one of that fact's `support_lines`. Not valid: `unknown_file`, `range`, `range_too_wide`
+   (a bad citation); on a line that states the fact but cites other lines: `unsupported`; no good citation at all:
+   `missing_citation`.
+4. A required fact is met only by ONE fact line whose claim matches AND whose citations support it (same line). Facts are met by
+   different lines (bipartite matching), so a one-line list of everything satisfies one fact (`shared_line`, rule 1).
+5. A behaviour fact is matched against the claim with every backticked span, every `path:line`, and every identifier of the
+   cited files' symbol table removed. The symbol table is computed from the fixture with `ast` (functions, classes, parameters,
+   names, attributes, keyword arguments, imports and aliases, `except` names, identifier-like strings), so it is a superset of
+   "names defined or parameters"; no list is kept by hand. A claim of only names and signature text has nothing left to match
+   and, when no fact needs it, is `identifier_only` (rule 5). Python keywords are stripped for that test only, never for matching.
+
+The result also lists `failures`: one `{rule, kind, line, text}` per failed line, so a failed reply says which rule 1 to 5 it
+broke. The runner keeps the raw reply. The prompt in `config/local.example.json` states the format with one example.
 
 Completeness: every item a chore asks for (each using file, export, step, state, difference) is its own required fact, never one
-alternation over the items; a fact about a file is tied to it (the file name and the words on one line, either order, or the file
-alone on a heading, a bold line or a bullet with the words in the lines below it). Where the task asks for an order (the states, the
-deploy steps) `order` lists the facts and the position of the first match of each must be greater than the one before; a fact that
-comes too early is listed under `order` and fails the reply. Each answer carries a hand-written `reference` reply, one cited
-sentence or bullet per fact (`facts` says which); the tests check that it passes, with its quotes and without, and that dropping the
-sentence that states one fact fails with that fact among the failed ones (`missing` when nothing else names it; `unsupported` when
-another sentence names it, an export's name in the sentence on what it does, but cites other lines than the evidence of the name).
+alternation over the items. Where the task asks for an order (the states, the deploy steps) `order` lists the facts and the
+position of the first match of each must be greater than the one before. Each answer carries a hand-written `reference` reply, one
+fact line per fact (`facts` says which); the tests check that it passes (24 of 24), that dropping the line for one fact fails with
+that fact among the failed ones, and that every line of every reference shifted by one line passes none.
 
-Round 5 (a design change; rounds 2 to 4 had patched one regex at a time):
+`support_lines` (one entry per fact) is `{"src/x.py": ["14", "20-22"]}`: the fixture lines that are evidence of the fact. For what
+code does it is the lines that do it (body, return, raise, a docstring that states it), the signature only if it alone shows it;
+for a name, its definition line. `anchors` records a short exact substring of each accepted line, and
+`test_support_is_a_set_of_lines_and_every_anchor_is_on_its_line` fails when a fixture edit moves one. The set accepts
+`src/worker.py:22` for echo and the docstring `src/cache.py:14` for get, and refuses the signatures next to them. A good citation
+that no fact's support vouched for (on a line that states no fact, or overlapping no support set there) is `unchecked`: counted
+per run and not a failure; S2 reports the count. A correct reply that merely mentions a forbidden claim to deny it can be scored
+as a hit; read the failing replies before changing a prompt for them.
 
-1. Behaviour is matched without the citations. Before `required` is matched, every citation is removed from the reply text: the
-   line numbers of `path:N` and `Line N`, the quote next to them, and the bracket the removal leaves empty. The path stays when the
-   citation is not inside brackets, so `cli.py:29 creates` still says `cli.py`. ``chunked (src/utils.py:16 `def chunked(items, size):`)``
-   leaves `chunked` and nothing else, so a name with a quoted signature can no longer stand for "what it does". Each exports fact is
-   split into the name and, where the chore asks what each does, the behaviour (the `behaviour` field of an answer gives the
-   name and the signature line, for the tests). A behaviour regex needs a word that says it (`returns`, `stores`, `evicts`,
-   `at most`, ...) near the name, and not one an identifier or a parameter name can supply: `\bLRU\b` and not `LRU` (`LRUCache`),
-   no bare `size`, `default`, `payload` or `3`; a word inside a name (`BACKOFF_SECONDS`, `sleep_job`) is not a word, as `\b` does not
-   split at `_`.
-2. Evidence is a set of lines. `support_lines` (one entry per fact) is `{"src/x.py": ["14", "20-22"]}`: the fixture lines that
-   are evidence of the fact. For what code does it is the lines that do it (body, return, raise, a docstring that states it), the
-   signature only if it alone shows it; for a name, its definition line. At least one good citation on the fact's sentence or bullet
-   must overlap the set (ranges are at most 5 lines), or the fact is `unsupported`, quote or no quote. `anchors` records a short exact
-   substring of each accepted line, and `test_support_is_a_set_of_lines_and_every_anchor_is_on_its_line` fails when a fixture edit
-   moves one. The same set accepts `src/worker.py:22 `return payload`` for echo and the docstring `src/cache.py:14` for get, and
-   refuses the lines next to them (the signatures).
-3. Any file-like heading sets the context. `Line N` / `Lines a-b` takes the file from the nearest of its own line and the headings
-   and bullets above it that names a file-like token: `name.ext` with any extension, or any token with a `/`. That line must name
-   exactly one file and it must be one of the chore's files, whole (`cache.py.bak` is not `cache.py`): two files is
-   `ambiguous_context`, a file that is not the chore's (`nonexistent.xyz`, `notes.txt`, `README.md`, `config.json`, `src/nothing`)
-   `unknown_file`, none anywhere `no_context`; each is a bad citation, and the check never falls back to an earlier heading. Code
-   with a space, a bracket or a quote in backticks, a call (`queue.pop(now)`), `e.g.` and a version (`3.12`) are not files.
-   The price: a dotted identifier outside such code (`queue.dead`, `LRUCache.get`) reads as a file with an unknown extension, so
-   a `Line N` under a heading or bullet that mentions one is a bad citation (Main's smoke reply, below, has three). This is the
-   rule the review asked for; if the live runs show it costing real passes, S2 can name the allowed dotted identifiers per chore.
-4. The packet picker table's separator is back to three columns.
+Main's saved smoke reply (use-jobqueue; "### src/<file>" headings, "- **Line 29** -- ..." bullets) now fails by rule 2: its 9 bullets
+have no trailing citation list (`uncited`), the headings and prose count for nothing, and no fact is stated (rule 4). Round 5
+scored it as 11 bad citations; the model is now told the format by the prompt, and the live runs show whether it follows it.
 
-Citations: every required fact needs a good citation on its line or in its bullet: `path:line` or `path:a-b` (any extension or
-none, also a bare file name), or `Line N` / `Lines a-b` as above. A fact without a good citation is `missing_citation`; a citation
-of a file outside the chore's files, a missing file, a line out of range, a range wider than 5 lines (`range_too_wide`: a model
-cannot cite a whole file) or a quote that is not on the cited lines is a bad citation and fails the reply. A citation without a
-quote that no fact's support vouched for (on a line with no required fact, or overlapping no support set there) is `unchecked`:
-counted per run (`unchecked` in the record, `unchecked_citations` in the summary) and not a failure; S2 reports the count.
-It does not count bullets. A correct reply that merely mentions a forbidden claim to deny it can be scored as a hit; read the
-failing replies before changing a prompt for them.
 
-Main's saved smoke reply (use-jobqueue, 15 line numbers, 12 wrong) now scores: fails; 11 bad citations (the 8 with a wrong quote or
-range, the 21-line "Lines 18-38", and worker.py "Line 35", "Line 40" and "Line 45", which are `unknown_file`: the bullet of Line 35
-mentions `queue.dead`); facts 3 to 6 (jobq.py defines it; worker.py receives the queue, pops, handles failure) have no good
-citation; 2 `unchecked` (cli.py 9 and 34); the right cli.py 29 and 31 support their facts. Round 4 scored it 9 bad, 2
-`missing_citation`, 2 `unsupported` and 4 `unchecked`; the three bad citations added are lines that were wrong anyway (the
-fixture's worker.py pops at 32 and fails the job at 44).
-
-### Audit of the required facts (round 5)
+### Audit of the required facts (round 6)
 
 Each chore against its text and fixtures: what the chore asks for, the required fact that covers each (F1 is the first in
 `answers.jsonl`), the lines of the fixtures that are evidence of it (`file:lines`, from `support_lines`), and which facts are
@@ -332,7 +324,7 @@ behaviour facts, matched on words that say what the code does (the others are na
 | use-lrucache | which files use LRUCache (none) and where it lives | F1 no other file uses it; F2 cache.py defines LRUCache | F1 cli.py:6-8, worker.py:2-3,5, jobq.py:2-3; F2 cache.py:6 | none |
 | use-utils | which files use parse_duration, chunked, slugify (none) and where they live | F1 no file uses the helpers; F2 utils.py defines the helpers | F1 cli.py:6-8, worker.py:2-3,5, settings.py:2-3; F2 utils.py:1,8,16,22 | none |
 | use-worker-imports | each import of worker.py (logging, time, load_settings) and what it is used for | F1 imports logging; F2 logging is used to log errors; F3 imports time; F4 time is used to sleep; F5 imports load_settings; F6 load_settings gives run_forever its default settings | F1 worker.py:2; F2 worker.py:7,37,43; F3 worker.py:3; F4 worker.py:27,52-53; F5 worker.py:5; F6 worker.py:50 | F2, F4, F6 |
-| exports-jobq | each export of jobq.py (Job, JobQueue, MAX_RETRIES, BACKOFF_SECONDS, backoff_for): its name and its job | F1 exports Job; F2 exports JobQueue; F3 exports MAX_RETRIES; F4 exports BACKOFF_SECONDS; F5 exports backoff_for; F6 Job holds name, payload, priority, attempts; F7 JobQueue has push, pop, fail and a dead list; F8 MAX_RETRIES is the retry limit; F9 BACKOFF_SECONDS are the waits; F10 backoff_for returns the wait; F11 the last backoff repeats | F1 jobq.py:15; F2 jobq.py:23; F3 jobq.py:5; F4 jobq.py:6; F5 jobq.py:9; F6 jobq.py:16-20; F7 jobq.py:25,27,29-30,33-34,39-40; F8 jobq.py:5,40,42; F9 jobq.py:6,10-12,45; F10 jobq.py:10-12; F11 jobq.py:10-11 | F6, F7, F8, F9, F10, F11 |
+| exports-jobq | each export of jobq.py (Job, JobQueue, MAX_RETRIES, BACKOFF_SECONDS, backoff_for): its name and its job | F1 exports Job; F2 exports JobQueue; F3 exports MAX_RETRIES; F4 exports BACKOFF_SECONDS; F5 exports backoff_for; F6 Job holds name, payload, priority, attempts; F7 JobQueue has push, pop, fail and a dead list; F8 MAX_RETRIES is the retry limit; F9 BACKOFF_SECONDS are the waits; F10 backoff_for returns the wait; F11 the last backoff repeats | F1 jobq.py:15; F2 jobq.py:23; F3 jobq.py:5; F4 jobq.py:6; F5 jobq.py:9; F6 jobq.py:16-20; F7 jobq.py:25,27,29-30,33-34,39-40; F8 jobq.py:5,40,42; F9 jobq.py:6,12; F10 jobq.py:10-12; F11 jobq.py:10-11 | F6, F7, F8, F9, F10, F11 |
 | exports-utils | each function of utils.py (parse_duration, chunked, slugify): its name and what it does, and the units and error of parse_duration | F1 exports parse_duration; F2 exports chunked; F3 exports slugify; F4 parse_duration converts a duration string to seconds; F5 chunked yields lists of at most size items; F6 slugify lowercases and joins with hyphens; F7 the accepted suffixes are s, m, h; F8 anything else raises ValueError | F1 utils.py:8; F2 utils.py:16; F3 utils.py:22; F4 utils.py:9-10,13; F5 utils.py:17-19; F6 utils.py:23-24; F7 utils.py:4-5,9; F8 utils.py:9,11-12 | F4, F5, F6, F7, F8 |
 | exports-cache | each method of cache.py (LRUCache.get, put, clear, __len__): its name and its job, and the ttl and capacity | F1 exports LRUCache; F2 has get; F3 has put; F4 has clear; F5 has __len__; F6 get returns the cached value and marks it used; F7 put stores a value and evicts when over capacity; F8 clear empties the cache; F9 len gives the number of entries; F10 an optional ttl makes entries expire; F11 the capacity limits how many entries it keeps | F1 cache.py:6; F2 cache.py:13; F3 cache.py:25; F4 cache.py:32; F5 cache.py:35; F6 cache.py:14,17,21-23; F7 cache.py:26-30; F8 cache.py:33; F9 cache.py:36; F10 cache.py:1,9,19-20; F11 cache.py:8,26,29-30 | F6, F7, F8, F9, F10, F11 |
 | exports-settings | the exports of settings.py (DEFAULTS, ENV_PREFIX, load_settings) and the prefix value | F1 exports DEFAULTS; F2 exports ENV_PREFIX; F3 exports load_settings; F4 the prefix is JOBQ_ | F1 settings.py:5; F2 settings.py:12; F3 settings.py:15; F4 settings.py:12 | none |

@@ -43,17 +43,8 @@ def reference(answer):
     return "\n".join(s["text"] for s in answer["reference"])
 
 
-CITATION = re.compile(r"((?:src|docs)/[\w./]+):(\d+)(?:-(\d+))?")
-QUOTED = re.compile(r" `[^`]*`")
+CITE = re.compile(r"\[([^\[\]]*)\]$")  # the trailing citation list of a fact line
 _LINES = {}
-
-
-def unquoted(text):
-    return QUOTED.sub("", text)
-
-
-def labels_of(answer):
-    return [fact[0] for fact in answer["required"]]
 
 
 def fixture_lines(name):
@@ -62,19 +53,37 @@ def fixture_lines(name):
     return _LINES[name]
 
 
+def labels_of(answer):
+    return [fact[0] for fact in answer["required"]]
+
+
 def stating(answer, k):
-    """Indexes into answer["reference"] of the sentences that state fact k."""
+    """Indexes into answer["reference"] of the fact lines that state fact k."""
     return [i for i, s in enumerate(answer["reference"]) if k in s["facts"]]
 
 
 def reply_with(answer, changes):
-    """The reference reply with the sentences in changes ({index: new text}) replaced; None drops one."""
+    """The reference reply with the fact lines in changes ({index: new text}) replaced; None drops one."""
     texts = [changes.get(i, s["text"]) for i, s in enumerate(answer["reference"])]
     return "\n".join(t for t in texts if t is not None)
 
 
+def cited(text, citation):
+    """The fact line text with its citation list replaced by citation."""
+    return CITE.sub("[" + citation + "]", text)
+
+
 def failed(result):
     return result["missing"] + result["missing_citation"] + result["unsupported"]
+
+
+def rules(result):
+    """{(rule, kind)} of the failures: which rule each failed line (or fact) broke."""
+    return {(f["rule"], f["kind"]) for f in result["failures"]}
+
+
+def answer_of(chore_id):
+    return next(a for a in jsonl("answers.jsonl") if a["id"] == chore_id)
 
 
 class DataTests(unittest.TestCase):
@@ -89,6 +98,9 @@ class DataTests(unittest.TestCase):
             answer = self.answers[chore["id"]]
             for k in range(len(answer["required"])):
                 yield chore["id"], answer, k
+
+    def check(self, reply, chore_id):
+        return summarize_check.check(reply, self.answers[chore_id], FIXTURES)
 
     def test_chores_and_answers_pair_up(self):
         ids = [c["id"] for c in self.chores]
@@ -129,6 +141,8 @@ class DataTests(unittest.TestCase):
                     self.assertTrue(text.strip() and text in fixture_lines(name)[int(n) - 1], "{} {}:{} {!r}".format(where, name, n, text))
 
     def test_patterns_compile_and_the_reference_reply_passes(self):
+        # Main's probe: the references pass, 24 of 24. Each reference line is a fact line (rule 1) and the reply holds nothing else.
+        passed = 0
         for chore in self.chores:
             answer = self.answers[chore["id"]]
             self.assertTrue(len(answer["required"]) >= 2 and answer["forbidden"], chore["id"])
@@ -138,23 +152,24 @@ class DataTests(unittest.TestCase):
             for pattern in answer["forbidden"]:
                 re.compile(pattern)
             for sentence in answer["reference"]:
-                self.assertEqual(len(CITATION.findall(sentence["text"])), 1, sentence["text"])  # one citation per sentence
-            result = summarize_check.check(reference(answer), answer, FIXTURES)
+                claim, cites, kind = summarize_check.parse_fact_line(sentence["text"])
+                self.assertEqual((kind, len(cites or [])), (None, 1), sentence["text"])  # one fact line, one citation
+                self.assertNotIn("`", sentence["text"])
+            result = self.check(reference(answer), chore["id"])
             self.assertTrue(result["pass"], "{}: {}".format(chore["id"], result))
-            self.assertEqual(result["unchecked"], 0, chore["id"])  # every citation is a quoted one or vouched for by a support
-            # the right numbers without the quotes pass as well: support, not the quote, is what ties a number to the fact
-            bare = summarize_check.check(unquoted(reference(answer)), answer, FIXTURES)
-            self.assertTrue(bare["pass"], "{}: {}".format(chore["id"], bare))
-            self.assertEqual(bare["unchecked"], 0, chore["id"])
-            empty = summarize_check.check("", answer, FIXTURES)
+            self.assertEqual((result["unchecked"], result["failures"], result["uncited"]), (0, [], []), chore["id"])
+            passed += result["pass"]
+            empty = self.check("", chore["id"])
             self.assertFalse(empty["pass"], chore["id"])
             self.assertEqual(len(empty["missing"]), len(answer["required"]), chore["id"])
+            self.assertEqual(rules(empty), {(4, "missing")}, chore["id"])  # nothing stated: rule 4, for every fact
+        self.assertEqual(passed, 24)
 
     def test_every_fact_is_needed_and_the_reference_is_complete(self):
-        # The reference reply is hand-written, one cited sentence or bullet per fact (reference[].facts says which facts it states).
-        # It passes; and with the sentences that state fact k removed the reply fails, with k among the failed facts: `missing`
-        # when nothing else states it, `unsupported` when another sentence names it (an export's name, in the sentence on what it
-        # does) but cites lines that are not the evidence of k. So each fact is needed and the reference leaves none out.
+        # The reference reply is hand-written, one fact line per fact (reference[].facts says which facts it states). It passes;
+        # and with the lines that state fact k removed the reply fails, with k among the failed facts: `missing` when nothing else
+        # states it, `unsupported` when another line names it (an export's name, in the line on what it does) but cites lines that
+        # are not the evidence of k. So each fact is needed and the reference leaves none out.
         for chore_id, answer, k in self.facts():
             labels = labels_of(answer)
             kept = [s for s in answer["reference"] if k not in s["facts"]]
@@ -165,74 +180,129 @@ class DataTests(unittest.TestCase):
             self.assertIn(labels[k], failed(result), where)
             self.assertEqual(result["missing"], [labels[n] for n in gone if labels[n] in result["missing"]], where)
             self.assertTrue(set(labels[n] for n in gone) <= set(failed(result)), where)
-            self.assertEqual((result["order"], result["forbidden_hit"], result["bad_citations"]), ([], [], []), where)
-            # nothing else fails but the facts only those sentences stated and the facts they were the evidence of
+            self.assertEqual((result["order"], result["forbidden_hit"], result["bad_citations"], result["uncited"]), ([], [], [], []), where)
+            # nothing else fails but the facts only those lines stated and the facts they were the evidence of
             self.assertEqual(sorted(set(failed(result)) - {labels[n] for n in gone} - {labels[k]}), [], where)
+            self.assertTrue(rules(result) <= {(4, "missing"), (3, "unsupported"), (3, "missing_citation")}, where)
 
-    def test_a_signature_alone_does_not_say_what_a_function_does(self):
-        # Round 5, finding 1: `NAME (file:SIGNATURE_LINE `signature`)` in place of the sentence on what NAME does names it and quotes
-        # its signature (the parameter names included): every behaviour fact must then be `missing`, however it is cited.
+    def test_names_and_signature_text_alone_fail_rule_5(self):
+        # Round 5 / rule 5: `NAME [file:SIGNATURE_LINE]`, the signature as written (parameter names included), or both, in place of
+        # the line on what NAME does: every behaviour fact must then be `missing`, with rule 5, however it is cited.
         count = 0
         for chore_id, answer, k in self.facts():
             behaviour = answer.get("behaviour", {}).get(str(k))
             if behaviour is None:
                 continue
             count += 1
-            name = behaviour["name"]
-            sig_file, sig_line = behaviour["sig"].rsplit(":", 1)
+            name, where_sig = behaviour["name"], behaviour["sig"]
+            sig_file, sig_line = where_sig.rsplit(":", 1)
             signature = fixture_lines(sig_file)[int(sig_line) - 1].strip()
-            for form in ("{name} ({file}:{line} `{sig}`)", "{name} ({file}:{line})", "{name}: `{sig}` ({file}:{line})", "`{sig}` ({file}:{line})"):
-                sentence = form.format(name=name, file=sig_file, line=sig_line, sig=signature)
-                where = "{} fact {} {}".format(chore_id, k, sentence)
-                changes = {i: sentence for i in stating(answer, k)}
-                result = summarize_check.check(reply_with(answer, changes), answer, FIXTURES)
-                self.assertFalse(result["pass"], where)
-                self.assertIn(labels_of(answer)[k], result["missing"], where)
-                self.assertEqual((result["bad_citations"], result["forbidden_hit"]), ([], []), where)
+            for form in ("- {name} [{at}]", "- `{sig}` [{at}]", "- {name}: `{sig}` [{at}]", "- {name}: {sig} [{at}]", "- {sig} [{at}]"):
+                line = form.format(name=name, at=where_sig, sig=signature)
+                text = "{} fact {} {}".format(chore_id, k, line)
+                result = summarize_check.check(reply_with(answer, {i: line for i in stating(answer, k)}), answer, FIXTURES)
+                self.assertFalse(result["pass"], text)
+                self.assertIn(labels_of(answer)[k], failed(result), text)  # not met by that line (met by no line, or only by one that cites other lines)
+                self.assertEqual((result["bad_citations"], result["forbidden_hit"], result["uncited"]), ([], [], []), text)
+                self.assertIn(line, result["identifier_only"], text)
+                self.assertIn((5, "identifier_only"), rules(result), text)  # the line is no claim: rule 5
         self.assertGreaterEqual(count, 60)
         for chore in self.chores:
             if chore["id"].startswith("exports-") and chore["id"] != "exports-settings":
                 self.assertTrue(self.answers[chore["id"]].get("behaviour"), chore["id"])  # an exports chore asks what each does
 
-    def test_the_reviewers_reproducers(self):
-        utils, cache, worker = self.answers["exports-utils"], self.answers["sum-cache"], self.answers["exports-worker"]
-        # F1: chunked's sentence replaced by its name and signature; the rest of the complete answer is unchanged
-        k = labels_of(utils).index(next(f[0] for f in utils["required"] if "chunked" in f[0] and f[0] != r"\bchunked\b"))
-        sentence = "chunked (src/utils.py:16 `def chunked(items, size):`)."
-        result = summarize_check.check(reply_with(utils, {i: sentence for i in stating(utils, k)}), utils, FIXTURES)
-        self.assertFalse(result["pass"])
-        self.assertEqual(result["missing"], [labels_of(utils)[k]])
-        # F2: a nearer heading of an unknown file, whatever its extension, sets the context
-        block = "\n### src/cache.py\n### nonexistent.xyz\n- LRUCache Line 6\n"
-        self.assertTrue(summarize_check.check(reference(cache), cache, FIXTURES)["pass"])
-        result = summarize_check.check(reference(cache) + block, cache, FIXTURES)
-        self.assertFalse(result["pass"])
-        self.assertEqual(result["bad_citations"], ["Line 6 (unknown_file)"])
-        # F3: the implementation line and the docstring are evidence of what a function does; the signature is not
-        cases = (("exports-worker", "echo returns", "src/worker.py:22 `return payload`", "src/worker.py:21"),
-                 ("exports-cache", "get returns", "src/cache.py:14 `Return the cached value", "src/cache.py:13"))
-        for chore_id, start, cited, signature in cases:
+    def test_a_behaviour_fact_is_met_by_words_and_not_by_names(self):
+        # Rule 5 from the other side: the reference claims of a behaviour fact are made of words, so they still meet it with every
+        # name removed from them (the checker removes them before it matches).
+        count = 0
+        for chore_id, answer, k in self.facts():
+            if str(k) not in answer.get("behaviour", {}):
+                continue
+            names = summarize_check.names_in_code(FIXTURES, answer["cite_files"])
+            for i in stating(answer, k):
+                claim = summarize_check.parse_fact_line(answer["reference"][i]["text"])[0]
+                self.assertTrue(any(re.search(a, summarize_check.without_names(claim, names), re.I) for a in answer["required"][k]),
+                                "{} fact {}: {}".format(chore_id, k, claim))
+                count += 1
+        self.assertGreaterEqual(count, 65)
+
+    def test_the_reviewers_reproducers_fail_for_their_rule(self):
+        # Every reproducer of reviews 2-5, as a reply, with the rule it must fail.
+        jobq, utils, cache, states = (self.answers[c] for c in ("exports-jobq", "exports-utils", "sum-cache", "steps-states"))
+        job = next(k for k, f in enumerate(jobq["required"]) if jobq["behaviour"].get(str(k), {}).get("name") == "Job")
+        chunked = next(k for k in range(len(utils["required"])) if utils["behaviour"].get(str(k), {}).get("name") == "chunked")
+        # F1: an identifier and its parameter names are not what the code does -- rule 5
+        result = summarize_check.check(reply_with(jobq, {i: "- Job(name, payload, priority=0) [src/jobq.py:15]" for i in stating(jobq, job)}),
+                                       jobq, FIXTURES)
+        self.assertIn(labels_of(jobq)[job], failed(result))
+        self.assertEqual(result["identifier_only"], ["- Job(name, payload, priority=0) [src/jobq.py:15]"])
+        self.assertIn((5, "identifier_only"), rules(result))
+        # F1: chunked's name and signature, as the fact line and as the round-5 prose (which is no fact line at all -- rule 4)
+        signature = "- chunked(items, size) [src/utils.py:16]"
+        prose = "chunked (src/utils.py:16 `def chunked(items, size):`)."
+        for text, expected in ((signature, (5, "identifier_only")), (prose, (4, "missing"))):
+            result = summarize_check.check(reply_with(utils, {i: text for i in stating(utils, chunked)}), utils, FIXTURES)
+            self.assertFalse(result["pass"], text)
+            self.assertIn(labels_of(utils)[chunked], failed(result), text)
+            self.assertIn(expected, rules(result), text)
+            self.assertEqual(result["identifier_only"], [signature] if text == signature else [], text)
+        # F1: the heading-spanning creation bullet: the heading says the file and the bullet says the claim, and neither is a fact line
+        jobqueue = self.answers["use-jobqueue"]
+        for text in ("### src/cli.py creates a JobQueue\n- Line 29", "### src/cli.py\n- creates a JobQueue (Line 29)",
+                     "**src/cli.py**\n- creates a JobQueue\n  - Line 29"):
+            result = summarize_check.check(reply_with(jobqueue, {0: text}), jobqueue, FIXTURES)
+            self.assertFalse(result["pass"], text)
+            self.assertEqual(result["missing"], [labels_of(jobqueue)[0]], text)
+            self.assertIn((4, "missing"), rules(result), text)
+            if "- " in text:
+                self.assertIn((2, "uncited"), rules(result), text)  # a "- " line without its own citation list
+        # F3: a heading of any file name is ignored (rule 2), whatever its extension; the lines under it are uncited bullets
+        for heading in ("### archive.7z", "### nonexistent.xyz", "### src/nonexistent.rs", "### src/cache.py.bak"):
+            result = summarize_check.check(reference(cache) + "\n" + heading + "\n- LRUCache Line 6\n", cache, FIXTURES)
+            self.assertFalse(result["pass"], heading)
+            self.assertEqual((result["bad_citations"], result["uncited"]), ([], ["- LRUCache Line 6"]), heading)
+            self.assertEqual(rules(result), {(2, "uncited")}, heading)
+        # F3: a fact line that names such a file itself is a bad citation (rule 3), and does not fall back to a file above it
+        for path in ("archive.7z", "nonexistent.xyz", "src/nonexistent.rs", "src/cache.py.bak", "docs/deploy.md"):
+            result = summarize_check.check("{}\n- this entry is an extra remark [{}:6]".format(reference(cache), path), cache, FIXTURES)
+            self.assertFalse(result["pass"], path)
+            self.assertEqual(result["bad_citations"], [path + ":6 (unknown_file)"], path)
+            self.assertEqual(rules(result), {(3, "unknown_file")}, path)
+        # F3: the implementation line and the docstring are evidence of what a function does; the signature is not -- rule 3
+        cases = (("exports-worker", "- echo returns", "src/worker.py:22", "src/worker.py:21"),
+                 ("exports-cache", "- get returns", "src/cache.py:14", "src/cache.py:13"))
+        for chore_id, start, at, signature_at in cases:
             answer = self.answers[chore_id]
             index = next(i for i, s in enumerate(answer["reference"]) if s["text"].startswith(start))
             text = answer["reference"][index]["text"]
-            self.assertIn(cited, text)
+            self.assertTrue(text.endswith("[" + at + "]"), text)
             self.assertTrue(summarize_check.check(reference(answer), answer, FIXTURES)["pass"], text)
-            moved = re.sub(r"src/\w+\.py:\d+(?: `[^`]*`)?", signature, text)
+            moved = cited(text, signature_at)
             result = summarize_check.check(reply_with(answer, {index: moved}), answer, FIXTURES)
             self.assertFalse(result["pass"], moved)
             self.assertEqual(len(result["unsupported"]), 1, moved)
+            self.assertEqual(rules(result), {(3, "unsupported")}, moved)
+        # the reversed one-liner: no fact line of its own for any fact but one -- rule 1 (and not a fact line without its "- ")
+        one = "dead, retrying, succeeded, running, pending"
+        for text, expected in (("- {} [docs/lifecycle.md:5-9]".format(one), (1, "shared_line")), ("{} (docs/lifecycle.md:5-9).".format(one), (4, "missing"))):
+            for words in (one, ", ".join(one.split(", ")[::-1])):
+                result = summarize_check.check(text.replace(one, words), states, FIXTURES)
+                self.assertFalse(result["pass"], text)
+                self.assertIn(expected, rules(result), text)
+                self.assertGreaterEqual(len(result["missing"]), 4, text)
 
     def test_citing_each_support_line_passes_and_every_line_outside_the_set_fails(self):
-        # For every fact and every sentence that states it: the same sentence citing each line of its support_lines (alone,
-        # unquoted) passes; citing any line outside the set, in the file the sentence cites, with the same width, fails as
-        # `unsupported` and as nothing else. Qwen's known failure is a plausible, in-range, wrong line number (12 of 15 in Main's smoke).
+        # For every fact and every line that states it: the same fact line citing each line of its support_lines (alone) passes;
+        # citing any line outside the set, in the file the line cites, with the same width, fails as `unsupported` (rule 3) and as
+        # nothing else. Qwen's known failure is a plausible, in-range, wrong line number (12 of 15 in Main's smoke).
         passed = shifted = 0
         for chore_id, answer, k in self.facts():
             labels = labels_of(answer)
             sets = summarize_check.support_sets(answer["support_lines"][k])
             for i in stating(answer, k):
-                text = unquoted(answer["reference"][i]["text"])
-                name, a, b = CITATION.search(text).groups()
+                text = answer["reference"][i]["text"]
+                name, a = CITE.search(text).group(1).split(",")[0].rsplit(":", 1)
+                a, _, b = a.partition("-")
                 width = int(b or a) - int(a) + 1
                 cases = [("{}:{}".format(n_name, n), True) for n_name, lines in sorted(sets.items()) for n in sorted(lines)]
                 size = len(fixture_lines(name))
@@ -240,7 +310,7 @@ class DataTests(unittest.TestCase):
                     if not set(range(first, first + width)) & sets.get(name, set()):
                         cases.append(("{}:{}".format(name, first) if width == 1 else "{}:{}-{}".format(name, first, first + width - 1), False))
                 for citation, ok in cases:
-                    result = summarize_check.check(reply_with(answer, {i: CITATION.sub(citation, text)}), answer, FIXTURES)
+                    result = summarize_check.check(reply_with(answer, {i: cited(text, citation)}), answer, FIXTURES)
                     where = "{} fact {} cites {}: {}".format(chore_id, k, citation, result)
                     self.assertEqual(result["pass"], ok, where)
                     if ok:
@@ -248,10 +318,34 @@ class DataTests(unittest.TestCase):
                     else:
                         shifted += 1
                         self.assertEqual(result["unsupported"], [labels[k]], where)
+                        self.assertEqual(rules(result), {(3, "unsupported")}, where)
                         self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"], result["forbidden_hit"]),
                                          ([], [], [], []), where)
         self.assertGreaterEqual(passed, 250)
         self.assertGreaterEqual(shifted, 144)  # round 4 tried 144 wrong windows; this tries every one
+
+    def test_every_line_shifted_passes_none(self):
+        # Main's probe: the reference with EVERY citation moved off the evidence (to the nearest line, in the same file and of the same
+        # width, that is outside the support of every fact the line states) passes in no chore, and every fact is `unsupported`.
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            lines = []
+            for s in answer["reference"]:
+                name, a = CITE.search(s["text"]).group(1).rsplit(":", 1)
+                first, _, last = a.partition("-")
+                width = int(last or first) - int(first) + 1
+                evidence = set()
+                for entry in answer["support_lines"]:  # outside the evidence of every fact, so no other fact is met by the line
+                    evidence |= summarize_check.support_sets(entry).get(name, set())
+                size = len(fixture_lines(name))
+                moved = next((n for d in range(1, size) for n in (int(first) - d, int(first) + d)
+                              if 1 <= n and n + width - 1 <= size and not set(range(n, n + width)) & evidence), None)
+                self.assertIsNotNone(moved, (chore["id"], s["text"]))
+                lines.append(cited(s["text"], "{}:{}".format(name, moved) + ("-{}".format(moved + width - 1) if width > 1 else "")))
+            result = self.check("\n".join(lines), chore["id"])
+            self.assertFalse(result["pass"], chore["id"])
+            self.assertEqual(result["unsupported"], labels_of(answer), chore["id"])
+            self.assertEqual(rules(result), {(3, "unsupported")}, chore["id"])
 
     def test_the_nearest_line_outside_the_set_fails(self):
         # The line just before and just after the set of each fact (when it exists), cited alone: the boundary of the set is exact.
@@ -265,28 +359,56 @@ class DataTests(unittest.TestCase):
                         continue
                     count += 1
                     for i in stating(answer, k):
-                        text = CITATION.sub("{}:{}".format(name, n), unquoted(answer["reference"][i]["text"]))
+                        text = cited(answer["reference"][i]["text"], "{}:{}".format(name, n))
                         result = summarize_check.check(reply_with(answer, {i: text}), answer, FIXTURES)
                         self.assertFalse(result["pass"], "{} fact {} cites {}:{}".format(chore_id, k, name, n))
                         self.assertEqual(result["unsupported"], [labels[k]], "{} fact {} cites {}:{}".format(chore_id, k, name, n))
         self.assertGreater(count, 100)
 
-    def test_a_heading_of_an_unknown_file_of_any_extension_makes_the_lines_under_it_bad(self):
-        # Round 5, finding 2, for every chore: a heading (or bullet) that names a file the chore did not allow sets the context
-        # whatever its extension, and never falls back to the allowed heading above it.
+    def test_a_fact_line_citing_a_file_that_is_not_the_chores_fails_rule_3(self):
+        # Main's probe, for every fact line of every chore: the same line with its file changed to a fixture file the chore did not
+        # name, or to one that does not exist, fails as unknown_file and nothing earlier in the reply supplies another.
+        every = sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.rglob("*") if p.is_file())
+        count = 0
         for chore in self.chores:
             answer = self.answers[chore["id"]]
-            allowed = answer["cite_files"][0]
-            fine = "{}\n### {}\n- Line 1".format(reference(answer), allowed)
-            self.assertEqual(summarize_check.check(fine, answer, FIXTURES)["bad_citations"], [], chore["id"])
-            for unknown in ("nonexistent.xyz", "notes.txt", "README.md", "config.json", "src/nonexistent", "docs/nothing", "Makefile.in"):
-                for form in ("### {allowed}\n### {unknown}\n- Line 1", "### {allowed}\n- {unknown}\n  - Line 1",
-                             "- {allowed}\n- {unknown}: Line 1"):
-                    reply = reference(answer) + "\n" + form.format(allowed=allowed, unknown=unknown)
-                    result = summarize_check.check(reply, answer, FIXTURES)
-                    where = "{} {!r}: {}".format(chore["id"], form.format(allowed=allowed, unknown=unknown), result)
+            others = [f for f in every if f not in answer["cite_files"]] + ["src/nonexistent.rs", "archive.7z"]
+            for i, s in enumerate(answer["reference"]):
+                for other in others:
+                    line = cited(s["text"], "{}:{}".format(other, CITE.search(s["text"]).group(1).rsplit(":", 1)[1]))
+                    result = summarize_check.check(reply_with(answer, {i: line}), answer, FIXTURES)
+                    where = "{}: {}".format(chore["id"], line)
                     self.assertFalse(result["pass"], where)
-                    self.assertEqual(result["bad_citations"], ["Line 1 (unknown_file)"], where)
+                    self.assertEqual(result["bad_citations"], [other + ":" + line.rsplit(":", 1)[1][:-1] + " (unknown_file)"], where)
+                    self.assertIn((3, "unknown_file"), rules(result), where)
+                    count += 1
+        self.assertGreater(count, 300)
+
+    def test_lines_that_are_not_fact_lines_count_for_nothing(self):
+        # Rule 2, for every chore: headings, bold lines, prose, blank lines, indented bullets and numbered or starred items, with
+        # citations and file names in them, are ignored: adding them changes nothing (the reference still passes, nothing is
+        # unchecked, nothing is bad); and a reply made only of them states nothing.
+        noise = ["# Summary", "", "### src/cache.py", "**src/jobq.py**", "Line 6 -- this is not a fact line (src/cache.py:6).",
+                 "  - indented bullet [src/cache.py:6]", "* starred bullet [src/cache.py:6]", "1. numbered [src/cache.py:6]",
+                 "-no space after the dash [src/cache.py:6]", "> quote [src/cache.py:6]", "The files hold it: src/cache.py:6, Lines 1-99.",
+                 "- Line 6", "### archive.7z", "Not in the files."]
+        for chore in self.chores:
+            answer = self.answers[chore["id"]]
+            ignorable = [n for n in noise if not n.startswith("- ")]
+            lines = [s["text"] for s in answer["reference"]]
+            spread = []
+            for n, line in enumerate(lines):
+                spread += [ignorable[n % len(ignorable)], line]
+            result = self.check("\n".join(ignorable + spread + ignorable), chore["id"])
+            self.assertTrue(result["pass"], "{}: {}".format(chore["id"], result))
+            self.assertEqual((result["unchecked"], result["failures"], result["bad_citations"], result["uncited"]), (0, [], [], []), chore["id"])
+            only = self.check("\n".join(ignorable), chore["id"])
+            self.assertEqual((only["bad_citations"], only["uncited"], only["unchecked"]), ([], [], 0), chore["id"])
+            self.assertEqual(len(only["missing"]), len(answer["required"]), chore["id"])
+            # the reference as a list of anything but "- " lines states nothing
+            for mark in ("* ", "1. ", "  - ", "", "-"):
+                other = "\n".join(mark + t[2:] if mark != "-" else "-" + t[2:] for t in lines)
+                self.assertEqual(len(self.check(other, chore["id"])["missing"]), len(answer["required"]), (chore["id"], mark))
 
     def test_a_reply_with_only_the_first_required_fact_fails(self):
         # Each item of a list chore (steps, states, exports, usages) is its own fact, so one item cannot satisfy the chore.
@@ -312,12 +434,7 @@ class DataTests(unittest.TestCase):
                 self.assertEqual(result["order"], expected, where)
                 self.assertFalse(result["pass"], where)
                 self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"]), ([], [], []), where)
-        # the reviewer's reversed reply, and the right order in one citation (a fact needs a citation, not a line of its own)
-        states = self.answers["steps-states"]
-        backwards = summarize_check.check("dead, retrying, succeeded, running, pending (docs/lifecycle.md:5-9).", states, FIXTURES)
-        self.assertEqual((backwards["pass"], backwards["order"], backwards["missing"]), (False, labels_of(states)[1:], []))
-        forwards = summarize_check.check("pending, running, succeeded, retrying, dead (docs/lifecycle.md:5-9).", states, FIXTURES)
-        self.assertTrue(forwards["pass"], forwards)
+                self.assertEqual({r for r, _ in rules(result)}, {None}, where)  # the order is no rule of the fact-line format
 
     def test_the_audit_table_covers_every_chore_and_fact(self):
         # tests/calibration/experiments.md: one row per chore, naming each of its required facts as F1..Fn and its support lines.
@@ -332,7 +449,7 @@ class DataTests(unittest.TestCase):
                 for name, specs in entry.items():
                     self.assertIn("{}:{}".format(Path(name).name, ",".join(specs)), rows[0], chore["id"])
             self.assertEqual(len(rows[0].split(" | ")), 5, chore["id"])
-        # F4 of the review: no row of a table has more or fewer cells than the row above it
+        # no row of a table has more or fewer cells than the row above it
         for table in re.findall(r"(?:^\|.*\n)+", text, re.M):
             widths = [len(re.findall(r"(?<!\\)\|", row)) for row in table.splitlines()]
             self.assertEqual(len(set(widths)), 1, table.splitlines()[0])
@@ -344,7 +461,8 @@ class CheckerTests(unittest.TestCase):
               "support_lines": [{"src/cache.py": ["1-36"]}, {"src/cache.py": ["1-36"]}]}
     TWO = dict(ANSWER, cite_files=["src/cache.py", "src/jobq.py"],
                support_lines=[{"src/cache.py": ["1-36"], "src/jobq.py": ["1-49"]}] * 2)
-    C = "(src/cache.py:6)"  # `class LRUCache:`
+    ONE = dict(ANSWER, required=[["alpha", "first"]], support_lines=[{"src/cache.py": ["1-36"]}])  # one fact: "alpha" on a line
+    C = "[src/cache.py:6]"  # `class LRUCache:`
 
     def check(self, reply, answer=None):
         return summarize_check.check(reply, answer or self.ANSWER, FIXTURES)
@@ -354,99 +472,137 @@ class CheckerTests(unittest.TestCase):
         return next(i for i, text in enumerate(lines, 1) if needle in text)
 
     def test_pass(self):
-        self.assertEqual(self.check("The first thing and beta {}.".format(self.C)),
+        self.assertEqual(self.check("# Answer\n- The first thing {c}\n\n- beta {c}\nThat is all.".format(c=self.C)),
                          {"pass": True, "missing": [], "missing_citation": [], "unsupported": [], "order": [], "forbidden_hit": [],
-                          "bad_citations": [], "unchecked": 0})
+                          "bad_citations": [], "unchecked": 0, "uncited": [], "identifier_only": [], "failures": []})
 
     def test_missing_fact(self):
-        result = self.check("Only beta {}.".format(self.C))
+        result = self.check("- Only beta {}".format(self.C))
         self.assertFalse(result["pass"])
         self.assertEqual((result["missing"], result["missing_citation"]), (["alpha"], []))
+        self.assertEqual(result["failures"], [{"rule": 4, "kind": "missing", "line": None, "text": "alpha"}])
 
     def test_forbidden_hit(self):
-        result = self.check("alpha beta, and gamma too {}".format(self.C))
+        result = self.check("- alpha {c}\n- beta, and gamma too {c}".format(c=self.C))
         self.assertFalse(result["pass"])
         self.assertEqual(result["forbidden_hit"], [r"\bgamma\b"])
         self.assertEqual((result["missing"], result["missing_citation"]), ([], []))
+        # a fabrication is looked for in the reply as written, an ignored line included
+        result = self.check("- alpha {c}\n- beta {c}\ngamma, said a heading".format(c=self.C))
+        self.assertEqual(result["forbidden_hit"], [r"\bgamma\b"])
 
     def test_citations(self):
         n = self.line("class LRUCache:")
         self.assertEqual(n, 6)
-        good = "alpha beta "
+        good = "- alpha "
         cases = [
-            ("path:line without quote", good + "src/cache.py:{}".format(n), True),
-            ("quote after matches", good + 'src/cache.py:{} `class LRUCache:`'.format(n), True),
-            ("quote after, separator", good + 'src/cache.py:{}: "class  LRUCache:"'.format(n), True),
-            ("quote before matches", good + '`class LRUCache:` (src/cache.py:{})'.format(n), True),
-            ("range holds quote", good + 'src/cache.py:{}-{} `class LRUCache:`'.format(n - 1, n + 1), True),
-            ("en dash range", good + "src/cache.py:{}\u2013{}".format(n - 1, n + 1), True),
-            ("absolute path to a cite file", good + "/tmp/x/src/cache.py:{}".format(n), True),
-            ("bare file name of a cite file", good + "cache.py:{}".format(n), True),
-            ("name closed before the colon", good + "`src/cache.py`:{}".format(n), True),
-            ("a clock time and a URL are not citations", good + "at 10:30 on http://localhost:8080 {}".format(self.C), True),
-            ("quote not on that line", good + 'src/cache.py:{} `def put(self, key, value):`'.format(n), False),
-            ("quote before not on that line", good + '`def put(self, key, value):` (src/cache.py:{})'.format(n), False),
-            ("line past the end", good + "src/cache.py:9999", False),
-            ("a range of 5 lines", good + "src/cache.py:{}-{}".format(n - 4, n), True),
-            ("a range of 6 lines", good + "src/cache.py:{}-{}".format(n - 5, n), False),
-            ("a whole file", good + "src/cache.py:1-36", False),
-            ("a 6-line range holding the quote", good + 'src/cache.py:1-6 `class LRUCache:`', False),
-            ("line zero", good + "src/cache.py:0", False),
-            ("range past the end", good + "src/cache.py:{}-9999".format(n), False),
-            ("file not in cite_files", good + "src/jobq.py:3", False),
-            ("file does not exist", good + "src/nothing.py:3", False),
-            # any extension or none: a fabricated file is as bad as a fabricated line
-            ("unlisted extension, no such file", good + "src/nonexistent.rs:999", False),
-            ("known file type outside cite_files", good + "docs/deploy.md:3", False),
-            ("no extension", good + "Makefile:3", False),
-            ("bare name of no cite file", good + "worker.py:31", False),
-            ("bare name, no extension", good + "nothing:3", False),
+            ("path:line", good + "[src/cache.py:{}]".format(n), None),
+            ("a range", good + "[src/cache.py:{}-{}]".format(n - 1, n + 1), None),
+            ("two citations in the list", good + "[src/cache.py:{}, src/cache.py:{}]".format(n, n + 1), None),
+            ("a space after the comma is optional", good + "[src/cache.py:{},src/cache.py:{}]".format(n, n + 1), None),
+            ("trailing spaces", good + "[src/cache.py:{}]   ".format(n), None),
+            ("a bracket in the claim that is no citation list", "- alpha [note] and more [src/cache.py:{}]".format(n), None),
+            ("a range of 5 lines", good + "[src/cache.py:{}-{}]".format(n - 4, n), None),
+            ("a range of 6 lines", good + "[src/cache.py:{}-{}]".format(n - 5, n), "range_too_wide"),
+            ("a whole file", good + "[src/cache.py:1-36]", "range_too_wide"),
+            ("line zero", good + "[src/cache.py:0]", "range"),
+            ("line past the end", good + "[src/cache.py:9999]", "range"),
+            ("range past the end", good + "[src/cache.py:{}-9999]".format(n), "range"),
+            ("a reversed range", good + "[src/cache.py:9-6]", "range"),
+            ("an absolute path to a cite file", good + "[/tmp/x/src/cache.py:{}]".format(n), "unknown_file"),
+            ("the bare name of a cite file", good + "[cache.py:{}]".format(n), "unknown_file"),
+            ("a dot-slash path", good + "[./src/cache.py:{}]".format(n), "unknown_file"),
+            ("file not in cite_files", good + "[src/jobq.py:3]", "unknown_file"),
+            ("file does not exist", good + "[src/nothing.py:3]", "unknown_file"),
+            ("unlisted extension, no such file", good + "[src/nonexistent.rs:999]", "unknown_file"),
+            ("known file type outside cite_files", good + "[docs/deploy.md:3]", "unknown_file"),
+            ("no extension", good + "[Makefile:3]", "unknown_file"),
+            ("a backup of the file", good + "[src/cache.py.bak:3]", "unknown_file"),
+            ("a longer name that ends the same", good + "[my_src/cache.py:3]", "unknown_file"),
+            # not a citation list: the line is uncited (rule 2), whatever else it holds
+            ("an en dash range", good + "[src/cache.py:{}–{}]".format(n - 1, n + 1), "uncited"),
+            ("a quote after the list", good + "[src/cache.py:{}] `class LRUCache:`".format(n), "uncited"),
+            ("parentheses", good + "(src/cache.py:{})".format(n), "uncited"),
+            ("no file", good + "[line {}]".format(n), "uncited"),
+            ("an empty list", good + "[]", "uncited"),
+            ("no colon", good + "[src/cache.py {}]".format(n), "uncited"),
+            ("one good citation and one that is not", good + "[src/cache.py:{}, line 7]".format(n), "uncited"),
+            ("an unclosed list", good + "[src/cache.py:{}".format(n), "uncited"),
         ]
-        for name, reply, ok in cases:
-            result = self.check(reply)
-            self.assertEqual(result["pass"], ok, "{}: {}".format(name, result))
-            self.assertEqual(bool(result["bad_citations"]), not ok, "{}: {}".format(name, result))
-        wide = self.check(good + "src/cache.py:1-6")
+        rule = {"uncited": 2, None: None}
+        for name, reply, kind in cases:
+            result = self.check(reply, self.ONE)
+            self.assertEqual(result["pass"], kind is None, "{}: {}".format(name, result))
+            self.assertEqual(bool(result["bad_citations"]), kind not in (None, "uncited"), "{}: {}".format(name, result))
+            self.assertEqual(bool(result["uncited"]), kind == "uncited", "{}: {}".format(name, result))
+            if kind:
+                self.assertIn((rule.get(kind, 3), kind), rules(result), "{}: {}".format(name, result))
+        wide = self.check(good + "[src/cache.py:1-6]", self.ONE)
         self.assertEqual(wide["bad_citations"], ["src/cache.py:1-6 (range_too_wide)"])
-        self.assertEqual(self.check("alpha beta Lines 1-6 of cache.py")["bad_citations"], ["src/cache.py: Lines 1-6 (range_too_wide)"])
 
-    def test_a_fact_needs_a_citation_on_its_line_or_bullet(self):
+    def test_rule_1_one_fact_per_line_with_one_citation_list(self):
         c = self.C
-        cases = [
-            ("no citation", "alpha and beta", ["alpha", "beta"]),
-            ("one line, one citation", "alpha and beta {}".format(c), []),
-            ("another line", "alpha {}\nbeta".format(c), ["beta"]),
-            ("a blank line ends the scope", "alpha\n\nbeta {}".format(c), ["alpha"]),
-            ("bullets", "- alpha {}\n- beta".format(c), ["beta"]),
-            ("a wrapped bullet is one bullet", "- alpha\n  beta {}".format(c), []),
-            ("a lazy continuation line", "- alpha\nbeta {}".format(c), []),
-            ("a numbered item", "1. alpha {}\n2. beta {}".format(c, c), []),
-            ("a sub-bullet is its own bullet", "- alpha {}\n  - beta".format(c), ["beta"]),
-            ("a heading is not a bullet", "### alpha\n- beta {}".format(c), ["alpha"]),
-            ("a bad citation does not support", "alpha beta src/cache.py:9999", ["alpha", "beta"]),
-        ]
-        for name, reply, expected in cases:
-            result = self.check(reply)
-            self.assertEqual(result["missing_citation"], expected, "{}: {}".format(name, result))
-            self.assertEqual(result["missing"], [], name)
-            self.assertEqual(result["pass"], not expected, name)
+        two = self.check("- alpha {c} and beta {c}".format(c=c))
+        self.assertFalse(two["pass"])
+        self.assertEqual(rules(two), {(1, "two_citation_lists")} | {(4, "missing")})
+        self.assertEqual(two["uncited"], ["- alpha {c} and beta {c}".format(c=c)])
+        # one line meets one fact: the other fact it names is `missing` under rule 1
+        both = self.check("- alpha and beta {}".format(c))
+        self.assertEqual((both["pass"], both["missing"], rules(both)), (False, ["beta"], {(1, "shared_line")}))
+        self.assertTrue(self.check("- alpha {c}\n- beta {c}".format(c=c))["pass"])
+        # a line that fits both facts is not wasted when another line fits only one of them
+        answer = dict(self.ANSWER, required=[["alpha"], ["beta"]])
+        self.assertTrue(self.check("- alpha and beta {c}\n- alpha {c}".format(c=c), answer)["pass"])
+        self.assertTrue(self.check("- alpha {c}\n- alpha and beta {c}".format(c=c), answer)["pass"])
+        self.assertFalse(self.check("- alpha and beta {c}\n- again {c}".format(c=c), answer)["pass"])
 
-    def test_support_ties_a_citation_to_the_fact(self):
-        # support_lines: a citation must overlap the set of lines that are evidence of the fact; a quote alone, or a number in range,
-        # is not enough.
+    def test_rule_2_other_lines_are_ignored_and_an_uncited_bullet_fails(self):
+        c = self.C
+        ignored = [("a sentence", "alpha and beta {}".format(c)), ("a heading", "### alpha beta {}".format(c)),
+                   ("a bold line", "**alpha beta** {}".format(c)), ("a starred bullet", "* alpha beta {}".format(c)),
+                   ("a numbered item", "1. alpha beta {}".format(c)), ("an indented bullet", "  - alpha beta {}".format(c)),
+                   ("no space", "-alpha beta {}".format(c)), ("a tab", "-\talpha beta {}".format(c)),
+                   ("a quote", "> alpha beta {}".format(c))]
+        for name, reply in ignored:
+            result = self.check(reply)
+            self.assertEqual((result["pass"], result["missing"], result["uncited"], result["bad_citations"]),
+                             (False, ["alpha", "beta"], [], []), name)
+            self.assertEqual((rules(result), result["unchecked"]), ({(4, "missing")}, 0), name)  # no claim, no citation, nothing to check
+        # the neighbours supply nothing, in either direction
+        cases = [("heading above", "### src/cache.py\n- alpha beta", ["- alpha beta"]),
+                 ("the line above", "- alpha {}\n- beta".format(c), ["- beta"]),
+                 ("the line below", "- alpha\n- beta {}".format(c), ["- alpha"]),
+                 ("a wrapped bullet", "- alpha\n  beta {}".format(c), ["- alpha"]),
+                 ("a lazy continuation", "- alpha\nbeta {}".format(c), ["- alpha"]),
+                 ("a citation in running text", "- alpha beta\nsee src/cache.py:6", ["- alpha beta"]),
+                 ("a path with no line", "- alpha beta [src/cache.py]", ["- alpha beta [src/cache.py]"]),
+                 ("a Line N", "- alpha beta (Line 6)", ["- alpha beta (Line 6)"]),
+                 ("brackets with no path", "- alpha beta [6]", ["- alpha beta [6]"])]
+        for name, reply, uncited in cases:
+            result = self.check(reply)
+            self.assertEqual(result["uncited"], uncited, name)
+            self.assertFalse(result["pass"], name)
+            self.assertIn((2, "uncited"), rules(result), name)
+        # one uncited bullet fails a reply whose facts are all stated and cited: no partial credit
+        reply = "- alpha {c}\n- beta {c}".format(c=c)
+        self.assertTrue(self.check(reply)["pass"])
+        result = self.check(reply + "\n- an aside with no citation")
+        self.assertEqual((result["pass"], result["missing"], result["uncited"]), (False, [], ["- an aside with no citation"]))
+        self.assertEqual(result["failures"], [{"rule": 2, "kind": "uncited", "line": 3, "text": "- an aside with no citation"}])
+
+    def test_rule_3_a_citation_must_cover_a_support_line_of_its_own_fact_line(self):
+        # support_lines: the citations of a fact line must overlap the set of lines that are evidence of the fact it states.
         put, get = self.line("def put(self, key, value):"), self.line("def get(self, key, default=None):")
         answer = dict(self.ANSWER, support_lines=[{"src/cache.py": ["6"]}, {"src/cache.py": [str(put)]}])
-        both = "- alpha (src/cache.py:{c})\n- beta (src/cache.py:{p})"
+        both = "- alpha [src/cache.py:{c}]\n- beta [src/cache.py:{p}]"
         cases = [
-            ("both right, no quotes", both.format(c=6, p=put), [], 0),
-            ("both right, quoted", "- alpha (src/cache.py:6 `class LRUCache:`)\n- beta (src/cache.py:{} `def put(self, key, value):`)".format(put), [], 0),
+            ("both right", both.format(c=6, p=put), [], 0),
             ("one number moved in range", both.format(c=6, p=get), ["beta"], 1),
             ("both moved in range", both.format(c=7, p=get), ["alpha", "beta"], 2),
-            ("moved, and the quote is right for the moved line", "- alpha (src/cache.py:6)\n- beta (src/cache.py:{} `def get(self, key, default=None):`)".format(get), ["beta"], 0),
-            ("a range that holds the right line", "- alpha (src/cache.py:6)\n- beta (src/cache.py:{}-{})".format(put - 2, put + 2), [], 0),
-            ("a range that stops short of it", "- alpha (src/cache.py:6)\n- beta (src/cache.py:{}-{})".format(put - 4, put - 1), ["beta"], 1),
-            ("one of two citations on the line is enough", "- alpha beta (src/cache.py:6, src/cache.py:{})".format(put), [], 0),
-            ("the wrong file does not support", "alpha beta (src/jobq.py:3)", ["alpha", "beta"], 1),
+            ("a range that holds the right line", "- alpha [src/cache.py:6]\n- beta [src/cache.py:{}-{}]".format(put - 2, put + 2), [], 0),
+            ("a range that stops short of it", "- alpha [src/cache.py:6]\n- beta [src/cache.py:{}-{}]".format(put - 4, put - 1), ["beta"], 1),
+            ("one of two citations on the line is enough", "- alpha [src/cache.py:6, src/cache.py:{p}]\n- beta [src/cache.py:6, src/cache.py:{p}]".format(p=put), [], 2),
+            ("the wrong file does not support", "- alpha [src/jobq.py:3]\n- beta [src/jobq.py:3]", ["alpha", "beta"], 2),
         ]
         for name, reply, unsupported, unchecked in cases:
             result = self.check(reply, dict(answer, cite_files=["src/cache.py", "src/jobq.py"]) if "jobq" in reply else answer)
@@ -454,121 +610,122 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"]), ([], [], []), name)
             self.assertEqual(result["unchecked"], unchecked, "{}: {}".format(name, result))
             self.assertEqual(result["pass"], not unsupported, name)
-        # unsupported is not missing_citation: no good citation at all stays missing_citation
-        self.assertEqual(self.check("alpha and beta", answer)["unsupported"], [])
-        self.assertEqual(self.check("alpha and beta", answer)["missing_citation"], ["alpha", "beta"])
+            self.assertEqual(rules(result), {(3, "unsupported")} if unsupported else set(), name)
+        # the support of a fact is for that fact only: alpha's line does not vouch for beta
+        swapped = self.check("- alpha [src/cache.py:{}]\n- beta [src/cache.py:6]".format(put), answer)
+        self.assertEqual(swapped["unsupported"], ["alpha", "beta"])
+        # unsupported is not missing_citation: a fact line with no good citation at all is that
+        bad = self.check("- alpha [src/cache.py:9999]\n- beta [src/cache.py:{}]".format(put), answer)
+        self.assertEqual((bad["missing_citation"], bad["unsupported"], bad["bad_citations"]), (["alpha"], [], ["src/cache.py:9999 (range)"]))
+        self.assertEqual(rules(bad), {(3, "range"), (3, "missing_citation")})
         with self.assertRaises(ValueError):
-            self.check("alpha beta", dict(answer, support_lines=[{"src/cache.py": ["6"]}]))  # one entry for two facts
-        for bad in ("x", "", "14-", "-3", "20-14", "1,2", "0x3"):
-            with self.assertRaises(ValueError, msg=bad):
-                self.check("alpha beta", dict(answer, support_lines=[{"src/cache.py": [bad]}, {"src/cache.py": ["6"]}]))
+            self.check("- alpha {}".format(self.C), dict(answer, support_lines=[{"src/cache.py": ["6"]}]))  # one entry for two facts
+        for spec in ("x", "", "14-", "-3", "20-14", "1,2", "0x3"):
+            with self.assertRaises(ValueError, msg=spec):
+                self.check("- alpha {}".format(self.C), dict(answer, support_lines=[{"src/cache.py": [spec]}, {"src/cache.py": ["6"]}]))
         self.assertEqual(summarize_check.support_sets({"src/cache.py": ["6", "20-22", "21"], "a": []}),
                          {"src/cache.py": {6, 20, 21, 22}, "a": set()})
 
     def test_every_citation_is_checked_and_the_unvouched_are_counted(self):
-        # A quoted citation is checked by its quote. An unquoted one counts only through a fact's support; one on a line with no fact
-        # (or matching no support there) is `unchecked`: counted, not a failure.
-        answer = dict(self.ANSWER, support_lines=[{"src/cache.py": ["6"]}, {"src/cache.py": ["6"]}])
+        # A good citation counts through the support of a fact the line states; one on a line that states no fact, or that matches no
+        # support there, is `unchecked`: counted, not a failure. A bad citation is bad, not unchecked.
+        answer = dict(self.ONE, support_lines=[{"src/cache.py": ["6"]}])
         cases = [
-            ("a cited fact line only", "alpha beta (src/cache.py:6)", 0),
-            ("an unquoted citation on a line with no fact", "alpha beta (src/cache.py:6)\nSee also src/cache.py:20.", 1),
-            ("the same, quoted", 'alpha beta (src/cache.py:6)\nSee also src/cache.py:20 `del self._items[key]`.', 0),
-            ("an unquoted miss beside a vouching citation", "alpha beta (src/cache.py:6, src/cache.py:20)", 1),
-            ("two on a line with no fact", "alpha beta (src/cache.py:6)\nsrc/cache.py:20 and src/cache.py:21", 2),
-            ("a bad citation is bad, not unchecked", "alpha beta (src/cache.py:6)\nsrc/cache.py:999", 0),
+            ("a fact line only", "- alpha [src/cache.py:6]", 0, True),
+            ("a citation on a line that states no fact", "- alpha [src/cache.py:6]\n- see also [src/cache.py:20]", 1, True),
+            ("a miss beside a vouching citation", "- alpha [src/cache.py:6, src/cache.py:20]", 1, True),
+            ("two on a line that states no fact", "- alpha [src/cache.py:6]\n- aside [src/cache.py:20, src/cache.py:21]", 2, True),
+            ("a bad citation is bad, not unchecked", "- alpha [src/cache.py:6]\n- aside [src/cache.py:999]", 0, False),
+            ("a line that is not a fact line has no citation to count", "- alpha [src/cache.py:6]\nsee src/cache.py:20", 0, True),
         ]
-        for name, reply, unchecked in cases:
+        for name, reply, unchecked, ok in cases:
             result = self.check(reply, answer)
-            self.assertEqual(result["unchecked"], unchecked, "{}: {}".format(name, result))
-            self.assertEqual(result["pass"], name != "a bad citation is bad, not unchecked", "{}: {}".format(name, result))
+            self.assertEqual((result["unchecked"], result["pass"]), (unchecked, ok), "{}: {}".format(name, result))
 
-    def test_line_n_under_a_file_heading_or_bullet(self):
+    def test_rule_4_a_fact_is_met_by_one_line_that_also_supports_it(self):
         put = self.line("def put(self, key, value):")
-        cases = [
-            ("heading", "### `src/cache.py`\n- **Line 6** \u2014 alpha\n- Lines {}-{}: beta".format(put, put + 1), True),
-            ("heading, bare name, lower case", "## cache.py\n- alpha (line 6)\n- beta (lines 13-14)", True),
-            ("the bullet above names the file", "- src/cache.py\n  - Line 6 \u2014 alpha beta", True),
-            ("the same line names the file", "alpha beta: see src/cache.py, line 6", True),
-            ("quote after matches", "### src/cache.py\n- Line 6 `class LRUCache:` alpha beta", True),
-            ("quote after is not on that line", "### src/cache.py\n- Line 6 `def put(self, key, value):` alpha beta", False),
-            ("line past the end", "### src/cache.py\n- Line 9999 \u2014 alpha beta", False),
-            ("no file named above", "- Line 6 \u2014 alpha beta", False),
-            ("a heading names a file outside cite_files", "### src/jobq.py\n- Line 3 \u2014 alpha beta", False),
-            ("the nearest file heading is not a cited file", "### src/cache.py\n### src/jobq.py\n- Line 6 \u2014 alpha beta", False),
-            ("a plain paragraph is not a heading", "src/cache.py\n\n- Line 6 \u2014 alpha beta", False),
-        ]
-        for name, reply, ok in cases:
-            result = self.check(reply)
-            self.assertEqual((result["pass"], bool(result["bad_citations"])), (ok, not ok), "{}: {}".format(name, result))
-            self.assertEqual(result["missing"], [], name)
-        two = self.check("### src/cache.py and src/jobq.py\n- Line 6 \u2014 alpha beta", self.TWO)
-        self.assertEqual(two["bad_citations"], ["Line 6 (ambiguous_context)"])
-        self.assertFalse(two["pass"])
-        under = self.check("### src/jobq.py\n- Line 3 \u2014 alpha beta\n### src/cache.py\n- Line 6 \u2014 alpha beta", self.TWO)
-        self.assertTrue(under["pass"], under)
+        answer = dict(self.ANSWER, support_lines=[{"src/cache.py": ["6"]}, {"src/cache.py": [str(put)]}])
+        # the claim on one line and the support on another do not add up: each line must do both
+        split = self.check("- alpha [src/cache.py:{p}]\n- beta [src/cache.py:6]".format(p=put), answer)
+        self.assertEqual((split["pass"], split["unsupported"]), (False, ["alpha", "beta"]))
+        # a heading or an earlier line that states the claim does not carry it to a line that only cites
+        head = self.check("### alpha\n- beta [src/cache.py:{}]\n- [src/cache.py:6]".format(put), answer)
+        self.assertEqual((head["pass"], head["missing"]), (False, ["alpha"]))
+        # the right claim on a line with a wrong citation is not rescued by a second line with the right citation but another claim
+        rescue = self.check("- alpha [src/cache.py:7]\n- beta and gamma [src/cache.py:{}]\n- delta [src/cache.py:6]".format(put), answer)
+        self.assertEqual((rescue["pass"], rescue["unsupported"]), (False, ["alpha"]))
+        # both on their own lines, and in either order, pass
+        self.assertTrue(self.check("- alpha [src/cache.py:6]\n- beta [src/cache.py:{}]".format(put), answer)["pass"])
+        self.assertTrue(self.check("- beta [src/cache.py:{}]\n- alpha [src/cache.py:6]".format(put), answer)["pass"])
+        # a claim cannot cross lines
+        cross = self.check("- alp\n- ha beta [src/cache.py:6]", answer)
+        self.assertEqual(cross["missing"], ["alpha"])
 
-    def test_line_n_context_must_be_one_allowed_file_named_whole(self):
-        # The nearest heading or bullet that names any file-like token sets the file; it must name exactly one, whole (a path
-        # or a bare name, not a prefix of a longer name), and it must be a cite_files entry. The first three are the reviewer's.
-        ambiguous, not_allowed, none = "Line 6 (ambiguous_context)", "Line 6 (unknown_file)", "Line 6 (no_context)"
+    def test_rule_5_a_name_and_a_signature_are_not_a_behaviour(self):
+        answer = dict(self.ANSWER, required=[[r"\bholds?\b"], [r"\bbeta\b"]], behaviour={"0": {"name": "LRUCache", "sig": "src/cache.py:6"}})
         cases = [
-            ("a backup of the file is not the file", "### src/cache.py.bak\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a nearer heading of a file that is not there", "### src/cache.py\n### src/nonexistent.zig\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("an allowed and a disallowed file", "### src/cache.py and src/nonexistent.rs\n- alpha beta Line 6", self.ANSWER, [ambiguous]),
-            ("two allowed files", "### src/cache.py and src/jobq.py\n- alpha beta Line 6", self.TWO, [ambiguous]),
-            ("a bare backup name", "### cache.py.bak\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a longer name that ends the same", "### my_cache.py\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a name with another extension", "### src/cache.pyc\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a path of any extension", "### src/cache.xyz\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a nearer bullet of a file that is not there", "### src/cache.py\n- src/nonexistent.zig\n  - alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a nearer bullet of another cited file", "### src/cache.py\n- src/jobq.py\n  - alpha beta Line 6", self.TWO, []),  # jobq.py has 6 lines
-            ("no file anywhere above", "- alpha beta Line 6", self.ANSWER, [none]),
-            ("e.g. and i.e. are not file names", "### Notes, e.g. or i.e. only\n- alpha beta Line 6", self.ANSWER, [none]),
-            ("a call is not a file name", "### Calls queue.pop(now) and slugify(text)\n- alpha beta Line 6", self.ANSWER, [none]),
-            ("a version is not a file name", "### Python 3.12 and v1.2\n- alpha beta Line 6", self.ANSWER, [none]),
-            # the price of "any extension": a dotted identifier in a heading reads as a file, so its lines are bad, not guessed at
-            ("a dotted identifier in a heading is read as a file", "### Notes on queue.dead\n- alpha beta Line 6", self.ANSWER, [not_allowed]),
-            ("a dotted identifier beside the file", "### LRUCache.get in src/cache.py\n- alpha beta Line 6", self.ANSWER, [ambiguous]),
-            ("a dotted identifier in a code span with a space", "### `LRUCache.get(key)` in src/cache.py\n- alpha beta Line 6", self.ANSWER, []),
-            ("the same file twice", "### src/cache.py (cache.py)\n- alpha beta Line 6", self.ANSWER, []),
-            ("an absolute path to the file", "### /tmp/x/src/cache.py\n- alpha beta Line 6", self.ANSWER, []),
-            ("a dotted name in the quoted code", "### src/cache.py\n- alpha beta Line 30 `self._items.popitem(last=False)`", self.ANSWER, []),
-            ("a skipped heading with no file", "### src/cache.py\n### The code\n- alpha beta Line 6", self.ANSWER, []),
+            ("the words say it", "- LRUCache holds items [src/cache.py:6]", True),
+            ("the name alone", "- LRUCache [src/cache.py:6]", False),
+            ("the signature in backticks", "- `class LRUCache:` [src/cache.py:6]", False),
+            ("the signature as written", "- class LRUCache: [src/cache.py:6]", False),
+            ("the name and the signature", "- LRUCache `class LRUCache:` [src/cache.py:6]", False),
+            ("the file and the name", "- src/cache.py LRUCache [src/cache.py:6]", False),
+            ("a path:line in the claim", "- LRUCache src/cache.py:6 [src/cache.py:6]", False),
+            ("the verb in backticks", "- LRUCache `holds` [src/cache.py:6]", False),
+            ("a name that is a verb in the code", "- LRUCache(self, capacity, ttl=None) [src/cache.py:6]", False),
         ]
-        for name, reply, answer, bad in cases:
-            result = self.check(reply, answer)
-            self.assertEqual(result["bad_citations"], bad, "{}: {}".format(name, result))
-            self.assertEqual(result["pass"], not bad, "{}: {}".format(name, result))
-
-    def test_citations_are_removed_before_a_fact_is_matched(self):
-        # Round 5, finding 1: a citation (its numbers, the quote beside it, the brackets it leaves empty) never satisfies a fact.
-        # A name plus a quoted signature has to be backed by words that say the fact.
-        answer = dict(self.ANSWER, required=[[r"\bLRUCache\b[^\n]*\bclass\b"], [r"\bbeta\b"]])
-        cases = [
-            ("the words say it", "LRUCache is a class and beta (src/cache.py:6)", True),
-            ("only the quote says it", "LRUCache and beta (src/cache.py:6 `class LRUCache:`)", False),
-            ("the quote before the citation", "LRUCache and beta: `class LRUCache:` (src/cache.py:6)", False),
-            ("a Line N reference with its quote", "### src/cache.py\n- LRUCache Line 6 `class LRUCache:`\n- beta Line 6", False),
-            ("the same, with words", "### src/cache.py\n- LRUCache is a class, Line 6 `class LRUCache:`\n- beta Line 6", True),
-            ("a word glued by the citation is not made", "LRUCache(src/cache.py:6) class and beta (src/cache.py:6)", True),
-        ]
-        for name, reply, ok in cases:
-            result = self.check(reply, answer)
+        for name, fact_line, ok in cases:
+            result = self.check(fact_line + "\n- beta {}".format(self.C), answer)
             self.assertEqual(result["pass"], ok, "{}: {}".format(name, result))
-            self.assertEqual(result["missing"], [] if ok else [answer["required"][0][0]], "{}: {}".format(name, result))
-        # the file name is not removed from running text (it can be what the fact says); inside brackets it goes with the citation
-        named = dict(self.ANSWER, required=[[r"cache\.py"], [r"\bbeta\b"]])
-        self.assertTrue(self.check("cache.py:6 holds it and beta (src/cache.py:6)", named)["pass"])
-        self.assertEqual(self.check("it holds beta (src/cache.py:6)", named)["missing"], [r"cache\.py"])
-        # a forbidden pattern is looked for in the reply as written and in the text left
-        forbidden = dict(self.ANSWER, forbidden=[r"cache\.py:6\b"])
-        self.assertEqual(self.check("alpha beta (src/cache.py:6)", forbidden)["forbidden_hit"], [r"cache\.py:6\b"])
+            self.assertEqual(result["missing"], [] if ok else [r"\bholds?\b"], name)
+            self.assertEqual(result["identifier_only"], [] if ok else [fact_line], name)
+            self.assertEqual(rules(result), set() if ok else {(4, "missing"), (5, "identifier_only")}, "{}: {}".format(name, result))
+        # a fact that is not a behaviour keeps its regex on the whole claim: a name can be what it says
+        plain = dict(answer, required=[[r"\bLRUCache\b"], [r"\bbeta\b"]], behaviour={})
+        self.assertTrue(self.check("- LRUCache [src/cache.py:6]\n- beta {}".format(self.C), plain)["pass"])
+        # a line of names that a fact needs is not flagged: it is that fact (and one with words is preferred to it)
+        both = self.check("- LRUCache [src/cache.py:6]\n- LRUCache [src/cache.py:6]\n- beta {}".format(self.C), plain)
+        self.assertEqual((both["pass"], both["identifier_only"]), (False, ["- LRUCache [src/cache.py:6]"]))
+        # a fact line of words that do not say the fact is rule 4 only
+        words = self.check("- LRUCache is a thing [src/cache.py:6]\n- beta {}".format(self.C), answer)
+        self.assertEqual(rules(words), {(4, "missing")})
 
-    def test_mains_wrong_line_reproducer_and_the_right_numbers_without_quotes(self):
-        # Main (round 4): use-jobqueue's own reference with the quotes removed and each number changed to a wrong one in range
-        # passed with no bad citation, because an unquoted citation was only checked to be in range.
-        answer = next(a for a in jsonl("answers.jsonl") if a["id"] == "use-jobqueue")
-        right = unquoted(reference(answer))
+    def test_the_symbol_table_comes_from_the_fixture(self):
+        # Rule 5's names are computed with ast from the files the chore names: change a file and the names change with it.
+        with tempfile.TemporaryDirectory() as temp:
+            src = Path(temp) / "src"
+            src.mkdir()
+            (src / "a.py").write_text("import time\nfrom os import path as p\n\ndef fetch(url, retries=3):\n    return time.monotonic()\n"
+                                      "\nclass Box:\n    LIMIT = 3\n    def put(self, item, *, slot):\n        self.d['key_one'] = item\n")
+            names = summarize_check.names_in_code(temp, ["src/a.py"])
+            for name in ("time", "monotonic", "p", "fetch", "url", "retries", "Box", "LIMIT", "put", "self", "item", "slot", "d", "key_one"):
+                self.assertIn(name, names)
+            for word in ("returns", "stores", "def", "return", "the", "fetches"):
+                self.assertNotIn(word, names)
+            self.assertEqual(summarize_check.without_names("fetch(url, retries=3) returns a time", names).split(), ["(", ",", "=3)", "returns", "a"])
+            (src / "a.py").write_text("def fetched(address):\n    pass\n")
+            os.utime(src / "a.py", (1, 2 ** 31 - 1))  # a new mtime, so the cache cannot hide the edit
+            again = summarize_check.names_in_code(temp, ["src/a.py"])
+            self.assertTrue({"fetched", "address"} <= again and not {"fetch", "url", "Box"} & again, again)
+            (src / "a.py").write_text("def broken(:\n")  # code that does not parse: no names, no crash (the text is not in the table)
+            os.utime(src / "a.py", (1, 2 ** 31 - 2))
+            self.assertEqual(summarize_check.names_in_code(temp, ["src/a.py"]), frozenset())
+            self.assertEqual(summarize_check.names_in_code(temp, ["src/missing.py", "docs/x.md"]), frozenset())
+        # every identifier on the signature line of every behaviour fact is a name, a keyword or a file name
+        for answer in jsonl("answers.jsonl"):
+            names = summarize_check.names_in_code(FIXTURES, answer["cite_files"])
+            for k, behaviour in answer.get("behaviour", {}).items():
+                sig_file, sig_line = behaviour["sig"].rsplit(":", 1)
+                if not sig_file.endswith(".py"):
+                    continue
+                left = summarize_check.without_files(summarize_check.without_names(fixture_lines(sig_file)[int(sig_line) - 1], names), answer["cite_files"])
+                self.assertFalse(re.search(r"[A-Za-z]{2,}", left), "{} fact {}: {!r}".format(answer["id"], k, left))
+
+    def test_mains_wrong_line_reproducer(self):
+        # Main (round 4): use-jobqueue's own reference with each number changed to a wrong one in range passed with no bad citation,
+        # because an unquoted citation was only checked to be in range.
+        answer = answer_of("use-jobqueue")
+        right = reference(answer)
         self.assertTrue(summarize_check.check(right, answer, FIXTURES)["pass"])
         wrong = right
         for old, new in (("cli.py:29", "cli.py:5"), ("cli.py:31", "cli.py:7"), ("jobq.py:23", "jobq.py:3"), ("worker.py:30", "worker.py:2"),
@@ -580,49 +737,39 @@ class CheckerTests(unittest.TestCase):
         self.assertEqual(result["unsupported"], labels_of(answer))  # all six facts
         self.assertEqual((result["missing"], result["missing_citation"], result["bad_citations"]), ([], [], []))
         self.assertEqual(result["unchecked"], 6)
+        self.assertEqual(rules(result), {(3, "unsupported")})
 
-    def test_main_smoke_reply_is_scored_by_the_new_rules(self):
+    def test_main_smoke_reply_is_scored_by_the_fact_line_rules(self):
         # Main's live smoke (use-jobqueue, 2026-11-08) passed the first checker with zero bad citations: it cited "Line N" under
-        # "### src/<file>" headings. Of its 15 line numbers 3 are right (cli.py 29, 31, 34); 12 are wrong. Round 5: 11 citations are
-        # bad (the 8 whose quote or range is wrong, the 21-line "Lines 18-38", and worker.py "Line 35", "Line 40" and "Line 45":
-        # the bullet of Line 35 names `queue.dead`, which reads as a file that is not one of the chore's, and the two bullets below
-        # it have no file of their own, so the nearest one that names a file is that bullet); so facts 3 to 6 have no good citation.
-        # The right cli.py 29 and 31 support their facts; cli.py 9 and 34 are unchecked.
+        # "### src/<file>" headings. It is not in the fact-line format: its bullets are "- **Line 29** -- ..." with no trailing
+        # citation list, so each is `uncited` (rule 2), the headings and the prose are ignored, and no fact is stated (rule 4).
         reply = (DATA / "samples" / "smoke-use-jobqueue.txt").read_text(encoding="utf-8")
-        answer = next(a for a in jsonl("answers.jsonl") if a["id"] == "use-jobqueue")
+        answer = answer_of("use-jobqueue")
         result = summarize_check.check(reply, answer, FIXTURES)
-        labels = labels_of(answer)
+        bullets = [line for line in reply.splitlines() if line.startswith("- ")]
         self.assertFalse(result["pass"])
-        self.assertEqual(result["missing"], [])
-        self.assertEqual(result["missing_citation"], labels[2:])  # jobq.py defines it; worker.py receives, pops, handles failure
-        self.assertEqual(result["unsupported"], [])
-        self.assertEqual(result["order"], [])
-        self.assertEqual(result["bad_citations"], [
-            "src/jobq.py: Lines 18\u201338 (range_too_wide)", "src/jobq.py: line 19", "src/jobq.py: line 23", "src/jobq.py: line 29",
-            "src/jobq.py: line 34", "src/jobq.py: line 3", "src/jobq.py: line 39", "src/worker.py: Line 31", "Line 35 (unknown_file)",
-            "Line 40 (unknown_file)", "Line 45 (unknown_file)"])
-        self.assertEqual(result["unchecked"], 2)
+        self.assertEqual(result["missing"], labels_of(answer))
+        self.assertEqual(result["uncited"], bullets)
+        self.assertEqual(len(bullets), 9)
+        self.assertEqual((result["bad_citations"], result["unsupported"], result["missing_citation"], result["unchecked"]), ([], [], [], 0))
+        self.assertEqual(rules(result), {(2, "uncited"), (4, "missing")})
+        # the same facts in the format, with the smoke reply's own wrong numbers, are caught by rule 3
+        wrong = "\n".join(["- jobq.py defines the JobQueue class [src/jobq.py:19]", "- worker.py pops the next job [src/worker.py:31]",
+                           "- cli.py creates a JobQueue [src/cli.py:29]", "- cli.py pushes a job onto the queue [src/cli.py:31]"])
+        result = summarize_check.check(wrong, answer, FIXTURES)
+        self.assertEqual(rules(result) - {(4, "missing")}, {(3, "unsupported")})
+        self.assertIn(labels_of(answer)[2], result["unsupported"])  # jobq.py:19 is not the line that defines JobQueue
 
-    def test_a_reply_under_file_headings_passes_and_a_bare_name_is_not_a_heading(self):
-        # "Line N" under a heading (or bold line, or bullet) that is only a file's name; the fact is found in the lines below it.
-        answer = next(a for a in jsonl("answers.jsonl") if a["id"] == "use-jobqueue")
-        grouped = ("### src/cli.py\n- Line 29 \u2014 creates a JobQueue\n- Line 31 \u2014 pushes a job onto it\n"
-                   "### src/jobq.py\n- Line 23 \u2014 defines the JobQueue class\n"
-                   "### src/worker.py\n- Line 30 \u2014 takes the queue as an argument\n- Line 32 \u2014 pops jobs from it\n"
-                   "- Line 44 \u2014 fails the job so that it is retried\n")
-        result = summarize_check.check(grouped, answer, FIXTURES)
-        self.assertTrue(result["pass"], result)
-        bold = grouped.replace("### src/", "**src/").replace(".py\n", ".py**\n")
-        self.assertTrue(summarize_check.check(bold, answer, FIXTURES)["pass"], bold)
-        nested = ("- src/cli.py\n  - Line 29 \u2014 creates a JobQueue\n  - Line 31 \u2014 pushes a job\n- src/jobq.py\n  - Line 23 \u2014 defines JobQueue\n"
-                  "- src/worker.py\n  - Line 30 \u2014 takes the queue as an argument\n  - Line 32 \u2014 pops jobs\n  - Line 44 \u2014 fails the job\n")
-        self.assertTrue(summarize_check.check(nested, answer, FIXTURES)["pass"], nested)
-        # a wrong line under the heading is unsupported, as anywhere
-        self.assertEqual(summarize_check.check(grouped.replace("Line 32", "Line 36"), answer, FIXTURES)["unsupported"],
-                         [labels_of(answer)[4]])
-        # the file's name alone on a line of running text, with its citation removed, is not a heading
-        bare = ("src/cli.py (src/cli.py:23 `def main(argv=None):`)\n" + "\n".join(s["text"] for s in answer["reference"][2:]))
-        self.assertEqual(summarize_check.check(bare, answer, FIXTURES)["missing"], labels_of(answer)[:2])
+    def test_the_prompt_example_is_a_fact_line(self):
+        # R6: the prompt in config/local.example.json tells the model this format, with one example, and the example parses.
+        prompt = json.loads((ROOT / "config/local.example.json").read_text())["prompts"][MODEL]
+        example = re.search(r"for example: (- [^\n]*?\[[^\[\]]+\])\.", prompt)
+        self.assertTrue(example, prompt)
+        claim, cites, kind = summarize_check.parse_fact_line(example.group(1))
+        self.assertEqual((kind, len(cites)), (None, 1), example.group(1))
+        self.assertIn("- <claim> [path:line]", prompt)
+        self.assertIn("at most 5 lines", prompt)
+        self.assertEqual(summarize_check.MAX_RANGE, 5)
 
 
 class RunnerTests(unittest.TestCase):
@@ -697,17 +844,21 @@ class RunnerTests(unittest.TestCase):
         self.assert_clean()
 
     def test_failing_reply_is_scored_and_classed(self):
-        self.reply.write_text("worker.py uses LRUCache (src/worker.py:999).")
+        # the record keeps the raw reply and names, per failed line, the rule it broke; an uncited "- " line is its own class
+        raw = "## Notes\n- worker.py uses LRUCache [src/worker.py:999]\n- an aside with no citation\n"
+        self.reply.write_text(raw)
         _, records, summary = self.run_main()
         self.assertFalse(records[0]["pass"])
-        self.assertEqual(records[0]["bad_citations"], ["src/worker.py:999"])
+        self.assertEqual(records[0]["reply"].strip(), raw.strip())
+        self.assertEqual(records[0]["bad_citations"], ["src/worker.py:999 (range)"])
         self.assertTrue(records[0]["forbidden_hit"] and records[0]["missing"])
+        self.assertEqual({(f["rule"], f["kind"]) for f in records[0]["failures"]}, {(3, "range"), (2, "uncited"), (4, "missing")})
         self.assertEqual((summary["passed"], summary["fabricated_citations"]), (0, 1))
-        self.assertEqual(set(summary["failure_classes"]), {"missing", "forbidden_hit", "bad_citations"})
-        # a wrong line in range, no quote: scored `unsupported`, and the unquoted citation nothing vouched for is counted
-        self.reply.write_text(unquoted(self.example()).replace("src/cache.py:6", "src/cache.py:1") + "\nsee src/worker.py:30")
+        self.assertEqual(set(summary["failure_classes"]), {"missing", "forbidden_hit", "bad_citations", "uncited"})
+        # a wrong line in range: scored `unsupported`, and the good citation nothing vouches for is counted
+        self.reply.write_text(self.example().replace("src/cache.py:6", "src/cache.py:1") + "\n- see worker [src/worker.py:30]")
         _, records, summary = self.run_main()
-        self.assertEqual((records[0]["pass"], records[0]["unsupported"], records[0]["unchecked"]), (False, [records[0]["unsupported"][0]], 2))  # cache.py:1 and worker.py:30
+        self.assertEqual((records[0]["pass"], len(records[0]["unsupported"]), records[0]["unchecked"]), (False, 1, 2))  # cache.py:1 and worker.py:30
         self.assertEqual(summary["failure_classes"], {"unsupported": 1})
         self.assertEqual((summary["fabricated_citations"], summary["unchecked_citations"]), (0, 2))
         self.assert_clean()
@@ -776,6 +927,7 @@ class RunnerTests(unittest.TestCase):
         example = json.loads((ROOT / "config/local.example.json").read_text())["prompts"][MODEL]
         self.assertIn("grep -c", example)
         self.assertIn("path:line", example)
+        self.assertIn("- <claim> [path:line]", example)
 
 
 if __name__ == "__main__":

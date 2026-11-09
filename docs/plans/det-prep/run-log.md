@@ -683,3 +683,12 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   restart had named-file guidance. F1 (owed): sweep coverage of lib/ctxengine, localdocs, bench and redact*. Main did the
   sweep in the evidence, and no site writes one record twice. Closed F1, merged 4713181; GateTests 36 OK on main (py3.9);
   lane removed. Follow-ups: work_checkpoint (2 clock reads) and task_record (3).
+- FG-N1 round 7 (fixes/fg-n1-round7.md, coder-ee3a424f60). Main's rulings: 12 sg UNKNOWN cells accepted; 4 sudo over-reads
+  accepted, with each one traced; the 14 cells where a wrong table turned True into False were not accepted. The worker found
+  the real cause (a doubled line) and fixed it, and the test now asserts `lost == {}`. `sudo su -c 'git grep foo' nobody`
+  reads True (over-read, fails closed): accepted, follow-up. Main's re-run: the F1 reproducer is True with and without the
+  table; fgn1r6probe gives the same output on py3.9 and 3.14; matrix 762 OK x 4 (13 modules). On 3.14, the socket warning
+  is pre-existing F4. Review review-coder-ee3a424f60-001830: APPROVED_WITH_NOTES. F1 (sudo is not in the persisted
+  wrong-table product; the reviewer's 4,752-case sudo product passed) is a follow-up. F2 (owed: which commit each copied
+  tree is) was answered by blob-hash comparison: base-tree = dbb101c, r6-tree = 019e07e, main-tree = 7014c87. Committed
+  93013ee, closed N1, merged a924a5b.

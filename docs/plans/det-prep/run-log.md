@@ -625,3 +625,6 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
 - G2-A verify on its old base: 3 failures, all fixed on main or baselined (retry_packet flake; cap 16 vs 20 from G2-B;
   run-id collision from G2-C). G2-A committed ff1c47b, main merged into the lane, full set queued on the merged tree.
 - FG-N1 r4 verify OK x4; 3.14 prints an unclosed-socket ResourceWarning at exit, being traced on main vs lane.
+- G2-E review 2 APPROVED. Committed 814d669, closed (step id is `1` for this lane, not G2E), merged 1d38997, lane removed.
+  Baseline 10 -> 9: test_r9 reach-walk line removed (now ungated and passes, even with a broken deno on PATH).
+  Deno is now optional for tmux-pi's own suite: no test needs a real deno unless marked (14 NEEDS_DENO + 10 NEEDS_SANDBOX).

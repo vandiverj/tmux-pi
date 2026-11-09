@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 
+import lib_closure
+
 ROOT = Path(__file__).resolve().parent.parent
 SECRET = "SECRET-REQUEST-BODY"
 # The round-1 context list, claims last (packet_order claims-last:v1): the request (a), the scope (b), the diff (c), the other
@@ -22,8 +24,10 @@ PLAN = {"review": "required", "policy": "required",
 
 
 class TpReviewTests(unittest.TestCase):
-    TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
+    TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "command_wrappers.py", "redact.py", "redact_rules.py", "redaction_store.py",
                      "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py")   # the last two: the files contract.py's lifecycle and bin/tp-agent read
+    # tp-agent imports these inside the commands that route, escalate and pick context; tp-review's tests only run its pause classifier.
+    NOT_COPIED_ON_PURPOSE = (("model_router", "bin/tp-agent"), ("router_catalog", "bin/tp-agent"), ("context_broker", "bin/tp-agent"))
 
     @classmethod
     def setUpClass(cls):
@@ -89,6 +93,12 @@ echo review-1
         (self.task / "result.md").write_text("result.md\nRESULT_STATUS: complete\n")
         (self.task / "state.json").write_text('{"state":"waiting"}')
         (self.task / "request.md").write_text("do it\n")
+
+    def test_the_install_copy_holds_every_lib_module_its_files_import(self):
+        # A module split out of a copied one (command_wrappers out of sensitive_read) is imported at run time only, so a copy
+        # without it fails there with "No module named"; this names the module and who imports it before any test runs a script.
+        missing = lib_closure.missing_imports(ROOT / "lib", self.template, self.NOT_COPIED_ON_PURPOSE)
+        self.assertEqual(missing, {}, "TEMPLATE_LIBS is missing modules:" + lib_closure.describe(missing))
 
     def stub(self, name, body):
         path = self.root / "bin" / name

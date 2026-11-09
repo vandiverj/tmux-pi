@@ -676,3 +676,10 @@ Results are in `tmux-pi-wt-rtk-eval/docs/plans/rtk-eval/results.md` (branch rtk-
   Closed (step G2A), merged 16a9eb1, lane removed. Baseline 8 -> 2: G2-A's six lines are removed (the retry_packet
   loader error, 4 record_files deep reads, run_bounded --durations). Left: the sensitive_trust rg flake and the retry_packet
   digest flake (G2-F).
+- F-GATE-TS (fixes/f-gate-ts.md, lane gate-record-once, coder-c13cfc9e4c). G2-F's full-suite matrix found it: the gate record's
+  `finished` was read once per write, so the two copies could differ by a second. Fix: the token list is built once and written
+  twice. Fail-before: main's script fails `:03` vs `:02` with a stepping date stub; the lane passes. Matrix 160 OK x 4.
+  Review review-coder-c13cfc9e4c-000113: APPROVED_WITH_NOTES. The first reviewer was parked after two .env prompts; the
+  restart had named-file guidance. F1 (owed): sweep coverage of lib/ctxengine, localdocs, bench and redact*. Main did the
+  sweep in the evidence, and no site writes one record twice. Closed F1, merged 4713181; GateTests 36 OK on main (py3.9);
+  lane removed. Follow-ups: work_checkpoint (2 clock reads) and task_record (3).

@@ -483,14 +483,153 @@ async function acceptance(htmlPath, workDir, keep) {
   return {checks, failures: checks.filter((c) => !c[1]), exported, requests};
 }
 
+// ------------------------------------------------------------------ saved state, text and export parts at the limits
+
+// What the page saves it reloads (past one bundle's record cap too); what it refuses to read it offers back as
+// importable parts; it refuses text the CLI refuses at any depth; every export part has a save control and copyable
+// JSON before the records count as exported. Writes each part's copied JSON to WORKDIR and lists the paths (`parts`,
+// `recovered`) so the caller can check them with the CLI.
+async function limits(htmlPath, workDir) {
+  const checks = [];
+  const check = (name, ok, detail) => { checks.push([name, !!ok, detail === undefined ? null : detail]); return ok; };
+  const url = pathToFileURL(htmlPath).href;
+  const KEY = "tp-product-review:v1:review-queue-demo";
+  const stored = `localStorage.getItem(${JSON.stringify(KEY)})`;
+  const browser = await Browser.launch(workDir);
+  const out = {parts: [], recovered: [], noteIds: null, recoverable: [], textFiles: []};
+  const save = (name, text) => { const f = path.join(workDir, name); fs.writeFileSync(f, text); return f; };
+  // each phase stands alone: one that breaks fails its own check and the next phase still runs
+  const phase = async (name, fn) => { try { await fn(); } catch (e) { check(name + ": ran to the end", false, String(e && e.stack || e).slice(0, 2000)); } };
+  // String.prototype.isWellFormed made to call text holding MARK-UNREADABLE a lone surrogate: text no bundle can hold,
+  // put in the page's state by typing (a real one cannot be typed)
+  const unreadable = `(() => { const w = window.__isWellFormed = String.prototype.isWellFormed;
+    String.prototype.isWellFormed = function () { return this.indexOf("MARK-UNREADABLE") < 0 && (w ? w.call(this) : true); }; return 1; })()`;
+  let note = null, saved = null;
+  try {
+    const ctx = await browser.context();
+    await browser.send("Browser.setDownloadBehavior", {behavior: "deny", browserContextId: ctx});
+    const p = await browser.page(ctx);
+    await p.load(url + "#experience");
+    await p.type("#tp-reviewer", "Dee (reviewer-4)");
+    await p.click('[data-tp-target="page.submit"]', "right");
+    await p.type("#tp-note-text", "One note, copied below past the record cap.", {leave: false});
+    await p.click("#tp-note-save");
+    await p.settle();
+    saved = JSON.parse(await p.ev(stored));
+    note = saved.notes[0];
+
+    await phase("text", async () => {   // a lone surrogate in a free-form key at depth 6 is refused as the CLI refuses it
+      const bundle = (key, id) => `{"schema":"tp-product-feedback","schema_version":1,"package":"review-queue-demo","exported":"2026-11-10T09:00:00Z",` +
+        `"notes":[${JSON.stringify(Object.assign({}, note, {id, state: {page: "page.queue", a: {b: {c: {}}}}})).replace('"c":{}', `"c":{"${key}":"v"}`)}],"inputs":[]}`;
+      await p.click('[data-tp-view="feedback"]');
+      out.textFiles = [save("text-ok.json", bundle("key", "note.text.1")), save("text-bad.json", bundle("key\\ud800", "note.text.2"))];
+      let rep = await p.setFile("#tp-import-file", out.textFiles[0], "tp-imported");
+      check("a free-form key deep in a note's state imports", rep.ok, rep.errors);
+      rep = await p.setFile("#tp-import-file", out.textFiles[1], "tp-imported");
+      check("a lone surrogate in that key is refused, as by the CLI", !rep.ok && /not valid Unicode: the key notes\.0\.state\.a\.b\.c\.key/.test(rep.errors.join(" ")), rep.errors);
+    });
+
+    await phase("unreadable state", async () => {   // not stored, and not exported
+      const before = await p.ev(stored);
+      await p.ev(unreadable);
+      await p.click('[data-tp-view="experience"]');
+      await p.type("#tp-reviewer", "MARK-UNREADABLE");
+      const d = await p.dbg();
+      check("state the page could not read back is not stored, and the page says so",
+            !d.storage.ok && /could not read it back/.test(d.storage.reason) && /could not read it back/.test(await p.text("#tp-storage")) &&
+            (await p.ev(stored)) === before, d.storage);
+      await p.click('[data-tp-view="feedback"]');
+      await p.ev(`(window.__event = new Promise((r) => document.addEventListener("tp-exported", (e) => r(e.detail), {once: true})), 1)`);
+      await p.click("#tp-export");
+      const detail = await p.ev("window.__event");
+      await p.settle();
+      const shown = (await p.text("#tp-export-error")) || "";
+      check("an export holding text no bundle can hold is refused visibly, with nothing marked exported",
+            !detail.ok && /not valid Unicode: sessions\.0\.reviewer/.test(shown) && !JSON.parse(await p.ev(stored)).exported, [detail, shown]);
+      await p.ev("(String.prototype.isWellFormed = window.__isWellFormed, 1)");
+    });
+
+    await phase("saved state past the record cap", async () => {
+      const many = [];
+      for (let i = 1; i <= 5001; i++) many.push(Object.assign({}, note, {id: "note." + saved.session.id + "." + i}));
+      const big = Object.assign({}, saved, {notes: many});
+      out.noteIds = save("note-ids.json", JSON.stringify(many.map((n) => n.id)));
+      await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(JSON.stringify(big))})`);
+      await p.reload();
+      const d = await p.dbg();
+      check("5001 saved notes reload in full, with no notice", d.notes === 5001 && d.storage.ok && !d.storageNotice, [d.notes, d.storageNotice]);
+    });
+
+    await phase("split export", async () => {   // every part offered before the records count as exported
+      await p.click('[data-tp-view="feedback"]');
+      await p.ev(`(() => {
+        const count = () => Array.from(document.querySelectorAll('[data-tp-part^="tp-export:"]')).filter((e) => e.querySelector("[data-tp-save]") && e.querySelector("[data-tp-show]")).length;
+        window.__seen = [];
+        window.__marks = [];
+        new MutationObserver(() => window.__seen.push([/Not exported yet/.test(document.querySelector("#tp-storage").textContent), count()]))
+          .observe(document.getElementById("tp-root"), {childList: true, subtree: true});
+        const set = Storage.prototype.setItem;   // what was on the page when the export marker was stored
+        Storage.prototype.setItem = function (k, v) { try { if (JSON.parse(v).exported) window.__marks.push(count()); } catch (e) {} return set.call(this, k, v); };
+        window.__event = new Promise((r) => document.addEventListener("tp-exported", (e) => r(e.detail), {once: true}));
+        return 1;
+      })()`);
+      await p.click("#tp-export");
+      const ev = await p.ev("window.__event");
+      await p.settle();
+      check("5001 notes export as two parts, downloads denied", ev.ok && ev.parts === 2 && ev.offered === 2, ev);
+      const seen = await p.ev("window.__seen"), marks = await p.ev("window.__marks");
+      check("the records count as exported only once both parts are offered", seen.length > 0 && seen.every(([unsaved, n]) => unsaved || n === 2) &&
+            !seen[seen.length - 1][0] && marks.length === 1 && marks[0] === 2, {seen: seen.slice(-6), marks});
+      const now = await p.ev(stored), d = await p.dbg();
+      check("the export marker is stored as a short hash, not a second copy of the records",
+            d.storage.ok && typeof JSON.parse(now).exported === "string" && JSON.parse(now).exported.length < 64, [d.storage, now.length]);
+      for (let i = 1; i <= 2; i++) {
+        await p.click(`#tp-export-show-${i}`);
+        await p.settle();
+        const text = await p.ev(`(document.querySelector("#tp-export-text-${i}") || {}).value || ""`);
+        check(`part ${i} of 2 has a save control and its JSON to copy`, (await p.count(`#tp-export-save-${i}`)) === 1 && text.length > 0, text.length);
+        out.parts.push(save(`part-${i}.json`, text));
+      }
+    });
+
+    await phase("refused saved data", async () => {   // left as it is, downloadable, its importable records offered as parts
+      const refused = Object.assign({}, saved, {zz: 1});
+      refused.notes = [1, 2, 3].map((i) => Object.assign({}, note, {id: "note.good." + i})).concat([Object.assign({}, note, {id: "note.bad.1", text: "lone \ud800"})]);
+      out.recoverable = ["note.good.1", "note.good.2", "note.good.3"];
+      const raw = JSON.stringify(refused);
+      await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(raw)})`);
+      await p.reload();
+      const d = await p.dbg();
+      check("refused saved data gives a notice with a download of it as it is and an export of its records",
+            /could not be read/.test(d.storageNotice || "") && (await p.count("#tp-saved-download")) === 1 && (await p.count("#tp-saved-export")) === 1, d.storageNotice);
+      await p.click("#tp-saved-export");
+      await p.settle();
+      const rec = await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`);
+      check("its importable records are offered as one part, with a save control", rec.length > 0 && (await p.count("#tp-saved-save-1")) === 1);
+      check("the record no bundle can hold is listed as left out", /note\.bad\.1: not valid Unicode/.test((await p.text("#tp-saved-excluded")) || ""), await p.text("#tp-saved-excluded"));
+      check("the saved data stays as it was", (await p.ev(stored)) === raw);
+      out.recovered.push(save("recovered-1.json", rec));
+    });
+    await browser.dispose(ctx);
+  } catch (e) {
+    check("flow ran to the end", false, String(e && e.stack || e));
+  } finally {
+    await browser.close();
+  }
+  check("no request left file:, blob: or data:", browser.requests.every(allowedRequest), browser.requests.filter((u) => !allowedRequest(u)));
+  check("no console error or CSP violation", browser.logs.length === 0, browser.logs);
+  return Object.assign(out, {checks, failures: checks.filter((c) => !c[1]), requests: browser.requests});
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [mode, html, work, ...rest] = process.argv.slice(2);
   const keep = rest[0] === "--keep" ? rest[1] : null;
-  if (mode !== "acceptance" || !html || !work) {
-    console.error("usage: product_design_browser.mjs acceptance BUILD.html WORKDIR [--keep DIR]");
+  if (!["acceptance", "limits"].includes(mode) || !html || !work) {
+    console.error("usage: product_design_browser.mjs acceptance|limits BUILD.html WORKDIR [--keep DIR]");
     process.exit(2);
   }
-  const out = await acceptance(path.resolve(html), path.resolve(work), keep && path.resolve(keep));
-  process.stdout.write(JSON.stringify(out, null, 1) + "\n");
-  process.exit(out.failures.length ? 1 : 0);
+  const out = mode === "limits" ? await limits(path.resolve(html), path.resolve(work))
+                                : await acceptance(path.resolve(html), path.resolve(work), keep && path.resolve(keep));
+  // exit once the output is written: a pipe takes 64 KiB at a time, and exiting earlier would cut it off
+  process.stdout.write(JSON.stringify(out, null, 1) + "\n", () => process.exit(out.failures.length ? 1 : 0));
 }

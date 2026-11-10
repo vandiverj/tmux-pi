@@ -101,6 +101,34 @@
     return typeof s.isWellFormed === "function" ? s.isWellFormed()
       : !/[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(s);
   }
+  function readable(s) {   // a string fit to show in a message: lone surrogates become U+FFFD
+    return typeof s.toWellFormed === "function" ? s.toWellFormed() : s.replace(/[\ud800-\udfff]/g, "\ufffd");
+  }
+  // Every string and every key, at any depth (iterative, like depth()): the first one that is not valid Unicode, as
+  // package.text_problem refuses it (the CLI cannot write a lone surrogate as UTF-8). null when there is none.
+  function textProblem(v) {
+    var stack = [{x: v, up: null, key: null}];
+    function where(n, key) {
+      var at = key === null ? [] : [key];
+      for (; n && n.key !== null; n = n.up) at.unshift(n.key);
+      return at.length ? at.map(function (k) { return readable(String(k)); }).join(".") : "(bundle)";
+    }
+    while (stack.length) {
+      var n = stack.pop(), x = n.x;
+      if (typeof x === "string") {
+        if (!wellFormed(x)) return "not valid Unicode: " + where(n, null) + " holds a lone surrogate";
+        continue;
+      }
+      if (x === null || typeof x !== "object") continue;
+      if (Array.isArray(x)) { for (var i = x.length - 1; i >= 0; i--) stack.push({x: x[i], up: n, key: i}); continue; }
+      var ks = Object.keys(x);
+      for (var j = ks.length - 1; j >= 0; j--) {
+        if (!wellFormed(ks[j])) return "not valid Unicode: the key " + where(n, ks[j]) + " holds a lone surrogate";
+        stack.push({x: x[ks[j]], up: n, key: ks[j]});
+      }
+    }
+    return null;
+  }
   // Nesting depth (a top-level object is 1, as package.depth_problem counts it), without recursion: any depth is
   // measured, and the walk stops as soon as it is past `stopAt`.
   function depth(v, stopAt) {
@@ -230,7 +258,8 @@
   var RT = {      // derived or transient: never saved
     state: null, events: [], last: null, view: "overview", noteMode: false, pending: null, blocked: 0,
     selectedEvent: null, storage: {ok: false, reason: "not checked"}, storageNotice: null, message: null,
-    stepError: null, importReport: null, summary: null, exportText: null, exportParts: null, exportError: null,
+    stepError: null, importReport: null, summary: null, exportParts: null, exportError: null,
+    savedRefused: null, salvage: null, showPart: dict(),
     undeclared: dict(), questionFilter: "open",
     hint: false, engScenario: null, holding: false, renderPending: false, focusNote: false, paints: 0
   };
@@ -257,10 +286,17 @@
       return {ok: false, reason: (e && e.name ? e.name + ": " : "") + (e && e.message ? e.message : String(e))};
     }
   }
+  // Saved state is stored only when this page would read it back: the same check load() makes, on the same text.
   function save() {
     if (!RT.storage.ok) return;
     try {
-      window.localStorage.setItem(KEY, JSON.stringify(S));
+      var text = JSON.stringify(S), back = storedProblems(text);
+      if (back.problems.length) {
+        RT.storage = {ok: false, reason: "not saved, because this page could not read it back (" + back.problems.slice(0, 3).join("; ") +
+                                         "); the last state saved is kept"};
+        return;
+      }
+      window.localStorage.setItem(KEY, text);
     } catch (e) {
       RT.storage = {ok: false, reason: "saving failed: " + (e && e.name ? e.name : "") + " " + (e && e.message ? e.message : "")};
     }
@@ -271,25 +307,32 @@
     var raw;
     try { raw = window.localStorage.getItem(KEY); } catch (e) { RT.storage = {ok: false, reason: String(e)}; return freshState(); }
     if (raw === null) return freshState();
-    var saved, problems = [];
+    var got = storedProblems(raw);
+    if (got.problems.length) {
+      RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" +
+        got.problems.slice(0, 3).join("; ") + "). It is left untouched under the browser storage key " + KEY + "; " +
+        "nothing is saved over it from this tab. Download it as it is, or export the records in it that can still be imported.";
+      RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
+      RT.savedRefused = {raw: typeof raw === "string" ? raw : String(raw), value: got.value};
+      return freshState();
+    }
+    return got.value;
+  }
+  // {value, problems}: the stored text parsed, and why this page would not use it ([] when it would). Whatever is
+  // stored, the page starts: a check that throws is one more reason to ignore it.
+  function storedProblems(raw) {
+    var value, problems = [];
     try {
       if (typeof raw !== "string") problems.push("not text");
       else if (textDepth(raw, DATA.limits.depth) > DATA.limits.depth) problems.push("nested deeper than " + DATA.limits.depth + " levels");
       else {
-        saved = JSON.parse(raw);
-        problems = savedProblems(saved);
+        value = JSON.parse(raw);
+        problems = savedProblems(value);
       }
-    } catch (e) {   // whatever is stored, the page starts: a check that throws is one more reason to ignore it
+    } catch (e) {
       problems.push((e && e.name ? e.name + ": " : "") + (e && e.message ? e.message : String(e)));
     }
-    if (problems.length) {
-      RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" +
-        problems.slice(0, 3).join("; ") + "). It is left untouched under the browser storage key " + KEY + "; " +
-        "nothing new is saved over it until you change something.";
-      RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
-      return freshState();
-    }
-    return saved;
+    return {value: value, problems: problems};
   }
   // Every field the page reads from saved state is checked here, so a value that passes cannot throw later.
   function savedProblems(saved) {
@@ -300,7 +343,9 @@
     if (!isType("object", saved.session) || !Array.isArray(saved.sessions) || !Array.isArray(saved.notes) || !Array.isArray(saved.inputs)) return ["missing parts"];
     if (saved.run !== null && !(isType("object", saved.run) && typeof saved.run.seed === "string" && Array.isArray(saved.run.actions))) return ["bad prototype checkpoint"];
     if (saved.exported !== null && typeof saved.exported !== "string") return ["bad export marker"];
-    var p = bundleProblems(asBundle(saved), {local: true});   // the session, sessions, notes, inputs and checkpoint
+    // the session, sessions, notes, inputs and checkpoint: every rule a bundle has except its record cap (local state
+    // is not one bundle; an export splits it into bundles that each fit)
+    var p = bundleProblems(asBundle(saved), {local: true});
     if (p.length) return p;
     if (!isType("object", saved.ui) || Object.keys(saved.ui).sort().join() !== "guide,unguided") return ["bad ui state"];
     var tasks = saved.session.tasks;
@@ -602,7 +647,17 @@
     return {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(),
             notes: clone(S.notes), inputs: clone(S.inputs), sessions: clone(allSessions())};
   }
-  function exportDigest() { return canonical({notes: S.notes, inputs: S.inputs}); }
+  // What was last exported, as a short hash of the records' canonical text (two 32-bit FNV-1a passes with different
+  // seeds): saved state holds the hash, not a second copy of every record, so exporting never doubles what is stored.
+  function exportDigest() {
+    var t = canonical({notes: S.notes, inputs: S.inputs}), a = 0x811c9dc5, b = 0x050c5d1f;
+    for (var i = 0; i < t.length; i++) {
+      var c = t.charCodeAt(i);
+      a = Math.imul(a ^ c, 0x01000193);
+      b = Math.imul(b ^ c, 0x01000193) ^ (b >>> 13);
+    }
+    return "fnv:" + ("0000000" + (a >>> 0).toString(16)).slice(-8) + ("0000000" + (b >>> 0).toString(16)).slice(-8) + ":" + t.length;
+  }
   function download(name, text, type) {
     var url = URL.createObjectURL(new Blob([text], {type: type}));
     var a = document.createElement("a");
@@ -622,11 +677,23 @@
     return p;
   }
   function bundleText(b) { return JSON.stringify(b, null, 2); }
-  // The bundles an export writes. One when everything fits; otherwise the notes and inputs are split, in order, into
-  // bundles that each fit (the sessions go with the first), every one importable on its own. Returns {parts} or {error}.
-  function exportParts() {
-    var whole = bundle(), text = bundleText(whole);
-    if (!bundleFits(text, whole).length) return {parts: [{bundle: whole, text: text}]};
+  // Why the CLI (and this page's import) would refuse these bytes, [] when it would take them: the limits of one bundle
+  // and every rule an import applies (text, schema, ids, bookkeeping, numbers), on the text as it would be read back.
+  function exportProblems(text, b) {
+    var p = bundleFits(text, b);
+    if (p.length) return p;
+    p = bundleProblems(JSON.parse(text));
+    return p.length ? p : numberProblems(text);
+  }
+  function emptyBundle(sessions) {
+    return {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(), notes: [], inputs: [], sessions: sessions || []};
+  }
+  // The bundles an export of `whole` writes. One when it is importable as it is; otherwise the notes and inputs are
+  // split, in order, into bundles that each fit (the sessions go with the first), and every part must be importable on
+  // its own. Returns {parts: [{bundle, text}]} or {error}.
+  function exportParts(whole) {
+    var text = bundleText(whole);
+    if (!exportProblems(text, whole).length) return {parts: [{bundle: whole, text: text}]};
     var head = {schema: whole.schema, schema_version: whole.schema_version, package: whole.package, exported: whole.exported};
     function part(sessions) { return {schema: head.schema, schema_version: head.schema_version, package: head.package, exported: head.exported, notes: [], inputs: [], sessions: sessions}; }
     var first = part(whole.sessions), firstText = bundleText(first), firstProblems = bundleFits(firstText, first);
@@ -649,42 +716,112 @@
     parts.push(cur);
     var out = [];
     for (var j = 0; j < parts.length; j++) {
-      var t = bundleText(parts[j]), problems = bundleFits(t, parts[j]);
-      if (problems.length) return {error: "part " + (j + 1) + " would not fit one bundle (" + problems.join("; ") + ")"};
+      var t = bundleText(parts[j]), problems = exportProblems(t, parts[j]);
+      if (problems.length) return {error: (parts.length === 1 ? "the bundle" : "part " + (j + 1) + " of " + parts.length) +
+                                          " would not be importable (" + problems.slice(0, 3).join("; ") + ")"};
       out.push({bundle: parts[j], text: t});
     }
     return {parts: out};
   }
+  // Each part as it is offered: its file name, text and counts.
+  function offered(parts, base) {
+    var n = parts.length;
+    return parts.map(function (x, i) {
+      return {name: base + (n === 1 ? "" : "-part-" + (i + 1) + "-of-" + n) + ".json", text: x.text, bytes: utf8Length(x.text),
+              notes: x.bundle.notes.length, inputs: x.bundle.inputs.length};
+    });
+  }
+  // Exporting offers every part twice over: a download, and on the page a save control and the JSON to copy (a browser
+  // may block downloads, several downloads at once above all). The records count as exported only once every part is
+  // on the page and its download has been started.
   function doExport() {
-    var got = exportParts();
+    var got = exportParts(bundle());
     if (got.error) {   // nothing is marked exported: the records stay counted as unsaved
       RT.exportError = "Export refused: " + got.error + ". Nothing was exported.";
-      RT.exportText = null;
       RT.exportParts = null;
       render();
       document.dispatchEvent(new CustomEvent("tp-exported", {detail: {ok: false, error: RT.exportError}}));
       return;
     }
-    var parts = got.parts, base = DATA.package.id + "-feedback-" + S.session.id;
+    var parts = offered(got.parts, DATA.package.id + "-feedback-" + S.session.id), digest = exportDigest();
     RT.exportError = null;
-    RT.exportParts = parts.map(function (x) { return x.text; });
-    RT.exportText = parts.length === 1 ? parts[0].text : null;
-    S.exported = exportDigest();
-    save();
-    parts.forEach(function (x, i) {
-      download(base + (parts.length === 1 ? "" : "-part-" + (i + 1) + "-of-" + parts.length) + ".json", x.text, "application/json");
-    });
+    RT.exportParts = parts;
+    RT.showPart = dict();
     render();
-    document.dispatchEvent(new CustomEvent("tp-exported", {detail: {ok: true, parts: parts.length,
-      notes: parts.reduce(function (n, x) { return n + x.bundle.notes.length; }, 0),
-      inputs: parts.reduce(function (n, x) { return n + x.bundle.inputs.length; }, 0)}}));
+    settled().then(function () {
+      parts.forEach(function (x) { download(x.name, x.text, "application/json"); });
+      S.exported = digest;
+      save();
+      render();
+      return settled();
+    }).then(function () {
+      document.dispatchEvent(new CustomEvent("tp-exported", {detail: {ok: true, parts: parts.length, offered: parts.length,
+        notes: parts.reduce(function (n, x) { return n + x.notes; }, 0), inputs: parts.reduce(function (n, x) { return n + x.inputs; }, 0)}}));
+    });
   }
-  // A record is kept only if it can be exported: on its own it fits one bundle.
-  function recordFits(coll, r) {
-    var b = {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(), notes: [], inputs: [], sessions: []};
+  // Why one record cannot be exported (it would not be importable even alone in a bundle), or null.
+  function recordProblem(coll, r) {
+    var b = emptyBundle();
     b[coll].push(r);
-    var p = bundleFits(bundleText(b), b);
-    return p.length ? "it would not fit an export bundle (" + p.join("; ") + ")" : null;
+    var p = exportProblems(bundleText(b), b);
+    return p.length ? p.slice(0, 3).join("; ") : null;
+  }
+  // A record is kept only if it can be exported: on its own it is an importable bundle.
+  function recordFits(coll, r) {
+    var p = recordProblem(coll, r);
+    return p ? "it would not be importable in an export bundle (" + p + ")" : null;
+  }
+  // Saved data this page refused to read: the records in it that are importable on their own, as importable parts.
+  // Records that are not are listed by id with the reason; the stored bytes stay untouched and downloadable as they are.
+  function salvage() {
+    var v = RT.savedRefused && RT.savedRefused.value, excluded = [], ids = dict(), keep = {notes: [], inputs: []}, sessions = [];
+    if (!isType("object", v)) return;
+    ["notes", "inputs"].forEach(function (coll) {
+      (Array.isArray(v[coll]) ? v[coll] : []).forEach(function (r, i) {
+        var label = isType("object", r) && typeof r.id === "string" ? readable(r.id) : coll + "." + i;
+        var why = recordProblem(coll, r);
+        if (!why && ids[r.id] !== undefined) why = "another record here has this id";
+        if (why) { excluded.push(label + ": " + why); return; }
+        ids[r.id] = 1;
+        keep[coll].push(r);
+      });
+    });
+    var cands = [];
+    try { if (isType("object", v.session)) cands.push(sessionRecord(v.session, isType("object", v.run) ? v.run : null)); } catch (e) { /* not a session */ }
+    (Array.isArray(v.sessions) ? v.sessions : []).forEach(function (x) { cands.push(x); });
+    var sids = dict();
+    cands.forEach(function (x, i) {
+      var b = emptyBundle([x]);
+      var why = null;
+      try { why = exportProblems(bundleText(b), b); } catch (e) { why = [String(e)]; }
+      if (why.length || sids[x.id] !== undefined) { excluded.push("session " + (isType("object", x) && typeof x.id === "string" ? readable(x.id) : i) + ": " + (why.length ? why.slice(0, 2).join("; ") : "another session here has this id")); return; }
+      sids[x.id] = 1;
+      sessions.push(x);
+    });
+    var whole = emptyBundle(sessions);
+    whole.notes = keep.notes;
+    whole.inputs = keep.inputs;
+    var got = exportParts(whole);
+    RT.salvage = {parts: got.parts ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null, excluded: excluded};
+    RT.showPart = dict();
+    render();
+    if (RT.salvage.parts) settled().then(function () { RT.salvage.parts.forEach(function (x) { download(x.name, x.text, "application/json"); }); });
+  }
+  // Every part with its own save control and, on request (at once for a single part), its JSON to copy.
+  function partsBlock(prefix, parts) {
+    var n = parts.length;
+    return h("ol", {"class": "tp-parts", "id": prefix + "-list"}, parts.map(function (x, i) {
+      var k = i + 1, key = prefix + ":" + k, shown = n === 1 || !!RT.showPart[key];
+      return h("li", {"data-tp-part": key}, [
+        (n === 1 ? "The bundle" : "Part " + k + " of " + n) + ": " + x.notes + " note(s), " + x.inputs + " answer(s)/proposal(s), " + x.bytes + " bytes. ",
+        button(n === 1 ? "Save it again" : "Save part " + k, function () { download(x.name, x.text, "application/json"); },
+               {"id": prefix + "-save-" + k, "data-tp-save": "1"}),
+        n === 1 ? null : button(shown ? "Hide its JSON" : "Show its JSON to copy", function () { RT.showPart[key] = !shown; render(); },
+                                {"id": prefix + "-show-" + k, "data-tp-show": "1", "aria-expanded": shown ? "true" : "false"}),
+        shown ? h("textarea", {"readonly": true, "rows": 8, "aria-label": (n === 1 ? "Bundle" : "Part " + k) + " JSON",
+                               "id": n === 1 && prefix === "tp-export" ? "tp-export-text" : prefix + "-text-" + k}, x.text) : null
+      ]);
+    }));
   }
 
   function bundleProblems(b, opts) {
@@ -692,17 +829,19 @@
     var p = [];
     if (!isType("object", b)) return ["a feedback bundle is a JSON object"];
     if (depth(b) > DATA.limits.depth) return ["nested deeper than " + DATA.limits.depth + " levels"];
+    var bad = textProblem(b);   // the CLI's order: size, JSON, depth, then text, then the schema
+    if (bad) return [bad];
     if (b.schema !== "tp-product-feedback") p.push("schema must be tp-product-feedback");
     if (b.schema_version !== 1) p.push("schema_version " + JSON.stringify(b.schema_version) + " is not supported");
     if (b.package !== DATA.package.id) p.push("the bundle is for package " + JSON.stringify(b.package) + ", not " + DATA.package.id);
     if (p.length) return p;
     var count = (Array.isArray(b.notes) ? b.notes.length : 0) + (Array.isArray(b.inputs) ? b.inputs.length : 0);
-    if (count > DATA.limits.records) return [count + " records; at most " + DATA.limits.records];
+    if (!opts.local && count > DATA.limits.records) return [count + " records; at most " + DATA.limits.records];
     p = schemaIssues("feedback", b);
     if (p.length) return p;
     b.notes.forEach(function (n, i) {
       if (n.package !== DATA.package.id) p.push("notes." + i + ": belongs to package " + JSON.stringify(n.package));
-      if (!opts.local) ["anchor", "disposition", "remap"].forEach(function (f) { if (own(n, f)) p.push("notes." + i + "." + f + ": set locally by the package owner, never imported"); });
+      ["anchor", "disposition", "remap"].forEach(function (f) { if (own(n, f)) p.push("notes." + i + "." + f + ": set locally by the package owner, never imported"); });
     });
     b.inputs.forEach(function (x, i) {
       if (x.status !== "pending" || own(x, "reconciliation")) p.push("inputs." + i + ".status: an answer or proposal is pending until the package owner reconciles it");
@@ -1248,11 +1387,12 @@
       ] : ["Nothing was imported: ", list(rep.errors.concat(rep.conflicts))]) : null,
       RT.summary ? h("textarea", {"readonly": true, "rows": 14, "id": "tp-summary", "aria-label": "Feedback summary"}, RT.summary) : null,
       RT.exportError ? h("p", {"class": "tp-panel tp-error", "role": "alert", "id": "tp-export-error"}, RT.exportError) : null,
-      RT.exportText ? h("details", {}, [h("summary", {}, "Exported JSON (copy it if the download was blocked)"),
-                                        h("textarea", {"readonly": true, "rows": 8, "id": "tp-export-text"}, RT.exportText)]) : null,
-      RT.exportParts && RT.exportParts.length > 1 ? h("p", {"class": "tp-panel", "id": "tp-export-parts", "role": "status"},
-        "The feedback was larger than one bundle allows, so it was exported as " + RT.exportParts.length +
-        " bundles (part 1 of " + RT.exportParts.length + " and so on). Import every part; each is complete on its own.") : null,
+      RT.exportParts ? h("div", {"class": "tp-panel", "id": "tp-export-parts", "role": "status"}, [
+        h("p", {}, RT.exportParts.length > 1
+          ? "The feedback was larger than one bundle allows, so it was exported as " + RT.exportParts.length + " bundles (part 1 of " +
+            RT.exportParts.length + " and so on). Import every part; each is complete on its own. If a download was blocked, save that part again or copy its JSON."
+          : "Exported as one bundle. If the download was blocked, save it again or copy its JSON."),
+        partsBlock("tp-export", RT.exportParts)]) : null,
       h("h3", {}, "Notes"),
       S.notes.length ? h("div", {"id": "tp-notes"}, S.notes.map(noteCard)) : h("p", {"class": "tp-muted"}, "No notes yet. Use Add note (or press N) and pick any highlighted element."),
       h("h3", {}, "Unresolved anchors"),
@@ -1312,7 +1452,19 @@
                         (unsaved ? " Not exported yet: " + unsaved + " record(s)." : "")
                       : "Browser storage is unavailable (" + RT.storage.reason + "). Your notes exist only in this tab: export before you close it." +
                         (unsaved ? " Not exported yet: " + unsaved + " record(s)." : "")),
-      RT.storageNotice ? h("div", {"class": "tp-status tp-warn", "role": "alert"}, RT.storageNotice) : null,
+      RT.storageNotice ? h("div", {"class": "tp-status tp-warn", "role": "alert", "id": "tp-storage-notice"}, [RT.storageNotice,
+        RT.savedRefused ? h("div", {"class": "tp-actions"}, [
+          button("Download the saved data as it is (.json)", function () { download(DATA.package.id + "-saved-state.json", RT.savedRefused.raw, "application/json"); },
+                 {"id": "tp-saved-download"}),
+          isType("object", RT.savedRefused.value) ? button("Export its importable notes and answers", salvage, {"id": "tp-saved-export"}) : null
+        ]) : null,
+        RT.salvage && RT.salvage.error ? h("p", {"class": "tp-error", "id": "tp-saved-error"}, "Export refused: " + RT.salvage.error + ".") : null,
+        RT.salvage && RT.salvage.parts ? h("div", {"id": "tp-saved-parts"}, [
+          h("p", {}, "The saved records that are importable on their own, as " + RT.salvage.parts.length + " bundle(s); import every part."),
+          partsBlock("tp-saved", RT.salvage.parts)]) : null,
+        RT.salvage ? h("div", {"id": "tp-saved-excluded"}, RT.salvage.excluded.length
+          ? ["Left out (kept in the saved data as it is): ", list(RT.salvage.excluded.slice(0, 50).concat(RT.salvage.excluded.length > 50 ? ["and " + (RT.salvage.excluded.length - 50) + " more"] : []))]
+          : "Nothing was left out.") : null]) : null,
       RT.noteMode ? notePicker() : null
     ]);
   }
@@ -1513,7 +1665,9 @@
                     inputs: S ? S.inputs.length : 0, session: S && S.session, sessions: S ? S.sessions.length : 0,
                     storage: RT.storage, blocked: RT.blocked, noteMode: RT.noteMode, pending: RT.pending, stepError: RT.stepError,
                     guide: S && S.ui.guide, unguided: S && S.ui.unguided, errors: LOAD_ERRORS, storageNotice: RT.storageNotice,
-                    exportError: RT.exportError, exportParts: RT.exportParts ? RT.exportParts.map(utf8Length) : null});
+                    exportError: RT.exportError, exportParts: RT.exportParts ? RT.exportParts.map(function (x) { return x.bytes; }) : null,
+                    salvage: RT.salvage ? {parts: RT.salvage.parts ? RT.salvage.parts.map(function (x) { return x.bytes; }) : null,
+                                           error: RT.salvage.error, excluded: RT.salvage.excluded} : null});
     },
     summary: function () { return summaryText(); },
     settled: settled

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -118,11 +119,57 @@ class BuildTests(BuildCase):
         self.assertEqual([b["file"] for b in self.docs()["manifest"]["builds"]], [BUILD, new["file"]])
         self.assertEqual((self.pkg / BUILD).read_bytes(), page)
 
-    def test_a_deleted_build_file_is_built_again(self):
+    def status_codes(self, pkg=None):
+        rep, rc = cli.status_report(pkg or self.pkg)
+        return rc, [t["code"] for t in rep["trust"]]
+
+    def test_status_checks_every_recorded_build_and_a_deleted_last_build_is_restored(self):
+        r = R.build(self.pkg)
+        page = (self.pkg / BUILD).read_bytes()
+        self.assertEqual(self.status_codes(), (0, []))
+        tampers = {
+            "delete": (lambda p: p.unlink(), "package.build-missing"),
+            "truncate": (lambda p: p.write_bytes(page[:100]), "package.build-changed"),
+            "rewrite": (lambda p: p.write_bytes(page.replace(b"review build", b"review bxild", 1)), "package.build-changed"),
+            "directory": (lambda p: (p.unlink(), p.mkdir()), "package.build-changed"),
+            "symlink": (lambda p: (p.unlink(), (p.parent / "x").write_bytes(page), os.symlink("x", p)),
+                        "package.build-changed"),
+        }
+        for why, (tamper, code) in tampers.items():
+            with self.subTest(why):
+                tamper(self.pkg / BUILD)
+                self.assertEqual(self.status_codes(), (3, [code]))
+                rc, out, _ = self.run_cli("status", self.pkg)
+                self.assertEqual(rc, 3)
+                self.assertIn(BUILD, out)
+                # the advice is what works: a changed file is not replaced by build, so it is moved aside first
+                self.assertEqual("move it aside and run `tp-product build DIR`" in out, code == "package.build-changed", out)
+                if code == "package.build-changed":
+                    with self.assertRaises(T.StoreError) as cm:
+                        R.build(self.pkg)
+                    self.assertEqual(cm.exception.code, "build.exists")
+                if os.path.isdir(self.pkg / BUILD) and not os.path.islink(self.pkg / BUILD):
+                    (self.pkg / BUILD).rmdir()
+                elif os.path.lexists(self.pkg / BUILD):
+                    (self.pkg / BUILD).unlink()
+                if os.path.lexists(self.pkg / "builds/x"):
+                    (self.pkg / "builds/x").unlink()
+                # deleted: the next build writes the recorded bytes back (nothing is committed) and status is trusted
+                again = R.build(self.pkg)
+                self.assertEqual((again["up_to_date"], again["restored"], again["committed"], again["file"]),
+                                 (True, True, False, BUILD))
+                self.assertEqual((self.pkg / BUILD).read_bytes(), page)
+                self.assertEqual(T.file_digest(self.pkg / BUILD), r["digest"])
+                self.assertEqual(self.status_codes(), (0, []))
+        # an older recorded build that is deleted stays a trust problem: only the last build can be rendered again
+        C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
+                           "operations": [{"op": "set", "id": "rule.required-fields",
+                                           "fields": {"statement": "Refused; the message names each field."}}]}, 4)
         R.build(self.pkg)
         (self.pkg / BUILD).unlink()
-        r = R.build(self.pkg)
-        self.assertEqual((r["up_to_date"], r["file"], r["revision"]), (False, "builds/review-queue-demo-r4.html", 5))
+        self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
+        self.assertTrue(R.build(self.pkg)["up_to_date"])
+        self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
 
     def test_page_is_offline_and_package_text_is_inert(self):
         C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
@@ -204,7 +251,7 @@ class BuildTests(BuildCase):
         self.assertGreaterEqual(len(points), 20)
         self.assertEqual(points[:3], ["before-build-write", "after-build-write", "before-commit-point"])
         for i, point in enumerate(points):
-            for act in ("stop", "foreign", "delete"):
+            for act in ("stop", "foreign", "delete", "late-delete"):
                 with self.subTest(point=point, act=act):
                     pkg = self.tmp / f"p{i}-{act}"
                     shutil.copytree(FIXTURE, pkg)
@@ -214,9 +261,21 @@ class BuildTests(BuildCase):
                             return
                         if (pkg / BUILD).exists() and act == "foreign":
                             (pkg / BUILD).write_bytes(b"someone else's bytes")
-                        elif (pkg / BUILD).exists() and act == "delete":
+                        elif (pkg / BUILD).exists() and act in ("delete", "late-delete"):
                             (pkg / BUILD).unlink()
-                        raise RuntimeError(point)
+                        if act != "late-delete":
+                            raise RuntimeError(point)
+                    if act == "late-delete":
+                        # another writer deletes the file and the build carries on: wherever that lands, a build
+                        # that is recorded (or journaled) without its file is never reported trusted
+                        with contextlib.suppress(T.StoreError):
+                            R.build(pkg, fault=fault)
+                        if not (pkg / BUILD).exists() and self.committed(pkg) == 4 or (
+                                T.control(pkg) / "txn/txn.json").exists():
+                            rc, codes = self.status_codes(pkg)
+                            self.assertEqual(rc, 3)
+                            self.assertIn("package.build-missing", codes)
+                        continue
                     with self.assertRaises((RuntimeError, T.StoreError)):
                         R.build(pkg, fault=fault)
                     after_point = (T.control(pkg) / "txn/txn.json").exists() or self.committed(pkg) == 4
@@ -253,6 +312,61 @@ class BuildTests(BuildCase):
                         self.assertNotEqual(rc, 0)
                         self.assertIn("build", out)
 
+    def test_an_interrupt_at_any_real_call_keeps_the_commit_point(self):
+        """The fault hooks are named points; this interrupts the calls themselves: KeyboardInterrupt just after each
+        os.replace/rename/link/unlink/fsync of a build has landed, OSError just before. txn.json in place is the commit
+        point whatever raised: the journal and the build file stay, and recovery completes."""
+        wrapped = ("replace", "rename", "link", "unlink", "fsync")
+        real = {n: getattr(os, n) for n in wrapped}
+        state = {"n": 0, "at": None, "exc": None, "sites": []}
+
+        def wrap(name):
+            def call(*a, **k):
+                state["n"] += 1
+                if state["at"] is None:
+                    state["sites"].append(name)
+                elif state["n"] == state["at"] and state["exc"] is OSError:
+                    raise OSError(5, "injected before os." + name)
+                r = real[name](*a, **k)
+                if state["n"] == state["at"] and state["exc"] is KeyboardInterrupt:
+                    raise KeyboardInterrupt("injected after os." + name)
+                return r
+            return call
+
+        def build(pkg, at=None, exc=None):
+            state.update(n=0, at=at, exc=exc)
+            with contextlib.ExitStack() as stack:
+                for n in wrapped:
+                    stack.enter_context(unittest.mock.patch.object(os, n, wrap(n)))
+                R.build(pkg)
+
+        probe = self.tmp / "calls"
+        shutil.copytree(FIXTURE, probe)
+        build(probe)
+        page = (probe / BUILD).read_bytes()
+        self.assertGreaterEqual(len(state["sites"]), 30)
+        for i in range(1, len(state["sites"]) + 1):
+            for exc in (KeyboardInterrupt, OSError):
+                with self.subTest(call=i, site=state["sites"][i - 1], exc=exc.__name__):
+                    pkg = self.tmp / f"c{i}-{exc.__name__}"
+                    shutil.copytree(FIXTURE, pkg)
+                    (pkg / "builds").mkdir()
+                    (pkg / "builds/theirs.html").write_bytes(b"theirs")
+                    with self.assertRaises(exc):
+                        build(pkg, i, exc)
+                    journal = (T.control(pkg) / "txn/txn.json").exists()
+                    held = (pkg / BUILD).read_bytes() if (pkg / BUILD).exists() else None
+                    self.assertEqual((pkg / "builds/theirs.html").read_bytes(), b"theirs")
+                    if journal or self.committed(pkg) == 4:
+                        self.assertEqual(held, page)  # past the commit point: kept, whatever raised
+                        with T.lock(pkg):
+                            T.recover(pkg)
+                        self.assertEqual(self.status_codes(pkg), (0, []))
+                    else:
+                        self.assertIsNone(held)  # before it: this build's own file is removed, nothing else
+                        self.assertEqual(self.status_codes(pkg), (0, []))
+                    shutil.rmtree(pkg)
+
     def committed(self, pkg):
         path = T.control(pkg) / "commit.json"  # displaced (absent) for a moment while it is replaced
         return json.loads(path.read_text())["revision"] if path.exists() else None
@@ -271,6 +385,18 @@ class BuildTests(BuildCase):
         self.assertEqual((self.pkg / BUILD).read_bytes(), b"theirs")
         self.assertEqual([p.name for p in (self.pkg / "builds").iterdir()], [Path(BUILD).name])
         self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
+        (self.pkg / BUILD).unlink()
+
+        def directory(point):  # a directory cannot be linked back: it is renamed back, with what it holds
+            if point == "before-commit-point":
+                (self.pkg / BUILD).unlink()
+                (self.pkg / BUILD).mkdir()
+                (self.pkg / BUILD / "theirs").write_bytes(b"theirs")
+        with self.assertRaises(T.StoreError) as cm:
+            R.build(self.pkg, fault=directory)
+        self.assertEqual(cm.exception.code, "package.build-missing")
+        self.assertEqual((self.pkg / BUILD / "theirs").read_bytes(), b"theirs")
+        self.assertEqual([p.name for p in (self.pkg / "builds").iterdir()], [Path(BUILD).name])
 
     def test_line_endings_are_hashed_as_the_html_parser_delivers_them(self):
         proto = self.pkg / "prototype"
@@ -322,6 +448,13 @@ class BuildTests(BuildCase):
         (self.pkg / "design.json").write_text((self.pkg / "design.json").read_text().replace("Rejected", "Refused"))
         e = self.refused("package.external-edit")
         self.assertIn("design.json", str(e))
+        # with a recorded build missing as well, the refusal is still the edit's (status lists the build problem first)
+        (self.pkg / "design.json").write_bytes((FIXTURE / "design.json").read_bytes())
+        R.build(self.pkg, expected_revision=3)
+        (self.pkg / BUILD).unlink()
+        (self.pkg / "design.json").write_text((self.pkg / "design.json").read_text().replace("Rejected", "Refused"))
+        self.assertEqual([c for c, _ in T.trust_problems(T.inspect(self.pkg))], ["package.build-missing", "package.external-edit"])
+        self.assertIn("design.json", str(self.refused("package.external-edit")))
 
     def test_build_cli(self):
         rc, out, _ = self.run_cli("build", self.pkg, "--expected-revision", 3)
@@ -400,6 +533,40 @@ class AnchorTests(BuildCase):
         adapter.write_text(json.dumps(dict(a, targets=a["targets"] + [dict(a["targets"][0], id="record.reassign")])))
         back = C.ingest(self.pkg, b)  # the target is back: the duplicate import re-anchors it
         self.assertEqual((back["committed"], back["reanchored"]["note.anchor-t.1"]), (True, "current"))
+
+    def test_a_build_is_a_function_of_committed_state(self):
+        """Building twice with no change in between is up to date the second time, also when the first build re-anchors
+        a remapped note (whose anchor the page shows): the re-anchoring is committed before the fingerprint is taken."""
+        C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "t", "summary": "t",
+                           "operations": [{"op": "remap-anchor", "note": "note.session-b.1", "target": "record.reassign",
+                                           "reason": "moved", "by": "t", "date": "2026-11-10"}]}, 3)
+        R.build(self.pkg)
+        adapter = self.pkg / "prototype/adapter.json"
+        a = json.loads(adapter.read_text())
+        adapter.write_text(json.dumps(dict(a, targets=[t for t in a["targets"] if t["id"] != "record.reassign"])))
+        first = R.build(self.pkg)
+        self.assertEqual((first["reanchored"], first["up_to_date"], first["committed"]),
+                         ({"note.session-b.1": "unresolved"}, False, True))
+        page = (self.pkg / first["file"]).read_bytes()
+        self.assertEqual(embedded(page)["remaps"][0]["anchor"], "unresolved")  # the page shows the committed anchor
+        self.assertEqual(embedded(page)["build"]["revision"], first["revision"] - 1)  # the state it was built from
+        before = self.tree()
+        second = R.build(self.pkg)
+        self.assertEqual((second["up_to_date"], second["committed"], second["file"], second["reanchored"]),
+                         (True, False, first["file"], {}))
+        self.assertEqual(self.tree(), before)
+        # a re-anchor the page does not show (a note without a remap) commits and the build stays up to date
+        b = self.note_bundle("record.approve")
+        b["notes"][0].pop("remap", None)  # copied from the remapped note: an imported note carries no remap
+        self.assertEqual(C.ingest(self.pkg, b)["anchors"], {"current": ["note.anchor-t.1"]})
+        third = R.build(self.pkg)
+        a = json.loads(adapter.read_text())
+        adapter.write_text(json.dumps(dict(a, targets=[t for t in a["targets"] if t["id"] != "record.approve"])))
+        fourth = R.build(self.pkg)
+        self.assertEqual(fourth["reanchored"], {"note.anchor-t.1": "unresolved"})
+        self.assertTrue(R.build(self.pkg)["up_to_date"])
+        self.assertEqual(cli.status_report(self.pkg)[1], 0)
+        self.assertIsNotNone(third)
 
     def test_remap_anchor_cli(self):
         C.ingest(self.pkg, self.note_bundle("record.gone"))
@@ -488,6 +655,41 @@ class BrowserAcceptanceTests(BuildCase):
         self.assertEqual(sorted(n["target"]["id"] for n in notes), ["contract.submissions-api", "page.queue"])
         self.assertEqual(recs[rep["added"]["inputs"][0]][1]["status"], "pending")
         self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
+
+
+    def test_saved_state_text_and_export_parts_at_the_limits_in_headless_chrome(self):
+        """Saved state past one bundle's record cap reloads in full; a lone surrogate deep in a free-form key is refused
+        as the CLI refuses it; both parts of a split export have a save control and copyable JSON before the records
+        count as exported; state the page could not read back is never stored; refused saved data stays as it is and
+        its importable records are offered as parts. Every copied part is then checked with the CLI."""
+        R.build(self.pkg)
+        work = Path(tempfile.mkdtemp(prefix="pd-c-limits."))
+        self.addCleanup(shutil.rmtree, work, True)
+        proc = subprocess.Popen(["node", str(DRIVER), "limits", str(self.pkg / BUILD), str(work)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+                                env=dict(os.environ, TP_CHROME=CHROME))
+        try:
+            stdout, stderr = proc.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+            self.fail("the limits run took over 45 s; its process group was killed\n" + stderr[-3000:])
+        self.assertTrue(stdout.strip(), stderr[-3000:])
+        out = json.loads(stdout)
+        self.assertEqual([c[0] for c in out["failures"]], [], json.dumps(out["failures"], indent=1)[:4000])
+        self.assertEqual(proc.returncode, 0)
+        docs = self.docs()
+
+        def accepted(path):
+            got = C.check_bundle(docs, Path(path).read_bytes())
+            self.assertEqual((got["issues"], got["conflicts"]), ([], []), path)
+            return [r["id"] for r in got["bundle"]["notes"] + got["bundle"]["inputs"]]
+        ok, bad = out["textFiles"]
+        accepted(ok)
+        self.assertEqual([i.code for i in C.check_bundle(docs, Path(bad).read_bytes())["issues"]], ["bundle.encoding"])
+        self.assertEqual(len(out["parts"]), 2)
+        self.assertEqual(sorted(i for f in out["parts"] for i in accepted(f)), sorted(json.loads(Path(out["noteIds"]).read_text())))
+        self.assertEqual(sorted(i for f in out["recovered"] for i in accepted(f)), sorted(out["recoverable"]))
 
 
 if __name__ == "__main__":

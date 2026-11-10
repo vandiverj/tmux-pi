@@ -404,7 +404,9 @@ def _open(package_dir, expected_revision, adopting=False):
         raise T.StoreError(code, "; ".join(m for _, m in state["control"]), exit=3)
     commit = state["commit"]
     if (commit is None or state["external"]) and not adopting:
-        code, message = T.trust_problems(state)[0]
+        # the problem this refusal is for, not whichever comes first (a recorded build missing is listed before it)
+        problems = T.trust_problems(state)
+        code, message = next((p for p in problems if p[0] in ("package.uncommitted", "package.external-edit")), problems[0])
         raise T.StoreError(code, message, exit=3, details={"external": state["external"]})
     # With no commit record (a package written by hand), only adoption is possible, and it is refused while the package
     # holds any acceptance record (authority_changed then lists every one): acceptances are recorded only by operations.

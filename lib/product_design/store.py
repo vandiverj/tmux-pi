@@ -314,12 +314,14 @@ def inspect(package_dir) -> dict:
       control            (code, message) for control records that disagree with each other: not trusted
       builds             (file, why) for each build the interrupted commit records whose file is missing or not the
                          recorded bytes: recovery refuses to commit it (build_problems)
+      recorded_builds    (file, why) for each build the manifest records whose file is missing, not a regular file, or
+                         not the recorded digest (recorded_build_problems): what the commit says exists does not
     """
     root = Path(package_dir)
     docs, issues = P.read_docs(root)
     out = {"docs": docs, "issues": issues, "commit": None, "commit_state": "missing", "commit_digest": None,
            "interrupted": None, "external": [], "authority_changed": [], "originals_changed": [], "control": [],
-           "history": [], "displaced": [], "builds": []}
+           "history": [], "displaced": [], "builds": [], "recorded_builds": []}
     if not issues:
         out["issues"] = P.validate_docs(docs)
 
@@ -356,6 +358,8 @@ def inspect(package_dir) -> dict:
         for message in agreement_problems(commit, hist["numbers"], hist["entries"], docs, out["interrupted"]):
             mismatch(message)
 
+    if not out["issues"]:  # a valid manifest: every build it records must be there, holding the recorded bytes
+        out["recorded_builds"] = recorded_build_problems(root, docs)
     committed = commit if commit is not None else {"files": {}, "authority": {}, "originals": {}}
     live = file_digests(docs)
     out["external"] = sorted(name for name in FILES.values() if live.get(name) != committed["files"].get(name))
@@ -387,6 +391,14 @@ def trust_problems(state) -> list:
                     "the interrupted commit records review build(s) whose file is not the recorded build ("
                     + "; ".join(f"{rel} {why}" for rel, why in state["builds"]) + "); `tp-product apply DIR --recover` "
                     "refuses to commit them. Put the build file back, or move .tp-product/txn/ aside by hand"))
+    for code, verb in (("package.build-missing", "missing"), ("package.build-changed", "changed")):
+        found = [(rel, why) for rel, why in state.get("recorded_builds", ()) if (why == MISSING) == (verb == "missing")]
+        if found:
+            out.append((code, "the manifest records review build(s) that are " + verb + " ("
+                        + "; ".join(f"{rel} {why}" for rel, why in found) + "); a reader cannot rely on the recorded "
+                        "build. Put the recorded file back (from version control), or "
+                        + ("" if verb == "missing" else "move it aside and ") + "run `tp-product build DIR`, which "
+                        "restores the last build when it still renders the recorded bytes"))
     if state["commit"] is None and state["commit_state"] != "bad":  # a malformed one is reported above
         out.append(("package.uncommitted", "no commit record (.tp-product/commit.json): not created by `tp-product init`, "
                                             "or its control state was removed"))
@@ -637,7 +649,10 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
             raise _build_refusal(found, "nothing was written")
         _write(root, txn / "txn.json", meta_data)
     except BaseException:
-        shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched (nothing is displaced before the commit point)
+        # txn.json is the commit point, whatever raised after it landed (an error or an interrupt during the rename's
+        # own cleanup or a later fsync): from then on only recovery decides, so nothing here removes the journal.
+        if not os.path.lexists(txn / "txn.json"):
+            shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched (nothing is displaced before it)
         raise
     fault("after-commit-point")
     _roll_forward(root, fault)
@@ -671,7 +686,7 @@ def build_file_problem(root, rel, want=None) -> Optional[str]:
         safe_write.check_below(Path(root), path, "build file")
         st = os.lstat(path)
     except FileNotFoundError:
-        return "is missing"
+        return MISSING
     except (OSError, ValueError) as exc:
         return f"cannot be read ({getattr(exc, 'strerror', None) or exc})"
     if not stat.S_ISREG(st.st_mode):
@@ -683,6 +698,23 @@ def build_file_problem(root, rel, want=None) -> Optional[str]:
     except OSError as exc:
         return f"cannot be read ({exc.strerror or exc})"
     return None if got == want else "holds other bytes than the recorded build"
+
+
+MISSING = "is missing"
+
+
+def recorded_build_problems(root, docs) -> list:
+    """[(file, why)] for each build the manifest records whose file is not that build: missing, not a regular file, or
+    (for an entry with a digest) other bytes. An entry from before digests is checked for a regular file only."""
+    builds = _get(docs, "manifest", "builds")
+    out = []
+    for b in builds if isinstance(builds, list) else []:
+        rel = b.get("file") if isinstance(b, dict) else None
+        why = build_file_problem(root, rel, b.get("digest") if isinstance(b.get("digest"), str) else None) \
+            if isinstance(b, dict) else "is not a build entry"
+        if why:
+            out.append((rel, why))
+    return out
 
 
 def build_problems(root, entry) -> list:

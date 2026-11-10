@@ -367,9 +367,42 @@ def _escalated(meta, gate, cat, health, ctx):
     return rec
 
 
+FALLBACK_SCALE = (["off", "minimal", "low", "medium", "high", "xhigh", "max"], "high")
+
+
+def _effort_scale(cat):
+    """(effort order, ceiling): the catalog's, else the shipped catalog's read leniently, else the built-in scale. A
+    catalog that failed validation is never the source of the ceiling."""
+    if cat:
+        return cat["effort"]["order"], cat["effort"]["ceiling"]
+    try:
+        eff = json.loads(Path(rc.CATALOG_PATH).read_text(encoding="utf-8"))["effort"]
+        if isinstance(eff["order"], list) and eff["ceiling"] in eff["order"]:
+            return eff["order"], eff["ceiling"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return FALLBACK_SCALE
+
+
+def _approve_effort(cat, req, rec):
+    """The one approval check every route result passes (resolved, escalated, explicit or the catalog-error fallback):
+    an effort above the ceiling without --approve-effort is cut to the ceiling, as normal selection does, and the
+    step says so. Raises ValueError for an effort the scale does not have."""
+    if rec["source"] == "stop_and_ask":
+        return
+    order, ceiling = _effort_scale(cat)
+    effort = rec["effort"]
+    if effort not in order:
+        raise ValueError("effort {!r} is not one of: {}".format(effort, ", ".join(order)))
+    if order.index(effort) > order.index(ceiling) and not req.get("approve_effort"):
+        rec["effort"] = ceiling
+        rec.setdefault("steps", []).append("effort {} capped at {} (no approval recorded)".format(effort, ceiling))
+
+
 def _finish(kind, req, cat, rec, card, chain, config_error, started, base, log):
     rec.pop("_cat", None)
     rec.setdefault("steps", [])
+    _approve_effort(cat, req, rec)
     record = _record(kind, req, cat, rec, card, chain, config_error, started)
     record["status"] = "stop_and_ask" if rec["source"] == "stop_and_ask" else "ok"
     selection_id = write_selection(record, base) if log else None

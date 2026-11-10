@@ -109,7 +109,18 @@ def _chain_options(entry, name, providers, shown, levels):
 
 
 def validate_catalog(cat):
-    """Raise CatalogError unless the catalog is complete and consistent; return it."""
+    """Raise CatalogError unless the catalog is complete and consistent; return it. Only CatalogError leaves this
+    function: a value of the wrong type that a check below did not name is still reported as an invalid catalog, so
+    a caller that falls back on CatalogError never meets a traceback."""
+    try:
+        return _validate(cat)
+    except CatalogError:
+        raise
+    except (AttributeError, TypeError, KeyError, IndexError, ValueError, StopIteration) as exc:
+        raise CatalogError("catalog has a value of the wrong shape: {}: {}".format(type(exc).__name__, str(exc)[:120])) from exc
+
+
+def _validate(cat):
     _object(cat, "catalog", ("catalog_version", "default_level", "effort", "providers", "provider_order", "router",
                              "escalation", "reviewer", "review_policy", "principles", "review", "shapes", "roles",
                              "levels"), ("description", "protected_paths"))
@@ -283,6 +294,8 @@ def validate_catalog(cat):
         if shape["status"] not in ("qualified", "candidate"):
             _fail("shape {} status must be qualified or candidate".format(name))
         _text(shape["text"], "shape {} text".format(name))
+    if not isinstance(cat["roles"], dict):
+        _fail("roles must be an object")
     for role, rule in cat["roles"].items():
         _object(rule, "role " + role, (), ("min_level", "max_level", "min_effort", "below_floor_shapes", "strict_floor"))
         if "strict_floor" in rule:
@@ -299,6 +312,8 @@ def validate_catalog(cat):
             _fail("role {}: min_level is above max_level".format(role))
         if "min_effort" in rule and rule["min_effort"] not in vocab:
             _fail("role {}: min_effort must be in the vocabulary".format(role))
+    if "protected_paths" in cat and not isinstance(cat["protected_paths"], list):
+        _fail("protected_paths must be a list")
     for i, entry in enumerate(cat.get("protected_paths") or []):
         name = "protected_paths[{}]".format(i)
         _object(entry, name, ("pattern", "min_level"), ("min_effort", "roles", "why"))
@@ -310,8 +325,6 @@ def validate_catalog(cat):
         if "roles" in entry and (not isinstance(entry["roles"], list) or not entry["roles"]
                                  or any(not isinstance(r, str) or not r for r in entry["roles"])):
             _fail("{}: roles must be a list of role names".format(name))
-    if "protected_paths" in cat and not isinstance(cat["protected_paths"], list):
-        _fail("protected_paths must be a list")
     if not isinstance(cat["principles"], list) or not cat["principles"] or any(
             not isinstance(p, str) or not p.strip() for p in cat["principles"]):
         _fail("principles must be a nonempty list of text")

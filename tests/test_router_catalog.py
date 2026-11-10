@@ -202,6 +202,55 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(rc.CatalogError):
             rc.load_catalog(fx.ROOT / "config" / "nonexistent.json")
 
+    def test_every_wrong_shape_is_a_catalog_error_or_a_catalog_the_router_can_use(self):
+        """Attack: each path of the shipped catalog (3549 cases with six wrong types and a missing key) loads as a catalog
+        error and nothing else, or as a catalog that routes (a plain request, a gated escalation, an explicit model) without
+        anything but ValueError. The listed ones were tracebacks: "roles": null, "protected_paths": 42, a list or dict
+        where a name or key is read (router chain model, a level's provider, a shape key, shapes: null). The case count is
+        the catalog's size times seven, so it is not pinned."""
+        import model_router
+
+        def paths(node, prefix=()):
+            yield prefix
+            for k, v in (node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()):
+                yield from paths(v, prefix + (k,))
+
+        def no_router(*args, **kwargs):
+            raise OSError("no router")
+        wrong = (None, 7, "x", [], {}, True, "missing")
+        meta = {"model": fx.SONNET, "thinking": "medium", "route_info": {}}
+        requests = ({"task": "Fix src/a.py", "role": "coder", "worker": "claude", "level": "mid"},
+                    {"task": "Fix lib/sensitive_read.py", "role": "coder", "worker": "claude",
+                     "escalate": {"from": meta, "gate": "rule-first", "optional": True}},
+                    {"task": "Fix src/a.py", "role": "coder", "model": fx.SONNET})
+        raw = json.loads(fx.CATALOG_PATH.read_text(encoding="utf-8"))
+        cases = errors = used = 0
+        for path in (p for p in paths(raw) if p):
+            for value in wrong:
+                cases += 1
+                cat = copy.deepcopy(raw)
+                parent = cat
+                for key in path[:-1]:
+                    parent = parent[key]
+                if value == "missing":
+                    parent.pop(path[-1])
+                else:
+                    parent[path[-1]] = copy.deepcopy(value)
+                with self.subTest(path=path, value=value):
+                    try:
+                        loaded = rc.validate_catalog(cat)
+                    except rc.CatalogError:
+                        errors += 1
+                        continue
+                    for req in requests:
+                        try:
+                            model_router.select(dict(req), catalog=loaded, log=False, runner=no_router)
+                        except ValueError:
+                            pass
+                    used += 1
+        self.assertEqual(cases, errors + used)
+        self.assertGreater(errors, used)
+
 
 class QwenReasoningConfigTests(unittest.TestCase):
     QWEN_ID = "qwen/qwen3.6-35b-a3b"

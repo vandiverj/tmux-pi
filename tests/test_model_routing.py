@@ -410,6 +410,29 @@ class EscalationTests(Base):
             self.assertNotIn("Traceback", nocat.stderr)
             self.assertIn("the gated retry was not escalated: model catalog unreadable", nocat.stderr)
             self.assertEqual(self.meta(self.settled(json.loads(nocat.stdout)))["route_info"]["source"], "catalog_error_fallback")
+        # the same fallback holds the effort approval (was: xhigh and max started unapproved) and a catalog that parses
+        # with the wrong shape is a catalog error too (was: AttributeError / TypeError tracebacks)
+        for label, change, extra, effort in (("missing, xhigh unapproved", None, ("--thinking", "xhigh"), "high"),
+                                             ("missing, max unapproved", None, ("--thinking", "max"), "high"),
+                                             ("missing, xhigh approved", None, ("--thinking", "xhigh", "--approve-effort"), "xhigh"),
+                                             ("roles null", lambda c: c.update(roles=None), (), None),
+                                             ("protected_paths 42", lambda c: c.update(protected_paths=42), (), None)):
+            with self.subTest(label):
+                path = self.root / "missing-catalog.json"
+                if change:
+                    shaped = json.loads((ROOT / "config" / "model-catalog.json").read_text())
+                    change(shaped)
+                    path = self.root / "shaped-catalog.json"
+                    path.write_text(json.dumps(shaped))
+                run = self.run_cmd("tp-agent", "retry", second["id"], "--reason", "failed", "--route", "rule-first", *extra,
+                                   env=dict(self.env, TP_MODEL_CATALOG=str(path)))
+                self.assertEqual(run.returncode, 0, run.stderr[-300:])
+                self.assertNotIn("Traceback", run.stderr)
+                self.assertIn("the gated retry was not escalated: model catalog unreadable", run.stderr)
+                got = self.meta(self.settled(json.loads(run.stdout)))
+                self.assertEqual((got["route_info"]["source"], got["model"]), ("catalog_error_fallback", SOL))
+                if effort:
+                    self.assertEqual(got["thinking"], effort)
         mine = self.meta(self.settled(self.retry(second, "--route", "design", "--model", SONNET, "--thinking", "medium")))  # the user's model wins
         self.assertEqual((mine["model"], mine["thinking"]), (SONNET, "medium"))
         self.assertNotEqual(mine["route_info"]["decided_by"], "gated_retry")
@@ -418,6 +441,49 @@ class EscalationTests(Base):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("the gated retry was not escalated", run.stderr)
         self.assertNotEqual(self.meta(json.loads(run.stdout))["route_info"]["decided_by"], "gated_retry")
+
+
+class CatalogFallbackEffortTests(Base):
+    """Attack on one rule: no route starts above high without --approve-effort, whatever picked it and whatever state the
+    catalog is in. kind (first dispatch or plain retry, gated retry, --escalate) x --thinking x approval x catalog
+    (missing, not JSON, wrong shape) = the expected worker, model, concrete effort, source, step and reason."""
+
+    def catalogs(self):
+        shaped = json.loads((ROOT / "config" / "model-catalog.json").read_text())
+        shaped["roles"] = None
+        (self.root / "not-json.json").write_text("{not json")
+        (self.root / "shaped.json").write_text(json.dumps(shaped))
+        return {"missing": self.root / "missing.json", "not json": self.root / "not-json.json", "wrong shape": self.root / "shaped.json"}
+
+    def test_the_catalog_error_fallback_applies_the_effort_approval_on_every_kind(self):
+        prior = {"model": SONNET, "thinking": "medium", "route_info": {}}
+        rows = 0
+        for name, path in self.catalogs().items():
+            for kind in ("plain", "gated", "escalate"):
+                for thinking in (None, "low", "high", "xhigh", "max"):
+                    for approved in (False, True):
+                        rows += 1
+                        req = {"task": "Fix src/a.py", "role": "coder", "thinking": thinking, "approve_effort": approved}
+                        if kind != "plain":
+                            req["escalate"] = {"from": prior, "gate": "rule-first", "optional": kind == "gated"}
+                        with self.subTest(catalog=name, kind=kind, thinking=thinking, approved=approved):
+                            if kind == "escalate":  # a required escalation cannot be worked out without a catalog
+                                with self.assertRaises(model_router.RouteStop):
+                                    model_router.select(req, catalog_path=str(path), log=False)
+                                continue
+                            out = model_router.select(req, catalog_path=str(path), log=False)
+                            above = thinking in ("xhigh", "max") and not approved
+                            self.assertEqual((out["worker"], out["model"], out["source"], out["decided_by"]), ("pi", SOL, "catalog_error_fallback", None))
+                            self.assertEqual(out["effort"], "high" if above else thinking or "medium")
+                            self.assertEqual(out["steps"], ["effort {} capped at high (no approval recorded)".format(thinking)] if above else [])
+                            self.assertTrue(out["reason"].startswith("model catalog unreadable"), out["reason"])
+                            self.assertEqual(out.get("escalation_note") is not None, kind == "gated")
+        self.assertEqual(rows, 3 * 3 * 5 * 2)
+
+    def test_the_fallback_refuses_an_effort_the_scale_does_not_have(self):
+        for thinking in ("bogus", "ultra"):
+            with self.assertRaises(ValueError):
+                model_router.select({"task": "Fix src/a.py", "role": "coder", "thinking": thinking}, catalog_path=str(self.root / "missing.json"), log=False)
 
 
 class LocalOnlyCommandTests(Base):

@@ -12,7 +12,7 @@ import json
 import re
 import unittest
 
-from tests.test_product_design_store import C, P, PackageCase, READY, DRAFTY, cs, rec
+from test_product_design_store import C, P, PackageCase, READY, DRAFTY, cs, rec
 from product_design import cases as K  # noqa: E402
 from product_design import cli  # noqa: E402
 from product_design import schema as S  # noqa: E402

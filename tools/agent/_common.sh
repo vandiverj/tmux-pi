@@ -98,23 +98,36 @@ tp_app_of() {
 
 # tp_tree_fingerprint WORKTREE — print the tree sha of everything in the working tree that git would add: every tracked
 # file (even one that matches an ignore pattern) and untracked files that are not ignored (deletions are simply absent).
-# It is `git write-tree` on a temporary index: seeded with HEAD's tree, then every path of the real index (so a staged-new
-# tracked file counts, ignored or not), then `git add -A`. The real index is not copied, so its assume-unchanged and
-# skip-worktree flags cannot hide a rewrite, and it is not touched. The same content gives the same sha. HEAD is separate
-# (`git rev-parse HEAD`). lib/gate_record.py:fingerprint takes the same steps and a test holds the two equal.
+# It is `git write-tree` on a temporary index: seed HEAD, then `git add -A` (handles tracked files and type changes),
+# then refresh staged-new paths individually (including ignored ones). Rejected paths, e.g. descendants now beyond a
+# symlink, are skipped. Never copy the real index's assume-unchanged/skip-worktree flags or touch that index. If the
+# richer snapshot fails, retry the original empty-index add -A/write-tree so a valid type change cannot stop a command.
+# The same content gives the same sha. HEAD is separate. lib/gate_record.py:fingerprint takes the same steps.
 tp_tree_fingerprint() {
-  local dir idx tree rc=0
+  local dir idx tree path rc=0
+  local head=()
   dir="$(mktemp -d "${TMPDIR:-/tmp}/tp-fp.XXXXXX")" || return 1
   idx="$dir/index"
   if git -C "$1" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    head=(HEAD)
     GIT_INDEX_FILE="$idx" git -C "$1" read-tree HEAD >/dev/null 2>&1 || rc=1
-  fi
-  if [ "$rc" = 0 ]; then
-    git -C "$1" ls-files -z | GIT_INDEX_FILE="$idx" git -C "$1" update-index --add --remove -z --stdin >/dev/null 2>&1 || rc=1
   fi
   if [ "$rc" = 0 ]; then (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1; fi
   if [ "$rc" = 0 ]; then
+    # No renames: a renamed destination is new membership too. Include intent-to-add entries; keep names NUL-delimited.
+    git -C "$1" diff --cached --no-renames --ita-visible-in-index --diff-filter=A --name-only -z ${head[@]+"${head[@]}"} -- >"$dir/paths" 2>/dev/null || rc=1
+    while IFS= read -r -d '' path; do
+      GIT_INDEX_FILE="$idx" git -C "$1" update-index --add --remove -- "$path" >/dev/null 2>&1 || :
+    done <"$dir/paths"
+  fi
+  if [ "$rc" = 0 ]; then
     tree="$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree 2>/dev/null)" || rc=1
+  fi
+  if [ "$rc" != 0 ]; then
+    rm -f "$idx" "$idx.lock"
+    rc=0
+    (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1
+    if [ "$rc" = 0 ]; then tree="$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree 2>/dev/null)" || rc=1; fi
   fi
   rm -rf "$dir"
   [ "$rc" = 0 ] || return 1

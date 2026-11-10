@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools" / "agent"
@@ -1170,6 +1171,23 @@ class FingerprintTests(ScriptCase):
         (repo / "a.txt").unlink()
         self.assertNotEqual(self.shell_fingerprint(repo), before)
         self.assertEqual(self.git(repo, "status", "--porcelain").split(), ["D", "a.txt"])  # the real index was not touched
+        # If the richer snapshot fails, discard it and retry the original empty-index method.
+        expected = self.shell_fingerprint(repo)
+        real_git = shutil.which("git")
+        (self.bin / "git").unlink()
+        marker = self.tmp / "failed-once"
+        for step in ("read-tree", "add", "write-tree"):
+            with self.subTest(fallback_after=step):
+                (self.bin / "git").write_text(
+                    f'#!/bin/sh\ncase " $* " in *" {step} "*)\n'
+                    f'  if [ ! -e "{marker}" ]; then touch "{marker}"; exit 1; fi ;;\nesac\n'
+                    f'exec "{real_git}" "$@"\n')
+                (self.bin / "git").chmod(0o755)
+                for implementation in (self.shell_fingerprint, gate_record.current):
+                    with self.subTest(implementation=implementation.__name__):
+                        marker.unlink(missing_ok=True)
+                        with mock.patch.dict(os.environ, self.env):
+                            self.assertEqual(implementation(repo), expected)
 
     def test_a_tracked_file_that_matches_an_ignore_pattern_is_still_part_of_the_fingerprint(self):
         repo = self.repo(files={"a.txt": "one\n", "out.js": "built\n"})
@@ -1208,6 +1226,54 @@ class FingerprintTests(ScriptCase):
         self.write(repo, {"new.js": "y\n"})
         self.assertNotEqual(self.shell_fingerprint(repo), staged)
         self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        for kind in ("directory-to-symlink", "directory-to-file", "file-to-directory", "symlink-to-directory"):
+            for staged_new in (False, True):
+                with self.subTest(kind=kind, staged_new=staged_new):
+                    initial = {"a": "old\n"} if kind in ("file-to-directory", "symlink-to-directory") else {"a/b": "old\n"}
+                    repo = self.repo(f"{kind}-{staged_new}", files={"base": "x\n"} if staged_new else initial)
+                    if staged_new:
+                        self.write(repo, {**initial, ".gitignore": "z-ignored.js\n", "z-ignored.js": "staged\n"})
+                        self.git(repo, "add", "-f", "a", "z-ignored.js")
+                        self.write(repo, {"z-ignored.js": "rewritten\n"})  # still refreshed after a rejected path
+                    if kind == "symlink-to-directory":
+                        (repo / "a").unlink()
+                        (repo / "a").symlink_to("elsewhere")
+                        self.git(repo, "add", "a")
+                        if not staged_new:
+                            self.git(repo, "commit", "-qm", "symlink")
+                    index = repo / ".git/index"
+                    original_index = index.read_bytes()
+                    before = self.shell_fingerprint(repo)
+                    if kind in ("file-to-directory", "symlink-to-directory"):
+                        (repo / "a").unlink()
+                        self.write(repo, {"a/b": "new\n"})
+                    else:
+                        shutil.rmtree(repo / "a")
+                        if kind == "directory-to-symlink":
+                            (repo / "a").symlink_to("elsewhere")
+                        else:
+                            self.write(repo, {"a": "new\n"})
+                    # Build the independent expected tree with Git's original empty-index algorithm.
+                    with tempfile.TemporaryDirectory() as scratch:
+                        env = dict(self.env, GIT_INDEX_FILE=str(Path(scratch) / "index"))
+                        subprocess.run(["git", "-C", str(repo), "add", "-A"], env=env, check=True, capture_output=True)
+                        if staged_new:
+                            subprocess.run(["git", "-C", str(repo), "add", "-f", "z-ignored.js"], env=env,
+                                           check=True, capture_output=True)
+                        expected = subprocess.run(["git", "-C", str(repo), "write-tree"], env=env, check=True,
+                                                  capture_output=True, text=True).stdout.strip()
+                    for implementation in (self.shell_fingerprint, gate_record.current):
+                        with self.subTest(implementation=implementation.__name__):
+                            actual = implementation(repo)
+                            self.assertEqual(actual, expected)
+                            self.assertNotEqual(actual, before)
+                            self.assertEqual(implementation(repo), actual)  # repeat is stable
+                    marker = self.tmp / "command-ran"
+                    marker.unlink(missing_ok=True)
+                    out = self.run_script("test-run.sh", repo, "--", "touch", marker)
+                    self.assertEqual(out.returncode, 0, out.stdout)
+                    self.assertTrue(marker.exists(), out.stdout)
+                    self.assertEqual(index.read_bytes(), original_index)
 
     def test_equal_content_gives_an_equal_fingerprint_whatever_the_history(self):
         one = self.repo("one", files={"a.txt": "one\n"})

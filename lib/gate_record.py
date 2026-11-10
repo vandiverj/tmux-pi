@@ -129,21 +129,36 @@ def _git(worktree, *args, env=None) -> str:
 
 
 def fingerprint(worktree) -> Tuple[str, str]:
-    """(head, tree) of the working tree. The steps of tp_tree_fingerprint in tools/agent/_common.sh: a temporary index
-    seeded with HEAD's tree and every path of the real index (tracked-but-ignored files stay in; the real index's
-    assume-unchanged and skip-worktree flags are not inherited), then `git add -A`, then `git write-tree`. head is ""
-    in a repository without a commit."""
+    """(head, tree), using the same steps as tools/agent/_common.sh:tp_tree_fingerprint. Seed a temporary index from
+    HEAD, add -A, then refresh staged additions individually, skipping rejected paths (e.g. beyond a new symlink).
+    Real index flags are never inherited. On failure retry empty-index add -A/write-tree. head is "" without a commit.
+    """
     head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     scratch = tempfile.mkdtemp(prefix="tp-fp.")
     try:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(scratch, "index"))
-        if head:
-            _git(worktree, "read-tree", "HEAD", env=env)
-        paths = _git_raw(worktree, "ls-files", "-z")
-        _git_raw(worktree, "update-index", "--add", "--remove", "-z", "--stdin", env=env, data=paths)
-        _git(worktree, "add", "-A", env=env)
-        return head, _git(worktree, "write-tree", env=env)
+        try:
+            if head:
+                _git(worktree, "read-tree", "HEAD", env=env)
+            _git(worktree, "add", "-A", env=env)
+            # Read the real index, not the temporary one. No renames, so destinations count as additions;
+            # intent-to-add entries count too. Byte paths survive newlines and non-UTF-8 names.
+            paths = _git_raw(worktree, "diff", "--cached", "--no-renames", "--ita-visible-in-index", "--diff-filter=A",
+                             "--name-only", "-z", *(["HEAD"] if head else []), "--")
+            for path in paths.split(b"\0"):
+                if path:
+                    try:
+                        _git_raw(worktree, "update-index", "--add", "--remove", "--", os.fsdecode(path), env=env)
+                    except RuntimeError:
+                        pass  # A staged path may no longer be addressable in the worktree; add -A already handled it.
+            return head, _git(worktree, "write-tree", env=env)
+        except (RuntimeError, OSError):
+            for path in (env["GIT_INDEX_FILE"], env["GIT_INDEX_FILE"] + ".lock"):
+                if os.path.exists(path):
+                    os.unlink(path)
+            _git(worktree, "add", "-A", env=env)
+            return head, _git(worktree, "write-tree", env=env)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

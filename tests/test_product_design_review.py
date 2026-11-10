@@ -161,14 +161,36 @@ class BuildTests(BuildCase):
                 self.assertEqual((self.pkg / BUILD).read_bytes(), page)
                 self.assertEqual(T.file_digest(self.pkg / BUILD), r["digest"])
                 self.assertEqual(self.status_codes(), (0, []))
-        # an older recorded build that is deleted stays a trust problem: only the last build can be rendered again
+        # the whole builds/ folder deleted: made again as for a new build, the bytes restored, and the text says so
+        shutil.rmtree(self.pkg / "builds")
+        rc, out, err = self.run_cli("build", self.pkg)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("restored: " + BUILD, out)
+        self.assertNotIn("nothing was written", out)
+        self.assertEqual(((self.pkg / BUILD).read_bytes(), self.status_codes()), (page, (0, [])))
+        # a builds/ that cannot be a folder is refused by name (never io.error) and never written through
+        for why, block in (("not a folder", lambda p: p.write_text("x")),
+                           ("symbolic link", lambda p: os.symlink(self.tmp / "elsewhere", p))):
+            with self.subTest(why):
+                (self.tmp / "elsewhere").mkdir()
+                shutil.rmtree(self.pkg / "builds")
+                block(self.pkg / "builds")
+                rc, out, err = self.run_cli("build", self.pkg)
+                self.assertEqual((rc, "build.exists" in err, why in err), (3, True, True), err)
+                self.assertEqual(os.listdir(self.tmp / "elsewhere"), [])
+                self.assertEqual(self.status_codes(), (3, ["package.build-changed"]))
+                (self.pkg / "builds").unlink()
+                (self.tmp / "elsewhere").rmdir()
+                self.assertTrue(R.build(self.pkg)["restored"])
+        # an older recorded build that is deleted cannot be rendered again: build refuses by name, as status reports it
         C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
                            "operations": [{"op": "set", "id": "rule.required-fields",
                                            "fields": {"statement": "Refused; the message names each field."}}]}, 4)
         R.build(self.pkg)
         (self.pkg / BUILD).unlink()
         self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
-        self.assertTrue(R.build(self.pkg)["up_to_date"])
+        e = self.refused("package.build-missing", 3)
+        self.assertIn(BUILD + " is missing", str(e))
         self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
 
     def test_page_is_offline_and_package_text_is_inert(self):
@@ -209,6 +231,15 @@ class BuildTests(BuildCase):
         (self.pkg / "builds/x").write_text("x")
         os.symlink("x", self.pkg / BUILD)  # a link is not a build file either
         self.refused("build.exists", 3)
+        # the folder's name taken by a file or a link: refused by name, never io.error, never written through
+        shutil.rmtree(self.pkg / "builds")
+        (self.pkg / "builds").write_text("mine")
+        self.assertIn("builds/ is not a folder", str(self.refused("build.exists", 3)))
+        (self.pkg / "builds").unlink()
+        (self.tmp / "elsewhere").mkdir()
+        os.symlink(self.tmp / "elsewhere", self.pkg / "builds")
+        self.assertIn("symbolic link", str(self.refused("build.exists", 3)))
+        self.assertEqual(os.listdir(self.tmp / "elsewhere"), [])
 
     def test_identical_bytes_already_there_are_reused(self):
         other = self.tmp / "other"
@@ -229,6 +260,11 @@ class BuildTests(BuildCase):
         self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
 
     def test_a_recorded_build_with_other_bytes_is_never_up_to_date(self):
+        # before any build: a builds/ that is a file is refused by name, never io.error, and nothing is committed
+        (self.pkg / "builds").write_text("mine")
+        self.assertIn("builds/ is not a folder", str(self.refused("build.exists", 3)))
+        self.assertEqual((self.pkg / "builds").read_text(), "mine")
+        (self.pkg / "builds").unlink()
         R.build(self.pkg)
         page = (self.pkg / BUILD).read_bytes()
         for why, data in (("one byte changed", page[:-2] + b"X" + page[-1:]), ("empty", b""), ("other page", b"<p>x</p>")):

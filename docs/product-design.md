@@ -186,10 +186,10 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
 | `adopt.original` | 1 | An adoption would remove or change an original note, input or review |
 | `adapter.invalid` | 1 | `build`: `prototype/adapter.json` is unreadable or outside its schema, names an unknown page, contract or operation, repeats an id, or its script or style cannot be inlined (a symlink, outside the package, over 2 MiB, not UTF-8, or holding `</script`, `</style` or `<!--`) |
-| `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file), including the recorded build of the current source when its bytes are not the recorded digest; it is never replaced and never reported up to date |
+| `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file), including any recorded build whose bytes are not its recorded digest; it is never replaced and never reported up to date. Also when `builds/` is not a folder (a file) or is a symbolic link: nothing is written through it |
 | `build.conflict` | 3 | `build`: the commit failed before its commit point and the build file had been replaced by someone else meanwhile; their bytes are kept |
-| `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem. Also a `status` trust problem when a build the manifest records is missing |
-| `package.build-changed` | 3 | `status`: a build the manifest records is not a regular file holding its recorded digest (truncated, rewritten, a directory, a symlink). `tp-product build` refuses to replace it (`build.exists`); once it is moved aside, build restores the last build in place when the committed package still renders the recorded bytes; an older recorded build is not regenerated |
+| `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem. Also a `status` trust problem when a build the manifest records is missing, and a `build` refusal when that build cannot be written back (the package no longer renders its recorded bytes): nothing is written |
+| `package.build-changed` | 3 | `status`: a build the manifest records is not a regular file holding its recorded digest (truncated, rewritten, a directory, a symlink). `tp-product build` refuses to replace it (`build.exists`); once it is moved aside, build writes back every recorded build the committed package still renders byte for byte, and refuses (`package.build-missing`) for one it does not |
 | `bundle.unreadable` | 1 | `import-feedback`: the bundle file cannot be read |
 | `bundle.invalid`, `bundle.conflict` | 1 | `import-feedback`: see Feedback ingestion; nothing was written |
 
@@ -372,9 +372,14 @@ other change, so the build moves the package to the next revision.
   whatever is raised (an interrupt included); recovery decides from then on.
 - **Every recorded build is checked.** `status` (`store.trust_problems`) verifies that each build in
   the manifest's `builds` list is a regular file holding its recorded digest: a missing one is
-  `package.build-missing`, any other bytes `package.build-changed`, and status exits non-zero. When the last build's
-  file is missing and the committed package still renders exactly its recorded bytes, `tp-product build` writes it
-  back in place (reported up to date, `restored`, nothing committed).
+  `package.build-missing`, any other bytes `package.build-changed`, and status exits non-zero. `tp-product build`
+  checks the same list first: a recorded build that is missing (its folder too) and that the committed package still
+  renders byte for byte (same source, same digest) is written back in place, its folder made as for a new build
+  (`restored`; the text says "restored", never "nothing was written"); one that is missing and no longer renders is
+  refused by name (`package.build-missing`, exit 3), and one that holds other bytes is refused (`build.exists`). A
+  `builds/` that is a file or a symbolic link is refused (`build.exists`); a build is never written through a link.
+  Each refusal writes no build file, so `status` and `build` agree afterwards. An older build that is lost for good
+  must be put back from version control before the package builds again.
 - **Built from committed state.** A build first re-evaluates note anchors against the current registry; if that changes
   stored anchors, it commits that change as its own revision before it renders, so the page shows only committed
   state and building again reports up to date.
@@ -425,19 +430,27 @@ other change, so the build moves the package to the next revision.
   says so, and the page starts fresh. Saved state has its own limits, not one bundle's: it may hold any number of
   records (an export splits them), and every other rule an import applies (text, schema, bookkeeping, depth). The page
   stores state only after checking that it would read that same text back; when it would not, it keeps the last state
-  stored and says so. The notice for saved data it refused offers the stored bytes as a download as they are, and
-  exports the records in them that are importable on their own as importable parts (the others are listed by id with
-  the reason). What was last exported is saved as a short hash, so exporting never doubles what is stored.
+  stored and says so. The notice for saved data it refused, for any reason (too deep to parse, not JSON, cut short,
+  an unknown field, a bad record, a conflicting id), offers the stored bytes as a download as they are and, whenever
+  at least one note or answer in them is importable on its own, an export of those records as importable parts.
+  The records are found in the stored text without parsing all of it, each checked for depth before it is parsed;
+  the others are listed by id with the reason, both records of a conflicting id among them. The refused data is never
+  taken into the page's state. What was last exported is saved as a short hash, so exporting never doubles what is stored.
 - **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions) and lists every part on the
   page with a save control and its JSON to copy, in case a download was blocked; the records count as exported only
   once every part is listed and its download started. Import applies the CLI's rules (schema, package, version,
   limits, text that is valid Unicode in every string and key at any depth, pending inputs, no local bookkeeping,
-  conflicting ids) and is all or nothing. Nesting depth is measured without recursion, so any depth
+  conflicting ids) and is all or nothing. Conflicting ids are one rule, shared by import, export, saved state and its
+  recovery: an id held twice with different content refuses the whole bundle (the CLI's "the bundle holds two
+  different records with this id"); the same record twice is one record. Saved state holding such an id is refused
+  when it is loaded, so the page never exports it. The page cannot see the notes a package already holds: an id the
+  package holds with other content is refused by the CLI on import (`bundle.conflict`), never by the page. Nesting depth is measured without recursion, so any depth
   gets the 64-level refusal. A number the page could not export as written (an integer beyond 2^53, `-0`, an
   exponent, a trailing zero, a long decimal) is refused visibly, so whatever the page exports imports into the CLI as
   it was. Ids are looked up as own properties only: `constructor`, `__proto__` or `toString` are ids like any other,
   and an unknown field with such a name is refused as the CLI refuses it. Export checks each bundle it writes with
-  every import rule (bytes, records, depth, text, schema, bookkeeping, numbers); feedback larger than one bundle is
+  every import rule (bytes, records, depth, text, schema, bookkeeping, numbers, conflicting ids), and the parts
+  together with the same rules but the size of one bundle; feedback larger than one bundle is
   exported as several bundles (`-part-N-of-M`), each importable on its own, and an export that cannot be made
   importable is refused with nothing marked exported. A note or answer that would not be importable in a bundle on its
   own is refused when it is saved. Importing a bundle into a fresh browser and resuming its

@@ -326,9 +326,12 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
     source fingerprint are made from the state that commit published. So building twice with no change in between
     gives up_to_date the second time.
 
-    Up to date means: the last recorded build shows this source, and its file is there holding exactly the recorded
-    digest. When that file is missing and this source still renders the recorded digest at the recorded revision, it is
-    written back (restored) rather than built again under a new name. The build file is written before the commit
+    Every build the manifest records is checked first, as `status` checks it (_recorded_builds): one that is gone is
+    written back (restored) when this source still renders its recorded digest at its revision, its folder created as
+    for a new build; any other recorded build that is not its recorded bytes is refused by name (build.exists or
+    package.build-missing, exit 3) before a build file is written, so a build that succeeds leaves no build problem for
+    `status` to report. Up to date means: the last recorded build shows this source (its file is then its recorded
+    bytes). The build file is written before the commit
     point; if the commit fails before that point (any exception, an interrupt included) the file is removed again, but
     only while it holds this build's bytes; after it, the file is never removed (the journal records it, and recovery
     refuses to commit an entry whose file is missing or differs)."""
@@ -358,29 +361,20 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
                   "source_fingerprint": b["source_fingerprint"], "content_fingerprint": b["content_fingerprint"],
                   "warnings": data["warnings"], "reanchored": reanchored}
         builds = docs["manifest"].get("builds", [])
+        restored = _recorded_builds(root, builds, b["source_fingerprint"],
+                                    lambda rev: render_html(payload(docs, rev, adapter, script, style, runtime_js,
+                                                                    runtime_css), runtime_js, runtime_css, script, style),
+                                    fault)
+        result["restored"] = bool(restored)
         last = builds[-1] if builds else None
         if last and last.get("source") == b["source_fingerprint"]:
-            old = render_html(payload(docs, last["revision"], adapter, script, style, runtime_js, runtime_css),
-                              runtime_js, runtime_css, script, style)
-            want = last["digest"] if isinstance(last.get("digest"), str) else "sha256:" + hashlib.sha256(old).hexdigest()
-            if os.path.lexists(root / last["file"]):
-                # The recorded build is there: it is up to date only if its bytes are the recorded ones (the digest, or
-                # for an entry from before digests, the page this content renders at that revision).
-                problem = T.build_file_problem(root, last["file"], want)
-                if problem:
-                    raise T.StoreError("build.exists", f"{last['file']}, the recorded build of this content, {problem}; "
-                                                       "it was not replaced and it is not reported up to date. Move it "
-                                                       "aside and build again. Nothing was written.", exit=3,
-                                       details={"file": last["file"], "problem": problem})
-                return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"))
-            if "sha256:" + hashlib.sha256(old).hexdigest() == want:  # deleted: write the recorded bytes back
-                _restore(root, last["file"], old, fault)
-                return dict(result, file=last["file"], up_to_date=True, restored=True, digest=last.get("digest"))
+            # every recorded build is its recorded bytes now (_recorded_builds refused or restored the rest)
+            return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"))
         page = render_html(data, runtime_js, runtime_css, script, style)
         page_digest = "sha256:" + hashlib.sha256(page).hexdigest()
         rel = f"{BUILDS_DIR}/{docs['manifest']['id']}-r{current}.html"
         target = root / rel
-        safe_write.ensure_dir(target.parent, what="builds directory", root=root)
+        _builds_dir(root, rel)
         if os.path.lexists(target):
             if T.build_file_problem(root, rel, page_digest):
                 raise T.StoreError("build.exists", f"{rel} already exists with other content; it was not replaced. Move it "
@@ -422,8 +416,73 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
         return dict(result, file=rel, digest=page_digest, committed=done["committed"], revision=done["revision"])
 
 
+def _builds_dir(root, rel):
+    """Create the folder the build file `rel` is written in, for every writer of a build file (a new build and a
+    restore) alike: below the package, no symlink on the way. A folder that cannot be made (a file or a link has its
+    name) is refused by name (build.exists, exit 3), never replaced and never entered."""
+    parent = (Path(root) / rel).parent
+    shown = os.path.relpath(parent, root) + "/"
+    try:
+        safe_write.ensure_dir(parent, what="builds directory", root=root)
+    except safe_write.UnsafePath as exc:
+        raise T.StoreError("build.exists", f"{shown} (or a folder above it in the package) is a symbolic link; a build "
+                                           "is never written through a link. Move it aside and build again. No build "
+                                           "file was written.", exit=3, details={"file": rel, "problem": str(exc)}) from None
+    except (FileExistsError, NotADirectoryError) as exc:
+        raise T.StoreError("build.exists", f"{shown} is not a folder ({exc.strerror}); it was not replaced. Move it "
+                                           "aside and build again. No build file was written.", exit=3,
+                           details={"file": rel, "problem": exc.strerror}) from None
+
+
+def _recorded_builds(root, builds, source, render_at, fault) -> list:
+    """Every build the manifest records, checked as `status` checks it (store.build_file_problem). A build file that is
+    gone (nothing at its name) is written back in place when this source still renders it byte for byte: its entry
+    has this source fingerprint and the page made at its revision has its digest. Everything else is refused by name
+    before anything is written: a recorded file that is there but is not the recorded build (other bytes, not a regular
+    file, a link on its way: build.exists, never replaced) and a gone file this source no longer renders
+    (package.build-missing: only its own bytes can be put back, from version control). Returns the files restored."""
+    changed, missing, todo = [], [], []
+    for entry in builds:
+        if not isinstance(entry, dict):
+            changed.append((str(entry), "is not a build entry"))
+            continue
+        rel = entry.get("file")
+        want = entry.get("digest") if isinstance(entry.get("digest"), str) else None
+        why = T.build_file_problem(root, rel, want)
+        if why is None:
+            continue
+        if isinstance(rel, str) and rel and not os.path.lexists(Path(root) / rel):
+            if entry.get("source") == source:
+                page = render_at(entry["revision"])
+                if want is None or "sha256:" + hashlib.sha256(page).hexdigest() == want:
+                    todo.append((rel, page))
+                    continue
+            missing.append((rel, why))
+        else:
+            changed.append((rel, why))
+    if changed:
+        rel, why = changed[0]
+        raise T.StoreError("build.exists", "; ".join(f"{r} {w}" for r, w in changed) + ": the manifest records "
+                                           + ("that review build" if len(changed) == 1 else "those review builds")
+                                           + "; it was not replaced and it is not reported up to date. Move it aside "
+                                           "and build again. No build file was written.", exit=3,
+                           details={"file": rel, "problem": why, "builds": [{"file": r, "problem": w} for r, w in changed]})
+    if missing:
+        raise T.StoreError("package.build-missing", "; ".join(f"{r} {w}" for r, w in missing) + ": the manifest records "
+                                                    "that review build and this package no longer renders its bytes, "
+                                                    "so it cannot be built again. Put the recorded file back (from "
+                                                    "version control) and build again. No build file was "
+                                                    "written.", exit=3,
+                           details={"builds": [{"file": r, "problem": w} for r, w in missing]})
+    for rel, page in todo:
+        _builds_dir(root, rel)
+        _restore(root, rel, page, fault)
+    return [rel for rel, _ in todo]
+
+
 def _restore(root, rel, page, fault):
-    """Write the recorded bytes of the last build back where it was deleted. Never replaces a file that appeared."""
+    """Write the recorded bytes of a build back where it was deleted (its folder is there: _builds_dir). Never
+    replaces a file that appeared."""
     fault("before-build-restore")
     try:
         T._write_new(root, root / rel, page)

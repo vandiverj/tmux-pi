@@ -107,11 +107,16 @@ def _print_build(r, out, as_json):
     if as_json:
         print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
         return
-    if r["up_to_date"]:
+    if r["up_to_date"] and r.get("restored"):
+        print(f"restored: {r['file']} shows this content (source {r['source_fingerprint']}); the recorded build "
+              "was missing and its recorded bytes were written back (nothing was committed)", file=out)
+    elif r["up_to_date"]:
         print(f"up to date: {r['file']} shows this content (source {r['source_fingerprint']}); nothing was written", file=out)
     else:
         print(f"built {r['file']}" + (" (the file was already there, byte for byte)" if r["reused"] else ""), file=out)
         print(f"  recorded in the manifest: revision {r['revision']}", file=out)
+        if r.get("restored"):
+            print("  a recorded build that was missing was written back with its recorded bytes", file=out)
     print(f"  content {r['content_fingerprint']}", file=out)
     print(f"  source  {r['source_fingerprint']}", file=out)
     for w in r["warnings"]:

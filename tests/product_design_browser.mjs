@@ -594,7 +594,10 @@ async function limits(htmlPath, workDir) {
 
     await phase("refused saved data", async () => {   // left as it is, downloadable, its importable records offered as parts
       const refused = Object.assign({}, saved, {zz: 1});
-      refused.notes = [1, 2, 3].map((i) => Object.assign({}, note, {id: "note.good." + i})).concat([Object.assign({}, note, {id: "note.bad.1", text: "lone \ud800"})]);
+      // a record no bundle can hold, an id held twice with other content (an import refuses both), the same record twice
+      refused.notes = [1, 2, 3].map((i) => Object.assign({}, note, {id: "note.good." + i})).concat([Object.assign({}, note, {id: "note.bad.1", text: "lone \ud800"}),
+        Object.assign({}, note, {id: "note.dup.1", text: "one"}), Object.assign({}, note, {id: "note.dup.1", text: "other"}),
+        Object.assign({}, note, {id: "note.good.1"})]);
       out.recoverable = ["note.good.1", "note.good.2", "note.good.3"];
       const raw = JSON.stringify(refused);
       await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(raw)})`);
@@ -606,9 +609,47 @@ async function limits(htmlPath, workDir) {
       await p.settle();
       const rec = await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`);
       check("its importable records are offered as one part, with a save control", rec.length > 0 && (await p.count("#tp-saved-save-1")) === 1);
-      check("the record no bundle can hold is listed as left out", /note\.bad\.1: not valid Unicode/.test((await p.text("#tp-saved-excluded")) || ""), await p.text("#tp-saved-excluded"));
+      const left = (await p.text("#tp-saved-excluded")) || "";
+      check("the record no bundle can hold is listed as left out", /note\.bad\.1: not valid Unicode/.test(left), left);
+      check("both records of a conflicting id are left out, a repeat is exported once", (left.match(/note\.dup\.1: another saved record has this id/g) || []).length === 2 &&
+            /note\.good\.1: the same record again/.test(left), left);
       check("the saved data stays as it was", (await p.ev(stored)) === raw);
       out.recovered.push(save("recovered-1.json", rec));
+    });
+
+    await phase("conflicting saved state", async () => {   // the saved state itself is refused for an id held twice, never exported
+      const two = Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.twice.1", text: "one"}), Object.assign({}, note, {id: "note.twice.1", text: "other"}),
+                                                    Object.assign({}, note, {id: "note.alone.1"})]});
+      out.recoverable.push("note.alone.1");
+      await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(JSON.stringify(two))})`);
+      await p.reload();
+      const d = await p.dbg();
+      check("saved state holding two different records with one id is refused on load, not exported",
+            d.notes === 0 && /note\.twice\.1: the bundle holds two different records with this id/.test(d.storageNotice || ""), [d.notes, d.storageNotice]);
+      await p.click("#tp-saved-export");
+      await p.settle();
+      out.recovered.push(save("recovered-2.json", await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
+    });
+
+    await phase("saved data refused before it is parsed", async () => {   // too deep to parse: its records are still offered
+      const deep = Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.deep.1"})]});
+      const nest = "[".repeat(70) + "]".repeat(70), raw = JSON.stringify(deep).replace(/}$/, `,"zz":${nest}}`);
+      out.recoverable.push("note.deep.1");
+      await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(raw)})`);
+      await p.reload();
+      let d = await p.dbg();
+      check("saved data too deep to parse offers its importable records", /nested deeper than/.test(d.storageNotice || "") && d.notes === 0 &&
+            (await p.count("#tp-saved-export")) === 1, d.storageNotice);
+      await p.click("#tp-saved-export");
+      await p.settle();
+      out.recovered.push(save("recovered-3.json", await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
+      check("the deep saved data stays as it was", (await p.ev(stored)) === raw);
+      const none = JSON.stringify(Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.bad.2", text: "lone \ud800"})]})).replace(/}$/, `,"zz":${nest}}`);
+      await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(none)})`);
+      await p.reload();
+      d = await p.dbg();
+      check("with no importable record in it, no export is offered (the download still is)", /could not be read/.test(d.storageNotice || "") &&
+            (await p.count("#tp-saved-export")) === 0 && (await p.count("#tp-saved-download")) === 1, d.storageNotice);
     });
     await browser.dispose(ctx);
   } catch (e) {

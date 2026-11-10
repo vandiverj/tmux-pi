@@ -259,7 +259,7 @@
     state: null, events: [], last: null, view: "overview", noteMode: false, pending: null, blocked: 0,
     selectedEvent: null, storage: {ok: false, reason: "not checked"}, storageNotice: null, message: null,
     stepError: null, importReport: null, summary: null, exportParts: null, exportError: null,
-    savedRefused: null, salvage: null, showPart: dict(),
+    savedRefused: null, savedRaw: null, salvage: null, showPart: dict(),
     undeclared: dict(), questionFilter: "open",
     hint: false, engScenario: null, holding: false, renderPending: false, focusNote: false, paints: 0
   };
@@ -307,16 +307,26 @@
     var raw;
     try { raw = window.localStorage.getItem(KEY); } catch (e) { RT.storage = {ok: false, reason: String(e)}; return freshState(); }
     if (raw === null) return freshState();
+    RT.savedRaw = raw;
     var got = storedProblems(raw);
     if (got.problems.length) {
-      RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" +
-        got.problems.slice(0, 3).join("; ") + "). It is left untouched under the browser storage key " + KEY + "; " +
-        "nothing is saved over it from this tab. Download it as it is, or export the records in it that can still be imported.";
-      RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
-      RT.savedRefused = {raw: typeof raw === "string" ? raw : String(raw), value: got.value};
+      refuseSaved(raw, got.problems.slice(0, 3).join("; "));
       return freshState();
     }
     return got.value;
+  }
+  // Saved data this page will not use, for any reason (before or after parsing): it is never taken into state and
+  // never saved over. The notice offers its bytes as they are and, whenever at least one note or input in them is
+  // importable on its own, an export of those records.
+  function refuseSaved(raw, why) {
+    var text = typeof raw === "string" ? raw : String(raw), plan;
+    try { plan = salvagePlan(text); } catch (e) { plan = {parts: null, error: null, excluded: [String(e && e.message)], records: 0}; }
+    RT.savedRefused = {raw: text, plan: plan};
+    RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
+    RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" + why +
+      "). It is left untouched under the browser storage key " + KEY + "; nothing is saved over it from this tab. " +
+      (plan.records ? "Download it as it is, or export the " + plan.records + " record(s) in it that can still be imported."
+                    : "Download it as it is; none of the notes or answers in it can be imported on its own.");
   }
   // {value, problems}: the stored text parsed, and why this page would not use it ([] when it would). Whatever is
   // stored, the page starts: a check that throws is one more reason to ignore it.
@@ -692,6 +702,9 @@
   // split, in order, into bundles that each fit (the sessions go with the first), and every part must be importable on
   // its own. Returns {parts: [{bundle, text}]} or {error}.
   function exportParts(whole) {
+    // the parts together: every rule but the size of one bundle (a conflicting id stays one, wherever a split puts it)
+    var together = bundleProblems(whole, {local: true});
+    if (together.length) return {error: "the records together would not be importable (" + together.slice(0, 3).join("; ") + ")"};
     var text = bundleText(whole);
     if (!exportProblems(text, whole).length) return {parts: [{bundle: whole, text: text}]};
     var head = {schema: whole.schema, schema_version: whole.schema_version, package: whole.package, exported: whole.exported};
@@ -771,41 +784,113 @@
     var p = recordProblem(coll, r);
     return p ? "it would not be importable in an export bundle (" + p + ")" : null;
   }
-  // Saved data this page refused to read: the records in it that are importable on their own, as importable parts.
-  // Records that are not are listed by id with the reason; the stored bytes stay untouched and downloadable as they are.
-  function salvage() {
-    var v = RT.savedRefused && RT.savedRefused.value, excluded = [], ids = dict(), keep = {notes: [], inputs: []}, sessions = [];
-    if (!isType("object", v)) return;
+  // The records in stored text, found without parsing the whole of it (refused text may be too deep, cut short or not
+  // JSON at all): the elements of the top-level notes, inputs and sessions arrays and the session and run objects, as
+  // text slices. A key given twice keeps its last array, as JSON.parse does.
+  function storedParts(raw) {
+    var out = {notes: [], inputs: [], sessions: [], session: null, run: null};
+    if (typeof raw !== "string") return out;
+    var d = 0, top = 0, inStr = false, from = -1, last = null, key = null, arr = null, el = -1, obj = -1, objKey = null;
+    function name(k) { try { return k === null ? null : JSON.parse(k); } catch (e) { return null; } }
+    for (var i = 0; i < raw.length; i++) {
+      var c = raw.charCodeAt(i);
+      if (inStr) {
+        if (c === 92) i += 1;
+        else if (c === 34) { inStr = false; if (d === 1) last = raw.slice(from, i + 1); }
+        continue;
+      }
+      if (c === 32 || c === 9 || c === 10 || c === 13) continue;
+      if (!top) top = c;
+      if (top !== 123) return out;   // only an object holds records
+      if (arr !== null && d === 2 && el < 0 && c !== 44 && c !== 93) el = i;
+      if (c === 34) { inStr = true; from = i; }
+      else if (c === 58 && d === 1) key = last;
+      else if (c === 44 && d === 1) key = null;
+      else if (c === 44 && d === 2 && arr !== null) { if (el >= 0) out[arr].push(raw.slice(el, i)); el = -1; }
+      else if (c === 123 || c === 91) {
+        if (d === 1) {
+          var k = name(key);
+          if (c === 91 && (k === "notes" || k === "inputs" || k === "sessions")) { arr = k; out[k] = []; el = -1; }
+          else if (c === 123 && (k === "session" || k === "run")) { obj = i; objKey = k; }
+        }
+        d += 1;
+      } else if (c === 125 || c === 93) {
+        d -= 1;
+        if (d === 1 && arr !== null && c === 93) { if (el >= 0) out[arr].push(raw.slice(el, i)); arr = null; el = -1; }
+        if (d === 1 && obj >= 0 && c === 125) { out[objKey] = raw.slice(obj, i + 1); obj = -1; }
+        if (d <= 0) break;
+      }
+    }
+    return out;
+  }
+  // What can be recovered from refused saved data: each record found in its bytes that is importable on its own (its
+  // text within the depth one bundle allows before it is parsed, its numbers exported as written, every bundle rule),
+  // then the shared id rule over what is kept (a conflicting id leaves every record with it out; the same record
+  // again is exported once), as importable parts. Everything left out is listed by id with the reason.
+  function salvagePlan(raw) {
+    var found = storedParts(raw), excluded = [], L = DATA.limits.depth, keep = {notes: [], inputs: [], sessions: []};
+    function take(slice, room) {
+      try {
+        if (textDepth(slice, L) > room) return {why: "nested deeper than one bundle allows (" + L + " levels)"};
+        var v = JSON.parse(slice), n = numberProblems(slice);
+        return n.length ? {value: v, why: n[0]} : {value: v};
+      } catch (e) { return {why: "not readable on its own (" + (e && e.message) + ")"}; }
+    }
+    function label(v, fallback) { return isType("object", v) && typeof v.id === "string" ? readable(v.id) : fallback; }
     ["notes", "inputs"].forEach(function (coll) {
-      (Array.isArray(v[coll]) ? v[coll] : []).forEach(function (r, i) {
-        var label = isType("object", r) && typeof r.id === "string" ? readable(r.id) : coll + "." + i;
-        var why = recordProblem(coll, r);
-        if (!why && ids[r.id] !== undefined) why = "another record here has this id";
-        if (why) { excluded.push(label + ": " + why); return; }
-        ids[r.id] = 1;
-        keep[coll].push(r);
+      found[coll].forEach(function (slice, i) {
+        var got = take(slice, L - 2), why = got.why || recordProblem(coll, got.value);
+        if (why) excluded.push(label(got.value, coll + "." + i) + ": " + why); else keep[coll].push(got.value);
       });
     });
     var cands = [];
-    try { if (isType("object", v.session)) cands.push(sessionRecord(v.session, isType("object", v.run) ? v.run : null)); } catch (e) { /* not a session */ }
-    (Array.isArray(v.sessions) ? v.sessions : []).forEach(function (x) { cands.push(x); });
-    var sids = dict();
-    cands.forEach(function (x, i) {
-      var b = emptyBundle([x]);
-      var why = null;
-      try { why = exportProblems(bundleText(b), b); } catch (e) { why = [String(e)]; }
-      if (why.length || sids[x.id] !== undefined) { excluded.push("session " + (isType("object", x) && typeof x.id === "string" ? readable(x.id) : i) + ": " + (why.length ? why.slice(0, 2).join("; ") : "another session here has this id")); return; }
-      sids[x.id] = 1;
-      sessions.push(x);
+    if (found.session !== null) {
+      var s = take(found.session, L - 2), r = found.run === null ? {value: null} : take(found.run, L - 3);
+      if (s.why || r.why || !isType("object", s.value)) excluded.push("the open session: " + (s.why || (r.why ? "its prototype checkpoint: " + r.why : "not a session")));
+      else cands.push(sessionRecord(s.value, isType("object", r.value) ? r.value : null));
+    }
+    found.sessions.forEach(function (slice, i) {
+      var got = take(slice, L - 2);
+      if (got.why) excluded.push("session " + i + ": " + got.why); else cands.push(got.value);
     });
-    var whole = emptyBundle(sessions);
+    cands.forEach(function (x, i) {
+      var b = emptyBundle([x]), why;
+      try { why = exportProblems(bundleText(b), b); } catch (e) { why = [String(e && e.message)]; }
+      if (why.length) excluded.push("session " + label(x, String(i)) + ": " + why.slice(0, 2).join("; ")); else keep.sessions.push(x);
+    });
+    var clash = idConflicts(keep);
+    ["notes", "inputs", "sessions"].forEach(function (coll) {
+      var once = dict();
+      keep[coll] = keep[coll].filter(function (r) {
+        if (clash[coll + ":" + r.id] !== undefined) {
+          excluded.push(readable(r.id) + ": another saved record has this id with other content (an import refuses both), so neither is exported");
+          return false;
+        }
+        if (once[r.id]) { excluded.push(readable(r.id) + ": the same record again; it is exported once"); return false; }
+        once[r.id] = 1;
+        return true;
+      });
+    });
+    var whole = emptyBundle(keep.sessions);
     whole.notes = keep.notes;
     whole.inputs = keep.inputs;
     var got = exportParts(whole);
-    RT.salvage = {parts: got.parts ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null, excluded: excluded};
+    if (got.error && whole.sessions.length) {   // sessions that fit one by one but not together: the records still go
+      whole.sessions.forEach(function (x) { excluded.push("session " + readable(x.id) + ": the sessions together exceed one bundle"); });
+      whole.sessions = [];
+      got = exportParts(whole);
+    }
+    return {parts: got.parts ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null,
+            excluded: excluded, records: got.parts ? keep.notes.length + keep.inputs.length : 0};
+  }
+  // The recovery export: the plan made when the saved data was refused, offered on the page and downloaded.
+  function salvage() {
+    var plan = RT.savedRefused && RT.savedRefused.plan;
+    if (!plan) return;
+    RT.salvage = plan;
     RT.showPart = dict();
     render();
-    if (RT.salvage.parts) settled().then(function () { RT.salvage.parts.forEach(function (x) { download(x.name, x.text, "application/json"); }); });
+    if (plan.parts) settled().then(function () { plan.parts.forEach(function (x) { download(x.name, x.text, "application/json"); }); });
   }
   // Every part with its own save control and, on request (at once for a single part), its JSON to copy.
   function partsBlock(prefix, parts) {
@@ -848,7 +933,25 @@
       var t = record(x.target), kind = String(x.target).split(".")[0];
       if (!t || ["question", "rule", "decision"].indexOf(kind) < 0) p.push("inputs." + i + ".target: " + x.target + " is not a question, rule or decision of this package");
     });
+    var clash = idConflicts(b);
+    Object.keys(clash).forEach(function (k) { p.push(clash[k] + ": the bundle holds two different records with this id"); });
     return p;
+  }
+  // The one id rule of a bundle, as tp-product import-feedback (check_bundle) applies it, used by this page's import,
+  // its export (each part and the parts together), its saved state and the recovery of refused saved state: an id held
+  // twice with different content is a conflict, and the whole bundle is refused; held twice with the same content it is
+  // one record (a no-op). Notes and inputs as the CLI keys them; sessions too, as this page's import keeps them.
+  // Returns {"coll:id": id} for every conflicting id, in bundle order.
+  function idConflicts(b) {
+    var seen = dict(), out = dict();
+    ["notes", "inputs", "sessions"].forEach(function (coll) {
+      (Array.isArray(b[coll]) ? b[coll] : []).forEach(function (r) {
+        var k = coll + ":" + r.id, c = canonical(r);
+        if (seen[k] === undefined) seen[k] = c;
+        else if (seen[k] !== c) out[k] = r.id;
+      });
+    });
+    return out;
   }
   function importText(text) {
     var report = {ok: false, errors: [], added: {notes: [], inputs: [], sessions: []}, duplicates: [], conflicts: []};
@@ -869,7 +972,7 @@
     var seen = dict(), adds = {notes: [], inputs: [], sessions: []};
     function classify(coll, r, pool) {
       var c = canonical(r);
-      if (seen[coll + r.id] !== undefined) { if (seen[coll + r.id] !== c) report.conflicts.push(r.id + " (the bundle holds two different records with this id)"); return; }
+      if (seen[coll + r.id] !== undefined) return;   // the same record again (a different one: refused by idConflicts)
       seen[coll + r.id] = c;
       if (pool[r.id] === undefined) adds[coll].push(r);
       else if (pool[r.id] === c) report.duplicates.push(r.id);
@@ -1456,7 +1559,7 @@
         RT.savedRefused ? h("div", {"class": "tp-actions"}, [
           button("Download the saved data as it is (.json)", function () { download(DATA.package.id + "-saved-state.json", RT.savedRefused.raw, "application/json"); },
                  {"id": "tp-saved-download"}),
-          isType("object", RT.savedRefused.value) ? button("Export its importable notes and answers", salvage, {"id": "tp-saved-export"}) : null
+          RT.savedRefused.plan.records ? button("Export its importable notes and answers", salvage, {"id": "tp-saved-export"}) : null
         ]) : null,
         RT.salvage && RT.salvage.error ? h("p", {"class": "tp-error", "id": "tp-saved-error"}, "Export refused: " + RT.salvage.error + ".") : null,
         RT.salvage && RT.salvage.parts ? h("div", {"id": "tp-saved-parts"}, [
@@ -1635,8 +1738,11 @@
     KEY = "tp-product-review:v1:" + DATA.package.id;
     buildRegistry();
     try { S = load(); } catch (e) {
-      RT.storageNotice = "Review data saved in this browser could not be read (" + e.message + "); it is left untouched and this page starts fresh.";
-      RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
+      if (typeof RT.savedRaw === "string") refuseSaved(RT.savedRaw, "reading it failed: " + (e && e.message));
+      else {
+        RT.storageNotice = "Review data saved in this browser could not be read (" + (e && e.message) + "); it is left untouched and this page starts fresh.";
+        RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
+      }
       S = freshState();
     }
     if (PROTO && DATA.adapter) {

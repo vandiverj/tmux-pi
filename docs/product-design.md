@@ -392,6 +392,13 @@ other change, so the build moves the package to the next revision.
   file is `build.exists` or `build.unproved`, and a missing one `package.build-missing` ("is named by N recorded
   entries ... that no single page satisfies"). After writing back, the list is checked again and anything still
   unproved is `build.exists`.
+- **The whole plan is proved before any write** (`review._plan`). Entries are one file when their names are equal
+  once each component is put in Unicode NFC form and case-folded, whatever the disk: such a group is written back
+  once, with a page that satisfies every entry in it, or refused by name when they disagree. A plan in which one
+  target would be a folder above another (an entry under a recorded build file), or a target lies below an existing
+  file or a symbolic link, is refused (`build.exists`) before anything is written; so is a new build whose name is
+  taken by other bytes or by a build the plan writes back with another page. A build that is refused writes nothing;
+  one that succeeds leaves `status` clean.
 - **Built from committed state.** A build first re-evaluates note anchors against the current registry; if that changes
   stored anchors, it commits that change as its own revision before it renders, so the page shows only committed
   state and building again reports up to date.
@@ -445,17 +452,26 @@ other change, so the build moves the package to the next revision.
   stores state only after checking that it would read that same text back; when it would not, it keeps the last state
   stored and says so. The notice for saved data it refused, for any reason (too deep to parse, not JSON, cut short,
   an unknown field, a bad record, a conflicting id), offers the stored bytes as a download as they are and, whenever
-  at least one note or answer in them is importable on its own, an export of those records as importable parts.
+  at least one note, answer or review session in them is importable on its own, an export of those records as
+  importable parts.
   The records are found in the stored text without parsing all of it, by one rule whatever surrounds them (other
   bytes before or after, a BOM, the text cut short, a refused part before, between or after them, any wrapping key
   or array): every complete JSON object in the text, in the order it starts, is a candidate, and it is offered when
   the CLI's import would accept it on its own as a note, an answer or a session. Its inner objects are then its
   content; a candidate that is not accepted hides nothing inside it. Position and key names decide nothing. Each is
   checked for depth and size before it is parsed and then against every rule the CLI's import applies to it on its
-  own (numbers as the CLI reads them: `1.0` or an integer beyond 2^53 is kept, a number Python reads as infinite is
-  not); the others that look like records are listed by id with the reason, both records of a conflicting id among
-  them. An offered record is exported as its exact stored text, never re-serialized. The open session is offered as
-  a session record without its prototype checkpoint. The refused data is never
+  own (numbers as the CLI reads them: `1.0` or an integer beyond 2^53 is kept; the value checked is the one the CLI
+  keeps, the last member of a name, so a shadowed `1e400` before a finite member is offered and an infinite one that
+  is kept is not). A record is offered only when every supported CLI accepts it: the supported CLIs run on Python 3.9
+  and Python 3.14, and Python 3.14 refuses an integer of more than 4300 digits anywhere in the text (a shadowed member
+  too), so such a record is never offered, by name; the others that look like records are listed by id with the reason, both records of a conflicting id among
+  them. An offered record is exported as its exact stored text, never re-serialized. A review session counts like a
+  note or answer: one the CLI accepts on its own is offered, counted and exported, alone or with others (the saved
+  open session is such a candidate, recovered as it was stored; it is never made up from other fields). The offered
+  records are packed, in order, into parts by measurement, never by estimate: a part is offered only once its exact
+  text has been measured within one bundle's bytes and records and checked with every import rule; a part that is not
+  is split again, down to one record, so a record that is importable alone is always offered, and only a record that
+  is not importable alone is left out, by name. The refused data is never
   taken into the page's state. What was last exported is saved as a short hash, so exporting never doubles what is stored.
 - **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions) and lists every part on the
   page with a save control and its JSON to copy, in case a download was blocked; the records count as exported only
@@ -472,8 +488,9 @@ other change, so the build moves the package to the next revision.
   and an unknown field with such a name is refused as the CLI refuses it. Export checks each bundle it writes with
   every import rule (bytes, records, depth, text, schema, bookkeeping, numbers, conflicting ids), and the parts
   together with the same rules but the size of one bundle; feedback larger than one bundle is
-  exported as several bundles (`-part-N-of-M`), each importable on its own, and an export that cannot be made
-  importable is refused with nothing marked exported. A note or answer that would not be importable in a bundle on its
+  exported as several bundles (`-part-N-of-M`), each importable on its own, packed the same way as a recovery (each
+  part measured on its exact text, split again until it fits; sessions, notes and answers alike), and an export that
+  cannot be made importable (a record no bundle can hold on its own, named) is refused with nothing marked exported. A note or answer that would not be importable in a bundle on its
   own is refused when it is saved. Importing a bundle into a fresh browser and resuming its
   session restores the same prototype state. A note whose target is not in this build is listed as unresolved, never
   dropped.
@@ -496,3 +513,25 @@ The script calls `TPReview.registerPrototype({id, seeds, reduce, render, conditi
 
 The target registry is the one list a note may be anchored to: the views, every design record id and the adapter's
 targets. The page and `import-feedback` use the same rule.
+
+## Known limits
+
+The tools run on packages and saved states they wrote themselves, changed through the documented commands
+(`docs/plans/realistic-use-bar.md`). Inputs only a hand edit produces are known limits: one line each, the input shape
+and what the tool does. They are not fixed round by round.
+
+- **Manifest `builds` entries naming one file in two spellings** (case or Unicode form, by hand): treated as one file;
+  agreeing entries are written back once, disagreeing ones refused by name, nothing written. On a disk that tells such
+  names apart, the other spellings are written only while still absent. Tested on one case-insensitive disk (APFS).
+- **Manifest `builds` entries where one is a folder above another, or below an existing file** (by hand): the build is
+  refused (`build.exists`) before anything is written.
+- **Saved data with duplicated JSON members**: recovery checks the value the CLI keeps (the last member); a refused
+  record is listed by name, nothing is lost (the stored bytes stay and can be downloaded).
+- **Numbers of more than 4300 digits in saved data**: the record is never offered, because Python 3.14's CLI refuses
+  it (Python 3.9's accepts it); it is listed by name and stays in the stored bytes.
+- **Records sized within a few bytes of one bundle's limit** (4 MiB): parts are measured on their exact text and split
+  again until each fits; a record over the limit on its own is left out of a recovery by name, or refuses an export
+  by name with nothing marked exported. Recovery packing was attacked at limit-2..+2; the normal export's packing
+  uses the same measured packer but was not attacked at those byte boundaries.
+- **The page's own import** refuses a number whose JavaScript round trip would change it (an integer beyond 2^53,
+  `-0`, an exponent, a trailing zero), visibly; recovery keeps such numbers as their exact text.

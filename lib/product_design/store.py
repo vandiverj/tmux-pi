@@ -745,7 +745,7 @@ def recorded_build_checks(root, docs, prove=None) -> list:
     """recorded_build_problems with each problem's entry kept: [{"index", "entry", "file", "why"}], one per manifest
     build entry whose bytes are not proved, in manifest order. Every entry is its own proof obligation: several entries
     naming one file are each checked against its bytes, and a writer that puts a file back must satisfy all of them
-    (review._recorded_builds)."""
+    (review._plan)."""
     builds = _get(docs, "manifest", "builds")
     out = []
     for i, b in enumerate(builds if isinstance(builds, list) else []):

@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -163,19 +164,34 @@ class BuildTests(BuildCase):
         for form in ("digest", "legacy"):
             if form == "legacy":
                 self.legacy(cli.status_report(self.pkg)[0]["revision"])
-            self.duplicate_rows(page, form)
+            # names of one file once case and Unicode form are folded are one obligation, whatever this disk does
+            spellings = {"exact": (BUILD, BUILD), "case": (BUILD, BUILD.replace("review-queue", "REVIEW-Queue")),
+                         "nfd": ("builds/caf\u00e9-r3.html", "builds/cafe\u0301-r3.html")}
+            for spelling, names in spellings.items():
+                if form == "digest" or spelling == "exact":
+                    self.duplicate_rows(page, form, spelling, *names)
+            if form == "digest":
+                self.layout_rows(page)
 
-    def duplicate_rows(self, page, form):
-        """Several entries naming one file: each is its own proof obligation. Bytes are put back only when they satisfy
-        every entry; entries that disagree are refused by name, whichever of them comes last."""
+    def duplicate_rows(self, page, form, spelling, name, alias):
+        """Several entries naming one file: each is its own proof obligation. Bytes are put back once, and only when
+        they satisfy every entry; entries that disagree are refused by name, whichever of them comes last, and nothing
+        is written."""
         base = self.docs()["manifest"]["builds"]
-        own = base[-1]
-        others = {"same": dict(own), "other digest": dict(own, digest="sha256:" + "0" * 64),
-                  "other revision": {k: v for k, v in dict(own, revision=1).items() if k != "digest"},
-                  "other source": dict(own, source="sha256:" + "1" * 64)}
+        own = dict(base[-1], file=name)
+        others = {"same": dict(own, file=alias), "other digest": dict(own, file=alias, digest="sha256:" + "0" * 64),
+                  "other revision": {k: v for k, v in dict(own, file=alias, revision=1).items() if k != "digest"},
+                  "other source": dict(own, file=alias, source="sha256:" + "1" * 64)}
+
+        def put_back():
+            (self.pkg / name).write_bytes(page)
+            if not os.path.lexists(self.pkg / alias):  # a disk that tells the two names apart
+                (self.pkg / alias).write_bytes(page)
+        put_back()
+        same_file = os.path.samefile(self.pkg / name, self.pkg / alias)
         for why, other in others.items():
             for order in ("other last", "other first"):
-                with self.subTest(why, order=order, form=form):
+                with self.subTest(why, order=order, form=form, spelling=spelling):
                     self.adopt_builds(base[:-1] + ([own, other] if order == "other last" else [other, own]))
                     # the recorded bytes in place: trusted only when every entry is proved by them
                     agree = self.status_codes() == (0, [])
@@ -184,16 +200,56 @@ class BuildTests(BuildCase):
                         with self.assertRaises(T.StoreError) as cm:
                             R.build(self.pkg)
                         self.assertIn(cm.exception.code, ("build.exists", "build.unproved"))
-                    (self.pkg / BUILD).unlink()
+                    for n in (name, alias):
+                        if os.path.lexists(self.pkg / n):
+                            (self.pkg / n).unlink()
                     if agree:
                         self.assertEqual(R.build(self.pkg)["restored"], True)
-                        self.assertEqual(((self.pkg / BUILD).read_bytes(), self.status_codes()), (page, (0, [])))
+                        self.assertEqual(((self.pkg / name).read_bytes(), (self.pkg / alias).read_bytes(),
+                                          self.status_codes()), (page, page, (0, [])))
+                        def fold(n):
+                            return unicodedata.normalize("NFC", n).casefold()
+                        self.assertEqual(len([n for n in os.listdir(self.pkg / "builds")
+                                              if fold("builds/" + n) == fold(name)]), 1 if same_file else 2)
                     else:
                         e = self.refused("package.build-missing", 3)
-                        self.assertIn(BUILD + " is named by 2 recorded entries", str(e))
-                        self.assertFalse(os.path.lexists(self.pkg / BUILD))
+                        self.assertIn(" is named by 2 recorded entries", str(e))
+                        self.assertFalse(os.path.lexists(self.pkg / name))
                         self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
-                        (self.pkg / BUILD).write_bytes(page)
+                        put_back()
+        self.adopt_builds(base)
+        if name != BUILD:
+            for n in (name, alias):
+                if os.path.lexists(self.pkg / n):
+                    (self.pkg / n).unlink()
+        self.assertEqual(self.status_codes(), (0, []))
+
+    def layout_rows(self, page):
+        """The whole plan (every file put back and the new build) is proved before anything is written: a target that
+        is a folder above another target, a folder on a target's way that is a file, or a new build name taken by
+        other bytes refuses the build by name, and the gone file that comes first is not written either."""
+        base = self.docs()["manifest"]["builds"]
+        own, child = base[-1], dict(base[-1], file=BUILD + "/child.html")
+        first = dict(own, file="builds/a.html")  # gone, restorable, and first in the plan
+        rows = {"ancestor and child": ([own, child], "cannot be a folder"),
+                "file as parent": ([first, own, child], BUILD + "/ is not a folder"),
+                "new build name taken": ([first, dict(own, source="sha256:" + "1" * 64)], "already exists")}
+        for why, (builds, text) in rows.items():
+            with self.subTest(why):
+                self.adopt_builds(base[:-1] + builds)
+                taken = None
+                if why == "ancestor and child":
+                    (self.pkg / BUILD).unlink()
+                if why == "new build name taken":
+                    taken = self.pkg / f"builds/review-queue-demo-r{cli.status_report(self.pkg)[0]['revision']}.html"
+                    taken.write_text("mine")
+                self.assertIn(text, str(self.refused("build.exists", 3)))
+                self.assertFalse(os.path.lexists(self.pkg / "builds/a.html"))
+                self.assertEqual(self.status_codes()[0], 3)
+                if taken:
+                    taken.unlink()
+                if not os.path.lexists(self.pkg / BUILD):
+                    (self.pkg / BUILD).write_bytes(page)
         self.adopt_builds(base)
         self.assertEqual(self.status_codes(), (0, []))
 
@@ -813,6 +869,9 @@ class BrowserAcceptanceTests(BuildCase):
         self.assertEqual(len(out["parts"]), 2)
         self.assertEqual(sorted(i for f in out["parts"] for i in accepted(f)), sorted(json.loads(Path(out["noteIds"]).read_text())))
         self.assertEqual(sorted(i for f in out["recovered"] for i in accepted(f)), sorted(out["recoverable"]))
+        # the saved session, offered with each later recovery, is imported by the CLI (once per stored text)
+        self.assertEqual(sorted(s["id"] for f in out["sessions"] for s in C.check_bundle(docs, Path(f).read_bytes())["bundle"]["sessions"]),
+                         [out["sessionId"]] * 5)
         # recovered records keep their exact text: the CLI reads the numbers as they were stored
         for path, text in out["exact"]:
             self.assertIn(text, Path(path).read_text(encoding="utf-8"), path)

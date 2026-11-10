@@ -655,30 +655,56 @@ async function limits(htmlPath, workDir) {
       const state = (items) => JSON.stringify(Object.assign({}, saved, {notes: items.map((x, i) => "@REC" + i + "@")}))
         .replace(/"@REC(\d+)@"/g, (m, i) => items[Number(i)]);
       const [wrapped, nested, num, cut] = ["note.wrap.1", "note.nested.1", "note.num.1", "note.cut.1"].map(rec);
+      // The saved state's own session is a complete review session the CLI imports on its own: it is offered like any
+      // record (the session is recovered as it was saved, never made up from the page). A note whose effective number
+      // is finite (a shadowed 1e400 before a later member of the same name) is offered as the CLI reads it. A note and
+      // the session, each importable alone but one byte over the limit together, are offered as two parts.
+      const session = JSON.stringify(saved.session);
+      const shadow = JSON.stringify(Object.assign(one("note.shadow.1"), {state: {x: 0}})).replace('"x":0', '"x":1e400,"x":1');
+      const LIMIT = 4 * 1024 * 1024, pad = (r) => r.replace(/}$/, " ".repeat(LIMIT + 1 - Buffer.byteLength(
+        '{\n  "schema": "tp-product-feedback",\n  "schema_version": 1,\n  "package": "review-queue-demo",\n  "exported": "2026-01-01T00:00:00Z",\n' +
+        '  "notes": [\n    ' + r + '\n  ],\n  "inputs": [],\n  "sessions": [\n    ' + session + '\n  ]\n}')) + "}");
+      const big = pad(rec("note.big.1"));
+      const deep2 = (t) => t.replace(/}$/, `,"zz":${nest}}`);
       const texts = [
-        {name: "wrapped", ids: ["note.wrap.1", "note.nested.1", "note.num.1"],
+        {name: "wrapped", ids: ["note.wrap.1", "note.nested.1", "note.num.1"], recs: [wrapped, nested, num],
          text: '\ufeff[{"a":{"notes":[{"session":' + state([wrapped, "[[" + nested + "]]", num]).replace(/}$/, ',"zz":1}')},
-        {name: "cut", ids: ["note.cut.1"], text: ((t) => t.slice(0, t.indexOf(cut) + cut.length))(state([cut]))}];
+        {name: "cut", ids: ["note.cut.1"], recs: [cut], text: ((t) => t.slice(0, t.indexOf(cut) + cut.length))(state([cut]))},
+        {name: "shadowed", ids: ["note.shadow.1"], recs: [shadow], text: deep2(state([shadow]))},
+        {name: "session only", ids: [], recs: [], text: deep2(state([]))},
+        {name: "near the limit together", ids: ["note.big.1"], recs: [big], parts: 2, text: deep2(state([big]))}];
       out.exact = [];
-      for (const {name, ids, text} of texts) {
+      out.sessions = [];
+      for (const {name, ids, recs, text, parts = 1} of texts) await phase("stored text " + name, async () => {   // each row stands alone
         out.recoverable.push(...ids);
         await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(text)})`);
         await p.reload();
         d = await p.dbg();
-        check(`${name}: refused, and its ${ids.length} complete note(s) offered`, d.notes === 0 && (await p.count("#tp-saved-export")) === 1 &&
-              new RegExp(`export the ${ids.length} record`).test(d.storageNotice || ""), d.storageNotice);
+        check(`${name}: refused, and its ${ids.length} complete note(s) and the saved session offered`, d.notes === 0 &&
+              (await p.count("#tp-saved-export")) === 1 && new RegExp(`export the ${ids.length + 1} record`).test(d.storageNotice || ""), d.storageNotice);
         await p.click("#tp-saved-export");
         await p.settle();
-        const got = await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`);
-        out.recovered.push(save(`recovered-${name}.json`, got));
-        for (const id of ids) {
-          const r = rec(id);
-          out.exact.push([out.recovered[out.recovered.length - 1], r]);
-          check(`${id}: the record is exported as its exact text`, got.indexOf(r) >= 0, got.slice(0, 400));
+        const n = await p.count('[data-tp-part^="tp-saved:"]'), got = [];
+        for (let k = 1; k <= n; k++) {
+          if (n > 1) { await p.click(`#tp-saved-show-${k}`); await p.settle(); }
+          got.push(await p.ev(`(document.querySelector("#tp-saved-text-${k}") || {}).value || ""`));
         }
+        check(`${name}: offered as ${parts} part(s), each within one bundle`, n === parts && got.every((t) => t.length > 0 && Buffer.byteLength(t) <= LIMIT),
+              got.map((t) => Buffer.byteLength(t)));
+        const files = got.map((t, k) => save(`recovered-${name.replace(/ /g, "-")}-${k + 1}.json`, t));
+        out.recovered.push(...files);
+        out.sessions.push(...files);
+        recs.forEach((r, i) => {
+          const at = files.find((f, k) => got[k].indexOf(r) >= 0);
+          out.exact.push([at || files[0], r]);
+          check(`${ids[i]}: the record is exported as its exact text`, !!at, got.map((t) => t.slice(0, 200)));
+        });
+        check(`${name}: the saved session is exported as its exact text, once`, got.filter((t) => t.indexOf(session) >= 0).length === 1);
         check(`${name}: the saved data stays as it was`, (await p.ev(stored)) === text);
-      }
-      const none = JSON.stringify(Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.bad.2", text: "lone \ud800"})]})).replace(/}$/, `,"zz":${nest}}`);
+      });
+      out.sessionId = saved.session.id;
+      // with no importable record (the note unreadable, no session): no export is offered
+      const none = JSON.stringify(Object.assign({}, saved, {session: null, notes: [Object.assign({}, note, {id: "note.bad.2", text: "lone \ud800"})]})).replace(/}$/, `,"zz":${nest}}`);
       await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(none)})`);
       await p.reload();
       d = await p.dbg();

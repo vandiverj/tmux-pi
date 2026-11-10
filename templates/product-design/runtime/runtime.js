@@ -326,7 +326,7 @@
     RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" + why +
       "). It is left untouched under the browser storage key " + KEY + "; nothing is saved over it from this tab. " +
       (plan.records ? "Download it as it is, or export the " + plan.records + " record(s) in it that can still be imported."
-                    : "Download it as it is; none of the notes or answers in it can be imported on its own.");
+                    : "Download it as it is; none of the notes, answers or review sessions in it can be imported on its own.");
   }
   // {value, problems}: the stored text parsed, and why this page would not use it ([] when it would). Whatever is
   // stored, the page starts: a check that throws is one more reason to ignore it.
@@ -698,50 +698,45 @@
   function emptyBundle(sessions) {
     return {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(), notes: [], inputs: [], sessions: sessions || []};
   }
-  // The bundles an export of `whole` writes. One when it is importable as it is; otherwise the notes and inputs are
-  // split, in order, into bundles that each fit (the sessions go with the first), and every part must be importable on
-  // its own. Returns {parts: [{bundle, text}]} or {error}.
+  // The bundles an export of `whole` writes. One when it is importable as it is; otherwise its records (the sessions
+  // first, then the notes and inputs) are packed, in order, into bundles that are each importable on their own
+  // (packMeasured: every part measured, split until it is). A record no bundle can hold on its own refuses the export
+  // by name. Returns {parts: [{bundle, text}]} or {error}.
   function exportParts(whole) {
     // the parts together: every rule but the size of one bundle (a conflicting id stays one, wherever a split puts it)
     var together = bundleProblems(whole, {local: true});
     if (together.length) return {error: "the records together would not be importable (" + together.slice(0, 3).join("; ") + ")"};
     var text = bundleText(whole);
     if (!exportProblems(text, whole).length) return {parts: [{bundle: whole, text: text}]};
-    var head = {schema: whole.schema, schema_version: whole.schema_version, package: whole.package, exported: whole.exported};
-    function part(sessions) { return {schema: head.schema, schema_version: head.schema_version, package: head.package, exported: head.exported, notes: [], inputs: [], sessions: sessions}; }
-    var first = part(whole.sessions), firstText = bundleText(first), firstProblems = bundleFits(firstText, first);
-    if (firstProblems.length) return {error: "the review sessions alone exceed one bundle (" + firstProblems.join("; ") + ")"};
-    var parts = [], cur = first, size = utf8Length(firstText);
-    var recs = whole.notes.map(function (r) { return ["notes", r]; }).concat(whole.inputs.map(function (r) { return ["inputs", r]; }));
-    for (var i = 0; i < recs.length; i++) {
-      var coll = recs[i][0], r = recs[i][1];
-      // the record's size inside a bundle: its pretty text indented two more levels, a separator and a line break
-      var rt = JSON.stringify(r, null, 2), cost = utf8Length(rt) + 4 * (rt.split("\n").length) + 2;
-      if (depth(r, DATA.limits.depth) + 2 > DATA.limits.depth) return {error: r.id + " is nested deeper than one bundle allows (" + DATA.limits.depth + " levels)"};
-      if (cur.notes.length + cur.inputs.length > 0 && (size + cost > DATA.limits.bytes || cur.notes.length + cur.inputs.length + 1 > DATA.limits.records)) {
-        parts.push(cur);
-        cur = part([]);
-        size = utf8Length(bundleText(cur));
-      }
-      cur[coll].push(r);
-      size += cost;
+    function part(g) {
+      var b = {schema: whole.schema, schema_version: whole.schema_version, package: whole.package, exported: whole.exported, notes: [], inputs: [], sessions: []};
+      g.forEach(function (r) { b[r.coll].push(r.rec); });
+      return b;
     }
-    parts.push(cur);
-    var out = [];
-    for (var j = 0; j < parts.length; j++) {
-      var t = bundleText(parts[j]), problems = exportProblems(t, parts[j]);
-      if (problems.length) return {error: (parts.length === 1 ? "the bundle" : "part " + (j + 1) + " of " + parts.length) +
-                                          " would not be importable (" + problems.slice(0, 3).join("; ") + ")"};
-      out.push({bundle: parts[j], text: t});
+    var recs = [];
+    ["sessions", "notes", "inputs"].forEach(function (coll) { whole[coll].forEach(function (r) { recs.push({coll: coll, rec: r}); }); });
+    // the layout of JSON.stringify(b, null, 2): a record's own pretty text with every line indented two more levels;
+    // the first of a collection opens it ("[\n" ... "\n  ]" for "[]"), each next one adds ",\n"
+    var got = packMeasured(recs, utf8Length(bundleText(part([]))), function (r, first) {
+      var rt = JSON.stringify(r.rec, null, 2);
+      return utf8Length(rt) + 4 * rt.split("\n").length + (first ? 4 : 2);
+    }, function (g) {
+      var b = part(g), t = bundleText(b);
+      return {problems: exportProblems(t, b), bundle: b, text: t};
+    });
+    if (got.refused.length) {
+      return {error: got.refused.slice(0, 3).map(function (x) {
+        return (x.rec.coll === "sessions" ? "session " : "") + readable(String(x.rec.rec && x.rec.rec.id)) + " would not be importable even alone (" + x.problems.slice(0, 3).join("; ") + ")";
+      }).join("; ")};
     }
-    return {parts: out};
+    return {parts: got.parts.map(function (x) { return {bundle: x.bundle, text: x.text}; })};
   }
   // Each part as it is offered: its file name, text and counts.
   function offered(parts, base) {
     var n = parts.length;
     return parts.map(function (x, i) {
       return {name: base + (n === 1 ? "" : "-part-" + (i + 1) + "-of-" + n) + ".json", text: x.text, bytes: utf8Length(x.text),
-              notes: x.bundle.notes.length, inputs: x.bundle.inputs.length};
+              notes: x.bundle.notes.length, inputs: x.bundle.inputs.length, sessions: (x.bundle.sessions || []).length};
     });
   }
   // Exporting offers every part twice over: a download, and on the page a save control and the JSON to copy (a browser
@@ -851,33 +846,56 @@
     return out.sort(function (a, b) { return a.s - b.s; });
   }
   // How the CLI reads the numbers of a record's exact text (Python's json): an integer token is an exact int, any
-  // token with a fraction or an exponent a float, never an integer, even when its value is whole (1.0, 1e2). Returns
-  // {why} when the CLI refuses a number (a float that is infinite, an integer of more than 4300 digits), else
-  // {check, key}: the text with every float made non-whole and every integer kept (an integer beyond a double's range
-  // written as its sign and 1e308), read for the schema as the CLI reads types; and the text read as the CLI compares
-  // records (strings, ints and floats kept apart, ints exact), for the id rule. The record's own text is what is
-  // exported: no number in it is rewritten.
+  // token with a fraction or an exponent a float, never an integer, even when its value is whole (1.0, 1e2). A record
+  // is offered only when every supported CLI (Python 3.9 and 3.14) takes it. Returns {why} when one refuses a number,
+  // else {check, key}: the text with every float made non-whole and every integer kept (an integer beyond a double's
+  // range written as its sign and 1e308), read for the schema as the CLI reads types; and the text read as the CLI
+  // compares records (strings, ints and floats kept apart, ints exact), for the id rule. The record's own text is
+  // what is exported: no number in it is rewritten.
+  // What is refused: an integer of more than 4300 digits anywhere in the text (Python 3.14 refuses it while reading,
+  // before an object's members are merged), and an infinite float only where it is the value read: JSON's last member
+  // of a name wins, so an infinite number in a member a later one of the same name replaces is never seen.
   function pyNumbers(text) {
     var re = /"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/g, m, at = 0, check = [], key = [];
+    var inf = [], strs = [];
     while ((m = re.exec(text)) !== null) {
       var tok = m[0], before = text.slice(at, m.index);
       at = m.index + tok.length;
       check.push(before);
       key.push(before);
-      if (tok.charCodeAt(0) === 34) { check.push(tok); key.push('"s' + tok.slice(1)); continue; }
+      if (tok.charCodeAt(0) === 34) { check.push(tok); key.push('"s' + tok.slice(1)); strs.push(tok); continue; }
       var neg = tok.charCodeAt(0) === 45, v = Number(tok);
       if (/[.eE]/.test(tok)) {
-        if (!isFinite(v)) return {why: "the number " + tok + " is an infinite number, which the CLI refuses"};
-        check.push(neg ? "-0.5" : "0.5");
+        if (!isFinite(v)) { check.push({inf: inf.length}); inf.push(tok); }
+        else check.push(neg ? "-0.5" : "0.5");
         key.push('"f' + (Object.is(v, -0) ? "-0" : String(v)) + '"');
       } else {
-        if (tok.length - (neg ? 1 : 0) > 4300) return {why: "the number " + tok.slice(0, 12) + "... has more than 4300 digits, which the CLI refuses"};
+        if (tok.length - (neg ? 1 : 0) > 4300) return {why: "the number " + tok.slice(0, 12) + "... has more than 4300 digits, which the CLI refuses (Python 3.14 does)"};
         check.push(isFinite(v) ? tok : (neg ? "-1e308" : "1e308"));
         key.push('"i' + BigInt(tok).toString() + '"');
       }
     }
     check.push(text.slice(at));
     key.push(text.slice(at));
+    if (inf.length) {
+      // each infinite number becomes a marker string no string of the text starts with; a marker still in the value
+      // read (JSON's last member wins, as in the CLI) is an infinite number the CLI holds, and refuses
+      var mark = "\u0000tp-infinite-";
+      var decoded = function (s) { try { return JSON.parse(s); } catch (e) { return s; } };
+      while (strs.some(function (s) { return decoded(s).indexOf(mark) === 0 || s.indexOf(mark) >= 0; })) mark += "~";
+      var marked = check.map(function (x) { return typeof x === "string" ? x : JSON.stringify(mark + x.inf); }).join("");
+      var v0;
+      try { v0 = JSON.parse(marked); } catch (e) { v0 = undefined; }
+      for (var stack = [v0]; stack.length;) {
+        var x = stack.pop();
+        if (typeof x === "string") {
+          if (x.indexOf(mark) === 0) return {why: "the number " + inf[Number(x.slice(mark.length))] + " is an infinite number, which the CLI refuses"};
+        } else if (x && typeof x === "object") {
+          for (var k in x) if (own(x, k)) stack.push(x[k]);
+        }
+      }
+      return {check: marked, key: key.join("")};
+    }
     return {check: check.join(""), key: key.join("")};
   }
   // The member names and the id (when it is a string) of the object text `t`, read from its top level only, without
@@ -983,48 +1001,63 @@
       once[k] = 1;
       return true;
     });
+    // every record kept was taken on its own, so packing refuses none (it measures every part, splitting down to one
+    // record); a record it did refuse is still listed, never dropped silently
     var got = textParts(keep, exported);
-    if (got.error && keep.some(function (r) { return r.coll === "sessions"; })) {   // sessions that fit one by one but not together
-      keep = keep.filter(function (r) {
-        if (r.coll !== "sessions") return true;
-        excluded.push("session " + readable(r.id) + ": the sessions together exceed one bundle");
-        return false;
-      });
-      got = textParts(keep, exported);
-    }
-    var n = keep.filter(function (r) { return r.coll !== "sessions"; }).length;
-    return {parts: got.parts && n ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null,
-            excluded: excluded, records: got.parts ? n : 0};
+    got.refused.forEach(function (x) {
+      excluded.push((x.rec.coll === "sessions" ? "session " : "") + readable(x.rec.id) + ": " + x.problems.slice(0, 3).join("; "));
+    });
+    var n = keep.length - got.refused.length;
+    return {parts: n ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: null, excluded: excluded, records: n};
   }
-  // The recovered records as importable bundles written from their exact text: one when they fit, otherwise split, in
-  // order, into bundles that each fit (the sessions go with the first); every part is checked as the CLI reads it.
-  // Returns {parts: [{bundle: {notes, inputs}, text}]} or {error}.
-  function textParts(recs, exported) {
-    var sessions = recs.filter(function (r) { return r.coll === "sessions"; }), rest = recs.filter(function (r) { return r.coll !== "sessions"; });
-    var groups = [], cur = sessions.slice(), size = utf8Length(textBundle({notes: [], inputs: [], sessions: sessions.map(function (r) { return r.text; })}, exported));
-    if (size > DATA.limits.bytes) return {error: "the review sessions alone exceed one bundle"};
-    var count = 0;
-    rest.forEach(function (r) {
-      var cost = utf8Length(r.text) + 7;   // its text, a separator and an indented line
-      if (count > 0 && (size + cost > DATA.limits.bytes || count + 1 > DATA.limits.records)) {
+  // Records packed, in order, into parts that are each importable, by measurement. Groups are formed from `cost(r,
+  // first)`, the bytes r adds to a group's text (first: the first of its collection there) on top of `base`, and the
+  // records limit; that only proposes groups. A group becomes a part only once `measure(group)` finds no problem in its
+  // exact serialized text (its bytes, records, depth and every import rule); a group with a problem is split in two and
+  // each half measured again, down to one record. Only a record that is refused on its own is refused, with its
+  // problems; it never takes the others with it. Returns {parts: [what measure returned], refused: [{rec, problems}]}.
+  function packMeasured(recs, base, cost, measure) {
+    var groups = [], cur = [], size = base, count = 0, colls = dict();
+    recs.forEach(function (r) {
+      var counted = r.coll !== "sessions", add = cost(r, !colls[r.coll]);
+      if (cur.length && (size + add > DATA.limits.bytes || (counted && count + 1 > DATA.limits.records))) {
         groups.push(cur);
         cur = [];
+        size = base;
         count = 0;
-        size = utf8Length(textBundle({notes: [], inputs: [], sessions: []}, exported));
+        colls = dict();
+        add = cost(r, true);
       }
       cur.push(r);
-      count += 1;
-      size += cost;
+      colls[r.coll] = 1;
+      size += add;
+      if (counted) count += 1;
     });
-    groups.push(cur);
-    var out = [];
-    for (var j = 0; j < groups.length; j++) {
-      var b = textBundleProblems(groups[j], exported);
-      if (b.problems.length) return {error: (groups.length === 1 ? "the bundle" : "part " + (j + 1) + " of " + groups.length) +
-                                            " would not be importable (" + b.problems.slice(0, 3).join("; ") + ")"};
-      out.push({bundle: {notes: b.value.notes, inputs: b.value.inputs}, text: b.text});
+    if (cur.length) groups.push(cur);
+    var parts = [], refused = [];
+    function settle(group) {
+      var got = measure(group);
+      if (!got.problems.length) { parts.push(got); return; }
+      if (group.length === 1) { refused.push({rec: group[0], problems: got.problems}); return; }
+      var half = Math.ceil(group.length / 2);
+      settle(group.slice(0, half));
+      settle(group.slice(half));
     }
-    return {parts: out};
+    groups.forEach(settle);
+    return {parts: parts, refused: refused};
+  }
+  // The recovered records as importable bundles written from their exact text: one when they fit, otherwise packed, in
+  // order, into bundles that each fit (packMeasured: every part measured as the CLI reads it, split until it is).
+  // Returns {parts: [{bundle: {notes, inputs, sessions}, text}], refused: [{rec, problems}]}.
+  function textParts(recs, exported) {
+    var base = utf8Length(textBundle({notes: [], inputs: [], sessions: []}, exported));
+    // the layout of textBundle: the first record of a collection opens it ("[\n    " ... "\n  ]" for "[]"), each next
+    // one is a separator and an indented line
+    var got = packMeasured(recs, base, function (r, first) { return utf8Length(r.text) + (first ? 8 : 6); }, function (g) {
+      var b = textBundleProblems(g, exported);
+      return {problems: b.problems, bundle: b.value && {notes: b.value.notes, inputs: b.value.inputs, sessions: b.value.sessions}, text: b.text};
+    });
+    return {parts: got.parts.map(function (x) { return {bundle: x.bundle, text: x.text}; }), refused: got.refused};
   }
   // The recovery export: the plan made when the saved data was refused, offered on the page and downloaded.
   function salvage() {
@@ -1041,7 +1074,8 @@
     return h("ol", {"class": "tp-parts", "id": prefix + "-list"}, parts.map(function (x, i) {
       var k = i + 1, key = prefix + ":" + k, shown = n === 1 || !!RT.showPart[key];
       return h("li", {"data-tp-part": key}, [
-        (n === 1 ? "The bundle" : "Part " + k + " of " + n) + ": " + x.notes + " note(s), " + x.inputs + " answer(s)/proposal(s), " + x.bytes + " bytes. ",
+        (n === 1 ? "The bundle" : "Part " + k + " of " + n) + ": " + x.notes + " note(s), " + x.inputs + " answer(s)/proposal(s), " +
+          (x.sessions ? x.sessions + " review session(s), " : "") + x.bytes + " bytes. ",
         button(n === 1 ? "Save it again" : "Save part " + k, function () { download(x.name, x.text, "application/json"); },
                {"id": prefix + "-save-" + k, "data-tp-save": "1"}),
         n === 1 ? null : button(shown ? "Hide its JSON" : "Show its JSON to copy", function () { RT.showPart[key] = !shown; render(); },
@@ -1702,7 +1736,7 @@
         RT.savedRefused ? h("div", {"class": "tp-actions"}, [
           button("Download the saved data as it is (.json)", function () { download(DATA.package.id + "-saved-state.json", RT.savedRefused.raw, "application/json"); },
                  {"id": "tp-saved-download"}),
-          RT.savedRefused.plan.records ? button("Export its importable notes and answers", salvage, {"id": "tp-saved-export"}) : null
+          RT.savedRefused.plan.records ? button("Export its importable records", salvage, {"id": "tp-saved-export"}) : null
         ]) : null,
         RT.salvage && RT.salvage.error ? h("p", {"class": "tp-error", "id": "tp-saved-error"}, "Export refused: " + RT.salvage.error + ".") : null,
         RT.salvage && RT.salvage.parts ? h("div", {"id": "tp-saved-parts"}, [

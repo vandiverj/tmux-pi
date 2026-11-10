@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import stat
+import unicodedata
 from pathlib import Path
 
 from . import changes as C
@@ -326,7 +327,7 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
     source fingerprint are made from the state that commit published. So building twice with no change in between
     gives up_to_date the second time.
 
-    Every build the manifest records is checked first, as `status` checks it (_recorded_builds): one that is gone is
+    Every build the manifest records is checked first, as `status` checks it, and the whole plan proved before any write (_plan): one that is gone is
     written back (restored) when this source still renders its recorded digest at its revision, its folder created as
     for a new build; any other recorded build whose bytes are not proved (its digest, or for an entry from before
     digests the page this package renders for it) is refused by name (build.exists, build.unproved or
@@ -362,24 +363,25 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
                   "source_fingerprint": b["source_fingerprint"], "content_fingerprint": b["content_fingerprint"],
                   "warnings": data["warnings"], "reanchored": reanchored}
         builds = docs["manifest"].get("builds", [])
-        restored = _recorded_builds(root, docs, b["source_fingerprint"], build_prover(root, (runtime_js, runtime_css)),
-                                    fault)
-        result["restored"] = bool(restored)
         last = builds[-1] if builds else None
-        if last and last.get("source") == b["source_fingerprint"]:
-            # every recorded build's bytes are proved now (_recorded_builds refused or restored the rest)
+        up_to_date = bool(last) and last.get("source") == b["source_fingerprint"]
+        page = rel = None
+        if not up_to_date:
+            page = render_html(data, runtime_js, runtime_css, script, style)
+            rel = f"{BUILDS_DIR}/{docs['manifest']['id']}-r{current}.html"
+        # the whole plan (every recorded build put back, and the new build file) is proved before anything is written
+        prove = build_prover(root, (runtime_js, runtime_css))
+        restores = _plan(root, docs, b["source_fingerprint"], prove, (rel, page) if rel else None)
+        restored = _publish(root, docs, restores, prove, fault)
+        result["restored"] = bool(restored)
+        if up_to_date:
+            # every recorded build's bytes are proved now (_plan refused or _publish restored the rest)
             return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"))
-        page = render_html(data, runtime_js, runtime_css, script, style)
         page_digest = "sha256:" + hashlib.sha256(page).hexdigest()
-        rel = f"{BUILDS_DIR}/{docs['manifest']['id']}-r{current}.html"
         target = root / rel
-        _builds_dir(root, rel)
-        if os.path.lexists(target):
-            if T.build_file_problem(root, rel, page_digest):
-                raise T.StoreError("build.exists", f"{rel} already exists with other content; it was not replaced. Move it "
-                                                   "aside and build again. Nothing was written.", exit=3,
-                                   details={"file": rel})
-            result["reused"] = True
+        _builds_dir(root, rel, restored)
+        if os.path.lexists(target) and not T.build_file_problem(root, rel, page_digest):
+            result["reused"] = True  # the plan proved what is there is this page (or it was just put back as one)
         entry = {"revision": current, "fingerprint": b["content_fingerprint"], "source": b["source_fingerprint"],
                  "file": rel, "digest": page_digest}
         work = copy.deepcopy(docs)
@@ -415,22 +417,58 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
         return dict(result, file=rel, digest=page_digest, committed=done["committed"], revision=done["revision"])
 
 
-def _builds_dir(root, rel):
+def _builds_dir(root, rel, restored=()):
     """Create the folder the build file `rel` is written in, for every writer of a build file (a new build and a
-    restore) alike: below the package, no symlink on the way. A folder that cannot be made (a file or a link has its
-    name) is refused by name (build.exists, exit 3), never replaced and never entered."""
+    restore) alike: below the package, no symlink on the way. _plan has already refused every folder that cannot be
+    made, so a refusal here means the folder changed while the build was writing (`restored`: what it had put back by
+    then): a file or a link that has its name is refused by name (build.exists, exit 3), never replaced and never
+    entered."""
     parent = (Path(root) / rel).parent
     shown = os.path.relpath(parent, root) + "/"
+    done = (" Put back before that: " + ", ".join(restored) + ".") if restored else " No build file was written."
     try:
         safe_write.ensure_dir(parent, what="builds directory", root=root)
     except safe_write.UnsafePath as exc:
         raise T.StoreError("build.exists", f"{shown} (or a folder above it in the package) is a symbolic link; a build "
-                                           "is never written through a link. Move it aside and build again. No build "
-                                           "file was written.", exit=3, details={"file": rel, "problem": str(exc)}) from None
+                                           "is never written through a link. Move it aside and build again." + done,
+                           exit=3, details={"file": rel, "problem": str(exc)}) from None
     except (FileExistsError, NotADirectoryError) as exc:
         raise T.StoreError("build.exists", f"{shown} is not a folder ({exc.strerror}); it was not replaced. Move it "
-                                           "aside and build again. No build file was written.", exit=3,
+                                           "aside and build again." + done, exit=3,
                            details={"file": rel, "problem": exc.strerror}) from None
+
+
+def _fold(rel):
+    """The name two build file names share when they name one physical file on some disk, whatever this one does: the
+    normalised path with each component in Unicode NFC and case folded (and NFC again: folding can leave a composable
+    sequence)."""
+    return tuple(unicodedata.normalize("NFC", unicodedata.normalize("NFC", part).casefold())
+                 for part in os.path.normpath(rel).split("/"))
+
+
+def _layout_problem(root, rel):
+    """Why a build file cannot be written at root/rel, judged before anything is written, or None: it must be a
+    relative name below the package without `..`, and each folder on its way must be absent (it is made) or a real
+    folder, never a file and never a link. Returns (folder shown, why)."""
+    if os.path.isabs(rel) or ".." in rel.split("/"):
+        return rel, "is not a file name below the package"
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    here = Path(root)
+    for i, part in enumerate(parts[:-1]):
+        here = here / part
+        shown = "/".join(parts[:i + 1]) + "/"
+        try:
+            st = os.lstat(here)
+        except FileNotFoundError:
+            return None  # made by _builds_dir, with every folder below it
+        except OSError as exc:
+            return shown, f"cannot be read ({exc.strerror or exc})"
+        if stat.S_ISLNK(st.st_mode):
+            return shown, ("(or a folder above it in the package) is a symbolic link; a build is never written "
+                           "through a link")
+        if not stat.S_ISDIR(st.st_mode):
+            return shown, "is not a folder; it was not replaced"
+    return None
 
 
 def build_prover(package_dir, assets=None):
@@ -456,38 +494,55 @@ def build_prover(package_dir, assets=None):
     return prove
 
 
-def _recorded_builds(root, docs, source, prove, fault) -> list:
-    """Every build the manifest records, checked as `status` checks it (store.recorded_build_problems, with the same
-    prover): each must be a regular file whose bytes are proved (its digest, or for an entry from before digests the
-    page this committed package renders for it). A build file that is gone (nothing at its name) is written back in
-    place when this source still renders it: its entry has this source fingerprint and the page made at its revision
-    has its digest (or, without one, is that page). Everything else is refused by name before anything is written: a
-    file that is there but is not the recorded build (other bytes, not a regular file, a link on its way: build.exists,
-    never replaced), one whose bytes cannot be proved (build.unproved: no digest and no page to compare with), and a
-    gone file this source no longer renders (package.build-missing: only its own bytes can be put back, from version
-    control). Every entry is its own proof obligation: when several entries name one file, the bytes put back must
-    satisfy each of them (its digest, or without one the page rendered for it); entries that no single page satisfies
-    are refused by name (package.build-missing: "named by N recorded entries"), never settled by picking one. Returns the
-    files restored."""
+def _plan(root, docs, source, prove, new=None) -> list:
+    """The whole restore plan of a build, proved before anything is written; returns it as [(names, page)], one item
+    per physical file to put back. Every build the manifest records is checked as `status` checks it
+    (store.recorded_build_checks, with the same prover): each must be a regular file whose bytes are proved (its
+    digest, or for an entry from before digests the page this committed package renders for it).
+
+    Entries name one physical file when their names are equal after Unicode NFC and case folding of each component
+    (_fold), whatever this disk does: such a group is one proof obligation. A group with a gone file (nothing at a
+    name) is put back once, with a page this source renders for one of its entries (its entry has this source
+    fingerprint and the page made at its revision has its digest, or, without one, is that page) that satisfies every
+    entry of the group; entries that no single page satisfies are refused by name (package.build-missing: "named by N
+    recorded entries"), never settled by picking one.
+
+    Every file the plan writes, the new build `new` = (name, page) included, is then checked as a layout: a name
+    below the package, no folder on its way that is a file or a link, no target that is a folder above another target,
+    and a new build name not taken by other bytes or by a group put back with another page (build.exists). Everything
+    else is refused by name too: a file that is there but is not the recorded build (other bytes, not a regular file, a
+    link on its way: build.exists, never replaced), one whose bytes cannot be proved (build.unproved), a gone file this
+    source no longer renders (package.build-missing). A refused plan writes nothing."""
+    builds = docs["manifest"].get("builds", [])
+    checks = {c["index"]: c for c in T.recorded_build_checks(root, docs, prove)}
     changed, unproved, missing, todo = [], [], [], []
-    gone = {}  # normalised file name -> the checks (entry kept) of every entry naming that gone file
-    for check in T.recorded_build_checks(root, docs, prove):
-        rel, why = check["file"], check["why"]
-        if isinstance(rel, str) and rel and not os.path.lexists(Path(root) / rel):  # gone (or its folder is not one)
-            gone.setdefault(os.path.normpath(rel), []).append(check)
-        elif why.startswith(T.UNPROVED):
-            unproved.append((rel, why))
-        else:
-            changed.append((rel, why))
-    for checks in gone.values():
-        rel, page, why = checks[0]["file"], _satisfying_page(docs, [c["entry"] for c in checks], source, prove), None
-        if page is not None:
-            todo.append((rel, page))
+    for i, c in sorted(checks.items()):
+        rel, why = c["file"], c["why"]
+        if _gone(root, rel):
+            continue  # judged with its group below
+        (unproved if why.startswith(T.UNPROVED) else changed).append((rel, why))
+    groups = {}  # folded name -> [(index, entry)] of every entry naming that file
+    for i, entry in enumerate(builds if isinstance(builds, list) else []):
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str) and entry["file"]:
+            groups.setdefault(_fold(entry["file"]), []).append((i, entry))
+    pages = {}  # folded name -> the page put back there
+    for key, members in groups.items():
+        names = list(dict.fromkeys(e["file"] for _, e in members if _gone(root, e["file"])))
+        if not names:
             continue
-        if len(checks) > 1:
-            why = (f"is named by {len(checks)} recorded entries (entries "
-                   + ", ".join(str(c["index"]) for c in checks) + ") that no single page satisfies")
-        missing.append((rel, why or checks[0]["why"]))
+        page = _satisfying_page(docs, [e for _, e in members], source, prove)
+        if page is not None:
+            todo.append((names, page))
+            pages[key] = page
+            continue
+        spellings = list(dict.fromkeys(e["file"] for _, e in members))
+        if len(members) > 1:
+            why = (f"is named by {len(members)} recorded entries (entries " + ", ".join(str(i) for i, _ in members)
+                   + (": " + ", ".join(spellings) + ", names of one file once case and Unicode form are folded"
+                      if len(spellings) > 1 else "") + ") that no single page satisfies")
+        else:
+            why = checks[members[0][0]]["why"] if members[0][0] in checks else T.MISSING
+        missing.append((names[0], why))
     if changed:
         rel, why = changed[0]
         raise T.StoreError("build.exists", "; ".join(f"{r} {w}" for r, w in changed) + ": the manifest records "
@@ -509,18 +564,62 @@ def _recorded_builds(root, docs, source, prove, fault) -> list:
                                                     "recorded file back (from version control) and build again. No "
                                                     "build file was written.", exit=3,
                            details={"builds": [{"file": r, "problem": w} for r, w in missing]})
-    for rel, page in todo:
-        _builds_dir(root, rel)
-        _restore(root, rel, page, fault)
-    left = T.recorded_build_checks(root, docs, prove)  # e.g. two spellings of one file on a case-folding disk
-    if left:
-        raise T.StoreError("build.exists", "; ".join(f"{c['file']} {c['why']}" for c in left) + ": after the recorded "
-                                           "builds were put back, the manifest still records bytes that file does "
-                                           "not hold; it is not reported up to date. Check the recorded entries for "
-                                           "that file.", exit=3,
-                           details={"builds": [{"file": c["file"], "problem": c["why"], "entry": c["index"]}
-                                               for c in left]})
-    return [rel for rel, _ in todo]
+    targets = [rel for names, _ in todo for rel in names] + ([new[0]] if new else [])
+    bad = [(rel,) + p for rel in targets for p in [_layout_problem(root, rel)] if p]
+    keys = {rel: _fold(rel) for rel in targets}
+    for a in targets:
+        for b in targets:
+            if len(keys[a]) < len(keys[b]) and keys[b][:len(keys[a])] == keys[a]:
+                bad.append((b, a + "/", "is a build file the plan writes, so it cannot be a folder"))
+    if bad:
+        raise T.StoreError("build.exists", "; ".join(f"{r}: {shown} {why}" for r, shown, why in bad) + ". Move it "
+                                           "aside (or correct the recorded entries) and build again. No build file "
+                                           "was written.", exit=3,
+                           details={"file": bad[0][0], "problem": bad[0][2],
+                                    "builds": [{"file": r, "folder": s, "problem": w} for r, s, w in bad]})
+    if new:
+        rel, page = new
+        key = _fold(rel)
+        if key in pages:
+            other = pages[key] != page
+        else:
+            other = not _gone(root, rel) and bool(T.build_file_problem(
+                root, rel, "sha256:" + hashlib.sha256(page).hexdigest()))
+        if other:
+            raise T.StoreError("build.exists", f"{rel} already exists with other content; it was not replaced. Move it "
+                                               "aside and build again. No build file was written.", exit=3,
+                               details={"file": rel})
+    return todo
+
+
+def _gone(root, rel) -> bool:
+    """Nothing at the name (or a folder on its way is not one): what a build may put back."""
+    return isinstance(rel, str) and bool(rel) and not os.path.lexists(Path(root) / rel)
+
+
+def _publish(root, docs, todo, prove, fault) -> list:
+    """Put back each file of a proved plan (_plan) once: its first gone name is written; each other name of the group
+    is written only while it is still absent, on a disk that tells the names apart (on one that folds case or Unicode
+    form it now names the file just written). Then every recorded build is checked again, as status will check it;
+    anything left (a writer racing this one) is refused by name. Returns the names written."""
+    done = []
+    for names, page in todo:
+        for n, rel in enumerate(names):
+            if n and not _gone(root, rel):
+                continue
+            _builds_dir(root, rel, done)
+            _restore(root, rel, page, fault, done)
+            done.append(rel)
+    if todo:
+        left = T.recorded_build_checks(root, docs, prove)
+        if left:
+            raise T.StoreError("build.exists", "; ".join(f"{c['file']} {c['why']}" for c in left) + ": after the "
+                                               "recorded builds were put back (" + ", ".join(done) + "), the manifest "
+                                               "still records bytes that file does not hold (another writer changed it "
+                                               "meanwhile); it is not reported up to date. Build again.", exit=3,
+                               details={"builds": [{"file": c["file"], "problem": c["why"], "entry": c["index"]}
+                                                   for c in left]})
+    return done
 
 
 def _satisfying_page(docs, entries, source, prove):
@@ -540,7 +639,7 @@ def _satisfying_page(docs, entries, source, prove):
     return None
 
 
-def _restore(root, rel, page, fault):
+def _restore(root, rel, page, fault, restored=()):
     """Write the recorded bytes of a build back where it was deleted (its folder is there: _builds_dir). Never
     replaces a file that appeared."""
     fault("before-build-restore")
@@ -548,4 +647,6 @@ def _restore(root, rel, page, fault):
         T._write_new(root, root / rel, page)
     except FileExistsError:
         raise T.StoreError("build.exists", f"{rel} appeared while the recorded build was being restored; it was not "
-                                           "replaced. Build again.", exit=3, details={"file": rel}) from None
+                                           "replaced. Build again." + (" Put back before that: " + ", ".join(restored)
+                                                                       + "." if restored else ""),
+                           exit=3, details={"file": rel}) from None

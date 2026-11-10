@@ -394,15 +394,19 @@ def route_info(result):
 
 
 def route(task, role, worker, model, thinking, context=(), deliverable="", level=None, approve_effort=False,
-          local_only=False, workdir=None, base=None):
+          local_only=False, workdir=None, base=None, escalate=None):
     """Choose (worker, model, effort, route_info) with the catalog router (lib/model_router.py). Explicit --worker,
     --model, --thinking and --level are constraints; the pair is always valid, or ValueError says why the user must
-    decide. Nothing here calls Laya."""
+    decide. escalate (escalation_request) asks for the step above a failed attempt, under the same constraints; a
+    gated retry that cannot step up says why on stderr and is routed as an ordinary request. Nothing here calls Laya."""
     sys.path.insert(0, str(ROOT / "lib"))
     import model_router
     result = model_router.select({"task": task, "role": role, "deliverable": deliverable, "context": list(context),
                                   "workdir": workdir, "worker": worker, "model": model, "thinking": thinking,
-                                  "level": level, "local_only": local_only, "approve_effort": approve_effort}, base=base)
+                                  "level": level, "local_only": local_only, "approve_effort": approve_effort,
+                                  "escalate": escalate}, base=base)
+    if result.get("escalation_note"):
+        print(f"tp-agent: the gated retry was not escalated: {result['escalation_note']}", file=sys.stderr)
     return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
@@ -445,28 +449,26 @@ def escalation_evidence(base, previous):
     return failed, changes
 
 
-def escalation_route(base, previous, args, contexts, gate=None):
-    """(worker, model, effort, route_info) for `retry --escalate`: effort up before level, only after the catalog's
-    number of failed attempts or REQUEST_CHANGES reviews. gate is the route of a retry the repeated-family gate stopped
-    (rule-first or design): the gate is the evidence, so no count is needed, and the level goes up first."""
-    sys.path.insert(0, str(ROOT / "lib"))
-    import model_router
-    import router_catalog
-    catalog = router_catalog.load_catalog()
-    failed, changes = escalation_evidence(base, previous)
-    need = catalog["escalation"]["after"]
-    if not gate and max(failed, changes) < need:
-        raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
-                         f"{changes}. Retry without --escalate, or request a level explicitly with --level")
-    meta = read_json(previous / "meta.json")
-    try:  # the task text and admitted context, so the escalation record carries the same card hash as the dispatch
-        meta = dict(meta, task=(previous / "request.md").read_text().strip(), context=contexts)
-    except OSError:
-        pass
-    result = model_router.escalate_route(meta, catalog, role=args.role or meta.get("role"), worker=args.worker,
-                                         approve_effort=args.approve_effort, base=base,
-                                         local_only=getattr(args, "local_only", False), gate=gate)
-    return result["worker"], result["model"], result["thinking"], route_info(result)
+def escalation_request(base, previous, gate=None, required=True):
+    """The `escalate` part of a retry's routing request (model_router.select): the step above the failed attempt
+    `previous`, chosen when its replacement request is routed, so the replacement's own paths, context and flags
+    constrain it as they constrain any route. `retry --escalate` (required) needs the catalog's number of failed
+    attempts or REQUEST_CHANGES reviews. gate is the route of a retry the repeated-family gate stopped (rule-first or
+    design): the gate is the evidence, so no count is needed, and the level goes up first; a gated retry that is not
+    --escalate is optional (it falls back to an ordinary route and says why)."""
+    if required and not gate:
+        sys.path.insert(0, str(ROOT / "lib"))
+        import router_catalog
+        try:
+            catalog = router_catalog.load_catalog()
+        except router_catalog.CatalogError as error:
+            raise ValueError(f"cannot escalate: {error}") from error
+        failed, changes = escalation_evidence(base, previous)
+        need = catalog["escalation"]["after"]
+        if max(failed, changes) < need:
+            raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
+                             f"{changes}. Retry without --escalate, or request a level explicitly with --level")
+    return {"from": read_json(previous / "meta.json"), "gate": gate, "optional": not required}
 
 
 def lane_holders(base, lane, worktree, role, own=None):
@@ -1080,7 +1082,7 @@ def dispatch(args, base):
     chosen = getattr(args, "preroute", None) or route(
         args.task, args.role, args.worker, args.model, args.thinking, args.context or [], args.deliverable,
         level=getattr(args, "level", None), approve_effort=getattr(args, "approve_effort", False),
-        local_only=getattr(args, "local_only", False), workdir=workdir, base=base)
+        local_only=getattr(args, "local_only", False), workdir=workdir, base=base, escalate=getattr(args, "escalate_from", None))
     worker, model, thinking, info = chosen
     item = queue_item({"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
             "task": args.task, "workdir": workdir, "worker": worker, "model": model,
@@ -1557,17 +1559,15 @@ def _main(argv):
             except (review_rounds.Refused, OSError, ValueError) as error:  # a sweep that cannot be made does not stop the retry
                 print(f"tp-agent: sweep.md was not written: {error}", file=sys.stderr)
         lane_meta = lane_tags(meta)
-        preroute = None
+        escalate = None  # the step up is chosen when the replacement request below is routed, by the same rules as any route of it
         if args.escalate:
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
-            preroute = escalation_route(base, previous, args, contexts, gate=args.route if repeated else None)
-        elif repeated and args.route in ("rule-first", "design") and not (args.model or args.level or args.thinking):
-            # a repeated family is a capability gap: the gated retry goes a level up (a user's --model, --level or --thinking wins)
-            try:
-                preroute = escalation_route(base, previous, args, contexts, gate=args.route)
-            except ValueError as error:  # RouteStop: nothing stronger the limits allow; the retry is routed as a plain one
-                print(f"tp-agent: the gated retry was not escalated: {error}", file=sys.stderr)
+            escalate = escalation_request(base, previous, gate=args.route if repeated else None)
+        elif repeated and args.route in ("rule-first", "design") and not (args.model or args.level):
+            # a repeated family is a capability gap: the gated retry goes a level up (a user's --model or --level wins;
+            # --thinking is the effort it runs at)
+            escalate = escalation_request(base, previous, gate=args.route, required=False)
         task, brief_note = args.task, ""
         if not task:  # a --reason that names a usable .md file is the fix brief: the new attempt's request starts by saying to read it
             brief, brief_problem = fix_brief(args.reason)
@@ -1577,7 +1577,7 @@ def _main(argv):
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
                                          task=task, worker=args.worker,
                                          model=args.model, thinking=args.thinking, level=args.level,
-                                         approve_effort=args.approve_effort, preroute=preroute,
+                                         approve_effort=args.approve_effort, escalate_from=escalate,
                                          local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
                                          workdir=meta.get("workdir"), lane_meta=lane_meta,
                                          deliverable=meta.get("deliverable", ""),

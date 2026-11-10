@@ -283,6 +283,19 @@ class EscalationTests(Base):
         early = self.retry(first, "--escalate", check=False)
         self.assertEqual(early.returncode, 1)
         self.assertIn("needs 2 failed attempts", early.stderr)
+        with self.subTest("no catalog"):
+            nocat = self.run_cmd("tp-agent", "retry", first["id"], "--reason", "failed", "--escalate",
+                                 env=dict(self.env, TP_MODEL_CATALOG=str(self.root / "missing-catalog.json")))
+            self.assertEqual(nocat.returncode, 1)  # no catalog: a refusal that says so (was: a traceback)
+            self.assertNotIn("Traceback", nocat.stderr)
+            self.assertIn("cannot escalate: cannot read model catalog", nocat.stderr)
+        with self.subTest("protected path"):  # the step is held to the floors of the request it routes, as normal selection is (was: medium)
+            import router_catalog
+            guarded = model_router.escalate_route({"task": "Fix lib/sensitive_read.py and run its tests.", "model": SONNET, "thinking": "low",
+                                                   "route_info": {"level": "mid", "effort_abstract": "low"}},
+                                                  router_catalog.load_catalog(), role="coder", base=self.state, log=False)
+            self.assertEqual((guarded["model"], guarded["effort_abstract"], guarded["decided_by"]), (SONNET, "high", "escalation"))
+            self.assertIn("protected path lib/sensitive_read.py: effort high", guarded["steps"])
         second = self.retry(first, "--model", SONNET, "--thinking", "medium")
         self.mark_failed(second)
         third = self.retry(second, "--escalate")
@@ -343,6 +356,11 @@ class EscalationTests(Base):
         run = self.retry(first, "--escalate", "--model", OPUS, check=False)
         self.assertEqual(run.returncode, 1)
 
+    def settled(self, item):
+        """item, its process recorded as ended, so probe retries do not fill the fixture's worker capacity."""
+        (self.state / "tasks" / item["id"] / "exit").write_text("0")
+        return item
+
     def gated_chain(self, model, thinking, tag=""):
         """An author retried once, each attempt with a REQUEST_CHANGES review: the latest review of the second is gated."""
         first = self.dispatch("--model", model, "--thinking", thinking)
@@ -370,15 +388,29 @@ class EscalationTests(Base):
         alone = self.retry(second, "--escalate", check=False)
         self.assertEqual(alone.returncode, 1, alone.stdout)
         self.assertIn("--route", alone.stderr)
-        # a gated retry goes a level up first (was: effort up, Sonnet at high), with or without --escalate, and says why
-        for extra in (("--escalate",), ()):
-            third = self.meta(self.retry(second, *extra, "--route", "rule-first"))
-            self.assertEqual((third["model"], third["thinking"], third["route_info"]["source"]), (SOL, "high", "escalation_level_up"))
-            self.assertEqual(third["route_info"]["decided_by"], "gated_retry")
-            self.assertIn("--route rule-first", third["route_info"]["reason"])
-        pinned = self.meta(self.retry(second, "--route", "design", "--worker", "claude"))  # strong has no claude model: Opus
-        self.assertEqual((pinned["model"], pinned["route_info"]["source"]), (OPUS, "escalation_level_up"))
-        mine = self.meta(self.retry(second, "--route", "design", "--model", SONNET, "--thinking", "medium"))  # the user's model wins
+        # a gated retry goes a level up first (was: effort up, Sonnet at high), with or without --escalate, and says why;
+        # --thinking is the effort it asks for, not a model choice: the level still goes up
+        for extra in (("--escalate",), (), ("--thinking", "high")):
+            with self.subTest(extra=extra):
+                third = self.meta(self.settled(self.retry(second, *extra, "--route", "rule-first")))
+                self.assertEqual((third["model"], third["thinking"], third["route_info"]["source"]), (SOL, "high", "escalation_level_up"))
+                self.assertEqual(third["route_info"]["decided_by"], "gated_retry")
+                self.assertIn("--route rule-first", third["route_info"]["reason"])
+        # strong has no claude model: Opus. The step is chosen for the request the retry runs (its new --task names a
+        # protected path), so the path's effort floor holds as it does in normal selection (was: Opus at medium)
+        with self.subTest("protected path in the new task"):
+            pinned = self.meta(self.settled(self.retry(second, "--route", "design", "--worker", "claude", "--task", "Fix lib/sensitive_read.py and run its tests.")))
+            self.assertEqual((pinned["model"], pinned["thinking"], pinned["route_info"]["source"]), (OPUS, "high", "escalation_level_up"))
+            self.assertIn("protected path lib/sensitive_read.py: effort high", pinned["route_info"]["steps"])
+        # no readable catalog: the plain retry's validated fallback, and why it was not escalated (was: a traceback)
+        with self.subTest("no catalog"):
+            nocat = self.run_cmd("tp-agent", "retry", second["id"], "--reason", "failed", "--route", "rule-first",
+                                 env=dict(self.env, TP_MODEL_CATALOG=str(self.root / "missing-catalog.json")))
+            self.assertEqual(nocat.returncode, 0, nocat.stderr[-300:])
+            self.assertNotIn("Traceback", nocat.stderr)
+            self.assertIn("the gated retry was not escalated: model catalog unreadable", nocat.stderr)
+            self.assertEqual(self.meta(self.settled(json.loads(nocat.stdout)))["route_info"]["source"], "catalog_error_fallback")
+        mine = self.meta(self.settled(self.retry(second, "--route", "design", "--model", SONNET, "--thinking", "medium")))  # the user's model wins
         self.assertEqual((mine["model"], mine["thinking"]), (SONNET, "medium"))
         self.assertNotEqual(mine["route_info"]["decided_by"], "gated_retry")
         top = self.gated_chain(OPUS, "high", "-top")  # nothing stronger without approval: the retry is routed as a plain one
@@ -458,6 +490,14 @@ class LocalOnlyCommandTests(Base):
             with self.assertRaises(model_router.RouteStop):
                 model_router.escalate_route(meta, router_catalog.load_catalog(), role="researcher", base=self.state, log=False, gate=gate)
         cloud = dict(meta, model=SONNET, thinking="medium", route_info={"level": "mid", "effort_abstract": "medium"})
+        # a gated retry that cannot step up is routed as an ordinary request; when that stops too, the stop says why it was
+        # not escalated (here no local router answers)
+        def no_router(*args, **kwargs):
+            raise OSError("no router in this test")
+        with self.assertRaises(model_router.RouteStop) as stopped:
+            model_router.select({"task": TASK, "role": "researcher", "escalate": {"from": meta, "gate": "rule-first", "optional": True}},
+                                runner=no_router, opener=no_router, base=self.state, log=False, catalog=router_catalog.load_catalog())
+        self.assertIn("the gated retry was not escalated: ", str(stopped.exception))
         gated = model_router.escalate_route(cloud, router_catalog.load_catalog(), role="coder", worker="claude", base=self.state,
                                             log=False, gate="design")
         self.assertEqual((gated["model"], gated["source"], gated["decided_by"]), (OPUS, "escalation_level_up", "gated_retry"))

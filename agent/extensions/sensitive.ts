@@ -92,9 +92,9 @@ export default function (pi: ExtensionAPI) {
 		if (!decision.sensitive) return;
 		const safe = typeof decision.safe === "string" && decision.safe ? ` ${decision.safe}` : "";
 		const base = { target: decision.target, reason: decision.reason + safe, updated: new Date().toISOString() };
-		// A worker task (TP_TASK_DIR, set by bin/tp-spawn for workers only) is refused a shell search or read the safe tools
-		// replace: nobody answers its prompt. Main keeps the prompt.
-		if (taskDir && safe) {
+		// A worker task (TP_TASK_DIR, set by bin/tp-spawn for workers only) is refused when the classifier says a shell search
+		// or read caused the ask ("search_read"): nobody answers its prompt. Any other ask, and main, keep the prompt.
+		if (taskDir && decision.search_read === true) {
 			save({ ...base, status: "refused" });
 			return { block: true, reason: `tmux-pi refuses this shell read in a worker task: it may expose ${decision.target}.${safe}` };
 		}

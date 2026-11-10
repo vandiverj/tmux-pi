@@ -302,12 +302,13 @@ def bash_placeholders(event, command, params, result, kinds_info):
 
 
 def routed(decision, params, cwd=None):
-    """A sensitive-read ask or deny on a Bash command: the reason names the safe tool that replaces a shell search or read
-    (sensitive_read.safe_route), and in a worker task an ask becomes a deny marked `refused` (nobody answers a worker's
-    prompt). Anything else, an ask about placeholders included, is returned as it is; a deny is never lifted."""
+    """A sensitive-read ask or deny on a Bash command that holds a shell search or read the classifier finds sensitive
+    (sensitive_read.classify's "search_read"): the reason names the safe tools that replace it (sensitive_read.safe_route),
+    and in a worker task an ask becomes a deny marked `refused` (nobody answers a worker's prompt). Anything else, an ask
+    about placeholders included, is returned as it is; a deny is never lifted."""
     try:
-        from sensitive_read import safe_route, worker_task
-        route = safe_route("Bash", params, "claude", cwd)
+        from sensitive_read import classify, safe_route, worker_task
+        route = classify("Bash", params, cwd).get("search_read") and safe_route("Bash", params, "claude", cwd)
     except Exception:
         return decision  # the decision as it was; a failure here never lifts or adds a prompt
     if not route:

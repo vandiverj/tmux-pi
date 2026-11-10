@@ -786,7 +786,8 @@ class SensitiveReadTableTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = bash(command)
                 self.assertTrue(result["sensitive"])
-                self.assertEqual(set(result), {"sensitive", "target", "reason"})
+                self.assertEqual(set(result), {"sensitive", "target", "reason", "search_read"})
+                self.assertIsInstance(result["search_read"], bool)
                 self.assertTrue(result["target"] and result["reason"])
                 self.assertNotEqual(result["target"], "unparsed tool call")
                 response = hook_response({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": CWD})
@@ -971,7 +972,15 @@ class SensitiveReadTableTests(unittest.TestCase):
                 ("sed -n 1,9p config/local.json | head -3", f'mcp__tmux-pi-safe__safe_read with path "{CWD}/config/local.json"'),
                 ("grep -rn TOKEN config/; ls tests", grep_config),
                 ("grep -n VERSION README.md && grep -rn TOKEN config/", grep_config),
-                ("grep -r -f pats config/", generic)]
+                ("grep -r -f pats config/", generic),
+                # sg1 round 3: the classifier's cause decides. A shell's -c script is the search (F1); xargs feeding a reader
+                # and a git grep of a revision or the index are refused with the safe tools named, no path (F1, F2).
+                ("sh -c 'grep -rn TOKEN config/'", grep_config), ("bash -lc 'grep -rn TOKEN config/'", grep_config),
+                ('zsh -c "grep -rn TOKEN config/"', grep_config), ("bash -e -c 'grep -rn TOKEN config/'", grep_config),
+                (f"printf '%s\\n' {LOCAL} | xargs sed -n 1,5p", generic),
+                (f"printf '%s\\n' {LOCAL} | xargs git grep -n TOKEN --", generic),
+                ("git grep TOKEN HEAD", generic), ("git grep -e TOKEN main", generic),
+                (f"git grep --cached TOKEN -- {LOCAL}", generic), (f"git grep TOKEN HEAD -- {LOCAL}", generic)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -980,6 +989,8 @@ class SensitiveReadTableTests(unittest.TestCase):
                     self.assertEqual(decision, "deny")
                     self.assertIn("refuses this shell read in a worker task", reason)
                     self.assertIn(named, reason)
+                    if named == generic:  # no path is named: none would be the files the shell searched
+                        self.assertNotIn(" with path ", reason)
                     saved = json.loads(record.read_text())
                     self.assertEqual(saved["status"], "refused")
                     self.assertIn(named, saved["reason"])
@@ -989,7 +1000,10 @@ class SensitiveReadTableTests(unittest.TestCase):
                     self.assertIn(named, reason)
             # Not sensitive: nothing in either; sensitive but no safe replacement: still an ask in a worker, recorded pending.
             self.assertIsNone(run("grep -n x README.md", task))
-            for command in (f"python3 -c 'open(\"{ENV}\").read()'", f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md"):
+            # sg1 round 3: a shell wrapper around a non-search, and xargs git diff (a patch, not a search), keep their ask.
+            for command in (f"python3 -c 'open(\"{ENV}\").read()'", f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md",
+                            f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", "bash -c 'git diff -- config/'",
+                            f"printf '%s\\n' {LOCAL} | xargs git diff --"):
                 with self.subTest(command=command):  # the ask is the program's, not the harmless search's
                     decision, reason = run(command, task)
                     self.assertEqual(decision, "ask")
@@ -999,8 +1013,9 @@ class SensitiveReadTableTests(unittest.TestCase):
     def test_safe_route_table(self):
         """The forms workers send (evidence/transcript_forms.log), each with the safe calls that search or read the files the
         shell would (sg1 round 2: every search and read in the command, the target as the shell resolves it), the safe tools
-        by name for one it cannot name, or None when the command holds no search or read, or holds other commands and no
-        search or read in it is sensitive on its own (the ask is theirs and stands)."""
+        by name for one it cannot name. sg1 round 3: whether a call is refused is the classifier's ("search_read",
+        test_search_read_cause); this only picks the calls to name, and a command it cannot name gets the safe tools by
+        name. git grep is named only for files that exist in the work tree, never for a revision or the index (F2)."""
         grep = lambda pattern, path=None, i=False, glob=None: (
             f"safe_grep with pattern {json.dumps(pattern)}" + (f" and path {json.dumps(path)}" if path else "")
             + (f" and glob {json.dumps(glob)}" if glob else "") + (" and ignore_case true" if i else ""))
@@ -1014,6 +1029,12 @@ class SensitiveReadTableTests(unittest.TestCase):
                        if unnamed else " Search with safe_grep, read with safe_read.")) if calls else generic
             return text + (separately if other else "")
         sensitive_dir = "config/"  # a directory the classifier asks about whatever it holds
+        w = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-route-")))
+        self.addCleanup(shutil.rmtree, str(w), True)
+        for name in ("bin/tp-spawn", "lib/x.py", "sub/deeper/a", "other/repo/config/local.json", "config/local.json"):
+            (w / name).parent.mkdir(parents=True, exist_ok=True)
+            (w / name).write_text("")
+        W, other_repo = str(w), str(w / "other/repo")
         rows = [
             ("grep -rn foo agent/", None, use(grep("foo", "agent"))),
             ("grep -rn foo agent/ || echo exit-code: nonzero", None, use(grep("foo", "agent"))),
@@ -1036,8 +1057,8 @@ class SensitiveReadTableTests(unittest.TestCase):
             ("cd sub && grep -rn x", "/w", use(grep("x", "/w/sub"))),
             ("(cd sub && grep -n x a); grep -n y b", "/w", use(grep("x", "/w/sub/a"), grep("y", "/w/b"))),
             ("cd $D && grep -n x a", None, generic),
-            ("git grep -n -e x -- bin lib", None, use(grep("x", "bin"), grep("x", "lib"))),
-            ("git grep -n 'x\\+' bin/tp-spawn", None, use(grep("x+", "bin/tp-spawn"))),
+            ("git grep -n -e x -- bin lib", W, use(grep("x", f"{W}/bin"), grep("x", f"{W}/lib"))),
+            ("git grep -n 'x\\+' bin/tp-spawn", W, use(grep("x+", f"{W}/bin/tp-spawn"))),
             ("cat a b | grep x", None, use(grep("x", "a"), grep("x", "b"))),
             ("sed -n 1,20p config/router.json", None, use(read("config/router.json"))),
             ("cat -n lib/x.py", None, use(read("lib/x.py"))),
@@ -1049,7 +1070,7 @@ class SensitiveReadTableTests(unittest.TestCase):
             # F1: a search or read that cannot be named, or batched with other commands, is still the search the ask is about.
             ("grep -f pats .", None, generic), ("grep -rn $(echo x) .", None, generic),
             ("git grep -f pats -- " + sensitive_dir, None, generic), ("grep -rn \"$PAT\" lib", None, generic),
-            ("git --git-dir=/r/.git grep x", None, generic), ("git grep TOKEN HEAD -- " + sensitive_dir, None, generic),
+            ("git --git-dir=/r/.git grep x", None, generic), ("git grep TOKEN HEAD -- " + sensitive_dir, W, generic),
             ("git ls-files | xargs grep -n TOKEN", None, use(unnamed=True, other=True)),
             ("grep -rn TOKEN " + sensitive_dir + "; ls tests", "/w", use(grep("TOKEN", "/w/config"), other=True)),
             ("grep -rn TOKEN " + sensitive_dir + " && git status --short", "/w", use(grep("TOKEN", "/w/config"), other=True)),
@@ -1057,9 +1078,9 @@ class SensitiveReadTableTests(unittest.TestCase):
             ("grep -r -f pats " + sensitive_dir + "; ls", None, use(unnamed=True, other=True)),
             ("grep -n x README.md; grep -f p " + sensitive_dir, None, use(grep("x", "README.md"), unnamed=True)),
             # F2: the target is the one the shell searches.
-            ("git -C /other/repo grep -n TOKEN -- config/local.json", "/w", use(grep("TOKEN", "/other/repo/config/local.json"))),
-            ("git -C sub -C deeper grep -n TOKEN", "/w", use(grep("TOKEN", "/w/sub/deeper"))),
-            ("git -C sub grep -n TOKEN -- 'conf*'", "/w", generic),
+            (f"git -C {other_repo} grep -n TOKEN -- config/local.json", W, use(grep("TOKEN", f"{other_repo}/config/local.json"))),
+            ("git -C sub -C deeper grep -n TOKEN", W, use(grep("TOKEN", f"{W}/sub/deeper"))),
+            ("git -C sub grep -n TOKEN -- 'conf*'", W, generic),
             ("grep -n TOKEN < config/local.json", "/w", use(grep("TOKEN", "/w/config/local.json"))),
             ("cat config/local.json | grep TOKEN", "/w", use(grep("TOKEN", "/w/config/local.json"))),
             ("grep -rn TOKEN config/*.json", "/w", use(grep("TOKEN", "/w/config", glob="*.json"))),
@@ -1071,37 +1092,111 @@ class SensitiveReadTableTests(unittest.TestCase):
              use(grep("VERSION", "/w/README.md"), grep("TOKEN", "/w/config"))),
             ("grep -rn TOKEN " + sensitive_dir + "; grep -n VERSION README.md", "/w",
              use(grep("TOKEN", "/w/config"), grep("VERSION", "/w/README.md"))),
-            # A filter of another command's output or of a here-string searches no file.
-            ("git log | grep x", None, None), ("grep x <<< text", None, None),
-            ("python3 -c 'print(1)'", None, None), ("python3 -c 'print(1)'; grep -n x README.md", None, None),
-            ("find . -name x -exec grep y {} +", None, None), ("git show HEAD:x", None, None), ("cat x > y; rm y", None, None),
-            ("sed -n -i 's/a/b/p' f", None, None), ("sed -ni 1p f", None, None), ("sed -n --in-place 1p f", None, None),
+            # sg1 round 3, F1: a shell's -c script (and eval) is routed as if typed here; xargs feeding a reader is unnamed.
+            ("sh -c 'grep -rn TOKEN config/'", W, use(grep("TOKEN", f"{W}/config"))),
+            ("bash -lc 'cat config/local.json'", W, use(read(f"{W}/config/local.json"))),
+            ('zsh -c "grep -rn TOKEN config/"', W, use(grep("TOKEN", f"{W}/config"))),
+            ("bash -e -x -c 'grep -rn TOKEN config/; ls'", W, use(grep("TOKEN", f"{W}/config"), other=True)),
+            ("cd sub && sh -c 'grep -n x a'", W, use(grep("x", f"{W}/sub/a"))),
+            ("eval 'grep -rn TOKEN config/'", W, use(grep("TOKEN", f"{W}/config"))),
+            ("printf '%s\\n' config/local.json | xargs sed -n 1,5p", W, generic),
+            ("printf '%s\\n' config/local.json | xargs git grep TOKEN --", W, generic),
+            # F2: a revision, the index or files git does not track are not the work tree's files: no path is named.
+            ("git grep TOKEN HEAD", W, generic), ("git grep -e TOKEN main", W, generic),
+            ("git grep --cached TOKEN -- config/local.json", W, generic),
+            ("git grep TOKEN HEAD -- config/local.json", W, generic),
+            ("git grep --no-index TOKEN -- config/local.json", W, generic),
+            ("git grep -n TOKEN -- missing.json", W, generic),
+            ("git grep -n TOKEN -- config/local.json", W, use(grep("TOKEN", f"{W}/config/local.json"))),
+            # A command with no search or read in it (the classifier does not refuse it) still gets only the safe tools.
+            ("python3 -c 'print(1)'", None, generic), ("git log | grep x", None, generic),
         ]
         for command, cwd, expected in rows:
             with self.subTest(command=command, cwd=cwd):
                 self.assertEqual(sensitive_read.safe_route("bash", {"command": command}, "pi", cwd), expected)
         self.assertIsNone(sensitive_read.safe_route("Read", {"file_path": "x"}, "claude"))
         # It never raises: a crashed Claude hook answers nothing, and the call would run without its ask.
+        # A command it cannot read gets the safe tools by name.
+        claude_generic = ("Search with mcp__tmux-pi-safe__safe_grep and read with mcp__tmux-pi-safe__safe_read instead of a "
+                          "shell search or read.")
         with mock.patch.object(sensitive_read, "_route_parts", side_effect=RuntimeError("boom")):
-            self.assertIsNone(sensitive_read.safe_route("Bash", {"command": "cat x"}, "claude"))
-        self.assertIsNone(sensitive_read.safe_route("Bash", {"command": 42}, "claude"))
-        self.assertIsNone(sensitive_read.safe_route("Bash", None, "claude"))
+            self.assertEqual(sensitive_read.safe_route("Bash", {"command": "cat x"}, "claude"), claude_generic)
+        self.assertEqual(sensitive_read.safe_route("Bash", {"command": 42}, "claude"), claude_generic)
+        self.assertEqual(sensitive_read.safe_route("Bash", None, "claude"), claude_generic)
         claude = sensitive_read.safe_route("Bash", {"command": "grep -rn foo agent/"}, "claude")
         self.assertTrue(claude.startswith("Use mcp__tmux-pi-safe__safe_grep with pattern"), claude)
         self.assertIn("mcp__tmux-pi-safe__safe_read", claude)
-        # response_for: a route is named in an ask; with refuse it is a deny; refuse without a route stays an ask.
-        result = {"sensitive": True, "target": "t", "reason": "r"}
+        # response_for: a route is named in an ask; with refuse, an ask a shell search or read caused ("search_read") is a
+        # deny, naming the route or the safe tools; any other ask stays an ask, route or not (sg1 round 3).
+        result = {"sensitive": True, "target": "t", "reason": "r", "search_read": True}
         out = lambda *args: sensitive_read.response_for(result, *args)["hookSpecificOutput"]
         self.assertEqual(out()["permissionDecision"], "ask")
         self.assertEqual(out("R.")["permissionDecisionReason"],
                          "Read may expose t. Authorize this specific tool call only if its scope is needed. R.")
         self.assertEqual(out("R.", True), {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                            "permissionDecisionReason": "tmux-pi refuses this shell read in a worker task: it may expose t. R."})
+        self.assertEqual(out(None, True)["permissionDecisionReason"],
+                         "tmux-pi refuses this shell read in a worker task: it may expose t. " + claude_generic)
+        result = {"sensitive": True, "target": "t", "reason": "r", "search_read": False}
+        self.assertEqual(out("R.", True)["permissionDecision"], "ask")
         self.assertEqual(out(None, True)["permissionDecision"], "ask")
         self.assertIsNone(sensitive_read.response_for({"sensitive": False}, "R.", True))
         self.assertTrue(sensitive_read.worker_task({"TP_TASK_DIR": "/x"}))
         self.assertFalse(sensitive_read.worker_task({"TP_TASK_DIR": ""}))
         self.assertFalse(sensitive_read.worker_task({}))
+
+    def test_search_read_cause(self):
+        """sg1 round 3: the classifier says whether a shell search or read caused the ask ("search_read"); every consumer
+        refuses a worker on it alone. A search or read in a shell's -c script, eval, xargs, a substitution, a wrapper or
+        a `<` input is the cause; an ask that some other command, a revision read (git show), a patch (git diff, also
+        under xargs), find -exec, a remote shell or an editing sed causes is not, even batched with a harmless search."""
+        rows = [
+            ("grep -rn TOKEN config/", True), (f"cat {ENV}", True), (f"sed -n 1,5p {LOCAL}", True),
+            ("sh -c 'grep -rn TOKEN config/'", True), ("bash -lc 'grep -rn TOKEN config/'", True),
+            ('zsh -c "grep -rn TOKEN config/"', True), ("bash -e -x -c 'grep -rn TOKEN config/'", True),
+            (f"sh -c 'cat {ENV}'", True), ("eval 'grep -rn TOKEN config/'", True),
+            (f"printf '%s\\n' {LOCAL} | xargs sed -n 1,5p", True), (f"printf '%s\\n' {LOCAL} | xargs cat", True),
+            (f"printf '%s\\n' {LOCAL} | xargs grep -n TOKEN", True),
+            (f"printf '%s\\n' {LOCAL} | xargs git grep TOKEN --", True),
+            ("git grep TOKEN HEAD", True), ("git grep -e TOKEN main", True), (f"git grep --cached TOKEN -- {LOCAL}", True),
+            (f"git grep -n TOKEN -- {LOCAL}", True), (f"grep TOKEN < {LOCAL}", True), (f"timeout 5 cat {ENV}", True),
+            ("echo $(grep -rn TOKEN config/)", True), (f"bash <<EOF\ncat {ENV}\nEOF", True), (f"cat {ENV} | grep TOKEN", True),
+            (f"python3 -c 'open(\"{ENV}\").read()'; grep -rn TOKEN config/", True),
+            (f"for f in {ENV}; do cat $f; done", True),
+            # not a shell search or read: the ask stands in a worker
+            (f"python3 -c 'open(\"{ENV}\").read()'", False),
+            (f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md", False),
+            (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", False), ("bash -c 'git diff -- config/'", False),
+            (f"printf '%s\\n' {LOCAL} | xargs git diff --", False), ("find . -name x -exec grep TOKEN {} +", False),
+            (f"base64 {ENV}", False), (f"cat <<EOF\n{ENV}\nEOF", False), (f"ssh host cat {ENV}", False),
+            (f"docker exec c cat {ENV}", False), (f"sed -n -i 1p {LOCAL}", False), (f"sed -ni 1p {LOCAL}", False),
+            (f"sed -n --in-place 1p {LOCAL}", False), (f"git show HEAD:{LOCAL}", False), (f"cp {ENV} /tmp/x", False),
+            (f"sh {ENV}", False), (f"xargs python3 < {LOCAL}", False), (f"git diff -- {LOCAL}", False),
+            (f"for f in {ENV}; do python3 $f; done", False),
+        ]
+        for command, cause in rows:
+            with self.subTest(command=command):
+                result = classify("Bash", {"command": command}, CWD)
+                self.assertTrue(result["sensitive"])
+                self.assertIs(result["search_read"], cause)
+        # The wrapper floor judges `xargs git grep` without the repository's state; its hit is the search's when the program it
+        # tried is the one xargs runs (round 3 attack: it was an ask in a worker in a clean repository).
+        top = Path(os.path.realpath(tempfile.mkdtemp(prefix="tp-read-clean-")))
+        self.addCleanup(shutil.rmtree, str(top), True)
+        git(top, "init", "-q", "-b", "main", ".")
+        (top / "README.md").write_text("one\n")
+        git(top, "add", ".")
+        git(top, "commit", "-q", "-m", "first")
+        self.assertEqual(classify("Bash", {"command": "git grep -n TOKEN --"}, str(top)), {"sensitive": False})
+        for command in ("printf '%s\\n' README.md | xargs git grep -n TOKEN --", "ls | xargs git grep -n TOKEN"):
+            with self.subTest(command=command):
+                result = classify("Bash", {"command": command}, str(top))
+                self.assertTrue(result["sensitive"])
+                self.assertIs(result["search_read"], True)
+        # xargs git log / blame read only history: not sensitive here, and not a search.
+        for command in (f"printf '%s\\n' {LOCAL} | xargs git log --", f"printf '%s\\n' {LOCAL} | xargs git blame"):
+            with self.subTest(command=command):
+                self.assertEqual(classify("Bash", {"command": command}, CWD), {"sensitive": False})
 
     def test_classifier_names_the_safe_call_with_route(self):
         """--route: a sensitive shell search or read gets "safe", in the asking harness's names; others are unchanged."""
@@ -1749,12 +1844,13 @@ class UnscopedPatchTests(unittest.TestCase):
         with self.on_path(listing):
             result = bash("git diff", str(top))
         self.assertEqual(result, {"sensitive": True, "target": f"git diff of {SECRETS}",
-                                  "reason": "patch output covers a credential-bearing path"})
+                                  "reason": "patch output covers a credential-bearing path", "search_read": False})
         self.assertEqual(record.read_text(), "asked\nasked\n")
         record.unlink()
         # So does a listed submodule entry, and so does a patch with nothing in it.
         for output, expected in ((RAW.format("README.md") + ":160000 160000 1111111 2222222 M\\000vendor\\000",
-                                  {"sensitive": True, "target": "git diff of vendor", "reason": SUBMODULE_REASON}),
+                                  {"sensitive": True, "target": "git diff of vendor", "reason": SUBMODULE_REASON,
+                                   "search_read": False}),
                                  ("", {"sensitive": False})):
             with self.subTest(output=output), self.on_path(self.fake_git(f"echo asked >> '{record}'\nprintf '{output}'")):
                 self.assertEqual(bash("git diff", str(top)), expected)

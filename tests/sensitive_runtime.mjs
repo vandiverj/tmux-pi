@@ -198,6 +198,13 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["grep -n 'a\\|b' .env | head -5", new RegExp(`safe_grep with pattern "a\\|b" and path ${at('.env')}`)],
     ['grep -rn TOKEN config/; ls', new RegExp(`safe_grep with pattern "TOKEN" and path ${at('config')}.* Run the other commands`)],
     ['grep -r -f pats config/', /Search with safe_grep and read with safe_read/],
+    // sg1 round 3: the classifier's cause ("search_read") decides. A shell's -c script is the search; xargs feeding a reader
+    // and a git grep of a revision or the index name the safe tools and no path.
+    ["sh -c 'grep -rn TOKEN config/'", new RegExp(`safe_grep with pattern "TOKEN" and path ${at('config')}`)],
+    ["bash -lc 'cat .env'", new RegExp(`safe_read with path ${at('.env')}`)],
+    ["printf '%s\\n' config/local.json | xargs sed -n 1,5p", /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
+    ['git grep TOKEN HEAD', /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
+    ['git grep --cached TOKEN -- config/local.json', /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;
@@ -221,10 +228,14 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
   // Not sensitive: runs in both. Sensitive but not a plain search or read: the worker is still prompted, not refused.
   assert.equal(await hw.tool_call(call('bash', { command: 'grep -n one README.md' }), ui), undefined);
   assert.equal(await hm.tool_call(call('bash', { command: 'grep -n one README.md' }), ui), undefined);
-  prompts.length = 0;
-  const other = await hw.tool_call(call('bash', { command: "python3 -c 'print(open(\".env\").read())'" }), ui);
-  assert.equal(prompts.length, 1, 'a worker prompt the safe tools cannot replace was refused');
-  assert.match(other.reason, /User denied access/);
-  assert.equal(request().status, 'denied');
+  // sg1 round 3: so does a shell wrapper around a non-search, and xargs git diff (a patch, not a search).
+  for (const command of ["python3 -c 'print(open(\".env\").read())'", "bash -c 'python3 -c \"open(\\\".env\\\")\"'",
+                         "printf '%s\\n' config/local.json | xargs git diff --"]) {
+    prompts.length = 0;
+    const other = await hw.tool_call(call('bash', { command }), ui);
+    assert.equal(prompts.length, 1, `a worker prompt the safe tools cannot replace was refused: ${command}`);
+    assert.match(other.reason, /User denied access/);
+    assert.equal(request().status, 'denied');
+  }
 }
 console.log('ok');

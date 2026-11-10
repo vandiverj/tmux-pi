@@ -346,13 +346,21 @@ class UseScanTests(unittest.TestCase):
                  "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
                  "pkgutil", "pickle", "marshal", "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc",
                  # round 15: breakpoint() imports by PYTHONBREAKPOINT; __globals__ and a frame's f_* hand out a module namespace
-                 "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins")
+                 "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins",
+                 # round 16: m.__setattr__("Q", v) and object.__setattr__(m, "Q", v) write a module attribute as setattr does
+                 "__setattr__", "__delattr__")
         self.assertEqual(set(words), set(ss._DYNAMIC_ACCESS))
+        self.assertLessEqual(ss._DYNAMIC, set(words))  # the write forms are words too (see ss._DYNAMIC on why there are two sets)
         self.assertEqual(self.scan("x = 1\n"), ["- u.py does not use Q [u.py:1]"])
         for word in words:
             with self.subTest(word):
                 self.assertEqual(self.scan("x = 1\ny = {}\n".format(word)), [])
                 self.assertEqual(self.scan("x = 1  # {}\n".format(word)), [])  # the raw text: a comment holds it too
+                # round 16 (Main 2): words are checked as Python reads names. Every letter fullwidth (NFKC folds it back): in an
+                # identifier or attribute it is the word to Python (the spellings attack executes them), so it blocks the same
+                wide = "".join(chr(ord(c) + 0xFEE0) if c.isalpha() else c for c in word)
+                self.assertEqual(self.scan("x = 1\ny = {}\n".format(wide)), [])
+                self.assertEqual(self.scan("x = 1\ny = x.{}\n".format(wide.split(".")[-1])), [])
         # the word is matched on identifier boundaries: a longer identifier is not the word
         for user in ("x = execute\n", "y = evaluate(1)\n", "z = my_vars\n", "g = gcd(1, 2)\n", "i = inspector\n"):
             self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
@@ -466,7 +474,8 @@ class UseScanTests(unittest.TestCase):
                 # loader too; a module from outside the run root is used only as the allow-list allows (_outside_use)
                 ("a package that only looks alike, not supplied", "import pkg2\nfrom other.pkg import sub\n", ()),
                 ("a name that does not look like a run-root directory, not supplied", "import hh.real\n", (("src/h/real.py", "y = 1\n"),)),
-                ("a member bound to an import alias of an outside module", "from h import x\n", (("h.py", "import os as x\n"),)),
+                ("a member bound to an import alias of an outside module, used beyond the list", "from h import x\nx.system('true')\n",
+                 (("h.py", "import os as x\n"),)),
                 ("an outside module read through a run-root module", "import h\ny = h.os.sep\n", (("h.py", "import os\n"),)),
                 ("review F1 (round 15): a helper calls pydoc.locate", "import h\n", (("h.py", "import pydoc\npydoc.locate('helperpkg.redirect')\n"),)),
                 ("an unlisted call of a listed module", "import h\n", (("h.py", "import os\nos.system('true')\n"),)),
@@ -503,14 +512,33 @@ class UseScanTests(unittest.TestCase):
         # the relative form: a module of a package that imports a sibling the package does not have
         for label, user, others in (("a missing relative module", "from .missing import x\n", (("pkg2/__init__.py", ""),)),
                                     ("a missing relative member", "from . import missing\n", (("pkg2/__init__.py", "x = 1\n"),)),
+                # round 16 (Main 1): one resolver for every import form; a relative re-export of an outside module is held to the
+                # allow-list as a direct import is (review F1: the first row)
+                ("review F1: a relative re-export of an outside module, used beyond the list",
+                 "from .h import argparse as a\na._sys.path.insert(0, 'alt')\n", (("pkg2/__init__.py", ""), ("pkg2/h.py", "import argparse\n"))),
+                ("from . import h, then an outside module read through it", "from . import h\nh.argparse._sys.path.insert(0, 'alt')\n",
+                 (("pkg2/__init__.py", ""), ("pkg2/h.py", "import argparse\n"))),
+                ("a chain of two: relative, then absolute", "from .g import ap\nap._sys.path.insert(0, 'alt')\n",
+                 (("pkg2/__init__.py", ""), ("pkg2/g.py", "from pkg2.h import argparse as ap\n"), ("pkg2/h.py", "import argparse\n"))),
+                ("a chain of three, relative at level 2", "from .sub.g import ap\nap._sys.path.insert(0, 'alt')\n",
+                 (("pkg2/__init__.py", ""), ("pkg2/sub/__init__.py", ""), ("pkg2/sub/g.py", "from ..h import ap\n"),
+                  ("pkg2/h.py", "from .k import argparse as ap\n"), ("pkg2/k.py", "import argparse\n"))),
+                ("a re-export cycle", "from .g import a\n", (("pkg2/__init__.py", ""), ("pkg2/g.py", "from .h import a\n"),
+                                                             ("pkg2/h.py", "from .g import a\n"))),
                                     ("transitive: a relative missing module in a sibling", "from . import helper\n",
                                      (("pkg2/__init__.py", ""), ("pkg2/helper.py", "from .missing import y\n")))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others, at="pkg2/u.py"), [])
+        # round 16: a listed use through a relative re-export keeps the line, as the direct import does
+        for user in ("from .h import argparse as a\nparser = a.ArgumentParser()\n", "from . import h\nparser = h.argparse.ArgumentParser()\n"):
+            with self.subTest("control: a listed use through a relative re-export", user=user):
+                self.assertEqual(scan(user, ("pkg2/__init__.py", ""), ("pkg2/h.py", "import argparse\n"), at="pkg2/u.py"),
+                                 ["- u.py does not use Q [pkg2/u.py:1]"])
         # round 9: a module the file can load is part of what it runs, so every per-file test (_refers: the bare name, a string
         # reference, a _DYNAMIC_ACCESS word, a star import) is made on every module the walk visits (review F1: h loads Q by pydoc.locate).
         # The rows of the file itself are above (round 8b); a trigger in a module the file does not import keeps the line.
         triggers = (("the bare name", "def f():\n    return Q\n"),
+                    ("the bare name in fullwidth, which Python reads as Q (round 16)", "def f():\n    return \uff31\n"),
                      ("pydoc.locate of constants + chr (review F1)", "import pydoc\nresult = pydoc.locate('pkg.sub.t.' + chr(81))\n"),
                      ("a constant naming the target", "x = 'pkg.sub.t.Q'\n"),
                      ("constants joined by +", "x = 'pkg.' + 'sub.' + 't'\n"),
@@ -572,6 +600,10 @@ class UseScanTests(unittest.TestCase):
                 # submodule from outside the run root); a right-hand side that raises makes h, and so the importer, fail to import
                 ("a member bound to a call", "from h import x\n", (("h.py", "def unknown():\n    pass\n\n\nx = unknown()\n"),)),
                 ("a member bound to an import alias", "from h import x\n", (("h.py", "import g as x\n"), ("g.py", "y = 1\n"))),
+                # round 16 (Main 1): a member bound to an outside module resolves to it and is held to the allow-list exactly as a
+                # direct import is: `from h import x` with `import os as x` in h is `import os` (was opaque before round 16)
+                ("a member bound to an import alias of an outside module, unused, as `import os` is", "from h import x\n",
+                 (("h.py", "import os as x\n"),)),
                 ("a member bound to an undefined name", "from h import x\n", (("h.py", "x = nonexistent\n"),)),
                 ("a member defined by one plain class", "from h import C\n", (("h.py", "class C:\n    pass\n"),)),
                 ("a member that a package binds, in a package", "from h import f\n", (("h/__init__.py", "def f():\n    pass\n"),)),
@@ -1077,6 +1109,20 @@ class BindingProofUseTests(unittest.TestCase):
                       dict(star, **{p: t.replace(locate, "from unittest.mock import patch\npatch('helperpkg.redirect.marker', 1).start()\n") for p, t in extra.items()}),
                       head.replace(locate, "from unittest.mock import patch\npatch('helperpkg.redirect.marker', 1).start()\n"))]
         rows += [("round 15: an outside module read through a run-root module", {"h.py": "import argparse\n"}, "import h\nh.argparse._sys.path.insert(0, 'alt')\n")]
+        # round 16 (Main 1): one resolver for every import form, relative ones and re-export chains too (review F1: the first row);
+        # (Main 2) words as Python reads names (review F2: the fullwidth rows); m.__setattr__ writes as setattr does
+        reexport = {"app/__init__.py": "", "app/h.py": "import argparse\n"}
+        rows += [("review F1: a relative re-export of an outside module", reexport, "from .h import argparse as a\na._sys.path.insert(0, 'alt')\n"),
+                 ("from . import h, then an outside module through it", reexport, "from . import h\nh.argparse._sys.path.insert(0, 'alt')\n"),
+                 ("a relative chain of two", dict(reexport, **{"app/g.py": "from .h import argparse\n"}),
+                  "from .g import argparse as a\na._sys.path.insert(0, 'alt')\n"),
+                 ("a mixed chain: relative, then absolute", dict(reexport, **{"app/g.py": "from app.h import argparse as ap\n"}),
+                  "from .g import ap\nap._sys.path.insert(0, 'alt')\n"),
+                 ("round 16 review F2: __import__ in fullwidth, in a helper", {"h.py": "__\uff49\uff4d\uff50\uff4f\uff52\uff54__('sys').path.insert(0, 'alt')\n"},
+                  "import h\n"),
+                 ("round 16 review F2: __globals__ in fullwidth", {}, "g = (lambda: 0).__\uff47\uff4c\uff4f\uff42\uff41\uff4c\uff53__\n"),
+                 ("a helper writes Q by the module's __setattr__", {"h.py": "import pkg.t\npkg.t.__setattr__('Q', 1)\n"}, "import h\n"),
+                 ("a helper writes Q by object.__setattr__", {"h.py": "import pkg.t\nobject.__setattr__(pkg.t, 'Q', 1)\n"}, "import h\n")]
         controls = [("control: u's package __init__ imports a clean helper", {"app/__init__.py": "import h\n"}, ""),
                     ("control: a helper calls listed callables", {"h.py": "import re, json\nx = re.sub('a', 'b', json.loads('\"a\"'))\n"}, "import h\n"),
                     # round 15: os.path.dirname and sys.argv are not on the allow-list (the old input is a row above); listed calls are
@@ -1084,7 +1130,8 @@ class BindingProofUseTests(unittest.TestCase):
                      "import os, sys\nif __name__ == '__main__':\n    sys.exit(os.path.exists(__file__))\n"),
                     ("control: an unrelated file inserts into sys.path", {"w.py": sys_insert}, ""),
                     ("control: an unrelated file star-imports helperpkg", dict(star, **{"w.py": "from helperpkg import *\n"}), ""),
-                    ("control: a comment says site", {}, "x = 1  # the web site\n")]
+                    ("control: a comment says site", {}, "x = 1  # the web site\n"),
+                    ("control: a listed use through a relative re-export", reexport, "from .h import argparse as a\np = a.ArgumentParser()\n")]
         relative = (("from .t import Q\nobj = Q()\n", 1), ("from . import t\nobj = t.Q()\n", 2))
         for label, extra, head in rows + controls:
             for kind, target, verb in (("class", "class Q:\n    pass\n", "creates a"), ("function", "def Q():\n    pass\n", "calls")):

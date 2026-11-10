@@ -16,6 +16,7 @@ import re
 import socket
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -396,8 +397,26 @@ def _base(f):
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 # A file that names one of these anywhere can bind, rewrite or delete a name by a path the source does not show (globals()["X"] = 1,
-# setattr(module, "X", 1), exec("X = 1"), module.__dict__.update(...), importlib.import_module): it states nothing about its names.
-_DYNAMIC = frozenset(("globals", "vars", "locals", "setattr", "delattr", "exec", "eval", "__import__", "importlib", "__dict__"))
+# setattr(module, "X", 1), exec("X = 1"), module.__dict__.update(...), importlib.import_module, m.__setattr__("X", 1),
+# object.__setattr__(m, "X", 1)): it states nothing about its names. Round 16 (Main 2): this is one of two word sets ON PURPOSE.
+# _DYNAMIC holds the forms that WRITE a namespace; a file that uses one proves nothing about its own bindings (_binding_index: every
+# binding proof, version_diff, the use scan's attribution). _DYNAMIC_ACCESS (below) is _DYNAMIC plus the forms that only READ or
+# LOAD (getattr, compile, inspect, gc, ...): a file holding one may reach a name or module its imports do not show, so it is opaque to
+# every walk (_opaque), while its own statements still show what it binds. A read form can fetch a writer at run time
+# (getattr(builtins, "set" + "attr")); that only matters for a file that runs, and every file a walk runs, and every file a use line
+# is attributed through (_runs_clean), is held to _opaque and so to all of _DYNAMIC_ACCESS. Both are matched on names as Python reads
+# them: the AST holds NFKC-normalized identifiers, and the text tests read _spellings.
+_DYNAMIC = frozenset(("globals", "vars", "locals", "setattr", "delattr", "exec", "eval", "__import__", "importlib", "__dict__",
+                      "__setattr__", "__delattr__"))
+
+
+def _spellings(source):
+    """The text as written and as Python reads its names (round 16, Main 2): Python NFKC-normalizes every identifier, so
+    `__ｉｍｐｏｒｔ__` and `__import__` are one name, while strings and comments keep the characters written. A word test that reads
+    text tests every member of this tuple, so a word is found in an identifier however it is spelled, and in strings and comments as
+    written (a normalized string or comment that turns into a word only loses a line)."""
+    normal = unicodedata.normalize("NFKC", source)
+    return (source,) if normal == source else (source, normal)
 
 
 def _root_name(node):
@@ -823,20 +842,50 @@ def _imported_module(path, node):
     return ".".join(package + ([node.module] if node.module else []))
 
 
+_Alias = collections.namedtuple("_Alias", "node name local qualified module")
+
+
+def _import_aliases(path, tree):
+    """THE one reader of import statements (round 16, Main 1): one _Alias per name an import statement names, at any scope.
+    name: the alias as written (a.b, or the member n, or "*"); local: the name it binds (None for a star import); qualified: the dotted
+    name of what local refers to before any resolution against the run root (`import a.b` binds a: "a"; `import a.b as x`: "a.b";
+    `from S import n`: S + "." + n, S resolved from the importing file's package as Python does, _imported_module), or None when a
+    relative import does not resolve (path None: the importing file is not known, so no relative import resolves); module: the module
+    the statement loads first (a.b, or S, or None). What a qualified name then is, outside the run root, a run-root module, a member,
+    or unknown, is decided by _resolve only."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                local = a.asname or a.name.split(".")[0]
+                out.append(_Alias(node, a.name, local, a.name if a.asname else local, a.name))
+        elif isinstance(node, ast.ImportFrom):
+            module = _imported_module(path, node) if path is not None or not node.level else None
+            for a in node.names:
+                qualified = module + "." + a.name if module and a.name != "*" else None
+                out.append(_Alias(node, a.name, None if a.name == "*" else a.asname or a.name, qualified, module or None))
+    return out
+
+
 def _inside(dotted, module):
     return dotted == module or dotted.startswith(module + ".")
 
 
 # A file whose text holds one of these words can reach a name it does not spell (getattr(m, chr(81)), vars(m), importlib.import_module,
 # inspect.getmembers, a class from object.__subclasses__()): "does not use" is not said of it. The words are matched in the raw text,
-# comments and strings too, on identifier boundaries; a false hit only loses a line. The last six are beyond the brief's list.
+# comments and strings too, on identifier boundaries, as written and NFKC-normalized (_spellings: `__ｇｌｏｂａｌｓ__` is __globals__
+# to Python); a false hit only loses a line. Every word of _DYNAMIC is here (asserted below): _DYNAMIC is the write forms, this is
+# them plus the read and load forms (see _DYNAMIC for why there are two).
 _DYNAMIC_ACCESS = ("getattr", "__getattribute__", "__import__", "importlib", "import_module", "sys.modules", "eval", "exec", "compile",
                    "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
                    "pkgutil", "pickle", "marshal",
                    "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc",
                    # round 15: breakpoint() imports the module PYTHONBREAKPOINT names; a function's __globals__ and a frame's f_globals,
                    # f_locals and f_builtins hand out a module namespace (its imported modules, __builtins__) under no import binding
-                   "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins")
+                   "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins",
+                   # round 16: m.__setattr__("X", v) and object.__setattr__(m, "X", v) write a module attribute as setattr does
+                   "__setattr__", "__delattr__")
+assert _DYNAMIC <= frozenset(_DYNAMIC_ACCESS)
 _DYNAMIC_ACCESS_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(w) for w in _DYNAMIC_ACCESS) + r")(?![A-Za-z0-9_])")
 
 
@@ -845,16 +894,13 @@ def _imports_of(path, tree):
     (a.b, c) in members (c may be a module of a.b or an attribute a.b provably binds: _unresolved says which). A relative import is resolved
     as in _imported_module, and one that does not resolve makes the third False."""
     names, members, resolved = set(), set(), True
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(a.name for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            source = _imported_module(path, node)
-            if source is None:
-                resolved = False
-                continue
-            names.add(source)
-            members.update((source, a.name) for a in node.names if a.name != "*")
+    for al in _import_aliases(path, tree):
+        if al.module is None:
+            resolved = False
+            continue
+        names.add(al.module)
+        if isinstance(al.node, ast.ImportFrom) and al.local is not None:
+            members.add((al.module, al.name))
     return names, members, resolved
 
 
@@ -904,43 +950,32 @@ def _path_links(module, target, through_package):
     return steps + [(None, target)]
 
 
-def _holder_binds_other(holder, name, parsed, run):
+def _holder_binds_other(holder, name, graph):
     """True when the run root does not prove that the package holder's attribute name is only ever its submodule holder.name. The
     package is the one _module_identity proves for holder on the way to holder.name (round 11: a holder.py beside the package, an
-    __init__ of another suffix, a standard-library top-level name all leave it unproved, and so True). Then: the package's __init__.py
-    binds name by any statement other than an import of exactly that submodule (`from . import name`, `from <holder> import name`,
-    `import <holder>.<name> as name`), that is an `as` import of another module, an assignment, a def or class, a for or with target,
-    a global, a delete, a star import or a dynamic form (_binds); or it defines a module `__getattr__`, which can answer any name; or
-    the __init__.py was not supplied (it is on disk only) or does not parse. A namespace directory (no __init__) binds nothing."""
-    owners = _module_identity(holder + "." + name, run).owners
+    __init__ of another suffix, a standard-library top-level name all leave it unproved, and so True). Then what the package's
+    __init__.py binds as name is decided by the one resolver (round 16, Main 1: _file_member): anything but the submodule itself
+    (another module, an assignment, a def or class, a name bound twice or under a condition, a star import, a dynamic form, a module
+    `__getattr__`, a cycle) is True; so is an __init__.py that was not supplied (it is on disk only) or does not parse. A namespace
+    directory (no __init__) binds nothing."""
+    owners = _module_identity(holder + "." + name, graph.run).owners
     if owners is None:
         return True
     init = owners[-2]
     if init.endswith("/"):
         return False
-    tree = parsed.get(init)
-    if tree is None or _binds(tree, "__getattr__", None, False, existence=True) != []:
-        return True  # (None: a dynamic form or a star import, which binds names no statement shows)
-    found = _binds(tree, name, None, False, existence=True)
-    for kind, node, stmt, _scope, _role in found:
-        if not (kind == "name" and isinstance(node, ast.alias)):
-            return True
-        if isinstance(stmt, ast.ImportFrom) and _imported_module(init, stmt) == holder and node.name == name:
-            continue
-        if isinstance(stmt, ast.Import) and node.name == holder + "." + name and node.asname == name:
-            continue
-        return True
-    return False
+    entry = graph.files.get(init)
+    return entry is None or _file_member(init, entry[1], holder, name, graph, frozenset()) != {_Ref("module", holder + "." + name)}
 
 
-def _path_proved(module, target, through_package, parsed, written, run):
+def _path_proved(module, target, through_package, graph, written):
     """THE one proof of a name the use scan attributes through (round 10, Main): every link the name is resolved through (_path_links)
     is proved. A link is unproved when some run-root file writes or deletes an attribute of the link's name on any object (_written_names,
     _may_write: no alias analysis, as round 8), or, for a link held by a package, when that package's __init__ may bind the name to
     something other than its submodule, or the package itself is not proved (_holder_binds_other, _module_identity). Every form of
     import is proved here, so no form can skip a link. (That the module is the definer's file at all is proved once per target, in
     use_scan, by _module_identity.)"""
-    return not any(_may_write(written, name) or holder is not None and _holder_binds_other(holder, name, parsed, run)
+    return not any(_may_write(written, name) or holder is not None and _holder_binds_other(holder, name, graph)
                    for holder, name in _path_links(module, target, through_package))
 
 
@@ -975,7 +1010,7 @@ def _changes_import_state(source, tree):
     - holds a word of _DYNAMIC_ACCESS (its raw text).
     Reading __name__ and __file__ (`if __name__ == "__main__"`, `os.path.dirname(__file__)`) does not change it. Only _opaque calls
     this (round 14, Main: no walk is given it on its own). The walk below reads references only; no binding is decided here."""
-    if tree is None or _DYNAMIC_ACCESS_RE.search(source) or _STATE_WORDS_RE.search(source):
+    if tree is None or any(_DYNAMIC_ACCESS_RE.search(text) or _STATE_WORDS_RE.search(text) for text in _spellings(source)):
         return True
     events = _binding_index(tree).events
     if any(name in events for name in _STATE_ATTRS):
@@ -1025,8 +1060,11 @@ def _outside(dotted, graph):
 
 def _outside_use(tree, graph):
     """THE allow-list test (round 15, Main): None when every reference the file makes to a module from outside the run root is
-    allowed, else the first one that is not, as text (line: what). A reference is a name bound by `import m`, `import m as x` or
-    `from m import f`, m outside (_outside). Allowed:
+    allowed, else the first one that is not, as text (line: what). A reference is a name bound by an import statement of any form
+    (absolute or relative at any level, `from . import h`, re-export chains through run-root modules) that the one resolver (_resolve,
+    round 16) finds to be outside the run root, or an attribute read on a run-root module that it finds to be (h.argparse._sys): a
+    run-root member bound in its module to an outside name is held to the list exactly as a direct import of that name. A name the
+    resolver cannot decide (unknown) is not allowed. Allowed:
     - the import itself, when the module (or m.f) is a prefix of a list entry (_SAFE_PREFIXES) or an entry: importing any other
       outside module runs code no import of the run root shows;
     - a call whose callee is the binding followed by attribute reads to a qualified name on _SAFE_CALLABLES;
@@ -1034,9 +1072,9 @@ def _outside_use(tree, graph):
     - a decorator or a base class on either list.
     Every other use, at any scope, is not: calling something unlisted, passing the module or a function as a value, aliasing, a write
     or delete, a subscript. Calls on what a listed callable returns, on run-root objects and on local values are not restricted.
-    Also not allowed, since they reach an outside module under no binding of this file: an attribute (on anything not rooted at such
-    a binding) or a `from <run-root module> import` member whose name some file of the run root binds by an outside import
-    (_Graph.reexported: h.argparse._sys.path, `from h import os`); a reference to a builtin of _LOADER_NAMES; and any file at all when
+    Also not allowed, since it may reach an outside module under no binding the resolver follows: an attribute whose name some file
+    of the run root binds by an import that resolves outside (_Graph.reexported), unless the chain it ends is rooted at an import
+    binding and resolved to the end (f().argparse, C.argparse for a class whose body imports argparse); a reference to a builtin of _LOADER_NAMES; and any file at all when
     the run root has a module of a standard-library name (_Graph.shadowed: the standard library imports its own modules by name, and
     sys.path[0] answers first). A name is matched in every scope; a local of the same name is held to the same rule."""
     cached = getattr(tree, "_outside_use", None)
@@ -1051,55 +1089,70 @@ def _find_outside_use(tree, graph):
     shadow = graph.shadowed()
     if shadow is not None:
         return "1: the run root has a module named {} (a standard-library name)".format(shadow)
+    allowed_names = _SAFE_PREFIXES | _SAFE_CALLABLES | _SAFE_VALUES
     bound, reexported = {}, graph.reexported()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if _outside(a.name, graph):
-                    if a.name not in _SAFE_PREFIXES:
-                        return "{}: import {}".format(node.lineno, a.name)
-                    local, qualified = (a.asname, a.name) if a.asname else ((a.name.split(".")[0],) * 2)
-                    bound.setdefault(local, set()).add(qualified)
-        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
-            outside = _outside(node.module, graph)
-            for a in node.names:
-                qualified = node.module + "." + a.name
-                if outside and qualified not in _SAFE_PREFIXES | _SAFE_CALLABLES | _SAFE_VALUES:
-                    return "{}: from {} import {}".format(node.lineno, node.module, a.name)
-                if not outside and a.name in reexported:
-                    return "{}: from {} import {} (a module from outside the run root)".format(node.lineno, node.module, a.name)
-                if outside:
-                    bound.setdefault(a.asname or a.name, set()).add(qualified)
+    for al in _import_aliases(graph.path_of(tree), tree):
+        if al.local is None:
+            continue  # a star import: _opaque holds the file to _star
+        statement = "import " + al.name if isinstance(al.node, ast.Import) else "from {} import {}".format(al.module, al.name)
+        if isinstance(al.node, ast.Import) and _outside(al.name, graph) and al.name not in _SAFE_PREFIXES:
+            return "{}: {}".format(al.node.lineno, statement)
+        refs = _resolve_alias(al, graph)
+        for ref in sorted(refs, key=str):
+            if ref.kind == "unknown":
+                return "{}: {} (the scan cannot say what it binds: {})".format(al.node.lineno, statement, ref.name)
+            if ref.kind == "outside" and ref.name not in allowed_names:
+                return "{}: {} ({} from outside the run root)".format(al.node.lineno, statement, ref.name)
+        kept = {r for r in refs if r.kind in ("outside", "module")}
+        if kept:
+            bound.setdefault(al.local, set()).update(kept)
     parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in _LOADER_NAMES or isinstance(node, ast.Attribute) and node.attr in _LOADER_NAMES:
             return "{}: {}".format(node.lineno, _LOADER_NAMES[0] if isinstance(node, ast.Name) else "." + node.attr)
         if isinstance(node, ast.Attribute) and node.attr in reexported:
-            root = node.value
+            # exempt only a chain the check below resolves to the end: rooted at an import binding whose every meaning is outside, or
+            # a run-root module whose attributes up to this one resolve to modules or outside names (a member's attribute is not
+            # resolved: `C.argparse` of a class whose body imports argparse is caught here)
+            root, attrs = node, []
             while isinstance(root, ast.Attribute):
+                attrs.insert(0, root.attr)
                 root = root.value
-            if not (isinstance(root, ast.Name) and root.id in bound):
+            refs = bound.get(root.id, ()) if isinstance(root, ast.Name) else ()
+            if not refs or not all(r.kind == "outside" or all(x.kind in ("outside", "module") for x in _resolve(".".join([r.name] + attrs), graph))
+                                   for r in refs):
                 return "{}: .{} (a module from outside the run root)".format(node.lineno, node.attr)
         if isinstance(node, ast.Name) and node.id in bound:
-            for qualified in sorted(bound[node.id]):
-                chain = node
-                while isinstance(parents.get(id(chain)), ast.Attribute):
-                    chain = parents[id(chain)]
-                    qualified += "." + chain.attr
-                parent = parents.get(id(chain))
-                if isinstance(chain.ctx, (ast.Store, ast.Del)):
-                    use, allowed = "a write or delete of", ()
-                elif isinstance(parent, ast.Call) and parent.func is chain:
-                    use, allowed = "a call of", _SAFE_CALLABLES
-                elif isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
-                        chain in parent.decorator_list or isinstance(parent, ast.ClassDef) and chain in parent.bases):
-                    use, allowed = "a decorator or base", _SAFE_CALLABLES | _SAFE_VALUES
-                elif isinstance(parent, ast.Subscript) and parent.value is chain:
-                    use, allowed = "a subscript of", ()
-                else:
-                    use, allowed = "the value", _SAFE_VALUES
-                if qualified not in allowed:
-                    return "{}: {} {}".format(node.lineno, use, qualified)
+            chain, attrs = node, []
+            while isinstance(parents.get(id(chain)), ast.Attribute):
+                chain = parents[id(chain)]
+                attrs.append(chain.attr)
+            parent = parents.get(id(chain))
+            write = isinstance(chain.ctx, (ast.Store, ast.Del))
+            if write:
+                use, allowed = "a write or delete of", ()
+            elif isinstance(parent, ast.Call) and parent.func is chain:
+                use, allowed = "a call of", _SAFE_CALLABLES
+            elif isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+                    chain in parent.decorator_list or isinstance(parent, ast.ClassDef) and chain in parent.bases):
+                use, allowed = "a decorator or base", _SAFE_CALLABLES | _SAFE_VALUES
+            elif isinstance(parent, ast.Subscript) and parent.value is chain:
+                use, allowed = "a subscript of", ()
+            else:
+                use, allowed = "the value", _SAFE_VALUES
+            for ref in sorted(bound[node.id], key=str):
+                if ref.kind == "module":
+                    # an attribute read on a run-root module is resolved as an import of it is (h.argparse._sys); the attribute a write
+                    # or delete names need not exist, so only the object it is made on is resolved
+                    read = attrs[:-1] if write else attrs
+                    refs = _resolve(".".join([ref.name] + read), graph) if read else frozenset()
+                    for r in sorted(refs, key=str):
+                        if r.kind == "unknown":
+                            return "{}: {} (the scan cannot say what it is)".format(node.lineno, ".".join([node.id] + read))
+                        if r.kind == "outside" and r.name + "".join("." + a for a in attrs[len(read):]) not in allowed:
+                            return "{}: {} {}".format(node.lineno, use, r.name + "".join("." + a for a in attrs[len(read):]))
+                elif ref.name + "".join("." + a for a in attrs) not in allowed:
+                    return "{}: {} {}".format(node.lineno, use, ref.name + "".join("." + a for a in attrs))
     return None
 
 
@@ -1168,18 +1221,25 @@ class _Graph(dict):
         return self._shadowed
 
     def reexported(self):
-        """The names some supplied file binds by an import of a module from outside the run root (_outside): read as an attribute of
-        another object, or imported from a run-root module, one of them may be that outside module."""
+        """The names some supplied file binds by an import, of any form (relative too), that _resolve finds to be, or may be, a module or
+        name from outside the run root: read as an attribute of an object that is not an import binding, one of them may be that."""
         if not hasattr(self, "_reexported"):
-            names = set()
-            for entry in self.files.values():
-                for node in ast.walk(entry[1]) if entry is not None else ():
-                    if isinstance(node, ast.Import):
-                        names.update(a.asname or a.name.split(".")[0] for a in node.names if _outside(a.name, self))
-                    elif isinstance(node, ast.ImportFrom) and not node.level and node.module and _outside(node.module, self):
-                        names.update(a.asname or a.name for a in node.names if a.name != "*")
-            self._reexported = frozenset(names)
+            self._reexported = frozenset(al.local for path, entry in self.files.items() if entry is not None
+                                         for al in _import_aliases(path, entry[1])
+                                         if al.local is not None and any(r.kind == "outside" for r in _resolve_alias(al, self)))
         return self._reexported
+
+    def path_of(self, tree):
+        """The supplied path of a parsed tree of the run root, or None."""
+        if not hasattr(self, "_paths"):
+            self._paths = {id(entry[1]): path for path, entry in self.files.items() if entry is not None}
+        return self._paths.get(id(tree))
+
+    def written(self):
+        """The union of _written_names over the run root's modules (one that does not parse writes nothing)."""
+        if not hasattr(self, "_written"):
+            self._written = frozenset().union(*(entry[5] for entry in self.values() if entry is not None))
+        return self._written
 
     def loaded(self, dotted):
         """The modules that importing `dotted` runs: those with a name that is `dotted` or one of its ancestor packages."""
@@ -1215,12 +1275,119 @@ def _import_graph(files, parsed, run):
     return _Graph(graph, run, texts)
 
 
+_Ref = collections.namedtuple("_Ref", "kind name")  # kind: "outside", "module" (of the run root), "member" (of one), "unknown"
+
+
+def _resolve(dotted, graph, seen=frozenset()):
+    """THE one resolver of imported names (round 16, Main 1): the set of what the dotted name (a _Alias qualified name, or one followed
+    by attribute reads) may refer to once the import has run, each a _Ref:
+    - outside q: a module or name from outside the run root (_outside), q its full dotted name; an attribute of it is outside too;
+    - module m: the run-root module or package (directory) m;
+    - member q: a def, class or assignment the run-root module binds once (_single_binding); an attribute of it is a member too;
+    - unknown: the scan cannot say (a qualified name that did not resolve; a module that does not parse, has a star import, a dynamic
+      form or a module __getattr__; a name it binds more than once or under a condition; a name it does not bind and that is no
+      submodule; a name both a submodule and bound to anything but that submodule; a name some run-root file writes as an attribute;
+      a cycle of re-exports).
+    A run-root member bound in its module by an import resolves to what that import names, relative or absolute, through any number
+    of modules: `from .h import argparse as a` is outside argparse, and a._sys is outside argparse._sys, as for `import argparse`. No
+    other code decides what an imported name refers to: the allow-list (_find_outside_use, _Graph.reexported), the walks
+    (_unresolved) and the use scan's package links (_holder_binds_other) all ask here."""
+    cache = graph.__dict__.setdefault("_resolved", {})
+    if dotted in cache:
+        return cache[dotted]
+    if dotted is None:
+        return frozenset({_Ref("unknown", None)})
+    if dotted in seen:
+        return frozenset({_Ref("unknown", dotted)})  # a cycle
+    if _outside(dotted, graph):
+        result = frozenset({_Ref("outside", dotted)})
+    elif "." not in dotted:
+        result = frozenset({_Ref("module" if graph.known(dotted) else "unknown", dotted)})
+    else:
+        parent, _dot, last = dotted.rpartition(".")
+        result = set()
+        for ref in _resolve(parent, graph, seen | {dotted}):
+            if ref.kind in ("outside", "member"):
+                result.add(_Ref(ref.kind, ref.name + "." + last))
+            elif ref.kind == "module":
+                result |= _module_member(ref.name, last, graph, seen | {dotted})
+            else:
+                result.add(ref)
+        result = frozenset(result)
+    if not seen or all(r.kind != "unknown" for r in result):
+        cache[dotted] = result  # (a result inside a cycle is kept only when it does not depend on where the cycle was entered)
+    return result
+
+
+def _resolve_alias(al, graph, seen=frozenset()):
+    """What the name an import binds (an _Alias) may refer to (_resolve). `import a.b as x` reads the attribute b of a (Python's
+    IMPORT_FROM), so its qualified name is resolved as attribute reads; `from S import n` loads S by its full dotted name (sys.modules)
+    and reads its attribute n, so S is taken as the module it names and n is resolved on it (_resolve_from)."""
+    if al is None or al.local is None or al.qualified is None:
+        return frozenset({_Ref("unknown", None if al is None else al.qualified)})
+    if isinstance(al.node, ast.Import):
+        return _resolve(al.qualified, graph, seen)
+    return _resolve_from(al.module, al.name, graph, seen)
+
+
+def _resolve_from(module, name, graph, seen=frozenset()):
+    """What `from module import name` binds (module absolute): outside module.name for an outside module, the member name of a run-root
+    module (_module_member), and unknown for a module that is neither (a name with a run-root prefix that names no module of it)."""
+    if _outside(module, graph):
+        return frozenset({_Ref("outside", module + "." + name)})
+    if not graph.known(module):
+        return frozenset({_Ref("unknown", module + "." + name)})
+    if module + "." + name in seen:
+        return frozenset({_Ref("unknown", module + "." + name)})  # a cycle
+    return _module_member(module, name, graph, seen | {module + "." + name})
+
+
+def _module_member(module, last, graph, seen):
+    """What the attribute last of the run-root module (or package directory) module may be (_resolve): the union over every file that
+    module may be (_Graph.by_name: each module of that name, each of its files); a package directory with no file is a namespace,
+    whose attributes are its submodules only."""
+    sub = module + "." + last
+    files = [(graph.path_of(tree), tree) for m in graph.by_name.get(module, ()) for _s, tree in (graph[m][4] if graph[m] is not None else ((None, None),))]
+    if not files:
+        return frozenset({_Ref("module" if graph.known(sub) else "unknown", sub)})
+    return frozenset().union(*(_file_member(path, tree, module, last, graph, seen) for path, tree in files))
+
+
+def _file_member(path, tree, module, last, graph, seen):
+    """What the attribute last of the module whose file is (path, tree) may be (_resolve, _holder_binds_other)."""
+    sub = module + "." + last
+    unknown = frozenset({_Ref("unknown", sub)})
+    if tree is None or _binds(tree, "__getattr__", None, False, existence=True) != [] or _may_write(graph.written(), last):
+        return unknown  # (_binds is None for a star import or a dynamic form, which bind names no statement shows)
+    if last not in _binding_index(tree).events:
+        return frozenset({_Ref("module", sub)}) if graph.known(sub) else unknown  # (Python imports the submodule)
+    stmt = _single_binding(tree, last, existence=True)
+    if stmt is None:
+        return unknown
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        al = next((al for al in _import_aliases(path, tree) if al.node is stmt and al.local == last), None)
+        result = frozenset({_Ref("module", sub)}) if al is not None and _same_module(al.qualified, sub, graph) \
+            else _resolve_alias(al, graph, seen | {sub})
+    else:
+        result = frozenset({_Ref("member", sub)})
+    # a name that is also a submodule: importing the submodule anywhere rebinds the attribute to it
+    if graph.known(sub) and not (len(result) == 1 and next(iter(result)).kind == "module" and _same_module(next(iter(result)).name, sub, graph)):
+        return unknown
+    return frozenset({_Ref("module", sub)}) if graph.known(sub) else result
+
+
+def _same_module(a, b, graph):
+    """True when the dotted names a and b name the same one run-root module: equal, or each the name of exactly the same modules
+    (_Graph.by_name: src.h.t and h.t for src/h/t.py alone)."""
+    return a == b or a is not None and bool(graph.by_name.get(a)) and set(graph.by_name.get(a)) == set(graph.by_name.get(b, ()))
+
+
 def _unresolved(name, graph, attribute=False):
     """THE one rule for what a dotted import name is against the run root: True when it cannot be resolved. A name is resolved when it is
     a name of a run-root module or directory (_Graph: any dotted suffix of the path, a directory a package whether or not it has an
-    __init__.py). The name of a `from m import c` member (attribute) is resolved too when m names run-root modules and every one of them
-    proves c exists (_single_names: bound once at module scope, whatever the value) and no file of the run root writes or deletes an
-    attribute c (_written_names). A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
+    __init__.py). The name of a `from m import c` member (attribute) is resolved too when the one resolver (_resolve, round 16) finds
+    what m.c is, in every module m may be: c bound once at module scope (_single_binding), no file of the run root writing or deleting
+    an attribute c (_written_names), and, when c is bound by an import, what that import names resolved in turn. A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
     run-root h, `from h import missing` when h does not provably bind missing, `from .missing import x` in a package) is unresolved: it
     names no module of the run root and may be one nobody gave us, so it counts as a path to every module. A name none of whose
     prefixes is a name of the run root is outside it and is not unresolved.
@@ -1232,11 +1399,8 @@ def _unresolved(name, graph, attribute=False):
         return True
     if known(name):
         return False
-    parent, _dot, last = name.rpartition(".")
-    if attribute and parent:
-        owners = [graph[m] for m in graph.by_name.get(parent, ())]
-        if owners and all(o is not None and last in o[3] and not any(g is not None and _may_write(g[5], last) for g in graph.values()) for o in owners):
-            return False
+    if attribute and "." in name and all(r.kind != "unknown" for r in _resolve_from(*name.rsplit(".", 1), graph)):
+        return False
     parts = name.split(".")
     return any(known(".".join(parts[:i])) for i in range(1, len(parts)))
 
@@ -1351,7 +1515,8 @@ def _refers(source, tree, name, module, graph):
       the text is not, so this is a rule over strings and not a list of loaders;
     - the file is opaque (_opaque, against the run root's graph): it changes import state (a word of _DYNAMIC_ACCESS among them), has
       a star import, or makes a reference to a module from outside the run root that the allow-list does not allow (_outside_use)."""
-    return (_opaque(source, tree, graph) or bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source))
+    word = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+    return (_opaque(source, tree, graph) or any(word.search(text) for text in _spellings(source))
             or _string_mentions(tree, {name, module.split(".")[-1]}))
 
 
@@ -1381,7 +1546,7 @@ def _no_path_to(source, tree, path, name, module, graph):
     return start is not None and not _reaches(start, name, module, graph)
 
 
-def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None, written=frozenset(), run=None, credited=True):
+def _use_lines(f, tree, target, kind, module, others, members, dup, graph, written=frozenset(), credited=True):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
     path, `from m import *`, a dynamic form such as globals() or setattr (_DYNAMIC; the file then gives no line at all), an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
@@ -1393,7 +1558,7 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None,
     than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
     this module.
     The rule over links (round 10, Main): a call, creation or use is attributed through a name only when every link the name is
-    resolved through is proved (_path_proved, the one function every form calls; parsed is {path: tree} of the run root, written the
+    resolved through is proved (_path_proved, the one function every form calls; graph is the run root's _Graph, written the
     union of _written_names over it). A direct member import (`from a.b.c import T`) reads sys.modules['a.b.c'] and has one link, T:
     when some file of the run root writes or deletes an attribute named T (`x.T = v`, `x.T += v`, `del x.T`, any x; round 8) the import
     lines are the only facts of the file, and it is undecided. A module-path name (`import a.b.c`, `import a.b.c as x`,
@@ -1403,60 +1568,55 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None,
     same file keep their facts. No alias analysis: the write of the attribute name is the block.
     Round 11 (Main): credited is whether _module_identity proves module is the definer's file, every package __init__ on the way
     supplied (use_scan); when it is not, the import
-    lines of `from <module> import <T>` are the only facts of the file and it is undecided. run is the _RunRoot (default: the parsed
-    paths only)."""
+    lines of `from <module> import <T>` are the only facts of the file and it is undecided. Round 16: the import statements are read
+    by _import_aliases, the one reader; what a package link holds is decided by _resolve (_holder_binds_other)."""
     if _binding_index(tree).dynamic:
         return [], [], [], True  # a dynamic form (_DYNAMIC) anywhere: the source does not show what any name in this file is
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
     label = "{}.{}".format(module, target) if dup else target
     direct, modules, imports = {}, {}, []  # local name -> import statement; the dotted name used in code -> (bound name, statement)
     other_direct, other_modules, unexplained = set(), set(), False
-    for node in ast.walk(tree):
+    for al in _import_aliases(path, tree):  # the one reader of import statements (round 16)
+        node, source_module = al.node, al.module
         if isinstance(node, ast.ImportFrom):
-            source_module = _imported_module(path, node)
-            for alias in node.names:
-                local = alias.asname or alias.name
-                joined = (source_module + "." + alias.name if source_module else alias.name) if source_module is not None else None
-                if alias.name == "*":
-                    continue
-                if source_module == module and alias.name == target:
-                    direct[local] = node
-                    shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
-                                  if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
-                    imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
-                elif joined == module:
-                    modules[local] = (local, node)
-                elif source_module in others and alias.name == target:
-                    other_direct.add(local)
-                elif joined in others:
-                    other_modules.add(local)
-                elif alias.name == target:
-                    unexplained = True
-        elif isinstance(node, ast.Import):
-            for a in node.names:
-                code, bound = a.asname or a.name, a.asname or a.name.split(".")[0]
-                if a.name == module:
-                    modules[code] = (bound, node)
-                elif a.name in others:
-                    other_modules.add(code)
+            local, joined = al.local, al.qualified
+            if al.local is None:
+                continue
+            if source_module == module and al.name == target:
+                direct[local] = node
+                shown = next((n for n in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+                              if re.search(r"\b" + re.escape(target) + r"\b", source[n - 1])), node.lineno)
+                imports.append((shown, "- {} imports {} [{}:{}]".format(base, label, path, shown)))
+            elif joined == module:
+                modules[local] = (local, node)
+            elif source_module in others and al.name == target:
+                other_direct.add(local)
+            elif joined in others:
+                other_modules.add(local)
+            elif al.name == target:
+                unexplained = True
+        else:
+            code = al.local if al.qualified == al.name else al.name  # the dotted name used in code: x for `import a.b as x`, else a.b
+            if al.name == module:
+                modules[code] = (al.local, node)
+            elif al.name in others:
+                other_modules.add(code)
     if set(direct) & other_direct or set(modules) & other_modules:
         return [], [], [], True
     if _star(tree):
         # a star import binds names no statement shows: the import line is a fact, no call, creation or attribute use is (a parameter
         # included: whatever `q` is, it may be a name the star import brought)
         return sorted(imports, key=lambda item: item[0]), [], [], True
-    parsed = parsed or {}
-    run = run or _RunRoot(parsed)
     if not credited:
         return sorted(imports, key=lambda item: item[0]), [], [], True
-    if (direct or modules) and not _path_proved(module, target, False, parsed, written, run):
+    if (direct or modules) and not _path_proved(module, target, False, graph, written):
         return sorted(imports, key=lambda item: item[0]), [], [], True
     valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
     valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
     if valid_direct != set(direct) or valid_modules != set(modules):
         # the import is a fact; what the name then is, is not shown. Nothing is attributed through a name that may not be the import.
         return sorted(imports, key=lambda item: item[0]), [], [], True
-    if modules and not _path_proved(module, target, True, parsed, written, run):
+    if modules and not _path_proved(module, target, True, graph, written):
         # a package link may hold another object: no line through a module-path name, nor through a parameter when no direct import
         # of the target is left to explain it
         if not valid_direct:
@@ -1553,8 +1713,8 @@ load (_refers), or a path through the imports to the target's module): then it g
                     continue
                 if g["path"] not in clean:  # round 12: nothing Python runs on the way to g's imports changes import state
                     clean[g["path"]] = g["path"].endswith(".py") and _runs_clean(g["path"], _source(g["text"]), parsed[g["path"]], graph)
-                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, parsed, written,
-                                                        run, credited and clean[g["path"]])
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, graph,
+                                                        written, credited and clean[g["path"]])
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)

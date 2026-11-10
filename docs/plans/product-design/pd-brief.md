@@ -44,6 +44,12 @@ brief wins.
    `product-fit.md`. Pi: read how pi loads skills and prompts in this repo and use that path, or document the explicit
    prompt path if there is no alias parity. Do not document a command that does not exist.
 
+9. **Who can make a slice ready (decided after PD-A).** A model review (any `reviewer.type` that is not human) can move a
+   slice at most to ready-for-human-review. Ready-for-case-preparation needs a local reconciliation event naming the
+   responsible person, the decision evidence and the slice fingerprint (plan section 8). Implemented/verified needs delivery
+   evidence, never a prototype run. Imported reviewer labels claiming approval never count. Make this a rule in the
+   readiness code in PD-B, with attack rows for every reviewer type × claimed status.
+
 ## Every phase
 - **Attack the rule before you report.** For each rule the phase adds (validation, changeset apply, import dedupe and
   conflict, readiness and staleness, anchor remapping, case blocking, packet scope, note capture, reset/back replay),

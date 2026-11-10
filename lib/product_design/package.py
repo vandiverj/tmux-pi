@@ -84,8 +84,11 @@ def encode(value, pretty=False) -> bytes:
     """The one place a JSON value becomes bytes: the canonical form (keys sorted, no spaces; what every digest and
     fingerprint covers) or, `pretty`, the file form (two-space indent, a final newline). Refuses (TextError) a value
     whose text is not representable as UTF-8, so no route can hash, digest or write one."""
-    text = (json.dumps(value, indent=2, ensure_ascii=False) + "\n" if pretty else
-            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    try:  # allow_nan=False: NaN and the infinities are not JSON numbers (RFC 8259); no browser could read them back
+        text = (json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n" if pretty else
+                json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
+    except ValueError:
+        raise TextError("not JSON: it holds NaN or an infinite number") from None
     try:
         return text.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -123,6 +126,16 @@ def file_problem(value, render=render):
     return data, size_problem(len(data))
 
 
+def _not_a_json_number(name):
+    raise ValueError(f"{name} is not a JSON number")
+
+
+def loads(text):
+    """json.loads for JSON as RFC 8259 defines it (what a browser's JSON.parse reads): Python's json also reads NaN,
+    Infinity and -Infinity, which are refused here (ValueError). Every JSON input of the package is read with this."""
+    return json.loads(text, parse_constant=_not_a_json_number)
+
+
 def read_json_file(path):
     """Read a package or control file under the reader's limits. Raises OSError or ValueError; FileNotFoundError when
     it is missing."""
@@ -133,7 +146,7 @@ def read_json_file(path):
     if problem:
         raise OSError(problem)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = loads(path.read_text(encoding="utf-8"))
     except RecursionError:
         raise ValueError(f"nested deeper than {MAX_DEPTH} levels") from None
     problem = depth_problem(value) or text_problem(value)

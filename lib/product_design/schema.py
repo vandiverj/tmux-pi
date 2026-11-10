@@ -33,6 +33,33 @@ ID_RE = re.compile(r"(" + SLUG + r")\.(" + SLUG + r"(?:\." + SLUG + r")*)")
 ID_MAX = 96
 
 
+_PATTERNS = {}
+
+
+def pattern(source: str):
+    """A schema pattern compiled with its ECMA-262 meaning (the regex dialect of JSON Schema, and of the review page's
+    validator): an unescaped `$` outside a character class is the end of the text. Python's `$` also matches before a
+    final line break, which let "journey.x\\n" pass `^journey\\.[a-z]+$`."""
+    if source not in _PATTERNS:
+        out, i, in_class = [], 0, False
+        while i < len(source):
+            ch = source[i]
+            if ch == "\\":
+                out.append(source[i:i + 2])
+                i += 2
+                continue
+            if in_class:
+                in_class = ch != "]"
+            elif ch == "[":
+                in_class = True
+            elif ch == "$":
+                ch = r"\Z"
+            out.append(ch)
+            i += 1
+        _PATTERNS[source] = re.compile("".join(out))
+    return _PATTERNS[source]
+
+
 class Issue(NamedTuple):
     code: str
     path: Tuple
@@ -126,7 +153,7 @@ class _Walker:
                 self.add("schema.min-length", path, f"shorter than {schema['minLength']} character(s)")
             if "maxLength" in schema and len(value) > schema["maxLength"]:
                 self.add("schema.max-length", path, f"longer than {schema['maxLength']} characters")
-            if "pattern" in schema and not re.search(schema["pattern"], value):
+            if "pattern" in schema and not pattern(schema["pattern"]).search(value):
                 self.add("schema.pattern", path, f"does not match {schema['pattern']}")
             if "x-id" in schema:
                 kind = id_kind(value)

@@ -57,7 +57,7 @@ def load_json_input(raw, limit=None):
         if len(data) > limit:
             return None, ("size", f"larger than {limit} bytes ({len(data)})")
         try:  # text is parsed as given: a lone surrogate in it is reported below, as for every form
-            value = json.loads(raw if isinstance(raw, str) else data.decode("utf-8"))
+            value = P.loads(raw if isinstance(raw, str) else data.decode("utf-8"))
         except RecursionError:
             return None, ("depth", f"nested deeper than {P.MAX_DEPTH} levels")
         except (UnicodeDecodeError, ValueError) as exc:
@@ -548,13 +548,28 @@ def load_changeset(path):
 
 # ---------------------------------------------------------------- feedback ingestion
 
-def anchor(note, docs, idx, content_fp) -> str:
-    """Where a note stands against the current design: unresolved when its journey or scenario is gone; current when it
-    was captured against the same semantic content; else changed-context. Its original anchors are kept unchanged."""
+def load_bundle(path):
+    """The bytes of a feedback bundle file, read up to the bundle limit (check_bundle refuses a larger one). A file that
+    cannot be read is bundle.unreadable (exit 1)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(MAX_BUNDLE_BYTES + 1)
+    except OSError as exc:
+        raise T.StoreError("bundle.unreadable", f"cannot read the bundle {path}: {exc.strerror or exc}",
+                           details={"path": str(path)}) from None
+
+
+def anchor(note, docs, idx, content_fp, known=None) -> str:
+    """Where a note stands against the current design: unresolved when its journey or scenario is gone, or when its
+    target is not one a build of the package shows (`known(target id)`: review.known over the package's registry);
+    current when it was captured against the same semantic content; else changed-context. Its original anchors are kept
+    unchanged."""
     for field in ("journey", "scenario"):
         value = note.get(field)
         if value is not None and idx.get(value, (None,))[0] != field:
             return "unresolved"
+    if known is not None and not known(note["target"]["id"]):
+        return "unresolved"
     return "current" if note["build"]["fingerprint"] == content_fp else "changed-context"
 
 
@@ -653,8 +668,10 @@ def ingest(package_dir, raw, actor="tp-product import", expected_revision=None, 
             return dict(result, committed=False, revision=current)
         work = copy.deepcopy(docs)
         idx, content_fp = P.index(work), P.content_fingerprint(work)
+        from . import review  # the target registry: views, design records, the prototype adapter's targets
+        reg = review.package_registry(package_dir, work)  # an invalid adapter refuses the import (adapter.invalid)
         for note in got["notes"]:
-            note["anchor"] = anchor(note, work, idx, content_fp)
+            note["anchor"] = anchor(note, work, idx, content_fp, lambda t: review.known(reg, t))
             result["anchors"].setdefault(note["anchor"], []).append(note["id"])
         work["reviews"]["notes"] += got["notes"]
         work["reviews"]["inputs"] += got["inputs"]

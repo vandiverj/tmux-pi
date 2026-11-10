@@ -1,8 +1,8 @@
-"""tp-product: deterministic product design package commands (init, status, validate, apply).
+"""tp-product: deterministic product design package commands (init, status, validate, apply, build, import-feedback).
 
-Exit status: 0 done; 1 invalid or unreadable package, changeset or bundle (nothing written); 2 usage; 3 the package
-cannot be trusted yet (interrupted commit, uncommitted external edit, no commit record, control records that disagree,
-a file changed by someone else during the commit); 4 stale write (--expected-revision is not the current revision);
+Exit status: 0 done; 1 invalid or unreadable package, changeset, bundle or prototype adapter (nothing written); 2 usage;
+3 the package cannot be trusted yet (interrupted commit, uncommitted external edit, no commit record, control records
+that disagree, a file changed by someone else during the commit) or a build file exists with other content; 4 stale write (--expected-revision is not the current revision);
 5 another writer holds the lock. Reads (status, validate) never write and start nothing. With --json every refusal is
 one JSON object {"ok": false, "code", "message", "details"} on stdout.
 """
@@ -14,6 +14,7 @@ import sys
 
 from . import changes as C
 from . import package as P
+from . import review as R
 from . import schema as S
 from . import store as T
 
@@ -87,6 +88,44 @@ def _print_status(rep, out):
             print(f"pending {key.replace('_', ' ')}: {', '.join(ids)}", file=out)
 
 
+def _print_build(r, out, as_json):
+    if as_json:
+        print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
+        return
+    if r["up_to_date"]:
+        print(f"up to date: {r['file']} shows this content (source {r['source_fingerprint']}); nothing was written", file=out)
+    else:
+        print(f"built {r['file']}" + (" (the file was already there, byte for byte)" if r["reused"] else ""), file=out)
+        print(f"  recorded in the manifest: revision {r['revision']}", file=out)
+    print(f"  content {r['content_fingerprint']}", file=out)
+    print(f"  source  {r['source_fingerprint']}", file=out)
+    for w in r["warnings"]:
+        print(f"  warning: {w}", file=out)
+
+
+def _print_import(r, out, as_json):
+    if as_json:
+        print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
+        return
+    added = r["added"]
+    if r["committed"]:
+        print(f"imported {len(added['notes'])} note(s) and {len(added['inputs'])} answer(s)/proposal(s): "
+              f"committed revision {r['revision']}", file=out)
+    else:
+        print(f"nothing new: the package stays at revision {r['revision']}", file=out)
+    if r["duplicates"]:
+        print(f"  already imported (unchanged): {', '.join(r['duplicates'])}", file=out)
+    for kind in ("current", "changed-context", "remapped", "unresolved"):
+        if r["anchors"].get(kind):
+            print(f"  {kind}: {', '.join(r['anchors'][kind])}", file=out)
+    if r["anchors"].get("unresolved"):
+        print("  unresolved notes are kept; their target, journey or scenario is not in the package or its prototype: "
+              "record a disposition for each (tp-product status lists them)", file=out)
+    if added["inputs"]:
+        print("  answers and proposals are pending until you reconcile them (reconcile-input)", file=out)
+    print("  review sessions in the bundle (coverage, task outcomes) are not stored", file=out)
+
+
 def _fail(exc, out, err, as_json):
     if as_json:
         print(json.dumps({"ok": False, "code": exc.code, "message": str(exc), "details": exc.details}, indent=2), file=out)
@@ -126,6 +165,15 @@ def main(argv=None, out=None, err=None) -> int:
     c.add_argument("--expected-revision", type=int, help="the revision the changeset was written against")
     c.add_argument("--recover", action="store_true", help="only finish or discard an interrupted commit")
     c.add_argument("--json", action="store_true")
+    c = sub.add_parser("build", help="write the offline review page (builds/ID-rREV.html) and record it in the manifest")
+    c.add_argument("package_dir")
+    c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
+    c.add_argument("--json", action="store_true")
+    c = sub.add_parser("import-feedback", help="import a feedback bundle exported by a review page; all or nothing")
+    c.add_argument("package_dir")
+    c.add_argument("bundle", help="the exported feedback bundle (.json)")
+    c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
+    c.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     as_json = getattr(args, "json", False)
     try:
@@ -156,6 +204,15 @@ def main(argv=None, out=None, err=None) -> int:
                 for c, m in trust:
                     print(f"WARNING {c}: {m}", file=out)
             return 1 if state["issues"] else (3 if trust else 0)
+        if args.command == "build":
+            result = R.build(args.package_dir, args.expected_revision)
+            _print_build(result, out, as_json)
+            return 0
+        if args.command == "import-feedback":
+            result = C.ingest(args.package_dir, C.load_bundle(args.bundle), actor="tp-product import-feedback",
+                              expected_revision=args.expected_revision)
+            _print_import(result, out, as_json)
+            return 0
         # apply
         if args.recover:
             if args.changeset:

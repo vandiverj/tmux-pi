@@ -594,6 +594,23 @@ class IngestTests(PackageCase):
                                         "changed-context": ["note.c.3"]})
         n2 = rec(self.docs(), "note.c.2")
         self.assertEqual(n2["scenario"], "scenario.removed")  # the original anchor is kept verbatim
+        # The target is anchored too (review.registry): a target no build of the package shows is unresolved, kept.
+        gone = dict(self.note()["target"], id="record.escalate")
+        inst = dict(self.note()["target"], id="queue.row.s-9")  # an instance of the adapter's queue.row
+        r = C.ingest(self.pkg, bundle(self.note("note.c.4", build={"revision": 3, "fingerprint": fp}, target=gone),
+                                      self.note("note.c.5", build={"revision": 3, "fingerprint": fp}, target=inst),
+                                      self.note("note.c.6", build={"revision": 3, "fingerprint": fp},
+                                                target=dict(inst, id="queue.row"))))
+        # queue.row alone names no element: an instances target is a prefix, matched only with a further segment
+        self.assertEqual(r["anchors"], {"unresolved": ["note.c.4", "note.c.6"], "current": ["note.c.5"]})
+        self.assertEqual(rec(self.docs(), "note.c.4")["target"]["id"], "record.escalate")
+        # Without the adapter, prototype targets are unknown; with an invalid one, the import is refused whole.
+        shutil.move(str(self.pkg / "prototype"), str(self.tmp / "prototype"))
+        r = C.ingest(self.pkg, bundle(self.note("note.c.7", build={"revision": 3, "fingerprint": fp})))
+        self.assertEqual(r["anchors"], {"unresolved": ["note.c.7"]})  # record.reassign is a prototype target
+        (self.pkg / "prototype").mkdir()
+        (self.pkg / "prototype" / "adapter.json").write_text("{}")
+        self.refused_bundle("adapter.invalid", bundle(self.note("note.c.8")))
 
     def test_import_checks_the_expected_revision_and_trust(self):
         with self.assertRaises(T.StoreError) as cm:
@@ -712,6 +729,34 @@ class ReadBackTests(PackageCase):
             self.assertTrue(C.apply(self.pkg, change(text, title), rev)["committed"])
             self.assertEqual(self.docs()["manifest"]["title"], title + "\U0001F600")
         self.assert_trusted(5)
+
+    def test_nan_and_infinity_are_not_json_in_any_form(self):
+        # Python's json reads NaN, Infinity and -Infinity; a bundle holding one in a note's free-form state was once
+        # committed, and reviews.json then held text no browser (JSON.parse) and no RFC 8259 reader accepts.
+        for lit in ("NaN", "Infinity", "-Infinity"):
+            raw = json.dumps(bundle(self.note())).replace('"state": {', '"state": {"x": ' + lit + ", ", 1)
+            for name, value in (("text", raw), ("bytes", raw.encode())):
+                with self.subTest(lit, form=name):
+                    err = self.refused_bundle("bundle.invalid", value)
+                    self.assertEqual([i["code"] for i in err.details["issues"]], ["bundle.unreadable"])
+            with self.subTest(lit, form="dict"):
+                err = self.refused_bundle("bundle.invalid", json.loads(raw))
+                self.assertEqual([i["code"] for i in err.details["issues"]], ["bundle.encoding"])
+            with self.subTest(lit, form="changeset"):
+                cs_text = json.dumps(cs({"op": "set-manifest", "fields": {"title": "T"}})).replace(
+                    '"title": "T"', '"title": "T", "x": ' + lit)
+                self.assertEqual(self.refused("changeset.invalid", cs_text).details, {"problem": "unreadable"})
+            with self.subTest(lit, form="encode"):
+                with self.assertRaises(P.TextError):
+                    P.encode({"x": float(lit.replace("Infinity", "inf"))})
+        before = self.files()
+        (self.pkg / "reviews.json").write_text(
+            (self.pkg / "reviews.json").read_text().replace('"state": {', '"state": {"x": NaN, ', 1))
+        out = io.StringIO()
+        self.assertEqual(cli.main(["validate", str(self.pkg), "--json"], out=out, err=io.StringIO()), 1)
+        self.assertEqual([i["code"] for i in json.loads(out.getvalue())["issues"]], ["file.unreadable"])
+        (self.pkg / "reviews.json").write_bytes(before["reviews.json"])
+        self.assertTrue(C.ingest(self.pkg, json.dumps(bundle(self.note())))["committed"])  # the control is accepted
 
     def test_commits_stop_before_a_file_the_reader_would_refuse(self):
         # The reviewer's size probe: three bundles under the bundle limit once summed to a reviews.json no reader

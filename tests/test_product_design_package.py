@@ -89,6 +89,11 @@ class ValidationTests(unittest.TestCase):
             ("unknown field", lambda d: rec(d, "rule.queue-order").update(priority=1), "schema.additional"),
             ("missing required field", lambda d: rec(d, OPEN_Q).pop("owner"), "schema.required"),
             ("bad enum", lambda d: rec(d, "rule.queue-order").update(status="approved"), "schema.enum"),
+            # patterns mean what they mean in ECMA-262 (the page's validator): `$` is not satisfied before a line break
+            ("pattern value with a final line break",
+             lambda d: rec(d, "review.submit-and-queue-1").update(fingerprint="sha256:" + "a" * 64 + "\n"), "schema.pattern"),
+            ("date with a final line break",
+             lambda d: rec(d, "decision.missing-field-rejects")["acceptance"].update(date="2026-11-10\n"), "schema.pattern"),
             ("note of another package", lambda d: d["reviews"]["notes"][0].update(package="other"), "package.mismatch"),
             ("superseded without successor", lambda d: rec(d, "rule.queue-order").update(status="superseded"),
              "status.supersession"),

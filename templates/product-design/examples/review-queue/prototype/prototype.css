@@ -1,0 +1,18 @@
+/* Review queue prototype (synthetic): styles scoped to .rq-app. */
+.rq-app { font-size: 15px; }
+.rq-user { color: #555; font-size: 13px; margin: 0 0 8px; }
+.rq-nav { display: flex; gap: 6px; margin-bottom: 12px; }
+.rq-nav button.rq-on { background: #1f4e79; color: #fff; }
+.rq-page label { display: block; margin: 8px 0; }
+.rq-page input, .rq-page select { margin-left: 6px; padding: 4px 6px; }
+.rq-error { color: #a4161a; margin: 2px 0 8px; font-weight: 600; }
+.rq-flash { background: #eef6ee; border-left: 4px solid #2d6a4f; padding: 6px 10px; }
+.rq-primary { font-weight: 600; }
+.rq-table { border-collapse: collapse; width: 100%; }
+.rq-table th, .rq-table td { border-bottom: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+.rq-row { cursor: pointer; }
+.rq-row:hover, .rq-row:focus { background: #f2f6fa; }
+.rq-count { font-weight: 600; }
+.rq-draft { font-style: italic; }
+.rq-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.rq-sim { color: #555; }

@@ -1,9 +1,10 @@
 # Product design packages
 
 Status: the package contract (schema version 1), its validator, a synthetic fixture, and `bin/tp-product` with `init`,
-`status`, `validate` and `apply` exist, with atomic commits, external-edit detection and feedback-ingestion primitives
-in `lib/product_design/changes.py`. The review HTML build, the `import-feedback` command, the skills and case export
-are not built yet; nothing below describes them as available.
+`status`, `validate`, `apply`, `build` and `import-feedback` exist, with atomic commits, external-edit detection,
+feedback ingestion, and the offline review page (`lib/product_design/review.py`,
+`templates/product-design/runtime/`). The skills and case export are not built yet; nothing below describes them as
+available.
 
 A product design package is the durable record of one product design effort: facts and their sources, scenarios, rules,
 questions, decisions, proposed API and data contracts, delivery slices and the reviews of them. It lives in the
@@ -150,6 +151,10 @@ tp-product status DIR [--json]      revision, activity, next action, per-slice r
 tp-product validate DIR [--json]    schema, ids, references, invariants, versions, commit state
 tp-product apply DIR CHANGESET --expected-revision N [--json]
 tp-product apply DIR --recover      finish (or discard) an interrupted commit
+tp-product build DIR [--expected-revision N] [--json]
+                                    write the offline review page builds/ID-rREV.html and record it in the manifest
+tp-product import-feedback DIR BUNDLE [--expected-revision N] [--json]
+                                    import a feedback bundle exported by a review page; all or nothing
 ```
 
 | Exit | Meaning |
@@ -178,6 +183,10 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `txn.conflict` | 3 | A file was neither the old nor the new content when a commit or recovery came to replace it, or someone wrote to it while it was being replaced; their bytes are kept (`details.kept` names a copy kept in `txn/displaced/`) |
 | `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
 | `adopt.original` | 1 | An adoption would remove or change an original note, input or review |
+| `adapter.invalid` | 1 | `build`: `prototype/adapter.json` is unreadable or outside its schema, names an unknown page, contract or operation, repeats an id, or its script or style cannot be inlined (a symlink, outside the package, over 2 MiB, not UTF-8, or holding `</script`, `</style` or `<!--`) |
+| `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file); it is never replaced |
+| `bundle.unreadable` | 1 | `import-feedback`: the bundle file cannot be read |
+| `bundle.invalid`, `bundle.conflict` | 1 | `import-feedback`: see Feedback ingestion; nothing was written |
 
 ## Persistence
 
@@ -304,8 +313,8 @@ A feedback bundle is what a review build exports:
  "exported": "2026-11-10T09:00:00Z", "notes": [], "inputs": []}
 ```
 
-`changes.ingest(DIR, bundle)` (the `import-feedback` command comes with the review build) imports it in one
-transaction:
+`tp-product import-feedback DIR BUNDLE` (`changes.ingest`) imports it in one transaction. A bundle may also carry
+`sessions` (review sessions, so a review can be restored in another browser); they are validated and not stored.
 
 - The bundle is refused whole (`bundle.invalid`, nothing written) when its format, version, package, size (4 MiB,
   5000 records) or nesting depth (64) is wrong (the same limits for bytes, text and a parsed value), any record fails the schema, an input targets a record that does not exist, a note carries
@@ -314,8 +323,13 @@ transaction:
   duplicate, and importing the same bundle again is a no-op (no new revision). The same id with different content, in
   the package or twice in the bundle, refuses the bundle (`bundle.conflict`); the original is never overwritten, and
   an external edit that removed or changed it is not adopted (`adopt.original`), so a re-import cannot replace it.
-- Each new note gets an `anchor`: `unresolved` when its journey or scenario no longer exists, `current` when its build
-  fingerprint equals the package's content fingerprint, else `changed-context`. Its original fields are kept verbatim.
+- Each new note gets an `anchor`: `unresolved` when its journey or scenario no longer exists or its target is not in
+  the target registry (below), `current` when its build fingerprint equals the package's content fingerprint, else
+  `changed-context`. Its original fields are kept verbatim; a note is never dropped for its anchor. The command lists
+  the unresolved notes and says the inputs stay pending until reconciled.
+- JSON is read as RFC 8259 defines it, by the CLI and the page alike: a byte order mark, `NaN`, `Infinity` and
+  invalid UTF-8 are refused (`bundle.unreadable` issue), and nothing writes `NaN` or an infinity. Schema patterns
+  have their ECMA-262 meaning in both validators: `$` does not match before a final line break.
 - Importing notes and inputs changes no design fingerprint and no readiness.
 
 The content fingerprint (`package.content_fingerprint`) is the digest of every design record's fingerprint by id; a
@@ -326,3 +340,67 @@ review build records it so notes can be anchored.
 Note text, source excerpts and imported data are stored verbatim and treated as data: never evaluated, executed or
 rendered unescaped. Notes carry only synthetic, relevant application state, never cookies, credentials or browser
 profiles. Validation reads only the three package files, makes no network call and starts nothing.
+
+## The review build
+
+`tp-product build DIR` renders the committed, trusted package into one HTML file a reviewer opens from disk
+(`file://`), writes it as `builds/<id>-r<revision>.html` and records it in the manifest's `builds` list (`revision`,
+`fingerprint`, `source`, `file`) through the same transaction as every other change, so the build moves the package
+to the next revision. A build file exists only with its manifest entry: a failed commit removes it.
+
+- **Offline.** The runtime (`templates/product-design/runtime/`), the prototype and the package data are inlined. The
+  page's Content-Security-Policy is `default-src 'none'` (so no connection, image, frame or font), with the
+  inlined scripts and style allowed only by their sha256 hashes, and `base-uri` and `form-action` set to `'none'`.
+  Nothing is fetched and no CDN is used.
+- **Provenance.** The page records the package id, revision, generator, `content_fingerprint` (the design content
+  that notes carry) and `source_fingerprint` (everything the page shows except the revision counter).
+- **Stable.** Building an unchanged package again reports "up to date" and writes nothing. Importing notes changes no
+  source fingerprint; a design change does. Identical bytes already at the build path are reused. A file there with
+  other bytes is refused (`build.exists`, exit 3) and never replaced.
+- **Inert data.** Package text reaches the page only inside one JSON block whose `<`, `>`, `&`, U+2028 and U+2029 are
+  escaped. The page reads it with `JSON.parse` and renders it as text nodes, through one element builder that refuses
+  event-handler, URL and style attributes. The title is HTML-escaped.
+
+### The page
+
+- **Views:** Overview, Journeys, Product experience (the prototype), Questions and decisions, Engineering (the simulated
+  events each business action emitted, with the contract they belong to) and Feedback (summary, export, import). The
+  URL hash names the view. Browser back and forward switch views and never replay or repeat an action.
+- **Shared state:** the prototype state is the adapter's seed folded through its reducer with the session's action
+  list. Reset (no actions), Back (one fewer), reload and restore all replay from the seed, so an action never runs
+  twice and none is lost.
+- **Guided and unguided tasks:** a scenario can be followed step by step (guided) or attempted without steps
+  (unguided). Help requests and assisted steps are counted separately, and the outcome is recorded per task.
+- **Notes:** `n`, the toolbar button or a right click starts a note. In note mode, a click (or Enter or Space on a
+  focused target) picks a prototype target instead of acting. The note captures the page, journey, scenario, step,
+  target, a copy of the state and the checkpoint at that moment. While a note is open the prototype is paused: an
+  action is refused with a visible message until the note is saved or Escape closes it.
+- **Answers and proposals** on open questions and proposed rules and decisions are stored as `pending`. A label or
+  text that claims approval changes nothing.
+- **Storage:** everything is saved in the browser's `localStorage` under `tp-product-review:v1:<package id>`. When
+  storage is denied, or the saved data cannot be read, the page says so and keeps working for the visit. It never
+  overwrites data it could not read.
+- **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions; the JSON is also shown in
+  case the download was blocked). Import applies the CLI's rules (schema, package, version, limits, pending inputs, no
+  local bookkeeping, conflicting ids) and is all or nothing. Importing a bundle into a fresh browser and resuming its
+  session restores the same prototype state. A note whose target is not in this build is listed as unresolved, never
+  dropped.
+
+### The prototype adapter
+
+A package may have `prototype/adapter.json` (`tp-product-adapter`, schema version 1), which declares:
+- `pages`;
+- `targets`: a target with `instances` is a prefix, so `queue.row` matches `queue.row.s-1`;
+- `actions`: a business action names the contract operation it exercises;
+- `seeds`;
+- the `script`, plus an optional `style`.
+
+The script calls `TPReview.registerPrototype({id, seeds, reduce, render, conditions})`:
+- `seeds` maps each seed id to a function that returns the initial state.
+- `reduce(state, action)` is pure. It returns `{state, ok, events}`, and is the only way state changes.
+- `render(ui, state)` draws the current page. It builds elements with `ui.h`, marks review targets with
+  `ui.target(el, id, label, onActivate)` and dispatches with `ui.act(action, target, input)`.
+- `conditions` maps a scenario id to a check that the scenario's goal is observable in the state.
+
+The target registry is the one list a note may be anchored to: the views, every design record id and the adapter's
+targets. The page and `import-feedback` use the same rule.

@@ -57,6 +57,7 @@
             "revision": {"$ref": "#/$defs/revision"},
             "fingerprint": {"$ref": "#/$defs/fingerprint"},
             "file": {"type": "string", "minLength": 1, "maxLength": 500},
+            "source": {"$comment": "The build's source fingerprint (lib/product_design/review.py): what the build shows, whatever the revision counter says.", "$ref": "#/$defs/fingerprint"},
             "git": {"type": "string", "maxLength": 200}
           }
         }}
@@ -367,7 +368,81 @@
         "package": {"type": "string"},
         "exported": {"$ref": "#/$defs/timestamp"},
         "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}},
-        "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}}
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}},
+        "sessions": {"$comment": "Review sessions (coverage, task outcomes, prototype checkpoint) so a review can be restored in another browser. Not stored by ingest.", "type": "array", "items": {"$ref": "#/$defs/review_session"}}
+      }
+    },
+    "review_session": {
+      "$comment": "One reviewer's session in a review build: which scenarios were visited, each guided or unguided task's outcome with help and assistance counted separately, and the prototype checkpoint (seed and semantic actions; the state is replayed from them).",
+      "type": "object", "additionalProperties": false, "required": ["id", "reviewer", "build", "visited", "tasks", "prototype"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+        "reviewer": {"type": ["string", "null"], "maxLength": 200},
+        "build": {"type": "object", "additionalProperties": false, "required": ["revision", "fingerprint"],
+                  "properties": {"revision": {"$ref": "#/$defs/revision"}, "fingerprint": {"$ref": "#/$defs/fingerprint"}}},
+        "visited": {"type": "array", "items": {"type": "string", "pattern": "^scenario\\.[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*$", "maxLength": 96}},
+        "tasks": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["scenario", "mode", "outcome", "help_requested", "assisted_steps", "prior_guided", "started", "ended"],
+          "properties": {
+            "scenario": {"type": "string", "pattern": "^scenario\\.[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*$", "maxLength": 96},
+            "mode": {"enum": ["guided", "unguided"]},
+            "outcome": {"enum": ["in-progress", "completed", "self-reported", "abandoned"]},
+            "help_requested": {"type": "integer", "minimum": 0},
+            "assisted_steps": {"type": "integer", "minimum": 0},
+            "prior_guided": {"type": "boolean"},
+            "started": {"$ref": "#/$defs/timestamp"},
+            "ended": {"type": ["string", "null"], "maxLength": 40}
+          }
+        }},
+        "prototype": {"type": ["object", "null"], "additionalProperties": false, "required": ["seed", "actions"],
+          "properties": {
+            "seed": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+            "actions": {"type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["action", "target"],
+              "properties": {"action": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+                             "target": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$", "maxLength": 200},
+                             "input": {"type": "object"}}
+            }}
+          }
+        }
+      }
+    },
+    "adapter": {
+      "$comment": "prototype/adapter.json: what a package's prototype exposes to the review runtime (docs/product-design.md, The review build). Pages, stable review targets (instances: the id is a prefix of per-record targets such as queue.row.s-1), semantic actions with the contract operation they simulate, and named seeds. The script implements it (TPReview.registerPrototype).",
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "schema_version", "prototype", "script", "pages", "targets", "actions", "seeds"],
+      "properties": {
+        "schema": {"const": "tp-product-adapter"},
+        "schema_version": {"const": 1},
+        "prototype": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+        "script": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*\\.js$", "maxLength": 100},
+        "style": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*\\.css$", "maxLength": 100},
+        "pages": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "label"],
+          "properties": {"id": {"type": "string", "pattern": "^page\\.[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 96},
+                         "label": {"$ref": "#/$defs/label"}}
+        }},
+        "targets": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "label", "page"],
+          "properties": {"id": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$", "maxLength": 200},
+                         "label": {"$ref": "#/$defs/label"},
+                         "page": {"type": "string", "pattern": "^page\\.[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 96},
+                         "instances": {"type": "boolean"}}
+        }},
+        "actions": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "label", "business"],
+          "properties": {"id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+                         "label": {"$ref": "#/$defs/label"},
+                         "business": {"type": "boolean"},
+                         "contract": {"type": "string", "pattern": "^contract\\.[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*$"},
+                         "operation": {"$ref": "#/$defs/label"}}
+        }},
+        "seeds": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "label"],
+          "properties": {"id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+                         "label": {"$ref": "#/$defs/label"}}
+        }}
       }
     },
     "note": {

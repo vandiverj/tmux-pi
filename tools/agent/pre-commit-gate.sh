@@ -320,55 +320,41 @@ only_ts6305() {
   [ -n "$errors" ] && ! printf '%s\n' "$errors" | grep -qv 'error TS6305'
 }
 
-# Project-local opt-in, alongside the existing routine overrides. Only JSON true enables builds; an unreadable or
-# malformed config is an error, never permission to write. No fallback to another checkout's config.
-BUILD_TSC_REFS="$(python3 - "$WT/.tmux-pi/routines.json" 2>>"$TP_LOG" <<'PY'
-import json
+# Project-local opt-in, alongside the existing routine overrides: the worktree's .tmux-pi/routines.json, else the main
+# checkout's (lib/routines.py:project_flag). Only JSON true enables builds; an unreadable or malformed config is an
+# error, never permission to write.
+BUILD_TSC_REFS="$(python3 - "$TP_TOOLS_DIR/../../lib" "$WT" 2>>"$TP_LOG" <<'PY'
 import sys
 
-try:
-    with open(sys.argv[1], encoding="utf-8") as source:
-        config = json.load(source)
-except FileNotFoundError:
-    config = {}
-if not isinstance(config, dict):
-    raise ValueError("routines config must be an object")
-print(int(config.get("build_tsc_references") is True))
+sys.path.insert(0, sys.argv[1])
+import routines
+
+print(int(routines.project_flag(sys.argv[2], "build_tsc_references")))
 PY
 )" || tp_fail "cannot read .tmux-pi/routines.json (see log)"
 
-# reference_tree — content snapshot including tracked-but-ignored files: the temporary empty index in
-# tp_tree_fingerprint omits those, so hash the tracked diff as well. Include binary data; never invoke diff drivers.
-reference_tree() {
-  tp_tree_fingerprint "$WT" &&
-    git -C "$WT" diff HEAD --binary --no-ext-diff --no-textconv | git hash-object --stdin
-}
-
-# build_tsc_references APP BIN — opt-in permits writes, not silent worktree changes. Check status (including every
-# untracked file) and content: an already-dirty tracked file can be overwritten without its porcelain code changing.
-# Check after unsuccessful builds too; leave all writes in place for the user to inspect, never revert or delete them.
+# build_tsc_references APP BIN — opt-in permits writes, not silent worktree changes. Compare the tree fingerprint
+# (tracked, tracked-but-ignored and unignored untracked content) before and after, and name the paths that differ:
+# an already-dirty file can be overwritten without its status changing. Check after unsuccessful builds too; leave all
+# writes in place for the user to inspect, never revert or delete them.
 build_tsc_references() {
-  local app="$1" bin="$2" before_status before_tree after_status after_tree
-  if ! before_status="$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>>"$TP_LOG")" ||
-     ! before_tree="$(reference_tree 2>>"$TP_LOG")"; then
+  local app="$1" bin="$2" before after changed
+  if ! before="$(tp_tree_fingerprint "$WT" 2>>"$TP_LOG")"; then
     RC=1
-    TAIL="    cannot snapshot git status/content before reference build"
+    TAIL="    cannot snapshot the worktree before reference build"
     printf '%s\n' "$TAIL" >>"$TP_LOG"
     return
   fi
   run_in "$app" "$label references" "$bin" -b "${REFS[@]}"
-  if ! after_status="$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>>"$TP_LOG")" ||
-     ! after_tree="$(reference_tree 2>>"$TP_LOG")"; then
+  if ! after="$(tp_tree_fingerprint "$WT" 2>>"$TP_LOG")"; then
     RC=1
-    TAIL="    cannot snapshot git status/content after reference build"
+    TAIL="    cannot snapshot the worktree after reference build"
     printf '%s\n' "$TAIL" >>"$TP_LOG"
-  elif [ "$before_status" != "$after_status" ] || [ "$before_tree" != "$after_tree" ]; then
+  elif [ "$before" != "$after" ]; then
     RC=1
-    TAIL="    reference builds wrote files git does not ignore; inspect these paths (no files were reverted):
-    before:
-$before_status
-    after:
-$after_status"
+    changed="$(git -C "$WT" -c core.quotePath=false diff-tree -r --name-only --no-renames "$before" "$after" 2>>"$TP_LOG" | sed 's/^/      /')"
+    TAIL="    reference builds changed these tracked or unignored files (no files were reverted):
+$changed"
     printf '%s\n' "$TAIL" >>"$TP_LOG"
   fi
 }

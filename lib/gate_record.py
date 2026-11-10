@@ -114,6 +114,13 @@ def validate(record) -> List[str]:
     return problems
 
 
+def _git_raw(worktree, *args, env=None, data=None) -> bytes:
+    out = subprocess.run(["git", "-C", str(worktree), *args], env=env, input=data, capture_output=True)
+    if out.returncode != 0:
+        raise RuntimeError("git %s failed in %s: %s" % (" ".join(args), worktree, out.stderr.decode(errors="replace").strip()))
+    return out.stdout
+
+
 def _git(worktree, *args, env=None) -> str:
     out = subprocess.run(["git", "-C", str(worktree), *args], env=env, capture_output=True, text=True)
     if out.returncode != 0:
@@ -122,13 +129,19 @@ def _git(worktree, *args, env=None) -> str:
 
 
 def fingerprint(worktree) -> Tuple[str, str]:
-    """(head, tree) of the working tree. The steps of tp_tree_fingerprint in tools/agent/_common.sh: `git add -A` into a
-    temporary index, then `git write-tree`. head is "" in a repository without a commit."""
+    """(head, tree) of the working tree. The steps of tp_tree_fingerprint in tools/agent/_common.sh: a temporary index
+    seeded with HEAD's tree and every path of the real index (tracked-but-ignored files stay in; the real index's
+    assume-unchanged and skip-worktree flags are not inherited), then `git add -A`, then `git write-tree`. head is ""
+    in a repository without a commit."""
     head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     scratch = tempfile.mkdtemp(prefix="tp-fp.")
     try:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(scratch, "index"))
+        if head:
+            _git(worktree, "read-tree", "HEAD", env=env)
+        paths = _git_raw(worktree, "ls-files", "-z")
+        _git_raw(worktree, "update-index", "--add", "--remove", "-z", "--stdin", env=env, data=paths)
         _git(worktree, "add", "-A", env=env)
         return head, _git(worktree, "write-tree", env=env)
     finally:

@@ -27,27 +27,28 @@ By default the gate runs `tsc --noEmit` without building references. If the app 
 with TS6305 (unbuilt declarations), its typecheck is `missing` (setup), with an opt-in hint; `--require typecheck`
 makes that missing check fail the gate. Other errors still fail normally.
 
-To build references first, add this key to the **worktree's** `.tmux-pi/routines.json` (preserving any existing routine
-settings):
+To build references first, add this key to `.tmux-pi/routines.json` (preserving any existing routine settings). The gate
+reads the **worktree's** file first; a worktree without one (a lane worktree usually has none) uses the **main
+checkout's** file (the parent of `git rev-parse --git-common-dir`). A file that is present wins whole:
 
 ```json
 {"build_tsc_references": true}
 ```
 
 Only JSON `true` enables it; absent/false/other values do not. An unreadable, malformed, or non-object config stops the
-gate with an error. This is a project-wide opt-in for touched TypeScript apps, with no fallback to another checkout.
-The gate runs `tsc -b <references>` before `tsc --noEmit`. It compares git status (including untracked files) and a
-content fingerprint before and after each reference build, even a failed build. Changes to tracked files or unignored
-outputs fail the typecheck and name paths in the summary and log. Existing unrelated dirty files are allowed, but
-modifying them is not. **The gate does not undo writes**: opt in only when the project's build outputs are gitignored.
+gate with an error. This is a project-wide opt-in for touched TypeScript apps.
+The gate runs `tsc -b <references>` before `tsc --noEmit`. It compares the tree fingerprint (which includes tracked
+files even when they match an ignore pattern) before and after each reference build, even a failed build. Changes to
+tracked files or unignored outputs fail the typecheck and the summary and log list the paths whose content differs.
+Existing unrelated dirty files are allowed, but modifying them is not. **The gate does not undo writes**: opt in only when the project's build outputs are gitignored.
 Ignored outputs remain on disk for subsequent checks; output paths are not predicted by the gate.
 
 ## Records
 
 `pre-commit-gate.sh` and `test-run.sh` each write a JSON record of what ran on which tree, so a reader can tell whether
 the evidence still holds. Both name the tree they saw: `head` (the commit) and `tree`, the fingerprint of the working
-tree: `git write-tree` of a temporary index filled by `git add -A` (tracked changes plus untracked, non-ignored files; the
-real index is not touched; the same content gives the same sha).
+tree: `git write-tree` of a temporary index seeded from HEAD plus every path of the real index (flags such as assume-unchanged are not inherited), then filled by `git add -A` (every tracked file, ignored or not, plus
+untracked, non-ignored files; the real index is not touched; the same content gives the same sha).
 
 - **Gate**, `tp-gate:v1`: `worktree`, `base {ref, sha}`, `head`, `tree`, `files` (the changed files), `checks`
   (`name`, `status` = `passed|failed|missing|not_applicable`, `exit` or null, whole `seconds`), `exit`, `started`,

@@ -96,15 +96,23 @@ tp_app_of() {
   printf '.\n'
 }
 
-# tp_tree_fingerprint WORKTREE — print the tree sha of everything in the working tree that git would add: tracked
-# changes and untracked files that are not ignored (deletions are simply absent). It is `git write-tree` on a temporary
-# index filled by `git add -A`, so the real index is not touched. The same content gives the same sha. HEAD is separate
+# tp_tree_fingerprint WORKTREE — print the tree sha of everything in the working tree that git would add: every tracked
+# file (even one that matches an ignore pattern) and untracked files that are not ignored (deletions are simply absent).
+# It is `git write-tree` on a temporary index: seeded with HEAD's tree, then every path of the real index (so a staged-new
+# tracked file counts, ignored or not), then `git add -A`. The real index is not copied, so its assume-unchanged and
+# skip-worktree flags cannot hide a rewrite, and it is not touched. The same content gives the same sha. HEAD is separate
 # (`git rev-parse HEAD`). lib/gate_record.py:fingerprint takes the same steps and a test holds the two equal.
 tp_tree_fingerprint() {
   local dir idx tree rc=0
   dir="$(mktemp -d "${TMPDIR:-/tmp}/tp-fp.XXXXXX")" || return 1
   idx="$dir/index"
-  (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1
+  if git -C "$1" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="$idx" git -C "$1" read-tree HEAD >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" = 0 ]; then
+    git -C "$1" ls-files -z | GIT_INDEX_FILE="$idx" git -C "$1" update-index --add --remove -z --stdin >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" = 0 ]; then (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1; fi
   if [ "$rc" = 0 ]; then
     tree="$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree 2>/dev/null)" || rc=1
   fi

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from datetime import datetime, timezone
 
 STATE_VERSION = 2  # 2: counts carry each role's task count (the denominator for shares)
@@ -73,13 +74,39 @@ def _merged(base, extra):
     return {**{k: v for k, v in extra.items() if k not in base}, **{k: extra.get(k, v) for k, v in base.items()}}
 
 
+def override_path(project):
+    """Where PROJECT keeps its optional routines override."""
+    return os.path.join(project, ".tmux-pi", "routines.json")
+
+
+def main_project(worktree):
+    """The main checkout of WORKTREE's repository: the parent of `git rev-parse --git-common-dir` (WORKTREE itself
+    in the main checkout), or None when git cannot say."""
+    run = subprocess.run(["git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                         capture_output=True, text=True)
+    common = run.stdout.strip()
+    if run.returncode != 0 or not common.startswith("/"):
+        return None
+    return os.path.dirname(os.path.realpath(common))
+
+
+def project_flag(worktree, key):
+    """Whether the project override sets KEY to JSON true. The override is WORKTREE's own file when it has one, else the
+    main checkout's (a lane worktree has no .tmux-pi of its own); a file that is there wins whole. A file that cannot
+    be read raises ValueError."""
+    for project in (worktree, main_project(worktree)):
+        if project and os.path.isfile(override_path(project)):
+            return _read_config(override_path(project), False).get(key) is True
+    return False
+
+
 def load_config(path=CONFIG, project=None):
     """(lane regex, PROBES, PATH_PROBES) from the routines config, with PROJECT's optional override
     (PROJECT/.tmux-pi/routines.json, same keys, all optional) merged on top. lane_pattern replaces the shared one."""
     doc = _read_config(path, True)
     lane, probes, path_probes = doc["lane_pattern"], doc["probes"], doc["path_probes"]
     if project:
-        over = os.path.join(project, ".tmux-pi", "routines.json")
+        over = override_path(project)
         if os.path.isfile(over):
             extra = _read_config(over, False)
             lane = extra.get("lane_pattern") or lane

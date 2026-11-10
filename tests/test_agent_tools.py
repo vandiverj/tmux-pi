@@ -298,18 +298,50 @@ class GateTests(ScriptCase):
                 self.assertEqual((code, want_line in body), (want_code, True), body)
                 self.assertNotIn("arg: -b", self.calls_of("tsc"))
 
+    def test_the_opt_in_is_read_from_the_worktree_else_from_the_main_checkout(self):
+        yes, no, bad = '{"build_tsc_references": true}\n', '{"build_tsc_references": false}\n', "{"
+        for case, in_worktree, in_main, built, want_code in (
+                ("main checkout only", None, yes, True, 0),
+                ("worktree only", yes, None, True, 0),
+                ("worktree wins over main: off", no, yes, False, 0),
+                ("worktree wins over main: on", yes, no, True, 0),
+                ("worktree file without the key wins whole", "{}\n", yes, False, 0),
+                ("neither file", None, None, False, 0),
+                ("main file unreadable and no worktree file", None, bad, False, 2),
+                ("worktree file unreadable, main file on", bad, yes, False, 2)):
+            with self.subTest(case=case):
+                self.setUp()
+                main = self.lane_with_referencing_app()
+                with (main / ".git/info/exclude").open("a") as out:
+                    out.write(".tmux-pi/\n")
+                lane = self.tmp / "lane-wt"
+                self.git(main, "worktree", "add", "-q", "-b", "lane2", str(lane))
+                for root, text in ((lane, in_worktree), (main, in_main)):
+                    if text is not None:
+                        self.write(root, {".tmux-pi/routines.json": text})
+                self.tsc_projects({"web": (self.show({}, ["../lib/a", "../lib/b"]), [])})
+                code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", lane, "main"))
+                self.assertEqual(code, want_code, body)
+                self.assertEqual("arg: -b" in self.calls_of("tsc"), built)
+
     def test_a_reference_that_does_not_build_fails_the_typecheck_without_the_noemit_run(self):
-        for case, build_rc, build_body, dirty_first, changed in (
-                ("compiler failure", 1, None, False, None),
-                ("tracked overwrite", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js"),
-                ("new unignored file after failed build", 2, 'echo built > ../lib/a/new.js', False, "lib/a/new.js"),
-                ("already dirty tracked-but-ignored file", 0, 'echo built > ../lib/a/a.js', True, "lib/a/a.js")):
+        for case, build_rc, build_body, dirty_first, changed, unchanged, flag in (
+                ("compiler failure", 1, None, False, None, None, None),
+                ("tracked overwrite", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, None),
+                ("new unignored file after failed build", 2, 'echo built > ../lib/a/new.js', False, "lib/a/new.js", None, None),
+                ("already dirty tracked-but-ignored file", 0, 'echo built > ../lib/a/a.js', True, "lib/a/a.js", None, None),
+                ("already dirty file is named, not the other dirty files", 0, 'echo built > ../lib/a/a.js', True, "lib/a/a.js",
+                 ("README.md", "notes.txt"), None),
+                ("assume-unchanged tracked file", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, "--assume-unchanged"),
+                ("skip-worktree tracked file", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, "--skip-worktree")):
             with self.subTest(case=case):
                 self.setUp()
                 repo = self.lane_with_referencing_app(tracked={"lib/a/a.js": "old\n"}, opt_in=True)
                 if dirty_first:
                     self.commit(repo, {".gitignore": (repo / ".gitignore").read_text() + "lib/a/a.js\n"})
-                    self.write(repo, {"lib/a/a.js": "existing edit\n"})
+                    self.write(repo, {"lib/a/a.js": "existing edit\n", "README.md": "other edit\n", "notes.txt": "untracked\n"})
+                if flag:
+                    self.git(repo, "update-index", flag, "lib/a/a.js")
                 self.tsc_projects({"web": (self.show({}, ["../lib/a"]), [])}, build_rc=build_rc, build_body=build_body)
                 out = self.run_script("pre-commit-gate.sh", repo, "main")
                 code, log, body = self.last_line(out)
@@ -317,10 +349,13 @@ class GateTests(ScriptCase):
                 self.assertIn("typecheck:web 1", body)
                 self.assertNotIn("arg: --noEmit", self.calls_of("tsc"))
                 if changed:
-                    self.assertIn("reference builds wrote files git does not ignore", out.stdout)
-                    self.assertIn(changed, out.stdout)
+                    self.assertIn("reference builds changed these tracked or unignored files", out.stdout)
+                    self.assertIn(f"      {changed}\n", out.stdout)
                     self.assertIn(changed, self.assertLogged(log))
                     self.assertEqual((repo / changed).read_text(), "built\n")  # never undo the build
+                    for other in unchanged or ():
+                        self.assertNotIn(other, out.stdout.split("reference builds changed")[1])
+                        self.assertNotIn(other, self.assertLogged(log).split("reference builds changed")[1])
                 record = json.loads(Path(log).with_suffix(".json").read_text())
                 self.assertEqual({c["name"]: c["status"] for c in record["checks"]}["typecheck:web"], "failed")
 
@@ -1135,6 +1170,44 @@ class FingerprintTests(ScriptCase):
         (repo / "a.txt").unlink()
         self.assertNotEqual(self.shell_fingerprint(repo), before)
         self.assertEqual(self.git(repo, "status", "--porcelain").split(), ["D", "a.txt"])  # the real index was not touched
+
+    def test_a_tracked_file_that_matches_an_ignore_pattern_is_still_part_of_the_fingerprint(self):
+        repo = self.repo(files={"a.txt": "one\n", "out.js": "built\n"})
+        self.commit(repo, {".gitignore": "out.js\n"})  # tracked first, ignored after: git still tracks it
+        before = self.shell_fingerprint(repo)
+        self.assertEqual(gate_record.current(repo), before)
+        self.write(repo, {"out.js": "rewritten\n"})
+        edited = self.shell_fingerprint(repo)
+        self.assertNotEqual(edited, before)
+        self.assertEqual(gate_record.current(repo), edited)  # both rules agree
+        (repo / "out.js").unlink()
+        self.assertNotEqual(self.shell_fingerprint(repo), edited)  # deletion of a tracked ignored file counts too
+        self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        self.write(repo, {"out.js": "built\n"})
+        self.assertEqual(self.shell_fingerprint(repo), before)  # restored: same tree again
+        self.write(repo, {"never-tracked.js": "x\n", ".gitignore": "out.js\nnever-tracked.js\n"})
+        ignored_untracked = self.shell_fingerprint(repo)
+        self.write(repo, {"never-tracked.js": "y\n"})
+        self.assertEqual(self.shell_fingerprint(repo), ignored_untracked)  # an untracked ignored file is still left out
+        self.assertEqual(gate_record.current(repo), ignored_untracked)
+
+    def test_a_rewrite_of_a_flagged_tracked_file_changes_the_fingerprint(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                repo = self.repo(flag.strip("-"), files={"out.js": "old\n", "a.txt": "one\n"})
+                self.git(repo, "update-index", flag, "out.js")
+                before = self.shell_fingerprint(repo)
+                self.assertEqual(gate_record.current(repo), before)
+                self.write(repo, {"out.js": "rewritten\n"})
+                self.assertNotEqual(self.shell_fingerprint(repo), before)
+                self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        repo = self.repo("staged", files={"a.txt": "one\n"})  # staged-new and ignored: tracked, so counted
+        self.write(repo, {".gitignore": "new.js\n", "new.js": "x\n"})
+        self.git(repo, "add", "-f", "new.js")
+        staged = self.shell_fingerprint(repo)
+        self.write(repo, {"new.js": "y\n"})
+        self.assertNotEqual(self.shell_fingerprint(repo), staged)
+        self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
 
     def test_equal_content_gives_an_equal_fingerprint_whatever_the_history(self):
         one = self.repo("one", files={"a.txt": "one\n"})

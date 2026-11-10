@@ -1237,6 +1237,7 @@ class BindingProofUseTests(unittest.TestCase):
         # not followed: what is read through that binding is unknown, and a file that hands a module on is opaque (every file that
         # could read it runs that file). hp.x is never loaded, so each of these raises before Q (the reexport: helper hands it on).
         # The last row runs (hp.x loaded) and still loses its line: module values are not tracked through assignments.
+        vals = (("app/vals.py", "hp = 3\n"),)
         for label, text, extra in (
                 ("assignment alias", "import hp\na = hp\ny = a.x.v\n", ()),
                 ("tuple alias", "import hp\na, = (hp,)\ny = a.x.v\n", ()),
@@ -1249,10 +1250,34 @@ class BindingProofUseTests(unittest.TestCase):
                  (("app/helper.py", "import hp\ndef get():\n    return hp\n"),)),
                 ("bound in a class body, read through the class", "class C:\n    import hp\ny = C.hp.x.v\n", ()),
                 ("an import name rebound by an assignment", "import hp.x\nhp = 3\ny = hp.x.v\n", ()),
-                ("loaded, aliased (runs; not tracked)", "import hp.x\na = hp\ny = a.x.v\n", ())):
-            with self.subTest("round 19", case=label):
+                ("loaded, aliased (runs; not tracked)", "import hp.x\na = hp\ny = a.x.v\n", ()),
+                # round 20 (Main rule 1, review F1): a name bound by two imports resolves only when both name one module; vals.hp is 3
+                ("module then member import", "import hp.x\nfrom vals import hp\ny = hp.x.v\n", vals),
+                ("both imports with as", "import hp.x as a\nfrom vals import hp as a\ny = a.v\n", vals),
+                ("member import under an if", "import hp.x\nif True:\n    from vals import hp\ny = hp.x.v\n", vals),
+                ("in a helper", "import helper\n", (("app/helper.py", "import hp.x\nfrom vals import hp\ny = hp.x.v\n"),) + vals),
+                ("relative member import, level 2", "import p.sub.h\n", (("app/p/sub/h.py", "import hp.x\nfrom ..vals import hp\ny = hp.x.v\n"),
+                                                                      ("app/p/vals.py", "hp = 3\n"), ("app/p/__init__.py", ""), ("app/p/sub/__init__.py", ""))),
+                ("member then module import (runs; two meanings)", "from vals import hp\nimport hp.x\ny = hp.x.v\n", vals),
+                # (Main rule 2, review F2) an augmented assignment reads its target first, a del needs it there; x is never loaded
+                ("augmented attribute", "import hp\nhp.x += 1\n", ()),
+                ("augmented, import as", "import hp as a\na.x += 1\n", ()),
+                ("augmented, depth 2", "import hp\nhp.x.v += 1\n", ()),
+                ("augmented, in a helper", "import helper\n", (("app/helper.py", "import hp\nhp.x += 1\n"),)),
+                ("delete", "import hp\ndel hp.x\n", ()),
+                # runs, and still loses its line: the read of hp.x.v is resolved, and v is an attribute a file writes (this statement)
+                ("augmented, loaded (runs; the attribute is written)", "import hp.x\nhp.x.v += 1\n", ())):
+            with self.subTest("round 19-20", case=label):
                 call = text.count("\n") + 1
                 self.assertEqual(mine(text + "from pkg.t import Q\nQ()\n", "app/u.py", *hp, *extra), ["- u.py imports Q [app/u.py:{}]".format(call)])
+        # round 20 controls, which run and keep both lines: one module imported twice, a plain write (only its object is evaluated), and
+        # a name bound twice that nothing reads (rule 1 makes a read through it opaque, not a binding: attack19_cycles' `x = 1` then
+        # `from z import x`, clean at d207b11)
+        for label, text in (("one module, two imports", "import hp.x\nimport hp\ny = hp.x.v\n"), ("plain write", "import hp\nhp.x = 1\n"),
+                            ("bound twice, never read", "hp = 1\nfrom vals import hp\n")):
+            with self.subTest("round 20 control", case=label):
+                n = text.count("\n") + 1
+                self.assertEqual(mine(text + "from pkg.t import Q\nQ()\n", "app/u.py", *hp, *vals), [line.format(n, n + 1) for line in both])
 
     def test_an_attribute_write_anywhere_in_the_run_root_unproves_the_module_member(self):
         """Round 8 F1: a call, creation or use through `m.Q` or a `from m import Q` name holds only if no file of the run root writes or

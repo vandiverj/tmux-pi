@@ -1086,12 +1086,32 @@ def _outside_use(tree, graph):
     return reason
 
 
+# Round 20 (Main, rule 2): the ast target fields whose expression Python reads before it writes it. Printed from the ast module (every
+# class field named target, targets or optional_vars; Starred and Tuple/List elements nest in them) and checked against the bytecode of
+# both interpreters (a LOAD_ATTR of the last attribute before the store): only an augmented assignment reads its target. Every other
+# Store evaluates the object chain only (`a.b.x = v`, `for a.b.x in s`, `with w as a.b.x` read a.b), and so does a Del, which then
+# needs the attribute to be there (DELETE_ATTR raises AttributeError when it is not).
+_READ_THEN_WRITE = (("AugAssign", "target"),)
+
+
+def _evaluates(chain, parent):
+    """THE one decision of what Python evaluates for the attribute chain node chain (round 20, Main 2), parent the node that holds it:
+    (whole, value, writes).
+    whole: the whole chain must resolve, its last attribute included: it is read (a Load, or a target of _READ_THEN_WRITE), or deleted
+    (a Del: the attribute must exist); else (a Store) only the object chain, all but the last attribute, is evaluated.
+    value: what the whole chain holds is read as a value (a Load or a _READ_THEN_WRITE target; not a Del or a Store).
+    writes: the chain is also stored to or deleted (a Store or Del context)."""
+    writes = isinstance(chain.ctx, (ast.Store, ast.Del))
+    value = not writes or any(type(parent).__name__ == cls and getattr(parent, field, None) is chain for cls, field in _READ_THEN_WRITE)
+    return value or isinstance(chain.ctx, ast.Del), value, writes
+
+
 def _find_outside_use(tree, graph):
     shadow = graph.shadowed()
     if shadow is not None:
         return "1: the run root has a module named {} (a standard-library name)".format(shadow)
     allowed_names = _SAFE_PREFIXES | _SAFE_CALLABLES | _SAFE_VALUES
-    bound, reexported = {}, graph.reexported()
+    bound, imported, reexported = {}, {}, graph.reexported()
     path = graph.path_of(tree)
     if path is not None and path in graph.cyclic():
         return "1: {} is in an import cycle (what it reads from a module of the cycle depends on which ran first)".format(path)
@@ -1114,13 +1134,26 @@ def _find_outside_use(tree, graph):
                 # rule 3: an import in a class body makes the module an attribute of the class, read as C.x or self.x through a name
                 # no import binds
                 return "{}: {} (a module bound in a class body is read through the class: unknown)".format(al.node.lineno, statement)
-        kept = {r for r in refs if r.kind in ("outside", "module")}
-        if kept:
-            bound.setdefault(al.local, set()).update(kept)
-    # rule 3: a name an import binds that some other binding (any assignment form, for, with, walrus, a parameter, def, class, except,
-    # match capture, del) also binds is not provably the module: what a read of it gets depends on which binding ran last
-    rebound = {name: next(e for e in events[name] if e[0] in ("name", "def", "arg") and not isinstance(e[1], ast.alias))
-               for name in bound if any(e[0] in ("name", "def", "arg") and not isinstance(e[1], ast.alias) for e in events.get(name, ()))}
+        imported.setdefault(al.local, []).append((al.node, refs))
+    # rule 1 (round 20, Main): one binding per name, import bindings included. A name an import binds resolves only when every binding
+    # of it is an import and every one resolves to the same thing: one set of meanings, all modules (of the run root or outside), or,
+    # bound by one import only, all members (a member is not followed: not in bound). Any other binding of it (any assignment form,
+    # for, with, walrus, a parameter, def, class, except, match capture, del; in any scope, round 19), a second import that may name
+    # something else, or one import whose meanings mix members and modules, leaves it unknown: what a read gets depends on which
+    # binding ran last, or which file the module is, and every use of it makes the file opaque. No meaning is dropped before this.
+    unknown_names = {}
+    for name, bindings in imported.items():
+        other = next((e for e in events.get(name, ()) if e[0] in ("name", "def", "arg") and not isinstance(e[1], ast.alias)), None)
+        meanings = {refs for _node, refs in bindings}
+        kinds = {r.kind for refs in meanings for r in refs}
+        if other is not None:
+            unknown_names[name] = "bound by an import and by line {}: a name bound by anything but an import is no module".format(
+                getattr(other[1], "lineno", "?"))
+        elif len(meanings) > 1 or kinds - {"outside", "module"} and (kinds != {"member"} or len(bindings) > 1):
+            unknown_names[name] = "bound by the imports of lines {}, which do not all name one module: unknown".format(
+                ", ".join(str(n) for n in sorted({node.lineno for node, _refs in bindings})))
+        elif kinds and kinds <= {"outside", "module"}:
+            bound[name] = set(next(iter(meanings)))
     parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in _LOADER_NAMES or isinstance(node, ast.Attribute) and node.attr in _LOADER_NAMES:
@@ -1137,17 +1170,17 @@ def _find_outside_use(tree, graph):
             if not refs or not all(r.kind == "outside" or all(x.kind in ("outside", "module") for x in _resolve(".".join([r.name] + attrs), graph, loaded=before(node)))
                                    for r in refs):
                 return "{}: .{} (a module from outside the run root)".format(node.lineno, node.attr)
+        if isinstance(node, ast.Name) and node.id in unknown_names and _evaluates(node, parents.get(id(node)))[1]:
+            # rule 1: a read through the name (a Load, or `x += 1`, which reads first: _evaluates) is what makes the file opaque; a
+            # binding or delete of it reads nothing (`x = 1` then `from z import x`, never read, stays clean as at d207b11)
+            return "{}: {} ({})".format(node.lineno, node.id, unknown_names[node.id])
         if isinstance(node, ast.Name) and node.id in bound:
-            if node.id in rebound:
-                other = rebound[node.id][1]
-                return "{}: {} (bound by an import and by line {}: a name bound by anything but an import is no module)".format(
-                    node.lineno, node.id, getattr(other, "lineno", "?"))
             chain, attrs = node, []
             while isinstance(parents.get(id(chain)), ast.Attribute):
                 chain = parents[id(chain)]
                 attrs.append(chain.attr)
             parent = parents.get(id(chain))
-            write = isinstance(chain.ctx, (ast.Store, ast.Del))
+            whole, value, write = _evaluates(chain, parent)  # rule 2 (round 20): what Python evaluates of the chain
             if write:
                 use, allowed = "a write or delete of", ()
             elif isinstance(parent, ast.Call) and parent.func is chain:
@@ -1161,11 +1194,12 @@ def _find_outside_use(tree, graph):
                 use, allowed = "the value", _SAFE_VALUES
             for ref in sorted(bound[node.id], key=str):
                 if ref.kind == "module":
-                    # an attribute read on a run-root module is resolved as an import of it is (h.argparse._sys); the attribute a write
-                    # or delete names need not exist, so only the object it is made on is resolved
-                    read = attrs[:-1] if write else attrs
+                    # an attribute read on a run-root module is resolved as an import of it is (h.argparse._sys); the attribute a plain
+                    # write names need not exist, so only the object it is made on is resolved (_evaluates: `h.x += 1` reads h.x
+                    # first and `del h.x` needs it there, so both are resolved whole; only what is read as a value meets rule 3)
+                    read = attrs if whole else attrs[:-1]
                     refs = _resolve(".".join([ref.name] + read), graph, loaded=before(node)) if read else frozenset()
-                    if not write and any(r.kind == "module" for r in (refs if read else {ref})):
+                    if value and any(r.kind == "module" for r in (refs if read else {ref})):
                         # rule 3 (round 19, Main): a module value reaches a name only through an import. Used as anything but the
                         # object of an attribute read (assigned in any form, an argument, a container element, returned or yielded, a
                         # default, a with or for value, an operand, a decorator or base), it goes to a binding the scan does not

@@ -146,7 +146,9 @@ decides what `result.md` holds, not who started the turn: a reply with a valid
 (none, malformed, empty) never replaces a `result.md` that has one, so the report
 comes back at Stop and the reply is kept under `results/`, counted in `state.json`
 (`laterReplies`, `laterReplyPath`) and shown by `tp-agent inspect`/`list`. Every
-replaced or held-back reply is kept under `results/<n>.md`, never overwritten. A
+replaced or held-back reply is kept under `results/<n>.md`, never overwritten; a
+Stop with no open prompt whose reply is byte-equal to one already kept (a duplicate,
+however late) changes nothing, so `laterReplies` counts distinct later replies. A
 `result.md` without a status is replaced as before. Hook writes serialize per
 task using a macOS-compatible advisory lock; `tp-review` still requires both a
 result and a settled worker. Token counts include cached input; cost is shown

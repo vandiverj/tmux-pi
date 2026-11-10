@@ -359,6 +359,10 @@ class ClaudeReportTests(unittest.TestCase):
             self.assertEqual((self.task / self.later()[1]).read_text(), reply + "\n")
         self.assertEqual(sorted(p.read_text() for p in self.task.glob(".reply.*")),
                          ["final\nRESULT_STATUS: complete\n", "short E\n"])
+        # a late duplicate of a reply kept only in its own file, not the latest one, is already kept: nothing changes
+        settled = (self.later(), sorted(p.name for p in self.task.glob(".reply.*")))
+        self.hook("Stop", last_assistant_message="short E")
+        self.assertEqual((self.later(), sorted(p.name for p in self.task.glob(".reply.*"))), settled)
 
     def test_stop_without_an_open_prompt_keeps_its_reply_and_changes_nothing_else(self):
         self.hook("Stop", last_assistant_message="orphan\nRESULT_STATUS: complete")
@@ -372,6 +376,17 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
         self.assertEqual(self.state()["state"], "waiting")
         self.assertEqual((self.task / self.later()[1]).read_text(), "late short\n")
+        # a delayed duplicate is identified by its bytes against every kept reply, not only result.md and the latest one
+        # (F1 of review-coder-a6d0364bbf-235539): with one intervening reply (A after B) and two (late short after A, B)
+        self.turn("task-notification", "short A")
+        self.turn("task-notification", "short B")
+        settled = (self.kept(), self.later(), (self.task / "result.md").read_text())
+        self.assertEqual(settled[1][0], 3)
+        for duplicate in ("short A", "late short", self.REPORT.rstrip("\n"), "orphan\nRESULT_STATUS: complete"):
+            with self.subTest(duplicate=duplicate):
+                self.hook("Stop", last_assistant_message=duplicate)
+                self.assertEqual((self.kept(), self.later(), (self.task / "result.md").read_text()), settled)
+        self.assertEqual((self.task / self.later()[1]).read_text(), "short B\n")
 
 
 if __name__ == "__main__":

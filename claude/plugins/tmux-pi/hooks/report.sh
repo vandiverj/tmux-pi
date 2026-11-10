@@ -50,8 +50,9 @@ active="$(jq -rn --argjson prev "$prev" '
 # - An archive write never overwrites: each copy takes the first free results/<n>.md from the turn it belongs to upward,
 #   created exclusively (a hard link, else a noclobber write), so old state, a missing field or two close submits cannot
 #   destroy a kept reply. Where nothing can be created under results/, result.md and the reply both stay on disk.
-# - A Stop with no open prompt changes neither result.md nor the turn state, but a reply it carries that is not already
-#   kept is archived and counted.
+# - A Stop with no open prompt changes neither result.md nor the turn state. A reply it carries that is byte-equal to any
+#   reply already kept (already_kept: result.md, anything under results/, a kept .reply.* file) changes nothing at all,
+#   however late the duplicate arrives; any other reply is archived and counted.
 results_dir="$TP_TASK_DIR/results"
 status_py="$(dirname "$0")/../../../../lib/result_status.py"
 has_status() { [[ -s "$1" && -f "$status_py" ]] && python3 "$status_py" "$1" >/dev/null 2>&1; }
@@ -86,6 +87,17 @@ field() { jq -r ".$1 // empty | tostring" <<<"$prev" 2>/dev/null; }
 prompt_turn="$(field promptTurn)"; prompt_turn="${prompt_turn:-0}"
 settled_turn="$(field settledTurn)"; settled_turn="${settled_turn:-0}"
 later_path="$(field laterReplyPath)"
+already_kept() { # already_kept FILE: FILE's bytes equal a reply already kept anywhere on disk
+  # A reply has no id in the Stop input (only its text), so a reply is identified by its bytes. Kept means result.md,
+  # any file under results/ (including a .keep.* copy that could not be named), a reply that stayed in its own .reply.*
+  # file, and whatever laterReplyPath names. FILE itself (the reply being handled) is not a kept copy.
+  local f
+  for f in "$TP_TASK_DIR/result.md" "$results_dir"/* "$results_dir"/.[!.]* "$TP_TASK_DIR"/.reply.* \
+           ${later_path:+"$TP_TASK_DIR/$later_path"}; do
+    [[ -f "$f" && "$f" != "$1" ]] && cmp -s "$1" "$f" && return 0
+  done
+  return 1
+}
 later_count() { local n; n="$(jq -r '.laterReplies // 0 | if type == "number" then floor else 0 end' <<<"$prev" 2>/dev/null)"; echo "${n:-0}"; }
 ext='{}'
 if [[ "$event" == UserPromptSubmit ]]; then
@@ -103,9 +115,9 @@ elif [[ "$event" == Stop ]]; then
   reply_tmp="$(mktemp "$TP_TASK_DIR/.reply.XXXXXXXX")" || exit 0
   jq -r '.last_assistant_message // empty | select(length > 0)' <<<"$input" > "$reply_tmp" 2>/dev/null || : > "$reply_tmp"
   if [[ "$active" != yes ]]; then
-    # no open prompt: duplicate, late, or the second Stop of two overlapping turns. Keep its reply unless already kept.
-    if [[ -s "$reply_tmp" ]] && ! { [[ -f "$TP_TASK_DIR/result.md" ]] && cmp -s "$reply_tmp" "$TP_TASK_DIR/result.md"; } \
-       && ! same "$reply_tmp" "$later_path"; then
+    # no open prompt: duplicate (however late), late, or the second Stop of two overlapping turns. A reply byte-equal to
+    # one already kept changes nothing; any other is kept and counted, so laterReplies counts distinct later replies.
+    if [[ -s "$reply_tmp" ]] && ! already_kept "$reply_tmp"; then
       keep_reply
       ext="$(jq -nc --argjson n "$(( $(later_count) + 1 ))" --arg p "$archived" '{laterReplies: $n, laterReplyPath: $p}')"
     fi

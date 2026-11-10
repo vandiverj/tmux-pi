@@ -84,6 +84,8 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
             "lane": (("--other-lane-paths", cls.LANE_BODY), None),
             "facts": (("--lane-facts-file", str(cls.base / "facts.md"), "--worker-env", "LANE_BASE=0123abc", "--note", "n"), None),
             "gold-ctx": (("--context", "ctx.txt", "--note", "a note"), None),
+            "main-ok": ((), {**cls.env, "TP_MAIN_ID": "main-a1"}),
+            "main-bad": ((), {**cls.env, "TP_MAIN_ID": "a b; touch " + str(cls.base / "ran")}),
             "facts-secret": (("--lane-facts-file", str(cls.base / ".env")), None),
         }
         (cls.base / "facts.md").write_text("## Lane (facts)\nlane: x\n")
@@ -136,6 +138,19 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
         self.assertEqual(text, GOLDEN.read_text())
         self.assertNotIn("TP_TRIAL_ID", text)
         self.assertNotIn("TP_DOCS_TOOLS", text)
+
+    def test_the_dispatching_mains_id_follows_the_spawner_when_valid(self):
+        """TP_MAIN_ID in the spawner's environment is exported by run.sh, before the worker starts, so the worker's own dispatches are
+        tagged to the same main; a value that is not an id is not exported (no line, nothing run); unset gives the golden run.sh."""
+        run = self.runs["main-ok"]
+        self.assertEqual(run.returncode, 0, run.stderr)
+        text = self.run_sh("main-ok")
+        self.assertIn("export TP_MAIN_ID=main-a1\n", text)
+        self.assertLess(text.index("export TP_MAIN_ID"), text.index("tp-claude"))
+        bad = self.runs["main-bad"]
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertNotIn("TP_MAIN_ID", self.run_sh("main-bad"))
+        self.assertFalse((self.base / "ran").exists())
 
     def test_ctx_tools_follow_the_spawner(self):
         """ctx-enable: main with TP_CTX_TOOLS=1 gives the worker `export TP_CTX_TOOLS=1` before it starts; any other value in main

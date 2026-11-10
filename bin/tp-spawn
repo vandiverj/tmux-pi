@@ -765,6 +765,9 @@ run_sh="$(
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
   for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
+  # The dispatching main's identity (bin/tp-main) follows the spawner, never --worker-env, so the worker's own dispatches are
+  # tagged to the same main. Only when set and valid. It is not in the session environment: two mains may share a session.
+  if [[ "${TP_MAIN_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then printf 'export TP_MAIN_ID=%q\n' "$TP_MAIN_ID"; fi
   # The ctx tools follow the spawner, never --worker-env: main with TP_CTX_TOOLS=1 gives the worker the tools; otherwise
   # run.sh clears the switch, because the new window inherits the environment of the session, which may still hold a stale 1.
   if [[ "${TP_CTX_TOOLS:-}" == 1 ]]; then echo 'export TP_CTX_TOOLS=1'; else echo 'unset TP_CTX_TOOLS'; fi

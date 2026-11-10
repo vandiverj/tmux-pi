@@ -309,9 +309,12 @@ def main_id():
     """The identity of the main agent that runs this command, or None: TP_MAIN_ID if the launcher set one, else the Claude
     session id. A worker (TP_TASK_DIR set) has none: it never dispatches for a main. Recorded on each task it dispatches so
     the main's notifier can tell its tasks from another main's, in whichever session state directory they live."""
+    explicit = os.getenv("TP_MAIN_ID") or ""
+    if MAIN_ID.fullmatch(explicit):  # a worker carries its main's id (tp-spawn exports it): what it dispatches is tagged to that main
+        return explicit
     if os.getenv("TP_TASK_DIR"):
         return None
-    value = os.getenv("TP_MAIN_ID") or os.getenv("CLAUDE_CODE_SESSION_ID") or ""
+    value = os.getenv("CLAUDE_CODE_SESSION_ID") or ""
     return value if MAIN_ID.fullmatch(value) else None
 
 
@@ -319,11 +322,17 @@ def main_rows(base, ident):
     """`tp-agent list --main ID`: this session's rows except those another main dispatched (a row with no recorded main stays:
     older tasks, and mains with no identity), plus the tasks `ident` dispatched into any other session of the same workspace
     (<workdir>/.tmux-pi/sessions/*), each marked with its `state_dir`. A main that exports a different TP_STATE_DIR per command
-    still gets every one of its tasks. Other sessions are read only for tasks whose dispatch.json names `ident`."""
-    rows = [row for row in all_records(base) if row.get("main") in (None, ident)]
+    still gets every one of its tasks. Other sessions are read only for tasks whose dispatch.json names `ident`.
+    Returns (rows, other_main): other_main is the rows of THIS session left out because another main's id is on them ({id, status,
+    main} each), so a task is never hidden without a trace: it may belong to a live second main, or to this one under an id it
+    no longer has."""
+    every = all_records(base)
+    rows = [row for row in every if row.get("main") in (None, ident)]
+    other_main = [{"id": row.get("id"), "status": row.get("status"), "main": row.get("main")}
+                  for row in every if row.get("main") not in (None, ident)]
     parent = base.parent
     if parent.name != "sessions" or parent.parent.name != ".tmux-pi":
-        return rows
+        return rows, other_main
     for other in sorted(parent.iterdir()):
         tasks = other / "tasks"
         if other == base or other.is_symlink() or not tasks.is_dir() or tasks.is_symlink():
@@ -332,7 +341,7 @@ def main_rows(base, ident):
             if path.is_symlink() or not (path / "meta.json").is_file() or read_json(path / "dispatch.json").get("main") != ident:
                 continue
             rows.append(dict(record(path), state_dir=str(other)))
-    return sorted(rows, key=lambda row: row.get("updated") or "")
+    return sorted(rows, key=lambda row: row.get("updated") or ""), other_main
 
 
 def build_index(base):
@@ -701,8 +710,12 @@ def launch(base, item):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
     args += ["--", item["task"]]
     started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
+    # The worker carries the main that dispatched it, whichever process runs the start (a queued task is started by a later tick).
+    spawn_env = {key: value for key, value in os.environ.items() if key != "TP_MAIN_ID"}
+    if item.get("main"):
+        spawn_env["TP_MAIN_ID"] = item["main"]
     try:
-        run = subprocess.run(args, text=True, capture_output=True)
+        run = subprocess.run(args, text=True, capture_output=True, env=spawn_env)
     finally:
         if facts_file:
             Path(facts_file.name).unlink(missing_ok=True)
@@ -1372,7 +1385,9 @@ def _main(argv):
     rp.add_argument("--yes", action="store_true", help="confirm: end the listed processes")
     ls = sub.add_parser("list")
     ls.add_argument("--main", help="list as the main with this id sees its tasks: this session's rows except another main's, plus this "
-                                   "main's tasks in the other sessions of the workspace (the Claude notifier uses this)")
+                                   "main's tasks in the other sessions of the workspace (the Claude notifier uses this). The answer is then "
+                                   "{rows, other_main}: other_main counts, with id, status and main, the rows of this session left out because "
+                                   "another main's id is on them")
     sub.add_parser("tick")
     # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
     sub.add_parser("queue-view")
@@ -1610,9 +1625,15 @@ def _main(argv):
         if args.bounded:
             value = work_index.bounded(value)
     elif args.command == "list":
-        value = main_rows(base, args.main) if args.main else all_records(base)
+        other_main = None
+        if args.main:
+            value, other_main = main_rows(base, args.main)
+        else:
+            value = all_records(base)
         scanner = trust_dialog.Scanner()
         value = [with_trust_dialog(row, scanner) for row in value]
+        if other_main is not None:  # --main answers an object: the rows left out are reported beside the rows kept
+            value = {"rows": value, "other_main": {"count": len(other_main), "rows": other_main}}
     elif args.command == "objective":
         atomic_text(base / "session-objective.md", args.text.strip() + "\n", base)
         value = write_index(base)

@@ -34,6 +34,8 @@ function world(on: On, env: Record<string, string>) {
     acceptsAppend: false,
     appended: [] as string[], // the text of every row the module tried to append to the session
     listOut: undefined as string | undefined,
+    otherMain: undefined as { id: string; status: string; main: string }[] | undefined, // when set, `tp-agent list --main` answers {rows, other_main}
+    isTimingOut: false, // `tp-agent list` does not answer in time (the run rejects)
     listFor: undefined as ((main: string | undefined) => Row[]) | undefined, // when set, `tp-agent list` answers per `--main`
     ran: [] as string[][],
     submitted: [] as string[],
@@ -71,8 +73,10 @@ function world(on: On, env: Record<string, string>) {
     const [tool, verb, id] = e.argv
     let stdout = ''
     if (tool === AGENT && verb === 'index' && !e.argv.includes('--no-write')) w.indexWrites += 1
+    if (verb === 'list' && w.isTimingOut) throw new Error('timed out')
+    const listed = w.listFor ? w.listFor(e.argv[2] === '--main' ? e.argv[3] : undefined) : w.rows
     if (tool !== AGENT) stdout = `viewing ${verb}`
-    else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.listFor ? w.listFor(e.argv[2] === '--main' ? e.argv[3] : undefined) : w.rows)
+    else if (verb === 'list') stdout = w.listOut ?? JSON.stringify(w.otherMain !== undefined && e.argv[2] === '--main' ? { rows: listed, other_main: { count: w.otherMain.length, rows: w.otherMain } } : listed)
     else if (verb === 'index' && w.indexJson !== undefined) stdout = JSON.stringify(w.indexJson)
     else if (verb === 'index') stdout = JSON.stringify({ objective: w.objective, active: w.rows, pending: [], paused: w.paused ?? [], unstatused: w.unstatused ?? [], recent: [], ...(w.work === undefined ? {} : { work: w.work }), ...(w.workError === undefined ? {} : { work_error: w.workError }) })
     else if (verb === 'collect') stdout = JSON.stringify({ id, status: w.collectStatus, result_status: w.collectResult, ...w.collectReport })
@@ -121,8 +125,8 @@ for (const [name, env, isInteractive] of [
   })
 }
 
-test('a worker environment never notifies, even with a main identity and the orchestrator mode', async ($, on) => {
-  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1', CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_HARNESS: 'claude' })
+test('a worker environment never notifies, even with a main identity (tp-spawn gives workers their main\'s TP_MAIN_ID) and the orchestrator mode', async ($, on) => {
+  const w = world(on, { ...MAIN, TP_TASK_DIR: '/state/tasks/coder-1', CLAUDE_CODE_SESSION_ID: 'sess-1', TP_MAIN_ID: 'main-a', TP_MAIN_HARNESS: 'claude' })
   w.rows = [{ id: 'coder-2', status: 'settled' }]
   await $.session.start(start(true))
   await w.clock.advance(30000)
@@ -381,15 +385,78 @@ test('with no index at start, what is already waiting is announced once', async 
   expect(w.submitted.length).toBe(1)
 })
 
-test('a rejected wake is retried, and given up after three tries', async ($, on) => {
+const bandLines = async ($: never) => {
+  const ui = await ($ as any).ui.mount({ plugin: 'tmux-pi', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND, bodyColumns: 200 } as never })
+  const texts: string[] = (await ui.findAll({ type: 'Text' })).map((node: { text: string }) => node.text)
+  await ui.unmount()
+  return texts
+}
+
+test('a rejected wake keeps its row, backs off, says so once after three tries, and still delivers when a submit works', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'working' }]
   await $.session.start(start(true))
   w.isRejecting = true
   w.rows = [{ id: 'coder-1', status: 'failed' }]
-  await w.clock.advance(60000)
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  await w.clock.advance(10000) // inside the backoff: no second try on the next polls
+  expect(w.submitted.length).toBe(1)
+  await w.clock.advance(55000)
+  expect(w.submitted.length).toBe(3) // WAKE_TRIES failures in a row
+  expect(w.toasts.filter(text => text.includes('could not wake main'))).toHaveLength(1)
+  expect((await bandLines($ as never)).some(text => text.includes('main could not be woken') && text.includes('coder-1'))).toBe(true)
+  await w.clock.advance(40000) // the row is kept: a later try is made, and the warning is not repeated
+  expect(w.submitted.length).toBe(4)
+  expect(w.toasts.filter(text => text.includes('could not wake main'))).toHaveLength(1)
+  w.isRejecting = false
+  await w.clock.advance(120000)
+  expect(w.submitted.length).toBe(5)
+  expect(w.submitted[4]).toContain('coder-1 failed')
+  expect((await bandLines($ as never)).some(text => text.includes('could not be woken'))).toBe(false)
+  await w.clock.advance(300000) // delivered: never sent again
+  expect(w.submitted.length).toBe(5)
+})
+
+test('a held row whose task left that status while the wake kept failing is dropped, not sent late', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.isRejecting = true
+  w.rows = [{ id: 'coder-1', status: 'failed' }]
+  await w.clock.advance(65000) // three failures in a row: the band says main could not be woken
+  expect((await bandLines($ as never)).some(text => text.includes('could not be woken'))).toBe(true)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  w.isRejecting = false
+  await w.clock.advance(120000)
   expect(w.submitted.length).toBe(3)
-  expect(w.toasts.length).toBe(1)
+  expect((await bandLines($ as never)).some(text => text.includes('could not be woken'))).toBe(false)
+})
+
+test('a wake still in flight is not delivered: its row is pending and its key is delivered only once the submit resolves', async ($, on) => {
+  const w = world(on, MAIN)
+  const kept: Record<string, any> = { notifier: { epoch: 1, isIndexed: true, delivered: [], pending: [] } }
+  on('state.get', { plugin: 'tmux-pi' }, (_$, e, next) => (e.key in kept ? { value: { value: kept[e.key], version: 1 } } : next(e)))
+  on('state.set', { plugin: 'tmux-pi' }, (_$, e, next) => {
+    if (!(e.key in kept)) return next(e)
+    kept[e.key] = e.value
+    return { value: { isSet: true, version: 2 } }
+  })
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.isHolding = true
+  w.rows = [{ id: 'coder-1', status: 'settled' }]
+  await w.clock.advance(5000)
+  expect(w.submitted.length).toBe(1)
+  expect(kept.notifier.delivered).toEqual([])
+  expect(kept.notifier.pending.map((row: { id: string }) => row.id)).toEqual(['coder-1'])
+  w.isHolding = false
+  w.release?.()
+  await w.clock.advance(5000)
+  expect(kept.notifier.delivered).toEqual(['coder-1:settled'])
+  expect(kept.notifier.pending).toEqual([])
+  await w.clock.advance(30000)
+  expect(w.submitted.length).toBe(1)
 })
 
 test('an answered capability request does not relabel a permission prompt', async ($, on) => {
@@ -1410,4 +1477,61 @@ test('a task already settled in a second state directory at start is the baselin
   await $.session.start(start(true))
   await w.clock.advance(15000)
   expect(w.submitted).toEqual([])
+})
+
+// ---- MN1: nothing is hidden or dropped silently ----
+
+test('rows of this session that belong to another main are shown on the band and toasted once each, and wake nobody', async ($, on) => {
+  const w = world(on, { ...MAIN, TP_MAIN_ID: 'main-a' })
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  w.otherMain = [{ id: 'coder-9', status: 'settled', main: 'main-b' }]
+  await $.session.start(start(true))
+  await w.clock.advance(15000)
+  expect(w.submitted).toEqual([])
+  expect(w.toasts.filter(text => text.includes('coder-9'))).toHaveLength(1)
+  expect(w.toasts[0]).toContain('belongs to another main (main-b)')
+  const lines = await bandLines($ as never)
+  expect(lines.some(text => text.includes('1 worker in this session belongs to another main: coder-9 (main-b); tp-agent list'))).toBe(true)
+  w.otherMain.push({ id: 'coder-10', status: 'failed', main: 'main-b' })
+  await w.clock.advance(5000)
+  expect(w.toasts.filter(text => text.includes('another main'))).toHaveLength(2)
+  expect((await bandLines($ as never)).some(text => text.startsWith('2 workers in this session belong to another main: coder-9 (main-b), coder-10 (main-b)'))).toBe(true)
+  w.otherMain = []
+  await w.clock.advance(5000)
+  expect((await bandLines($ as never)).some(text => text.includes('another main'))).toBe(false)
+  expect(w.submitted).toEqual([])
+})
+
+for (const [name, why, fail] of [
+  ['a timeout', 'timed out', (w: { isTimingOut: boolean }) => (w.isTimingOut = true)],
+  ['a non-zero exit', 'exit 1', (w: { isFailing: boolean }) => (w.isFailing = true)],
+  ['output that is not JSON', 'bad output', (w: { listOut?: string }) => (w.listOut = 'not json')],
+] as const) {
+  test(`${name} of tp-agent list twice in a row pauses the notices on the band, with one toast, and a good read clears it`, async ($, on) => {
+    const w = world(on, { ...MAIN, TP_MAIN_ID: 'main-a' })
+    w.rows = [{ id: 'coder-1', status: 'working' }]
+    await $.session.start(start(true))
+    fail(w as never)
+    await w.clock.advance(5000)
+    expect((await bandLines($ as never)).some(text => text.includes('paused'))).toBe(false) // one failure is not yet news
+    await w.clock.advance(5000)
+    expect(w.toasts.filter(text => text === `worker notices paused: tp-agent list ${why}`)).toHaveLength(1)
+    expect((await bandLines($ as never)).some(text => text === `worker notices paused: tp-agent list ${why}`)).toBe(true)
+    await w.clock.advance(15000) // polling goes on; the toast is not repeated
+    expect(w.toasts.filter(text => text.startsWith('worker notices paused'))).toHaveLength(1)
+    w.isTimingOut = false
+    w.isFailing = false
+    w.listOut = undefined
+    w.rows = [{ id: 'coder-1', status: 'settled' }]
+    await w.clock.advance(5000)
+    expect((await bandLines($ as never)).some(text => text.includes('paused'))).toBe(false)
+    expect(w.submitted.length).toBe(1) // the notice that waited for the read is sent
+  })
+}
+
+test('/workers says why tp-agent list failed', async ($, on) => {
+  const w = world(on, MAIN)
+  await $.session.start(start(true))
+  w.isFailing = true
+  expect(await $.command.run(command('workers'))).toEqual({ text: 'tp-agent list failed: exit 1.' })
 })

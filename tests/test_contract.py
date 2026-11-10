@@ -737,6 +737,44 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "pause")
         self.assertEqual(self.recorded_state(), "paused")
 
+    def nudge(self, submit_recorded):
+        """Enforce a reminder with a tmux that records keys. The task is a Claude one (meta.json worker), so it is confirmed
+        by the worker's submit record: with submit_recorded the Enter makes the hook's record, else none ever arrives."""
+        import contextlib
+        import io
+        from unittest import mock
+        import pane_send
+        calls = []
+
+        def run(command, *args, **kwargs):
+            calls.append(command[1:])
+            typed = [c for c in calls if c[0] == "send-keys" and "-l" in c]
+            if submit_recorded and command[-1] == "Enter":
+                (self.task / "state.json").write_text(json.dumps({"promptSubmits": 1, "promptLog": [
+                    {"n": 1, "at": "t", "tokens": pane_send.TOKEN_RE.findall(typed[-1][-1])}]}))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        decision = {"action": ("nudge-draft", "draft due"), "status": None, "elapsed": 60, "turns": 3}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_SEND_CONFIRM_SECONDS": "0.05"}), \
+                mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
+                mock.patch.object(self.tool, "evaluate", return_value=decision), \
+                mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.tool.time, "sleep"), contextlib.redirect_stderr(err):
+            self.tool.cmd_enforce(None)
+        return calls, err.getvalue()
+
+    def test_a_reminder_goes_through_the_submit_helper_and_says_when_it_is_not_confirmed(self):
+        calls, err = self.nudge(submit_recorded=True)
+        keys = [c for c in calls if c[0] == "send-keys"]
+        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True])  # typed once, one Enter, confirmed by the record
+        self.assertEqual(err, "")
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        calls, err = self.nudge(submit_recorded=False)  # the pane never shows the text, yet a Claude task is not confirmed
+        keys = [c for c in calls if c[0] == "send-keys"]
+        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True, True, True])  # typed once, 1 + 2 Enters, never retyped
+        self.assertIn("not confirmed submitted after 3 Enter(s)", err)
+        self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "nudge-draft")
+
 
 if __name__ == "__main__":
     unittest.main()

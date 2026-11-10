@@ -11,6 +11,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "lib"))
+import pane_send  # noqa: E402
 from fake_tools import fake_tmux  # noqa: E402
 from session_env import outside_session  # noqa: E402
 HOOK = ROOT / "claude/plugins/tmux-pi/hooks/report.sh"
@@ -54,10 +56,37 @@ class ClaudeReportTests(unittest.TestCase):
             self.assertNotEqual(run.returncode, 0)
             self.assertTrue("has no result yet" in run.stderr or "has not completed successfully" in run.stderr, run.stderr)
 
+    def test_submit_log_records_every_delivery_id_in_the_prompt_and_keeps_the_last_records(self):
+        # The hook finds the delivery ids lib/pane_send.py send() types; it stores no text and compares none.
+        one, two = pane_send.new_token(), pane_send.new_token()
+        self.hook("UserPromptSubmit", prompt="  Use the local renderer \t\x1f for\n the {} evidence {}\n".format(one, two))
+        self.assertEqual(self.state()["promptLog"][-1]["tokens"], [one, two])  # all of them, in order
+        self.hook("UserPromptSubmit", prompt="no id here, only [tp:123] [tp:0123456789a] [tp:0123456789A]")
+        self.assertEqual(self.state()["promptLog"][-1]["tokens"], [])  # near misses are not ids
+        self.hook("UserPromptSubmit")  # no prompt at all
+        self.assertEqual(self.state()["promptLog"][-1]["tokens"], [])
+        for i in range(4, 11):
+            self.hook("UserPromptSubmit", prompt="p{} {}".format(i, "[tp:00000000{:02x}]".format(i)))
+        log = self.state()["promptLog"]
+        self.assertEqual([r["n"] for r in log], list(range(3, 11)))  # the last 8 of 10, oldest first
+        self.assertEqual(log[-1]["tokens"], ["[tp:000000000a]"])
+        self.assertEqual(self.state()["promptSubmits"], 10)
+        self.assertNotIn("promptHash", self.state())  # no text hash: the id is the whole rule
+
+    def test_the_hook_and_the_sender_use_the_same_id_pattern(self):
+        self.assertIn("marker_re='{}'".format(pane_send.TOKEN_PATTERN), HOOK.read_text())
+        self.assertRegex(pane_send.new_token(), "^" + pane_send.TOKEN_PATTERN + "$")
+
     def test_late_tool_does_not_reopen_stop_but_new_prompt_does(self):
         self.hook("SessionStart", model="claude-opus-5-5")
+        self.assertNotIn("promptSubmits", self.state())  # SessionStart is not a submit
         self.hook("UserPromptSubmit", prompt="first")
+        submit = self.state()  # the record lib/pane_send.py waits on: count, and a log entry with the ids in the prompt
+        self.assertEqual(submit["promptSubmits"], 1)
+        self.assertEqual(submit["promptLog"], [{"n": 1, "at": submit["updated"], "tokens": []}])
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "fixture.txt"})
+        self.assertEqual({k: self.state()[k] for k in ("promptSubmits", "promptLog")},
+                         {k: submit[k] for k in ("promptSubmits", "promptLog")})  # other events leave it
         self.hook("Stop", last_assistant_message="first reply\nRESULT_STATUS: complete")
         self.assertEqual(self.state()["state"], "waiting")
         self.review(accepted=True)
@@ -70,9 +99,12 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((self.task / "result.md").read_text(), "first reply\nRESULT_STATUS: complete\n")
         self.assertFalse(list(self.task.glob(".state.*")) + list(self.task.glob(".result.*")))
 
-        self.hook("UserPromptSubmit", prompt="confirm")
+        self.hook("UserPromptSubmit", prompt="confirm [tp:abcdef0123]")
         self.assertEqual(self.state()["state"], "working")
         self.assertEqual(self.state()["promptTurn"], 2)
+        self.assertEqual(self.state()["promptSubmits"], 2)
+        self.assertEqual([(r["n"], r["tokens"]) for r in self.state()["promptLog"]],
+                         [(1, []), (2, ["[tp:abcdef0123]"])])  # in order
         self.assertFalse((self.task / "result.md").exists())
         self.review()  # old answer cannot be reviewed for the new prompt
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})

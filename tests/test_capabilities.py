@@ -130,6 +130,18 @@ class CapabilityRegistryTests(unittest.TestCase):
             wrapped["capability_manifest"]["events"].append({"type": "capability_request", **pending["event"], "request": pending["request"]})
             (task / "context-manifest.json").write_text(json.dumps(wrapped))
             (task / "pending-capability.json").write_text(json.dumps(pending))
+            # An Enter that does not submit (the text stays in the box) is a failed delivery: the grant is not persisted.
+            stuck = root / "stuck-bin"
+            stuck.mkdir()
+            fake_tmux(stuck, 'case "$1" in\n send-keys) [ "$4" = -l ] && printf "%s" "$5" > "$TMUX_BOX";;\n capture-pane) cat "$TMUX_BOX";;\nesac\nexit 0\n')
+            before = (task / "context-manifest.json").read_text()
+            unsubmitted = subprocess.run(cmd + ["--approve"], capture_output=True, text=True,
+                                         env=dict(env, PATH=str(stuck) + os.pathsep + env["PATH"], TMUX_BOX=str(root / "box"),
+                                                  TP_SEND_CONFIRM_SECONDS="0.1"))
+            self.assertNotEqual(unsubmitted.returncode, 0)
+            self.assertIn("not confirmed submitted after 3 Enter(s)", unsubmitted.stderr)
+            self.assertTrue((task / "pending-capability.json").exists())
+            self.assertEqual((task / "context-manifest.json").read_text(), before)
             result = subprocess.run(cmd + ["--approve", "--json"], env=env, capture_output=True, text=True, check=True)
             self.assertTrue(json.loads(result.stdout)["pending_cleared"])
             self.assertFalse((task / "pending-capability.json").exists())

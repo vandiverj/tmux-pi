@@ -430,6 +430,28 @@ class GateTests(ScriptCase):
         self.assertIn("arg: check\narg: --allow-import\narg: main.ts", deno)
         self.assertEqual(self.calls_of("tsc").count("--- call"), 1)
 
+    def test_a_deno_config_with_only_imports_next_to_a_tsconfig_is_a_tsc_app_but_any_other_key_or_unparsable_config_stays_deno(self):
+        repo = self.repo()
+        imap = '{"imports": {"a": "npm:a"}}\n'
+        self.commit(repo, {
+            "node/package.json": "{}\n", "node/deno.json": imap, "node/tsconfig.json": "{}\n", "node/a.ts": "x\n",
+            "tasks/deno.json": '{"imports": {}, "tasks": {"x": "y"}}\n', "tasks/tsconfig.json": "{}\n", "tasks/a.ts": "x\n",
+            "opts/deno.json": '{"compilerOptions": {}}\n', "opts/tsconfig.json": "{}\n", "opts/a.ts": "x\n",
+            "jsonc/deno.jsonc": '// c\n{"imports": {}}\n', "jsonc/tsconfig.json": "{}\n", "jsonc/a.ts": "x\n",
+            "bare/deno.json": imap, "bare/a.ts": "x\n"})
+        for tool in ("deno", "tsc"):
+            self.stub(tool)
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
+        for app in ("node", "tasks", "opts", "jsonc", "bare"):
+            self.assertIn(f"typecheck:{app} 0", body)
+        tsc, deno = self.calls_of("tsc"), self.calls_of("deno")
+        self.assertEqual(tsc.count("--- call"), 1)
+        self.assertIn(f"cwd={repo}/node", tsc)
+        self.assertEqual(deno.count("--- call"), 4)
+        self.assertNotIn(f"cwd={repo}/node", deno)
+        for app in ("tasks", "opts", "jsonc", "bare"):
+            self.assertIn(f"cwd={repo}/{app}", deno)
+
     def test_a_change_to_a_web_apps_config_or_js_still_typechecks_the_app(self):
         repo = self.repo()
         self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n"})

@@ -702,20 +702,136 @@ def diff_now(now, lane, red):
     staged, unstaged and untracked files) against the review base (review_base: a lane's last closed step, else the lane base,
     else HEAD), with the same checks the later rounds' diff gets: safe_diff withholds sensitive paths, redact_diff the secrets.
     The text starts with a line saying which base it is measured from. A base that cannot be worked out is said in the text, not
-    guessed; a diff that cannot be checked raises Refused."""
+    guessed; a diff that cannot be checked raises Refused.
+
+    When the commits since the base include a merge of an upstream branch (upstream_reduction), the diff is of what the step
+    authored: each such merge as its resolution (remerge_diff), the commits around it as their own first-parent diffs, then the
+    last merge to the files as they are now; and the plan's base is that last merge. The text and the scope say so."""
     top = now["top"]
     try:
         base, basis = review_base(top, lane)
     except Refused as exc:
         return f"No diff: the base to measure the change from could not be worked out ({' '.join(str(exc).split())[:200]}). Inspect the working tree directly.\n", [], 0, None
     label = basis[len("base: "):] if basis else ("HEAD" if base == "HEAD" else "the empty tree (the repository has no commit yet)")
+    reduced = upstream_reduction(top, base)
+    if reduced:
+        label = f"{label}, with an upstream merge reduced to its resolution"
+        prefix, withheld, count = reduced_text(top, reduced, red)
+        base = reduced["last"]
+    else:
+        prefix, withheld, count = "", [], 0
     head = (f"[Change in the working tree against {label} (git diff, {base[:12]} to the files as they are now; untracked files included). "
             f"{SECTIONS_NOTE}]\n\n")
-    diff, withheld = safe_diff(top, base, now["tree"])
-    diff, count = redact_diff(red, diff)
-    text = head + (diff if diff.strip() else f"(empty: the working tree is identical to {label})\n")
+    if reduced:
+        head += reduced_note(reduced) + "\n"
+        label = f"merge {base[:12]}"
+    diff, more = safe_diff(top, base, now["tree"])
+    withheld += [p for p in more if p not in withheld]
+    diff, found = redact_diff(red, diff)
+    count += found
+    text = head + prefix + (diff if diff.strip() else f"(empty: the working tree is identical to {label})\n")
     extra, more, found, held = held_sections(top, base, now["tree"], red)
-    return text + extra, withheld + [p for p in more if p not in withheld], count + found, make_plan(top, base, basis, now["tree"], held)
+    return (text + extra, withheld + [p for p in more if p not in withheld], count + found,
+            make_plan(top, base, basis, now["tree"], held, reduced=reduced))
+
+
+def upstream_reduction(top, base):
+    """None, or {"origin": the review base commit, "last": the last upstream merge, "merges": [{"merge", "first", "upstream",
+    "paths"}] oldest first}: the merge commits on the first-parent line from `base` to HEAD that merge an upstream branch, a merge
+    of exactly two parents whose second parent is not a descendant of `base` (a branch the step did not start from). `paths` are
+    the paths the merge's resolution changes (git show --remerge-diff, empty for a clean auto-merge). None when there is no such
+    merge, `base` or HEAD is not a commit, or git cannot answer (no --remerge-diff before git 2.36): the caller then keeps the
+    ordinary diff against `base`. An octopus merge, and a merge of a branch that descends from `base`, are ordinary commits."""
+    root = commit_of(top, base)
+    if root is None or commit_of(top, "HEAD") is None:
+        return None
+    listed = git(top, "rev-list", "--first-parent", "--merges", "--parents", "--reverse", f"{root}..HEAD")
+    if listed.returncode:
+        return None
+    merges = []
+    for line in listed.stdout.splitlines():
+        ids = line.split()
+        if len(ids) != 3:
+            continue
+        merge, first, upstream = ids
+        descends = git(top, "merge-base", "--is-ancestor", root, upstream).returncode
+        if descends == 0:
+            continue
+        if descends != 1:
+            return None
+        names = subprocess.run(["git", "-C", top, "show", "--remerge-diff", "--format=", "--name-only", "-z", "--no-renames", merge],
+                               capture_output=True)
+        if names.returncode:
+            return None
+        try:
+            paths = sorted({p.decode("utf-8") for p in names.stdout.split(b"\0") if p})
+        except UnicodeDecodeError:
+            return None
+        merges.append({"merge": merge, "first": first, "upstream": upstream, "paths": paths})
+    return {"origin": root, "last": merges[-1]["merge"], "merges": merges} if merges else None
+
+
+def reduced_ranges(reduced):
+    """[(commit the commits before this merge start from, merge)]: what the lane authored before each merge is that commit to
+    the merge's first parent (nothing when they are the same commit); the next merge starts from this one."""
+    out, old = [], reduced["origin"]
+    for merge in reduced["merges"]:
+        out.append((old, merge))
+        old = merge["merge"]
+    return out
+
+
+def reduced_note(reduced):
+    """The sentence that says an upstream merge was reduced to its resolution, naming each merge and its upstream parent."""
+    merges = "; ".join(f"merge commit {m['merge'][:12]} brought in upstream {m['upstream'][:12]}" for m in reduced["merges"])
+    return (f"[An upstream merge was reduced to its resolution: {merges}. For each, only the conflict resolutions and edits made in the "
+            "merge commit (git show --remerge-diff) are shown, and the commits around it as their own diffs; everything else upstream "
+            "brought in is out of scope and not shown. The changed files and scoped commands follow the same reduced set.]\n")
+
+
+def remerge_diff(top, merge, paths, check):
+    """(text, withheld paths): `git show --remerge-diff` of the merge commit for the `paths` of its resolution, with the same rule as
+    safe_diff: a sensitive path is named and its contents withheld, a generated file is named and left out, and gate() checks the
+    text. A merge whose resolution changes nothing gives ("", [])."""
+    withheld = [p for p in paths if check(top, p)]
+    generated = [p for p in paths if p not in withheld and GENERATED.search(p)]
+    safe = [p for p in paths if p not in withheld and p not in generated]
+    body = ""
+    for at in range(0, len(safe), LS_CHUNK):
+        chunk = safe[at:at + LS_CHUNK]
+        run = subprocess.run(["git", "-C", top, "-c", "core.quotepath=false", "show", "--remerge-diff", "--format=", "--no-color",
+                              "--no-ext-diff", "--no-textconv", "--no-renames", merge, "--", *chunk],
+                             capture_output=True, env={**os.environ, "GIT_LITERAL_PATHSPECS": "1"})
+        if run.returncode:
+            raise Refused(f"cannot show the resolution of merge {merge[:12]}: {run.stderr.decode('utf-8', 'replace').strip()}")
+        part = run.stdout.decode("utf-8", "surrogateescape")
+        gate(part, chunk, withheld)
+        body += part
+    notes = "".join(f"{json.dumps(p)}: sensitive path, its contents were withheld from this diff\n" for p in withheld)
+    notes += "".join(f"{json.dumps(p)}: generated file, its contents were left out of this diff; open it if needed\n" for p in generated)
+    return notes + body, withheld
+
+
+def reduced_text(top, reduced, red):
+    """(text, withheld paths, redaction count): the sections before the last merge, in commit order: for each upstream merge the
+    commits the lane made before it (first-parent diff), then its resolution (remerge_diff). Each goes through safe_diff or
+    remerge_diff and redact_diff; an empty section is a line saying so for a resolution, nothing for commits."""
+    check = sensitive_checker()
+    text, withheld, total = "", [], 0
+    for old, merge in reduced_ranges(reduced):
+        if old != merge["first"]:
+            diff, more = safe_diff(top, old, merge["first"])
+            diff, count = redact_diff(red, diff)
+            withheld += [p for p in more if p not in withheld]
+            total += count
+            text += f"\nCommitted before merge {merge['merge'][:12]} ({old[:12]} to {merge['first'][:12]}):\n{diff}" if diff.strip() else ""
+        diff, more = remerge_diff(top, merge["merge"], merge["paths"], check)
+        diff, count = redact_diff(red, diff)
+        withheld += [p for p in more if p not in withheld]
+        total += count
+        text += (f"\nResolution of merge {merge['merge'][:12]} (upstream parent {merge['upstream'][:12]}; git show --remerge-diff):\n"
+                 + (diff if diff.strip() else "(empty: the merge is a clean auto-merge, nothing was resolved or edited in it)\n"))
+    return text + f"\nCommitted after the last merge and not committed ({reduced['last'][:12]} to the files as they are now):\n", withheld, total
 
 
 STAGED_HEAD = "Staged, not in the working files:"
@@ -787,27 +903,33 @@ def held_sections(top, base, tree, red, anchor=None):
     return text, withheld, total, sorted(paths)
 
 
-def make_plan(top, base, basis, tree, held, previous=0):
+def make_plan(top, base, basis, tree, held, previous=0, reduced=None):
     """The scope's input, from the same computation that built the attached diffs: `paths` is exactly the union of the paths of
     the main diff (`base` to `tree`) and of every held section (`held`, from held_sections or held_plan). `base` is what the main
     diff compares against (in a later round, `previous` > 0 is that round, the tree it reviewed); `basis` says which review base
     a lane's round 1 used; `head` is what scoped commands name as HEAD (the empty tree when there is no commit);
-    `untracked` the paths no commit or index holds."""
-    paths = sorted(changed_paths(top, base, tree) | set(held))
+    `untracked` the paths no commit or index holds. `reduced` (upstream_reduction) is kept in the plan, with `base` the last merge: the
+    paths then also include those of every section before it."""
+    paths = changed_paths(top, base, tree) | set(held)
+    for old, merge in reduced_ranges(reduced) if reduced else ():
+        paths |= changed_paths(top, old, merge["first"]) | set(merge["paths"])
+    paths = sorted(paths)
     others = git(top, "ls-files", "--others", "--exclude-standard", "-z")
     if others.returncode:
         raise Refused(f"git could not list the untracked files: {others.stderr.strip()}")
     new = {p for p in others.stdout.split("\0") if p}
     return {"top": top, "base": base, "basis": basis, "previous": previous, "head": head_name(top),
             "has_head": git(top, "rev-parse", "--verify", "-q", "HEAD").returncode == 0,
-            "paths": paths, "untracked": [p for p in paths if p in new]}
+            "paths": paths, "untracked": [p for p in paths if p in new], "reduced": reduced}
 
 
 def plan_for(now, lane):
     """The plan for the change against the review base without making any diff text (what a round-1 prepare gives); raises Refused."""
     base, basis = review_base(now["top"], lane)
+    reduced = upstream_reduction(now["top"], base)
+    base = reduced["last"] if reduced else base
     note, sections = held_plan(now["top"], base, now["tree"])
-    return make_plan(now["top"], base, basis, now["tree"], set().union(*[s[3] for s in sections]) if sections else set())
+    return make_plan(now["top"], base, basis, now["tree"], set().union(*[s[3] for s in sections]) if sections else set(), reduced=reduced)
 
 
 def reviewed_history(top, state, lane):
@@ -937,7 +1059,8 @@ def load_plan(source):
     if isinstance(source, (str, os.PathLike)):
         source = read_json(Path(source))
     keys = {"top": str, "base": str, "basis": str, "previous": int, "head": str, "has_head": bool, "paths": list, "untracked": list}
-    if not isinstance(source, dict) or any(not isinstance(source.get(k), t) for k, t in keys.items()):
+    if not isinstance(source, dict) or any(not isinstance(source.get(k), t) for k, t in keys.items()) \
+            or not isinstance(source.get("reduced"), (dict, type(None))):
         raise Refused("the scope input written with the diffs is unreadable")
     return source
 
@@ -1026,6 +1149,9 @@ def render_scope(found, lane, list_file, max_bytes):
         relative, kinds = f"the tree review round {previous} reviewed ({base[:12]})", "committed, staged, unstaged and untracked"
     else:
         relative = base[:12] if lane else "HEAD"  # with no commit yet HEAD is the empty tree (the commands below name it)
+    reduced = plan.get("reduced")
+    if reduced:  # the review base, not the last merge the commands below start from
+        relative = f"{reduced['origin'][:12]} (an upstream merge reduced to its resolution; the last merge is {base[:12]})"
     out = [f"Diff scope: {len(safe)} file(s) changed relative to {relative} ({kinds}) in the repository at {literal(top)}:"]
     if basis:  # a lane task: which base the list and the commands below use, and what that leaves out of scope
         closed = " Closed steps are out of scope except where the new lines change or call them." if "closed step" in basis else ""
@@ -1074,13 +1200,18 @@ def render_scope(found, lane, list_file, max_bytes):
         out.append(f"Withheld (sensitive paths; never diff, show or read them): {', '.join(literal(p) for p in shown_withheld) or '(see the list file)'}"
                    + (f" and {more_withheld} more" if shown_withheld and more_withheld else ""))
     git = f"GIT_LITERAL_PATHSPECS=1 git -C {literal(top)}"
+    if reduced:
+        out.insert(1 if basis else 0, reduced_note(reduced).strip())
     # `head` names HEAD, or the empty tree when the repository has no commit yet, so every printed command runs
     committed = f"`{git} diff {base} {head} -- <path> [<path> ...]` (base against {'HEAD' if plan['has_head'] else 'the empty tree'}), " if base != head else ""
+    merge_commands = "".join(f" For merge {m['merge'][:12]}: `{git} show --remerge-diff {m['merge']} -- <path> [<path> ...]` (its resolution)"
+                             + (f" and `{git} diff {old} {m['first']} -- <path> [<path> ...]` (the commits before it)" if old != m["first"] else "") + "."
+                             for old, m in reduced_ranges(reduced)) if reduced else ""
     out.append(f"Scoped commands (keep the GIT_LITERAL_PATHSPECS=1 prefix: it makes each path a literal file name, never a glob or pathspec magic): "
                f"`{git} diff {base} -- <path> [<path> ...]` (working tree against the base), {committed}"
                f"`{git} diff --cached {head} -- <path> [<path> ...]` (staged: the index against {'HEAD' if plan['has_head'] else 'the empty tree'}), "
                f"`{git} diff --stat {base} -- <path> ...`. Run {'the working-tree, the base-against-HEAD and the staged commands' if committed else 'both the working-tree and the staged command'} for a path: a change "
-               "the working tree undoes shows only in the others. "
+               f"the working tree undoes shows only in the others.{merge_commands} "
                "Every `git diff`, `git show` and `git log -p` you run must keep that prefix and must name explicit file paths from the list above; never run them "
                "unscoped, with a bare directory, or on a path that is withheld. Write each path literally in the command; never put paths in a "
                "shell variable or array (`$p`, `\"${p[@]}\"`): the sensitive-read guard cannot see them and stops for permission. Split a long list "

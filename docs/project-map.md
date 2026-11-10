@@ -46,7 +46,7 @@ Design constants: state is plain files so any piece can be inspected or replaced
 | `bin/tp-spawn` (402 lines) | Build a packet and `run.sh`, open a hidden window, start the worker. Flags for worker, model, thinking, context files (`-c path[:a-b]`), notes, workdir, contract (`-k -o -b -p`), view. |
 | `tp-list`, `tp-view`, `tp-kill`, `tp-clean`, `tp-reset`, `tp-exit` | List, swap into viewer, stop, archive killed, stop all and reset, and end the workspace (with retention). |
 | `bin/tp-status` | Interactive live status pane (repaints only on change). |
-| Reporters | Write `state.json` (state, current tool, turns, tokens, cost) and `result.md` (last reply). Worker states: starting, working, tool, waiting, permission, error, done, failed, killed. |
+| Reporters | Write `state.json` (state, current tool, turns, tokens, cost) and `result.md`: for pi workers the last reply; for Claude workers the last reply with a valid `RESULT_STATUS:` line once there is one (a reply without one never replaces it and is kept under `results/`, counted as `laterReplies` in `state.json`). Worker states: starting, working, tool, waiting, permission, error, done, failed, killed. |
 | Context packets | The worker's first message: task, selected files or line ranges, notes. Workers load no AGENTS.md or CLAUDE.md. Size limits and a credential-file denylist. |
 
 ### 4b. Main-agent extensions (`agent/extensions/`, loaded into main pi)

@@ -199,7 +199,7 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
-    # Turns the worker did not start (a task notification) replied after its report; those replies are in results/, not result.md.
+    # Replies without a RESULT_STATUS line that came after a report with one (a task notification's, say); they are in results/.
     later = state.get("laterReplies")
     if isinstance(later, int) and not isinstance(later, bool) and later > 0 and state.get("laterReplyPath"):
         result["later_replies"] = later

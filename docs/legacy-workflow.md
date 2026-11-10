@@ -140,7 +140,14 @@ and `result.md` (the last reply). `task.md` shows title/ticket, lifecycle state,
 `agent/extensions/reporter.ts`, Claude workers through the tmux-pi plugin's hooks
 (`claude/plugins/tmux-pi/hooks/`). Claude's Stop settles the current submitted prompt;
 late tool hooks cannot reopen it until another UserPromptSubmit. The next prompt
-invalidates the previous `result.md` before work resumes. Hook writes serialize per
+withdraws the previous `result.md` before work resumes. For a Claude worker the reply
+decides what `result.md` holds, not who started the turn: a reply with a valid
+`RESULT_STATUS:` line (`lib/result_status.py`) replaces it; a reply without one
+(none, malformed, empty) never replaces a `result.md` that has one, so the report
+comes back at Stop and the reply is kept under `results/`, counted in `state.json`
+(`laterReplies`, `laterReplyPath`) and shown by `tp-agent inspect`/`list`. Every
+replaced or held-back reply is kept under `results/<n>.md`, never overwritten. A
+`result.md` without a status is replaced as before. Hook writes serialize per
 task using a macOS-compatible advisory lock; `tp-review` still requires both a
 result and a settled worker. Token counts include cached input; cost is shown
 only for pi providers that price tokens.

@@ -123,10 +123,31 @@ class BuildTests(BuildCase):
         rep, rc = cli.status_report(pkg or self.pkg)
         return rc, [t["code"] for t in rep["trust"]]
 
+    def legacy(self, expected, digests=None):
+        """Drop the digest of every recorded build (an entry from before digests), or set them from `digests` (file ->
+        digest), adopted as an external edit."""
+        m = json.loads((self.pkg / "package.json").read_text())
+        for entry in m["builds"]:
+            entry.pop("digest", None)
+            if digests:
+                entry["digest"] = digests[entry["file"]]
+        (self.pkg / "package.json").write_text(json.dumps(m))
+        return C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
+                                  "operations": [{"op": "adopt-external-edit", "by": "Main", "reason": "legacy"}]},
+                       expected)["revision"]
+
     def test_status_checks_every_recorded_build_and_a_deleted_last_build_is_restored(self):
         r = R.build(self.pkg)
         page = (self.pkg / BUILD).read_bytes()
         self.assertEqual(self.status_codes(), (0, []))
+        for form in ("digest", "legacy"):  # an entry from before digests is proved by the page this package renders
+            if form == "legacy":
+                self.legacy(4)
+                self.assertEqual((self.status_codes(), R.build(self.pkg)["up_to_date"]), ((0, []), True))
+            self.tamper_rows(r, page, form)
+        self.tail_rows(page)  # the last build's entry has no digest from here on
+
+    def tamper_rows(self, r, page, form):
         tampers = {
             "delete": (lambda p: p.unlink(), "package.build-missing"),
             "truncate": (lambda p: p.write_bytes(page[:100]), "package.build-changed"),
@@ -136,7 +157,7 @@ class BuildTests(BuildCase):
                         "package.build-changed"),
         }
         for why, (tamper, code) in tampers.items():
-            with self.subTest(why):
+            with self.subTest(why, form=form):
                 tamper(self.pkg / BUILD)
                 self.assertEqual(self.status_codes(), (3, [code]))
                 rc, out, _ = self.run_cli("status", self.pkg)
@@ -161,6 +182,8 @@ class BuildTests(BuildCase):
                 self.assertEqual((self.pkg / BUILD).read_bytes(), page)
                 self.assertEqual(T.file_digest(self.pkg / BUILD), r["digest"])
                 self.assertEqual(self.status_codes(), (0, []))
+
+    def tail_rows(self, page):
         # the whole builds/ folder deleted: made again as for a new build, the bytes restored, and the text says so
         shutil.rmtree(self.pkg / "builds")
         rc, out, err = self.run_cli("build", self.pkg)
@@ -183,15 +206,29 @@ class BuildTests(BuildCase):
                 (self.tmp / "elsewhere").rmdir()
                 self.assertTrue(R.build(self.pkg)["restored"])
         # an older recorded build that is deleted cannot be rendered again: build refuses by name, as status reports it
+        self.legacy(5, {BUILD: T.file_digest(self.pkg / BUILD)})
         C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
                            "operations": [{"op": "set", "id": "rule.required-fields",
-                                           "fields": {"statement": "Refused; the message names each field."}}]}, 4)
+                                           "fields": {"statement": "Refused; the message names each field."}}]}, 6)
         R.build(self.pkg)
         (self.pkg / BUILD).unlink()
         self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
         e = self.refused("package.build-missing", 3)
         self.assertIn(BUILD + " is missing", str(e))
         self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
+        # put back, that older entry from before digests (another source) cannot be proved, whatever its bytes: status
+        # does not trust it and build refuses by name (never up to date, nothing written)
+        (self.pkg / BUILD).write_bytes(page)
+        self.assertEqual(self.status_codes(), (0, []))
+        self.legacy(8)
+        self.assertEqual(self.status_codes(), (3, ["package.build-unproved"]))
+        e = self.refused("build.unproved", 3)
+        self.assertIn(BUILD + " has no recorded digest", str(e))
+        # an uncommitted edit proves nothing either: status renders only the files the commit records
+        m = json.loads((self.pkg / "package.json").read_text())
+        m["title"] += " (edited)"
+        (self.pkg / "package.json").write_text(json.dumps(m))
+        self.assertEqual(self.status_codes(), (3, ["package.build-unproved", "package.external-edit"]))
 
     def test_page_is_offline_and_package_text_is_inert(self):
         C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",

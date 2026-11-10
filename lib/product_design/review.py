@@ -328,10 +328,11 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
 
     Every build the manifest records is checked first, as `status` checks it (_recorded_builds): one that is gone is
     written back (restored) when this source still renders its recorded digest at its revision, its folder created as
-    for a new build; any other recorded build that is not its recorded bytes is refused by name (build.exists or
+    for a new build; any other recorded build whose bytes are not proved (its digest, or for an entry from before
+    digests the page this package renders for it) is refused by name (build.exists, build.unproved or
     package.build-missing, exit 3) before a build file is written, so a build that succeeds leaves no build problem for
-    `status` to report. Up to date means: the last recorded build shows this source (its file is then its recorded
-    bytes). The build file is written before the commit
+    `status` to report. Up to date means: the last recorded build shows this source (its bytes are then proved). The
+    build file is written before the commit
     point; if the commit fails before that point (any exception, an interrupt included) the file is removed again, but
     only while it holds this build's bytes; after it, the file is never removed (the journal records it, and recovery
     refuses to commit an entry whose file is missing or differs)."""
@@ -361,14 +362,12 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
                   "source_fingerprint": b["source_fingerprint"], "content_fingerprint": b["content_fingerprint"],
                   "warnings": data["warnings"], "reanchored": reanchored}
         builds = docs["manifest"].get("builds", [])
-        restored = _recorded_builds(root, builds, b["source_fingerprint"],
-                                    lambda rev: render_html(payload(docs, rev, adapter, script, style, runtime_js,
-                                                                    runtime_css), runtime_js, runtime_css, script, style),
+        restored = _recorded_builds(root, docs, b["source_fingerprint"], build_prover(root, (runtime_js, runtime_css)),
                                     fault)
         result["restored"] = bool(restored)
         last = builds[-1] if builds else None
         if last and last.get("source") == b["source_fingerprint"]:
-            # every recorded build is its recorded bytes now (_recorded_builds refused or restored the rest)
+            # every recorded build's bytes are proved now (_recorded_builds refused or restored the rest)
             return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"))
         page = render_html(data, runtime_js, runtime_css, script, style)
         page_digest = "sha256:" + hashlib.sha256(page).hexdigest()
@@ -434,30 +433,59 @@ def _builds_dir(root, rel):
                            details={"file": rel, "problem": exc.strerror}) from None
 
 
-def _recorded_builds(root, builds, source, render_at, fault) -> list:
-    """Every build the manifest records, checked as `status` checks it (store.build_file_problem). A build file that is
-    gone (nothing at its name) is written back in place when this source still renders it byte for byte: its entry
-    has this source fingerprint and the page made at its revision has its digest. Everything else is refused by name
-    before anything is written: a recorded file that is there but is not the recorded build (other bytes, not a regular
-    file, a link on its way: build.exists, never replaced) and a gone file this source no longer renders
-    (package.build-missing: only its own bytes can be put back, from version control). Returns the files restored."""
-    changed, missing, todo = [], [], []
-    for entry in builds:
-        if not isinstance(entry, dict):
-            changed.append((str(entry), "is not a build entry"))
-            continue
-        rel = entry.get("file")
-        want = entry.get("digest") if isinstance(entry.get("digest"), str) else None
-        why = T.build_file_problem(root, rel, want)
-        if why is None:
-            continue
-        if isinstance(rel, str) and rel and not os.path.lexists(Path(root) / rel):
-            if entry.get("source") == source:
-                page = render_at(entry["revision"])
-                if want is None or "sha256:" + hashlib.sha256(page).hexdigest() == want:
-                    todo.append((rel, page))
+def build_prover(package_dir, assets=None):
+    """prove(docs, entry) for store.recorded_build_problems: the page `docs` renders for a recorded build, the bytes
+    that build must hold, or None when docs no longer render it (its entry records another source fingerprint). An
+    entry without a source fingerprint is rendered at its revision as it is: only identical bytes then prove it.
+    Raises StoreError when the package cannot render (an invalid adapter or runtime asset). Read-only; the adapter and
+    assets are read once, on the first entry that needs them, and each revision is rendered once."""
+    root, cache = Path(package_dir), {}
+
+    def prove(docs, entry):
+        if "parts" not in cache:
+            runtime_js, runtime_css = assets or runtime_assets()
+            adapter, script, style = read_adapter(root, docs)
+            cache["parts"] = (adapter, script, style, runtime_js, runtime_css)
+        adapter, script, style, runtime_js, runtime_css = cache["parts"]
+        rev = entry.get("revision")
+        if rev not in cache:
+            data = payload(docs, rev, adapter, script, style, runtime_js, runtime_css)
+            cache[rev] = (data["build"]["source_fingerprint"], render_html(data, runtime_js, runtime_css, script, style))
+        source, page = cache[rev]
+        return page if entry.get("source", source) == source else None
+    return prove
+
+
+def _recorded_builds(root, docs, source, prove, fault) -> list:
+    """Every build the manifest records, checked as `status` checks it (store.recorded_build_problems, with the same
+    prover): each must be a regular file whose bytes are proved (its digest, or for an entry from before digests the
+    page this committed package renders for it). A build file that is gone (nothing at its name) is written back in
+    place when this source still renders it: its entry has this source fingerprint and the page made at its revision
+    has its digest (or, without one, is that page). Everything else is refused by name before anything is written: a
+    file that is there but is not the recorded build (other bytes, not a regular file, a link on its way: build.exists,
+    never replaced), one whose bytes cannot be proved (build.unproved: no digest and no page to compare with), and a
+    gone file this source no longer renders (package.build-missing: only its own bytes can be put back, from version
+    control). Returns the files restored."""
+    changed, unproved, missing, todo = [], [], [], []
+    by_file = {}
+    for entry in docs["manifest"].get("builds", []):
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+            by_file.setdefault(entry["file"], []).append(entry)
+    for rel, why in T.recorded_build_problems(root, docs, prove):
+        if isinstance(rel, str) and rel and not os.path.lexists(Path(root) / rel):  # gone (or its folder is not one)
+            for entry in by_file.get(rel, []):
+                if entry.get("source") != source:
                     continue
-            missing.append((rel, why))
+                page = prove(docs, entry)
+                want = entry.get("digest") if isinstance(entry.get("digest"), str) else None
+                if page is not None and (want is None or "sha256:" + hashlib.sha256(page).hexdigest() == want):
+                    if rel not in [r for r, _ in todo]:
+                        todo.append((rel, page))
+                    break
+            else:
+                missing.append((rel, why))
+        elif why.startswith(T.UNPROVED):
+            unproved.append((rel, why))
         else:
             changed.append((rel, why))
     if changed:
@@ -467,6 +495,13 @@ def _recorded_builds(root, builds, source, render_at, fault) -> list:
                                            + "; it was not replaced and it is not reported up to date. Move it aside "
                                            "and build again. No build file was written.", exit=3,
                            details={"file": rel, "problem": why, "builds": [{"file": r, "problem": w} for r, w in changed]})
+    if unproved:
+        raise T.StoreError("build.unproved", "; ".join(f"{r} {w}" for r, w in unproved) + ": the manifest records "
+                                             "that review build without a digest, and this package does not render it, "
+                                             "so it is not reported up to date. Check the file against version control, "
+                                             "then record its sha256 as the entry's digest (or remove the entry) with "
+                                             "an adopt-external-edit changeset. No build file was written.", exit=3,
+                           details={"builds": [{"file": r, "problem": w} for r, w in unproved]})
     if missing:
         raise T.StoreError("package.build-missing", "; ".join(f"{r} {w}" for r, w in missing) + ": the manifest records "
                                                     "that review build and this package no longer renders its bytes, "

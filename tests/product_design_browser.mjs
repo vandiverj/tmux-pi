@@ -644,6 +644,24 @@ async function limits(htmlPath, workDir) {
       await p.settle();
       out.recovered.push(save("recovered-3.json", await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
       check("the deep saved data stays as it was", (await p.ev(stored)) === raw);
+      // other bytes before the saved object (a BOM, an object around it), or the text cut right after a complete note:
+      // that note is still offered
+      const one = (id) => Object.assign({}, note, {id}), cuts = {
+        "note.bom.1": (t) => "\ufeff" + t,
+        "note.wrap.1": (t) => '[{"a":' + t,
+        "note.cut.1": (t) => t.slice(0, t.indexOf(JSON.stringify(one("note.cut.1"))) + JSON.stringify(one("note.cut.1")).length)};
+      for (const [id, cut] of Object.entries(cuts)) {
+        const text = cut(JSON.stringify(Object.assign({}, saved, {notes: [one(id)]})));
+        out.recoverable.push(id);
+        await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(text)})`);
+        await p.reload();
+        d = await p.dbg();
+        check(`${id}: refused, and its complete note is offered`, d.notes === 0 && (await p.count("#tp-saved-export")) === 1, d.storageNotice);
+        await p.click("#tp-saved-export");
+        await p.settle();
+        out.recovered.push(save(`recovered-${id}.json`, await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
+        check(`${id}: the saved data stays as it was`, (await p.ev(stored)) === text);
+      }
       const none = JSON.stringify(Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.bad.2", text: "lone \ud800"})]})).replace(/}$/, `,"zz":${nest}}`);
       await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(none)})`);
       await p.reload();

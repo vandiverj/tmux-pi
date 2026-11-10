@@ -25,8 +25,9 @@ def _issue_lines(issues):
 
 
 def status_report(package_dir) -> tuple:
-    """(report dict, exit status). Read-only."""
-    state = T.inspect(package_dir)
+    """(report dict, exit status). Read-only. A recorded build is trusted only when its bytes are proved: its digest, or
+    for an entry from before digests the page the committed package renders for it (review.build_prover)."""
+    state = T.inspect(package_dir, R.build_prover(package_dir))
     docs = state["docs"]
     trust = [{"code": c, "message": m} for c, m in T.trust_problems(state)]
     rep = {"package": None, "revision": None, "trusted": not trust, "trust": trust, "issues": [i._asdict() for i in state["issues"]]}
@@ -219,7 +220,7 @@ def main(argv=None, out=None, err=None) -> int:
                 _print_status(rep, out)
             return code
         if args.command == "validate":
-            state = T.inspect(args.package_dir)
+            state = T.inspect(args.package_dir, R.build_prover(args.package_dir))
             trust = T.trust_problems(state)
             if as_json:
                 print(json.dumps({"valid": not state["issues"], "trusted": not trust,

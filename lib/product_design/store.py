@@ -294,7 +294,7 @@ def load_txn(root) -> dict:
 
 # ---------------------------------------------------------------- inspection (read-only)
 
-def inspect(package_dir) -> dict:
+def inspect(package_dir, prove=None) -> dict:
     """What a reader must know before trusting the package. Never writes.
 
     Returns {docs, issues, commit, commit_state, commit_digest, interrupted, external, authority_changed,
@@ -314,8 +314,11 @@ def inspect(package_dir) -> dict:
       control            (code, message) for control records that disagree with each other: not trusted
       builds             (file, why) for each build the interrupted commit records whose file is missing or not the
                          recorded bytes: recovery refuses to commit it (build_problems)
-      recorded_builds    (file, why) for each build the manifest records whose file is missing, not a regular file, or
-                         not the recorded digest (recorded_build_problems): what the commit says exists does not
+      recorded_builds    (file, why) for each build the manifest records whose bytes are not proved
+                         (recorded_build_problems): missing, not a regular file, not the recorded digest, or for an
+                         entry without a digest not the page `prove(docs, entry)` renders (review.build_prover). An
+                         entry without a digest is proved only against committed files: while a package file differs
+                         from the commit record (or without `prove`) it is unproved
     """
     root = Path(package_dir)
     docs, issues = P.read_docs(root)
@@ -358,11 +361,14 @@ def inspect(package_dir) -> dict:
         for message in agreement_problems(commit, hist["numbers"], hist["entries"], docs, out["interrupted"]):
             mismatch(message)
 
-    if not out["issues"]:  # a valid manifest: every build it records must be there, holding the recorded bytes
-        out["recorded_builds"] = recorded_build_problems(root, docs)
     committed = commit if commit is not None else {"files": {}, "authority": {}, "originals": {}}
     live = file_digests(docs)
     out["external"] = sorted(name for name in FILES.values() if live.get(name) != committed["files"].get(name))
+    if not out["issues"]:  # a valid manifest: every build it records must be there, holding bytes that are proved
+        if prove is not None and out["external"]:
+            def prove(_docs, _entry, files=", ".join(out["external"])):  # a render of uncommitted files proves nothing
+                raise StoreError("package.external-edit", f"{files} differ from the commit record")
+        out["recorded_builds"] = recorded_build_problems(root, docs, prove)
     if all(k in docs for k in FILES):
         current, before = P.authority_map(docs), committed["authority"]
         out["authority_changed"] = sorted(i for i in set(current) | set(before) if current.get(i) != before.get(i))
@@ -391,14 +397,24 @@ def trust_problems(state) -> list:
                     "the interrupted commit records review build(s) whose file is not the recorded build ("
                     + "; ".join(f"{rel} {why}" for rel, why in state["builds"]) + "); `tp-product apply DIR --recover` "
                     "refuses to commit them. Put the build file back, or move .tp-product/txn/ aside by hand"))
-    for code, verb in (("package.build-missing", "missing"), ("package.build-changed", "changed")):
-        found = [(rel, why) for rel, why in state.get("recorded_builds", ()) if (why == MISSING) == (verb == "missing")]
-        if found:
-            out.append((code, "the manifest records review build(s) that are " + verb + " ("
-                        + "; ".join(f"{rel} {why}" for rel, why in found) + "); a reader cannot rely on the recorded "
-                        "build. Put the recorded file back (from version control), or "
-                        + ("" if verb == "missing" else "move it aside and ") + "run `tp-product build DIR`, which "
-                        "restores the last build when it still renders the recorded bytes"))
+    def kind(why):
+        return "missing" if why == MISSING else "unproved" if why.startswith(UNPROVED) else "changed"
+    for code, verb in (("package.build-missing", "missing"), ("package.build-changed", "changed"),
+                       ("package.build-unproved", "unproved")):
+        found = [(rel, why) for rel, why in state.get("recorded_builds", ()) if kind(why) == verb]
+        if not found:
+            continue
+        listed = "; ".join(f"{rel} {why}" for rel, why in found)
+        if verb == "unproved":
+            out.append((code, "the manifest records review build(s) from before digests whose bytes cannot be proved ("
+                        + listed + "); a reader cannot rely on them. Check each file against version control, then "
+                        "record its sha256 as the entry's digest (or remove the entry) with an adopt-external-edit "
+                        "changeset"))
+            continue
+        out.append((code, "the manifest records review build(s) that are " + verb + " (" + listed + "); a reader "
+                    "cannot rely on the recorded build. Put the recorded file back (from version control), or "
+                    + ("" if verb == "missing" else "move it aside and ") + "run `tp-product build DIR`, which "
+                    "restores the last build when it still renders the recorded bytes"))
     if state["commit"] is None and state["commit_state"] != "bad":  # a malformed one is reported above
         out.append(("package.uncommitted", "no commit record (.tp-product/commit.json): not created by `tp-product init`, "
                                             "or its control state was removed"))
@@ -676,9 +692,13 @@ def file_digest(path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def build_file_problem(root, rel, want=None) -> Optional[str]:
-    """Why root/rel is not the review build a manifest entry records (a regular file below the package, no link on the
-    way, with digest `want` when given), or None."""
+def build_file_problem(root, rel, want=None, render=None) -> Optional[str]:
+    """Why root/rel is not the review build a manifest entry records, or None: a regular file below the package, no
+    link on the way, whose bytes are proved. With digest `want`, the proof is that digest. Without one (an entry from
+    before digests), `render` is how the bytes are proved: called, it returns the page the committed package renders for
+    that entry (bytes, which the file must equal), or None when the package no longer renders that build; it may raise
+    StoreError (the package cannot render). Without either, only the file's presence is checked (build_problems: a
+    journal entry this code wrote, whose operations always carry the digest)."""
     if not isinstance(rel, str) or not rel:
         return "is not a file name"
     path = Path(root) / rel
@@ -691,8 +711,16 @@ def build_file_problem(root, rel, want=None) -> Optional[str]:
         return f"cannot be read ({getattr(exc, 'strerror', None) or exc})"
     if not stat.S_ISREG(st.st_mode):
         return "is not a regular file"
-    if want is None:
+    if want is None and render is None:
         return None
+    if want is None:
+        try:
+            page = render()
+        except StoreError as exc:
+            return UNPROVED + f" (the package cannot render it: {exc})"
+        if page is None:
+            return UNPROVED + " (this package no longer renders that build)"
+        want = "sha256:" + hashlib.sha256(page).hexdigest()
     try:
         got = file_digest(path)
     except OSError as exc:
@@ -701,19 +729,26 @@ def build_file_problem(root, rel, want=None) -> Optional[str]:
 
 
 MISSING = "is missing"
+# An entry without a digest whose bytes cannot be compared with anything: never trusted, never reported up to date.
+UNPROVED = "has no recorded digest and its bytes cannot be proved"
 
 
-def recorded_build_problems(root, docs) -> list:
-    """[(file, why)] for each build the manifest records whose file is not that build: missing, not a regular file, or
-    (for an entry with a digest) other bytes. An entry from before digests is checked for a regular file only."""
+def recorded_build_problems(root, docs, prove=None) -> list:
+    """[(file, why)] for each build the manifest records whose bytes are not proved to be that build: missing, not a
+    regular file, other bytes than its digest, or (an entry from before digests) other bytes than the page the
+    committed package renders for it, or no such page. prove(docs, entry) returns that page (bytes) or None; without
+    `prove`, an entry with no digest is unproved."""
     builds = _get(docs, "manifest", "builds")
     out = []
     for b in builds if isinstance(builds, list) else []:
-        rel = b.get("file") if isinstance(b, dict) else None
-        why = build_file_problem(root, rel, b.get("digest") if isinstance(b.get("digest"), str) else None) \
-            if isinstance(b, dict) else "is not a build entry"
+        if not isinstance(b, dict):
+            out.append((None, "is not a build entry"))
+            continue
+        want = b.get("digest") if isinstance(b.get("digest"), str) else None
+        why = build_file_problem(root, b.get("file"), want,
+                                 (lambda b=b: prove(docs, b)) if prove is not None else (lambda: None))
         if why:
-            out.append((rel, why))
+            out.append((b.get("file"), why))
     return out
 
 

@@ -784,42 +784,72 @@
     var p = recordProblem(coll, r);
     return p ? "it would not be importable in an export bundle (" + p + ")" : null;
   }
-  // The records in stored text, found without parsing the whole of it (refused text may be too deep, cut short or not
-  // JSON at all): the elements of the top-level notes, inputs and sessions arrays and the session and run objects, as
-  // text slices. A key given twice keeps its last array, as JSON.parse does.
+  // The records in stored text, found without parsing the whole of it (refused text may be too deep, cut short, not
+  // JSON, or have other bytes around it), as text slices. One rule: a record is a complete object (its closing brace
+  // read, at the end of the text too) that is an element of an array given as the notes, inputs or sessions member of
+  // an object, at any depth, unless it lies inside another record (a note's captured state may hold anything); the
+  // session and run are complete object members of those names, outside records (the last one read). Outside any
+  // object the bytes are skipped (a BOM, whitespace, anything else) until a "{" that opens a well-formed first member
+  // ({ "name": ...) or none ({}); inside one only strings and brackets are followed. Anything else is not a record: an
+  // element that is no object, a member of another name, an object cut short. What each record is worth is decided
+  // after, record by record (salvagePlan).
   function storedParts(raw) {
     var out = {notes: [], inputs: [], sessions: [], session: null, run: null};
     if (typeof raw !== "string") return out;
-    var d = 0, top = 0, inStr = false, from = -1, last = null, key = null, arr = null, el = -1, obj = -1, objKey = null;
+    var n = raw.length;
+    function skipWs(j) {
+      for (var c; j < n && ((c = raw.charCodeAt(j)) === 32 || c === 9 || c === 10 || c === 13); j++);
+      return j;
+    }
+    function strEnd(j) {   // raw[j] is a quote: the index of the quote that closes the string, or -1 (cut short)
+      for (j += 1; j < n; j++) { var c = raw.charCodeAt(j); if (c === 92) j += 1; else if (c === 34) return j; }
+      return -1;
+    }
+    function opens(j) {    // raw[j] is "{": does an object start here?
+      var k = skipWs(j + 1);
+      if (k >= n || raw.charCodeAt(k) === 125) return true;
+      if (raw.charCodeAt(k) !== 34) return false;
+      var e = strEnd(k);
+      return e < 0 || (k = skipWs(e + 1)) >= n || raw.charCodeAt(k) === 58;
+    }
     function name(k) { try { return k === null ? null : JSON.parse(k); } catch (e) { return null; } }
-    for (var i = 0; i < raw.length; i++) {
-      var c = raw.charCodeAt(i);
-      if (inStr) {
-        if (c === 92) i += 1;
-        else if (c === 34) { inStr = false; if (d === 1) last = raw.slice(from, i + 1); }
-        continue;
-      }
-      if (c === 32 || c === 9 || c === 10 || c === 13) continue;
-      if (!top) top = c;
-      if (top !== 123) return out;   // only an object holds records
-      if (arr !== null && d === 2 && el < 0 && c !== 44 && c !== 93) el = i;
-      if (c === 34) { inStr = true; from = i; }
-      else if (c === 58 && d === 1) key = last;
-      else if (c === 44 && d === 1) key = null;
-      else if (c === 44 && d === 2 && arr !== null) { if (el >= 0) out[arr].push(raw.slice(el, i)); el = -1; }
-      else if (c === 123 || c === 91) {
-        if (d === 1) {
-          var k = name(key);
-          if (c === 91 && (k === "notes" || k === "inputs" || k === "sessions")) { arr = k; out[k] = []; el = -1; }
-          else if (c === 123 && (k === "session" || k === "run")) { obj = i; objKey = k; }
+    // the object at s and everything in it; returns the index after it (n when it is cut short). Each open bracket is
+    // a frame: an object's frame keeps the member name being read, an array's the collection its elements belong to;
+    // a record (or the session or run) is read as one slice, nothing inside it looked at.
+    function object(s) {
+      var stack = [], rec = -1, recDepth = 0, recInto = null;
+      for (var j = s; j < n; j++) {
+        var c = raw.charCodeAt(j), top = stack[stack.length - 1];
+        if (c === 34) {
+          var e = strEnd(j);
+          if (e < 0) return n;
+          if (rec < 0 && top && top.obj) top.last = raw.slice(j, e + 1);
+          j = e;
+        } else if (rec >= 0) {
+          if (c === 123 || c === 91) recDepth += 1;
+          else if (c === 125 || c === 93) {
+            recDepth -= 1;
+            if (recDepth === 0) {
+              if (c === 125) { if (recInto === "session" || recInto === "run") out[recInto] = raw.slice(rec, j + 1); else out[recInto].push(raw.slice(rec, j + 1)); }
+              rec = -1;
+            }
+          }
+        } else if (c === 58 && top && top.obj) top.key = name(top.last);
+        else if (c === 44 && top && top.obj) top.key = top.last = null;
+        else if (c === 123 && top && !top.obj && top.coll !== null) { rec = j; recDepth = 1; recInto = top.coll; }
+        else if (c === 123 && top && top.obj && (top.key === "session" || top.key === "run")) { rec = j; recDepth = 1; recInto = top.key; }
+        else if (c === 123) stack.push({obj: true, key: null, last: null});
+        else if (c === 91) stack.push({obj: false, coll: top && top.obj && (top.key === "notes" || top.key === "inputs" || top.key === "sessions") ? top.key : null});
+        else if (c === 125 || c === 93) {
+          stack.pop();
+          if (!stack.length) return j + 1;
         }
-        d += 1;
-      } else if (c === 125 || c === 93) {
-        d -= 1;
-        if (d === 1 && arr !== null && c === 93) { if (el >= 0) out[arr].push(raw.slice(el, i)); arr = null; el = -1; }
-        if (d === 1 && obj >= 0 && c === 125) { out[objKey] = raw.slice(obj, i + 1); obj = -1; }
-        if (d <= 0) break;
       }
+      return n;
+    }
+    for (var i = 0; i < n;) {
+      if (raw.charCodeAt(i) === 123 && opens(i)) i = object(i);
+      else i += 1;
     }
     return out;
   }
@@ -1776,6 +1806,13 @@
                                            error: RT.salvage.error, excluded: RT.salvage.excluded} : null});
     },
     summary: function () { return summaryText(); },
+    // what the recovery of refused saved data would offer for this stored text (read-only: nothing is stored, shown or
+    // downloaded): the importable parts as JSON text, the parse-free record scan's leftovers and the count
+    recoveryPlan: function (text) {
+      var plan = salvagePlan(String(text));
+      return {parts: plan.parts ? plan.parts.map(function (x) { return x.text; }) : null, error: plan.error,
+              excluded: plan.excluded.slice(), records: plan.records};
+    },
     settled: settled
   });
   document.addEventListener("DOMContentLoaded", start);

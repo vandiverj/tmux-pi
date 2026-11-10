@@ -189,7 +189,8 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file), including any recorded build whose bytes are not its recorded digest; it is never replaced and never reported up to date. Also when `builds/` is not a folder (a file) or is a symbolic link: nothing is written through it |
 | `build.conflict` | 3 | `build`: the commit failed before its commit point and the build file had been replaced by someone else meanwhile; their bytes are kept |
 | `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem. Also a `status` trust problem when a build the manifest records is missing, and a `build` refusal when that build cannot be written back (the package no longer renders its recorded bytes): nothing is written |
-| `package.build-changed` | 3 | `status`: a build the manifest records is not a regular file holding its recorded digest (truncated, rewritten, a directory, a symlink). `tp-product build` refuses to replace it (`build.exists`); once it is moved aside, build writes back every recorded build the committed package still renders byte for byte, and refuses (`package.build-missing`) for one it does not |
+| `package.build-changed` | 3 | `status`: a build the manifest records is not a regular file holding its recorded digest (for an entry from before digests: the page the committed package renders for it) (truncated, rewritten, a directory, a symlink). `tp-product build` refuses to replace it (`build.exists`); once it is moved aside, build writes back every recorded build the committed package still renders byte for byte, and refuses (`package.build-missing`) for one it does not |
+| `build.unproved`, `package.build-unproved` | 3 | `build` refuses, and `status` does not trust, a recorded build from before digests (no `digest` in its entry) whose bytes cannot be proved: the committed package no longer renders it (its entry records another source), cannot render it (an invalid adapter or asset), or (`status`) a package file differs from the commit record. Check the file against version control, then record its sha256 as the entry's `digest` (or remove the entry) with an `adopt-external-edit` changeset. Nothing is written |
 | `bundle.unreadable` | 1 | `import-feedback`: the bundle file cannot be read |
 | `bundle.invalid`, `bundle.conflict` | 1 | `import-feedback`: see Feedback ingestion; nothing was written |
 
@@ -371,12 +372,16 @@ other change, so the build moves the package to the next revision.
   point is `txn/txn.json` landing: once it is in place nothing in the same process removes it or the build file,
   whatever is raised (an interrupt included); recovery decides from then on.
 - **Every recorded build is checked.** `status` (`store.trust_problems`) verifies that each build in
-  the manifest's `builds` list is a regular file holding its recorded digest: a missing one is
-  `package.build-missing`, any other bytes `package.build-changed`, and status exits non-zero. `tp-product build`
-  checks the same list first: a recorded build that is missing (its folder too) and that the committed package still
+  the manifest's `builds` list is a regular file whose bytes are proved: its recorded digest, or for an entry from
+  before digests the page the committed package renders for it (`review.build_prover`, the same check for `status`
+  and `build`). A missing one is `package.build-missing`, any other bytes `package.build-changed`, an entry from
+  before digests that the package does not render (another source) or cannot render `package.build-unproved`, and
+  status exits non-zero. `tp-product build` checks the same list first, with the same prover: a recorded build that is
+  missing (its folder too) and that the committed package still
   renders byte for byte (same source, same digest) is written back in place, its folder made as for a new build
   (`restored`; the text says "restored", never "nothing was written"); one that is missing and no longer renders is
-  refused by name (`package.build-missing`, exit 3), and one that holds other bytes is refused (`build.exists`). A
+  refused by name (`package.build-missing`, exit 3), one that holds other bytes is refused (`build.exists`), and one
+  whose bytes cannot be proved is refused (`build.unproved`): it is never reported up to date. A
   `builds/` that is a file or a symbolic link is refused (`build.exists`); a build is never written through a link.
   Each refusal writes no build file, so `status` and `build` agree afterwards. An older build that is lost for good
   must be put back from version control before the package builds again.
@@ -392,8 +397,9 @@ other change, so the build moves the package to the next revision.
 - **Provenance.** The page records the package id, revision, generator, `content_fingerprint` (the design content
   that notes carry) and `source_fingerprint` (everything the page shows except the revision counter).
 - **Stable.** Building an unchanged package again reports "up to date" and writes nothing, but only when the recorded
-  build file holds exactly the recorded digest (an entry from before digests: exactly the page this content renders);
-  otherwise it is `build.exists`, never up to date. Importing notes changes no
+  build file holds exactly the recorded digest (an entry from before digests: exactly the page this content renders
+  for it); otherwise it is `build.exists` (or `build.unproved` when there is nothing to compare with), never up to
+  date. Importing notes changes no
   source fingerprint; a design change does. Identical bytes already at the build path are reused. A file there with
   other bytes is refused (`build.exists`, exit 3) and never replaced.
 - **Inert data.** Package text reaches the page only inside one JSON block whose `<`, `>`, `&`, U+2028 and U+2029 are
@@ -433,8 +439,12 @@ other change, so the build moves the package to the next revision.
   stored and says so. The notice for saved data it refused, for any reason (too deep to parse, not JSON, cut short,
   an unknown field, a bad record, a conflicting id), offers the stored bytes as a download as they are and, whenever
   at least one note or answer in them is importable on its own, an export of those records as importable parts.
-  The records are found in the stored text without parsing all of it, each checked for depth before it is parsed;
-  the others are listed by id with the reason, both records of a conflicting id among them. The refused data is never
+  The records are found in the stored text without parsing all of it, by one rule whatever surrounds them (other
+  bytes before or after, a BOM, the text cut short, a refused part before, between or after them): a record is a
+  complete object that is an element of a `notes`, `inputs` or `sessions` array at any depth, unless it lies inside
+  another record (a note's captured state may hold anything). Each is checked for depth before it is parsed and then
+  against every rule the CLI's import applies to it on its own; those it would import are offered, the others are
+  listed by id with the reason, both records of a conflicting id among them. The refused data is never
   taken into the page's state. What was last exported is saved as a short hash, so exporting never doubles what is stored.
 - **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions) and lists every part on the
   page with a save control and its JSON to copy, in case a download was blocked; the records count as exported only

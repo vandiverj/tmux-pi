@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
 from typing import Callable, Dict, List
 
 from . import package as P
@@ -37,6 +36,42 @@ def _need(op, *keys):
     missing = [k for k in keys if k not in op]
     if missing:
         raise OpError("op.missing", f"{op.get('op')} needs {', '.join(missing)}")
+
+
+def _get(rec, *path):
+    """rec[path...] or None: a record read in the middle of a changeset may be any shape until the result is validated."""
+    for key in path:
+        rec = rec.get(key) if isinstance(rec, dict) else None
+    return rec
+
+
+def load_json_input(raw, limit=None):
+    """(value, problem) for JSON input given as bytes, text or an already-parsed value. The same limits apply to every
+    form: at most `limit` bytes (of the UTF-8 text, or of the canonical JSON of a parsed value) and package.MAX_DEPTH
+    levels of nesting. problem is None or (code suffix: "size" | "unreadable" | "depth", message)."""
+    limit = MAX_BUNDLE_BYTES if limit is None else limit
+    if isinstance(raw, (bytes, bytearray, str)):
+        data = raw.encode("utf-8", "surrogatepass") if isinstance(raw, str) else bytes(raw)
+        if len(data) > limit:
+            return None, ("size", f"larger than {limit} bytes ({len(data)})")
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except RecursionError:
+            return None, ("depth", f"nested deeper than {P.MAX_DEPTH} levels")
+        except (UnicodeDecodeError, ValueError) as exc:
+            return None, ("unreadable", f"not JSON: {exc}")
+        depth = P.depth_problem(value)
+        return (None, ("depth", depth)) if depth else (value, None)
+    depth = P.depth_problem(raw)  # first: canonical() recurses
+    if depth:
+        return None, ("depth", depth)
+    try:
+        size = len(P.canonical(raw))
+    except (TypeError, ValueError, RecursionError) as exc:
+        return None, ("unreadable", f"not a JSON value: {exc}")
+    if size > limit:
+        return None, ("size", f"larger than {limit} bytes as JSON ({size})")
+    return raw, None
 
 
 def _find(work, rid, kinds):
@@ -73,6 +108,8 @@ def op_add(work, op, ctx):
         raise OpError("op.shape", f"add needs a known collection and a record object, got {coll!r}")
     kind = P.COLLECTIONS[coll][1]
     rid = rec.get("id")
+    if not isinstance(rid, str):
+        raise OpError("op.shape", f"add needs a record with a text id, got {rid!r}")
     if kind != "review":  # reviews are append-only: added, never edited
         _generic_kind(kind, rid)
     if rid in P.index(work):
@@ -81,7 +118,8 @@ def op_add(work, op, ctx):
     _refuse_authority(kind, fields, rid)
     if kind == "slice":
         r = rec.get("readiness")
-        if not isinstance(r, dict) or set(r) - {"state", "evidence"} or r.get("state") in P.ACCEPTED_STATES:
+        if not isinstance(r, dict) or set(r) - {"state", "evidence"} or not isinstance(r.get("state"), str) \
+                or r["state"] in P.ACCEPTED_STATES:
             raise OpError("op.authority", f"{rid}: a new slice starts as draft or ready-for-human-review; "
                                           "use set-readiness to accept it")
     work[P.COLLECTIONS[coll][0]][coll].append(copy.deepcopy(rec))
@@ -119,9 +157,9 @@ def op_supersede(work, op, ctx):
     _need(op, "id", "record")
     kind, old = _find(work, op["id"], {"rule", "decision"})
     new = op["record"]
-    if not isinstance(new, dict):
-        raise OpError("op.shape", "supersede needs the successor record")
-    if old["status"] == "superseded":
+    if not isinstance(new, dict) or not isinstance(new.get("id"), str):
+        raise OpError("op.shape", "supersede needs the successor record, with a text id")
+    if _get(old, "status") == "superseded":
         raise OpError("op.state", f"{op['id']} is already superseded by {old.get('superseded_by')}")
     _refuse_authority(kind, set(new), new.get("id"))
     if {"supersedes", "superseded_by"} & set(new):
@@ -135,7 +173,7 @@ def op_supersede(work, op, ctx):
 def op_accept_decision(work, op, ctx):
     _need(op, "id", "by", "date", "evidence")
     _, rec = _find(work, op["id"], {"decision"})
-    if rec["status"] == "superseded":
+    if _get(rec, "status") == "superseded":
         raise OpError("op.state", f"{op['id']} is superseded; accept its successor")
     rec["status"] = "accepted"
     rec.pop("acceptance", None)
@@ -147,7 +185,7 @@ def op_set_readiness(work, op, ctx):
     _need(op, "slice", "state")
     sid, state = op["slice"], op["state"]
     _, rec = _find(work, sid, {"slice"})
-    old = rec["readiness"]
+    old = rec.get("readiness") if isinstance(rec.get("readiness"), dict) else {}
     idx = P.index(work)
     if state in ("draft", "ready-for-human-review"):
         new = {"state": state}
@@ -163,25 +201,27 @@ def op_set_readiness(work, op, ctx):
         kind, review = idx.get(op["review"], (None, None))
         if kind != "review":
             raise OpError("op.kind", f"{op['review']!r} is not a review")
-        if review["reviewer"]["type"] != "human":
-            raise OpError("acceptance.not-human", f"{op['review']} is a {review['reviewer']['type']} review: only a human "
+        reviewer = _get(review, "reviewer", "type")
+        if reviewer != "human":
+            raise OpError("acceptance.not-human", f"{op['review']} is a {reviewer!r} review: only a human "
                                                   "review accepts a slice; a model review brings it at most to "
                                                   "ready-for-human-review")
         fp = P.slice_fingerprint(work, sid, idx)
-        if review["verdict"] != "accept" or sid not in review["scope"]:
+        scope = _get(review, "scope")
+        if _get(review, "verdict") != "accept" or not isinstance(scope, list) or sid not in scope:
             raise OpError("acceptance.review", f"{op['review']} does not accept {sid}")
-        if review["fingerprint"] != fp:
-            raise OpError("acceptance.fingerprint", f"{op['review']} reviewed {review['fingerprint']}; {sid} is now {fp}: "
-                                                    "it needs a review of the current content")
+        if _get(review, "fingerprint") != fp:
+            raise OpError("acceptance.fingerprint", f"{op['review']} reviewed {_get(review, 'fingerprint')!r}; {sid} is "
+                                                    f"now {fp}: it needs a review of the current content")
         rec["readiness"] = {"state": state, "acceptance": {
             "by": op["by"], "date": op["date"], "review": op["review"], "evidence": op["evidence"],
             "fingerprint": fp, "origin": "local"}}
         ctx["accepted"].append(sid)
     elif state == "implemented-verified":
         _need(op, "by", "date", "delivery")
-        if old["state"] not in P.ACCEPTED_STATES:
-            raise OpError("op.state", f"{sid} is {old['state']}: it is accepted for case preparation before it can be "
-                                      "implemented-verified")
+        if old.get("state") not in P.ACCEPTED_STATES or "acceptance" not in old:
+            raise OpError("op.state", f"{sid} is {old.get('state')!r}: it is accepted for case preparation before it "
+                                      "can be implemented-verified")
         rec["readiness"] = {"state": state, "acceptance": old["acceptance"], "delivery": {
             "by": op["by"], "date": op["date"], "evidence": op["delivery"], "origin": "local"}}
         ctx["accepted"].append(sid)
@@ -192,8 +232,8 @@ def op_set_readiness(work, op, ctx):
 def op_reconcile_input(work, op, ctx):
     _need(op, "id", "status", "by", "date", "outcome")
     _, rec = _find(work, op["id"], {"input"})
-    if rec["status"] != "pending":
-        raise OpError("op.state", f"{op['id']} is already {rec['status']}")
+    if _get(rec, "status") != "pending":
+        raise OpError("op.state", f"{op['id']} is already {_get(rec, 'status')!r}")
     if op["status"] not in ("reconciled", "declined"):
         raise OpError("op.shape", "status is reconciled or declined")
     event = {"by": op["by"], "date": op["date"], "outcome": op["outcome"], "origin": "local"}
@@ -205,7 +245,7 @@ def op_reconcile_input(work, op, ctx):
 def op_accept_uncertainty(work, op, ctx):
     _need(op, "question", "scope", "rationale", "revisit_trigger", "by", "date")
     _, rec = _find(work, op["question"], {"question"})
-    if rec["status"] in ("accepted-uncertainty", "withdrawn"):
+    if _get(rec, "status") in ("accepted-uncertainty", "withdrawn"):
         raise OpError("op.state", f"{op['question']} is {rec['status']}")
     rec.pop("decision", None)
     rec.update(status="accepted-uncertainty", uncertainty={
@@ -234,6 +274,48 @@ OPERATIONS = {
     "accept-uncertainty": op_accept_uncertainty, "set-disposition": op_set_disposition, "set-manifest": op_set_manifest,
     "adopt-external-edit": None,  # handled by apply: it must be the only operation
 }
+
+# The fields each operation takes: (required, optional), each field -> its type. Checked for every operation before the
+# package is read, so a wrong type is a refusal (op.missing, op.shape), never a crash. Unknown fields are refused.
+TYPES = {"text": (lambda v: isinstance(v, str), "text"),
+         "object": (lambda v: isinstance(v, dict), "an object"),
+         "list": (lambda v: isinstance(v, list), "a list"),
+         "texts": (lambda v: isinstance(v, list) and all(isinstance(e, str) for e in v), "a list of text")}
+_EVENT = {"by": "text", "date": "text"}
+SPECS = {
+    "add": ({"collection": "text", "record": "object"}, {}),
+    "set": ({"id": "text"}, {"fields": "object", "unset": "texts"}),
+    "replace": ({"id": "text", "record": "object"}, {}),
+    "supersede": ({"id": "text", "record": "object"}, {}),
+    "accept-decision": (dict(_EVENT, id="text", evidence="texts"), {}),
+    "set-readiness": ({"slice": "text", "state": "text"},
+                      dict(_EVENT, review="text", evidence="texts", delivery="list")),
+    "reconcile-input": (dict(_EVENT, id="text", status="text", outcome="text"), {"decision": "text"}),
+    "accept-uncertainty": (dict(_EVENT, question="text", scope="text", rationale="text", revisit_trigger="text"), {}),
+    "set-disposition": (dict(_EVENT, note="text", kind="text", rationale="text"), {"link": "text"}),
+    "set-manifest": ({"fields": "object"}, {}),
+    "adopt-external-edit": ({"by": "text", "reason": "text"}, {}),
+}
+
+
+def check_operation(n, op):
+    """Refuse an operation whose fields are missing, unknown or of the wrong type (StoreError op.missing / op.shape)."""
+    name = op["op"]
+    required, optional = SPECS[name]
+
+    def refuse(code, message):
+        raise T.StoreError(code, f"operation {n} ({name}): {message}. Nothing was written.", details={"operation": n})
+
+    missing = [k for k in required if k not in op]
+    if missing:
+        refuse("op.missing", f"needs {', '.join(missing)}")
+    extra = sorted(set(op) - set(required) - set(optional) - {"op"})
+    if extra:
+        refuse("op.shape", f"unknown field(s) {', '.join(map(str, extra))}")
+    for field, kind in list(required.items()) + list(optional.items()):
+        test, what = TYPES[kind]
+        if field in op and not test(op[field]):
+            refuse("op.shape", f"{field} is {what}, got {type(op[field]).__name__}")
 
 
 # ---------------------------------------------------------------- impact
@@ -293,6 +375,9 @@ def _open(package_dir, expected_revision, adopting=False):
     if any(i.code.startswith("file.") or i.code.startswith("control.") for i in state["issues"]):
         raise T.StoreError("package.unreadable", _issues_text(state["issues"]), exit=1,
                            details={"issues": [i._asdict() for i in state["issues"]]})
+    if state["control"]:  # control records that disagree are not believed, and not written over, even by an adoption
+        code, message = state["control"][0]
+        raise T.StoreError(code, "; ".join(m for _, m in state["control"]), exit=3)
     commit = state["commit"]
     if (commit is None or state["external"]) and not adopting:
         code, message = T.trust_problems(state)[0]
@@ -312,7 +397,11 @@ def _open(package_dir, expected_revision, adopting=False):
 
 
 def apply(package_dir, changeset, expected_revision, fault: Callable = T._noop) -> dict:
-    """Apply a changeset atomically. Returns {"committed": bool, "revision": N, "impact": {...}} or raises StoreError."""
+    """Apply a changeset atomically. Returns {"committed": bool, "revision": N, "impact": {...}} or raises StoreError.
+    `changeset` is a parsed value, JSON text or bytes; every form has the same size and depth limits."""
+    changeset, problem = load_json_input(changeset)
+    if problem:
+        raise T.StoreError("changeset.invalid", f"the changeset is {problem[1]}", details={"problem": problem[0]})
     problems = check_changeset(changeset)
     if problems:
         raise T.StoreError("changeset.invalid", "; ".join(problems), details={"problems": problems})
@@ -320,6 +409,8 @@ def apply(package_dir, changeset, expected_revision, fault: Callable = T._noop) 
         raise T.StoreError("changeset.invalid", f"the changeset expects revision {changeset['expected_revision']}, "
                                                 f"--expected-revision says {expected_revision}")
     ops = changeset["operations"]
+    for n, op in enumerate(ops):
+        check_operation(n, op)
     adopting = any(o["op"] == "adopt-external-edit" for o in ops)
     with T.lock(package_dir):
         state, current = _open(package_dir, expected_revision, adopting)
@@ -336,12 +427,13 @@ def apply(package_dir, changeset, expected_revision, fault: Callable = T._noop) 
             except OpError as exc:
                 raise T.StoreError(exc.code, f"operation {n} ({op['op']}): {exc}. Nothing was written.",
                                    details={"operation": n}) from None
-        return _finish(package_dir, docs, work, current, changeset, ctx, fault, before=docs)
+        return _finish(package_dir, state, work, current, changeset, ctx, fault, before=docs)
 
 
-def _finish(package_dir, live, work, current, changeset, ctx, fault, before):
-    """Validate `work` as revision current+1 and commit it. `live` is the docs on disk (their digests are the journal's
-    old state); `before` is the committed content to measure impact against, or None (an adopted edit: unknown)."""
+def _finish(package_dir, state, work, current, changeset, ctx, fault, before):
+    """Validate `work` as revision current+1 and commit it. `state` is the inspection the change was computed from: the
+    commit refuses to replace a file that no longer matches it; `before` is the committed content to measure impact
+    against, or None (an adopted edit: unknown)."""
     if before is not None and P.canonical(work) == P.canonical(before):
         return {"committed": False, "revision": current, "impact": None}
     work["manifest"]["revision"] = current + 1
@@ -361,7 +453,8 @@ def _finish(package_dir, live, work, current, changeset, ctx, fault, before):
              "actor": changeset["actor"], "summary": changeset["summary"], "evidence": changeset.get("evidence", []),
              "operations": changeset["operations"],
              "impact": effect and {k: effect[k] for k in ("changed", "stale", "unlinked", "content_fingerprint")}}
-    T.commit(package_dir, work, entry, fault=fault, base_digests=T.file_digests(live))
+    T.commit(package_dir, work, entry, fault=fault, base_digests=T.file_digests(state["docs"]),
+             base_commit=state["commit_digest"])
     return {"committed": True, "revision": current + 1, "impact": effect}
 
 
@@ -382,16 +475,14 @@ def _adopt(package_dir, state, current, changeset, fault):
                            "is recorded only by its operation. Restore those fields to their committed values, adopt "
                            "the rest, then record each acceptance with its operation. Nothing was written.",
                            details={"ids": state["authority_changed"]})
-    _need_adopt(changeset["operations"][0])
-    return _finish(package_dir, state["docs"], copy.deepcopy(state["docs"]), current, changeset, {"accepted": []}, fault,
+    if state["originals_changed"]:
+        raise T.StoreError("adopt.original",
+                           f"the edit removes or changes the original records {', '.join(state['originals_changed'])} "
+                           "(imported notes and inputs, review records): originals are kept verbatim. Restore them, adopt "
+                           "the rest, then record a disposition or reconciliation instead. Nothing was written.",
+                           details={"ids": state["originals_changed"]})
+    return _finish(package_dir, state, copy.deepcopy(state["docs"]), current, changeset, {"accepted": []}, fault,
                    before=None)
-
-
-def _need_adopt(op):
-    try:
-        _need(op, "by", "reason")
-    except OpError as exc:
-        raise T.StoreError("changeset.invalid", str(exc)) from None
 
 
 def check_changeset(cs) -> List[str]:
@@ -418,19 +509,24 @@ def check_changeset(cs) -> List[str]:
         out.append("operations is a non-empty list")
     else:
         for n, op in enumerate(ops):
-            if not isinstance(op, dict) or op.get("op") not in OPERATIONS:
+            if not isinstance(op, dict) or not isinstance(op.get("op"), str) or op["op"] not in OPERATIONS:
                 out.append(f"operation {n}: op must be one of {', '.join(OPERATIONS)}")
     return out
 
 
-def load_changeset(path) -> dict:
-    data = Path(path).read_bytes()
-    if len(data) > MAX_BUNDLE_BYTES:
-        raise T.StoreError("changeset.invalid", f"{path} is larger than {MAX_BUNDLE_BYTES} bytes")
+def load_changeset(path):
+    """The parsed changeset file. A file that cannot be read is changeset.unreadable; one that is too large, too deep
+    or not JSON is changeset.invalid (both exit 1)."""
     try:
-        return json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise T.StoreError("changeset.invalid", f"{path} is not JSON: {exc}") from None
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_BUNDLE_BYTES + 1)
+    except OSError as exc:
+        raise T.StoreError("changeset.unreadable", f"cannot read the changeset {path}: {exc.strerror or exc}",
+                           details={"path": str(path)}) from None
+    value, problem = load_json_input(data)
+    if problem:
+        raise T.StoreError("changeset.invalid", f"{path} is {problem[1]}", details={"problem": problem[0]})
+    return value
 
 
 # ---------------------------------------------------------------- feedback ingestion
@@ -453,22 +549,16 @@ def check_bundle(docs, raw) -> dict:
     notes/inputs  records new to the package, in bundle order
     duplicates  ids already present with the same content: importing them again is a no-op
     """
-    out = {"issues": [], "conflicts": [], "notes": [], "inputs": [], "duplicates": []}
+    out = {"issues": [], "conflicts": [], "notes": [], "inputs": [], "duplicates": [], "bundle": None}
 
     def issue(code, path, message):
         out["issues"].append(S.Issue(code, tuple(path), message))
 
-    if isinstance(raw, (bytes, bytearray)):
-        if len(raw) > MAX_BUNDLE_BYTES:
-            issue("bundle.size", (), f"larger than {MAX_BUNDLE_BYTES} bytes")
-            return out
-        try:
-            bundle = json.loads(bytes(raw).decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            issue("bundle.unreadable", (), f"not JSON: {exc}")
-            return out
-    else:
-        bundle = raw
+    bundle, problem = load_json_input(raw)  # bytes, text or a parsed value: the same size and depth limits
+    if problem:
+        issue("bundle." + problem[0], (), problem[1])
+        return out
+    out["bundle"] = bundle
     if not isinstance(bundle, dict):
         issue("bundle.shape", (), "a feedback bundle is a JSON object")
         return out
@@ -552,11 +642,7 @@ def ingest(package_dir, raw, actor="tp-product import", expected_revision=None, 
         work["reviews"]["notes"] += got["notes"]
         work["reviews"]["inputs"] += got["inputs"]
         cs = {"actor": actor, "summary": f"import feedback: {len(got['notes'])} note(s), {len(got['inputs'])} input(s)",
-              "evidence": [], "operations": [{"op": "import-feedback", "bundle": P.digest(_bundle_obj(raw)),
+              "evidence": [], "operations": [{"op": "import-feedback", "bundle": P.digest(got["bundle"]),
                                               "notes": result["added"]["notes"], "inputs": result["added"]["inputs"]}]}
-        done = _finish(package_dir, docs, work, current, cs, {"accepted": []}, fault, before=docs)
+        done = _finish(package_dir, state, work, current, cs, {"accepted": []}, fault, before=docs)
         return dict(result, committed=done["committed"], revision=done["revision"])
-
-
-def _bundle_obj(raw):
-    return json.loads(bytes(raw).decode("utf-8")) if isinstance(raw, (bytes, bytearray)) else raw

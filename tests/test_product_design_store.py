@@ -10,6 +10,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
@@ -598,6 +600,493 @@ class IngestTests(PackageCase):
         self.assertEqual(cm.exception.code, "revision.conflict")
         (self.pkg / "design.json").write_text((self.pkg / "design.json").read_text().replace("Rejected", "Refused"))
         self.refused_bundle("package.external-edit", bundle(self.note()))
+
+
+
+# ---------------------------------------------------------------- round 2: the five rules, rows kept from the attack
+
+def nested(depth):
+    """A JSON list nested `depth` levels deep (the outer list is level 1)."""
+    v = []
+    for _ in range(depth - 1):
+        v = [v]
+    return v
+
+
+def deep_text(depth):
+    return "[" * depth + "]" * depth  # json.dumps would recurse
+
+
+class ReadBackTests(PackageCase):
+    """Rule 1: what is committed can always be read back. The reader's limits (package.MAX_FILE_BYTES, MAX_DEPTH) are
+    checked on every file a commit writes; the input limits apply to bytes, text and parsed values alike."""
+    note = IngestTests.note
+    refused_bundle = IngestTests.refused_bundle
+
+    def setUp(self):
+        super().setUp()
+        for obj, name, value in ((C, "MAX_BUNDLE_BYTES", 16384), (P, "MAX_FILE_BYTES", 65536)):  # small, for speed
+            patcher = mock.patch.object(obj, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def padded(self, size, form):
+        b = bundle(self.note(state={"blob": ""}))
+        measure = (lambda v: len(P.canonical(v))) if form == "dict" else (lambda v: len(json.dumps(v).encode()))
+        b["notes"][0]["state"]["blob"] = "x" * (size - measure(b))
+        return {"bytes": lambda: json.dumps(b).encode(), "str": lambda: json.dumps(b), "dict": lambda: b}[form]()
+
+    def test_every_form_of_a_bundle_has_the_same_limits(self):
+        for form in ("bytes", "str", "dict"):
+            with self.subTest(form, size="at"):
+                self.assertTrue(C.ingest(self.pkg, self.padded(C.MAX_BUNDLE_BYTES, form))["committed"])
+                shutil.rmtree(self.pkg)
+                shutil.copytree(FIXTURE, self.pkg)
+            deep = bundle(self.note(state={"deep": nested(P.MAX_DEPTH - 3)}))  # bundle > notes > note > state
+            rows = [("size", self.padded(C.MAX_BUNDLE_BYTES + 1, form)),
+                    ("depth", {"bytes": json.dumps(deep).encode(), "str": json.dumps(deep), "dict": deep}[form])]
+            if form != "dict":
+                text = json.dumps(bundle(self.note(state={"deep": "DEEP"}))).replace('"DEEP"', deep_text(5000))
+                rows.append(("depth", text.encode() if form == "bytes" else text))  # once a RecursionError
+            for problem, raw in rows:
+                with self.subTest(form, problem=problem):
+                    err = self.refused_bundle("bundle.invalid", raw)
+                    self.assertEqual([i["code"] for i in err.details["issues"]], ["bundle." + problem])
+        at_depth = bundle(self.note(state={"deep": nested(P.MAX_DEPTH - 4)}))
+        self.assertEqual(P.depth_problem(at_depth), None)
+        self.assertTrue(C.ingest(self.pkg, at_depth)["committed"])
+
+    def test_every_form_of_a_changeset_has_the_same_limits(self):
+        big = cs({"op": "set-manifest", "fields": {"title": "Padded"}}, summary="s" * C.MAX_BUNDLE_BYTES)
+        deep = cs({"op": "set", "id": "rule.queue-order", "fields": {"examples": nested(P.MAX_DEPTH - 3)}})
+        far = json.dumps(cs({"op": "set", "id": "rule.queue-order", "fields": {"examples": "DEEP"}})).replace(
+            '"DEEP"', deep_text(5000))
+        rows = [("dict size", big, "size"), ("text size", json.dumps(big), "size"),
+                ("bytes size", json.dumps(big).encode(), "size"), ("dict depth", deep, "depth"),
+                ("text depth", json.dumps(deep), "depth"), ("far too deep", far, "depth")]
+        for name, changeset, problem in rows:
+            with self.subTest(name):
+                err = self.refused("changeset.invalid", changeset)
+                self.assertEqual(err.details, {"problem": problem})
+        self.assertTrue(C.apply(self.pkg, json.dumps(cs(CommitTests.EDIT)).encode(), 3)["committed"])  # bytes work
+
+    def test_commits_stop_before_a_file_the_reader_would_refuse(self):
+        # The reviewer's size probe: three bundles under the bundle limit once summed to a reviews.json no reader
+        # accepted. The result is checked before the commit point; the refused commit writes nothing.
+        for n in range(1, 40):
+            before, raw = self.files(), json.dumps(bundle(self.note(f"note.size.{n}", state={"b": "y" * 13000})))
+            try:
+                C.ingest(self.pkg, raw)
+            except T.StoreError as err:
+                self.assertEqual((err.code, err.exit, err.details["file"]), ("result.unreadable", 1, "reviews.json"))
+                break
+        self.assertGreater(n, 2)
+        self.assertEqual(self.files(), before)
+        self.assert_trusted(n + 2)
+        self.assertLessEqual((self.pkg / "reviews.json").stat().st_size, P.MAX_FILE_BYTES)
+
+    def test_one_change_at_and_over_the_file_limit(self):
+        with mock.patch.object(C, "MAX_BUNDLE_BYTES", 2 * P.MAX_FILE_BYTES):
+            probe = self.tmp / "probe"
+            shutil.copytree(FIXTURE, probe)
+            C.ingest(probe, bundle(self.note(state={"blob": ""})))
+            base = (probe / "reviews.json").stat().st_size
+            self.refused_bundle("result.unreadable",
+                                bundle(self.note(state={"blob": "q" * (P.MAX_FILE_BYTES + 1 - base)})))
+            C.ingest(self.pkg, bundle(self.note(state={"blob": "q" * (P.MAX_FILE_BYTES - base)})))
+        self.assertEqual((self.pkg / "reviews.json").stat().st_size, P.MAX_FILE_BYTES)
+        self.assert_trusted(4)  # read back at exactly the limit
+
+    def test_the_writer_checks_depth_on_a_parsed_result(self):
+        docs = self.docs()
+        docs["manifest"]["revision"] = 4
+        rec(docs, "rule.queue-order")["examples"] = nested(P.MAX_DEPTH)
+        state, before = T.inspect(self.pkg), self.files()
+        with T.lock(self.pkg), self.assertRaises(T.StoreError) as cm:
+            T.commit(self.pkg, docs, T.history_entry("a", "s", [], 3), base_digests=T.file_digests(state["docs"]),
+                     base_commit=state["commit_digest"])
+        self.assertEqual((cm.exception.code, cm.exception.details["file"]), ("result.unreadable", "design.json"))
+        self.assertEqual(self.files(), before)
+        self.assertFalse((self.pkg / ".tp-product/txn").exists())
+
+
+def edit_file(pkg, target):
+    """An outside writer's edit to `target`; returns a check that it is still on disk."""
+    if target == "history":
+        nums = T.history_numbers(pkg)
+        path = T.history_path(pkg, nums[-1] + 1 if nums else 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"foreign": true}\n')
+        return lambda: path.read_bytes() == b'{"foreign": true}\n'
+    path = pkg / (".tp-product/commit.json" if target == "commit.json" else target)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"external": true}\n')
+        return lambda: path.read_bytes() == b'{"external": true}\n'
+    doc = json.loads(path.read_text())
+    doc["x-outside"] = "kept"
+    path.write_text(json.dumps(doc))
+    return lambda: json.loads(path.read_text()).get("x-outside") == "kept"
+
+
+class WriterConflictTests(PackageCase):
+    """Rule 2: no write replaces bytes it has not seen. A file that differs, at the commit point or in roll-forward, from
+    what the change was computed from is someone else's write: refused, their bytes kept."""
+    TARGETS = ("package.json", "design.json", "reviews.json", "commit.json", "history")
+
+    def run_command(self, command, pkg, fault):
+        if command == "init":
+            return T.init(pkg, "fresh", "Fresh", fault=fault)
+        if command == "adopt":
+            return C.apply(pkg, cs({"op": "adopt-external-edit", "by": "Owner", "reason": "hand"}), 3, fault=fault)
+        if command == "ingest":
+            return C.ingest(pkg, bundle(IngestTests.note(self, "note.c.9")), fault=fault)
+        return C.apply(pkg, cs(CommitTests.EDIT), 3, fault=fault)
+
+    def fresh_pkg(self, command):
+        pkg = self.tmp / f"{command}-{len(list(self.tmp.iterdir()))}"
+        if command != "init":
+            shutil.copytree(FIXTURE, pkg)
+        if command == "adopt":
+            m = json.loads((pkg / "package.json").read_text())
+            m["title"] = m["title"] + " (hand edit)"
+            (pkg / "package.json").write_text(json.dumps(m))
+        return pkg
+
+    def test_an_edit_before_the_commit_point_is_kept_and_the_commit_refused(self):
+        for command in ("init", "apply", "adopt", "ingest"):
+            for target in self.TARGETS:
+                with self.subTest(command=command, target=target):
+                    pkg, kept = self.fresh_pkg(command), []
+
+                    def fault(point):
+                        if point == "before-commit-point":
+                            kept.append(edit_file(pkg, target))
+                    with self.assertRaises(T.StoreError) as cm:
+                        self.run_command(command, pkg, fault)
+                    self.assertEqual((cm.exception.code, cm.exception.exit), ("commit.external-edit", 3))
+                    self.assertTrue(kept[0]())
+                    self.assertFalse((pkg / ".tp-product/txn").exists())
+
+    def test_recovery_refuses_an_edit_to_any_file(self):
+        for command in ("init", "apply", "adopt", "ingest"):
+            for target in self.TARGETS:
+                with self.subTest(command=command, target=target):
+                    pkg = self.fresh_pkg(command)
+                    with self.assertRaises(Crash):
+                        self.run_command(command, pkg, crash_at("after-replace:design.json"))
+                    kept = edit_file(pkg, target)
+                    with T.lock(pkg), self.assertRaises(T.StoreError) as cm:
+                        T.recover(pkg)
+                    self.assertEqual((cm.exception.code, cm.exception.exit), ("txn.conflict", 3))
+                    self.assertTrue(kept())
+                    self.assertTrue((pkg / ".tp-product/txn/txn.json").exists())  # still reported as interrupted
+
+    def test_the_reviewers_editor_probe(self):
+        # An editor saved design.json between inspection and the commit point; the commit used to replace it.
+        def edit(point):
+            if point == "before-commit-point":
+                d = json.loads((self.pkg / "design.json").read_text())
+                d["rules"][0]["statement"] = "Unsaved external edit"
+                (self.pkg / "design.json").write_text(json.dumps(d))
+        with self.assertRaises(T.StoreError) as cm:
+            C.apply(self.pkg, cs({"op": "set-manifest", "fields": {"title": "New title"}}), 3, fault=edit)
+        self.assertEqual(cm.exception.code, "commit.external-edit")
+        state = T.inspect(self.pkg)
+        self.assertEqual(state["docs"]["design"]["rules"][0]["statement"], "Unsaved external edit")
+        self.assertEqual([c for c, _ in T.trust_problems(state)], ["package.external-edit"])
+
+    def test_a_history_entry_is_never_replaced(self):
+        foreign = b'{"foreign": true}\n'
+        (self.pkg / ".tp-product/history/000004.json").write_bytes(foreign)
+        self.refused("package.control-mismatch", cs(CommitTests.EDIT))
+        state = T.inspect(self.pkg)
+        docs = copy.deepcopy(state["docs"])
+        docs["manifest"]["revision"] = 4
+        with T.lock(self.pkg), self.assertRaises(T.StoreError) as cm:
+            T.commit(self.pkg, docs, T.history_entry("a", "s", [], 3), base_digests=T.file_digests(state["docs"]),
+                     base_commit=state["commit_digest"])
+        self.assertEqual((cm.exception.code, cm.exception.exit), ("history.exists", 3))
+        self.assertEqual((self.pkg / ".tp-product/history/000004.json").read_bytes(), foreign)
+
+
+class ControlRecordTests(PackageCase):
+    """Rule 3: control records are checked before they are believed. Malformed is a structured refusal (exit 1);
+    records that disagree with each other are untrusted (exit 3); nothing writes over a history entry."""
+    H3, TXN = ".tp-product/history/000003.json", ".tp-product/txn/txn.json"
+
+    @staticmethod
+    def rewrite(path, fn):
+        d = json.loads(path.read_text())
+        fn(d)
+        path.write_text(json.dumps(d))
+
+    def variants(self):
+        def commit(fn):
+            return lambda p: self.rewrite(p / ".tp-product/commit.json", fn)
+
+        def write(rel, data):
+            return lambda p: (p / rel).write_bytes(data)
+
+        def hist(dst, fn):
+            def f(p):
+                d = json.loads((p / self.H3).read_text())
+                fn(d)
+                (p / f".tp-product/history/{dst:06d}.json").write_text(json.dumps(d))
+            return f
+
+        def txn(fn):
+            return lambda p: self.rewrite(p / self.TXN, fn)
+        zero = "sha256:" + "0" * 64
+        return [  # name, mutate, interrupted first, exit
+            ("commit empty", write(".tp-product/commit.json", b""), False, 1),
+            ("commit a list", write(".tp-product/commit.json", b"[1]"), False, 1),  # once an AttributeError
+            ("commit revision text", commit(lambda d: d.update(revision="3")), False, 1),
+            ("commit revision bool", commit(lambda d: d.update(revision=True)), False, 1),
+            ("commit files a list", commit(lambda d: d.update(files=[])), False, 1),
+            ("commit digest a number", commit(lambda d: d["files"].update({"design.json": 1})), False, 1),
+            ("commit unknown field", commit(lambda d: d.update(extra=1)), False, 1),
+            ("commit revision lower", commit(lambda d: d.update(revision=2)), False, 3),
+            ("commit revision higher", commit(lambda d: d.update(revision=4)), False, 3),
+            ("history top missing", lambda p: (p / self.H3).unlink(), False, 3),
+            ("history top empty", write(self.H3, b""), False, 1),
+            ("history top a list", write(self.H3, b"[1]"), False, 1),
+            ("history top revision text", hist(3, lambda d: d.update(revision="3")), False, 1),
+            ("history top other files", hist(3, lambda d: d["files"].update({"design.json": zero})), False, 3),
+            ("history beyond the commit", hist(4, lambda d: d.update(revision=4)), False, 3),
+            ("history gap", hist(1, lambda d: d.update(revision=1)), False, 3),
+            ("txn empty", write(self.TXN, b""), True, 1),
+            ("txn a list", write(self.TXN, b"[1]"), True, 1),
+            ("txn revision text", txn(lambda d: d.update(revision="4")), True, 1),
+            ("txn revision lower", txn(lambda d: d.update(revision=2)), True, 1),  # disagrees with the journal's own entry
+            ("txn revision far ahead", txn(lambda d: d.update(revision=6)), True, 1),
+        ]
+
+    def snapshot(self):
+        return {str(p): p.read_bytes() for p in sorted(self.pkg.rglob("*")) if p.is_file() and p.name != "lock"}
+
+    def test_every_command_refuses_a_bad_control_record_without_a_traceback(self):
+        for name, mutate, interrupted, exit_code in self.variants():
+            with self.subTest(name):
+                shutil.rmtree(self.pkg)
+                shutil.copytree(FIXTURE, self.pkg)
+                if interrupted:
+                    with self.assertRaises(Crash):
+                        C.apply(self.pkg, cs(CommitTests.EDIT), 3, fault=crash_at("after-commit-point"))
+                mutate(self.pkg)
+                before = self.snapshot()
+                codes = {}
+                for command in ("status", "validate"):
+                    out = io.StringIO()
+                    rc = cli.main([command, str(self.pkg), "--json"], out=out, err=io.StringIO())
+                    json.loads(out.getvalue())
+                    codes[command] = rc
+                self.assertIn(codes["status"], (1, 3) if exit_code == 1 else (3,))
+                self.assertEqual(codes["validate"] != 0, True)
+                for command, run in (("apply", lambda: C.apply(self.pkg, cs(CommitTests.EDIT), 3)),
+                                     ("ingest", lambda: C.ingest(self.pkg, bundle(IngestTests.note(self))))):
+                    with self.assertRaises(T.StoreError) as cm:
+                        run()
+                    self.assertIn(cm.exception.exit, (1, 3), (command, cm.exception.code))
+                out = io.StringIO()
+                rc = cli.main(["apply", str(self.pkg), "--recover", "--json"], out=out, err=io.StringIO())
+                if interrupted:
+                    self.assertEqual(rc, exit_code, out.getvalue())
+                    self.assertFalse(json.loads(out.getvalue())["ok"])
+                self.assertEqual(self.snapshot(), before)  # nothing was written
+
+    def test_the_reviewers_control_probe(self):
+        # commit.json lowered to revision 1 used to be trusted, and the next apply replaced history entry 2.
+        fresh = self.tmp / "p"
+        T.init(fresh, "p", "one")
+        for rev, title in [(1, "two"), (2, "three")]:
+            C.apply(fresh, cs({"op": "set-manifest", "fields": {"title": title}}), rev)
+        old = (fresh / ".tp-product/history/000002.json").read_bytes()
+        self.rewrite(fresh / ".tp-product/commit.json", lambda d: d.update(revision=1))
+        rep, rc = cli.status_report(fresh)
+        self.assertEqual((rc, rep["trusted"]), (3, False))
+        self.assertIn("package.control-mismatch", {t["code"] for t in rep["trust"]})
+        for rev in (1, 3):
+            with self.assertRaises(T.StoreError) as cm:
+                C.apply(fresh, cs({"op": "set-manifest", "fields": {"title": "overwrite"}}), rev)
+            self.assertEqual(cm.exception.code, "package.control-mismatch")
+        self.assertEqual((fresh / ".tp-product/history/000002.json").read_bytes(), old)
+
+    def test_a_journal_that_does_not_match_its_files_is_not_rolled_forward(self):
+        with self.assertRaises(Crash):
+            C.apply(self.pkg, cs(CommitTests.EDIT), 3, fault=crash_at("after-commit-point"))
+        self.rewrite(self.pkg / self.TXN, lambda d: d["new"].update({"design.json": "sha256:" + "1" * 64}))
+        before = self.snapshot()
+        with T.lock(self.pkg), self.assertRaises(T.StoreError) as cm:
+            T.recover(self.pkg)
+        self.assertEqual((cm.exception.code, cm.exception.exit), ("control.invalid", 1))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_init_writes_a_complete_history_entry(self):
+        fresh = self.tmp / "p"
+        T.init(fresh, "p", "one")
+        self.assertEqual(T.history_problems(json.loads(T.history_path(fresh, 1).read_text()), 1), [])
+        self.assertEqual(T.commit_problems(json.loads((fresh / ".tp-product/commit.json").read_text())), [])
+
+
+class OriginalsTests(PackageCase):
+    """Rule 4: original feedback is never lost. An adoption that removes or changes an original (note, input, review)
+    is refused; a re-import with other content under the same id is a conflict; both orders end with the original."""
+    ADOPT = cs({"op": "adopt-external-edit", "by": "Owner", "reason": "hand"})
+
+    def test_an_original_note_or_input_is_kept_whatever_the_order(self):
+        for coll, kind in (("notes", "note"), ("inputs", "input")):
+            for change in ("delete", "change"):
+                for content in ("same", "different"):
+                    for order in ("adopt first", "re-import first"):
+                        with self.subTest(kind=kind, change=change, content=content, order=order):
+                            shutil.rmtree(self.pkg)
+                            shutil.copytree(FIXTURE, self.pkg)
+                            self.check(coll, kind, change, content, order)
+
+    def check(self, coll, kind, change, content, order):
+        orig = json.loads((FIXTURE / "reviews.json").read_text())[coll][0]
+        again = copy.deepcopy(orig)
+        if kind == "note":
+            for f in ("anchor", "disposition"):
+                again.pop(f, None)
+        if content == "different":
+            again["text"] = "Different text"
+
+        def reimport():
+            b = bundle(*([again] if kind == "note" else []), inputs=[again] if kind == "input" else [])
+            before = self.files()
+            if content == "same":
+                self.assertEqual(C.ingest(self.pkg, b)["duplicates"], [orig["id"]])
+            else:
+                with self.assertRaises(T.StoreError) as cm:
+                    C.ingest(self.pkg, b)
+                self.assertEqual(cm.exception.code, "bundle.conflict")
+            self.assertEqual(self.files(), before)
+
+        def hand_edit_and_adopt():
+            d = json.loads((self.pkg / "reviews.json").read_text())
+            if change == "delete":
+                d[coll] = d[coll][1:]
+            else:
+                d[coll][0]["text"] = "Changed by hand"
+            (self.pkg / "reviews.json").write_text(json.dumps(d))
+            with self.assertRaises(T.StoreError) as cm:
+                C.apply(self.pkg, self.ADOPT, 3)
+            # an input's status is an acceptance field, so deleting an input is refused by that check first
+            expected = "adopt.authority" if (kind, change) == ("input", "delete") else "adopt.original"
+            self.assertEqual(cm.exception.code, expected)
+            shutil.copy(FIXTURE / "reviews.json", self.pkg / "reviews.json")  # the owner restores the file
+
+        for step in ((hand_edit_and_adopt, reimport) if order == "adopt first" else (reimport, hand_edit_and_adopt)):
+            step()
+        self.assertEqual(P.index(self.docs())[orig["id"]][1], orig)
+        self.assert_trusted(3)
+
+    def test_a_changed_review_is_not_adopted(self):
+        d = json.loads((self.pkg / "reviews.json").read_text())
+        d["reviews"][0]["evidence"] = ["rewritten by hand"]
+        (self.pkg / "reviews.json").write_text(json.dumps(d))
+        self.refused("adopt.original", self.ADOPT)
+
+    def test_the_reviewers_originals_probe_and_bookkeeping(self):
+        # Deleting an imported note by hand and adopting that used to let a re-import replace the original.
+        d = json.loads((self.pkg / "reviews.json").read_text())
+        d["notes"] = []
+        (self.pkg / "reviews.json").write_text(json.dumps(d))
+        self.refused("adopt.original", self.ADOPT)
+        shutil.copy(FIXTURE / "reviews.json", self.pkg / "reviews.json")
+        d = json.loads((self.pkg / "reviews.json").read_text())
+        d["notes"][0]["anchor"] = "unresolved"  # local bookkeeping stays adoptable
+        (self.pkg / "reviews.json").write_text(json.dumps(d))
+        self.assertTrue(C.apply(self.pkg, self.ADOPT, 3)["committed"])
+
+
+class OperationShapeTests(PackageCase):
+    """Rule 5: every expected bad input is a structured refusal: operation fields are checked against changes.SPECS
+    before use, and under --json every refusal is the JSON error object with the documented exit code."""
+    WRONG = {"list": [], "dict": {}, "number": 3, "null": None, "bool": True, "list of numbers": [1]}
+    GOOD = {"text": "x", "object": {}, "list": [], "texts": []}
+
+    def test_every_field_of_every_operation_refuses_a_wrong_type(self):
+        for name, (required, optional) in C.SPECS.items():
+            base = dict({k: self.GOOD[t] for k, t in required.items()}, op=name)
+            for field, kind in list(required.items()) + list(optional.items()):
+                for wrong, value in self.WRONG.items():
+                    if C.TYPES[kind][0](value):
+                        continue
+                    with self.subTest(name, field=field, wrong=wrong):
+                        err = self.refused("op.shape", cs(dict(base, **{field: value})))
+                        self.assertEqual(err.details, {"operation": 0})
+            for field in required:
+                with self.subTest(name, missing=field):
+                    self.refused("op.missing", cs({k: v for k, v in base.items() if k != field}))
+            with self.subTest(name, extra=True):
+                self.refused("op.shape", cs(dict(base, approve=True)))
+        for wrong, value in self.WRONG.items():
+            with self.subTest("op", wrong=wrong):
+                self.refused("changeset.invalid", cs({"op": value}))
+
+    def test_the_reviewers_malformed_operations(self):
+        path = self.tmp / "c.json"
+        for op, code in (({"op": "set", "id": [], "fields": {"title": "x"}}, "op.shape"),
+                         ({"op": []}, "changeset.invalid"),
+                         ({"op": "set", "id": "rule.queue-order", "unset": [{}]}, "op.shape"),
+                         ({"op": "add", "collection": "rules", "record": {"id": 5}}, "op.shape"),
+                         ({"op": "supersede", "id": "rule.queue-order", "record": {"id": ["x"]}}, "op.shape"),
+                         ({"op": "adopt-external-edit"}, "op.missing")):
+            with self.subTest(op):
+                path.write_text(json.dumps(cs(op)))
+                out = io.StringIO()
+                rc = cli.main(["apply", str(self.pkg), str(path), "--expected-revision", "3", "--json"], out=out,
+                              err=io.StringIO())
+                self.assertEqual((rc, json.loads(out.getvalue())["code"]), (1, code))
+
+    def test_changeset_files_and_usage_errors_under_json(self):
+        good = self.tmp / "good.json"
+        good.write_text(json.dumps(cs(CommitTests.EDIT)))
+        files = {"missing": (self.tmp / "absent.json", "changeset.unreadable"),
+                 "a directory": (self.tmp, "changeset.unreadable"),
+                 "unreadable": (self.tmp / "noread.json", "changeset.unreadable"),
+                 "empty": (self.tmp / "empty.json", "changeset.invalid"),
+                 "not JSON": (self.tmp / "bad.json", "changeset.invalid"),
+                 "not UTF-8": (self.tmp / "latin.json", "changeset.invalid"),
+                 "too large": (self.tmp / "big.json", "changeset.invalid")}
+        files["unreadable"][0].write_text("{}")
+        files["unreadable"][0].chmod(0)
+        self.addCleanup(files["unreadable"][0].chmod, 0o600)
+        files["empty"][0].write_bytes(b"")
+        files["not JSON"][0].write_bytes(b"{nope")
+        files["not UTF-8"][0].write_bytes(b'{"x": "\xff"}')
+        files["too large"][0].write_bytes(b'"' + b"x" * C.MAX_BUNDLE_BYTES + b'"')
+        before = self.files()
+        for name, (path, code) in files.items():
+            if name == "unreadable" and os.access(path, os.R_OK):  # root reads anything
+                continue
+            for as_json in (True, False):
+                with self.subTest(name, json=as_json):
+                    out, err = io.StringIO(), io.StringIO()
+                    argv = ["apply", str(self.pkg), str(path), "--expected-revision", "3"] + ["--json"] * as_json
+                    self.assertEqual(cli.main(argv, out=out, err=err), 1)
+                    self.assertIn(f"tp-product: {code}:", err.getvalue())
+                    if as_json:
+                        obj = json.loads(out.getvalue())
+                        self.assertEqual((obj["ok"], obj["code"], sorted(obj)),
+                                         (False, code, ["code", "details", "message", "ok"]))
+                    else:
+                        self.assertEqual(out.getvalue(), "")
+        for argv in (["apply", str(self.pkg), str(good)], ["apply", str(self.pkg), "--recover", str(good)],
+                     ["apply", str(self.pkg), str(good), "--expected-revision", "x"], ["status", str(self.pkg), "--bogus"]):
+            with self.subTest(argv[2:]):
+                out = io.StringIO()
+                with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                    cli.main(argv + ["--json"], out=out, err=io.StringIO())
+                self.assertEqual((cm.exception.code, json.loads(out.getvalue())["code"]), (2, "usage"))
+        out = io.StringIO()
+        rc = cli.main(["apply", str(good), str(good), "--expected-revision", "3", "--json"], out=out, err=io.StringIO())
+        self.assertNotEqual(rc, 0)  # a file where the package should be
+        self.assertFalse(json.loads(out.getvalue())["ok"])
+        self.assertEqual(self.files(), before)
 
 
 if __name__ == "__main__":

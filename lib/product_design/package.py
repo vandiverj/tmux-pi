@@ -41,7 +41,10 @@ COLLECTIONS = {
     "notes": ("reviews", "note"), "inputs": ("reviews", "input"), "reviews": ("reviews", "review"),
 }
 ACCEPTED_STATES = ("ready-for-case-preparation", "implemented-verified")
+# The reader's limits. Every package and control file is read through read_json_file, which enforces them, and every
+# writer checks what it is about to write with file_problem, so whatever is committed can be read back.
 MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_DEPTH = 64  # JSON nesting: a top-level object is depth 1. The fixture's deepest file is 7.
 
 _schema_cache = None
 
@@ -55,17 +58,55 @@ def load_schema() -> dict:
     return _schema_cache
 
 
+def size_problem(size: int):
+    """Why a file of `size` bytes cannot be read back, or None. The one owner of MAX_FILE_BYTES."""
+    return f"larger than {MAX_FILE_BYTES} bytes ({size})" if size > MAX_FILE_BYTES else None
+
+
+def depth_problem(value):
+    """Why `value` nests too deeply to be read back, or None. The one owner of MAX_DEPTH. Iterative: no recursion."""
+    todo = [(value, 1)]
+    while todo:
+        cur, depth = todo.pop()
+        if isinstance(cur, (dict, list)):
+            if depth > MAX_DEPTH:
+                return f"nested deeper than {MAX_DEPTH} levels"
+            todo.extend((v, depth + 1) for v in (cur.values() if isinstance(cur, dict) else cur))
+    return None
+
+
+def file_problem(data: bytes, value):
+    """Why bytes `data` (the rendering of `value`) would not be read back by read_json_file, or None. Writers call this
+    on every file before their commit point."""
+    return size_problem(len(data)) or depth_problem(value)
+
+
+def read_json_file(path):
+    """Read a package or control file under the reader's limits. Raises OSError or ValueError; FileNotFoundError when
+    it is missing."""
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError("is a symbolic link")
+    problem = size_problem(path.stat().st_size)
+    if problem:
+        raise OSError(problem)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError:
+        raise ValueError(f"nested deeper than {MAX_DEPTH} levels") from None
+    problem = depth_problem(value)
+    if problem:
+        raise ValueError(problem)
+    return value
+
+
 def read_docs(package_dir) -> tuple:
-    """Read the three documents. Returns (docs, issues); a missing, oversized or unparsable file is an issue."""
+    """Read the three documents. Returns (docs, issues); a missing, oversized, too deep or unparsable file is an issue."""
     docs, issues = {}, []
     for key, (name, _, _) in DOCUMENTS.items():
         path = Path(package_dir) / name
         try:
-            if path.is_symlink():
-                raise OSError("is a symbolic link")
-            if path.stat().st_size > MAX_FILE_BYTES:
-                raise OSError(f"larger than {MAX_FILE_BYTES} bytes")
-            docs[key] = json.loads(path.read_text(encoding="utf-8"))
+            docs[key] = read_json_file(path)
         except FileNotFoundError:
             issues.append(S.Issue("file.missing", (name,), "file is missing"))
         except (OSError, UnicodeDecodeError, ValueError) as exc:
@@ -384,3 +425,15 @@ def authority_map(docs) -> Dict[str, str]:
             if held:
                 out[rec["id"]] = digest(held)
     return out
+
+
+# Records kept as their originals (plan section 8: preserve all originals): imported notes and inputs, and reviews
+# (append-only). No operation edits them, and an external edit that removes or changes one is not adopted (store.py).
+# Their local bookkeeping (a note's anchor and disposition, an input's reconciliation) is not part of the original.
+ORIGINALS = ("note", "input", "review")
+
+
+def originals_map(docs) -> Dict[str, str]:
+    """id -> digest of the record's semantic content, for every original record (the same digest dedupe compares)."""
+    return {rec["id"]: digest(semantic(rec, kind)) for _, _, kind, rec in records(docs)
+            if kind in ORIGINALS and isinstance(rec, dict) and isinstance(rec.get("id"), str)}

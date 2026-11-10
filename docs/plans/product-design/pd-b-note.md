@@ -34,3 +34,36 @@ primitives, impact propagation, and brief decision 9 in the readiness code. The 
 - **Withdrawing a blocking question** (`set` on a question's status) unblocks a slice without an acceptance event.
   It cannot make a slice ready (that still needs a human acceptance), so it is left as an ordinary edit, recorded in
   history.
+
+## Round 2: hardening (2026-11-09)
+
+- **Read-back.** Every file a commit writes is checked against the reader's limits (`package.MAX_FILE_BYTES`,
+  `MAX_DEPTH`, each owned by one function in `package.py`) before the commit point (`result.unreadable`). Bundles and
+  changesets have the same size and depth limits whether they arrive as bytes, text or a parsed value
+  (`changes.load_json_input`).
+- **Other writers' bytes.** Just before the commit point, and per file in roll-forward, the live files, `commit.json`
+  and the new history slot must still match what the change was computed from. Choice: withdraw the commit and keep
+  the other writer's bytes (`commit.external-edit`, exit 3) rather than merge. History entries are created with a
+  link, so an existing one is never replaced (`history.exists`).
+- **Control records** are shape-checked (`commit_problems`, `history_problems`, `txn_problems`) and must agree with
+  each other; disagreement is `package.control-mismatch` (untrusted, exit 3) and every writer, adoption included,
+  refuses. `init` now writes a complete history entry.
+- **Originals.** `commit.json` records a digest of each original note, input and review. Choice: an adoption that
+  removes or changes one is refused (`adopt.original`); a re-import with other content stays a `bundle.conflict`.
+- **Operation shapes** are checked against `changes.SPECS` before use (`op.missing`, `op.shape`); under `--json`
+  every refusal, usage and an unreadable changeset file included, is the JSON error object.
+
+Deviations and limits:
+
+- **Reopening an accepted uncertainty** (a `set` that withdraws or rewrites an accepted question) is not changed here;
+  it is owed to PD-E with the rest of the uncertainty workflow.
+- History may start after revision 1 (an imported package); only the newest entry is validated field by field, the
+  rest by name and sequence.
+- The commit-point check and the replacement are not one atomic step: an editor that saves in the instant between the
+  check and a rename can still be replaced. Roll-forward rechecks each file just before its replace, which narrows
+  but does not close that window; the lock only excludes cooperating writers.
+- Deleting an original input or review by hand is refused by the earlier checks (`adopt.authority` for an input's
+  status, `adopt.invalid` when a slice's readiness names the review), not by `adopt.original`; either way the
+  original is kept.
+- Round 1's attack report miscounted its mismatches: the final run had none, and the runs before it had 5 and then
+  1 (two expectation-ordering errors, one readiness expectation, two TypeErrors, then one adoption ordering).

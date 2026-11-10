@@ -1,8 +1,10 @@
 """tp-product: deterministic product design package commands (init, status, validate, apply).
 
-Exit status: 0 done; 1 invalid package, changeset or bundle (nothing written); 2 usage; 3 the package cannot be trusted
-yet (interrupted commit, uncommitted external edit, no commit record); 4 stale write (--expected-revision is not the
-current revision); 5 another writer holds the lock. Reads (status, validate) never write and start nothing.
+Exit status: 0 done; 1 invalid or unreadable package, changeset or bundle (nothing written); 2 usage; 3 the package
+cannot be trusted yet (interrupted commit, uncommitted external edit, no commit record, control records that disagree,
+a file changed by someone else during the commit); 4 stale write (--expected-revision is not the current revision);
+5 another writer holds the lock. Reads (status, validate) never write and start nothing. With --json every refusal is
+one JSON object {"ok": false, "code", "message", "details"} on stdout.
 """
 from __future__ import annotations
 
@@ -95,7 +97,15 @@ def _fail(exc, out, err, as_json):
 def main(argv=None, out=None, err=None) -> int:
     out = out or sys.stdout
     err = err or sys.stderr
-    p = argparse.ArgumentParser(prog="tp-product", description=__doc__.split("\n")[0],
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):  # a usage error is still exit 2; under --json it is also the JSON error object
+            if "--json" in argv:
+                print(json.dumps({"ok": False, "code": "usage", "message": message, "details": {}}, indent=2), file=out)
+            super().error(message)
+
+    p = Parser(prog="tp-product", description=__doc__.split("\n")[0],
                                 epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
     c = sub.add_parser("init", help="create a package scaffold at revision 1; refuses to overwrite")
@@ -177,5 +187,5 @@ def main(argv=None, out=None, err=None) -> int:
     except T.StoreError as exc:
         return _fail(exc, out, err, as_json)
     except OSError as exc:
-        print(f"tp-product: {exc}", file=err)
-        return 1
+        return _fail(T.StoreError("io.error", f"{exc.strerror or exc}" + (f": {exc.filename}" if exc.filename else ""),
+                                  details={"errno": exc.errno}), out, err, as_json)

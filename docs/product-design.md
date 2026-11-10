@@ -155,14 +155,29 @@ tp-product apply DIR --recover      finish (or discard) an interrupted commit
 | Exit | Meaning |
 | --- | --- |
 | 0 | Done (or the changeset changed nothing: "no change", same revision) |
-| 1 | Invalid package, changeset, result or bundle; nothing was written |
+| 1 | Invalid package, changeset, result, bundle or control record; nothing was written |
 | 2 | Usage |
-| 3 | The package cannot be trusted yet: an interrupted commit, an uncommitted external edit, or no commit record. `status` and `validate` still report, with a warning |
+| 3 | The package cannot be trusted yet, or another writer's bytes are in the way: an interrupted commit, an uncommitted external edit, no commit record, control records that disagree, or a file changed under the commit. `status` and `validate` still report, with a warning |
 | 4 | Revision conflict: `--expected-revision` is not the current revision; nothing was written |
 | 5 | Another writer holds the lock (waited 30 s) |
 
 Errors print `tp-product: CODE: message`; with `--json`, a `{"ok": false, "code", "message", "details"}` object.
-Reads never write. No command makes a network call or starts anything.
+Every refusal has one, a usage error (`usage`, exit 2) and an unreadable changeset file included; no command ends in a
+traceback. Reads never write. No command makes a network call or starts anything.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `changeset.unreadable` | 1 | The changeset file is missing, a directory or not readable |
+| `changeset.invalid` | 1 | Not UTF-8 JSON, wrong format, too large or too deep (`details.problem`: `size`, `depth`, `unreadable`) |
+| `op.missing`, `op.shape` | 1 | An operation lacks a field, has an unknown one, or one of the wrong type (`details.operation`) |
+| `result.invalid`, `result.unreadable` | 1 | The result does not validate, or a file it would write exceeds what a reader accepts (`details.file`) |
+| `control.invalid` | 1 | `commit.json`, a history entry or the journal is malformed, or the journal does not match its files |
+| `io.error` | 1 | The package path cannot be read or written as a directory |
+| `package.control-mismatch` | 3 | Control records disagree (commit revision, top history entry, history gap, journal revision) |
+| `commit.external-edit` | 3 | A file changed between inspection and the commit point; the commit is withdrawn and the edit kept |
+| `txn.conflict` | 3 | Recovery found a file that is neither the old nor the new content |
+| `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
+| `adopt.original` | 1 | An adoption would remove or change an original note, input or review |
 
 ## Persistence
 
@@ -170,7 +185,7 @@ Control state is in `DIR/.tp-product/`:
 
 | Path | Tracked with the package | Holds |
 | --- | --- | --- |
-| `commit.json` | yes | The commit record: revision, the canonical digest of each package file, the digest of each record's acceptance (authority) fields |
+| `commit.json` | yes | The commit record: revision, the canonical digest of each package file, the digest of each record's acceptance (authority) fields, and the digest of each original note, input and review |
 | `history/NNNNNN.json` | yes | One entry per committed revision: actor, summary, evidence, operations, base revision, impact |
 | `lock` | no | The writer lock (flock) |
 | `txn/` | no | The journal of a commit in progress; present only during, or after an interrupted, commit |
@@ -183,12 +198,27 @@ writer discards the partial journal). A crash after it leaves every file whole (
 report `package.interrupted`, writers refuse, and `apply --recover` rolls the commit forward. Recovery refuses
 (`txn.conflict`) when a live file is neither the old nor the new content: someone edited it during the interruption.
 
+No write replaces bytes it has not seen. Just before the commit point every live file, `commit.json` and the new
+history slot are compared with what the change was computed from; a difference withdraws the commit
+(`commit.external-edit`), keeps the other writer's bytes and leaves the package reporting the edit. Roll-forward checks
+each file again before replacing it. A history entry is created, never replaced (`history.exists`).
+
+Every file a commit writes is checked against the reader's limits first (8 MiB, nesting depth 64), with the same
+constants the reader uses, so what is committed can always be read back (`result.unreadable`, nothing written).
+
+The control records are checked before they are believed: a malformed `commit.json`, history entry or journal is
+`control.invalid`; a `commit.json` whose revision is not the newest history entry's, a gap in history, a top entry
+whose file digests differ from `commit.json`, or a journal for an unexpected revision makes the package untrusted
+(`package.control-mismatch`). Writers, adoption included, refuse until the owner repairs it. History may start after
+revision 1 (an imported package); only the newest entry is checked field by field.
+
 Digests are of canonical JSON, so re-indenting a file is not an edit. Files are written with two-space indentation.
 
 **Direct edits.** A package file whose content differs from the commit record is an external edit: `status` and
 `validate` warn (`package.external-edit`, exit 3) and `apply` refuses everything except an `adopt-external-edit`
 changeset. Adoption commits the edited files as the next revision when they are valid and change no acceptance
-(authority) field; otherwise it is refused (`adopt.invalid`, `adopt.authority`). Impact is not computed for an adopted
+(authority) field and keep every original note, input and review (local bookkeeping, such as a note's `anchor` and
+`disposition`, is not part of the original); otherwise it is refused (`adopt.invalid`, `adopt.authority`, `adopt.original`). Impact is not computed for an adopted
 edit (the previous content is not kept), but readiness is derived from fingerprints, so an edited dependency still
 shows its slices as stale. A package with no commit record can be adopted only while it holds no acceptance record.
 
@@ -201,6 +231,10 @@ shows its slices as stale. A package with no commit record can be adopted only w
 
 `expected_revision` is optional; when present it must equal `--expected-revision`. Operations apply in order to a
 copy; the result must validate as a whole, or nothing is written. A changeset that changes nothing is not committed.
+A changeset has the same limits as a bundle (4 MiB, nesting depth 64) whether it arrives as a file, text or a parsed
+value. Each operation's fields are checked against the table below before the package is read: a missing field is
+`op.missing`, an unknown field or a wrong type (`id` and other names are text; `record` and `fields` are objects;
+`evidence` and `unset` are lists of text; `delivery` is a list) is `op.shape`.
 
 | Operation | Fields | Notes |
 | --- | --- | --- |
@@ -238,12 +272,13 @@ A feedback bundle is what a review build exports:
 `changes.ingest(DIR, bundle)` (the `import-feedback` command comes with the review build) imports it in one
 transaction:
 
-- The bundle is refused whole (`bundle.invalid`, nothing written) when its format, version, package or size (4 MiB,
-  5000 records) is wrong, any record fails the schema, an input targets a record that does not exist, a note carries
+- The bundle is refused whole (`bundle.invalid`, nothing written) when its format, version, package, size (4 MiB,
+  5000 records) or nesting depth (64) is wrong (the same limits for bytes, text and a parsed value), any record fails the schema, an input targets a record that does not exist, a note carries
   local bookkeeping (`anchor`, `disposition`), or an input is not `pending` or carries a reconciliation.
 - Records are deduplicated by id on their semantic content: an id already present with the same content is a
   duplicate, and importing the same bundle again is a no-op (no new revision). The same id with different content, in
-  the package or twice in the bundle, refuses the bundle (`bundle.conflict`); the original is never overwritten.
+  the package or twice in the bundle, refuses the bundle (`bundle.conflict`); the original is never overwritten, and
+  an external edit that removed or changed it is not adopted (`adopt.original`), so a re-import cannot replace it.
 - Each new note gets an `anchor`: `unresolved` when its journey or scenario no longer exists, `current` when its build
   fingerprint equals the package's content fingerprint, else `changed-context`. Its original fields are kept verbatim.
 - Importing notes and inputs changes no design fingerprint and no readiness.

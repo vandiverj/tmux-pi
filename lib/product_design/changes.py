@@ -48,8 +48,8 @@ def _get(rec, *path):
 def load_json_input(raw, limit=None):
     """(value, problem) for JSON input given as bytes, text or an already-parsed value. The same limits apply to every
     form: at most `limit` bytes (of the UTF-8 text, or of the canonical JSON of a parsed value), package.MAX_DEPTH
-    levels of nesting, and text that is valid Unicode (package.text_problem: no lone surrogate, whether it arrives as
-    an escape, in text built in memory or in a parsed value). problem is None or (code suffix: "size" | "unreadable" |
+    levels of nesting, and text that is valid Unicode (package.encode's refusal: no lone surrogate, whether it arrives
+    as an escape, in text built in memory or in a parsed value). problem is None or (code suffix: "size" | "unreadable" |
     "depth" | "encoding", message)."""
     limit = MAX_BUNDLE_BYTES if limit is None else limit
     if isinstance(raw, (bytes, bytearray, str)):
@@ -70,13 +70,12 @@ def load_json_input(raw, limit=None):
     depth = P.depth_problem(raw)  # first: canonical() recurses
     if depth:
         return None, ("depth", depth)
-    try:
-        text = P.text_problem(raw)
-        size = None if text else len(P.canonical(raw))
+    try:  # measuring it encodes it: encode's refusal of text that is not UTF-8 is the encoding problem
+        size = len(P.canonical(raw))
+    except P.TextError as exc:
+        return None, ("encoding", str(exc))
     except (TypeError, ValueError, RecursionError) as exc:
         return None, ("unreadable", f"not a JSON value: {exc}")
-    if text:
-        return None, ("encoding", text)
     if size > limit:
         return None, ("size", f"larger than {limit} bytes as JSON ({size})")
     return raw, None

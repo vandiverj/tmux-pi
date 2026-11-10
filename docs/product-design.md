@@ -171,9 +171,9 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `changeset.invalid` | 1 | Not UTF-8 JSON, wrong format, too large, too deep, or text that is not valid Unicode (`details.problem`: `size`, `depth`, `unreadable`, `encoding`) |
 | `op.missing`, `op.shape` | 1 | An operation lacks a field, has an unknown one, or one of the wrong type (`details.operation`) |
 | `result.invalid`, `result.unreadable` | 1 | The result does not validate, or a file it would write exceeds what a reader accepts (`details.file`) |
-| `control.invalid` | 1 | `commit.json`, a history entry or the journal is malformed, or the journal does not match its files |
+| `control.invalid` | 1 | `commit.json`, a history entry or the journal is malformed, the journal does not match its files, or its staged files would not be read back as committed (the journal is kept; `details.staged` names its files) |
 | `io.error` | 1 | The package path cannot be read or written as a directory |
-| `package.control-mismatch` | 3 | Control records disagree (commit revision, a history entry's file digests or `base_revision`, a gap in history, journal revision) |
+| `package.control-mismatch` | 3 | Control records disagree (commit revision, a history entry's file digests or `base_revision`, a gap in history, journal revision), or would disagree after a commit or recovery (nothing written; on recovery the journal is kept) |
 | `commit.external-edit` | 3 | A file changed between inspection and the commit point; the commit is withdrawn and the edit kept |
 | `txn.conflict` | 3 | A file was neither the old nor the new content when a commit or recovery came to replace it, or someone wrote to it while it was being replaced; their bytes are kept (`details.kept` names a copy kept in `txn/displaced/`) |
 | `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
@@ -199,6 +199,17 @@ aside into `txn/displaced/`); readers report `package.interrupted`, writers refu
 commit forward the same way. Recovery refuses (`txn.conflict`) when a live file is neither the old nor the new content:
 someone edited it during the interruption.
 
+**No command publishes a state its own reader refuses.** Before anything is written, a commit builds the whole state it
+would publish (the package files, the new history entry with the history before it, the commit record) and checks it
+with the functions `status` and `validate` use: each file's limits, the package's validity, the shape of the entry and
+the record, the history chain, and that the record, the entry and the manifest agree. Any refusal is the code the
+reader would report (`result.unreadable`, `result.invalid`, `control.invalid`, `package.control-mismatch`), with
+`details.file` naming the file, and nothing is written. `apply`, adoption, `ingest` and `apply --recover` all use this
+check. Recovery runs it on the staged files before it replaces anything. If the staged files differ from `txn.json`,
+are unreadable or would not be read back as committed, recovery refuses with `control.invalid` or
+`package.control-mismatch`. It replaces nothing and keeps the journal and its staged files (`details.journal`,
+`details.staged`), so `status` keeps reporting `package.interrupted`.
+
 **A commit never destroys bytes it did not write.** A file is replaced in three steps: the live file is renamed into
 `txn/displaced/NAME~TOKEN` (never unlinked), the displaced bytes are checked against what the change was computed from,
 and the new file is linked into place, which fails if anything has appeared at the name since. If the displaced bytes
@@ -216,9 +227,11 @@ each file again before replacing it. A history entry is created, never replaced 
 
 Every file a commit writes is checked against the reader's limits first (8 MiB, nesting depth 64, text that is valid
 Unicode), with the same functions the reader uses, so what is committed can always be read back (`result.unreadable`,
-nothing written). Text that is not valid Unicode (a lone surrogate, which JSON's `\ud800` escape can carry) is refused
-in every input form, bytes, text, a parsed value or a file (`changeset.invalid` or `bundle.encoding`), and a package file
-holding it is `file.unreadable`.
+nothing written). One function turns a value into bytes (`package.encode`, behind every render and digest), and it
+refuses text that is not valid Unicode: a lone surrogate, which JSON's `\ud800` escape can carry. So such text is
+refused in every input form: bytes, text, a parsed value, a file, or a value given to the store directly
+(`changeset.invalid` or `bundle.encoding` on input, `result.unreadable` on a commit, `control.invalid` on recovery). A
+package file holding it is `file.unreadable`. An escaped pair (`\ud83d\ude00`) is one valid character and is kept.
 
 The control records are checked before they are believed: a malformed `commit.json`, history entry or journal is
 `control.invalid`; a `commit.json` whose revision is not the newest history entry's, a gap in history, a top entry

@@ -10,12 +10,14 @@ Control state lives in `<package>/.tp-product/` (docs/product-design.md, "Persis
   txn/               the journal of a commit in progress. Not content; exists only during (or after an interrupted) commit.
                      txn/displaced/ holds the live files the commit moved aside until it is complete.
 
-A commit is: take the lock; check that every file it writes is readable back (package.file_problem); write every new
-file into txn/; check that no live file changed since the change was computed; write txn/txn.json last (the commit
+A commit is: take the lock; build the state it publishes and check it whole with the reader's own checks (prospective:
+the documents, the commit record, the history with the new entry, and the reader's limits); write every new file into
+txn/; check that no live file changed since the change was computed; write txn/txn.json last (the commit
 point); place each changed live file (_place: rename the old one into txn/displaced/, check it, link the new one in;
 someone else's bytes are never destroyed, only kept and reported), then the history entry and commit.json; remove txn/
 and the displaced copies that hold the old content. A crash before txn.json leaves the live package untouched (the partial txn/ is discarded); a crash after it is
-rolled forward by `recover`. Readers never write: they report an interrupted commit, an uncommitted external edit and
+rolled forward by `recover`, which first checks the journal's files the same way (prospective) and, if they would
+publish a state the reader refuses, refuses and keeps the journal. Readers never write: they report an interrupted commit, an uncommitted external edit and
 control records that disagree, and readiness is not trusted until that is resolved.
 
 Control records are believed only after their shape is checked and they agree: every history entry is well formed and
@@ -65,8 +67,7 @@ def now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def render(doc) -> bytes:
-    return (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+render = P.render  # the file form of package.encode: the one place a value becomes bytes
 
 
 def control(package_dir) -> Path:
@@ -92,6 +93,12 @@ def commit_record(docs) -> dict:
 
 
 # ---------------------------------------------------------------- control record shapes
+
+def _get(value, *path):
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
 
 def _is_int(v, least=0):
     return type(v) is int and v >= least
@@ -228,38 +235,48 @@ def check_history(root) -> dict:
             out["invalid"].append((rel, value))
     out["numbers"] = sorted(found)
     out["entries"] = {r: e for r, e in found.items() if e is not None}
-    prev = None
-    for rev in out["numbers"]:
+    out["broken"] = chain_problems(found)
+    return out
+
+
+def chain_problems(found) -> list:
+    """[message] for each place the chain of history entries is not whole. `found` maps the revision of every entry to
+    the entry, or to None when it is malformed (reported on its own). Used on the history on disk (check_history) and
+    on the history a commit would publish (prospective)."""
+    out, prev = [], None
+    for rev in sorted(found):
         entry = found[rev]
         if prev is not None and rev != prev + 1:
-            out["broken"].append(f"history has no entry between revisions {prev} and {rev}")
+            out.append(f"history has no entry between revisions {prev} and {rev}")
         if entry is not None:
             base = entry["base_revision"]
             if prev is None and base not in (None, rev - 1):
-                out["broken"].append(f"history entry {rev} is the first, so its base_revision is null or {rev - 1}, "
-                                     f"not {base}")
+                out.append(f"history entry {rev} is the first, so its base_revision is null or {rev - 1}, not {base}")
             elif prev is not None and base != prev:
-                out["broken"].append(f"history entry {rev} has base_revision {base}, but the entry before it is {prev}")
+                out.append(f"history entry {rev} has base_revision {base}, but the entry before it is {prev}")
         prev = rev
     return out
 
 
-def _history_refusal(root, check, revision):
-    """StoreError when the history does not let `revision` be written next (None when it does): an entry is
-    malformed, the chain is broken, or the newest entry is neither revision - 1 nor (a commit interrupted after it
-    wrote its entry) revision itself. A command never writes a state its own reader refuses."""
-    if check["invalid"]:
-        rel, message = check["invalid"][0]
-        return StoreError("control.invalid", f"{control(root) / rel} is {message}. Nothing was written; restore "
-                                             ".tp-product/history from version control", exit=1)
-    problems = list(check["broken"])
-    top = check["numbers"][-1] if check["numbers"] else None
-    if top is not None and top not in (revision - 1, revision):
-        problems.append(f"the newest history entry is {top}, so revision {revision} cannot follow it")
-    if problems:
-        return StoreError("package.control-mismatch", "; ".join(problems) + ". Nothing was written; restore "
-                                                                        ".tp-product/ from version control", exit=3)
-    return None
+def agreement_problems(commit, numbers, entries, docs, interrupted=None) -> list:
+    """[message] for each way a well-formed commit record disagrees with the history (`numbers`: every entry's revision;
+    `entries`: the well-formed ones) and the package documents. `interrupted` is the revision of a journal after its
+    commit point, which may already have written its history entry. Used by inspect and by prospective."""
+    out, rev = [], commit["revision"]
+    if interrupted is not None and interrupted not in (rev, rev + 1):
+        return [f"the interrupted commit is to revision {interrupted}, but commit.json is at {rev}"]
+    top = numbers[-1] if numbers else None
+    if top != rev and not (interrupted == rev + 1 and top == rev + 1):
+        out.append(f"commit.json is at revision {rev}, but the highest history entry is {'missing' if top is None else top}")
+    entry = entries.get(rev)
+    if entry is not None and entry["files"] != commit["files"]:
+        out.append(f"history entry {rev} records other file digests than commit.json")
+    manifest = docs.get("manifest")
+    if (interrupted is None and isinstance(manifest, dict)
+            and file_digests(docs).get(FILES["manifest"]) == commit["files"][FILES["manifest"]]
+            and manifest.get("revision") != rev):
+        out.append(f"commit.json is at revision {rev}, but the committed package.json says {manifest.get('revision')!r}")
+    return out
 
 
 def load_txn(root) -> dict:
@@ -327,24 +344,9 @@ def inspect(package_dir) -> dict:
         bad(rel, message)
     for message in hist["broken"]:
         mismatch(message)
-    if commit and txn and status == "ok" and txn["revision"] not in (commit["revision"], commit["revision"] + 1):
-        mismatch(f"the interrupted commit is to revision {txn['revision']}, but commit.json is at {commit['revision']}")
-    elif commit:
-        rev = commit["revision"]
-        top = hist["numbers"][-1] if hist["numbers"] else None
-        # an interrupted commit may have written its own history entry before commit.json
-        if top != rev and not (out["interrupted"] == rev + 1 and top == rev + 1):
-            mismatch(f"commit.json is at revision {rev}, but the highest history entry is "
-                     f"{'missing' if top is None else top}")
-        entry = hist["entries"].get(rev)
-        if entry is not None and entry["files"] != commit["files"]:
-            mismatch(f"history entry {rev} records other file digests than commit.json")
-    if commit and out["interrupted"] is None:
-        rev = commit["revision"]
-        manifest = docs.get("manifest")
-        if (isinstance(manifest, dict) and file_digests(docs).get(FILES["manifest"]) == commit["files"][FILES["manifest"]]
-                and manifest.get("revision") != rev):
-            mismatch(f"commit.json is at revision {rev}, but the committed package.json says {manifest.get('revision')!r}")
+    if commit:
+        for message in agreement_problems(commit, hist["numbers"], hist["entries"], docs, out["interrupted"]):
+            mismatch(message)
 
     committed = commit or {}
     live = file_digests(docs)
@@ -380,6 +382,83 @@ def trust_problems(state) -> list:
                     f"{', '.join(state['external'])} changed outside `tp-product apply`; adopt the edit with an "
                     "adopt-external-edit changeset, or restore the committed files"))
     return out + list(state["control"])
+
+
+# ---------------------------------------------------------------- the prospective state
+
+def prospective(root, docs, entry, record=None, revision=None) -> dict:
+    """Build the state a commit would publish and check it whole, with the checks `status` and `validate` apply to the
+    published package (validate_docs, commit_problems, history_problems, check_history, chain_problems,
+    agreement_problems) and the reader's limits (file_problem). Every commit (apply, adoption, ingest, init) calls it
+    before its commit point, and recovery calls it on the journal's files before it replaces anything: no command
+    publishes a state its own reader refuses (docs/product-design.md, "Persistence").
+
+    A commit passes the documents and its history entry without revision and files (`record` None): the commit record
+    is built here and the entry completed. Recovery passes the staged documents, entry and commit record, and the
+    journal's `revision`: they are checked as they are, the record against the one these documents make.
+
+    Returns {revision, record, entry, data, problems}. data holds the rendered bytes by file name (the package files,
+    "history.json", "commit.json"); problems lists (code, file, message), empty when the state may be published:
+      result.unreadable         a file the reader would refuse: too deep, too large, text that is not UTF-8
+      result.invalid            the documents do not validate
+      control.invalid           the commit record or the entry is malformed, an existing history entry is malformed,
+                                or the journal's revision is not the documents'
+      package.control-mismatch  the records disagree: the commit record is not the one the documents make, the history
+                                with the new entry is not whole, or the commit record is not its newest entry
+    """
+    out = {"revision": None, "record": record, "entry": entry, "data": {}, "problems": []}
+
+    def refuse(code, name, message):
+        out["problems"].append((code, name, message))
+        return out
+
+    docs = docs if isinstance(docs, dict) else {}
+    for key, name in FILES.items():  # the reader's limits first: nothing below encodes a value it would refuse
+        data, problem = P.file_problem(docs.get(key), render)
+        if problem:
+            return refuse("result.unreadable", name, f"would be {problem}")
+        out["data"][name] = data
+    issues = P.validate_docs(docs)
+    if issues:
+        return refuse("result.invalid", issues[0].path[0] if issues[0].path else "package",
+                      "does not validate: " + "; ".join(f"{S.format_path(i.path)}: {i.message} [{i.code}]"
+                                                         for i in issues))
+    rev = out["revision"] = docs["manifest"]["revision"]
+    built = commit_record(docs)
+    if record is None:
+        if not isinstance(entry, dict):
+            return refuse("control.invalid", f"history entry {rev}", "is not a JSON object")
+        record = out["record"] = built
+        entry = out["entry"] = dict(entry, revision=rev, files=built["files"])
+    elif revision is not None and revision != rev:
+        return refuse("control.invalid", "package.json", f"is revision {rev!r}, but the journal commits revision "
+                                                         f"{revision}")
+    for name, problems in (("commit.json", commit_problems(record)),
+                           (f"history entry {rev}", history_problems(entry, rev))):
+        if problems:
+            return refuse("control.invalid", name, "is malformed: " + "; ".join(problems))
+    if record != built:
+        return refuse("package.control-mismatch", "commit.json", "is not the commit record of the package files "
+                                                                 "committed with it")
+    hist = check_history(root)
+    if hist["invalid"]:
+        rel, message = hist["invalid"][0]
+        return refuse("control.invalid", f"{CONTROL}/{rel.as_posix()}", f"is {message}")
+    found = {n: hist["entries"].get(n) for n in hist["numbers"]}
+    found[rev] = entry
+    problems = chain_problems(found) + agreement_problems(record, sorted(found), found, docs)
+    if problems:
+        return refuse("package.control-mismatch", f"history entry {rev}", "; ".join(problems))
+    for name, value in (("history.json", entry), ("commit.json", record)):
+        data, problem = P.file_problem(value, render)
+        if problem:
+            return refuse("result.unreadable", f"history entry {rev}" if name == "history.json" else name,
+                          f"would be {problem}")
+        out["data"][name] = data
+    return out
+
+
+EXITS = {"package.control-mismatch": 3}
 
 
 # ---------------------------------------------------------------- lock
@@ -508,39 +587,38 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
     elif txn.exists():
         raise StoreError("package.interrupted", f"{txn} holds an interrupted commit: run `tp-product apply DIR --recover` "
                                                 "first", exit=3)
-    revision = docs["manifest"]["revision"]
-    record = commit_record(docs)
-    entry = dict(entry, revision=revision, files=record["files"])
-    meta = {"revision": revision, "old": base_digests, "new": record["files"], "old_commit": base_commit,
-            "new_commit": P.digest(record)}
-    blobs = [(name, docs[key]) for key, name in FILES.items()] + [
-        (f"history entry {revision}", entry), ("commit.json", record), ("txn.json", meta)]
-    rendered = []
-    for name, value in blobs:  # what is committed can always be read back: the reader's limits, checked here
-        data, problem = P.file_problem(value, render)
-        if problem:
-            raise StoreError("result.unreadable", f"{name} would be {problem}: the package could not be read back. "
-                                                  "Nothing was written.", details={"file": name, "problem": problem})
-        rendered.append(data)
-    if os.path.lexists(history_path(root, revision)):
+    revision = _get(docs, "manifest", "revision")
+    if _is_int(revision, 1) and os.path.lexists(history_path(root, revision)):  # someone's entry: never replaced
         raise StoreError("history.exists", f"{history_path(root, revision)} already exists: a history entry is never "
                                            "replaced. Nothing was written; check .tp-product/ against version control",
                          exit=3)
-    refusal = _history_refusal(root, check_history(root), revision)
-    if refusal:
-        raise refusal
+    state = prospective(root, docs, entry)  # the whole state this commit publishes, checked as its reader will
+    if state["problems"]:
+        code, name, message = state["problems"][0]
+        raise StoreError(code, f"{name} {message}: the package would not be read back as committed. Nothing was "
+                               "written.", exit=EXITS.get(code, 1), details={"file": name, "problem": message})
+    revision, record, rendered = state["revision"], state["record"], state["data"]
+    meta = {"revision": revision, "old": base_digests, "new": record["files"], "old_commit": base_commit,
+            "new_commit": P.digest(record)}
+    meta_data, problem = P.file_problem(meta, render)
+    if problem:  # base_digests from a caller: digests, so only a malformed argument fails here
+        raise StoreError("result.unreadable", f"txn.json would be {problem}. Nothing was written.",
+                         details={"file": "txn.json", "problem": problem})
+    if txn_problems(meta):
+        raise StoreError("control.invalid", f"txn.json would be malformed: {'; '.join(txn_problems(meta))}. Nothing "
+                                            "was written.", details={"file": "txn.json"})
     safe_write.ensure_dir(txn, what="package journal", root=root)
     try:
-        for name, data in zip(list(FILES.values()) + ["history.json", "commit.json"], rendered):
+        for name, data in rendered.items():
             _write(root, txn / name, data)
         fault("before-commit-point")
-        changed = _changed_under(root, meta, ALL) + _history_taken(root, revision, rendered[3])
+        changed = _changed_under(root, meta, ALL) + _history_taken(root, revision, rendered["history.json"])
         if changed:
             raise StoreError("commit.external-edit",
                              f"{', '.join(changed)} changed while this commit was being prepared (someone edited it "
                              "outside tp-product). Nothing was written and their content is kept: read `tp-product "
                              "status`, then adopt or restore the edit and retry", exit=3, details={"files": changed})
-        _write(root, txn / "txn.json", rendered[-1])
+        _write(root, txn / "txn.json", meta_data)
     except BaseException:
         shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched (nothing is displaced before the commit point)
         raise
@@ -663,25 +741,12 @@ def _roll_forward(root: Path, fault: Callable = _noop):
     """Make the journal's files live (each by _place), then its history entry and commit record."""
     txn = control(root) / "txn"
     meta = load_txn(root)
-    for name in FILES.values():  # the journal must hold what txn.json says it holds
-        if _live_digest(txn, name) != meta["new"][name]:
-            raise StoreError("control.invalid", f"{txn / name} does not match {txn / 'txn.json'}", exit=1)
-    if _live_digest(txn, "commit.json") != meta["new_commit"]:
-        raise StoreError("control.invalid", f"{txn / 'commit.json'} does not match {txn / 'txn.json'}", exit=1)
-    try:
-        hist = _read_json(txn / "history.json", txn)
-    except (OSError, ValueError) as exc:
-        raise StoreError("control.invalid", f"{txn / 'history.json'} is unreadable: {exc}", exit=1) from None
-    if history_problems(hist, meta["revision"]) or hist["files"] != meta["new"]:
-        raise StoreError("control.invalid", f"{txn / 'history.json'} does not match {txn / 'txn.json'}", exit=1)
-    data = (txn / "history.json").read_bytes()
     target = history_path(root, meta["revision"])
-    taken = _history_taken(root, meta["revision"], data)  # before any live file is replaced
-    if taken:
-        raise _conflict(root, meta, taken[0])
-    refusal = _history_refusal(root, check_history(root), meta["revision"])  # never written on top of a bad chain
-    if refusal:
-        raise refusal
+    with contextlib.suppress(OSError):  # someone else's entry in this commit's slot first: it is kept (txn.conflict)
+        taken = _history_taken(root, meta["revision"], (txn / "history.json").read_bytes())
+        if taken:
+            raise _conflict(root, meta, taken[0])
+    data = _staged(root, meta)  # then the journal's state, whole, before any live file is replaced
     for name in FILES.values():
         _place(root, meta, name, fault)
     safe_write.ensure_dir(target.parent, what="package history", root=root)
@@ -695,6 +760,37 @@ def _roll_forward(root: Path, fault: Callable = _noop):
     _place(root, meta, "commit.json", fault)
     fault("after-commit-record")
     _finish_txn(root, meta, fault)
+
+
+def _staged(root: Path, meta) -> bytes:
+    """Check the journal's files before any of them is made live: each is what txn.json says it holds, and together
+    they are a state the reader accepts (prospective). Returns the staged history entry's bytes. A refusal is a
+    structured control error naming the journal and its staged files, which are kept as they are."""
+    txn = control(root) / "txn"
+    staged = sorted(str(p) for p in txn.iterdir() if p.is_file())
+
+    def refuse(code, name, message):
+        return StoreError(code, f"{name} in the journal {message}. Publishing it would leave a package `tp-product "
+                                f"status` refuses, so nothing was replaced; the journal {txn} and its staged files are "
+                                "kept. Restore the package from version control, or move the journal aside by hand",
+                          exit=EXITS.get(code, 1), details={"file": name, "problem": message, "journal": str(txn),
+                                                            "staged": staged})
+    for name in FILES.values():  # the journal must hold what txn.json says it holds
+        if _live_digest(txn, name) != meta["new"][name]:
+            raise refuse("control.invalid", name, f"does not match {txn / 'txn.json'}")
+    if _live_digest(txn, "commit.json") != meta["new_commit"]:
+        raise refuse("control.invalid", "commit.json", f"does not match {txn / 'txn.json'}")
+    try:
+        docs = {key: _read_json(txn / name, txn) for key, name in FILES.items()}
+        record = _read_json(txn / "commit.json", txn)
+        entry = _read_json(txn / "history.json", txn)
+    except (OSError, ValueError) as exc:
+        raise refuse("control.invalid", "a staged file", f"is unreadable: {exc}") from None
+    state = prospective(root, docs, entry, record, revision=meta["revision"])
+    if state["problems"]:
+        code, name, message = state["problems"][0]
+        raise refuse("control.invalid" if code.startswith("result.") else code, name, message)
+    return (txn / "history.json").read_bytes()
 
 
 def recover(package_dir, fault: Callable = _noop) -> Optional[dict]:

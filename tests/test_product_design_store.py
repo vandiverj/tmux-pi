@@ -8,6 +8,7 @@ The generated input space is the PD-B attack script (task evidence, not tracked)
 """
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -739,17 +740,43 @@ class ReadBackTests(PackageCase):
         self.assertEqual((self.pkg / "reviews.json").stat().st_size, P.MAX_FILE_BYTES)
         self.assert_trusted(4)  # read back at exactly the limit
 
-    def test_the_writer_checks_depth_on_a_parsed_result(self):
-        docs = self.docs()
-        docs["manifest"]["revision"] = 4
-        rec(docs, "rule.queue-order")["examples"] = nested(P.MAX_DEPTH)
+    def test_the_transaction_api_checks_the_whole_result_before_its_commit_point(self):
+        # T.commit takes validated documents; what they and the history entry would publish is still checked whole
+        # (store.prospective). The surrogate title passed validate_docs and once raised UnicodeEncodeError from the
+        # digest (review F2); actor 7 once left a journal no command could recover (review F1).
+        def title(text):
+            return lambda d, e: d["manifest"].update(title=text)
+        rows = [  # name, mutate(docs, entry), code, file
+            ("too deep", lambda d, e: rec(d, "rule.queue-order").update(examples=nested(P.MAX_DEPTH)),
+             "result.unreadable", "design.json"),
+            ("lone high surrogate in the manifest", title("\ud800"), "result.unreadable", "package.json"),
+            ("lone low surrogate in a design record", lambda d, e: rec(d, "rule.queue-order").update(statement="\udc00"),
+             "result.unreadable", "design.json"),
+            ("lone surrogate in the history entry", lambda d, e: e.update(summary="\ud800"), "result.unreadable",
+             "history entry 4"),
+            ("history actor a number", lambda d, e: e.update(actor=7), "control.invalid", "history entry 4"),
+            ("history base not the top", lambda d, e: e.update(base_revision=999), "package.control-mismatch",
+             "history entry 4"),
+            ("documents that do not validate", lambda d, e: d["manifest"].pop("owner"), "result.invalid", "package.json"),
+        ]
         state, before = T.inspect(self.pkg), self.files()
-        with T.lock(self.pkg), self.assertRaises(T.StoreError) as cm:
-            T.commit(self.pkg, docs, T.history_entry("a", "s", [], 3), base_digests=T.file_digests(state["docs"]),
-                     base_commit=state["commit_digest"])
-        self.assertEqual((cm.exception.code, cm.exception.details["file"]), ("result.unreadable", "design.json"))
-        self.assertEqual(self.files(), before)
+        for name, mutate, code, file in rows:
+            with self.subTest(name):
+                docs, entry = copy.deepcopy(state["docs"]), T.history_entry("a", "s", [], 3)
+                docs["manifest"]["revision"] = 4
+                mutate(docs, entry)
+                with T.lock(self.pkg), self.assertRaises(T.StoreError) as cm:
+                    T.commit(self.pkg, docs, entry, base_digests=T.file_digests(state["docs"]),
+                             base_commit=state["commit_digest"])
+                self.assertEqual((cm.exception.code, cm.exception.details["file"]), (code, file), str(cm.exception))
+                self.assertEqual(self.files(), before)
+                self.assertFalse((self.pkg / ".tp-product/txn").exists())
+        with self.assertRaises(T.StoreError) as cm:  # the same check through ingest's actor argument
+            C.ingest(self.pkg, bundle(self.note()), actor=7)
+        self.assertEqual(cm.exception.code, "control.invalid")
         self.assertFalse((self.pkg / ".tp-product/txn").exists())
+        self.assertTrue(C.ingest(self.pkg, bundle(self.note()))["committed"])  # nothing left to recover
+        self.assert_trusted(4)
 
 
 def edit_file(pkg, target):
@@ -1083,6 +1110,89 @@ class ControlRecordTests(PackageCase):
             T.recover(self.pkg)
         self.assertEqual((cm.exception.code, cm.exception.exit), ("control.invalid", 1))
         self.assertEqual(self.snapshot(), before)
+
+    @staticmethod
+    def restage(pkg, name, fn):
+        """Change the journal's staged `name` with fn(value), then make the journal's own digests agree (txn.json's
+        new digests and new_commit, the staged commit record's and history entry's file maps), so only the content
+        defect is left for recovery to find."""
+        txn = pkg / ".tp-product/txn"
+        load = lambda n: json.loads((txn / n).read_text())  # noqa: E731
+        # The digest of the canonical text, so a value the store refuses to encode (a lone surrogate) is restaged too.
+        digest_of = lambda v: "sha256:" + hashlib.sha256(json.dumps(  # noqa: E731
+            v, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "surrogatepass")).hexdigest()
+        value = load(name)
+        fn(value)
+        (txn / name).write_text(json.dumps(value))
+        meta, record, entry = load("txn.json"), load("commit.json"), load("history.json")
+        if name in T.FILES.values():
+            digest = digest_of(value)
+            for files in (meta["new"], record["files"], entry["files"]):
+                files[name] = digest
+            (txn / "commit.json").write_text(json.dumps(record))
+            if name != "history.json":
+                (txn / "history.json").write_text(json.dumps(entry))
+        meta["new_commit"] = digest_of(load("commit.json"))
+        (txn / "txn.json").write_text(json.dumps(meta))
+
+    def test_recovery_never_publishes_a_staged_state_the_reader_refuses(self):
+        # The review's F1: a staged history base_revision of 999, or a staged commit record at revision 999 with the
+        # journal's digest made to match, was rolled forward, the journal removed, and status then refused the result.
+        rows = [  # name, staged file, change, restage digests (or "bytes": write these bytes, None removes), code
+            ("history base far", "history.json", lambda d: d.update(base_revision=999), False, "package.control-mismatch"),
+            ("history base older", "history.json", lambda d: d.update(base_revision=2), False, "package.control-mismatch"),
+            ("history base huge", "history.json", lambda d: d.update(base_revision=10 ** 30), False,
+             "package.control-mismatch"),
+            ("history base negative", "history.json", lambda d: d.update(base_revision=-1), False, "control.invalid"),
+            ("history revision other", "history.json", lambda d: d.update(revision=5), False, "control.invalid"),
+            ("history actor a number", "history.json", lambda d: d.update(actor=7), False, "control.invalid"),
+            ("history other files", "history.json", lambda d: d["files"].update({"design.json": "sha256:" + "0" * 64}),
+             False, "package.control-mismatch"),
+            ("history an empty object", "history.json", lambda d: d.clear(), False, "control.invalid"),
+            ("commit revision far", "commit.json", lambda d: d.update(revision=999), True, "package.control-mismatch"),
+            ("commit revision text", "commit.json", lambda d: d.update(revision="4"), True, "control.invalid"),
+            ("commit authority other", "commit.json", lambda d: d["authority"].update({"x": "sha256:" + "0" * 64}), True,
+             "package.control-mismatch"),
+            ("manifest revision far", "package.json", lambda d: d.update(revision=999), True, "control.invalid"),
+            ("manifest revision negative", "package.json", lambda d: d.update(revision=-1), True, "control.invalid"),
+            ("design not valid", "design.json", lambda d: d.update(rules={}), True, "control.invalid"),
+            ("reviews field a number", "reviews.json", lambda d: d.update(notes=7), True, "control.invalid"),
+            ("design digest other", "design.json", lambda d: d.update(package="other"), False, "control.invalid"),
+            ("history missing", "history.json", None, "bytes", "control.invalid"),
+            ("commit empty", "commit.json", b"", "bytes", "control.invalid"),
+            ("manifest a list", "package.json", b"[]", "bytes", "control.invalid"),
+            # rule 2 on the recovery route: text that is not valid Unicode, staged as an escape, digests made to agree
+            ("design text a lone high surrogate", "design.json", lambda d: d["rules"][0].update(statement="\ud800"),
+             True, "control.invalid"),
+            ("history summary a lone low surrogate", "history.json", lambda d: d.update(summary="\udc00"), True,
+             "control.invalid"),
+        ]
+        for name, staged, change, consistent, code in rows:
+            with self.subTest(name):
+                shutil.rmtree(self.pkg)
+                shutil.copytree(FIXTURE, self.pkg)
+                with self.assertRaises(Crash):
+                    C.apply(self.pkg, cs(CommitTests.EDIT), 3, fault=crash_at("after-commit-point"))
+                if consistent == "bytes":
+                    path = self.pkg / ".tp-product/txn" / staged
+                    path.unlink() if change is None else path.write_bytes(change)
+                elif consistent:
+                    self.restage(self.pkg, staged, change)
+                else:
+                    self.rewrite(self.pkg / ".tp-product/txn" / staged, change)
+                before = self.snapshot()
+                out = io.StringIO()
+                rc = cli.main(["apply", str(self.pkg), "--recover", "--json"], out=out, err=io.StringIO())
+                err = json.loads(out.getvalue())
+                self.assertEqual((rc, err["code"]), (3 if code == "package.control-mismatch" else 1, code), err["message"])
+                txn = self.pkg / ".tp-product/txn"  # the refusal names the journal and every file it holds
+                self.assertEqual((err["details"]["journal"], err["details"]["staged"]),
+                                 (str(txn), sorted(str(f) for f in txn.iterdir() if f.is_file())))
+                self.assertIn(str(txn / "txn.json"), err["details"]["staged"])
+                self.assertEqual(self.snapshot(), before)  # journal and staged files kept, nothing replaced
+                rep, rc = cli.status_report(self.pkg)
+                self.assertEqual((rc, [t["code"] for t in rep["trust"]]), (3, ["package.interrupted"]))
+                self.assertEqual(rep["revision"], 3)
 
     def test_an_adoption_without_a_commit_record_continues_from_the_history(self):
         # The review's adopt-gap probe: with commit.json deleted and the manifest saying 3, adoption wrote entry 4 after

@@ -99,3 +99,24 @@ Limits, stated:
 - `init` writes `.gitignore` only when absent; the changeset path given on the command line is not checked for
   symlinks (it is read, never written).
 - F7 (reopening an accepted uncertainty) stays owed to PD-E.
+
+## Round 4: no command publishes a state its reader refuses (2026-11-09)
+
+- **One prospective check (F1).** `store.prospective(root, docs, entry, record=None, revision=None)` builds what a
+  commit would publish: the package files, the new history entry after the existing history, and the commit record.
+  It checks that state with the reader's own functions: `file_problem`, `validate_docs`, `commit_problems`,
+  `history_problems`, `check_history`, and `chain_problems` and `agreement_problems` (both taken out of `check_history`
+  and `inspect`, so status and the writers share them). `commit` (behind `apply`, adoption, `ingest` and `init`) calls
+  it before the journal exists. `_staged`, run by roll-forward and so by `recover`, calls it on the staged files before
+  anything is replaced. A refusal names the file. On recovery it keeps the journal and its staged files
+  (`details.journal`, `details.staged`). Choices: recovery reports `result.*` problems as `control.invalid`, because the
+  staged files are control data the user did not write in this command; a disagreement stays
+  `package.control-mismatch` (exit 3), the code status gives. `history.exists` and `txn.conflict` are still checked
+  first, so a foreign file keeps its own code.
+- **One encode function (F2).** `package.encode` is the only place a value becomes bytes (`render`, `canonical`,
+  `digest`). It turns a lone surrogate into `TextError`. `file_problem` gets the encoding problem by rendering, with
+  no separate pre-check. `load_json_input` gets it for a parsed value by measuring its canonical size. `text_problem`
+  calls `encode` and remains as the earlier, friendlier message in `read_json_file` and for text input.
+- **Report correction (F3).** Round 3's report said adoption replaces `commit.json`. It also replaces `package.json`:
+  adoption commits the edited files as the next revision, so the manifest's revision is incremented and
+  `package.json` is rewritten along with `commit.json` and the new history entry.

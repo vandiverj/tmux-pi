@@ -75,25 +75,51 @@ def depth_problem(value):
     return None
 
 
-def text_problem(value):
-    """Why `value` holds text that cannot be written as UTF-8 (a lone surrogate, from a "\\ud800" escape or a str built
-    in memory), or None. The one owner of that rule: every input form and the on-disk package call it, after the depth
-    check (the walk is recursive)."""
+class TextError(ValueError):
+    """A value holds text that cannot be written as UTF-8 (a lone surrogate). Raised by `encode`, the only place a JSON
+    value becomes bytes; a ValueError, so every reader that refuses unreadable input refuses this too."""
+
+
+def encode(value, pretty=False) -> bytes:
+    """The one place a JSON value becomes bytes: the canonical form (keys sorted, no spaces; what every digest and
+    fingerprint covers) or, `pretty`, the file form (two-space indent, a final newline). Refuses (TextError) a value
+    whose text is not representable as UTF-8, so no route can hash, digest or write one."""
+    text = (json.dumps(value, indent=2, ensure_ascii=False) + "\n" if pretty else
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
     try:
-        canonical(value)
+        return text.encode("utf-8")
     except UnicodeEncodeError as exc:
-        return f"not valid Unicode: it holds a lone surrogate ({exc.object[exc.start:exc.end]!r})"
+        raise TextError(f"not valid Unicode: it holds a lone surrogate ({exc.object[exc.start:exc.end]!r})") from None
+
+
+def render(value) -> bytes:
+    """The bytes of a package or control file (encode's file form)."""
+    return encode(value, pretty=True)
+
+
+def text_problem(value):
+    """Why `value` holds text that cannot be written as UTF-8, or None: encode's refusal, asked early so an input form
+    or a file on disk is refused with its own code. Call after the depth check (the walk is recursive)."""
+    try:
+        encode(value)
+    except TextError as exc:
+        return str(exc)
     return None
 
 
-def file_problem(value, render):
+def file_problem(value, render=render):
     """(bytes, problem): `render(value)` and why those bytes would not be read back by read_json_file (None when they
-    would). Writers call this on every file before their commit point; the bytes are only rendered once the value is
-    known to be representable."""
-    problem = depth_problem(value) or text_problem(value)
+    would): too deep, not representable (encode's refusal) or too large. Writers call this on every file before their
+    commit point."""
+    problem = depth_problem(value)
     if problem:
         return None, problem
-    data = render(value)
+    try:
+        data = render(value)
+    except TextError as exc:
+        return None, str(exc)
+    except (TypeError, ValueError) as exc:  # a value built in memory that JSON cannot hold (a set, NaN is allowed)
+        return None, f"not a JSON value: {exc}"
     return data, size_problem(len(data))
 
 
@@ -136,7 +162,7 @@ def validate(package_dir) -> List[S.Issue]:
 
 
 def canonical(value) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return encode(value)
 
 
 def digest(value) -> str:

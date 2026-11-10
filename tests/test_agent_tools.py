@@ -415,15 +415,33 @@ class GateTests(ScriptCase):
         self.assertIn("eslint:web skipped (no eslint config)", body)
         self.assertEqual(self.calls_of("eslint"), "")
 
+    def test_an_eslint_run_that_ignored_every_file_is_not_a_pass_and_a_failing_deno_lint_fails_the_gate(self):
+        repo = self.repo()
+        self.commit(repo, {"web/package.json": "{}\n", "web/eslint.config.js": "x\n", "web/a.ts": "x\n", "web/b.ts": "x\n"})
+        self.stub("eslint", output="File ignored because no matching configuration was supplied\n" * 3)
+        body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
+        self.assertIn("eslint:web skipped (eslint ignored every file: no matching configuration)", body)
+        self.assertNotIn("eslint:web 0", body)
+        repo = self.repo("repo2")
+        self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n"})
+        self.stub("deno", exit_code=1, output="error: lint")
+        code, _, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))
+        self.assertEqual(code, 1)
+        self.assertIn("eslint:api 1 (deno lint)", body)
+
     def test_a_deno_app_is_checked_with_deno_check_and_a_web_app_with_tsc(self):
         repo = self.repo()
         self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n", "web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n",
                            "lib/helper.ts": "x\n"})
         for tool in ("deno", "tsc"):
             self.stub(tool)
+        self.stub("eslint")
         body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
         self.assertIn("typecheck:api 0", body)
         self.assertIn("typecheck:web 0", body)
+        self.assertIn("eslint:api 0 (deno lint)", body)  # a deno app is linted by deno, never by eslint
+        self.assertIn("arg: lint\narg: main.ts", self.calls_of("deno"))
+        self.assertNotIn("cwd=" + str(repo) + "/api", self.calls_of("eslint"))
         self.assertIn("typecheck:. skipped (no deno.json or tsconfig.json)", body)
         deno = self.calls_of("deno")
         self.assertIn(f"cwd={repo}/api", deno)
@@ -447,7 +465,7 @@ class GateTests(ScriptCase):
         tsc, deno = self.calls_of("tsc"), self.calls_of("deno")
         self.assertEqual(tsc.count("--- call"), 1)
         self.assertIn(f"cwd={repo}/node", tsc)
-        self.assertEqual(deno.count("--- call"), 4)
+        self.assertEqual(deno.count("--- call"), 8)  # a check and a lint per deno app
         self.assertNotIn(f"cwd={repo}/node", deno)
         for app in ("tasks", "opts", "jsonc", "bare"):
             self.assertIn(f"cwd={repo}/{app}", deno)

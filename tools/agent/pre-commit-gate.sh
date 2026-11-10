@@ -10,6 +10,8 @@
 # `deno check` when deno.json(c) is there, else `tsc --noEmit` when tsconfig.json is there; nothing else is guessed.
 # Exception: a deno.json(c) that holds only an `imports` map next to a tsconfig.json is a Node/tsc project (the import
 # map is a resolver aid), so it takes the tsc path. A config that cannot be parsed stays on deno.
+# A Deno app (as above) is linted with `deno lint` instead of eslint, recorded as eslint:APP; an eslint run that ignored
+# every file is recorded missing, not passed.
 # prettier and eslint run per app and are recorded per app (`prettier:APP`, `eslint:APP`, like `typecheck:APP`): an app
 # without an eslint config is not_applicable on its own and never hides behind another app's pass.
 # Prints one `name exit` line per check (`name skipped (reason)` for a tool that is not installed, a project without an
@@ -253,6 +255,30 @@ prettier_ignore_args() {
   esac
 }
 
+# deno_config_is_import_map_only APP — true when APP has a tsconfig.json and the deno config deno itself would read
+# (deno.json before deno.jsonc) is a JSON object whose only key is `imports` (or that is empty). The one place this is
+# decided; any read or parse failure (comments in .jsonc included) returns false, i.e. the deno path.
+deno_config_is_import_map_only() {
+  local cfg="$WT/$1/deno.json"
+  [ -e "$WT/$1/tsconfig.json" ] || return 1
+  [ -e "$cfg" ] || cfg="$WT/$1/deno.jsonc"
+  python3 - "$cfg" 2>>"$TP_LOG" <<'PY'
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if isinstance(cfg, dict) and set(cfg) <= {"imports"} else 1)
+PY
+}
+
+# is_deno_app APP — APP is checked and linted with deno: a deno.json(c) that is not an import map beside a tsconfig.
+is_deno_app() {
+  { [ -e "$WT/$1/deno.json" ] || [ -e "$WT/$1/deno.jsonc" ]; } && ! deno_config_is_import_map_only "$1"
+}
+
 # tool_check NAME TOOL EXT_REGEX ARGS... — run TOOL on the matching changed files of each app, and record the result
 # per app as NAME:APP (passed, failed, missing, or not_applicable). No app's result stands for another's.
 tool_check() {
@@ -266,7 +292,17 @@ tool_check() {
     any=1
     label="$name:$app"
     RUN_SECS=0
-    if [ "$name" = eslint ] && ! has_eslint_config "$app"; then
+    if [ "$name" = eslint ] && is_deno_app "$app"; then
+      if bin="$(tp_find_deno "$WT")"; then
+        run_in "$app" "$label" "$bin" lint "${rels[@]}"
+        printf '%s %s (deno lint)\n' "$label" "$RC"
+        rec_ran "$label" "$RC"
+        if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
+      else
+        printf '%s skipped (deno not found)\n' "$label"
+        rec "$label" missing ""
+      fi
+    elif [ "$name" = eslint ] && ! has_eslint_config "$app"; then
       printf '%s skipped (no eslint config)\n' "$label"
       rec "$label" not_applicable ""
     elif ! bin="$(tp_find_tool "$tool" "$WT/$app" "$WT")"; then
@@ -274,7 +310,14 @@ tool_check() {
       rec "$label" missing ""
     else
       [ "$name" != prettier ] || prettier_ignore_args "$app" "$bin"
+      LOG_AT="$(wc -l <"$TP_LOG")"
       run_in "$app" "$label" "$bin" "$@" ${IGNORE_ARGS[@]+"${IGNORE_ARGS[@]}"} ${rels[@]+"${rels[@]}"}
+      if [ "$name" = eslint ] && [ "$RC" = 0 ] &&
+        [ "$(sed -n "$((LOG_AT + 1)),\$p" "$TP_LOG" | grep -c 'File ignored because no matching configuration')" -ge "${#rels[@]}" ]; then
+        printf '%s skipped (eslint ignored every file: no matching configuration)\n' "$label"
+        rec "$label" missing ""
+        continue
+      fi
       printf '%s %s\n' "$label" "$RC"
       rec_ran "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
@@ -366,25 +409,6 @@ $changed"
 # import, can break the typecheck as well as a .ts one.
 # `tsc --noEmit` checks the whole app. `deno check` needs files: the changed TS files when only TS changed (and nothing
 # was deleted), else every TS file of the app. An app without a config is reported only when TS changed or was deleted in it.
-# deno_config_is_import_map_only APP — true when APP has a tsconfig.json and the deno config deno itself would read
-# (deno.json before deno.jsonc) is a JSON object whose only key is `imports` (or that is empty). The one place this is
-# decided; any read or parse failure (comments in .jsonc included) returns false, i.e. the deno path.
-deno_config_is_import_map_only() {
-  local cfg="$WT/$1/deno.json"
-  [ -e "$WT/$1/tsconfig.json" ] || return 1
-  [ -e "$cfg" ] || cfg="$WT/$1/deno.jsonc"
-  python3 - "$cfg" 2>>"$TP_LOG" <<'PY'
-import json, sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        cfg = json.load(f)
-except (OSError, ValueError):
-    sys.exit(1)
-sys.exit(0 if isinstance(cfg, dict) and set(cfg) <= {"imports"} else 1)
-PY
-}
-
 TS_EXT='ts|tsx|mts|cts'
 typed=0
 for app in ${APPS[@]+"${APPS[@]}"}; do
@@ -393,7 +417,7 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
   label="typecheck:$app"
   RUN_SECS=0
   deleted_here="$(deleted_in "$app")"
-  if { [ -e "$WT/$app/deno.json" ] || [ -e "$WT/$app/deno.jsonc" ]; } && ! deno_config_is_import_map_only "$app"; then
+  if is_deno_app "$app"; then
     typed=1
     if [ "$deleted_here" -gt 0 ] || [ "$(count_in "$app")" -gt "${#rels[@]}" ]; then
       if all_ts_of "$app"; then

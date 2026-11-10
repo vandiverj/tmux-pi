@@ -598,3 +598,41 @@ class ExistingReportUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectOverrideTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.dir, ".tmux-pi"))
+        self.path = os.path.join(self.dir, ".tmux-pi", "routines.json")
+
+    def write(self, doc):
+        with open(self.path, "w") as fh:
+            json.dump(doc, fh)
+
+    def test_no_override_is_the_shared_config(self):
+        lane, probes, paths = routines.load_config(project=self.dir)
+        self.assertEqual((list(probes), paths), (list(routines.PROBES), routines.PATH_PROBES))
+
+    def test_override_replaces_in_place_and_new_names_go_first(self):
+        self.write({"lane_pattern": r"\bxyz-\d+", "probes": {"gitleaks run": "GL", "mine": "mine"}, "path_probes": {"Read: x": "x"}})
+        lane, probes, paths = routines.load_config(project=self.dir)
+        names = list(routines.PROBES)
+        self.assertEqual(list(probes), ["mine"] + names)
+        self.assertEqual(probes["gitleaks run"], "GL")
+        self.assertEqual(list(paths)[0], "Read: x")
+        self.assertEqual(lane.pattern, r"\bxyz-\d+")
+
+    def test_bad_override_names_the_file(self):
+        self.write({"probes": {"a": "("}})
+        with self.assertRaisesRegex(ValueError, "routines.json"):
+            routines.load_config(project=self.dir)
+
+    def test_tables_are_restored_after_use(self):
+        before = (routines.LANE, routines.PROBES, routines.PROBE_ORDER)
+        self.write({"probes": {"mine": "mine"}})
+        saved = routines.use_project_config(self.dir)
+        self.assertIn("mine", routines.PROBES)
+        routines.restore_config(saved)
+        self.assertEqual((routines.LANE, routines.PROBES, routines.PROBE_ORDER), before)

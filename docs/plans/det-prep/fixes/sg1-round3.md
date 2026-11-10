@@ -7,6 +7,14 @@ Review review-coder-153677e451-113620 (REQUEST_CHANGES), report, reproducers and
 absolute targets, every search named, main sessions unchanged, never weaker, `refused` never treated as waiting). Bar:
 `/Users/jerrickvandiver/Documents/Projects/tmux-pi/docs/plans/realistic-use-bar.md`. F1-F3 are realistic.
 
+## The rule change (route rule-first; this family recurred across rounds 1-2)
+The refuse-or-ask decision must come from **the classifier's own identification** of a shell search or read (the reason it
+asked: it already recognises `sh -c 'grep …'` and `xargs sed -n`), not from a second list of forms in `safe_route`. Make the
+classifier return that cause in its result (e.g. a `search_read` flag or the kind of finding), and have every consumer refuse a
+worker when that cause is present. `safe_route`'s parser then only decides which safe calls to name; when it cannot name them
+faithfully, the message is generic. Asks with any other cause keep their ask. Show by code that every classifier path that
+identifies a shell search/read sets the cause (enumerate them), and that no other path does.
+
 ## F1 (Closes by: code): wrapped and piped-filename searches are refused too
 - `sh -c '…'`, `bash -c '…'`, `bash -lc '…'`, `zsh -c '…'` (and the same with `-e`/`-x`-style flags before `-c`): parse the
   single-quoted or double-quoted script and route it as if it were the command (worker refusal, safe calls named where faithful,

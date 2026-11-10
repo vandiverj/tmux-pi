@@ -133,8 +133,7 @@ Limits, stated:
   used for every document (`read_docs`), every control file (`store._read_json`, so `_load` for `commit.json`, history
   entries and `txn.json`, and `_live_digest`) and every staged file (`_staged` reads each staged file once through it;
   a missing staged file is `control.invalid`).
-- **No reader turns a falsy value into absence.** The `or {}` and `revision or ...` tests on control values were
-  replaced with explicit `is None` or `is ABSENT` tests (`inspect`, `_expected`, `history_problems`, `changes._open`,
-  `cli.status_report`). One `if commit` remains and is correct as it is: `inspect`'s agreement check (store.py:348) runs
-  after `_load` has required a valid commit object, so `None` (no commit record) is the only falsy value that reaches it. `prospective` refuses a commit whose documents lack a key instead of
+- **No reader turns a falsy value into absence.** Every `or {}`, `if commit` and `revision or ...` on a control value
+  was replaced with an explicit `is None` or `is ABSENT` test (`inspect`, `_expected`, `history_problems`,
+  `changes._open`, `cli.status_report`). `prospective` refuses a commit whose documents lack a key instead of
   rendering that key as `null`. The task report lists each site and how it was handled.

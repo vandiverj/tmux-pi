@@ -114,6 +114,13 @@ def validate(record) -> List[str]:
     return problems
 
 
+def _git_raw(worktree, *args, env=None, data=None) -> bytes:
+    out = subprocess.run(["git", "-C", str(worktree), *args], env=env, input=data, capture_output=True)
+    if out.returncode != 0:
+        raise RuntimeError("git %s failed in %s: %s" % (" ".join(args), worktree, out.stderr.decode(errors="replace").strip()))
+    return out.stdout
+
+
 def _git(worktree, *args, env=None) -> str:
     out = subprocess.run(["git", "-C", str(worktree), *args], env=env, capture_output=True, text=True)
     if out.returncode != 0:
@@ -122,15 +129,36 @@ def _git(worktree, *args, env=None) -> str:
 
 
 def fingerprint(worktree) -> Tuple[str, str]:
-    """(head, tree) of the working tree. The steps of tp_tree_fingerprint in tools/agent/_common.sh: `git add -A` into a
-    temporary index, then `git write-tree`. head is "" in a repository without a commit."""
+    """(head, tree), using the same steps as tools/agent/_common.sh:tp_tree_fingerprint. Seed a temporary index from
+    HEAD, add -A, then refresh staged additions individually, skipping rejected paths (e.g. beyond a new symlink).
+    Real index flags are never inherited. On failure retry empty-index add -A/write-tree. head is "" without a commit.
+    """
     head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     scratch = tempfile.mkdtemp(prefix="tp-fp.")
     try:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(scratch, "index"))
-        _git(worktree, "add", "-A", env=env)
-        return head, _git(worktree, "write-tree", env=env)
+        try:
+            if head:
+                _git(worktree, "read-tree", "HEAD", env=env)
+            _git(worktree, "add", "-A", env=env)
+            # Read the real index, not the temporary one. No renames, so destinations count as additions;
+            # intent-to-add entries count too. Byte paths survive newlines and non-UTF-8 names.
+            paths = _git_raw(worktree, "diff", "--cached", "--no-renames", "--ita-visible-in-index", "--diff-filter=A",
+                             "--name-only", "-z", *(["HEAD"] if head else []), "--")
+            for path in paths.split(b"\0"):
+                if path:
+                    try:
+                        _git_raw(worktree, "update-index", "--add", "--remove", "--", os.fsdecode(path), env=env)
+                    except RuntimeError:
+                        pass  # A staged path may no longer be addressable in the worktree; add -A already handled it.
+            return head, _git(worktree, "write-tree", env=env)
+        except (RuntimeError, OSError):
+            for path in (env["GIT_INDEX_FILE"], env["GIT_INDEX_FILE"] + ".lock"):
+                if os.path.exists(path):
+                    os.unlink(path)
+            _git(worktree, "add", "-A", env=env)
+            return head, _git(worktree, "write-tree", env=env)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

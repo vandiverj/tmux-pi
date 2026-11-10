@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools" / "agent"
@@ -36,9 +37,9 @@ class ScriptCase(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "LC_ALL": "C.UTF-8"}
 
     # --- fixtures
-    def stub(self, name, exit_code=0, output="", where=None, fail_on_call=None):
+    def stub(self, name, exit_code=0, output="", where=None, fail_on_call=None, body=None):
         """An executable that appends its cwd, TZ and arguments to calls/<name>, prints `output`, exits `exit_code`
-        (`fail_on_call` N: only the Nth call exits 1)."""
+        (`fail_on_call` N: only the Nth call exits 1). `body`: shell text that replaces the output and the exit."""
         directory = where or self.bin
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
@@ -48,10 +49,39 @@ class ScriptCase(unittest.TestCase):
             f'log="{self.calls}/{name}"\n'
             'n=$(($(cat "$log.count" 2>/dev/null || echo 0) + 1)); echo "$n" > "$log.count"\n'
             '{ echo "--- call $n cwd=$PWD TZ=${TZ-unset}"; for a in "$@"; do echo "arg: $a"; done; } >> "$log"\n'
-            f"cat <<'OUT'\n{output}\nOUT\n"
-            f"{code}\n")
+            + (f"{body}\n" if body else f"cat <<'OUT'\n{output}\nOUT\n{code}\n"))
         path.chmod(0o755)
         return path
+
+    def tsc_projects(self, projects, noemit=("", 0), build_rc=0, build_body=None):
+        """A tsc stub that answers per project directory (its basename): `--showConfig` with the project's config text
+        (absent: it fails), `-b` writes ignored output unless `build_body` is supplied, then exits `build_rc`;
+        `--noEmit` returns the `noemit` (output, exit)."""
+        data = self.tmp / "tscdata"
+        data.mkdir(exist_ok=True)
+        for name, (config, files) in projects.items():
+            if config is not None:
+                (data / f"{name}.config").write_text(config)
+            (data / f"{name}.files").write_text("".join(f"{f}\n" for f in files))
+        (data / "noemit.out").write_text(noemit[0])
+        (data / "noemit.rc").write_text(str(noemit[1]))
+        build_body = build_body or 'mkdir -p ../lib/a/dist; echo built > ../lib/a/dist/a.js'
+        self.stub("tsc", body=(
+            f'd="{data}"; name=$(basename "$PWD")\n'
+            'case " $* " in\n'
+            '  *" --showConfig "*) cat "$d/$name.config" || exit 1; exit 0 ;;\n'
+            '  *" --listFilesOnly "*) cat "$d/$name.files"; exit 0 ;;\n'
+            f'  *" -b "*) {build_body}; exit {build_rc} ;;\n'
+            '  *) cat "$d/noemit.out"; exit "$(cat "$d/noemit.rc")" ;;\n'
+            "esac"))
+
+    @staticmethod
+    def show(options=None, refs=()):
+        """`tsc --showConfig` text: the options at the indent tsc prints scalars at, the references as {path} objects."""
+        doc = {"compilerOptions": options or {}}
+        if refs:
+            doc["references"] = [{"path": r} for r in refs]
+        return json.dumps(doc, indent=4)
 
     def calls_of(self, name):
         path = self.calls / name
@@ -169,6 +199,173 @@ class GateTests(ScriptCase):
         self.assertIn("arg: eslint.config.js\n", self.calls_of("eslint"))  # a changed JS file is linted even when it is the config
         self.assertIn("arg: --noEmit", self.calls_of("tsc"))
         self.assertIn(f"cwd={repo}/web", self.calls_of("tsc"))
+
+    def arg_lists(self, name):
+        """The arguments of each call of a stub, in call order."""
+        return [[a for a in call.splitlines()[1:]] for call in self.calls_of(name).split("--- call ")[1:]]
+
+    def test_prettier_in_an_app_directory_honours_the_root_and_app_ignore_files(self):
+        # Prettier reads only the ignore files of its cwd; the root's patterns (generated files) must still apply.
+        for version, expected in (("3.8.3", True), ("2.8.8", False)):
+            with self.subTest(prettier=version):
+                self.setUp()
+                repo = self.repo(files={".gitignore": "dist/\n", ".prettierignore": "web/gen/**\n!web/gen/*.ts\n"})
+                self.commit(repo, {"web/package.json": "{}\n", "web/.prettierignore": "x/\n", "web/a.ts": "export const a = 1\n"})
+                self.stub("prettier", output=version)
+                self.run_script("pre-commit-gate.sh", repo, "main")
+                version_call, check = self.arg_lists("prettier")
+                self.assertEqual(version_call, ["arg: --version"])
+                ignores = [f"arg: {repo}/.gitignore", f"arg: {repo}/.prettierignore", f"arg: {repo}/web/.prettierignore"]
+                want = [x for path in ignores for x in ("arg: --ignore-path", path)] if expected else []
+                self.assertEqual(check, ["arg: --check", "arg: --ignore-unknown", *want, "arg: a.ts", "arg: package.json"])
+
+    def test_prettier_at_the_worktree_root_keeps_its_default_ignore_files(self):
+        repo = self.repo(files={".prettierignore": "gen/\n"})
+        self.commit(repo, {"a.ts": "export const a = 1\n"})
+        self.stub("prettier", output="3.8.3")
+        self.run_script("pre-commit-gate.sh", repo, "main")
+        self.assertNotIn("--ignore-path", self.calls_of("prettier"))
+        self.assertNotIn("--version", self.calls_of("prettier"))
+
+    TS6305 = "a.ts(1,1): error TS6305: Output file 'lib/a/a.d.ts' has not been built from source file 'lib/a/a.ts'."
+
+    def lane_with_referencing_app(self, tracked=None, opt_in=False):
+        """web references ../lib/a and ../lib/b; .gitignore holds the build output patterns of airtera."""
+        repo = self.repo(files={"README.md": "hi\n"})
+        self.commit(repo, {
+            ".gitignore": "dist/\n*.tsbuildinfo\nlib/**/*.d.ts\n*.d.ts.map\n",
+            "web/package.json": "{}\n", "web/tsconfig.json": '// refs\n{"references": [{"path": "../lib/a"}]}\n',
+            "web/a.ts": "export const a = 1\n",
+            "lib/a/tsconfig.json": "{}\n", "lib/a/a.ts": "export const a = 1\n", "lib/b/tsconfig.json": "{}\n",
+            "lib/b/b.ts": "export const b = 1\n", **(tracked or {})})
+        if opt_in:
+            # Project-local config must not itself become a build-created untracked file.
+            with (repo / ".git/info/exclude").open("a") as out:
+                out.write(".tmux-pi/\n")
+            self.write(repo, {".tmux-pi/routines.json": '{"build_tsc_references": true}\n'})
+        return repo
+
+    def test_tsc_builds_the_project_references_before_the_noemit_check(self):
+        repo = self.lane_with_referencing_app(opt_in=True)
+        self.tsc_projects({"web": (self.show({}, ["../lib/a", "../lib/b"]), [])})
+        # Existing unrelated edits are permitted, but must not be modified by the build.
+        self.write(repo, {"README.md": "pre-existing edit\n", "notes.txt": "pre-existing untracked\n"})
+        before = self.git(repo, "status", "--porcelain")
+        out = self.run_script("pre-commit-gate.sh", repo, "main")
+        code, log, body = self.last_line(out)
+        self.assertEqual(code, 0)
+        calls = [c for c in self.arg_lists("tsc") if c[0] in ("arg: -b", "arg: --noEmit")]
+        self.assertEqual(calls, [["arg: -b", "arg: ../lib/a", "arg: ../lib/b"], ["arg: --noEmit"]])
+        self.assertIn(f"cwd={repo}/web", self.calls_of("tsc"))
+        self.assertEqual([l for l in body if l.startswith("typecheck:web")], ["typecheck:web 0"])
+        self.assertIn("== typecheck:web references: ", self.assertLogged(log))
+        self.assertEqual(self.git(repo, "status", "--porcelain"), before)
+        self.assertTrue((repo / "lib/a/dist/a.js").exists())
+
+    def test_without_opt_in_references_are_not_built_and_ts6305_alone_is_missing(self):
+        repo = self.lane_with_referencing_app(tracked={"lib/a/a.js": "old\n"})
+        self.tsc_projects({"web": (self.show({}, ["../lib/a"]), []),
+                           "a": (self.show({"composite": True, "emitDeclarationOnly": True, "outDir": "./dist"}), [])},
+                          noemit=(self.TS6305 + "\n", 2))
+        before = self.git(repo, "status", "--porcelain")
+        out = self.run_script("pre-commit-gate.sh", repo, "main")
+        code, log, body = self.last_line(out)
+        self.assertEqual(code, 0)
+        self.assertNotIn("arg: -b", self.calls_of("tsc"))
+        self.assertEqual((repo / "lib/a/a.js").read_text(), "old\n")
+        self.assertEqual(self.git(repo, "status", "--porcelain"), before)
+        self.assertEqual([l for l in body if l.startswith("typecheck:web")],
+                         ["typecheck:web skipped (references not built; set build_tsc_references=true in .tmux-pi/routines.json to opt in)"])
+        record = json.loads(Path(log).with_suffix(".json").read_text())
+        self.assertEqual({c["name"]: (c["status"], c["exit"]) for c in record["checks"]}["typecheck:web"], ("missing", None))
+
+    def test_without_a_build_a_typecheck_that_fails_for_another_reason_fails_and_one_that_passes_passes(self):
+        other = "web/a.ts(2,1): error TS2322: Type 'string' is not assignable to type 'number'."
+        for label, config, noemit, want_code, want_line in (
+                ("TS6305 and another error", {}, (f"{self.TS6305}\n{other}\n", 2), 1, "typecheck:web 2"),
+                ("no TS error line", {"build_tsc_references": False}, ("boom\n", 2), 1, "typecheck:web 2"),
+                ("passes", {}, ("", 0), 0, "typecheck:web 0"),
+                ("string true is not opt-in", {"build_tsc_references": "true"}, ("", 0), 0, "typecheck:web 0"),
+                ("nonobject config", [], ("", 0), 2, "pre-commit-gate.sh: cannot read .tmux-pi/routines.json (see log)"),
+                ("malformed config", "{", ("", 0), 2, "pre-commit-gate.sh: cannot read .tmux-pi/routines.json (see log)")):
+            with self.subTest(case=label):
+                self.setUp()
+                repo = self.lane_with_referencing_app(opt_in=True)
+                self.write(repo, {".tmux-pi/routines.json": config if isinstance(config, str) else json.dumps(config)})
+                self.tsc_projects({"web": (self.show({}, ["../lib/a"]), []),
+                                   "a": (self.show({"composite": True, "emitDeclarationOnly": True, "outDir": "./dist"}), [])},
+                                  noemit=noemit)
+                code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))
+                self.assertEqual((code, want_line in body), (want_code, True), body)
+                self.assertNotIn("arg: -b", self.calls_of("tsc"))
+
+    def test_the_opt_in_is_read_from_the_worktree_else_from_the_main_checkout(self):
+        yes, no, bad = '{"build_tsc_references": true}\n', '{"build_tsc_references": false}\n', "{"
+        for case, in_worktree, in_main, built, want_code in (
+                ("main checkout only", None, yes, True, 0),
+                ("worktree only", yes, None, True, 0),
+                ("worktree wins over main: off", no, yes, False, 0),
+                ("worktree wins over main: on", yes, no, True, 0),
+                ("worktree file without the key wins whole", "{}\n", yes, False, 0),
+                ("neither file", None, None, False, 0),
+                ("main file unreadable and no worktree file", None, bad, False, 2),
+                ("worktree file unreadable, main file on", bad, yes, False, 2)):
+            with self.subTest(case=case):
+                self.setUp()
+                main = self.lane_with_referencing_app()
+                with (main / ".git/info/exclude").open("a") as out:
+                    out.write(".tmux-pi/\n")
+                lane = self.tmp / "lane-wt"
+                self.git(main, "worktree", "add", "-q", "-b", "lane2", str(lane))
+                for root, text in ((lane, in_worktree), (main, in_main)):
+                    if text is not None:
+                        self.write(root, {".tmux-pi/routines.json": text})
+                self.tsc_projects({"web": (self.show({}, ["../lib/a", "../lib/b"]), [])})
+                code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", lane, "main"))
+                self.assertEqual(code, want_code, body)
+                self.assertEqual("arg: -b" in self.calls_of("tsc"), built)
+
+    def test_a_reference_that_does_not_build_fails_the_typecheck_without_the_noemit_run(self):
+        for case, build_rc, build_body, dirty_first, changed, unchanged, flag in (
+                ("compiler failure", 1, None, False, None, None, None),
+                ("tracked overwrite", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, None),
+                ("new unignored file after failed build", 2, 'echo built > ../lib/a/new.js', False, "lib/a/new.js", None, None),
+                ("already dirty tracked-but-ignored file", 0, 'echo built > ../lib/a/a.js', True, "lib/a/a.js", None, None),
+                ("already dirty file is named, not the other dirty files", 0, 'echo built > ../lib/a/a.js', True, "lib/a/a.js",
+                 ("README.md", "notes.txt"), None),
+                ("assume-unchanged tracked file", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, "--assume-unchanged"),
+                ("skip-worktree tracked file", 0, 'echo built > ../lib/a/a.js', False, "lib/a/a.js", None, "--skip-worktree")):
+            with self.subTest(case=case):
+                self.setUp()
+                repo = self.lane_with_referencing_app(tracked={"lib/a/a.js": "old\n"}, opt_in=True)
+                if dirty_first:
+                    self.commit(repo, {".gitignore": (repo / ".gitignore").read_text() + "lib/a/a.js\n"})
+                    self.write(repo, {"lib/a/a.js": "existing edit\n", "README.md": "other edit\n", "notes.txt": "untracked\n"})
+                if flag:
+                    self.git(repo, "update-index", flag, "lib/a/a.js")
+                self.tsc_projects({"web": (self.show({}, ["../lib/a"]), [])}, build_rc=build_rc, build_body=build_body)
+                out = self.run_script("pre-commit-gate.sh", repo, "main")
+                code, log, body = self.last_line(out)
+                self.assertEqual(code, 1)
+                self.assertIn("typecheck:web 1", body)
+                self.assertNotIn("arg: --noEmit", self.calls_of("tsc"))
+                if changed:
+                    self.assertIn("reference builds changed these tracked or unignored files", out.stdout)
+                    self.assertIn(f"      {changed}\n", out.stdout)
+                    self.assertIn(changed, self.assertLogged(log))
+                    self.assertEqual((repo / changed).read_text(), "built\n")  # never undo the build
+                    for other in unchanged or ():
+                        self.assertNotIn(other, out.stdout.split("reference builds changed")[1])
+                        self.assertNotIn(other, self.assertLogged(log).split("reference builds changed")[1])
+                record = json.loads(Path(log).with_suffix(".json").read_text())
+                self.assertEqual({c["name"]: c["status"] for c in record["checks"]}["typecheck:web"], "failed")
+
+    def test_a_tsconfig_that_only_mentions_references_runs_just_the_noemit_check(self):
+        repo = self.lane_with_referencing_app(opt_in=True)
+        self.commit(repo, {"web/tsconfig.json": '{"references": []}\n'})
+        self.tsc_projects({"web": (self.show(), [])})
+        self.run_script("pre-commit-gate.sh", repo, "main")
+        self.assertEqual(self.arg_lists("tsc"), [["arg: --showConfig"], ["arg: --noEmit"]])
 
     def test_gitleaks_scans_base_to_head(self):
         repo = self.lane_with_web_app()
@@ -974,6 +1171,109 @@ class FingerprintTests(ScriptCase):
         (repo / "a.txt").unlink()
         self.assertNotEqual(self.shell_fingerprint(repo), before)
         self.assertEqual(self.git(repo, "status", "--porcelain").split(), ["D", "a.txt"])  # the real index was not touched
+        # If the richer snapshot fails, discard it and retry the original empty-index method.
+        expected = self.shell_fingerprint(repo)
+        real_git = shutil.which("git")
+        (self.bin / "git").unlink()
+        marker = self.tmp / "failed-once"
+        for step in ("read-tree", "add", "write-tree"):
+            with self.subTest(fallback_after=step):
+                (self.bin / "git").write_text(
+                    f'#!/bin/sh\ncase " $* " in *" {step} "*)\n'
+                    f'  if [ ! -e "{marker}" ]; then touch "{marker}"; exit 1; fi ;;\nesac\n'
+                    f'exec "{real_git}" "$@"\n')
+                (self.bin / "git").chmod(0o755)
+                for implementation in (self.shell_fingerprint, gate_record.current):
+                    with self.subTest(implementation=implementation.__name__):
+                        marker.unlink(missing_ok=True)
+                        with mock.patch.dict(os.environ, self.env):
+                            self.assertEqual(implementation(repo), expected)
+
+    def test_a_tracked_file_that_matches_an_ignore_pattern_is_still_part_of_the_fingerprint(self):
+        repo = self.repo(files={"a.txt": "one\n", "out.js": "built\n"})
+        self.commit(repo, {".gitignore": "out.js\n"})  # tracked first, ignored after: git still tracks it
+        before = self.shell_fingerprint(repo)
+        self.assertEqual(gate_record.current(repo), before)
+        self.write(repo, {"out.js": "rewritten\n"})
+        edited = self.shell_fingerprint(repo)
+        self.assertNotEqual(edited, before)
+        self.assertEqual(gate_record.current(repo), edited)  # both rules agree
+        (repo / "out.js").unlink()
+        self.assertNotEqual(self.shell_fingerprint(repo), edited)  # deletion of a tracked ignored file counts too
+        self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        self.write(repo, {"out.js": "built\n"})
+        self.assertEqual(self.shell_fingerprint(repo), before)  # restored: same tree again
+        self.write(repo, {"never-tracked.js": "x\n", ".gitignore": "out.js\nnever-tracked.js\n"})
+        ignored_untracked = self.shell_fingerprint(repo)
+        self.write(repo, {"never-tracked.js": "y\n"})
+        self.assertEqual(self.shell_fingerprint(repo), ignored_untracked)  # an untracked ignored file is still left out
+        self.assertEqual(gate_record.current(repo), ignored_untracked)
+
+    def test_a_rewrite_of_a_flagged_tracked_file_changes_the_fingerprint(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(flag=flag):
+                repo = self.repo(flag.strip("-"), files={"out.js": "old\n", "a.txt": "one\n"})
+                self.git(repo, "update-index", flag, "out.js")
+                before = self.shell_fingerprint(repo)
+                self.assertEqual(gate_record.current(repo), before)
+                self.write(repo, {"out.js": "rewritten\n"})
+                self.assertNotEqual(self.shell_fingerprint(repo), before)
+                self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        repo = self.repo("staged", files={"a.txt": "one\n"})  # staged-new and ignored: tracked, so counted
+        self.write(repo, {".gitignore": "new.js\n", "new.js": "x\n"})
+        self.git(repo, "add", "-f", "new.js")
+        staged = self.shell_fingerprint(repo)
+        self.write(repo, {"new.js": "y\n"})
+        self.assertNotEqual(self.shell_fingerprint(repo), staged)
+        self.assertEqual(gate_record.current(repo), self.shell_fingerprint(repo))
+        for kind in ("directory-to-symlink", "directory-to-file", "file-to-directory", "symlink-to-directory"):
+            for staged_new in (False, True):
+                with self.subTest(kind=kind, staged_new=staged_new):
+                    initial = {"a": "old\n"} if kind in ("file-to-directory", "symlink-to-directory") else {"a/b": "old\n"}
+                    repo = self.repo(f"{kind}-{staged_new}", files={"base": "x\n"} if staged_new else initial)
+                    if staged_new:
+                        self.write(repo, {**initial, ".gitignore": "z-ignored.js\n", "z-ignored.js": "staged\n"})
+                        self.git(repo, "add", "-f", "a", "z-ignored.js")
+                        self.write(repo, {"z-ignored.js": "rewritten\n"})  # still refreshed after a rejected path
+                    if kind == "symlink-to-directory":
+                        (repo / "a").unlink()
+                        (repo / "a").symlink_to("elsewhere")
+                        self.git(repo, "add", "a")
+                        if not staged_new:
+                            self.git(repo, "commit", "-qm", "symlink")
+                    index = repo / ".git/index"
+                    original_index = index.read_bytes()
+                    before = self.shell_fingerprint(repo)
+                    if kind in ("file-to-directory", "symlink-to-directory"):
+                        (repo / "a").unlink()
+                        self.write(repo, {"a/b": "new\n"})
+                    else:
+                        shutil.rmtree(repo / "a")
+                        if kind == "directory-to-symlink":
+                            (repo / "a").symlink_to("elsewhere")
+                        else:
+                            self.write(repo, {"a": "new\n"})
+                    # Build the independent expected tree with Git's original empty-index algorithm.
+                    with tempfile.TemporaryDirectory() as scratch:
+                        env = dict(self.env, GIT_INDEX_FILE=str(Path(scratch) / "index"))
+                        subprocess.run(["git", "-C", str(repo), "add", "-A"], env=env, check=True, capture_output=True)
+                        if staged_new:
+                            subprocess.run(["git", "-C", str(repo), "add", "-f", "z-ignored.js"], env=env,
+                                           check=True, capture_output=True)
+                        expected = subprocess.run(["git", "-C", str(repo), "write-tree"], env=env, check=True,
+                                                  capture_output=True, text=True).stdout.strip()
+                    for implementation in (self.shell_fingerprint, gate_record.current):
+                        with self.subTest(implementation=implementation.__name__):
+                            actual = implementation(repo)
+                            self.assertEqual(actual, expected)
+                            self.assertNotEqual(actual, before)
+                            self.assertEqual(implementation(repo), actual)  # repeat is stable
+                    marker = self.tmp / "command-ran"
+                    marker.unlink(missing_ok=True)
+                    out = self.run_script("test-run.sh", repo, "--", "touch", marker)
+                    self.assertEqual(out.returncode, 0, out.stdout)
+                    self.assertTrue(marker.exists(), out.stdout)
+                    self.assertEqual(index.read_bytes(), original_index)
 
     def test_equal_content_gives_an_equal_fingerprint_whatever_the_history(self):
         one = self.repo("one", files={"a.txt": "one\n"})

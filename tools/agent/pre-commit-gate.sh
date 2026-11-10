@@ -229,10 +229,33 @@ run_in() {
   [ "$RC" = 0 ] || TAIL="$(sed -n "$((start + 2)),$((start + 9))p" "$TP_LOG" | sed 's/^/    /')"
 }
 
+# prettier_ignore_args APP BIN — set IGNORE_ARGS to `--ignore-path FILE` pairs for APP. Prettier reads only the
+# .gitignore and .prettierignore of its cwd, and the gate runs it from APP's directory, so the worktree root's files
+# would be dropped; naming them restores what a run from the root applies. Naming any file replaces the default pair,
+# so APP's own two files are named too. Prettier 3 reads each file's patterns relative to that file's directory and
+# takes several --ignore-path; older Prettier does neither, so it keeps its default.
+prettier_ignore_args() {
+  local app="$1" bin="$2" dir f ver
+  IGNORE_ARGS=()
+  [ "$app" != . ] || return 0
+  for dir in "$WT" "$WT/$app"; do
+    for f in .gitignore .prettierignore; do
+      [ -f "$dir/$f" ] && IGNORE_ARGS+=(--ignore-path "$dir/$f")
+    done
+  done
+  [ "${#IGNORE_ARGS[@]}" -gt 0 ] || return 0
+  ver="$(cd "$WT/$app" && "$bin" --version 2>>"$TP_LOG")"
+  case "$ver" in
+    [3-9].* | [1-9][0-9].*) ;;
+    *) IGNORE_ARGS=() ;;
+  esac
+}
+
 # tool_check NAME TOOL EXT_REGEX ARGS... — run TOOL on the matching changed files of each app, and record the result
 # per app as NAME:APP (passed, failed, missing, or not_applicable). No app's result stands for another's.
 tool_check() {
   local name="$1" tool="$2" ext="$3" app bin any=0 rels label
+  IGNORE_ARGS=()
   shift 3
   for app in ${APPS[@]+"${APPS[@]}"}; do
     rels=()
@@ -248,7 +271,8 @@ tool_check() {
       printf '%s skipped (not found)\n' "$label"
       rec "$label" missing ""
     else
-      run_in "$app" "$label" "$bin" "$@" ${rels[@]+"${rels[@]}"}
+      [ "$name" != prettier ] || prettier_ignore_args "$app" "$bin"
+      run_in "$app" "$label" "$bin" "$@" ${IGNORE_ARGS[@]+"${IGNORE_ARGS[@]}"} ${rels[@]+"${rels[@]}"}
       printf '%s %s\n' "$label" "$RC"
       rec_ran "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
@@ -277,6 +301,63 @@ has_eslint_config() {
 
 tool_check prettier prettier 'js|jsx|ts|tsx|mjs|cjs|mts|cts|json|css|scss|md|yml|yaml' --check --ignore-unknown
 tool_check eslint eslint 'js|jsx|ts|tsx|mjs|cjs|mts|cts'
+
+# tsc_references APP BIN — set REFS to the project references of APP's tsconfig.json (paths as written, relative to APP).
+# `tsc --noEmit` does not build them, and in a fresh worktree their declarations do not exist (TS6305). The cheap grep
+# skips the --showConfig run for the usual config without references; --showConfig reads the JSONC and the extends.
+tsc_references() {
+  local line
+  REFS=()
+  grep -q '"references"' "$WT/$1/tsconfig.json" || return 0
+  TP_TSC_CONF="$(cd "$WT/$1" && "$2" --showConfig 2>>"$TP_LOG")"
+  while IFS= read -r line; do [ -z "$line" ] || REFS+=("$line"); done < <(tp_tsc_conf_refs)
+}
+
+# only_ts6305 START — the last run_in (its output begins after log line START) failed with TS errors that are all TS6305.
+only_ts6305() {
+  local errors
+  errors="$(sed -n "$(($1 + 2)),\$p" "$TP_LOG" | grep 'error TS[0-9]')"
+  [ -n "$errors" ] && ! printf '%s\n' "$errors" | grep -qv 'error TS6305'
+}
+
+# Project-local opt-in, alongside the existing routine overrides: the worktree's .tmux-pi/routines.json, else the main
+# checkout's (lib/routines.py:project_flag). Only JSON true enables builds; an unreadable or malformed config is an
+# error, never permission to write.
+BUILD_TSC_REFS="$(python3 - "$TP_TOOLS_DIR/../../lib" "$WT" 2>>"$TP_LOG" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import routines
+
+print(int(routines.project_flag(sys.argv[2], "build_tsc_references")))
+PY
+)" || tp_fail "cannot read .tmux-pi/routines.json (see log)"
+
+# build_tsc_references APP BIN — opt-in permits writes, not silent worktree changes. Compare the tree fingerprint
+# (tracked, tracked-but-ignored and unignored untracked content) before and after, and name the paths that differ:
+# an already-dirty file can be overwritten without its status changing. Check after unsuccessful builds too; leave all
+# writes in place for the user to inspect, never revert or delete them.
+build_tsc_references() {
+  local app="$1" bin="$2" before after changed
+  if ! before="$(tp_tree_fingerprint "$WT" 2>>"$TP_LOG")"; then
+    RC=1
+    TAIL="    cannot snapshot the worktree before reference build"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+    return
+  fi
+  run_in "$app" "$label references" "$bin" -b "${REFS[@]}"
+  if ! after="$(tp_tree_fingerprint "$WT" 2>>"$TP_LOG")"; then
+    RC=1
+    TAIL="    cannot snapshot the worktree after reference build"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+  elif [ "$before" != "$after" ]; then
+    RC=1
+    changed="$(git -C "$WT" -c core.quotePath=false diff-tree -r --name-only --no-renames "$before" "$after" 2>>"$TP_LOG" | sed 's/^/      /')"
+    TAIL="    reference builds changed these tracked or unignored files (no files were reverted):
+$changed"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+  fi
+}
 
 # Typecheck, one line per touched app that has a typecheck config (deno.json(c) or tsconfig.json). Any changed or
 # deleted file in the app counts: a package.json, tsconfig, deno.json or .js change, or a deleted file that others
@@ -322,7 +403,21 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
   elif [ -e "$WT/$app/tsconfig.json" ]; then
     typed=1
     if bin="$(tp_find_tool tsc "$WT/$app" "$WT")"; then
-      run_in "$app" "$label" "$bin" --noEmit
+      # Without explicit permission, check the app as it stands. TS6305 alone is an unbuilt-reference setup gap.
+      tsc_references "$app" "$bin"
+      RC=0
+      if [ "${#REFS[@]}" -gt 0 ] && [ "$BUILD_TSC_REFS" = 1 ]; then
+        build_tsc_references "$app" "$bin"
+      fi
+      if [ "$RC" = 0 ]; then
+        LOG_AT="$(wc -l <"$TP_LOG")"
+        run_in "$app" "$label" "$bin" --noEmit
+      fi
+      if [ "$BUILD_TSC_REFS" != 1 ] && [ "${#REFS[@]}" -gt 0 ] && [ "$RC" != 0 ] && only_ts6305 "$LOG_AT"; then
+        printf '%s skipped (references not built; set build_tsc_references=true in .tmux-pi/routines.json to opt in)\n' "$label"
+        rec "$label" missing ""
+        continue
+      fi
       printf '%s %s\n' "$label" "$RC"
       rec_ran "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi

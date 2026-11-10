@@ -96,17 +96,38 @@ tp_app_of() {
   printf '.\n'
 }
 
-# tp_tree_fingerprint WORKTREE — print the tree sha of everything in the working tree that git would add: tracked
-# changes and untracked files that are not ignored (deletions are simply absent). It is `git write-tree` on a temporary
-# index filled by `git add -A`, so the real index is not touched. The same content gives the same sha. HEAD is separate
-# (`git rev-parse HEAD`). lib/gate_record.py:fingerprint takes the same steps and a test holds the two equal.
+# tp_tree_fingerprint WORKTREE — print the tree sha of everything in the working tree that git would add: every tracked
+# file (even one that matches an ignore pattern) and untracked files that are not ignored (deletions are simply absent).
+# It is `git write-tree` on a temporary index: seed HEAD, then `git add -A` (handles tracked files and type changes),
+# then refresh staged-new paths individually (including ignored ones). Rejected paths, e.g. descendants now beyond a
+# symlink, are skipped. Never copy the real index's assume-unchanged/skip-worktree flags or touch that index. If the
+# richer snapshot fails, retry the original empty-index add -A/write-tree so a valid type change cannot stop a command.
+# The same content gives the same sha. HEAD is separate. lib/gate_record.py:fingerprint takes the same steps.
 tp_tree_fingerprint() {
-  local dir idx tree rc=0
+  local dir idx tree path rc=0
+  local head=()
   dir="$(mktemp -d "${TMPDIR:-/tmp}/tp-fp.XXXXXX")" || return 1
   idx="$dir/index"
-  (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1
+  if git -C "$1" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    head=(HEAD)
+    GIT_INDEX_FILE="$idx" git -C "$1" read-tree HEAD >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" = 0 ]; then (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1; fi
+  if [ "$rc" = 0 ]; then
+    # No renames: a renamed destination is new membership too. Include intent-to-add entries; keep names NUL-delimited.
+    git -C "$1" diff --cached --no-renames --ita-visible-in-index --diff-filter=A --name-only -z ${head[@]+"${head[@]}"} -- >"$dir/paths" 2>/dev/null || rc=1
+    while IFS= read -r -d '' path; do
+      GIT_INDEX_FILE="$idx" git -C "$1" update-index --add --remove -- "$path" >/dev/null 2>&1 || :
+    done <"$dir/paths"
+  fi
   if [ "$rc" = 0 ]; then
     tree="$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree 2>/dev/null)" || rc=1
+  fi
+  if [ "$rc" != 0 ]; then
+    rm -f "$idx" "$idx.lock"
+    rc=0
+    (cd "$1" && GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1) || rc=1
+    if [ "$rc" = 0 ]; then tree="$(GIT_INDEX_FILE="$idx" git -C "$1" write-tree 2>/dev/null)" || rc=1; fi
   fi
   rm -rf "$dir"
   [ "$rc" = 0 ] || return 1
@@ -124,3 +145,9 @@ tp_json_write() {
 
 # tp_now — UTC time, ISO 8601.
 tp_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# tp_tsc_conf_refs — the `path` of each project reference in the `tsc --showConfig` output held in $TP_TSC_CONF, as
+# written, one per line.
+tp_tsc_conf_refs() {
+  printf '%s\n' "$TP_TSC_CONF" | sed -n '/^    "references": \[/,/^    \]/p' | sed -n 's/^ *"path": "\(.*\)",\{0,1\}$/\1/p'
+}

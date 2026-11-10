@@ -72,7 +72,7 @@ TAMPER_EXPECT = {
     "collect-id": ("collect", "returned the task's record"),
     "collect-state": ("collect", "collected tasks are completed"),
     "collect-reaped": ("collect", "reaped.json"),
-    "pane-alive": ("collect", "panes of the three tasks are gone"),
+    "pane-alive": ("collect", "no task pane is still running"),
     "remove-abandoned": ("remove", "not abandoned"),
     "worktree-back": ("remove", "worktree directory is gone"),
     "lane-back": ("remove", "archived, no longer listed"),

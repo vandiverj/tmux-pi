@@ -114,6 +114,9 @@ class FlowTest(Base):
         self.assertEqual(set(summary["ids"]), {"first", "retry", "reviewer"})
         self.assertEqual(summary["decline"], {"status": "declined", "event": "UserPromptSubmit"}, "what the real settle_declined writes for the redirect's prompt")
         self.assertGreater(len(records()), 3)      # the runs did use tmux, all through the shim
+        # live run 8's order: the stopped first task's pane is gone; the retry's process was ended at review time and its pane is still
+        # listed, dead (remain-on-exit); the reviewer's process is ended by collect. Fake mode must reproduce it, and the check accept it.
+        self.assertEqual(summary["collect_panes"], {"first": "absent", "retry": "dead", "reviewer": "dead"})
 
     def test_every_parallel_run_used_only_its_own_private_tmux(self):
         """Each run's calls: its own TMUX_TMPDIR and -L socket (equality with its summary), and exactly one kill-server, its own."""
@@ -1012,6 +1015,45 @@ class ExactWorktreePathTest(Base):
         self.assertEqual(summary["made"]["dirs"], [str(parent)])
         self.assertFalse(parent.exists())
         self.assertEqual(summary["cleanup"], {"ran": True, "errors": [], "leftovers": [], "kept": []})
+
+
+class CollectPaneCheckTest(Base):
+    """The collect check: each task's recorded pane is absent, or present and dead; present and not dead fails, naming pane and command.
+    Rows: (name, listing of `list-panes -a` in PANE_FORMAT, recorded panes, failing task or None)."""
+    ROWS = (
+        ("all absent", "", {"first": "%1", "retry": "%2", "reviewer": "%3"}, None),
+        ("dead with remain-on-exit", "%2\t1\tsleep\n%3\t1\tsleep\n", {"first": "%1", "retry": "%2", "reviewer": "%3"}, None),
+        ("alive running the worker", "%2\t0\tclaude\n", {"first": "%1", "retry": "%2", "reviewer": "%3"}, "retry"),
+        ("alive running something else", "%1\t0\tsleep\n%2\t1\tsleep\n", {"first": "%1", "retry": "%2", "reviewer": "%3"}, "first"),
+        ("id now held by another session's live pane", "%3\t0\tvim\n", {"first": "%1", "retry": "%2", "reviewer": "%3"}, "reviewer"),
+        ("id now held by another session's dead pane", "%3\t1\tvim\n", {"first": "%1", "retry": "%2", "reviewer": "%3"}, None),
+        ("no pane recorded", "%9\t0\tzsh\n", {"first": None, "retry": "%2", "reviewer": "%3"}, None),
+    )
+
+    def smoke(self, panes):
+        smoke = g3.Smoke(g3.parse(["--fake", "--out", str(self.out)]))
+        self.addCleanup(shutil.rmtree, smoke.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, smoke.tmux_tmp, ignore_errors=True)
+        smoke.step_name = "collect"
+        smoke.ids = {key: f"coder-{key}" for key in panes}
+        smoke.read = lambda path, default=None: {"pane": panes[path.parent.name.removeprefix("coder-")]}
+        smoke.task_dir = lambda ident: Path(ident) / ident
+        return smoke
+
+    def test_each_task_pane_absent_or_dead_passes_and_a_running_one_fails_naming_it(self):
+        for name, listing, panes, failing in self.ROWS:
+            with self.subTest(name):
+                smoke = self.smoke(panes)
+                if failing is None:
+                    smoke.check_no_task_pane_running(listing)
+                    self.assertNotIn("running", smoke.facts["collect_panes"].values())
+                    continue
+                with self.assertRaises(g3.SmokeError) as raised:
+                    smoke.check_no_task_pane_running(listing)
+                self.assertIn("no task pane is still running", raised.exception.message)
+                self.assertIn(f"{failing}: {panes[failing]} is running", raised.exception.message)
+                command = [line.split("\t")[2] for line in listing.splitlines() if line.startswith(panes[failing] + "\t")][0]
+                self.assertIn(repr(command), raised.exception.message)
 
 
 class GuardTest(Base):

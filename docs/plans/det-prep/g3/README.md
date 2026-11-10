@@ -26,7 +26,7 @@ if the message names the worktree, trust that folder as the message says and rer
 the tmux session, not from the process that ran tmux, so the session the smoke makes would not see Main's setting and `tp-pi` would exit at once on a machine without the pinned
 Node (live runs 6 and 7: `tp-review ... no such pane`, `reviewer 'pi' ... could not start`). So the smoke names the variables it carries in one tuple, `CARRIED_ENV` (today only `TP_PI_NODE`;
 never the whole environment): when the caller's environment has one (set, even empty), the session is made with the same value, in the same call (`new-session -e NAME=VALUE`, tmux 3.2 or newer;
-an older tmux is refused at setup, naming the requirement, before anything is made). Unset in the caller: nothing is added and `tp-pi`'s default applies. Setup then reads it back
+an older tmux is refused at setup, naming the requirement, before the tmux session is created). Unset in the caller: nothing is added and `tp-pi`'s default applies. Setup then reads it back
 (`show-environment -t =<run> TP_PI_NODE`) in the check "the run's tmux session carries the caller's TP_PI_NODE"; a mismatch fails step `setup`.
 
 Exit 0: every step and the cleanup passed. Exit 1: stderr says `FAILED at step '<name>': <what>`, and `cleanup: ...` / `left behind: ...` lines.
@@ -144,7 +144,7 @@ the passing flow makes has no case.
 - close: the file is committed on the lane branch and the tree is clean (`close-dirty`); after `tp-agent lane close` the lane record lists step `s1` as closed (`lane-record`).
 - merge: a merge commit on the integration branch (made with `commit-tree`, no checkout) with parents (previous tip, lane tip) (`merge-parents`); the branch changed exactly one file, added (`merge-extra-file`);
   that file holds exactly the requested line (`scratch-commit`); the repository's own branch did not move (`main-moved`).
-- collect: `collect` of the retry and of the reviewer returns their records (`collect-id`), the tasks are `completed` (`collect-state`) and have `reaped.json` (`collect-reaped`); the panes of all three tasks are gone (`pane-alive`).
+- collect: `collect` of the retry and of the reviewer returns their records (`collect-id`), the tasks are `completed` (`collect-state`) and have `reaped.json` (`collect-reaped`); no task pane is still running: each is gone or kept dead, never alive (`pane-alive`).
 - remove: `lane remove` says removed, not abandoned, integrated in the integration branch (`remove-abandoned`); the lane worktree directory is gone (`worktree-back`); the lane record is archived (`lane-back`).
 - leftovers: no worktree, branch, lane record or pane of the run is left (`leftover-worktree`, `leftover-branch`, `leftover-lane-record`, `leftover-pane`: each leaves that thing on purpose and the check must name it);
   after killing the run's session, no session and no pane of it remains (`session-kept`). A probe that cannot finish is an error, not a pass.

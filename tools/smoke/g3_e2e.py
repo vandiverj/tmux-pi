@@ -68,6 +68,7 @@ GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@inv
 # bin/tp-pi runs pi on ${TP_PI_NODE-<pinned nvm node>}: without this a pi reviewer exits at once on a machine that lacks the pinned node.
 CARRIED_ENV = ("TP_PI_NODE",)
 MIN_TMUX_FOR_ENV = (3, 2)     # `new-session -e NAME=VALUE`
+PANE_FORMAT = "#{pane_id}\t#{pane_dead}\t#{pane_current_command}"      # list-panes -a: what the collect check reads
 MARKER = "@g3_run"     # the tmux session option that says which run made a session (set in the same tmux call that creates it)
 FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
 FOREIGN_LANE = {"state": "open", "note": "someone else's lane record; the smoke run must leave it exactly as it is"}
@@ -756,10 +757,22 @@ class Smoke:
         if self.tamper("pane-alive"):          # a live pane recorded as the first task's
             made = self.tmux("new-window", "-d", "-P", "-t", f"={self.name}:", "-n", "sa:g3-alive", "-F", "#{pane_id}", "sleep 300").stdout.strip()
             self.edit(self.task_dir(self.ids["first"]) / "meta.json", lambda m: m.update(pane=made))
-        panes = self.tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
+        self.check_no_task_pane_running(self.tmux("list-panes", "-a", "-F", PANE_FORMAT).stdout)
+
+    def check_no_task_pane_running(self, listing):
+        """`collect` keeps a collected task's pane as a dead pane (remain-on-exit) with its scrollback, and `tp-agent stop` kills the
+        pane: so each task's recorded pane is absent, or present and dead. A present pane that is not dead fails, naming it and its
+        command. `listing` is `list-panes -a` in PANE_FORMAT. A recorded id that another session's pane now holds counts as that pane."""
+        rows = {}
+        for line in listing.splitlines():
+            pane, _, rest = line.partition("\t")
+            rows[pane] = rest.partition("\t")
+        self.facts["collect_panes"] = {}
         for key in ("first", "retry", "reviewer"):
             pane = self.read(self.task_dir(self.ids[key]) / "meta.json", {}).get("pane")
-            self.check("the panes of the three tasks are gone from tmux", pane not in panes, f"{key}: {pane}")
+            dead, _, command = rows.get(pane, ("1", "", ""))
+            self.facts["collect_panes"][key] = "absent" if pane not in rows else "dead" if dead == "1" else "running"
+            self.check("no task pane is still running (each is gone, or kept dead)", dead == "1", f"{key}: {pane} is running {command!r}")
 
     def step_remove(self):
         before = self.lane_json()
@@ -844,10 +857,11 @@ class Smoke:
             if self.facts.get("common") and lanes_dir.exists():
                 found.append(f"lane record {lanes_dir}")
         found += [f"directory {d}" for d in self.made["dirs"] if os.path.lexists(d)]
-        rows = probe("tmux list-panes", [*self.tmux_cmd, "list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_id}"])
+        rows = probe("tmux list-panes", [*self.tmux_cmd, "list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_dead}"])
         for row in rows.splitlines():
-            session, window, pane = (row.split("\t") + ["", "", ""])[:3]
-            if session == self.name and (window.startswith("sa:") or not session_alive):
+            session, window, pane, dead = (row.split("\t") + ["", "", "", ""])[:4]
+            # while the session lives, a worker pane kept dead (remain-on-exit) with its scrollback is not a leftover: a running one is
+            if session == self.name and ((window.startswith("sa:") and dead != "1") or not session_alive):
                 found.append(f"pane {pane} ({window}) in session {session}")
         return found, similar
 
@@ -895,6 +909,7 @@ class Smoke:
         wrapper.write_text(f'''#!/bin/sh
 TMUX_TMPDIR='{self.tmux_tmp}'; export TMUX_TMPDIR; unset TMUX TMUX_PANE
 case "$1" in
+ set-option) case "$*" in *remain-on-exit*) exec {tmux} -L {self.sock} "$@" ;; esac; exit 0 ;;
  new-session|list-panes|kill-pane|kill-session|has-session|list-sessions|capture-pane) exec {tmux} -L {self.sock} "$@" ;;
  send-keys) {submit_sh} ;;
  display-message) case "$*" in *pane_current_path*) printf '%s\\n' "$TP_MAIN_CWD"; exit 0 ;; esac; exec {tmux} -L {self.sock} "$@" ;;
@@ -921,7 +936,7 @@ esac
         return [(name, os.environ[name]) for name in CARRIED_ENV if name in os.environ]
 
     def require_env_flag(self):
-        """`new-session -e` needs tmux 3.2: on an older (or unreadable) one the run refuses here, before it makes anything."""
+        """`new-session -e` needs tmux 3.2: on an older (or unreadable) one the run refuses here, before the tmux session is created."""
         said = self.tmux("-V").stdout.strip()
         found = re.search(r"(\d+)\.(\d+)", said)
         if not found and re.search(r"\b(master|next)\b", said):
@@ -929,7 +944,7 @@ esac
         if not found or (int(found.group(1)), int(found.group(2))) < MIN_TMUX_FOR_ENV:
             names = ", ".join(name for name, _ in self.carried())
             raise SmokeError(self.step_name, f"tmux says {said!r}; carrying {names} into the run's session needs tmux {MIN_TMUX_FOR_ENV[0]}.{MIN_TMUX_FOR_ENV[1]} or newer "
-                                             f"(new-session -e). Nothing was changed; upgrade tmux, or unset {names} in the environment that runs the smoke")
+                                             f"(new-session -e). No tmux session was created; upgrade tmux, or unset {names} in the environment that runs the smoke")
 
     def check_carried(self):
         """The session holds the caller's value of each carried variable (what a new pane of it gets)."""
@@ -1103,7 +1118,7 @@ esac
                    "socket": self.sock if self.fake else None, "started": self.stamp,
                    "failed_step": failure.step if failure else None, "error": failure.message if failure else None,
                    "seconds": round(time.monotonic() - self.started, 2), "steps": self.steps, "cleanup": self.cleanup_report,
-                   "ids": self.ids, "decline": self.facts.get("decline")}
+                   "ids": self.ids, "decline": self.facts.get("decline"), "collect_panes": self.facts.get("collect_panes")}
         out = Path(self.args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(summary, indent=2) + "\n")

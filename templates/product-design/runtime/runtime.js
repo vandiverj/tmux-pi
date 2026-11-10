@@ -555,12 +555,37 @@
     if (u) return {mode: "unguided", ref: u, task: S.session.tasks[u.task]};
     return {mode: "free", ref: null, task: null};
   }
+  function blockTexts(el) {   // the texts of an element, split where a child is laid out as a block (a cell, a list item)
+    var parts = [""];
+    (function walk(node) {
+      for (var c = node.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) { parts[parts.length - 1] += c.data; continue; }
+        if (c.nodeType !== 1) continue;
+        var d = window.getComputedStyle(c).display || "";
+        var block = !/^(inline|ruby)|^(contents|math)$/.test(d);   // inline-level boxes (and contents) continue the text
+        if (block) parts.push("");
+        walk(c);
+        if (block) parts.push("");
+      }
+    })(el);
+    return parts.map(function (t) { return t.replace(/\s+/g, " ").trim(); }).filter(function (t) { return t !== ""; });
+  }
   function contextOf(el) {
     var c = el.getAttribute("data-tp-context");
     if (c) return c;
-    var text = (el.textContent || el.value || "").replace(/\s+/g, " ").trim().slice(0, 300);
+    var text = (blockTexts(el).join(" \u00b7 ") || el.value || "").replace(/\s+/g, " ").trim().slice(0, 300);
     var where = RT.view === "experience" && RT.state ? "prototype page " + RT.state.page : "view " + RT.view;
     return (text ? "\"" + text + "\" on " : "On ") + where + (S.run ? ", checkpoint " + S.run.seed + "@" + S.run.actions.length : "");
+  }
+  function guideDone(g) {
+    var sc = record(g.scenario);
+    return !!sc && g.step >= (sc.actions || []).length;
+  }
+  function stepText(n) {   // a note's task position; an older note may hold the step count itself after the last step
+    if (!n.scenario) return "";
+    var sc = record(n.scenario);
+    if (n.step === null ? n.mode === "guided" : sc && n.step >= (sc.actions || []).length) return ", " + n.scenario + ", all steps done";
+    return ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "");
   }
   function closeNote() {   // every way a note ends (saved, cancelled, Escape, note mode toggled) resumes the prototype
     RT.pending = null;
@@ -580,7 +605,7 @@
       page: currentPage(),
       journey: a.ref ? scenarioJourney(a.ref.scenario) : null,
       scenario: a.ref ? a.ref.scenario : null,
-      step: a.mode === "guided" ? a.ref.step : null,
+      step: a.mode === "guided" && !guideDone(a.ref) ? a.ref.step : null,   // after the last step there is no step to name
       state: RT.state ? clone(RT.state) : {},
       checkpoint: S.run ? S.run.seed + "@" + S.run.actions.length : null,
       mode: a.mode,
@@ -1273,7 +1298,7 @@
         .forEach(function (n) {
           L.push("  [" + (n.page || "-") + "] " + n.target.label + " (" + n.target.id + ")  " + n.id);
           L.push("    by " + n.reviewer + ", " + n.mode + (n.assistance !== "none" ? ", " + n.assistance : "") +
-                 (n.scenario ? ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "") : "") +
+                 stepText(n) +
                  ", build revision " + n.build.revision + ", anchor " + anchorOf(n) + (remapOf(n.id) ? " (remapped to " + remapOf(n.id).target + ", original " + n.target.id + ")" : "") + (n.category ? ", category " + n.category : ""));
           L.push.apply(L, quote(n.text));
         });
@@ -1704,7 +1729,7 @@
     return h("article", {"class": "tp-note", "data-note-id": n.id}, [
       h("p", {"class": "tp-note-text"}, n.text),
       h("p", {"class": "tp-muted"}, [n.id, " by ", n.reviewer, " on ", n.target.label, " (", n.target.id, "), ", n.page || "-",
-        n.scenario ? ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "") : "", ", ", n.mode,
+        stepText(n), ", ", n.mode,
         n.assistance !== "none" ? " (" + n.assistance + ")" : "", n.category ? ", " + n.category : ""]),
       h("p", {"class": "tp-muted"}, ["Context: ", n.target.context, ". Checkpoint ", n.checkpoint || "-", ". ",
         badge(a === "current" ? "this build" : a === "changed-context" ? "from build revision " + n.build.revision + ": context may have changed" :
@@ -1771,7 +1796,7 @@
     return h("aside", {"class": "tp-note-panel", "role": "dialog", "aria-label": "Add a note", "id": "tp-note-panel"}, [
       h("h3", {}, "Note on: " + p.target.label),
       h("p", {"class": "tp-muted"}, p.target.context),
-      h("p", {"class": "tp-muted"}, "Captured at " + (p.checkpoint || "-") + " in " + p.mode + " mode; later actions do not change it."),
+      h("p", {"class": "tp-muted"}, "Captured at " + (p.checkpoint || "-") + " in " + p.mode + " mode" + stepText(p) + "; later actions do not change it."),
       ta, h("label", {}, ["Category ", cat]), err,
       h("div", {"class": "tp-actions"}, [
         button("Save note", function () { var e = saveNote(ta.value, cat.value); if (e) err.textContent = e; }, {"id": "tp-note-save"}),

@@ -266,6 +266,16 @@ async function acceptance(htmlPath, workDir, keep) {
     await a.click('[data-tp-target="page.queue"]');
     d = await a.dbg();
     check("guided task completes on its condition", d.guide.step === 5 && d.session.tasks[0].outcome === "completed", d.session.tasks);
+    // a note opened after the last step: its context separates the row's cells, and it names no step past the end
+    await a.key("n");
+    await a.click('[data-tp-target="queue.row.s-1"]');
+    d = await a.dbg();
+    check("a note's context separates a table row's cells", d.pending && d.pending.target.id === "queue.row.s-1" && d.pending.target.label === "Queue row S-1" &&
+          d.pending.target.context.startsWith('"S-1 · Laptop request · Hardware · Waiting · -" on prototype page page.queue'), d.pending && d.pending.target);
+    const panel = await a.text("#tp-note-panel");
+    check("a note after the last step is recorded and shown as all steps done", d.pending && d.pending.mode === "guided" && d.pending.step === null &&
+          /scenario\.submit-complete-record, all steps done/.test(panel) && !/step \d/.test(panel), [d.pending && d.pending.step, panel]);
+    await a.key("Escape");
     await a.click('[data-tp-target="page.summary"]');
     check("the consequence shows on another page (summary)", (await a.text('[data-tp-target="summary.waiting"]')) === "Waiting: 1");
 
@@ -323,6 +333,8 @@ async function acceptance(htmlPath, workDir, keep) {
 
     // export
     await a.click('[data-tp-view="feedback"]');
+    const cards = await a.ev(`[...document.querySelectorAll(".tp-note")].map((e) => e.textContent).join("\\n")`);
+    check("the Feedback list shows the notes after the last step as all steps done", (cards.match(/all steps done/g) || []).length === 2 && !/step \d/.test(cards), cards);
     check("the hostile note text renders as text", (await a.ev(`[...document.querySelectorAll(".tp-note-text")].some((e) => e.textContent.includes(${JSON.stringify(HOSTILE)}))`))
           && (await a.count("#tp-root img, #tp-root script")) === 0 && (await a.ev("window.__pwned === undefined")));
     const stateA = (await a.dbg()).state;
@@ -332,6 +344,8 @@ async function acceptance(htmlPath, workDir, keep) {
     fs.copyFileSync(dl.file, exported);
     const bundle = JSON.parse(fs.readFileSync(exported, "utf8"));
     check("export downloads the bundle", bundle.schema === "tp-product-feedback" && bundle.notes.length === 2 && bundle.inputs.length === 1 && bundle.sessions.length === 1 && /\.json$/.test(dl.suggested), dl.suggested);
+    check("the exported notes after the last step carry no step", bundle.notes.every((n) => n.mode === "guided" && n.scenario === "scenario.submit-complete-record" && n.step === null),
+          bundle.notes.map((n) => [n.mode, n.scenario, n.step]));
     check("exported input is pending; note text verbatim", bundle.inputs[0].status === "pending" && !("reconciliation" in bundle.inputs[0]) && bundle.notes[0].text.includes(HOSTILE));
     check("exported session carries the checkpoint", canonical(bundle.sessions[0].prototype) === canonical(runA), bundle.sessions[0].prototype);
 
@@ -392,6 +406,17 @@ async function acceptance(htmlPath, workDir, keep) {
     rep = await b.setFile("#tp-import-file", oldFile, "tp-imported");
     d = await b.dbg();
     check("an old-build note with an unknown target is imported and listed unresolved", rep.ok && d.notes === 3 && /record\.escalate/.test(await b.text("#tp-unresolved")), rep);
+    // an older export holds the step count itself after the last step: it imports and shows as all steps done
+    const past = JSON.parse(JSON.stringify(bundle));
+    past.notes = [Object.assign({}, bundle.notes[1], {id: bundle.notes[1].id.replace(/\.\d+$/, ".91"), step: 5})];
+    past.inputs = [];
+    past.sessions = [];
+    const pastFile = path.join(workDir, "past-last-step.json");
+    fs.writeFileSync(pastFile, JSON.stringify(past));
+    rep = await b.setFile("#tp-import-file", pastFile, "tp-imported");
+    const pastCard = await b.ev(`[...document.querySelectorAll('[data-note-id="${past.notes[0].id}"]')].map((e) => e.textContent).join("\\n")`);
+    check("an older note recorded past the last step imports and shows as all steps done", rep.ok && rep.added.notes.length === 1 &&
+          /all steps done/.test(pastCard) && !/step \d/.test(pastCard), [rep, pastCard]);
     // ids that are also Object.prototype names are ids like any other; an unknown field with such a name is refused
     const proto = JSON.parse(JSON.stringify(bundle));
     proto.sessions = [Object.assign({}, bundle.sessions[0], {id: "constructor", prototype: null})];

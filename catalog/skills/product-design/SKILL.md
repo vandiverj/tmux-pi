@@ -41,6 +41,7 @@ often enough.
   record.
 - Record the pointer in the session objective:
   `tp-agent objective "product-design package=<absolute DIR> revision=<N> slice=<slice id or none> next: <next action text>"`.
+  The package path runs up to the first ` revision=<N> slice=`, so a path with spaces is kept whole.
 - On resume, in a new process or a new session, take the package path from the objective, or from the human. Run `tp-product status
   DIR`. Where the objective and the status disagree (revision, next action), the status wins; then refresh the objective. Compare the
   relevant source revisions before trusting older claims.

@@ -25,7 +25,8 @@ FIXTURE = ROOT / "templates/product-design/examples/review-queue"
 SKILL = ROOT / "catalog/skills/product-design/SKILL.md"
 CASE_SHAPE = ROOT / "catalog/skills/prepare-cases/references/case-shape.md"
 # The objective line the product-design skill tells Main to record (its "Persist on every meaningful pause" section).
-OBJECTIVE = re.compile(r"product-design package=(?P<package>\S+) revision=(?P<revision>\d+) slice=(?P<slice>\S+) next: (?P<next>.+)")
+# The package path runs to the first ' revision=<N> slice=<id> next: ', so a path with spaces is read whole.
+OBJECTIVE = re.compile(r"product-design package=(?P<package>.+?) revision=(?P<revision>\d+) slice=(?P<slice>\S+) next: (?P<next>.+)")
 
 
 def product(*argv):
@@ -46,7 +47,7 @@ class ResumeTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
-        self.pkg = self.base / "workspace" / "product-design" / "review-queue-demo"
+        self.pkg = self.base / "my workspace" / "product-design" / "review-queue-demo"   # an ordinary folder name with a space
         shutil.copytree(FIXTURE, self.pkg)
 
     def agent(self, state, *argv):
@@ -55,7 +56,7 @@ class ResumeTests(unittest.TestCase):
         # a scratch session state, work store and work config: never the user's (~/.config/tmux-pi/work)
         (self.base / "work-config.json").write_text("{}")
         env.update(TP_STATE_DIR=str(state), TP_WORK_DIR=str(self.base / "work"),
-                   TP_WORK_CONFIG=str(self.base / "work-config.json"), TP_WORKDIR=str(self.base / "workspace"))
+                   TP_WORK_CONFIG=str(self.base / "work-config.json"), TP_WORKDIR=str(self.base / "my workspace"))
         rc, out, err = tp_agent_inproc.run(list(argv), env=env)
         self.assertEqual(rc, 0, err)
         return out

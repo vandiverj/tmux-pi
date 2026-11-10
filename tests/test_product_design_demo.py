@@ -157,7 +157,7 @@ class DemoRound(unittest.TestCase):
     def test_9_a_fresh_process_recovers_the_package_and_next_action(self):
         self.step_passed(9, 4)
         objective = json.loads((self.out / "state" / "session-index.json").read_text())["objective"]
-        m = re.fullmatch(r"product-design package=(\S+) revision=(\d+) slice=(\S+) next: (.+)", objective.strip())
+        m = re.fullmatch(r"product-design package=(.+?) revision=(\d+) slice=(\S+) next: (.+)", objective.strip())
         self.assertIsNotNone(m, objective)
         st = self.status()
         self.assertEqual((Path(m[1]), int(m[2]), m[4]), (self.pkg, st["revision"], st["next_action"]["text"]))
@@ -167,15 +167,18 @@ class DemoRound(unittest.TestCase):
 
 class DemoWithoutBrowser(unittest.TestCase):
     def test_the_browser_steps_skip_with_a_reason_and_the_rest_of_the_round_stands(self):
-        with tempfile.TemporaryDirectory(prefix="pd-f.") as tmp:
-            r = run_demo(Path(tmp) / "out", "--no-browser")
+        with tempfile.TemporaryDirectory(prefix="pd-f.") as tmp:   # an ordinary folder name with spaces: recovery reads it whole
+            r = run_demo(Path(tmp) / "demo with spaces", "--no-browser")
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-2000:])
-            summary = json.loads((Path(tmp) / "out/demo.json").read_text())
+            summary = json.loads((Path(tmp) / "demo with spaces/demo.json").read_text())
             self.assertEqual(set(summary["skipped"]), {"1", "2", "3", "4", "5"})
             self.assertIn("--no-browser was given", summary["skipped"]["1"])
             self.assertIn("skipped: no exported bundle", r.stdout)
             self.assertEqual(sorted({c[0] for c in summary["checks"]}), [6, 7, 8, 9])
             self.assertEqual(summary["failed"], 0)
+            recovery = {c[1]: c[2] for c in summary["checks"] if c[0] == 9}
+            self.assertEqual(recovery.get("a fresh process reads the package path, revision and slice from the session objective"), True)
+            self.assertEqual(recovery.get("tp-product status on that path gives the saved next action"), True)
 
     def test_the_output_folder_must_be_new_or_empty_and_outside_the_repository(self):
         with tempfile.TemporaryDirectory(prefix="pd-f.") as tmp:

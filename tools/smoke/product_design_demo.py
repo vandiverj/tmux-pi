@@ -50,7 +50,8 @@ CHROME_DEFAULT = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 DROP = ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_MAIN_ID", "TP_MAIN_CWD", "TP_TRIAL_ID", "CLAUDE_CODE_SESSION_ID",
         "TP_MODE", "TP_SESSION", "TP_REDACTION_LAUNCH", "TP_REDACTION_SESSION", "TP_STATE_DIR", "TP_WORK_DIR",
         "TP_WORK_CONFIG", "TP_WORKDIR")
-OBJECTIVE = re.compile(r"product-design package=(?P<package>\S+) revision=(?P<revision>\d+) slice=(?P<slice>\S+) next: (?P<next>.+)")
+# The package path runs to the first ' revision=<N> slice=<id> next: ', so a path with spaces is read whole.
+OBJECTIVE = re.compile(r"product-design package=(?P<package>.+?) revision=(?P<revision>\d+) slice=(?P<slice>\S+) next: (?P<next>.+)")
 STEPS = {1: "submit, and see the record on another page", 2: "guided review of the missing field",
          3: "unguided review without click hints", 4: "notes from two reviewers",
          5: "export twice, import one twice: one copy of each note", 6: "a decision and a revised rule",

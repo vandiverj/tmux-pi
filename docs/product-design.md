@@ -733,7 +733,8 @@ is judged, not who judges: the reviewer and its provider independence come from 
 
 **Resume.** The manifest (`activity`, `next_action`, set with a `set-manifest` changeset) is the durable record. At
 each pause Main also records `tp-agent objective "product-design package=<absolute DIR> revision=<N> slice=<id or
-none> next: <text>"`. A new main in the same tmux session sees it in the session index. It then runs
+none> next: <text>"`; the package path runs up to the first ` revision=<N> slice=`, so a path with spaces is kept
+whole. A new main in the same tmux session sees it in the session index. It then runs
 `tp-product status DIR`, and the status wins where the two disagree. A different tmux session has its own state and
 no objective: it resumes from the package path alone.
 
@@ -765,5 +766,3 @@ and what the tool does. They are not fixed round by round.
 - **A tracker record deleted and re-created under a new id**: `record-publication` refuses the second id for the
   same case and system (`publication.duplicate`), and no operation removes a publication entry. Record the new id
   under another `system` label (for example `tracker-2`) and say why in the changeset summary.
-- **A package path containing spaces** in the resume objective: the `package=` field ends at the first space. Give the
-  path to `tp-product status` by hand; the manifest is the record either way.

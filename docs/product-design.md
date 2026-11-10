@@ -555,13 +555,21 @@ a rule without examples is not accepted away: review the slice again, or add the
 `slice.blocked`, `slice.not-ready`, naming each blocker) and a slice with a stale or blocked case (`case.stale`,
 `case.blocked`) or with no case (`cases.none`). Otherwise it writes, with no model call:
 
-- `OUTDIR/<case id>.md`, one per case: title, provenance (package, revision, slice, slice fingerprint, case digest),
-  outcome, scope, exclusions, examples, rules, scenarios, decisions, contracts, QA, completion evidence, areas;
-- `OUTDIR/cases.json`: schema `tp-product-cases`, the provenance, and per case its key (the case id), file, digest
-  (the case's content and the record fingerprints of everything it names), the case, its references, its recorded
-  publications and reopen events, and a publication **proposal** per system: `create` (never published), `unchanged`
-  (published at this digest) or `update` (published at another digest: update the existing external record, never
-  create a second one, and check it was not edited there first: never overwrite it silently);
+- `OUTDIR/<case id>.md`, one per case: title, provenance (package, revision, slice, slice fingerprint, publication
+  digest), outcome, scope, exclusions, examples, every other case field (feasibility, non-blocking matters, QA,
+  completion evidence, areas, reopen events), its dependencies, and every record in its scope in full: the scenarios
+  (seed, actions, expected results), rules (with examples), decisions, contracts (operations, failures,
+  compatibility; the status is the confidence), the claims they cite and the sources' excerpts and anchors; then its
+  publications and the proposal. Every field of its `cases.json` entry is in it but the per-reference fingerprints;
+- `OUTDIR/cases.json`: schema `tp-product-cases`, the provenance, and per case its key (the case id), file, digest,
+  the case, its references, its recorded publications and reopen events, and a publication **proposal** per system:
+  `create` (never published), `unchanged` (published at this digest) or `update` (published at another digest:
+  update the existing external record, never create a second one, and check it was not edited there first: never
+  overwrite it silently). The **publication digest** covers what an export shows: the case (title and reopen events
+  included), its references (kind, title, fingerprint) and its scope in full (titles included). Readiness
+  fingerprints leave titles out, so a retitle does not stale a case, but it does change this digest, and the next
+  export proposes an `update`. The publication mapping itself is left out: recording a publication changes nothing
+  that was published;
 - `OUTDIR/export.json`, the export record: what was written and its digests.
 
 Keys are sorted and the output is a function of the committed package, so exporting twice writes nothing the second
@@ -574,8 +582,16 @@ spaces, bidirectional controls are shown as `[U+XXXX]`, and only ids and digests
 (`case.blocked`), then writes one worker packet: the provenance (package fingerprint, revision, slice fingerprint,
 case digest); the case; its dependencies; only the scenarios, rules (with examples), decisions, contracts, claims and
 actors in its scope; the excerpts and anchors of the sources they cite; the verification requirements; its
-publications; and links (id, kind, title, file) for every other record. It has no Git facts (branch, commit, dirty
-files): the worker reads those live. An existing FILE that is not a packet is refused (`packet.exists`).
+publications; and links (id, kind, title, file, relation, and for a slice or case its state) for the rest of its slice,
+for every record an included record names (the question a decision answers, for example), and for its delivery
+dependencies. The scope is the case's rule, scenario, decision and contract dependencies and what they reach; a
+dependency on another slice (or a case, journey or measurement) is a `delivery-dependency` link with that slice's
+readiness, and none of that slice's records is in the scope. The Markdown packet carries every field of the JSON one.
+A stale case's refusal also names its blockers. It has no Git facts (branch, commit, dirty files): the worker reads
+those live. An existing FILE that is not a packet is refused (`packet.exists`).
+
+A packet is generated output: `packet` regenerates its file whole and keeps nothing added to it. Keep worker notes
+and clarifications elsewhere (the task, or a changeset to the package), never in the packet file.
 
 **`tp-product impact DIR [--since REV]`** lists slices that are stale or blocked, reviews whose fingerprint is not the
 slice's current one (with whether the review accepted the slice), and cases that are not ready with their

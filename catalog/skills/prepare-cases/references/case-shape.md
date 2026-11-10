@@ -38,6 +38,8 @@ Then commit the changeset with `tp-product apply DIR CHANGESET --expected-revisi
     "outcome": "A requester who leaves out a required field is told which one, and nothing is queued.",
     "scope": ["Server-side check of title and category", "A message naming each missing field"],
     "exclusions": ["Saving drafts"],
+    "feasibility": ["The handler already refuses a missing title; the category check is new"],
+    "nonblocking": ["The exact message wording; the owner reviews it on the build"],
     "qa": {"approach": "One API test per missing field, plus one form test", "fixtures": ["An empty queue"]},
     "completion_evidence": ["A test run showing the 422 response for each missing field"],
     "implementation_areas": [{"area": "Submission request handler", "basis": "tentative"}],
@@ -45,9 +47,10 @@ Then commit the changeset with `tp-product apply DIR CHANGESET --expected-revisi
  ]}
 ```
 
-`actor` through `implementation_areas` are optional; also available are `feasibility` and `nonblocking` (lists of
-text) and, per area, `"basis": "observed"` with the `source` it was seen in. Contracts and their confidence come from
-the dependencies.
+`actor` through `implementation_areas` are optional (`feasibility` and `nonblocking` are lists of text); per area,
+`"basis": "observed"` takes the `source` it was seen in. Contracts and their confidence come from the dependencies: the
+export and the packet carry every rule, scenario, decision and contract the dependencies reach, in full. A dependency on
+another slice is a delivery dependency: a link with that slice's readiness, never its scope.
 
 Then export and hand over:
 

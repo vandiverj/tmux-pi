@@ -50,7 +50,8 @@ Commit the case definitions with an `add` changeset to the `cases` collection, t
   or case that is blocked or stale, naming the missing decision; report that, do not work around it. It never
   overwrites a file someone edited.
 - `tp-product packet DIR --case ID --out FILE` writes the worker packet for one case: only its scope, with links for
-  the rest. Give the worker that file, not the package. It holds no Git facts; the worker reads them live.
+  the rest (another slice it depends on is a link with that slice's readiness). Give the worker that file, not the
+  package. It holds no Git facts; the worker reads them live. It is regenerated whole: keep worker notes elsewhere.
 - Publishing to a tracker is the human's step. After it, record the external id with a `record-publication`
   changeset (the `digest` and revision from `cases.json`). A later export proposes `update` for that id: never
   create a second ticket, and check the ticket was not edited there before replacing its text.

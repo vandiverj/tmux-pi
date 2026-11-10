@@ -6,6 +6,7 @@ In-process (`cli.main(argv, out, err)`, `changes.apply`) on a temporary copy of 
 changesets. The generated input space is the PD-E attack script (task evidence, not tracked); these are the rows worth
 keeping.
 """
+import copy
 import io
 import json
 import re
@@ -14,10 +15,41 @@ import unittest
 from tests.test_product_design_store import C, P, PackageCase, READY, DRAFTY, cs, rec
 from product_design import cases as K  # noqa: E402
 from product_design import cli  # noqa: E402
+from product_design import schema as S  # noqa: E402
 
 OPEN_Q = "question.reassignment-during-review"
 ANSWERED_Q = "question.missing-field-behaviour"
 EVENT = {"by": "Owner (synthetic)", "date": "2026-11-10"}
+CASE_SHAPE = P.ROOT / "catalog/skills/prepare-cases/references/case-shape.md"
+
+
+def documented_case():
+    """The case record of the worked changeset in the prepare-cases reference (its source is filled by the caller)."""
+    block = re.search(r"```json\n(.*?)```", CASE_SHAPE.read_text(), re.S).group(1)
+    return json.loads(block)["operations"][0]["record"]
+
+
+def leaves(value, path=()):
+    """(path, scalar) for every scalar in a JSON value."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield from leaves(v, path + (k,))
+    elif isinstance(value, list):
+        for n, v in enumerate(value):
+            yield from leaves(v, path + (n,))
+    else:
+        yield path, value
+
+
+def flat(text):
+    return " ".join(str(text).split())
+
+
+def missing_from(markdown, data, skip=lambda path: False):
+    """The JSON fields of `data` whose value a reader of `markdown` does not see: checked by code over every field."""
+    shown = flat(K.unescape(markdown))
+    return [(path, v) for path, v in leaves(data) if not skip(path)
+            and flat(v if isinstance(v, str) else json.dumps(v)) not in shown]
 
 
 class CaseFlow(PackageCase):
@@ -59,12 +91,9 @@ class CaseFlow(PackageCase):
                     "evidence": ["re-review"], **EVENT})
 
     def reject_case(self, **extra):
-        return self.case("case.reject-missing-field", READY,
-                         ["rule.required-fields", "decision.missing-field-rejects", "scenario.submit-missing-category"],
-                         **dict({"actor": "actor.requester",
-                                 "outcome": "An incomplete submission is refused, naming the field.",
-                                 "qa": {"approach": "API test per missing field", "fixtures": ["empty-queue"]},
-                                 "completion_evidence": ["A test run showing the refusal for each field"]}, **extra))
+        """The documented example (catalog/skills/prepare-cases/references/case-shape.md), prepared now."""
+        return dict(documented_case(), source={"package_revision": self.rev, "slice_fingerprint": self.fp(READY)},
+                    **extra)
 
 
 class ExportTests(CaseFlow):
@@ -107,6 +136,25 @@ class ExportTests(CaseFlow):
             self.assertNotIn(r.get("statement") or r["expected"][0], body)
         self.assertNotIn("branch", json.dumps(pk["provenance"]))
         self.assertFalse(re.search(r"\b(HEAD|origin/|worktree path|base commit)\b", body))
+        # the Markdown handoffs carry what the JSON carries: the contract reached through the scenario (operations,
+        # failures, the slow-response requirement), the scenario's seed and actions, feasibility, non-blocking matters,
+        # cited claims; the question the included decision answers is a link
+        self.assertIn("contract.submissions-api", [c["id"] for c in pk["scope"]["contracts"]])
+        self.assertIn(ANSWERED_Q, links)
+        self.assertEqual(missing_from(body, pk), [])
+        entry = data["cases"][0]
+        fingerprints = lambda path: path[:1] == ("references",) and path[-1] == "fingerprint"  # noqa: E731 (in cases.json)
+        self.assertEqual(missing_from(md, entry, skip=fingerprints), [])
+        self.assertEqual(missing_from(md, {"scope": pk["scope"], "sources": pk["sources"]}), [])
+        # a dependency on another slice is a delivery link with that slice's readiness, never its scope
+        self.apply({"op": "set", "id": "case.reject-missing-field",
+                    "fields": {"dependencies": entry["case"]["dependencies"] + [DRAFTY]}})
+        pk = K.build_packet(self.docs(), "case.reject-missing-field")
+        self.assertEqual([s["id"] for s in pk["scope"]["scenarios"]], ["scenario.submit-missing-category"])
+        self.assertNotIn("rule.reassignment-in-review", [r["id"] for r in pk["scope"]["rules"]])
+        link = [l for l in pk["links"] if l["id"] == DRAFTY]
+        self.assertEqual([(l["state"], l["relation"]) for l in link], [("blocked", "delivery-dependency")])
+        self.assertEqual(missing_from(K.render_packet(pk), pk), [])
 
     def test_a_blocked_or_unready_slice_names_what_it_is_missing(self):
         self.add_cases(self.case("case.reassign-keeps-notes", DRAFTY, ["rule.assigned-reviewer"]))
@@ -131,14 +179,16 @@ class ExportTests(CaseFlow):
             ("case.reject-missing-field",
              [{"op": "set", "id": "contract.submissions-api", "fields": {"contradicted_by": [
                  {"evidence": "source.queue-observation", "statement": "The service answers 400."}]}}],
-             "case.stale", "slice.submit-and-queue"),
+             "case.stale",
+             r"case\.slice-changed slice\.submit-and-queue: .*; "
+             r"it is also blocked: contract\.contradicted contract\.submissions-api"),
         ]
         for cid, ops, code, named in rows:
             with self.subTest(cid):
                 if ops:
                     self.apply(*ops)
                 body = self.refused_cli(code, "packet", str(self.pkg), "--case", cid, "--out", str(self.tmp / "p.md"))
-                self.assertIn(named, body["message"])
+                self.assertRegex(body["message"], named)
                 self.assertFalse((self.tmp / "p.md").exists())
         # the contradiction blocks the slice by name (the stale check comes first for the case itself)
         r = P.readiness(self.docs())[READY]
@@ -186,6 +236,15 @@ class StalenessTests(CaseFlow):
         prepared = rec(self.docs(), "case.reject-missing-field")["source"]
         self.run_cli("cases", str(self.pkg), "--slice", READY, "--out", str(out))
         self.assertEqual(json.loads((out / "cases.json").read_text())["cases"][0]["proposal"]["action"], "unchanged")
+        # a retitle is published content: the next export proposes an update of T-101; readiness does not move (PD-B)
+        ready = P.readiness(self.docs())
+        self.apply({"op": "set", "id": "case.reject-missing-field", "fields": {"title": "Name each missing field"}})
+        self.assertEqual(P.readiness(self.docs()), ready)
+        self.assertEqual(P.case_report(self.docs())["case.reject-missing-field"]["state"], "ready")
+        self.run_cli("cases", str(self.pkg), "--slice", READY, "--out", str(out))
+        prop = json.loads((out / "cases.json").read_text())["cases"][0]["proposal"]
+        self.assertEqual((prop["action"], prop["systems"][0]["external_id"]), ("update", "T-101"))
+        self.assert_digest_covers_what_an_export_shows("case.reject-missing-field")
         # a second id for the same case, or the same id for another case, is a duplicate: refused
         self.add_cases(self.case("case.other", READY, ["rule.queue-order"]))
         for op in (dict(publish, external_id="T-102"), dict(publish, case="case.other")):
@@ -222,6 +281,47 @@ class StalenessTests(CaseFlow):
         self.assertEqual((prop["action"], prop["systems"][0]["external_id"], prop["systems"][0]["published_revision"]),
                          ("update", "T-101", 4))
         self.assertIn("never overwrite it silently", prop["check"])
+
+    def assert_digest_covers_what_an_export_shows(self, cid):
+        """By code, over every field readiness fingerprints leave out (schema x-bookkeeping) of every record the case's
+        export shows (the case, its references with a slice dependency added, its scope and sources): a change to the
+        field changes the publication digest exactly when the case Markdown shows it. The publication mapping is the
+        one field shown and not covered: recording a publication does not change what was published."""
+        docs = copy.deepcopy(self.docs())
+        P.index(docs)[cid][1]["dependencies"].append(DRAFTY)
+        prov = {"package": "p", "package_revision": 1, "content_fingerprint": "sha256:" + "0" * 64, "slice": READY,
+                "slice_fingerprint": "sha256:" + "0" * 64}
+
+        def export(d):
+            idx = P.index(d)
+            return (K.render_case(d, idx[cid][1], idx, prov, {"action": "create", "systems": []}, prov["slice_fingerprint"]),
+                    K.case_digest(d, idx[cid][1], idx))
+
+        md0, digest0 = export(docs)
+        idx = P.index(docs)
+        pub = K.published(docs, idx[cid][1], idx)
+        shown = {cid} | set(pub["references"]) | {s["id"] for s in pub["sources"]} \
+            | {r["id"] for coll in pub["scope"].values() for r in coll}
+        rows = set()
+        for i in sorted(shown):
+            kind = idx[i][0]
+            for field in sorted(S.bookkeeping_fields(P.load_schema(), kind) - {"publication"}):
+                with self.subTest(i, field=field):
+                    d = copy.deepcopy(docs)
+                    r = P.index(d)[i][1]
+                    marker = f"Marker {i} {field}"
+                    if isinstance(r.get(field), dict):
+                        r[field] = dict(r[field], marker=marker)
+                    elif isinstance(r.get(field), list):
+                        r[field] = r[field] + [{"reason": marker}]
+                    else:
+                        r[field] = marker
+                    text, digest = export(d)
+                    self.assertEqual(marker in K.unescape(text), digest != digest0, (i, field))
+                    rows.add((kind, field, marker in K.unescape(text)))
+        self.assertTrue({("case", "title", True), ("case", "reopened", True), ("contract", "title", True),
+                         ("slice", "title", True), ("claim", "note", True), ("decision", "acceptance", False),
+                         ("slice", "readiness", False)} <= rows, rows)
 
     def test_re_export_never_overwrites_a_hand_edited_file(self):
         self.add_cases(self.reject_case())

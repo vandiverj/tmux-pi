@@ -40,11 +40,12 @@ def _refuse(code, message, details=None, exit=1):
 
 # ---------------------------------------------------------------- inert Markdown
 
-def md(text) -> str:
+def md(text, indent=2) -> str:
     """`text` as inert Markdown inline content: every character Markdown gives a meaning to is backslash-escaped, so it
     renders as the character itself; controls become spaces; bidirectional controls become a visible [U+XXXX]; line
     breaks become hard breaks (`\\` at the end of the line) inside the same paragraph, with leading spaces dropped and
-    the start of each line escaped, so no text can start a heading, list, quote, code block, table or HTML block."""
+    the start of each line escaped, so no text can start a heading, list, quote, code block, table or HTML block. A
+    continuation line is indented by `indent` spaces: the content column of the list item the text is in."""
     text = _BIDI.sub(lambda m: f"[U+{ord(m.group()):04X}]", str(text))
     text = "".join(" " if unicodedata.category(ch) == "Cc" and ch not in "\n\r" else ch for ch in text)
     lines = [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
@@ -59,7 +60,7 @@ def md(text) -> str:
             else:
                 chars.append(ch)
         out.append("".join(chars))
-    return "\\\n  ".join(out)
+    return ("\\\n" + " " * indent).join(out)
 
 
 def code(ident) -> str:
@@ -70,7 +71,55 @@ def code(ident) -> str:
 
 def unescape(text) -> str:
     """The inverse of `md` on its output (for tests and the attack): the text a renderer shows."""
-    return re.sub(r"\\(.)", r"\1", text.replace("\\\n  ", "\n"))
+    return re.sub(r"\\(.)", r"\1", re.sub(r"\\\n *", "\n", text))
+
+
+def _scalar(value) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _value(value, indent) -> str:
+    """One JSON scalar as inert Markdown: ids and digests as code, true/false/null as in JSON, text through `md`."""
+    if value is None or isinstance(value, bool):
+        return {None: "null", True: "true", False: "false"}[value]
+    if isinstance(value, str) and (S.ID_RE.fullmatch(value) or re.fullmatch(r"sha256:[0-9a-f]{64}", value)):
+        return code(value)
+    return md(value, indent)
+
+
+def tree(value, depth=0) -> list:
+    """Every field of a JSON object or list as a nested Markdown list (inert): `- field: value`, a nested list for an
+    object or list, `none` for an empty one. An object inside a list is one item, headed by its first plain field. The
+    Markdown handoff carries what the JSON carries this way, field for field (docs/product-design.md)."""
+    pad, col = "  " * depth, 2 * depth + 2
+    out = []
+    if isinstance(value, dict):
+        for key, v in value.items():
+            if _scalar(v):
+                out.append(f"{pad}- {md(key, col)}: {_value(v, col)}")
+            elif not v:
+                out.append(f"{pad}- {md(key, col)}: none")
+            else:
+                out += [f"{pad}- {md(key, col)}:"] + tree(v, depth + 1)
+    elif isinstance(value, list):
+        for n, v in enumerate(value, 1):
+            if _scalar(v):
+                out.append(f"{pad}- {_value(v, col)}")
+            elif isinstance(v, dict) and v:
+                head = next((k for k, x in v.items() if _scalar(x)), None)
+                out.append(f"{pad}- " + (f"{md(head, col)}: {_value(v[head], col)}" if head is not None else f"Item {n}"))
+                out += tree({k: x for k, x in v.items() if k != head}, depth + 1)
+            elif not v:
+                out.append(f"{pad}- none")
+            else:
+                out += [f"{pad}- Item {n}:"] + tree(v, depth + 1)
+    return out
+
+
+def record_md(rec, skip=()) -> list:
+    """One record: `- id: title`, then every other field (`tree`)."""
+    head = f"- {code(rec['id'])}" + (f": {md(rec['title'])}" if rec.get("title") else "")
+    return [head] + tree({k: v for k, v in rec.items() if k not in ("id", "title") + tuple(skip)}, 1)
 
 
 # ---------------------------------------------------------------- reading a trusted package
@@ -98,23 +147,69 @@ def _without(rec, *fields):
 
 
 def _refs(docs, case, idx):
-    """The records a case names: its dependencies and their dependency closure, plus its actor and implementation-area
-    sources, as id -> (kind, record), in id order."""
+    """The records a case names: its dependencies, the dependency closure of its rule, scenario, decision and contract
+    dependencies, its actor and its implementation-area sources, as id -> (kind, record), in id order. A dependency on
+    a slice (or a case, journey or measurement) is a delivery dependency: it is named, but its closure is that slice's
+    scope, not this case's, so it is not followed."""
     ids = set(case["dependencies"])
     for dep in case["dependencies"]:
-        ids |= set(P.closure(docs, dep, idx))
+        if idx[dep][0] in P.CASE_DEP_KINDS:
+            ids |= set(P.closure(docs, dep, idx))
     if "actor" in case:
         ids.add(case["actor"])
     ids |= {a["source"] for a in case.get("implementation_areas", []) if "source" in a}
     return {i: idx[i] for i in sorted(ids)}
 
 
-def case_digest(docs, case, idx) -> str:
-    """What a published case says: its semantic content and the fingerprints of the records it names. A revision that
-    changes neither leaves it unchanged, so a re-export proposes no update for it."""
+SCOPE_KINDS = ("scenario", "rule", "decision", "contract", "claim", "actor")
+SOURCE_FIELDS = ("id", "title", "locator", "revision", "digest", "anchor", "excerpt", "captured")
+
+
+def case_scope(docs, case, idx) -> tuple:
+    """(refs, scope, sources): the records the case names (`_refs`); the scenarios, rules, decisions (without their
+    acceptance event), contracts, claims and actors among them, plus every claim an included rule or contract cites;
+    and the sources any of them cites, with their excerpts and anchors. The one definition of a case's scope: the
+    case Markdown, cases.json, the publication digest and the packet all read it."""
     refs = _refs(docs, case, idx)
-    return P.digest({"case": P.semantic(case, "case"),
-                     "refs": [[i, P.record_fingerprint(r, k)] for i, (k, r) in refs.items()]})
+    scope = {}
+    for kind in SCOPE_KINDS:
+        scope[kind + "s"] = [_without(r, "acceptance") if kind == "decision" else r
+                            for i, (k, r) in refs.items() if k == kind]
+    cited = set(i for i, (k, _) in refs.items() if k == "source")
+    for r in scope["rules"] + scope["contracts"]:
+        cited |= set(r.get("sources", []))
+        for cl in r.get("claims", []):
+            cited.add(cl)
+            cited |= set(idx[cl][1].get("sources", []))
+    for cl in sorted(i for i in cited if idx[i][0] == "claim" and i not in refs):
+        scope["claims"].append(idx[cl][1])
+    for cl in scope["claims"]:
+        cited |= set(cl.get("sources", []))
+    sources = [{k: idx[s][1][k] for k in SOURCE_FIELDS if k in idx[s][1]}
+               for s in sorted(i for i in cited if idx[i][0] == "source")]
+    return refs, scope, sources
+
+
+def references(refs) -> dict:
+    """cases.json's `references` of a case: kind, title and record fingerprint of every record it names."""
+    return {i: {"kind": k, "title": rec.get("title"), "fingerprint": P.record_fingerprint(rec, k)}
+            for i, (k, rec) in refs.items()}
+
+
+def published(docs, case, idx) -> dict:
+    """What an export publishes about a case, the provenance and the publication mapping aside: the case (title and
+    reopen events included), its references and its scope (titles included). The Markdown draft and the cases.json
+    entry render nothing else, so the digest of this covers every field a ticket shows. The mapping (`publication`)
+    is left out: recording where a case was published does not change what was published."""
+    refs, scope, sources = case_scope(docs, case, idx)
+    return {"case": _without(case, "publication"), "references": references(refs), "scope": scope, "sources": sources}
+
+
+def case_digest(docs, case, idx) -> str:
+    """The publication digest of a case: of `published`. A revision that changes nothing an export shows (a note, a
+    record outside the case's scope) leaves it unchanged, so a re-export proposes no update; a retitle changes it.
+    Readiness fingerprints leave titles out (PD-B); this digest does not, because a ticket shows them."""
+    return P.digest(published(docs, case, idx))
 
 
 def publication_proposal(case, digest) -> dict:
@@ -187,65 +282,75 @@ def _examples(examples):
     return out
 
 
-def _ref_line(idx, ident):
-    kind, rec = idx[ident]
-    title = rec.get("title") or rec.get("statement") or rec.get("choice") or ident
-    line = f"- {code(ident)}: {md(title)}"
-    if kind == "rule":
-        line += f"\\\n  {md(rec['statement'])}"
-    elif kind == "decision":
-        line += f" \\({md(rec['status'])}\\)\\\n  {md(rec['choice'])}"
-    elif kind == "contract":
-        line += f" \\({md(rec['kind'])}, {md(rec['status'])}\\)\\\n  {md(rec['summary'])}"
-    elif kind == "scenario":
-        line += f" \\({md(rec['kind'])}\\)"
-    return line
+# The case fields the Markdown renders under their own heading; every other field is rendered by `tree` under
+# "Case details", so a field the schema adds later is never dropped from the handoff.
+CASE_HEADED = ("id", "title", "slice", "dependencies", "outcome", "scope", "exclusions", "acceptance_examples",
+               "publication")
+# The scope sections: scope key, heading.
+SCOPE_HEADINGS = (("scenarios", "Scenarios"), ("rules", "Rules (with their examples)"), ("decisions", "Decisions"),
+                  ("contracts", "Contracts (status is the confidence: proposed or existing-verified)"),
+                  ("claims", "Claims cited"), ("actors", "Actors"))
 
 
-def render_case(docs, case, idx, provenance, proposal) -> str:
-    """One case draft as Markdown. Deterministic: the same package content gives the same bytes."""
-    deps = case["dependencies"]
-    by_kind = {}
-    for d in deps:
-        by_kind.setdefault(idx[d][0], []).append(d)
+def _case_body(case, refs, scope, sources) -> list:
+    """The case's own content and its whole scope, every field: the part of the case Markdown and of the packet that
+    is the same. `refs` maps each dependency and the actor to (kind, record or link)."""
+    actor = refs[case["actor"]][1].get("title") or case["actor"] if "actor" in case else None
+    out = ["## Outcome", "", (f"{md(actor)}: " if actor else "") + md(case.get("outcome", "Not recorded.")), ""]
+    out += ["## Scope", ""] + _lines(case.get("scope", [])) + [""]
+    out += ["## Exclusions", ""] + _lines(case.get("exclusions", [])) + [""]
+    out += ["## Acceptance examples", ""] + _examples(case["acceptance_examples"]) + [""]
+    details = {k: v for k, v in case.items() if k not in CASE_HEADED}
+    out += ["## Case details", "", "Every other field of the case (feasibility findings, unresolved non-blocking "
+            "matters, QA, completion evidence, suggested implementation areas, the revision it was prepared from)."]
+    out += [""] + tree(details) + [""]
+    out += ["## Dependencies", ""]
+    for d in case["dependencies"]:
+        kind, rec = refs[d]
+        out.append(f"- {code(d)} \\({md(kind)}\\)" + (f": {md(rec['title'])}" if rec.get("title") else "")
+                   + ("" if kind in SCOPE_KINDS or kind == "source" else
+                      " \\(linked: a delivery dependency, not this case's scope\\)"))
+    out.append("")
+    for key, heading in SCOPE_HEADINGS:
+        if scope[key]:
+            out += [f"## {heading}", ""]
+            for rec in scope[key]:
+                out += record_md(rec)
+            out.append("")
+    if sources:
+        out += ["## Sources (excerpts and anchors)", ""]
+        for s in sources:
+            out += record_md(s)
+        out.append("")
+    return out
+
+
+def _publications(pubs) -> list:
+    return [f"- {md(p['system'])} {md(p['external_id'])}, published from revision {p['package_revision']} at digest "
+            f"{code(p['digest']) if 'digest' in p else 'not recorded'} by {md(p.get('by', 'not recorded'))} on "
+            f"{md(p.get('date', 'not recorded'))}" for p in pubs] or ["- Not published."]
+
+
+def render_case(docs, case, idx, provenance, proposal, digest) -> str:
+    """One case draft as Markdown: the case, everything in its scope, its publications and the proposal. Every field
+    of its cases.json entry is in it but the per-reference fingerprints (machine data, in cases.json). Deterministic:
+    the same package content gives the same bytes."""
+    refs, scope, sources = case_scope(docs, case, idx)
     out = [f"# {md(case['title'])}", "",
            f"Case {code(case['id'])}, slice {code(case['slice'])}. Package {code(provenance['package'])} revision "
            f"{provenance['package_revision']}, content {code(provenance['content_fingerprint'])}; slice fingerprint "
-           f"{code(provenance['slice_fingerprint'])}. Prepared from revision {case['source']['package_revision']}.", ""]
-    actor = idx[case["actor"]][1].get("title", case["actor"]) if "actor" in case else None
-    out += ["## Outcome", "", (f"{md(actor)}: " if actor else "") + md(case.get("outcome", "Not recorded.")), ""]
-    out += ["## Scope", ""] + _lines(case.get("scope", [])) + [""]
-    out += ["## Exclusions", ""] + _lines(case.get("exclusions", [])) + [""]
-    out += ["## Acceptance examples", ""]
-    out += _examples(case["acceptance_examples"]) + [""]
-    for kind, heading in (("rule", "Rules"), ("scenario", "Scenarios"), ("decision", "Decisions"),
-                          ("contract", "Contracts (status is the confidence: proposed or existing-verified)")):
-        if by_kind.get(kind):
-            out += [f"## {heading}", ""] + [_ref_line(idx, d) for d in by_kind[kind]] + [""]
-    other = [d for d in deps if idx[d][0] not in ("rule", "scenario", "decision", "contract")]
-    out += ["## Other dependencies", ""] + ([_ref_line(idx, d) for d in other] or ["- None recorded."]) + [""]
-    out += ["## Unresolved non-blocking matters", ""] + _lines(case.get("nonblocking", [])) + [""]
-    out += ["## Feasibility findings", ""] + _lines(case.get("feasibility", [])) + [""]
-    qa = case.get("qa")
-    out += ["## QA", ""]
-    if qa:
-        out += [f"- Approach: {md(qa['approach'])}"] + [f"- Fixture: {md(x)}" for x in qa.get("fixtures", [])] \
-            + [f"- Non-functional: {md(x)}" for x in qa.get("nonfunctional", [])]
-    else:
-        out.append("- None recorded.")
-    out.append("")
-    areas = [f"- {md(a['area'])} \\({a['basis']}" + (f", {code(a['source'])}" if "source" in a else "") + "\\)"
-             for a in case.get("implementation_areas", [])]
-    out += ["## Suggested implementation areas", ""] + (areas or ["- None recorded."]) + [""]
-    out += ["## Completion evidence", ""] + _lines(case.get("completion_evidence", [])) + [""]
-    out += ["## Publication", ""]
-    pubs = case.get("publication", [])
-    out += [f"- {md(p['system'])} {md(p['external_id'])}, published from revision {p['package_revision']}"
-            for p in pubs] or ["- Not published."]
+           f"{code(provenance['slice_fingerprint'])}; publication digest {code(digest)}. Prepared from revision "
+           f"{case['source']['package_revision']}. File {md(case['id'] + '.md')}; per-record fingerprints of the "
+           "references are in cases.json.", ""]
+    out += _case_body(case, refs, scope, sources)
+    out += ["## Publication", ""] + _publications(case.get("publication", []))
     out.append(f"- Proposal: {proposal['action']}")
-    for r in case.get("reopened", []):
-        out.append(f"- Reopened {code(r['question'])} on {md(r['date'])} by {md(r['by'])}: {md(r['reason'])} "
-                   f"\\(prior revision {r['prior']['package_revision']}\\)")
+    for s in proposal["systems"]:
+        at = code(s["published_digest"]) if s["published_digest"] else "null"
+        out.append(f"  - {md(s['system'])} {md(s['external_id'])}: {s['action']} \\(published from revision "
+                   f"{s['published_revision']} at digest {at}\\)")
+    if proposal.get("check"):
+        out.append(f"  - Check: {md(proposal['check'], 4)}")
     return "\n".join(out) + "\n"
 
 
@@ -301,12 +406,10 @@ def export_cases(package_dir, slice_id, out_dir) -> dict:
         digest = case_digest(docs, case, idx)
         proposal = publication_proposal(case, digest)
         name = f"{case['id']}.md"
-        files[name] = render_case(docs, case, idx, provenance, proposal).encode("utf-8")
-        refs = _refs(docs, case, idx)
+        files[name] = render_case(docs, case, idx, provenance, proposal, digest).encode("utf-8")
         entries.append({"key": case["id"], "file": name, "digest": digest,
                         "case": _without(case, "publication", "reopened"),
-                        "references": {i: {"kind": k, "title": rec.get("title"), "fingerprint": P.record_fingerprint(rec, k)}
-                                       for i, (k, rec) in refs.items()},
+                        "references": references(_refs(docs, case, idx)),
                         "publication": case.get("publication", []), "reopened": case.get("reopened", []),
                         "proposal": proposal})
     files["cases.json"] = P.render(dict({"schema": EXPORT_SCHEMA, "schema_version": 1}, **provenance, cases=entries))
@@ -358,46 +461,59 @@ def _write_outputs(out_dir: Path, package_id, slice_id, files) -> list:
 
 # ---------------------------------------------------------------- tp-product packet
 
+_DOC_OF = {kind: doc for doc, kind in P.COLLECTIONS.values()}
+
+
+def _named(rec, kind) -> set:
+    """Every id a record names (dependency or not): the schema's x-ref fields."""
+    _, _, refs = S.validate(P.load_schema(), rec, entry=kind)
+    return {value for _, _, _, value in refs if isinstance(value, str)}
+
+
 def build_packet(docs, case_id) -> dict:
-    """The packet of one case as data (see `packet`). Refuses a stale case first, then a blocked one, by name."""
+    """The packet of one case as data (see `packet`). Refuses a stale case first (naming its blockers too), then a
+    blocked one, by name."""
     idx = P.index(docs)
     if idx.get(case_id, (None,))[0] != "case":
         _refuse("case.unknown", f"{case_id!r} is not a case of this package")
     case = idx[case_id][1]
-    state = P.case_report(docs)[case_id]
+    report = P.readiness(docs)
+    states = P.case_report(docs, report)
+    state = states[case_id]
     if state["stale"]:
-        _refuse("case.stale", f"{case_id} is stale: " + "; ".join(_blocker_text(b) for b in state["stale"])
+        also = ("; it is also blocked: " + "; ".join(_blocker_text(b) for b in state["blockers"])
+                if state["blockers"] else "")
+        _refuse("case.stale", f"{case_id} is stale: " + "; ".join(_blocker_text(b) for b in state["stale"]) + also
                 + ". Prepare it again from the current package before handing it out. Nothing was written.",
-                details={"case": case_id, "stale": state["stale"]})
+                details={"case": case_id, "stale": state["stale"], "blockers": state["blockers"]})
     if state["blockers"]:
         _refuse("case.blocked", f"{case_id} is blocked: " + "; ".join(_blocker_text(b) for b in state["blockers"])
                 + ". Nothing was written.", details={"case": case_id, "blockers": state["blockers"]})
     m = docs["manifest"]
-    refs = _refs(docs, case, idx)
-    scope = {}
-    for kind in ("scenario", "rule", "decision", "contract", "claim", "actor"):
-        scope[kind + "s"] = [_without(r, "acceptance") if kind == "decision" else r
-                            for i, (k, r) in refs.items() if k == kind]
-    cited = set(i for i, (k, _) in refs.items() if k == "source")
-    for r in scope["rules"] + scope["contracts"]:
-        cited |= set(r.get("sources", []))
-        for cl in r.get("claims", []):
-            cited.add(cl)
-            cited |= set(idx[cl][1].get("sources", []))
-    for cl in sorted(i for i in cited if idx[i][0] == "claim" and i not in refs):
-        scope["claims"].append(idx[cl][1])
-    claims = scope["claims"]
-    for cl in claims:
-        cited |= set(cl.get("sources", []))
-    sources = [{k: idx[s][1][k] for k in ("id", "title", "locator", "revision", "digest", "anchor", "excerpt", "captured")
-                if k in idx[s][1]} for s in sorted(i for i in cited if idx[i][0] == "source")]
+    refs, scope, sources = case_scope(docs, case, idx)
     inside = {r["id"] for coll in scope.values() for r in coll} | {s["id"] for s in sources} | {case_id}
     sid = case["slice"]
-    linked = sorted(set(P.closure(docs, sid, idx)) | {sid} | set(idx[sid][1].get("depends_on", []))
-                    | {d for d in case["dependencies"] if idx[d][0] in ("case", "slice", "journey", "measurement")}
-                    | {c["id"] for c in docs["design"]["cases"] if c["slice"] == sid})
-    links = [{"id": i, "kind": idx[i][0], "title": idx[i][1].get("title"), "in": P.DOCUMENTS["design"][0]}
-             for i in linked if i not in inside]
+    deps = set(case["dependencies"])
+    named = set()
+    for key, coll in scope.items():
+        for r in coll:
+            named |= _named(r, key[:-1])
+    for s in sources:
+        named |= _named(idx[s["id"]][1], "source")
+    linked = (set(P.closure(docs, sid, idx)) | {sid} | set(idx[sid][1].get("depends_on", [])) | deps | named
+              | {c["id"] for c in docs["design"]["cases"] if c["slice"] == sid})
+    links = []
+    for i in sorted(linked):
+        if i in inside or i not in idx:
+            continue
+        kind, rec = idx[i]
+        link = {"id": i, "kind": kind, "title": rec.get("title"), "in": P.DOCUMENTS[_DOC_OF[kind]][0],
+                "relation": "delivery-dependency" if i in deps else "context"}
+        if kind == "slice":
+            link["state"] = report[i]["effective"]
+        elif kind == "case":
+            link["state"] = states[i]["state"]
+        links.append(link)
     verification = {"acceptance_examples": case["acceptance_examples"], "qa": case.get("qa"),
                     "completion_evidence": case.get("completion_evidence", []),
                     "scenario_expectations": [{"scenario": s["id"], "expected": s.get("expected", [])}
@@ -415,55 +531,27 @@ def build_packet(docs, case_id) -> dict:
 
 
 def render_packet(pk) -> str:
-    """The packet as Markdown (inert, deterministic)."""
+    """The packet as Markdown (inert, deterministic), from the packet's JSON alone: every field of it, the verification
+    requirements gathered as a checklist, and the links with their state."""
     pv, case = pk["provenance"], pk["case"]
+    refs = {l["id"]: (l["kind"], {"title": l["title"]}) for l in pk["links"]}
+    refs.update({s["id"]: ("source", s) for s in pk["sources"]})
+    refs.update({r["id"]: (key[:-1], r) for key, coll in pk["scope"].items() for r in coll})
     out = [f"# Worker packet: {md(case['title'])}", "",
-           f"Case {code(pv['case'])}, slice {code(pv['slice'])}. Package {code(pv['package'])} revision "
-           f"{pv['package_revision']}, content {code(pv['content_fingerprint'])}; slice fingerprint "
-           f"{code(pv['slice_fingerprint'])}.", "", md(pk["note"]), "",
-           "## Outcome", "", md(case.get("outcome", "Not recorded.")), ""]
-    out += ["## Scope", ""] + _lines(case.get("scope", [])) + ["", "## Exclusions", ""] + _lines(case.get("exclusions", [])) + [""]
-    out += ["## Acceptance examples", ""]
-    out += _examples(case["acceptance_examples"]) + [""]
-    sc = pk["scope"]
-    if sc["scenarios"]:
-        out += ["## Scenarios", ""]
-        for s in sc["scenarios"]:
-            out.append(f"- {code(s['id'])}: {md(s.get('title', s['id']))} \\({md(s['kind'])}\\)")
-            out += [f"  - Expected: {md(e)}" for e in s.get("expected", [])]
-        out.append("")
-    if sc["rules"]:
-        out += ["## Rules", ""]
-        for r in sc["rules"]:
-            out.append(f"- {code(r['id'])}: {md(r['statement'])}")
-            out += [f"  - Example: {md(e['situation'])} Outcome: {md(e['outcome'])}" for e in r.get("examples", [])]
-        out.append("")
-    if sc["decisions"]:
-        out += ["## Decisions", ""] + [f"- {code(d['id'])} \\({md(d['status'])}\\): {md(d['choice'])}"
-                                       for d in sc["decisions"]] + [""]
-    if sc["contracts"]:
-        out += ["## Contracts", ""] + [f"- {code(c['id'])} \\({md(c['kind'])}, {md(c['status'])}\\): {md(c['summary'])}"
-                                       for c in sc["contracts"]] + [""]
-    if pk["sources"]:
-        out += ["## Sources", ""]
-        for s in pk["sources"]:
-            loc = s["locator"]
-            ver = s.get("revision") or s.get("digest")
-            out.append(f"- {code(s['id'])}: {md(loc['root'])} {md(loc['path'])} \\({md(loc['kind'])}, {md(ver)}\\)"
-                       + (f", anchor {md(s['anchor'])}" if "anchor" in s else ""))
-            if "excerpt" in s:
-                out.append(f"  - Excerpt: {md(s['excerpt'])}")
-        out.append("")
+           f"Format {md(pk['schema'])} version {pk['schema_version']}. Case {code(pv['case'])}, slice "
+           f"{code(pv['slice'])}. Package {code(pv['package'])} revision {pv['package_revision']}, content "
+           f"{code(pv['content_fingerprint'])}; slice fingerprint {code(pv['slice_fingerprint'])}; case digest "
+           f"{code(pv['case_digest'])}.", "", md(pk["note"]), ""]
+    out += _case_body(case, refs, pk["scope"], pk["sources"])
     v = pk["verification"]
-    out += ["## Verification", ""]
-    if v["qa"]:
-        out += [f"- QA approach: {md(v['qa']['approach'])}"] + [f"- Fixture: {md(x)}" for x in v["qa"].get("fixtures", [])] \
-            + [f"- Non-functional: {md(x)}" for x in v["qa"].get("nonfunctional", [])]
-    out += [f"- Completion evidence: {md(x)}" for x in v["completion_evidence"]] or []
-    out += ["", "## Dependencies", ""] + [f"- {code(d)}" for d in pk["dependencies"]] + [""]
+    out += ["## Verification", "",
+            "The acceptance examples above, each scenario's expected results and each rule's examples, and:"]
+    out += [""] + (tree({k: v[k] for k in ("qa", "completion_evidence")}) or ["- None recorded."]) + [""]
+    out += ["## Publication", ""] + _publications(pk["publication"]) + [""]
     out += ["## Links (read in the package when needed)", ""]
-    out += [f"- {code(l['id'])} \\({l['kind']}\\)" + (f": {md(l['title'])}" if l["title"] else "") for l in pk["links"]] \
-        or ["- None."]
+    out += [f"- {code(l['id'])} \({md(l['kind'])}" + (f", {md(l['state'])}" if "state" in l else "")
+            + f", {md(l['relation'])}, in {md(l['in'])}\)" + (f": {md(l['title'])}" if l["title"] else "")
+            for l in pk["links"]] or ["- None."]
     return "\n".join(out) + "\n"
 
 

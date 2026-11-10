@@ -513,7 +513,30 @@ class UseScanTests(unittest.TestCase):
                  (("h.py", "import h\nv = h.x\nx = 1\n"),)),
                 ("round 17: a module imports from itself a name it binds later", "import h\n", (("h.py", "from h import x as y\nx = 1\n"),)),
                 ("round 17: a two-module cycle back to a name bound later", "import h\n",
-                 (("h.py", "from g import x as y\nx = 1\n"), ("g.py", "from h import x\n")))):
+                 (("h.py", "from g import x as y\nx = 1\n"), ("g.py", "from h import x\n"))),
+                # round 18 (Main 1): every module of an import cycle (a strongly connected component of more than one module, or one
+                # that imports itself) is opaque, whatever it reads back: what it finds in a module of the cycle depends on which ran
+                # first. Edges are every import form at every scope, relative included; importing a submodule imports its package.
+                ("review F1 (round 18): a two-module cycle back to a name bound before", "import h\n",
+                 (("h.py", "import g\nx = 1\n"), ("g.py", "from h import x\n"))),
+                ("round 18: a three-module cycle, read back by attribute", "import h\n",
+                 (("h.py", "import g\nx = 1\n"), ("g.py", "import k\n"), ("k.py", "import h\ny = h.x\n"))),
+                ("round 18: a cycle through a package __init__ and its submodule", "import hp\n",
+                 (("hp/__init__.py", "from . import g\nx = 1\n"), ("hp/g.py", "from hp import x\n"))),
+                ("round 18: a cycle in a function body", "import h\n", (("h.py", "def f():\n    import g\n"), ("g.py", "import h\n"))),
+                ("round 18: an import cycle that ends nowhere (was kept before round 18)", "import h\n", (("h.py", "import u\n"),)),
+                # round 18 (Main 2): a submodule is an attribute of its package only once loaded: by an import in the reading file
+                # before the read, or by the package __init__ (which must be acyclic); a read of an unloaded one is unknown
+                ("review F2 (round 18): an attribute read of a submodule nothing loads", "import hp\ny = hp.x\n",
+                 (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"))),
+                ("round 18: ... by an alias", "import hp as a\ny = a.x.v\n", (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"))),
+                ("round 18: ... the submodule loaded after the read", "import hp\ny = hp.x\nimport hp.x\n",
+                 (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"))),
+                ("round 18: ... loaded only by a third module", "import hp\nimport k\ny = hp.x\n",
+                 (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"), ("k.py", "import hp.x\n"))),
+                ("round 18: ... of a namespace package", "import hn.a\ny = hn.x\n", (("src/hn/a.py", ""), ("src/hn/x.py", "v = 1\n"))),
+                ("round 18: ... read in a module the file imports", "import k\n",
+                 (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"), ("k.py", "import hp\ny = hp.x\n")))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others), [])
         # round 7 F2: the target's own names are every suffix of its path, and the directories above it are ancestor packages
@@ -595,7 +618,6 @@ class UseScanTests(unittest.TestCase):
                 ("two hops that end elsewhere", "import h\n", (("h.py", "import g\n"), ("g.py", "import json\n"))),
                 ("a package whose __init__ does not import the target", "import lib.x\n",
                  (("lib/__init__.py", "import os\n"), ("lib/x.py", "y = 1\n"))),
-                ("an import cycle that ends nowhere", "import h\n", (("h.py", "import u\n"),)),
                 ("by the path below a directory on sys.path, ending elsewhere", "import worker\n", (("src/worker.py", "import os\n"),)),
                 # round 6 F1: an import that resolves to a run-root module keeps the line, whatever hops it takes
                 ("a clean module it imports, words that only look alike", "import h\n", (("h.py", "x = execute(evaluate(my_vars))\n"),)),
@@ -605,6 +627,14 @@ class UseScanTests(unittest.TestCase):
                 # round 17: a package that imports its own submodule (from . import real) names a module the graph has
                 ("a member a package re-exports as its own submodule", "from h import real\n",
                  (("h/__init__.py", "from . import real\n"), ("h/real.py", "y = 1\n"))),
+                # round 18 (Main 2): a submodule read as an attribute once loaded (by the reader before the read, or by the __init__)
+                ("round 18: a submodule the reader loads before the read", "import hp.x\ny = hp.x.v\n",
+                 (("hp/__init__.py", ""), ("hp/x.py", "v = 1\n"))),
+                ("round 18: a submodule the __init__ loads", "import hp\ny = hp.x.v\n",
+                 (("hp/__init__.py", "from . import x\n"), ("hp/x.py", "v = 1\n"))),
+                ("round 18: a submodule of a namespace package the reader loads", "import hn.a\nimport hn.x\ny = hn.x.v\n",
+                 (("src/hn/a.py", ""), ("src/hn/x.py", "v = 1\n"))),
+                ("round 18: an import chain without a cycle", "import h\n", (("h.py", "import g\nx = 1\n"), ("g.py", "y = 2\n"))),
                 ("a member the package binds", "from h import x\n", (h_pkg,)),
                 ("a member a module binds", "from h import x\n", (h_mod,)),
                 ("a member from a module of a package", "from h.real import y\n", (h_pkg, ("h/real.py", "y = 1\n"))),
@@ -1185,6 +1215,24 @@ class BindingProofUseTests(unittest.TestCase):
         self.assertEqual(self.scan("import pkg.t as t\nt.Q = other\nt.Q()\n"), [])
         self.assertEqual(self.scan("import pkg.t\npkg.t.Q = other\npkg.t.Q()\n"), [])
         self.assertEqual(self.scan("from pkg.t import Q\nQ.pop = other\nQ()\n"), ["- u.py imports Q [app/u.py:1]"])
+        def mine(*args):
+            return [line for line in self.scan(*args) if line.startswith("- u.py")]
+
+        # round 18 (Main 1, review F1): u imports h, which is in a cycle with g (g reads x back from h): h is opaque, so u's walk is
+        # blocked; (Main 2, review F2) u reads hp.x, a submodule nothing loaded: unknown, so u is opaque
+        cycle = (("app/h.py", "import g\nx = 1\n"), ("app/g.py", "from h import x\n"))
+        self.assertEqual(mine("import h\nfrom pkg.t import Q\nQ()\n", "app/u.py", *cycle), ["- u.py imports Q [app/u.py:2]"])
+        hp = (("app/hp/__init__.py", ""), ("app/hp/x.py", "v = 1\n"))
+        self.assertEqual(mine("import hp\ny = hp.x\nfrom pkg.t import Q\nQ()\n", "app/u.py", *hp), ["- u.py imports Q [app/u.py:3]"])
+        # round 18 attack: a package __init__ below a package that imports its own submodule by the full path binds the outer package,
+        # through which it reads itself (app.hp.x) while it still runs: a self-edge although the name bound is not its own
+        self.assertEqual(mine("import hp\nfrom pkg.t import Q\nQ()\n", "app/u.py", ("app/hp/__init__.py", "x = 1\nimport app.hp.s\nv = app.hp.x\n"),
+                              ("app/hp/s.py", ""), ("app/__init__.py", "")), ["- u.py imports Q [app/u.py:2]"])
+        # controls: no cycle (g does not import h); the submodule loaded by the reader first
+        both = ["- u.py imports Q [app/u.py:{0}]", "- u.py creates a Q [app/u.py:{1}]"]
+        self.assertEqual(mine("import h\nfrom pkg.t import Q\nQ()\n", "app/u.py", cycle[0], ("app/g.py", "y = 1\n")),
+                         [line.format(2, 3) for line in both])
+        self.assertEqual(mine("import hp.x\ny = hp.x\nfrom pkg.t import Q\nQ()\n", "app/u.py", *hp), [line.format(3, 4) for line in both])
 
     def test_an_attribute_write_anywhere_in_the_run_root_unproves_the_module_member(self):
         """Round 8 F1: a call, creation or use through `m.Q` or a `from m import Q` name holds only if no file of the run root writes or
@@ -1278,8 +1326,10 @@ class BindingProofUseTests(unittest.TestCase):
             for path, text in direct_forms:
                 with self.subTest(label, form=text.split("\n")[0], where=path):
                     lines, last = deep_scan(path, text, changes)
-                    # round 14 (Main): a star import on the way is opaque (_opaque) for the direct form too: only the import line
-                    creates = [] if "star import" in label else ["- {} creates a Q [{}:{}]".format(Path(path).name, path, last)]
+                    # round 14 (Main): a star import on the way is opaque (_opaque) for the direct form too: only the import line.
+                    # Round 18 (Main 1): `import pkg.sub.t` in pkg/__init__ binds pkg, the module still running: a self-edge, so the
+                    # __init__ every import of pkg.sub.t runs first is opaque too
+                    creates = [] if "star import" in label or "in the package __init__" in label else ["- {} creates a Q [{}:{}]".format(Path(path).name, path, last)]
                     self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last - 1)] + creates)
         # keep the line: no break, or an __init__ that binds the link only by importing exactly that submodule
         for label, changes in (("no break", {}), ("__init__: from . import t", {"pkg/sub/__init__.py": "from . import t\n"}),

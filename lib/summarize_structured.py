@@ -965,7 +965,8 @@ def _holder_binds_other(holder, name, graph):
     if init.endswith("/"):
         return False
     entry = graph.files.get(init)
-    return entry is None or _file_member(init, entry[1], holder, name, graph, frozenset()) != {_Ref("module", holder + "." + name)}
+    return entry is None or _file_member(init, entry[1], holder, name, graph, frozenset(), frozenset({holder + "." + name})) \
+        != {_Ref("module", holder + "." + name)}  # (the import the link is read through loads holder.name)
 
 
 def _path_proved(module, target, through_package, graph, written):
@@ -1092,14 +1093,16 @@ def _find_outside_use(tree, graph):
     allowed_names = _SAFE_PREFIXES | _SAFE_CALLABLES | _SAFE_VALUES
     bound, reexported = {}, graph.reexported()
     path = graph.path_of(tree)
-    running = frozenset({path}) if path is not None else frozenset()  # (this file's code runs while its names are read)
+    if path is not None and path in graph.cyclic():
+        return "1: {} is in an import cycle (what it reads from a module of the cycle depends on which ran first)".format(path)
+    before = (lambda node: graph.loaded_before(path, tree, node)) if path is not None else (lambda node: frozenset())
     for al in _import_aliases(path, tree):
         if al.local is None:
             continue  # a star import: _opaque holds the file to _star
         statement = "import " + al.name if isinstance(al.node, ast.Import) else "from {} import {}".format(al.module, al.name)
         if isinstance(al.node, ast.Import) and _outside(al.name, graph) and al.name not in _SAFE_PREFIXES:
             return "{}: {}".format(al.node.lineno, statement)
-        refs = _resolve_alias(al, graph, running=running)
+        refs = _resolve_alias(al, graph, loaded=before(al.node))
         for ref in sorted(refs, key=str):
             if ref.kind == "unknown":
                 return "{}: {} (the scan cannot say what it binds: {})".format(al.node.lineno, statement, ref.name)
@@ -1121,7 +1124,7 @@ def _find_outside_use(tree, graph):
                 attrs.insert(0, root.attr)
                 root = root.value
             refs = bound.get(root.id, ()) if isinstance(root, ast.Name) else ()
-            if not refs or not all(r.kind == "outside" or all(x.kind in ("outside", "module") for x in _resolve(".".join([r.name] + attrs), graph, running=running))
+            if not refs or not all(r.kind == "outside" or all(x.kind in ("outside", "module") for x in _resolve(".".join([r.name] + attrs), graph, loaded=before(node)))
                                    for r in refs):
                 return "{}: .{} (a module from outside the run root)".format(node.lineno, node.attr)
         if isinstance(node, ast.Name) and node.id in bound:
@@ -1147,7 +1150,7 @@ def _find_outside_use(tree, graph):
                     # an attribute read on a run-root module is resolved as an import of it is (h.argparse._sys); the attribute a write
                     # or delete names need not exist, so only the object it is made on is resolved
                     read = attrs[:-1] if write else attrs
-                    refs = _resolve(".".join([ref.name] + read), graph, running=running) if read else frozenset()
+                    refs = _resolve(".".join([ref.name] + read), graph, loaded=before(node)) if read else frozenset()
                     for r in sorted(refs, key=str):
                         if r.kind == "unknown":
                             return "{}: {} (the scan cannot say what it is)".format(node.lineno, ".".join([node.id] + read))
@@ -1199,10 +1202,127 @@ class _Graph(dict):
     def __init__(self, entries, run, files=None):
         super().__init__(entries)
         self.run, self.by_name, self.packages, self.files = run, {}, set(), files or {}
+        self.dirs, self.paths = {}, {}  # a name -> the full dotted names of the directories it can be; a full module -> its files
         for module in self:
             for name in _suffixes(module):
                 self.by_name.setdefault(name, []).append(module)
             self.packages.update(_ancestor_names(module))
+            parts = module.split(".")
+            for i in range(1, len(parts)):
+                for name in _suffixes(".".join(parts[:i])):
+                    self.dirs.setdefault(name, set()).add(".".join(parts[:i]))
+        for path in self.files:
+            self.paths.setdefault(_module_name(path), []).append(path)
+
+    def targets(self, dotted):
+        """The full dotted names (a module of the graph, or a directory one sits in) the import name dotted can be (_suffixes)."""
+        return frozenset(self.by_name.get(dotted, ())) | frozenset(self.dirs.get(dotted, ()))
+
+    def loads(self, al):
+        """The full dotted names an import statement's alias (_Alias) loads, so that each is in sys.modules and an attribute of its
+        package after it has run: `import a.b.c` loads a, a.b, a.b.c; `from M import n` loads M and its packages, and M.n when that is
+        a module (whether it is, _file_member decides: a name M binds is not imported)."""
+        if isinstance(al.node, ast.Import):
+            names = [al.name]
+        elif al.module is None:
+            return frozenset()
+        else:
+            names = [al.module] + ([al.module + "." + al.name] if al.name != "*" else [])
+        return frozenset(t for n in names for i in range(1, n.count(".") + 2) for t in self.targets(".".join(n.split(".")[:i])))
+
+    def loaded_before(self, path, tree, node):
+        """THE set of full dotted names a file has loaded, by its own imports, when the statement holding node runs (round 18, Main 2):
+        the loads of every import statement at the top level of the module, unconditional, before the top-level statement that holds
+        node. An import in a function, a class, a condition or a try is not counted, nor one later in the file: whether it has run
+        when node runs is order the scan does not decide."""
+        cache = tree.__dict__.setdefault("_loaded_before", {})
+        if cache.get("graph") is not self:
+            cache.clear()
+            cache["graph"], before = self, frozenset()
+            for top in tree.body:
+                for n in ast.walk(top):
+                    cache[id(n)] = before
+                if isinstance(top, (ast.Import, ast.ImportFrom)):
+                    before = before | frozenset().union(*(self.loads(al) for al in _import_aliases(path, top)))
+            cache["all"] = before
+        return cache.get(id(node), frozenset())
+
+    def init_loads(self, path):
+        """The full dotted names the package __init__ (or module) at path loads by its top-level unconditional imports (loaded_before)."""
+        entry = self.files.get(path)
+        if entry is None:
+            return frozenset()
+        self.loaded_before(path, entry[1], entry[1])
+        return entry[1]._loaded_before["all"]
+
+    def cyclic(self):
+        """THE import-cycle rule (round 18, Main 1): the supplied files that are in an import cycle. The graph has an edge from a file
+        to every file an import statement of it (any form, at any scope, relative too: _import_aliases) loads (loads: a package's
+        __init__ counts as imported by any import of a submodule) and to every file whose names it binds or reads: `import a.b` binds
+        a, `import a.b as x` binds a.b, and the module it names is run; `from M import n` reads n from M, or takes the submodule M.n
+        when the file of M has one (_submodule_of). The file's own module loaded only as the package of what it imports runs nothing
+        and is no edge (`from . import sub` in pkg/__init__.py); binding or reading it is a self-edge (`from h import x` and `import h`
+        in h.py, `import pkg.sub` in pkg/__init__.py, which binds pkg; `import app.pkg.sub` in app/pkg/__init__.py, which binds app,
+        through which app.pkg, the module still running, is read: a plain `import a.b.c` has an edge to every file it loads). A file
+        in a strongly connected component of more than one file, or with a self-edge, is in a cycle: what it reads from a module of the
+        cycle depends on which ran first."""
+        if hasattr(self, "_cyclic"):
+            return self._cyclic
+        files = lambda names: {p for t in names for p in self.paths.get(t, ())}  # noqa: E731
+        edges = {}
+        for path, entry in self.files.items():
+            if entry is None:
+                continue
+            out = set()
+            for al in _import_aliases(path, entry[1]):
+                plain = isinstance(al.node, ast.Import) and al.qualified == al.local  # binds a: a.b, a.b.c are read through it
+                out |= files(self.loads(al)) - (set() if plain else {path})
+                if isinstance(al.node, ast.Import):
+                    out |= files(self.targets(al.name) | self.targets(al.qualified))
+                elif al.module is not None:
+                    for m in self.targets(al.module):
+                        holders = self.paths.get(m, ())
+                        sub = files({m + "." + al.name}) if al.name != "*" else set()
+                        out |= sub if not holders else set().union(*(sub if al.name != "*" and _submodule_of(p, al.name, self) else {p}
+                                                                      for p in holders))
+            edges[path] = out
+        cyclic, index, low, stack, on, counter = set(), {}, {}, [], set(), [0]
+        for root in edges:  # Tarjan's strongly connected components, iteratively
+            if root in index:
+                continue
+            work = [(root, iter(sorted(edges[root])))]
+            index[root] = low[root] = counter[0]
+            counter[0] += 1
+            stack.append(root)
+            on.add(root)
+            while work:
+                node, it = work[-1]
+                nxt = next((w for w in it if w in edges), None)
+                if nxt is not None:
+                    if nxt not in index:
+                        index[nxt] = low[nxt] = counter[0]
+                        counter[0] += 1
+                        stack.append(nxt)
+                        on.add(nxt)
+                        work.append((nxt, iter(sorted(edges[nxt]))))
+                    elif nxt in on:
+                        low[node] = min(low[node], index[nxt])
+                    continue
+                work.pop()
+                if work:
+                    low[work[-1][0]] = min(low[work[-1][0]], low[node])
+                if low[node] == index[node]:
+                    component = []
+                    while True:
+                        w = stack.pop()
+                        on.discard(w)
+                        component.append(w)
+                        if w == node:
+                            break
+                    if len(component) > 1 or node in edges[node]:
+                        cyclic.update(component)
+        self._cyclic = frozenset(cyclic)
+        return self._cyclic
 
     def known(self, dotted):
         """True when dotted is a name of the run root: of a module (any dotted suffix of its path) or of a directory one sits in."""
@@ -1228,7 +1348,8 @@ class _Graph(dict):
         if not hasattr(self, "_reexported"):
             self._reexported = frozenset(al.local for path, entry in self.files.items() if entry is not None
                                          for al in _import_aliases(path, entry[1])
-                                         if al.local is not None and any(r.kind == "outside" for r in _resolve_alias(al, self)))
+                                         if al.local is not None and any(r.kind == "outside" for r in
+                                                                         _resolve_alias(al, self, loaded=self.loaded_before(path, entry[1], al.node))))
         return self._reexported
 
     def path_of(self, tree):
@@ -1280,7 +1401,7 @@ def _import_graph(files, parsed, run):
 _Ref = collections.namedtuple("_Ref", "kind name")  # kind: "outside", "module" (of the run root), "member" (of one), "unknown"
 
 
-def _resolve(dotted, graph, seen=frozenset(), running=frozenset()):
+def _resolve(dotted, graph, seen=frozenset(), loaded=frozenset()):
     """THE one resolver of imported names (round 16, Main 1): the set of what the dotted name (a _Alias qualified name, or one followed
     by attribute reads) may refer to once the import has run, each a _Ref:
     - outside q: a module or name from outside the run root (_outside), q its full dotted name; an attribute of it is outside too;
@@ -1289,18 +1410,23 @@ def _resolve(dotted, graph, seen=frozenset(), running=frozenset()):
     - unknown: the scan cannot say (a qualified name that did not resolve; a module that does not parse, has a star import, a dynamic
       form or a module __getattr__; a name it binds more than once or under a condition; a name it does not bind and that is no
       submodule; a name both a submodule and bound to anything but that submodule; a name some run-root file writes as an attribute;
-      a cycle of re-exports; round 17: a name a module binds, read while that module's own code is still running, below).
+      a cycle of re-exports; round 18: any name of a module in an import cycle, and a submodule read as an attribute that no import
+      has loaded, below).
     A run-root member bound in its module by an import resolves to what that import names, relative or absolute, through any number
     of modules: `from .h import argparse as a` is outside argparse, and a._sys is outside argparse._sys, as for `import argparse`. No
     other code decides what an imported name refers to: the allow-list (_find_outside_use, _Graph.reexported), the walks
     (_unresolved) and the use scan's package links (_holder_binds_other) all ask here.
-    Round 17 (Main 1): running is the set of files whose code is still running when the name is read: the file that reads it (its
-    own imports and attribute reads, _outside_use, _Graph.reexported), and each file whose import statement the resolver follows on
-    the way. A name such a file binds is unknown (_file_member): whether its binding has run yet is a matter of order, as in a module
-    importing a name from itself (`from h import x` in h, `import h` then h.x), at any depth of a re-export chain, and in a cycle."""
+    Round 18 (Main): two whole-graph rules, decided before any name is resolved, replace round 17's tracking of running files.
+    1. A name a module in an import cycle binds is unknown (_Graph.cyclic; _file_member): whether its binding has run when it is read
+       depends on which module of the cycle ran first. A self-import is a cycle of one.
+    2. loaded is the set of full dotted names the reading code has loaded by its own imports when it reads the name
+       (_Graph.loaded_before; _resolve_alias adds the loads of the import statement itself, _resolve_from the member it imports). A
+       submodule is an attribute of its package only when it is loaded: by the reading code (loaded), or by the package's own
+       __init__.py, which is not in a cycle (_Graph.init_loads); a file that exists proves only that `from pkg import sub` can import
+       it (_resolve_from)."""
     cache = graph.__dict__.setdefault("_resolved", {})
-    if (dotted, running) in cache:
-        return cache[(dotted, running)]
+    if (dotted, loaded) in cache:
+        return cache[(dotted, loaded)]
     if dotted is None:
         return frozenset({_Ref("unknown", None)})
     if dotted in seen:
@@ -1312,65 +1438,75 @@ def _resolve(dotted, graph, seen=frozenset(), running=frozenset()):
     else:
         parent, _dot, last = dotted.rpartition(".")
         result = set()
-        for ref in _resolve(parent, graph, seen | {dotted}, running):
+        for ref in _resolve(parent, graph, seen | {dotted}, loaded):
             if ref.kind in ("outside", "member"):
                 result.add(_Ref(ref.kind, ref.name + "." + last))
             elif ref.kind == "module":
-                result |= _module_member(ref.name, last, graph, seen | {dotted}, running)
+                result |= _module_member(ref.name, last, graph, seen | {dotted}, loaded)
             else:
                 result.add(ref)
         result = frozenset(result)
     if not seen or all(r.kind != "unknown" for r in result):
-        cache[(dotted, running)] = result  # (a result inside a cycle is kept only when it does not depend on where the cycle was entered)
+        cache[(dotted, loaded)] = result  # (a result inside a cycle is kept only when it does not depend on where the cycle was entered)
     return result
 
 
-def _resolve_alias(al, graph, seen=frozenset(), running=frozenset()):
-    """What the name an import binds (an _Alias) may refer to (_resolve). `import a.b as x` reads the attribute b of a (Python's
-    IMPORT_FROM), so its qualified name is resolved as attribute reads; `from S import n` loads S by its full dotted name (sys.modules)
-    and reads its attribute n, so S is taken as the module it names and n is resolved on it (_resolve_from)."""
+def _resolve_alias(al, graph, seen=frozenset(), loaded=frozenset()):
+    """What the name an import binds (an _Alias) may refer to (_resolve), the statement's own loads added to loaded (_Graph.loads).
+    `import a.b as x` reads the attribute b of a (Python's IMPORT_FROM), so its qualified name is resolved as attribute reads; `from S
+    import n` loads S by its full dotted name (sys.modules) and reads its attribute n, so S is taken as the module it names and n is
+    resolved on it (_resolve_from)."""
     if al is None or al.local is None or al.qualified is None:
         return frozenset({_Ref("unknown", None if al is None else al.qualified)})
+    loaded = loaded | graph.loads(al)
     if isinstance(al.node, ast.Import):
-        return _resolve(al.qualified, graph, seen, running)
-    return _resolve_from(al.module, al.name, graph, seen, running)
+        return _resolve(al.qualified, graph, seen, loaded)
+    return _resolve_from(al.module, al.name, graph, seen, loaded)
 
 
-def _resolve_from(module, name, graph, seen=frozenset(), running=frozenset()):
+def _resolve_from(module, name, graph, seen=frozenset(), loaded=frozenset()):
     """What `from module import name` binds (module absolute): outside module.name for an outside module, the member name of a run-root
-    module (_module_member), and unknown for a module that is neither (a name with a run-root prefix that names no module of it)."""
+    module (_module_member), and unknown for a module that is neither (a name with a run-root prefix that names no module of it). The
+    statement imports module.name when module does not bind name, so that submodule counts as loaded."""
     if _outside(module, graph):
         return frozenset({_Ref("outside", module + "." + name)})
     if not graph.known(module):
         return frozenset({_Ref("unknown", module + "." + name)})
     if module + "." + name in seen:
         return frozenset({_Ref("unknown", module + "." + name)})  # a cycle
-    return _module_member(module, name, graph, seen | {module + "." + name}, running)
+    loaded = loaded | graph.targets(module + "." + name)
+    return _module_member(module, name, graph, seen | {module + "." + name}, loaded)
 
 
-def _module_member(module, last, graph, seen, running=frozenset()):
+def _module_member(module, last, graph, seen, loaded=frozenset()):
     """What the attribute last of the run-root module (or package directory) module may be (_resolve): the union over every file that
     module may be (_Graph.by_name: each module of that name, each of its files); a package directory with no file is a namespace,
-    whose attributes are its submodules only."""
+    whose attributes are its submodules only, each only once loaded (round 18, Main 2: by the reading code; a namespace has no
+    __init__ to load it)."""
     sub = module + "." + last
     files = [(graph.path_of(tree), tree) for m in graph.by_name.get(module, ()) for _s, tree in (graph[m][4] if graph[m] is not None else ((None, None),))]
     if not files:
-        return frozenset({_Ref("module" if graph.known(sub) else "unknown", sub)})
-    return frozenset().union(*(_file_member(path, tree, module, last, graph, seen, running) for path, tree in files))
+        present = graph.known(sub) and any(d + "." + last in loaded for d in graph.targets(module))
+        return frozenset({_Ref("module" if present else "unknown", sub)})
+    return frozenset().union(*(_file_member(path, tree, module, last, graph, seen, loaded) for path, tree in files))
 
 
-def _file_member(path, tree, module, last, graph, seen, running=frozenset()):
-    """What the attribute last of the module whose file is (path, tree) may be (_resolve, _holder_binds_other). A name the file does
-    not bind is its submodule or nothing (_submodule_of); a name it binds once is what that binding is, unless the file's code is still
-    running (path in running: _resolve), when it is unknown, except a binding that imports the very submodule (`from . import sub`
-    in pkg/__init__.py, with pkg/sub.py): Python imports that submodule whether or not the attribute is set yet."""
+def _file_member(path, tree, module, last, graph, seen, loaded=frozenset()):
+    """What the attribute last of the module whose file is (path, tree) may be (_resolve, _holder_binds_other), read by code that has
+    loaded the full dotted names loaded. Round 18 (Main 1): every name of a file in an import cycle (_Graph.cyclic) is unknown. A
+    name the file does not bind is its submodule (_submodule_of) once that is loaded (Main 2: by the reading code, loaded, or by the
+    file's own top-level imports, _Graph.init_loads), else unknown; a name it binds once is what that binding is, an import binding
+    resolved with what the file had loaded when that import ran (_Graph.loaded_before)."""
     sub = module + "." + last
     unknown = frozenset({_Ref("unknown", sub)})
-    if tree is None or _binds(tree, "__getattr__", None, False, existence=True) != [] or _may_write(graph.written(), last):
+    if tree is None or path in graph.cyclic() or _binds(tree, "__getattr__", None, False, existence=True) != [] \
+            or _may_write(graph.written(), last):
         return unknown  # (_binds is None for a star import or a dynamic form, which bind names no statement shows)
     submodule = _submodule_of(path, last, graph)
     if last not in _binding_index(tree).events:
-        return frozenset({_Ref("module", sub)}) if submodule else unknown  # (Python imports the submodule)
+        full = _module_name(path) + "." + last
+        present = submodule and (full in loaded or full in graph.init_loads(path))
+        return frozenset({_Ref("module", sub)}) if present else unknown  # (Python sets the attribute when it imports the submodule)
     stmt = _single_binding(tree, last, existence=True)
     if stmt is None:
         return unknown
@@ -1378,10 +1514,8 @@ def _file_member(path, tree, module, last, graph, seen, running=frozenset()):
         if isinstance(stmt, (ast.Import, ast.ImportFrom)) else None
     if submodule and al is not None and _same_module(al.qualified, sub, graph):
         result = frozenset({_Ref("module", sub)})
-    elif path in running:
-        return unknown  # (the file is still running: whether this binding has run is order)
     elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-        result = _resolve_alias(al, graph, seen | {sub}, running | {path})  # (the file runs while its import runs)
+        result = _resolve_alias(al, graph, seen | {sub}, graph.loaded_before(path, tree, stmt))
     else:
         result = frozenset({_Ref("member", sub)})
     # a name that is also a submodule: importing the submodule anywhere rebinds the attribute to it
@@ -1394,7 +1528,8 @@ def _submodule_of(path, last, graph):
     """THE proof that the attribute last of the module whose file is path can be a run-root submodule (round 17, Main 1: a module
     reference names a module the graph has; equal names prove nothing): path is a package __init__.py and its directory holds last as a
     supplied module file (last.py), a package (last/__init__.py) or a directory of supplied modules (a namespace portion). A plain
-    module (h.py) has no submodules: `from h import x` in h.py, with no x bound, names nothing, whatever other directory has an h/x.py."""
+    module (h.py) has no submodules: `from h import x` in h.py, with no x bound, names nothing, whatever other directory has an h/x.py.
+    That it can be does not make it an attribute: Python sets that when the submodule is imported (_file_member, round 18)."""
     if path is None or path.rsplit("/", 1)[-1] != "__init__.py":
         return False
     prefix = path[:-len("__init__.py")] + last

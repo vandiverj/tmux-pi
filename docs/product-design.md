@@ -538,7 +538,7 @@ Entry points:
 
 | Harness | Command | How it resolves |
 | --- | --- | --- |
-| Claude | `/product-design`, `/prepare-cases` | `claude/plugins/tmux-pi/commands/<name>.md` calls the `get_skill` tool with the id; the id must be in `ON_DEMAND_SKILLS` in `claude/mcp/subagents.mjs` |
+| Claude | `/product-design`, `/prepare-cases` | `claude/plugins/tmux-pi/commands/<name>.md` calls the `get_skill` tool with the id; the id must be in `ON_DEMAND_SKILLS` in `claude/mcp/subagents.mjs`, which lists `get_skill` in the orchestrator main (`bin/tp-main`) and the legacy main, never in a worker |
 | Pi | `/product-design`, `/prepare-cases` | `tp-pi` sets `PI_CODING_AGENT_DIR` to `agent/`, so `agent/prompts/<name>.md` is a prompt template; the catalogue extension first selects the skill from the raw `/name …` input |
 | Worker packet | (selected by the task text) | `tp-skills --mode packet` inlines the selected SKILL.md |
 

@@ -744,14 +744,16 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         import io
         from unittest import mock
         import pane_send
-        calls = []
+        calls, pasted = [], []
 
         def run(command, *args, **kwargs):
             calls.append(command[1:])
-            typed = [c for c in calls if c[0] == "send-keys" and "-l" in c]
+            if command[1] == "load-buffer":  # a Claude task's text goes in as one paste of a buffer loaded from stdin
+                pasted.append(kwargs["input"].decode())
             if submit_recorded and command[-1] == "Enter":
+                marks = pane_send.prompt_marks(pasted[-1])  # the record report.sh writes for the whole pasted text
                 (self.task / "state.json").write_text(json.dumps({"promptSubmits": 1, "promptLog": [
-                    {"n": 1, "at": "t", "tokens": pane_send.TOKEN_RE.findall(typed[-1][-1])}]}))
+                    {"n": 1, "at": "t", "tokens": [m["id"] for m in marks], "marks": marks}]}))
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         decision = {"action": ("nudge-draft", "draft due"), "status": None, "elapsed": 60, "turns": 3}
         err = io.StringIO()
@@ -765,13 +767,13 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
 
     def test_a_reminder_goes_through_the_submit_helper_and_says_when_it_is_not_confirmed(self):
         calls, err = self.nudge(submit_recorded=True)
-        keys = [c for c in calls if c[0] == "send-keys"]
-        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True])  # typed once, one Enter, confirmed by the record
+        keys = [c[0] if c[0] != "send-keys" else c[-1] for c in calls if c[0] in ("send-keys", "load-buffer", "paste-buffer")]
+        self.assertEqual(keys, ["load-buffer", "paste-buffer", "Enter"])  # put in once, one Enter, confirmed by the record
         self.assertEqual(err, "")
         (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
         calls, err = self.nudge(submit_recorded=False)  # the pane never shows the text, yet a Claude task is not confirmed
-        keys = [c for c in calls if c[0] == "send-keys"]
-        self.assertEqual([c[-1] == "Enter" for c in keys], [False, True, True, True])  # typed once, 1 + 2 Enters, never retyped
+        keys = [c[0] if c[0] != "send-keys" else c[-1] for c in calls if c[0] in ("send-keys", "load-buffer", "paste-buffer")]
+        self.assertEqual(keys, ["load-buffer", "paste-buffer", "Enter", "Enter", "Enter"])  # put in once, 1 + 2 Enters
         self.assertIn("not confirmed submitted after 3 Enter(s)", err)
         self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "nudge-draft")
 

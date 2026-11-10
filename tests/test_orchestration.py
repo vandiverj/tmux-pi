@@ -818,6 +818,18 @@ esac
         self.assertEqual((line["text"], line["submitted"], line["attempts"]), ("carry on", False, 3))
         self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "pending")
         self.assertEqual(server.typed(raw, "carry on"), 1)
+        # MS2: a Claude worker whose prompt held the delivery id and only the start of the text did not get the message: exit 1,
+        # what arrived, one Enter, and the request stays pending. The id and its space are 19 characters; " with it" is lost.
+        pane, log, raw = server.worker("normal", task_dir=task, options=("--keep-first", "27"))
+        (task / "meta.json").write_text(json.dumps({**meta, "worker": "claude", "pane": pane}))
+        run = self.raw("message", item["id"], "--text", "carry on with it", env={**self.env, **server.env()}, timeout=30)
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("not delivered whole: the worker's prompt held 7 of its 13 characters", run.stderr)
+        self.assertEqual({k: json.loads(run.stdout)[k] for k in ("submitted", "attempts", "received", "length")},
+                         {"submitted": False, "attempts": 1, "received": 7, "length": 13})
+        line = json.loads((task / "messages.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((line["submitted"], line["received"], line["length"]), (False, 7, 13))
+        self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "pending")
 
     def test_retry_links_prior_attempt_and_records_reason(self):
         first = self.dispatch()

@@ -2,6 +2,7 @@
 summarize's answer order. The fixtures here are written for the tests; the calibration files are only read by the guard. Stub endpoint."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import ast
+import importlib.machinery
 import json
 import re
 import sys
@@ -507,6 +508,26 @@ class UseScanTests(unittest.TestCase):
             with self.subTest(label):
                 expected = [] if label.startswith("a relative import that resolves") else none  # pkg is an ancestor of pkg.sub.t
                 self.assertEqual(scan(user, *others), expected)
+        # round 11: with the run root on disk, an import for which Python's finder may load a file the scan was not given (an
+        # __init__.py, a module, a .pyc or an extension module on disk only) is a path; a namespace directory runs nothing
+        reach = "from pkg.sub.t import Q\nQ()\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, (label, user, others, disk, expected) in enumerate((
+                    ("h/__init__.py on disk beside a supplied h.py", "import h\n", (h_mod,), {"h/__init__.py": reach}, []),
+                    ("h.py on disk only", "import h\n", (), {"h.py": reach}, []),
+                    ("h.pyc on disk beside a supplied h.py", "import h\n", (h_mod,), {"h.pyc": ""}, []),
+                    ("an extension module h on disk beside a supplied h.py", "import h\n", (h_mod,),
+                     {"h" + importlib.machinery.EXTENSION_SUFFIXES[0]: ""}, []),
+                    ("a submodule on disk only, from a supplied package", "from h import real\n", (h_pkg,), {"h/real.py": reach}, []),
+                    ("on disk too, nothing else there", "import h\n", (h_mod,), {}, none),
+                    ("a namespace directory on disk only", "import ns\n", (), {"ns/notes.txt": ""}, none))):
+                root = Path(tmp) / str(n)
+                for p, t in [(target["path"], "class Q:\n    pass\n"), ("u.py", user)] + list(others) + list(disk.items()):
+                    (root / p).parent.mkdir(parents=True, exist_ok=True)
+                    (root / p).write_text(t)
+                with self.subTest(label, root="on disk"):
+                    files = [target] + [num(p, t) for p, t in others] + [num("u.py", user)]
+                    self.assertEqual([line for line in ss.use_scan("Who uses Q?", files, str(root)) if line.startswith("- u.py")], expected)
 
     def test_a_rebound_name_keeps_only_the_import(self):
         imp = "- u.py imports Q [u.py:1]"
@@ -796,6 +817,48 @@ class BindingProofUseTests(unittest.TestCase):
                             ("pkg bound twice", "import pkg.t\nimport pkg.other\npkg.t.Q()\n")):
             with self.subTest(label):
                 self.assertEqual(self.scan(text), [])
+        # Round 11 (Main): a module is credited to a file only when Python's finder can load nothing else for that name from the run
+        # root (_module_identity), at every step: a competing candidate, supplied or on disk (the root), leaves the import line of
+        # `from pkg.t import Q` at most, and no file gets "does not use". Rows from the round-11 attack (729 cases on both interpreters,
+        # 0 unsound after); the first is the review's repro. Extension suffixes are the running interpreter's.
+        other = "Q = lambda: 'other'\n"
+        rows = [("review: pkg/t/__init__.py supplied beside pkg/t.py", {"pkg/t/__init__.py": other}, {}),
+                ("pkg/t/__init__.py on disk only", {}, {"pkg/t/__init__.py": other}),
+                ("pkg/t/ with no __init__, on disk", {}, {"pkg/t/notes.txt": ""}),
+                ("pkg.py supplied beside the package", {"pkg.py": other}, {}),
+                ("pkg.py on disk beside the package", {}, {"pkg.py": other}),
+                # an __init__ on disk only runs unseen on the way to pkg.t: here it rebinds t.Q
+                ("pkg/__init__.py on disk only", "drop", {"pkg/__init__.py": "from . import t\nt.Q = lambda: 'other'\n"})]
+        for ext in [s for s in importlib.machinery.all_suffixes() if s != ".py"]:
+            rows += [("pkg/t{} on disk".format(ext), {}, {"pkg/t" + ext: ""}), ("pkg{} on disk".format(ext), {}, {"pkg" + ext: ""}),
+                     ("pkg/__init__{} on disk".format(ext), {}, {"pkg/__init__" + ext: ""})]
+        forms = (("import pkg.t\nobj = pkg.t.Q()\n", 2), ("import pkg.t as t\nobj = t.Q()\n", 2), ("from pkg import t\nobj = t.Q()\n", 2),
+                 ("from pkg.t import Q\nobj = Q()\n", 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, (label, supplied, disk) in enumerate([("control: nothing competes, on disk", {}, {})] + rows):
+                for kind, target, verb in (("class", "class Q:\n    pass\n", "creates a"), ("function", "def Q():\n    pass\n", "calls")):
+                    for text, imp in forms:
+                        files = {"pkg/__init__.py": "", "pkg/t.py": target, "app/u.py": text, "v.py": "x = 1\n"}
+                        if supplied == "drop":
+                            del files["pkg/__init__.py"]
+                        else:
+                            files.update(supplied)
+                        root = Path(tmp) / str(n) / kind / str(imp) / text.split("\n")[0].replace(" ", "_")
+                        for p, t in list(files.items()) + list(disk.items()):
+                            (root / p).parent.mkdir(parents=True, exist_ok=True)
+                            (root / p).write_text(t)
+                        with self.subTest(label, kind=kind, form=text.split("\n")[0]):
+                            out = ss.use_scan("Who uses Q?", [num(p, t) for p, t in files.items()], str(root))
+                            credited = ["- u.py imports Q [app/u.py:{}]".format(imp), "- u.py {} Q [app/u.py:2]".format(verb)]
+                            expected = credited if n == 0 else ["- u.py imports Q [app/u.py:1]"] if imp == 1 else []
+                            self.assertEqual([line for line in out if line.startswith("- u.py")], expected)
+                            self.assertEqual("- v.py does not use Q [v.py:1]" in out, n == 0)
+        # the top-level name of the module is a builtin or standard-library name: Python may answer it without the run root
+        for path, module in (("json.py", "json"), ("os/t.py", "os.t"), ("sys/__init__.py", "sys"), ("collections/abc.py", "collections.abc")):
+            with self.subTest("a standard-library top-level name", module=module):
+                out = ss.use_scan("Who uses Q?", [num(path, "class Q:\n    pass\n"), num("app/u.py", "from {} import Q\nQ()\n".format(module)),
+                                                  num("v.py", "x = 1\n")])
+                self.assertEqual(out, ["- u.py imports Q [app/u.py:1]"])
 
     def test_the_review_reproductions(self):
         # F1: the module overwritten by a star import, the name by a dotted import, the attribute by a write

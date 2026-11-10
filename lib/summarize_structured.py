@@ -9,10 +9,12 @@ template is config/local.example.json), read by load_settings through lib/router
 """
 import ast
 import collections
+import importlib.machinery
 import json
 import os
 import re
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -698,6 +700,112 @@ def _module_name(path):
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
 
+# The top-level names of the standard library, for an interpreter without sys.stdlib_module_names (3.9): the 3.14 list and the 3.9
+# stdlib listing, fixed here (test-only and sysconfigdata modules left out). A name too many only withholds lines.
+_STDLIB_FIXED = frozenset("""
+331
+    __future__ _abc _aix_support _android_support _apple_support _ast _ast_unparse _asyncio _bisect _blake2 _bootlocale
+    _bootsubprocess _bz2 _codecs _codecs_cn _codecs_hk _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw _collections
+    _collections_abc _colorize _compat_pickle _compression _contextvars _crypt _csv _ctypes _curses _curses_panel _datetime _dbm
+    _decimal _elementtree _frozen_importlib _frozen_importlib_external _functools _gdbm _hashlib _heapq _hmac _imp
+    _interpchannels _interpqueues _interpreters _io _ios_support _json _locale _lsprof _lzma _markupbase _md5 _multibytecodec
+    _multiprocessing _opcode _opcode_metadata _operator _osx_support _overlapped _peg_parser _pickle _posixshmem
+    _posixsubprocess _py_abc _py_warnings _pydatetime _pydecimal _pyio _pylong _pyrepl _queue _random _remote_debugging _scproxy
+    _sha1 _sha2 _sha256 _sha3 _sha512 _signal _sitebuiltins _socket _sqlite3 _sre _ssl _stat _statistics _string _strptime
+    _struct _suggestions _symtable _sysconfig _thread _threading_local _tkinter _tokenize _tracemalloc _types _typing _uuid
+    _warnings _weakref _weakrefset _winapi _wmi _xxsubinterpreters _zoneinfo _zstd abc aifc annotationlib antigravity argparse
+    array ast asynchat asyncio asyncore atexit audioop base64 bdb binascii binhex bisect builtins bz2 cProfile calendar cgi
+    cgitb chunk cmath cmd code codecs codeop collections colorsys compileall compression concurrent configparser contextlib
+    contextvars copy copyreg crypt csv ctypes curses dataclasses datetime dbm decimal difflib dis distutils doctest email
+    encodings ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch formatter fractions ftplib functools gc
+    genericpath getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html http idlelib imaplib imghdr imp importlib
+    inspect io ipaddress itertools json keyword lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes
+    mmap modulefinder msvcrt multiprocessing netrc nis nntplib nt ntpath nturl2path numbers opcode operator optparse os parser
+    pathlib pdb pickle pickletools pipes pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd
+    py_compile pyclbr pydoc pydoc_data pyexpat queue quopri random re readline reprlib resource rlcompleter runpy sched secrets
+    select selectors shelve shlex shutil signal site smtpd smtplib sndhdr socket socketserver sqlite3 sre_compile sre_constants
+    sre_parse ssl stat statistics string stringprep struct subprocess sunau symbol symtable sys sysconfig syslog tabnanny
+    tarfile telnetlib tempfile termios textwrap this threading time timeit tkinter token tokenize tomllib trace traceback
+    tracemalloc tty turtle turtledemo types typing unicodedata unittest urllib uu uuid venv warnings wave weakref webbrowser
+    winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib zoneinfo
+""".split())
+
+
+def _reserved_names():
+    """Top-level module names Python may answer without the path finder: builtins, and the standard library (already imported, frozen,
+    or found in the stdlib by a later sys.path entry when the run root's candidate is only a namespace directory)."""
+    return frozenset(sys.builtin_module_names) | frozenset(getattr(sys, "stdlib_module_names", _STDLIB_FIXED))
+
+
+class _RunRoot:
+    """The run root as Python's path finder sees it, with the run root as sys.path[0]: the supplied paths (and the directories they sit
+    in), and, when root is a directory on disk, the names in each directory the finder is asked about (a listing: names, and whether
+    each is a directory; nothing is read). A run with no run root on disk sees only the supplied files."""
+
+    def __init__(self, paths, root=None):
+        self.supplied = frozenset(paths)
+        self.root = root if root is not None and os.path.isdir(root) else None
+        self._listings = {}
+
+    def listing(self, directory):
+        """(file names, directory names) in directory ("" is the run root, else a/b)."""
+        if directory not in self._listings:
+            files, dirs, prefix = set(), set(), directory + "/" if directory else ""
+            for path in self.supplied:
+                if path.startswith(prefix):
+                    head, sep, _rest = path[len(prefix):].partition("/")
+                    (dirs if sep else files).add(head)
+            if self.root is not None:
+                try:
+                    with os.scandir(os.path.join(self.root, *directory.split("/")) if directory else self.root) as entries:
+                        for entry in entries:
+                            (dirs if entry.is_dir() else files).add(entry.name)
+                except OSError:
+                    pass
+            self._listings[directory] = (files, dirs)
+        return self._listings[directory]
+
+
+_Identity = collections.namedtuple("_Identity", "owners candidates")
+
+
+def _module_identity(dotted, run):
+    """THE one function that turns a dotted module name into files (round 11, Main): nothing else maps a name to a file. Python's path
+    finder, for each step of the name, looks in that step's directory for a package directory (name/ with an __init__ of any import
+    suffix), then a module file name.<suffix> in the order of importlib.machinery.all_suffixes() (extension modules first on this
+    interpreter's loaders, then .py, then .pyc), then a namespace portion (name/ without an __init__); a name already in sys.modules
+    (a builtin, a frozen or already imported standard module) never reaches the finder.
+    candidates: for each step, from the first, that the run root (_RunRoot) has anything for, the set of what the finder could load
+    there: "a/b.py", "a/b.<ext>", "a/b/__init__.<suffix>", or "a/b/" for a directory with no __init__; the list stops at a step with
+    nothing (the name then names nothing in the run root from that step on).
+    owners: the one path of each step, or None when the run root does not prove it. A step is proved only when its candidate set holds
+    exactly one entry: a module file name.py and no name/ directory of any kind and no name with another suffix; a package
+    name/__init__.py and no other __init__ suffix and no name.<suffix> beside it; or, for a step that is not the last, a namespace
+    directory name/ and no name.<suffix> beside it. The last step must be a .py file (a module or a package __init__.py). The top-level
+    name must not be a builtin or standard-library name (_reserved_names). A module is credited to a file only through owners. What
+    the finder sees beyond the run root is a limit, stated in _no_path_to."""
+    parts, suffixes = dotted.split("."), importlib.machinery.all_suffixes()
+    candidates, owners = [], []
+    for i, name in enumerate(parts):
+        directory = "/".join(parts[:i])
+        files, dirs = run.listing(directory)
+        base = directory + "/" + name if directory else name
+        found = {base + s for s in suffixes if name + s in files}
+        if name in dirs:
+            inits = {base + "/__init__" + s for s in suffixes if "__init__" + s in run.listing(base)[0]}
+            found |= inits or {base + "/"}
+        if not found:
+            break
+        candidates.append(found)
+        one = next(iter(found)) if len(found) == 1 else ""
+        # a step before the last must be a package (an __init__.py, or a namespace directory); the last must be a .py file
+        proved = (i or name not in _reserved_names()) and (one.endswith(".py") if i == len(parts) - 1 else one.endswith(("/__init__.py", "/")))
+        owners = owners + [one] if owners is not None and proved else None
+    if owners is not None and len(owners) < len(parts):
+        owners = None
+    return _Identity(owners, candidates)
+
+
 def _imported_module(path, node):
     """The full dotted module a `from <module> import` statement names: a relative one is resolved from the importing file's
     package, as Python does (level 1 is that package, each further level its parent); None when it has no such package (a module at
@@ -789,20 +897,21 @@ def _path_links(module, target, through_package):
     return steps + [(None, target)]
 
 
-def _holder_binds_other(holder, name, parsed):
-    """True when the run root does not prove that the package holder's attribute name is only ever its submodule holder.name: the
-    package's __init__.py binds name by any statement other than an import of exactly that submodule (`from . import name`,
-    `from <holder> import name`, `import <holder>.<name> as name`), that is an `as` import of another module, an assignment, a def or
-    class, a for or with target, a global, a delete, a star import or a dynamic form (_binds); or it defines a module `__getattr__`,
-    which can answer any name; or the __init__.py does not parse; or a module file holder.py stands beside the package. A package with
-    no __init__.py in the run root (a namespace directory) binds nothing."""
-    base = holder.replace(".", "/")
-    if base + ".py" in parsed:
+def _holder_binds_other(holder, name, parsed, run):
+    """True when the run root does not prove that the package holder's attribute name is only ever its submodule holder.name. The
+    package is the one _module_identity proves for holder on the way to holder.name (round 11: a holder.py beside the package, an
+    __init__ of another suffix, a standard-library top-level name all leave it unproved, and so True). Then: the package's __init__.py
+    binds name by any statement other than an import of exactly that submodule (`from . import name`, `from <holder> import name`,
+    `import <holder>.<name> as name`), that is an `as` import of another module, an assignment, a def or class, a for or with target,
+    a global, a delete, a star import or a dynamic form (_binds); or it defines a module `__getattr__`, which can answer any name; or
+    the __init__.py was not supplied (it is on disk only) or does not parse. A namespace directory (no __init__) binds nothing."""
+    owners = _module_identity(holder + "." + name, run).owners
+    if owners is None:
         return True
-    init = base + "/__init__.py"
-    if init not in parsed:
+    init = owners[-2]
+    if init.endswith("/"):
         return False
-    tree = parsed[init]
+    tree = parsed.get(init)
     if tree is None or _binds(tree, "__getattr__", None, False, existence=True) != []:
         return True  # (None: a dynamic form or a star import, which binds names no statement shows)
     found = _binds(tree, name, None, False, existence=True)
@@ -817,12 +926,14 @@ def _holder_binds_other(holder, name, parsed):
     return False
 
 
-def _path_proved(module, target, through_package, parsed, written):
+def _path_proved(module, target, through_package, parsed, written, run):
     """THE one proof of a name the use scan attributes through (round 10, Main): every link the name is resolved through (_path_links)
     is proved. A link is unproved when some run-root file writes or deletes an attribute of the link's name on any object (_written_names,
     _may_write: no alias analysis, as round 8), or, for a link held by a package, when that package's __init__ may bind the name to
-    something other than its submodule (_holder_binds_other). Every form of import is proved here, so no form can skip a link."""
-    return not any(_may_write(written, name) or holder is not None and _holder_binds_other(holder, name, parsed)
+    something other than its submodule, or the package itself is not proved (_holder_binds_other, _module_identity). Every form of
+    import is proved here, so no form can skip a link. (That the module is the definer's file at all is proved once per target, in
+    use_scan, by _module_identity.)"""
+    return not any(_may_write(written, name) or holder is not None and _holder_binds_other(holder, name, parsed, run)
                    for holder, name in _path_links(module, target, through_package))
 
 
@@ -842,11 +953,11 @@ def _suffixes(dotted):
 class _Graph(dict):
     """{dotted module: (names, members, resolved, single, texts, written) or None} for the run root (see _import_graph), and the names the
     run root answers to: by_name {a name: [the modules it can be]} (every dotted suffix of each module's path) and packages (every
-    dotted suffix of each directory a module sits in, whether or not it has an __init__.py)."""
+    dotted suffix of each directory a module sits in, whether or not it has an __init__.py), and run, the _RunRoot the finder sees."""
 
-    def __init__(self, entries):
+    def __init__(self, entries, run):
         super().__init__(entries)
-        self.by_name, self.packages = {}, set()
+        self.run, self.by_name, self.packages = run, {}, set()
         for module in self:
             for name in _suffixes(module):
                 self.by_name.setdefault(name, []).append(module)
@@ -864,7 +975,7 @@ def _ancestor_names(module):
     return {name for i in range(1, len(parts)) for name in _suffixes(".".join(parts[:i]))}
 
 
-def _import_graph(files, parsed):
+def _import_graph(files, parsed, run):
     """_Graph of {dotted module: (names, members, resolved, single, texts, written) or None} for every .py file of the run root
     (_imports_of, _single_names, ((source, tree), ...) of its files for _refers, _written_names); None for one that does not parse (or
     when one of two files of the same module name does not)."""
@@ -882,7 +993,7 @@ def _import_graph(files, parsed):
                 else:
                     found = None
             graph[module] = found
-    return _Graph(graph)
+    return _Graph(graph, run)
 
 
 def _unresolved(name, graph, attribute=False):
@@ -893,10 +1004,15 @@ def _unresolved(name, graph, attribute=False):
     attribute c (_written_names). A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
     run-root h, `from h import missing` when h does not provably bind missing, `from .missing import x` in a package) is unresolved: it
     names no module of the run root and may be one nobody gave us, so it counts as a path to every module. A name none of whose
-    prefixes is a name of the run root is outside it and is not unresolved."""
+    prefixes is a name of the run root is outside it and is not unresolved.
+    Round 11: before any of that, the name is unresolved when Python's finder may load, for some step of it, a file of the run root
+    the scan was not given (_module_identity's candidates: an __init__.py or module on disk only, a .pyc, an extension module): what it
+    runs is not shown. A namespace directory runs nothing."""
     def known(dotted):
         return dotted in graph.by_name or dotted in graph.packages
 
+    if any(c not in graph.run.supplied and not c.endswith("/") for step in _module_identity(name, graph.run).candidates for c in step):
+        return True
     if known(name):
         return False
     parent, _dot, last = name.rpartition(".")
@@ -990,11 +1106,14 @@ def _no_path_to(source, tree, path, name, module, graph):
     The limit, stated once: a name that reaches the code from outside its source (a configuration file, the environment, the network),
     or that the source computes without writing any token of it anywhere in the closure (every character from chr, say), is beyond
     static proof; the absence line is a statement about the source it was given. A finding that needs such a name is closed by this
-    limit; a finding where a token of the target is written anywhere in the closure is not."""
+    limit; a finding where a token of the target is written anywhere in the closure is not.
+    The limit of module identity (round 11, _module_identity), stated once: the run root is taken as sys.path[0], and a run with no
+    run root on disk sees only the supplied files. Another sys.path entry (which may add a namespace portion, or answer a top-level
+    name the run root has only as a namespace directory) or a .pth file is beyond static proof."""
     return not _reaches(((source, tree),), *_imports_of(path, tree), name, module, graph)
 
 
-def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None, written=frozenset()):
+def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None, written=frozenset(), run=None, credited=True):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
     path, `from m import *`, a dynamic form such as globals() or setattr (_DYNAMIC; the file then gives no line at all), an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
@@ -1013,7 +1132,11 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None,
     `from a.b import c`, relative forms too) also goes through each attribute step after the first component (b, c): when one of those
     is written or deleted anywhere, or the __init__ of its package binds it by anything but an import of exactly that submodule
     (_holder_binds_other), nothing is attributed through the module-path names and the file is undecided; direct member imports of the
-    same file keep their facts. No alias analysis: the write of the attribute name is the block."""
+    same file keep their facts. No alias analysis: the write of the attribute name is the block.
+    Round 11 (Main): credited is whether _module_identity proves module is the definer's file, every package __init__ on the way
+    supplied (use_scan); when it is not, the import
+    lines of `from <module> import <T>` are the only facts of the file and it is undecided. run is the _RunRoot (default: the parsed
+    paths only)."""
     if _binding_index(tree).dynamic:
         return [], [], [], True  # a dynamic form (_DYNAMIC) anywhere: the source does not show what any name in this file is
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
@@ -1055,14 +1178,17 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None,
         # included: whatever `q` is, it may be a name the star import brought)
         return sorted(imports, key=lambda item: item[0]), [], [], True
     parsed = parsed or {}
-    if (direct or modules) and not _path_proved(module, target, False, parsed, written):
+    run = run or _RunRoot(parsed)
+    if not credited:
+        return sorted(imports, key=lambda item: item[0]), [], [], True
+    if (direct or modules) and not _path_proved(module, target, False, parsed, written, run):
         return sorted(imports, key=lambda item: item[0]), [], [], True
     valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
     valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
     if valid_direct != set(direct) or valid_modules != set(modules):
         # the import is a fact; what the name then is, is not shown. Nothing is attributed through a name that may not be the import.
         return sorted(imports, key=lambda item: item[0]), [], [], True
-    if modules and not _path_proved(module, target, True, parsed, written):
+    if modules and not _path_proved(module, target, True, parsed, written, run):
         # a package link may hold another object: no line through a module-path name, nor through a parameter when no direct import
         # of the target is left to explain it
         if not valid_direct:
@@ -1111,7 +1237,7 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None,
     return sorted(imports, key=key), sorted(creates, key=key), sorted(uses, key=key), unexplained
 
 
-def use_scan(task, files):
+def use_scan(task, files, root=None):
     """Code-made fact lines about who uses a class or top-level function (the target) that the task names as a whole word, that a
     named .py file defines, and whose binding there is proven single (_single_binding). Per other .py file: its import, creation or
     call, and the attribute uses through a variable bound once from T(...) or a parameter (only of a name the class defines, dunder
@@ -1120,7 +1246,11 @@ def use_scan(task, files):
     every link the name is resolved through is proved (_path_proved): for a module-path name (`import a.b.c`, `import a.b.c as x`,
     `from a.b import c`) each attribute step after the first component and the target; for `from a.b.c import T` the target only. A
     link is unproved when a run-root file writes or deletes an attribute of its name, or the __init__ of the package that holds it
-    binds it by anything but an import of exactly that submodule. A file with none of these gives `<base> does not use <T> [path:1]`,
+    binds it by anything but an import of exactly that submodule. Round 11 (Main): a target is credited through its module only when
+    _module_identity proves the module's name is that file and nothing else Python's finder could load from the run root (root, the
+    run root on disk, as sys.path[0]; with no root, only the supplied files are seen), and every package __init__ on the way was
+    supplied (an __init__ on disk only runs unseen); else every other file gives its
+    `from <module> import <T>` import lines at most, and no "does not use" line. A file with none of these gives `<base> does not use <T> [path:1]`,
     unless the file's text and the run root's import graph do not prove it has no path to the name (_no_path_to: a star import, a word of
     _DYNAMIC_ACCESS, the name anywhere in the text, a string that names it or its module, in the file or in any run-root module it can
 load (_refers), or a path through the imports to the target's module): then it gives nothing. When more than one file
@@ -1128,7 +1258,8 @@ load (_refers), or a path through the imports to the target's module): then it g
     or whose binding of the name is ambiguous, gives nothing for it."""
     out = []
     parsed = {f["path"]: _parse(f["path"], f["text"]) for f in files}
-    graph = _import_graph(files, parsed)
+    run = _RunRoot(parsed, root)
+    graph = _import_graph(files, parsed, run)
     # round 8: every attribute name some file of the run root writes or deletes (_written_names), on any object; a file that does not
     # parse cannot run, so it writes nothing
     written = frozenset().union(*(_written_names(t) for t in parsed.values() if t is not None))
@@ -1143,11 +1274,16 @@ load (_refers), or a path through the imports to the target's module): then it g
             others = {_module_name(p) for p in definers if p != f["path"]}
             if module in others:
                 continue
+            owners = _module_identity(module, run).owners if f["path"].endswith(".py") else None
+            # the module is the definer's file, and every package __init__ the import runs on the way was supplied (one on disk only
+            # runs unseen, and may rebind what the scan attributes through)
+            credited = owners is not None and owners[-1] == f["path"] and all(o.endswith("/") or o in run.supplied for o in owners)
             members = _members(parsed[f["path"]], name) if kind == "class" else set()
             for g in files:
                 if g["path"] in definers or parsed[g["path"]] is None:
                     continue
-                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, parsed, written)
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, parsed, written,
+                                                        run, credited)
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)
@@ -1156,13 +1292,13 @@ load (_refers), or a path through the imports to the target's module): then it g
     return list(dict.fromkeys(out))
 
 
-def code_facts(task, files):
-    """(diff lines, use lines) made by code for this task and these files."""
+def code_facts(task, files, root=None):
+    """(diff lines, use lines) made by code for this task and these files; root is the run root on disk, if any (use_scan)."""
     diff = [line for old, new in version_pairs(files) for line in version_diff(old, new)]
-    return list(dict.fromkeys(diff)), use_scan(task, files)
+    return list(dict.fromkeys(diff)), use_scan(task, files, root)
 
 
-def user_message(task, files):
+def user_message(task, files, root=None):
     parts = []
     for f in files:
         part = "## {}\n```\n{}\n```".format(f["path"], f["text"])
@@ -1173,7 +1309,7 @@ def user_message(task, files):
                 for line, kind, name, owner in names))
         parts.append(part)
     message = "# Task\n\n{}\n\n# Files (numbered; take line numbers from here)\n\n{}".format(task, "\n\n".join(parts))
-    diff, uses = code_facts(task, files)
+    diff, uses = code_facts(task, files, root)
     if diff:
         message += "\n\nDifferences found by code:\n" + "\n".join(diff)
     if uses:
@@ -1189,14 +1325,14 @@ def summarize(root, paths, task, *, endpoint, model, settings, budget_chars=DEFA
     files (path, lines, chars), chars, drops, kept, indexed (the index lines), code_facts (the diff and use lines), seconds, model."""
     started = time.monotonic()
     files = prepare(root, paths, budget_chars)
-    reply = ask(endpoint, model, settings["system"], user_message(task, files), settings["schema"], timeout)
+    reply = ask(endpoint, model, settings["system"], user_message(task, files, root), settings["schema"], timeout)
     facts = json.loads(reply).get("facts") if isinstance(json.loads(reply), dict) else None
     if not isinstance(facts, list):
         raise AskError("reply has no facts list", _completions(endpoint), 200)
     defined = {f["path"]: {name for _l, _k, name, _o in outline(f["path"], f["text"])} for f in files}
     kept, drops = validate(facts, {f["path"]: f["lines"] for f in files}, defined)
     index = name_index(files)
-    diff, uses = code_facts(task, files)
+    diff, uses = code_facts(task, files, root)
     record = {"files": [{k: f[k] for k in ("path", "lines", "chars")} for f in files],
               "chars": sum(f["chars"] for f in files), "kept": len(kept), "drops": drops, "indexed": len(index), "code_facts": len(diff) + len(uses),
               "seconds": round(time.monotonic() - started, 2), "model": model}

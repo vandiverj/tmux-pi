@@ -1,0 +1,19 @@
+{
+  "schema": "tp-product-package",
+  "schema_version": 1,
+  "id": "review-queue-demo",
+  "title": "Review queue (synthetic demonstration)",
+  "owner": "Product owner (synthetic)",
+  "objective": "Let a requester submit a record and an assigned reviewer resolve it from a shared queue, with clear handling of incomplete submissions.",
+  "source_roots": [
+    {"id": "root.notes", "kind": "documents", "path": "sources"}
+  ],
+  "revision": 3,
+  "activity": "review-reconcile",
+  "next_action": {
+    "text": "Get an owner decision on question.reassignment-during-review (input.session-b.answer-1 is a pending suggestion), then re-review slice.reassignment.",
+    "owner": "Product owner (synthetic)",
+    "set": "2026-11-09"
+  },
+  "builds": []
+}

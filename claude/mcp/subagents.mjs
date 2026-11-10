@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // subagents MCP server — the Claude-main equivalent of agent/extensions/subagents.ts.
-// Exposes spawn/list/send/collect/review/kill over the bin/tp-* commands. Exposes no
-// tools in a tp-spawn worker (TP_TASK_DIR), the shared orchestrator mode, or outside tmux.
+// Exposes spawn/list/send/collect/review/kill over the bin/tp-* commands. Which tool each
+// environment gets is decided by `exposed` below and nowhere else.
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -10,11 +10,15 @@ import { createInterface } from "node:readline";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const bin = (n) => join(ROOT, "bin", n);
-// The normal Claude orchestrator delegates through tp-agent; these legacy MCP tools
-// are only for the separate TP_MAIN=claude prompt path.
-const active = !process.env.TP_TASK_DIR && process.env.TP_MODE !== "orchestrator" && !!process.env.TMUX;
+// A main is a Claude session in tmux that is not a tp-spawn worker (TP_TASK_DIR). The normal Claude orchestrator
+// (bin/tp-main sets TP_MODE=orchestrator) delegates through tp-agent, so the worker-management tools are only for the
+// legacy TP_MAIN=claude main. get_skill is read-only (it returns a catalogued skill body) and serves the plugin's
+// slash commands, so both mains get it. A worker and a process outside tmux get no tool.
+const isMain = !process.env.TP_TASK_DIR && !!process.env.TMUX;
+const isLegacyMain = isMain && process.env.TP_MODE !== "orchestrator";
+const BOTH_MAINS = new Set(["get_skill"]);
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const ON_DEMAND_SKILLS = ["make-qa", "counterpoint", "product-fit", "threat-model"];
+const ON_DEMAND_SKILLS = ["make-qa", "counterpoint", "product-fit", "threat-model", "product-design", "prepare-cases"];
 const lastInput = new Map();
 
 const run = (cmd, args, input) =>
@@ -204,7 +208,7 @@ const TOOLS = {
     },
   },
   get_skill: {
-    description: "Load the full instructions of one on-demand skill for an explicit user command (make-qa, counterpoint, product-fit, threat-model). Guidance only; grants no tool, edit or external-write authority.",
+    description: "Load the full instructions of one on-demand skill for an explicit user command (make-qa, counterpoint, product-fit, threat-model, product-design, prepare-cases). Guidance only; grants no tool, edit or external-write authority.",
     schema: { type: "object", required: ["id"], properties: { id: { type: "string", enum: ON_DEMAND_SKILLS } } },
     async run(p) {
       if (!ON_DEMAND_SKILLS.includes(p.id)) throw new Error(`unknown skill: ${p.id}`);
@@ -221,6 +225,9 @@ const TOOLS = {
   },
 };
 
+const exposed = (name) =>
+  Object.prototype.hasOwnProperty.call(TOOLS, name) && (BOTH_MAINS.has(name) ? isMain : isLegacyMain);
+
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 async function handle(msg) {
   const { id, method, params } = msg;
@@ -229,9 +236,9 @@ async function handle(msg) {
     return send({ id, result: { protocolVersion: params?.protocolVersion ?? "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "tmux-pi-subagents", version: "0.1.0" } } });
   if (method === "ping") return send({ id, result: {} });
   if (method === "tools/list")
-    return send({ id, result: { tools: active ? Object.entries(TOOLS).map(([name, t]) => ({ name, description: t.description, inputSchema: t.schema })) : [] } });
+    return send({ id, result: { tools: Object.entries(TOOLS).filter(([name]) => exposed(name)).map(([name, t]) => ({ name, description: t.description, inputSchema: t.schema })) } });
   if (method === "tools/call") {
-    const tool = active && TOOLS[params?.name];
+    const tool = exposed(params?.name) && TOOLS[params.name];
     if (!tool) return send({ id, result: { isError: true, content: [{ type: "text", text: `unknown tool ${params?.name}` }] } });
     try {
       return send({ id, result: { content: [{ type: "text", text: await tool.run(params.arguments ?? {}) }] } });

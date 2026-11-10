@@ -78,7 +78,7 @@ class ConfigTests(unittest.TestCase):
         value = json.loads((ROOT / "config" / "orchestration.json").read_text())
         for key in ("max_local_workers", "max_active_workers", "lanes"):
             self.assertIn(key, value)
-        self.assertEqual(value["lanes"]["max_active_lanes"], 20)
+        self.assertEqual(value["lanes"]["max_active_lanes"], 25)
 
     def test_a_missing_block_gives_the_defaults_and_a_partial_one_fills_in(self):
         self.assertEqual(self.load({"max_local_workers": 3})[0], trial_session.TRIAL_DEFAULTS)

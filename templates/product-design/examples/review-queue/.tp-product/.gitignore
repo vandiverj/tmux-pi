@@ -1,0 +1,3 @@
+# tp-product: the writer lock and an in-progress commit journal are not package content
+lock
+txn/

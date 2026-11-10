@@ -1,0 +1,21 @@
+{
+  "schema": "tp-product-commit",
+  "schema_version": 1,
+  "revision": 3,
+  "files": {
+    "package.json": "sha256:65fb4135e0f3f971a84d48f5469c3ae757c3ffbedffa38c84b312171bb9bda3a",
+    "design.json": "sha256:2d3ca3bb4d7b63251549a71daa986c5203e63be5ad35eb4fa2ac9340a2f0da9f",
+    "reviews.json": "sha256:625be226abc4fec44e487da00988b3e02002e625490d00296d6a2bc1e056aaa4"
+  },
+  "authority": {
+    "decision.missing-field-rejects": "sha256:b8b50893caf5dce73653ed867f54de0fbee90e1858e816557e43e5e4cdae9516",
+    "slice.submit-and-queue": "sha256:1c41b7bea6fe791c054f0734d914a0429292b4eacd63e2918aff270c05509501",
+    "slice.reassignment": "sha256:626fdba091fed61ea11c53cca19c4013e8b093ea23c52539a3816fefc7a0f6d4",
+    "input.session-b.answer-1": "sha256:a839711b15b8e9862282ec0ed1034f134efb54b5d9969e66ea285babef923d4a"
+  },
+  "originals": {
+    "note.session-b.1": "sha256:ec0b091ec662c2abec65a78ac2fa6b11f63c98dfe1ad73c1f0b0f252d9c7eaa4",
+    "input.session-b.answer-1": "sha256:9bf9239246fb8c80275f603cb18590fa449ede31be6f1e39f5be4267b45b85a6",
+    "review.submit-and-queue-1": "sha256:fc503143a9f19b5da65c1577079c7d2c86167edbae9b0a482f550564d5671a44"
+  }
+}

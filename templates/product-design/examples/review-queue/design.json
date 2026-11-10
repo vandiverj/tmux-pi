@@ -1,0 +1,335 @@
+{
+  "schema": "tp-product-design",
+  "schema_version": 1,
+  "package": "review-queue-demo",
+  "sources": [
+    {
+      "id": "source.intake-notes",
+      "title": "Intake notes",
+      "locator": {"root": "root.notes", "path": "intake-notes.md", "kind": "document"},
+      "digest": "sha256:80475f4bd16e7ecedb3bc62bb8b3bd1e2681b2248d9e2993ec9967c6ec0d0df1",
+      "anchor": "## Submission",
+      "excerpt": "Every submission needs a title and a category; reviewers cannot triage a record without both.",
+      "captured": "2026-11-09"
+    },
+    {
+      "id": "source.queue-observation",
+      "title": "Queue observation",
+      "locator": {"root": "root.notes", "path": "queue-observation.md", "kind": "document"},
+      "digest": "sha256:25df9f529db4a219dcad6f3f5cfe19b1ed4ff2cffa87995f9ef7c736df54c15c",
+      "anchor": "## Queue order",
+      "captured": "2026-11-09"
+    }
+  ],
+  "claims": [
+    {
+      "id": "claim.submission-needs-title-and-category",
+      "statement": "A submission needs a title and a category before a reviewer can triage it.",
+      "status": "documented-requirement",
+      "sources": ["source.intake-notes"]
+    },
+    {
+      "id": "claim.queue-lists-oldest-first",
+      "statement": "The current queue lists waiting submissions oldest first.",
+      "status": "observed-current",
+      "sources": ["source.queue-observation"]
+    },
+    {
+      "id": "claim.reassignment-is-rare",
+      "statement": "Reassignment during a review is rare.",
+      "status": "assumption",
+      "sources": [],
+      "note": "No evidence yet; raised while shaping slice.reassignment."
+    }
+  ],
+  "actors": [
+    {"id": "actor.requester", "title": "Requester", "description": "Submits records that need a review."},
+    {"id": "actor.reviewer", "title": "Reviewer", "description": "Works the shared queue and resolves the submissions assigned to them."}
+  ],
+  "journeys": [
+    {
+      "id": "journey.submit-and-review",
+      "title": "Submit a record and get it reviewed",
+      "actor": "actor.requester",
+      "goal": "A complete submission reaches the right reviewer and is resolved.",
+      "steps": [
+        {"text": "The requester submits a record.", "rules": ["rule.required-fields"],
+         "scenarios": ["scenario.submit-complete-record", "scenario.submit-missing-category"]},
+        {"text": "The reviewer sees it in the queue.", "rules": ["rule.queue-order"], "scenarios": ["scenario.submit-complete-record"]},
+        {"text": "The assigned reviewer resolves it.", "rules": ["rule.assigned-reviewer"], "scenarios": ["scenario.resolve-assigned-submission"]},
+        {"text": "Assignment changes during the review.", "rules": ["rule.reassignment-in-review"], "scenarios": ["scenario.reassign-during-review"]}
+      ],
+      "slices": ["slice.submit-and-queue", "slice.reassignment"]
+    }
+  ],
+  "rules": [
+    {
+      "id": "rule.required-fields",
+      "title": "Title and category are required",
+      "status": "accepted",
+      "statement": "A submission without a title or a category is rejected with a message naming each missing field, and nothing is queued.",
+      "explanation": "Reviewers cannot triage a record without both fields.",
+      "examples": [
+        {"situation": "Title 'Laptop request', category 'Hardware'.", "outcome": "Accepted; appears in the queue as Waiting."},
+        {"situation": "Title 'Laptop request', no category.", "outcome": "Rejected: 'Category is required'. The queue is unchanged."}
+      ],
+      "claims": ["claim.submission-needs-title-and-category"],
+      "decisions": ["decision.missing-field-rejects"]
+    },
+    {
+      "id": "rule.queue-order",
+      "title": "Queue lists oldest first",
+      "status": "accepted",
+      "statement": "The queue lists waiting submissions oldest first.",
+      "examples": [
+        {"situation": "S-1 submitted at 09:00, S-2 at 09:05.", "outcome": "S-1 is listed above S-2."}
+      ],
+      "claims": ["claim.queue-lists-oldest-first"],
+      "decisions": []
+    },
+    {
+      "id": "rule.assigned-reviewer",
+      "title": "Only the assigned reviewer resolves",
+      "status": "accepted",
+      "statement": "Only the reviewer a submission is assigned to can resolve it.",
+      "examples": [
+        {"situation": "S-1 is assigned to reviewer R1; R2 tries to resolve it.", "outcome": "Refused: 'Assigned to another reviewer'. S-1 stays In review."}
+      ],
+      "claims": [],
+      "decisions": []
+    },
+    {
+      "id": "rule.reassignment-in-review",
+      "title": "Reassignment during a review",
+      "status": "proposed",
+      "statement": "When a submission is reassigned during a review, the new reviewer takes it over; what happens to the previous reviewer's unsaved work is not decided.",
+      "examples": [],
+      "claims": ["claim.reassignment-is-rare"],
+      "decisions": []
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "scenario.submit-complete-record",
+      "title": "Submit a complete record",
+      "kind": "normal",
+      "actor": "actor.requester",
+      "goal": "Submit a record and see it reach the review queue.",
+      "seed": "empty-queue",
+      "actions": [
+        {"action": "open-page", "target": "page.submit"},
+        {"action": "fill", "target": "submit.title", "input": {"value": "Laptop request"}},
+        {"action": "fill", "target": "submit.category", "input": {"value": "Hardware"}},
+        {"action": "submit", "target": "submit.send"},
+        {"action": "open-page", "target": "page.queue"}
+      ],
+      "expected": [
+        "The queue shows 'Laptop request' with status Waiting.",
+        "The summary count of waiting submissions goes from 0 to 1."
+      ],
+      "rules": ["rule.required-fields", "rule.queue-order"],
+      "exceptions": ["scenario.submit-missing-category"],
+      "contracts": ["contract.submissions-api", "contract.submissions-table"]
+    },
+    {
+      "id": "scenario.submit-missing-category",
+      "title": "Submit without a category",
+      "kind": "exception",
+      "actor": "actor.requester",
+      "goal": "Submit a record without a category.",
+      "seed": "empty-queue",
+      "actions": [
+        {"action": "open-page", "target": "page.submit"},
+        {"action": "fill", "target": "submit.title", "input": {"value": "Laptop request"}},
+        {"action": "submit", "target": "submit.send"}
+      ],
+      "expected": [
+        "The form shows 'Category is required' next to the category field.",
+        "The queue and the summary count are unchanged."
+      ],
+      "rules": ["rule.required-fields"],
+      "exceptions": [],
+      "contracts": ["contract.submissions-api"]
+    },
+    {
+      "id": "scenario.resolve-assigned-submission",
+      "title": "Resolve an assigned submission",
+      "kind": "normal",
+      "actor": "actor.reviewer",
+      "goal": "Resolve a submission assigned to you.",
+      "seed": "one-assigned",
+      "actions": [
+        {"action": "open-page", "target": "page.queue"},
+        {"action": "open-record", "target": "queue.row.s-1"},
+        {"action": "resolve", "target": "record.approve"}
+      ],
+      "expected": ["S-1 shows Approved and leaves the waiting count."],
+      "rules": ["rule.assigned-reviewer"],
+      "exceptions": ["scenario.reassign-during-review"],
+      "contracts": ["contract.submissions-api"]
+    },
+    {
+      "id": "scenario.reassign-during-review",
+      "title": "Reassign during a review",
+      "kind": "exception",
+      "actor": "actor.reviewer",
+      "goal": "Hand a submission you are reviewing to another reviewer.",
+      "seed": "one-in-review",
+      "actions": [
+        {"action": "open-record", "target": "queue.row.s-1"},
+        {"action": "reassign", "target": "record.reassign", "input": {"to": "reviewer-2"}}
+      ],
+      "expected": ["S-1 is assigned to reviewer-2.", "Not decided: what happens to reviewer-1's unsaved notes."],
+      "rules": ["rule.reassignment-in-review"],
+      "exceptions": [],
+      "contracts": []
+    }
+  ],
+  "questions": [
+    {
+      "id": "question.missing-field-behaviour",
+      "title": "Reject or hold incomplete submissions?",
+      "decision_needed": "Is a submission missing a required field rejected, or held as a draft?",
+      "why_it_matters": "Holding drafts needs draft storage and a draft list; rejecting does not.",
+      "owner": "Product owner (synthetic)",
+      "options": [
+        {"choice": "Reject with a message naming the missing field.", "tradeoff": "Simple; the requester re-enters the form."},
+        {"choice": "Hold as a draft the requester completes later.", "tradeoff": "Friendlier; adds draft state and storage."}
+      ],
+      "recommendation": "Reject with a message; drafts can be a later slice.",
+      "affected_slices": ["slice.submit-and-queue"],
+      "blocking": true,
+      "status": "answered",
+      "decision": "decision.missing-field-rejects"
+    },
+    {
+      "id": "question.reassignment-during-review",
+      "title": "What happens on reassignment during a review?",
+      "decision_needed": "When a submission is reassigned during a review, what happens to the previous reviewer's unsaved notes and draft decision?",
+      "why_it_matters": "It decides whether the data model keeps per-reviewer drafts and what the new reviewer sees.",
+      "owner": "Product owner (synthetic)",
+      "options": [
+        {"choice": "Discard the previous reviewer's draft.", "tradeoff": "Simple; work can be lost."},
+        {"choice": "Keep the draft with the submission and show it to the new reviewer.", "tradeoff": "No lost work; needs a draft record and a visibility rule."}
+      ],
+      "recommendation": "Keep the draft with the submission; confirm who may see it.",
+      "affected_slices": ["slice.reassignment"],
+      "blocking": true,
+      "status": "open"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "decision.missing-field-rejects",
+      "title": "Reject incomplete submissions",
+      "question": "question.missing-field-behaviour",
+      "choice": "Reject a submission missing a required field, with a message naming each missing field.",
+      "rationale": "Keeps the first slice small; drafts are not needed for the first release.",
+      "evidence": ["Product owner review of scenario.submit-missing-category on 2026-11-09 (synthetic)."],
+      "responsible": "Product owner (synthetic)",
+      "date": "2026-11-09",
+      "status": "accepted",
+      "acceptance": {
+        "by": "Product owner (synthetic)",
+        "date": "2026-11-09",
+        "evidence": ["Recorded locally by Main from the owner's reply in the review session (synthetic)."],
+        "fingerprint": "sha256:a8f46b9baf8fada04fc0798131b35415e46e2b978d45ebdcaf9ef0f5d2c8c4af",
+        "origin": "local"
+      }
+    }
+  ],
+  "contracts": [
+    {
+      "id": "contract.submissions-api",
+      "title": "Submissions API (simulated)",
+      "kind": "api",
+      "status": "proposed",
+      "summary": "Proposed operations to create and resolve submissions. Simulated in the review build; no real service.",
+      "operations": [
+        {
+          "name": "Create submission",
+          "request": "POST /submissions {title, category}",
+          "response": "201 {id, status: 'waiting', created}",
+          "failures": [
+            {"condition": "Title or category missing.", "response": "422 {errors: [{field, message}]}"},
+            {"condition": "Service slow to respond.", "response": "The form shows 'Still sending' and does not submit twice."}
+          ]
+        },
+        {
+          "name": "Resolve submission",
+          "request": "POST /submissions/{id}/resolve {outcome}",
+          "response": "200 {id, status: outcome}",
+          "failures": [{"condition": "Caller is not the assigned reviewer.", "response": "403 {error: 'assigned to another reviewer'}"}]
+        }
+      ],
+      "compatibility": "New operations; no existing clients.",
+      "sources": [],
+      "rules": ["rule.required-fields", "rule.assigned-reviewer"]
+    },
+    {
+      "id": "contract.submissions-table",
+      "title": "Submissions table (proposed)",
+      "kind": "data",
+      "status": "proposed",
+      "summary": "Proposed storage for submissions and their assignment. Needs engineering validation before any migration.",
+      "entities": [
+        {"name": "submissions", "owner": "Review queue service",
+         "changes": ["New table: id, title, category, status, assignee, created.", "category is NOT NULL (rule.required-fields)."]}
+      ],
+      "sources": ["source.intake-notes"],
+      "rules": ["rule.required-fields"]
+    }
+  ],
+  "slices": [
+    {
+      "id": "slice.submit-and-queue",
+      "title": "Submit and see it queued",
+      "outcome": "A requester submits a complete record and a reviewer sees it in the queue; an incomplete one is rejected clearly.",
+      "includes": ["Submission form with title and category", "Rejection message for a missing field", "Queue listing, oldest first"],
+      "excludes": ["Drafts", "Resolving or reassigning a submission"],
+      "journey": "journey.submit-and-review",
+      "scenarios": ["scenario.submit-complete-record", "scenario.submit-missing-category"],
+      "rules": ["rule.required-fields", "rule.queue-order"],
+      "decisions": ["decision.missing-field-rejects"],
+      "contracts": ["contract.submissions-api", "contract.submissions-table"],
+      "depends_on": [],
+      "readiness": {
+        "state": "ready-for-case-preparation",
+        "acceptance": {
+          "by": "Product owner (synthetic)",
+          "date": "2026-11-09",
+          "review": "review.submit-and-queue-1",
+          "evidence": ["Owner accepted the slice in the revision 3 review session (synthetic); see review.submit-and-queue-1."],
+          "fingerprint": "sha256:7516873b1ddfeda06239f0bd724405f496d0c78ccf7517b64ad6ea2f52552a77",
+          "origin": "local"
+        },
+        "evidence": ["review.submit-and-queue-1"]
+      }
+    },
+    {
+      "id": "slice.reassignment",
+      "title": "Resolve and reassign",
+      "outcome": "The assigned reviewer resolves a submission, and a submission can be reassigned during a review without losing work.",
+      "includes": ["Resolve as approved or returned", "Reassign to another reviewer"],
+      "excludes": ["Bulk reassignment"],
+      "journey": "journey.submit-and-review",
+      "scenarios": ["scenario.resolve-assigned-submission", "scenario.reassign-during-review"],
+      "rules": ["rule.assigned-reviewer", "rule.reassignment-in-review"],
+      "decisions": [],
+      "contracts": ["contract.submissions-api"],
+      "depends_on": ["slice.submit-and-queue"],
+      "readiness": {"state": "ready-for-human-review"}
+    }
+  ],
+  "cases": [],
+  "measurements": [
+    {
+      "id": "measurement.time-to-first-review",
+      "outcome": "Submissions reach a reviewer quickly.",
+      "baseline": "Unknown: the current system is not measured.",
+      "instrumentation": "Record the time from submission to the first reviewer opening it.",
+      "follow_up": "Compare the median after the first slice ships.",
+      "slices": ["slice.submit-and-queue"]
+    }
+  ]
+}

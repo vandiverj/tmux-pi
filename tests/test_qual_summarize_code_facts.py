@@ -305,7 +305,7 @@ class UseScanTests(unittest.TestCase):
         target = num("pkg/sub/t.py", "class Q:\n    pass\n")
         none = ["- u.py does not use Q [u.py:1]"]
 
-        def scan(user, *others, at="u.py"):
+        def scan(user, *others, at="u.py", target=target):
             files = [target] + [num(path, text) for path, text in others] + [num(at, user)]
             return [line for line in ss.use_scan("Who uses Q?", files) if line.startswith("- u.py")]
 
@@ -355,9 +355,49 @@ class UseScanTests(unittest.TestCase):
                 ("a module it imports from, which uses importlib", "from h import x\n", (("h.py", "import importlib\nx = 1\n"),)),
                 ("the package __init__ it loads has a star import", "import h.real\n", (("h/__init__.py", "from os import *\n"), ("h/real.py", "y = 1\n"))),
                 ("two hops: the second module uses getattr", "import h\n", (("h.py", "import g\n"), ("g.py", "x = getattr(a, 'b')\n"))),
-                ("two hops: the second module has a star import", "import h\n", (("h.py", "import g\n"), ("g.py", "from os import *\n")))):
+                ("two hops: the second module has a star import", "import h\n", (("h.py", "import g\n"), ("g.py", "from os import *\n"))),
+                # round 7 F1: a member import is resolved only when the module's own source proves the member is bound, once, simply
+                # (_single_binding); a possible write, an annotation, a delete, a condition or a write to another object proves nothing
+                ("a member that is only annotated", "from h import missing\n", (("h.py", "missing: int\n"),)),
+                ("a member that is deleted", "from h import missing\n", (("h.py", "missing = 1\ndel missing\n"),)),
+                ("a member bound under a condition", "from h import missing\n", (("h.py", "if False:\n    missing = 1\n"),)),
+                ("a member that only another object is given", "from h import missing\n",
+                 (("h.py", "class C: pass\nobj = C()\nobj.missing = 1\n"),)),
+                ("a member bound twice", "from h import x\n", (("h.py", "x = 1\nx = 2\n"),)),
+                ("a member bound in a try", "from h import x\n", (("h.py", "try:\n    x = 1\nexcept Exception:\n    pass\n"),)),
+                # round 7b: only a Del, a write whose attribute is the name, or another binding can unbind the name
+                ("a member whose item is deleted", "from h import x\n", (("h.py", "x = {}\nx['a'] = 1\ndel x['a']\n"),)),
+                ("a member whose item is deleted (no write)", "from h import x\n", (("h.py", "x = {}\ndel x['a']\n"),)),
+                ("a member whose attribute is deleted", "from h import x\n", (("h.py", "x = C()\ndel x.a\n"),)),
+                ("a member that another object in the file is given as an attribute", "from h import x\n", (("h.py", "x = 1\nobj.x = 2\n"),)),
+                ("a member that another file sets as an attribute of h", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\nh.x = 2\n"))),
+                ("a member rebound by an augmented assignment", "from h import x\n", (("h.py", "x = {}\nx |= {}\n"),)),
+                ("a member that another module deletes", "from h import x\n", (("h.py", "x = 1\n"), ("g.py", "import h\ndel h.x\n"))),
+                ("a member of one of two files of one module name, only one proves it", "from h import y\n",
+                 (h_pkg, ("h.py", "y = 2\n"))),
+                # round 7 F2: any directory may be on sys.path, so a module is known by every dotted suffix of its path and a directory
+                # above it by its own suffixes, with or without an __init__.py
+                ("a missing submodule of a namespace package under src", "import h.missing\n", (("src/h/real.py", "x = 1\n"),)),
+                ("a missing member of a namespace package under src", "from h import missing\n", (("src/h/real.py", "x = 1\n"),)),
+                ("a missing module of a namespace package under src, from-import", "from h.missing import f\n", (("src/h/real.py", "x = 1\n"),)),
+                ("a missing submodule below src", "import src.h.missing\n", (("src/h/real.py", "x = 1\n"),)),
+                ("transitive: a missing submodule of a namespace package", "import helper\n",
+                 (("src/h/real.py", "x = 1\n"), ("helper.py", "import h.missing\n"))),
+                ("a member of a namespace package that is no module", "from h import real2\n", (("src/h/real.py", "x = 1\n"),))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others), [])
+        # round 7 F2: the target's own names are every suffix of its path, and the directories above it are ancestor packages
+        for label, user in (("an ancestor below src (the review's reproduction)", "import h\n"),
+                            ("an ancestor above the sys.path directory", "import src\n"),
+                            ("the ancestor and its submodule", "import src.h\n"),
+                            ("the target by the path below src", "import h.t\n"),
+                            ("the target by the path below its directory", "import t\n"),
+                            ("the target by its full path", "import src.h.t\n"),
+                            ("a member that is the target module", "from h import t\n"),
+                            ("a member that is the target module, from src", "from src.h import t\n"),
+                            ("a submodule of the target by a suffix", "import h.t.deeper\n")):
+            with self.subTest(label):
+                self.assertEqual(scan(user, target=num("src/h/t.py", "class Q:\n    pass\n")), [])
         # the relative form: a module of a package that imports a sibling the package does not have
         for label, user, others in (("a missing relative module", "from .missing import x\n", (("pkg2/__init__.py", ""),)),
                                     ("a missing relative member", "from . import missing\n", (("pkg2/__init__.py", "x = 1\n"),)),
@@ -383,7 +423,23 @@ class UseScanTests(unittest.TestCase):
                 ("a member the package binds", "from h import x\n", (h_pkg,)),
                 ("a member a module binds", "from h import x\n", (h_mod,)),
                 ("a member from a module of a package", "from h.real import y\n", (h_pkg, ("h/real.py", "y = 1\n"))),
-                ("a member of one of two files of one module name", "from h import y\n", (h_pkg, ("h.py", "y = 2\n"))),
+                # round 7: the line stays when the import is proved
+                # round 7b: a write into the object a name holds does not unbind the name (the calibration cli.py: HANDLERS[name] = fn)
+                ("a member whose item is written", "from h import x\n", (("h.py", "x = {}\nx['a'] = 1\n"),)),
+                ("a member whose item is written in a function", "from h import x\n",
+                 (("h.py", "x = {}\n\n\ndef reg(name):\n    def deco(fn):\n        x[name] = fn\n        return fn\n    return deco\n"),)),
+                ("a member whose item is added with +=", "from h import x\n", (("h.py", "x = {'a': [1]}\nx['a'] += [2]\n"),)),
+                ("a function that carries an attribute", "from h import f\n", (("h.py", "def f():\n    pass\n\n\nf.cache = {}\n"),)),
+                ("a member whose item another file deletes", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\ndel h.x['a']\n"))),
+                ("a member another file writes an item of", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\nh.x['a'] = 1\n"))),
+                ("a member defined by one plain def", "from h import f\n", (("h.py", "def f():\n    pass\n"),)),
+                ("a member defined by one plain class", "from h import C\n", (("h.py", "class C:\n    pass\n"),)),
+                ("a member that a package binds, in a package", "from h import f\n", (("h/__init__.py", "def f():\n    pass\n"),)),
+                ("a module of a namespace package under src", "import h.real\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a module of a namespace package under src, by the full path", "import src.h.real\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a member that is a module of a namespace package", "from h import real\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a member from a module of a namespace package", "from h.real import y\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a name that does not look like a run-root directory", "import hh.real\n", (("src/h/real.py", "y = 1\n"),)),
                 ("transitive: a submodule that exists", "import helper\n", (h_pkg, ("h/real.py", "y = 1\n"), ("helper.py", "import h.real\n"))),
                 ("transitive: a member that exists", "import helper\n", (h_pkg, ("helper.py", "from h import x\n"))),
                 ("a relative import that resolves, to a file that imports elsewhere", "import pkg.o\n",

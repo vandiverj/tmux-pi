@@ -410,10 +410,13 @@ _Index = collections.namedtuple("_Index", "events star dynamic")
 
 def _binding_index(tree):
     """_Index(events, star, dynamic): every way the file binds or writes a name, read once and kept on the tree.
-    events is {name: [(kind, node, statement, scope)]}.
+    events is {name: [(kind, node, statement, scope, role)]}.
     kind is "name" (a Store or Del target of any form, an import alias, an except name, a match capture), "def" (a def, async def or
     class), "arg" (a parameter), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
-    or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. star: some
+    or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. role (round 7b) says
+    which part of a write names it: "attr" when the name is the attribute written (`x.name = v`: x may be the module), "root" when it is
+    the root of the target (`name.x = v`, `name[k] = v`, `name[k] += v`: a write into the object the name holds, which cannot unbind or
+    rebind the name); None for every other kind. The context of the write (Store or Del) is that of the node (node.ctx). star: some
     `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import)."""
     cached = getattr(tree, "_binding_index", None)
     if cached:
@@ -424,13 +427,15 @@ def _binding_index(tree):
         node, scope, stmt = stack.pop()
         if isinstance(node, ast.stmt):
             stmt = node
-        found = []  # (name, kind)
+        found = []  # (name, kind[, role])
         if isinstance(node, ast.Name) and node.id in _DYNAMIC or isinstance(node, ast.Attribute) and node.attr in _DYNAMIC:
             dynamic = True
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             found.append((node.id, "name"))
         elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            found.extend((n, "write") for n in {getattr(node, "attr", None), _root_name(node.value)} - {None})
+            roles = {n: "root" for n in (_root_name(node.value),) if n}
+            roles.update({node.attr: "attr"} if isinstance(node, ast.Attribute) else {})  # `x.x = v`: the attribute role wins
+            found.extend((n, "write", role) for n, role in roles.items())
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             found.append((node.name, "def"))
         elif isinstance(node, ast.arg):
@@ -451,8 +456,8 @@ def _binding_index(tree):
             found.append((node.name, "name"))
         elif type(node).__name__ == "MatchMapping" and node.rest:
             found.append((node.rest, "name"))
-        for name, kind in found:
-            events.setdefault(name, []).append((kind, node, stmt, scope))
+        for name, kind, *role in found:
+            events.setdefault(name, []).append((kind, node, stmt, scope, role[0] if role else None))
         inner = node if isinstance(node, _SCOPE_NODES) else scope
         stack.extend((child, inner, stmt) for child in ast.iter_child_nodes(node))
     tree._binding_index = _Index(events, star, dynamic)
@@ -465,39 +470,46 @@ def _star(tree):
     return _binding_index(tree).star
 
 
-def _binds(tree, name, owner, shadow):
+def _binds(tree, name, owner, shadow, existence=False):
     """The events of _binding_index that can change what name is in the scope of owner (a ClassDef of the module, or None for the
     module); None when the file uses a dynamic form (_DYNAMIC) or, in the module scope, has a star import. In the module scope every Store of the name counts
     wherever it sits in the file (a function's `global` or a local of the same name too); a def or class counts when it is in that
-    scope, or anywhere when shadow. A parameter counts only when shadow. Attribute and subscript writes always count."""
+    scope, or anywhere when shadow. A parameter counts only when shadow. Attribute and subscript writes always count, except under
+    existence (round 7b: the question is whether the name exists, not what it holds): a Store whose target is rooted at the name
+    (`name[k] = v`, `name.x = v`) changes the object, not the name, and is not counted. A Del of any form, and a write whose attribute is
+    the name (`x.name = v`), still count."""
     index = _binding_index(tree)
     if index.dynamic or (owner is None and _star(tree)):
         return None
     counted = []
     for event in index.events.get(name, ()):
         kind, scope = event[0], event[3]
+        if kind == "write" and existence and event[4] == "root" and isinstance(event[1].ctx, ast.Store):
+            continue
         if kind == "write" or (kind == "arg" and shadow) or (kind == "def" and (shadow or scope is owner)) \
                 or (kind in ("name", "global") and (owner is None or scope is owner)):
             counted.append(event)
     return counted
 
 
-def _single_binding(tree, name, cls=None, *, shadow=False, nested=False):
+def _single_binding(tree, name, cls=None, *, shadow=False, nested=False, existence=False):
     """THE one predicate for "is this name provably bound once, simply": the statement that binds name, or None when the source does
     not prove it. Proven means: in the module scope (or in the body of the module-level class cls, which must itself pass this test)
     exactly one thing binds or writes the name (see _binds), and it is a `def`, `async def` or `class`, a plain `NAME = value`
     (one Name target; `NAME: type = value` too), or an import alias, standing directly in that scope's statements and not under an if, try, with, for, while or
     match; a file that uses a dynamic form (_DYNAMIC) proves nothing. nested: the statement may be anywhere in the file (a variable bound inside a function). shadow: a parameter or a def in
-    another scope of the same name counts as a binding too (for a name a use scan reads anywhere in the file)."""
+    another scope of the same name counts as a binding too (for a name a use scan reads anywhere in the file). existence (round 7b, only
+    for the proof that a member import finds the name): a write into the object the name holds (`name[k] = v`, `name.x = v`) is not a
+    binding of the name (_binds); every other caller asks about the value and keeps the default."""
     owner = None
     if cls is not None:
-        owner = _single_binding(tree, cls)
+        owner = _single_binding(tree, cls, existence=existence)
         if not isinstance(owner, ast.ClassDef):
             return None
-    found = _binds(tree, name, owner, shadow)
+    found = _binds(tree, name, owner, shadow, existence)
     if not found or len(found) != 1:
         return None
-    kind, node, stmt, _scope = found[0]
+    kind, node, stmt = found[0][:3]
     if kind == "def":
         result = node
     elif kind == "name" and isinstance(stmt, ast.Assign) and stmt.targets == [node]:
@@ -712,7 +724,7 @@ _DYNAMIC_ACCESS_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(w) 
 
 def _imports_of(path, tree):
     """(names, members, whether every import resolved): `import a.b` puts a.b in names; `from a.b import c` puts a.b in names and
-    (a.b, c) in members (c may be a module of a.b or an attribute a.b binds: _resolve_import says which). A relative import is resolved
+    (a.b, c) in members (c may be a module of a.b or an attribute a.b provably binds: _unresolved says which). A relative import is resolved
     as in _imported_module, and one that does not resolve makes the third False."""
     names, members, resolved = set(), set(), True
     for node in ast.walk(tree):
@@ -728,11 +740,21 @@ def _imports_of(path, tree):
     return names, members, resolved
 
 
-def _bound_names(tree):
-    """The names a module can hold as attributes once it has run: the set of names it binds or writes in its module scope (or declares
-    global in a function). A module with a star import or a dynamic word is opaque (_opaque) and blocks on its own."""
+def _single_names(tree):
+    """The names the module provably holds as attributes once it has run: those _single_binding proves bound once, simply, in its module
+    scope (a plain def, class or `NAME = value`, not under an if or try, nothing else binding, deleting it or writing it as an attribute, no
+    star import, no dynamic form). It asks whether the name exists, so a write into the object it holds (`name[k] = v`, `name.x = v`) does
+    not count (_single_binding, existence). A name that is only annotated, deleted, bound under a condition, written as `obj.name = v`,
+    or bound twice is not in it. The one place a member import (`from m import name`) is proved, through the one predicate."""
+    return frozenset(name for name in _binding_index(tree).events if _single_binding(tree, name, existence=True) is not None)
+
+
+def _written_names(tree):
+    """The names the file may unbind or rebind on another object, which may be a module: `h.x = v` and `del h.x` name x (_binding_index
+    kind "write", role "attr"), and a Del of any form rooted at a name (`del x[k]`) names x. A Store into the object a name holds
+    (`x[k] = v`) does not: it cannot remove the name from a module."""
     return frozenset(name for name, events in _binding_index(tree).events.items()
-                     if any(e[0] in ("write", "global") or e[3] is None for e in events))
+                     if any(e[0] == "write" and (e[4] == "attr" or isinstance(e[1].ctx, ast.Del)) for e in events))
 
 
 def _opaque(source, tree):
@@ -741,69 +763,105 @@ def _opaque(source, tree):
     return _star(tree) or bool(_DYNAMIC_ACCESS_RE.search(source))
 
 
+def _suffixes(dotted):
+    """Every dotted suffix of a dotted path: a.b.c is a.b.c, b.c and c. Any directory of the run root may be on sys.path, so a module
+    is known by each of them."""
+    parts = dotted.split(".")
+    return {".".join(parts[i:]) for i in range(len(parts))}
+
+
+class _Graph(dict):
+    """{dotted module: (names, members, resolved, single, opaque, written) or None} for the run root (see _import_graph), and the names the
+    run root answers to: by_name {a name: [the modules it can be]} (every dotted suffix of each module's path) and packages (every
+    dotted suffix of each directory a module sits in, whether or not it has an __init__.py)."""
+
+    def __init__(self, entries):
+        super().__init__(entries)
+        self.by_name, self.packages = {}, set()
+        for module in self:
+            for name in _suffixes(module):
+                self.by_name.setdefault(name, []).append(module)
+            self.packages.update(_ancestor_names(module))
+
+    def loaded(self, dotted):
+        """The modules that importing `dotted` runs: those with a name that is `dotted` or one of its ancestor packages."""
+        parts = dotted.split(".")
+        return {m for i in range(1, len(parts) + 1) for m in self.by_name.get(".".join(parts[:i]), ())}
+
+
+def _ancestor_names(module):
+    """The names of the directories above a module path: for a.b.c, a and a.b and b (every suffix of each proper prefix)."""
+    parts = module.split(".")
+    return {name for i in range(1, len(parts)) for name in _suffixes(".".join(parts[:i]))}
+
+
 def _import_graph(files, parsed):
-    """{dotted module: (names, members, resolved, bound, opaque) or None} for every .py file of the run root (_imports_of, _bound_names,
-    _opaque); None for one that does not parse (or when one of two files of the same module name does not)."""
+    """_Graph of {dotted module: (names, members, resolved, single, opaque, written) or None} for every .py file of the run root
+    (_imports_of, _single_names, _opaque, _written_names); None for one that does not parse (or when one of two files of the same module
+    name does not)."""
     graph = {}
     for f in files:
         if f["path"].endswith(".py"):
             module, tree = _module_name(f["path"]), parsed[f["path"]]
-            found = (*_imports_of(f["path"], tree), _bound_names(tree), _opaque(_source(f["text"]), tree)) if tree is not None else None
-            if module in graph:  # pkg.py and pkg/__init__.py: either may run, so the module holds the imports of both
+            found = (*_imports_of(f["path"], tree), _single_names(tree), _opaque(_source(f["text"]), tree), _written_names(tree)) \
+                if tree is not None else None
+            if module in graph:  # pkg.py and pkg/__init__.py: either may run, so the module holds the imports of both and proves only what both prove
                 other = graph[module]
                 if found is not None and other is not None:
-                    found = (found[0] | other[0], found[1] | other[1], found[2] and other[2], found[3] | other[3], found[4] or other[4])
+                    found = (found[0] | other[0], found[1] | other[1], found[2] and other[2], found[3] & other[3], found[4] or other[4],
+                             found[5] | other[5])
                 else:
                     found = None
             graph[module] = found
-    return graph
+    return _Graph(graph)
 
 
-def _resolve_import(name, graph, attribute=False):
-    """THE one rule for what a dotted import name is against the run root: (named, unresolved). named is the set of dotted names it can
-    be: itself, and every run-root module whose dotted path ends in it (`worker` for src/worker.py: the path below a directory on
-    sys.path). The name is resolved when it is a run-root module, a name of one (that ending), or an ancestor package of one. The name
-    of a `from m import c` member (attribute) is resolved too when it is an attribute some run-root module m binds. A name that is not
-    resolved but has a proper prefix that is (`import h.missing` with a run-root h, `from h import missing` when h binds no missing,
-    `from .missing import x` in a package) is unresolved: it names no module of the run root and may be one nobody gave us, so it
-    counts as a path to every module. A name none of whose prefixes is in the run root is outside it and is not unresolved."""
-    named = {name} | {m for m in graph if m.endswith("." + name)}
-
+def _unresolved(name, graph, attribute=False):
+    """THE one rule for what a dotted import name is against the run root: True when it cannot be resolved. A name is resolved when it is
+    a name of a run-root module or directory (_Graph: any dotted suffix of the path, a directory a package whether or not it has an
+    __init__.py). The name of a `from m import c` member (attribute) is resolved too when m names run-root modules and every one of them
+    proves c (_single_names: bound once, simply, at module scope) and no file of the run root writes or deletes an attribute c
+    (_written_names). A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
+    run-root h, `from h import missing` when h does not provably bind missing, `from .missing import x` in a package) is unresolved: it
+    names no module of the run root and may be one nobody gave us, so it counts as a path to every module. A name none of whose
+    prefixes is a name of the run root is outside it and is not unresolved."""
     def known(dotted):
-        return dotted in graph or any(m.endswith("." + dotted) or _inside(m, dotted) for m in graph)
+        return dotted in graph.by_name or dotted in graph.packages
 
     if known(name):
-        return named, False
+        return False
     parent, _dot, last = name.rpartition(".")
     if attribute and parent:
-        owners = [graph[m] for m in graph if m == parent or m.endswith("." + parent)]
-        if owners and all(o is not None and last in o[3] for o in owners):
-            return named, False
+        owners = [graph[m] for m in graph.by_name.get(parent, ())]
+        if owners and all(o is not None and last in o[3] and not any(g is not None and last in g[5] for g in graph.values()) for o in owners):
+            return False
     parts = name.split(".")
-    return named, any(known(".".join(parts[:i])) for i in range(1, len(parts)))
+    return any(known(".".join(parts[:i])) for i in range(1, len(parts)))
 
 
 def _reaches(names, members, resolved, module, graph):
     """True when code that imports the dotted names `names` and the (module, member) pairs `members` may reach the dotted module `module`
-    through the run root's import graph. An import counts when it can name the target: it is equal to it, an ancestor package of it or
-    a descendant of it. A name may name a run-root module by its full path or by the path below a directory on sys.path (`worker` for
-    src/worker.py). Importing a module runs the modules of its ancestor packages, and each module it loads is followed through its own
-    imports (transitively), and one that is opaque (_opaque: a star import or a _DYNAMIC_ACCESS word in its text) counts as a path, as the
-    file's own text does in _no_path_to. An import that cannot be resolved (a relative one above the run root; a name under a run-root package or
-    module that names no module there, _resolve_import), a file that does not parse, all count as a path. The unresolved test is made on
-    every import, the file's own and those of each module it loads."""
+    through the run root's import graph. An import counts when it can name the target: it is equal to one of the target's names (every
+    dotted suffix of its path: src.h.t is also h.t and t, as any directory may be on sys.path), a descendant of one, or the name of a
+    directory above it (an ancestor package: src, src.h, h). Importing a module runs the modules of its ancestor packages, and each
+    module it loads is followed through its own imports (transitively), and one that is opaque (_opaque: a star import or a
+    _DYNAMIC_ACCESS word in its text) counts as a path, as the file's own text does in _no_path_to. An import that cannot be resolved
+    (a relative one above the run root; a name under a run-root package or module that names no module there, or a member the module does
+    not provably bind, _unresolved), a file that does not parse, all count as a path. The unresolved test is made on every import, the
+    file's own and those of each module it loads."""
     if not resolved:
         return True
+    own, above = _suffixes(module), _ancestor_names(module)
     seen, todo = set(), [(n, False) for n in names] + [(s + "." + c, True) for s, c in members]
     while todo:
         item = todo.pop()
         if item in seen:
             continue
         seen.add(item)
-        named, unresolved = _resolve_import(item[0], graph, item[1])
-        if unresolved or any(_inside(n, module) or _inside(module, n) for n in named):
+        dotted = item[0]
+        if _unresolved(dotted, graph, item[1]) or dotted in above or any(_inside(dotted, n) for n in own):
             return True
-        for m in {m for m in graph if any(_inside(n, m) for n in named)}:
+        for m in graph.loaded(dotted):
             if graph[m] is None or not graph[m][2] or graph[m][4]:  # a module that is opaque (_opaque) may load the target unseen
                 return True
             todo.extend([(n, False) for n in graph[m][0]] + [(s + "." + c, True) for s, c in graph[m][1]])

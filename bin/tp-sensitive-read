@@ -92,9 +92,9 @@ def main():
             return
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
         if result["sensitive"]:
-            # An ask a shell search or read caused ("search_read") names the safe tools that replace it; in a worker task it
-            # is refused, not asked. Any other ask stays an ask in both.
-            searched = result.get("search_read")
+            # A shell ask with no non-search cause ("worker_refuse", sg1 round 4) names the safe tools; in a worker task it
+            # is refused, not asked. An ask with a cause, and a Read or Grep tool ask, stays an ask in both.
+            searched = result.get("worker_refuse")
             route = safe_route(event.get("tool_name", ""), event.get("tool_input", {}), "claude", cwd) if searched else None
             refuse = bool(searched) and worker_task()
             save_request({**result, "reason": f"{result['reason']}. {route}" if route else result["reason"]},
@@ -102,7 +102,7 @@ def main():
             print(json.dumps(response_for(result, route, refuse)))
     else:
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
-        route = args.route and result.get("search_read") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}), args.route, cwd)
+        route = args.route and result.get("worker_refuse") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}), args.route, cwd)
         print(json.dumps({**result, "safe": route} if route else result))
 
 

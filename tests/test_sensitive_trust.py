@@ -1665,10 +1665,10 @@ class CommandLineTests(World):
 
     @staticmethod
     def main_hook_answer(event):
-        """What the hook answers main (no TP_TASK_DIR) without lifts: the classifier's ask, naming the safe tool when a
-        shell search or read caused it (sg1 round 3: "search_read")."""
+        """What the hook answers main (no TP_TASK_DIR) without lifts: the classifier's ask, naming the safe tool when the
+        classifier gives a shell ask no non-search cause (sg1 round 4: "worker_refuse")."""
         result = sr.classify(event["tool_name"], event["tool_input"], event.get("cwd"))
-        route = result.get("search_read") and sr.safe_route(event["tool_name"], event["tool_input"], "claude", event.get("cwd"))
+        route = result.get("worker_refuse") and sr.safe_route(event["tool_name"], event["tool_input"], "claude", event.get("cwd"))
         return sr.response_for(result, route or None)
 
     def test_hook_mode_lifts_only_with_the_flag(self):

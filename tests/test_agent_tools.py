@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -52,6 +53,18 @@ class ScriptCase(unittest.TestCase):
             + (f"{body}\n" if body else f"cat <<'OUT'\n{output}\nOUT\n{code}\n"))
         path.chmod(0o755)
         return path
+
+    def deno_lint(self, repo, findings=(), rc=None, errors=(), raw=None):
+        """A deno stub: `lint --json` prints the diagnostics of `findings` ((app-relative file, start line) pairs, as deno
+        prints them: file:// URL, 1-based line) and the `errors` (messages), exiting `rc` (default: 1 when there is any); every
+        other subcommand exits 0. `raw`: print this text instead of the JSON."""
+        diags = [{"filename": "file://" + urllib.parse.quote(str(repo / "api" / f)), "range": {"start": {"line": n, "col": 0}, "end": {"line": n, "col": 3}},
+                  "message": "msg", "code": "no-var", "hint": None} for f, n in findings]
+        text = raw if raw is not None else json.dumps({"version": 1, "diagnostics": diags, "errors": [{"file_path": "x", "message": m} for m in errors], "checked_files": []})
+        data = self.tmp / "denolint.json"
+        data.write_text(text)
+        rc = (1 if findings or errors else 0) if rc is None else rc
+        return self.stub("deno", body=f'[ "$1" = lint ] || exit 0\ncat "{data}"\nexit {rc}')
 
     def tsc_projects(self, projects, noemit=("", 0), build_rc=0, build_body=None):
         """A tsc stub that answers per project directory (its basename): `--showConfig` with the project's config text
@@ -433,23 +446,52 @@ class GateTests(ScriptCase):
             shutil.rmtree(repo)
         repo = self.repo("repo2")
         self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n"})
-        self.stub("deno", exit_code=1, output="error: lint")
+        self.deno_lint(repo, [("main.ts", 1)])  # a new file: every line is a changed line
         code, _, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))
         self.assertEqual(code, 1)
         self.assertIn("eslint:api 1 (deno lint)", body)
+
+    def test_deno_lint_fails_only_on_diagnostics_that_start_on_added_or_modified_lines(self):
+        old = "".join(f"var l{i};\n" for i in range(1, 6))
+        repo = self.repo(files={"README.md": "x\n", "api/deno.json": "{}\n", "api/old.ts": old})
+        self.commit(repo, {"api/old.ts": old.replace("var l3;", "var l3x;") + "var l6;\n"})  # modified line 3, added line 6
+        self.stub("tsc")
+
+        def gate(*args, **kw):
+            self.deno_lint(repo, *args, **kw)
+            code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))
+            return code, log, [line for line in body if line.startswith("eslint:api")]
+
+        code, log, line = gate([("old.ts", 1), ("old.ts", 2), ("old.ts", 4), ("old.ts", 5)])  # only old lines
+        self.assertEqual((code, line), (0, ["eslint:api 0 (deno lint; 4 on lines this change did not touch ignored)"]))
+        self.assertIn("deno lint --json: 0 on changed lines, 4 on untouched lines", Path(log).read_text())
+        for finding in (("old.ts", 3), ("old.ts", 6)):  # the modified line, the added line
+            code, _, line = gate([("old.ts", 1), finding])
+            self.assertEqual((code, line), (1, ["eslint:api 1 (deno lint; 1 on lines this change did not touch ignored)"]), finding)
+        (repo / "api" / "new file.ts").write_text("var a;\nvar b;\n")  # untracked: every line counts (a name that is URL-quoted)
+        code, _, line = gate([("new file.ts", 2)])
+        self.assertEqual((code, line), (1, ["eslint:api 1 (deno lint)"]))
+        (repo / "api" / "new file.ts").unlink()
+        (repo / "api" / "old.ts").write_text(old.replace("var l3;", "var l3x;") + "var l6;\nvar l7;\n")  # an uncommitted edit counts too
+        self.assertEqual(gate([("old.ts", 7)])[0], 1)
+        # a lint that cannot be judged is missing, never a pass: no JSON, a failure without diagnostics, a deno error
+        for kw in ({"raw": "error: No target files found."}, {"raw": '{"version": 1}'}, {"rc": 1}, {"rc": 2}):
+            code, _, line = gate(**kw)
+            self.assertEqual((code, line), (0, ["eslint:api skipped (deno lint --json could not be judged: see log)"]), kw)
+        self.assertEqual(gate(errors=["SyntaxError: x"])[0], 1)  # a file deno cannot parse fails whatever its lines
 
     def test_a_deno_app_is_checked_with_deno_check_and_a_web_app_with_tsc(self):
         repo = self.repo()
         self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n", "web/package.json": "{}\n", "web/tsconfig.json": "{}\n", "web/a.ts": "x\n",
                            "lib/helper.ts": "x\n"})
-        for tool in ("deno", "tsc"):
-            self.stub(tool)
+        self.stub("tsc")
+        self.deno_lint(repo)
         self.stub("eslint")
         body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
         self.assertIn("typecheck:api 0", body)
         self.assertIn("typecheck:web 0", body)
         self.assertIn("eslint:api 0 (deno lint)", body)  # a deno app is linted by deno, never by eslint
-        self.assertIn("arg: lint\narg: main.ts", self.calls_of("deno"))
+        self.assertIn("arg: lint\narg: --json\narg: main.ts", self.calls_of("deno"))
         self.assertNotIn("cwd=" + str(repo) + "/api", self.calls_of("eslint"))
         self.assertIn("typecheck:. skipped (no deno.json or tsconfig.json)", body)
         deno = self.calls_of("deno")

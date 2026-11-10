@@ -10,8 +10,11 @@
 # `deno check` when deno.json(c) is there, else `tsc --noEmit` when tsconfig.json is there; nothing else is guessed.
 # Exception: a deno.json(c) that holds only an `imports` map next to a tsconfig.json is a Node/tsc project (the import
 # map is a resolver aid), so it takes the tsc path. A config that cannot be parsed stays on deno.
-# A Deno app (as above) is linted with `deno lint` instead of eslint, recorded as eslint:APP; an eslint run that ignored
-# every file is recorded missing, not passed.
+# A Deno app (as above) is linted with `deno lint --json` instead of eslint, recorded as eslint:APP. Old repos carry lint
+# errors nobody ran deno lint for, so only a diagnostic that starts on a line the change adds or modifies (git diff -U0
+# from the merge base to the working tree; an untracked file counts as all lines) fails; the rest are counted in the log.
+# A run that cannot start or whose JSON does not parse is recorded missing, not passed. An eslint run that ignored every
+# file is recorded missing too.
 # prettier and eslint run per app and are recorded per app (`prettier:APP`, `eslint:APP`, like `typecheck:APP`): an app
 # without an eslint config is not_applicable on its own and never hides behind another app's pass.
 # Prints one `name exit` line per check (`name skipped (reason)` for a tool that is not installed, a project without an
@@ -279,10 +282,120 @@ is_deno_app() {
   { [ -e "$WT/$1/deno.json" ] || [ -e "$WT/$1/deno.jsonc" ]; } && ! deno_config_is_import_map_only "$1"
 }
 
+# deno_lint_new_lines APP BIN REL... — `deno lint --json` on the changed files of APP, then keep only the diagnostics that
+# start on a line the change adds or modifies. Sets RC (0 passed, 1 failed), LINT_OLD (diagnostics on untouched lines,
+# not failures) and TAIL; returns 1 when the lint could not be judged (no run, no JSON, an unexplained failure).
+deno_lint_new_lines() {
+  local app="$1" bin="$2" out mb res from
+  shift 2
+  from="$(wc -l <"$TP_LOG")"
+  out="$(mktemp "${TMPDIR:-/tmp}/tp-gate-lint.XXXXXX")" || { printf '== %s: no temp file\n' "$label" >>"$TP_LOG"; return 1; }
+  printf '== %s: %s lint --json %s\n' "$label" "$bin" "$*" >>"$TP_LOG"
+  (cd "$WT/$app" && "$bin" lint --json "$@") >"$out" 2>>"$TP_LOG"
+  RC=$?
+  LINT_OLD=0
+  TAIL=""
+  if mb="$(git -C "$WT" merge-base "$BASE_SHA" HEAD 2>>"$TP_LOG")" && [ -n "$mb" ]; then
+    res="$(python3 - "$WT" "$app" "$mb" "$RC" "$out" 2>>"$TP_LOG" <<'PY'
+import json, os, re, subprocess, sys
+from urllib.parse import unquote, urlparse
+
+wt, app, base, rc, path = sys.argv[1:6]
+wt = os.path.realpath(wt)
+
+
+def say(*parts):
+    print(*parts, file=sys.stderr)
+
+
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    diags, errs = data["diagnostics"], data["errors"]
+    assert isinstance(diags, list) and isinstance(errs, list)
+except (OSError, ValueError, KeyError, AssertionError, TypeError):
+    say("deno lint --json: output did not parse")
+    print("missing")
+    sys.exit(0)
+if rc not in ("0", "1"):
+    say("deno lint --json: exit", rc)
+    print("missing")
+    sys.exit(0)
+if rc == "1" and not diags and not errs:
+    say("deno lint --json: failed with no diagnostics")
+    print("missing")
+    sys.exit(0)
+
+untracked = set(subprocess.run(["git", "-C", wt, "ls-files", "-z", "--others", "--exclude-standard"],
+                               capture_output=True, text=True).stdout.split("\0"))
+cache = {}
+
+
+def added(rel):
+    """Added or modified 1-based line ranges of rel (None: every line), from the merge base to the working tree."""
+    if rel in untracked:
+        return None
+    if rel not in cache:
+        r = subprocess.run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-renames", base, "--", rel],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            say("git diff failed for", rel)
+            print("missing")
+            sys.exit(0)
+        ranges = []
+        for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", r.stdout, re.M):
+            start, n = int(m.group(1)), 1 if m.group(2) is None else int(m.group(2))
+            if n:
+                ranges.append((start, start + n - 1))
+        cache[rel] = ranges
+    return cache[rel]
+
+
+def rel_of(name):
+    p = unquote(urlparse(name).path) if name.startswith("file://") else name
+    return os.path.relpath(os.path.realpath(p), wt)
+
+
+old, new = 0, []
+for d in diags:
+    try:
+        rel, line = rel_of(d["filename"]), int(d["range"]["start"]["line"])
+        ranges = added(rel)
+        hit = ranges is None or any(a <= line <= b for a, b in ranges)
+        text = f'{rel}:{line} {d.get("code")}: {d.get("message")}'
+    except (KeyError, TypeError, ValueError):
+        say("deno lint --json: unreadable diagnostic")
+        print("missing")
+        sys.exit(0)
+    if hit:
+        new.append(text)
+    else:
+        old += 1
+for e in errs:
+    new.append("error: " + str(e.get("message", e) if isinstance(e, dict) else e).splitlines()[0])
+for t in new:
+    say("  new:", t)
+say(f"deno lint --json: {len(new)} on changed lines, {old} on untouched lines (not failures)")
+print("failed" if new else "passed", old)
+PY
+)" || res=missing
+  else
+    printf 'cannot find the merge base of %s and HEAD\n' "$BASE_SHA" >>"$TP_LOG"
+    res=missing
+  fi
+  rm -f "$out"
+  case "$res" in
+    passed*) RC=0 ;;
+    failed*) RC=1; TAIL="$(sed -n "$((from + 1)),\$p" "$TP_LOG" | grep '^  new:' | head -8 | sed 's/^  new:/   /')" ;;
+    *) return 1 ;;
+  esac
+  LINT_OLD="${res#* }"
+}
+
 # tool_check NAME TOOL EXT_REGEX ARGS... — run TOOL on the matching changed files of each app, and record the result
 # per app as NAME:APP (passed, failed, missing, or not_applicable). No app's result stands for another's.
 tool_check() {
-  local name="$1" tool="$2" ext="$3" app bin any=0 rels label
+  local name="$1" tool="$2" ext="$3" app bin any=0 rels label t0
   IGNORE_ARGS=()
   shift 3
   for app in ${APPS[@]+"${APPS[@]}"}; do
@@ -294,10 +407,18 @@ tool_check() {
     RUN_SECS=0
     if [ "$name" = eslint ] && is_deno_app "$app"; then
       if bin="$(tp_find_deno "$WT")"; then
-        run_in "$app" "$label" "$bin" lint "${rels[@]}"
-        printf '%s %s (deno lint)\n' "$label" "$RC"
-        rec_ran "$label" "$RC"
-        if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
+        t0="$SECONDS"
+        if deno_lint_new_lines "$app" "$bin" "${rels[@]}"; then
+          RUN_SECS=$((SECONDS - t0))
+          if [ "$LINT_OLD" = 0 ]; then printf '%s %s (deno lint)\n' "$label" "$RC"
+          else printf '%s %s (deno lint; %s on lines this change did not touch ignored)\n' "$label" "$RC" "$LINT_OLD"; fi
+          rec_ran "$label" "$RC"
+          if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi
+        else
+          RUN_SECS=$((SECONDS - t0))
+          printf '%s skipped (deno lint --json could not be judged: see log)\n' "$label"
+          rec "$label" missing ""
+        fi
       else
         printf '%s skipped (deno not found)\n' "$label"
         rec "$label" missing ""

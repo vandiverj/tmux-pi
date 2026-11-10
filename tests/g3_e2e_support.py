@@ -56,7 +56,10 @@ if [ $M = 1 ] && listed "$G3_SHIM_AFTER" "$3"; then "$G3_REAL_TMUX" "$@" >/dev/n
 exec "$G3_REAL_TMUX" "$@"
 '''
 
-CONFIG_DIR = ".tmux" + "-pi"          # where a repository keeps its lane config (lanes.json)
+# Every run in these tests carries a caller's TP_PI_NODE, whatever the machine running the suite has (Main's own is empty): a space, `=`
+# and both quotes in one value, so every full run shows the value reaches the session as one argv word and comes back unchanged.
+PI_NODE = "/opt/pi node/a=b \"q\" 'r'/bin/node"
+CONFIG_DIR =".tmux" + "-pi"          # where a repository keeps its lane config (lanes.json)
 WORK = DECOY = LOG = PATCH = None
 NOTHING_MADE = {"session": False, "integration": False, "lane": False, "lane_branch": False, "worktree": None, "dirs": []}
 RUNS = []          # the JSON summary of every run the module made (parallel or in-process)
@@ -77,7 +80,8 @@ def set_up_module():
     shim.write_text(SHIM)
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
     PATCH = mock.patch.dict(os.environ, {"PATH": f"{WORK / 'bin'}{os.pathsep}{os.environ['PATH']}", "G3_SHIM_LOG": str(LOG), "G3_REAL_TMUX": real,
-                                         "TMUX_TMPDIR": str(DECOY), "TMUX": f"{DECOY}/default,1,0", "TMUX_PANE": "%999"})
+                                         "TMUX_TMPDIR": str(DECOY), "TMUX": f"{DECOY}/default,1,0", "TMUX_PANE": "%999",
+                                         "TP_PI_NODE": PI_NODE})
     PATCH.start()
 
 

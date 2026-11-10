@@ -63,7 +63,12 @@ except ValueError as error:      # the lanes module's own refusal of a config (a
     print(json.dumps({"refused": str(error)}))
 """
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "g3-smoke", "GIT_AUTHOR_EMAIL": "g3-smoke@invalid", "GIT_COMMITTER_NAME": "g3-smoke", "GIT_COMMITTER_EMAIL": "g3-smoke@invalid"}
-MARKER = "@g3_run"      # the tmux session option that says which run made a session (set in the same tmux call that creates it)
+# How a worker starts is Main's setting, and a worker pane takes its environment from the tmux server and session, not from the process that
+# ran tmux. The smoke's own session therefore carries these variables of the caller's environment (set, even empty), and no others.
+# bin/tp-pi runs pi on ${TP_PI_NODE-<pinned nvm node>}: without this a pi reviewer exits at once on a machine that lacks the pinned node.
+CARRIED_ENV = ("TP_PI_NODE",)
+MIN_TMUX_FOR_ENV = (3, 2)     # `new-session -e NAME=VALUE`
+MARKER = "@g3_run"     # the tmux session option that says which run made a session (set in the same tmux call that creates it)
 FOREIGN_COMMIT = "someone else's work: a commit that is on no other branch"      # the collision tampers: things that are not this run's
 FOREIGN_LANE = {"state": "open", "note": "someone else's lane record; the smoke run must leave it exactly as it is"}
 TRUST_SCREEN = """ Accessing workspace:
@@ -93,7 +98,7 @@ RESULT_STATUS: complete
 # The step each one fails at; tests/test_g3_e2e.py holds the check each must name.
 TAMPERS = {
     "not-git": "setup", "bad-lane-config": "setup", "dirty-repo": "setup", "on-scratch-branch": "setup", "integration-exists": "setup", "lane-branch-exists": "setup",
-    "lane-record-exists": "setup", "worktree-exists": "setup", "session-exists": "setup",
+    "lane-record-exists": "setup", "worktree-exists": "setup", "session-exists": "setup", "pinode-mismatch": "setup",
     "dispatch-id": "dispatch", "dispatch-queued": "dispatch", "dispatch-meta": "dispatch", "dispatch-pane": "dispatch",
     "dispatch-lane": "dispatch", "dispatch-worktree": "dispatch",
     "no-prompt": "prompt", "prompt-no-reason": "prompt", "trust-dialog": "prompt",
@@ -911,9 +916,37 @@ esac
             self.run(["git", "-C", self.repo, "add", "."])
             self.run(["git", "-C", self.repo, "commit", "-q", "-m", "readme"], env={**self.env(), **GIT_IDENTITY})
 
+    def carried(self):
+        """[(name, value)] of CARRIED_ENV that the caller's environment has (set, even empty), in tuple order."""
+        return [(name, os.environ[name]) for name in CARRIED_ENV if name in os.environ]
+
+    def require_env_flag(self):
+        """`new-session -e` needs tmux 3.2: on an older (or unreadable) one the run refuses here, before it makes anything."""
+        said = self.tmux("-V").stdout.strip()
+        found = re.search(r"(\d+)\.(\d+)", said)
+        if not found and re.search(r"\b(master|next)\b", said):
+            return                        # a development build is newer than any release
+        if not found or (int(found.group(1)), int(found.group(2))) < MIN_TMUX_FOR_ENV:
+            names = ", ".join(name for name, _ in self.carried())
+            raise SmokeError(self.step_name, f"tmux says {said!r}; carrying {names} into the run's session needs tmux {MIN_TMUX_FOR_ENV[0]}.{MIN_TMUX_FOR_ENV[1]} or newer "
+                                             f"(new-session -e). Nothing was changed; upgrade tmux, or unset {names} in the environment that runs the smoke")
+
+    def check_carried(self):
+        """The session holds the caller's value of each carried variable (what a new pane of it gets)."""
+        for name, value in self.carried():
+            said = self.tmux("show-environment", "-t", f"={self.name}", name).stdout
+            if self.tamper("pinode-mismatch"):
+                said = f"{name}=tampered\n"
+            self.check(f"the run's tmux session carries the caller's {name}", said == f"{name}={value}\n", said.rstrip("\n"),
+                       hint="a worker pane takes its environment from the session, so a pi worker would start differently from Main's")
+
     def start_session(self):
         """The run's own tmux session, with the two options tp-spawn reads. --fake: on a private server behind the wrapper."""
         cwd = str(self.repo)
+        carried = self.carried()
+        if carried:
+            self.require_env_flag()
+        env_args = [arg for name, value in carried for arg in ("-e", f"{name}={value}")]       # one argv word each: no shell sees the value
         if self.fake:
             self.tmux("new-session", "-d", "-s", "anchor", "sleep 600")
         # One tmux call makes the session and marks it as this run's (the `;` runs set-option only if new-session succeeded), so the marker
@@ -921,11 +954,12 @@ esac
         #  - a definite refusal (rc != 0, e.g. "duplicate session") means the run never owned it: nothing is recorded, nothing is killed;
         #  - a timeout is indeterminate (the session may or may not exist): `session_unsure`, settled by the cleanup from the marker.
         try:
-            self.tmux("new-session", "-d", "-s", self.name, "-c", cwd, "sleep 7200", ";", "set-option", "-t", f"={self.name}:", MARKER, self.run_id)
+            self.tmux("new-session", "-d", "-s", self.name, *env_args, "-c", cwd, "sleep 7200", ";", "set-option", "-t", f"={self.name}:", MARKER, self.run_id)
         except SmokeError as error:
             self.session_unsure = error.timed_out or "duplicate session" not in error.message     # only a plain duplicate is a definite refusal
             raise
         self.made["session"] = True
+        self.check_carried()
         if not self.fake:                 # the wrapper answers these two in --fake
             pane = self.tmux("list-panes", "-t", f"={self.name}:", "-F", "#{pane_id}").stdout.split()[0]
             self.tmux("set-option", "-t", f"={self.name}:", "@tp_state_dir", str(self.state))

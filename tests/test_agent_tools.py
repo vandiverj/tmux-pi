@@ -479,6 +479,13 @@ class GateTests(ScriptCase):
             code, _, line = gate(**kw)
             self.assertEqual((code, line), (0, ["eslint:api skipped (deno lint --json could not be judged: see log)"]), kw)
         self.assertEqual(gate(errors=["SyntaxError: x"])[0], 1)  # a file deno cannot parse fails whatever its lines
+        # diff.interHunkContext would merge two edits 4 lines apart into one hunk; the line between them is still untouched
+        seven = "".join(f"var m{i};\n" for i in range(1, 8))
+        repo = self.repo("repo-hunks", files={"README.md": "x\n", "api/deno.json": "{}\n", "api/hunks.ts": seven})
+        subprocess.run(["git", "-C", str(repo), "config", "diff.interHunkContext", "4"], check=True)
+        self.commit(repo, {"api/hunks.ts": seven.replace("var m2;", "var m2x;").replace("var m6;", "var m6x;")})
+        code, _, line = gate([("hunks.ts", 4)])
+        self.assertEqual((code, line), (0, ["eslint:api 0 (deno lint; 1 on lines this change did not touch ignored)"]))
 
     def test_a_deno_app_is_checked_with_deno_check_and_a_web_app_with_tsc(self):
         repo = self.repo()

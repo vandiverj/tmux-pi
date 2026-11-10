@@ -336,7 +336,7 @@ def added(rel):
     if rel in untracked:
         return None
     if rel not in cache:
-        r = subprocess.run(["git", "-C", wt, "diff", "-U0", "--no-color", "--no-renames", base, "--", rel],
+        r = subprocess.run(["git", "-C", wt, "-c", "diff.interHunkContext=0", "diff", "-U0", "--no-color", "--no-renames", base, "--", rel],
                            capture_output=True, text=True)
         if r.returncode != 0:
             say("git diff failed for", rel)

@@ -170,6 +170,69 @@ class GateTests(ScriptCase):
         self.assertIn("arg: --noEmit", self.calls_of("tsc"))
         self.assertIn(f"cwd={repo}/web", self.calls_of("tsc"))
 
+    def arg_lists(self, name):
+        """The arguments of each call of a stub, in call order."""
+        return [[a for a in call.splitlines()[1:]] for call in self.calls_of(name).split("--- call ")[1:]]
+
+    def test_prettier_in_an_app_directory_honours_the_root_and_app_ignore_files(self):
+        # Prettier reads only the ignore files of its cwd; the root's patterns (generated files) must still apply.
+        for version, expected in (("3.8.3", True), ("2.8.8", False)):
+            with self.subTest(prettier=version):
+                self.setUp()
+                repo = self.repo(files={".gitignore": "dist/\n", ".prettierignore": "web/gen/**\n!web/gen/*.ts\n"})
+                self.commit(repo, {"web/package.json": "{}\n", "web/.prettierignore": "x/\n", "web/a.ts": "export const a = 1\n"})
+                self.stub("prettier", output=version)
+                self.run_script("pre-commit-gate.sh", repo, "main")
+                version_call, check = self.arg_lists("prettier")
+                self.assertEqual(version_call, ["arg: --version"])
+                ignores = [f"arg: {repo}/.gitignore", f"arg: {repo}/.prettierignore", f"arg: {repo}/web/.prettierignore"]
+                want = [x for path in ignores for x in ("arg: --ignore-path", path)] if expected else []
+                self.assertEqual(check, ["arg: --check", "arg: --ignore-unknown", *want, "arg: a.ts", "arg: package.json"])
+
+    def test_prettier_at_the_worktree_root_keeps_its_default_ignore_files(self):
+        repo = self.repo(files={".prettierignore": "gen/\n"})
+        self.commit(repo, {"a.ts": "export const a = 1\n"})
+        self.stub("prettier", output="3.8.3")
+        self.run_script("pre-commit-gate.sh", repo, "main")
+        self.assertNotIn("--ignore-path", self.calls_of("prettier"))
+        self.assertNotIn("--version", self.calls_of("prettier"))
+
+    TSC_CONFIG = (
+        '{\n    "compilerOptions": {},\n    "references": [\n        {\n            "path": "../lib/a"\n        },\n'
+        '        {\n            "path": "../lib/b"\n        }\n    ],\n    "include": ["x"]\n}')
+
+    def lane_with_referencing_app(self, config='// refs\n{"references": [{"path": "../lib/a"}]}\n'):
+        repo = self.repo(files={"README.md": "hi\n"})
+        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": config, "web/a.ts": "export const a = 1\n"})
+        return repo
+
+    def test_tsc_builds_the_project_references_before_the_noemit_check(self):
+        # Unbuilt references make `tsc --noEmit` fail with TS6305 in a fresh worktree.
+        repo = self.lane_with_referencing_app()
+        self.stub("tsc", output=self.TSC_CONFIG)
+        out = self.run_script("pre-commit-gate.sh", repo, "main")
+        code, log, body = self.last_line(out)
+        self.assertEqual(self.arg_lists("tsc"), [["arg: --showConfig"], ["arg: -b", "arg: ../lib/a", "arg: ../lib/b"], ["arg: --noEmit"]])
+        self.assertIn(f"cwd={repo}/web", self.calls_of("tsc"))
+        self.assertIn("typecheck:web 0", body)
+        self.assertEqual([l for l in body if l.startswith("typecheck")], ["typecheck:web 0"])
+        self.assertIn("== typecheck:web references: ", self.assertLogged(log))
+
+    def test_a_reference_that_does_not_build_fails_the_typecheck_without_the_noemit_run(self):
+        repo = self.lane_with_referencing_app()
+        self.stub("tsc", output=self.TSC_CONFIG, fail_on_call=2)
+        out = self.run_script("pre-commit-gate.sh", repo, "main")
+        code, log, body = self.last_line(out)
+        self.assertEqual(code, 1)
+        self.assertIn("typecheck:web 1", body)
+        self.assertNotIn("arg: --noEmit", self.calls_of("tsc"))
+
+    def test_a_tsconfig_that_only_mentions_references_runs_just_the_noemit_check(self):
+        repo = self.lane_with_referencing_app('{"references": []}\n')
+        self.stub("tsc", output='{\n    "files": []\n}')
+        self.run_script("pre-commit-gate.sh", repo, "main")
+        self.assertEqual(self.arg_lists("tsc"), [["arg: --showConfig"], ["arg: --noEmit"]])
+
     def test_gitleaks_scans_base_to_head(self):
         repo = self.lane_with_web_app()
         for tool in ("prettier", "eslint", "tsc", "gitleaks"):

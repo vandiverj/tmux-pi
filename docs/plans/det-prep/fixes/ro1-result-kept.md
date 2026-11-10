@@ -34,6 +34,15 @@ report goes missing.
      - `state.json` records that a later reply exists (for example `laterReplies: N` and the latest path).
    - If the start of the turn cannot be told apart from the hook input, use this simpler rule instead and say why: a reply
      without `RESULT_STATUS:` never replaces one with it.
+   - **Main's lead (2026-11-09).** The transcript tells the turns apart even if the hook input does not. In the MS1
+     worker's transcript (path in `.../tasks/coder-1396de7de6/transcript-path`), each user entry has `promptSource`,
+     `turnOrigin` and `origin.kind`:
+     - the dispatch prompt: `"typed"`, `"human"`, `{"kind": "human"}`;
+     - the three task-notification turns: `"system"`, `"task_notification"`, `{"kind": "task-notification", "producer":
+       "session-task", …}`.
+     `report.sh` already reads `transcript_path`. Check whether the hook input carries any of these fields. If it does
+     not, read the newest user entry in the transcript at `Stop`. Handle a transcript that is not flushed yet as "origin
+     unknown", which falls back to the simpler rule.
 3. **Main sees both.**
    - `tp-agent inspect` and `tp-agent list` show that a later reply exists, so a main knows to look.
    - The notifier (`register.tsx`) is not changed in this lane.

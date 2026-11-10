@@ -43,24 +43,49 @@ GIT_VALUE_LONG = ("--git-dir", "--work-tree", "--namespace", "--super-prefix", "
 CONFIG = os.environ.get("TP_ROUTINES_CONFIG") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "routines.json")
 
 
-def load_config(path=CONFIG):
-    """(lane regex, PROBES, PATH_PROBES) from the routines config. Raises ValueError naming the file and the
-    problem when it is missing, not JSON, malformed, or holds a regex that does not compile."""
+def _read_config(path, whole):
+    """The config document at PATH, checked. `whole`: lane_pattern, probes and path_probes are all required;
+    otherwise (a project override) each is optional. Raises ValueError naming the file and the problem."""
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError) as err:
         raise ValueError("cannot read routines config {}: {}".format(path, err))
     try:
-        lane = doc["lane_pattern"]
-        tables = (doc["probes"], doc["path_probes"])
+        if not isinstance(doc, dict):
+            raise TypeError("the top level must be an object")
+        if whole:
+            doc["lane_pattern"], doc["probes"], doc["path_probes"]
+        lane = doc.get("lane_pattern", "")
+        tables = [doc.get("probes", {}), doc.get("path_probes", {})]
         if not isinstance(lane, str) or not all(isinstance(t, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in t.items()) for t in tables):
             raise TypeError("lane_pattern must be a string, probes and path_probes objects of name -> regex")
         for rx in (lane, *tables[0].values(), *tables[1].values()):
             re.compile(rx)
     except (KeyError, TypeError, re.error) as err:
         raise ValueError("bad routines config {}: {!r}".format(path, err))
-    return re.compile(lane), tables[0], tables[1]
+    return doc
+
+
+def _merged(base, extra):
+    """BASE with EXTRA on top: a name BASE has keeps its place with the new regex; new names go first (a project's
+    own probes are more specific than the shared ones)."""
+    return {**{k: v for k, v in extra.items() if k not in base}, **{k: extra.get(k, v) for k, v in base.items()}}
+
+
+def load_config(path=CONFIG, project=None):
+    """(lane regex, PROBES, PATH_PROBES) from the routines config, with PROJECT's optional override
+    (PROJECT/.tmux-pi/routines.json, same keys, all optional) merged on top. lane_pattern replaces the shared one."""
+    doc = _read_config(path, True)
+    lane, probes, path_probes = doc["lane_pattern"], doc["probes"], doc["path_probes"]
+    if project:
+        over = os.path.join(project, ".tmux-pi", "routines.json")
+        if os.path.isfile(over):
+            extra = _read_config(over, False)
+            lane = extra.get("lane_pattern") or lane
+            probes = _merged(probes, extra.get("probes", {}))
+            path_probes = _merged(path_probes, extra.get("path_probes", {}))
+    return re.compile(lane), probes, path_probes
 
 
 LANE, PROBES, PATH_PROBES = load_config()
@@ -194,6 +219,20 @@ PROBE_ORDER = list(PROBES) + list(PATH_PROBES)  # table order: most specific fir
 def first_probe(probes):
     """The one probe that claims a call (`exclusive`): the first in table order, or None."""
     return next((p for p in PROBE_ORDER if p in probes), None)
+
+
+def use_project_config(project):
+    """Make PROJECT's merged probes the module's tables; returns what to hand to restore_config."""
+    global LANE, PROBES, PATH_PROBES, PROBE_ORDER
+    saved = (LANE, PROBES, PATH_PROBES, PROBE_ORDER)
+    LANE, PROBES, PATH_PROBES = load_config(project=project)
+    PROBE_ORDER = list(PROBES) + list(PATH_PROBES)
+    return saved
+
+
+def restore_config(saved):
+    global LANE, PROBES, PATH_PROBES, PROBE_ORDER
+    LANE, PROBES, PATH_PROBES, PROBE_ORDER = saved
 
 
 def call_key(call):
@@ -544,8 +583,12 @@ def run(project, role="", since="", min_tasks=3, as_json=False, out="", until=""
         previous, why = load_state(counts_path(out))
         if why:
             warnings.append(why)
-    roles = mine(find_tasks(sessions, since=since, role=role or None, until=until))
-    report = build_report(roles, previous, min_tasks, since=since, until=until, role=role, project=project)
+    saved = use_project_config(project)
+    try:
+        roles = mine(find_tasks(sessions, since=since, role=role or None, until=until))
+        report = build_report(roles, previous, min_tasks, since=since, until=until, role=role, project=project)
+    finally:
+        restore_config(saved)
     body = json.dumps(report, indent=2) + "\n" if as_json else render_text(report)
     if not out:
         return body, warnings

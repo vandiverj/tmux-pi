@@ -14,7 +14,9 @@ and message index so they can be checked.
 `routines` mines DIR/.tmux-pi/sessions task transcripts (Claude and pi) for repeated worker
 routines, per role: probes in more tasks than in the previous report, new Bash lead commands in
 --min-tasks or more tasks that match no probe, and probes in fewer tasks. With --out it writes the
-report there and keeps this run's counts in PATH.counts.json for the next run. See lib/routines.py.
+report there and keeps this run's counts in PATH.counts.json for the next run. Probes come from config/routines.json;
+DIR/.tmux-pi/routines.json (same keys, all optional) overrides them for that project: a name the shared file has
+keeps its place with the new regex, new names go first. See lib/routines.py.
 """
 import argparse
 import collections

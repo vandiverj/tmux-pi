@@ -73,3 +73,17 @@ to a fresh `mktemp -d /tmp/ro1.XXXX` and uses a private `-L` socket; never the d
 `-L`. Never read `.env*`, and never write that string in a shell command. Never search `bin/` as a directory; name the bin
 files. Never search `claude/`, `agent/` or `config/` recursively; name the files. Never edit the Claude profile or its trust
 store.
+
+## Attack the rule before you report (Main, 2026-11-09)
+The rule in item 2 must hold for every kind of turn and every order of hook events, not just the case above.
+- List the turn origins from the engine's own records: every `promptSource`, `turnOrigin` and `origin.kind` value in
+  the engine types (name the lines), plus "origin unknown" (transcript not flushed, missing, unreadable).
+- For each origin, cover each prior state: no `result.md`; a `result.md` with `RESULT_STATUS:`; one without it; a
+  prior turn still open.
+- Also cover duplicate and late `Stop`, a `Stop` with no open prompt, and two turns in quick succession where the second
+  `UserPromptSubmit` lands before the first `Stop`.
+- For each case, write the expected `result.md`, `results/` and `state.json` and the reason, run the real hook, and
+  compare. Put the script in `evidence/attack.sh` (or `.py`) and its log in `evidence/attack.log`, and report counts
+  (cases, matches, mismatches fixed).
+- Fix any mismatch by the rule, never by special-casing the case. Rows worth keeping go into the existing report-hook
+  tests.

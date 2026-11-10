@@ -802,14 +802,16 @@ class BrowserAcceptanceTests(BuildCase):
     def test_review_round_trip_in_headless_chrome(self):
         """Act in the prototype and see the consequence on another page; select the matching engineering event and
         note on it; export, then restore and resume in a fresh browser context; back, reset and reload never repeat
-        an action; storage denied is shown; nothing leaves file:. Then the exported bundle imports into the package."""
+        an action; storage denied is shown; nothing leaves file:. A note keeps its recorded step when a copy of the
+        package cuts the scenario shorter (tp-product apply, rebuild, import). Then the exported bundle imports into
+        the package."""
         R.build(self.pkg)
         work = Path(tempfile.mkdtemp(prefix="pd-c-chrome."))
         self.addCleanup(shutil.rmtree, work, True)
         # its own process group: a run that overstays is killed with the Chrome it started, never left behind
         proc = subprocess.Popen(["node", str(DRIVER), "acceptance", str(self.pkg / BUILD), str(work)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-                                env=dict(os.environ, TP_CHROME=CHROME))
+                                env=dict(os.environ, TP_CHROME=CHROME, TP_PYTHON=sys.executable))
         try:
             stdout, stderr = proc.communicate(timeout=45)
         except subprocess.TimeoutExpired:

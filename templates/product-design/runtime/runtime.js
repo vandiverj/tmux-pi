@@ -581,11 +581,16 @@
     var sc = record(g.scenario);
     return !!sc && g.step >= (sc.actions || []).length;
   }
-  function stepText(n) {   // a note's task position; an older note may hold the step count itself after the last step
+  // A note's task position is what the note recorded, never a comparison with today's scenario: a guided note taken
+  // after the last step holds step null. An older note may hold the step count itself after the last step; that is
+  // completion only when the note was taken on this very build (same revision and content), whose scenario is the one
+  // the step was counted against. From any other build its recorded step is shown as it is.
+  function stepText(n) {
     if (!n.scenario) return "";
-    var sc = record(n.scenario);
-    if (n.step === null ? n.mode === "guided" : sc && n.step >= (sc.actions || []).length) return ", " + n.scenario + ", all steps done";
-    return ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "");
+    if (n.step === null) return ", " + n.scenario + (n.mode === "guided" ? ", all steps done" : "");
+    var b = n.build, sc = b && b.revision === DATA.build.revision && b.fingerprint === DATA.build.content_fingerprint ? record(n.scenario) : null;
+    if (sc && n.step >= (sc.actions || []).length) return ", " + n.scenario + ", all steps done";
+    return ", " + n.scenario + " step " + (n.step + 1);
   }
   function closeNote() {   // every way a note ends (saved, cancelled, Escape, note mode toggled) resumes the prototype
     RT.pending = null;

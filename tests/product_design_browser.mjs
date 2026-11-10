@@ -7,13 +7,14 @@
 // Every wait is on an event (a CDP event, a page event, the runtime's settled() promise) with a deadline, never a
 // fixed sleep. Chrome runs with a fresh --user-data-dir under WORKDIR, host resolution mapped to nothing, and every
 // network request the pages make is recorded: only file:, blob: and data: URLs are allowed.
-import {spawn} from "node:child_process";
+import {execFileSync, spawn} from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import {pathToFileURL} from "node:url";
+import {fileURLToPath, pathToFileURL} from "node:url";
 
 export const CHROME = process.env.TP_CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEADLINE = 8000;
+const REPO = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 export class Browser {
   static async launch(workDir) {
@@ -487,6 +488,58 @@ async function acceptance(htmlPath, workDir, keep) {
     check("the next note carries the resumed task's context", d.notes === 1 &&
           /guided, assisted-advance, scenario\.submit-complete-record step 2/.test(resumedNote), resumedNote.split("\n").filter((l) => /by Ana|by Ben|by Cy/.test(l)));
     await browser.dispose(ctxE);
+
+    // ---- context F: a note keeps the task position it recorded when the scenario is later revised. A note at step 4
+    // of 5 is exported; a copy of the package cuts that scenario to 3 steps (tp-product apply) and is rebuilt; the
+    // untouched bundles import into the new build: the note still reads step 4, a note taken after the last step
+    // still reads all steps done, and no imported note changes.
+    const ctxF = await browser.context();
+    const g = await browser.page(ctxF);
+    await g.load(url + "#journeys");
+    await g.type("#tp-reviewer", "Di (reviewer-4)");
+    await g.click('[data-tp-start="guided:scenario.submit-complete-record"]');
+    for (let i = 0; i < 3; i++) await g.click("#tp-assist");
+    await g.click('[data-tp-target="submit.send"]', "right");
+    await g.type("#tp-note-text", "What happens if I submit now?", {leave: false});
+    await g.click("#tp-note-save");
+    const step4Dl = await g.download(downloads, () => g.click('[data-tp-view="feedback"]').then(() => g.click("#tp-export")));
+    const step4File = path.join(workDir, "step-4-of-5.json");
+    fs.copyFileSync(step4Dl.file, step4File);
+    const step4 = JSON.parse(fs.readFileSync(step4File, "utf8"));
+    check("a note at step 4 of 5 is exported with that step, its task in progress", step4.notes.length === 1 && step4.notes[0].step === 3 &&
+          step4.sessions[0].tasks[0].outcome === "in-progress", [step4.notes.map((n) => n.step), step4.sessions[0].tasks]);
+    await browser.dispose(ctxF);
+    const pkgCopy = path.join(workDir, "revised-package");
+    fs.cpSync(path.dirname(path.dirname(htmlPath)), pkgCopy, {recursive: true});
+    const product = (...args) => JSON.parse(execFileSync(process.env.TP_PYTHON || "python3",
+      [path.join(REPO, "bin/tp-product"), ...args, "--json"], {encoding: "utf8", env: Object.assign({}, process.env, {PYTHONDONTWRITEBYTECODE: "1"})}));
+    const design = JSON.parse(fs.readFileSync(path.join(pkgCopy, "design.json"), "utf8"));
+    const tour = design.scenarios.find((s) => s.id === "scenario.submit-complete-record");
+    const change = {schema: "tp-product-changeset", schema_version: 1, actor: "Main", summary: "Combine field entry with submission",
+                    operations: [{op: "set", id: tour.id, fields: {actions: tour.actions.filter((x, i) => i === 0 || i >= 3)}}]};
+    const changeFile = path.join(workDir, "three-steps.json");
+    fs.writeFileSync(changeFile, JSON.stringify(change));
+    product("apply", pkgCopy, changeFile, "--expected-revision", String(product("status", pkgCopy).revision));
+    const revised = product("build", pkgCopy);
+    const h2 = await browser.page(await browser.context());
+    await h2.load(pathToFileURL(path.join(pkgCopy, revised.file)).href + "#feedback");
+    const rep4 = await h2.setFile("#tp-import-file", step4File, "tp-imported");
+    const repDone = await h2.setFile("#tp-import-file", exported, "tp-imported");
+    const cardOf = (id) => h2.ev(`[...document.querySelectorAll('[data-note-id="${id}"]')].map((e) => e.textContent).join("\\n")`);
+    const card4 = await cardOf(step4.notes[0].id);
+    const summary4 = (await h2.ev("TPReview.summary()")).split("\n");
+    const line4 = summary4[summary4.findIndex((l) => l.includes(step4.notes[0].id)) + 1] || "";
+    check("after the scenario is cut to 3 steps the imported note still reads step 4, never all steps done",
+          rep4.ok && rep4.added.notes.length === 1 && /scenario\.submit-complete-record step 4/.test(card4) && !/all steps done/.test(card4) &&
+          /scenario\.submit-complete-record step 4/.test(line4) && !/all steps done/.test(line4), [rep4.errors, card4, line4]);
+    const doneIds = JSON.parse(fs.readFileSync(exported, "utf8")).notes.map((n) => n.id);
+    const doneCards = await Promise.all(doneIds.map(cardOf));
+    const doneLines = doneIds.map((id) => summary4[summary4.findIndex((l) => l.includes(id)) + 1] || "");
+    check("notes taken after the last step still read all steps done after the same revision", repDone.ok && repDone.added.notes.length === 2 &&
+          doneCards.concat(doneLines).every((t) => /scenario\.submit-complete-record, all steps done/.test(t) && !/step \d/.test(t)), [repDone.errors, doneCards, doneLines]);
+    const stored = JSON.parse(await h2.ev(`localStorage.getItem("tp-product-review:v1:review-queue-demo")`)).notes;
+    const sent = step4.notes.concat(JSON.parse(fs.readFileSync(exported, "utf8")).notes);
+    check("import changes no note", sent.every((n) => canonical(stored.find((s) => s.id === n.id)) === canonical(n)), stored.map((n) => [n.id, n.step]));
 
     // ---- context C: storage denied is visible, and the page still works in the tab
     const c = await browser.page(await browser.context(), {beforeLoad: STORAGE_DENIED});

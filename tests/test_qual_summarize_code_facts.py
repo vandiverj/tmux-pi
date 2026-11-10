@@ -494,7 +494,26 @@ class UseScanTests(unittest.TestCase):
                 ("a missing submodule below src", "import src.h.missing\n", (("src/h/real.py", "x = 1\n"),)),
                 ("transitive: a missing submodule of a namespace package", "import helper\n",
                  (("src/h/real.py", "x = 1\n"), ("helper.py", "import h.missing\n"))),
-                ("a member of a namespace package that is no module", "from h import real2\n", (("src/h/real.py", "x = 1\n"),))):
+                ("a member of a namespace package that is no module", "from h import real2\n", (("src/h/real.py", "x = 1\n"),)),
+                # round 17 (Main 1): a module reference names a module the graph has; equal names prove nothing. A module that imports
+                # a name from itself, which it does not otherwise bind and has no submodule of, names nothing (Python: ImportError on
+                # the partly initialized module): unknown, so the file and every importer are opaque (review F1, its five forms)
+                ("review F1 (round 17): a module imports a member from itself", "from h import x\n", (("h.py", "from h import x\n"),)),
+                ("review F1 (round 17): ... by an explicit alias", "from h import x\n", (("h.py", "from h import x as x\n"),)),
+                ("review F1 (round 17): ... a package by from . import", "from hp import x\n", (("hp/__init__.py", "from . import x\n"),)),
+                ("review F1 (round 17): ... a package module by a relative import", "from hp.h import x\n",
+                 (("hp/__init__.py", ""), ("hp/h.py", "from .h import x\n"))),
+                ("review F1 (round 17): ... the importer takes the module", "import h\n", (("h.py", "from h import x\n"),)),
+                # a plain module has no submodules: another directory's h/x.py does not make x of h.py a module
+                ("round 17: a module imports a member from itself, an h/x.py elsewhere", "from h import x\n",
+                 (("h.py", "from h import x\n"), ("src/h/__init__.py", ""), ("src/h/x.py", "y = 1\n"))),
+                # a name a module binds, read while its own code still runs (the module itself, or a chain back to it), is unknown:
+                # whether that binding has run yet is order (Python: AttributeError or ImportError on the partly initialized module)
+                ("round 17: a module reads through its own name a member it binds later", "import h\n",
+                 (("h.py", "import h\nv = h.x\nx = 1\n"),)),
+                ("round 17: a module imports from itself a name it binds later", "import h\n", (("h.py", "from h import x as y\nx = 1\n"),)),
+                ("round 17: a two-module cycle back to a name bound later", "import h\n",
+                 (("h.py", "from g import x as y\nx = 1\n"), ("g.py", "from h import x\n")))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others), [])
         # round 7 F2: the target's own names are every suffix of its path, and the directories above it are ancestor packages
@@ -583,6 +602,9 @@ class UseScanTests(unittest.TestCase):
                 ("two clean hops", "import h\n", (("h.py", "import g\n"), ("g.py", "x = 1\n"))),
                 ("a submodule that exists", "import h.real\n", (h_pkg, ("h/real.py", "y = 1\n"))),
                 ("a member that is a submodule", "from h import real\n", (h_pkg, ("h/real.py", "y = 1\n"))),
+                # round 17: a package that imports its own submodule (from . import real) names a module the graph has
+                ("a member a package re-exports as its own submodule", "from h import real\n",
+                 (("h/__init__.py", "from . import real\n"), ("h/real.py", "y = 1\n"))),
                 ("a member the package binds", "from h import x\n", (h_pkg,)),
                 ("a member a module binds", "from h import x\n", (h_mod,)),
                 ("a member from a module of a package", "from h.real import y\n", (h_pkg, ("h/real.py", "y = 1\n"))),

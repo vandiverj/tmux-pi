@@ -8,17 +8,19 @@ Control state lives in `<package>/.tp-product/` (docs/product-design.md, "Persis
                      Tracked. An entry is written once and never replaced.
   lock               flock target for every writer. Not content.
   txn/               the journal of a commit in progress. Not content; exists only during (or after an interrupted) commit.
+                     txn/displaced/ holds the live files the commit moved aside until it is complete.
 
 A commit is: take the lock; check that every file it writes is readable back (package.file_problem); write every new
 file into txn/; check that no live file changed since the change was computed; write txn/txn.json last (the commit
-point); replace the live files (each re-checked just before it is replaced), the history entry and commit.json; remove
-txn/. A crash before txn.json leaves the live package untouched (the partial txn/ is discarded); a crash after it is
+point); place each changed live file (_place: rename the old one into txn/displaced/, check it, link the new one in;
+someone else's bytes are never destroyed, only kept and reported), then the history entry and commit.json; remove txn/
+and the displaced copies that hold the old content. A crash before txn.json leaves the live package untouched (the partial txn/ is discarded); a crash after it is
 rolled forward by `recover`. Readers never write: they report an interrupted commit, an uncommitted external edit and
 control records that disagree, and readiness is not trusted until that is resolved.
 
-Control records are believed only after their shape is checked and they agree: the commit record's revision is the
-highest history entry's, that entry records the same file digests, history has no gap, and an unedited manifest carries
-the same revision. Digests are of the canonical JSON (package.canonical), so re-indenting a file is not an edit.
+Control records are believed only after their shape is checked and they agree: every history entry is well formed and
+follows the one before it (check_history), the commit record's revision is the highest entry's, that entry records the
+same file digests, and an unedited manifest carries the same revision. Digests are of the canonical JSON (package.canonical), so re-indenting a file is not an edit.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import time
@@ -46,6 +49,7 @@ FILES = {key: name for key, (name, _, _) in P.DOCUMENTS.items()}  # doc key -> f
 LOCK_WAIT = 30.0
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 HISTORY_NAME = re.compile(r"([0-9]{6,})\.json\Z")
+DISPLACED = "displaced"  # txn/displaced/: the live files a commit moved aside, until it is complete
 UNREADABLE = "unreadable"  # the live digest of a file that exists but cannot be read back
 
 
@@ -189,6 +193,75 @@ def history_numbers(root) -> list:
     return sorted(int(m.group(1)) for m in map(HISTORY_NAME.match, names) if m)
 
 
+def check_history(root) -> dict:
+    """Every history entry and the chain they form. The one check every reader and writer uses; never only the newest.
+
+    Returns {numbers, entries, invalid, broken}:
+      numbers   the revision of every entry file, ascending (a malformed entry included)
+      entries   revision -> the entry, for the well-formed ones
+      invalid   [(path below .tp-product, message)]: an entry that is unreadable, of the wrong shape or types, whose
+                revision is not its file name's, or whose name is not the one tp-product writes (control.invalid)
+      broken    [message]: the chain is not whole: a gap between two entries, or a base_revision that is not the
+                previous entry's revision (package.control-mismatch)
+    History may start after revision 1 (an imported package): the first entry's base_revision is null or the revision
+    before it. Adjacency is compared between the entries that exist, so any integer revision is checked without
+    building a range over the revision numbers.
+    """
+    out = {"numbers": [], "entries": {}, "invalid": [], "broken": []}
+    try:
+        names = sorted(os.listdir(control(root) / "history"))
+    except (FileNotFoundError, NotADirectoryError):
+        return out
+    found = {}
+    for name in names:
+        m = HISTORY_NAME.match(name)
+        if not m:
+            continue  # not an entry name: a writer's temp file (".000004.json.<token>")
+        rev, rel = int(m.group(1)), Path("history") / name
+        if rev < 1 or name != f"{rev:06d}.json":
+            out["invalid"].append((rel, f"is not a history entry name: revision {rev} is written as "
+                                        f"{max(rev, 1):06d}.json"))
+            continue
+        status, value = _load(Path(root), Path(CONTROL) / rel, lambda h: history_problems(h, rev))
+        found[rev] = value if status == "ok" else None
+        if status != "ok":
+            out["invalid"].append((rel, value))
+    out["numbers"] = sorted(found)
+    out["entries"] = {r: e for r, e in found.items() if e is not None}
+    prev = None
+    for rev in out["numbers"]:
+        entry = found[rev]
+        if prev is not None and rev != prev + 1:
+            out["broken"].append(f"history has no entry between revisions {prev} and {rev}")
+        if entry is not None:
+            base = entry["base_revision"]
+            if prev is None and base not in (None, rev - 1):
+                out["broken"].append(f"history entry {rev} is the first, so its base_revision is null or {rev - 1}, "
+                                     f"not {base}")
+            elif prev is not None and base != prev:
+                out["broken"].append(f"history entry {rev} has base_revision {base}, but the entry before it is {prev}")
+        prev = rev
+    return out
+
+
+def _history_refusal(root, check, revision):
+    """StoreError when the history does not let `revision` be written next (None when it does): an entry is
+    malformed, the chain is broken, or the newest entry is neither revision - 1 nor (a commit interrupted after it
+    wrote its entry) revision itself. A command never writes a state its own reader refuses."""
+    if check["invalid"]:
+        rel, message = check["invalid"][0]
+        return StoreError("control.invalid", f"{control(root) / rel} is {message}. Nothing was written; restore "
+                                             ".tp-product/history from version control", exit=1)
+    problems = list(check["broken"])
+    top = check["numbers"][-1] if check["numbers"] else None
+    if top is not None and top not in (revision - 1, revision):
+        problems.append(f"the newest history entry is {top}, so revision {revision} cannot follow it")
+    if problems:
+        return StoreError("package.control-mismatch", "; ".join(problems) + ". Nothing was written; restore "
+                                                                        ".tp-product/ from version control", exit=3)
+    return None
+
+
 def load_txn(root) -> dict:
     """The journal's txn.json, shape-checked, or StoreError control.invalid."""
     status, value = _load(Path(root), Path(CONTROL) / "txn" / "txn.json", txn_problems)
@@ -205,9 +278,12 @@ def inspect(package_dir) -> dict:
     """What a reader must know before trusting the package. Never writes.
 
     Returns {docs, issues, commit, commit_state, commit_digest, interrupted, external, authority_changed,
-    originals_changed, control}:
+    originals_changed, control, history, displaced}:
       issues             read errors (package.read_docs), else validation issues; plus control.invalid for a control
-                         file (commit.json, txn/txn.json, the top history entry) that is unreadable or malformed
+                         file (commit.json, txn/txn.json, any history entry) that is unreadable or malformed
+      history            the revisions of the history entries, ascending (check_history)
+      displaced          paths (below the package) of copies a commit displaced and kept, because they are not the
+                         content it expected to replace: someone else's bytes
       commit             the commit record when its shape is right, else None
       commit_state       "ok", "missing" or "bad"
       commit_digest      the commit record's canonical digest (what a writer checks before replacing it), or None
@@ -220,7 +296,8 @@ def inspect(package_dir) -> dict:
     root = Path(package_dir)
     docs, issues = P.read_docs(root)
     out = {"docs": docs, "issues": issues, "commit": None, "commit_state": "missing", "commit_digest": None,
-           "interrupted": None, "external": [], "authority_changed": [], "originals_changed": [], "control": []}
+           "interrupted": None, "external": [], "authority_changed": [], "originals_changed": [], "control": [],
+           "history": [], "displaced": []}
     if not issues:
         out["issues"] = P.validate_docs(docs)
 
@@ -238,29 +315,32 @@ def inspect(package_dir) -> dict:
         bad("txn/txn.json", txn)
     elif status == "ok":
         out["interrupted"] = txn["revision"]
+    out["displaced"] = [str(p.relative_to(root)) for p in _kept(root, txn if status == "ok" else None)]
     commit = out["commit"]
 
     def mismatch(message):
         out["control"].append(("package.control-mismatch", message + "; restore .tp-product/ from version control"))
 
+    hist = check_history(root)  # every entry, every time
+    out["history"] = hist["numbers"]
+    for rel, message in hist["invalid"]:
+        bad(rel, message)
+    for message in hist["broken"]:
+        mismatch(message)
     if commit and txn and status == "ok" and txn["revision"] not in (commit["revision"], commit["revision"] + 1):
         mismatch(f"the interrupted commit is to revision {txn['revision']}, but commit.json is at {commit['revision']}")
-    elif commit and out["interrupted"] is None:
-        numbers = history_numbers(root)
+    elif commit:
         rev = commit["revision"]
-        if not numbers or numbers[-1] != rev:
+        top = hist["numbers"][-1] if hist["numbers"] else None
+        # an interrupted commit may have written its own history entry before commit.json
+        if top != rev and not (out["interrupted"] == rev + 1 and top == rev + 1):
             mismatch(f"commit.json is at revision {rev}, but the highest history entry is "
-                     f"{numbers[-1] if numbers else 'missing'}")
-        elif numbers != list(range(numbers[0], rev + 1)):
-            gaps = sorted(set(range(numbers[0], rev + 1)) - set(numbers))
-            mismatch(f"history has no entry for revision(s) {', '.join(map(str, gaps))}")
-        else:
-            rel = Path(CONTROL) / "history" / history_path(root, rev).name
-            hstatus, entry = _load(root, rel, lambda h: history_problems(h, rev))
-            if hstatus == "bad":
-                bad(rel.relative_to(CONTROL), entry)
-            elif hstatus == "ok" and entry["files"] != commit["files"]:
-                mismatch(f"history entry {rev} records other file digests than commit.json")
+                     f"{'missing' if top is None else top}")
+        entry = hist["entries"].get(rev)
+        if entry is not None and entry["files"] != commit["files"]:
+            mismatch(f"history entry {rev} records other file digests than commit.json")
+    if commit and out["interrupted"] is None:
+        rev = commit["revision"]
         manifest = docs.get("manifest")
         if (isinstance(manifest, dict) and file_digests(docs).get(FILES["manifest"]) == commit["files"][FILES["manifest"]]
                 and manifest.get("revision") != rev):
@@ -283,13 +363,19 @@ def trust_problems(state) -> list:
     if state["interrupted"] is not None:
         out.append(("package.interrupted",
                     f"a commit to revision {state['interrupted']} was interrupted; `tp-product apply DIR --recover` finishes it"))
-    if state["commit_state"] == "bad":
-        out.append(("package.control-invalid", ".tp-product/commit.json is malformed (see the control.invalid issue); "
-                                               "restore it from version control"))
-    elif state["commit"] is None:
+    malformed = ["/".join(map(str, i.path)) for i in state["issues"] if i.code == "control.invalid"]
+    if malformed:  # any malformed control record, whichever it is: never trusted
+        out.append(("package.control-invalid", f"{', '.join(malformed)} is malformed (see the control.invalid "
+                                               "issue); restore it from version control"))
+    if state["displaced"]:
+        out.append(("package.displaced",
+                    f"{', '.join(state['displaced'])} holds bytes someone else wrote while a commit replaced the file; "
+                    "they were kept. Compare them with the live file, move what you need out of .tp-product/txn/, then "
+                    "run `tp-product apply DIR --recover`"))
+    if state["commit"] is None and state["commit_state"] != "bad":  # a malformed one is reported above
         out.append(("package.uncommitted", "no commit record (.tp-product/commit.json): not created by `tp-product init`, "
                                             "or its control state was removed"))
-    elif state["external"] and state["interrupted"] is None:
+    elif state["commit"] is not None and state["external"] and state["interrupted"] is None:
         out.append(("package.external-edit",
                     f"{', '.join(state['external'])} changed outside `tp-product apply`; adopt the edit with an "
                     "adopt-external-edit changeset, or restore the committed files"))
@@ -344,21 +430,64 @@ def _live_digest(root: Path, rel) -> Optional[str]:
         return UNREADABLE
 
 
-def _changed_under(root: Path, meta: dict, names) -> list:
+def _expected(meta, name):
+    """(old, new): the digest a live package file or commit.json had when the change was computed, and will have."""
+    if name == "commit.json":
+        return meta["old_commit"], meta["new_commit"]
+    return (meta["old"] or {}).get(name), meta["new"][name]
+
+
+def _live_rel(name) -> Path:
+    return Path(CONTROL) / "commit.json" if name == "commit.json" else Path(name)
+
+
+def _displaced(root: Path, meta) -> list:
+    """[(path, file name or None, ours)] for each copy in txn/displaced/. A copy is `ours` when it holds the content
+    the commit expected to displace (its file's old content, or the new one: no one else's bytes either way); without a
+    journal (`meta` None) none is. The copy of FILE is named FILE~TOKEN."""
+    held = control(root) / "txn" / DISPLACED
+    safe_write.check_below(root, held, "package journal")
+    try:
+        names = sorted(os.listdir(held))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    out = []
+    for n in names:
+        name = n.rsplit("~", 1)[0] if "~" in n else None
+        name = name if name in ALL else None
+        ours = meta is not None and name is not None and _live_digest(held, n) in _expected(meta, name)
+        out.append((held / n, name, ours))
+    return out
+
+
+def _kept(root: Path, meta) -> list:
+    """The displaced copies no commit may remove: someone else's bytes (see _displaced)."""
+    return [p for p, _, ours in _displaced(root, meta) if not ours]
+
+
+def _changed_under(root: Path, meta: dict, names, copies=()) -> list:
     """The files among `names` (package file names, or "commit.json") that are neither what the change was computed
-    from (meta old) nor what it writes (meta new): someone else wrote them. Absent counts as None on both sides."""
+    from (meta old) nor what it writes (meta new): someone else wrote them. Absent counts as None on both sides; a file
+    this commit displaced before an interruption (a copy of it in `copies` is ours) is absent by its own doing."""
     out = []
     for name in names:
-        if name == "commit.json":
-            live, allowed = _live_digest(root, Path(CONTROL) / name), (meta["old_commit"], meta["new_commit"])
-        else:
-            live, allowed = _live_digest(root, name), ((meta["old"] or {}).get(name), meta["new"][name])
-        if live not in allowed:
-            out.append(name)
+        live = _live_digest(root, _live_rel(name))
+        if live in _expected(meta, name) or (live is None and any(n == name and ours for _, n, ours in copies)):
+            continue
+        out.append(name)
     return out
 
 
 ALL = tuple(FILES.values()) + ("commit.json",)
+
+
+def _discard(root: Path, txn: Path):
+    """Remove a journal that stopped before its commit point. Nothing live was touched, so it holds no displaced copy;
+    if it does (a journal edited by hand), it is not removed: those may be someone's only bytes."""
+    if _displaced(root, None):
+        raise StoreError("control.invalid", f"{txn} has no txn.json but holds displaced copies in {txn / DISPLACED}: "
+                                            "move them out of .tp-product/ by hand, then retry", exit=1)
+    shutil.rmtree(txn)
 
 
 def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None, base_commit=None):
@@ -367,14 +496,15 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
     `entry` is the history entry (revision filled in from docs). `base_digests` are the digests of the live files the
     change was computed from and `base_commit` the digest of the commit record it was computed against (None for init:
     the files and the record must be absent). A file that differs from them at the commit point is someone else's write:
-    the commit is refused (commit.external-edit) and their bytes are kept. `fault(point)` is called at each step so a
-    test can stop the commit there.
+    the commit is refused (commit.external-edit) and their bytes are kept. The existing history must let this revision
+    follow it (check_history). `fault(point)` is called at each step so a test can stop the commit there or act as
+    another writer.
     """
     root = Path(package_dir)
     txn = control(root) / "txn"
     safe_write.check_below(root, txn, "package journal")
     if txn.exists() and not (txn / "txn.json").exists():
-        shutil.rmtree(txn)  # a commit that stopped before its commit point: nothing live was touched
+        _discard(root, txn)  # a commit that stopped before its commit point: nothing live was touched
     elif txn.exists():
         raise StoreError("package.interrupted", f"{txn} holds an interrupted commit: run `tp-product apply DIR --recover` "
                                                 "first", exit=3)
@@ -387,8 +517,7 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
         (f"history entry {revision}", entry), ("commit.json", record), ("txn.json", meta)]
     rendered = []
     for name, value in blobs:  # what is committed can always be read back: the reader's limits, checked here
-        data = render(value)
-        problem = P.file_problem(data, value)
+        data, problem = P.file_problem(value, render)
         if problem:
             raise StoreError("result.unreadable", f"{name} would be {problem}: the package could not be read back. "
                                                   "Nothing was written.", details={"file": name, "problem": problem})
@@ -397,6 +526,9 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
         raise StoreError("history.exists", f"{history_path(root, revision)} already exists: a history entry is never "
                                            "replaced. Nothing was written; check .tp-product/ against version control",
                          exit=3)
+    refusal = _history_refusal(root, check_history(root), revision)
+    if refusal:
+        raise refusal
     safe_write.ensure_dir(txn, what="package journal", root=root)
     try:
         for name, data in zip(list(FILES.values()) + ["history.json", "commit.json"], rendered):
@@ -410,7 +542,7 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
                              "status`, then adopt or restore the edit and retry", exit=3, details={"files": changed})
         _write(root, txn / "txn.json", rendered[-1])
     except BaseException:
-        shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched; the package keeps its committed state
+        shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched (nothing is displaced before the commit point)
         raise
     fault("after-commit-point")
     _roll_forward(root, fault)
@@ -434,17 +566,101 @@ def _write_new(root, target: Path, data):
         os.unlink(temp)
 
 
-def _conflict(root, meta, name):
+def _conflict(root, meta, name, why="was changed by someone else", kept=()):
     txn = control(root) / "txn"
     what = ".tp-product/commit.json" if name == "commit.json" else name
-    return StoreError("txn.conflict", f"{what} was changed by someone else during the commit to revision "
-                                      f"{meta['revision']}; it was not overwritten. Compare it with {txn / name} and "
-                                      "restore one of them, then run `tp-product apply DIR --recover`", exit=3,
-                      details={"file": name, "revision": meta["revision"]})
+    kept = [str(p) for p in kept]
+    return StoreError("txn.conflict", f"{what} {why} during the commit to revision {meta['revision']}; it was not "
+                                      "overwritten" + (f", and the bytes the commit displaced are kept at "
+                                                       f"{', '.join(kept)}" if kept else "") +
+                                      f". Compare it with {txn / name} and restore one of them, then run "
+                                      "`tp-product apply DIR --recover`", exit=3,
+                      details={"file": name, "revision": meta["revision"], "kept": kept})
+
+
+def _place(root: Path, meta: dict, name, fault: Callable):
+    """Make the journal's `name` (a package file or commit.json) the live file without destroying bytes this commit did
+    not write (docs/product-design.md, "Persistence").
+
+    The live file is renamed into txn/displaced/ (never unlinked), the displaced bytes are checked against what the
+    change was computed from, and the new file is linked into place: a link fails if anything has appeared at the
+    target since. After the link the displaced copy is checked again (a writer holding the old file open may have
+    written to it). Anything unexpected is kept and named in a txn.conflict; the journal stays, so the package reports
+    the interrupted commit, and the kept copy, until `--recover` finishes it."""
+    rel = _live_rel(name)
+    target = root / rel
+    old, new = _expected(meta, name)
+    if _live_digest(root, rel) == new:  # already in place: unchanged by this commit, or placed before an interruption
+        fault("after-replace:" + name)
+        return
+    txn = control(root) / "txn"
+    held_dir = safe_write.ensure_dir(txn / DISPLACED, what="package journal", root=root)
+    temp = safe_write.write_temp(target, (txn / name).read_bytes(), root=root, fsync=True)
+    try:
+        fault("before-displace:" + name)
+        held = held_dir / f"{name}~{secrets.token_hex(8)}"
+        try:
+            os.rename(target, held)  # the live inode keeps a name: the commit never unlinks it
+        except FileNotFoundError:
+            held = None
+        fault("after-displace:" + name)
+        if held is None:
+            if old is not None and not any(n == name and ours for _, n, ours in _displaced(root, meta)):
+                raise _conflict(root, meta, name, "was removed by someone else")
+        elif _live_digest(held_dir, held.name) not in (old, new):
+            try:  # put their bytes back, unless the target has reappeared since
+                os.link(held, target, follow_symlinks=False)
+                why = "was changed by someone else (their bytes are back in place)"
+            except FileExistsError:
+                why = "was changed by someone else, then saved again (the newer save is in place)"
+            raise _conflict(root, meta, name, why, kept=[held])
+        fault("after-check:" + name)
+        fault("before-link:" + name)
+        try:
+            os.link(temp, target, follow_symlinks=False)
+        except FileExistsError:
+            raise _conflict(root, meta, name, "was saved by someone else while it was being replaced (their file is "
+                                              "in place)", kept=[held] if held else []) from None
+        fault("after-link:" + name)
+        if held is not None and _live_digest(held_dir, held.name) not in (old, new):
+            raise _conflict(root, meta, name, "was written in place by someone else while it was being replaced (the "
+                                              "new content is live)", kept=[held])
+        fault("after-replace:" + name)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
+
+
+def _finish_txn(root: Path, meta: dict, fault: Callable):
+    """Remove the journal of a complete commit. A displaced copy is removed only when it is ours (see _displaced),
+    checked just before; any other is kept, and the journal with it (txn.conflict), so status keeps reporting it."""
+    txn = control(root) / "txn"
+    fault("before-cleanup")
+    copies = _displaced(root, meta)
+    kept = [p for p, _, ours in copies if not ours]
+    if kept:
+        raise StoreError("txn.conflict", f"the commit to revision {meta['revision']} is in place, but "
+                                         f"{', '.join(map(str, kept))} holds bytes someone else wrote while a file was "
+                                         "being replaced; they were kept. Compare them with the live file, move what "
+                                         "you need out of .tp-product/txn/, then run `tp-product apply DIR --recover`",
+                         exit=3, details={"revision": meta["revision"], "kept": [str(p) for p in kept]})
+    for path, _, _ in copies:
+        os.unlink(path)
+    try:
+        os.rmdir(txn / DISPLACED)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # a copy appeared after the check: keep it, and the journal
+        if exc.errno != errno.ENOTEMPTY:
+            raise
+        raise StoreError("txn.conflict", f"{txn / DISPLACED} gained a file while the commit was finishing; it was "
+                                         "kept. Move it out of .tp-product/txn/, then run `tp-product apply DIR "
+                                         "--recover`", exit=3, details={"revision": meta["revision"]}) from None
+    shutil.rmtree(txn)
 
 
 def _roll_forward(root: Path, fault: Callable = _noop):
-    """Replace the live files with the journal's, each only while it is still the old or the new content."""
+    """Make the journal's files live (each by _place), then its history entry and commit record."""
     txn = control(root) / "txn"
     meta = load_txn(root)
     for name in FILES.values():  # the journal must hold what txn.json says it holds
@@ -463,11 +679,11 @@ def _roll_forward(root: Path, fault: Callable = _noop):
     taken = _history_taken(root, meta["revision"], data)  # before any live file is replaced
     if taken:
         raise _conflict(root, meta, taken[0])
+    refusal = _history_refusal(root, check_history(root), meta["revision"])  # never written on top of a bad chain
+    if refusal:
+        raise refusal
     for name in FILES.values():
-        if _changed_under(root, meta, [name]):  # checked again just before its replacement
-            raise _conflict(root, meta, name)
-        _write(root, root / name, (txn / name).read_bytes())
-        fault("after-replace:" + name)
+        _place(root, meta, name, fault)
     safe_write.ensure_dir(target.parent, what="package history", root=root)
     if not os.path.lexists(target):  # present with these bytes: written by this commit before an interruption
         try:
@@ -476,31 +692,39 @@ def _roll_forward(root: Path, fault: Callable = _noop):
             pass
     if _history_taken(root, meta["revision"], data):  # never replaced, whoever wrote it
         raise _conflict(root, meta, f"{CONTROL}/history/{target.name}")
-    if _changed_under(root, meta, ["commit.json"]):
-        raise _conflict(root, meta, "commit.json")
-    _write(root, control(root) / "commit.json", (txn / "commit.json").read_bytes())
+    _place(root, meta, "commit.json", fault)
     fault("after-commit-record")
-    shutil.rmtree(txn)
+    _finish_txn(root, meta, fault)
 
 
-def recover(package_dir) -> Optional[dict]:
+def recover(package_dir, fault: Callable = _noop) -> Optional[dict]:
     """With the lock held: finish a commit interrupted after its commit point, or discard one interrupted before it.
     Returns {"action": "rolled-forward"|"discarded", "revision": N} or None when there was nothing to recover.
-    Refuses (StoreError txn.conflict) when a live file is neither the old nor the new committed content: someone edited
-    it during the interruption, and overwriting it would lose that edit. A malformed journal is control.invalid."""
+    Refuses (StoreError txn.conflict) when a live file is neither the old nor the new committed content (someone edited
+    it during the interruption: overwriting it would lose that edit), or when a displaced copy holds someone else's
+    bytes (kept until the owner moves it). Roll-forward replaces files the same way a commit does (_place). A
+    malformed journal is control.invalid."""
     root = Path(package_dir)
     txn = control(root) / "txn"
     safe_write.check_below(root, txn, "package journal")
     if not txn.exists():
         return None
     if not (txn / "txn.json").exists():
-        shutil.rmtree(txn)
+        _discard(root, txn)
         return {"action": "discarded", "revision": None}
     meta = load_txn(root)
-    changed = _changed_under(root, meta, ALL)  # all of them, before any is replaced
+    copies = _displaced(root, meta)
+    kept = [p for p, _, ours in copies if not ours]
+    if kept:
+        raise StoreError("txn.conflict", f"{', '.join(map(str, kept))} holds bytes someone else wrote while the commit "
+                                         f"to revision {meta['revision']} replaced a file; they are kept. Compare them "
+                                         "with the live file, move what you need out of .tp-product/txn/, then run "
+                                         "`tp-product apply DIR --recover` again", exit=3,
+                         details={"revision": meta["revision"], "kept": [str(p) for p in kept]})
+    changed = _changed_under(root, meta, ALL, copies)  # all of them, before any is replaced
     if changed:
         raise _conflict(root, meta, changed[0])
-    _roll_forward(root)
+    _roll_forward(root, fault)
     return {"action": "rolled-forward", "revision": meta["revision"]}
 
 
@@ -534,14 +758,16 @@ def init(package_dir, package_id, title, owner="Not set", objective="Not framed 
     root = Path(package_dir)
     if root.is_symlink():
         raise StoreError("init.unsafe", f"{root} is a symbolic link")
-    def present():
+    def present():  # a history entry counts: init never starts a second history under an old one
         names = [n for n in FILES.values() if os.path.lexists(root / n)]
-        return names + [f"{CONTROL}/commit.json"] * os.path.lexists(control(root) / "commit.json")
+        names += [f"{CONTROL}/commit.json"] * os.path.lexists(control(root) / "commit.json")
+        return names + [f"{CONTROL}/history/{h:06d}.json" for h in history_numbers(root)]
     if present() and not (control(root) / "txn" / "txn.json").exists():
         raise StoreError("init.exists", f"{root} already holds {', '.join(present())}; refusing to overwrite a package")
     today = now()[:10]
     docs = scaffold(package_id, title, owner, objective, today)
-    issues = P.validate_docs(docs)
+    text = P.text_problem(docs)  # the one representability rule (package.text_problem), before the schema walks it
+    issues = [S.Issue("file.encoding", (), text)] if text else P.validate_docs(docs)
     if issues:
         raise StoreError("init.invalid", "; ".join(f"{S.format_path(i.path)}: {i.message}" for i in issues),
                          details={"issues": [i._asdict() for i in issues]})
@@ -552,7 +778,11 @@ def init(package_dir, package_id, title, owner="Not set", objective="Not framed 
         recover(root)
         if present():  # re-checked under the lock: a racing init lost
             raise StoreError("init.exists", f"{root} was initialised by another writer: {', '.join(present())}")
-        _write(root, control(root) / ".gitignore", IGNORE)
+        safe_write.ensure_dir(control(root), what="package control directory", root=root)
+        try:  # created once, never replaced: a .gitignore someone edited is theirs
+            _write_new(root, control(root) / ".gitignore", IGNORE)
+        except FileExistsError:
+            pass
         commit(root, docs, history_entry(actor, f"init {package_id}", [], None), fault=fault)
     return docs
 

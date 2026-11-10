@@ -75,10 +75,26 @@ def depth_problem(value):
     return None
 
 
-def file_problem(data: bytes, value):
-    """Why bytes `data` (the rendering of `value`) would not be read back by read_json_file, or None. Writers call this
-    on every file before their commit point."""
-    return size_problem(len(data)) or depth_problem(value)
+def text_problem(value):
+    """Why `value` holds text that cannot be written as UTF-8 (a lone surrogate, from a "\\ud800" escape or a str built
+    in memory), or None. The one owner of that rule: every input form and the on-disk package call it, after the depth
+    check (the walk is recursive)."""
+    try:
+        canonical(value)
+    except UnicodeEncodeError as exc:
+        return f"not valid Unicode: it holds a lone surrogate ({exc.object[exc.start:exc.end]!r})"
+    return None
+
+
+def file_problem(value, render):
+    """(bytes, problem): `render(value)` and why those bytes would not be read back by read_json_file (None when they
+    would). Writers call this on every file before their commit point; the bytes are only rendered once the value is
+    known to be representable."""
+    problem = depth_problem(value) or text_problem(value)
+    if problem:
+        return None, problem
+    data = render(value)
+    return data, size_problem(len(data))
 
 
 def read_json_file(path):
@@ -94,7 +110,7 @@ def read_json_file(path):
         value = json.loads(path.read_text(encoding="utf-8"))
     except RecursionError:
         raise ValueError(f"nested deeper than {MAX_DEPTH} levels") from None
-    problem = depth_problem(value)
+    problem = depth_problem(value) or text_problem(value)
     if problem:
         raise ValueError(problem)
     return value

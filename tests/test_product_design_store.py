@@ -670,6 +670,48 @@ class ReadBackTests(PackageCase):
                 self.assertEqual(err.details, {"problem": problem})
         self.assertTrue(C.apply(self.pkg, json.dumps(cs(CommitTests.EDIT)).encode(), 3)["committed"])  # bytes work
 
+    def test_text_that_is_not_unicode_is_one_structured_refusal_in_every_form(self):
+        # A lone surrogate (valid JSON, not UTF-8) once raised UnicodeEncodeError from apply, ingest, status and validate.
+        def change(text, title="T"):
+            return '{"schema":"tp-product-changeset","schema_version":1,"actor":"A","summary":"s","evidence":["e' + \
+                text + '"],"operations":[{"op":"set-manifest","fields":{"title":"' + title + text + '"}}]}'
+        for text in ("\\ud800", "\\udc00"):
+            escaped, char = change(text), json.dumps(json.loads(change(text)), ensure_ascii=False)  # str holds it raw
+            for name, value in (("text", escaped), ("text, raw", char), ("bytes", escaped.encode()),
+                                ("dict", json.loads(escaped))):
+                with self.subTest(text, form=name):
+                    err = self.refused("changeset.invalid", value)
+                    self.assertEqual(err.details, {"problem": "encoding"})
+            with self.subTest(text, form="bundle"):
+                raw = json.dumps(bundle(self.note())).replace('"text": "', '"text": "' + text, 1)
+                err = self.refused_bundle("bundle.invalid", raw.encode())
+                self.assertEqual([i["code"] for i in err.details["issues"]], ["bundle.encoding"])
+            with self.subTest(text, form="changeset file, --json"):
+                path = self.tmp / "cs.json"
+                path.write_text(escaped)
+                out = io.StringIO()
+                rc = cli.main(["apply", str(self.pkg), str(path), "--expected-revision", "3", "--json"], out=out,
+                              err=io.StringIO())
+                self.assertEqual((rc, json.loads(out.getvalue())["code"]), (1, "changeset.invalid"))
+        before = self.files()
+        (self.pkg / "package.json").write_text(
+            (self.pkg / "package.json").read_text().replace('"title": "', '"title": "\\ud800', 1))
+        for command in ("status", "validate"):
+            for flag in ([], ["--json"]):
+                with self.subTest("package on disk", command=command, flag=flag):
+                    out = io.StringIO()
+                    self.assertEqual(cli.main([command, str(self.pkg)] + flag, out=out, err=io.StringIO()), 1)
+                    if flag:
+                        rep = json.loads(out.getvalue())
+                        self.assertEqual([i["code"] for i in rep["issues"]], ["file.unreadable"])
+                        self.assertIn("lone surrogate", rep["issues"][0]["message"])
+        (self.pkg / "package.json").write_bytes(before["package.json"])
+        # Valid text: a pair written as two escapes and an unescaped astral character are accepted and read back.
+        for rev, title, text in ((3, "A", "\\ud83d\\ude00"), (4, "B", "\U0001F600")):
+            self.assertTrue(C.apply(self.pkg, change(text, title), rev)["committed"])
+            self.assertEqual(self.docs()["manifest"]["title"], title + "\U0001F600")
+        self.assert_trusted(5)
+
     def test_commits_stop_before_a_file_the_reader_would_refuse(self):
         # The reviewer's size probe: three bundles under the bundle limit once summed to a reviews.json no reader
         # accepted. The result is checked before the commit point; the refused commit writes nothing.
@@ -799,7 +841,7 @@ class WriterConflictTests(PackageCase):
     def test_a_history_entry_is_never_replaced(self):
         foreign = b'{"foreign": true}\n'
         (self.pkg / ".tp-product/history/000004.json").write_bytes(foreign)
-        self.refused("package.control-mismatch", cs(CommitTests.EDIT))
+        self.refused("package.unreadable", cs(CommitTests.EDIT))  # every history entry is checked: this one is malformed
         state = T.inspect(self.pkg)
         docs = copy.deepcopy(state["docs"])
         docs["manifest"]["revision"] = 4
@@ -808,6 +850,113 @@ class WriterConflictTests(PackageCase):
                      base_commit=state["commit_digest"])
         self.assertEqual((cm.exception.code, cm.exception.exit), ("history.exists", 3))
         self.assertEqual((self.pkg / ".tp-product/history/000004.json").read_bytes(), foreign)
+
+
+class DisplacementTests(PackageCase):
+    """A commit never destroys bytes it did not write. Each live file is renamed into txn/displaced/, checked, and the
+    new file linked into place; an editor at any step keeps its bytes, live or in a named copy that status reports."""
+    POINTS = ("before-displace", "after-displace", "after-check", "before-link", "after-link", "after-replace",
+              "before-cleanup")
+    EDIT_ALL = (CommitTests.EDIT, {"op": "set-manifest", "fields": {"title": "Placed"}})
+    KINDS = ("rename", "path", "held")
+    fresh_pkg = WriterConflictTests.fresh_pkg
+
+    def run_command(self, command, pkg, fault):
+        if command == "apply":
+            return C.apply(pkg, cs(*self.EDIT_ALL), 3, fault=fault)
+        if command == "recover":  # an apply interrupted after its commit point, finished with the fault
+            with self.assertRaises(Crash):
+                C.apply(pkg, cs(*self.EDIT_ALL), 3, fault=crash_at("after-commit-point"))
+            with T.lock(pkg):
+                return T.recover(pkg, fault=fault)
+        return WriterConflictTests.run_command(self, command, pkg, fault)
+
+    @staticmethod
+    def editor(target, kind, data):
+        """An editor that saves by rename, writes through the path, or writes through a file it opened earlier."""
+        fd = os.open(target, os.O_WRONLY) if kind == "held" else None
+
+        def save():
+            if kind == "rename":
+                tmp = target.with_name(target.name + ".editor")
+                tmp.write_bytes(data)
+                os.replace(tmp, target)
+            elif kind == "path":
+                target.write_bytes(data)
+            else:
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, data, 0)
+        return save, (lambda: os.close(fd)) if fd is not None else (lambda: None)
+
+    def test_an_editor_at_every_step_keeps_its_bytes(self):
+        reached = 0
+        for command, names in (("apply", ("package.json", "design.json", "commit.json")),
+                               ("ingest", ("package.json", "reviews.json", "commit.json")),
+                               ("adopt", ("commit.json",)), ("recover", ("design.json", "commit.json"))):
+            for name in names:
+                for n, point in enumerate(self.POINTS):  # every editor for apply; one per step, in turn, for the rest
+                    for kind in self.KINDS if command == "apply" else self.KINDS[(n + len(name)) % 3:][:1]:
+                        with self.subTest(command=command, file=name, point=point, editor=kind):
+                            pkg = self.fresh_pkg(command)
+                            target = pkg / (".tp-product/commit.json" if name == "commit.json" else name)
+                            data = f'{{"editor": "{command} {name} {point} {kind}"}}\n'.encode()
+                            save, close = self.editor(target, kind, data)
+                            want, fired = point if point == "before-cleanup" else f"{point}:{name}", []
+
+                            def fault(p):
+                                if p == want and not fired:
+                                    fired.append(save())
+                            try:
+                                self.run_command(command, pkg, fault)
+                                err = None
+                            except T.StoreError as exc:
+                                err = exc
+                            finally:
+                                close()
+                            self.assertTrue(fired)
+                            reached += 1
+                            where = sorted((p for p in pkg.rglob("*") if p.is_file() and p.read_bytes() == data),
+                                           key=lambda p: "displaced" not in p.parts)
+                            # kept, as one file: put back in place, its displaced name is the retained copy
+                            self.assertEqual(len({p.stat().st_ino for p in where}), 1, where)
+                            rep, rc = cli.status_report(pkg)
+                            self.assertEqual(rep["trusted"], False)
+                            self.assertIn(rc, (1, 3))  # 1 when the editor's bytes are not a valid document
+                            if "displaced" in where[0].parts:  # kept aside: named, reported, and kept by recover
+                                self.assertEqual((err.code, err.details["kept"]), ("txn.conflict", [str(where[0])]))
+                                self.assertIn("package.displaced", {t["code"] for t in rep["trust"]})
+                                with T.lock(pkg), self.assertRaises(T.StoreError):
+                                    T.recover(pkg)
+                                self.assertEqual(where[0].read_bytes(), data)
+                            elif err is not None:
+                                self.assertIn(err.code, ("txn.conflict", "commit.external-edit"))
+        self.assertEqual(reached, 7 * 3 * 3 + 7 * 6)
+
+    def test_a_crash_at_every_step_recovers_and_leaves_nothing_displaced(self):
+        for name in ("package.json", "design.json", "commit.json"):
+            for point in self.POINTS:
+                with self.subTest(file=name, point=point):
+                    pkg = self.fresh_pkg("apply")
+                    want = point if point == "before-cleanup" else f"{point}:{name}"
+                    with self.assertRaises(Crash):
+                        C.apply(pkg, cs(*self.EDIT_ALL), 3, fault=crash_at(want))
+                    self.assertEqual(T.inspect(pkg)["interrupted"], 4)
+                    with T.lock(pkg):
+                        self.assertEqual(T.recover(pkg), {"action": "rolled-forward", "revision": 4})
+                    rep, rc = cli.status_report(pkg)
+                    self.assertEqual((rc, rep["revision"]), (0, 4))
+                    self.assertFalse((pkg / ".tp-product/txn").exists())
+
+    def test_a_journal_without_its_commit_point_never_discards_a_displaced_copy(self):
+        held = self.pkg / ".tp-product/txn/displaced"
+        held.mkdir(parents=True)
+        (held / "design.json~0").write_bytes(b"only copy")
+        rep, rc = cli.status_report(self.pkg)
+        self.assertEqual((rc, rep["trusted"]), (3, False))
+        with self.assertRaises(T.StoreError) as cm:
+            C.apply(self.pkg, cs(CommitTests.EDIT), 3)
+        self.assertEqual(cm.exception.code, "control.invalid")
+        self.assertEqual((held / "design.json~0").read_bytes(), b"only copy")
 
 
 class ControlRecordTests(PackageCase):
@@ -855,6 +1004,17 @@ class ControlRecordTests(PackageCase):
             ("history top other files", hist(3, lambda d: d["files"].update({"design.json": zero})), False, 3),
             ("history beyond the commit", hist(4, lambda d: d.update(revision=4)), False, 3),
             ("history gap", hist(1, lambda d: d.update(revision=1)), False, 3),
+            # Every entry is checked, not only the top (the review's F2-F4 probes), without building a range (F6).
+            ("history older a list", write(".tp-product/history/000002.json", b"[]"), False, 1),
+            ("history older empty", write(".tp-product/history/000002.json", b""), False, 1),
+            ("history older base text", hist(2, lambda d: d.update(revision=2, base_revision="1")), False, 1),
+            ("history top base far", hist(3, lambda d: d.update(base_revision=999)), False, 3),
+            ("history top base negative", hist(3, lambda d: d.update(base_revision=-1)), False, 1),
+            ("history top revision huge", hist(3, lambda d: d.update(revision=10 ** 30)), False, 1),
+            ("history entry numbered huge", hist(10 ** 30, lambda d: d.update(revision=10 ** 30, base_revision=3)),
+             False, 3),
+            ("commit revision huge", commit(lambda d: d.update(revision=10 ** 30)), False, 3),
+            ("commit revision negative", commit(lambda d: d.update(revision=-1)), False, 1),
             ("txn empty", write(self.TXN, b""), True, 1),
             ("txn a list", write(self.TXN, b"[1]"), True, 1),
             ("txn revision text", txn(lambda d: d.update(revision="4")), True, 1),
@@ -879,7 +1039,9 @@ class ControlRecordTests(PackageCase):
                 for command in ("status", "validate"):
                     out = io.StringIO()
                     rc = cli.main([command, str(self.pkg), "--json"], out=out, err=io.StringIO())
-                    json.loads(out.getvalue())
+                    rep = json.loads(out.getvalue())
+                    self.assertTrue(rep["trust"], (command, rep))  # never trusted, in either output (F2)
+                    self.assertIs(rep["trusted"], False)
                     codes[command] = rc
                 self.assertIn(codes["status"], (1, 3) if exit_code == 1 else (3,))
                 self.assertEqual(codes["validate"] != 0, True)
@@ -921,6 +1083,28 @@ class ControlRecordTests(PackageCase):
             T.recover(self.pkg)
         self.assertEqual((cm.exception.code, cm.exception.exit), ("control.invalid", 1))
         self.assertEqual(self.snapshot(), before)
+
+    def test_an_adoption_without_a_commit_record_continues_from_the_history(self):
+        # The review's adopt-gap probe: with commit.json deleted and the manifest saying 3, adoption wrote entry 4 after
+        # entry 1, a history with a gap. It now follows the history (checked whole) or refuses.
+        fresh = self.tmp / "p"
+        T.init(fresh, "p", "one")
+        (fresh / ".tp-product/commit.json").unlink()
+        self.rewrite(fresh / "package.json", lambda d: d.update(revision=3))
+        adopt = cs({"op": "adopt-external-edit", "by": "Owner", "reason": "restore control"})
+        before = {p: p.read_bytes() for p in fresh.rglob("*") if p.is_file() and p.name != "lock"}
+        with self.assertRaises(T.StoreError) as cm:
+            C.apply(fresh, adopt, 3)
+        self.assertEqual((cm.exception.code, cm.exception.exit, cm.exception.details["current"]),
+                         ("revision.conflict", 4, 1))
+        self.assertEqual({p: p.read_bytes() for p in fresh.rglob("*") if p.is_file() and p.name != "lock"}, before)
+        self.assertEqual(C.apply(fresh, adopt, 1)["revision"], 2)
+        self.assertEqual(T.history_numbers(fresh), [1, 2])
+        rep, rc = cli.status_report(fresh)
+        self.assertEqual((rc, rep["trusted"], rep["revision"]), (0, True, 2))
+        # A history that starts after revision 1 is whole when its chain is (the fixture's starts at 3).
+        T.history_path(fresh, 1).unlink()
+        self.assertEqual(cli.status_report(fresh)[1], 0)
 
     def test_init_writes_a_complete_history_entry(self):
         fresh = self.tmp / "p"

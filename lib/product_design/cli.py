@@ -144,7 +144,8 @@ def main(argv=None, out=None, err=None) -> int:
             state = T.inspect(args.package_dir)
             trust = T.trust_problems(state)
             if as_json:
-                print(json.dumps({"valid": not state["issues"], "issues": [i._asdict() for i in state["issues"]],
+                print(json.dumps({"valid": not state["issues"], "trusted": not trust,
+                                  "issues": [i._asdict() for i in state["issues"]],
                                   "trust": [{"code": c, "message": m} for c, m in trust]}, indent=2), file=out)
             elif state["issues"]:
                 print(f"invalid: {len(state['issues'])} issue(s)", file=out)

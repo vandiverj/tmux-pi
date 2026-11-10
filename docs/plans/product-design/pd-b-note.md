@@ -57,13 +57,45 @@ Deviations and limits:
 
 - **Reopening an accepted uncertainty** (a `set` that withdraws or rewrites an accepted question) is not changed here;
   it is owed to PD-E with the rest of the uncertainty workflow.
-- History may start after revision 1 (an imported package); only the newest entry is validated field by field, the
-  rest by name and sequence.
-- The commit-point check and the replacement are not one atomic step: an editor that saves in the instant between the
-  check and a rename can still be replaced. Roll-forward rechecks each file just before its replace, which narrows
-  but does not close that window; the lock only excludes cooperating writers.
+- (Superseded by round 3: every history entry is now validated, and files are displaced rather than replaced.)
 - Deleting an original input or review by hand is refused by the earlier checks (`adopt.authority` for an input's
   status, `adopt.invalid` when a slice's readiness names the review), not by `adopt.original`; either way the
   original is kept.
 - Round 1's attack report miscounted its mismatches: the final run had none, and the runs before it had 5 and then
   1 (two expectation-ordering errors, one readiness expectation, two TypeErrors, then one adoption ordering).
+
+## Round 3: a commit never loses data or trust (2026-11-09)
+
+- **Displacement, not replacement (F1).** `store._place` renames each live file into `txn/displaced/NAME~TOKEN`,
+  checks the displaced bytes against the old (or new) digest, and links the new file in place with `os.link`, which
+  fails if the name has reappeared. Someone else's displaced bytes are linked back (unless the name was saved again,
+  when the newer save stays) and kept; a file that appeared at the name stays; after the link the displaced copy is
+  checked again. Each is `txn.conflict` naming the kept copy (`details.kept`); the journal stays, so status reports
+  `package.interrupted` and `package.displaced` until `--recover`. `_finish_txn` removes only copies that hold the
+  old or new content, checked just before. `recover` and roll-forward use the same steps. A file whose live content is
+  already the new content is not rewritten (it used to be replaced with identical bytes).
+- **Every control record is validated (F2-F4, F6).** `store.check_history` reads every `NNNNNN.json`: shape, types,
+  revision equal to the name, and each `base_revision` equal to the entry before it, gaps found by comparing
+  neighbours (no range is built, so any integer is a structured refusal). Any `control.invalid` makes status and
+  validate untrusted (`package.control-invalid`). `commit`, roll-forward and `init` (which also refuses a leftover
+  history) refuse to write a revision on a history that fails. An adoption with `commit.json` missing continues from
+  the newest history entry, or is refused (`revision.conflict`, exit 4) when `--expected-revision` is the manifest's.
+- **One representability rule (F5).** `package.text_problem` (a lone surrogate) is called by `file_problem` (every
+  file a commit writes), `read_json_file` (every file read) and `changes.load_json_input` (bytes, text, parsed
+  values and changeset files), so each form is a structured `encoding` problem; `--json` prints the error object.
+- **Report correction (F8).** Round 2's report said `read_json_file` went through `file_problem`; it calls
+  `size_problem` and `depth_problem` directly (now also `text_problem`).
+
+Limits, stated:
+
+- A writer that holds the old file open and writes to it after `_finish_txn`'s last check (between the check and the
+  unlink of a displaced copy) still loses that write: the window is one `unlink` long, and only a writer that keeps
+  writing to a file that is no longer at its name can hit it. The same holds for the instant between the final check
+  in `_place` and the next step.
+- Copies are compared by canonical-JSON digest: an editor's save that only re-indents the old content counts as the
+  old content, and its copy is removed.
+- An editor that saves by rename after the new file is linked wins: its file is live and the package reports
+  `package.external-edit`, as for any edit after a commit.
+- `init` writes `.gitignore` only when absent; the changeset path given on the command line is not checked for
+  symlinks (it is read, never written).
+- F7 (reopening an accepted uncertainty) stays owed to PD-E.

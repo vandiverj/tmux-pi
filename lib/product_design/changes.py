@@ -47,28 +47,36 @@ def _get(rec, *path):
 
 def load_json_input(raw, limit=None):
     """(value, problem) for JSON input given as bytes, text or an already-parsed value. The same limits apply to every
-    form: at most `limit` bytes (of the UTF-8 text, or of the canonical JSON of a parsed value) and package.MAX_DEPTH
-    levels of nesting. problem is None or (code suffix: "size" | "unreadable" | "depth", message)."""
+    form: at most `limit` bytes (of the UTF-8 text, or of the canonical JSON of a parsed value), package.MAX_DEPTH
+    levels of nesting, and text that is valid Unicode (package.text_problem: no lone surrogate, whether it arrives as
+    an escape, in text built in memory or in a parsed value). problem is None or (code suffix: "size" | "unreadable" |
+    "depth" | "encoding", message)."""
     limit = MAX_BUNDLE_BYTES if limit is None else limit
     if isinstance(raw, (bytes, bytearray, str)):
         data = raw.encode("utf-8", "surrogatepass") if isinstance(raw, str) else bytes(raw)
         if len(data) > limit:
             return None, ("size", f"larger than {limit} bytes ({len(data)})")
-        try:
-            value = json.loads(data.decode("utf-8"))
+        try:  # text is parsed as given: a lone surrogate in it is reported below, as for every form
+            value = json.loads(raw if isinstance(raw, str) else data.decode("utf-8"))
         except RecursionError:
             return None, ("depth", f"nested deeper than {P.MAX_DEPTH} levels")
         except (UnicodeDecodeError, ValueError) as exc:
             return None, ("unreadable", f"not JSON: {exc}")
         depth = P.depth_problem(value)
-        return (None, ("depth", depth)) if depth else (value, None)
+        if depth:
+            return None, ("depth", depth)
+        text = P.text_problem(value)
+        return (None, ("encoding", text)) if text else (value, None)
     depth = P.depth_problem(raw)  # first: canonical() recurses
     if depth:
         return None, ("depth", depth)
     try:
-        size = len(P.canonical(raw))
+        text = P.text_problem(raw)
+        size = None if text else len(P.canonical(raw))
     except (TypeError, ValueError, RecursionError) as exc:
         return None, ("unreadable", f"not a JSON value: {exc}")
+    if text:
+        return None, ("encoding", text)
     if size > limit:
         return None, ("size", f"larger than {limit} bytes as JSON ({size})")
     return raw, None
@@ -384,9 +392,19 @@ def _open(package_dir, expected_revision, adopting=False):
         raise T.StoreError(code, message, exit=3, details={"external": state["external"]})
     # With no commit record (a package written by hand), only adoption is possible, and it is refused while the package
     # holds any acceptance record (authority_changed then lists every one): acceptances are recorded only by operations.
-    current = commit["revision"] if commit else state["docs"].get("manifest", {}).get("revision")
+    # Without a commit record but with a history (commit.json deleted), the revision continues from the history, which
+    # inspect has checked whole: the next entry follows its top, whatever the manifest says.
+    current = commit["revision"] if commit else (state["history"][-1] if state["history"] else
+                                                 state["docs"].get("manifest", {}).get("revision"))
     if not isinstance(current, int) or isinstance(current, bool):
         raise T.StoreError("package.invalid", "the manifest has no integer revision", exit=1)
+    if expected_revision is not None and expected_revision != current and commit is None and state["history"]:
+        raise T.StoreError("revision.conflict",
+                           f"the package has no commit record and its history ends at revision {current} (the manifest "
+                           f"says {_get(state['docs'], 'manifest', 'revision')!r}): an adoption continues from the history. "
+                           f"Apply it with --expected-revision {current}, or restore .tp-product/commit.json from version "
+                           "control. Nothing was written.",
+                           exit=4, details={"expected": expected_revision, "current": current})
     if expected_revision is not None and expected_revision != current:
         raise T.StoreError("revision.conflict",
                            f"the package is at revision {current}, not {expected_revision}: another change was committed "

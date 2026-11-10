@@ -168,14 +168,14 @@ traceback. Reads never write. No command makes a network call or starts anything
 | Code | Exit | Meaning |
 | --- | --- | --- |
 | `changeset.unreadable` | 1 | The changeset file is missing, a directory or not readable |
-| `changeset.invalid` | 1 | Not UTF-8 JSON, wrong format, too large or too deep (`details.problem`: `size`, `depth`, `unreadable`) |
+| `changeset.invalid` | 1 | Not UTF-8 JSON, wrong format, too large, too deep, or text that is not valid Unicode (`details.problem`: `size`, `depth`, `unreadable`, `encoding`) |
 | `op.missing`, `op.shape` | 1 | An operation lacks a field, has an unknown one, or one of the wrong type (`details.operation`) |
 | `result.invalid`, `result.unreadable` | 1 | The result does not validate, or a file it would write exceeds what a reader accepts (`details.file`) |
 | `control.invalid` | 1 | `commit.json`, a history entry or the journal is malformed, or the journal does not match its files |
 | `io.error` | 1 | The package path cannot be read or written as a directory |
-| `package.control-mismatch` | 3 | Control records disagree (commit revision, top history entry, history gap, journal revision) |
+| `package.control-mismatch` | 3 | Control records disagree (commit revision, a history entry's file digests or `base_revision`, a gap in history, journal revision) |
 | `commit.external-edit` | 3 | A file changed between inspection and the commit point; the commit is withdrawn and the edit kept |
-| `txn.conflict` | 3 | Recovery found a file that is neither the old nor the new content |
+| `txn.conflict` | 3 | A file was neither the old nor the new content when a commit or recovery came to replace it, or someone wrote to it while it was being replaced; their bytes are kept (`details.kept` names a copy kept in `txn/displaced/`) |
 | `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
 | `adopt.original` | 1 | An adoption would remove or change an original note, input or review |
 
@@ -188,29 +188,48 @@ Control state is in `DIR/.tp-product/`:
 | `commit.json` | yes | The commit record: revision, the canonical digest of each package file, the digest of each record's acceptance (authority) fields, and the digest of each original note, input and review |
 | `history/NNNNNN.json` | yes | One entry per committed revision: actor, summary, evidence, operations, base revision, impact |
 | `lock` | no | The writer lock (flock) |
-| `txn/` | no | The journal of a commit in progress; present only during, or after an interrupted, commit |
+| `txn/` | no | The journal of a commit in progress; present only during, or after an interrupted, commit. `txn/displaced/` holds the live files the commit moved aside |
 | `.gitignore` | yes | Written by `init`: ignores `lock` and `txn/` |
 
 A commit takes the lock, checks `--expected-revision`, validates the whole result, writes every new file into `txn/`,
 then writes `txn/txn.json` last: that is the commit point. It then replaces the live files, writes the history entry
 and the commit record, and removes `txn/`. A crash before the commit point leaves the live package untouched (the next
-writer discards the partial journal). A crash after it leaves every file whole (old or new, never partial); readers
-report `package.interrupted`, writers refuse, and `apply --recover` rolls the commit forward. Recovery refuses
-(`txn.conflict`) when a live file is neither the old nor the new content: someone edited it during the interruption.
+writer discards the partial journal). A crash after it leaves every file whole (old or new, never partial, or moved
+aside into `txn/displaced/`); readers report `package.interrupted`, writers refuse, and `apply --recover` rolls the
+commit forward the same way. Recovery refuses (`txn.conflict`) when a live file is neither the old nor the new content:
+someone edited it during the interruption.
+
+**A commit never destroys bytes it did not write.** A file is replaced in three steps: the live file is renamed into
+`txn/displaced/NAME~TOKEN` (never unlinked), the displaced bytes are checked against what the change was computed from,
+and the new file is linked into place, which fails if anything has appeared at the name since. If the displaced bytes
+are someone else's, they are put back (unless the name was saved again meanwhile, when the newer save stays) and the
+copy is kept; if a file appeared at the name, it stays; after the link the displaced copy is checked once more, for a
+writer that held the old file open. Each case is `txn.conflict` with the kept copy named in `details.kept`; the journal
+stays, so `status` reports `package.interrupted` and `package.displaced` until the owner moves the copy out of
+`.tp-product/txn/` and runs `apply --recover`. Displaced copies that hold the old (or new) content are removed when the
+commit completes; nothing else is removed without a user's command. A file the commit does not change is not rewritten.
 
 No write replaces bytes it has not seen. Just before the commit point every live file, `commit.json` and the new
 history slot are compared with what the change was computed from; a difference withdraws the commit
 (`commit.external-edit`), keeps the other writer's bytes and leaves the package reporting the edit. Roll-forward checks
 each file again before replacing it. A history entry is created, never replaced (`history.exists`).
 
-Every file a commit writes is checked against the reader's limits first (8 MiB, nesting depth 64), with the same
-constants the reader uses, so what is committed can always be read back (`result.unreadable`, nothing written).
+Every file a commit writes is checked against the reader's limits first (8 MiB, nesting depth 64, text that is valid
+Unicode), with the same functions the reader uses, so what is committed can always be read back (`result.unreadable`,
+nothing written). Text that is not valid Unicode (a lone surrogate, which JSON's `\ud800` escape can carry) is refused
+in every input form, bytes, text, a parsed value or a file (`changeset.invalid` or `bundle.encoding`), and a package file
+holding it is `file.unreadable`.
 
 The control records are checked before they are believed: a malformed `commit.json`, history entry or journal is
 `control.invalid`; a `commit.json` whose revision is not the newest history entry's, a gap in history, a top entry
 whose file digests differ from `commit.json`, or a journal for an unexpected revision makes the package untrusted
-(`package.control-mismatch`). Writers, adoption included, refuse until the owner repairs it. History may start after
-revision 1 (an imported package); only the newest entry is checked field by field.
+(`package.control-mismatch`). Every history entry is checked: its fields and types, its revision against its file name
+(`NNNNNN.json`, six digits or more; other names are ignored), and its `base_revision` against the entry before it. Any
+`control.invalid` makes the package untrusted in every output (`package.control-invalid`). Writers, adoption included,
+refuse until the owner repairs it, and no command writes a revision on top of a history that fails these checks. History
+may start after revision 1 (an imported package) when its chain is complete from there. A package whose `commit.json`
+is missing but whose history is whole is adopted from the newest history entry (`--expected-revision` is that entry's
+revision, whatever the manifest says).
 
 Digests are of canonical JSON, so re-indenting a file is not an edit. Files are written with two-space indentation.
 

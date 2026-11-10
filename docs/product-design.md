@@ -155,6 +155,8 @@ tp-product build DIR [--expected-revision N] [--json]
                                     write the offline review page builds/ID-rREV.html and record it in the manifest
 tp-product import-feedback DIR BUNDLE [--expected-revision N] [--json]
                                     import a feedback bundle exported by a review page; all or nothing
+tp-product remap-anchor DIR NOTE TARGET --reason TEXT [--by LABEL] [--expected-revision N] [--json]
+                                    anchor a note to another target of the review build, keeping its original
 ```
 
 | Exit | Meaning |
@@ -184,7 +186,9 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `history.exists` | 3 | The history entry for the new revision already exists; it is never replaced |
 | `adopt.original` | 1 | An adoption would remove or change an original note, input or review |
 | `adapter.invalid` | 1 | `build`: `prototype/adapter.json` is unreadable or outside its schema, names an unknown page, contract or operation, repeats an id, or its script or style cannot be inlined (a symlink, outside the package, over 2 MiB, not UTF-8, or holding `</script`, `</style` or `<!--`) |
-| `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file); it is never replaced |
+| `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file), including the recorded build of the current source when its bytes are not the recorded digest; it is never replaced and never reported up to date |
+| `build.conflict` | 3 | `build`: the commit failed before its commit point and the build file had been replaced by someone else meanwhile; their bytes are kept |
+| `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem |
 | `bundle.unreadable` | 1 | `import-feedback`: the bundle file cannot be read |
 | `bundle.invalid`, `bundle.conflict` | 1 | `import-feedback`: see Feedback ingestion; nothing was written |
 
@@ -327,6 +331,16 @@ A feedback bundle is what a review build exports:
   the target registry (below), `current` when its build fingerprint equals the package's content fingerprint, else
   `changed-context`. Its original fields are kept verbatim; a note is never dropped for its anchor. The command lists
   the unresolved notes and says the inputs stay pending until reconciled.
+- Anchors are re-evaluated on every import and every build, for every stored note, duplicates included: a note whose
+  target, journey or scenario has left the build's registry becomes `unresolved` (its original fields are kept), and
+  one whose target is back is anchored again. A change is committed as a `re-anchor` operation; `status` lists the
+  unresolved notes from the live evaluation.
+- `tp-product remap-anchor DIR NOTE TARGET --reason TEXT` anchors a note to another target of the registry. It goes
+  through the same transaction as every change (`remap-anchor` operation): the note keeps its original `target`, and
+  `remap` records the new target, the reason, who decided it and the date; the anchor becomes `remapped` (or
+  `unresolved` if that target later leaves the registry). The same target and reason again is a no-op; a target outside
+  the registry is refused. A bundle may not carry `remap`. `status` lists remapped notes with both targets, and the
+  review page shows them the same way.
 - JSON is read as RFC 8259 defines it, by the CLI and the page alike: a byte order mark, `NaN`, `Infinity` and
   invalid UTF-8 are refused (`bundle.unreadable` issue), and nothing writes `NaN` or an infinity. Schema patterns
   have their ECMA-262 meaning in both validators: `$` does not match before a final line break.
@@ -345,16 +359,25 @@ profiles. Validation reads only the three package files, makes no network call a
 
 `tp-product build DIR` renders the committed, trusted package into one HTML file a reviewer opens from disk
 (`file://`), writes it as `builds/<id>-r<revision>.html` and records it in the manifest's `builds` list (`revision`,
-`fingerprint`, `source`, `file`) through the same transaction as every other change, so the build moves the package
-to the next revision. A build file exists only with its manifest entry: a failed commit removes it.
+`fingerprint`, `source`, `file`, `digest`: the sha256 of the file's bytes) through the same transaction as every
+other change, so the build moves the package to the next revision.
+
+- **The build file and the commit point.** The file is written before the commit point. If the commit fails before
+  that point, the file is removed, but only while it is still this build's file with this build's bytes (someone
+  else's bytes are kept). After the commit point the file is never removed. A commit, and recovery of an interrupted
+  one, checks every build it records just before the commit record and refuses (`package.build-missing`, journal
+  kept) when a file is absent or holds other bytes; `status` reports such a journal as a trust problem.
 
 - **Offline.** The runtime (`templates/product-design/runtime/`), the prototype and the package data are inlined. The
   page's Content-Security-Policy is `default-src 'none'` (so no connection, image, frame or font), with the
   inlined scripts and style allowed only by their sha256 hashes, and `base-uri` and `form-action` set to `'none'`.
-  Nothing is fetched and no CDN is used.
+  Nothing is fetched and no CDN is used. Scripts and styles are inlined with their line breaks normalized to LF (as
+  the HTML parser delivers CRLF and CR), so the policy's hashes match what the browser hashes; a NUL is refused.
 - **Provenance.** The page records the package id, revision, generator, `content_fingerprint` (the design content
   that notes carry) and `source_fingerprint` (everything the page shows except the revision counter).
-- **Stable.** Building an unchanged package again reports "up to date" and writes nothing. Importing notes changes no
+- **Stable.** Building an unchanged package again reports "up to date" and writes nothing, but only when the recorded
+  build file holds exactly the recorded digest (an entry from before digests: exactly the page this content renders);
+  otherwise it is `build.exists`, never up to date. Importing notes changes no
   source fingerprint; a design change does. Identical bytes already at the build path are reused. A file there with
   other bytes is refused (`build.exists`, exit 3) and never replaced.
 - **Inert data.** Package text reaches the page only inside one JSON block whose `<`, `>`, `&`, U+2028 and U+2029 are
@@ -371,18 +394,34 @@ to the next revision. A build file exists only with its manifest entry: a failed
   twice and none is lost.
 - **Guided and unguided tasks:** a scenario can be followed step by step (guided) or attempted without steps
   (unguided). Help requests and assisted steps are counted separately, and the outcome is recorded per task.
+  Back and Reset in a guided task reopen it: undoing a step that completed it sets it to in progress again. A completed
+  unguided task stays completed after Back or Reset: its outcome is an observation (the reviewer reached the result
+  without steps), and undoing the actions afterwards does not unmake that observation.
+- **Resuming:** resuming a session (from this browser or an imported bundle) resumes its task in progress: the
+  scenario, the mode, a guided task's step (derived from the checkpoint's actions) and the help and assistance counts.
+  The next note carries that context.
 - **Notes:** `n`, the toolbar button or a right click starts a note. In note mode, a click (or Enter or Space on a
   focused target) picks a prototype target instead of acting. The note captures the page, journey, scenario, step,
   target, a copy of the state and the checkpoint at that moment. While a note is open the prototype is paused: an
-  action is refused with a visible message until the note is saved or Escape closes it.
+  action is refused with a visible message until the note is saved or Escape closes it. An open note keeps its whole
+  draft (text and category) across every redraw of the page.
 - **Answers and proposals** on open questions and proposed rules and decisions are stored as `pending`. A label or
   text that claims approval changes nothing.
 - **Storage:** everything is saved in the browser's `localStorage` under `tp-product-review:v1:<package id>`. When
   storage is denied, or the saved data cannot be read, the page says so and keeps working for the visit. It never
-  overwrites data it could not read.
+  overwrites data it could not read. Any stored value (not JSON, `null`, `0`, an array, a partial or inconsistent
+  state, any depth) is checked field by field before use; one that fails is left untouched under its key, a notice
+  says so, and the page starts fresh.
 - **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions; the JSON is also shown in
   case the download was blocked). Import applies the CLI's rules (schema, package, version, limits, pending inputs, no
-  local bookkeeping, conflicting ids) and is all or nothing. Importing a bundle into a fresh browser and resuming its
+  local bookkeeping, conflicting ids) and is all or nothing. Nesting depth is measured without recursion, so any depth
+  gets the 64-level refusal. A number the page could not export as written (an integer beyond 2^53, `-0`, an
+  exponent, a trailing zero, a long decimal) is refused visibly, so whatever the page exports imports into the CLI as
+  it was. Ids are looked up as own properties only: `constructor`, `__proto__` or `toString` are ids like any other,
+  and an unknown field with such a name is refused as the CLI refuses it. Export checks the bundle's bytes, records
+  and depth first; feedback larger than one bundle is exported as several bundles (`-part-N-of-M`), each within the
+  limits and importable on its own. A note or answer that would not fit a bundle on its own is refused when it is
+  saved. Importing a bundle into a fresh browser and resuming its
   session restores the same prototype state. A note whose target is not in this build is listed as unresolved, never
   dropped.
 

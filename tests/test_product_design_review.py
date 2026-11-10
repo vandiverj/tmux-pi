@@ -7,12 +7,14 @@ profile, a file:// URL and every non-file request recorded; it is skipped, with 
 missing. The generated input spaces (escaping, note capture, reset/back replay, the export/import round trip) are the
 PD-C attack scripts (task evidence, not tracked); these are the rows worth keeping.
 """
+import contextlib
 import copy
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -82,7 +84,8 @@ class BuildTests(BuildCase):
         page = (self.pkg / BUILD).read_bytes()
         m = self.docs()["manifest"]
         self.assertEqual(m["builds"][-1], {"revision": 3, "fingerprint": r["content_fingerprint"],
-                                           "source": r["source_fingerprint"], "file": BUILD})
+                                           "source": r["source_fingerprint"], "file": BUILD, "digest": r["digest"]})
+        self.assertEqual(r["digest"], T.file_digest(self.pkg / BUILD))
         self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
         data = embedded(page)
         self.assertEqual((data["build"]["revision"], data["build"]["source_fingerprint"],
@@ -178,6 +181,119 @@ class BuildTests(BuildCase):
         self.assertFalse((self.pkg / BUILD).exists())
         self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
 
+    def test_a_recorded_build_with_other_bytes_is_never_up_to_date(self):
+        R.build(self.pkg)
+        page = (self.pkg / BUILD).read_bytes()
+        for why, data in (("one byte changed", page[:-2] + b"X" + page[-1:]), ("empty", b""), ("other page", b"<p>x</p>")):
+            with self.subTest(why):
+                (self.pkg / BUILD).write_bytes(data)
+                e = self.refused("build.exists", 3)
+                self.assertIn("not reported up to date", str(e))
+                self.assertEqual(self.run_cli("build", self.pkg, "--json")[0], 3)
+        (self.pkg / BUILD).unlink()
+        (self.pkg / "builds/x").write_bytes(page)
+        os.symlink("x", self.pkg / BUILD)  # the recorded bytes behind a link are not the build file either
+        self.refused("build.exists", 3)
+
+    def test_every_interruption_point_keeps_the_build_file_after_the_commit_point_and_only_its_own_before(self):
+        points = []
+        probe = self.tmp / "probe"
+        shutil.copytree(FIXTURE, probe)
+        R.build(probe, fault=points.append)
+        page = (probe / BUILD).read_bytes()
+        self.assertGreaterEqual(len(points), 20)
+        self.assertEqual(points[:3], ["before-build-write", "after-build-write", "before-commit-point"])
+        for i, point in enumerate(points):
+            for act in ("stop", "foreign", "delete"):
+                with self.subTest(point=point, act=act):
+                    pkg = self.tmp / f"p{i}-{act}"
+                    shutil.copytree(FIXTURE, pkg)
+
+                    def fault(at, point=point, act=act, pkg=pkg):
+                        if at != point:
+                            return
+                        if (pkg / BUILD).exists() and act == "foreign":
+                            (pkg / BUILD).write_bytes(b"someone else's bytes")
+                        elif (pkg / BUILD).exists() and act == "delete":
+                            (pkg / BUILD).unlink()
+                        raise RuntimeError(point)
+                    with self.assertRaises((RuntimeError, T.StoreError)):
+                        R.build(pkg, fault=fault)
+                    after_point = (T.control(pkg) / "txn/txn.json").exists() or self.committed(pkg) == 4
+                    held = (pkg / BUILD).read_bytes() if (pkg / BUILD).exists() else None
+                    if act == "foreign" and point != "before-build-write":
+                        self.assertEqual(held, b"someone else's bytes")  # never deleted, whoever wrote it
+                    elif act == "delete" and point != "before-build-write":
+                        self.assertIsNone(held)
+                    elif after_point:
+                        self.assertEqual(held, page)  # after the commit point the file stays
+                    else:
+                        self.assertIsNone(held)  # before it, this build's own file is removed
+                    if not after_point:
+                        self.assertFalse((T.control(pkg) / "txn").exists())
+                        self.assertEqual(T.trust_problems(T.inspect(pkg)), [])
+                        continue
+                    if held == page:
+                        with T.lock(pkg):
+                            T.recover(pkg)
+                        self.assertEqual(T.trust_problems(T.inspect(pkg)), [])
+                        entry = self.docs_at(pkg)["manifest"]["builds"][-1]
+                        self.assertEqual((entry["file"], entry["digest"]), (BUILD, T.file_digest(pkg / BUILD)))
+                    elif (T.control(pkg) / "txn/txn.json").exists():
+                        # the journal records a build whose file is gone or differs: never committed, and reported
+                        codes = [c for c, _ in T.trust_problems(T.inspect(pkg))]
+                        self.assertIn("package.build-missing", codes)
+                        with T.lock(pkg), self.assertRaises(T.StoreError) as cm:
+                            T.recover(pkg)
+                        self.assertEqual(cm.exception.code, "package.build-missing")
+                        # the commit record names revision 4 only where it was written before the file was touched
+                        self.assertEqual(self.committed(pkg) == 4, point in (
+                            "after-link:commit.json", "after-replace:commit.json", "after-commit-record", "before-cleanup"))
+                        rc, out, _ = self.run_cli("status", pkg)
+                        self.assertNotEqual(rc, 0)
+                        self.assertIn("build", out)
+
+    def committed(self, pkg):
+        path = T.control(pkg) / "commit.json"  # displaced (absent) for a moment while it is replaced
+        return json.loads(path.read_text())["revision"] if path.exists() else None
+
+    def docs_at(self, pkg):
+        docs, _ = P.read_docs(pkg)
+        return docs
+
+    def test_foreign_bytes_written_over_the_build_before_the_commit_point_are_kept(self):
+        def fault(point):
+            if point == "before-commit-point":
+                (self.pkg / BUILD).write_bytes(b"theirs")
+                raise RuntimeError(point)
+        with self.assertRaises(RuntimeError):
+            R.build(self.pkg, fault=fault)
+        self.assertEqual((self.pkg / BUILD).read_bytes(), b"theirs")
+        self.assertEqual([p.name for p in (self.pkg / "builds").iterdir()], [Path(BUILD).name])
+        self.assertEqual(T.trust_problems(T.inspect(self.pkg)), [])
+
+    def test_line_endings_are_hashed_as_the_html_parser_delivers_them(self):
+        proto = self.pkg / "prototype"
+        js = (proto / "prototype.js").read_text()
+        css = (proto / "prototype.css").read_text()
+        for name, text, other in (("crlf", js.replace("\n", "\r\n"), css.replace("\n", "\r\n")),
+                                  ("cr", js.replace("\n", "\r"), css.replace("\n", "\r")),
+                                  ("mixed", js.replace("\n", "\r\n", 3).replace("\n", "\r", 3), css + "\r")):
+            with self.subTest(name):
+                (proto / "prototype.js").write_bytes(text.encode())
+                (proto / "prototype.css").write_bytes(other.encode())
+                docs = self.docs()
+                adapter, script, style = R.read_adapter(self.pkg, docs)
+                self.assertNotIn("\r", script + style)
+                page = R.render_html(R.payload(docs, 3, adapter, script, style, *R.runtime_assets()),
+                                     *R.runtime_assets(), script, style).decode()
+                self.assertNotIn("\r", page)
+                csp = re.search(r'http-equiv="Content-Security-Policy" content="([^"]*)"', page).group(1)
+                for body in re.findall(r"<script>(.*?)</script>", page, re.S):
+                    self.assertIn(R._csp_hash(body), csp)
+        (proto / "prototype.js").write_text(js + "\n// \x00\n")
+        self.refused("adapter.invalid", 1)
+
     def test_invalid_adapter_and_assets_are_refused(self):
         proto = self.pkg / "prototype"
         js = (proto / "prototype.js").read_text()
@@ -251,6 +367,82 @@ class ImportFeedbackCliTests(BuildCase):
         self.assertEqual((rc, "bundle.unreadable" in err), (1, True))
 
 
+class AnchorTests(BuildCase):
+    def note_bundle(self, target):
+        docs = self.docs()
+        note = copy.deepcopy(docs["reviews"]["notes"][0])
+        for f in ("anchor", "disposition"):
+            note.pop(f)
+        note.update(id="note.anchor-t.1", review_session="anchor-t", target={"id": target, "label": "x", "context": "c"},
+                    build={"revision": 3, "fingerprint": P.content_fingerprint(docs)})
+        return {"schema": "tp-product-feedback", "schema_version": 1, "package": "review-queue-demo",
+                "exported": "2026-11-10T09:00:00Z", "notes": [note], "inputs": []}
+
+    def stored(self, rid):
+        return P.index(self.docs())[rid][1]
+
+    def test_anchors_are_re_evaluated_on_every_import_and_build_even_for_duplicates(self):
+        b = self.note_bundle("record.reassign")
+        self.assertEqual(C.ingest(self.pkg, b)["anchors"], {"current": ["note.anchor-t.1"]})
+        R.build(self.pkg)
+        adapter = self.pkg / "prototype/adapter.json"
+        a = json.loads(adapter.read_text())
+        a["targets"] = [t for t in a["targets"] if t["id"] != "record.reassign"]
+        adapter.write_text(json.dumps(a))
+        r = R.build(self.pkg)  # the target left the registry this build shows
+        self.assertEqual(r["reanchored"]["note.anchor-t.1"], "unresolved")
+        self.assertEqual(self.stored("note.anchor-t.1")["anchor"], "unresolved")
+        self.assertEqual(self.stored("note.anchor-t.1")["target"]["id"], "record.reassign")  # the original is kept
+        rep, _ = cli.status_report(self.pkg)
+        self.assertIn("note.anchor-t.1", rep["pending"]["unresolved_anchors"])
+        again = C.ingest(self.pkg, b)  # a duplicate: reported under its live anchor, nothing new to commit
+        self.assertEqual((again["committed"], again["anchors"]), (False, {"unresolved": ["note.anchor-t.1"]}))
+        adapter.write_text(json.dumps(dict(a, targets=a["targets"] + [dict(a["targets"][0], id="record.reassign")])))
+        back = C.ingest(self.pkg, b)  # the target is back: the duplicate import re-anchors it
+        self.assertEqual((back["committed"], back["reanchored"]["note.anchor-t.1"]), (True, "current"))
+
+    def test_remap_anchor_cli(self):
+        C.ingest(self.pkg, self.note_bundle("record.gone"))
+        self.assertEqual(self.stored("note.anchor-t.1")["anchor"], "unresolved")
+        rev = self.docs()["manifest"]["revision"]
+        rc, out, err = self.run_cli("remap-anchor", self.pkg, "note.anchor-t.1", "rule.required-fields",
+                                    "--reason", "the button moved to the rule it enforces", "--expected-revision", rev)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("remapped", out)
+        rec = self.stored("note.anchor-t.1")
+        self.assertEqual((rec["anchor"], rec["target"]["id"], rec["remap"]["target"], rec["remap"]["reason"]),
+                         ("remapped", "record.gone", "rule.required-fields", "the button moved to the rule it enforces"))
+        hist = json.loads(T.history_path(self.pkg, rev + 1).read_text())
+        self.assertEqual(hist["operations"][0]["op"], "remap-anchor")
+        before = self.tree()
+        rc, out, _ = self.run_cli("remap-anchor", self.pkg, "note.anchor-t.1", "rule.required-fields",
+                                  "--reason", "the button moved to the rule it enforces")
+        self.assertEqual((rc, self.tree() == before), (0, True))  # idempotent
+        self.assertIn("no change", out)
+        for target in ("record.nope", "constructor"):
+            rc, _, err = self.run_cli("remap-anchor", self.pkg, "note.anchor-t.1", target, "--reason", "r")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("not a target", err)
+        self.assertEqual(self.tree(), before)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):  # a reason is required
+            self.run_cli("remap-anchor", self.pkg, "note.anchor-t.1", "rule.required-fields")
+        rep, _ = cli.status_report(self.pkg)
+        self.assertEqual(rep["remapped"], [{"note": "note.anchor-t.1", "original": "record.gone",
+                                            "target": "rule.required-fields",
+                                            "reason": "the button moved to the rule it enforces", "anchor": "remapped"}])
+        self.assertNotIn("note.anchor-t.1", rep["pending"]["unresolved_anchors"])
+        rc, out, _ = self.run_cli("status", self.pkg)
+        self.assertIn("note.anchor-t.1", out)
+        R.build(self.pkg)  # the page shows the remap with the original target
+        page = sorted((self.pkg / "builds").iterdir())[-1].read_bytes()
+        self.assertEqual(embedded(page)["remaps"], rep["remapped"])
+        b = self.note_bundle("record.gone")
+        b["notes"][0]["remap"] = {"target": "rule.required-fields", "reason": "r", "by": "x", "date": "2026-11-10"}
+        with self.assertRaises(T.StoreError) as cm:  # never imported
+            C.ingest(self.pkg, dict(b, notes=[dict(b["notes"][0], id="note.anchor-t.2")]))
+        self.assertEqual(cm.exception.code, "bundle.invalid")
+
+
 def _browser_skip_reason():
     if not shutil.which("node"):
         return "node is not installed"
@@ -268,13 +460,22 @@ class BrowserAcceptanceTests(BuildCase):
         R.build(self.pkg)
         work = Path(tempfile.mkdtemp(prefix="pd-c-chrome."))
         self.addCleanup(shutil.rmtree, work, True)
-        r = subprocess.run(["node", str(DRIVER), "acceptance", str(self.pkg / BUILD), str(work)],
-                           capture_output=True, text=True, timeout=45, env=dict(os.environ, TP_CHROME=CHROME))
+        # its own process group: a run that overstays is killed with the Chrome it started, never left behind
+        proc = subprocess.Popen(["node", str(DRIVER), "acceptance", str(self.pkg / BUILD), str(work)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+                                env=dict(os.environ, TP_CHROME=CHROME))
+        try:
+            stdout, stderr = proc.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+            self.fail("the acceptance run took over 45 s; its process group was killed\n" + stderr[-3000:])
+        r = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         self.assertTrue(r.stdout.strip(), r.stderr[-3000:])
         out = json.loads(r.stdout)
         self.assertEqual([c[0] for c in out["failures"]], [], json.dumps(out["failures"], indent=1)[:4000])
         self.assertEqual(r.returncode, 0)
-        self.assertGreaterEqual(len(out["checks"]), 30)
+        self.assertGreaterEqual(len(out["checks"]), 50)
         self.assertTrue(out["requests"] and all(u.startswith(("file:", "blob:", "data:")) for u in out["requests"]))
         # the page's export is what import-feedback reads
         rc, text, err = self.run_cli("import-feedback", self.pkg, out["exported"], "--json")

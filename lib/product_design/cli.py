@@ -1,4 +1,5 @@
-"""tp-product: deterministic product design package commands (init, status, validate, apply, build, import-feedback).
+"""tp-product: deterministic product design package commands (init, status, validate, apply, build, import-feedback,
+remap-anchor).
 
 Exit status: 0 done; 1 invalid or unreadable package, changeset, bundle or prototype adapter (nothing written); 2 usage;
 3 the package cannot be trusted yet (interrupted commit, uncommitted external edit, no commit record, control records
@@ -35,6 +36,13 @@ def status_report(package_dir) -> tuple:
     readiness = P.readiness(docs)
     idx = P.index(docs)
     notes, inputs = docs["reviews"]["notes"], docs["reviews"]["inputs"]
+    anchors = {n["id"]: n.get("anchor") for n in notes}
+    try:  # anchors as they stand now, against the registry a build would show (stored ones go stale until the next build)
+        reg = R.package_registry(package_dir, docs)
+        content_fp = P.content_fingerprint(docs)
+        anchors = {n["id"]: C.anchor(n, docs, idx, content_fp, lambda t: R.known(reg, t)) for n in notes}
+    except T.StoreError as exc:
+        rep["anchor_warning"] = f"anchors are the stored ones: {exc}"
     rep.update({
         "package": m["id"], "title": m["title"], "revision": m["revision"],
         "committed_revision": None if state["commit"] is None else state["commit"]["revision"],
@@ -49,11 +57,13 @@ def status_report(package_dir) -> tuple:
         "pending": {
             "inputs": [i["id"] for i in inputs if i["status"] == "pending"],
             "notes_without_disposition": [n["id"] for n in notes if "disposition" not in n],
-            "unresolved_anchors": [n["id"] for n in notes if n.get("anchor") == "unresolved"],
+            "unresolved_anchors": [n["id"] for n in notes if anchors[n["id"]] == "unresolved"],
             "awaiting_human_review": [sid for sid, r in readiness.items()
                                       if r["state"] == "ready-for-human-review" and not r["blockers"]],
             "needs_re_review": [sid for sid, r in readiness.items() if r["stale"]],
         },
+        "remapped": [{"note": n["id"], "original": n["target"]["id"], "target": n["remap"]["target"],
+                      "reason": n["remap"]["reason"], "anchor": anchors[n["id"]]} for n in notes if "remap" in n],
     })
     return rep, (3 if trust else 0)
 
@@ -86,6 +96,11 @@ def _print_status(rep, out):
     for key, ids in rep["pending"].items():
         if ids:
             print(f"pending {key.replace('_', ' ')}: {', '.join(ids)}", file=out)
+    for r in rep["remapped"]:
+        print(f"remapped {r['note']}: {r['original']} -> {r['target']} ({r['reason']})"
+              + (" [the new target is gone: unresolved]" if r["anchor"] == "unresolved" else ""), file=out)
+    if rep.get("anchor_warning"):
+        print(f"WARNING {rep['anchor_warning']}", file=out)
 
 
 def _print_build(r, out, as_json):
@@ -118,6 +133,8 @@ def _print_import(r, out, as_json):
     for kind in ("current", "changed-context", "remapped", "unresolved"):
         if r["anchors"].get(kind):
             print(f"  {kind}: {', '.join(r['anchors'][kind])}", file=out)
+    for nid, kind in r.get("reanchored", {}).items():
+        print(f"  re-anchored {nid}: now {kind}", file=out)
     if r["anchors"].get("unresolved"):
         print("  unresolved notes are kept; their target, journey or scenario is not in the package or its prototype: "
               "record a disposition for each (tp-product status lists them)", file=out)
@@ -174,6 +191,14 @@ def main(argv=None, out=None, err=None) -> int:
     c.add_argument("bundle", help="the exported feedback bundle (.json)")
     c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
     c.add_argument("--json", action="store_true")
+    c = sub.add_parser("remap-anchor", help="anchor a note to another target of the review build, keeping the original")
+    c.add_argument("package_dir")
+    c.add_argument("note", help="the note id")
+    c.add_argument("target", help="a target id the review build shows (a view, design record or prototype target)")
+    c.add_argument("--reason", required=True, help="why the note belongs to the new target")
+    c.add_argument("--by", default="tp-product remap-anchor", help="who decided it")
+    c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
+    c.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     as_json = getattr(args, "json", False)
     try:
@@ -212,6 +237,20 @@ def main(argv=None, out=None, err=None) -> int:
             result = C.ingest(args.package_dir, C.load_bundle(args.bundle), actor="tp-product import-feedback",
                               expected_revision=args.expected_revision)
             _print_import(result, out, as_json)
+            return 0
+        if args.command == "remap-anchor":
+            op = {"op": "remap-anchor", "note": args.note, "target": args.target, "reason": args.reason, "by": args.by,
+                  "date": T.now()[:10]}
+            cs = {"schema": "tp-product-changeset", "schema_version": 1, "actor": "tp-product remap-anchor",
+                  "summary": f"remap the anchor of {args.note} to {args.target}", "evidence": [], "operations": [op]}
+            result = C.apply(args.package_dir, cs, args.expected_revision)
+            if as_json:
+                print(json.dumps(dict(result, ok=True), indent=2, ensure_ascii=False), file=out)
+            elif result["committed"]:
+                print(f"remapped {args.note} to {args.target}: committed revision {result['revision']} (the original "
+                      "target is kept)", file=out)
+            else:
+                print(f"no change: {args.note} is already remapped to {args.target} with this reason", file=out)
             return 0
         # apply
         if args.recover:

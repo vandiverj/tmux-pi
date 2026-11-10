@@ -20,11 +20,13 @@ escaped, read with JSON.parse and rendered as text nodes; the title is HTML-esca
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import html
 import os
 import re
+import secrets
 from pathlib import Path
 
 from . import changes as C
@@ -72,7 +74,11 @@ def _asset(package_dir, rel, kind):
         raise _refuse(f"{rel}: cannot be read: {getattr(exc, 'strerror', None) or exc}", {"file": str(rel)}) from None
     if CLOSERS[kind].search(text):
         raise _refuse(f"{rel} contains '</{kind}' or '<!--', which would end the inlined {kind} element", {"file": str(rel)})
-    return text
+    if "\x00" in text:  # the HTML parser delivers U+FFFD for it: the hash would not be of what runs
+        raise _refuse(f"{rel} contains a NUL character, which the HTML parser would not deliver as written", {"file": str(rel)})
+    # The HTML parser turns CRLF and a lone CR into LF before a script or style sees its text, and the policy hashes
+    # what it delivers: the page inlines, and hashes, the text in that form.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def read_adapter(package_dir, docs):
@@ -195,8 +201,9 @@ def runtime_assets():
 
 
 def payload(docs, revision, adapter, script, style, runtime_js, runtime_css):
-    """The data the page embeds, with build.source_fingerprint filled in. Notes, inputs and reviews are not embedded:
-    the page is for capturing new feedback against this content."""
+    """The data the page embeds, with build.source_fingerprint filled in. Notes, inputs and reviews are not embedded
+    (the page is for capturing new feedback against this content), except the owner's anchor remaps, which the page
+    shows with each note's original target."""
     report = P.readiness(docs)
     m = docs["manifest"]
     data = {
@@ -213,6 +220,10 @@ def payload(docs, revision, adapter, script, style, runtime_js, runtime_css):
         "schema": _schema_closure(P.load_schema()),
         "limits": {"bytes": C.MAX_BUNDLE_BYTES, "records": C.MAX_BUNDLE_RECORDS, "depth": P.MAX_DEPTH},
         "warnings": warnings(docs, adapter),
+        # Owner decisions the page shows next to the original target: a remapped note keeps what it was written on.
+        "remaps": [{"note": n["id"], "original": n["target"]["id"], "target": n["remap"]["target"],
+                    "reason": n["remap"]["reason"], "anchor": n.get("anchor")}
+                   for n in docs.get("reviews", {}).get("notes", []) if isinstance(n.get("remap"), dict)],
     }
     unversioned = copy.deepcopy(data)
     del unversioned["build"]["revision"]  # the counter moves on every commit; what is shown does not
@@ -257,11 +268,53 @@ def render_html(data, runtime_js, runtime_css, script, style) -> bytes:
 
 # ---------------------------------------------------------------- build
 
+def _committed(root, current) -> bool:
+    """Whether the commit of revision current+1 passed its commit point: its journal holds txn.json (recovery will roll
+    it forward) or the commit record is already that revision's."""
+    if os.path.lexists(T.control(root) / "txn" / "txn.json"):
+        return True
+    with contextlib.suppress(OSError, ValueError):
+        value = T._read_json(T.control(root) / "commit.json", root)
+        return isinstance(value, dict) and isinstance(value.get("revision"), int) and value["revision"] > current
+    return True  # unreadable: it cannot be shown to be before the commit point, so the file is kept
+
+
+def _remove_own(root, target, page):
+    """Remove the build file this build created, and only if it still holds the bytes this build wrote: it is moved to
+    a private name first, so what is compared is what is removed. Someone else's bytes are put back (or, if the name has
+    been taken again since, kept at the private name, which the refusal names)."""
+    held = target.with_name(f".{target.name}.{secrets.token_hex(6)}.discard")
+    try:
+        os.rename(target, held)
+    except FileNotFoundError:
+        return None
+    try:
+        ours = held.is_file() and not held.is_symlink() and held.read_bytes() == page
+    except OSError:
+        ours = False
+    if ours:
+        os.unlink(held)
+        return None
+    try:
+        os.link(held, target, follow_symlinks=False)
+    except FileExistsError:
+        return held
+    os.unlink(held)
+    return None
+
+
 def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
     """Build the review page of the committed package and record it in the manifest. Returns {committed, revision,
-    file, up_to_date, reused, source_fingerprint, content_fingerprint, warnings}. Refuses (StoreError) a package that
-    is not trusted or not valid, an invalid adapter (adapter.invalid) and a build file that exists with other bytes
-    (build.exists, exit 3)."""
+    file, up_to_date, reused, source_fingerprint, content_fingerprint, digest, warnings, reanchored}. Refuses
+    (StoreError) a package that is not trusted or not valid, an invalid adapter (adapter.invalid), and a build file that
+    exists with other bytes (build.exists, exit 3), including the recorded build itself when its file no longer holds
+    the recorded bytes.
+
+    Up to date means: the last recorded build shows this source, and its file is there holding exactly the recorded
+    digest. The commit also re-evaluates every stored note's anchor against the registry this build shows
+    (changes.reanchor). The build file is written before the commit point; if the commit fails before that point the
+    file is removed again, but only while it holds this build's bytes; after it, the file is never removed (the journal
+    records it, and recovery refuses to commit an entry whose file is missing or differs)."""
     root = Path(package_dir)
     runtime_js, runtime_css = runtime_assets()
     with T.lock(package_dir):
@@ -274,43 +327,72 @@ def build(package_dir, expected_revision=None, fault=T._noop) -> dict:
         b = data["build"]
         result = {"committed": False, "revision": current, "up_to_date": False, "reused": False,
                   "source_fingerprint": b["source_fingerprint"], "content_fingerprint": b["content_fingerprint"],
-                  "warnings": data["warnings"]}
+                  "warnings": data["warnings"], "reanchored": {}}
+        work = copy.deepcopy(docs)
+        reg = registry(work, adapter)
+        result["reanchored"] = C.reanchor(work, lambda t: known(reg, t))
         builds = docs["manifest"].get("builds", [])
         last = builds[-1] if builds else None
-        if last and last.get("source") == b["source_fingerprint"] and _regular(root, last["file"]):
-            return dict(result, file=last["file"], up_to_date=True)
+        if last and last.get("source") == b["source_fingerprint"] and os.path.lexists(root / last["file"]):
+            # The recorded build is there: it is up to date only if its bytes are the recorded ones (the digest, or for
+            # an entry from before digests, the page this content renders at that revision).
+            if isinstance(last.get("digest"), str):
+                problem = T.build_file_problem(root, last["file"], last["digest"])
+            else:
+                old = render_html(payload(docs, last["revision"], adapter, script, style, runtime_js, runtime_css),
+                                  runtime_js, runtime_css, script, style)
+                problem = T.build_file_problem(root, last["file"], "sha256:" + hashlib.sha256(old).hexdigest())
+            if problem:
+                raise T.StoreError("build.exists", f"{last['file']}, the recorded build of this content, {problem}; it "
+                                                   "was not replaced and it is not reported up to date. Move it aside "
+                                                   "and build again. Nothing was written.", exit=3,
+                                   details={"file": last["file"], "problem": problem})
+            if not result["reanchored"]:
+                return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"))
+            cs = {"actor": "tp-product build", "summary": "re-anchor notes against the build's target registry",
+                  "evidence": [], "operations": [{"op": "re-anchor", "anchors": result["reanchored"]}]}
+            done = C._finish(package_dir, state, work, current, cs, {"accepted": []}, fault, before=docs)
+            return dict(result, file=last["file"], up_to_date=True, digest=last.get("digest"),
+                        committed=done["committed"], revision=done["revision"])
         page = render_html(data, runtime_js, runtime_css, script, style)
+        page_digest = "sha256:" + hashlib.sha256(page).hexdigest()
         rel = f"{BUILDS_DIR}/{docs['manifest']['id']}-r{current}.html"
         target = root / rel
         safe_write.ensure_dir(target.parent, what="builds directory", root=root)
         created = False
         if os.path.lexists(target):
-            if not _regular(root, rel) or target.read_bytes() != page:
+            if T.build_file_problem(root, rel, page_digest):
                 raise T.StoreError("build.exists", f"{rel} already exists with other content; it was not replaced. Move it "
                                                    "aside and build again. Nothing was written.", exit=3,
                                    details={"file": rel})
             result["reused"] = True
         else:
-            T._write_new(root, target, page)
-            created = True
-        work = copy.deepcopy(docs)
-        entry = {"revision": current, "fingerprint": b["content_fingerprint"], "source": b["source_fingerprint"], "file": rel}
+            fault("before-build-write")
+            try:
+                T._write_new(root, target, page)
+                created = True
+            except FileExistsError:  # someone else's file appeared since the check: theirs, never replaced
+                raise T.StoreError("build.exists", f"{rel} appeared while it was being written; it was not replaced. "
+                                                   "Nothing was recorded.", exit=3, details={"file": rel}) from None
+        entry = {"revision": current, "fingerprint": b["content_fingerprint"], "source": b["source_fingerprint"],
+                 "file": rel, "digest": page_digest}
         work["manifest"].setdefault("builds", []).append(entry)
-        cs = {"actor": "tp-product build", "summary": f"record review build {rel}", "evidence": [],
-              "operations": [dict(entry, op="record-build")]}
+        ops = [dict(entry, op="record-build")]
+        if result["reanchored"]:
+            ops.append({"op": "re-anchor", "anchors": result["reanchored"]})
+        cs = {"actor": "tp-product build", "summary": f"record review build {rel}", "evidence": [], "operations": ops}
         try:
+            if created:
+                fault("after-build-write")
             done = C._finish(package_dir, state, work, current, cs, {"accepted": []}, fault, before=docs)
-        except BaseException:
-            if created:  # nothing records it: a build file exists only with its manifest entry
-                os.unlink(target)
+        except BaseException as exc:
+            if created and not _committed(root, current):  # before the commit point nothing records it
+                kept = _remove_own(root, target, page)
+                if kept is not None:
+                    raise T.StoreError("build.conflict", f"the build was not recorded ({exc}); {rel} was replaced by "
+                                                         f"someone else meanwhile, and their bytes are kept at {kept}",
+                                       exit=3, details={"file": rel, "kept": str(kept)}) from exc
             raise
-        return dict(result, file=rel, committed=done["committed"], revision=done["revision"])
+        return dict(result, file=rel, digest=page_digest, committed=done["committed"], revision=done["revision"])
 
 
-def _regular(root, rel) -> bool:
-    path = Path(root) / rel
-    try:
-        safe_write.check_below(Path(root), path, "build file")
-    except (OSError, ValueError):
-        return False
-    return path.is_file() and not path.is_symlink()

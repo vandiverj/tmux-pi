@@ -283,6 +283,11 @@ async function acceptance(htmlPath, workDir, keep) {
     check("note mode picks the event row as the note target", d.pending && d.pending.target.id === "contract.submissions-api" && d.pending.checkpoint === "empty-queue@" + actionsBefore, d.pending && d.pending.target);
     await a.type("#tp-note-text", "The 201 response should name the queue position. " + HOSTILE, {leave: false});
     await a.choose("#tp-note-category", "question");
+    await a.ev(`document.querySelector("#tp-reviewer").dispatchEvent(new Event("change"))`);   // any repaint
+    await a.settle();
+    check("an open note keeps its whole draft across a repaint",
+          (await a.ev(`document.querySelector("#tp-note-category").value`)) === "question" &&
+          (await a.ev(`document.querySelector("#tp-note-text").value`)).startsWith("The 201 response"), (await a.dbg()).pending.draft);
     await a.click("#tp-note-save");
     d = await a.dbg();
     check("the contextual note is saved", d.notes === 1 && d.pending === null);
@@ -387,8 +392,76 @@ async function acceptance(htmlPath, workDir, keep) {
     rep = await b.setFile("#tp-import-file", oldFile, "tp-imported");
     d = await b.dbg();
     check("an old-build note with an unknown target is imported and listed unresolved", rep.ok && d.notes === 3 && /record\.escalate/.test(await b.text("#tp-unresolved")), rep);
+    // ids that are also Object.prototype names are ids like any other; an unknown field with such a name is refused
+    const proto = JSON.parse(JSON.stringify(bundle));
+    proto.sessions = [Object.assign({}, bundle.sessions[0], {id: "constructor", prototype: null})];
+    proto.notes = [Object.assign({}, bundle.notes[1], {id: "note.constructor.1", review_session: "constructor"})];
+    proto.inputs = [];
+    const protoFile = path.join(workDir, "proto-ids.json");
+    fs.writeFileSync(protoFile, JSON.stringify(proto));
+    rep = await b.setFile("#tp-import-file", protoFile, "tp-imported");
+    check("ids such as constructor import like any id", rep.ok && rep.added.notes.length === 1 && rep.added.sessions.length === 1, rep);
+    fs.writeFileSync(protoFile, JSON.stringify(proto).replace('"review_session"', '"constructor":1,"review_session"').replace("note.constructor.1", "note.constructor.2"));
+    rep = await b.setFile("#tp-import-file", protoFile, "tp-imported");
+    check("an unknown field named constructor is refused, as by the CLI", !rep.ok && /constructor/.test(rep.errors.join(" ")), rep.errors);
+    // numbers this page could not export as written are refused, visibly, before anything is imported
+    fs.writeFileSync(protoFile, JSON.stringify(old).replace('"revision":1', '"revision":9007199254740993').replace(/\.90"/, '.91"'));
+    rep = await b.setFile("#tp-import-file", protoFile, "tp-imported");
+    check("a number that would re-export differently is refused", !rep.ok && /9007199254740993/.test(rep.errors.join(" ")) &&
+          /9007199254740993/.test(await b.text("#tp-import-report")), rep.errors);
+    // any depth: the 64-level refusal in the import report, never a stack overflow
+    fs.writeFileSync(protoFile, "[".repeat(200000) + "]".repeat(200000));
+    rep = await b.setFile("#tp-import-file", protoFile, "tp-imported");
+    check("a bundle nested 200000 deep gets the 64-level refusal", !rep.ok && /deeper than 64/.test(await b.text("#tp-import-report")), rep.errors);
+    fs.writeFileSync(protoFile, "[".repeat(2200000) + "]".repeat(2200000));   // over the byte limit too: both are reported
+    rep = await b.setFile("#tp-import-file", protoFile, "tp-imported");
+    check("a bundle nested 2200000 deep and over 4 MiB gets the 64-level refusal too", !rep.ok &&
+          /deeper than 64/.test(await b.text("#tp-import-report")) && /larger than/.test(rep.errors.join(" ")), rep.errors);
     if (keep) await b.screenshot(path.join(keep, "context-b-feedback.png"));
     await browser.dispose(ctxB);
+
+    // ---- context D: a session saved mid-task resumes the task (scenario, step, assistance) and notes carry it
+    const ctxD = await browser.context();
+    const e = await browser.page(ctxD);
+    await e.load(url + "#journeys");
+    await e.type("#tp-reviewer", "Ben (reviewer-2)");
+    await e.click('[data-tp-start="guided:scenario.submit-complete-record"]');
+    await e.click("#tp-assist");
+    d = await e.dbg();
+    const midTask = {guide: d.guide, task: d.session.tasks[0]};
+    const midDl = await e.download(downloads, () => e.click('[data-tp-view="feedback"]').then(() => e.click("#tp-export")));
+    const midFile = path.join(workDir, "mid-task.json");
+    fs.copyFileSync(midDl.file, midFile);
+    // a stored value of any shape: the page starts, says so, and leaves the value as it was
+    for (const raw of ["null", "0", "false", "[]", '{"v":1}', '{"v":1,"ui":{"guide":{"task":7}}}']) {
+      await e.ev(`localStorage.setItem("tp-product-review:v1:review-queue-demo", ${JSON.stringify(raw)})`);
+      await e.reload();
+      d = await e.dbg();
+      check("stored value " + raw + " gives a working page, a notice and an untouched value",
+            d.notes === 0 && d.errors.length === 0 && /could not be read/.test(d.storageNotice || "") &&
+            (await e.ev(`localStorage.getItem("tp-product-review:v1:review-queue-demo")`)) === raw, d.storageNotice);
+    }
+    await browser.dispose(ctxD);
+    const ctxE = await browser.context();
+    const f = await browser.page(ctxE);
+    await f.load(url + "#feedback");
+    rep = await f.setFile("#tp-import-file", midFile, "tp-imported");
+    await f.type("#tp-reviewer", "Cy (reviewer-3)");
+    await f.click(`[data-tp-resume="${midTask.task && (JSON.parse(fs.readFileSync(midFile, "utf8")).sessions[0].id)}"]`);
+    d = await f.dbg();
+    check("restoring a session resumes its task in progress", rep.ok && d.guide && d.guide.scenario === midTask.guide.scenario &&
+          d.guide.step === midTask.guide.step && d.guide.step === 1 && d.session.tasks[0].outcome === "in-progress" &&
+          d.session.tasks[0].assisted_steps === 1, [d.guide, midTask.guide]);
+    await f.click('[data-tp-view="experience"]');
+    check("the resumed task's next step is highlighted", (await f.count('.tp-highlight[data-tp-target="submit.title"]')) === 1);
+    await f.click('[data-tp-target="submit.title"]', "right");
+    await f.type("#tp-note-text", "Title field: what length is allowed?", {leave: false});
+    await f.click("#tp-note-save");
+    const resumedNote = await f.ev(`TPReview.summary()`);
+    d = await f.dbg();
+    check("the next note carries the resumed task's context", d.notes === 1 &&
+          /guided, assisted-advance, scenario\.submit-complete-record step 2/.test(resumedNote), resumedNote.split("\n").filter((l) => /by Ana|by Ben|by Cy/.test(l)));
+    await browser.dispose(ctxE);
 
     // ---- context C: storage denied is visible, and the page still works in the tab
     const c = await browser.page(await browser.context(), {beforeLoad: STORAGE_DENIED});

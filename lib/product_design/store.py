@@ -30,11 +30,13 @@ import contextlib
 import datetime as _dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -310,12 +312,14 @@ def inspect(package_dir) -> dict:
       authority_changed  ids whose acceptance fields differ from the commit record
       originals_changed  original records (notes, inputs, reviews) the commit record holds that are gone or changed
       control            (code, message) for control records that disagree with each other: not trusted
+      builds             (file, why) for each build the interrupted commit records whose file is missing or not the
+                         recorded bytes: recovery refuses to commit it (build_problems)
     """
     root = Path(package_dir)
     docs, issues = P.read_docs(root)
     out = {"docs": docs, "issues": issues, "commit": None, "commit_state": "missing", "commit_digest": None,
            "interrupted": None, "external": [], "authority_changed": [], "originals_changed": [], "control": [],
-           "history": [], "displaced": []}
+           "history": [], "displaced": [], "builds": []}
     if not issues:
         out["issues"] = P.validate_docs(docs)
 
@@ -333,6 +337,9 @@ def inspect(package_dir) -> dict:
         bad("txn/txn.json", txn)
     elif status == "ok":
         out["interrupted"] = txn["revision"]
+        with contextlib.suppress(OSError, ValueError):  # a malformed staged entry is _staged's refusal, at --recover
+            entry = _read_json(control(root) / "txn" / "history.json", root)
+            out["builds"] = build_problems(root, entry)
     out["displaced"] = [str(p.relative_to(root)) for p in _kept(root, txn if status == "ok" else None)]
     commit = out["commit"]
 
@@ -375,6 +382,11 @@ def trust_problems(state) -> list:
                     f"{', '.join(state['displaced'])} holds bytes someone else wrote while a commit replaced the file; "
                     "they were kept. Compare them with the live file, move what you need out of .tp-product/txn/, then "
                     "run `tp-product apply DIR --recover`"))
+    if state.get("builds"):
+        out.append(("package.build-missing",
+                    "the interrupted commit records review build(s) whose file is not the recorded build ("
+                    + "; ".join(f"{rel} {why}" for rel, why in state["builds"]) + "); `tp-product apply DIR --recover` "
+                    "refuses to commit them. Put the build file back, or move .tp-product/txn/ aside by hand"))
     if state["commit"] is None and state["commit_state"] != "bad":  # a malformed one is reported above
         out.append(("package.uncommitted", "no commit record (.tp-product/commit.json): not created by `tp-product init`, "
                                             "or its control state was removed"))
@@ -620,6 +632,9 @@ def commit(package_dir, docs, entry, fault: Callable = _noop, base_digests=None,
                              f"{', '.join(changed)} changed while this commit was being prepared (someone edited it "
                              "outside tp-product). Nothing was written and their content is kept: read `tp-product "
                              "status`, then adopt or restore the edit and retry", exit=3, details={"files": changed})
+        found = build_problems(root, state["entry"])
+        if found:
+            raise _build_refusal(found, "nothing was written")
         _write(root, txn / "txn.json", meta_data)
     except BaseException:
         shutil.rmtree(txn, ignore_errors=True)  # nothing live was touched (nothing is displaced before the commit point)
@@ -635,6 +650,60 @@ def _history_taken(root, revision, data) -> list:
         return []
     safe_write.check_below(root, target, "package history entry")
     return [] if target.read_bytes() == data else [f"{CONTROL}/history/{target.name}"]
+
+
+def file_digest(path) -> str:
+    """sha256 of a file's bytes, as "sha256:HEX" (what a build entry records)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def build_file_problem(root, rel, want=None) -> Optional[str]:
+    """Why root/rel is not the review build a manifest entry records (a regular file below the package, no link on the
+    way, with digest `want` when given), or None."""
+    if not isinstance(rel, str) or not rel:
+        return "is not a file name"
+    path = Path(root) / rel
+    try:
+        safe_write.check_below(Path(root), path, "build file")
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "is missing"
+    except (OSError, ValueError) as exc:
+        return f"cannot be read ({getattr(exc, 'strerror', None) or exc})"
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file"
+    if want is None:
+        return None
+    try:
+        got = file_digest(path)
+    except OSError as exc:
+        return f"cannot be read ({exc.strerror or exc})"
+    return None if got == want else "holds other bytes than the recorded build"
+
+
+def build_problems(root, entry) -> list:
+    """[(file, why)] for each record-build operation of a history entry whose file is not the recorded build. A commit
+    checks this just before its commit point and recovery before it publishes anything: a manifest never records a
+    build whose file is absent or differs."""
+    ops = entry.get("operations") if isinstance(entry, dict) else None
+    out = []
+    for op in ops if isinstance(ops, list) else []:
+        if isinstance(op, dict) and op.get("op") == "record-build":
+            why = build_file_problem(root, op.get("file"), op.get("digest") if isinstance(op.get("digest"), str) else None)
+            if why:
+                out.append((op.get("file"), why))
+    return out
+
+
+def _build_refusal(found, when):
+    return StoreError("package.build-missing",
+                      "; ".join(f"{rel} {why}" for rel, why in found) + f": the commit records that review build, so "
+                      f"{when}. Put the build file back (or move the journal aside by hand) and run `tp-product status`",
+                      exit=3, details={"builds": [{"file": rel, "problem": why} for rel, why in found]})
 
 
 def _write_new(root, target: Path, data):
@@ -749,6 +818,7 @@ def _roll_forward(root: Path, fault: Callable = _noop):
         if taken:
             raise _conflict(root, meta, taken[0])
     data = _staged(root, meta)  # then the journal's state, whole, before any live file is replaced
+    entry = json.loads(data)
     for name in FILES.values():
         _place(root, meta, name, fault)
     safe_write.ensure_dir(target.parent, what="package history", root=root)
@@ -759,6 +829,9 @@ def _roll_forward(root: Path, fault: Callable = _noop):
             pass
     if _history_taken(root, meta["revision"], data):  # never replaced, whoever wrote it
         raise _conflict(root, meta, f"{CONTROL}/history/{target.name}")
+    found = build_problems(root, entry)  # again, last thing before the commit record: never commit a missing build
+    if found:
+        raise _build_refusal(found, "the commit record was not written; the journal is kept")
     _place(root, meta, "commit.json", fault)
     fault("after-commit-record")
     _finish_txn(root, meta, fault)
@@ -793,6 +866,9 @@ def _staged(root: Path, meta) -> bytes:
     if state["problems"]:
         code, name, message = state["problems"][0]
         raise refuse("control.invalid" if code.startswith("result.") else code, name, message)
+    found = build_problems(root, values["history.json"])
+    if found:
+        raise _build_refusal(found, "nothing was replaced and the journal is kept")
     return (txn / "history.json").read_bytes()
 
 

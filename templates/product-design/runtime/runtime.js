@@ -51,6 +51,9 @@
   // ------------------------------------------------------------------ small helpers
 
   function clone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
+  // Data-keyed lookups use own properties only: an id such as constructor, __proto__ or toString is just an id.
+  function own(o, k) { return o !== null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k); }
+  function dict() { return Object.create(null); }
   function canonical(v) {
     if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";
     if (v && typeof v === "object") {
@@ -67,16 +70,17 @@
   function utf8Length(s) { return new TextEncoder().encode(s).length; }
   function short(fp) { return fp ? fp.replace(/^sha256:/, "").slice(0, 12) : "none"; }
   function byId(coll) {
-    var out = {};
+    var out = dict();
     (DATA.design[coll] || []).forEach(function (r) { out[r.id] = r; });
     return out;
   }
   function record(id) {
     var kind = String(id).split(".")[0];
-    var coll = {source: "sources", claim: "claims", actor: "actors", journey: "journeys", rule: "rules",
-                scenario: "scenarios", question: "questions", decision: "decisions", contract: "contracts",
-                slice: "slices", "case": "cases", measurement: "measurements"}[kind];
-    if (!coll) return null;
+    var colls = {source: "sources", claim: "claims", actor: "actors", journey: "journeys", rule: "rules",
+                 scenario: "scenarios", question: "questions", decision: "decisions", contract: "contracts",
+                 slice: "slices", "case": "cases", measurement: "measurements"};
+    if (!own(colls, kind)) return null;
+    var coll = colls[kind];
     return (DATA.design[coll] || []).filter(function (r) { return r.id === id; })[0] || null;
   }
   function title(id) { var r = record(id); return r && r.title ? r.title : id; }
@@ -97,11 +101,57 @@
     return typeof s.isWellFormed === "function" ? s.isWellFormed()
       : !/[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(s);
   }
-  function depth(v) {
-    if (v === null || typeof v !== "object") return 0;
-    var d = 0;
-    (Array.isArray(v) ? v : Object.keys(v).map(function (k) { return v[k]; })).forEach(function (x) { d = Math.max(d, depth(x)); });
-    return d + 1;
+  // Nesting depth (a top-level object is 1, as package.depth_problem counts it), without recursion: any depth is
+  // measured, and the walk stops as soon as it is past `stopAt`.
+  function depth(v, stopAt) {
+    var max = 0, stack = [v, 1];
+    while (stack.length) {
+      var d = stack.pop(), x = stack.pop();
+      if (x === null || typeof x !== "object") continue;
+      if (d > max) { max = d; if (stopAt !== undefined && max > stopAt) return max; }
+      if (Array.isArray(x)) for (var i = 0; i < x.length; i++) stack.push(x[i], d + 1);
+      else Object.keys(x).forEach(function (k) { stack.push(x[k], d + 1); });
+    }
+    return max;
+  }
+  // The nesting depth of JSON text, counted on the text before it is parsed (strings skipped). The parser and
+  // everything after it then only ever see values within the limit.
+  function textDepth(text, stopAt) {
+    var d = 0, max = 0, inStr = false;
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if (inStr) { if (c === 92) i += 1; else if (c === 34) inStr = false; continue; }
+      if (c === 34) inStr = true;
+      else if (c === 123 || c === 91) { d += 1; if (d > max) { max = d; if (max > stopAt) return max; } }
+      else if (c === 125 || c === 93) d -= 1;
+    }
+    return max;
+  }
+  // textDepth over raw UTF-8 bytes, resumable: st carries the depth and string state from one chunk to the next
+  function bytesDepth(st, u8, stopAt) {
+    for (var i = 0; i < u8.length; i++) {
+      var c = u8[i];
+      if (st.inStr) { if (st.esc) st.esc = false; else if (c === 92) st.esc = true; else if (c === 34) st.inStr = false; continue; }
+      if (c === 34) st.inStr = true;
+      else if (c === 123 || c === 91) { st.d += 1; if (st.d > st.max) { st.max = st.d; if (st.max > stopAt) return; } }
+      else if (c === 125 || c === 93) st.d -= 1;
+    }
+  }
+  // Numbers the page could not export as they were written: JSON.parse reads a number into a double, and
+  // JSON.stringify writes that double back. A token whose text would change (an integer beyond 2^53, -0, 1.0, 1e5, a
+  // long decimal) would be re-exported as another value than the CLI holds, so it is refused, never rewritten.
+  function numberProblems(text) {
+    var re = /"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/g, m, out = [];
+    while ((m = re.exec(text)) !== null) {
+      var tok = m[0];
+      if (tok.charCodeAt(0) === 34) continue;
+      var back = JSON.stringify(Number(tok));
+      if (back !== tok) {
+        out.push("the number " + tok + " would be exported as " + back + " (this page keeps numbers as JavaScript does), so the bundle cannot round-trip");
+        if (out.length >= 5) break;
+      }
+    }
+    return out;
   }
   function schemaIssues(entry, value) {
     var defs = DATA.schema.$defs, issues = [];
@@ -109,35 +159,35 @@
     function walk(s, v, path) {
       if (s === true) return;
       if (s === false) { add(path, "no value is allowed here"); return; }
-      if (s.$ref) walk(defs[s.$ref.replace("#/$defs/", "")], v, path);
+      if (s.$ref) walk(defs[s.$ref.replace("#/$defs/", "")], v, path);   // the build's own schema: its keys are ours
       if (s.type) {
         var ts = Array.isArray(s.type) ? s.type : [s.type];
         if (!ts.some(function (t) { return isType(t, v); })) { add(path, "expected " + ts.join(" or ")); return; }
       }
-      if ("const" in s && canonical(v) !== canonical(s["const"])) add(path, "must be " + JSON.stringify(s["const"]));
+      if (own(s, "const") && canonical(v) !== canonical(s["const"])) add(path, "must be " + JSON.stringify(s["const"]));
       if (s["enum"] && !s["enum"].some(function (o) { return canonical(o) === canonical(v); })) add(path, "is not one of " + s["enum"].join(", "));
       if (typeof v === "string") {
         var n = Array.from(v).length;
         if (!wellFormed(v)) add(path, "is not valid Unicode text");
-        if ("minLength" in s && n < s.minLength) add(path, "shorter than " + s.minLength);
-        if ("maxLength" in s && n > s.maxLength) add(path, "longer than " + s.maxLength);
+        if (own(s, "minLength") && n < s.minLength) add(path, "shorter than " + s.minLength);
+        if (own(s, "maxLength") && n > s.maxLength) add(path, "longer than " + s.maxLength);
         if (s.pattern && !new RegExp(s.pattern).test(v)) add(path, "does not match " + s.pattern);
         if (s["x-id"]) {   // schema.id_kind: <kind>.<slug>[.<slug>...], at most 96 characters
           var m = /^([a-z0-9]+(?:-[a-z0-9]+)*)\.[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*$/.exec(v);
           if (!m || n > 96 || m[1] !== s["x-id"]) add(path, JSON.stringify(v) + " is not a " + s["x-id"] + ".<slug> id");
         }
       }
-      if (typeof v === "number" && "minimum" in s && v < s.minimum) add(path, "less than " + s.minimum);
+      if (typeof v === "number" && own(s, "minimum") && v < s.minimum) add(path, "less than " + s.minimum);
       if (Array.isArray(v)) {
-        if ("minItems" in s && v.length < s.minItems) add(path, "needs at least " + s.minItems + " item(s)");
+        if (own(s, "minItems") && v.length < s.minItems) add(path, "needs at least " + s.minItems + " item(s)");
         if (s.items) v.forEach(function (x, i) { walk(s.items, x, path.concat([i])); });
       }
       if (isType("object", v)) {
         var props = s.properties || {};
-        (s.required || []).forEach(function (k) { if (!(k in v)) add(path.concat([k]), "required field is missing"); });
+        (s.required || []).forEach(function (k) { if (!own(v, k)) add(path.concat([k]), "required field is missing"); });
         Object.keys(v).forEach(function (k) {
           if (!wellFormed(k)) add(path, "a field name is not valid Unicode text");
-          if (k in props) walk(props[k], v[k], path.concat([k]));
+          if (own(props, k)) walk(props[k], v[k], path.concat([k]));
           else if (s.additionalProperties === false) add(path.concat([k]), "unknown field");
           else if (s.additionalProperties && typeof s.additionalProperties === "object") walk(s.additionalProperties, v[k], path.concat([k]));
         });
@@ -149,7 +199,7 @@
 
   // ------------------------------------------------------------------ review targets
 
-  var REG = {exact: {}, prefixes: {}};
+  var REG = {exact: dict(), prefixes: dict()};
   function buildRegistry() {
     DATA.view_targets.forEach(function (t) { REG.exact[t.id] = t.label; });
     Object.keys(DATA.design).forEach(function (coll) {
@@ -160,7 +210,7 @@
     });
   }
   function knownTarget(id) {
-    if (Object.prototype.hasOwnProperty.call(REG.exact, id)) return true;
+    if (REG.exact[id] !== undefined) return true;
     return Object.keys(REG.prefixes).some(function (p) { return id.length > p.length + 1 && id.indexOf(p + ".") === 0; });
   }
   function tgt(el, id, label, context) {
@@ -180,7 +230,8 @@
   var RT = {      // derived or transient: never saved
     state: null, events: [], last: null, view: "overview", noteMode: false, pending: null, blocked: 0,
     selectedEvent: null, storage: {ok: false, reason: "not checked"}, storageNotice: null, message: null,
-    stepError: null, importReport: null, summary: null, exportText: null, undeclared: {}, questionFilter: "open",
+    stepError: null, importReport: null, summary: null, exportText: null, exportParts: null, exportError: null,
+    undeclared: dict(), questionFilter: "open",
     hint: false, engScenario: null, holding: false, renderPending: false, focusNote: false, paints: 0
   };
 
@@ -221,8 +272,16 @@
     try { raw = window.localStorage.getItem(KEY); } catch (e) { RT.storage = {ok: false, reason: String(e)}; return freshState(); }
     if (raw === null) return freshState();
     var saved, problems = [];
-    try { saved = JSON.parse(raw); } catch (e) { problems.push("not JSON"); }
-    if (saved) problems = problems.concat(savedProblems(saved));
+    try {
+      if (typeof raw !== "string") problems.push("not text");
+      else if (textDepth(raw, DATA.limits.depth) > DATA.limits.depth) problems.push("nested deeper than " + DATA.limits.depth + " levels");
+      else {
+        saved = JSON.parse(raw);
+        problems = savedProblems(saved);
+      }
+    } catch (e) {   // whatever is stored, the page starts: a check that throws is one more reason to ignore it
+      problems.push((e && e.name ? e.name + ": " : "") + (e && e.message ? e.message : String(e)));
+    }
     if (problems.length) {
       RT.storageNotice = "Review data saved in this browser for this package could not be read and was ignored (" +
         problems.slice(0, 3).join("; ") + "). It is left untouched under the browser storage key " + KEY + "; " +
@@ -232,16 +291,35 @@
     }
     return saved;
   }
+  // Every field the page reads from saved state is checked here, so a value that passes cannot throw later.
   function savedProblems(saved) {
     if (!isType("object", saved) || saved.v !== 1) return ["unknown format"];
-    var p = bundleProblems(asBundle(saved), {local: true});
-    if (saved.run !== null && !(isType("object", saved.run) && typeof saved.run.seed === "string" && Array.isArray(saved.run.actions))) p.push("bad prototype checkpoint");
-    if (!isType("object", saved.ui)) p.push("bad ui state");
-    return p;
+    var want = ["v", "session", "sessions", "notes", "inputs", "run", "ui", "exported"];
+    var extra = Object.keys(saved).filter(function (k) { return want.indexOf(k) < 0; });
+    if (extra.length) return ["unknown fields " + extra.slice(0, 3).join(", ")];
+    if (!isType("object", saved.session) || !Array.isArray(saved.sessions) || !Array.isArray(saved.notes) || !Array.isArray(saved.inputs)) return ["missing parts"];
+    if (saved.run !== null && !(isType("object", saved.run) && typeof saved.run.seed === "string" && Array.isArray(saved.run.actions))) return ["bad prototype checkpoint"];
+    if (saved.exported !== null && typeof saved.exported !== "string") return ["bad export marker"];
+    var p = bundleProblems(asBundle(saved), {local: true});   // the session, sessions, notes, inputs and checkpoint
+    if (p.length) return p;
+    if (!isType("object", saved.ui) || Object.keys(saved.ui).sort().join() !== "guide,unguided") return ["bad ui state"];
+    var tasks = saved.session.tasks;
+    function ref(x, guided) {
+      if (x === null) return true;
+      if (!isType("object", x) || Object.keys(x).sort().join() !== (guided ? "advancedAt,scenario,step,task" : "scenario,task")) return false;
+      var sc = typeof x.scenario === "string" ? record(x.scenario) : null;
+      if (!sc || x.scenario.indexOf("scenario.") !== 0) return false;
+      if (!isType("integer", x.task) || x.task < 0 || x.task >= tasks.length || tasks[x.task].scenario !== x.scenario) return false;
+      if (!guided) return true;
+      return isType("integer", x.step) && x.step >= 0 && x.step <= (sc.actions || []).length && Array.isArray(x.advancedAt) &&
+             x.advancedAt.length === x.step && x.advancedAt.every(function (i) { return isType("integer", i) && i >= 0; });
+    }
+    if (!ref(saved.ui.guide, true) || !ref(saved.ui.unguided, false)) return ["bad task state"];
+    return [];
   }
   function asBundle(s) {
     return {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(),
-            notes: s.notes, inputs: s.inputs, sessions: [sessionRecord(s.session, s.run)].concat(s.sessions || [])};
+            notes: s.notes, inputs: s.inputs, sessions: [sessionRecord(s.session, s.run)].concat(s.sessions)};
   }
   function sessionRecord(sess, run) {
     var r = clone(sess);
@@ -274,7 +352,7 @@
   function replay() {
     RT.state = null; RT.events = []; RT.last = null;
     if (!PROTO || !S.run) return;
-    var seedFn = PROTO.seeds[S.run.seed];
+    var seedFn = own(PROTO.seeds, S.run.seed) ? PROTO.seeds[S.run.seed] : null;
     if (!seedFn) { RT.message = {kind: "error", text: "The prototype has no seed named " + S.run.seed + "."}; return; }
     var state = clone(seedFn());
     S.run.actions.forEach(function (act, i) {
@@ -356,7 +434,7 @@
   function startTask(sid, mode) {
     var sc = record(sid);
     if (!sc || !PROTO) return;
-    if (!PROTO.seeds[sc.seed]) {
+    if (!own(PROTO.seeds, sc.seed)) {
       RT.message = {kind: "error", text: sc.id + " starts from seed '" + sc.seed + "', which this prototype does not provide."};
       render();
       return;
@@ -400,7 +478,7 @@
     }
   }
   function condition(sid) {
-    var f = PROTO && PROTO.conditions && PROTO.conditions[sid];
+    var f = PROTO && own(PROTO.conditions, sid) ? PROTO.conditions[sid] : null;
     if (typeof f !== "function" || !RT.state) return null;
     try { return !!f(clone(RT.state)); } catch (e) { return false; }
   }
@@ -474,6 +552,8 @@
     };
     var issues = schemaIssues("note", note);
     if (issues.length) return "The note cannot be saved: " + issues.join("; ");
+    var big = recordFits("notes", note);
+    if (big) return "The note cannot be saved: " + big + ".";
     S.notes.push(note);
     closeNote();
     save();
@@ -487,6 +567,8 @@
                  text: text, reviewer: S.session.reviewer, package_revision: DATA.build.revision, status: "pending"};
     var issues = schemaIssues("input", input);
     if (issues.length) return "Cannot record it: " + issues.join("; ");
+    var big = recordFits("inputs", input);
+    if (big) return "Cannot record it: " + big + ".";
     S.inputs.push(input);
     save();
     render();
@@ -495,7 +577,13 @@
 
   // ------------------------------------------------------------------ anchors (the same rule as tp-product import-feedback)
 
+  function remapOf(id) {
+    var r = (DATA.remaps || []).filter(function (x) { return x.note === id; });
+    return r.length ? r[0] : null;
+  }
   function anchorOf(note) {
+    var rm = remapOf(note.id);
+    if (rm) return knownTarget(rm.target) ? "remapped" : "unresolved";
     if (note.journey !== null && !(record(note.journey) && note.journey.indexOf("journey.") === 0)) return "unresolved";
     if (note.scenario !== null && !(record(note.scenario) && note.scenario.indexOf("scenario.") === 0)) return "unresolved";
     if (!knownTarget(note.target.id)) return "unresolved";
@@ -525,15 +613,78 @@
     a.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
   }
+  // What one bundle may hold: the limits tp-product import-feedback and this page's import enforce.
+  function bundleFits(text, b) {
+    var p = [];
+    if (utf8Length(text) > DATA.limits.bytes) p.push(utf8Length(text) + " bytes; at most " + DATA.limits.bytes);
+    if (b.notes.length + b.inputs.length > DATA.limits.records) p.push((b.notes.length + b.inputs.length) + " records; at most " + DATA.limits.records);
+    if (depth(b, DATA.limits.depth) > DATA.limits.depth) p.push("nested deeper than " + DATA.limits.depth + " levels");
+    return p;
+  }
+  function bundleText(b) { return JSON.stringify(b, null, 2); }
+  // The bundles an export writes. One when everything fits; otherwise the notes and inputs are split, in order, into
+  // bundles that each fit (the sessions go with the first), every one importable on its own. Returns {parts} or {error}.
+  function exportParts() {
+    var whole = bundle(), text = bundleText(whole);
+    if (!bundleFits(text, whole).length) return {parts: [{bundle: whole, text: text}]};
+    var head = {schema: whole.schema, schema_version: whole.schema_version, package: whole.package, exported: whole.exported};
+    function part(sessions) { return {schema: head.schema, schema_version: head.schema_version, package: head.package, exported: head.exported, notes: [], inputs: [], sessions: sessions}; }
+    var first = part(whole.sessions), firstText = bundleText(first), firstProblems = bundleFits(firstText, first);
+    if (firstProblems.length) return {error: "the review sessions alone exceed one bundle (" + firstProblems.join("; ") + ")"};
+    var parts = [], cur = first, size = utf8Length(firstText);
+    var recs = whole.notes.map(function (r) { return ["notes", r]; }).concat(whole.inputs.map(function (r) { return ["inputs", r]; }));
+    for (var i = 0; i < recs.length; i++) {
+      var coll = recs[i][0], r = recs[i][1];
+      // the record's size inside a bundle: its pretty text indented two more levels, a separator and a line break
+      var rt = JSON.stringify(r, null, 2), cost = utf8Length(rt) + 4 * (rt.split("\n").length) + 2;
+      if (depth(r, DATA.limits.depth) + 2 > DATA.limits.depth) return {error: r.id + " is nested deeper than one bundle allows (" + DATA.limits.depth + " levels)"};
+      if (cur.notes.length + cur.inputs.length > 0 && (size + cost > DATA.limits.bytes || cur.notes.length + cur.inputs.length + 1 > DATA.limits.records)) {
+        parts.push(cur);
+        cur = part([]);
+        size = utf8Length(bundleText(cur));
+      }
+      cur[coll].push(r);
+      size += cost;
+    }
+    parts.push(cur);
+    var out = [];
+    for (var j = 0; j < parts.length; j++) {
+      var t = bundleText(parts[j]), problems = bundleFits(t, parts[j]);
+      if (problems.length) return {error: "part " + (j + 1) + " would not fit one bundle (" + problems.join("; ") + ")"};
+      out.push({bundle: parts[j], text: t});
+    }
+    return {parts: out};
+  }
   function doExport() {
-    var b = bundle();
-    var text = JSON.stringify(b, null, 2);
-    RT.exportText = text;
+    var got = exportParts();
+    if (got.error) {   // nothing is marked exported: the records stay counted as unsaved
+      RT.exportError = "Export refused: " + got.error + ". Nothing was exported.";
+      RT.exportText = null;
+      RT.exportParts = null;
+      render();
+      document.dispatchEvent(new CustomEvent("tp-exported", {detail: {ok: false, error: RT.exportError}}));
+      return;
+    }
+    var parts = got.parts, base = DATA.package.id + "-feedback-" + S.session.id;
+    RT.exportError = null;
+    RT.exportParts = parts.map(function (x) { return x.text; });
+    RT.exportText = parts.length === 1 ? parts[0].text : null;
     S.exported = exportDigest();
     save();
-    download(DATA.package.id + "-feedback-" + S.session.id + ".json", text, "application/json");
+    parts.forEach(function (x, i) {
+      download(base + (parts.length === 1 ? "" : "-part-" + (i + 1) + "-of-" + parts.length) + ".json", x.text, "application/json");
+    });
     render();
-    document.dispatchEvent(new CustomEvent("tp-exported", {detail: {notes: b.notes.length, inputs: b.inputs.length}}));
+    document.dispatchEvent(new CustomEvent("tp-exported", {detail: {ok: true, parts: parts.length,
+      notes: parts.reduce(function (n, x) { return n + x.bundle.notes.length; }, 0),
+      inputs: parts.reduce(function (n, x) { return n + x.bundle.inputs.length; }, 0)}}));
+  }
+  // A record is kept only if it can be exported: on its own it fits one bundle.
+  function recordFits(coll, r) {
+    var b = {schema: "tp-product-feedback", schema_version: 1, package: DATA.package.id, exported: now(), notes: [], inputs: [], sessions: []};
+    b[coll].push(r);
+    var p = bundleFits(bundleText(b), b);
+    return p.length ? "it would not fit an export bundle (" + p.join("; ") + ")" : null;
   }
 
   function bundleProblems(b, opts) {
@@ -551,10 +702,10 @@
     if (p.length) return p;
     b.notes.forEach(function (n, i) {
       if (n.package !== DATA.package.id) p.push("notes." + i + ": belongs to package " + JSON.stringify(n.package));
-      if (!opts.local) ["anchor", "disposition"].forEach(function (f) { if (f in n) p.push("notes." + i + "." + f + ": set locally by the package owner, never imported"); });
+      if (!opts.local) ["anchor", "disposition", "remap"].forEach(function (f) { if (own(n, f)) p.push("notes." + i + "." + f + ": set locally by the package owner, never imported"); });
     });
     b.inputs.forEach(function (x, i) {
-      if (x.status !== "pending" || "reconciliation" in x) p.push("inputs." + i + ".status: an answer or proposal is pending until the package owner reconciles it");
+      if (x.status !== "pending" || own(x, "reconciliation")) p.push("inputs." + i + ".status: an answer or proposal is pending until the package owner reconciles it");
       var t = record(x.target), kind = String(x.target).split(".")[0];
       if (!t || ["question", "rule", "decision"].indexOf(kind) < 0) p.push("inputs." + i + ".target: " + x.target + " is not a question, rule or decision of this package");
     });
@@ -562,16 +713,21 @@
   }
   function importText(text) {
     var report = {ok: false, errors: [], added: {notes: [], inputs: [], sessions: []}, duplicates: [], conflicts: []};
-    if (utf8Length(text) > DATA.limits.bytes) { report.errors.push("larger than " + DATA.limits.bytes + " bytes"); return report; }
+    // both limits are reported together (the depth scan stops one level past the limit, so it is cheap at any size)
+    if (utf8Length(text) > DATA.limits.bytes) report.errors.push("larger than " + DATA.limits.bytes + " bytes");
+    if (textDepth(text, DATA.limits.depth) > DATA.limits.depth) report.errors.push("nested deeper than " + DATA.limits.depth + " levels");
+    if (report.errors.length) return report;
     var b;
     try { b = JSON.parse(text); } catch (e) { report.errors.push("not JSON: " + e.message); return report; }
     report.errors = bundleProblems(b);
     if (report.errors.length) return report;
-    var have = {};
+    report.errors = numberProblems(text);
+    if (report.errors.length) { report.errors.push("nothing was imported"); return report; }
+    var have = dict();
     S.notes.concat(S.inputs).forEach(function (r) { have[r.id] = canonical(r); });
-    var sessions = {};
+    var sessions = dict();
     [sessionRecord(S.session, S.run)].concat(S.sessions).forEach(function (s) { sessions[s.id] = canonical(s); });
-    var seen = {}, adds = {notes: [], inputs: [], sessions: []};
+    var seen = dict(), adds = {notes: [], inputs: [], sessions: []};
     function classify(coll, r, pool) {
       var c = canonical(r);
       if (seen[coll + r.id] !== undefined) { if (seen[coll + r.id] !== c) report.conflicts.push(r.id + " (the bundle holds two different records with this id)"); return; }
@@ -583,7 +739,7 @@
     b.notes.forEach(function (r) { classify("notes", r, have); });
     b.inputs.forEach(function (r) { classify("inputs", r, have); });
     (b.sessions || []).forEach(function (s) {
-      if (s.id === S.session.id && !(s.id in sessions && sessions[s.id] === canonical(s))) {
+      if (s.id === S.session.id && sessions[s.id] !== canonical(s)) {
         report.conflicts.push(s.id + " (the session open in this browser has this id; its record differs)");
         return;
       }
@@ -605,7 +761,26 @@
       render();
       document.dispatchEvent(new CustomEvent("tp-imported", {detail: report}));
     }
-    if (file.size > DATA.limits.bytes) { done({ok: false, errors: ["larger than " + DATA.limits.bytes + " bytes"], added: {notes: [], inputs: [], sessions: []}, duplicates: [], conflicts: []}); return; }
+    if (file.size > DATA.limits.bytes) {
+      // never parsed; the depth is still measured, chunk by chunk over the bytes (brackets and quotes are ASCII, so
+      // they never occur inside a UTF-8 sequence), and the scan stops one level past the limit
+      var st = {d: 0, max: 0, inStr: false, esc: false}, at = 0, CHUNK = 1 << 20;
+      var errors = ["larger than " + DATA.limits.bytes + " bytes"];
+      var finish = function () {
+        if (st.max > DATA.limits.depth) errors.push("nested deeper than " + DATA.limits.depth + " levels");
+        done({ok: false, errors: errors, added: {notes: [], inputs: [], sessions: []}, duplicates: [], conflicts: []});
+      };
+      var step = function () {
+        if (at >= file.size || st.max > DATA.limits.depth) { finish(); return; }
+        file.slice(at, at + CHUNK).arrayBuffer().then(function (buf) {
+          bytesDepth(st, new Uint8Array(buf), DATA.limits.depth);
+          at += CHUNK;
+          step();
+        }, finish);
+      };
+      step();
+      return;
+    }
     var fr = new FileReader();
     fr.onload = function () {
       var text;
@@ -621,7 +796,7 @@
     var i = S.sessions.map(function (s) { return s.id; }).indexOf(sid);
     if (i < 0) return;
     var rec = S.sessions[i];
-    if (rec.prototype && PROTO && !PROTO.seeds[rec.prototype.seed]) {
+    if (rec.prototype && PROTO && !own(PROTO.seeds, rec.prototype.seed)) {
       RT.message = {kind: "error", text: "Session " + sid + " was recorded on seed " + rec.prototype.seed + ", which this prototype does not have."};
       render();
       return;
@@ -634,9 +809,25 @@
     var s = clone(rec);
     delete s.prototype;
     S.session = s;
+    resumeTask();
     replay();
     save();
     render();
+  }
+  // The session's last task, if still in progress, is open again: its scenario, mode and assistance counts come from
+  // the task record, and a guided task's step from the checkpoint's actions (startTask begins it with an empty run).
+  function resumeTask() {
+    var n = S.session.tasks.length - 1, t = S.session.tasks[n];
+    if (!t || t.outcome !== "in-progress") return;
+    var sc = record(t.scenario);
+    if (!sc || !S.run || S.run.seed !== sc.seed) return;
+    if (t.mode !== "guided") { S.ui.unguided = {scenario: t.scenario, task: n}; return; }
+    var g = {scenario: t.scenario, task: n, step: 0, advancedAt: []};
+    S.run.actions.forEach(function (act, idx) {
+      var st = sc.actions[g.step];
+      if (st && act && st.action === act.action && st.target === act.target) { g.advancedAt.push(idx); g.step += 1; }
+    });
+    S.ui.guide = g;
   }
   function allSessionsHas(s) {
     return s.tasks.length || s.visited.length || S.notes.some(function (n) { return n.review_session === s.id; }) ||
@@ -649,13 +840,13 @@
     function quote(t) { return String(t).split(/\r?\n/).map(function (l) { return "    > " + l; }); }
     L.push("Review summary: " + DATA.package.title + " (" + DATA.package.id + ")");
     L.push("Build: revision " + DATA.build.revision + ", content " + DATA.build.content_fingerprint + ", source " + DATA.build.source_fingerprint);
-    var reviewers = {};
+    var reviewers = dict();
     notes.concat(inputs).forEach(function (r) { reviewers[r.reviewer] = true; });
     L.push("Reviewers (labels, not authenticated): " + (Object.keys(reviewers).sort().join(", ") || "none"));
     L.push("Notes: " + notes.length + ". Answers and proposals: " + inputs.length + " (pending until the package owner reconciles them).");
     L.push("");
     L.push("== Notes by journey and page ==");
-    var groups = {};
+    var groups = dict();
     notes.forEach(function (n) { var k = n.journey || "~"; (groups[k] = groups[k] || []).push(n); });
     Object.keys(groups).sort().forEach(function (k) {
       L.push("-- " + (k === "~" ? "Free exploration (no journey)" : k + ": " + title(k)) + " --");
@@ -664,7 +855,7 @@
           L.push("  [" + (n.page || "-") + "] " + n.target.label + " (" + n.target.id + ")  " + n.id);
           L.push("    by " + n.reviewer + ", " + n.mode + (n.assistance !== "none" ? ", " + n.assistance : "") +
                  (n.scenario ? ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "") : "") +
-                 ", build revision " + n.build.revision + ", anchor " + anchorOf(n) + (n.category ? ", category " + n.category : ""));
+                 ", build revision " + n.build.revision + ", anchor " + anchorOf(n) + (remapOf(n.id) ? " (remapped to " + remapOf(n.id).target + ", original " + n.target.id + ")" : "") + (n.category ? ", category " + n.category : ""));
           L.push.apply(L, quote(n.text));
         });
     });
@@ -678,7 +869,7 @@
     L.push("");
     L.push("== Coverage (visiting a scenario is not approval) ==");
     var sessions = allSessions().slice().sort(function (a, b) { return cmp(a.id, b.id); });
-    var visited = {};
+    var visited = dict();
     sessions.forEach(function (s) { s.visited.forEach(function (v) { visited[v] = true; }); });
     var scen = (DATA.design.scenarios || []).map(function (s) { return s.id; }).sort();
     L.push("Visited: " + (scen.filter(function (s) { return visited[s]; }).join(", ") || "none"));
@@ -894,7 +1085,7 @@
   }
   function describe(x) {
     var a = adapterAction(x.action);
-    var t = REG.exact[x.target] || x.target;
+    var t = (REG.exact[x.target] !== undefined && REG.exact[x.target]) || x.target;
     var input = x.input && x.input.value !== undefined ? " with \"" + x.input.value + "\"" : x.input && x.input.to ? " to " + x.input.to : "";
     return (a ? a.label : x.action) + ": " + t + input;
   }
@@ -1036,7 +1227,7 @@
   }
 
   function viewFeedback() {
-    var anchors = {current: [], "changed-context": [], unresolved: []};
+    var anchors = {current: [], "changed-context": [], remapped: [], unresolved: []};
     S.notes.forEach(function (n) { anchors[anchorOf(n)].push(n); });
     var fileIn = h("input", {"type": "file", "accept": ".json,application/json", "id": "tp-import-file", "aria-label": "Import a feedback bundle"});
     fileIn.addEventListener("change", function () { if (fileIn.files && fileIn.files[0]) importFile(fileIn.files[0]); });
@@ -1056,14 +1247,23 @@
         String(rep.added.sessions.length), " session(s); ", String(rep.duplicates.length), " already here (unchanged)."
       ] : ["Nothing was imported: ", list(rep.errors.concat(rep.conflicts))]) : null,
       RT.summary ? h("textarea", {"readonly": true, "rows": 14, "id": "tp-summary", "aria-label": "Feedback summary"}, RT.summary) : null,
+      RT.exportError ? h("p", {"class": "tp-panel tp-error", "role": "alert", "id": "tp-export-error"}, RT.exportError) : null,
       RT.exportText ? h("details", {}, [h("summary", {}, "Exported JSON (copy it if the download was blocked)"),
                                         h("textarea", {"readonly": true, "rows": 8, "id": "tp-export-text"}, RT.exportText)]) : null,
+      RT.exportParts && RT.exportParts.length > 1 ? h("p", {"class": "tp-panel", "id": "tp-export-parts", "role": "status"},
+        "The feedback was larger than one bundle allows, so it was exported as " + RT.exportParts.length +
+        " bundles (part 1 of " + RT.exportParts.length + " and so on). Import every part; each is complete on its own.") : null,
       h("h3", {}, "Notes"),
       S.notes.length ? h("div", {"id": "tp-notes"}, S.notes.map(noteCard)) : h("p", {"class": "tp-muted"}, "No notes yet. Use Add note (or press N) and pick any highlighted element."),
       h("h3", {}, "Unresolved anchors"),
       h("p", {"class": "tp-muted"}, "Notes whose target, journey or scenario is not in this build. They are kept, never dropped; the package owner remaps them."),
       anchors.unresolved.length ? h("ul", {"id": "tp-unresolved"}, anchors.unresolved.map(function (n) { return h("li", {}, n.id + ": " + n.target.id + " (" + n.target.label + "), build revision " + n.build.revision); }))
                                 : h("p", {"class": "tp-muted", "id": "tp-unresolved"}, "None."),
+      h("h3", {}, "Remapped by the package owner"),
+      (DATA.remaps || []).length ? h("ul", {"id": "tp-remaps"}, DATA.remaps.map(function (r) {
+        return h("li", {}, [r.note, ": now on ", h("code", {}, r.target), " (" + title(r.target) + "), originally on ", h("code", {}, r.original),
+                            ". Reason: ", r.reason]);
+      })) : h("p", {"class": "tp-muted", "id": "tp-remaps"}, "None."),
       h("h3", {}, "Answers and proposals"),
       S.inputs.length ? list(S.inputs.map(function (x) { return h("span", {"class": "tp-input"}, [badge(x.status, "pending"), " ", x.id, " on ", x.target, " by ", x.reviewer, ": ", x.text]); }))
                       : h("p", {"class": "tp-muted"}, "None."),
@@ -1087,7 +1287,8 @@
         n.scenario ? ", " + n.scenario + (n.step !== null ? " step " + (n.step + 1) : "") : "", ", ", n.mode,
         n.assistance !== "none" ? " (" + n.assistance + ")" : "", n.category ? ", " + n.category : ""]),
       h("p", {"class": "tp-muted"}, ["Context: ", n.target.context, ". Checkpoint ", n.checkpoint || "-", ". ",
-        badge(a === "current" ? "this build" : a === "changed-context" ? "from build revision " + n.build.revision + ": context may have changed" : "unresolved anchor", a)])
+        badge(a === "current" ? "this build" : a === "changed-context" ? "from build revision " + n.build.revision + ": context may have changed" :
+              a === "remapped" ? "remapped to " + remapOf(n.id).target + " (original " + n.target.id + ")" : "unresolved anchor", a)])
     ]);
   }
 
@@ -1126,9 +1327,14 @@
   function notePanel() {
     var p = RT.pending;
     if (!p) return null;
+    var draft = p.draft || (p.draft = {text: "", category: ""});   // transient, like the rest of RT.pending
     var ta = h("textarea", {"id": "tp-note-text", "rows": 5, "aria-label": "Note text"});
     var cat = h("select", {"id": "tp-note-category", "aria-label": "Category"}, [["", "No category"], ["question", "Question"], ["confusing", "Confusing"],
       ["problem", "Problem"], ["idea", "Idea"], ["agree", "Looks right"]].map(function (c) { return h("option", {"value": c[0]}, c[1]); }));
+    ta.value = draft.text;
+    cat.value = draft.category;
+    ta.addEventListener("input", function () { draft.text = ta.value; });
+    cat.addEventListener("change", function () { draft.category = cat.value; });
     var err = h("p", {"class": "tp-error", "role": "alert"}, "");
     return h("aside", {"class": "tp-note-panel", "role": "dialog", "aria-label": "Add a note", "id": "tp-note-panel"}, [
       h("h3", {}, "Note on: " + p.target.label),
@@ -1169,10 +1375,14 @@
     RT.renderPending = false;
     var root = document.getElementById("tp-root");
     var active = focusKey(document.activeElement);
-    var pendingText = document.getElementById("tp-note-text");
-    var keep = pendingText ? pendingText.value : null;
+    var pendingText = document.getElementById("tp-note-text"), pendingCat = document.getElementById("tp-note-category");
+    if (RT.pending && RT.pending.draft) {   // whatever the fields hold now, even if no event reported it yet
+      if (pendingText) RT.pending.draft.text = pendingText.value;
+      if (pendingCat) RT.pending.draft.category = pendingCat.value;
+    }
+    var selStart = pendingText ? pendingText.selectionStart : null, selEnd = pendingText ? pendingText.selectionEnd : null;
     clear(root);
-    RT.undeclared = {};
+    RT.undeclared = dict();
     var main = h("main", {"id": "tp-main", "class": RT.noteMode ? "tp-note-mode" : ""});
     var body;
     try {
@@ -1188,7 +1398,8 @@
     root.insertBefore(toolbar(), main);  // after main exists, so the note picker can list its targets
     var panel = notePanel();
     if (panel) append(root, panel);
-    if (keep !== null && document.getElementById("tp-note-text")) document.getElementById("tp-note-text").value = keep;
+    var newText = document.getElementById("tp-note-text");
+    if (newText && selStart !== null) { try { newText.setSelectionRange(selStart, selEnd); } catch (e) { /* not focusable yet */ } }
     if (RT.noteMode) Array.prototype.forEach.call(main.querySelectorAll("[data-tp-target]"), function (e) { if (!e.hasAttribute("tabindex")) e.setAttribute("tabindex", "0"); });
     highlightStep();
     var ta = document.getElementById("tp-note-text");
@@ -1271,11 +1482,15 @@
     }
     KEY = "tp-product-review:v1:" + DATA.package.id;
     buildRegistry();
-    S = load();
+    try { S = load(); } catch (e) {
+      RT.storageNotice = "Review data saved in this browser could not be read (" + e.message + "); it is left untouched and this page starts fresh.";
+      RT.storage = {ok: false, reason: "saved data unreadable; not overwriting it"};
+      S = freshState();
+    }
     if (PROTO && DATA.adapter) {
-      DATA.adapter.seeds.forEach(function (s) { if (!PROTO.seeds[s.id]) LOAD_ERRORS.push("seed " + s.id + " is declared but the script does not provide it"); });
+      DATA.adapter.seeds.forEach(function (s) { if (!own(PROTO.seeds, s.id)) LOAD_ERRORS.push("seed " + s.id + " is declared but the script does not provide it"); });
       if (!S.run) S.run = {seed: DATA.adapter.seeds[0].id, actions: []};
-      try { replay(); } catch (e) { RT.message = {kind: "error", text: "Replaying the saved checkpoint failed: " + e.message + ". Reset to start again."}; }
+      try { replay(); } catch (e) { RT.message = {kind: "error", text: "Replaying the saved checkpoint failed: " + (e && e.message) + ". Reset to start again."}; }
     }
     var v = location.hash.replace(/^#/, "");
     RT.view = VIEWS.some(function (x) { return x[0] === v; }) ? v : "overview";
@@ -1297,7 +1512,8 @@
       return clone({view: RT.view, run: S && S.run, state: RT.state, events: RT.events, notes: S ? S.notes.length : 0,
                     inputs: S ? S.inputs.length : 0, session: S && S.session, sessions: S ? S.sessions.length : 0,
                     storage: RT.storage, blocked: RT.blocked, noteMode: RT.noteMode, pending: RT.pending, stepError: RT.stepError,
-                    guide: S && S.ui.guide, unguided: S && S.ui.unguided, errors: LOAD_ERRORS});
+                    guide: S && S.ui.guide, unguided: S && S.ui.unguided, errors: LOAD_ERRORS, storageNotice: RT.storageNotice,
+                    exportError: RT.exportError, exportParts: RT.exportParts ? RT.exportParts.map(utf8Length) : null});
     },
     summary: function () { return summaryText(); },
     settled: settled

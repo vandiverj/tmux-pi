@@ -58,6 +58,7 @@
             "fingerprint": {"$ref": "#/$defs/fingerprint"},
             "file": {"type": "string", "minLength": 1, "maxLength": 500},
             "source": {"$comment": "The build's source fingerprint (lib/product_design/review.py): what the build shows, whatever the revision counter says.", "$ref": "#/$defs/fingerprint"},
+            "digest": {"$comment": "sha256 of the build file's bytes: the build is up to date only while its file holds them.", "$ref": "#/$defs/fingerprint"},
             "git": {"type": "string", "maxLength": 200}
           }
         }}
@@ -480,6 +481,17 @@
         "mode": {"enum": ["guided", "unguided", "free"]},
         "assistance": {"enum": ["none", "help-requested", "assisted-advance"]},
         "anchor": {"x-bookkeeping": true, "enum": ["current", "changed-context", "unresolved", "remapped"]},
+        "remap": {
+          "$comment": "remap-anchor: the target the note is anchored to now, and why. target (above) stays the original.",
+          "x-bookkeeping": true,
+          "type": "object", "additionalProperties": false, "required": ["target", "reason", "by", "date"],
+          "properties": {
+            "target": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$", "maxLength": 200},
+            "reason": {"$ref": "#/$defs/text"},
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"}
+          }
+        },
         "disposition": {
           "x-bookkeeping": true,
           "type": "object", "additionalProperties": false, "required": ["kind", "rationale", "by", "date"],

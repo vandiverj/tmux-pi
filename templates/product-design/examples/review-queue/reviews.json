@@ -21,7 +21,7 @@
       "category": "question",
       "mode": "guided",
       "assistance": "none",
-      "anchor": "current",
+      "anchor": "changed-context",
       "disposition": {
         "kind": "needs-decision",
         "rationale": "Same gap as the open reassignment question.",

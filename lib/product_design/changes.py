@@ -266,6 +266,22 @@ def op_set_disposition(work, op, ctx):
     rec["disposition"] = {k: op[k] for k in ("kind", "rationale", "link", "by", "date") if k in op}
 
 
+def op_remap_anchor(work, op, ctx):
+    """Anchor a note to another target of the registry, with the reason. The note's original target is kept as it was
+    imported; `remap` records the new target, the reason and who decided it, and the anchor becomes `remapped`. The
+    same target and reason again is a no-op; an id outside the registry is refused."""
+    _need(op, "note", "target", "reason", "by", "date")
+    _, rec = _find(work, op["note"], {"note"})
+    if not ctx["known"](work, op["target"]):
+        raise OpError("op.target", f"{op['target']} is not a target of this package's review build (its views, design "
+                                   "records and prototype targets); a note is remapped only to a target the page shows")
+    held = rec.get("remap")
+    if isinstance(held, dict) and held.get("target") == op["target"] and held.get("reason") == op["reason"]:
+        return
+    rec["remap"] = {"target": op["target"], "reason": op["reason"], "by": op["by"], "date": op["date"]}
+    rec["anchor"] = "remapped"
+
+
 def op_set_manifest(work, op, ctx):
     _need(op, "fields")
     fields = op["fields"]
@@ -278,7 +294,7 @@ def op_set_manifest(work, op, ctx):
 OPERATIONS = {
     "add": op_add, "set": op_set, "replace": op_replace, "supersede": op_supersede,
     "accept-decision": op_accept_decision, "set-readiness": op_set_readiness, "reconcile-input": op_reconcile_input,
-    "accept-uncertainty": op_accept_uncertainty, "set-disposition": op_set_disposition, "set-manifest": op_set_manifest,
+    "accept-uncertainty": op_accept_uncertainty, "set-disposition": op_set_disposition, "set-manifest": op_set_manifest, "remap-anchor": op_remap_anchor,
     "adopt-external-edit": None,  # handled by apply: it must be the only operation
 }
 
@@ -301,6 +317,7 @@ SPECS = {
     "accept-uncertainty": (dict(_EVENT, question="text", scope="text", rationale="text", revisit_trigger="text"), {}),
     "set-disposition": (dict(_EVENT, note="text", kind="text", rationale="text"), {"link": "text"}),
     "set-manifest": ({"fields": "object"}, {}),
+    "remap-anchor": (dict(_EVENT, note="text", target="text", reason="text"), {}),
     "adopt-external-edit": ({"by": "text", "reason": "text"}, {}),
 }
 
@@ -437,7 +454,7 @@ def apply(package_dir, changeset, expected_revision, fault: Callable = T._noop) 
         if state["issues"]:  # a committed, unedited package is valid; say so plainly if it is not
             raise T.StoreError("package.invalid", _issues_text(state["issues"]))
         work = copy.deepcopy(docs)
-        ctx = {"accepted": []}
+        ctx = {"accepted": [], "known": lambda w, t: _registry_known(package_dir, w)(t)}
         for n, op in enumerate(ops):
             try:
                 OPERATIONS[op["op"]](work, op, ctx)
@@ -559,11 +576,22 @@ def load_bundle(path):
                            details={"path": str(path)}) from None
 
 
+def _registry_known(package_dir, work):
+    """known(target id) over the registry a build of `work` shows (review.registry with the package's adapter)."""
+    from . import review  # the target registry: views, design records, the prototype adapter's targets
+    reg = review.package_registry(package_dir, work)  # an invalid adapter refuses (adapter.invalid)
+    return lambda t: review.known(reg, t)
+
+
 def anchor(note, docs, idx, content_fp, known=None) -> str:
-    """Where a note stands against the current design: unresolved when its journey or scenario is gone, or when its
+    """Where a note stands against the current design: a remapped note (remap-anchor) is `remapped` while its new
+    target is in the registry, else unresolved; otherwise unresolved when its journey or scenario is gone, or when its
     target is not one a build of the package shows (`known(target id)`: review.known over the package's registry);
     current when it was captured against the same semantic content; else changed-context. Its original anchors are kept
     unchanged."""
+    remap = note.get("remap")
+    if isinstance(remap, dict):
+        return "remapped" if known is None or known(remap["target"]) else "unresolved"
     for field in ("journey", "scenario"):
         value = note.get(field)
         if value is not None and idx.get(value, (None,))[0] != field:
@@ -571,6 +599,20 @@ def anchor(note, docs, idx, content_fp, known=None) -> str:
     if known is not None and not known(note["target"]["id"]):
         return "unresolved"
     return "current" if note["build"]["fingerprint"] == content_fp else "changed-context"
+
+
+def reanchor(work, known) -> dict:
+    """Re-evaluate the anchor of every note in `work` against its current content and `known` (the registry), in place.
+    Returns {note id: new anchor} for each note whose stored anchor changed. Import and build run it every time, so a
+    note whose target left the registry becomes unresolved (its original target kept) even when nothing new arrives."""
+    idx, content_fp = P.index(work), P.content_fingerprint(work)
+    changed = {}
+    for note in work["reviews"]["notes"]:
+        now = anchor(note, work, idx, content_fp, known)
+        if note.get("anchor") != now:
+            note["anchor"] = now
+            changed[note["id"]] = now
+    return changed
 
 
 def check_bundle(docs, raw) -> dict:
@@ -623,7 +665,7 @@ def check_bundle(docs, raw) -> dict:
             if kind == "note":
                 if rec["package"] != package_id:
                     issue("package.mismatch", path + ("package",), f"note belongs to {rec['package']!r}")
-                for field in ("anchor", "disposition"):
+                for field in ("anchor", "disposition", "remap"):
                     if field in rec:
                         issue("feedback.bookkeeping", path + (field,), f"an imported note has no {field}: it is set locally")
             if kind == "input" and (rec["status"] != "pending" or "reconciliation" in rec):
@@ -663,20 +705,30 @@ def ingest(package_dir, raw, actor="tp-product import", expected_revision=None, 
                 f"{c['id']} ({c['reason']})" for c in got["conflicts"]) + ". Nothing was written; the originals in the "
                 "package are unchanged.", details={"conflicts": got["conflicts"]})
         result = {"added": {"notes": [n["id"] for n in got["notes"]], "inputs": [i["id"] for i in got["inputs"]]},
-                  "duplicates": got["duplicates"], "anchors": {}}
-        if not got["notes"] and not got["inputs"]:
-            return dict(result, committed=False, revision=current)
+                  "duplicates": got["duplicates"], "anchors": {}, "reanchored": {}}
         work = copy.deepcopy(docs)
+        known = _registry_known(package_dir, work)
+        result["reanchored"] = reanchor(work, known)  # every stored note, duplicates included, every import
         idx, content_fp = P.index(work), P.content_fingerprint(work)
-        from . import review  # the target registry: views, design records, the prototype adapter's targets
-        reg = review.package_registry(package_dir, work)  # an invalid adapter refuses the import (adapter.invalid)
         for note in got["notes"]:
-            note["anchor"] = anchor(note, work, idx, content_fp, lambda t: review.known(reg, t))
+            note["anchor"] = anchor(note, work, idx, content_fp, known)
             result["anchors"].setdefault(note["anchor"], []).append(note["id"])
+        for rid in got["duplicates"]:
+            kind, rec = P.index(work)[rid]
+            if kind == "note":
+                result["anchors"].setdefault(rec["anchor"], []).append(rid)
+        if not got["notes"] and not got["inputs"] and not result["reanchored"]:
+            return dict(result, committed=False, revision=current)
         work["reviews"]["notes"] += got["notes"]
         work["reviews"]["inputs"] += got["inputs"]
-        cs = {"actor": actor, "summary": f"import feedback: {len(got['notes'])} note(s), {len(got['inputs'])} input(s)",
-              "evidence": [], "operations": [{"op": "import-feedback", "bundle": P.digest(got["bundle"]),
-                                              "notes": result["added"]["notes"], "inputs": result["added"]["inputs"]}]}
+        ops = []
+        if got["notes"] or got["inputs"]:
+            ops.append({"op": "import-feedback", "bundle": P.digest(got["bundle"]), "notes": result["added"]["notes"],
+                        "inputs": result["added"]["inputs"]})
+        if result["reanchored"]:
+            ops.append({"op": "re-anchor", "anchors": result["reanchored"]})
+        cs = {"actor": actor, "summary": f"import feedback: {len(got['notes'])} note(s), {len(got['inputs'])} input(s)"
+                                         + (f", {len(result['reanchored'])} note(s) re-anchored" if result["reanchored"] else ""),
+              "evidence": [], "operations": ops}
         done = _finish(package_dir, state, work, current, cs, {"accepted": []}, fault, before=docs)
         return dict(result, committed=done["committed"], revision=done["revision"])

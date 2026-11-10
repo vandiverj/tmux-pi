@@ -320,6 +320,59 @@ only_ts6305() {
   [ -n "$errors" ] && ! printf '%s\n' "$errors" | grep -qv 'error TS6305'
 }
 
+# Project-local opt-in, alongside the existing routine overrides. Only JSON true enables builds; an unreadable or
+# malformed config is an error, never permission to write. No fallback to another checkout's config.
+BUILD_TSC_REFS="$(python3 - "$WT/.tmux-pi/routines.json" 2>>"$TP_LOG" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        config = json.load(source)
+except FileNotFoundError:
+    config = {}
+if not isinstance(config, dict):
+    raise ValueError("routines config must be an object")
+print(int(config.get("build_tsc_references") is True))
+PY
+)" || tp_fail "cannot read .tmux-pi/routines.json (see log)"
+
+# reference_tree — content snapshot including tracked-but-ignored files: the temporary empty index in
+# tp_tree_fingerprint omits those, so hash the tracked diff as well. Include binary data; never invoke diff drivers.
+reference_tree() {
+  tp_tree_fingerprint "$WT" &&
+    git -C "$WT" diff HEAD --binary --no-ext-diff --no-textconv | git hash-object --stdin
+}
+
+# build_tsc_references APP BIN — opt-in permits writes, not silent worktree changes. Check status (including every
+# untracked file) and content: an already-dirty tracked file can be overwritten without its porcelain code changing.
+# Check after unsuccessful builds too; leave all writes in place for the user to inspect, never revert or delete them.
+build_tsc_references() {
+  local app="$1" bin="$2" before_status before_tree after_status after_tree
+  if ! before_status="$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>>"$TP_LOG")" ||
+     ! before_tree="$(reference_tree 2>>"$TP_LOG")"; then
+    RC=1
+    TAIL="    cannot snapshot git status/content before reference build"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+    return
+  fi
+  run_in "$app" "$label references" "$bin" -b "${REFS[@]}"
+  if ! after_status="$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>>"$TP_LOG")" ||
+     ! after_tree="$(reference_tree 2>>"$TP_LOG")"; then
+    RC=1
+    TAIL="    cannot snapshot git status/content after reference build"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+  elif [ "$before_status" != "$after_status" ] || [ "$before_tree" != "$after_tree" ]; then
+    RC=1
+    TAIL="    reference builds wrote files git does not ignore; inspect these paths (no files were reverted):
+    before:
+$before_status
+    after:
+$after_status"
+    printf '%s\n' "$TAIL" >>"$TP_LOG"
+  fi
+}
+
 # Typecheck, one line per touched app that has a typecheck config (deno.json(c) or tsconfig.json). Any changed or
 # deleted file in the app counts: a package.json, tsconfig, deno.json or .js change, or a deleted file that others
 # import, can break the typecheck as well as a .ts one.
@@ -364,23 +417,18 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
   elif [ -e "$WT/$app/tsconfig.json" ]; then
     typed=1
     if bin="$(tp_find_tool tsc "$WT/$app" "$WT")"; then
-      # Build the referenced projects first (their declarations go to their own build output), then check the app. A
-      # reference that does not build is the app's typecheck failure. The build runs only when every file it would
-      # write is ignored by git and untracked: it must not change the worktree under review. Otherwise the app is
-      # checked as it stands, and TS6305 alone (unbuilt references) is a setup gap, `missing`, not a failure.
+      # Without explicit permission, check the app as it stands. TS6305 alone is an unbuilt-reference setup gap.
       tsc_references "$app" "$bin"
       RC=0
-      UNSAFE=""
-      if [ "${#REFS[@]}" -gt 0 ]; then
-        UNSAFE="$(tp_tsc_unsafe_refs "$WT" "$bin" "$WT/$app" "${REFS[@]}")"
-        [ -n "$UNSAFE" ] || run_in "$app" "$label references" "$bin" -b "${REFS[@]}"
+      if [ "${#REFS[@]}" -gt 0 ] && [ "$BUILD_TSC_REFS" = 1 ]; then
+        build_tsc_references "$app" "$bin"
       fi
       if [ "$RC" = 0 ]; then
         LOG_AT="$(wc -l <"$TP_LOG")"
         run_in "$app" "$label" "$bin" --noEmit
       fi
-      if [ -n "$UNSAFE" ] && [ "$RC" != 0 ] && only_ts6305 "$LOG_AT"; then
-        printf '%s skipped (references not built; building them would write files git does not ignore: %s)\n' "$label" "$UNSAFE"
+      if [ "$BUILD_TSC_REFS" != 1 ] && [ "${#REFS[@]}" -gt 0 ] && [ "$RC" != 0 ] && only_ts6305 "$LOG_AT"; then
+        printf '%s skipped (references not built; set build_tsc_references=true in .tmux-pi/routines.json to opt in)\n' "$label"
         rec "$label" missing ""
         continue
       fi

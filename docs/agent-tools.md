@@ -21,6 +21,27 @@ loops). Each prints a short summary; its **last line is `exit=N log=PATH`**, wit
 
 Exit code of a script = the `N` in the last line.
 
+## TypeScript project references
+
+By default the gate runs `tsc --noEmit` without building references. If the app has project references and fails only
+with TS6305 (unbuilt declarations), its typecheck is `missing` (setup), with an opt-in hint; `--require typecheck`
+makes that missing check fail the gate. Other errors still fail normally.
+
+To build references first, add this key to the **worktree's** `.tmux-pi/routines.json` (preserving any existing routine
+settings):
+
+```json
+{"build_tsc_references": true}
+```
+
+Only JSON `true` enables it; absent/false/other values do not. An unreadable, malformed, or non-object config stops the
+gate with an error. This is a project-wide opt-in for touched TypeScript apps, with no fallback to another checkout.
+The gate runs `tsc -b <references>` before `tsc --noEmit`. It compares git status (including untracked files) and a
+content fingerprint before and after each reference build, even a failed build. Changes to tracked files or unignored
+outputs fail the typecheck and name paths in the summary and log. Existing unrelated dirty files are allowed, but
+modifying them is not. **The gate does not undo writes**: opt in only when the project's build outputs are gitignored.
+Ignored outputs remain on disk for subsequent checks; output paths are not predicted by the gate.
+
 ## Records
 
 `pre-commit-gate.sh` and `test-run.sh` each write a JSON record of what ran on which tree, so a reader can tell whether
@@ -30,7 +51,7 @@ real index is not touched; the same content gives the same sha).
 
 - **Gate**, `tp-gate:v1`: `worktree`, `base {ref, sha}`, `head`, `tree`, `files` (the changed files), `checks`
   (`name`, `status` = `passed|failed|missing|not_applicable`, `exit` or null, whole `seconds`), `exit`, `started`,
-  `finished`, `log`. `missing` = the tool is not installed; `not_applicable` = no config or no matching files. Written
+  `finished`, `log`. `missing` = the tool is not installed or references need setup (see above); `not_applicable` = no config or no matching files. Written
   beside the log (same name, `.json`) and, when env `TP_TASK_DIR` is set, to `$TP_TASK_DIR/gate.json`; an earlier
   `gate.json` is kept as `gate-<timestamp>.json`. There is no aggregate per-app check: `prettier`, `eslint` and the
   typecheck are each recorded once per changed app (`prettier:APP`, `eslint:APP`, `typecheck:APP`), so an app without an

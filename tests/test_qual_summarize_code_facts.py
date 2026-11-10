@@ -277,8 +277,14 @@ class UseScanTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual([l for l in self.scan(user) if "does not use" in l], [])
         # decided: no star import, no dynamic form, no import of the target's module or that cannot be resolved, and the name spelled nowhere
-        for user in ("x = 1\n", "import os\nfrom pkg import helper\nx = os.sep\n", "from other.t import W\nx = W\n"):
-            self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
+        # round 15 (Main): a module from outside the run root is held to the allow-list (_outside_use): os.sep is a value read not on
+        # _SAFE_VALUES, and `pkg` and `other` are modules the scan was not given, so the inputs now use what the list allows and supply them
+        for user in ("x = 1\n", "import os\nfrom pkg import helper\nx = os.path.exists('a')\n", "from other.t import W\nx = W\n"):
+            others = (num("other/t.py", "W = 1\n"),) if user.startswith("from other") else (num("pkg/__init__.py", "helper = 1\n"),)
+            out = ss.use_scan("Who uses Q?", [num("t.py", self.TARGET), *others, num("u.py", user)])
+            self.assertEqual([l for l in out if l.startswith("- u.py")], ["- u.py does not use Q [u.py:1]"], user)
+        for user in ("import os\nfrom pkg import helper\nx = os.sep\n", "from other.t import W\nx = W\n"):  # the old inputs: opaque
+            self.assertEqual(self.scan(user), [], user)
 
     def test_absence_needs_positive_proof(self):
         """Round 4 F2: "does not use" only when the file has no path to the name; each row is one way it might, and gives no line."""
@@ -312,7 +318,10 @@ class UseScanTests(unittest.TestCase):
             self.assertEqual(self.scan(user), ["- u.py does not use Q [u.py:1]"], user)
         # the review's second reproduction, and a file with nothing that reaches the target still gets its line
         self.assertEqual(self.scan("from t import *\n"), [])
-        self.assertEqual(self.scan("import json\nx = json.dumps(1)\n"), ["- u.py does not use Q [u.py:1]"])
+        # round 15: a call of a standard-library callable keeps the line only when it is on _SAFE_CALLABLES (json.loads is, json.dumps
+        # is not)
+        self.assertEqual(self.scan("import json\nx = json.loads('1')\n"), ["- u.py does not use Q [u.py:1]"])
+        self.assertEqual(self.scan("import json\nx = json.dumps(1)\n"), [])
 
     def test_relative_imports_resolve_only_as_python_does(self):
         """Round 4 F1: a relative import resolves by the importer's package; a module at the run root has none, and no level climbs
@@ -335,7 +344,9 @@ class UseScanTests(unittest.TestCase):
         otherwise clean file; the table must equal ss._DYNAMIC_ACCESS, so a word added there needs its row here."""
         words = ("getattr", "__getattribute__", "__import__", "importlib", "import_module", "sys.modules", "eval", "exec", "compile",
                  "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
-                 "pkgutil", "pickle", "marshal", "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc")
+                 "pkgutil", "pickle", "marshal", "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc",
+                 # round 15: breakpoint() imports by PYTHONBREAKPOINT; __globals__ and a frame's f_* hand out a module namespace
+                 "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins")
         self.assertEqual(set(words), set(ss._DYNAMIC_ACCESS))
         self.assertEqual(self.scan("x = 1\n"), ["- u.py does not use Q [u.py:1]"])
         for word in words:
@@ -451,6 +462,21 @@ class UseScanTests(unittest.TestCase):
                 ("constants joined by +", "import pydoc\nresult = pydoc.locate('pkg.' + 'sub.' + 't.' + chr(81))\n", ()),
                 ("the module name as bytes", "import pydoc\nresult = pydoc.locate(b'pkg.sub.t.'.decode() + chr(81))\n", ()),
                 ("the module name as a bare string", "x = 't'\n", ()),
+                # round 15 (Main): an import of a module the scan was not given (not supplied, not on disk) may run anything, a string
+                # loader too; a module from outside the run root is used only as the allow-list allows (_outside_use)
+                ("a package that only looks alike, not supplied", "import pkg2\nfrom other.pkg import sub\n", ()),
+                ("a name that does not look like a run-root directory, not supplied", "import hh.real\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a member bound to an import alias of an outside module", "from h import x\n", (("h.py", "import os as x\n"),)),
+                ("an outside module read through a run-root module", "import h\ny = h.os.sep\n", (("h.py", "import os\n"),)),
+                ("review F1 (round 15): a helper calls pydoc.locate", "import h\n", (("h.py", "import pydoc\npydoc.locate('helperpkg.redirect')\n"),)),
+                ("an unlisted call of a listed module", "import h\n", (("h.py", "import os\nos.system('true')\n"),)),
+                ("a listed callable passed as a value", "import h\n", (("h.py", "import json\nf = json.loads\n"),)),
+                ("a listed module aliased", "import h\n", (("h.py", "import json\nj = json\n"),)),
+                ("a listed module subscripted into a call", "import h\n", (("h.py", "import os\nos.environ['A']\n"),)),
+                ("an unlisted call in a function", "import h\n", (("h.py", "def f():\n    import pydoc\n    return pydoc.locate('x')\n"),)),
+                ("the builtin help", "import h\n", (("h.py", "help('helperpkg')\n"),)),
+                ("help reached as an attribute", "import h\n", (("h.py", "b = print.__self__\nb.help('helperpkg')\n"),)),
+                ("a run-root module of a standard-library name", "x = 1\n", (("json.py", "y = 1\n"),)),
                 # round 7 F2: any directory may be on sys.path, so a module is known by every dotted suffix of its path and a directory
                 # above it by its own suffixes, with or without an __init__.py
                 ("a missing submodule of a namespace package under src", "import h.missing\n", (("src/h/real.py", "x = 1\n"),)),
@@ -515,7 +541,9 @@ class UseScanTests(unittest.TestCase):
                 ("a dotted string without the module name", "x = 'pkg.sub.other'\n", ()),
                 ("a path string of another file", "x = 'pkg/sub/other.py'\n", ()),
                 ("the standard library", "import os\nfrom collections import OrderedDict\n", ()),
-                ("a package that only looks alike", "import pkg2\nfrom other.pkg import sub\n", ()),
+                # round 15: pkg2 and other.pkg are supplied, so they are run-root modules (unseen, each would be opaque: below)
+                ("a package that only looks alike", "import pkg2\nfrom other.pkg import sub\n",
+                 (("pkg2/__init__.py", ""), ("other/pkg/__init__.py", "sub = 1\n"))),
                 ("a module of its own", "import h\n", (("h.py", "import os\n"),)),
                 ("two hops that end elsewhere", "import h\n", (("h.py", "import g\n"), ("g.py", "import json\n"))),
                 ("a package whose __init__ does not import the target", "import lib.x\n",
@@ -543,7 +571,7 @@ class UseScanTests(unittest.TestCase):
                 # round 8 F2: one unconditional binding of any value proves the member exists (the import takes the attribute, not a
                 # submodule from outside the run root); a right-hand side that raises makes h, and so the importer, fail to import
                 ("a member bound to a call", "from h import x\n", (("h.py", "def unknown():\n    pass\n\n\nx = unknown()\n"),)),
-                ("a member bound to an import alias", "from h import x\n", (("h.py", "import os as x\n"),)),
+                ("a member bound to an import alias", "from h import x\n", (("h.py", "import g as x\n"), ("g.py", "y = 1\n"))),
                 ("a member bound to an undefined name", "from h import x\n", (("h.py", "x = nonexistent\n"),)),
                 ("a member defined by one plain class", "from h import C\n", (("h.py", "class C:\n    pass\n"),)),
                 ("a member that a package binds, in a package", "from h import f\n", (("h/__init__.py", "def f():\n    pass\n"),)),
@@ -551,7 +579,7 @@ class UseScanTests(unittest.TestCase):
                 ("a module of a namespace package under src, by the full path", "import src.h.real\n", (("src/h/real.py", "y = 1\n"),)),
                 ("a member that is a module of a namespace package", "from h import real\n", (("src/h/real.py", "y = 1\n"),)),
                 ("a member from a module of a namespace package", "from h.real import y\n", (("src/h/real.py", "y = 1\n"),)),
-                ("a name that does not look like a run-root directory", "import hh.real\n", (("src/h/real.py", "y = 1\n"),)),
+                ("a name that does not look like a run-root directory", "import hh.real\n", (("src/h/real.py", "y = 1\n"), ("hh/real.py", ""))),
                 ("transitive: a submodule that exists", "import helper\n", (h_pkg, ("h/real.py", "y = 1\n"), ("helper.py", "import h.real\n"))),
                 ("transitive: a member that exists", "import helper\n", (h_pkg, ("helper.py", "from h import x\n"))),
                 ("a relative import that resolves, to a file that imports elsewhere", "import pkg.o\n",
@@ -571,7 +599,10 @@ class UseScanTests(unittest.TestCase):
                      {"h" + importlib.machinery.EXTENSION_SUFFIXES[0]: ""}, []),
                     ("a submodule on disk only, from a supplied package", "from h import real\n", (h_pkg,), {"h/real.py": reach}, []),
                     ("on disk too, nothing else there", "import h\n", (h_mod,), {}, none),
-                    ("a namespace directory on disk only", "import ns\n", (), {"ns/notes.txt": ""}, none))):
+                    # round 15: a namespace directory runs nothing, but `ns` names no supplied module: a later sys.path entry may
+                    # answer it with a regular package, which the scan does not see, so the import is opaque (_outside_use)
+                    ("a namespace directory on disk only", "import ns\n", (), {"ns/notes.txt": ""}, []),
+                    ("a namespace directory on disk, a supplied module in it", "import ns.m\n", (("ns/m.py", ""),), {"ns/notes.txt": ""}, none))):
                 root = Path(tmp) / str(n)
                 for p, t in [(target["path"], "class Q:\n    pass\n"), ("u.py", user)] + list(others) + list(disk.items()):
                     (root / p).parent.mkdir(parents=True, exist_ok=True)
@@ -1026,8 +1057,31 @@ class BindingProofUseTests(unittest.TestCase):
                 ("a helper star-imports a plain module", {"h.py": "from m import *\n", "m.py": "x = 1\n"}, "import h\n"),
                 ("a helper only u's package __init__ imports star-imports helperpkg",
                  dict(star, **{"app/__init__.py": "import h\n", "h.py": "from helperpkg import *\n"}), "")]
+        # round 15 (Main): every reference to a module from outside the run root is on the allow-list, or the file is opaque
+        # (_outside_use); the review's loaders (pydoc.locate, an aliased locate, unittest.mock.patch) at each place of the walk
+        rows += [("round 15: u reads sys.argv and calls os.path.dirname (not listed)", {},
+                  "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n")]
+        locate = "import pydoc\npydoc.locate('helperpkg.redirect')\n"
+        for where, extra, head in (("u", {}, locate),
+                                   ("a helper", {"h.py": locate}, "import h\n"),
+                                   ("a helper two deep", {"h.py": "import h2\n", "h2.py": locate}, "import h\n"),
+                                   ("u's package __init__", {"app/__init__.py": locate}, ""),
+                                   ("a helper only u's package __init__ imports", {"app/__init__.py": "import h\n", "h.py": locate}, ""),
+                                   ("pkg/__init__.py", {"pkg/__init__.py": locate}, ""),
+                                   ("the target", {"pkg/t.py": "{target}" + locate}, "")):
+            rows += [("round 15 review: pydoc.locate in " + where, dict(star, **extra), head),
+                     ("round 15 review: an aliased locate in " + where,
+                      dict(star, **{p: t.replace(locate, "from pydoc import locate as load\nload('helperpkg.redirect')\n") for p, t in extra.items()}),
+                      head.replace(locate, "from pydoc import locate as load\nload('helperpkg.redirect')\n")),
+                     ("round 15 review: unittest.mock.patch in " + where,
+                      dict(star, **{p: t.replace(locate, "from unittest.mock import patch\npatch('helperpkg.redirect.marker', 1).start()\n") for p, t in extra.items()}),
+                      head.replace(locate, "from unittest.mock import patch\npatch('helperpkg.redirect.marker', 1).start()\n"))]
+        rows += [("round 15: an outside module read through a run-root module", {"h.py": "import argparse\n"}, "import h\nh.argparse._sys.path.insert(0, 'alt')\n")]
         controls = [("control: u's package __init__ imports a clean helper", {"app/__init__.py": "import h\n"}, ""),
-                    ("control: u reads __name__ and __file__, and sys.argv", {}, "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n"),
+                    ("control: a helper calls listed callables", {"h.py": "import re, json\nx = re.sub('a', 'b', json.loads('\"a\"'))\n"}, "import h\n"),
+                    # round 15: os.path.dirname and sys.argv are not on the allow-list (the old input is a row above); listed calls are
+                    ("control: u reads __name__ and __file__, and calls listed callables", {},
+                     "import os, sys\nif __name__ == '__main__':\n    sys.exit(os.path.exists(__file__))\n"),
                     ("control: an unrelated file inserts into sys.path", {"w.py": sys_insert}, ""),
                     ("control: an unrelated file star-imports helperpkg", dict(star, **{"w.py": "from helperpkg import *\n"}), ""),
                     ("control: a comment says site", {}, "x = 1  # the web site\n")]
@@ -1046,6 +1100,14 @@ class BindingProofUseTests(unittest.TestCase):
                         expected = credited if label.startswith("control") else ["- u.py imports Q [{}:{}]".format(upath, 1 + lines)] if imp == 1 else []
                         self.assertEqual([line for line in out if line.startswith("- u.py")], expected)
                         self.assertIn("- v.py does not use Q [v.py:1]", out)
+        # round 15: a run-root module with a standard-library name makes every file opaque (_Graph.shadowed): argparse imports
+        # gettext, and sys.path[0] answers first; so v.py gives no line either
+        for name in ("gettext.py", "copyreg.py", "json/__init__.py"):
+            with self.subTest("a run-root module of a standard-library name", name=name):
+                files = {"pkg/__init__.py": "", "pkg/t.py": "class Q:\n    pass\n", "v.py": "x = 1\n", name: "x = 1\n",
+                         "app/u.py": "import argparse\nfrom pkg.t import Q\nobj = Q()\n"}
+                out = ss.use_scan("Who uses Q?", [num(p, t) for p, t in files.items()])
+                self.assertEqual(out, ["- u.py imports Q [app/u.py:2]"])
 
     def test_the_review_reproductions(self):
         # F1: the module overwritten by a star import, the name by a dotted import, the attribute by a write
@@ -1113,10 +1175,12 @@ class BindingProofUseTests(unittest.TestCase):
 
         # the review's repro, verbatim: A (h rebinds the package attribute t through an alias), B (the __init__ binds t to another module)
         helper = ("app/h.py", "import pkg.t\nimport other\na = pkg\na.t = other\n")
+        other = ("other.py", "Q = lambda: 'other'\n")
         for text in ("import h\nimport pkg.t\nobj = pkg.t.Q()\n", "import h\nimport pkg.t as t\nobj = t.Q()\n", "import h\nfrom pkg import t\nobj = t.Q()\n"):
             with self.subTest("review A", form=text.split("\n")[1]):
-                self.assertEqual([line for line in self.scan(text, "app/u.py", helper) if line.startswith("- u.py")], [])
-        self.assertEqual(self.scan("import h\nfrom pkg.t import Q\nobj = Q()\n", "app/u.py", helper),
+                self.assertEqual([line for line in self.scan(text, "app/u.py", helper, other) if line.startswith("- u.py")], [])
+        # round 15: other.py is supplied; unseen, `import other` would make h opaque (a module the scan was not given)
+        self.assertEqual(self.scan("import h\nfrom pkg.t import Q\nobj = Q()\n", "app/u.py", helper, other),
                          ["- u.py imports Q [app/u.py:2]", "- u.py creates a Q [app/u.py:3]"])
         with self.subTest("review B"):
             self.assertEqual(self.scan("from pkg import t\nobj = t.Q()\n", "app/u.py", ("pkg/__init__.py", "from . import other as t\n"),
@@ -1133,7 +1197,8 @@ class BindingProofUseTests(unittest.TestCase):
                 ("__init__ binds t by a def", {"pkg/sub/__init__.py": "def t():\n    pass\n"}),
                 ("__init__ binds t by a class", {"pkg/sub/__init__.py": "class t:\n    Q = None\n"}),
                 ("__init__ binds t by a for target", {"pkg/sub/__init__.py": "import other\nfor t in [other]:\n    pass\n"}),
-                ("__init__ binds t by a with target", {"pkg/sub/__init__.py": "import contextlib\nwith contextlib.nullcontext(1) as t:\n    pass\n"}),
+                # round 15: a builtin context manager (contextlib.nullcontext is not on the allow-list, and would make the __init__ opaque)
+                ("__init__ binds t by a with target", {"pkg/sub/__init__.py": "with open(__file__) as t:\n    pass\n"}),
                 ("__init__ binds t by a global", {"pkg/sub/__init__.py": "def f():\n    global t\n    t = 1\n\n\nf()\n"}),
                 ("__init__ binds t by a star import", {"pkg/sub/__init__.py": "from other import *\n"}),
                 ("__init__ answers any name by __getattr__", {"pkg/sub/__init__.py": "def __getattr__(name):\n    return None\n"}),
@@ -1322,7 +1387,55 @@ class GuardTests(unittest.TestCase):
             n = self.check_lines(root, row["files"], row["task"])
             checked[row["split"]] = checked.get(row["split"], 0) + n
         print("guard lines checked per split:", dict(sorted(checked.items())))
-        self.assertGreater(sum(checked.values()), 10)
+        # round 15b (Main): tune 3 / holdout 9 / real 0 (were 8 / 12 / 0). A guard row that imports a run-root module it does not
+        # supply makes the importer opaque (_outside_use: a module the scan cannot read may run anything). Lost at round 15:
+        #   use-lrucache (tune):  cli.py does not use LRUCache [src/cli.py:1]       src/cli.py:7    from settings import load_settings
+        #                         worker.py does not use LRUCache [src/worker.py:1] src/worker.py:5 from settings import load_settings
+        #   use-jobqueue (tune):  worker.py uses JobQueue.pop on queue [src/worker.py:32], .dead [:38], .fail [:44]
+        #                                                                           src/worker.py:5 from settings import load_settings
+        #   use-utils (holdout):  cli.py does not use parse_duration / chunked / slugify [src/cli.py:1]
+        #                                                                           src/cli.py:6    from jobq import Job
+        # test_full_src_rows_keep_every_line shows each comes back when all seven src files are supplied.
+        self.assertEqual(checked, {"tune": 3, "holdout": 9, "real": 0})
+
+    # round 15b (Main): the use-lrucache, use-jobqueue and use-utils questions with all seven src/*.py files supplied: every line the
+    # guard rows gave at 493bc23 is given, and the whole answer is this one
+    FULL_SRC = {
+        "use-lrucache": ["- cli.py does not use LRUCache [src/cli.py:1]", "- jobq.py does not use LRUCache [src/jobq.py:1]",
+                         "- settings.py does not use LRUCache [src/settings.py:1]",
+                         "- settings_v2.py does not use LRUCache [src/settings_v2.py:1]",
+                         "- worker.py does not use LRUCache [src/worker.py:1]"],
+        "use-jobqueue": ["- cache.py does not use JobQueue [src/cache.py:1]", "- settings.py does not use JobQueue [src/settings.py:1]",
+                         "- settings_v2.py does not use JobQueue [src/settings_v2.py:1]",
+                         "- worker.py uses JobQueue.pop on queue [src/worker.py:32]",
+                         "- worker.py uses JobQueue.dead on queue [src/worker.py:38]",
+                         "- worker.py uses JobQueue.fail on queue [src/worker.py:44]"],
+        "use-utils": ["- {} does not use {} [src/{}:1]".format(f, n, f) for n in ("parse_duration", "chunked", "slugify")
+                      for f in ("cache.py", "cli.py", "jobq.py", "settings.py", "settings_v2.py", "worker.py")]}
+    OLD_ROW_LINES = {  # what the guard rows (their own file lists) gave at 493bc23
+        "use-lrucache": ["- worker.py does not use LRUCache [src/worker.py:1]", "- cli.py does not use LRUCache [src/cli.py:1]",
+                         "- jobq.py does not use LRUCache [src/jobq.py:1]"],
+        "use-jobqueue": ["- worker.py uses JobQueue.pop on queue [src/worker.py:32]",
+                         "- worker.py uses JobQueue.dead on queue [src/worker.py:38]",
+                         "- worker.py uses JobQueue.fail on queue [src/worker.py:44]"],
+        "use-utils": ["- {} does not use {} [src/{}:1]".format(f, n, f) for n in ("parse_duration", "chunked", "slugify")
+                      for f in ("worker.py", "cli.py", "settings.py")]}
+
+    def test_full_src_rows_keep_every_line(self):
+        root = base.DATA / "fixtures"
+        seven = ["src/" + p.name for p in sorted((root / "src").glob("*.py"))]
+        self.assertEqual(len(seven), 7)
+        diff_lines = ["- settings_v2.py adds the function validate_settings [src/settings_v2.py:15]",
+                      "- in settings_v2.py, load_settings now calls validate_settings [src/settings_v2.py:33]"]
+        for row in map(json.loads, (base.DATA / "chores.jsonl").read_text().splitlines()):
+            if row["id"] not in self.FULL_SRC:
+                continue
+            with self.subTest(row["id"]):
+                diff, uses = ss.code_facts(row["task"], ss.prepare(root, seven, GUARD_BUDGET_CHARS))
+                self.assertEqual(diff, diff_lines)
+                self.assertEqual(sorted(uses), sorted(self.FULL_SRC[row["id"]]))
+                self.assertEqual([l for l in self.OLD_ROW_LINES[row["id"]] if l not in uses], [])
+                self.assertEqual(self.check_lines(root, seven, row["task"]), len(diff_lines) + len(self.FULL_SRC[row["id"]]))
 
     def test_real_files_cite_their_line_when_their_names_are_asked_about(self):
         """The real rows ask no question about a name, so code_facts says nothing for them; ask about every top-level name."""
@@ -1344,7 +1457,9 @@ class GuardTests(unittest.TestCase):
 
         probe()  # every line is checked; round 12: the real files that gave lines run sys.path.insert, so they are opaque and give none
         # so that the cite checks still reach real files, they are made again with import state taken as unchanged
-        with mock.patch.object(ss, "_changes_import_state", lambda source, tree: bool(ss._DYNAMIC_ACCESS_RE.search(source))):
+        # (round 15: and the allow-list as passed, since the real files call much the list does not hold)
+        with mock.patch.object(ss, "_changes_import_state", lambda source, tree: bool(ss._DYNAMIC_ACCESS_RE.search(source))), \
+                mock.patch.object(ss, "_outside_use", lambda tree, graph: None):
             self.assertGreater(probe(), 0)
 
 

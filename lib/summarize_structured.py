@@ -833,7 +833,10 @@ def _inside(dotted, module):
 _DYNAMIC_ACCESS = ("getattr", "__getattribute__", "__import__", "importlib", "import_module", "sys.modules", "eval", "exec", "compile",
                    "globals", "locals", "vars", "__dict__", "attrgetter", "methodcaller", "runpy", "builtins", "__builtins__",
                    "pkgutil", "pickle", "marshal",
-                   "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc")
+                   "setattr", "delattr", "inspect", "getmembers", "__subclasses__", "gc",
+                   # round 15: breakpoint() imports the module PYTHONBREAKPOINT names; a function's __globals__ and a frame's f_globals,
+                   # f_locals and f_builtins hand out a module namespace (its imported modules, __builtins__) under no import binding
+                   "breakpoint", "__globals__", "f_globals", "f_locals", "f_builtins")
 _DYNAMIC_ACCESS_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(w) for w in _DYNAMIC_ACCESS) + r")(?![A-Za-z0-9_])")
 
 
@@ -994,12 +997,120 @@ def _changes_import_state(source, tree):
     return False
 
 
-def _opaque(source, tree):
-    """THE one per-file test of whether a file's imports show what it loads (round 14, Main): False only when it does not change import
-    state (_changes_import_state: which includes a word of _DYNAMIC_ACCESS) and has no star import (_star: `from m import *` runs every
-    submodule m's __all__ names, which no import of the file shows; __all__ is not resolved). Every walk holds each file it visits to
-    it: the credit walk (_runs_clean) and the absence walk (_reaches, through _refers); no walk is given a narrower test."""
-    return _star(tree) or _changes_import_state(source, tree)
+# Round 15 (Main): the allow-list of what a file may do with a module from outside the run root. Each entry is proved by execution
+# (an attack row calls it with supplied module names as a string, bytes, a dotted path, module:attr and a path, under a sys.meta_path
+# recorder, and no supplied module is looked up or imported), and each is here only because a guard or lrucache fixture file uses it:
+# src/cache.py (collections.OrderedDict, time.monotonic as a default value), src/cli.py (argparse.ArgumentParser, json.loads,
+# sys.exit), src/jobq.py (itertools.count, heapq.heappush, heapq.heappop), src/settings.py and src/settings_v2.py (os.path.exists,
+# json.load, os.environ.get), src/utils.py (re.compile, re.sub), src/worker.py (logging.getLogger, time.sleep, time.time).
+_SAFE_CALLABLES = frozenset((
+    "argparse.ArgumentParser", "collections.OrderedDict", "heapq.heappop", "heapq.heappush", "itertools.count", "json.load", "json.loads",
+    "logging.getLogger", "os.environ.get", "os.path.exists", "re.compile", "re.sub", "sys.exit", "time.sleep", "time.time"))
+_SAFE_VALUES = frozenset(("time.monotonic",))
+# the dotted names a file may import or bind to reach an entry: every proper prefix of one (os, os.path, os.environ, ...)
+_SAFE_PREFIXES = frozenset(".".join(q.split(".")[:i]) for q in _SAFE_CALLABLES | _SAFE_VALUES for i in range(1, q.count(".") + 1))
+# builtins that load a module by a string and that are matched as a name (help(x) imports pydoc, which imports the module x names),
+# not as a raw word: `help=` is the keyword of every argparse.add_argument (src/cli.py)
+_LOADER_NAMES = ("help",)
+
+
+def _outside(dotted, graph):
+    """True when the absolute import name dotted is a module from outside the run root: its top-level name is a standard-library or
+    builtin name (_reserved_names: the scan takes those from outside, and _Graph.shadowed makes every file opaque when the run root
+    has one), or neither it nor any prefix of it is a name of the run root (_Graph.known). A name with a run-root prefix that is not
+    itself known is unresolved (_unresolved), which every walk already counts as blocked."""
+    parts = dotted.split(".")
+    return parts[0] in _reserved_names() or not any(graph.known(".".join(parts[:i])) for i in range(1, len(parts) + 1))
+
+
+def _outside_use(tree, graph):
+    """THE allow-list test (round 15, Main): None when every reference the file makes to a module from outside the run root is
+    allowed, else the first one that is not, as text (line: what). A reference is a name bound by `import m`, `import m as x` or
+    `from m import f`, m outside (_outside). Allowed:
+    - the import itself, when the module (or m.f) is a prefix of a list entry (_SAFE_PREFIXES) or an entry: importing any other
+      outside module runs code no import of the run root shows;
+    - a call whose callee is the binding followed by attribute reads to a qualified name on _SAFE_CALLABLES;
+    - an attribute read whose qualified name is on _SAFE_VALUES;
+    - a decorator or a base class on either list.
+    Every other use, at any scope, is not: calling something unlisted, passing the module or a function as a value, aliasing, a write
+    or delete, a subscript. Calls on what a listed callable returns, on run-root objects and on local values are not restricted.
+    Also not allowed, since they reach an outside module under no binding of this file: an attribute (on anything not rooted at such
+    a binding) or a `from <run-root module> import` member whose name some file of the run root binds by an outside import
+    (_Graph.reexported: h.argparse._sys.path, `from h import os`); a reference to a builtin of _LOADER_NAMES; and any file at all when
+    the run root has a module of a standard-library name (_Graph.shadowed: the standard library imports its own modules by name, and
+    sys.path[0] answers first). A name is matched in every scope; a local of the same name is held to the same rule."""
+    cached = getattr(tree, "_outside_use", None)
+    if cached is not None and cached[0] is graph:
+        return cached[1]
+    reason = _find_outside_use(tree, graph)
+    tree._outside_use = (graph, reason)
+    return reason
+
+
+def _find_outside_use(tree, graph):
+    shadow = graph.shadowed()
+    if shadow is not None:
+        return "1: the run root has a module named {} (a standard-library name)".format(shadow)
+    bound, reexported = {}, graph.reexported()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if _outside(a.name, graph):
+                    if a.name not in _SAFE_PREFIXES:
+                        return "{}: import {}".format(node.lineno, a.name)
+                    local, qualified = (a.asname, a.name) if a.asname else ((a.name.split(".")[0],) * 2)
+                    bound.setdefault(local, set()).add(qualified)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            outside = _outside(node.module, graph)
+            for a in node.names:
+                qualified = node.module + "." + a.name
+                if outside and qualified not in _SAFE_PREFIXES | _SAFE_CALLABLES | _SAFE_VALUES:
+                    return "{}: from {} import {}".format(node.lineno, node.module, a.name)
+                if not outside and a.name in reexported:
+                    return "{}: from {} import {} (a module from outside the run root)".format(node.lineno, node.module, a.name)
+                if outside:
+                    bound.setdefault(a.asname or a.name, set()).add(qualified)
+    parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _LOADER_NAMES or isinstance(node, ast.Attribute) and node.attr in _LOADER_NAMES:
+            return "{}: {}".format(node.lineno, _LOADER_NAMES[0] if isinstance(node, ast.Name) else "." + node.attr)
+        if isinstance(node, ast.Attribute) and node.attr in reexported:
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if not (isinstance(root, ast.Name) and root.id in bound):
+                return "{}: .{} (a module from outside the run root)".format(node.lineno, node.attr)
+        if isinstance(node, ast.Name) and node.id in bound:
+            for qualified in sorted(bound[node.id]):
+                chain = node
+                while isinstance(parents.get(id(chain)), ast.Attribute):
+                    chain = parents[id(chain)]
+                    qualified += "." + chain.attr
+                parent = parents.get(id(chain))
+                if isinstance(chain.ctx, (ast.Store, ast.Del)):
+                    use, allowed = "a write or delete of", ()
+                elif isinstance(parent, ast.Call) and parent.func is chain:
+                    use, allowed = "a call of", _SAFE_CALLABLES
+                elif isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+                        chain in parent.decorator_list or isinstance(parent, ast.ClassDef) and chain in parent.bases):
+                    use, allowed = "a decorator or base", _SAFE_CALLABLES | _SAFE_VALUES
+                elif isinstance(parent, ast.Subscript) and parent.value is chain:
+                    use, allowed = "a subscript of", ()
+                else:
+                    use, allowed = "the value", _SAFE_VALUES
+                if qualified not in allowed:
+                    return "{}: {} {}".format(node.lineno, use, qualified)
+    return None
+
+
+def _opaque(source, tree, graph):
+    """THE one per-file test of whether a file's imports show what it loads (round 14, Main; round 15 adds the allow-list): False only
+    when it does not change import state (_changes_import_state: which includes a word of _DYNAMIC_ACCESS), has no star import (_star:
+    `from m import *` runs every submodule m's __all__ names, which no import of the file shows; __all__ is not resolved), and makes
+    no reference to a module from outside the run root that the allow-list does not allow (_outside_use, against the run root's
+    _Graph). Every walk holds each file it visits to it: the credit walk (_runs_clean) and the absence walk (_reaches, through
+    _refers); no walk is given a narrower test."""
+    return _star(tree) or _changes_import_state(source, tree) or _outside_use(tree, graph) is not None
 
 
 def _package_inits(path, run):
@@ -1037,6 +1148,38 @@ class _Graph(dict):
             for name in _suffixes(module):
                 self.by_name.setdefault(name, []).append(module)
             self.packages.update(_ancestor_names(module))
+
+    def known(self, dotted):
+        """True when dotted is a name of the run root: of a module (any dotted suffix of its path) or of a directory one sits in."""
+        return dotted in self.by_name or dotted in self.packages
+
+    def shadowed(self):
+        """A standard-library or builtin top-level name (_reserved_names) that the run root has as a module, or None: a supplied module
+        or package whose name (any dotted suffix) is that one name, or, at the run root on disk, a module file of any import suffix or
+        a directory with an __init__ of that name (a namespace directory does not answer before the standard library's own)."""
+        if not hasattr(self, "_shadowed"):
+            suffixes = importlib.machinery.all_suffixes()
+            files, dirs = self.run.listing("")
+            names = {n for n in self.by_name if "." not in n}
+            names |= {f[:-len(s)] for f in files for s in suffixes if f.endswith(s)}
+            names |= {d for d in dirs if any("__init__" + s in self.run.listing(d)[0] for s in suffixes)}
+            hit = sorted(names & _reserved_names())
+            self._shadowed = hit[0] if hit else None
+        return self._shadowed
+
+    def reexported(self):
+        """The names some supplied file binds by an import of a module from outside the run root (_outside): read as an attribute of
+        another object, or imported from a run-root module, one of them may be that outside module."""
+        if not hasattr(self, "_reexported"):
+            names = set()
+            for entry in self.files.values():
+                for node in ast.walk(entry[1]) if entry is not None else ():
+                    if isinstance(node, ast.Import):
+                        names.update(a.asname or a.name.split(".")[0] for a in node.names if _outside(a.name, self))
+                    elif isinstance(node, ast.ImportFrom) and not node.level and node.module and _outside(node.module, self):
+                        names.update(a.asname or a.name for a in node.names if a.name != "*")
+            self._reexported = frozenset(names)
+        return self._reexported
 
     def loaded(self, dotted):
         """The modules that importing `dotted` runs: those with a name that is `dotted` or one of its ancestor packages."""
@@ -1084,9 +1227,7 @@ def _unresolved(name, graph, attribute=False):
     Round 11: before any of that, the name is unresolved when Python's finder may load, for some step of it, a file of the run root
     the scan was not given (_module_identity's candidates: an __init__.py or module on disk only, a .pyc, an extension module): what it
     runs is not shown. A namespace directory runs nothing."""
-    def known(dotted):
-        return dotted in graph.by_name or dotted in graph.packages
-
+    known = graph.known
     if any(c not in graph.run.supplied and not c.endswith("/") for step in _module_identity(name, graph.run).candidates for c in step):
         return True
     if known(name):
@@ -1157,7 +1298,7 @@ def _reaches(start, name, module, graph):
     same target tokens: one that refers to the target counts as a path. An unresolved import, a file that does not parse, all count as
     a path."""
     own, above = _suffixes(module), _ancestor_names(module)
-    return _walk_blocked(start, graph, lambda source, tree: _refers(source, tree, name, module),
+    return _walk_blocked(start, graph, lambda source, tree: _refers(source, tree, name, module, graph),
                          lambda dotted: dotted in above or any(_inside(dotted, n) for n in own))
 
 
@@ -1170,7 +1311,7 @@ def _runs_clean(path, source, tree, graph):
     does not run T's path, so the test is per importing file: a T whose path is opaque is credited through no import, and a file with
     no path to T keeps its "does not use" line (_no_path_to)."""
     start = _start_set(path, source, tree, graph)
-    return start is not None and not _walk_blocked(start, graph, _opaque)
+    return start is not None and not _walk_blocked(start, graph, lambda source, tree: _opaque(source, tree, graph))
 
 
 def _string_text(node):
@@ -1198,7 +1339,7 @@ def _string_mentions(tree, tokens):
     return False
 
 
-def _refers(source, tree, name, module):
+def _refers(source, tree, name, module, graph):
     """THE per-file tests of the absence path (round 9: one function, made on the file scanned and on every module _reaches visits, so a
     test cannot be added to one and not the other). True when the file's source or tree may refer to the name defined in the dotted
     module `module`; none of these is a list of syntax cases:
@@ -1208,8 +1349,9 @@ def _refers(source, tree, name, module):
       constant parts of an f-string. Every string-built loader (pydoc.locate, unittest.mock.patch, logging.config, an entry point
       "t:Q", a path "pkg/sub/t.py", pkgutil.resolve_name, ...) needs the target's name as text, and the set of loaders is open while
       the text is not, so this is a rule over strings and not a list of loaders;
-    - the file is opaque (_opaque): its text holds a word of _DYNAMIC_ACCESS, or it has a star import."""
-    return (_opaque(source, tree) or bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source))
+    - the file is opaque (_opaque, against the run root's graph): it changes import state (a word of _DYNAMIC_ACCESS among them), has
+      a star import, or makes a reference to a module from outside the run root that the allow-list does not allow (_outside_use)."""
+    return (_opaque(source, tree, graph) or bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source))
             or _string_mentions(tree, {name, module.split(".")[-1]}))
 
 

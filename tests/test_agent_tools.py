@@ -420,8 +420,17 @@ class GateTests(ScriptCase):
         self.commit(repo, {"web/package.json": "{}\n", "web/eslint.config.js": "x\n", "web/a.ts": "x\n", "web/b.ts": "x\n"})
         self.stub("eslint", output="File ignored because no matching configuration was supplied\n" * 3)
         body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
-        self.assertIn("eslint:web skipped (eslint ignored every file: no matching configuration)", body)
+        self.assertIn("eslint:web skipped (eslint ignored every file: no config or ignore pattern matched)", body)
         self.assertNotIn("eslint:web 0", body)
+        # (3 files: a.ts, b.ts, eslint.config.js) every file ignored by a pattern, or a mix of both reasons, is also not a pass; one checked file is
+        ignore = 'File ignored because of a matching ignore pattern. Use --no-ignore to override.\n'
+        for out, ignored in ((ignore * 3, True), (ignore * 2 + "File ignored because no matching configuration was supplied\n", True), (ignore * 2, False)):
+            repo = self.repo("repo-ign")
+            self.commit(repo, {"web/package.json": "{}\n", "web/eslint.config.js": "x\n", "web/a.ts": "x\n", "web/b.ts": "x\n"})
+            self.stub("eslint", output=out)
+            body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))[2]
+            self.assertEqual("eslint:web skipped (eslint ignored" in "\n".join(body), ignored, out)
+            shutil.rmtree(repo)
         repo = self.repo("repo2")
         self.commit(repo, {"api/deno.json": "{}\n", "api/main.ts": "x\n"})
         self.stub("deno", exit_code=1, output="error: lint")

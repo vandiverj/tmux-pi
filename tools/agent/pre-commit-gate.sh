@@ -313,8 +313,8 @@ tool_check() {
       LOG_AT="$(wc -l <"$TP_LOG")"
       run_in "$app" "$label" "$bin" "$@" ${IGNORE_ARGS[@]+"${IGNORE_ARGS[@]}"} ${rels[@]+"${rels[@]}"}
       if [ "$name" = eslint ] && [ "$RC" = 0 ] &&
-        [ "$(sed -n "$((LOG_AT + 1)),\$p" "$TP_LOG" | grep -c 'File ignored because no matching configuration')" -ge "${#rels[@]}" ]; then
-        printf '%s skipped (eslint ignored every file: no matching configuration)\n' "$label"
+        [ "$(sed -n "$((LOG_AT + 1)),\$p" "$TP_LOG" | grep -c 'File ignored because')" -ge "${#rels[@]}" ]; then
+        printf '%s skipped (eslint ignored every file: no config or ignore pattern matched)\n' "$label"
         rec "$label" missing ""
         continue
       fi

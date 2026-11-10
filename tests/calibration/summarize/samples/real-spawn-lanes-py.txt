@@ -1,0 +1,4 @@
+- tp-spawn runs lanes.py main-checkout when a lane is given and no preamble file is passed in [real/bin/tp-spawn:217-218]
+- tp-spawn runs lanes.py check-tree when no lane is given [real/bin/tp-spawn:221]
+- lanes.py check-tree refuses a working directory that is inside a lane's tree [real/lib/lanes.py:1083-1084]
+- lanes.py main-checkout prints the repository's main working tree [real/lib/lanes.py:1085-1086]

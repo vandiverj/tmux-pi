@@ -26,7 +26,7 @@ from session_env import SESSION_KEYS, isolate_session, outside_session  # noqa: 
 # here, as identity (and then to SESSION_KEYS) or as configuration.
 CONFIG = {
     "TP_ROOT", "TP_STATE_DIR", "TP_LIB_DIR", "TP_MODEL_CATALOG", "TP_ROUTING_EVALS_TEXT", "TP_ROUTING_EVALS", "TP_ROUTING_EVAL_DIR",
-    "TP_WORKDIR", "TP_WORK_DIR", "TP_WORK_CONFIG", "TP_WORK_LOCK_TIMEOUT", "TP_TICKET_PREFIXES", "TP_DOCS_TOOLS", "TP_DOCS_PROJECT",
+    "TP_WORKDIR", "TP_WORK_DIR", "TP_WORK_CONFIG", "TP_WORK_LOCK_TIMEOUT", "TP_SEND_CONFIRM_SECONDS", "TP_TICKET_PREFIXES", "TP_DOCS_TOOLS", "TP_DOCS_PROJECT",
     "TP_CTX_TOOLS", "TP_CTX_PROJECT", "TP_CTX_TODAY", "TP_CTX_NAV_MODULES", "TP_LOCAL_CONFIG", "TP_PROXY", "TP_TRUST",
     "TP_TRUST_GUARD_LOG_DIR", "TP_CLAUDE_CONFIG_DIR", "TP_PI_NODE", "TP_NO_ATTACH", "TP_ROUTER_LLM_URL", "TP_ROUTER_BASE_URL",
     "TP_ROUTER_MODEL", "TP_REDACTION", "TP_REDACTION_DIR", "TP_REDACTION_LLM_URL", "TP_REDACTION_WATCHDOG",
@@ -40,6 +40,9 @@ CONFIG = {
     "TP_BENCH_WORK",  # bin/tp-bench:157: --work-root default, not caller identity
     "TP_HL1",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
     "TP_X1_ARM",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
+    "TP_TRUST_CAPTURE_TIMEOUT",  # lib/trust_dialog.py:22,37: capture-timeout test hook, read at each call, not caller identity
+    "TP_TRUST_SCAN_BUDGET",  # lib/trust_dialog.py:24,95: scan-budget test hook, read when a Scanner starts, not caller identity
+    "TP_ROUTINES_CONFIG",  # lib/routines.py:43: probe-table config path override, not caller identity
     "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_POLICY_SKILLS", "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
 }
 NAME = re.compile(r"TP_[A-Z0-9_]+|CLAUDE_CODE_[A-Z_]+|TMUX_PANE|TMUX")

@@ -537,7 +537,11 @@ if [[ -n "$parent" ]]; then
 fi
 preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" ${preamble_args[@]+"${preamble_args[@]}"})" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
-packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
+if [[ "$worker" == claude ]]; then  # claude/plugins/tmux-pi/hooks/report.sh keeps a report by its RESULT_STATUS line
+  packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md, and a later reply replaces it only when it holds a RESULT_STATUS line, so end every final reply with one, whoever asked for it. A reply without one, and each result.md that is replaced, is kept under $task_dir/results/. report.md is kept and the main agent is shown its path and size."
+else
+  packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
+fi
 packet+=$'\n'
 if [[ -n "$role" ]]; then
   packet+=$'\n\n# Worker Role\n\n'
@@ -550,7 +554,7 @@ if [[ -n "$deliverable" ]]; then
   packet+=$'\n'
 fi
 packet+=$'\n\n# Return\n\n'
-packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence."
+packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence. Do not leave background shells or log watchers running after your final reply: each one that finishes starts another turn, and its short reply can bury your report."
 packet+=$'\n\n'
 packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
 packet+=$'\n\n'
@@ -773,6 +777,9 @@ run_sh="$(
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
   for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
+  # The dispatching main's identity (bin/tp-main) follows the spawner, never --worker-env, so the worker's own dispatches are
+  # tagged to the same main. Only when set and valid. It is not in the session environment: two mains may share a session.
+  if [[ "${TP_MAIN_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then printf 'export TP_MAIN_ID=%q\n' "$TP_MAIN_ID"; fi
   # The ctx tools follow the spawner, never --worker-env: main with TP_CTX_TOOLS=1 gives the worker the tools; otherwise
   # run.sh clears the switch, because the new window inherits the environment of the session, which may still hold a stale 1.
   if [[ "${TP_CTX_TOOLS:-}" == 1 ]]; then echo 'export TP_CTX_TOOLS=1'; else echo 'unset TP_CTX_TOOLS'; fi

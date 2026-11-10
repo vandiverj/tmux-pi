@@ -203,7 +203,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per command or file")
     parser.add_argument("--grace", type=float, default=DEFAULT_GRACE, help="seconds between SIGTERM and SIGKILL")
     parser.add_argument("--log", help="JSON lines file to append to")
-    parser.add_argument("--durations", type=int, metavar="N", help="passed to unittest in file mode")
+    parser.add_argument("--durations", type=int, metavar="N", help="passed to unittest in file mode (Python 3.12+; older unittest has no such option, the per-file seconds still come from the `Ran N tests in Xs` line)")
     parser.add_argument("rest", nargs=argparse.REMAINDER, help="-- CMD..., or test files")
     args = parser.parse_args(argv)
     rest = args.rest[1:] if args.rest[:1] == ["--"] else None
@@ -221,7 +221,7 @@ def main(argv=None):
     status = 0
     for path in args.rest:
         cmd = [sys.executable, "-m", "unittest", "discover"]
-        if args.durations is not None:
+        if args.durations is not None and sys.version_info >= (3, 12):  # unittest has no --durations before 3.12
             cmd += ["--durations", str(args.durations)]  # after `discover`: it rejects options placed before it
         # the project's own command shape: discover in the file's directory, run from the repository root
         cmd += ["-s", str(Path(path).resolve().parent), "-p", module_of(path) + ".py"]

@@ -47,7 +47,20 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(sorted(set(roster) - set(catalog)), [])
         self.assertNotIn(FABLE, roster)
         self.assertTrue(catalog["openai/gpt-6.1-sol"]["in_roster"])
-        self.assertFalse(next(lv for lv in CAT["levels"] if lv["key"] == "strong")["shown"])
+        # The committed catalog offers strong with gpt-6.1-sol rostered at high (was shown false, in_roster false).
+        shipped = fx.shipped_catalog()
+        strong = next(lv for lv in shipped["levels"] if lv["key"] == "strong")
+        self.assertTrue(strong["shown"])
+        self.assertTrue(strong["models"][0]["in_roster"])
+        self.assertIn("openai/gpt-6.1-sol", {m["model"] for lv in shipped["levels"] if lv.get("shown", True) for m in lv["models"]
+                                             if m["in_roster"]})
+        self.assertFalse(next(lv for lv in CAT["levels"] if lv["key"] == "strong")["shown"])  # the fixture keeps it hidden
+        # An explicit strong request resolves to gpt-6.1-sol at high (it was moved to mid with "level is not offered").
+        picked = rr.resolve(K("strong", "high"), shipped, None, {"role": "coder", "allow_unrostered": False})
+        self.assertEqual((picked["level_key"], picked["model"], picked["effort"]), ("strong", SOL, "high"))
+        self.assertNotIn("level is not offered: used level mid", picked["steps"])
+        explicit = rr.resolve(None, shipped, None, {"role": "coder", "explicit": {"model": SOL, "worker": "pi", "thinking": "high"}})
+        self.assertEqual((explicit["level_key"], explicit["effort"]), ("strong", "high"))  # was refused: "not offered"
 
 
 class ChoiceTests(unittest.TestCase):
@@ -242,7 +255,12 @@ class EffortTests(unittest.TestCase):
         r = R(D("small", "low", shape="small_edit"), role="coder", paths=guard)
         self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
         self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
-        self.assertIn("protected path lib/sensitive_read.py: effort high", r["steps"])
+        # command_wrappers.py decides what counts as a sensitive read, so it is held to the same floor as the guard it was split from.
+        r = R(D("small", "low", shape="small_edit"), role="coder", paths=["lib/command_wrappers.py"])
+        self.assertEqual((r["level_key"], r["effort"]), ("mid", "high"))
+        self.assertIn("protected path lib/command_wrappers.py: effort high", r["steps"])
+        entries = {e["pattern"]: e for e in CAT["protected_paths"]}
+        self.assertEqual(entries["lib/command_wrappers.py"], dict(entries["lib/sensitive_read.py"], pattern="lib/command_wrappers.py"))
         # An absolute path, a glob pattern and a hooks file all match.
         for path in ("/repo/bin/tp-sensitive-read", "lib/redact_hook.py", "claude/plugins/tmux-pi/hooks/hooks.json"):
             with self.subTest(path=path):
@@ -470,6 +488,9 @@ class LocalOnlyResolveTests(unittest.TestCase):
         e2 = rr.escalate(dict(prior, effort_abstract="high"), CAT, ctx={"local_only": True})
         self.assertEqual(e2["source"], "stop_and_ask")
         self.assertIn("local-only", e2["reason"])
+        g1 = rr.escalate(prior, CAT, ctx={"local_only": True}, level_first=True)  # no local model above: effort, never cloud
+        self.assertEqual((g1["source"], g1["provider"], g1["model"]), ("escalation_effort_up", "local", QWEN))
+        self.assertEqual(rr.escalate(dict(prior, effort_abstract="high"), CAT, ctx={"local_only": True}, level_first=True)["source"], "stop_and_ask")
 
 
 class RedirectTests(unittest.TestCase):
@@ -535,10 +556,7 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(e3["source"], "stop_and_ask")
         for e in (e1, e2):
             self.assertNotIn(e["effort"], ("xhigh", "max"))
-        cat = copy.deepcopy(CAT)
-        strong = next(lv for lv in cat["levels"] if lv["key"] == "strong")
-        strong["shown"] = True
-        strong["models"][0]["in_roster"] = True
+        cat = fx.shipped_catalog()  # offers strong (was: the fixture, with strong switched on here)
         prior = {"model": SOL, "level_key": "mid", "effort": "medium", "effort_abstract": "medium", "review": "optional"}
         moved = rr.escalate(prior, cat, ctx={"role": "coder", "require_worker": "pi"})
         self.assertEqual((moved["model"], moved["effort"], moved["level_key"]), (SOL, "high", "strong"))
@@ -546,6 +564,14 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(X(SOL, "pi", "medium")["level_key"], "mid")
         with self.assertRaisesRegex(rr.ExplicitError, "not offered"):
             X(SOL, "pi", "high")
+        # level_first (a gated retry): the next level that the pin allows, at the same effort; the top level steps effort instead
+        g = rr.escalate(r, CAT, ctx=dict(role="coder"), level_first=True)
+        self.assertEqual((g["level_key"], g["effort_abstract"], g["source"]), ("top", "medium", "escalation_level_up"))
+        self.assertEqual(rr.escalate(g, CAT, ctx=dict(role="coder"), level_first=True)["source"], "escalation_effort_up")
+        sonnet = {"model": SONNET, "level_key": "mid", "effort": "medium", "effort_abstract": "medium", "review": "optional"}
+        pinned = {w: rr.escalate(sonnet, cat, ctx={"role": "coder", "require_worker": w}, level_first=True) for w in ("claude", "pi")}
+        self.assertEqual((pinned["claude"]["model"], pinned["claude"]["level_key"]), (OPUS, "top"))  # strong has no claude model
+        self.assertEqual((pinned["pi"]["model"], pinned["pi"]["level_key"]), (SOL, "strong"))
 
     def test_escalation_skips_the_hidden_level_and_role_caps(self):
         r = R(D("mid", "high"), role="tester")
@@ -565,6 +591,101 @@ class EscalationTests(unittest.TestCase):
     def test_top_level_stops_and_asks(self):
         r = R(D("top", "high"), role="architect")
         self.assertEqual(self.step(r)["source"], "stop_and_ask")
+
+
+class EffortCapInputTests(unittest.TestCase):
+    """The effort cap (the ceiling unless --approve-effort) is an input to resolution: a model counts only with an effort
+    it allows within the cap, so no route is made valid afterwards by cutting its effort (was: the F2 catalog, where the
+    top level maps every effort to xhigh and its pi model allows only xhigh, gave pi / astra / high, a pair the catalog
+    does not have)."""
+
+    @staticmethod
+    def f2(cat):
+        top = cat["levels"][-1]
+        top["effort_map"] = {e: "xhigh" for e in cat["effort"]["vocabulary"]}
+        for m in top["models"]:
+            if m["worker"] == "pi":
+                m["efforts"] = ["xhigh"]
+
+    def variations(self):
+        """The F2 catalog, then each level's effort_map forced to one effort, then each worker's models allowed one
+        effort: every variation the validator accepts."""
+        shipped = fx.shipped_catalog()
+        order = shipped["effort"]["order"]
+        edits = {"F2": self.f2}
+        for i, lv in enumerate(shipped["levels"]):
+            for v in order:
+                edits["{} effort_map all {}".format(lv["key"], v)] = (
+                    lambda c, i=i, v=v: c["levels"][i].update(effort_map={e: v for e in c["effort"]["vocabulary"]}))
+        for worker in ("claude", "pi"):
+            for e in order:
+                edits["{} models allow only {}".format(worker, e)] = (
+                    lambda c, w=worker, e=e: [m.update(efforts=[e]) for lv in c["levels"] for m in lv["models"] if m["worker"] == w])
+        out, rejected = {}, 0
+        for name, edit in edits.items():
+            cat = copy.deepcopy(shipped)
+            edit(cat)
+            try:
+                out[name] = rc.validate_catalog(cat)
+            except rc.CatalogError:
+                rejected += 1
+        return out, rejected, len(edits)
+
+    def test_the_f2_catalog_never_routes_an_unallowed_pair(self):
+        cat = copy.deepcopy(fx.shipped_catalog())
+        self.f2(cat)
+        rc.validate_catalog(cat)
+        ctx = {"role": "coder", "require_worker": "pi", "skip_caps": True}
+        r = rr.resolve(K("top"), cat, None, ctx)
+        self.assertNotEqual((r.get("model"), r.get("effort")), (ASTRA, "high"))
+        self.assertEqual((r["model"], r["effort"], r["level_key"]), (SOL, "high", "strong"))
+        self.assertIn("openai/gpt-6-astra allows no effort at or below high (xhigh); more needs --approve-effort", r["steps"])
+        approved = rr.resolve(K("top"), cat, None, dict(ctx, approvals={"effort_above_high": True}))
+        self.assertEqual((approved["model"], approved["effort"], approved["level_key"]), (ASTRA, "xhigh", "top"))
+        with self.assertRaisesRegex(rr.ExplicitError, "allows no effort at or below high"):
+            rr.resolve(None, cat, None, {"role": "coder", "explicit": {"model": ASTRA, "worker": "pi", "thinking": None}})
+
+    def test_every_route_is_an_allowed_pair_within_the_cap(self):
+        """Attack (rule 2): the variations x worker x --thinking x approval x kind (each shown level asked for, each
+        model of the worker chosen explicitly, a plain and a gated escalation from mid). The oracle: a stop, or a
+        worker / model / effort the catalog has, on the worker asked for, at or below the cap."""
+        catalogs, rejected, edits = self.variations()
+        rows = stops = 0
+        for name, cat in catalogs.items():
+            order = cat["effort"]["order"]
+            for worker in ("claude", "pi"):
+                for thinking in [None] + order:
+                    for approved in (False, True):
+                        ctx = {"role": "coder", "require_worker": worker, "approvals": {"effort_above_high": approved}}
+                        if thinking:
+                            ctx["explicit_effort"] = thinking
+                        cap = rr.effort_cap(order, cat["effort"]["ceiling"], approved)
+                        kinds = [("level " + k, lambda k=k: rr.resolve(K(k), cat, None, dict(ctx, skip_caps=True))) for k in rc.shown_keys(cat)]
+                        kinds += [("explicit " + m["model"], lambda m=m: rr.resolve(None, cat, None, dict(ctx, explicit={
+                            "model": m["model"], "worker": worker, "thinking": thinking})))
+                                  for lv in cat["levels"] for m in lv["models"] if m["worker"] == worker]
+                        prior = rr.resolve(K("mid", "medium"), cat, None, ctx)
+                        if prior["source"] != "stop_and_ask":
+                            kinds += [("escalate", lambda: rr.escalate(prior, cat, None, ctx)),
+                                      ("gated", lambda: rr.escalate(prior, cat, None, ctx, level_first=True))]
+                        for kind, run in kinds:
+                            rows += 1
+                            with self.subTest(catalog=name, worker=worker, thinking=thinking, approved=approved, kind=kind):
+                                try:
+                                    r = run()
+                                except rr.ExplicitError:
+                                    stops += 1
+                                    continue
+                                if r["source"] == "stop_and_ask":
+                                    stops += 1
+                                    continue
+                                entry = rc.level_of(cat, r["model"], r["effort"])[1]
+                                self.assertIsNotNone(entry, (r["model"], r["effort"]))
+                                self.assertEqual((entry["worker"], r["worker"]), (worker, worker))
+                                self.assertLessEqual(order.index(r["effort"]), order.index(cap), r["effort"])
+        self.assertGreater(len(catalogs), edits // 2)
+        self.assertGreater(rows, stops)
+        self.assertGreater(stops, 0)
 
 
 class ReviewerTests(unittest.TestCase):

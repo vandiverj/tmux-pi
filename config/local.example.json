@@ -18,9 +18,9 @@
     }
   },
   "_rules": "Send a task type a model is known to get wrong elsewhere: when the router picks a model in from and the task text matches pattern, use to. None needed now: counting went to Slotstream while Qwen3.5-4B was the standard model; Qwen3.6-35B-A3B with the prompt below gets counts right (tests/calibration/experiments.md).",
-  "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.6-35B-A3B's counting: 82% correct without, 96% with (tests/calibration/experiments.md).",
+  "_prompts": "Extra system-prompt text for a model's workers, for a mistake it is known to make. Qwen3.6-35B-A3B's counting: 82% correct without, 96% with (tests/calibration/experiments.md). The second paragraph is a draft rule for summarize_files chores (explain, compare or list what named files contain): it tells the model the fact-line format that tools/qual/summarize_check.py parses exactly (\"- <claim> [path:line]\", one fact per line, starting with the name the fact is about; any other list item fails the reply, and so does a file and line written in any other shape or place - a bare path:N, path#LN, path line N, (line N) after a path, a bracket split over lines, in prose, a heading, a code span or a code block - a fabricated one is also counted; other lines are ignored); it is not qualified until tools/qual/summarize_run.py shows it on the holdout split (tests/calibration/experiments.md, \"Summarize chores\").",
   "prompts": {
-    "lmstudio/qwen/qwen3.6-35b-a3b": "The grep tool lists matching lines and never counts them. To answer a count, run a counting command with the bash tool (grep -c, wc -l, or jq length for JSON) and report the number it prints; do not count lines of tool output yourself."
+    "lmstudio/qwen/qwen3.6-35b-a3b": "The grep tool lists matching lines and never counts them. To answer a count, run a counting command with the bash tool (grep -c, wc -l, or jq length for JSON) and report the number it prints; do not count lines of tool output yourself.\n\nWhen asked what files contain or how they differ, read every named file in full before answering. Answer with fact lines only. A fact line is one fact on one line, in exactly this form: - <claim> [path:line]. It starts with \"- \" and ends with one bracketed citation list, the path written in full as the task names the file, and a line number or a short range of at most 5 lines, for example: - load_config returns the defaults when the file is missing [src/config.py:41-43]. Start each fact line with the name it is about (the function, variable, class or file, as load_config starts the example; for a method, its own name), then say in words what the code does; a name or a signature alone is not a claim. Write a file and line only as the trailing [path:line] of a fact line, never in any other shape or place: no path:line, path#L, \"line N\" or \"(line N)\" in a claim, a heading, a sentence, a code span or a code block, no citation split over two lines, and no heading or \"Line N\" under a file name. Any other reference to a file and line fails the whole reply, even a correct one; a fact line without its own [path:line] is not counted. State only what the files say. If the files do not show something, say \"not in the files\" instead of guessing."
   },
   "_followup": "A fast local chat model judges whether a new message belongs to a running delegated task; between the two ask_between probabilities the user is asked. extra_body is added to the judge's request (LM Studio's Qwen3.6 thinks unless reasoning_effort is none). Without this key Laya judges, and asks more often (tests/calibration/experiments.md).",
   "followup": {
@@ -42,5 +42,31 @@
     "selector": "claude-sonnet-5-5"
   },
   "_redaction": "Secret redaction for tool output (docs/sensitive-read-redaction-design.md). shadow (default) keeps the per-call sensitive-read prompts and logs what redaction would do to ~/.config/tmux-pi/state/redaction/shadow.log; on redacts output with placeholders and prompts only for credential stores; off disables it. TP_REDACTION overrides.",
-  "redaction": {"mode": "shadow"}
+  "redaction": {"mode": "shadow"},
+  "_summarize_structured": "summarize_files without a tool loop (docs/plans/det-prep/ls1c-structured-summarize.md): lib/summarize_structured.py numbers the named files, lists the names each .py file defines (read with ast) after its text, asks the local endpoint once with this system prompt and JSON schema (response_format json_schema, temperature 0), drops every fact whose citation does not check out, and writes the rest as fact lines after a name index (one code-made line per class, function, method and constant). A fact is {subject, claim, path, lines}, lines being 1 to 3 line numbers; the old line_start/line_end form is still accepted from a local config. tools/qual/summarize_run.py --path structured uses it. budget_chars (optional, 1000 to 2000000) is the most numbered text it will send; without it 60000. The system text is prompt-t6 of the S1b tuning (bench-results/ls1c-2026-11-09).",
+  "summarize_structured": {
+    "system": "You answer a task about named files by listing facts. State only what the files say.\n\nEach fact has:\n- subject: the one bare name the fact is about. A function or method's own name (`load`, not `Store.load`), a class, variable, constant, setting, state or step name, or a file's base name (`app.py`) when the fact is about what a whole file does.\n- claim: the rest of the sentence, saying ONE thing the subject does or is, in your own plain words. It must read correctly after the subject. Describe the action as a verb (\"pops the next ready job\", \"removes every entry\", \"counts the entries\"), never by quoting code (\"calls queue.pop\", \"returns len(self._items)\"): code names in the claim do not count as saying anything. No file paths, no line numbers.\n- path: the file the lines are in.\n- lines: 1 to 3 line numbers that show the claim: the line that does it (an assignment, call, return or condition), plus the def or class line when that helps. Never a whole block. Use only the numbers shown in front of each line.\n\nOne thing per fact. When something does several things, write several facts with the same subject. Never join two behaviours with \"and\", \"or\", a semicolon or a comma list. A list or table of several values (delays, steps, states, fields) is one fact per value.\n\nChoosing the subject: for what one function or method does, its own name; for how a class behaves as a whole (its order, its limits, what it never does), the class name; for what a constant or setting means, its name; for what a whole file does with something, the file's base name.\n\nComparing two versions of a file: one fact per name that is added, removed or changed, with that name as subject (\"state_file is removed in the new version\").\n\nA list of every name each code file defines is added to your answer for you. Do not write facts that only say a name exists or is defined; write what each name does or is.\n\nCover the task completely: every name the task asks about, every thing each one does, and for a question about which files use something, one fact per file per use.\n\nIf the files do not show something the task asks about, add a fact with that subject whose claim says it is not in the files, citing line 1 of the file you checked.\n\nExamples (made-up code):\n- subject `Store`, claim \"is a class that keeps records in a dict\", lines [4, 6]\n- subject `load`, claim \"returns the record for a key\", lines [10, 14]\n- subject `load`, claim \"returns None when the key is missing\", lines [12]\n- subject `save`, claim \"writes the record to disk\", lines [18]\n- subject `app.py`, claim \"creates a Store\", lines [7]\n- subject `app.py`, claim \"saves the record after each request\", lines [21]\n- subject `worker.py`, claim \"takes the store as an argument from its caller\", lines [30]\n- subject `TIMEOUTS`, claim \"sets the first timeout to 2 seconds\", lines [3]\n- subject `TIMEOUTS`, claim \"sets the second timeout to 8 seconds\", lines [3]",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["facts"],
+      "properties": {
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["subject", "claim", "path", "lines"],
+            "properties": {
+              "subject": {"type": "string"},
+              "claim": {"type": "string"},
+              "path": {"type": "string"},
+              "lines": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 3}
+            }
+          }
+        }
+      }
+    },
+    "budget_chars": 60000
+  }
 }

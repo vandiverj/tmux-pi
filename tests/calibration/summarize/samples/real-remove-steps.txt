@@ -1,0 +1,5 @@
+- 1. the lane record is read and checked against git, so the tree that goes is the one the record names [real/lib/lane_remove.py:8]
+- 2. refusals: the tip is not integrated, a live process runs on the lane, work is queued for it, or git refuses a dirty tree [real/lib/lane_remove.py:10]
+- 3. the shared node_modules symlinks are unlinked with os.unlink, then git worktree remove runs without --force [real/lib/lane_remove.py:12-14]
+- 4. the branch is deleted with git update-ref -d when its tip is integrated, or with git branch -D under --abandon when it is not [real/lib/lane_remove.py:19-22]
+- 5. the lane directory is moved to lanes/archive/NAME-TIMESTAMP [real/lib/lane_remove.py:23]

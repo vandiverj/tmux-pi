@@ -1,0 +1,6 @@
+- lane_lease.py implements the lease itself, with reserve, activate and release [real/lib/lane_lease.py:205]
+- lane_lease.py also has a command line interface that takes reserve, activate or release [real/lib/lane_lease.py:271]
+- test_lane_lease.py is made of test classes that check the lease [real/tests/test_lane_lease.py:150]
+- test_lane_lease.py imports lane_lease, lanes and worker_process to drive them [real/tests/test_lane_lease.py:19-21]
+- lane_lease.py makes every change to a lane's holders under the lane lock [real/lib/lane_lease.py:6-7]
+- test_lane_lease.py orders its races by a lane lock that the test holds, never by sleeping [real/tests/test_lane_lease.py:4]

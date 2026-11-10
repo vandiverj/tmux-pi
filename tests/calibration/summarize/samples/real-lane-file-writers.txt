@@ -1,0 +1,4 @@
+- write_lane validates a lane record and writes it atomically, and only while the caller holds the lane lock [real/lib/lanes.py:489]
+- write_lane_file replaces another file in a lane's directory atomically with new text, or removes the file when the text is None [real/lib/lanes.py:553]
+- discard_lane_record undoes a record write that was just made, removing lane.json, any temporary file and the then empty directory [real/lib/lanes.py:600]
+- archive_lane_record moves a lane's directory into lanes/archive and keeps the record instead of deleting it [real/lib/lanes.py:631]

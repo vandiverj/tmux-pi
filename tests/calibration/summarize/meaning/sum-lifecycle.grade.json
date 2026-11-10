@@ -1,0 +1,395 @@
+{
+ "chore": "sum-lifecycle",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct; omits that dead jobs are never run again."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete, near-verbatim restatement."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct; omits that dead jobs are never run again (line listing five states cites only 5-7, judged ok as partial support)."
+  },
+  "R4": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete; identical to R2."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct; omits that dead jobs are never run again."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete and correct."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "unsupported",
+     "note": "transitions cited at line 9 (the dead state); they are on line 11"
+    },
+    {
+     "n": 3,
+     "verdict": "unsupported",
+     "note": "in-memory/restart claim cited at line 11 (transitions); it is on line 13"
+    }
+   ],
+   "note": "Content true but citations are off by two lines: the states bullet cites 3-7 so backoff (8) and dead conditions (9) are uncited, and the restart fact cites line 11; never says dead jobs are never run again. Only F1 met."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct; omits that dead jobs are never run again."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct; identical to R8, omits never run again."
+  }
+ }
+}

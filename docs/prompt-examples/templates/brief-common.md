@@ -129,5 +129,10 @@ listed and restore `meta/_journal.json`, then stop and report); table registered
   5. Text: each new or changed user-visible string and comment, and the code that makes it true now.
   6. Consumers: typed fixtures, mocks, READMEs or docs that describe the old behaviour, updated or named.
   7. AC and case-table rows: each mapped to its test file:line.
+  8. Attack: for each rule you changed, the inputs it must hold for, listed from an authoritative source (a grammar or
+     `ast` node list, an enum or state machine, the event list, the concurrent pairs and their orders; printed by code
+     when the source is code), or the cases you chose and why when none exists; each run against the real code with its
+     expected outcome and reason; counts (cases, matches, mismatches fixed) with the script and log under `evidence/`.
+     A mismatch is fixed by the rule, never by special-casing the input; the cases worth keeping become rows of existing tests.
   The reviewer spot-checks two lines; a false line is a defect.
 - Last line: `RESULT_STATUS: complete`.

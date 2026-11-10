@@ -1,0 +1,205 @@
+{
+ "chore": "steps-retries",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Both lines true and cited at docs/limits.md:3; meets all four facts."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Both lines true and cited at docs/limits.md:3; meets all four facts."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Both lines true and cited at docs/limits.md:3; meets all four facts."
+  },
+  "R4": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "unsupported",
+     "note": "content is correct but the citation 'Line 2' points at a blank line of docs/limits.md; the retries line is 3"
+    }
+   ],
+   "note": "States all four facts correctly but its only citation (line 2) is blank, so none are met; not in path:line form either."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Near-verbatim copy of line 3 plus one line per wait; all true and cited."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Both lines true and cited at docs/limits.md:3; meets all four facts."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Both lines true and cited at docs/limits.md:3; meets all four facts."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Redundant but all lines true and cited at line 3."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Line 1 meets all facts; lines 2-5 are off-topic (not about retries) but true and correctly cited, so ok."
+  }
+ }
+}

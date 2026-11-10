@@ -1,0 +1,3070 @@
+diff --git a/README.md b/README.md
+index c96e016..f06acb8 100644
+--- a/README.md
++++ b/README.md
+@@ -228,7 +228,9 @@ The status pane (top right) lists workers live. Click it to focus it, then:
+ | `-` | clear the viewer |
+ | `r` / `t` | read its last reply / its context packet in a popup |
+ | `x` | kill it (asks first) |
+-| `c` | archive killed workers |
++| `c` | archive workers whose pane is gone, then run `tp-clean --retired` |
++
++The pane holds at most `status.max_rows` rows (default 50, in `config/orchestration.json`). Every starting, working, needs-input, paused or `settled` worker is always shown, past the cap; the rest of the rows go to the newest finished workers, and a footer line, `N finished not shown (tp-agent find / tp-task list --all)`, says how many are left out. `tp-clean --retired` archives the finished workers that nothing can still ask for: completed (collected), stopped, killed or failed, finished more than `status.retire_after_minutes` ago (default 30), or, for a lane step, whose step the lane has closed. It closes only a dead pane of such a worker, never a live one, and prints `archived N, kept M` with the reasons for the first few it kept. A worker stays while a review of it is unfinished, a queued `after` or a retry names it as parent, a lane step is open, or a request of its own is pending or unreadable. `status.auto_retire` (default `true`) lets the status pane run that pass in the background once a minute; set it to `false` to run it only by hand or with `c`. A failed pass shows in the footer until one succeeds. A bad `status` value in the config is refused, not guessed at.
+ 
+ States come from each worker's reporter: `starting`, `working`, `tool`, `waiting`, `permission`, `error`, then `done`, `failed:<code>` or `killed` once the process ends. A second line shows elapsed time and turns, and settled work shows its `result.md` path; a reply with no `RESULT_STATUS:` line shows as `paused`, not settled, and is listed under `paused` in the session index. The line is `RESULT_STATUS: complete` (or `empty`, `blocked`, `incomplete`) on a line of its own; Markdown around it (`### `, `**…**`, backticks, a list marker) is accepted, any other text before it on the line is not. One reader (`lib/result_status.py`) serves `collect`, `tp-review`, the verdict reader and the dispatcher; the paused notice from `collect` states this form and the `tp-agent message` command that asks the worker for it. Token counts include cached input; cost is shown only for Pi providers that price tokens. If the pane looks stale, see `/refresh-status` above.
+ 
+diff --git a/bin/tp-agent b/bin/tp-agent
+index 4f04632..d1dc197 100755
+--- a/bin/tp-agent
++++ b/bin/tp-agent
+@@ -65,7 +65,8 @@ def atomic_text(path, text, root=None):
+     A link at path is replaced, never written through; one in a directory below root (the session state directory, which
+     every caller passes) is refused."""
+     path = Path(path)
+-    safe_write.ensure_dir(path.parent, root=root)
++    if safe_write.task_root(path.parent) is None:   # queue/, the session directory...: made here. A task directory never is (its creator makes it).
++        safe_write.ensure_dir(path.parent, root=root)
+     safe_write.write_atomic(path, text, mode=0o600, root=root)
+ 
+ 
+diff --git a/bin/tp-clean b/bin/tp-clean
+index bdaf0fe..9b752f5 100755
+--- a/bin/tp-clean
++++ b/bin/tp-clean
+@@ -2,7 +2,12 @@
+ # tp-clean — archive subagents whose pane is gone (killed, or left over from an
+ # earlier session). Their task dirs move to .tmux-pi/archive/; nothing is deleted.
+ #
+-# Usage: tp-clean
++# With --retired it archives the finished tasks nothing can still ask for instead (lib/task_record.py retire_plan: collected,
++# stopped, killed or failed; no open lane step, queued `after`, retry child or unfinished review; a non-lane task also
++# status.retire_after_minutes old), closing the dead tmux window of each first. A pane that still runs a process is never
++# killed. Prints `archived N, kept M (reasons: ...)`.
++#
++# Usage: tp-clean [--retired]
+ set -euo pipefail
+ 
+ src="${BASH_SOURCE[0]}"
+@@ -14,9 +19,20 @@ done
+ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
+ source "$ROOT/lib/tp.sh"
+ 
++mode=gone
++case "${1:-}" in
++  "") ;;
++  --retired) mode=retired; shift ;;
++  *) die "usage: tp-clean [--retired]" ;;
++esac
++[[ $# -eq 0 ]] || die "usage: tp-clean [--retired]"
++
+ session="$(tp_session)"
+ state_dir="$(tp_opt "$session" @tp_state_dir)"
+ tp_owned_dir --root "$state_dir" "$state_dir/archive"
++if [[ "$mode" == retired ]]; then
++  exec python3 "$ROOT/lib/task_record.py" retire "$state_dir"
++fi
+ n=0
+ for meta in "$state_dir"/tasks/*/meta.json; do
+   [[ -f "$meta" ]] || continue
+diff --git a/bin/tp-contract b/bin/tp-contract
+index 32a024c..431b68c 100755
+--- a/bin/tp-contract
++++ b/bin/tp-contract
+@@ -45,6 +45,7 @@ from pathlib import Path
+ ROOT = Path(__file__).resolve().parent.parent
+ sys.path.insert(0, str(ROOT / "lib"))
+ import safe_write  # noqa: E402
++from task_archive import resolved_contract_meta  # noqa: E402
+ from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
+                       escalation_record, extension, is_local, ledger_row, load_research, message, note,
+                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
+@@ -116,7 +117,7 @@ def find(root, task_id):
+     meta = read(d / "meta.json")
+     if not meta:
+         raise ContractError("no subagent '{}'".format(task_id))
+-    return d, meta
++    return d, resolved_contract_meta(d, meta)   # an artifact archiving recorded relative is read from this directory
+ 
+ 
+ def tasks(root, only=None):
+@@ -137,7 +138,7 @@ def tasks(root, only=None):
+         # worker processes; keep them out of subagent status/enforcement.
+         if meta.get("worker") == "main":
+             continue
+-        yield meta_path.parent, meta
++        yield meta_path.parent, resolved_contract_meta(meta_path.parent, meta)
+ 
+ 
+ def clock(seconds):
+@@ -179,13 +180,16 @@ def cmd_build(args):
+     errors = config.get("tool_errors", 4)
+     contract = build(args.kind, os.path.normpath(artifact), budget, checkpoints, stall, grace, errors,
+                      profile=profile, no_edits=args.no_edits)
+-    if not args.no_edits:
+-        os.makedirs(os.path.dirname(contract["artifact"]), exist_ok=True)
++    artifact_dir = os.path.dirname(contract["artifact"])
++    task_path = os.path.abspath(args.task_dir)
++    if not args.no_edits and os.path.commonpath([artifact_dir, task_path]) != task_path:   # inside the task directory: its creator makes it
++        os.makedirs(artifact_dir, exist_ok=True)
+     print(json.dumps({"contract": contract, "note": note(contract, time.time())}))
+ 
+ 
+ def cmd_status(args):
+     root, pane_map, now = state_dir(), panes(), time.time()
++    gone = False
+     for d, meta in tasks(root, args.ids or None):
+         life, state, events, reply = task_state(d, meta, pane_map)
+         alive = pane_map.get(meta.get("pane")) == "alive"
+@@ -222,8 +226,15 @@ def cmd_status(args):
+                 parts.append("result: {}".format(d / "result.md"))
+             parts.append(summary_line(reply, question=life == "needs_input"))
+         detail = " · ".join(parts)
+-        write_record(d, lifecycle_state=life, detail=detail, meta=meta)
++        try:
++            write_record(d, lifecycle_state=life, detail=detail, meta=meta)
++        except safe_write.GoneDir as exc:   # archived or removed while this was looking at it: said, nothing recreated, the rest go on
++            print("tp-contract: {}".format(exc), file=sys.stderr)
++            gone = True
++            continue
+         print("{}\x1f{}\x1f{}".format(meta.get("id", d.name), life, detail))
++    if gone:
++        sys.exit(1)
+ 
+ 
+ def send(pane, text):
+@@ -396,19 +407,9 @@ def cmd_collect(args):
+     if required and not marker_path.exists() and not marker_path.is_symlink():
+         # Legacy required-review tasks lacked a marker. Mint a human-resolvable
+         # blocker on first collect attempt, without overwriting a concurrent review.
+-        import tempfile
+-        with tempfile.NamedTemporaryFile(mode="w", dir=d, prefix=".review-required-", delete=False) as tmp:
+-            json.dump({"required": True, "status": "needs_human", "task_id": args.id,
+-                       "reasons": ["Required review was not recorded before collection; human resolution required"]}, tmp)
+-            tmp.write("\n")
+-            pending = Path(tmp.name)
+-        try:
+-            try:
+-                os.link(pending, marker_path)
+-            except FileExistsError:
+-                pass
+-        finally:
+-            pending.unlink()
++        safe_write.write_new(marker_path, json.dumps({"required": True, "status": "needs_human", "task_id": args.id,
++                             "reasons": ["Required review was not recorded before collection; human resolution required"]}) + "\n",
++                             mode=0o600, root=root)
+     marker = read_json(marker_path)
+     approved = approved_delegated_review(d, meta, marker)
+     if (unresolved_review(marker_path, args.id) and not approved) or (required and
+@@ -520,7 +521,7 @@ def main():
+             globals()["cmd_" + args.cmd](args)
+         else:
+             print(json.dumps(research_config()))
+-    except (ContractError, safe_write.UnsafePath) as exc:
++    except (ContractError, safe_write.UnsafePath, safe_write.GoneDir) as exc:   # GoneDir: the task was archived or removed
+         print("tp-contract: {}".format(exc), file=sys.stderr)
+         return 1
+     return 0
+diff --git a/bin/tp-review b/bin/tp-review
+index 53770b6..b9a4f6b 100755
+--- a/bin/tp-review
++++ b/bin/tp-review
+@@ -222,7 +222,8 @@ review_task="Review the completed work from subagent '$id'. You are an independe
+ # A research report (M9) is checked for source support rather than code changes.
+ extra=()
+ if [[ "$(jq -r '.contract.kind // empty' "$dir/meta.json")" == research ]]; then
+-  report="$(jq -r '.contract.artifact' "$dir/meta.json")"
++  # an artifact that archiving recorded relative to the task directory is read from this directory (lib/task_archive.py artifact_path)
++  report="$(jq -r --arg dir "$dir" '.contract.artifact | if type == "string" and length > 0 and (startswith("/") | not) then $dir + "/" + . else . end' "$dir/meta.json")"
+   review_task="Review the research report from subagent '$id' at $report (read it in full; the author's final reply is only a summary). You are an independent reviewer. Check each important claim against its cited source where you can reach it: is it supported by a primary source, only by the report's own reasoning, or by nothing? Name hidden assumptions, say whether the conclusions apply to this project's workflow, and note any local measurement or repository fact that contradicts the report. Classify the key claims as verified, report-derived, background knowledge, or synthesis. Do not change files. $outside_rule $findings_rule $report_coverage_rule $verdict_rule a brief rationale or the findings (unsupported or wrong claims first)."
+   extra=(--note "Research report: $report")
+ fi
+diff --git a/bin/tp-spawn b/bin/tp-spawn
+index 5bc3697..c3175e9 100755
+--- a/bin/tp-spawn
++++ b/bin/tp-spawn
+@@ -591,11 +591,11 @@ fi
+ # The task directory and its first three files are made in one python start (tp_write_many). A symlinked tasks/ or task directory
+ # is refused, not entered. A required review marker, when there is one, goes in between the directory and the files, as before.
+ skill_selection_json="$(jq . <<<"$skill_selection")"
+-mkdir_args=(--mkdir "$state_dir/tasks" --mkdir "$task_dir")
++mkdir_args=(--task-dir "$task_dir")
+ # A required review must exist before the worker pane (or task id) is observable.
+ # Use atomic replacement so collect never sees a partial marker.
+ if [[ -n "$decision_json" ]] && jq -e '.review == "required"' <<<"$decision_json" >/dev/null; then
+-  tp_owned_dir --root "$state_dir" "$state_dir/tasks" "$task_dir"
++  tp_create_task_dir --root "$state_dir" "$task_dir"
+   made_task_dir=1
+   mkdir_args=()
+   nonce="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+diff --git a/bin/tp-status b/bin/tp-status
+index 692f0c8..a07ad8e 100755
+--- a/bin/tp-status
++++ b/bin/tp-status
+@@ -11,15 +11,17 @@
+ #        -            clear the viewer
+ #        r / t        read its result / context packet in a popup
+ #        x            kill it (asks first)
+-#        c            archive killed subagents (tp-clean)
++#        c            archive killed subagents (tp-clean) and the retired ones (tp-clean --retired)
+ #
+ # Checks every second, painting only when the displayed frame changes, from each task's state.json (written by the reporters)
+ # and its pane. A key only redraws from what the last check read (load_data); only the once-a-second timer, and a key that
+ # changes something (view, kill, clean, read, or a move past the loaded window), reads the task records again.
+ #
+-# However many tasks the session has, the pane holds a window of them (lib/tp_window.py): the newest $TP_STATUS_WINDOW
+-# (60), and every task that is starting, working, needs_input or paused whatever its age. Older tasks are read from their
+-# records when a key moves to them (j/k at the first row, PgUp, g). Nothing on disk is deleted. When the newest task is
++# However many tasks the session has, the pane holds a window of them (lib/tp_window.py) of at most $TP_STATUS_WINDOW rows
++# (default status.max_rows, 50): every task that is starting, working, needs_input, paused or settled whatever its age or the
++# cap, then the newest finished ones; a footer line says how many finished tasks are not shown. Once a minute a background
++# pass (tp-clean --retired, unless status.auto_retire is false) archives the finished tasks nothing can still ask for.
++# Older tasks are read from their records when a key moves to them (j/k at the first row, PgUp, g). Nothing on disk is deleted. When the newest task is
+ # selected the pane follows new workers; a task outside the window whose files changed gets its record (task.md) refreshed
+ # through tp-contract status (the C lines of tp_window.py); a background tick (tp-agent tick) that fails, or runs over a
+ # minute, is said in the footer on every frame until a later one succeeds; once the selection is anywhere else it stays put and the header says
+@@ -53,7 +55,14 @@ read_clock() {
+   now=$SECONDS
+ }
+ last_tick=-5 tick_pid="" tick_note=""   # tick_note: why the background tick is not doing its work, shown in the footer
+-keep="${TP_STATUS_WINDOW-60}"
++last_retire="" retire_pid="" retire_note=""   # retire_note: why the once-a-minute retire pass (tp-clean --retired) is not doing its work
++max_rows=50 auto_retire=true   # status.max_rows / status.auto_retire in config/orchestration.json (lib/task_record.py status_settings)
++if cfg="$(python3 "$TP_LIB_DIR/task_record.py" status-settings 2>&1)"; then
++  read -r max_rows auto_retire _ <<<"$cfg"
++else
++  retire_note="status settings: $(head -c 160 <<<"$cfg" | tr '\n' ' ')"
++fi
++keep="${TP_STATUS_WINDOW-$max_rows}"
+ [[ "$keep" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "tp-status: TP_STATUS_WINDOW must be a positive number, not '$keep'" >&2; exit 1; }
+ # What lib/tp_window.py learns about the tasks is kept between refreshes in this file, so a refresh reads only the records
+ # that changed. It is derived from the task files, private to this process, and removed with it.
+@@ -130,13 +139,14 @@ pad() { local t="$2"; printf -v R '%s%*s' "$t" $(( $1 > ${#t} ? $1 - ${#t} : 1 )
+ # facts (H line: total tasks, where the window starts, the newest task, each row's list position).
+ parse_window() {
+   local line pos
+-  rows="" usage_lines=() row_pos=() changed_ids=()
++  rows="" usage_lines=() row_pos=() changed_ids=() cap_note=""
+   while IFS= read -r line; do
+     case "$line" in
+       H*) IFS=$'\x1f' read -r _ total wstart newest pos <<<"$line"
+           IFS=, read -ra row_pos <<<"$pos" ;;
+       R*) rows+="${line:1}"$'\n' ;;
+       C*) changed_ids+=("${line:1}") ;;
++      F*) cap_note="${line:1}" ;;
+       U*) usage_lines+=("${line:1}") ;;
+     esac
+   done <<<"$1"
+@@ -146,14 +156,25 @@ parse_window() {
+ # in_ids <id> — is the task one of the loaded rows?
+ in_ids() { local i; for i in "${!ids[@]}"; do [[ "${ids[$i]}" == "$1" ]] && return 0; done; return 1; }
+ 
+-# pick_wanted — select what a key asked for once the window it asked for has loaded: the first or last row (g, G), or the
+-# row at (the nearest to) the list position a move past the loaded rows asked for.
++# extreme_row <min|max> — set R to the id of the loaded task with the lowest (the oldest) or the highest (the newest) list
++# position. Rows are drawn active first, so the first or last row says nothing about age: age is the position in the list.
++extreme_row() {
++  local i best=-1
++  R=""
++  for i in "${!ids[@]}"; do
++    if (( best < 0 )) || { [[ "$1" == min ]] && (( row_pos[i] < row_pos[best] )); } || { [[ "$1" == max ]] && (( row_pos[i] > row_pos[best] )); }; then best=$i; fi
++  done
++  (( best < 0 )) || R="${ids[best]}"
++}
++
++# pick_wanted — select what a key asked for once the window it asked for has loaded: the oldest or newest loaded task (g, G),
++# or the row at (the nearest to) the list position a move past the loaded rows asked for.
+ pick_wanted() {
+   local i n=${#ids[@]} best=-1 gap
+   (( n > 0 )) || { want="" want_pos=""; return 0; }
+   case "$want" in
+-    first) selected="${ids[0]}" ;;
+-    last) selected="${ids[n - 1]}" ;;
++    first) extreme_row min; selected="$R" ;;
++    last) extreme_row max; selected="$R" ;;
+   esac
+   if [[ -n "$want_pos" ]]; then
+     for (( i = 0; i < n; i++ )); do
+@@ -194,6 +215,29 @@ tick_check() {
+   tick_note="background tick failed (exit $rc)${detail:+: $detail}"
+ }
+ 
++# retire_check — start the retire pass (tp-clean --retired: archives the finished tasks nothing can still ask for, and closes
++# their dead windows) in the background at most once a minute, and look at the one started earlier without waiting for it. Like
++# the tick, a pass that fails leaves retire_note for the footer until a later one succeeds; the pane keeps painting either way.
++# The first pass is a minute after the pane starts. status.auto_retire false turns it off.
++retire_check() {
++  local rc=0 detail
++  [[ "$auto_retire" == true ]] || return 0
++  [[ -n "$last_retire" ]] || last_retire=$now
++  if [[ -n "$retire_pid" ]]; then
++    kill -0 "$retire_pid" 2>/dev/null && return 0
++    wait "$retire_pid" 2>/dev/null || rc=$?
++    retire_pid=""
++    if (( rc == 0 )); then retire_note=""; else
++      detail="$(head -c 160 "$cache_dir/retire.err" 2>/dev/null | tr '\n' ' ')"
++      retire_note="retire pass failed (exit $rc)${detail:+: $detail}"
++    fi
++  fi
++  if (( now - last_retire >= 60 )); then
++    "$ROOT/bin/tp-clean" --retired >/dev/null 2>"$cache_dir/retire.err" &
++    retire_pid=$! last_retire=$now
++  fi
++}
++
+ # load_data — read everything the frame is drawn from: the task rows of the window, their lifecycle details, the viewed
+ # task, the queue, the pane size, the usage page. render draws from these variables alone, so redrawing (a key that only
+ # moves the selection or scrolls) reads no file and runs no program. One process (lib/tp_window.py) picks the window
+@@ -206,6 +250,7 @@ usage_lines=() queue_lines=() changed_ids=()   # changed_ids: tasks outside the
+ load_data() {
+   local out id queued line panes pass
+   tick_check
++  retire_check
+   if (( now - last_tick >= 5 )) && [[ -z "$tick_pid" ]]; then   # tp-agent tick reads every record; never wait for it here
+     "$ROOT/bin/tp-agent" tick >/dev/null 2>"$cache_dir/tick.err" &
+     tick_pid=$! last_tick=$now   # last_tick moves only when a tick was started, not while the last one still runs
+@@ -260,7 +305,7 @@ load_data() {
+ }
+ 
+ render() {
+-  local qi qshow out i id worker status tool tokens cost model line c sel_index detail life role y header hint count_label n hdr budget sum_text sum_n sel_text sel_n msg_text msg_n need want used area full vis lines_left permission requested ul sl compact
++  local qi qshow out i id worker status tool tokens cost model line c sel_index detail life role y header hint count_label n hdr budget sum_text sum_n sel_text sel_n msg_text msg_n cap_text cap_n need want used area full vis lines_left permission requested ul sl compact
+   frame_cols="$cols"
+   compact=0
+   (( frame_lines < 16 )) && compact=1
+@@ -269,7 +314,10 @@ render() {
+   # Keep the selection on the same id; fall back to the newest subagent.
+   sel_index=-1
+   for i in "${!ids[@]}"; do if [[ "${ids[$i]}" == "$selected" ]]; then sel_index=$i; fi; done
+-  if (( sel_index < 0 && ${#ids[@]} > 0 )); then sel_index=$(( ${#ids[@]} - 1 )); selected="${ids[$sel_index]}"; fi
++  if (( sel_index < 0 && ${#ids[@]} > 0 )); then
++    extreme_row max; selected="$R"   # the newest by list position, not the last drawn row
++    for i in "${!ids[@]}"; do if [[ "${ids[$i]}" == "$selected" ]]; then sel_index=$i; fi; done
++  fi
+   if (( ${#ids[@]} == 0 )); then selected=""; fi
+ 
+   # A tick that failed (or that runs too long) is flagged in the header, which every page and every pane height draws; the
+@@ -280,6 +328,10 @@ render() {
+     "") ;;
+     *) tick_flag=" · ⚠ tick slow" ;;
+   esac
++  # The same for the retire pass (and a status config that could not be read): the footer carries the words.
++  retire_flag="" cap_flag=""
++  [[ -z "$retire_note" ]] || retire_flag=" · ⚠ retire failed"
++  tick_flag+="$retire_flag"
+ 
+   if [[ "$page" == stats ]]; then
+     # Usage page: bounded to the pane, no clickable rows, any overflow counted.
+@@ -309,7 +361,7 @@ render() {
+ 
+   # Optional blocks, in priority order; each is dropped when it would squeeze
+   # the task list below min(need, 6) lines.
+-  sum_text="" sum_n=0 sel_text="" sel_n=0 msg_text="" msg_n=0
++  sum_text="" sum_n=0 sel_text="" sel_n=0 msg_text="" msg_n=0 cap_text="" cap_n=0
+   if (( ! compact )); then
+     ul=("${usage_lines[@]}")
+     if (( ${#ul[@]} )); then
+@@ -326,11 +378,23 @@ render() {
+         sel_text+="${dim}reply ${reset}${R}${esc}[K"$'\n'; sel_n=5
+       fi
+     fi
+-    if [[ -n "$message" || -n "$tick_note" ]]; then   # a key's feedback first; the tick's failure otherwise, until it is gone
+-      clip "$cols" "${message:-$tick_note}"
++    if [[ -n "$message" || -n "$tick_note" || -n "$retire_note" ]]; then   # a key's feedback first; the tick's failure, then the retire pass's, until it is gone
++      clip "$cols" "${message:-${tick_note:-$retire_note}}"
+       msg_text="${esc}[K"$'\n'"${yellow}${R}${reset}${esc}[K"$'\n'; msg_n=2
+     fi
+   fi
++  # Finished tasks outside the window (status.max_rows): how many and where to find them. Not optional: its line is taken from
++  # the budget first, in a compact pane too; where not even one line can be spared the header carries the count.
++  if [[ -n "$cap_note" ]]; then
++    if (( budget >= 2 )); then
++      clip "$cols" "$cap_note"
++      cap_text="${dim}${R}${reset}${esc}[K"$'\n'; cap_n=1; budget=$(( budget - 1 ))
++    else
++      cap_total=0   # the footer reads "4 finished, 1 escalated not shown ..."; the header has room for the total only
++      for cap_word in ${cap_note%% not shown*}; do [[ "$cap_word" =~ ^[0-9]+$ ]] && cap_total=$(( cap_total + cap_word )); done
++      cap_flag=" · $cap_total not shown"
++    fi
++  fi
+   need=$(( (compact ? (n > 0 ? n : 1) : (n > 0 ? 2 * n : 1)) + nq ))
+   want=$(( need < 6 ? need : 6 ))
+   used=0
+@@ -398,14 +462,14 @@ render() {
+     fi
+     lines_left=$(( lines_left - qshow - (qshow < ${#queue_lines[@]} ? 1 : 0) ))
+   fi
+-  out+="$sum_text$sel_text$msg_text"
++  out+="$sum_text$sel_text$msg_text$cap_text"
+   count_label="subagents $agents"
+   if (( agents < total )); then count_label+="/$total"; fi
+   # No line was left for the queue (active rows filled the pane): the header carries the count instead, so queued and
+   # refused entries are never silently absent.
+   if (( nq && lines_left < 1 )); then count_label+=" · ${#queue_lines[@]} queued/refused (enlarge pane)"; fi
+   if (( new_below )); then count_label+=" · ↓ new worker (G)"; fi
+-  count_label+="$tick_flag · $session_label"
++  count_label+="$tick_flag$cap_flag · $session_label"
+   clip $((cols - ${#count_label} - 2)) "s stats · click/j/k move · g/G top/bottom · PgUp/PgDn · enter view · o focus · - clear · r result · t packet · x kill · c clean"
+   header="${esc}[H${bold}${count_label}${reset}${dim}  ${R}${reset}${esc}[K"$'\n'
+   (( compact )) || header+="${esc}[K"$'\n'
+@@ -450,7 +514,7 @@ leave_follow() { if (( follow )); then seen_newest="$newest"; fi; follow=0; }
+ # go_top / go_bottom — g and G: the oldest and the newest task of the whole list.
+ go_top() {
+   leave_follow
+-  if (( wstart == 0 && ${#ids[@]} > 0 )); then selected="${ids[0]}"; settle_follow; return 0; fi
++  if (( wstart == 0 && ${#ids[@]} > 0 )); then extreme_row min; selected="$R"; settle_follow; return 0; fi
+   win_start=0 want=first reload=1
+ }
+ go_bottom() { follow=1 win_start=newest want=last reload=1; }
+@@ -553,7 +617,7 @@ while true; do
+          # Tasks spawned before M4 have no packet.
+          if [[ -f "$tasks/$selected/packet.md" ]]; then popup packet.md; else popup task.md; fi
+        fi ;;
+-    c) message="$("$ROOT/bin/tp-clean" 2>&1)"; reload=1 ;;
++    c) message="$("$ROOT/bin/tp-clean" 2>&1 | tr '\n' ' ')· retired: $("$ROOT/bin/tp-clean" --retired 2>&1 | tr '\n' ' ')"; reload=1 ;;
+     x)
+       reload=1
+       if [[ -n "$selected" ]]; then
+diff --git a/bin/tp-task b/bin/tp-task
+index 1439a72..194c55e 100755
+--- a/bin/tp-task
++++ b/bin/tp-task
+@@ -362,7 +362,8 @@ def _safe_handshake_id(value):
+ 
+ 
+ def _write_json(path, data, root=None):
+-    safe_write.ensure_dir(Path(path).parent, root=root)
++    if safe_write.task_root(Path(path).parent) is None:   # handoffs/<id>...: made here. A task directory never is (its creator makes it).
++        safe_write.ensure_dir(Path(path).parent, root=root)
+     safe_write.write_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n", root=root)
+ 
+ 
+@@ -775,7 +776,7 @@ def main():
+     args = parser.parse_args()
+     try:
+         globals()["cmd_" + args.cmd.replace("-", "_")](args)
+-    except (ContractError, safe_write.UnsafePath) as exc:
++    except (ContractError, safe_write.UnsafePath, safe_write.GoneDir) as exc:   # GoneDir: the task was archived or removed
+         print("tp-task: {}".format(exc), file=sys.stderr)
+         return 1
+     return 0
+diff --git a/config/orchestration.json b/config/orchestration.json
+index a63fe3a..f9194ad 100644
+--- a/config/orchestration.json
++++ b/config/orchestration.json
+@@ -2,6 +2,7 @@
+   "max_local_workers": 2,
+   "max_active_workers": 10,
+   "lanes": { "max_active_lanes": 20 },
++  "status": { "max_rows": 50, "auto_retire": true, "retire_after_minutes": 30 },
+   "trial": {
+     "max_local_workers": 1,
+     "attempt_timeout_s": 2700,
+diff --git a/lib/contract.py b/lib/contract.py
+index 3876069..e1e5cfc 100644
+--- a/lib/contract.py
++++ b/lib/contract.py
+@@ -33,6 +33,7 @@ import request_file
+ import safe_write
+ from lifecycle_files import LIFECYCLE_FILES
+ from result_status import RESULT_STATUS_RE  # noqa: F401  (the one RESULT_STATUS reader: lib/result_status.py)
++from task_archive import resolved_contract_meta
+ from task_record import request_text
+ 
+ KINDS = ("research", "task")
+@@ -698,7 +699,7 @@ def ledger_row(task_dir, now):
+     """One ledger row for a task: what ran, for how long, what it cost and what it produced."""
+     d = Path(task_dir)
+     read = lambda name: json.loads((d / name).read_text()) if (d / name).exists() else {}
+-    meta, state = read("meta.json"), read("state.json")
++    meta, state = resolved_contract_meta(d, read("meta.json")), read("state.json")   # a relative artifact is read from this directory
+     contract = meta.get("contract")
+     art = artifact_info(contract["artifact"]) if contract else None
+     reply_only = bool(contract and contract.get("kind") == "task" and contract.get("no_edits") is True)
+diff --git a/lib/preflight.py b/lib/preflight.py
+index 731ddcb..3d88268 100644
+--- a/lib/preflight.py
++++ b/lib/preflight.py
+@@ -382,16 +382,16 @@ def contract_note(preflight):
+ def create_preflight_record(state_dir, request, preflight, name="contract", main_contract=None, policy_decision=None, lifecycle_state="working"):
+     """Create a durable main-owned task directory without spawning a worker."""
+     tasks = Path(state_dir) / "tasks"
+-    safe_write.ensure_dir(tasks, what="tasks directory", root=state_dir)
+     stamp = _dt.datetime.now().strftime("%H%M%S")
+     safe = re.sub(r"[^\w.-]+", "-", name or "contract").strip("-") or "contract"
+     task_id = f"{safe}-{stamp}"
+     n = 0
+-    while (tasks / task_id).exists():
++    while True:   # the name is taken by creating the directory: one that exists, however it came to, is skipped
++        d = tasks / task_id
++        if safe_write.create_task_dir(d, state_dir):
++            break
+         n += 1
+         task_id = f"{safe}-{stamp}-{n}"
+-    d = tasks / task_id
+-    d.mkdir()
+     safe_write.write_atomic(d / "request.md", (request or preflight.get("task") or "").strip() + "\n", root=state_dir)
+     meta = {
+         "id": task_id,
+diff --git a/lib/safe_write.py b/lib/safe_write.py
+index cedf5b2..9d427b0 100644
+--- a/lib/safe_write.py
++++ b/lib/safe_write.py
+@@ -18,10 +18,15 @@ from the path: a caller that knows its state directory passes it, and `task_root
+ caller knows is `<state>/tasks/<id>` (or `archive/<id>`). With no root only the path itself is at risk, which the replace or
+ O_NOFOLLOW deals with; ensure_dir refuses a link at the directory it is given.
+ 
++A write into an existing directory goes through a handle on that directory (`open_dir`): the temp file is made and renamed
++relative to the handle, so a directory that is renamed meanwhile (a task archived) receives the write where it now is, leaves
++no temp file behind, and is never recreated. A directory that is already gone is refused (`GoneDir`), not made. The only
++function that makes a task directory is `create_task_dir`.
++
+ The file mode is what the old write gave it. An explicit `mode` is applied as given. Otherwise a new file gets the creation
+ mode (0o666, or 0o777 for an executable) less the umask; an existing regular file keeps its own mode when `keep_mode` (a
+ write into the file did that), and gets the creation mode too when not (a new file renamed over it did that). Standalone
+-(stdlib only) so a shell script can run it: `python3 lib/safe_write.py write|append|mkdir|check PATH` (stdin is the content).
++(stdlib only) so a shell script can run it: `python3 lib/safe_write.py write|append|mkdir|task-dir|check PATH` (stdin is the content).
+ """
+ import argparse
+ import errno
+@@ -41,6 +46,22 @@ class UnsafePath(OSError):
+         super().__init__(errno.ELOOP, f"unsafe {what} (symlink): {path}", str(path))
+ 
+ 
++class GoneDir(FileNotFoundError):
++    """The directory a write was meant for is not there (a task archived or removed). Nothing was created."""
++
++    def __init__(self, path):
++        parent, name = os.path.split(os.path.abspath(path))
++        what = ("task {} is no longer active (archived or removed)".format(name) if os.path.basename(parent) == "tasks"
++                else "directory {} is gone".format(path))
++        super().__init__(errno.ENOENT, what, str(path))
++
++    def __str__(self):
++        return self.strerror
++
++
++after_open = None   # test seam: called with the directory path once a handle on it is open, before anything is written
++
++
+ def is_link(path):
+     return os.path.islink(path)
+ 
+@@ -127,29 +148,80 @@ def ensure_dir(path, mode=0o777, what="state directory", root=None):
+     return path
+ 
+ 
++def create_task_dir(path, root):
++    """The ONE place a task directory (`<root>/tasks/<id>`) is made. tasks/ is made (a link there is refused); the task
++    directory is made if absent. True when this call made it, False when it was already there (a link there is refused)."""
++    path = Path(path)
++    if path.parent.name != "tasks":
++        raise ValueError("not a task directory: {}".format(path))
++    ensure_dir(path.parent, what="tasks directory", root=root)
++    check_below(root, path, "task directory")
++    try:
++        path.mkdir(mode=0o777)
++    except FileExistsError:
++        return False
++    return True
++
++
++def check_dir(path, root=None, what="state directory"):
++    """Refuse (UnsafePath) a link at or below root, and (GoneDir) a directory that is not there; makes and writes nothing."""
++    os.close(open_dir(path, root, what, seam=False))
++
++
++def open_dir(path, root=None, what="state directory", seam=True):
++    """A handle (fd) on the existing directory `path`, for writes made relative to it. With a root, a link at any component
++    below it, the directory itself included, is refused; without one the directory may be reached through a link (a path
++    the user named). A missing directory is GoneDir: this never creates one. The caller closes the fd."""
++    path = os.fspath(path)
++    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
++    if root is not None:
++        check_below(root, path, what)
++        flags |= NOFOLLOW
++    try:
++        fd = os.open(path, flags)
++    except FileNotFoundError as exc:
++        raise GoneDir(path) from exc
++    except OSError as exc:
++        if exc.errno == errno.ELOOP:
++            raise UnsafePath(path, what) from exc
++        raise
++    if seam and after_open is not None:
++        try:
++            after_open(path)
++        except BaseException:
++            os.close(fd)
++            raise
++    return fd
++
++
+ def _payload(data, encoding, errors):
+     return data if isinstance(data, (bytes, bytearray)) else data.encode(encoding, errors)
+ 
+ 
+ def write_temp(path, data, mode=None, create=0o666, fsync=False, encoding="utf-8", errors="strict", root=None,
+-               keep_mode=True):
++               keep_mode=True, dir_fd=None):
+     """Write data to a new O_EXCL temp file beside path and return its name; the caller renames it into place (and
+-    removes it on failure). Never opens path itself; a link in any directory between root and path is refused first."""
++    removes it on failure). Never opens path itself; a link in any directory between root and path is refused first.
++    With dir_fd (a handle on path's directory) the file is made in that directory and its bare name is returned."""
+     path = os.fspath(path)
+-    check_parent(root, path)
+     directory, base = os.path.split(os.path.abspath(path))
++    if dir_fd is None:
++        check_parent(root, path)
+     body = _payload(data, encoding, errors)
+     if mode is None and keep_mode:
+         try:
+-            old = os.lstat(path)
++            old = os.lstat(base, dir_fd=dir_fd) if dir_fd is not None else os.lstat(path)
+         except OSError:
+             old = None
+         if old is not None and stat.S_ISREG(old.st_mode):
+             mode = stat.S_IMODE(old.st_mode)
+     for _ in range(100):
+-        temp = os.path.join(directory, f".{base[:100]}.{secrets.token_hex(6)}")
++        temp = f".{base[:100]}.{secrets.token_hex(6)}"
++        if dir_fd is None:
++            temp = os.path.join(directory, temp)
+         try:
+-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | getattr(os, "O_CLOEXEC", 0), create)
++            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | getattr(os, "O_CLOEXEC", 0), create,
++                         dir_fd=dir_fd)
+             break
+         except FileExistsError:
+             continue
+@@ -165,7 +237,7 @@ def write_temp(path, data, mode=None, create=0o666, fsync=False, encoding="utf-8
+                 os.fsync(out.fileno())
+     except BaseException:
+         try:
+-            os.unlink(temp)
++            os.unlink(temp, dir_fd=dir_fd)
+         except OSError:
+             pass
+         raise
+@@ -177,28 +249,59 @@ def write_atomic(path, data, mode=None, create=0o666, fsync=False, encoding="utf
+     """Replace path with data (str or bytes) through a temp file in the same directory. A symlink at path is replaced,
+     never written through. An explicit mode wins; with none, an existing regular file keeps its mode when keep_mode, and
+     otherwise (a new file, or keep_mode=False) the mode is `create` less the umask."""
+-    temp = write_temp(path, data, mode, create, fsync, encoding, errors, root, keep_mode)
++    path = os.fspath(path)
++    directory, base = os.path.split(os.path.abspath(path))
++    handle = open_dir(directory, root, "state directory")   # one handle: the temp file and the rename both go through it
+     try:
+-        os.replace(temp, path)
+-    except BaseException:
++        temp = write_temp(path, data, mode, create, fsync, encoding, errors, root, keep_mode, dir_fd=handle)
+         try:
+-            os.unlink(temp)
+-        except OSError:
+-            pass
+-        raise
++            os.replace(temp, base, src_dir_fd=handle, dst_dir_fd=handle)
++        except BaseException:
++            try:
++                os.unlink(temp, dir_fd=handle)
++            except OSError:
++                pass
++            raise
++    finally:
++        os.close(handle)
+     return str(path)
+ 
+ 
++def write_new(path, data, mode=None, create=0o666, fsync=False, encoding="utf-8", errors="strict", root=None):
++    """Create path with data only when nothing is there (a link, dangling or not, counts as there) and never replace what is.
++    True when this call made it. Whole or not at all: a temp file linked into place, through a handle on the directory."""
++    path = os.fspath(path)
++    directory, base = os.path.split(os.path.abspath(path))
++    handle = open_dir(directory, root, "state directory")
++    try:
++        temp = write_temp(path, data, mode, create, fsync, encoding, errors, root, False, dir_fd=handle)
++        try:
++            os.link(temp, base, src_dir_fd=handle, dst_dir_fd=handle, follow_symlinks=False)
++        except FileExistsError:
++            return False
++        finally:
++            try:
++                os.unlink(temp, dir_fd=handle)
++            except OSError:
++                pass
++        return True
++    finally:
++        os.close(handle)
++
++
+ def open_append(path, mode=0o666, encoding="utf-8", errors="strict", root=None):
+     """The file at path opened for appending text (created with `mode` less the umask). A symlink there, or in a
+     directory between root and path, is refused."""
+-    check_parent(root, path)
++    directory, base = os.path.split(os.path.abspath(path))
++    handle = open_dir(directory, root, "state directory")
+     try:
+-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
++        fd = os.open(base, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode, dir_fd=handle)
+     except OSError as exc:
+         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)) or (NOFOLLOW and os.path.islink(path)):
+             raise UnsafePath(path, "append target") from exc
+         raise
++    finally:
++        os.close(handle)
+     return os.fdopen(fd, "a", encoding=encoding, errors=errors)
+ 
+ 
+@@ -223,6 +326,9 @@ def main(argv=None):
+     p = sub.add_parser("mkdir", help="mkdir -p for owned directories; a symlink is refused")
+     p.add_argument("--root")
+     p.add_argument("paths", nargs="+")
++    p = sub.add_parser("task-dir", help="make the task directory PATH (<state>/tasks/<id>); the one way a shell script makes one")
++    p.add_argument("--root", required=True)
++    p.add_argument("path")
+     p = sub.add_parser("check", help="exit 1 when a path is a symlink")
+     p.add_argument("--root")
+     p.add_argument("paths", nargs="+")
+@@ -231,6 +337,7 @@ def main(argv=None):
+                                           "prints `owned DIR` for each --mkdir DIR once it was checked and exists")
+     p.add_argument("--root")
+     p.add_argument("--mkdir", action="append", default=[], metavar="DIR")
++    p.add_argument("--task-dir", metavar="DIR", help="make the task directory DIR (create_task_dir) after the --mkdir ones")
+     p.add_argument("--file", action="append", default=[], metavar="PATH", dest="targets", type=lambda v: ("file", v))
+     p.add_argument("--exec", action="append", default=[], metavar="PATH", dest="targets", type=lambda v: ("exec", v))
+     args = parser.parse_args(argv)
+@@ -242,11 +349,16 @@ def main(argv=None):
+             for path in args.mkdir:
+                 ensure_dir(path, root=args.root)
+                 print(f"owned {path}", flush=True)  # said only once every ancestor was checked and the directory exists
++            if args.task_dir:
++                create_task_dir(args.task_dir, args.root)
++                print(f"owned {args.task_dir}", flush=True)
+             for (kind, path), body in zip(args.targets, chunks):  # --file and --exec keep their command-line order
+                 write_atomic(path, body, create=0o777 if kind == "exec" else 0o666, root=args.root, keep_mode=kind != "exec")
+         elif args.command == "mkdir":
+             for path in args.paths:
+                 ensure_dir(path, root=args.root)
++        elif args.command == "task-dir":
++            create_task_dir(args.path, args.root)
+         elif args.command == "check":
+             for path in args.paths:
+                 check_below(args.root, path, "state directory")
+diff --git a/lib/task_archive.py b/lib/task_archive.py
+index 71ae1aa..b4704fd 100644
+--- a/lib/task_archive.py
++++ b/lib/task_archive.py
+@@ -20,3 +20,20 @@ def find_archived_task(state_dir, ident):
+         if found == ident:
+             return meta.parent
+     return None
++
++
++def artifact_path(record_dir, artifact):
++    """A contract artifact as an absolute path. A worker records it absolute; archiving writes it relative to the task directory
++    (it must not name where the task will end up), so a relative one is read from the record's own directory. An absolute one
++    (every record written before that) is returned as it is."""
++    if not isinstance(artifact, str) or not artifact or Path(artifact).is_absolute():
++        return artifact
++    return str(Path(record_dir) / artifact)
++
++
++def resolved_contract_meta(record_dir, meta):
++    """meta with contract.artifact made absolute for the directory the record is read from (meta itself is not changed)."""
++    contract = meta.get("contract") if isinstance(meta, dict) else None
++    if not isinstance(contract, dict) or not isinstance(contract.get("artifact"), str):
++        return meta
++    return {**meta, "contract": {**contract, "artifact": artifact_path(record_dir, contract["artifact"])}}
+diff --git a/lib/task_record.py b/lib/task_record.py
+index 488e586..bbf37d5 100644
+--- a/lib/task_record.py
++++ b/lib/task_record.py
+@@ -7,9 +7,11 @@ was the raw request are migrated additively when a record is written.
+ """
+ 
+ import datetime as _dt
++import errno
+ import json
+ import os
+ import re
++import stat
+ import subprocess
+ import textwrap
+ import sys
+@@ -19,7 +21,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
+     sys.path.insert(0, str(Path(__file__).resolve().parent))
+ import review_verdict  # noqa: E402
+ import safe_write  # noqa: E402
+-from task_archive import find_archived_task  # noqa: E402,F401  (re-exported: archive_task names what it finds)
++from task_archive import artifact_path, find_archived_task  # noqa: E402,F401  (re-exported: archive_task names what it finds)
+ 
+ MARKER = "<!-- tmux-pi-task-record:v1 -->"
+ ACCEPTED_STATES = {"starting", "working", "needs_input", "settled", "completed", "paused", "failed", "killed", "stopped", "escalated"}
+@@ -45,17 +47,16 @@ def is_canonical(text):
+ def _read(path):
+     try:
+         return Path(path).read_text(encoding="utf-8")
+-    except OSError:
++    except (OSError, ValueError):   # ValueError: UnicodeDecodeError, text that is not UTF-8
+         return ""
+ 
+ 
+ def _write_atomic(path, text):
+-    """Replace path through a temp file (0600, fsynced). A link at path is replaced; one at the task directory or at the
+-    tasks/ (archive/) above it, i.e. anything below the state directory, is refused."""
++    """Replace path through a temp file (0600, fsynced), made and renamed through a handle on the task directory: a directory
++    that moved to the archive meanwhile gets the write there; one already gone is refused (safe_write.GoneDir), never made.
++    A link at path is replaced; one at the task directory or at the tasks/ (archive/) above it is refused."""
+     path = Path(path)
+-    root = safe_write.task_root(path.parent)
+-    safe_write.ensure_dir(path.parent, what="task directory", root=root)
+-    safe_write.write_atomic(path, text, mode=0o600, fsync=True, root=root)
++    safe_write.write_atomic(path, text, mode=0o600, fsync=True, root=safe_write.task_root(path.parent))
+ 
+ 
+ def _fence(text):
+@@ -241,17 +242,37 @@ def _artifact_status(path):
+     return "present"
+ 
+ 
++def _inside_task(d, task_id, path):
++    """`path` as a name relative to the task directory when it lies inside it (as tasks/<id> or as `d` itself), else None: a
++    relative path, an external one, and one that climbs out are not inside. The one test for "inside the task"."""
++    for base in (d.parent.parent / "tasks" / task_id, d):
++        try:
++            inside = Path(path).relative_to(base)
++        except (ValueError, TypeError):
++            continue
++        return inside.as_posix() if inside.parts and ".." not in inside.parts else None
++    return None
++
++
++def _shown_artifact(d, meta):
++    """The contract artifact as task.md names it: by name from the task directory when it is inside it, else as recorded."""
++    artifact = (meta.get("contract") or {}).get("artifact")
++    return (_inside_task(d, meta.get("id") or d.name, artifact) or artifact) if isinstance(artifact, str) and artifact else artifact
++
++
+ def _links(task_dir, meta):
++    """(label, path) of the task's files. A file inside the task directory is named by file name, from the record's own
++    directory, always: the record says nothing about where the task lives, so it is right in tasks/<id>, in archive/<name>, and
++    whichever writer lands while the task moves."""
+     d = Path(task_dir)
+     links = []
+     for name, label in (("request.md", "request"), ("packet.md", "context packet"), ("main-contract.json", "main Orient/Frame contract"),
+                         ("policy-decision.json", "post-contract policy decision"), ("context-manifest.json", "context manifest"),
+                         ("result.md", "result"), ("state.json", "runtime state"), ("meta.json", "metadata")):
+         if (d / name).exists():
+-            links.append((label, str(d / name)))
+-    contract = meta.get("contract") or {}
+-    if contract.get("artifact"):
+-        links.append(("contract artifact", contract["artifact"]))
++            links.append((label, name))
++    if (meta.get("contract") or {}).get("artifact"):
++        links.append(("contract artifact", _shown_artifact(d, meta)))
+     if meta.get("review"):
+         links.append(("review task", meta["review"]))
+     if (d / "escalated").exists():
+@@ -284,13 +305,17 @@ def _material_record_text(text):
+ 
+ 
+ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, force=False):
+-    """Write/update canonical task.md and return its structured fields.
++    """Write/update canonical task.md and return its structured fields. task.md names the files inside the task directory by
++    name, from its own directory, never by absolute path (one form for every writer: it cannot know where the task will be read
++    from, and a writer that lands while the task is archived must not leave a stale location).
+ 
+     If this is a legacy task dir, preserve the old raw task text as request.md
+     before replacing task.md with the canonical record.
+     """
+     d = Path(task_dir)
+-    safe_write.ensure_dir(d, what="task directory", root=safe_write.task_root(d))  # tasks/ and the task directory: a link at either is refused
++    # Never makes the directory (only its creator does, safe_write.create_task_dir): a handle opened and closed here refuses a
++    # link at tasks/ or the task directory, and a task that is already gone, before anything is read or computed for it.
++    safe_write.check_dir(d, safe_write.task_root(d), "task directory")
+     meta = meta or read_json(d / "meta.json")
+     old_task = _read(d / "task.md")
+     if old_task.strip() and not is_canonical(old_task) and not (d / "request.md").exists():
+@@ -334,7 +359,7 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
+         "",
+     ]
+     if reply:
+-        parts.append("- Result file: `{}` (updated {})".format(d / "result.md", _mtime_iso(d / "result.md")))
++        parts.append("- Result file: `{}` (updated {})".format("result.md", _mtime_iso(d / "result.md")))
+         parts.append("- Summary: {}".format(_clip(_summary(reply), 220)))
+         if meta.get("worker") == "main" and preflight.get("stop"):
+             out_fence = _fence(reply)
+@@ -342,7 +367,7 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
+     else:
+         parts.append("- No `result.md` yet.")
+     if artifact:
+-        parts.append("- Contract artifact: `{}` ({})".format(artifact, _artifact_status(artifact)))
++        parts.append("- Contract artifact: `{}` ({})".format(_shown_artifact(d, meta), _artifact_status(artifact_path(d, artifact))))
+     relocation = meta.get("archive_relocation") or {}
+     if isinstance(relocation, dict) and relocation.get("artifact_from"):
+         parts.append("- Archived artifact origin: `{}`".format(relocation["artifact_from"]))
+@@ -525,7 +550,7 @@ def _artifact_protects(task_dir, artifact):
+     if not artifact:
+         return False
+     try:
+-        art = Path(artifact).resolve()
++        art = Path(artifact_path(task_dir, artifact)).resolve()
+         d = Path(task_dir).resolve()
+     except OSError:
+         return False
+@@ -771,46 +796,68 @@ def capture_main_output(task_dir, output, lifecycle_state="completed"):
+     return write_record(d, lifecycle_state=state, meta=meta, force=True)
+ 
+ 
+-def _archive_destination(archive_dir, task_id):
+-    dest = Path(archive_dir) / task_id
+-    if not os.path.lexists(dest):
+-        return dest
++def _reserve_archive_name(archive_dir, task_id):
++    """Create, and so own, an empty directory archive/<id> (or <id>-ended-<stamp>[-N] when that name is taken), and return it.
++    The name is taken by the mkdir itself: a name that exists, however it came to, is skipped, never reused."""
+     stamp = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+-    n = 0
+-    while True:
+-        candidate = Path(archive_dir) / "{}-ended-{}{}".format(task_id, stamp, "-{}".format(n) if n else "")
+-        if not os.path.lexists(candidate):
+-            return candidate
+-        n += 1
++    for n in range(-1, 1000):
++        name = task_id if n < 0 else "{}-ended-{}{}".format(task_id, stamp, "-{}".format(n) if n else "")
++        candidate = Path(archive_dir) / name
++        try:
++            os.mkdir(candidate)
++        except FileExistsError:
++            continue
++        return candidate
++    raise OSError("no free archive name for {}".format(task_id))
++
++
++RECONCILE_FILES = ("meta.json", "task.md", "request.md", "retention.json")   # what _reconcile_archived_record may write
+ 
+ 
+ def _reconcile_archived_record(task_dir):
+-    """Repair relocated local artifact provenance, then render paths from the new home."""
++    """Bring the record of the task in task_dir to what an archived one says: a local artifact that lives inside the task is
++    named relative to the task directory (meta.json contract.artifact; the old absolute path is kept as
++    archive_relocation.artifact_from), and task.md names its files by name. Nothing written depends on where the directory is
++    or will be, so the record is right in tasks/<id>, in archive/<name>, and in between. Used in place before the move, and on
++    an old archive.
++
++    Every write is atomic and the whole can be run again, so a failure part-way leaves a task that is still readable and can
++    be reconciled once more. Nothing is written through a link: a target that is a link or not a regular file refuses the
++    whole reconcile before the first write. meta.json goes last (it is the one a reader of the live task depends on)."""
+     d = Path(task_dir)
++    for name in RECONCILE_FILES:
++        try:
++            mode = os.lstat(d / name).st_mode
++        except FileNotFoundError:
++            continue
++        if not stat.S_ISREG(mode):
++            raise ValueError("{} is not a regular file; the task is left where it is".format(d / name))
+     meta = read_json(d / "meta.json")
+     contract = meta.get("contract") or {}
+     artifact = contract.get("artifact")
++    relocated = False
+     if isinstance(artifact, str) and artifact:
+         # Only an absolute artifact inside the original task directory can have
+         # moved with it. Never rewrite external research paths (or relative paths).
+-        old = d.parent.parent / "tasks" / (meta.get("id") or d.name)
+-        try:
+-            relative = Path(artifact).relative_to(old)
+-        except ValueError:
+-            relative = None
+-        if relative is not None and relative.parts and ".." not in relative.parts:
+-            new_artifact = str(d / relative)
+-            meta["contract"] = {**contract, "artifact": new_artifact}
+-            meta.setdefault("archive_relocation", {"artifact_from": artifact, "artifact_to": new_artifact})
+-            meta_path = d / "meta.json"
+-            stamp = meta_path.stat()
+-            _write_atomic(meta_path, json.dumps(meta, indent=2, sort_keys=True) + "\n")
+-            os.utime(meta_path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
++        # An earlier pass that did not finish has recorded where the artifact came from: work from that.
++        recorded = meta.get("archive_relocation")
++        recorded = recorded if isinstance(recorded, dict) else {}
++        origin = recorded["artifact_from"] if isinstance(recorded.get("artifact_from"), str) else artifact
++        relative = _inside_task(d, meta.get("id") or d.name, origin)
++        if relative is not None and relative != artifact:
++            meta["contract"] = {**contract, "artifact": relative}
++            meta["archive_relocation"] = {**{k: v for k, v in recorded.items() if k != "artifact_to"}, "artifact_from": origin}
++            relocated = True
+     write_record(d, lifecycle_state=parse_record(d)["state"], meta=meta)
++    if relocated:
++        meta_path = d / "meta.json"
++        stamp = meta_path.stat()
++        _write_atomic(meta_path, json.dumps(meta, indent=2, sort_keys=True) + "\n")
++        os.utime(meta_path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+ 
+ 
+ def archive_task(state_dir, task_dir):
+-    """Move one active task to a distinct archive name and reconcile its record."""
++    """Reconcile the record of one active task in place, then move it to a distinct archive name with a single rename."""
+     root = Path(state_dir)
+     d = Path(task_dir)
+     try:  # tasks/ and the task directory are looked at themselves (lstat), never resolved: a link at either is refused
+@@ -821,21 +868,23 @@ def archive_task(state_dir, task_dir):
+         raise ValueError("not an active task directory: {}".format(d))
+     archive_dir = root / "archive"
+     safe_write.ensure_dir(archive_dir, what="archive directory", root=root)
+-    dest = _archive_destination(archive_dir, d.name)
+-    # An exclusive empty-directory reservation prevents nesting into an existing
+-    # archive; rename replaces only that empty reservation on the same filesystem.
+-    while True:
+-        try:
+-            dest.mkdir()
+-            break
+-        except FileExistsError:
+-            dest = _archive_destination(archive_dir, d.name)
++    # Two phases, and nothing is ever restored. 1: the record is reconciled in place, in tasks/<id>, by atomic repeatable writes
++    # that name nothing about where the task will be (see _reconcile_archived_record), so a failure leaves a task that is still
++    # correct there and archives on a later pass. 2: one rename of the directory, the last step; nothing touches the task after.
++    # The archive name is owned first: the mkdir creates it (a taken name is skipped), the task directory is renamed onto that
++    # empty directory (POSIX allows it), and only a directory this call created is ever renamed onto or removed.
++    dest = _reserve_archive_name(archive_dir, d.name)
++    moved = False
+     try:
+-        d.rename(dest)
+-    except Exception:
+-        dest.rmdir()  # only our empty reservation; leave the source untouched
+-        raise
+-    _reconcile_archived_record(dest)
++        _reconcile_archived_record(d)
++        os.rename(d, dest)
++        moved = True
++    finally:
++        if not moved:
++            try:
++                os.rmdir(dest)   # only while it is empty; a failure to remove it hides nothing worse than the error being raised
++            except OSError:
++                pass
+     return dest
+ 
+ 
+@@ -914,3 +963,331 @@ def format_record_for_resume(task_dir):
+ 
+     {body}{output}
+     """).format(dir=d, record=d / "task.md", body=text, output=output_section).rstrip() + "\n"
++
++
++# --- retiring finished tasks (tp-clean --retired, the status pane's once-a-minute pass) --------------------------------------
++# A task is retired when nothing can still ask for its directory in tasks/: task_dir() refuses archived ids, so review, retry
++# lineage, a queued `after` and `lane close` (which needs its settled writer in tasks/) all break if the wrong task moves.
++
++RETIRE_LIFECYCLES = ("completed", "stopped", "killed", "failed")
++STATUS_DEFAULTS = {"max_rows": 50, "auto_retire": True, "retire_after_minutes": 30}
++MACHINE_CONFIG = Path(__file__).resolve().parent.parent / "config" / "orchestration.json"
++
++
++def status_settings(path=None):
++    """The "status" block of config/orchestration.json (TP_ORCHESTRATION_CONFIG names another file): max_rows (a positive
++    integer), auto_retire (true/false) and retire_after_minutes (a number, 0 or more). An absent file, block or key takes its
++    default; a value of the wrong type, or a file that cannot be read, refuses."""
++    path = Path(path or os.environ.get("TP_ORCHESTRATION_CONFIG") or MACHINE_CONFIG)
++    try:
++        cfg = json.loads(path.read_text(encoding="utf-8"))
++    except FileNotFoundError:
++        cfg = {}
++    except (OSError, ValueError) as error:
++        raise ValueError("cannot read {} ({})".format(path, error))
++    block = cfg.get("status", {}) if isinstance(cfg, dict) else None
++    if not isinstance(block, dict):
++        raise ValueError('{} "status" must be an object'.format(path))
++    out = dict(STATUS_DEFAULTS)
++    for key, value in block.items():
++        if key not in STATUS_DEFAULTS:
++            continue
++        number = isinstance(value, (int, float)) and not isinstance(value, bool)
++        if key == "max_rows" and not (isinstance(value, int) and not isinstance(value, bool) and value > 0):
++            raise ValueError("{} status.max_rows must be a positive integer, got {!r}".format(path, value))
++        if key == "auto_retire" and not isinstance(value, bool):
++            raise ValueError("{} status.auto_retire must be true or false, got {!r}".format(path, value))
++        if key == "retire_after_minutes" and not (number and value >= 0):
++            raise ValueError("{} status.retire_after_minutes must be a number of minutes (0 or more), got {!r}".format(path, value))
++        out[key] = value
++    return out
++
++
++def _json_object(path):
++    try:
++        value = json.loads(Path(path).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def _finished_at(task_dir):
++    from lifecycle_files import LIFECYCLE_FILES
++    newest = 0.0
++    for name in LIFECYCLE_FILES:
++        try:
++            newest = max(newest, os.stat(os.path.join(task_dir, name)).st_mtime)
++        except OSError:
++            pass
++    return newest
++
++
++def _queue_claims(state_dir):
++    """({task id: queued item that names it in `after` or `parent`}, [(item, raw text) of queue items that cannot be read])."""
++    claimed, unreadable = {}, []
++    queue = Path(state_dir) / "queue"
++    for file in sorted(queue.glob("*.json")) if queue.is_dir() else []:
++        item = _json_object(file)
++        if item is None:   # not JSON, not UTF-8 or not readable: its text (None when none) may still name a task
++            try:
++                text = file.read_bytes().decode("utf-8", errors="replace")
++            except OSError:
++                text = None
++            unreadable.append((file.stem, text))
++            continue
++        after = item.get("after") if isinstance(item.get("after"), list) else []
++        for ident in [*after, item.get("parent")]:
++            if isinstance(ident, str):
++                claimed.setdefault(ident, file.stem)
++    return claimed, unreadable
++
++
++def _pane_unknown(pane):
++    """A recorded pane that is neither absent nor a tmux pane id (%N, nothing else): whether it still runs cannot be told, so
++    its task is kept and tmux is not asked. The rule is worker_process.recorded_pane, shared with live_process."""
++    import worker_process
++    return worker_process.recorded_pane(pane) == "unknown"
++
++
++def _lane_state(meta, cache):
++    """(closed, why) for a lane task: its step is closed in the lane record, or the lane is removed (closed); otherwise why it
++    is kept. The lane records are in the repository's git directory, found from the task's preamble_from or workdir."""
++    import lanes
++    name, step = meta.get("lane"), meta.get("lane_step")
++    if not isinstance(name, str) or not isinstance(step, str):
++        return False, "lane tags unreadable"
++    common = None
++    for key in ("preamble_from", "workdir"):
++        source = meta.get(key)
++        if not (isinstance(source, str) and source and os.path.isdir(source)):
++            continue
++        if source not in cache["common"]:
++            try:
++                cache["common"][source] = lanes.git_common_dir(source)
++            except (ValueError, OSError):
++                cache["common"][source] = None
++        common = cache["common"][source]
++        if common:
++            break
++    if not common:
++        return False, "lane {} repository not found".format(name)
++    if (common, name) not in cache["lane"]:
++        try:
++            cache["lane"][(common, name)] = "removed" if name not in lanes.lane_names(common) else lanes.read_lane(common, name)
++        except (ValueError, OSError, RecursionError):
++            cache["lane"][(common, name)] = None
++    record = cache["lane"][(common, name)]
++    if record is None:
++        return False, "lane {} record unreadable".format(name)
++    if record == "removed":
++        return True, "lane {} removed".format(name)
++    if step in {entry["step"] for entry in record["closed"]}:
++        return True, "lane step {} closed".format(step)
++    return False, "open lane step {}".format(step)
++
++
++def retire_plan(state_dir, panes=None, now=None, settings=None):
++    """(retired, kept): lists of (task id, reason) for the finished tasks of tasks/ (completed, stopped, killed, failed).
++    retired: why nothing can ask for the task any more; kept: the reason it stays. `panes` is {pane id: alive} (default:
++    tmux list-panes), `now` seconds since the epoch. Tasks that are at work, settled, paused or escalated are in neither."""
++    import time
++    import contract
++    import request_file
++    root = Path(state_dir)
++    settings = settings or status_settings()
++    now = time.time() if now is None else now
++    if panes is None:
++        import worker_process
++        panes = worker_process.pane_flags()
++    tasks_dir = root / "tasks"
++    if tasks_dir.is_symlink() or not tasks_dir.is_dir():
++        return [], []
++    info = {}
++    for d in sorted(tasks_dir.iterdir()):
++        if d.name.startswith(".") or d.is_symlink() or not d.is_dir():
++            continue
++        meta = _json_object(d / "meta.json")
++        pane = meta.get("pane") if meta else None
++        unknown = _pane_unknown(pane)
++        word = "gone" if unknown or not pane or pane not in panes else ("alive" if panes[pane] else "dead")
++        try:
++            life = contract.task_lifecycle(d, word)[0]
++        except Exception:   # a record the lifecycle cannot read is neither finished nor retired
++            life = None
++        info[d.name] = {"dir": d, "meta": meta, "pane": pane, "word": word, "life": life, "unknown": unknown}
++    claimed, unreadable = _queue_claims(root)
++    reviewers, children, unreadable_reviews = {}, {}, {}   # unreadable_reviews: task -> is it unfinished
++    for name, item in info.items():
++        try:
++            author = (item["dir"] / "review-of").read_text(encoding="utf-8").strip()
++        except FileNotFoundError:
++            author = ""
++        except (OSError, UnicodeDecodeError):   # unreadable: the reviewer stays, and an unfinished one may be holding any task
++            author = ""
++            unreadable_reviews[name] = item["life"] not in RETIRE_LIFECYCLES
++        if author and item["life"] not in RETIRE_LIFECYCLES:
++            reviewers.setdefault(author, name)
++        parent = item["meta"].get("parent") if item["meta"] else None
++        if isinstance(parent, str) and parent:
++            children.setdefault(parent, []).append(name)
++    lane_cache = {"common": {}, "lane": {}}
++    kept, retired_now, why = [], {}, {}
++    for name, item in info.items():
++        if item["life"] is not None and item["life"] not in RETIRE_LIFECYCLES:
++            continue
++        d, meta = item["dir"], item["meta"]
++        reason = None
++        if meta is None:
++            reason = "record unreadable"
++        elif item["life"] is None:
++            reason = "lifecycle unreadable"
++        elif item["life"] == "completed" and not (d / "collected.json").exists():
++            reason = "completed without collected.json"
++        elif meta.get("worker") == "main":
++            reason = "main-owned record"
++        elif item["unknown"]:
++            reason = "pane {!r} unreadable".format(item["pane"])
++        elif item["word"] == "alive":
++            reason = "pane {} still runs".format(item["pane"])
++        elif request_file.is_pending(str(d / "capability-request.json")) or os.path.lexists(d / "pending-capability.json"):
++            reason = "pending capability request"
++        elif request_file.unreadable_names(str(d)):
++            reason = "unreadable request file"
++        elif os.path.lexists(d / "process.json"):
++            reason = "process.json awaiting reap"
++        elif name in claimed:
++            reason = "queued {} names it".format(claimed[name])
++        elif any(text is None or name in text for _, text in unreadable):
++            reason = "an unreadable queue item may name it"
++        elif name in reviewers:
++            reason = "unfinished review {}".format(reviewers[name])
++        elif name in unreadable_reviews:
++            reason = "review-of unreadable"
++        elif any(unreadable_reviews.values()):
++            reason = "review-of of {} unreadable".format(next(n for n, open_ in unreadable_reviews.items() if open_))
++        elif "lane" in meta or "lane_step" in meta:
++            closed, why[name] = _lane_state(meta, lane_cache)
++            reason = None if closed else why[name]
++        else:
++            age = (now - _finished_at(d)) / 60
++            why[name] = "finished over {} min ago".format(settings["retire_after_minutes"])
++            if age <= settings["retire_after_minutes"]:
++                reason = "finished {:.0f} min ago (kept {} min)".format(max(age, 0), settings["retire_after_minutes"])
++        if reason:
++            kept.append((name, reason))
++        else:
++            retired_now[name] = why[name]
++    parent_of = {name: item["meta"].get("parent") for name, item in info.items() if item["meta"]}
++
++    def loop_from(name):   # the parent chain of name when it comes back to name (a -> b -> a), else None; no depth is trusted
++        chain, here = [name], parent_of.get(name)
++        while here in retired_now:
++            if here == name:
++                return chain + [name]
++            if here in chain:   # leads into a loop that does not include name
++                return None
++            chain.append(here)
++            here = parent_of.get(here)
++        return None
++    changed = True
++    while changed:   # retry lineage: a parent goes only after every child that is in tasks/ has gone
++        changed = False
++        loops = {name: loop_from(name) for name in retired_now}   # all of a loop is found before any of it is dropped
++        for name in sorted(retired_now):
++            looped = loops[name]
++            blocking = [c for c in children.get(name, []) if c not in retired_now]
++            if looped:   # no order archives a loop of parents: all of it stays
++                del retired_now[name]
++                kept.append((name, "parent chain loops ({})".format(" -> ".join(looped))))
++                changed = True
++            elif blocking:
++                del retired_now[name]
++                kept.append((name, "parent of {}".format(blocking[0])))
++                changed = True
++    return sorted(retired_now.items()), sorted(kept)
++
++
++def retired(state_dir, panes=None, now=None, settings=None):
++    """The (task id, reason) of every task that retire_plan finds retired."""
++    return retire_plan(state_dir, panes, now, settings)[0]
++
++
++def retire(state_dir, panes=None, now=None, settings=None):
++    """Archive every retired task, closing its dead pane first (a pane that runs a process is never killed: that task stays).
++    Returns {"archived": [ids], "kept": [(id, reason)], "failed": [(id, error)]}: a task whose pane could not be closed or
++    that could not be written to the archive is in failed (and stays), not in kept, so the caller can say the pass failed."""
++    import worker_process
++    root = Path(state_dir)
++    plan, kept = retire_plan(root, panes, now, settings)
++    archived, failed = [], []
++    parents = {name: (_json_object(root / "tasks" / name / "meta.json") or {}).get("parent") for name, _ in plan}
++
++    def depth(name):   # how many retired ancestors the task has: the deepest (the children) go first
++        seen, count = {name}, 0
++        while isinstance(parents.get(name), str) and parents[name] in parents and parents[name] not in seen:
++            name = parents[name]
++            seen.add(name)
++            count += 1
++        return count
++    stuck = {}   # a retired task that stays (kept or failed): its parent stays too, a retry's lineage needs it in tasks/
++    for name, _ in sorted(plan, key=lambda item: (-depth(item[0]), item[0])):
++        d = root / "tasks" / name
++        blocker = next((c for c, p in parents.items() if p == name and c in stuck), None)
++        if blocker:
++            stuck[name] = True
++            kept.append((name, "parent of {}".format(blocker)))
++            continue
++        try:
++            pane = (_json_object(d / "meta.json") or {}).get("pane")
++            if _pane_unknown(pane):
++                stuck[name] = True
++                kept.append((name, "pane {!r} unreadable".format(pane)))
++                continue
++            if worker_process.kill_dead_pane(pane or "") == "alive":
++                stuck[name] = True
++                kept.append((name, "pane {} still runs".format(pane)))
++                continue
++            archive_task(root, d)
++            archived.append(name)
++        except (ValueError, RuntimeError, OSError) as error:
++            stuck[name] = True
++            failed.append((name, str(error)))
++    archived.sort()
++    return {"archived": archived, "kept": sorted(kept), "failed": failed}
++
++
++def _listed(pairs, limit=5):
++    """`id: why; id: why; +N more` for the first `limit` pairs."""
++    shown = ["{}: {}".format(name, why) for name, why in pairs[:limit]]
++    if len(pairs) > limit:
++        shown.append("+{} more".format(len(pairs) - limit))
++    return "; ".join(shown)
++
++
++def retire_summary(result, limit=5):
++    """`archived N, kept M (reasons: id: why; ...)`, then `, failed K (id: error; ...)` when some task could not be archived."""
++    kept, failed = result["kept"], result.get("failed", [])
++    text = "archived {}, kept {}".format(len(result["archived"]), len(kept))
++    if kept:
++        text += " (reasons: {})".format(_listed(kept, limit))
++    if failed:
++        text += ", failed {} ({})".format(len(failed), _listed(failed, limit))
++    return text
++
++
++if __name__ == "__main__":   # task_record.py status-settings | retire STATE_DIR  (bin/tp-status, bin/tp-clean --retired)
++    try:
++        if sys.argv[1:2] == ["status-settings"] and len(sys.argv) == 2:
++            cfg = status_settings()
++            print(cfg["max_rows"], "true" if cfg["auto_retire"] else "false", cfg["retire_after_minutes"])
++        elif sys.argv[1:2] == ["retire"] and len(sys.argv) == 3:
++            result = retire(sys.argv[2])
++            print(retire_summary(result))
++            if result["failed"]:   # the summary above stays; the exit status and stderr are what the status pane's pass reports
++                print("task_record.py: {} not archived ({})".format(len(result["failed"]), _listed(result["failed"])), file=sys.stderr)
++                sys.exit(1)
++        else:
++            raise ValueError("usage: task_record.py status-settings | retire STATE_DIR")
++    except (ValueError, RuntimeError, OSError) as error:
++        print("task_record.py: {}".format(error), file=sys.stderr)
++        sys.exit(1)
+diff --git a/lib/tp.sh b/lib/tp.sh
+index dbbce45..9ca94a3 100644
+--- a/lib/tp.sh
++++ b/lib/tp.sh
+@@ -111,5 +111,7 @@ tp_write_many() { python3 "$TP_LIB_DIR/safe_write.py" write-many "$@"; }
+ tp_append() { python3 "$TP_LIB_DIR/safe_write.py" append "$@"; }
+ # tp_owned_dir <dir>... — mkdir -p for a directory tmux-pi owns; a symlink in its place is refused, not entered.
+ tp_owned_dir() { python3 "$TP_LIB_DIR/safe_write.py" mkdir "$@"; }
++# tp_create_task_dir --root STATE_DIR <task dir> — make <state>/tasks/<id>: the one way a script makes a task directory (tp_owned_dir is not).
++tp_create_task_dir() { python3 "$TP_LIB_DIR/safe_write.py" task-dir "$@"; }
+ # tp_not_link <path>... — refuse (exit 1, saying so) when any path is a symlink.
+ tp_not_link() { python3 "$TP_LIB_DIR/safe_write.py" check "$@"; }
+diff --git a/lib/tp_window.py b/lib/tp_window.py
+index 5f8e1f2..1159dc1 100644
+--- a/lib/tp_window.py
++++ b/lib/tp_window.py
+@@ -5,11 +5,17 @@ TASKS is the tasks directory, PANES `tmux list-panes -a -F '#{pane_id} #{pane_de
+ runs (or - for none), KEEP how many tasks the window holds, START where it begins: a position in the list (0 is the oldest
+ task) or `newest`. Tasks are ordered oldest first by meta.json mtime, as tp_rows.py orders them.
+ 
+-The window is KEEP consecutive tasks from START, plus every task that is starting, working, needs_input or paused, or has a
+-request file that cannot be read, whatever its age. Output, one record per line, first character says what it is:
++KEEP is the most rows the pane holds (status.max_rows in config/orchestration.json). Every task that is starting, working,
++needs_input, paused or settled, or has a request file that cannot be read, is in the window whatever its age or the cap; the
++rest of KEEP goes to the other (finished) tasks: the newest ones for START `newest`, else the ones from START on. The window
++never holds more than max(KEEP, the number of always-shown tasks) rows. Output, one record per line, first character says
++what it is:
+     H<US>total<US>start<US>newest<US>positions   total tasks in the list, where the window really starts, the id of the newest
+                                                   task, and the list position of each R line below, comma separated
+     R<row>                                        a tp_rows.py row (id worker status tool tokens cost model)
++    F<text>                                       the footer line when tasks are not in the window: how many of each state
++                                                  (`3 finished, 2 escalated not shown`), and where to find them
++                                                  (tp-agent find / tp-task list --all)
+     C<id>                                         a task outside the window whose files changed since the last run: the caller
+                                                   refreshes its canonical record (task.md), which only the window's rows get otherwise
+     U<line>                                       a line of the session token usage summary (lib/tp_usage.py)
+@@ -24,6 +30,7 @@ to CACHE, and it is rewritten only when one of them is new, changed or gone, not
+ yet) reads every record once and reports no C lines. A cache that cannot be read is rebuilt: it only ever holds what the
+ task files say.
+ """
++import bisect
+ import json
+ import os
+ import stat
+@@ -40,7 +47,8 @@ from lifecycle_files import LIFECYCLE_FILES  # noqa: E402
+ 
+ SEP = "\x1f"
+ ACTIVE = ("starting", "working", "needs_input", "paused")
+-VERSION = 4
++FINISHED = ("completed", "stopped", "killed", "failed")
++VERSION = 6   # 6: each entry carries its lifecycle state ("l"), which the footer groups by
+ 
+ 
+ def stamp(path):
+@@ -108,8 +116,9 @@ def usage_of(directory):
+ 
+ 
+ def evaluate(directory, pane_flags, task_lifecycle):
+-    """Read one task's records: id, pane, whether it is left out of the list, whether it must stay in the window ("a"), usage."""
+-    entry = {"i": "", "p": "", "s": True, "a": False, "u": usage_of(directory)}   # every task's state.json counts, listed or not
++    """Read one task's records: id, pane, whether it is left out of the list, whether it is active ("a": read every time), whether
++    the window must always show it ("v": active, or settled: a reply waits to be read), usage."""
++    entry = {"i": "", "p": "", "s": True, "a": False, "v": False, "l": "", "u": usage_of(directory)}   # every task's state.json counts, listed or not
+     meta_bytes = tp_rows.read_bytes(os.path.join(directory, "meta.json"))
+     if meta_bytes is None:
+         return entry
+@@ -119,15 +128,37 @@ def evaluate(directory, pane_flags, task_lifecycle):
+         return entry
+     entry["i"], entry["p"], entry["s"] = fields[0], fields[2], False
+     if fields[1] == "main":
++        entry["l"] = "main"
+         return entry    # a main-owned record is not a worker process; bin/tp-contract leaves it out too
+     try:
+         life = task_lifecycle(directory, pane_word(pane_flags, fields[2]))[0]
+     except Exception:   # a record the lifecycle cannot read: show the task rather than hide it
+         life = "working"
+     entry["a"] = life in ACTIVE or bool(request_file.unreadable_names(directory))
++    entry["v"] = entry["a"] or life == "settled"
++    entry["l"] = life
+     return entry
+ 
+ 
++def omitted_label(entry):
++    """The word the footer uses for a task left out of the window: its lifecycle state, with the states a task ends in
++    (completed, stopped, killed, failed) called "finished". Never a word for a state the task is not in."""
++    return "finished" if entry["l"] in FINISHED else (entry["l"] or "unread")
++
++
++def footer(entries):
++    """`3 finished, 2 escalated not shown (...)`: how many tasks are left out of the window, by state ("finished" first, then
++    the other states by name); a state with none is not printed. "" when none are left out."""
++    counts = {}
++    for entry in entries:
++        label = omitted_label(entry)
++        counts[label] = counts.get(label, 0) + 1
++    if not counts:
++        return ""
++    order = sorted(counts, key=lambda label: (label != "finished", label))
++    return "%s not shown (tp-agent find / tp-task list --all)" % ", ".join("%d %s" % (counts[label], label) for label in order)
++
++
+ def main(tasks, panes_text, cache_path, keep, start):
+     pane_flags = tp_rows.dead_flags(panes_text)
+     try:
+@@ -171,11 +202,16 @@ def main(tasks, panes_text, cache_path, keep, start):
+ 
+     listed = [(name, directory) for _, name, directory, _ in found if not cache[name]["s"]]
+     total = len(listed)
++    always = [i for i, (name, _) in enumerate(listed) if cache[name]["v"]]
++    others = [i for i, (name, _) in enumerate(listed) if not cache[name]["v"]]
++    quota = max(0, keep - len(always))   # what the cap leaves for the tasks that are neither at work nor waiting for a reply
+     if start == "newest":
+-        first = max(0, total - keep)
++        at = max(0, len(others) - quota)
+     else:
+-        first = min(max(0, int(start)), max(0, total - keep))
+-    chosen = [i for i, (name, _) in enumerate(listed) if first <= i < first + keep or cache[name]["a"]]
++        at = min(bisect.bisect_left(others, max(0, int(start))), max(0, len(others) - quota))
++    picked = others[at:at + quota]
++    first = 0 if at == 0 else (others[at] if at < len(others) else total)
++    chosen = always + picked   # active (and settled) rows first, then the finished ones; each group oldest first
+     rows, positions, shown = [], [], set()
+     for i in chosen:
+         line = tp_rows.row_line(listed[i][1], pane_flags)
+@@ -186,6 +222,10 @@ def main(tasks, panes_text, cache_path, keep, start):
+     newest = cache[listed[-1][0]]["i"] if listed else ""
+     out = ["H" + SEP + SEP.join((str(total), str(first), newest, ",".join(positions)))]
+     out.extend("R" + line.rstrip("\n") for line in rows)
++    taken = set(picked)
++    left_out = [cache[listed[i][0]] for i in others if i not in taken]
++    if left_out:
++        out.append("F" + footer(left_out))
+     if not cold:
+         out.extend("C" + cache[name]["i"] for name, _ in listed if name in fresh and name not in shown)
+ 
+diff --git a/lib/worker_process.py b/lib/worker_process.py
+index 973b0a8..d27953c 100644
+--- a/lib/worker_process.py
++++ b/lib/worker_process.py
+@@ -6,6 +6,7 @@ an unreadable pane table, a task record that is not a JSON object, a live task w
+ import json
+ import os
+ from pathlib import Path
++import re
+ import signal
+ import subprocess
+ import sys
+@@ -62,14 +63,59 @@ def pane_table():
+     return table
+ 
+ 
++def pane_flags():
++    """{pane id: alive} for every tmux pane (the status pane's own query: id and dead flag). An unreadable table refuses."""
++    run = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], text=True, capture_output=True)
++    if run.returncode:
++        raise RuntimeError(f"cannot read tmux panes: {run.stderr.strip() or 'tmux failed'}")
++    flags = {}
++    for line in run.stdout.splitlines():
++        parts = line.split()
++        if len(parts) < 2 or parts[1] not in {"0", "1"}:
++            raise RuntimeError(f"cannot read tmux panes: unexpected row {line!r}")
++        flags[parts[0]] = parts[1] == "0"
++    return flags
++
++
++def kill_dead_pane(pane):
++    """Close the window of a pane whose process has ended (remain-on-exit keeps it open), the way tp-kill closes a pane.
++    'gone' when the pane is not there, 'alive' when it still runs a process (never killed here), 'unknown' when it is not a
++    pane id (tmux is not asked), else 'killed'."""
++    kind = recorded_pane(pane)
++    if kind != "id":
++        return "gone" if kind == "none" else "unknown"
++    flags = pane_flags()
++    if pane not in flags:
++        return "gone"
++    if flags[pane]:
++        return "alive"
++    run = subprocess.run(["tmux", "kill-pane", "-t", pane], text=True, capture_output=True)
++    if run.returncode and pane in pane_flags():
++        raise RuntimeError(f"cannot kill pane {pane}: {run.stderr.strip() or 'tmux failed'}")
++    return "killed"
++
++
++PANE_ID = re.compile(r"%[0-9]+")
++
++
++def recorded_pane(pane):
++    """What a pane recorded in meta.json is: "none" (absent or empty: queued, or never started), "id" (a tmux pane id, %N and
++    nothing else) or "unknown" (anything else: whether it still runs cannot be told, so the caller keeps the task and does
++    not ask tmux). The one place that decides it, for every reader of a recorded pane."""
++    if pane is None or pane == "":
++        return "none"
++    return "id" if isinstance(pane, str) and PANE_ID.fullmatch(pane) else "unknown"
++
++
+ def live_process(path, table, meta=None):
+     """(pane, pid) when the task's pane still runs a process, else None. A task with no pane recorded (queued) has none;
+-    a pane recorded as anything but a string refuses. A string that is no pane of the server (a gone pane) is not live."""
++    a pane recorded as anything but a pane id (%N) refuses. An id that is no pane of the server (a gone pane) is not live."""
+     meta = strict_meta(path) if meta is None else meta
+     pane = meta.get("pane")
+-    if pane is None or pane == "":
++    kind = recorded_pane(pane)
++    if kind == "none":
+         return None
+-    if not isinstance(pane, str):
++    if kind == "unknown":
+         raise ValueError(f"{Path(path).name} records an unreadable pane {pane!r}, so a live process of it cannot be ruled out. "
+                          f"Set pane in {Path(path).name}/meta.json to the pane id (like %3) or remove the key")
+     entry = table.get(pane)
+diff --git a/tests/test_status_repaint.py b/tests/test_status_repaint.py
+index ca31bd5..9e294fd 100644
+--- a/tests/test_status_repaint.py
++++ b/tests/test_status_repaint.py
+@@ -116,8 +116,18 @@ esac
+         contract.unlink()
+         contract.write_text('#!/bin/sh\necho "$*" >> "$FAKE_BASE/asked"\nexec "%s" "$@"\n' % (ROOT / "bin" / "tp-contract"))
+         contract.chmod(0o755)
++        # The stub retire pass: logs its arguments, fails while retire_fail exists (the real one archives tasks).
++        clean = root / "bin" / "tp-clean"
++        clean.unlink()
++        clean.write_text('#!/bin/sh\necho "$*" >> "$FAKE_BASE/retires"\n'
++                         'if [ -f "$FAKE_BASE/retire_fail" ]; then echo "boom: no tmux" >&2; exit 4; fi\nexit 0\n')
++        clean.chmod(0o755)
+         return ["bash", str(root / "bin" / "tp-status")]
+ 
++    def retires(self):
++        path = self.base / "retires"
++        return path.read_text().splitlines() if path.exists() else []
++
+     def ticks(self):
+         path = self.base / "ticks"
+         return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+@@ -745,11 +755,13 @@ class StatusWindowTest(StatusPaneFixture):
+         (directory / "state.json").write_text(json.dumps(state))
+ 
+     def add(self, number, state=None):
+-        """Task f<number>: finished (a reply with a RESULT_STATUS line) unless a state is given. Each is newer than the last."""
++        """Task f<number>: finished and collected (a reply with a RESULT_STATUS line; a settled one is never left out of the
++        window) unless a state is given. Each is newer than the last."""
+         name = "f%02d" % number
+         self.write_state(name, state or self.DONE)
+         if state is None:
+             (self.state / "tasks" / name / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
++            (self.state / "tasks" / name / "collected.json").write_text("{}")
+         if self.proc is not None:     # a running pane reads it at the next tick; the frame it paints is left for last_frame
+             self.tick(keep=True)
+         return name
+@@ -815,6 +827,7 @@ class StatusWindowTest(StatusPaneFixture):
+         frame = self.last_frame("── f30", "subagents 5/30")
+         self.assertIn("g/G top/bottom", frame.split("\n")[0])
+         self.assertNotIn("f01", frame)                  # only the window is on screen
++        self.assertIn("25 finished not shown (tp-agent find / tp-task list --all)", frame)     # and the footer says how many are not
+         os.write(self.master, b"g")
+         frame = self.last_frame("── f01")
+         self.assertIn("reply of f01", frame)            # an older task shows the details a recent one shows
+@@ -828,6 +841,35 @@ class StatusWindowTest(StatusPaneFixture):
+             os.write(self.master, key)
+             self.assertEqual(self.selected_line(self.last_frame("── " + name)), name, key)
+ 
++    def check_navigation_by_age(self, active):
++        """Twelve tasks, the numbers in `active` at work (drawn first, whatever their age): g selects the oldest task (f01) and
++        G the newest (f12), and a repaint or the loss of the selected row keeps to that meaning, not to the first or last row."""
++        for n in range(1, 13):
++            self.add(n, state=self.LIVE if n in active else None)
++        self.assertEqual(self.selected_line(self.last_frame("── f12", "/12")), "f12")
++        os.write(self.master, b"g")
++        self.assertEqual(self.selected_line(self.last_frame("── f01")), "f01")
++        os.write(self.master, b"ss")                       # the usage page and back: a repaint keeps the selection
++        self.assertEqual(self.selected_line(self.last_frame("── f01")), "f01")
++        os.write(self.master, b"G")
++        self.assertEqual(self.selected_line(self.last_frame("── f12")), "f12")
++        os.write(self.master, b"\x1b[H")
++        self.assertEqual(self.selected_line(self.last_frame("── f01")), "f01")
++        os.write(self.master, b"\x1b[F")
++        self.assertEqual(self.selected_line(self.last_frame("── f12")), "f12")
++
++    def test_g_and_G_select_by_age_when_the_oldest_task_is_active(self):
++        self.check_navigation_by_age({1})                  # the oldest is active: it is also the first row
++
++    def test_g_and_G_select_by_age_when_the_newest_task_is_active(self):
++        self.check_navigation_by_age({12})                 # drawn first, yet the newest: g must not stop on it
++
++    def test_g_and_G_select_by_age_when_an_active_task_is_in_the_middle(self):
++        self.check_navigation_by_age({6})
++
++    def test_g_and_G_select_by_age_when_every_task_is_finished(self):
++        self.check_navigation_by_age(set())
++
+     def test_paging_reaches_older_tasks_read_from_disk_and_back(self):
+         for n in range(1, 31):
+             self.add(n)
+@@ -861,7 +903,7 @@ class StatusWindowTest(StatusPaneFixture):
+         self.add(1, state=self.LIVE)                       # the oldest task is a live worker
+         for n in range(2, 31):
+             self.add(n)
+-        frame = self.last_frame("── f30", "f01", "subagents 6/30")
++        frame = self.last_frame("── f30", "f01", "subagents 5/30")      # the cap of 5 rows holds the live task and 4 finished ones
+         self.assertRegex(frame, r"f01\s+pi\s+working")
+         self.assertNotIn("f02 ", frame)
+         self.assertNotIn("f20 ", frame)
+@@ -903,6 +945,7 @@ class StatusBackgroundWorkTest(StatusPaneFixture):
+             (directory / "task.md").write_text("task of %s\n" % name)
+             (directory / "state.json").write_text(json.dumps(self.DONE))
+             (directory / "result.md").write_text("reply of %s\nRESULT_STATUS: complete\n" % name)
++            (directory / "collected.json").write_text("{}")      # collected: finished and handed off (a settled task is never left out)
+             os.utime(directory / "meta.json", (self.clock + len(os.listdir(self.state / "tasks")),) * 2)
+         for fname, value in files.items():
+             (directory / fname).write_text(json.dumps(value))
+@@ -975,6 +1018,63 @@ class StatusBackgroundWorkTest(StatusPaneFixture):
+         self.tick()
+         self.assertTrue(all("f1" not in line.split() for line in self.asked()[before:]), self.asked())
+ 
++    def test_the_retire_pass_runs_once_a_minute_and_not_on_the_draw_path(self):
++        self.add("f1")
++        self.first_frame(b"f1")
++        self.tick(30)
++        self.assertEqual(self.retires(), [])                          # the first pass is a minute after the pane starts
++        self.tick(35)
++        self.assertTrue(self.wait_for(lambda: self.retires() == ["--retired"], 10.0), self.retires())
++        for _ in range(3):
++            self.tick(15)                                             # inside the minute: no second pass
++        self.assertEqual(self.retires(), ["--retired"])
++        self.tick(30)
++        self.assertTrue(self.wait_for(lambda: len(self.retires()) == 2, 10.0), self.retires())
++
++    def test_status_auto_retire_false_turns_the_pass_off(self):
++        config = self.base / "orchestration.json"
++        config.write_text(json.dumps({"status": {"auto_retire": False}}))
++        self.environ["TP_ORCHESTRATION_CONFIG"] = str(config)
++        self.add("f1")
++        self.first_frame(b"f1")
++        for _ in range(3):
++            self.tick(70)
++        self.assertEqual(self.retires(), [])
++
++    def test_a_failed_retire_pass_is_shown_in_the_footer_until_one_succeeds(self):
++        (self.base / "retire_fail").write_text("")
++        self.add("f1")
++        self.first_frame(b"f1")
++        self.tick(65)
++        frame = self.tick_until(lambda f: b"retire pass failed (exit 4): boom: no tmux" in f)
++        self.assertIn(b"f1", frame)                                   # the list is still there
++        (self.base / "retire_fail").unlink()
++        gone = self.tick_until(lambda f: b"f1" in f and b"retire pass failed" not in f, secs=30)
++        self.assertNotIn(b"retire pass failed", gone)
++
++
++    def test_the_finished_not_shown_count_and_a_failed_retire_pass_reach_a_compact_and_a_small_pane(self):
++        (self.base / "lines").write_text("15\n")                      # under 16 lines: no optional block is drawn
++        (self.base / "retire_fail").write_text("")
++        for n in range(1, 6):                                         # the window holds 3: 2 finished are not shown
++            self.add("f%d" % n)
++        self.first_frame(b"f5")
++        self.tick(65)
++        frame = self.tick_until(lambda f: b"retire failed" in f)
++        self.assertIn(b"retire failed", frame.split(b"\n")[0])        # the flag is on the header, where this pane has room
++        self.assertIn(b"2 finished not shown (tp-agent find / tp-task list --all)", frame)
++        self.assertIn(b"f5", frame)
++        (self.base / "lines").write_text("3\n")                       # not even one line to spare: the header says the count
++        small = self.tick_until(lambda f: b"2 not shown" in f.split(b"\n")[0])
++        self.assertIn(b"retire failed", small.split(b"\n")[0])
++
++    def test_the_finished_not_shown_line_is_kept_when_the_optional_blocks_fill_the_pane(self):
++        (self.base / "lines").write_text("16\n")                      # the smallest pane with the optional blocks: the usage summary
++        for n in range(1, 6):                                         # and the selected task's lines leave no room for a third
++            self.add("f%d" % n)
++        frame = self.tick_until(lambda f: b"f5" in f)
++        self.assertIn(b"2 finished not shown (tp-agent find / tp-task list --all)", frame)
++
+ 
+ class StatusRealClockTest(StatusPaneFixture):
+     """The seam unused (no TP_STATUS_CLOCK, no TP_STATUS_POLL): the pane's own clock and one-second timer pick up a change."""
+diff --git a/tests/test_task_record.py b/tests/test_task_record.py
+index 36246d1..848ddad 100644
+--- a/tests/test_task_record.py
++++ b/tests/test_task_record.py
+@@ -7,6 +7,7 @@ import tempfile
+ import time
+ import unittest
+ from pathlib import Path
++from unittest import mock
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+ sys.path.insert(0, str(ROOT / "lib"))
+@@ -260,11 +261,12 @@ class TaskRecordTests(unittest.TestCase):
+             os.utime(p, (old, old))
+         before = retention_report(self.root, days=90)[0]["age_days"]
+         dest = Path(end_session_retention(self.root)["archived"][0]["to"])
+-        new_path = str(dest / "result.md")
+-        self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], new_path)
++        # the record names the artifact relative to its own directory: it says nothing of where the task lives
++        self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], "result.md")
+         text = (dest / "task.md").read_text()
+-        self.assertIn("Result file: `" + new_path + "`", text)
+-        self.assertIn("Contract artifact: `" + new_path + "` (present)", text)
++        self.assertIn("Result file: `result.md`", text)
++        self.assertIn("Contract artifact: `result.md` (present)", text)
++        self.assertNotIn(str(dest), text)
+         self.assertIn("Archived artifact origin: `" + str(d / "result.md") + "`", text)
+         self.assertEqual(retention_report(self.root, days=90)[0]["age_days"], before)
+         # Simulate an old /end archive: canonical text and metadata both stale.
+@@ -272,11 +274,12 @@ class TaskRecordTests(unittest.TestCase):
+         meta["contract"]["artifact"] = str(d / "result.md")
+         meta.pop("archive_relocation")
+         (dest / "meta.json").write_text(json.dumps(meta))
+-        (dest / "task.md").write_text(text.replace(new_path, str(d / "result.md")).replace(
++        (dest / "task.md").write_text(text.replace("Result file: `result.md`", "Result file: `" + str(d / "result.md") + "`").replace(
++            "Contract artifact: `result.md`", "Contract artifact: `" + str(d / "result.md") + "`").replace(
+             "- Archived artifact origin: `" + str(d / "result.md") + "`\n", ""))
+         cmd = [str(ROOT / "bin/tp-task"), "--state-dir", str(self.root), "resume", "reply-only"]
+         resume = subprocess.run(cmd, text=True, capture_output=True, check=True).stdout
+-        self.assertIn("Contract artifact: `" + new_path + "` (present)", resume)
++        self.assertIn("Contract artifact: `result.md` (present)", resume)
+         self.assertIn("Archived artifact origin: `" + str(d / "result.md") + "`", resume)
+         self.assertNotIn("Result file: `" + str(d / "result.md") + "`", resume)
+         stamp = (dest / "task.md").stat().st_mtime_ns
+@@ -298,8 +301,9 @@ class TaskRecordTests(unittest.TestCase):
+         self.assertEqual((occupied / "proof").read_text(), "untouched")
+         self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], str(external))
+         self.assertIn("Contract artifact: `" + str(external) + "` (final)", (dest / "task.md").read_text())
+-        self.assertIn(str(dest / "result.md"), (dest / "task.md").read_text())
++        self.assertIn("Result file: `result.md`", (dest / "task.md").read_text())
+         self.assertNotIn(str(d / "result.md"), (dest / "task.md").read_text())
++        self.assertNotIn(str(dest), (dest / "task.md").read_text())
+ 
+     def test_tp_clean_collision_reconciles_local_artifact(self):
+         fake = self.root / "fake-bin"
+@@ -320,8 +324,8 @@ class TaskRecordTests(unittest.TestCase):
+         self.assertEqual(result.stdout.strip(), "archived 1")
+         self.assertEqual((occupied / "proof").read_text(), "original")
+         dest = next(p for p in (self.root / "archive").iterdir() if p != occupied)
+-        self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], str(dest / "result.md"))
+-        self.assertIn("Result file: `" + str(dest / "result.md") + "`", (dest / "task.md").read_text())
++        self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], "result.md")
++        self.assertIn("Result file: `result.md`", (dest / "task.md").read_text())
+ 
+     def test_main_contract_preserves_handoff_request_and_cleanup_reports_it(self):
+         request = "+plan Original request details"
+@@ -597,5 +601,350 @@ class TaskRecordTests(unittest.TestCase):
+         self.assertIn("Verify/close out", body)
+ 
+ 
++# Every call of write_record in bin/ and lib/ (the count per file). A new caller fails the parity test until it is added here and
++# driven below (or named as driven by the one that shares its code).
++WRITE_RECORD_CALLERS = {
++    "bin/tp-contract": 6,        # status (driven), build/escalate/... (same call, same meta)
++    "bin/tp-spawn": 1,           # the starting record (a python heredoc calling write_record(dir, lifecycle_state="starting"))
++    "bin/tp-task": 4,            # resume of a legacy record, pin, unpin (driven: pin), capability resolve
++    "lib/preflight.py": 1,       # create_preflight_record (driven)
++    "lib/task_record.py": 4,     # capture_main_output (driven), the reconcile (driven), end_session_retention, resume (driven)
++}
++LINK_LINE = __import__("re").compile(r"^- (?:[\w ./]+: |Result file: )`([^`]+)`")
++
++
++def load_bin(name):
++    import importlib.machinery
++    import importlib.util
++    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_") + "_under_test", str(ROOT / "bin" / name))
++    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
++    loader.exec_module(module)
++    return module
++
++
++class LocationFreeRecordTests(unittest.TestCase):
++    """task.md has one form: it names the files inside the task directory by name. No writer can leave a record that is stale
++    once the task has moved, and a record written before this (absolute links) is still read as it is."""
++
++    def setUp(self):
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.state = Path(directory.name).resolve() / "state"
++        (self.state / "tasks").mkdir(parents=True)
++        (self.state / "archive").mkdir()
++
++    def task(self, name="loc-1"):
++        d = self.state / "tasks" / name
++        d.mkdir()
++        whole = {"kind": "task", "artifact": str(d / "out.md"), "stall": 10 ** 9, "grace": 1, "checkpoints": {},
++                 "budget": {"seconds": 10 ** 9, "turns": None, "tokens": None}}
++        (d / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": "%7", "model": "m", "thinking": "",
++                                                 "created": "2026-09-08T00:00:00Z", "contract": whole}))
++        (d / "request.md").write_text("Look at the cache\n")
++        (d / "packet.md").write_text("# Task\n")
++        (d / "result.md").write_text("Answer.\nRESULT_STATUS: complete\n")
++        (d / "state.json").write_text(json.dumps({"state": "waiting"}))
++        (d / "out.md").write_text("artifact\n")
++        return d
++
++    def links(self, text):
++        """The paths task.md names in its links and its result line."""
++        names, in_links = [], False
++        for line in text.splitlines():
++            in_links = line == "## Artifact Links" or (in_links and not line.startswith("## "))
++            m = LINK_LINE.match(line)
++            if m and (in_links or line.startswith("- Result file")):
++                names.append(m.group(1))
++        return names
++
++    def assertLocationFree(self, d, where=None):
++        """task.md of `d` names nothing by the absolute path of a task directory, and every link resolves from `d` itself."""
++        text = (d / "task.md").read_text()
++        body = [l for l in text.splitlines() if "Archived artifact origin" not in l]   # (provenance: where the artifact once was)
++        for stale in {str(d), str(self.state / "tasks"), str(self.state / "archive")}:
++            self.assertEqual([l for l in body if stale in l], [], (d, text))
++        names = self.links(text)
++        self.assertIn("request.md", names)
++        for name in names:
++            self.assertTrue(os.path.lexists(d / name), (name, text))   # a name resolves from the record's own directory
++
++    def status_of(self, d):
++        tool = load_bin("tp-contract")
++        tool.state_dir, tool.panes = (lambda: str(self.state)), (lambda: {})
++        tool.cmd_status(mock_args(ids=[d.name]))
++
++    def test_the_signature_has_no_relative_and_every_caller_is_in_the_table(self):
++        import inspect
++        import task_record
++        self.assertNotIn("relative", inspect.signature(task_record.write_record).parameters)
++        self.assertNotIn("relative", inspect.signature(task_record._links).parameters)
++        found = subprocess.run(["git", "grep", "-n", "--untracked", "-E", r"(^|[^A-Za-z0-9_.])write_record\(", "--", "bin", "lib"],
++                               cwd=ROOT, text=True, capture_output=True, check=True).stdout.splitlines()
++        calls = {}
++        for line in found:
++            path, _, code = line.split(":", 2)
++            if not code.lstrip().startswith("def "):
++                calls[path] = calls.get(path, 0) + 1
++                self.assertNotIn("relative", code, line)   # nobody passes it
++        self.assertEqual(calls, WRITE_RECORD_CALLERS)
++
++    def test_every_writer_leaves_a_record_that_names_nothing_by_where_the_task_is(self):
++        import preflight
++        import task_record
++        import contract
++        d = self.task("w-record")
++        task_record.write_record(d, lifecycle_state="settled")                      # lib/task_record.py (and tp-spawn's call)
++        self.assertLocationFree(d)
++        d = self.task("w-status")
++        self.status_of(d)                                                           # bin/tp-contract status (and its other commands)
++        self.assertLocationFree(d)
++        d = self.task("w-pin")
++        task_record.write_record(d, lifecycle_state="working")
++        load_bin("tp-task").cmd_pin(mock_args(state_dir=str(self.state), query="w-pin", reason="x"))   # bin/tp-task
++        self.assertLocationFree(d)
++        d = self.task("w-resume")                                                   # a legacy raw task.md, written canonical on resume
++        (d / "task.md").write_text("Look at the cache\n")
++        task_record.format_record_for_resume(d)
++        self.assertLocationFree(d)
++        made = preflight.create_preflight_record(self.state, "Answer directly", {"mode": "delegated", "artifact_tier": 1})   # lib/preflight.py
++        self.assertLocationFree(Path(made["dir"]))
++        main = self.state / "tasks" / "w-main"
++        main.mkdir()
++        meta = {"id": "w-main", "worker": "main", "preflight": {"mode": "prototype", "stop": True, "artifact_tier": 1}}
++        (main / "meta.json").write_text(json.dumps(meta))
++        (main / "request.md").write_text("Sketch\n")
++        task_record.capture_main_output(main, "Sketch output")                       # capture_main_output
++        self.assertLocationFree(main)
++        d = self.task("w-reconcile")
++        self.assertLocationFree(task_record.archive_task(self.state, d))            # the reconcile, then the move
++
++    def test_a_status_that_lands_between_the_reconcile_and_the_move_leaves_a_record_every_link_of_which_resolves_in_the_archive(self):
++        import task_record
++        d = self.task("race-1")
++        real = os.rename
++
++        def rename(src, dst):   # tp-contract status writes task.md after the reconcile finished and before the directory moves
++            self.status_of(d)
++            return real(src, dst)
++        with mock.patch.object(task_record.os, "rename", side_effect=rename):
++            dest = task_record.archive_task(self.state, d)
++        self.assertLocationFree(dest)
++        self.assertIn("out.md", self.links((dest / "task.md").read_text()))
++
++    def test_every_reader_resolves_a_relative_record_and_a_legacy_one_with_absolute_links(self):
++        import contract
++        import task_archive
++        import task_record
++        for form in ("relative", "legacy"):
++            with self.subTest(form=form):
++                d = self.task("read-" + form)
++                task_record.write_record(d, lifecycle_state="completed")
++                if form == "legacy":   # what was written before: the same record naming each file by its absolute path
++                    text = (d / "task.md").read_text()
++                    for name in self.links(text):
++                        text = text.replace("`{}`".format(name), "`{}`".format(d / name))
++                    (d / "task.md").write_text(text)
++                names = [Path(n) if os.path.isabs(n) else d / n for n in self.links((d / "task.md").read_text())]
++                self.assertTrue(names and all(p.exists() for p in names), names)   # a relative link resolves from d, an absolute as it is
++                self.assertEqual(task_record.parse_record(d)["state"], "completed")                           # parse_record
++                self.assertIn("Lifecycle State:** `completed`", task_record.format_record_for_resume(d))     # resume (tp-task, tp-status popup)
++                self.assertEqual([m[2]["id"] for m in task_record.find_task(self.state, d.name)], [d.name])   # tp-task list/find
++                meta = json.loads((d / "meta.json").read_text())
++                self.assertTrue(os.path.isfile(task_archive.artifact_path(d, meta["contract"]["artifact"])))  # the artifact resolver
++                self.assertEqual(contract.ledger_row(d, 0)["artifact_chars"], len("artifact\n"))             # tp-review / ledger
++                dest = task_record.archive_task(self.state, d)                                              # tp-clean / archive
++                self.assertLocationFree(dest)
++                self.assertEqual(task_record.parse_record(dest)["state"], "completed")
++
++    # ---- round 9: one creator, every other writer goes through the directory handle ----
++
++    # (file, pattern count) of the creators and directory makers in bin/ and lib/, each classified. A new one fails the parity
++    # test until it is added here: "creator" is the only kind allowed to make tasks/<id>.
++    MAKERS = {
++        "lib/safe_write.py": "creator (create_task_dir) + the generic owned-dir helper (ensure_dir, not a task dir)",
++        "lib/preflight.py": "calls create_task_dir",
++        "bin/tp-spawn": "calls task-dir / write-many --task-dir (the creator)",
++    }
++
++    def test_only_create_task_dir_makes_a_task_directory(self):
++        import re
++        found = subprocess.run(["git", "grep", "-n", "--untracked", "-E", r"create_task_dir|tp_create_task_dir|--task-dir|task-dir",
++                                "--", "bin", "lib"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.splitlines()
++        files = {line.split(":", 1)[0] for line in found}
++        # tp-contract/tp-task take --task-dir as an input path (they never make it); the callers that make it are the table.
++        inputs = {"bin/tp-contract", "bin/tp-task", "bin/tp-agent", "bin/tp-review", "bin/tp-status", "bin/tp-clean", "lib/tp.sh",
++                  "lib/task_record.py", "lib/worker_process.py"}   # (a comment naming the creator; a usage string)
++        self.assertEqual(files - inputs, set(self.MAKERS))
++        # no other code in bin/lib joins "tasks" and makes the directory
++        loose = subprocess.run(["git", "grep", "-n", "--untracked", "-E", r"(tasks|task_dir|task_path)[^\n]*(mkdir|makedirs)\(",
++                                "--", "bin", "lib"], cwd=ROOT, text=True, capture_output=True).stdout.splitlines()
++        loose = [l for l in loose if not re.match(r"lib/safe_write\.py:", l)]
++        self.assertEqual(loose, [], loose)
++
++    def rename_once(self, d, when=None):
++        """A safe_write.after_open hook that moves tasks/<d.name> into archive/ (once) as soon as a write has its directory open."""
++        done = []
++
++        def hook(path):
++            p = Path(path)
++            if done or p.name != d.name or p.parent.name != "tasks":
++                return
++            if when and not when(p):
++                return
++            os.rename(p, self.state / "archive" / d.name)
++            done.append(1)
++        hook.done = done
++        return hook
++
++    def assertLandedInArchive(self, d, hook):
++        self.assertTrue(hook.done, "the rename never happened")
++        self.assertFalse((self.state / "tasks" / d.name).exists())
++        archived = self.state / "archive" / d.name
++        self.assertTrue(archived.is_dir())
++        self.assertEqual([p.name for p in archived.iterdir() if p.name.startswith(".")], [])   # no temp file left behind
++        return archived
++
++    def test_a_write_that_has_its_directory_open_when_the_task_is_archived_lands_in_the_archive(self):
++        import safe_write
++        import task_record
++        import preflight
++        rows = []
++        d = self.task("race-status")
++        hook = self.rename_once(d)
++        with mock.patch.object(safe_write, "after_open", hook):
++            try:
++                self.status_of(d)
++            except SystemExit:
++                pass
++        rows.append((self.assertLandedInArchive(d, hook), True))
++        d = self.task("race-record")
++        hook = self.rename_once(d)
++        with mock.patch.object(safe_write, "after_open", hook):
++            try:
++                task_record.write_record(d, lifecycle_state="settled")
++            except safe_write.GoneDir:
++                pass
++        rows.append((self.assertLandedInArchive(d, hook), True))
++        d = self.task("race-pin")
++        task_record.write_record(d, lifecycle_state="working")
++        hook = self.rename_once(d)
++        with mock.patch.object(safe_write, "after_open", hook):
++            try:
++                task_record.set_pin(d, True, "x")
++            except safe_write.GoneDir:
++                pass
++        archived = self.assertLandedInArchive(d, hook)
++        self.assertTrue((archived / "retention.json").exists())
++        main = self.state / "tasks" / "race-main"
++        main.mkdir()
++        meta = {"id": "race-main", "worker": "main", "preflight": {"mode": "prototype", "stop": True, "artifact_tier": 1}}
++        (main / "meta.json").write_text(json.dumps(meta))
++        (main / "request.md").write_text("Sketch\n")
++        hook = self.rename_once(main)
++        with mock.patch.object(safe_write, "after_open", hook):
++            try:
++                task_record.capture_main_output(main, "Sketch output")
++            except safe_write.GoneDir:
++                pass
++        self.assertLandedInArchive(main, hook)
++        # preflight: the rename comes once meta.json is down, so a later write of the record finds the directory gone
++        made = []
++        real = preflight.safe_write.create_task_dir
++
++        def spy(path, root):
++            made.append(Path(path))
++            return real(path, root)
++        with mock.patch.object(preflight.safe_write, "create_task_dir", spy):
++            probe = self.rename_once(Path("unused"))
++            fired = []
++
++            def hook(path):
++                p = Path(path)
++                if not fired and p.parent.name == "tasks" and (p / "meta.json").exists():
++                    os.rename(p, self.state / "archive" / p.name)
++                    fired.append(p)
++            with mock.patch.object(safe_write, "after_open", hook):
++                try:
++                    preflight.create_preflight_record(self.state, "Answer directly", {"mode": "delegated", "artifact_tier": 1})
++                except safe_write.GoneDir:
++                    pass
++        self.assertTrue(fired and made)
++        self.assertFalse((self.state / "tasks" / fired[0].name).exists())
++        self.assertEqual([p.name for p in (self.state / "archive" / fired[0].name).iterdir() if p.name.startswith(".")], [])
++        # the reconcile writer inside archive_task: the directory moves while the record is being written
++        d = self.task("race-reconcile")
++        hook = self.rename_once(d)
++        with mock.patch.object(safe_write, "after_open", hook):
++            try:
++                task_record.archive_task(self.state, d)
++            except (safe_write.GoneDir, OSError):
++                pass
++        self.assertTrue(hook.done)
++        self.assertFalse((self.state / "tasks" / d.name).exists())
++        self.assertEqual([p.name for p in (self.state / "archive").rglob(".*") if p.is_file()], [])
++
++    def test_a_write_that_starts_after_the_task_is_archived_is_refused_and_creates_nothing(self):
++        import safe_write
++        import task_record
++        gone = self.state / "tasks" / "gone-1"
++        message = "task gone-1 is no longer active (archived or removed)"
++        agent, task_tool = load_bin("tp-agent"), load_bin("tp-task")
++        root = str(self.state)
++        calls = {
++            "write_record": lambda: task_record.write_record(gone, lifecycle_state="settled"),
++            "_write_atomic": lambda: task_record._write_atomic(gone / "x.json", "{}"),
++            "set_pin": lambda: task_record.set_pin(gone, True, "x"),
++            "safe_write.write_atomic": lambda: safe_write.write_atomic(gone / "x", "a", root=self.state),
++            "safe_write.open_append": lambda: safe_write.open_append(gone / "x", root=self.state),
++            "safe_write.write_new": lambda: safe_write.write_new(gone / "x", "a", root=self.state),
++            "tp-agent atomic_text": lambda: agent.atomic_text(gone / "x", "a", root=self.state),
++            "tp-task _write_json": lambda: task_tool._write_json(gone / "x.json", {}, self.state),
++        }
++        for name, call in calls.items():
++            with self.subTest(writer=name):
++                try:
++                    call()
++                except safe_write.GoneDir as e:
++                    self.assertIn(message, str(e))
++                else:
++                    self.fail("no refusal")
++                self.assertFalse(gone.exists())
++        result = subprocess.run([sys.executable, str(ROOT / "lib/safe_write.py"), "write", "--root", root, str(gone / "x")],
++                                input="a", text=True, capture_output=True)
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(message, result.stderr)
++        self.assertNotIn("Traceback", result.stderr)
++        self.assertFalse(gone.exists())
++
++    def test_the_creator_makes_a_task_directory_once_and_refuses_a_link(self):
++        import safe_write
++        import preflight
++        d = self.state / "tasks" / "new-1"
++        self.assertTrue(safe_write.create_task_dir(d, self.state))
++        self.assertFalse(safe_write.create_task_dir(d, self.state))
++        elsewhere = self.state / "elsewhere"
++        elsewhere.mkdir()
++        (self.state / "tasks" / "link-1").symlink_to(elsewhere)
++        with self.assertRaises(OSError):
++            safe_write.create_task_dir(self.state / "tasks" / "link-1", self.state)
++        cli = [sys.executable, str(ROOT / "lib/safe_write.py")]
++        out = subprocess.run(cli + ["task-dir", "--root", str(self.state), str(self.state / "tasks" / "cli-1")],
++                             text=True, capture_output=True)
++        self.assertEqual(out.returncode, 0, out.stderr)
++        self.assertTrue((self.state / "tasks" / "cli-1").is_dir())
++        out = subprocess.run(cli + ["write-many", "--root", str(self.state), "--task-dir", str(self.state / "tasks" / "cli-2"),
++                                    "--file", str(self.state / "tasks" / "cli-2" / "a")], input="x\0", text=True, capture_output=True)
++        self.assertEqual(out.returncode, 0, out.stderr)
++        self.assertIn("owned", out.stdout)
++        self.assertEqual((self.state / "tasks" / "cli-2" / "a").read_text(), "x")
++        made = preflight.create_preflight_record(self.state, "Answer directly", {"mode": "delegated", "artifact_tier": 1})
++        self.assertTrue(Path(made["dir"]).is_dir())
++
++
++def mock_args(**kw):
++    import argparse
++    return argparse.Namespace(**kw)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_tp_clean.py b/tests/test_tp_clean.py
+new file mode 100644
+index 0000000..da4ed9a
+--- /dev/null
++++ b/tests/test_tp_clean.py
+@@ -0,0 +1,772 @@
++"""`tp-clean --retired` and the retire pass behind it (lib/task_record.py retire_plan / retire, bin/tp-clean, the status pane's
++c key and once-a-minute pass): which finished tasks nothing can still ask for are archived, that only the dead pane of such a
++task is closed, that a second run does nothing, and that review, `lane close` and a queued `after` still work once a task has
++gone. The plan is worked out from hand-made task directories; tmux is a stub in the CLI tests and the private server of
++tests/lane_fixture.py in the others; no model runs."""
++import errno
++import json
++import os
++from pathlib import Path
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++from unittest import mock
++import zlib
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
++from lane_fixture import MODEL, ROOT, TmuxCase  # noqa: E402
++from test_lane_steps import StepCase  # noqa: E402
++import contract  # noqa: E402
++import lanes  # noqa: E402
++import task_archive  # noqa: E402
++import task_record  # noqa: E402
++import worker_process  # noqa: E402
++
++NOW = 1_800_000_000.0
++PAUSE = {"action": "pause", "at": 1000, "tools": 3}
++SETTINGS = {"max_rows": 50, "auto_retire": True, "retire_after_minutes": 30}
++REPLY = "Done.\nRESULT_STATUS: complete\n"
++
++
++def tp_contract():
++    """bin/tp-contract as a module (its main is guarded), for the lookups it makes of a task's contract."""
++    import importlib.machinery
++    import importlib.util
++    loader = importlib.machinery.SourceFileLoader("tp_contract_under_test", str(Path(ROOT) / "bin" / "tp-contract"))
++    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
++    loader.exec_module(module)
++    return module
++
++
++def pane_of(name):
++    """The pane id a fixture task records: %N, the only form of a pane id (a name would be an unknown pane)."""
++    return "%" + str(zlib.crc32(name.encode()) % 100_000_000)
++
++
++def make_task(tasks, panes, name, pane="gone", exit=None, reply=REPLY, state="waiting", files=None, meta=None, minutes=120, now=NOW,
++              worker="pi"):
++    """A task directory `name` in `tasks`. pane: gone (not in the pane list), dead or alive (its entry in `panes`, {id: alive}).
++    exit: the exit file's text. meta: more keys for meta.json, or the file's raw text. Every file is `minutes` old at `now`."""
++    d = tasks / name
++    d.mkdir()
++    pane_id = pane_of(name)
++    if pane != "gone":
++        panes[pane_id] = pane == "alive"
++    record = {"id": name, "worker": worker, "pane": pane_id, "model": "", "thinking": ""}
++    record = meta if isinstance(meta, str) else {**record, **(meta or {})}
++    (d / "meta.json").write_text(record if isinstance(record, str) else json.dumps(record))
++    (d / "state.json").write_text(json.dumps({"state": state, "model": "m", "tokens": {}}))
++    if reply is not None:
++        (d / "result.md").write_text(reply)
++    if exit is not None:
++        (d / "exit").write_text(str(exit))
++    for fname, value in (files or {}).items():
++        (d / fname).write_text(value if isinstance(value, str) else json.dumps(value))
++    stamp = now - minutes * 60
++    for path in d.iterdir():
++        os.utime(path, (stamp, stamp))
++    return d
++
++
++class StateFixture(unittest.TestCase):
++    def setUp(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        self.root = Path(tmp.name).resolve()
++        self.state = self.root / "state"
++        self.tasks = self.state / "tasks"
++        self.tasks.mkdir(parents=True)
++        (self.state / "queue").mkdir()
++        self.panes = {}
++
++    def task(self, name, **kw):
++        return make_task(self.tasks, self.panes, name, **kw)
++
++    def queue(self, name, item):
++        (self.state / "queue" / (name + ".json")).write_text(item if isinstance(item, str) else json.dumps(item))
++
++
++class RetirePlanTests(StateFixture):
++    """Item 1: a state directory with every case gives exactly the expected retired set and the kept reasons."""
++
++    def build(self):
++        fresh = dict(minutes=10)
++        # finished and nothing asks for them: retired
++        self.task("ok-completed", pane="dead", exit=0, files={"collected.json": {}})
++        self.task("ok-killed")
++        self.task("ok-failed", pane="dead", exit=1, reply=None)
++        self.task("ok-stopped", pane="dead", files={"stopped.json": {}})
++        # finished but something may still ask for them: kept, and why
++        self.task("fresh-killed", **fresh)
++        self.task("main-owned", worker="main")
++        self.task("live-pane", pane="alive", exit=1)
++        self.task("uncollected", pane="dead", exit=0, files={"completed": str(NOW)})
++        self.task("pending-cap", files={"pending-capability.json": {}})
++        self.task("bad-request", files={"permission-request.json": "{"})
++        self.task("awaiting-reap", files={"process.json": {}})
++        self.task("bad-meta", meta="{")
++        self.task("queued-after")
++        self.task("queued-parent")
++        self.task("named-in-junk")
++        self.queue("q-after", {"id": "q-after", "after": ["queued-after"], "parent": ""})
++        self.queue("q-parent", {"id": "q-parent", "after": [], "parent": "queued-parent"})
++        self.queue("broken", "{ named-in-junk")
++        # a review: the author is kept while its reviewer works, and goes with it once both are done
++        self.task("author-open")
++        self.task("rev-open", pane="alive", state="working", reply=None, files={"review-of": "author-open\n"})
++        self.task("author-done")
++        self.task("rev-done", files={"review-of": "author-done\n"})
++        # retry lineage: a parent goes only after every child that is still in tasks/ has gone
++        self.task("grand-g")
++        self.task("parent-c", meta={"parent": "grand-g"})
++        self.task("child-c", pane="alive", state="working", reply=None, meta={"parent": "parent-c"})
++        self.task("parent-q")
++        self.task("child-d", meta={"parent": "parent-q"})
++        # not finished, or not decided by the lifecycle: in neither list
++        self.task("working", pane="alive", state="working", reply=None)
++        self.task("paused", pane="alive", state="working", reply="Done, I think.\n", files={"checkpoints.json": {"events": [PAUSE]}})
++        self.task("asking", pane="alive", state="working", reply=None, files={"permission-request.json": {"status": "pending", "target": "db"}})
++        self.task("settled", pane="dead", exit=0)
++        # lane tasks: their step's state in the lane record decides, not their age
++        here = str(self.root)
++        self.task("lane-closed", meta={"lane": "alpha", "lane_step": "s1", "preamble_from": here}, minutes=1)
++        self.task("lane-open", meta={"lane": "alpha", "lane_step": "s2", "preamble_from": here})
++        self.task("lane-removed", meta={"lane": "gone", "lane_step": "s1", "workdir": here})
++        self.task("lane-nowhere", meta={"lane": "alpha", "lane_step": "s1", "preamble_from": str(self.root / "missing")})
++        self.task("lane-tags", meta={"lane": "alpha"})
++        self.task("lane-badrecord", meta={"lane": "broken", "lane_step": "s1", "preamble_from": here})
++
++    def lanes_stub(self):
++        def read_lane(common, name):
++            if name == "broken":
++                raise ValueError("lane.json was changed by hand")
++            return {"closed": [{"step": "s1"}]}
++        return (mock.patch.object(lanes, "git_common_dir", return_value="/common"),
++                mock.patch.object(lanes, "lane_names", return_value=["alpha", "broken"]),
++                mock.patch.object(lanes, "read_lane", side_effect=read_lane))
++
++    def plan(self):
++        a, b, c = self.lanes_stub()
++        with a, b, c:
++            return task_record.retire_plan(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++
++    def test_the_retired_set_and_the_kept_reasons_are_exactly_these(self):
++        self.build()
++        retired, kept = self.plan()
++        ago = "finished over 30 min ago"
++        self.assertEqual(dict(retired), {
++            "ok-completed": ago, "ok-killed": ago, "ok-failed": ago, "ok-stopped": ago,
++            "author-done": ago, "rev-done": ago, "parent-q": ago, "child-d": ago,
++            "lane-closed": "lane step s1 closed", "lane-removed": "lane gone removed"})
++        self.assertEqual(dict(kept), {
++            "fresh-killed": "finished 10 min ago (kept 30 min)",
++            "main-owned": "main-owned record",
++            "live-pane": "pane %s still runs" % pane_of("live-pane"),
++            "uncollected": "completed without collected.json",
++            "pending-cap": "pending capability request",
++            "bad-request": "unreadable request file",
++            "awaiting-reap": "process.json awaiting reap",
++            "bad-meta": "record unreadable",
++            "queued-after": "queued q-after names it",
++            "queued-parent": "queued q-parent names it",
++            "named-in-junk": "an unreadable queue item may name it",
++            "author-open": "unfinished review rev-open",
++            "parent-c": "parent of child-c",
++            "grand-g": "parent of parent-c",
++            "lane-open": "open lane step s2",
++            "lane-nowhere": "lane alpha repository not found",
++            "lane-tags": "lane tags unreadable",
++            "lane-badrecord": "lane broken record unreadable"})
++        # never retired, never named as kept: working, paused, asking (needs input) and settled tasks, and the reviewer at work
++        for name in ("working", "paused", "asking", "settled", "rev-open", "child-c"):
++            self.assertNotIn(name, dict(retired))
++            self.assertNotIn(name, dict(kept))
++
++    def test_retired_is_the_first_half_of_the_plan_and_the_lists_are_sorted(self):
++        self.build()
++        a, b, c = self.lanes_stub()
++        with a, b, c:
++            retired = task_record.retired(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++            plan = task_record.retire_plan(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual(retired, plan[0])
++        self.assertEqual(plan[0], sorted(plan[0]))
++        self.assertEqual(plan[1], sorted(plan[1]))
++
++    def test_the_planning_changes_nothing_on_disk(self):
++        self.build()
++        before = sorted((str(p), p.stat().st_mtime) for p in self.state.rglob("*"))
++        self.plan()
++        self.assertEqual(sorted((str(p), p.stat().st_mtime) for p in self.state.rglob("*")), before)
++
++    def test_the_age_threshold_is_status_retire_after_minutes_and_does_not_apply_to_a_lane_step(self):
++        self.task("recent", minutes=20)
++        self.task("older", minutes=40)
++        for minutes, expected in ((30, ["older"]), (10, ["older", "recent"]), (60, [])):
++            with self.subTest(minutes=minutes):
++                retired = task_record.retired(self.state, panes=self.panes, now=NOW, settings={**SETTINGS, "retire_after_minutes": minutes})
++                self.assertEqual([name for name, _ in retired], expected)
++
++    def test_a_task_a_reviewer_has_finished_with_no_longer_holds_its_author(self):
++        self.task("author")
++        self.task("rev", files={"review-of": "author\n"})
++        self.assertEqual([n for n, _ in task_record.retired(self.state, panes=self.panes, now=NOW, settings=SETTINGS)], ["author", "rev"])
++
++    def test_a_review_of_file_that_cannot_be_read_keeps_what_it_may_hold_and_stops_nothing_else(self):
++        # a reviewer's review-of that is not text: a finished reviewer stays itself; an unfinished one may hold any finished task
++        self.task("independent")
++        self.task("rev-done", files={"review-of": "x"})
++        (self.tasks / "rev-done" / "review-of").write_bytes(b"\xff\xfe\x00")
++        self.assertEqual(task_record.retire_plan(self.state, panes=self.panes, now=NOW, settings=SETTINGS),
++                         ([("independent", "finished over 30 min ago")], [("rev-done", "review-of unreadable")]))
++        self.task("rev-work", pane="alive", state="working", reply=None, files={"review-of": "x"})
++        (self.tasks / "rev-work" / "review-of").write_bytes(b"\xff\xfe\x00")
++        retired, kept = task_record.retire_plan(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual((retired, dict(kept)), ([], {"independent": "review-of of rev-work unreadable", "rev-done": "review-of unreadable"}))
++
++    def test_nothing_is_retired_from_a_state_directory_without_tasks(self):
++        empty = self.root / "none"
++        empty.mkdir()
++        self.assertEqual(task_record.retire_plan(empty, panes={}, now=NOW, settings=SETTINGS), ([], []))
++
++    def test_an_unreadable_pane_list_stops_the_pass_and_changes_nothing(self):
++        self.task("ok-killed")
++        with mock.patch.object(worker_process, "pane_flags", side_effect=RuntimeError("cannot read tmux panes: no server")):
++            with self.assertRaisesRegex(RuntimeError, "cannot read tmux panes"):
++                task_record.retire(self.state, now=NOW, settings=SETTINGS)
++        self.assertTrue((self.tasks / "ok-killed").is_dir())
++
++
++class RetireTests(StateFixture):
++    def test_the_dead_pane_of_a_retired_task_is_closed_before_it_is_archived_and_a_live_one_never(self):
++        self.task("dead-failed", pane="dead", exit=1, reply=None)
++        self.task("gone-killed")
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="killed") as kill:
++            result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual(sorted(call.args[0] for call in kill.call_args_list), sorted([pane_of("dead-failed"), pane_of("gone-killed")]))
++        self.assertEqual((result["archived"], result["kept"]), (["dead-failed", "gone-killed"], []))
++        # the pane came back to life between the plan and the close: the task stays, with that as the reason
++        self.task("revived", pane="dead", exit=1, reply=None)
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="alive"):
++            result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual((result["archived"], result["kept"]), ([], [("revived", "pane %s still runs" % pane_of("revived"))]))
++        self.assertTrue((self.tasks / "revived").is_dir())
++
++    def test_a_task_that_cannot_be_archived_is_failed_not_kept_and_the_others_are_still_archived(self):
++        self.task("a-first")
++        self.task("b-second")
++        real = task_record.archive_task
++
++        def archive(root, d):
++            if d.name == "a-first":
++                raise OSError("disk full")
++            return real(root, d)
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"), mock.patch.object(task_record, "archive_task", side_effect=archive):
++            result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual(result, {"archived": ["b-second"], "kept": [], "failed": [("a-first", "disk full")]})
++        self.assertEqual(task_record.retire_summary(result), "archived 1, kept 0, failed 1 (a-first: disk full)")
++        self.assertTrue((self.tasks / "a-first").is_dir())
++
++    def test_children_are_archived_before_their_parent_and_a_child_that_stays_keeps_its_parent(self):
++        self.task("a-parent")
++        self.task("z-child", meta={"parent": "a-parent"})
++        real, order = task_record.archive_task, []
++
++        def archive(root, d):
++            order.append(d.name)
++            if d.name == "z-child" and self.fail_child:
++                raise OSError("disk full")
++            return real(root, d)
++        for self.fail_child in (True, False):
++            order.clear()
++            with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"), mock.patch.object(task_record, "archive_task", side_effect=archive):
++                result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++            if self.fail_child:   # the child could not move: the parent its retry lineage needs is still in tasks/
++                self.assertEqual((order, result), (["z-child"], {"archived": [], "kept": [("a-parent", "parent of z-child")],
++                                                                  "failed": [("z-child", "disk full")]}))
++                self.assertEqual(sorted(p.name for p in self.tasks.iterdir()), ["a-parent", "z-child"])
++            else:
++                self.assertEqual((order, result["archived"]), (["z-child", "a-parent"], ["a-parent", "z-child"]))
++
++    def test_a_task_whose_record_cannot_be_reconciled_stays_in_tasks_as_it_was_and_can_be_retried(self):
++        d = self.task("ok-killed")
++        before = {p.name: p.read_bytes() for p in d.iterdir()}
++        with mock.patch.object(task_record, "_reconcile_archived_record", side_effect=OSError("cannot write task.md")):
++            with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++                result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual(result, {"archived": [], "kept": [], "failed": [("ok-killed", "cannot write task.md")]})
++        self.assertEqual({p.name: p.read_bytes() for p in d.iterdir()}, before)
++        self.assertEqual(list((self.state / "archive").iterdir()), [])
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++            self.assertEqual(task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)["archived"], ["ok-killed"])
++
++    def legacy_task(self, name, **kw):
++        """A legacy task (task.md is the raw request, no request.md) naming a ticket and an artifact inside itself: the reconcile
++        writes request.md, retention.json, task.md and meta.json."""
++        whole = {"kind": "task", "artifact": str(self.tasks / name / "out.md"), "stall": 10 ** 9, "grace": 1, "checkpoints": {},
++                 "budget": {"seconds": 10 ** 9, "turns": None, "tokens": None}}   # whole enough for the ledger row to be worked out
++        d = self.task(name, meta={"contract": whole}, **kw)
++        (d / "task.md").write_text("youtrack: ABC-12 fix please\n")
++        (d / "out.md").write_text("artifact\n")
++        os.utime(d / "meta.json", (NOW - 7200, NOW - 7200))
++        return d
++
++    def archive_of(self, name):
++        return self.state / "archive" / name
++
++    def assertReadersFindTheArtifactIn(self, d):
++        """Every reader of the contract artifact (the shared resolver, the ledger row, tp-contract's own lookups, task.md's status
++        line) finds out.md in the directory `d` it is read from, whatever meta.json holds, and task.md names no other location."""
++        meta = json.loads((d / "meta.json").read_text())
++        expected = str(d / "out.md")
++        self.assertTrue(os.path.isfile(task_archive.artifact_path(d, meta["contract"]["artifact"])))
++        self.assertEqual(task_archive.artifact_path(d, meta["contract"]["artifact"]), expected)
++        self.assertEqual(contract.ledger_row(d, NOW)["artifact"], expected)
++        self.assertEqual(contract.ledger_row(d, NOW)["artifact_chars"], len("artifact\n"))
++        if d.parent == self.tasks:   # tp-contract works on active tasks only
++            for _, found in (tp_contract().find(self.state, d.name),):
++                self.assertEqual(found["contract"]["artifact"], expected)
++            self.assertEqual([m["contract"]["artifact"] for _, m in tp_contract().tasks(self.state)], [expected])
++        text = (d / "task.md").read_text()
++        if task_record.is_canonical(text):   # (a task.md writer that failed leaves the legacy text, which names nothing)
++            self.assertIn("(present)", text)   # task.md's own status line found the file too
++            self.assertNotIn(str(self.state / "archive"), text)   # it says nothing of where the task will be
++            self.assertEqual([line for line in text.splitlines() if str(d) in line and "origin" not in line], [])   # nor of where it is read from now
++
++    def assertStaysAndArchivesLater(self, d):
++        """The task is still in tasks/, still a task (its meta.json reads, nothing stray beside it, nothing in archive/), every reader
++        of its artifact finds it there, and a second run with nothing failing archives it, readers finding it at the archive."""
++        self.assertTrue(d.is_dir())
++        self.assertEqual(json.loads((d / "meta.json").read_text())["id"], d.name)
++        self.assertEqual(sorted(p.name for p in self.tasks.iterdir()), [d.name])
++        self.assertEqual(list((self.state / "archive").iterdir()), [])
++        self.assertReadersFindTheArtifactIn(d)
++        dest = task_record.archive_task(self.state, d)
++        self.assertEqual(dest, self.archive_of(d.name))
++        self.assertFalse(d.exists())
++        self.assertEqual(json.loads((dest / "meta.json").read_text())["contract"]["artifact"], "out.md")
++        self.assertReadersFindTheArtifactIn(dest)
++
++    def test_a_reconcile_writer_that_fails_leaves_the_task_in_tasks_valid_and_a_second_run_archives_it(self):
++        real = task_record._write_atomic
++        for writer in task_record.RECONCILE_FILES:
++            with self.subTest(writer=writer):
++                d = self.legacy_task("t-" + writer.split(".")[0])
++                seen = []
++
++                def write(path, text, writer=writer):
++                    seen.append(Path(path).name)
++                    if Path(path).name == writer:
++                        raise OSError("cannot write " + writer)
++                    return real(path, text)
++                with mock.patch.object(task_record, "_write_atomic", side_effect=write):
++                    with self.assertRaisesRegex(OSError, "cannot write " + writer):
++                        task_record.archive_task(self.state, d)
++                self.assertIn(writer, seen)   # the writer was reached: the row tests it, not an earlier failure
++                self.assertStaysAndArchivesLater(d)
++                shutil.rmtree(self.archive_of(d.name))
++
++    def test_a_target_that_is_a_link_or_not_a_file_refuses_before_any_write_and_the_outside_file_is_unchanged(self):
++        outside = self.root / "outside.txt"
++        outside.write_text("PRIVATE")
++        for target in task_record.RECONCILE_FILES:
++            with self.subTest(target=target):
++                d = self.legacy_task("t-" + target.split(".")[0])
++                before = {p.name: p.read_bytes() for p in d.iterdir() if p.name != target}
++                (d / target).unlink(missing_ok=True)
++                (d / target).symlink_to(outside)
++                with self.assertRaisesRegex(ValueError, "not a regular file"):
++                    task_record.archive_task(self.state, d)
++                self.assertEqual(outside.read_text(), "PRIVATE")
++                self.assertEqual({p.name: p.read_bytes() for p in d.iterdir() if p.name != target}, before)   # nothing else was written
++                self.assertTrue((d / target).is_symlink())
++                self.assertEqual(list((self.state / "archive").iterdir()), [])
++                shutil.rmtree(d)
++
++    def test_a_fifo_in_the_task_is_archived_because_a_rename_does_not_read_it(self):
++        d = self.legacy_task("has-fifo")
++        os.mkfifo(d / "pipe")
++        dest = task_record.archive_task(self.state, d)
++        self.assertTrue(stat.S_ISFIFO(os.lstat(dest / "pipe").st_mode))
++        self.assertFalse(d.exists())
++
++    def test_a_hard_linked_file_keeps_its_inode_when_the_archive_fails_and_when_it_succeeds(self):
++        d = self.legacy_task("has-link")
++        other = self.root / "other-name"
++        os.link(d / "result.md", other)
++        inode = os.stat(other).st_ino
++        with mock.patch.object(task_record, "_write_atomic", side_effect=OSError("cannot write")):
++            with self.assertRaises(OSError):
++                task_record.archive_task(self.state, d)
++        self.assertEqual(os.stat(d / "result.md").st_ino, inode)
++        dest = task_record.archive_task(self.state, d)
++        self.assertEqual(os.stat(dest / "result.md").st_ino, inode)
++        other.write_text("changed through the other link")   # still the same file
++        self.assertEqual((dest / "result.md").read_text(), "changed through the other link")
++
++    def test_a_write_that_lands_between_the_reconcile_and_the_move_is_in_the_archive(self):
++        d = self.legacy_task("late-write")
++        real = os.rename
++
++        def rename(src, dst):   # the worker writes after the reconcile finished, just before the directory moves
++            (Path(src) / "result.md").write_text("late reply")
++            (Path(src) / "late.txt").write_text("late file")
++            return real(src, dst)
++        with mock.patch.object(task_record.os, "rename", side_effect=rename):
++            dest = task_record.archive_task(self.state, d)
++        self.assertEqual(((dest / "result.md").read_text(), (dest / "late.txt").read_text()), ("late reply", "late file"))
++
++    def test_a_move_that_fails_after_the_reconcile_leaves_a_live_record_every_reader_resolves_and_no_reservation(self):
++        d = self.legacy_task("move-fails")
++        with mock.patch.object(task_record.os, "rename", side_effect=OSError(errno.EIO, "disk")):
++            with self.assertRaises(OSError):
++                task_record.archive_task(self.state, d)
++        # the record was reconciled (relative artifact), the reservation was removed, and every reader finds out.md in tasks/<id>
++        self.assertEqual(json.loads((d / "meta.json").read_text())["contract"]["artifact"], "out.md")
++        self.assertEqual(list((self.state / "archive").iterdir()), [])
++        self.assertStaysAndArchivesLater(d)
++
++    def test_the_archive_name_is_owned_before_the_move_so_a_third_party_directory_is_never_replaced_or_removed(self):
++        # theirs appears (empty) just before our mkdir: it is skipped, the next name is used, theirs is still there and empty
++        e = self.legacy_task("name-taken")
++        real_mkdir = os.mkdir
++
++        def mkdir(path, *a, **kw):
++            if Path(path).name == "name-taken" and not os.path.lexists(path):
++                real_mkdir(path)   # the other party wins the race for this name
++            return real_mkdir(path, *a, **kw)
++        with mock.patch.object(task_record.os, "mkdir", side_effect=mkdir):
++            dest = task_record.archive_task(self.state, e)
++        self.assertNotEqual(dest, self.archive_of("name-taken"))
++        self.assertTrue(dest.name.startswith("name-taken-ended-"))
++        self.assertEqual(list(self.archive_of("name-taken").iterdir()), [])   # theirs: not renamed onto, not removed
++        self.assertReadersFindTheArtifactIn(dest)
++        # theirs tries to take the name we own, between the reservation and the move: it fails, ours is the one renamed onto
++        f = self.legacy_task("name-owned")
++        real_rename, theirs = os.rename, []
++
++        def rename(src, dst):
++            try:
++                real_mkdir(dst)
++            except FileExistsError:
++                theirs.append("refused")
++            return real_rename(src, dst)
++        with mock.patch.object(task_record.os, "rename", side_effect=rename):
++            dest = task_record.archive_task(self.state, f)
++        self.assertEqual((theirs, dest), (["refused"], self.archive_of("name-owned")))
++        self.assertReadersFindTheArtifactIn(dest)
++
++    def test_a_reservation_is_removed_when_the_reconcile_or_the_move_fails_and_kept_when_somebody_filled_it(self):
++        for failing in ("reconcile", "move"):
++            with self.subTest(failing=failing):
++                d = self.legacy_task("res-" + failing)
++                target = "_reconcile_archived_record" if failing == "reconcile" else "rename"
++                holder = task_record if failing == "reconcile" else task_record.os
++                with mock.patch.object(holder, target, side_effect=OSError(errno.EIO, "no")):
++                    with self.assertRaises(OSError):
++                        task_record.archive_task(self.state, d)
++                self.assertEqual(list((self.state / "archive").iterdir()), [])
++        # a reservation that is no longer empty is not removed (rmdir only removes an empty directory)
++        e = self.legacy_task("res-filled")
++        real = os.rename
++
++        def rename(src, dst):
++            (Path(dst) / "theirs").write_text("x")
++            raise OSError(errno.EIO, "no")
++        with mock.patch.object(task_record.os, "rename", side_effect=rename):
++            with self.assertRaises(OSError):
++                task_record.archive_task(self.state, e)
++        self.assertEqual([p.name for p in self.archive_of("res-filled").iterdir()], ["theirs"])
++        self.assertTrue(e.is_dir())
++
++    def test_a_record_with_an_absolute_artifact_is_read_where_it_is_and_archives_to_a_relative_one(self):
++        # written before the artifact was recorded relative: an absolute path into its own directory, and a rewritten one in an archive
++        d = self.legacy_task("old-absolute")
++        meta = json.loads((d / "meta.json").read_text())
++        self.assertEqual(meta["contract"]["artifact"], str(d / "out.md"))   # the fixture's form
++        self.assertReadersFindTheArtifactIn(d)
++        dest = task_record.archive_task(self.state, d)
++        self.assertEqual(json.loads((dest / "meta.json").read_text())["archive_relocation"], {"artifact_from": str(d / "out.md")})
++        self.assertReadersFindTheArtifactIn(dest)
++        old = self.state / "archive" / "old-absolute-ended-20260101000000"   # a name taken once: the record's id is still old-absolute
++        shutil.copytree(dest, old)
++        record = json.loads((old / "meta.json").read_text())
++        record.update(contract={**record["contract"], "artifact": str(old / "out.md")},
++                      archive_relocation={"artifact_from": str(d / "out.md"), "artifact_to": str(old / "out.md")})
++        (old / "meta.json").write_text(json.dumps(record))
++        self.assertEqual(task_archive.artifact_path(old, record["contract"]["artifact"]), str(old / "out.md"))   # absolute: as it is
++        task_record.format_record_for_resume(old)   # reading it for resume reconciles it without dropping the origin
++        after = json.loads((old / "meta.json").read_text())
++        self.assertEqual((after["contract"]["artifact"], after["archive_relocation"]), ("out.md", {"artifact_from": str(d / "out.md")}))
++        self.assertTrue(os.path.isfile(task_archive.artifact_path(old, after["contract"]["artifact"])))
++
++    def test_a_loop_of_parents_is_never_archived_and_each_member_says_so(self):
++        for size in (1, 2, 3):
++            with self.subTest(loop=size):
++                names = ["l%d-%d" % (size, n) for n in range(size)]
++                for n, name in enumerate(names):
++                    self.task(name, meta={"parent": names[(n + 1) % size]})
++                self.task("l%d-tail" % size, meta={"parent": names[0]})   # a child of a loop member, outside the loop
++                with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++                    result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++                self.assertEqual(result["archived"], ["l%d-tail" % size])
++                self.assertEqual([name for name, _ in result["kept"]], sorted(names))
++                for name, reason in result["kept"]:
++                    self.assertIn("parent chain loops", reason)
++                self.assertEqual(result["failed"], [])
++                for name in names:
++                    self.assertTrue((self.tasks / name).is_dir())
++                    shutil.rmtree(self.tasks / name)
++
++    def test_a_recorded_pane_is_a_pane_id_and_nothing_else_or_it_is_unknown_and_the_task_stays(self):
++        # (recorded pane, is it unknown): %N only is an id; absent or empty is none (gone, as before); the rest is unknown
++        table = [("%7", False), ("%bad", True), ("%7oops", True), ("7", True), ("% 7", True), ("%", True), ("%-1", True),
++                 ("%7\n", True), ("", False), (None, False), (7, True), (["%7"], True), ({"id": "%7"}, True)]
++        for n, (pane, unknown) in enumerate(table):
++            with self.subTest(pane=pane):
++                name = "odd-%d" % n
++                self.task(name, meta={"pane": pane})
++                tmux = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))   # a server with no pane at all
++                with mock.patch.object(worker_process.subprocess, "run", tmux):
++                    result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++                if unknown:
++                    tmux.assert_not_called()   # tmux is not asked about a value that is no pane id
++                    self.assertEqual((result["archived"], result["kept"]), ([], [(name, "pane %r unreadable" % (pane,))]))
++                    self.assertTrue((self.tasks / name).is_dir())
++                    shutil.rmtree(self.tasks / name)
++                else:
++                    self.assertEqual((result["archived"], result["kept"]), ([name], []))
++        self.assertEqual([worker_process.recorded_pane(p) for p, _ in table],
++                         ["unknown" if unknown else ("id" if p == "%7" else "none") for p, unknown in table])
++
++    def test_a_queue_item_that_is_not_utf8_keeps_only_the_tasks_it_may_name_and_stops_nothing(self):
++        self.task("named")
++        self.task("other")
++        (self.state / "queue" / "bad.json").write_bytes(b"\xff\xfe after: named")
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++            result = task_record.retire(self.state, panes=self.panes, now=NOW, settings=SETTINGS)
++        self.assertEqual((result["archived"], result["kept"]), (["other"], [("named", "an unreadable queue item may name it")]))
++        self.assertEqual(task_record._read(self.state / "queue" / "bad.json"), "")
++
++    def test_kill_dead_pane_closes_a_dead_pane_only(self):
++        calls = []
++
++        def run(argv, **kw):
++            calls.append(argv[1])
++            out = "%1 1\n%2 0\n" if argv[1] == "list-panes" else ""
++            return subprocess.CompletedProcess(argv, 0, out, "")
++        with mock.patch.object(worker_process.subprocess, "run", side_effect=run):
++            for odd in ("%bad", "7", 7, ["%1"]):
++                self.assertEqual(worker_process.kill_dead_pane(odd), "unknown")   # not a pane id: tmux is not asked
++            self.assertEqual(calls, [])
++            self.assertEqual(worker_process.kill_dead_pane("%9"), "gone")
++            self.assertEqual(worker_process.kill_dead_pane(""), "gone")
++            self.assertEqual(worker_process.kill_dead_pane("%2"), "alive")
++            self.assertNotIn("kill-pane", calls)
++            self.assertEqual(worker_process.kill_dead_pane("%1"), "killed")
++        self.assertEqual(calls.count("kill-pane"), 1)
++
++    def test_retire_summary_says_how_many_and_why_up_to_five_reasons(self):
++        kept = [("t%d" % n, "why %d" % n) for n in range(7)]
++        self.assertEqual(task_record.retire_summary({"archived": ["a"], "kept": kept[:2]}), "archived 1, kept 2 (reasons: t0: why 0; t1: why 1)")
++        self.assertEqual(task_record.retire_summary({"archived": [], "kept": kept}),
++                         "archived 0, kept 7 (reasons: t0: why 0; t1: why 1; t2: why 2; t3: why 3; t4: why 4; +2 more)")
++        self.assertEqual(task_record.retire_summary({"archived": ["a", "b"], "kept": []}), "archived 2, kept 0")
++
++
++class StatusSettingsTests(unittest.TestCase):
++    def setUp(self):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        self.dir = Path(tmp.name)
++
++    def config(self, value):
++        path = self.dir / "orchestration.json"
++        path.write_text(value if isinstance(value, str) else json.dumps(value))
++        return path
++
++    def test_the_shipped_config_holds_the_documented_defaults(self):
++        self.assertEqual(json.loads((ROOT / "config/orchestration.json").read_text())["status"],
++                         {"max_rows": 50, "auto_retire": True, "retire_after_minutes": 30})
++        self.assertEqual(task_record.status_settings(), SETTINGS)
++
++    def test_an_absent_file_block_or_key_takes_its_default_and_a_value_is_taken(self):
++        self.assertEqual(task_record.status_settings(self.dir / "nowhere.json"), SETTINGS)
++        self.assertEqual(task_record.status_settings(self.config({"lanes": {}})), SETTINGS)
++        self.assertEqual(task_record.status_settings(self.config({"status": {"max_rows": 7}})), {**SETTINGS, "max_rows": 7})
++        self.assertEqual(task_record.status_settings(self.config({"status": {"auto_retire": False, "retire_after_minutes": 0.5, "other": 1}})),
++                         {**SETTINGS, "auto_retire": False, "retire_after_minutes": 0.5})
++
++    def test_a_value_of_the_wrong_type_or_a_file_that_cannot_be_read_refuses(self):
++        for status, words in (({"max_rows": 0}, "max_rows"), ({"max_rows": True}, "max_rows"), ({"max_rows": "50"}, "max_rows"),
++                              ({"max_rows": 2.5}, "max_rows"), ({"auto_retire": "yes"}, "auto_retire"), ({"auto_retire": 1}, "auto_retire"),
++                              ({"retire_after_minutes": -1}, "retire_after_minutes"), ({"retire_after_minutes": "30"}, "retire_after_minutes"),
++                              ({"retire_after_minutes": True}, "retire_after_minutes"), ([], "must be an object")):
++            with self.subTest(status=status), self.assertRaisesRegex(ValueError, words):
++                task_record.status_settings(self.config({"status": status}))
++        for text in ("{", "[]"):
++            with self.subTest(text=text), self.assertRaises(ValueError):
++                task_record.status_settings(self.config(text))
++
++    def test_the_command_line_prints_what_the_status_pane_reads_and_refuses_a_bad_config(self):
++        env = {**os.environ, "TP_ORCHESTRATION_CONFIG": str(self.config({"status": {"max_rows": 12, "auto_retire": False}}))}
++        run = subprocess.run([sys.executable, str(ROOT / "lib/task_record.py"), "status-settings"], env=env, text=True, capture_output=True)
++        self.assertEqual((run.returncode, run.stdout), (0, "12 false 30\n"), run.stderr)
++        env["TP_ORCHESTRATION_CONFIG"] = str(self.config({"status": {"max_rows": 0}}))
++        run = subprocess.run([sys.executable, str(ROOT / "lib/task_record.py"), "status-settings"], env=env, text=True, capture_output=True)
++        self.assertEqual((run.returncode, run.stdout), (1, ""))
++        self.assertIn("status.max_rows must be a positive integer", run.stderr)
++
++
++class TpCleanRetiredTests(StateFixture):
++    """`tp-clean --retired` as a program, tmux a stub that serves a pane list and logs the panes it is asked to kill."""
++
++    def setUp(self):
++        super().setUp()
++        bin_dir = self.root / "bin"
++        bin_dir.mkdir()
++        tmux = bin_dir / "tmux"
++        tmux.write_text('#!/bin/sh\ncase "$1" in\n has-session) exit 0 ;;\n show-options) printf \'%s\\n\' "$TP_STATE_DIR" ;;\n'
++                        ' list-panes) cat "$FAKE_PANES" ;;\n'
++                        ' kill-pane) [ -z "$FAKE_KILL_FAIL" ] || { echo "no permission" >&2; exit 1; }; echo "$3" >> "$FAKE_KILLS"; grep -v "^$3 " "$FAKE_PANES" > "$FAKE_PANES.new"; mv "$FAKE_PANES.new" "$FAKE_PANES" ;;\n'
++                        'esac\n')
++        tmux.chmod(0o755)
++        self.pane_file, self.kill_file = self.root / "panes", self.root / "kills"
++        self.env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"], "TP_STATE_DIR": str(self.state),
++                    "TP_SESSION": "fixture", "FAKE_PANES": str(self.pane_file), "FAKE_KILLS": str(self.kill_file)}
++        self.env.pop("TMUX", None)
++        self.env.pop("TP_ORCHESTRATION_CONFIG", None)
++        self.now = time.time()
++
++    def build(self):
++        self.task("dead-failed", pane="dead", exit=1, reply=None, now=self.now)
++        self.task("gone-killed", now=self.now)
++        self.task("live-failed", pane="alive", exit=1, now=self.now)
++        self.task("fresh-killed", minutes=10, now=self.now)
++        self.task("busy", pane="alive", state="working", reply=None, now=self.now)
++        self.pane_file.write_text("".join("%s %d\n" % (pane, 0 if alive else 1) for pane, alive in self.panes.items()))
++
++    def task(self, name, **kw):
++        return make_task(self.tasks, self.panes, name, **kw)
++
++    def run_clean(self, *args):
++        return subprocess.run([str(ROOT / "bin/tp-clean"), *args], env=self.env, text=True, capture_output=True, timeout=30)
++
++    def kills(self):
++        return self.kill_file.read_text().split() if self.kill_file.exists() else []
++
++    def present(self):
++        return sorted(p.name for p in self.tasks.iterdir())
++
++    def test_it_archives_the_retired_set_closes_only_their_dead_panes_and_a_second_run_does_nothing(self):
++        self.build()
++        reasons = "fresh-killed: finished 10 min ago (kept 30 min); live-failed: pane %s still runs" % pane_of("live-failed")
++        first = self.run_clean("--retired")
++        self.assertEqual((first.returncode, first.stdout.strip()), (0, "archived 2, kept 2 (reasons: %s)" % reasons), first.stderr)
++        self.assertEqual(self.kills(), [pane_of("dead-failed")])                 # the dead pane; the gone one is not there to close
++        self.assertEqual(self.present(), ["busy", "fresh-killed", "live-failed"])
++        self.assertEqual(sorted(p.name for p in (self.state / "archive").iterdir()), ["dead-failed", "gone-killed"])
++        self.assertEqual(sorted(self.pane_file.read_text().split("\n")), sorted(["", pane_of("busy") + " 0", pane_of("live-failed") + " 0"]))
++        second = self.run_clean("--retired")
++        self.assertEqual((second.returncode, second.stdout.strip()), (0, "archived 0, kept 2 (reasons: %s)" % reasons), second.stderr)
++        self.assertEqual(self.kills(), [pane_of("dead-failed")])                 # nothing closed again
++        self.assertEqual(self.present(), ["busy", "fresh-killed", "live-failed"])
++        self.assertEqual(sorted(p.name for p in (self.state / "archive").iterdir()), ["dead-failed", "gone-killed"])
++
++    def test_a_task_waits_for_the_configured_minutes(self):
++        self.task("killed", minutes=10, now=self.now)
++        self.pane_file.write_text("")
++        config = self.root / "orchestration.json"
++        config.write_text(json.dumps({"status": {"retire_after_minutes": 5}}))
++        self.env["TP_ORCHESTRATION_CONFIG"] = str(config)
++        run = self.run_clean("--retired")
++        self.assertEqual((run.returncode, run.stdout.strip()), (0, "archived 1, kept 0"), run.stderr)
++
++    def test_an_unreadable_pane_list_or_config_fails_the_run_and_leaves_every_task(self):
++        self.task("ok-killed", now=self.now)
++        self.pane_file.write_text("%1 maybe\n")
++        run = self.run_clean("--retired")
++        self.assertEqual((run.returncode, run.stdout), (1, ""))
++        self.assertIn("cannot read tmux panes", run.stderr)
++        self.pane_file.write_text("")
++        config = self.root / "orchestration.json"
++        config.write_text("{")
++        self.env["TP_ORCHESTRATION_CONFIG"] = str(config)
++        run = self.run_clean("--retired")
++        self.assertEqual((run.returncode, run.stdout), (1, ""))
++        self.assertIn("cannot read", run.stderr)
++        self.assertEqual(self.present(), ["ok-killed"])
++
++    def test_a_pane_that_cannot_be_closed_fails_the_run_after_the_rest_was_archived(self):
++        self.task("dead-failed", pane="dead", exit=1, reply=None, now=self.now)
++        self.task("gone-killed", now=self.now)
++        pane = pane_of("dead-failed")
++        self.pane_file.write_text(pane + " 1\n")
++        self.env["FAKE_KILL_FAIL"] = "1"
++        run = self.run_clean("--retired")
++        self.assertEqual(run.returncode, 1)                               # the status pane's pass reads this and says so
++        self.assertEqual(run.stdout.strip(), "archived 1, kept 0, failed 1 (dead-failed: cannot kill pane %s: no permission)" % pane)
++        self.assertIn("1 not archived (dead-failed: cannot kill pane %s" % pane, run.stderr)
++        self.assertEqual(self.present(), ["dead-failed"])                 # the one that failed stays; the independent one went
++
++    def test_any_other_argument_is_the_usage_message(self):
++        for args in (("--bogus",), ("--retired", "x")):
++            run = self.run_clean(*args)
++            self.assertEqual(run.returncode, 1, args)
++            self.assertIn("usage: tp-clean [--retired]", run.stderr)
++
++
++class AfterArchivingTests(StepCase):
++    """What other commands do with a task still in tasks/ is the same once the retired ones have gone: `lane close` on a closed
++    step, a review of a kept author. (A lane's records are the real ones: a repository, a worktree, lane.json.)"""
++
++    def retire(self):
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++            return task_record.retire(self.state, panes={}, now=time.time() + 7200, settings=SETTINGS)
++
++    def test_lane_close_on_a_closed_step_and_the_next_step_behave_as_before_its_writer_is_archived(self):
++        author, reviewer = self.approved_and_committed()
++        before = self.closes()
++        result = self.retire()
++        self.assertEqual(sorted(result["archived"]), sorted([author, reviewer]))
++        self.assertEqual(list((self.state / "tasks").iterdir()), [])
++        self.assertTrue((self.state / "archive" / author).is_dir())
++        self.untouched(self.close, "step s1 is already closed at", before["closed"][0]["commit"], "nothing to do")
++        item, _ = self.existing(step="s2")                      # and the lane takes its next step
++        self.assertEqual((item["lane"], item["lane_step"]), ("alpha", "s2"))
++
++    def test_a_kept_author_can_still_be_reviewed(self):
++        author, _ = self.writer()                               # step s1 is open: its writer is not retired
++        self.edit()
++        self.commit()
++        result = self.retire()
++        self.assertEqual((result["archived"], result["kept"]), ([], [(author, "open lane step s1")]))
++        reviewer = self.new_reviewer(author)                    # tp-agent review AUTHOR --force, as a person types it
++        self.assertTrue((reviewer / "review-of").read_text().strip() == author)
++        self.assertTrue((self.state / "tasks" / author).is_dir())
++
++
++class QueuedAfterTests(TmuxCase):
++    shared_server = True
++
++    def test_a_task_a_queued_item_waits_on_is_kept_until_the_queue_has_run(self):
++        first, first_dir = self.dispatch()
++        queued = self.cli("dispatch", "--role", "coder", "--task", "b", "--worker", "pi", "--model", MODEL, "--thinking", "medium",
++                          "--workdir", str(self.project), "--deliverable", "Report", "--after", first["id"])
++        self.assertEqual(queued["status"], "queued")
++        self.settle(first_dir)
++        later = time.time() + 7200
++        with mock.patch.object(worker_process, "kill_dead_pane", return_value="gone"):
++            result = task_record.retire(self.state, panes={}, now=later, settings=SETTINGS)
++            self.assertEqual((result["archived"], result["kept"]), ([], [(first["id"], "queued %s names it" % queued["id"])]))
++            self.assertEqual(self.cli("tick")["started"], [queued["id"]])         # it starts, as it does without a retire pass
++            result = task_record.retire(self.state, panes={}, now=later, settings=SETTINGS)
++        self.assertIn(first["id"], result["archived"])                            # and is released once the queue item has gone
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_tp_window.py b/tests/test_tp_window.py
+index c53874d..b35efe1 100644
+--- a/tests/test_tp_window.py
++++ b/tests/test_tp_window.py
+@@ -144,13 +144,15 @@ class ActiveTasksAlwaysShownTest(WindowFixture):
+                 self.assertNotIn("old-finished" if start == "newest" else "done29", ids)
+                 self.assertEqual(header[0], "35")      # the whole list is counted, not just what is loaded
+ 
+-    def test_the_window_is_the_newest_tasks_plus_the_active_ones_in_list_order(self):
++    def test_the_window_is_the_active_ones_plus_the_newest_finished_up_to_the_cap_in_list_order(self):
+         self.build()
+         header, ids, _, _ = self.run_window(5)
+-        self.assertEqual(ids, ["old-starting", "old-working", "old-asking", "old-paused",
+-                               "done25", "done26", "done27", "done28", "done29"])
+-        self.assertEqual(header[1:3], ["30", "done29"])
+-        self.assertEqual(header[3], "0,1,2,3,30,31,32,33,34")     # list positions, so the pane can place the rows
++        self.assertEqual(ids, ["old-starting", "old-working", "old-asking", "old-paused", "done29"])   # the cap is 5 rows in all
++        self.assertEqual(header[1:3], ["34", "done29"])
++        self.assertEqual(header[3], "0,1,2,3,34")                 # list positions, so the pane can place the rows
++        header, ids, _, _ = self.run_window(8)
++        self.assertEqual(ids[4:], ["done26", "done27", "done28", "done29"])
++        self.assertEqual(header[3], "0,1,2,3,31,32,33,34")
+ 
+     def test_a_settled_task_is_not_active_however_new_the_window_wants_it_to_be(self):
+         self.build()
+@@ -158,7 +160,7 @@ class ActiveTasksAlwaysShownTest(WindowFixture):
+         self.assertIn("old-finished", ids)                  # inside the window by position
+         _, ids, _, _ = self.run_window(2, "newest")
+         self.assertNotIn("old-finished", ids)               # outside it, and finished
+-        self.assertEqual(len(ids), 6)                       # 4 active + the 2 newest
++        self.assertEqual(len(ids), 4)                       # the 4 active fill the cap of 2: none is hidden, no finished one fits
+ 
+ 
+ class OlderTasksLookLikeRecentOnesTest(WindowFixture):
+@@ -255,7 +257,68 @@ class MemoryIsBoundedTest(WindowFixture):
+             # the keep newest, which include the two live ones when keep >= 2, plus the live ones outside them
+             self.assertEqual(len(ids), max(keep, 2))
+         _, ids, _, _ = self.run_window(60, 100)
+-        self.assertEqual(len(ids), 62)
++        self.assertEqual(len(ids), 60)      # the cap holds: 2 live + 58 finished from position 100
++
++    def footer(self):
++        return [line[1:] for line in self.out.split("\n") if line.startswith("F")]
++
++    def test_120_finished_and_3_active_show_the_3_and_the_47_newest_with_a_footer_line(self):
++        for n in range(60):
++            self.finished("done%03d" % n)
++        self.task("live-a", state=WORKING, alive=True)       # the oldest live ones sit among the finished
++        for n in range(60, 120):
++            self.finished("done%03d" % n)
++        self.task("live-b", state=WORKING, alive=True)
++        self.task("live-c", state=WORKING, alive=True)
++        counts = self.counting()
++        self.refresh(counts, 50)
++        ids = self.shown()
++        self.assertEqual(len(ids), 50)
++        self.assertEqual(ids[:3], ["live-a", "live-b", "live-c"])      # active rows first, though live-a is older than 60 finished ones
++        self.assertEqual(ids[3:], sorted(ids[3:]))                      # then the finished ones, oldest first
++        self.assertEqual([i for i in ids if i.startswith("done")], ["done%03d" % n for n in range(73, 120)])   # the 47 newest
++        self.assertEqual(self.footer(), ["73 finished not shown (tp-agent find / tp-task list --all)"])
++
++    def test_no_footer_when_all_finished_tasks_show_and_active_ones_past_the_cap_are_never_hidden(self):
++        for n in range(3):
++            self.finished("done%d" % n)
++        counts = self.counting()
++        self.refresh(counts, 5)
++        self.assertEqual(self.footer(), [])
++        for n in range(4):
++            self.task("live%d" % n, state=WORKING, alive=True)
++        self.refresh(counts, 2)                               # more active tasks than the cap: none is hidden, no finished one shown
++        self.assertEqual(self.shown(), ["live0", "live1", "live2", "live3"])
++        self.assertEqual(self.footer(), ["3 finished not shown (tp-agent find / tp-task list --all)"])
++
++    def test_the_footer_names_what_it_leaves_out_by_state(self):
++        """Each row: (finished, escalated) tasks, the cap, the footer. A state with none is not printed; "finished" is never the
++        word for an escalated task (ten escalated and a cap of five used to say `5 finished not shown`)."""
++        tail = "not shown (tp-agent find / tp-task list --all)"
++        for finished, escalated, keep, expected in (
++                (6, 0, 2, ["4 finished " + tail]),                            # finished only
++                (0, 10, 5, ["5 escalated " + tail]),                           # escalated only
++                (4, 3, 2, ["4 finished, 1 escalated " + tail]),                # mixed: the newest two (escalated) show
++                (2, 2, 9, [])):                                                # nothing omitted: no footer
++            with self.subTest(finished=finished, escalated=escalated, keep=keep):
++                self.setUp()
++                for n in range(finished):
++                    self.finished("done%d" % n)
++                for n in range(escalated):
++                    self.task("esc%d" % n, state=SETTLED, result="Done.\nRESULT_STATUS: complete\n", files={"escalated": "x"})
++                counts = self.counting()
++                self.refresh(counts, keep)
++                self.assertEqual(self.footer(), expected)
++
++    def test_a_settled_task_is_in_the_window_whatever_the_cap_and_its_age(self):
++        self.task("old-settled", state=SETTLED, result="Done.\nRESULT_STATUS: complete\n", alive=True)   # a reply waits to be read
++        for n in range(10):
++            self.finished("done%d" % n)
++        counts = self.counting()
++        for start in ("newest", 0, 8):
++            self.refresh(counts, 3, start)
++            self.assertIn("old-settled", self.shown(), "start %s" % start)
++            self.assertEqual(len(self.shown()), 3)
+ 
+     def test_the_pane_refuses_a_window_that_is_not_a_positive_number(self):
+         for keep, start in (("0", "newest"), ("-3", "newest"), ("many", "newest"), ("5", "soon"), ("5", "")):
+@@ -368,9 +431,10 @@ class EveryLifecycleFileCountsTest(WindowFixture):
+         self.assertEqual(self.refresh(counts, 2)["evaluate"], 1)
+ 
+     def move(self, label, build, change, keep=2):
+-        """An old task that is not active is outside the window; after `change` it is active and is inside."""
++        """An old task that is finished and collected (not active, not settled) is outside the window; after `change` it is
++        active and is inside. A settled task is never outside it (test_a_settled_task_is_in_the_window_whatever_the_cap)."""
+         counts = self.counting()
+-        old = self.task("old", **build)
++        old = self.task("old", **dict(build, files=dict(build.get("files", {}), **{"collected.json": {}})))
+         self.pad()
+         self.refresh(counts, keep)
+         self.assertNotIn("old", self.shown(), "%s: the old task was not outside the window to begin with" % label)
+@@ -504,6 +568,7 @@ class RecordRefreshHintsTest(WindowFixture):
+         self.assertEqual(self.changed(), [])
+         (old / "state.json").write_text(json.dumps(SETTLED))
+         (old / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
++        (old / "collected.json").write_text("{}")                  # collected: finished and handed off (settled would stay in)
+         self.refresh(counts, 2)
+         self.assertNotIn("old", self.shown())
+         self.assertEqual(self.changed(), ["old"])

@@ -1,0 +1,344 @@
+{
+ "chore": "steps-deploy",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "not_met",
+    "F3": "not_met",
+    "F4": "not_met",
+    "F5": "not_met",
+    "F6": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "unsupported",
+     "note": "cites (line 2) which shows a blank line; the step is at docs/deploy.md:3"
+    },
+    {
+     "n": 2,
+     "verdict": "unsupported",
+     "note": "cites (line 3) which shows step 1; the step is at docs/deploy.md:4"
+    },
+    {
+     "n": 3,
+     "verdict": "unsupported",
+     "note": "cites (line 4) which shows step 2; the step is at docs/deploy.md:5"
+    },
+    {
+     "n": 4,
+     "verdict": "unsupported",
+     "note": "cites (line 5) which shows step 3; the step is at docs/deploy.md:6"
+    },
+    {
+     "n": 5,
+     "verdict": "unsupported",
+     "note": "cites (line 6) which shows step 4; the step is at docs/deploy.md:7"
+    },
+    {
+     "n": 6,
+     "verdict": "unsupported",
+     "note": "cites (line 7) which shows step 5; the step is at docs/deploy.md:8"
+    }
+   ],
+   "note": "Steps and order are correct, but every citation is off by one line (cites 2-7 instead of 3-8), so no cited line shows its step and no fact is met."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R4": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All six steps in order with correct citations."
+  }
+ }
+}

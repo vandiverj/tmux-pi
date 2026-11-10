@@ -1,0 +1,617 @@
+{
+ "chore": "exports-jobq",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "not_met",
+    "F7": "not_met",
+    "F8": "not_met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Never mentions Job; JobQueue's dead-after-failures behaviour (fail) missing so F7 not_met; F8 not_met: states MAX_RETRIES is 3 but never its role as the retry limit. F9 met via adjacent lines 2-3 (backoff_for reads BACKOFF_SECONDS)."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Complete; F7 met across consecutive JobQueue lines (heap 6, pop 8, dead after MAX_RETRIES 9); F8 met from 'MAX_RETRIES is 3' plus fail moving to dead after MAX_RETRIES (borderline, non-adjacent); F9 borderline via lines 3-4 ('the list' cites line 11 showing BACKOFF_SECONDS). Some citations partial (attempts line 20, dead line 27 not cited) but cited lines show part of each claim."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    }
+   ],
+   "note": "All exports and roles covered; does not say backoff_for repeats the last backoff (F11)."
+  },
+  "R4": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "not_met",
+    "F7": "not_met",
+    "F8": "not_met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Omits Job entirely and fail/dead-list behaviour; F8 not_met: states MAX_RETRIES is 3 but never its role as the retry limit. F9 met via adjacent lines 2-3."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    },
+    {
+     "n": 25,
+     "verdict": "ok"
+    },
+    {
+     "n": 26,
+     "verdict": "ok"
+    },
+    {
+     "n": 27,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Name list plus roles; F7 met (borderline: fail moves to dead list without stating the retry condition); F11 repeat-last not stated."
+  },
+  "R6": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "not_met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "not_met",
+    "F7": "not_met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "unsupported",
+     "note": "Job row cites src/jobq.py:14, a blank line; class Job is at 15"
+    },
+    {
+     "n": 5,
+     "verdict": "unsupported",
+     "note": "JobQueue row cites src/jobq.py:20 (self.attempts = 0 in Job); JobQueue is at 23"
+    }
+   ],
+   "note": "Content is accurate, but the Job and JobQueue rows cite wrong lines, so F1, F2, F6, F7 are not met on citation."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "not_met",
+    "F9": "not_met",
+    "F10": "met",
+    "F11": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Lists all exports and JobQueue behaviour (F7 met, borderline on dead-list condition) but never states MAX_RETRIES=3, BACKOFF_SECONDS values, or the repeat-last rule."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "not_met",
+    "F9": "not_met",
+    "F10": "met",
+    "F11": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    }
+   ],
+   "note": "F7 borderline not_met: fail only 'handles failures and retries', never says jobs move to the dead list after too many failures; F8 not_met: states MAX_RETRIES is 3 but never its role as the retry limit. F9 not_met: values stated but not linked to retry delays; F11 missing."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "met",
+    "F9": "met",
+    "F10": "met",
+    "F11": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Thorough and correct; only misses that backoff_for repeats the last backoff (F11)."
+  }
+ }
+}

@@ -7,6 +7,8 @@ question: `pin(project, name)`. The answer is a version the lockfile names, or n
 `lock_hash(project)` is the sha256 of every lockfile present (name and bytes); an index built from the lockfiles
 records it, and `tp-docs refresh` rebuilds when it changes.
 """
+from __future__ import annotations
+
 import hashlib
 import json
 import re

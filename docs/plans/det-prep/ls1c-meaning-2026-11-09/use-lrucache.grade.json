@@ -1,0 +1,449 @@
+{
+ "chore": "use-lrucache",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Only describes cache.py; never says the other files do not use LRUCache."
+  },
+  "R2": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Right answer, but the 'none of the other files use it' line has no path:line citation, so it is ignored and F1 not_met (borderline: Amendment 1 waives the line-shows-it test but the line still has no citation)."
+  },
+  "R3": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "wrong",
+     "note": "LRUCache is defined at src/cache.py:6, so 'not in the files' is false"
+    },
+    {
+     "n": 2,
+     "verdict": "wrong",
+     "note": "LRUCache is defined at src/cache.py:6, so 'not in the files' is false"
+    },
+    {
+     "n": 3,
+     "verdict": "wrong",
+     "note": "LRUCache is defined at src/cache.py:6, so 'not in the files' is false"
+    },
+    {
+     "n": 4,
+     "verdict": "wrong",
+     "note": "LRUCache is defined at src/cache.py:6, so 'not in the files' is false"
+    }
+   ],
+   "note": "Every line claims LRUCache is not in the files, which is false (cache.py:6); absence claims graded on truth per Amendment 1."
+  },
+  "R4": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "not_met"
+   },
+   "lines": [],
+   "note": "Empty reply."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Correct and complete; the three true absence lines together meet F1 (graded on truth per Amendment 1)."
+  },
+  "R6": {
+   "facts": {
+    "F1": "met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Identical to R5: correct and complete; absence lines graded on truth per Amendment 1."
+  },
+  "R7": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    },
+    {
+     "n": 25,
+     "verdict": "ok"
+    },
+    {
+     "n": 26,
+     "verdict": "ok"
+    },
+    {
+     "n": 27,
+     "verdict": "ok"
+    },
+    {
+     "n": 28,
+     "verdict": "ok"
+    },
+    {
+     "n": 29,
+     "verdict": "ok"
+    },
+    {
+     "n": 30,
+     "verdict": "ok"
+    },
+    {
+     "n": 31,
+     "verdict": "ok"
+    },
+    {
+     "n": 32,
+     "verdict": "ok"
+    },
+    {
+     "n": 33,
+     "verdict": "ok"
+    },
+    {
+     "n": 34,
+     "verdict": "ok"
+    },
+    {
+     "n": 35,
+     "verdict": "ok"
+    },
+    {
+     "n": 36,
+     "verdict": "ok"
+    },
+    {
+     "n": 37,
+     "verdict": "ok"
+    },
+    {
+     "n": 38,
+     "verdict": "ok"
+    },
+    {
+     "n": 39,
+     "verdict": "ok"
+    },
+    {
+     "n": 40,
+     "verdict": "ok"
+    },
+    {
+     "n": 41,
+     "verdict": "ok"
+    },
+    {
+     "n": 42,
+     "verdict": "ok"
+    },
+    {
+     "n": 43,
+     "verdict": "ok"
+    },
+    {
+     "n": 44,
+     "verdict": "ok"
+    },
+    {
+     "n": 45,
+     "verdict": "ok"
+    },
+    {
+     "n": 46,
+     "verdict": "ok"
+    },
+    {
+     "n": 47,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Deterministic name list; correct but never addresses use of LRUCache in other files."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    }
+   ],
+   "note": "True absence claims meet F1 (Amendment 1); never states cache.py defines LRUCache, so F2 not_met."
+  },
+  "R9": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Name list; correct but never addresses use of LRUCache in other files."
+  }
+ }
+}

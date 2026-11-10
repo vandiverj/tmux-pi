@@ -1,0 +1,12 @@
+# M2b: tests and docs still name openai/gpt-6-sol after M2
+
+## Signal
+Main's full two-mode suite on integrate d496bdd (M2 + T1b + H10): 387 distinct failing names outside the baseline, in 20 modules (list: m2b-off-baseline.txt). All but the F-FLAKE family come from M2: M2 replaced `openai/gpt-6-sol` with `openai/gpt-6.1-sol` in config/model-catalog.json, and test fixtures that dispatch through the committed catalog still name the old model, e.g. tests/lane_fixture.py:18 `MODEL = "openai/gpt-6-sol"` -> "tp-agent: model openai/gpt-6-sol is not in the model catalog". M2's worker ran only the five routing modules, which use fixture catalogs.
+
+## Task (lane gpt61, step M2b)
+1. Before any edit, run each failing module once (sanitized, outside mode; bound 300s; test_lane_recovery takes ~130s) and save the counts: test_autonomy, test_contract, test_decisions_gate, test_failing_tests, test_lane_lease, test_lane_other_paths, test_lane_recovery, test_lane_remove, test_lane_steps, test_lane_writer, test_main_notify, test_orchestration, test_process_end, test_refusal_remedies, test_router_floor_followups, test_session_resolution, test_t9_small_faults, test_trial_shadow.
+2. Every test or fixture that passes a model to the real catalog uses `openai/gpt-6.1-sol`. Mind effort: on mid it allows only low and medium; strong (high) is hidden and unrostered. A test that dispatches it with high, xhigh, max, off or minimal must pick an effort the test means (usually medium), or a model that allows that effort; never widen the catalog. Fixture catalogs that build their own levels (tests/route_fixture.py SOL) may keep gpt-6-sol only where the test is about a legacy or fixture-only id; say which in the report.
+3. Docs/examples that suggest a model: README.md:40, agent/extensions/subagents.ts:155 (description string), agent/settings.example.json:3 -> gpt-6.1-sol.
+4. No change to config/ or lib/. If a failure is not about the model id or its effort, stop and report it with the traceback line.
+5. After: rerun the same modules; every failure left must be in docs/plans/det-prep/baseline-failing.txt (that file lives on main: /Users/jerrickvandiver/Documents/Projects/tmux-pi/docs/plans/det-prep/baseline-failing.txt). Main runs inside mode.
+6. Run `git diff` and `git status` as standalone commands, never chained (H27). Do not search .env files or your own task-dir logs with rg; read your logs with plain `tail`/`grep` on the file.

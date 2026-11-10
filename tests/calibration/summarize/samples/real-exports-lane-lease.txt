@@ -1,0 +1,8 @@
+- lane_lease.py has a read function [real/lib/lane_lease.py:60]
+- lane_lease.py has a live function [real/lib/lane_lease.py:85]
+- lane_lease.py has a blocking function [real/lib/lane_lease.py:103]
+- lane_lease.py has a conflicts function [real/lib/lane_lease.py:108]
+- read gives the holders recorded for a lane, stale ones included, and refuses a lease file that cannot be read or does not validate [real/lib/lane_lease.py:61]
+- live keeps only the holders that are still running, found by their pid or by a process started from the task's run.sh [real/lib/lane_lease.py:86]
+- blocking gives the holders that keep a task out: any holder blocks a writer, and only a writer blocks a reader [real/lib/lane_lease.py:104]
+- conflicts gives the live holders that a new task could not run beside, and it needs no lock because it only reads [real/lib/lane_lease.py:109-110]

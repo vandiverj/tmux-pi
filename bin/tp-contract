@@ -44,6 +44,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import pane_send  # noqa: E402
 import safe_write  # noqa: E402
 from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
                       escalation_record, extension, is_local, ledger_row, load_research, message, note,
@@ -226,11 +227,9 @@ def cmd_status(args):
         print("{}\x1f{}\x1f{}".format(meta.get("id", d.name), life, detail))
 
 
-def send(pane, text):
-    """Type a message into a worker the way the dispatcher does: literal text, then Enter."""
-    subprocess.run(["tmux", "send-keys", "-t", pane, "-l", text.replace("\n", " ")], check=True)
-    time.sleep(0.3)
-    subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+def send(pane, text, task_dir=None):
+    """Type a message into a worker: literal text, a pause, Enter, then confirm it was submitted (lib/pane_send.py)."""
+    return pane_send.send(pane, text, task_dir=task_dir)
 
 
 def cmd_enforce(_args):
@@ -274,7 +273,10 @@ def cmd_enforce(_args):
                     subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "C-u"], check=True)
                     time.sleep(0.1)
             else:
-                send(meta["pane"], text_)
+                sent = send(meta["pane"], text_, task_dir=d)
+                if not sent["submitted"]:
+                    print("tp-contract: the {} message to {} was typed but not confirmed submitted after {} Enter(s)".format(
+                        action.split("@")[0], meta.get("id", d.name), sent["attempts"]), file=sys.stderr)
         except subprocess.CalledProcessError:
             continue
         print(json.dumps({"id": meta.get("id", d.name), "action": action.split("@")[0], "reason": reason,

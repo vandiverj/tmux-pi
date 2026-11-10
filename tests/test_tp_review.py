@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 
+import lib_closure
+
 ROOT = Path(__file__).resolve().parent.parent
 SECRET = "SECRET-REQUEST-BODY"
 # The round-1 context list, claims last (packet_order claims-last:v1): the request (a), the scope (b), the diff (c), the other
@@ -22,8 +24,10 @@ PLAN = {"review": "required", "policy": "required",
 
 
 class TpReviewTests(unittest.TestCase):
-    TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py")   # the last two: the files contract.py's lifecycle and bin/tp-agent read
+    TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "command_wrappers.py", "redact.py", "redact_rules.py", "redaction_store.py",
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py", "trust_dialog.py", "pane_send.py")   # autonomy, owner_confirm, trust_dialog: the files contract.py's lifecycle and bin/tp-agent read; pane_send: bin/tp-agent imports it at load (MS1)
+    # tp-agent imports these inside the commands that route, escalate and pick context; tp-review's tests only run its pause classifier.
+    NOT_COPIED_ON_PURPOSE = (("model_router", "bin/tp-agent"), ("router_catalog", "bin/tp-agent"), ("context_broker", "bin/tp-agent"))
 
     @classmethod
     def setUpClass(cls):
@@ -89,6 +93,12 @@ echo review-1
         (self.task / "result.md").write_text("result.md\nRESULT_STATUS: complete\n")
         (self.task / "state.json").write_text('{"state":"waiting"}')
         (self.task / "request.md").write_text("do it\n")
+
+    def test_the_install_copy_holds_every_lib_module_its_files_import(self):
+        # A module split out of a copied one (command_wrappers out of sensitive_read) is imported at run time only, so a copy
+        # without it fails there with "No module named"; this names the module and who imports it before any test runs a script.
+        missing = lib_closure.missing_imports(ROOT / "lib", self.template, self.NOT_COPIED_ON_PURPOSE)
+        self.assertEqual(missing, {}, "TEMPLATE_LIBS is missing modules:" + lib_closure.describe(missing))
 
     def stub(self, name, body):
         path = self.root / "bin" / name
@@ -376,6 +386,31 @@ echo review-1
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("without dropping author evidence", r.stderr)
         self.assertFalse(self.log.exists())  # nothing was started, and no part of the diff was dropped to make it fit
+
+    def test_a_large_verified_copy_keeps_the_packet_under_the_limit_and_the_same_lane_without_the_manifest_is_refused(self):
+        # FC1: a copy of a committed file that frozen-copies.json vouches for is named, not repeated; without the manifest the
+        # same 330000-char copy is refused as before (the limit is not raised and nothing is dropped)
+        self.git("init", "-q")
+        (self.work / "vendor").mkdir()
+        (self.work / "vendor" / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(30000)))
+        self.git("add", "-A")
+        self.git("commit", "-qm", "first")
+        head = subprocess.run(["git", "-C", str(self.work), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+        (self.work / "fx").mkdir()
+        shutil.copyfile(self.work / "vendor" / "big.txt", self.work / "fx" / "big.txt")
+        r = self.review()  # no manifest: the copy is an ordinary 330000-char addition
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("without dropping author evidence", r.stderr)
+        self.assertFalse(self.log.exists())
+        manifest = {"copies": [{"path": "big.txt", "source": "vendor/big.txt", "commit": head}]}
+        (self.work / "fx" / "frozen-copies.json").write_text(json.dumps(manifest))
+        r = self.review()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        packet = "".join(self.copy(p).read_text() for p in self.spawn_contexts()) + self.task_text()
+        self.assertLess(len(packet), 100000)
+        self.assertIn(f'"fx/big.txt" (added): byte-identical to {head}:vendor/big.txt (blob ', packet)
+        self.assertIn("fx/frozen-copies.json", packet)  # the manifest itself is an ordinary changed file, shown in full
+        self.assertNotIn("line 29999", packet)
 
     def test_the_suggested_commands_are_literal_so_a_magic_file_name_cannot_select_a_withheld_file(self):
         self.git("init", "-q")

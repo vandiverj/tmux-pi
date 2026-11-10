@@ -46,10 +46,20 @@ def strict_meta(path, override=""):
     return value
 
 
+def _no_server(stderr):
+    """True when tmux says there is no server to ask (none started on the socket, or a socket nobody listens on). Any other
+    failure (permission, a broken tmux) is not this and still refuses."""
+    text = stderr.strip()
+    return text.startswith("no server running") or (
+        text.startswith("error connecting to") and text.endswith(("(No such file or directory)", "(Connection refused)")))
+
+
 def pane_table():
-    """{pane id: (alive, pid)} for every tmux pane. An unreadable table, or any row of it that does not parse, refuses:
-    a guess could end the wrong process or let a second writer start."""
+    """{pane id: (alive, pid)} for every tmux pane; {} when no tmux server is running. An unreadable table, or any row of it
+    that does not parse, refuses: a guess could end the wrong process or let a second writer start."""
     run = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead} #{pane_pid}"], text=True, capture_output=True)
+    if run.returncode and _no_server(run.stderr):
+        return {}  # no server means no live pane: nothing can be alive in one
     if run.returncode:
         raise RuntimeError(f"cannot read tmux panes: {run.stderr.strip() or 'tmux failed'}. Run this from inside the tmux session "
                            "(`tmux list-panes -a` must work there), then try again")

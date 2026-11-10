@@ -1,0 +1,179 @@
+{
+ "copies": [
+  {
+   "path": "RUBRIC.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/RUBRIC.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "diff-order.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/diff-order.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "diff-order.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/diff-order.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "diff-settings.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/diff-settings.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "diff-settings.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/diff-settings.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-cache.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-cache.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-cache.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-cache.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-jobq.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-jobq.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-jobq.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-jobq.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-worker.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-worker.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "exports-worker.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/exports-worker.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "key.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/key.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/base.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/base.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/pi.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/pi.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t1.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t1.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t2.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t2.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t3.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t3.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t4.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t4.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t5.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t5.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t6.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t6.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "runs/t7.jsonl",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/runs/t7.jsonl",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-deploy.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-deploy.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-deploy.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-deploy.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-retries.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-retries.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-retries.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-retries.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-states.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-states.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "steps-states.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/steps-states.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "sum-lifecycle.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/sum-lifecycle.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "sum-lifecycle.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/sum-lifecycle.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "sum-worker.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/sum-worker.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "sum-worker.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/sum-worker.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "use-jobqueue.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/use-jobqueue.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "use-jobqueue.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/use-jobqueue.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "use-lrucache.grade.json",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/use-lrucache.grade.json",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  },
+  {
+   "path": "use-lrucache.md",
+   "source": "docs/plans/det-prep/ls1c-meaning-2026-11-09/use-lrucache.md",
+   "commit": "898eeb244671fce0150820e51110b489ff0afbec"
+  }
+ ]
+}

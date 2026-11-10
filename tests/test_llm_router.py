@@ -293,6 +293,30 @@ class DirectChatTests(ChainTestCase):
             (self.base / "evals" / model_router.SELECTIONS).read_text().splitlines()[-1])["attempts"][0]["error"])
         self.assertEqual(self.models_called(), [])
 
+    def test_a_transport_setup_error_is_a_failed_attempt_not_a_traceback(self):
+        # was: a timeout the socket cannot convert raised OverflowError out of call (the catalog now bounds timeouts at
+        # load; this is the second line: whatever the transport raises while it is set up is a failed attempt)
+        import socket
+        entry = next(e for e in CAT["router"]["chain"] if e.get("transport") == "direct_chat")
+
+        def offline_timeout(request, timeout):  # the urllib transport's own timeout conversion; nothing connects
+            sock = socket.socket()
+            try:
+                sock.settimeout(timeout)
+            finally:
+                sock.close()
+
+        def raises(exc):
+            def opener(request, timeout):
+                raise exc
+            return opener
+        for label, opener, timeout in (("1e100 timeout", offline_timeout, 1e100), ("OverflowError", raises(OverflowError("x")), 5),
+                                       ("ZeroDivisionError", raises(ZeroDivisionError("x")), 5)):
+            with self.subTest(label):
+                got = llm_router.call(entry, "low", "s", "u", timeout, opener=opener)
+                self.assertFalse(got["ok"])
+                self.assertIn("Error", got["error"])
+
     def test_a_server_error_and_a_cut_off_reply_fail_the_router(self):
         self.script(chat=[{"status": 500}])
         with self.assertRaises(model_router.RouteStop):
@@ -413,9 +437,14 @@ class ShippedChainTests(ChainTestCase):
         self.assertEqual((confirmation["asked"], confirmation["confirmed_by"], confirmation["first_level"], confirmation["level"]),
                          (QWEN, HAIKU, 4, 3))
         # Haiku's pick stands even when it is the one that goes up
-        self.script(chat=text((4, "high")), claude=text((4, "high", "required", None, "breadth")))
+        # The shipped router prompt now lists five levels (strong is 4, top is 5); top was 4 while strong was hidden.
+        self.script(chat=text((4, "high")), claude=text((5, "high", "required", None, "breadth")))
         r = self.select(role="architect")
         self.assertEqual((r["decided_by"], r["level"], r["model"]), (HAIKU, "top", OPUS))
+        # and a router that picks the new level 4 gets strong: gpt-6.1-sol at high
+        self.script(chat=text((4, "high")), claude=text((4, "high", "required", None, "big review")))
+        r = self.select(role="architect")
+        self.assertEqual((r["decided_by"], r["level"], r["model"], r["effort"]), (HAIKU, "strong", "openai/gpt-6.1-sol", "high"))
 
     def test_qwen_picks_the_local_level_for_an_unqualified_shape_and_haiku_is_asked(self):
         self.script(chat=text((1, "low", "none", None, "lookup")), claude=text((2, "low", "none", "small_edit", "small")))

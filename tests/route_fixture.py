@@ -39,10 +39,17 @@ def shipped_catalog():
     return router_catalog.load_catalog(CATALOG_PATH)
 
 
-def fixture_catalog(order=DEFAULT_ORDER, confirm=False):
+def fixture_catalog(order=DEFAULT_ORDER, confirm=False, strong_shown=False):
     """The shipped catalog with its router chain reordered to `order` (model names). Each entry keeps its shipped transport,
-    limits, cap and thinking setting; its confirm rule is dropped unless confirm=True, so a test adds the rule it exercises."""
+    limits, cap and thinking setting; its confirm rule is dropped unless confirm=True, so a test adds the rule it exercises.
+    The shipped catalog offers the strong level; the fixture hides it (and unrosters its model) unless strong_shown=True, so
+    the tests of the hidden-level mechanics and of the four-level router prompt keep a hidden level to work on."""
     cat = copy.deepcopy(json.loads(CATALOG_PATH.read_text(encoding="utf-8")))
+    if not strong_shown:
+        strong = next(lv for lv in cat["levels"] if lv["key"] == "strong")
+        strong["shown"] = False
+        for model in strong["models"]:
+            model["in_roster"] = False
     by_model = {e["model"]: e for e in cat["router"]["chain"]}
     chain = [by_model[m] for m in order]
     if not confirm:
@@ -56,9 +63,9 @@ def catalog(order=DEFAULT_ORDER):
     return fixture_catalog(order)
 
 
-def write_catalog(path, order=DEFAULT_ORDER, change=None):
+def write_catalog(path, order=DEFAULT_ORDER, change=None, strong_shown=False):
     """Write a fixture catalog (optionally edited by change(cat)) to path and return the path."""
-    cat = fixture_catalog(order)
+    cat = fixture_catalog(order, strong_shown=strong_shown)
     if change:
         change(cat)
     Path(path).write_text(json.dumps(cat))
@@ -162,9 +169,9 @@ class Stubs:
     """Stub claude and pi on a private bin dir, and the local chat endpoint. script maps "claude", "pi/<model>" or
     "chat" (the direct local router) to steps."""
 
-    def __init__(self, base, script, order=DEFAULT_ORDER):
+    def __init__(self, base, script, order=DEFAULT_ORDER, strong_shown=False):
         self.base = Path(base)
-        self.catalog_path = write_catalog(self.base / "fixture-catalog.json", order)
+        self.catalog_path = write_catalog(self.base / "fixture-catalog.json", order, strong_shown=strong_shown)
         self.bin = self.base / "stubbin"
         self.bin.mkdir(parents=True, exist_ok=True)
         self.log = self.base / "stub.log"

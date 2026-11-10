@@ -1,0 +1,7 @@
+- 1. phase 2 comes first, with B1, C2 and E2 [real/docs/plans/det-prep/README.md:152-153]
+- 2. phase 3 follows, with B2 and D2 [real/docs/plans/det-prep/README.md:152-153]
+- 3. J1 and its control runs [real/docs/plans/det-prep/README.md:152-153]
+- 4. H1 comes after the control runs [real/docs/plans/det-prep/README.md:152-153]
+- 5. i1 to i4 come next [real/docs/plans/det-prep/README.md:152-153]
+- 6. the prompt-examples cleanup [real/docs/plans/det-prep/README.md:152-153]
+- 7. the improvement loop in loop/PROTOCOL.md, with a research run first and then cycles [real/docs/plans/det-prep/README.md:152-153]

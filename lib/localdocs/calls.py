@@ -3,6 +3,8 @@
 Result states, as logged: hit (an answer), miss (a valid request with no answer: not found, no pinned version, no index),
 rejected (the read-only rules refused the request), error (a bug; the text says so without a traceback).
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from . import guard, index, log, signature

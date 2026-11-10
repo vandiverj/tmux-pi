@@ -142,3 +142,16 @@ F1 and G1 can start now beside Phase 1 (no shared files). After I lands, `docs/p
 rules tmux-pi now enforces; that edit is a `small` coder step with the list of rules as its input. One rule there is
 already stale: `04-tmux-pi-operations.md` says a REQUEST_CHANGES with no `code` finding is "not built yet", but
 lib/review_verdict.py already treats it as unusable.
+
+## Added 2026-11-07 (2): benchmark and improvement loop
+
+| Lane | Steps | Brief | Waits for | Level |
+|---|---|---|---|---|
+| J `bench` | j1 | `j1-benchmark.md` | E1, E2 merged | mid |
+
+Order of the remaining work: Phase 2 (B1 C2 E2), Phase 3 (B2 D2), J1 and its control runs, H1, i1 to i4, the
+prompt-examples cleanup, then the improvement loop in `loop/PROTOCOL.md` (research run first, then cycles). The loop's
+state is entirely in `loop/`; read `loop/PROTOCOL.md` after any compaction.
+
+## Added 2026-11-07 (3): lane K `sensitive-grep`
+The owner opened K1 (`k1-tracked-git-grep.md`): a plain `git grep` over agent/, config/ or claude/ stops prompting when git tracks no credential file there. It is based on lane/integrate, the coder is Opus, and it gets a cross-provider review. Fix A, the reviewer instruction in `bin/tp-review:219`, is folded into D2. Until then, Main appends `review-search-note` text to every review's evidence.

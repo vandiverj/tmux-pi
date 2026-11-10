@@ -189,6 +189,12 @@ class BuildTests(unittest.TestCase):
         text = family_sweep.build(state, "author-2", None)
         self.assertLessEqual(len(text.encode()), family_sweep.SWEEP_BUDGET)
         self.assertLess(family_sweep.SWEEP_BUDGET, family_sweep.SPAWN_MAX_FILE)
+        # the attack on the rule is fixed text, complete even here: after the search, before the table, the Attack: line under it
+        self.assertEqual(text.count("## Attack the rule"), 1)
+        self.assertLess(text.index("## Find the sites no review cited"), text.index("## Attack the rule"))
+        self.assertLess(text.index("## Attack the rule"), text.index("## Table to report"))
+        self.assertIn("`Attack: <cases> cases, <matches> matched, <fixed> mismatches fixed; script <path>; log <path>`",
+                      text[text.index("| (sites you found) | | |"):])
         for n in range(1, 5):
             self.assertIn(f"- `lib/s{n}.py:{n}` (cited by review-1, review-2)", text)
             self.assertIn(f"| `lib/s{n}.py:{n}` | | |", text)

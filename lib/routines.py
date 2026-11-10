@@ -27,7 +27,6 @@ UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 TASKID = re.compile(r"\b(?:coder|researcher|tester|review|architect|investigator)-[0-9a-f]{6,}(?:-[0-9a-f]+)*\b")
 PATH = re.compile(r"(?<![\w.-])(?:~|\.{0,2})?/[^\s'\";|&)(<>]+")
 REL_PATH = re.compile(r"(?<![\w.@<>/:-])[\w.@-]+/[^\s'\";|&)(<>]*")  # src/a.ts, origin/main, tests/
-LANE = re.compile(r"\bdmp-\d+[\w-]*")
 QUOTED = re.compile(r"'[^']{25,}'|\"[^\"]{25,}\"")
 NUM = re.compile(r"\b\d+\b")
 HEREDOC = re.compile(r"<<(?!<)-?\s*['\"]?(\w+)['\"]?.*", re.S)
@@ -38,51 +37,58 @@ FETCH_PROBE = "git fetch"  # matched on git's parsed subcommand (git_subcommands
 GIT_VALUE_SHORT = ("-C", "-c")
 GIT_VALUE_LONG = ("--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env")
 
-# Probes over a Bash command (heredoc bodies already cut out).
-PROBES = {
-    "deno binary path discovery (mise path/which deno)": r"mise/installs/deno|DENO=|which deno|command -v deno|deno --version",
-    "gitleaks run": r"gitleaks",
-    "semgrep run": r"semgrep",
-    "node_modules/.bin lookup (ls/which)": r"ls [^;|&]*node_modules/\.bin|which (prettier|jest|tsc)|ls [^;|&]*node_modules( |$)",  # before the tool probes it names
-    "prettier --check/--write": r"prettier",
-    "eslint": r"\beslint\b",
-    "web jest zod4 scratch config": r"jest\.zod4|zod4",
-    "path with (protected) parens in a command": r"\(protected\)",
-    "jest --runTestsByPath": r"runTestsByPath",
-    "web jest (any)": r"\bjest\b",  # general, so after the jest probes it is a part of
-    "api DB test wrapper api-db-test*.sh": r"api-db-test",
-    "direct deno task test": r"deno task test|\$DENO test|deno test",
-    "revert deno.lock/deno.test.json after tests": r"checkout -- [^;&]*deno\.(lock|test\.json)|git checkout [^;&]*deno\.lock",
-    "typecheck (tsc / deno check)": r"\btsc\b|deno check|npm run typecheck",
-    "gate: npm run check:*": r"npm run check:",
-    "gate: npm run smoke:*": r"npm run smoke:",
-    "npm run build": r"npm run build",
-    "drizzle migration/journal/snapshot": r"drizzle|_journal|snapshot\.json|prevId|meta/\d{4}",
-    "lane base / merge-base / origin base": r"merge-base|sprint2-base|origin/DMP|origin/develop",  # never sees a `git fetch` invocation (see keys_for)
-    FETCH_PROBE: r"(?!)",  # set by keys_for from git_subcommands; the entry only fixes its place in the order
-    "git status/log orientation": r"git (-C \S+ )?(status|log --oneline|branch --show-current)",
-    "git add+commit": r"git (-C \S+ )?commit",
-    "read review report": r"review-[\w-]+/report\.md|tasks/review",
-    "tp-agent --help/-h/help": r"tp-agent (--help|-h|help)\b",
-    "tp-agent request": r"tp-agent request\b",
-    "tp-agent (any)": r"tp-agent",  # general, so after the exact tp-agent probes
-    "test-runs log dir (campaign logs)": r"test-runs/",
-    "pre-commit gate bundle (prettier|eslint|gitleaks|tsc|deno check)": r"prettier|\beslint\b|gitleaks|\btsc\b|deno check",
-    "find prior task dir (ls .../tasks)": r"ls [^|;&]*tasks(/| |$)|ls -t[^|;&]*tasks|find [^|;&]*tasks",
-    "find worktree (worktree list / ls Projects)": r"git (-C \S+ )?worktree list|ls [^|;&]*airtera-monorepo-wt|ls [^|;&]*Projects( |$)",
-    "serialized 5-run loop": r"for \w+ in (1 2 3 4 5|\$\(seq 1 5\)|\{1\.\.5\})|seq 1 5",
-    "check-requirements prototype script": r"check:requirements|check-requirements",
-}
+# Probes live in config/routines.json (most are specific to the Airtera/DMP monorepo): "probes" over a Bash
+# command (heredoc bodies already cut out), "path_probes" over the path a Read / Edit / Write call targets, and
+# "lane_pattern" for lane names. Order is significant (specific before the general probe it is part of).
+CONFIG = os.environ.get("TP_ROUTINES_CONFIG") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "routines.json")
 
-# Probes over the path a Read / Edit / Write tool call targets.
-PATH_PROBES = {
-    "Read: lane/brief common brief (lane-common/brief-common)": r"lane-common|brief-common",
-    "Read: campaign research/decision doc": r"campaigns/[^/]+/(research|briefs/sprint|cases)/",
-    "Read: review report.md": r"review-[\w-]+/report\.md|tasks/review",
-    "Read: prototype (engineering-context damp-prototype)": r"engineering-context/domains/drug/damp-prototype",
-    "Write/Edit: scratch jest zod4 config": r"jest\.zod4",
-    "Read: prior task result/report": r"tasks/(coder|researcher|tester)-[0-9a-f]+/(result|report)\.md",
-}
+
+def _read_config(path, whole):
+    """The config document at PATH, checked. `whole`: lane_pattern, probes and path_probes are all required;
+    otherwise (a project override) each is optional. Raises ValueError naming the file and the problem."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as err:
+        raise ValueError("cannot read routines config {}: {}".format(path, err))
+    try:
+        if not isinstance(doc, dict):
+            raise TypeError("the top level must be an object")
+        if whole:
+            doc["lane_pattern"], doc["probes"], doc["path_probes"]
+        lane = doc.get("lane_pattern", "")
+        tables = [doc.get("probes", {}), doc.get("path_probes", {})]
+        if not isinstance(lane, str) or not all(isinstance(t, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in t.items()) for t in tables):
+            raise TypeError("lane_pattern must be a string, probes and path_probes objects of name -> regex")
+        for rx in (lane, *tables[0].values(), *tables[1].values()):
+            re.compile(rx)
+    except (KeyError, TypeError, re.error) as err:
+        raise ValueError("bad routines config {}: {!r}".format(path, err))
+    return doc
+
+
+def _merged(base, extra):
+    """BASE with EXTRA on top: a name BASE has keeps its place with the new regex; new names go first (a project's
+    own probes are more specific than the shared ones)."""
+    return {**{k: v for k, v in extra.items() if k not in base}, **{k: extra.get(k, v) for k, v in base.items()}}
+
+
+def load_config(path=CONFIG, project=None):
+    """(lane regex, PROBES, PATH_PROBES) from the routines config, with PROJECT's optional override
+    (PROJECT/.tmux-pi/routines.json, same keys, all optional) merged on top. lane_pattern replaces the shared one."""
+    doc = _read_config(path, True)
+    lane, probes, path_probes = doc["lane_pattern"], doc["probes"], doc["path_probes"]
+    if project:
+        over = os.path.join(project, ".tmux-pi", "routines.json")
+        if os.path.isfile(over):
+            extra = _read_config(over, False)
+            lane = extra.get("lane_pattern") or lane
+            probes = _merged(probes, extra.get("probes", {}))
+            path_probes = _merged(path_probes, extra.get("path_probes", {}))
+    return re.compile(lane), probes, path_probes
+
+
+LANE, PROBES, PATH_PROBES = load_config()
 
 # pi names its tools in lower case; fold them onto the Claude names the probes are written for.
 PI_TOOLS = {"bash": "Bash", "read": "Read", "edit": "Edit", "write": "Write", "grep": "Grep", "find": "Glob"}
@@ -213,6 +219,20 @@ PROBE_ORDER = list(PROBES) + list(PATH_PROBES)  # table order: most specific fir
 def first_probe(probes):
     """The one probe that claims a call (`exclusive`): the first in table order, or None."""
     return next((p for p in PROBE_ORDER if p in probes), None)
+
+
+def use_project_config(project):
+    """Make PROJECT's merged probes the module's tables; returns what to hand to restore_config."""
+    global LANE, PROBES, PATH_PROBES, PROBE_ORDER
+    saved = (LANE, PROBES, PATH_PROBES, PROBE_ORDER)
+    LANE, PROBES, PATH_PROBES = load_config(project=project)
+    PROBE_ORDER = list(PROBES) + list(PATH_PROBES)
+    return saved
+
+
+def restore_config(saved):
+    global LANE, PROBES, PATH_PROBES, PROBE_ORDER
+    LANE, PROBES, PATH_PROBES, PROBE_ORDER = saved
 
 
 def call_key(call):
@@ -563,8 +583,12 @@ def run(project, role="", since="", min_tasks=3, as_json=False, out="", until=""
         previous, why = load_state(counts_path(out))
         if why:
             warnings.append(why)
-    roles = mine(find_tasks(sessions, since=since, role=role or None, until=until))
-    report = build_report(roles, previous, min_tasks, since=since, until=until, role=role, project=project)
+    saved = use_project_config(project)
+    try:
+        roles = mine(find_tasks(sessions, since=since, role=role or None, until=until))
+        report = build_report(roles, previous, min_tasks, since=since, until=until, role=role, project=project)
+    finally:
+        restore_config(saved)
     body = json.dumps(report, indent=2) + "\n" if as_json else render_text(report)
     if not out:
         return body, warnings

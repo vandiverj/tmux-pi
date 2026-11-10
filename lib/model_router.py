@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import llm_router  # noqa: E402
+from builtin_route_policy import BUILTIN_POLICY  # noqa: E402
 import route_card  # noqa: E402
 import route_resolve as rr  # noqa: E402
 import router  # noqa: E402
@@ -87,64 +88,26 @@ def explicit_pair(cat, worker, model):
     return worker or (known["worker"] if known else "pi" if "/" in model else "claude")
 
 
-def _raw_catalogs(catalog_path):
-    """The catalog files that might say what a role's floor is, read leniently (the selected one failed validation, so
-    nothing in it is trusted beyond what is checked below): the selected file, then the shipped one. Unreadable ones are skipped."""
-    found = []
-    for path in dict.fromkeys(str(p) for p in (catalog_path or os.environ.get("TP_MODEL_CATALOG") or rc.CATALOG_PATH, rc.CATALOG_PATH)):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
-            found.append(data)
-    return found
-
-
-def _at_or_above_floor(raw, role, model):
-    """True when the raw catalog puts `model` in a level at or above the role's min_level; False on anything malformed."""
-    try:
-        keys = [level["key"] for level in raw["levels"]]
-        floor = keys.index(raw["roles"][role]["min_level"])
-        return any(entry["model"] == model for level in raw["levels"][floor:] for entry in level["models"])
-    except (KeyError, IndexError, TypeError, ValueError):
-        return False
-
-
-def _emergency(config, worker, role=None, catalog_path=None):
-    """Last resort when the catalog cannot be read: the legacy router config's ordinary pair.
-
-    A model is returned only for a role that a leniently read catalog file names. A role with a strict floor, or with any min_level (the catalog is invalid, so a lost strict_floor flag is not trusted), gets the
-    pair only when it is confirmed at or above the floor; it is never replaced by another model of the worker. When no
-    readable catalog names the role (including an invalid shipped catalog that lost it) nothing is routed."""
-    if not config:
-        raise RouteStop("model catalog and router config are both unreadable; choose a model explicitly with --model")
-    fallback = (config.get("claude_preference", {}).get("ordinary", {}) if worker == "claude"
-                else config.get("routes", {}).get("coding", {}))
-    entry = next((m for m in config["models"] if m["model"] == fallback.get("model")), None)
-    fits = bool(entry) and not (worker and entry["worker"] != worker)
-    raws = _raw_catalogs(catalog_path)
-    if not raws:
-        raise RouteStop("model catalog unreadable and no catalog file can say what role {} may run on, so it is not routed; "
-                        "fix the catalog".format(role))
-    named = [raw["roles"][role] for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)]
-    if not named:
-        # Absence of the role in a catalog that failed validation is not evidence that it has no floor.
-        raise RouteStop("model catalog unreadable and no catalog file confirms the floor of role {}, so it is not routed; "
-                        "fix the catalog or use --model".format(role))
-    strict = [raw for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)
-              and (raw["roles"][role].get("strict_floor") or "min_level" in raw["roles"][role])]
-    if strict:
-        if not fits or not all(_at_or_above_floor(raw, role, entry["model"]) for raw in strict):
-            raise RouteStop("model catalog unreadable and the configured fallback ({}) cannot be confirmed at or above the floor "
-                            "of role {} for worker {}, so the user must decide (use --model)".format(fallback.get("model"), role, worker))
-    elif not fits:
-        entry = next((m for m in config["models"] if not worker or m["worker"] == worker), None)
-    if not entry:
-        raise RouteStop("no model available for worker {}".format(worker))
-    thinking = fallback.get("thinking") if fallback.get("thinking") in entry["thinking"] else entry["thinking"][0]
-    return entry["worker"], entry["model"], thinking
+def _builtin_route(req):
+    """The route record of the built-in policy for a request: its worker (default pi), that worker's model, and the
+    effort it asks for (default medium) within its cap (high unless --approve-effort) mapped onto what the model allows.
+    Raises ValueError for an effort or worker the policy does not have."""
+    policy = BUILTIN_POLICY
+    order = list(policy["effort_order"])
+    want = req.get("thinking") or policy["default_effort"]
+    if want not in order:
+        raise ValueError("effort {!r} is not one of: {}".format(want, ", ".join(order)))
+    worker = req.get("worker") or policy["default_worker"]
+    if worker not in policy["models"]:
+        raise ValueError("worker {!r} is not one of: {}".format(worker, ", ".join(policy["models"])))
+    model, efforts = policy["models"][worker]
+    cap = rr.effort_cap(order, policy["ceiling"], bool(req.get("approve_effort")))
+    steps = ["effort {} capped at {} (no approval recorded)".format(want, cap)] if order.index(want) > order.index(cap) else []
+    effort, note = rr.pick_effort(order, want, list(efforts), cap, model)
+    if effort is None:
+        return {"source": "stop_and_ask", "reason": note, "steps": steps}
+    return {"source": "catalog_error_fallback", "worker": worker, "model": model, "effort": effort,
+            "steps": steps + ([note] if note else [])}
 
 
 def write_selection(record, base=None):
@@ -229,10 +192,19 @@ def task_paths(task, deliverable="", context=()):
     return sorted({path.rstrip(".,;:") for path in found if path})
 
 
-def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path=None, log=True, opener=None):
+def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path=None, log=True, opener=None, catalog=None):
     """Choose a worker, model and effort for a request. req keys: task, role, deliverable, context, workdir, worker,
-    model, thinking, level, local_only, approve_effort. Returns a dict with worker, model, thinking and the record
-    of how they were chosen; raises ValueError for a bad request and RouteStop when the user must decide."""
+    model, thinking, level, local_only, approve_effort, escalate. Returns a dict with worker, model, thinking and the
+    record of how they were chosen; raises ValueError for a bad request and RouteStop when the user must decide.
+
+    escalate ({"from": the failed attempt's meta, "gate": rule-first|design|None, "optional": bool}) asks for the next
+    route after that attempt instead of the router's pick (with no --model or --level). It is chosen under the same
+    constraints as any route of this request (route_ctx: the request's own paths, local-only, --worker, approvals,
+    --thinking as the effort, the effort ceiling). With an unreadable catalog only a request that names no level takes
+    the fallback (BUILTIN_POLICY, which reads no catalog bytes); --level, a gated retry and --escalate stop, since the
+    catalog defines the levels. When nothing stronger is allowed, an optional escalation (a gated retry) is routed as an ordinary request and the result's
+    escalation_note says why; a required one (--escalate) stops. The result of a request with escalate carries
+    escalation_note (None when it escalated)."""
     started = time.monotonic()
     worker, model, thinking = req.get("worker"), req.get("model"), req.get("thinking")
     if model and req.get("level"):
@@ -241,9 +213,12 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
     # The card is built and hashed before anything branches, so every selection record, explicit ones included, carries it.
     card = route_card.build_card(req.get("role"), req.get("task", ""), req.get("deliverable", ""), req.get("context") or (),
                                  req.get("workdir"))
+    escalation = req.get("escalate") if not (model or req.get("level")) else None
+    if escalation and (escalation["from"].get("route_info") or {}).get("local_only"):
+        req = dict(req, local_only=True)  # the failed attempt was local-only: so is its next route
     local_only = bool(req.get("local_only"))
     try:
-        cat = rc.load_catalog(catalog_path)
+        cat = catalog if catalog is not None else rc.load_catalog(catalog_path)
     except rc.CatalogError as exc:
         if local_only:
             raise RouteStop("model catalog unreadable ({}): a local-only task cannot be checked, so it is not routed".format(str(exc)[:120]))
@@ -252,30 +227,36 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
             # checked, so the choice is refused rather than started unchecked.
             raise RouteStop("model catalog unreadable ({}): --model {} cannot be validated, so it is not routed".format(
                 str(exc)[:120], model))
-        w, m, t = _emergency(config, worker, req.get("role"), catalog_path)
-        return _finish("route", req, None, {"source": "catalog_error_fallback", "worker": w, "model": m, "effort": thinking or t,
-                       "reason": "model catalog unreadable: {}".format(str(exc)[:160]), "steps": []},
-                       card, None, config_error, started, base, log)
-    if thinking and thinking not in cat["effort"]["order"]:
-        raise ValueError("effort {!r} is not one of: {}".format(thinking, ", ".join(cat["effort"]["order"])))
-    if local_only and worker and worker not in {v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}:
-        raise ValueError("--worker {} cannot run local-only work: its models are cloud models; local models run on {}".format(
-            worker, ", ".join(sorted({v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}))))
-    approvals = {"effort_above_high": bool(req.get("approve_effort"))}
-    ctx = {"role": req.get("role"), "approvals": approvals, "local_only": local_only,
-           "require_worker": worker, "est_tokens": estimate_tokens(req.get("task", ""), req.get("deliverable", ""),
-                                                                  req.get("context"), req.get("workdir"))}
-    ctx["paths"] = task_paths(req.get("task", ""), req.get("deliverable", ""), req.get("context"))
+        # Levels are defined by the catalog: a request that names one (--level, or a gated retry, which asks for the
+        # level above the failed attempt) cannot be honored without it, and running the built-in pair in its place
+        # would be a silent rewrite. Only a request with no level takes the built-in policy.
+        if req.get("level"):
+            raise RouteStop("model catalog unreadable ({}): level {} is defined by the catalog and cannot be honored, so it is "
+                            "not routed".format(str(exc)[:120], req["level"]))
+        if escalation and not escalation.get("optional"):
+            raise RouteStop("model catalog unreadable ({}): the next route cannot be worked out, so it is not escalated".format(str(exc)[:120]))
+        if escalation:
+            raise RouteStop("model catalog unreadable ({}): the gated retry{} asks for the level above {}, which the catalog "
+                            "defines, so it is not routed".format(str(exc)[:120],
+                                                                  " (--route {})".format(escalation["gate"]) if escalation.get("gate") else "",
+                                                                  escalation["from"].get("model") or "the failed attempt"))
+        rec = _builtin_route(req)
+        if rec["source"] != "stop_and_ask":
+            rec["reason"] = "model catalog unreadable: {}".format(str(exc)[:160])
+        return _finish("route", req, None, rec, card, None, config_error, started, base, log)
+    ctx = route_ctx(req, cat)
     health = read_health(base or os.environ.get("TP_STATE_DIR"))
-    chain = None
+    chain, kind, note, rec = None, "route", None, None
     if model:
         worker = explicit_pair(cat, worker, model)
         ctx["explicit"] = {"model": model, "worker": worker, "thinking": thinking}
         rec = rr.resolve(None, cat, health, ctx, None)
         rec["decided_by_name"], rec["reason"] = "explicit", "explicit dispatch selection"
-    else:
-        if thinking:
-            ctx["explicit_effort"] = thinking
+    elif escalation:
+        rec, kind = _escalated(escalation["from"], escalation.get("gate"), cat, health, ctx), "escalation"
+        if rec["source"] == "stop_and_ask" and escalation.get("optional"):
+            rec, kind, note = None, "route", rec.get("reason") or "no stronger route allowed"
+    if rec is None:
         if req.get("level"):
             if req["level"] not in rc.shown_keys(cat):
                 raise ValueError("level {!r} is not offered; choose one of {}".format(req["level"], ", ".join(rc.shown_keys(cat))))
@@ -303,14 +284,91 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
                 else:
                     rec["reason"] = chain["decision"]["reason"]
     rec["_cat"] = cat
-    if rec["source"] != "stop_and_ask":
+    if rec["source"] != "stop_and_ask" and kind == "route":  # a local rule may not undo an escalation (as before)
         _local_rule(rec, req, config, ctx, health)
-    return _finish("route", req, cat, rec, card, chain, config_error, started, base, log)
+    try:
+        out = _finish(kind, req, cat, rec, card, chain, config_error, started, base, log)
+    except RouteStop as stop:
+        if note:  # the ordinary route of a gated retry stopped too: say both
+            raise RouteStop("{} (the gated retry was not escalated: {})".format(stop, note)) from stop
+        raise
+    return dict(out, escalation_note=note) if escalation else out
+
+
+def route_ctx(req, cat):
+    """The constraints every route of a request is chosen under, whoever picks the level (the router, an explicit
+    --level, escalation): the effort the request names, local-only and its worker, --worker, the effort approval, the
+    size of the request and the paths it names (protected-path floors). Raises ValueError for a bad request."""
+    worker, thinking, local_only = req.get("worker"), req.get("thinking"), bool(req.get("local_only"))
+    if thinking and thinking not in cat["effort"]["order"]:
+        raise ValueError("effort {!r} is not one of: {}".format(thinking, ", ".join(cat["effort"]["order"])))
+    if local_only and worker and worker not in {v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}:
+        raise ValueError("--worker {} cannot run local-only work: its models are cloud models; local models run on {}".format(
+            worker, ", ".join(sorted({v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}))))
+    ctx = {"role": req.get("role"), "approvals": {"effort_above_high": bool(req.get("approve_effort"))}, "local_only": local_only,
+           "require_worker": worker, "est_tokens": estimate_tokens(req.get("task", ""), req.get("deliverable", ""),
+                                                                  req.get("context"), req.get("workdir"))}
+    ctx["paths"] = task_paths(req.get("task", ""), req.get("deliverable", ""), req.get("context"))
+    if thinking and not req.get("model"):
+        ctx["explicit_effort"] = thinking
+    return ctx
+
+
+def _stronger(cat, before, after):
+    """True when route after is above route before: a higher level, or the same level at a higher effort."""
+    keys = rc.level_keys(cat)
+    if after["level_key"] != before["level_key"]:
+        return keys.index(after["level_key"]) > keys.index(before["level_key"])
+    return rr.effort_rank(cat, after.get("effort_abstract")) > rr.effort_rank(cat, before["effort_abstract"])
+
+
+def _escalated(meta, gate, cat, health, ctx):
+    """The route record one step above the failed attempt meta, under ctx (route_ctx of the request being routed).
+    A stop_and_ask record when nothing stronger is allowed: a local-only task with no stronger local option, or a gated
+    retry whose step lands no higher (the top level, or an effort the user fixed with --thinking)."""
+    level, effort = level_effort_of_task(meta, cat)
+    prior = {"level_key": level, "effort_abstract": effort, "model": meta.get("model"), "review": "optional",
+             "decided_by": None}
+    rec = rr.escalate(prior, cat, health, ctx, ctx["approvals"], level_first=bool(gate))
+    if ctx["local_only"] and rec["source"] != "stop_and_ask" and (rec["model"], rec["effort"]) == (meta.get("model"), meta.get("thinking")):
+        rec = dict(rec, source="stop_and_ask", reason="local-only task: no stronger local model or effort to escalate to")
+    if gate and rec["source"] != "stop_and_ask" and not _stronger(cat, prior, rec):
+        rec = dict(rec, source="stop_and_ask", reason="no stronger route than {} at {} is allowed{}".format(
+            level, effort, " with --thinking {}".format(ctx["explicit_effort"]) if ctx.get("explicit_effort") else ""))
+    rec["decided_by_name"] = "gated_retry" if gate else "escalation"
+    rec["reason"] = ("gated retry (--route {}: a repeated finding family), one level up first: {}".format(gate, rec.get("reason") or rec.get("source", ""))
+                     if gate else "escalation after repeated failure: {}".format(rec.get("reason") or rec.get("source", "")))
+    return rec
+
+
+def route_problem(cat, req, rec):
+    """Why a route result breaks the rules every route keeps, or None: its worker/model/effort must be a pair the
+    active policy allows (the catalog, or BUILTIN_POLICY when there is none) and its effort within the request's cap
+    (the ceiling unless --approve-effort). The cap is an input to every choice (route_resolve.resolve, an explicit model,
+    the built-in policy), so this check only confirms it: a failure stops the route, it never rewrites it."""
+    if cat:
+        order, ceiling = cat["effort"]["order"], cat["effort"]["ceiling"]
+        entry = rc.level_of(cat, rec.get("model"), rec.get("effort"))[1]
+        allowed = bool(entry) and entry["worker"] == rec.get("worker")
+    else:
+        order, ceiling = list(BUILTIN_POLICY["effort_order"]), BUILTIN_POLICY["ceiling"]
+        model, efforts = BUILTIN_POLICY["models"].get(rec.get("worker"), (None, ()))
+        allowed = rec.get("model") == model and rec.get("effort") in efforts
+    if not allowed:
+        return "{} / {} / {} is not a worker, model and effort the {} allows".format(
+            rec.get("worker"), rec.get("model"), rec.get("effort"), "catalog" if cat else "built-in policy")
+    cap = rr.effort_cap(order, ceiling, bool(req.get("approve_effort")))
+    if order.index(rec["effort"]) > order.index(cap):
+        return "effort {} is above {} and no approval is recorded".format(rec["effort"], cap)
+    return None
 
 
 def _finish(kind, req, cat, rec, card, chain, config_error, started, base, log):
     rec.pop("_cat", None)
     rec.setdefault("steps", [])
+    problem = None if rec["source"] == "stop_and_ask" else route_problem(cat, req, rec)
+    if problem:
+        rec.update(source="stop_and_ask", reason="the route failed the final check, so it is not started: " + problem)
     record = _record(kind, req, cat, rec, card, chain, config_error, started)
     record["status"] = "stop_and_ask" if rec["source"] == "stop_and_ask" else "ok"
     selection_id = write_selection(record, base) if log else None
@@ -351,29 +409,21 @@ def meta_card(meta, role=None):
                                  meta.get("context") or (), meta.get("workdir"))
 
 
-def escalate_route(meta, cat, role=None, worker=None, approve_effort=False, base=None, log=True, local_only=False):
+def escalate_route(meta, cat, role=None, worker=None, approve_effort=False, base=None, log=True, local_only=False, gate=None,
+                   request=None):
     """The next route after repeated failure: effort up before level, never above the ceiling without approval.
     Returns the same result as select(); raises RouteStop at the top level at the ceiling, and for a local-only task
     (the flag is also read from the failed attempt's recorded route) when no stronger local option exists: it never
-    escalates to a cloud model."""
-    started = time.monotonic()
-    local_only = bool(local_only or (meta.get("route_info") or {}).get("local_only"))
-    level, effort = level_effort_of_task(meta, cat)
-    prior = {"level_key": level, "effort_abstract": effort, "model": meta.get("model"), "review": "optional",
-             "decided_by": None}
-    ctx = {"role": role, "require_worker": worker, "approvals": {"effort_above_high": bool(approve_effort)},
-           "local_only": local_only,
-           "est_tokens": estimate_tokens(meta.get("task", ""), meta.get("deliverable", ""), meta.get("context"), meta.get("workdir"))}
-    if local_only and worker and worker not in {v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}:
-        raise ValueError("--worker {} cannot run local-only work".format(worker))
-    rec = rr.escalate(prior, cat, read_health(base), ctx, ctx["approvals"])
-    if local_only and rec["source"] != "stop_and_ask" and (rec["model"], rec["effort"]) == (meta.get("model"), meta.get("thinking")):
-        rec = dict(rec, source="stop_and_ask", reason="local-only task: no stronger local model or effort to escalate to")
-    rec["decided_by_name"] = "escalation"
-    rec["reason"] = "escalation after repeated failure: {}".format(rec.get("reason") or rec.get("source", ""))
-    request = {"role": role, "task": meta.get("task") or "escalation of {}".format(meta.get("id", "")), "worker": worker,
-               "approve_effort": approve_effort, "local_only": local_only}
-    return _finish("escalation", request, cat, rec, meta_card(meta, role), None, None, started, base, log)
+    escalates to a cloud model. gate is the route of a retry the repeated-family gate stopped (rule-first or design):
+    the level goes up first (rr.escalate level_first), and the record says the gate chose it (decided_by
+    gated_retry, the reason names the route). request is the request the next attempt will run (default: meta's own);
+    it is routed by select(), so its constraints are the ones any route of it gets."""
+    req = dict(request) if request else {"task": meta.get("task") or "escalation of {}".format(meta.get("id", "")),
+                                         "deliverable": meta.get("deliverable", ""), "context": meta.get("context") or [],
+                                         "workdir": meta.get("workdir")}
+    req.update(role=role, worker=worker, approve_effort=approve_effort, local_only=local_only,
+               escalate={"from": meta, "gate": gate, "optional": False})
+    return select(req, base=base, log=log, catalog=cat)
 
 
 def git_files_touched(workdir, runner=subprocess.run):

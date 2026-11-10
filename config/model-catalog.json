@@ -129,6 +129,7 @@
   },
   "protected_paths": [
     {"pattern": "lib/sensitive_read.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
+    {"pattern": "lib/command_wrappers.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "bin/tp-sensitive-read", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "lib/redact*.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
     {"pattern": "lib/redaction_store.py", "min_level": "mid", "min_effort": "high", "roles": ["coder", "infrastructure", "architect"], "why": "fail-closed security guard: a mistake blocks every agent or leaks a secret"},
@@ -231,7 +232,7 @@
       "key": "strong",
       "name": "GPT sol 6.1",
       "rank": 40,
-      "shown": false,
+      "shown": true,
       "for": "Hard work with a known approach where Sonnet at high effort is likely to miss things: a very large review or refactor, an audit across many components, a long careful investigation. Rare. No Claude model sits at this level today.",
       "not_for": "Anything Sonnet at high effort can reasonably do. Architecture across many subsystems or deep inference (that is the top level).",
       "anchors": [
@@ -242,7 +243,7 @@
       "models": [
         {
           "provider": "openai", "worker": "pi", "model": "openai/gpt-6.1-sol",
-          "efforts": ["high"], "context_window": 500000, "max_output": 128000, "in_roster": false
+          "efforts": ["high"], "context_window": 500000, "max_output": 128000, "in_roster": true
         }
       ],
       "effort_map": {"low": "high", "medium": "high", "high": "high"}

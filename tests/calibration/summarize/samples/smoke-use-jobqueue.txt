@@ -1,0 +1,27 @@
+Here is how each file uses `JobQueue`:
+
+### `src/jobq.py`
+- **Lines 18–38** — Defines the `JobQueue` class itself, providing the core data structure and methods:
+  - `__init__` (line 19): initializes an internal heap, a tie-breaking counter, and a `dead` list.
+  - `push` (line 23): enqueues a `Job` onto the priority heap.
+  - `pop` (line 29): dequeues the next ready job (by `ready_at`, then priority).
+  - `fail` (line 34): retries a failed job with backoff, or moves it to the dead list after `MAX_RETRIES` (line 3).
+  - `__len__` (line 39): returns the number of pending jobs.
+
+This file is the **definition** of `JobQueue` — it does not *use* `JobQueue` as a consumer, it *creates* it.
+
+### `src/worker.py`
+- **Line 31** — `run_one(queue, now)` calls `queue.pop(now)` to fetch the next job.
+- **Line 35** — If no handler exists, the job is appended to `queue.dead`.
+- **Line 40** — On exception, `queue.fail(job, now)` retries or dead-letters the job.
+- **Line 45** — `run_forever(queue, settings)` passes the `JobQueue` into `run_one` in a polling loop.
+
+This file **consumes** `JobQueue` to dequeue and execute jobs, handling failure/retry logic.
+
+### `src/cli.py`
+- **Line 9** — Imports `JobQueue` from `jobq`.
+- **Line 29** — Creates a `queue = JobQueue()` instance.
+- **Line 31** — Calls `queue.push(Job(args.name, json.loads(args.payload)))` to enqueue a single job via the `enqueue` subcommand.
+- **Line 34** — Passes the `JobQueue` into `run_forever(queue, settings)` to start processing.
+
+This file **consumes** `JobQueue` to (1) create and push individual jobs from the CLI, and (2) hand it off to the worker loop.

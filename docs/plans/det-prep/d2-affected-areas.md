@@ -28,3 +28,9 @@ TypeScript navigator (importers, references) but nothing in the review packet us
 4. A reply missing one id or one changed file in Coverage is incomplete and the message names it; with every id marked it passes; without `affected-ids.json` the old rule applies.
 5. Tests for 1 to 4 fail without the change.
 6. `bin/tp-review`'s header and `docs/` (the review paragraph in README or docs/lanes.md: one paragraph only) document the block.
+
+## Also in D2: the reviewer search instruction (from H11, added 2026-11-07)
+- `bin/tp-review:219` (`outside_rule`) tells reviewers to use safe_read and safe_grep only for files outside the working tree. Inside the worktree they use bash `git grep` over agent/, config/ or claude/, and stop on "Authorize sensitive read?". That happened in 8 of 17 reviews on 2026-11-07.
+- Change the rule to cover the whole repository: search with safe_grep, or with git grep whose roots are outside agent/, config/ and claude/; read files in those directories by exact path.
+- Test: the review task text in `tests/test_tp_review.py` names safe_grep and the three directories.
+- After K1 merges, a plain git grep over those directories no longer prompts when nothing tracked there is a credential. Keep the instruction anyway: it costs one sentence and covers grep and rg.

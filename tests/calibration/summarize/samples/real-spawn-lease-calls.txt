@@ -1,0 +1,6 @@
+- tp-spawn runs lane_lease.py reserve for a task that has a lane and exits when the reservation is refused [real/bin/tp-spawn:676]
+- tp-spawn runs lane_lease.py activate with the new pane right after it creates the pane [real/bin/tp-spawn:789-790]
+- tp-spawn runs lane_lease.py release to give the lane back when a start fails [real/bin/tp-spawn:658]
+- reserve refuses to take a lane for a writer while another holder is on it and names the holders [real/lib/lane_lease.py:220-221]
+- release keeps a task's holder while a process of that task is still running, and says which command ends it [real/lib/lane_lease.py:233]
+- activate turns a task's reservation into the worker's own holder, tied to the pane's process [real/lib/lane_lease.py:248]

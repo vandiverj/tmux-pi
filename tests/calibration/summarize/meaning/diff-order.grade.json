@@ -1,0 +1,662 @@
+{
+ "chore": "diff-order",
+ "replies": {
+  "R1": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    },
+    {
+     "n": 24,
+     "verdict": "ok"
+    },
+    {
+     "n": 25,
+     "verdict": "ok"
+    },
+    {
+     "n": 26,
+     "verdict": "ok"
+    },
+    {
+     "n": 27,
+     "verdict": "ok"
+    },
+    {
+     "n": 28,
+     "verdict": "ok"
+    },
+    {
+     "n": 29,
+     "verdict": "ok"
+    },
+    {
+     "n": 30,
+     "verdict": "ok"
+    },
+    {
+     "n": 31,
+     "verdict": "ok"
+    },
+    {
+     "n": 32,
+     "verdict": "ok"
+    },
+    {
+     "n": 33,
+     "verdict": "ok"
+    },
+    {
+     "n": 34,
+     "verdict": "ok"
+    },
+    {
+     "n": 35,
+     "verdict": "ok"
+    },
+    {
+     "n": 36,
+     "verdict": "ok"
+    },
+    {
+     "n": 37,
+     "verdict": "wrong",
+     "note": "pop takes the heap head ordered by ready_at first (jobq.py:31,35), not the next ready job by priority"
+    },
+    {
+     "n": 38,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Name list plus ordering lines; F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F7 not_met: the only pop line misstates it as 'by priority'. F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R2": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate and cited. F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R3": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    },
+    {
+     "n": 14,
+     "verdict": "ok"
+    },
+    {
+     "n": 15,
+     "verdict": "ok"
+    },
+    {
+     "n": 16,
+     "verdict": "ok"
+    },
+    {
+     "n": 17,
+     "verdict": "ok"
+    },
+    {
+     "n": 18,
+     "verdict": "ok"
+    },
+    {
+     "n": 19,
+     "verdict": "ok"
+    },
+    {
+     "n": 20,
+     "verdict": "ok"
+    },
+    {
+     "n": 21,
+     "verdict": "ok"
+    },
+    {
+     "n": 22,
+     "verdict": "ok"
+    },
+    {
+     "n": 23,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate. F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F7 not_met: 'pops jobs by ready_at...' omits that pop only releases a job once due. F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R4": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate and cited. F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R5": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate and cited. F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R6": {
+   "facts": {
+    "F1": "not_met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "not_met",
+    "F6": "not_met",
+    "F7": "not_met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "unsupported",
+     "note": "'Access changes order' row: true, but cites cache.py:17 and :24 (return default / blank); move_to_end is at 22 and 28"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "unsupported",
+     "note": "'Eviction policy' row: cites cache.py:27 (store tuple) and jobq.py:20 (attempts=0); popitem is at cache.py:30, heappop at jobq.py:36"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "unsupported",
+     "note": "'Failure-based removal' row: cites jobq.py:29-31 (push); fail/dead list is at jobq.py:39-45"
+    },
+    {
+     "n": 6,
+     "verdict": "unsupported",
+     "note": "'Clear' row: cites cache.py:29 (capacity check); clear is at cache.py:32-33"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "unsupported",
+     "note": "failure/dead-letter summary cites jobq.py:28-31 (blank/push), not fail at 39-45"
+    }
+   ],
+   "note": "Prose/table reply with mostly true claims but nearly every citation off by several lines; cited lines numbered among the 9 cited rows/points (229,235,236,237,238,239,244,245,246). F1, F4-F7 not_met because their statements are uncited or cite lines that do not show them; F8 not_met because 'never evicts' cites only cache lines and the dead-list row cites push lines."
+  },
+  "R7": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "met",
+    "F6": "met",
+    "F7": "not_met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate and cited, includes 'lower first'. F7 not_met: 'removes items when they are popped' omits the due/ready_at condition. F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R8": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "met",
+    "F5": "not_met",
+    "F6": "met",
+    "F7": "met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate and cited. F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  },
+  "R9": {
+   "facts": {
+    "F1": "met",
+    "F2": "met",
+    "F3": "met",
+    "F4": "not_met",
+    "F5": "not_met",
+    "F6": "not_met",
+    "F7": "met",
+    "F8": "not_met"
+   },
+   "lines": [
+    {
+     "n": 1,
+     "verdict": "ok"
+    },
+    {
+     "n": 2,
+     "verdict": "ok"
+    },
+    {
+     "n": 3,
+     "verdict": "ok"
+    },
+    {
+     "n": 4,
+     "verdict": "ok"
+    },
+    {
+     "n": 5,
+     "verdict": "ok"
+    },
+    {
+     "n": 6,
+     "verdict": "ok"
+    },
+    {
+     "n": 7,
+     "verdict": "ok"
+    },
+    {
+     "n": 8,
+     "verdict": "ok"
+    },
+    {
+     "n": 9,
+     "verdict": "ok"
+    },
+    {
+     "n": 10,
+     "verdict": "ok"
+    },
+    {
+     "n": 11,
+     "verdict": "ok"
+    },
+    {
+     "n": 12,
+     "verdict": "ok"
+    },
+    {
+     "n": 13,
+     "verdict": "ok"
+    }
+   ],
+   "note": "Accurate per-method summary. F4/F6 not_met: push line lists the tuple fields but never says jobs are ordered by them; F5 not_met: says 'then priority' without the lower-number-first direction (jobq.py:30). F8 not_met: states the dead list but never says JobQueue has no eviction/capacity, so the contrast is not explicit."
+  }
+ }
+}

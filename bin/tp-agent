@@ -25,9 +25,11 @@ import family_sweep  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
 import owner_confirm  # noqa: E402
+import pane_send  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
+import trust_dialog  # noqa: E402
 import work  # noqa: E402
 import work_commands  # noqa: E402
 import work_find  # noqa: E402
@@ -117,6 +119,22 @@ def lifecycle(path):
     return task_lifecycle(path)[0]
 
 
+def with_trust_dialog(row, scanner):
+    """A claude worker row that is starting or working, whose recorded pane shows Claude Code's folder-trust dialog, as needs_input
+    (a new row: status, a detail first, and trust_dialog {dir}). The dialog shows before any hook loads, so nothing on disk says so.
+    Read-only: the pane is captured (lib/trust_dialog.py, bounded), never answered; any other row, and a capture that fails or
+    times out, is returned as it was, except that a pane that could not be looked at (a timeout, or the list's scan budget spent) adds
+    trust_dialog_check: "not checked", so a row that was not looked at never reads as clear. tp-agent's lifecycle still does not look
+    at panes: only inspect and list ask for this."""
+    if row.get("harness") != "claude" or row.get("status") not in ("starting", "working") or not row.get("task_dir"):
+        return row
+    meta = read_json(Path(row["task_dir"]) / "meta.json")
+    found = scanner.dialog(meta.get("pane"), meta.get("workdir") if isinstance(meta.get("workdir"), str) else "")
+    if not found:
+        return row if scanner.checked else {**row, "trust_dialog_check": trust_dialog.NOT_CHECKED}
+    return {"detail": trust_dialog.message(found["dir"]), **row, "status": "needs_input", "trust_dialog": found}
+
+
 def usage_fields(state):
     """(tokens, cost) for a task record, only what the harness measured. Tokens are null until the reporter has counted some
     (a Claude worker's are counted from its transcript at each prompt and at Stop, so a zero before that is not a count).
@@ -181,6 +199,11 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
+    # Replies without a RESULT_STATUS line that came after a report with one (a task notification's, say); they are in results/.
+    later = state.get("laterReplies")
+    if isinstance(later, int) and not isinstance(later, bool) and later > 0 and state.get("laterReplyPath"):
+        result["later_replies"] = later
+        result["later_reply_path"] = str(path / str(state["laterReplyPath"]))
     if "lane" in meta and "lane_step" in meta:  # shown only; a task with no lane has neither key
         result.update(lane=meta["lane"], lane_step=meta["lane_step"])
     main = read_json(path / "dispatch.json").get("main")  # the main that dispatched it (main_id), when it had an identity
@@ -291,9 +314,12 @@ def main_id():
     """The identity of the main agent that runs this command, or None: TP_MAIN_ID if the launcher set one, else the Claude
     session id. A worker (TP_TASK_DIR set) has none: it never dispatches for a main. Recorded on each task it dispatches so
     the main's notifier can tell its tasks from another main's, in whichever session state directory they live."""
+    explicit = os.getenv("TP_MAIN_ID") or ""
+    if MAIN_ID.fullmatch(explicit):  # a worker carries its main's id (tp-spawn exports it): what it dispatches is tagged to that main
+        return explicit
     if os.getenv("TP_TASK_DIR"):
         return None
-    value = os.getenv("TP_MAIN_ID") or os.getenv("CLAUDE_CODE_SESSION_ID") or ""
+    value = os.getenv("CLAUDE_CODE_SESSION_ID") or ""
     return value if MAIN_ID.fullmatch(value) else None
 
 
@@ -301,11 +327,17 @@ def main_rows(base, ident):
     """`tp-agent list --main ID`: this session's rows except those another main dispatched (a row with no recorded main stays:
     older tasks, and mains with no identity), plus the tasks `ident` dispatched into any other session of the same workspace
     (<workdir>/.tmux-pi/sessions/*), each marked with its `state_dir`. A main that exports a different TP_STATE_DIR per command
-    still gets every one of its tasks. Other sessions are read only for tasks whose dispatch.json names `ident`."""
-    rows = [row for row in all_records(base) if row.get("main") in (None, ident)]
+    still gets every one of its tasks. Other sessions are read only for tasks whose dispatch.json names `ident`.
+    Returns (rows, other_main): other_main is the rows of THIS session left out because another main's id is on them ({id, status,
+    main} each), so a task is never hidden without a trace: it may belong to a live second main, or to this one under an id it
+    no longer has."""
+    every = all_records(base)
+    rows = [row for row in every if row.get("main") in (None, ident)]
+    other_main = [{"id": row.get("id"), "status": row.get("status"), "main": row.get("main")}
+                  for row in every if row.get("main") not in (None, ident)]
     parent = base.parent
     if parent.name != "sessions" or parent.parent.name != ".tmux-pi":
-        return rows
+        return rows, other_main
     for other in sorted(parent.iterdir()):
         tasks = other / "tasks"
         if other == base or other.is_symlink() or not tasks.is_dir() or tasks.is_symlink():
@@ -314,7 +346,7 @@ def main_rows(base, ident):
             if path.is_symlink() or not (path / "meta.json").is_file() or read_json(path / "dispatch.json").get("main") != ident:
                 continue
             rows.append(dict(record(path), state_dir=str(other)))
-    return sorted(rows, key=lambda row: row.get("updated") or "")
+    return sorted(rows, key=lambda row: row.get("updated") or ""), other_main
 
 
 def build_index(base):
@@ -326,7 +358,7 @@ def build_index(base):
                "reason", "updated")}
         # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves. A
         # REQUEST_CHANGES with no Closes by: code finding keeps its verdict and says why it is neither a rejection nor an approval
-        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step")
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step", "later_replies")
                     if key in row})
         if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
             out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1
@@ -377,15 +409,19 @@ def route_info(result):
 
 
 def route(task, role, worker, model, thinking, context=(), deliverable="", level=None, approve_effort=False,
-          local_only=False, workdir=None, base=None):
+          local_only=False, workdir=None, base=None, escalate=None):
     """Choose (worker, model, effort, route_info) with the catalog router (lib/model_router.py). Explicit --worker,
     --model, --thinking and --level are constraints; the pair is always valid, or ValueError says why the user must
-    decide. Nothing here calls Laya."""
+    decide. escalate (escalation_request) asks for the step above a failed attempt, under the same constraints; a
+    gated retry that cannot step up says why on stderr and is routed as an ordinary request. Nothing here calls Laya."""
     sys.path.insert(0, str(ROOT / "lib"))
     import model_router
     result = model_router.select({"task": task, "role": role, "deliverable": deliverable, "context": list(context),
                                   "workdir": workdir, "worker": worker, "model": model, "thinking": thinking,
-                                  "level": level, "local_only": local_only, "approve_effort": approve_effort}, base=base)
+                                  "level": level, "local_only": local_only, "approve_effort": approve_effort,
+                                  "escalate": escalate}, base=base)
+    if result.get("escalation_note"):
+        print(f"tp-agent: the gated retry was not escalated: {result['escalation_note']}", file=sys.stderr)
     return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
@@ -428,27 +464,26 @@ def escalation_evidence(base, previous):
     return failed, changes
 
 
-def escalation_route(base, previous, args, contexts):
-    """(worker, model, effort, route_info) for `retry --escalate`: effort up before level, only after the catalog's
-    number of failed attempts or REQUEST_CHANGES reviews."""
-    sys.path.insert(0, str(ROOT / "lib"))
-    import model_router
-    import router_catalog
-    catalog = router_catalog.load_catalog()
-    failed, changes = escalation_evidence(base, previous)
-    need = catalog["escalation"]["after"]
-    if max(failed, changes) < need:
-        raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
-                         f"{changes}. Retry without --escalate, or request a level explicitly with --level")
-    meta = read_json(previous / "meta.json")
-    try:  # the task text and admitted context, so the escalation record carries the same card hash as the dispatch
-        meta = dict(meta, task=(previous / "request.md").read_text().strip(), context=contexts)
-    except OSError:
-        pass
-    result = model_router.escalate_route(meta, catalog, role=args.role or meta.get("role"), worker=args.worker,
-                                         approve_effort=args.approve_effort, base=base,
-                                         local_only=getattr(args, "local_only", False))
-    return result["worker"], result["model"], result["thinking"], route_info(result)
+def escalation_request(base, previous, gate=None, required=True):
+    """The `escalate` part of a retry's routing request (model_router.select): the step above the failed attempt
+    `previous`, chosen when its replacement request is routed, so the replacement's own paths, context and flags
+    constrain it as they constrain any route. `retry --escalate` (required) needs the catalog's number of failed
+    attempts or REQUEST_CHANGES reviews. gate is the route of a retry the repeated-family gate stopped (rule-first or
+    design): the gate is the evidence, so no count is needed, and the level goes up first; a gated retry that is not
+    --escalate is optional (it falls back to an ordinary route and says why)."""
+    if required and not gate:
+        sys.path.insert(0, str(ROOT / "lib"))
+        import router_catalog
+        try:
+            catalog = router_catalog.load_catalog()
+        except router_catalog.CatalogError as error:
+            raise ValueError(f"cannot escalate: {error}") from error
+        failed, changes = escalation_evidence(base, previous)
+        need = catalog["escalation"]["after"]
+        if max(failed, changes) < need:
+            raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
+                             f"{changes}. Retry without --escalate, or request a level explicitly with --level")
+    return {"from": read_json(previous / "meta.json"), "gate": gate, "optional": not required}
 
 
 def lane_holders(base, lane, worktree, role, own=None):
@@ -683,8 +718,12 @@ def launch(base, item):
             args += ["--note", f"Dependency {parent} result: {predecessor['result_path']}"]
     args += ["--", item["task"]]
     started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
+    # The worker carries the main that dispatched it, whichever process runs the start (a queued task is started by a later tick).
+    spawn_env = {key: value for key, value in os.environ.items() if key != "TP_MAIN_ID"}
+    if item.get("main"):
+        spawn_env["TP_MAIN_ID"] = item["main"]
     try:
-        run = subprocess.run(args, text=True, capture_output=True)
+        run = subprocess.run(args, text=True, capture_output=True, env=spawn_env)
     finally:
         if facts_file:
             Path(facts_file.name).unlink(missing_ok=True)
@@ -1062,7 +1101,7 @@ def dispatch(args, base):
     chosen = getattr(args, "preroute", None) or route(
         args.task, args.role, args.worker, args.model, args.thinking, args.context or [], args.deliverable,
         level=getattr(args, "level", None), approve_effort=getattr(args, "approve_effort", False),
-        local_only=getattr(args, "local_only", False), workdir=workdir, base=base)
+        local_only=getattr(args, "local_only", False), workdir=workdir, base=base, escalate=getattr(args, "escalate_from", None))
     worker, model, thinking, info = chosen
     item = queue_item({"id": f"{args.role}-{uuid4().hex[:10]}", "created": now(), "role": args.role,
             "task": args.task, "workdir": workdir, "worker": worker, "model": model,
@@ -1354,7 +1393,9 @@ def _main(argv):
     rp.add_argument("--yes", action="store_true", help="confirm: end the listed processes")
     ls = sub.add_parser("list")
     ls.add_argument("--main", help="list as the main with this id sees its tasks: this session's rows except another main's, plus this "
-                                   "main's tasks in the other sessions of the workspace (the Claude notifier uses this)")
+                                   "main's tasks in the other sessions of the workspace (the Claude notifier uses this). The answer is then "
+                                   "{rows, other_main}: other_main counts, with id, status and main, the rows of this session left out because "
+                                   "another main's id is on them")
     sub.add_parser("tick")
     # Read-only text lines for the shell views (tp-list, tp-status); the validator stays the only reader.
     sub.add_parser("queue-view")
@@ -1539,11 +1580,15 @@ def _main(argv):
             except (review_rounds.Refused, OSError, ValueError) as error:  # a sweep that cannot be made does not stop the retry
                 print(f"tp-agent: sweep.md was not written: {error}", file=sys.stderr)
         lane_meta = lane_tags(meta)
-        preroute = None
+        escalate = None  # the step up is chosen when the replacement request below is routed, by the same rules as any route of it
         if args.escalate:
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
-            preroute = escalation_route(base, previous, args, contexts)
+            escalate = escalation_request(base, previous, gate=args.route if repeated else None)
+        elif repeated and args.route in ("rule-first", "design") and not (args.model or args.level):
+            # a repeated family is a capability gap: the gated retry goes a level up (a user's --model or --level wins;
+            # --thinking is the effort it runs at)
+            escalate = escalation_request(base, previous, gate=args.route, required=False)
         task, brief_note = args.task, ""
         if not task:  # a --reason that names a usable .md file is the fix brief: the new attempt's request starts by saying to read it
             brief, brief_problem = fix_brief(args.reason)
@@ -1553,7 +1598,7 @@ def _main(argv):
         replacement = argparse.Namespace(role=args.role or meta.get("role", "coder"),
                                          task=task, worker=args.worker,
                                          model=args.model, thinking=args.thinking, level=args.level,
-                                         approve_effort=args.approve_effort, preroute=preroute,
+                                         approve_effort=args.approve_effort, escalate_from=escalate,
                                          local_only=args.local_only or bool((meta.get("route_info") or {}).get("local_only")),
                                          workdir=meta.get("workdir"), lane_meta=lane_meta,
                                          deliverable=meta.get("deliverable", ""),
@@ -1592,7 +1637,15 @@ def _main(argv):
         if args.bounded:
             value = work_index.bounded(value)
     elif args.command == "list":
-        value = main_rows(base, args.main) if args.main else all_records(base)
+        other_main = None
+        if args.main:
+            value, other_main = main_rows(base, args.main)
+        else:
+            value = all_records(base)
+        scanner = trust_dialog.Scanner()
+        value = [with_trust_dialog(row, scanner) for row in value]
+        if other_main is not None:  # --main answers an object: the rows left out are reported beside the rows kept
+            value = {"rows": value, "other_main": {"count": len(other_main), "rows": other_main}}
     elif args.command == "objective":
         atomic_text(base / "session-objective.md", args.text.strip() + "\n", base)
         value = write_index(base)
@@ -1625,7 +1678,7 @@ def _main(argv):
             return
         path = task_dir(base, args.id)
         if args.command == "inspect":
-            value = record(path, include_result=True)
+            value = with_trust_dialog(record(path, include_result=True), trust_dialog.Scanner())
             if value.get("review_notice"):
                 value = {"notice": value["review_notice"], **value}
         elif args.command == "collect":
@@ -1666,20 +1719,33 @@ def _main(argv):
                                  f"start it again with: `tp-agent retry {args.id} --reason \"say what changed\"`")
             if (path / "reaped.json").exists():
                 raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
-            subprocess.run(["tmux", "send-keys", "-t", pane, "-l", args.text.replace("\n", " ")], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            sent = pane_send.send(pane, args.text, task_dir=path)
+            submit = {k: sent[k] for k in ("submitted", "attempts", "received", "length") if k in sent}
             (path / "collected.json").unlink(missing_ok=True)
-            value = {"id": args.id, "sent": True}
+            value = {"id": args.id, "sent": True, **submit}
             try:
-                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text}) + "\n", root=base)
+                # Written even when not confirmed: the text may be sitting in the worker's input box.
+                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text, **submit}) + "\n",
+                                       root=base)
                 requested = path / "capability-request.json"
-                if requested.exists():
+                if requested.exists() and sent["submitted"]:  # unconfirmed: the worker has not read the answer
                     pending = read_json(requested)
                     if pending.get("status") == "pending":
                         pending.update({"status": "answered", "answered": now()})
                         atomic_json(requested, pending, base)
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
+            if not sent["submitted"] and "received" in sent:  # MS2: submitted, but only the end of it reached the worker
+                print(json.dumps(value, indent=2))
+                raise RuntimeError(f"message to {args.id} was not delivered whole: the worker's prompt held {sent['received']} "
+                                   f"of its {sent['length']} characters (spaces not counted) after the delivery id. Nothing "
+                                   "was retyped. Send it again; for a long text, write it to a file and send a short message "
+                                   "that points the worker at the file")
+            if not sent["submitted"]:
+                print(json.dumps(value, indent=2))
+                raise RuntimeError(f"message to {args.id} was typed but not confirmed submitted after {sent['attempts']} Enter(s); "
+                                   "the text may be sitting in the worker's input box. Look at the pane, press Enter there "
+                                   "or clear the box, then send again if needed")
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))

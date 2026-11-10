@@ -326,6 +326,12 @@ class MainLauncherIdentityTests(unittest.TestCase):
                     run = subprocess.run([str(self.root / "bin/tp-main")], env=env, text=True, capture_output=True, timeout=25, cwd=str(self.root))
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertIn("could not lock", run.stderr)
+                if given and content:
+                    self.assertIn("main-given", run.stderr)
+                    self.assertIn("recorded id stays main-kept", run.stderr)
+                    # a following launch without the override exports the recorded id
+                    held_off = self.launch(state=state)
+                    self.assertEqual(held_off, "main-kept")
                 # the recorded id, else the given one, else a fresh one for this launch: never empty
                 self.assertRegex(run.stdout.strip(), f"^{expect}$" if expect else r"^main-[0-9a-f]{16}$")
                 if content is None:

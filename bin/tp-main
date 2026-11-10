@@ -25,8 +25,10 @@ export TP_MODE=orchestrator
 # different given ids: the last writer wins in the file and each exports its own given id; a later launch without one keeps the
 # file's); otherwise a valid file is used and never removed or rewritten; an empty or bad file is replaced with a fresh id,
 # written to a temp file and renamed over it, then read back. If the lock is not taken within MAIN_ID_LOCK_WAIT seconds
-# (default 5), the launch goes on without repairing or writing anything: it exports the file's id if valid, else the given id,
-# else a fresh id for this launch only, and says so on stderr. An empty id is never exported.
+# (default 5), the launch goes on and writes nothing (no repair, no record). Order of the id it exports: a valid given
+# TP_MAIN_ID (the user's explicit choice of which main this is, e.g. to reach workers that already carry it), else the recorded
+# valid id, else a fresh id for this launch only; it says so on stderr. With a given id the file is left as it is, so a later
+# launch without TP_MAIN_ID exports the recorded id. An empty id is never exported.
 # Test-only: MAIN_ID_TEST_PAUSE=R:G (fds) writes a byte to R and then blocks reading G, between the read and the repair, under
 # the lock; MAIN_ID_TEST_WAITING=W (fd) gets a byte when the lock is first found taken. tests/test_main_notify.py uses them.
 # (These three names carry no TP_ prefix on purpose: tests/test_session_env.py makes every TP_ name bin/ reads either a session key
@@ -103,7 +105,10 @@ lock = take_lock()
 if lock is None:
     current = read()
     if good:
-        say("could not lock " + state + "; using the given TP_MAIN_ID " + good + " without recording it")
+        note = ""
+        if valid(current):
+            note = "; the recorded id stays " + current + " and later launches without TP_MAIN_ID will use it"
+        say("could not lock " + state + "; using the given TP_MAIN_ID " + good + " without recording it" + note)
         print(good)
     elif valid(current):
         say("could not lock " + state + "; using the recorded main id " + current + " without repair")

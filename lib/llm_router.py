@@ -139,7 +139,9 @@ def call(entry, effort, system, user, timeout, runner=subprocess.run, config=Non
         return {"ok": True, "text": text, "seconds": round(time.monotonic() - started, 2), "thinking_tokens": thinking, "error": None}
     except (TimeoutError, subprocess.TimeoutExpired):
         error = "timed out after {:g}s".format(timeout)
-    except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError, urllib.error.URLError, router.RouterError) as exc:
+    # ArithmeticError: a timeout the transport cannot convert (OverflowError) while it is set up is a failed attempt too
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError, ArithmeticError, urllib.error.URLError,
+            router.RouterError) as exc:
         error = "{}: {}".format(type(exc).__name__, exc)[:240]
     return {"ok": False, "text": "", "seconds": round(time.monotonic() - started, 2), "thinking_tokens": None, "error": error}
 

@@ -5,11 +5,13 @@ retry fixes every site of the finding and not the one the last review cited.
 Everything in it comes from the author chain's review replies (review_rounds.chain_labels is the one reader of the chain, review_verdict
 the one reader of the Family: and Closes by: labels): the Family: names each review gave, every file:line token any earlier
 REQUEST_CHANGES finding cites, the finding of the latest review in the reviewer's own words, how to look for the sites no review
-cited, and the table the coder reports back. A finding with no readable file:line token is listed
+cited, the attack on the rule (each earlier round fixed the input a review showed, so the coder lists the rule's whole input space,
+runs every case and reports the counts), and the table the coder reports back with its Attack: line. A finding with no readable file:line token is listed
 verbatim, never dropped. Every review reply goes through the redaction pass once, first, and the findings, Family: names and sites are all read from that redacted text (the gate family passed in is printed only as a name those replies give) (ids, paths and
 the working directory are not review text). The file has a hard byte budget, SWEEP_BUDGET, derived from tp-spawn's cap on a context
 file: findings are quoted whole while they fit and are never cut; the rest are listed as pointers (review, finding number, result.md);
-the sites and the table are always complete, or SweepTooLarge is raised and the retry goes on without a sweep. No model call.
+the sites, the attack section and the table are always complete (the attack section is fixed text, so it moves the bound by a
+constant), or SweepTooLarge is raised and the retry goes on without a sweep. No model call.
 
 A finding is the text that ends at a `Closes by:` line (the lines after the last one, up to a Coverage or Verification heading,
 are one more finding); a reply with no `Closes by:` line is one finding. Reviews that are missing, cannot be read or are not a
@@ -277,6 +279,14 @@ def build(state_dir, task_id, family, workdir=None):
             "- `tp-ctx` importers/references of the symbol, when `tp-ctx` is available;",
             "- the opposite and the repeat of the action (the reader of what a writer writes, the undo of what a call does).", "",
             "Read each hit. A hit that is not an instance of the rule still gets a row.", "",
+            "## Attack the rule", "",
+            "Each earlier round fixed the input its review showed, and the next review wrote a new input that broke the same rule. "
+            "Break it yourself first: name the inputs the rule must hold for (the forms, states, orders or interleavings that reach it) "
+            "and list them from an authoritative source (a grammar or `ast` node list, an enum or state machine, the event list, the "
+            "concurrent pairs and their orders), printed by code when the source is code; where none exists, say so and list the cases "
+            "you chose and why. Run every case against the real code with its expected outcome and the reason. Fix a mismatch by the "
+            "rule, never by special-casing the input; keep the cases worth keeping as rows of existing tests. Put the script and its log "
+            "under `evidence/` in your task directory.", "",
             "## Table to report", "",
             "End your report with this table, one row per site: each cited site above and each one you found. Disposition is one of "
             f"{', '.join(f'`{d}`' for d in DISPOSITIONS)}; give evidence for each (the changed line, the line that is already right, why it is out of scope, what blocks it). "
@@ -284,7 +294,8 @@ def build(state_dir, task_id, family, workdir=None):
             "that leaves a row `unresolved` without a `Closes by:` note in its Evidence.", "",
             "| Site | Disposition | Evidence |", "| --- | --- | --- |"]
     tail += [f"| `{token}` | | |" for token in cited]
-    tail += ["| (sites you found) | | |", ""]
+    tail += ["| (sites you found) | | |", "",
+             "Under the table, one line: `Attack: <cases> cases, <matches> matched, <fixed> mismatches fixed; script <path>; log <path>`.", ""]
     sections = ("## The rule, in the reviewer's words\n\n", "## Findings with no file:line site, verbatim\n\n")
     fixed = "\n".join(head) + "\n\n" + "".join(sections) + "\n".join(tail)
     pointer_note = "\n\nNot quoted, to keep this file within its size limit; open the review's result.md for them:\n\n"

@@ -44,16 +44,38 @@ def _text(value, where):
     return value
 
 
-def _int(value, where, minimum=1):
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        _fail("{} must be an integer of at least {}".format(where, minimum))
+# The bounds of every number the router reads, checked here at load and nowhere else, so a reader never meets a NaN,
+# an infinity or a value too large to convert (a socket timeout of 1e100 is an OverflowError). (minimum, maximum,
+# whether the minimum itself is allowed). Seconds: a router call, and the whole chain, take more than 0 and at most an
+# hour (the shipped values are 20 to 80). Tokens: at most 100M (the largest shipped context window is 1M). The rest
+# are small counts by nature.
+BOUNDS = {
+    "seconds": (0, 3600, False),          # router.budget_seconds, router.chain[].timeout_seconds
+    "tokens": (1, 100_000_000, True),     # context_window, max_output, max_packet_tokens, router max_input_tokens
+    "retries": (0, 10, True),             # router.retries_on_invalid
+    "temperature": (0, 2, True),          # router.chain[].temperature
+    "seed": (0, 2 ** 32 - 1, True),       # router.chain[].seed
+    "count": (1, 1_000_000, True),        # catalog_version, levels[].rank, escalation.after, review_policy.files_*_at
+    "share": (0, 1, True),                # levels[].expected_share[]
+}
+
+
+def _bounded(value, where, kind, integer):
+    low, high, low_ok = BOUNDS[kind]
+    ok = (not isinstance(value, bool) and isinstance(value, int if integer else (int, float))
+          and (value >= low if low_ok else value > low) and value <= high)  # False for NaN; inf is above every maximum
+    if not ok:
+        _fail("{} must be {} {} {} and at most {}".format(where, "an integer" if integer else "a number",
+                                                          "of at least" if low_ok else "above", low, high))
     return value
 
 
-def _number(value, where):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
-        _fail("{} must be a positive number".format(where))
-    return value
+def _int(value, where, kind="count"):
+    return _bounded(value, where, kind, True)
+
+
+def _number(value, where, kind="seconds"):
+    return _bounded(value, where, kind, False)
 
 
 def _flag(value, where):
@@ -87,15 +109,14 @@ def _chain_options(entry, name, providers, shown, levels):
         for key in ("temperature", "seed"):
             if key in entry:
                 _fail("router {}: {} cannot be set through a CLI (claude and pi have no such option)".format(name, key))
-    if "temperature" in entry and (isinstance(entry["temperature"], bool) or not isinstance(entry["temperature"], (int, float))
-                                   or entry["temperature"] < 0):
-        _fail("router temperature for {} must be a number of at least 0".format(name))
+    if "temperature" in entry:
+        _number(entry["temperature"], "router temperature for " + name, "temperature")
     if "seed" in entry:
-        _int(entry["seed"], "router seed for " + name, 0)
+        _int(entry["seed"], "router seed for " + name, "seed")
     if "thinking_off" in entry:
         _flag(entry["thinking_off"], "router thinking_off for " + name)
     if "max_input_tokens" in entry:
-        _int(entry["max_input_tokens"], "router max_input_tokens for " + name)
+        _int(entry["max_input_tokens"], "router max_input_tokens for " + name, "tokens")
     if "confirm" in entry:
         rule = _object(entry["confirm"], "router confirm for " + name, (), ("above_level", "unqualified_local"))
         if not rule:
@@ -109,10 +130,25 @@ def _chain_options(entry, name, providers, shown, levels):
 
 
 def validate_catalog(cat):
-    """Raise CatalogError unless the catalog is complete and consistent; return it."""
+    """Raise CatalogError unless the catalog is complete and consistent; return it. Only CatalogError leaves this
+    function: a value of the wrong type that a check below did not name is still reported as an invalid catalog, so
+    a caller that falls back on CatalogError never meets a traceback."""
+    try:
+        _validate(cat)
+        catalog_sha(cat)  # every selection record hashes the catalog: a value that cannot be serialized is invalid here
+        return cat
+    except CatalogError:
+        raise
+    except (AttributeError, TypeError, KeyError, IndexError, ValueError, StopIteration, RecursionError, OverflowError) as exc:
+        raise CatalogError("catalog has a value of the wrong shape: {}: {}".format(type(exc).__name__, str(exc)[:120])) from exc
+
+
+def _validate(cat):
     _object(cat, "catalog", ("catalog_version", "default_level", "effort", "providers", "provider_order", "router",
                              "escalation", "reviewer", "review_policy", "principles", "review", "shapes", "roles",
                              "levels"), ("description", "protected_paths"))
+    if "description" in cat:
+        _text(cat["description"], "description")
     _int(cat["catalog_version"], "catalog_version")
     eff = _object(cat["effort"], "effort", ("order", "vocabulary", "default", "ceiling", "ceiling_rule", "meaning"))
     order = _names(eff["order"], "effort.order")
@@ -165,8 +201,11 @@ def validate_catalog(cat):
             if flag in level:
                 _flag(level[flag], "{} {}".format(where, flag))
         share = level["expected_share"]
-        if (not isinstance(share, list) or len(share) != 2 or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in share)
-                or not 0 <= share[0] <= share[1] <= 1):
+        if not isinstance(share, list) or len(share) != 2:
+            _fail("{}: expected_share must be [low, high] within 0..1".format(where))
+        for x in share:
+            _number(x, where + " expected_share", "share")
+        if share[0] > share[1]:
             _fail("{}: expected_share must be [low, high] within 0..1".format(where))
         emap = _object(level["effort_map"], where + " effort_map", vocab)
         for name in vocab:
@@ -205,13 +244,13 @@ def validate_catalog(cat):
                     _fail("model {} is listed twice".format(name))
             if sorted(efforts, key=order.index) != efforts:
                 _fail("{}: efforts must follow effort.order".format(name))
-            _int(model["context_window"], name + " context_window")
-            _int(model["max_output"], name + " max_output")
+            _int(model["context_window"], name + " context_window", "tokens")
+            _int(model["max_output"], name + " max_output", "tokens")
             _flag(model["in_roster"], name + " in_roster")
             if "explicit_only" in model:
                 _flag(model["explicit_only"], name + " explicit_only")
             if "max_packet_tokens" in model:
-                _int(model["max_packet_tokens"], name + " max_packet_tokens")
+                _int(model["max_packet_tokens"], name + " max_packet_tokens", "tokens")
             for target in emap.values():
                 if order.index(efforts[0]) > order.index(target):
                     _fail("{}: every allowed effort is above effort_map target {!r} at level {}".format(name, target, level["key"]))
@@ -231,7 +270,7 @@ def validate_catalog(cat):
 
     router = _object(cat["router"], "router", ("chain", "budget_seconds", "retries_on_invalid"))
     _number(router["budget_seconds"], "router.budget_seconds")
-    _int(router["retries_on_invalid"], "router.retries_on_invalid", 0)
+    _int(router["retries_on_invalid"], "router.retries_on_invalid", "retries")
     if not isinstance(router["chain"], list) or not router["chain"]:
         _fail("router.chain must list at least one router")
     for entry in router["chain"]:
@@ -283,6 +322,9 @@ def validate_catalog(cat):
         if shape["status"] not in ("qualified", "candidate"):
             _fail("shape {} status must be qualified or candidate".format(name))
         _text(shape["text"], "shape {} text".format(name))
+        _text(shape["evidence"], "shape {} evidence".format(name))
+    if not isinstance(cat["roles"], dict):
+        _fail("roles must be an object")
     for role, rule in cat["roles"].items():
         _object(rule, "role " + role, (), ("min_level", "max_level", "min_effort", "below_floor_shapes", "strict_floor"))
         if "strict_floor" in rule:
@@ -299,10 +341,14 @@ def validate_catalog(cat):
             _fail("role {}: min_level is above max_level".format(role))
         if "min_effort" in rule and rule["min_effort"] not in vocab:
             _fail("role {}: min_effort must be in the vocabulary".format(role))
+    if "protected_paths" in cat and not isinstance(cat["protected_paths"], list):
+        _fail("protected_paths must be a list")
     for i, entry in enumerate(cat.get("protected_paths") or []):
         name = "protected_paths[{}]".format(i)
         _object(entry, name, ("pattern", "min_level"), ("min_effort", "roles", "why"))
         _text(entry["pattern"], name + " pattern")
+        if "why" in entry:
+            _text(entry["why"], name + " why")
         if entry["min_level"] not in keys:
             _fail("{}: min_level {!r} is not a level key".format(name, entry["min_level"]))
         if "min_effort" in entry and entry["min_effort"] not in vocab:
@@ -310,8 +356,6 @@ def validate_catalog(cat):
         if "roles" in entry and (not isinstance(entry["roles"], list) or not entry["roles"]
                                  or any(not isinstance(r, str) or not r for r in entry["roles"])):
             _fail("{}: roles must be a list of role names".format(name))
-    if "protected_paths" in cat and not isinstance(cat["protected_paths"], list):
-        _fail("protected_paths must be a list")
     if not isinstance(cat["principles"], list) or not cat["principles"] or any(
             not isinstance(p, str) or not p.strip() for p in cat["principles"]):
         _fail("principles must be a nonempty list of text")
@@ -323,12 +367,18 @@ def validate_catalog(cat):
 
 
 def load_catalog(path=None):
-    """Load and validate a catalog: the given path, else TP_MODEL_CATALOG (tests point the commands at a fixture), else the shipped one."""
+    """Load and validate a catalog: the given path, else TP_MODEL_CATALOG (tests point the commands at a fixture), else the shipped one.
+
+    The one function that reads catalog bytes: it returns a validated catalog or raises CatalogError, whatever the file
+    holds (missing, empty, not JSON, nested too deep to parse, NaN or numbers too large, any wrong shape). A caller
+    that falls back after CatalogError uses a policy of its own and never reads the file again."""
     path = Path(path or os.environ.get("TP_MODEL_CATALOG") or CATALOG_PATH)
     try:
         cat = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         raise CatalogError("cannot read model catalog {}: {}".format(path, exc)) from exc
+    except (RecursionError, ValueError, OverflowError, TypeError) as exc:
+        raise CatalogError("cannot read model catalog {}: {}: {}".format(path, type(exc).__name__, str(exc)[:120])) from exc
     return validate_catalog(cat)
 
 

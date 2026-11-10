@@ -293,6 +293,30 @@ class DirectChatTests(ChainTestCase):
             (self.base / "evals" / model_router.SELECTIONS).read_text().splitlines()[-1])["attempts"][0]["error"])
         self.assertEqual(self.models_called(), [])
 
+    def test_a_transport_setup_error_is_a_failed_attempt_not_a_traceback(self):
+        # was: a timeout the socket cannot convert raised OverflowError out of call (the catalog now bounds timeouts at
+        # load; this is the second line: whatever the transport raises while it is set up is a failed attempt)
+        import socket
+        entry = next(e for e in CAT["router"]["chain"] if e.get("transport") == "direct_chat")
+
+        def offline_timeout(request, timeout):  # the urllib transport's own timeout conversion; nothing connects
+            sock = socket.socket()
+            try:
+                sock.settimeout(timeout)
+            finally:
+                sock.close()
+
+        def raises(exc):
+            def opener(request, timeout):
+                raise exc
+            return opener
+        for label, opener, timeout in (("1e100 timeout", offline_timeout, 1e100), ("OverflowError", raises(OverflowError("x")), 5),
+                                       ("ZeroDivisionError", raises(ZeroDivisionError("x")), 5)):
+            with self.subTest(label):
+                got = llm_router.call(entry, "low", "s", "u", timeout, opener=opener)
+                self.assertFalse(got["ok"])
+                self.assertIn("Error", got["error"])
+
     def test_a_server_error_and_a_cut_off_reply_fail_the_router(self):
         self.script(chat=[{"status": 500}])
         with self.assertRaises(model_router.RouteStop):

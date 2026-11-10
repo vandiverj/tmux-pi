@@ -195,6 +195,121 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("PostToolUse", tool_name="Bash", transcript_path=str(self.base / "t.jsonl"))
         self.assertEqual(self.state()["turns"], 2)
 
+    # --- RO1: an unprompted turn must not replace a report that carries RESULT_STATUS ------------------------------
+    REPORT = "full report\nRESULT_STATUS: complete\n"
+
+    def turn(self, via, kind, reply, **extra):
+        """One Claude turn whose origin reaches the hook `via` the hook input ("input"), the prompt text ("prompt"), the
+        transcript read at Stop ("transcript"), or nowhere ("none"). kind is origin.kind: human, task-notification, hook."""
+        self.entries = getattr(self, "entries", [])
+        self.entries.append({"type": "user", "promptSource": "typed" if kind == "human" else "system", "origin": {"kind": kind}})
+        fields = dict(extra)
+        if via == "input":
+            fields["origin"] = {"kind": kind}
+        if via == "prompt" and kind == "task-notification":
+            fields["prompt"] = "<task-notification>\n<task-id>b1</task-id>\n</task-notification>"
+        stop = {}
+        if via == "transcript":
+            stop["transcript_path"] = self.transcript(self.entries)
+        self.hook("UserPromptSubmit", **fields)
+        self.hook("Stop", last_assistant_message=reply, **stop)
+
+    def kept(self):
+        return sorted(p.read_text() for p in (self.task / "results").glob("*.md")) if (self.task / "results").is_dir() else []
+
+    def test_task_notification_turn_leaves_the_report_and_records_its_reply(self):
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        for n, via in enumerate(("input", "prompt", "transcript"), 1):
+            self.turn(via, "task-notification", f"nothing new {n}")
+            self.assertEqual((self.task / "result.md").read_text(), self.REPORT, via)
+            self.assertEqual((self.state()["laterReplies"], self.state()["laterReplyPath"]), (n, f"results/{n + 1}.md"), via)
+            self.assertEqual((self.task / self.state()["laterReplyPath"]).read_text(), f"nothing new {n}\n")
+        self.assertEqual(self.state()["state"], "waiting")
+        self.assertIn(self.REPORT, self.kept())  # the report is also kept apart from result.md
+        self.review(accepted=True)
+
+    def test_inspect_and_list_rows_show_a_later_reply(self):
+        import tp_agent_inproc
+        agent = tp_agent_inproc.load()
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        self.assertNotIn("later_replies", agent.record(self.task))
+        self.turn("input", "task-notification", "nothing new")
+        row = agent.record(self.task)
+        self.assertEqual((row["later_replies"], row["later_reply_path"]), (1, str(self.task / "results/2.md")))
+        self.assertEqual(row["result_status"], "complete")
+        index = [r for k in ("active", "pending", "paused", "unstatused", "recent") for r in agent.build_index(self.state_dir)[k]
+                 if r["id"] == "w1"]
+        self.assertTrue(index and all(r.get("later_replies") == 1 for r in index), index)
+
+    def test_a_message_turn_replaces_the_report_and_keeps_the_old_one(self):
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        self.turn("transcript", "human", "second\nRESULT_STATUS: blocked")
+        self.assertEqual((self.task / "result.md").read_text(), "second\nRESULT_STATUS: blocked\n")
+        self.assertIn(self.REPORT, self.kept())
+        self.assertEqual((self.state()["laterReplies"], self.state()["laterReplyPath"]), (0, ""))
+        # a human turn with a short reply replaces too (origin known), and the old report is still kept
+        self.turn("transcript", "human", "short")
+        self.assertEqual((self.task / "result.md").read_text(), "short\n")
+        self.assertIn("second\nRESULT_STATUS: blocked\n", self.kept())
+
+    def test_unprompted_turn_with_a_status_replaces_and_two_quick_turns_hold_the_report(self):
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        self.turn("input", "task-notification", "new\nRESULT_STATUS: incomplete")
+        self.assertEqual((self.task / "result.md").read_text(), "new\nRESULT_STATUS: incomplete\n")
+        self.assertIn(self.REPORT, self.kept())
+        # human submit, then a notification submit before any Stop: the one Stop belongs to the newest origin
+        self.entries = []
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        self.hook("UserPromptSubmit", prompt="msg")
+        self.assertFalse((self.task / "result.md").exists())  # a human prompt withdraws the old reply while it works
+        self.hook("UserPromptSubmit", origin={"kind": "task-notification"})
+        self.hook("Stop", last_assistant_message="meh")
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual(self.state()["laterReplies"], 1)
+
+    def test_origin_attack_table(self):
+        # origin x prior result.md x reply. A reply without RESULT_STATUS replaces a report with one only when the turn
+        # came from outside the worker (human); every other origin, and an origin nobody can tell, keeps it.
+        prior_text = {"none": None, "status": self.REPORT, "plain": "plain old reply\n"}
+        replies = {"status": "r\nRESULT_STATUS: complete", "short": "short", "empty": ""}
+        for kind, via in (("human", "transcript"), ("task-notification", "input"), ("hook", "transcript"), ("human", "none")):
+            for prior, reply in ((p, r) for p in prior_text for r in replies):
+                with self.subTest(kind=kind, via=via, prior=prior, reply=reply):
+                    self.tearDown_task()
+                    self.entries = []
+                    if prior_text[prior] is not None:
+                        self.turn("none", "human", prior_text[prior].rstrip("\n"))
+                    tell = via != "none"
+                    outside = kind == "human" and tell
+                    protected = prior == "status" and not outside and reply != "status"
+                    self.turn(via, kind, replies[reply])
+                    want = (prior_text[prior] if protected else None if replies[reply] == "" else replies[reply] + "\n")
+                    got = (self.task / "result.md").read_text() if (self.task / "result.md").exists() else None
+                    self.assertEqual(got, want)
+                    if prior_text[prior] is not None:
+                        self.assertIn(prior_text[prior], self.kept())  # the old reply is never lost
+                    self.assertEqual(self.state().get("laterReplies", 0), 1 if protected and reply == "short" else 0)
+
+    def tearDown_task(self):
+        for p in list(self.task.iterdir()):
+            if p.name not in ("meta.json", "task.md", "packet.md"):
+                if p.is_dir():
+                    for q in p.iterdir():
+                        q.unlink()
+                    p.rmdir()
+                else:
+                    p.unlink()
+
+    def test_stop_without_an_open_prompt_and_duplicate_stop_change_nothing(self):
+        self.hook("Stop", last_assistant_message="orphan\nRESULT_STATUS: complete")
+        self.assertFalse((self.task / "result.md").exists())
+        self.turn("none", "human", self.REPORT.rstrip("\n"))
+        before = (self.state(), self.kept())
+        self.hook("Stop", last_assistant_message="late short")
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual((self.state()["laterReplies"] if "laterReplies" in self.state() else 0), 0)
+        self.assertEqual(self.kept(), before[1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,11 @@ def record(path, include_result=False):
         "transcript": (path / "transcript-path").read_text().strip() if (path / "transcript-path").exists()
                       else str(path / "transcript.jsonl") if (path / "transcript.jsonl").exists() else None,
     }
+    # Turns the worker did not start (a task notification) replied after its report; those replies are in results/, not result.md.
+    later = state.get("laterReplies")
+    if isinstance(later, int) and not isinstance(later, bool) and later > 0 and state.get("laterReplyPath"):
+        result["later_replies"] = later
+        result["later_reply_path"] = str(path / str(state["laterReplyPath"]))
     if "lane" in meta and "lane_step" in meta:  # shown only; a task with no lane has neither key
         result.update(lane=meta["lane"], lane_step=meta["lane_step"])
     main = read_json(path / "dispatch.json").get("main")  # the main that dispatched it (main_id), when it had an identity
@@ -344,7 +349,7 @@ def build_index(base):
                "reason", "updated")}
         # a reviewer row carries its stated verdict and whether the review is complete; only a complete one approves. A
         # REQUEST_CHANGES with no Closes by: code finding keeps its verdict and says why it is neither a rejection nor an approval
-        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step")
+        out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step", "later_replies")
                     if key in row})
         if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
             out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1

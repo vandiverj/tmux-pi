@@ -37,14 +37,82 @@ active="$(jq -rn --argjson prev "$prev" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   if turn > settled then "yes" else "no" end' 2>/dev/null)" || exit 0
+# Every report is kept: before result.md is removed or replaced it is copied to results/<turn>.md (the turn that wrote it).
+# A turn the worker did not start itself (a task notification from its own background shell, a hook-driven turn) must not
+# replace a report that carries RESULT_STATUS with a reply that does not. Only a prompt from outside the worker (origin
+# "human": a tp-agent message, a retry, a capability answer) may. The origin comes from the hook input when it carries one
+# (origin.kind, turnOrigin, promptSource; a prompt that opens with <task-notification>), else, at Stop, from the newest
+# origin-bearing user entry of the transcript; with neither it is "unknown" and the simpler rule holds: a reply without
+# RESULT_STATUS never replaces one with it.
+results_dir="$TP_TASK_DIR/results"
+status_py="$(dirname "$0")/../../../../lib/result_status.py"  # the one RESULT_STATUS reader
+has_status() { [[ -s "$1" && -f "$status_py" ]] && python3 "$status_py" "$1" >/dev/null 2>&1; }
+norm_origin() { case "$1" in human|typed) echo human;; "") echo unknown;; *) echo "$1";; esac; }
+archive() { # archive FILE TURN: copy FILE to results/TURN.md atomically
+  mkdir -p "$results_dir" 2>/dev/null || return 0
+  local tmp; tmp="$(mktemp "$results_dir/.keep.XXXXXXXX")" || return 0
+  if cp "$1" "$tmp" 2>/dev/null; then mv "$tmp" "$results_dir/$2.md"; else rm -f "$tmp"; fi
+}
+prev_turn="$(jq -r '.promptTurn // 0' <<<"$prev" 2>/dev/null)" || prev_turn=0
+result_turn="$(jq -r '.resultTurn // .promptTurn // 0' <<<"$prev" 2>/dev/null)" || result_turn=0
+ext='{}'
 if [[ "$event" == UserPromptSubmit ]]; then
-  rm -f "$TP_TASK_DIR/result.md"
+  origin="$(jq -r '(try (.origin | objects | .kind) catch null) // .turnOrigin // .promptSource // empty' <<<"$input" 2>/dev/null)" || origin=""
+  if [[ -z "$origin" ]] && [[ "$(jq -r '(.prompt // "" | tostring) | ltrimstr("\n") | startswith("<task-notification>")' <<<"$input" 2>/dev/null)" == true ]]; then
+    origin=task-notification
+  fi
+  origin="$(norm_origin "$origin")"
+  ext="$(jq -nc --arg o "$origin" '{promptOrigin: $o}')"
+  if [[ -f "$TP_TASK_DIR/result.md" ]]; then
+    archive "$TP_TASK_DIR/result.md" "$result_turn"
+    if has_status "$TP_TASK_DIR/result.md" && [[ "$origin" != human && "$origin" != unknown ]]; then
+      :  # an unprompted turn leaves the report in place
+    else
+      if has_status "$TP_TASK_DIR/result.md"; then held="results/$result_turn.md"; else held=""; fi
+      ext="$(jq -c --arg h "$held" '. + {heldReport: $h}' <<<"$ext")"
+      rm -f "$TP_TASK_DIR/result.md"
+    fi
+  fi
 elif [[ "$event" == Stop && "$active" == yes ]]; then
-  result_tmp="$(mktemp "$TP_TASK_DIR/.result.XXXXXXXX")" || exit 0
-  if jq -er '.last_assistant_message // empty | select(length > 0)' <<<"$input" > "$result_tmp" && [[ -s "$result_tmp" ]]; then
-    mv "$result_tmp" "$TP_TASK_DIR/result.md" || exit 0
+  origin="$(jq -r '.promptOrigin // "unknown"' <<<"$prev" 2>/dev/null)" || origin=unknown
+  t_path="$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null)"
+  t_origin=""
+  if [[ -n "$t_path" && -f "$t_path" ]]; then
+    t_origin="$(jq -rs --argjson need "$prev_turn" '[ .[] | select(type == "object" and .type == "user" and (.origin | type) == "object" and .origin.kind != null) ] as $u
+      | if ($u | length) >= $need and ($u | length) > 0 then ($u | last | .origin.kind) else empty end' "$t_path" 2>/dev/null)" || t_origin=""
+  fi
+  if [[ -n "$t_origin" ]]; then origin="$(norm_origin "$t_origin")"; fi
+  reply_tmp="$(mktemp "$TP_TASK_DIR/.reply.XXXXXXXX")" || exit 0
+  jq -r '.last_assistant_message // empty | select(length > 0)' <<<"$input" > "$reply_tmp" 2>/dev/null || : > "$reply_tmp"
+  held_file=""
+  held_rel="$(jq -r '.heldReport // empty' <<<"$prev" 2>/dev/null)" || held_rel=""
+  if [[ -n "$held_rel" && -f "$TP_TASK_DIR/$held_rel" ]]; then held_file="$TP_TASK_DIR/$held_rel"; fi
+  base=""
+  if [[ -f "$TP_TASK_DIR/result.md" ]]; then
+    if has_status "$TP_TASK_DIR/result.md"; then base="$TP_TASK_DIR/result.md"; fi
+  elif [[ -n "$held_file" ]] && has_status "$held_file"; then base="$held_file"; fi
+  if [[ -n "$base" && "$origin" != human ]] && ! has_status "$reply_tmp"; then
+    # protected: the reply goes to results/<turn>.md and state.json says a later reply exists
+    if [[ -s "$reply_tmp" ]]; then
+      archive "$reply_tmp" "$prev_turn"
+      later="$(jq -r '(.laterReplies // 0) + 1' <<<"$prev")"
+      ext="$(jq -nc --argjson n "$later" --arg p "results/$prev_turn.md" '{laterReplies: $n, laterReplyPath: $p, heldReport: ""}')"
+    else
+      ext='{"heldReport": ""}'
+    fi
+    if [[ "$base" == "$held_file" ]]; then
+      cp "$held_file" "$TP_TASK_DIR/.restore.$$" && mv "$TP_TASK_DIR/.restore.$$" "$TP_TASK_DIR/result.md"
+    fi
+    rm -f "$reply_tmp"
   else
-    rm -f "$result_tmp" "$TP_TASK_DIR/result.md"
+    if [[ -f "$TP_TASK_DIR/result.md" ]]; then archive "$TP_TASK_DIR/result.md" "$result_turn"; fi
+    if [[ -s "$reply_tmp" ]]; then
+      mv "$reply_tmp" "$TP_TASK_DIR/result.md" || exit 0
+      ext="$(jq -nc --argjson t "$prev_turn" '{resultTurn: $t, laterReplies: 0, laterReplyPath: "", heldReport: ""}')"
+    else
+      rm -f "$reply_tmp" "$TP_TASK_DIR/result.md"
+      ext='{"laterReplies": 0, "laterReplyPath": "", "heldReport": ""}'
+    fi
   fi
 fi
 
@@ -96,7 +164,7 @@ fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson tokens "$tokens" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson tokens "$tokens" --argjson ext "$ext" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -124,6 +192,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
       then $usage | if .model == "" then del(.model) else . end else {} end )
+  + $ext
   + { updated: $now }
 ' > "$state_tmp" 2>/dev/null && mv "$state_tmp" "$state"
 rm -f "$state_tmp"

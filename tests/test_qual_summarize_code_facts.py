@@ -429,7 +429,33 @@ class UseScanTests(unittest.TestCase):
                                      (("pkg2/__init__.py", ""), ("pkg2/helper.py", "from .missing import y\n")))):
             with self.subTest(label):
                 self.assertEqual(scan(user, *others, at="pkg2/u.py"), [])
+        # round 9: a module the file can load is part of what it runs, so every per-file test (_refers: the bare name, a string
+        # reference, a _DYNAMIC_ACCESS word, a star import) is made on every module the walk visits (review F1: h loads Q by pydoc.locate).
+        # The rows of the file itself are above (round 8b); a trigger in a module the file does not import keeps the line.
+        triggers = (("the bare name", "def f():\n    return Q\n"),
+                     ("pydoc.locate of constants + chr (review F1)", "import pydoc\nresult = pydoc.locate('pkg.sub.t.' + chr(81))\n"),
+                     ("a constant naming the target", "x = 'pkg.sub.t.Q'\n"),
+                     ("constants joined by +", "x = 'pkg.' + 'sub.' + 't'\n"),
+                     ("an f-string with a constant part", "n = chr(81)\nx = f'pkg.sub.t.{n}'\n"),
+                     ("an entry point", "x = 'pkg.sub.t:' + chr(81)\n"),
+                     ("a path string", "x = 'pkg/sub/t.py'\n"),
+                     ("bytes", "x = b'pkg.sub.t'\n"),
+                     ("the module name as a bare string", "x = 't'\n"),
+                     ("a dynamic word", "x = getattr(a, 'b')\n"),
+                     ("a star import", "from os import *\n"))
+        for form, text in triggers:
+            for where, user, others in (
+                    ("a module it imports", "import h\n", (("h.py", text),)),
+                    ("two imports away", "import h\n", (("h.py", "import g\n"), ("g.py", text))),
+                    ("the __init__ of an ancestor package", "import lib.x\n", (("lib/__init__.py", text), ("lib/x.py", "y = 1\n"))),
+                    ("a module reached by a member import", "from lib import x\n", (("lib/__init__.py", ""), ("lib/x.py", text))),
+                    ("a module in an import cycle", "import h\n", (("h.py", "import g\n"), ("g.py", "import h\n" + text)))):
+                with self.subTest("{} in {}".format(form, where)):
+                    self.assertEqual(scan(user, *others), [])
+            with self.subTest("{} in a module the file does not import".format(form)):
+                self.assertEqual(scan("import h\n", ("h.py", "x = 1\n"), ("g.py", text)), none)
         for label, user, others in (
+                ("a module in the closure with no trigger", "import h\n", (("h.py", "import g\nx = 'pkg.sub.other'\n"), ("g.py", "y = 'QUEUE'\n"))),
                 ("nothing imported", "x = 1\n", ()),
                 # round 8b: strings that name neither the target nor its module's last component keep the line
                 ("an unrelated string", "x = 'hello world'\n", ()),

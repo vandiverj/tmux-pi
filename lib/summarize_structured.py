@@ -751,7 +751,7 @@ def _single_names(tree):
     an attribute of m or falls back to importing a submodule m.name that may come from outside the run root; Python takes the attribute
     when m binds the name at module scope. One unconditional binding proves that, whatever the right-hand side: if it raises, m fails to
     import and so does the importer. What the name holds is m's business: m is in the import graph (_reaches), every module it imports
-    is walked and every module the walk visits is checked by _opaque, so a value that reaches the target makes a path. The proof does
+    is walked and every module the walk visits is held to the file's own tests (_refers), so a value that reaches the target makes a path. The proof does
     not judge the value. Because it asks whether the name exists, a write into the object it holds (`name[k] = v`, `name.x = v`) does
     not count (_single_binding, existence). A name that is only annotated, deleted, bound under a condition, written as `obj.name = v`,
     or bound twice is not in it."""
@@ -780,7 +780,7 @@ def _may_write(written, name):
 
 def _opaque(source, tree):
     """True when the file's raw text holds a word of _DYNAMIC_ACCESS or the file has a star import: what it loads is then not shown by
-    its imports. The one test of it, for the file scanned (_no_path_to) and for every module the graph walk visits (_reaches)."""
+    its imports. One of the per-file tests of _refers."""
     return _star(tree) or bool(_DYNAMIC_ACCESS_RE.search(source))
 
 
@@ -792,7 +792,7 @@ def _suffixes(dotted):
 
 
 class _Graph(dict):
-    """{dotted module: (names, members, resolved, single, opaque, written) or None} for the run root (see _import_graph), and the names the
+    """{dotted module: (names, members, resolved, single, texts, written) or None} for the run root (see _import_graph), and the names the
     run root answers to: by_name {a name: [the modules it can be]} (every dotted suffix of each module's path) and packages (every
     dotted suffix of each directory a module sits in, whether or not it has an __init__.py)."""
 
@@ -817,19 +817,19 @@ def _ancestor_names(module):
 
 
 def _import_graph(files, parsed):
-    """_Graph of {dotted module: (names, members, resolved, single, opaque, written) or None} for every .py file of the run root
-    (_imports_of, _single_names, _opaque, _written_names); None for one that does not parse (or when one of two files of the same module
-    name does not)."""
+    """_Graph of {dotted module: (names, members, resolved, single, texts, written) or None} for every .py file of the run root
+    (_imports_of, _single_names, ((source, tree), ...) of its files for _refers, _written_names); None for one that does not parse (or
+    when one of two files of the same module name does not)."""
     graph = {}
     for f in files:
         if f["path"].endswith(".py"):
             module, tree = _module_name(f["path"]), parsed[f["path"]]
-            found = (*_imports_of(f["path"], tree), _single_names(tree), _opaque(_source(f["text"]), tree), _written_names(tree)) \
+            found = (*_imports_of(f["path"], tree), _single_names(tree), ((_source(f["text"]), tree),), _written_names(tree)) \
                 if tree is not None else None
             if module in graph:  # pkg.py and pkg/__init__.py: either may run, so the module holds the imports of both and proves only what both prove
                 other = graph[module]
                 if found is not None and other is not None:
-                    found = (found[0] | other[0], found[1] | other[1], found[2] and other[2], found[3] & other[3], found[4] or other[4],
+                    found = (found[0] | other[0], found[1] | other[1], found[2] and other[2], found[3] & other[3], found[4] + other[4],
                              found[5] | other[5])
                 else:
                     found = None
@@ -860,17 +860,18 @@ def _unresolved(name, graph, attribute=False):
     return any(known(".".join(parts[:i])) for i in range(1, len(parts)))
 
 
-def _reaches(names, members, resolved, module, graph):
-    """True when code that imports the dotted names `names` and the (module, member) pairs `members` may reach the dotted module `module`
-    through the run root's import graph. An import counts when it can name the target: it is equal to one of the target's names (every
-    dotted suffix of its path: src.h.t is also h.t and t, as any directory may be on sys.path), a descendant of one, or the name of a
-    directory above it (an ancestor package: src, src.h, h). Importing a module runs the modules of its ancestor packages, and each
-    module it loads is followed through its own imports (transitively), and one that is opaque (_opaque: a star import or a
-    _DYNAMIC_ACCESS word in its text) counts as a path, as the file's own text does in _no_path_to. An import that cannot be resolved
-    (a relative one above the run root; a name under a run-root package or module that names no module there, or a member the module does
-    not provably bind, _unresolved), a file that does not parse, all count as a path. The unresolved test is made on every import, the
-    file's own and those of each module it loads."""
-    if not resolved:
+def _reaches(texts, names, members, resolved, name, module, graph):
+    """True when code whose own files are `texts` ((source, tree) pairs), that imports the dotted names `names` and the (module, member)
+    pairs `members`, may reach the name defined in the dotted module `module` (round 9: the file and every module it can load are one
+    closure, and every per-file test is made on each of them). An import counts when it can name the target: it is equal to one of the
+    target's names (every dotted suffix of its path: src.h.t is also h.t and t, as any directory may be on sys.path), a descendant of
+    one, or the name of a directory above it (an ancestor package: src, src.h, h). Importing a module runs the modules of its ancestor
+    packages, and each module it loads is followed through its own imports (transitively). The code's own files and every module the
+    walk visits are held to the same per-file tests, _refers, with the same target tokens: one that refers to the target counts as a
+    path. An import that cannot be resolved (a relative one above the run root; a name under a run-root package or module that names no
+    module there, or a member the module does not provably bind, _unresolved), a file that does not parse, all count as a path. The
+    unresolved test is made on every import, the file's own and those of each module it loads."""
+    if not resolved or any(_refers(source, tree, name, module) for source, tree in texts):
         return True
     own, above = _suffixes(module), _ancestor_names(module)
     seen, todo = set(), [(n, False) for n in names] + [(s + "." + c, True) for s, c in members]
@@ -883,9 +884,10 @@ def _reaches(names, members, resolved, module, graph):
         if _unresolved(dotted, graph, item[1]) or dotted in above or any(_inside(dotted, n) for n in own):
             return True
         for m in graph.loaded(dotted):
-            if graph[m] is None or not graph[m][2] or graph[m][4]:  # a module that is opaque (_opaque) may load the target unseen
+            entry = graph[m]
+            if entry is None or not entry[2] or any(_refers(source, tree, name, module) for source, tree in entry[4]):
                 return True
-            todo.extend([(n, False) for n in graph[m][0]] + [(s + "." + c, True) for s, c in graph[m][1]])
+            todo.extend([(n, False) for n in entry[0]] + [(s + "." + c, True) for s, c in entry[1]])
     return False
 
 
@@ -914,28 +916,34 @@ def _string_mentions(tree, tokens):
     return False
 
 
+def _refers(source, tree, name, module):
+    """THE per-file tests of the absence path (round 9: one function, made on the file scanned and on every module _reaches visits, so a
+    test cannot be added to one and not the other). True when the file's source or tree may refer to the name defined in the dotted
+    module `module`; none of these is a list of syntax cases:
+    - the bare name occurs in the raw text (code, strings, bytes, comments, docstrings), on identifier boundaries;
+    - a string of the file is a reference to the target (_string_mentions, round 8b): split on `.`, `:` and `/`, it has a token equal
+      to the name or to the last component of the module's names, whether the string is one constant, a `+` of constants, or the
+      constant parts of an f-string. Every string-built loader (pydoc.locate, unittest.mock.patch, logging.config, an entry point
+      "t:Q", a path "pkg/sub/t.py", pkgutil.resolve_name, ...) needs the target's name as text, and the set of loaders is open while
+      the text is not, so this is a rule over strings and not a list of loaders;
+    - the file is opaque (_opaque): its text holds a word of _DYNAMIC_ACCESS, or it has a star import."""
+    return (_opaque(source, tree) or bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source))
+            or _string_mentions(tree, {name, module.split(".")[-1]}))
+
+
 def _no_path_to(source, tree, path, name, module, graph):
     """True when the file's text and the run root's import graph prove the file has no path to the name defined in the dotted module
-    `module`, so that "does not use" may be said. All of these hold; none is a list of syntax cases:
-    - the bare name occurs nowhere in the raw text (code, strings, bytes, comments, docstrings), on identifier boundaries;
-    - no string constant of the file is a reference to the target (_string_mentions, round 8b): split on `.`, `:` and `/`, none has a
-      token equal to the name or to the last component of the module's names, whether the string is one constant, a `+` of constants,
-      or the constant parts of an f-string. Every string-built loader (pydoc.locate, unittest.mock.patch, logging.config, an entry point
-      "t:Q", a path "pkg/sub/t.py", pkgutil.resolve_name, ...) needs the target's name as text, and the set of loaders is open while the
-      text is not, so this is a rule over strings and not a list of loaders;
-    - the text holds none of _DYNAMIC_ACCESS;
-    - no star import (_star);
-    - no path through the import graph to the module (_reaches): none of its imports, nor those of any run-root module it loads,
-      is the target module, an ancestor package or a submodule of it, or cannot be resolved, and none of those modules is itself opaque
-      (_opaque: the same two checks above, made on each module the walk visits).
-    Anything else gives no absence line.
-    The limit, stated once: a name that reaches the file from outside its source (a configuration file, the environment, the network)
-    is beyond static proof; the absence line is a statement about the source it was given."""
-    if _opaque(source, tree) or re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source):
-        return False
-    if _string_mentions(tree, {name, module.split(".")[-1]}):
-        return False
-    return not _reaches(*_imports_of(path, tree), module, graph)
+    `module`, so that "does not use" may be said: no path through _reaches, which makes the per-file tests (_refers: the bare name in
+    the raw text, a string reference, a _DYNAMIC_ACCESS word, a star import) on the file and, with the same target tokens, on every
+    run-root module it can load (directly, through any number of imports, an ancestor package's __init__, a `from pkg import sub`
+    member, an import cycle), and finds none of its imports, nor those of any module it loads, to be the target module, an ancestor
+    package or a submodule of it, or unresolvable. A module the file can load is part of what the file runs. Anything else gives no
+    absence line.
+    The limit, stated once: a name that reaches the code from outside its source (a configuration file, the environment, the network),
+    or that the source computes without writing any token of it anywhere in the closure (every character from chr, say), is beyond
+    static proof; the absence line is a statement about the source it was given. A finding that needs such a name is closed by this
+    limit; a finding where a token of the target is written anywhere in the closure is not."""
+    return not _reaches(((source, tree),), *_imports_of(path, tree), name, module, graph)
 
 
 def _use_lines(f, tree, target, kind, module, others, members, dup, rewritten=False):
@@ -1049,7 +1057,8 @@ def use_scan(task, files):
     methods too), each only through an import of the target by its full dotted path whose name nothing else binds, writes or
     shadows (see _use_lines); `from m import *` attributes nothing. A file with none of these gives `<base> does not use <T> [path:1]`,
     unless the file's text and the run root's import graph do not prove it has no path to the name (_no_path_to: a star import, a word of
-    _DYNAMIC_ACCESS, the name anywhere in the text, a path through the imports to the target's module): then it gives nothing. When more than one file
+    _DYNAMIC_ACCESS, the name anywhere in the text, a string that names it or its module, in the file or in any run-root module it can
+load (_refers), or a path through the imports to the target's module): then it gives nothing. When more than one file
     defines the name, each definer is scanned as its own module and its lines say `<module>.<T>`; a file that defines the name itself,
     or whose binding of the name is ambiguous, gives nothing for it."""
     out = []

@@ -309,10 +309,15 @@ tsc_references() {
   local line
   REFS=()
   grep -q '"references"' "$WT/$1/tsconfig.json" || return 0
-  while IFS= read -r line; do [ -z "$line" ] || REFS+=("$line"); done < <(
-    cd "$WT/$1" && "$2" --showConfig 2>>"$TP_LOG" |
-      sed -n '/^    "references": \[/,/^    \]/p' | sed -n 's/^ *"path": "\(.*\)",\{0,1\}$/\1/p'
-  )
+  TP_TSC_CONF="$(cd "$WT/$1" && "$2" --showConfig 2>>"$TP_LOG")"
+  while IFS= read -r line; do [ -z "$line" ] || REFS+=("$line"); done < <(tp_tsc_conf_refs)
+}
+
+# only_ts6305 START — the last run_in (its output begins after log line START) failed with TS errors that are all TS6305.
+only_ts6305() {
+  local errors
+  errors="$(sed -n "$(($1 + 2)),\$p" "$TP_LOG" | grep 'error TS[0-9]')"
+  [ -n "$errors" ] && ! printf '%s\n' "$errors" | grep -qv 'error TS6305'
 }
 
 # Typecheck, one line per touched app that has a typecheck config (deno.json(c) or tsconfig.json). Any changed or
@@ -359,12 +364,26 @@ for app in ${APPS[@]+"${APPS[@]}"}; do
   elif [ -e "$WT/$app/tsconfig.json" ]; then
     typed=1
     if bin="$(tp_find_tool tsc "$WT/$app" "$WT")"; then
-      # Build the referenced projects first (their declarations go to their own outDir, which is build output), then
-      # check the app. A reference that does not build is the app's typecheck failure.
+      # Build the referenced projects first (their declarations go to their own build output), then check the app. A
+      # reference that does not build is the app's typecheck failure. The build runs only when every file it would
+      # write is ignored by git and untracked: it must not change the worktree under review. Otherwise the app is
+      # checked as it stands, and TS6305 alone (unbuilt references) is a setup gap, `missing`, not a failure.
       tsc_references "$app" "$bin"
       RC=0
-      if [ "${#REFS[@]}" -gt 0 ]; then run_in "$app" "$label references" "$bin" -b "${REFS[@]}"; fi
-      if [ "$RC" = 0 ]; then run_in "$app" "$label" "$bin" --noEmit; fi
+      UNSAFE=""
+      if [ "${#REFS[@]}" -gt 0 ]; then
+        UNSAFE="$(tp_tsc_unsafe_refs "$WT" "$bin" "$WT/$app" "${REFS[@]}")"
+        [ -n "$UNSAFE" ] || run_in "$app" "$label references" "$bin" -b "${REFS[@]}"
+      fi
+      if [ "$RC" = 0 ]; then
+        LOG_AT="$(wc -l <"$TP_LOG")"
+        run_in "$app" "$label" "$bin" --noEmit
+      fi
+      if [ -n "$UNSAFE" ] && [ "$RC" != 0 ] && only_ts6305 "$LOG_AT"; then
+        printf '%s skipped (references not built; building them would write files git does not ignore: %s)\n' "$label" "$UNSAFE"
+        rec "$label" missing ""
+        continue
+      fi
       printf '%s %s\n' "$label" "$RC"
       rec_ran "$label" "$RC"
       if [ "$RC" != 0 ]; then FAILED=1; printf '%s\n' "$TAIL"; fi

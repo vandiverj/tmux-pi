@@ -36,9 +36,9 @@ class ScriptCase(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "LC_ALL": "C.UTF-8"}
 
     # --- fixtures
-    def stub(self, name, exit_code=0, output="", where=None, fail_on_call=None):
+    def stub(self, name, exit_code=0, output="", where=None, fail_on_call=None, body=None):
         """An executable that appends its cwd, TZ and arguments to calls/<name>, prints `output`, exits `exit_code`
-        (`fail_on_call` N: only the Nth call exits 1)."""
+        (`fail_on_call` N: only the Nth call exits 1). `body`: shell text that replaces the output and the exit."""
         directory = where or self.bin
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / name
@@ -48,11 +48,40 @@ class ScriptCase(unittest.TestCase):
             f'log="{self.calls}/{name}"\n'
             'n=$(($(cat "$log.count" 2>/dev/null || echo 0) + 1)); echo "$n" > "$log.count"\n'
             '{ echo "--- call $n cwd=$PWD TZ=${TZ-unset}"; for a in "$@"; do echo "arg: $a"; done; } >> "$log"\n'
-            f"cat <<'OUT'\n{output}\nOUT\n"
-            f"{code}\n")
+            + (f"{body}\n" if body else f"cat <<'OUT'\n{output}\nOUT\n{code}\n"))
         path.chmod(0o755)
         return path
 
+    def tsc_projects(self, projects, noemit=("", 0), build_rc=0):
+        """A tsc stub that answers per project directory (its basename): `--showConfig` with the project's config text
+        (absent: it fails), `--listFilesOnly` with its files, `-b` like a tsc with no outDir (it writes <ref>/a.js) and
+        exits `build_rc`, `--noEmit` with the `noemit` (output, exit)."""
+        data = self.tmp / "tscdata"
+        data.mkdir(exist_ok=True)
+        for name, (config, files) in projects.items():
+            if config is not None:
+                (data / f"{name}.config").write_text(config)
+            (data / f"{name}.files").write_text("".join(f"{f}\n" for f in files))
+        (data / "noemit.out").write_text(noemit[0])
+        (data / "noemit.rc").write_text(str(noemit[1]))
+        self.stub("tsc", body=(
+            f'd="{data}"; name=$(basename "$PWD")\n'
+            'case " $* " in\n'
+            '  *" --showConfig "*) cat "$d/$name.config" || exit 1; exit 0 ;;\n'
+            '  *" --listFilesOnly "*) cat "$d/$name.files"; exit 0 ;;\n'
+            f'  *" -b "*) for p in "$@"; do [ "$p" = -b ] || echo built > "$p/a.js"; done; exit {build_rc} ;;\n'
+            '  *) cat "$d/noemit.out"; exit "$(cat "$d/noemit.rc")" ;;\n'
+            "esac"))
+
+    @staticmethod
+    def show(options=None, refs=()):
+        """`tsc --showConfig` text: the options at the indent tsc prints scalars at, the references as {path} objects."""
+        doc = {"compilerOptions": options or {}}
+        if refs:
+            doc["references"] = [{"path": r} for r in refs]
+        return json.dumps(doc, indent=4)
+
+    BUILT = {"composite": True, "emitDeclarationOnly": True}  # the options of a referenced project
     def calls_of(self, name):
         path = self.calls / name
         return path.read_text() if path.exists() else ""
@@ -197,30 +226,75 @@ class GateTests(ScriptCase):
         self.assertNotIn("--ignore-path", self.calls_of("prettier"))
         self.assertNotIn("--version", self.calls_of("prettier"))
 
-    TSC_CONFIG = (
-        '{\n    "compilerOptions": {},\n    "references": [\n        {\n            "path": "../lib/a"\n        },\n'
-        '        {\n            "path": "../lib/b"\n        }\n    ],\n    "include": ["x"]\n}')
+    TS6305 = "a.ts(1,1): error TS6305: Output file 'lib/a/a.d.ts' has not been built from source file 'lib/a/a.ts'."
 
-    def lane_with_referencing_app(self, config='// refs\n{"references": [{"path": "../lib/a"}]}\n'):
+    def lane_with_referencing_app(self, tracked=None):
+        """web references ../lib/a and ../lib/b; .gitignore holds the build output patterns of airtera."""
         repo = self.repo(files={"README.md": "hi\n"})
-        self.commit(repo, {"web/package.json": "{}\n", "web/tsconfig.json": config, "web/a.ts": "export const a = 1\n"})
+        self.commit(repo, {
+            ".gitignore": "dist/\n*.tsbuildinfo\nlib/**/*.d.ts\n*.d.ts.map\n",
+            "web/package.json": "{}\n", "web/tsconfig.json": '// refs\n{"references": [{"path": "../lib/a"}]}\n',
+            "web/a.ts": "export const a = 1\n",
+            "lib/a/tsconfig.json": "{}\n", "lib/a/a.ts": "export const a = 1\n", "lib/b/tsconfig.json": "{}\n",
+            "lib/b/b.ts": "export const b = 1\n", **(tracked or {})})
         return repo
 
     def test_tsc_builds_the_project_references_before_the_noemit_check(self):
-        # Unbuilt references make `tsc --noEmit` fail with TS6305 in a fresh worktree.
+        # Unbuilt references make `tsc --noEmit` fail with TS6305 in a fresh worktree. The build runs after the
+        # outputs of every referenced project were found ignored: lib/a into an ignored outDir, lib/b (a reference of
+        # lib/a) next to its sources as ignored .d.ts files with the .tsbuildinfo beside its config.
         repo = self.lane_with_referencing_app()
-        self.stub("tsc", output=self.TSC_CONFIG)
+        self.tsc_projects({
+            "web": (self.show({}, ["../lib/a", "../lib/b"]), []),
+            "a": (self.show({**self.BUILT, "outDir": "./dist"}, ["../b"]), []),
+            "b": (self.show({**self.BUILT, "declarationMap": True}), [f"{repo}/lib/b/b.ts", f"{repo}/node_modules/x/y.ts"]),
+        })
         out = self.run_script("pre-commit-gate.sh", repo, "main")
         code, log, body = self.last_line(out)
-        self.assertEqual(self.arg_lists("tsc"), [["arg: --showConfig"], ["arg: -b", "arg: ../lib/a", "arg: ../lib/b"], ["arg: --noEmit"]])
+        self.assertEqual(code, 0)
+        calls = [c for c in self.arg_lists("tsc") if c[0] in ("arg: -b", "arg: --noEmit")]
+        self.assertEqual(calls, [["arg: -b", "arg: ../lib/a", "arg: ../lib/b"], ["arg: --noEmit"]])
         self.assertIn(f"cwd={repo}/web", self.calls_of("tsc"))
-        self.assertIn("typecheck:web 0", body)
-        self.assertEqual([l for l in body if l.startswith("typecheck")], ["typecheck:web 0"])
+        self.assertEqual([l for l in body if l.startswith("typecheck:web")], ["typecheck:web 0"])
         self.assertIn("== typecheck:web references: ", self.assertLogged(log))
+
+    def test_references_whose_build_would_write_tracked_files_are_not_built_and_ts6305_alone_is_missing(self):
+        # lib/a has no outDir and emits JS next to its sources, over the tracked a.js. Building would change the
+        # worktree under review, so it is not built; the app is checked as it stands, and its TS6305 is a setup gap.
+        repo = self.lane_with_referencing_app(tracked={"lib/a/a.js": "old\n"})
+        self.tsc_projects({"web": (self.show({}, ["../lib/a"]), []), "a": (self.show({"composite": True}), [f"{repo}/lib/a/a.ts"])},
+                          noemit=(self.TS6305 + "\n", 2))
+        before = self.git(repo, "status", "--porcelain")
+        out = self.run_script("pre-commit-gate.sh", repo, "main")
+        code, log, body = self.last_line(out)
+        self.assertEqual(code, 0)
+        self.assertNotIn("arg: -b", self.calls_of("tsc"))
+        self.assertEqual((repo / "lib/a/a.js").read_text(), "old\n")
+        self.assertEqual(self.git(repo, "status", "--porcelain"), before)
+        self.assertEqual([l for l in body if l.startswith("typecheck:web")],
+                         ["typecheck:web skipped (references not built; building them would write files git does not ignore: "
+                          "lib/a/tsconfig.json: would write lib/a/a.js, which git does not ignore (or tracks))"])
+        record = json.loads(Path(log).with_suffix(".json").read_text())
+        self.assertEqual({c["name"]: (c["status"], c["exit"]) for c in record["checks"]}["typecheck:web"], ("missing", None))
+
+    def test_without_a_build_a_typecheck_that_fails_for_another_reason_fails_and_one_that_passes_passes(self):
+        other = "web/a.ts(2,1): error TS2322: Type 'string' is not assignable to type 'number'."
+        for label, noemit, want_code, want_line in (
+                ("TS6305 and another error", (f"{self.TS6305}\n{other}\n", 2), 1, "typecheck:web 2"),
+                ("no TS error line", ("boom\n", 2), 1, "typecheck:web 2"),
+                ("passes", ("", 0), 0, "typecheck:web 0")):
+            with self.subTest(case=label):
+                self.setUp()
+                repo = self.lane_with_referencing_app(tracked={"lib/a/a.js": "old\n"})
+                self.tsc_projects({"web": (self.show({}, ["../lib/a"]), []), "a": (self.show({"composite": True}), [f"{repo}/lib/a/a.ts"])},
+                                  noemit=noemit)
+                code, log, body = self.last_line(self.run_script("pre-commit-gate.sh", repo, "main"))
+                self.assertEqual((code, want_line in body), (want_code, True), body)
+                self.assertNotIn("arg: -b", self.calls_of("tsc"))
 
     def test_a_reference_that_does_not_build_fails_the_typecheck_without_the_noemit_run(self):
         repo = self.lane_with_referencing_app()
-        self.stub("tsc", output=self.TSC_CONFIG, fail_on_call=2)
+        self.tsc_projects({"web": (self.show({}, ["../lib/a"]), []), "a": (self.show({**self.BUILT, "outDir": "./dist"}), [])}, build_rc=1)
         out = self.run_script("pre-commit-gate.sh", repo, "main")
         code, log, body = self.last_line(out)
         self.assertEqual(code, 1)
@@ -228,8 +302,9 @@ class GateTests(ScriptCase):
         self.assertNotIn("arg: --noEmit", self.calls_of("tsc"))
 
     def test_a_tsconfig_that_only_mentions_references_runs_just_the_noemit_check(self):
-        repo = self.lane_with_referencing_app('{"references": []}\n')
-        self.stub("tsc", output='{\n    "files": []\n}')
+        repo = self.lane_with_referencing_app()
+        self.commit(repo, {"web/tsconfig.json": '{"references": []}\n'})
+        self.tsc_projects({"web": (self.show(), [])})
         self.run_script("pre-commit-gate.sh", repo, "main")
         self.assertEqual(self.arg_lists("tsc"), [["arg: --showConfig"], ["arg: --noEmit"]])
 
@@ -1214,3 +1289,65 @@ class JsonWriteTests(ScriptCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TscReferenceOutputTests(ScriptCase):
+    """tp_tsc_unsafe_refs (_common.sh): which referenced project's `tsc -b` would write a path git does not ignore. One
+    repository, one row per rule; each row feeds the tsc stub the configs of its projects and names the expected reason."""
+
+    GITIGNORE = "dist/\n*.tsbuildinfo\nlib/**/*.d.ts\n*.d.ts.map\n"
+
+    def unsafe(self, repo, refs):
+        script = '. "$1/_common.sh"; TP_LOG=/dev/null; tp_tsc_unsafe_refs "$2" "$3" "$2/web" "${@:4}"'
+        out = subprocess.run(["bash", "-c", script, "x", str(TOOLS), str(repo), str(self.bin / "tsc"), *refs],
+                             env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual((out.returncode, out.stderr), (0, ""))
+        return "\n".join(out.stdout.splitlines()[:-1])  # the last line is the EXIT trap's `exit=N log=PATH`
+
+    def test_a_reference_is_unsafe_when_its_build_would_write_a_path_git_does_not_ignore_or_tracks(self):
+        files = {".gitignore": self.GITIGNORE, "web/tsconfig.json": "{}\n", "lib/t/t.js": "old\n", "lib/e/dist/x.js": "old\n"}
+        for name in "abcdefghtx":
+            files[f"lib/{name}/tsconfig.json"] = "{}\n"
+            files[f"lib/{name}/{name}.ts"] = "export {}\n"
+        files["lib/f/tsconfig.build.json"] = "{}\n"
+        repo = self.repo(files=files)
+        self.git(repo, "add", "-f", "lib/e/dist/x.js")
+        self.git(repo, "commit", "-q", "-m", "tracked build output")
+        src = lambda n, f=None: [f"{repo}/lib/{n}/{f or n + '.ts'}"]
+        js, dts = {"composite": True}, {"composite": True, "emitDeclarationOnly": True}
+        # (case, refs as written in web's config, {project: (config, source files)}, expected: "" = safe, else reason)
+        table = [
+            ("ignored outDir holds declarations and the buildinfo", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./dist"}), [])}, ""),
+            ("declarations next to sources, ignored by pattern, with their maps", ["../lib/a"],
+             {"a": (self.show({**dts, "declarationMap": True}), src("a"))}, ""),
+            ("a reference given as a config file", ["../lib/f/tsconfig.build.json"],
+             {"f": (self.show({**dts, "outDir": "./dist"}), [])}, ""),
+            ("a cycle of safe references ends", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./dist"}, ["../b"]), []), "b": (self.show({**dts, "outDir": "./dist"}, ["../a"]), [])}, ""),
+            ("JS next to the sources over a tracked file", ["../lib/t"],
+             {"t": (self.show(js), src("t"))}, "lib/t/tsconfig.json: would write lib/t/t.js, which git does not ignore (or tracks)"),
+            ("JS next to the sources, not ignored", ["../lib/a"],
+             {"a": (self.show(js), src("a"))}, "lib/a/a.js"),
+            ("an outDir that is not ignored", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./out"}), [])}, "lib/a/out"),
+            ("an outDir that holds tracked files", ["../lib/e"],
+             {"e": (self.show({**dts, "outDir": "./dist"}), [])}, "lib/e/dist, which holds tracked files"),
+            ("a declarationDir that is not ignored", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./dist", "declarationDir": "./types"}), [])}, "lib/a/types"),
+            ("a tsBuildInfoFile that is not ignored", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./dist", "tsBuildInfoFile": "./info.json"}), [])}, "lib/a/info.json"),
+            ("declarations of .mts sources are .d.mts, which the pattern does not ignore", ["../lib/a"],
+             {"a": (self.show(dts), [f"{repo}/lib/a/m.mts", f"{repo}/lib/a/x.d.ts", f"{repo}/node_modules/q/q.ts"])}, "lib/a/m.d.mts"),
+            ("a source file outside the worktree writes nothing here", ["../lib/a"],
+             {"a": (self.show(dts), ["/elsewhere/z.ts"])}, ""),
+            ("an unsafe project behind a safe one", ["../lib/a"],
+             {"a": (self.show({**dts, "outDir": "./dist"}, ["../b"]), []), "b": (self.show(js), src("b"))}, "lib/b/tsconfig.json: would write lib/b/b.js"),
+            ("a config that cannot be read", ["../lib/h"], {}, "lib/h/tsconfig.json: its config cannot be read"),
+        ]
+        for label, refs, projects, want in table:
+            with self.subTest(case=label):
+                self.tsc_projects(projects)
+                got = self.unsafe(repo, refs)
+                self.assertEqual(got == "", want == "", got)
+                self.assertIn(want, got)

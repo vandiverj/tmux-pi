@@ -34,12 +34,12 @@ class PrivateTmux:
     def tmux(self, *args):
         return subprocess.run([str(self.bin_dir / "tmux"), *args], capture_output=True, text=True, timeout=10)
 
-    def worker(self, mode="normal", task_dir=None, paste_ms=150, foreign=False):
+    def worker(self, mode="normal", task_dir=None, paste_ms=150, foreign=False, hold=False):
         """Start a fake worker in a new session; returns (pane id, log path, raw path). Waits for its ready file."""
         self.count += 1
         log, raw, ready = (self.dir / "w{}.{}".format(self.count, n) for n in ("log", "raw", "ready"))
         cmd = [sys.executable, str(FAKE), "--mode", mode, "--paste-ms", str(paste_ms), "--log", str(log), "--raw", str(raw),
-               "--ready", str(ready)] + (["--task-dir", str(task_dir)] if task_dir else []) + (["--foreign"] if foreign else [])
+               "--ready", str(ready)] + (["--task-dir", str(task_dir)] if task_dir else []) + (["--foreign"] if foreign else []) + (["--hold"] if hold else [])
         made = self.tmux("new-session", "-d", "-s", "w{}".format(self.count), "-x", "100", "-y", "20", " ".join(map(_quote, cmd)))
         if made.returncode:
             raise RuntimeError(made.stderr)
@@ -50,6 +50,10 @@ class PrivateTmux:
                 raise RuntimeError("fake worker did not start")
             time.sleep(0.02)
         return pane, log, raw
+
+    def release(self, log):
+        """Let a --hold worker's held records land in its task's state.json (the slow hook finally ran)."""
+        Path(str(log) + ".release").write_text("")
 
     def submitted(self, log):
         return [json.loads(line)["submitted"] for line in log.read_text().splitlines()] if log.exists() else []

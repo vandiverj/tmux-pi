@@ -751,7 +751,7 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
             typed = [c for c in calls if c[0] == "send-keys" and "-l" in c]
             if submit_recorded and command[-1] == "Enter":
                 (self.task / "state.json").write_text(json.dumps({"promptSubmits": 1, "promptLog": [
-                    {"n": 1, "at": "t", "hash": pane_send.prompt_hash(typed[-1][-1])}]}))
+                    {"n": 1, "at": "t", "tokens": pane_send.TOKEN_RE.findall(typed[-1][-1])}]}))
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         decision = {"action": ("nudge-draft", "draft due"), "status": None, "elapsed": 60, "turns": 3}
         err = io.StringIO()

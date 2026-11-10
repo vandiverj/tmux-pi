@@ -3,34 +3,42 @@
 Claude Code reads a fast burst of keys as a paste, so an Enter sent right after the text becomes part of the paste and
 nothing is submitted. send() types the text, waits SETTLE_SECONDS, sends Enter, then checks that the worker took it.
 
+Delivery id. send() ends the text it types with a marker like " [tp:0a1b2c3d4e]" (TOKEN_RE): 10 random hex digits, new for
+every call. It is a delivery id for the sender's bookkeeping and has no meaning to the worker; the worker may ignore it.
+It is typed once, with the text. A retry presses Enter again and does not make a new one.
+
 How "submitted" is decided. The harness comes from the task: meta.json "worker" ("claude" or "pi"), and only when meta.json
 has none, state.json "harness". Telemetry that is missing never changes the harness.
-  * Claude task: this message's own submit record, never the screen. The plugin's UserPromptSubmit hook
-    (claude/plugins/tmux-pi/hooks/report.sh) appends {n, hash, at} to `promptLog` in state.json (last 8 records). The send
-    reads `promptSubmits` before typing (no state.json = count 0), and is confirmed only by a record with n above that
-    count and the hash of this message (prompt_hash). A higher count alone is not proof: a delayed hook for an earlier
-    prompt can raise it. The snapshot rules out a repeat of the same text: the first send's record has n at or below the
-    count read for the second send, so it cannot confirm it. Limit: if the first send was not confirmed and its record
-    arrives after the second snapshot, it looks like the second's. If the plugin hooks are not installed in the worker, no
-    record ever arrives and the result is submitted false even though the text may have gone in. The hook's `prompt` is
-    not documented as byte-identical to the typed text (types/claude-code/index.d.ts says only `prompt: string` for the
-    UserPromptSubmit hook, line 16362; the engine's own `prompt.submit` text is "as typed, pastes already expanded",
-    line 9911), so both sides hash the text with all whitespace removed. If the box already held other text, the hook's
-    prompt includes it, the hash differs, and the result is submitted false (the text did go in; the sender is told to
-    check).
+  * Claude task: this send's own submit record, never the screen. The plugin's UserPromptSubmit hook
+    (claude/plugins/tmux-pi/hooks/report.sh) finds every marker in the prompt it was given and appends
+    {n, at, tokens: [...]} to `promptLog` in state.json (last 8 records). The send is confirmed only by a record whose
+    tokens hold the marker this call typed. Nothing else counts: not a higher `promptSubmits`, not a record of the same
+    text sent earlier (it carries that send's marker), not a record that arrives late for an earlier send. No text is
+    compared, so no whitespace rule has to match between this module and the hook. A missing state.json means no record
+    yet, never the pane check.
+    Limits: if the plugin hooks are not installed in the worker, no record ever arrives and the result is submitted false
+    even though the text may have gone in. `promptLog` keeps 8 records, so a record can be missed only if 8 more prompts
+    are submitted within one POLL_SECONDS. What the hook's `prompt` holds for a pasted message is not proven byte for
+    byte: the engine types say `prompt: string` for UserPromptSubmitHookInput (types/claude-code/index.d.ts line 16360,
+    under .claude-plugin/ and git-ignored) and, for the engine's own prompt.submit, "The prompt's text as typed, pastes
+    already expanded" (lines 9909-9914). A worker transcript shows a message typed by `tp-agent message` recorded in full
+    (tasks/coder-36ec1ecbe7, transcript line 285, the 822-character "Main: one more change..." user entry). Not verified:
+    the hook's `prompt` for a long message. If it held a paste placeholder instead of the text, the marker would be
+    missing and the send would read as not submitted: a false "not submitted", never a false "submitted". If the box
+    already held other text, the prompt holds it too, with our marker, and the send is confirmed.
   * pi task, or a send with no task dir: the pane check. agent/extensions/reporter.ts has no prompt-submit record (its
-    agent_start only sets state "working"), so the text must be gone from the bottom PANE_LINES lines of capture-pane.
-    Limits: it cannot tell a submit from a worker that cleared or redrew its box for another reason; text echoed into the
-    conversation just above the box can keep it "present" for up to PANE_LINES lines (a false "not submitted", which costs
-    an extra Enter at most); a screen that never showed the text at all reads as submitted.
+    agent_start only sets state "working"), so the typed text (marker included) must be gone from the bottom PANE_LINES
+    lines of capture-pane. Limits: it cannot tell a submit from a worker that cleared or redrew its box for another
+    reason; text echoed into the conversation just above the box can keep it "present" for up to PANE_LINES lines (a false
+    "not submitted", which costs an extra Enter at most); a screen that never showed the text at all reads as submitted.
 
 If there is no confirmation within CONFIRM_SECONDS, Enter is sent again, at most RETRIES more times. The text is typed
 once and never retyped. Returns {"submitted": bool, "attempts": N} where attempts counts Enters sent.
 """
-import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -42,6 +50,10 @@ RETRIES = 2            # extra Enters after the first
 POLL_SECONDS = 0.05
 PANE_LINES = 6         # bottom lines of the pane that count as the input region
 PROBE_CHARS = 24       # tail of the text (spaces removed) looked for in the input region
+# The delivery id typed after the text. report.sh holds the same pattern to find it in the hook's prompt; a test keeps the
+# two equal.
+TOKEN_PATTERN = r"\[tp:[0-9a-f]{10}\]"
+TOKEN_RE = re.compile(TOKEN_PATTERN)
 
 
 def flatten(text):
@@ -74,26 +86,20 @@ def harness(task_dir):
     return None
 
 
-def submits(task_dir):
-    count = _state(task_dir).get("promptSubmits")
-    return count if isinstance(count, int) else 0
-
-
 def uses_record(task_dir):
     return harness(task_dir) == "claude"
 
 
-def prompt_hash(text):
-    """sha1 of `text` with all whitespace removed, first 12 hex chars. report.sh computes the same on the hook's prompt."""
-    return hashlib.sha1(_squash(text).encode("utf-8")).hexdigest()[:12]
+def new_token():
+    """A delivery id: "[tp:" + 10 random hex digits + "]" (matches TOKEN_RE). New on every call."""
+    return "[tp:" + secrets.token_hex(5) + "]"
 
 
-def delivered(task_dir, before, text):
-    """True when a submit record after the snapshot `before` carries the hash of `text`."""
+def delivered(task_dir, token):
+    """True when a submit record in state.json carries `token`. No state.json, or no such record, is False."""
     log = _state(task_dir).get("promptLog")
-    want = prompt_hash(text)
     return isinstance(log, list) and any(
-        isinstance(r, dict) and isinstance(r.get("n"), int) and r["n"] > before and r.get("hash") == want for r in log)
+        isinstance(r, dict) and isinstance(r.get("tokens"), list) and token in r["tokens"] for r in log)
 
 
 def _squash(text):
@@ -111,15 +117,15 @@ def pane_has_text(pane, text):
 
 
 def send(pane, text, task_dir=None, settle=SETTLE_SECONDS, confirm=None, retries=RETRIES):
-    """Type `text` (newlines flattened), press Enter, and confirm. Raises CalledProcessError if tmux fails."""
-    text = flatten(text)
+    """Type `text` (newlines flattened) and a new delivery id, press Enter, confirm. Raises CalledProcessError if tmux fails."""
+    token = new_token()
+    text = flatten(text) + " " + token
     if confirm is None:
         try:
             confirm = float(os.environ.get(CONFIRM_ENV, CONFIRM_SECONDS))
         except ValueError:
             confirm = CONFIRM_SECONDS
     record = uses_record(task_dir)
-    before = submits(task_dir) if record else 0
     _tmux("send-keys", "-t", pane, "-l", text, capture_output=True)
     attempts = 0
     for _ in range(retries + 1):
@@ -128,7 +134,7 @@ def send(pane, text, task_dir=None, settle=SETTLE_SECONDS, confirm=None, retries
         attempts += 1
         deadline = time.monotonic() + confirm
         while True:
-            if delivered(task_dir, before, text) if record else not pane_has_text(pane, text):
+            if delivered(task_dir, token) if record else not pane_has_text(pane, text):
                 return {"submitted": True, "attempts": attempts}
             if time.monotonic() >= deadline:
                 break

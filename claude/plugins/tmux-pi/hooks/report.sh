@@ -82,19 +82,21 @@ if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]
   if [[ -z "$usage" ]]; then usage='null'; fi
 fi
 
-# The submit record lib/pane_send.py waits on. Only a UserPromptSubmit writes it: promptSubmits (a count), promptSubmitted
-# (time), promptHash, and promptLog, the last 8 records {n, hash, at} in order, so two quick submits cannot hide each other.
-# The hash rule is the one lib/pane_send.py prompt_hash() uses: sha1 of the prompt with every whitespace character removed
-# (no trailing newline), first 12 hex chars. The hook's `prompt` is not documented as byte-identical to what was typed (a
-# paste may be expanded, edges trimmed), so whitespace is dropped on both sides.
-phash=""
+# The submit record lib/pane_send.py waits on. Only a UserPromptSubmit writes it: promptSubmits (a running count, the
+# source of n) and promptLog, the last 8 records {n, at, tokens} in order, so two quick submits cannot hide each other.
+# `tokens` is every delivery id found in the hook's `prompt` (lib/pane_send.py send() types one at the end of each message;
+# the pattern below is pane_send.TOKEN_PATTERN, and a test keeps them equal). The text itself is neither stored nor compared,
+# so no whitespace rule has to agree between this hook and the sender. A prompt with no marker records tokens [].
+marker_re='\[tp:[0-9a-f]{10}\]'
+tokens='[]'
 if [[ "$event" == UserPromptSubmit ]]; then
-  phash="$(jq -j '(.prompt // "" | tostring) | gsub("\\s+"; "")' <<<"$input" 2>/dev/null | shasum | cut -c1-12)"
+  tokens="$(jq -c --arg re "$marker_re" '[(.prompt // "" | tostring) | scan($re)]' <<<"$input" 2>/dev/null)" || tokens='[]'
+  if [[ -z "$tokens" ]]; then tokens='[]'; fi
 fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" --arg phash "$phash" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson tokens "$tokens" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -108,8 +110,8 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then
         { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
-          promptSubmits: (($prev.promptSubmits // 0) + 1), promptSubmitted: $now, promptHash: $phash,
-          promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), hash: $phash, at: $now }]) | .[-8:]) }
+          promptSubmits: (($prev.promptSubmits // 0) + 1),
+          promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $tokens }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
       elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }

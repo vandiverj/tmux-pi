@@ -806,6 +806,99 @@ class StepBaseTests(unittest.TestCase):
         self.assertNotIn(review_rounds.STAGED_HEAD + "\n", text)
         self.assertIn("- a.txt\n", self.scope())
 
+    def upstream(self, name, text):
+        """A commit on main, the branch the lane started from (what the lane's step merges in)."""
+        (self.main / name).write_text(text)
+        run_git(self.main, "add", name)
+        run_git(self.main, "commit", "-qm", f"upstream {name}")
+        return run_git(self.main, "rev-parse", "HEAD")
+
+    def merge(self, branch, resolve=None):
+        run = subprocess.run(["git", "-C", str(self.wt), "-c", "user.email=t@t", "-c", "user.name=t", "merge", "--no-ff", "-m", "sync", branch],
+                             capture_output=True, text=True)
+        for name, text in (resolve or {}).items():
+            (self.wt / name).write_text(text)
+            run_git(self.wt, "add", name)
+        if resolve:
+            run_git(self.wt, "commit", "-qm", "sync")
+        self.assertEqual(run.returncode, 1 if resolve else 0, run.stdout + run.stderr)
+        return run_git(self.wt, "rev-parse", "HEAD")
+
+    def test_a_step_that_merges_an_upstream_is_reviewed_by_its_resolution_not_by_what_upstream_brought_in(self):
+        s1 = self.commit("s1.txt")  # the closed step the review is measured from; main does not descend from it
+        self.record([("s1", s1)])
+        before = self.commit("a.txt", "lane\n")
+        self.upstream("a.txt", "up\n")
+        self.upstream("big.txt", "UPSTREAM_ONLY\n" * 50)
+        merge = self.merge("main", {"a.txt": "resolved\n"})
+        (self.wt / "dirty.txt").write_text("uncommitted\n")
+        text = self.round_one_diff()
+        self.assertIn("An upstream merge was reduced to its resolution", text)
+        self.assertIn(f"merge commit {merge[:12]} brought in upstream {run_git(self.wt, 'rev-parse', merge + '^2')[:12]}", text)
+        before_part, rest = text.split(f"Committed before merge {merge[:12]}")[1].split("Resolution of merge")
+        self.assertIn("+lane", before_part)  # what the lane committed before the merge: its own diff
+        resolution, after = rest.split("Committed after the last merge")
+        self.assertIn("-<<<<<<<", resolution)  # the conflict as it came out of the merge...
+        self.assertIn("+resolved", resolution)  # ...and what the step made of it
+        self.assertIn("+++ b/dirty.txt", after)
+        self.assertIn("+uncommitted", after)
+        self.assertNotIn("UPSTREAM_ONLY", text)
+        self.assertNotIn("a/big.txt", text)  # (a commit subject in a conflict marker may name it)
+        scope = self.scope()
+        self.assertIn("- a.txt\n", scope)
+        self.assertIn("- dirty.txt (untracked: read the file)\n", scope)
+        self.assertNotIn("big.txt", scope)
+        self.assertIn(f"show --remerge-diff {merge} -- <path>", scope)
+        self.assertIn(f"diff {s1} {before} -- <path>", scope)
+        self.assertIn(f"diff {merge} -- <path>", scope)
+        self.assertIn("reduced to its resolution", scope)
+        self.assertIn(f"relative to {s1[:12]} (an upstream merge reduced", scope)
+
+    def test_a_clean_upstream_merge_shows_no_resolution_and_only_the_commit_on_top(self):
+        s1 = self.commit("s1.txt")  # the closed step the review is measured from; main does not descend from it
+        self.record([("s1", s1)])
+        self.upstream("big.txt", "UPSTREAM_ONLY\n" * 50)
+        self.merge("main")
+        self.commit("n1.txt")
+        text = self.round_one_diff()
+        self.assertIn("(empty: the merge is a clean auto-merge", text)
+        self.assertIn("+++ b/n1.txt", text)
+        self.assertNotIn("a/big.txt", text)  # (a commit subject in a conflict marker may name it)
+        self.assertNotIn("UPSTREAM_ONLY", text)
+        scope = self.scope()
+        self.assertIn("Diff scope: 1 file(s) changed", scope)
+        self.assertIn("- n1.txt\n", scope)
+        self.assertNotIn("big.txt", scope)
+
+    def test_a_merge_of_a_branch_that_descends_from_the_base_is_an_ordinary_commit(self):
+        s1 = self.commit("s1.txt")  # the closed step the review is measured from; main does not descend from it
+        self.record([("s1", s1)])
+        run_git(self.wt, "checkout", "-qb", "feature")
+        self.commit("f1.txt", "FEATURE\n")
+        run_git(self.wt, "checkout", "-q", "lane-b")
+        self.commit("n1.txt")
+        self.merge("feature")
+        text = self.round_one_diff()
+        self.assertNotIn("reduced to its resolution", text)
+        self.assertIn("+FEATURE", text)
+        self.assertNotIn("reduced", self.scope())
+
+    def test_a_git_without_remerge_diff_keeps_the_whole_diff(self):
+        s1 = self.commit("s1.txt")  # the closed step the review is measured from; main does not descend from it
+        self.record([("s1", s1)])
+        self.upstream("big.txt", "UPSTREAM_ONLY\n")
+        self.merge("main")
+        real = subprocess.run
+
+        def old_git(command, *args, **kwargs):
+            if "--remerge-diff" in command:
+                return subprocess.CompletedProcess(command, 129, b"", b"unknown option")
+            return real(command, *args, **kwargs)
+        with mock.patch.object(review_rounds.subprocess, "run", old_git):
+            text = self.round_one_diff()
+        self.assertNotIn("reduced to its resolution", text)
+        self.assertIn("+UPSTREAM_ONLY", text)
+
     def test_a_non_lane_scope_is_unchanged(self):
         text = review_rounds.scope_text(str(self.main), "")[0]
         self.assertIn("relative to HEAD (staged, unstaged and untracked)", text)

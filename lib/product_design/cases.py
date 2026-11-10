@@ -190,19 +190,35 @@ def case_scope(docs, case, idx) -> tuple:
     return refs, scope, sources
 
 
-def references(refs) -> dict:
-    """cases.json's `references` of a case: kind, title and record fingerprint of every record it names."""
-    return {i: {"kind": k, "title": rec.get("title"), "fingerprint": P.record_fingerprint(rec, k)}
+def delivery_states(docs, refs) -> dict:
+    """The state now of each delivery dependency among `refs` (a slice: its effective readiness; a case: its case
+    state), as the packet's links show it. Only direct dependencies are slices or cases (`_refs` follows no slice)."""
+    kinds = {k for k, _ in refs.values()}
+    if not kinds & {"slice", "case"}:
+        return {}
+    report = P.readiness(docs)
+    cases = P.case_report(docs, report) if "case" in kinds else {}
+    return {i: report[i]["effective"] if k == "slice" else cases[i]["state"]
+            for i, (k, _) in refs.items() if k in ("slice", "case")}
+
+
+def references(refs, states) -> dict:
+    """cases.json's `references` of a case: kind, title and record fingerprint of every record it names, and for a
+    delivery dependency (a slice or a case) its state now (`delivery_states`)."""
+    return {i: dict({"kind": k, "title": rec.get("title"), "fingerprint": P.record_fingerprint(rec, k)},
+                    **({"state": states[i]} if i in states else {}))
             for i, (k, rec) in refs.items()}
 
 
 def published(docs, case, idx) -> dict:
     """What an export publishes about a case, the provenance and the publication mapping aside: the case (title and
-    reopen events included), its references and its scope (titles included). The Markdown draft and the cases.json
-    entry render nothing else, so the digest of this covers every field a ticket shows. The mapping (`publication`)
-    is left out: recording where a case was published does not change what was published."""
+    reopen events included), its references (with the state of each delivery dependency, which the draft shows) and
+    its scope (titles included). The Markdown draft and the cases.json entry render nothing else, so the digest of
+    this covers every field a ticket shows. The mapping (`publication`) is left out: recording where a case was
+    published does not change what was published."""
     refs, scope, sources = case_scope(docs, case, idx)
-    return {"case": _without(case, "publication"), "references": references(refs), "scope": scope, "sources": sources}
+    return {"case": _without(case, "publication"), "references": references(refs, delivery_states(docs, refs)),
+            "scope": scope, "sources": sources}
 
 
 def case_digest(docs, case, idx) -> str:
@@ -292,9 +308,10 @@ SCOPE_HEADINGS = (("scenarios", "Scenarios"), ("rules", "Rules (with their examp
                   ("claims", "Claims cited"), ("actors", "Actors"))
 
 
-def _case_body(case, refs, scope, sources) -> list:
+def _case_body(case, refs, scope, sources, states) -> list:
     """The case's own content and its whole scope, every field: the part of the case Markdown and of the packet that
-    is the same. `refs` maps each dependency and the actor to (kind, record or link)."""
+    is the same. `refs` maps each dependency and the actor to (kind, record or link); `states` gives each delivery
+    dependency's state now (a slice's readiness, a case's state)."""
     actor = refs[case["actor"]][1].get("title") or case["actor"] if "actor" in case else None
     out = ["## Outcome", "", (f"{md(actor)}: " if actor else "") + md(case.get("outcome", "Not recorded.")), ""]
     out += ["## Scope", ""] + _lines(case.get("scope", [])) + [""]
@@ -309,7 +326,8 @@ def _case_body(case, refs, scope, sources) -> list:
         kind, rec = refs[d]
         out.append(f"- {code(d)} \\({md(kind)}\\)" + (f": {md(rec['title'])}" if rec.get("title") else "")
                    + ("" if kind in SCOPE_KINDS or kind == "source" else
-                      " \\(linked: a delivery dependency, not this case's scope\\)"))
+                      " \\(linked: a delivery dependency, not this case's scope"
+                      + (f"; state now: {md(states[d])}" if d in states else "") + "\\)"))
     out.append("")
     for key, heading in SCOPE_HEADINGS:
         if scope[key]:
@@ -336,13 +354,14 @@ def render_case(docs, case, idx, provenance, proposal, digest) -> str:
     of its cases.json entry is in it but the per-reference fingerprints (machine data, in cases.json). Deterministic:
     the same package content gives the same bytes."""
     refs, scope, sources = case_scope(docs, case, idx)
+    states = delivery_states(docs, refs)
     out = [f"# {md(case['title'])}", "",
            f"Case {code(case['id'])}, slice {code(case['slice'])}. Package {code(provenance['package'])} revision "
            f"{provenance['package_revision']}, content {code(provenance['content_fingerprint'])}; slice fingerprint "
            f"{code(provenance['slice_fingerprint'])}; publication digest {code(digest)}. Prepared from revision "
            f"{case['source']['package_revision']}. File {md(case['id'] + '.md')}; per-record fingerprints of the "
            "references are in cases.json.", ""]
-    out += _case_body(case, refs, scope, sources)
+    out += _case_body(case, refs, scope, sources, states)
     out += ["## Publication", ""] + _publications(case.get("publication", []))
     out.append(f"- Proposal: {proposal['action']}")
     for s in proposal["systems"]:
@@ -406,10 +425,11 @@ def export_cases(package_dir, slice_id, out_dir) -> dict:
         digest = case_digest(docs, case, idx)
         proposal = publication_proposal(case, digest)
         name = f"{case['id']}.md"
+        refs = _refs(docs, case, idx)
         files[name] = render_case(docs, case, idx, provenance, proposal, digest).encode("utf-8")
         entries.append({"key": case["id"], "file": name, "digest": digest,
                         "case": _without(case, "publication", "reopened"),
-                        "references": references(_refs(docs, case, idx)),
+                        "references": references(refs, delivery_states(docs, refs)),
                         "publication": case.get("publication", []), "reopened": case.get("reopened", []),
                         "proposal": proposal})
     files["cases.json"] = P.render(dict({"schema": EXPORT_SCHEMA, "schema_version": 1}, **provenance, cases=entries))
@@ -542,7 +562,7 @@ def render_packet(pk) -> str:
            f"{code(pv['slice'])}. Package {code(pv['package'])} revision {pv['package_revision']}, content "
            f"{code(pv['content_fingerprint'])}; slice fingerprint {code(pv['slice_fingerprint'])}; case digest "
            f"{code(pv['case_digest'])}.", "", md(pk["note"]), ""]
-    out += _case_body(case, refs, pk["scope"], pk["sources"])
+    out += _case_body(case, refs, pk["scope"], pk["sources"], {l["id"]: l["state"] for l in pk["links"] if "state" in l})
     v = pk["verification"]
     out += ["## Verification", "",
             "The acceptance examples above, each scenario's expected results and each rule's examples, and:"]

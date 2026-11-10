@@ -158,71 +158,83 @@ def _fail(exc, out, err, as_json):
     return exc.exit
 
 
-def main(argv=None, out=None, err=None) -> int:
-    out = out or sys.stdout
-    err = err or sys.stderr
-    argv = list(sys.argv[1:] if argv is None else argv)
+def parser(argv=(), out=None) -> argparse.ArgumentParser:
+    """The command line: the commands, their arguments and help. `argv` and `out` only shape a usage error: under --json it
+    is also printed to `out` as the JSON error object."""
+    argv = list(argv)
 
     class Parser(argparse.ArgumentParser):
         def error(self, message):  # a usage error is still exit 2; under --json it is also the JSON error object
             if "--json" in argv:
-                print(json.dumps({"ok": False, "code": "usage", "message": message, "details": {}}, indent=2), file=out)
+                print(json.dumps({"ok": False, "code": "usage", "message": message, "details": {}}, indent=2), file=out or sys.stdout)
             super().error(message)
 
-    p = Parser(prog="tp-product", description=__doc__.split("\n")[0],
-                                epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="command", required=True)
-    c = sub.add_parser("init", help="create a package scaffold at revision 1; refuses to overwrite")
-    c.add_argument("package_dir")
+    head, tail = __doc__.split("\n\n", 1)
+    p = Parser(prog="tp-product", description=head, epilog=tail,
+               formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    def command(name, text):   # the one-line help in the command list is also the subcommand's own --help description
+        return sub.add_parser(name, help=text, description=text)
+    c = command("init", "create a package scaffold at revision 1; refuses to overwrite")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("--id", required=True, help="package id: one lower-case slug, at most 64 characters")
-    c.add_argument("--title", required=True)
-    c.add_argument("--owner", default="Not set")
-    c.add_argument("--objective", default="Not framed yet.")
-    c = sub.add_parser("status", help="revision, slice readiness, blockers, stale cases, pending reviews, next action")
-    c.add_argument("package_dir")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("validate", help="schema, ids, references, invariants, versions and commit state")
-    c.add_argument("package_dir")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("apply", help="commit a changeset atomically, or finish an interrupted commit (--recover)")
-    c.add_argument("package_dir")
+    c.add_argument("--title", required=True, help="the package title")
+    c.add_argument("--owner", default="Not set", help="who owns the product decisions")
+    c.add_argument("--objective", default="Not framed yet.", help="the objective in one sentence")
+    c = command("status", "revision, slice readiness, blockers, stale cases, pending reviews, next action")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("validate", "schema, ids, references, invariants, versions and commit state")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("apply", "commit a changeset atomically, or finish an interrupted commit (--recover)")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("changeset", nargs="?", help="changeset JSON file (docs/product-design.md, Changesets)")
     c.add_argument("--expected-revision", type=int, help="the revision the changeset was written against")
     c.add_argument("--recover", action="store_true", help="only finish or discard an interrupted commit")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("build", help="write the offline review page (builds/ID-rREV.html) and record it in the manifest")
-    c.add_argument("package_dir")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("build", "write the offline review page (builds/ID-rREV.html) and record it in the manifest")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("import-feedback", help="import a feedback bundle exported by a review page; all or nothing")
-    c.add_argument("package_dir")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("import-feedback", "import a feedback bundle exported by a review page; all or nothing")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("bundle", help="the exported feedback bundle (.json)")
     c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("remap-anchor", help="anchor a note to another target of the review build, keeping the original")
-    c.add_argument("package_dir")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("remap-anchor", "anchor a note to another target of the review build, keeping the original")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("note", help="the note id")
     c.add_argument("target", help="a target id the review build shows (a view, design record or prototype target)")
     c.add_argument("--reason", required=True, help="why the note belongs to the new target")
     c.add_argument("--by", default="tp-product remap-anchor", help="who decided it")
     c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("cases", help="render the slice's prepared cases to Markdown and cases.json; refuses a blocked "
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("cases", "render the slice's prepared cases to Markdown and cases.json; refuses a blocked "
                                      "or stale slice or case by name")
-    c.add_argument("package_dir")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("--slice", required=True, help="the slice id")
     c.add_argument("--out", required=True, help="the folder to write <case id>.md, cases.json and export.json in")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("packet", help="write one case's bounded worker packet (Markdown, or JSON for a .json file); "
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("packet", "write one case's bounded worker packet (Markdown, or JSON for a .json file); "
                                       "refuses a stale or blocked case by name")
-    c.add_argument("package_dir")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("--case", required=True, help="the case id")
     c.add_argument("--out", required=True, help="the packet file")
-    c.add_argument("--json", action="store_true")
-    c = sub.add_parser("impact", help="slices, reviews and cases affected by changes: stale, blocked, published ids")
-    c.add_argument("package_dir")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    c = command("impact", "slices, reviews and cases affected by changes: stale, blocked, published ids")
+    c.add_argument("package_dir", help="the package folder (holds package.json)")
     c.add_argument("--since", type=int, help="also list the design records changed after this revision (history)")
-    c.add_argument("--json", action="store_true")
+    c.add_argument("--json", action="store_true", help="print the result, or the refusal, as one JSON object")
+    return p
+
+
+def main(argv=None, out=None, err=None) -> int:
+    out = out or sys.stdout
+    err = err or sys.stderr
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = parser(argv, out)
     args = p.parse_args(argv)
     as_json = getattr(args, "json", False)
     try:

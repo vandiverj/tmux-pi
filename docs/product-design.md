@@ -12,6 +12,89 @@ questions, decisions, proposed API and data contracts, delivery slices and the r
 product's own workspace (for example `product-design/<package-id>/` in the product or context repository), not in
 tmux-pi. The compiled review HTML is an output of a package, never its editable source.
 
+## Routine use
+
+One review round, as Main runs it (`/product-design` and `/prepare-cases` load the same steps as skills; see
+"Workflow skills"). The commands are the real ones with example values: the package is
+`product-design/review-queue-demo`, and each `--expected-revision` is the revision `tp-product status` printed last.
+`tools/smoke/product_design_demo.py` runs this whole round on the synthetic fixture and checks every step (see
+"Demonstration" below).
+
+**Start a package.** Create it, then shape it with changesets (see Changesets):
+
+```sh
+tp-product init product-design/review-queue-demo --id review-queue-demo --title "Review queue" --owner "Product owner"
+tp-product apply product-design/review-queue-demo changes/01-shape.json --expected-revision 1
+tp-product status product-design/review-queue-demo
+```
+
+**Build and share the review page.** `build` writes one offline HTML file and records it in the manifest. Send the
+file itself; reviewers open it in a browser, walk guided or unguided tasks, add notes (`n` or right-click) and answer
+questions, then use Export on the Feedback view and send back the downloaded bundle.
+
+```sh
+tp-product build product-design/review-queue-demo --expected-revision 3
+```
+
+**Import feedback.** Each bundle is imported whole or not at all; importing the same bundle again adds nothing.
+Answers stay pending until reconciled; a note on a target the build no longer has is kept and listed as unresolved:
+
+```sh
+tp-product import-feedback product-design/review-queue-demo reviewer-a.json --expected-revision 4
+tp-product remap-anchor product-design/review-queue-demo note.rc79be68b1f.1 queue.waiting-count --reason "Same control, renamed"
+```
+
+**Decide.** Record the owner's decision, the rule it settles, the reconciled answers and a disposition for each note
+in one changeset (`accept-decision`, `set`, `reconcile-input`, `set-disposition`). A reviewer's answer never accepts
+anything. `apply` prints which accepted slices went stale; `impact` lists them with the reviews to redo:
+
+```sh
+tp-product apply product-design/review-queue-demo changes/07-decide.json --expected-revision 6
+tp-product impact product-design/review-queue-demo --since 6
+```
+
+**Re-review.** A human review of the slice's current content, then the local acceptance (`set-readiness` to
+`ready-for-case-preparation`), in one changeset. A model review can bring a slice only to `ready-for-human-review`:
+
+```sh
+tp-product apply product-design/review-queue-demo changes/08-re-review.json --expected-revision 7
+```
+
+**Prepare cases and packets.** Add the case drafts with a changeset (`prepare-cases`), export them, and write one
+bounded packet per case for the worker that builds it. A stale or blocked slice or case is refused by name:
+
+```sh
+tp-product apply product-design/review-queue-demo changes/09-cases.json --expected-revision 8
+tp-product cases product-design/review-queue-demo --slice slice.submit-and-queue --out out/cases
+tp-product packet product-design/review-queue-demo --case case.reject-missing-field --out out/case.reject-missing-field.md
+tp-product packet product-design/review-queue-demo --case case.reject-missing-field --out out/case.reject-missing-field.json
+```
+
+**Recover in a new session.** At each pause, set the manifest's `activity` and `next_action` (`set-manifest`) and
+record the session objective. A new main in the same tmux session reads the objective from the session index; any
+other session starts from the package path alone. Either way `tp-product status` is the record:
+
+```sh
+tp-agent objective "product-design package=/work/product-design/review-queue-demo revision=9 slice=slice.submit-and-queue next: Publish the two cases"
+tp-agent index --no-write --text
+tp-product status product-design/review-queue-demo
+```
+
+**Harness entry points.** In Claude, type `/product-design` or `/prepare-cases`
+(`claude/plugins/tmux-pi/commands/product-design.md`, `claude/plugins/tmux-pi/commands/prepare-cases.md`); in pi,
+the same names (`agent/prompts/product-design.md`, `agent/prompts/prepare-cases.md`). Both load the catalogue skill;
+neither approves, publishes or opens a ticket.
+
+**Demonstration.** One reproducible round on the synthetic review-queue fixture: two reviewers in a headless browser,
+both imports, the decision, the stale and the unrelated slice, the re-review, case drafts, packets and the recovery.
+It prints each step and its check, writes only to its output folder (default: a new temporary folder) and skips the
+browser steps, saying why, when Node or Chrome (`TP_CHROME`) is missing:
+
+```sh
+python3 tools/smoke/product_design_demo.py --out /tmp/pd-demo
+python3 tools/smoke/product_design_demo.py --no-browser
+```
+
 ## Package contract (schema version 1)
 
 ### Layout
@@ -557,7 +640,8 @@ a rule without examples is not accepted away: review the slice again, or add the
 
 - `OUTDIR/<case id>.md`, one per case: title, provenance (package, revision, slice, slice fingerprint, publication
   digest), outcome, scope, exclusions, examples, every other case field (feasibility, non-blocking matters, QA,
-  completion evidence, areas, reopen events), its dependencies, and every record in its scope in full: the scenarios
+  completion evidence, areas, reopen events), its dependencies (a delivery dependency, another slice or case, with its
+  state now, as the packet's link shows it), and every record in its scope in full: the scenarios
   (seed, actions, expected results), rules (with examples), decisions, contracts (operations, failures,
   compatibility; the status is the confidence), the claims they cite and the sources' excerpts and anchors; then its
   publications and the proposal. Every field of its `cases.json` entry is in it but the per-reference fingerprints;
@@ -566,7 +650,8 @@ a rule without examples is not accepted away: review the slice again, or add the
   `create` (never published), `unchanged` (published at this digest) or `update` (published at another digest:
   update the existing external record, never create a second one, and check it was not edited there first: never
   overwrite it silently). The **publication digest** covers what an export shows: the case (title and reopen events
-  included), its references (kind, title, fingerprint) and its scope in full (titles included). Readiness
+  included), its references (kind, title, fingerprint, and a delivery dependency's state) and its scope in full (titles
+  included). Readiness
   fingerprints leave titles out, so a retitle does not stale a case, but it does change this digest, and the next
   export proposes an `update`. The publication mapping itself is left out: recording a publication changes nothing
   that was published;

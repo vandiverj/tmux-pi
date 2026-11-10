@@ -6,12 +6,14 @@ In-process (`cli.main(argv)`, `changes.apply`) on a temporary copy of the fixtur
 Crashes are injected through the commit's fault hook; concurrency waits on threading events, never on a fixed time.
 The generated input space is the PD-B attack script (task evidence, not tracked); these are the rows worth keeping.
 """
+import argparse
 import contextlib
 import copy
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -171,6 +173,34 @@ class CliTests(PackageCase):
         with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):  # usage
             self.run_cli("apply", self.pkg, path)
         self.assertEqual(cm.exception.code, 2)
+
+    def help_text(self, *argv):
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(out):
+            cli.main([*argv, "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        return out.getvalue()
+
+    def test_help_lists_what_exists(self):
+        """--help names every command whole (it once cut the list off at its first line), and each command's --help says
+        what the command does and what each of its arguments is."""
+        subs = next(a for a in cli.parser()._actions if isinstance(a, argparse._SubParsersAction)).choices
+        commands = list(subs)
+        self.assertEqual(commands, ["init", "status", "validate", "apply", "build", "import-feedback", "remap-anchor",
+                                    "cases", "packet", "impact"])
+        top = self.help_text()
+        self.assertIn(f"({', '.join(commands)}).", " ".join(top.split()))
+        listed = [ln.split()[0] for ln in re.split(r"\n(?:optional arguments|options):", top)[0].split("COMMAND\n", 1)[1].splitlines()
+                  if ln.startswith("    ") and not ln.startswith("     ")]
+        self.assertEqual(listed, commands)
+        for name, sub in subs.items():
+            text = " ".join(self.help_text(name).split())
+            self.assertTrue(sub.description, name)
+            self.assertIn(" ".join(sub.description.split()), text, name)
+            for action in sub._actions:
+                if action.dest != "help":
+                    self.assertTrue(action.help, f"{name} {action.dest}")
+                    self.assertIn(action.option_strings[0] if action.option_strings else action.dest, text)
 
     def test_wrapper_runs_without_a_session(self):
         r = subprocess.run([sys.executable, str(ROOT / "bin/tp-product"), "validate", str(self.pkg)],

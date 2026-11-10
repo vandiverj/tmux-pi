@@ -2,10 +2,14 @@
 reference's case changeset is one the package accepts. In-process (tp-agent through tests/tp_agent_inproc.py, tp-product
 through its main); a scratch TP_STATE_DIR per session, no tmux, no model, no network."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import argparse
+import contextlib
 import io
 import json
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -138,6 +142,79 @@ class CaseShapeReferenceTests(unittest.TestCase):
             self.assertEqual(product("validate", str(pkg))[0], 0)
             cases = json.loads((pkg / "design.json").read_text())["cases"]
             self.assertEqual([c["id"] for c in cases], ["case.reject-missing-field"])
+
+
+class RoutineUseDocTests(unittest.TestCase):
+    """docs/product-design.md "Routine use": every command it shows exists and is accepted by the command's own parser (the
+    one its --help prints), every file it names exists, and the command synopsis lists every tp-product command with only
+    the options that command has."""
+    DOC = ROOT / "docs/product-design.md"
+
+    def section(self, title):
+        text = self.DOC.read_text()
+        return text.split(f"\n## {title}\n", 1)[1].split("\n## ", 1)[0]
+
+    def shown_commands(self):
+        blocks = re.findall(r"```sh\n(.*?)```", self.section("Routine use"), re.S)
+        return [shlex.split(line) for b in blocks for line in b.splitlines() if line.strip()]
+
+    def test_every_routine_command_parses_with_its_own_parser(self):
+        shown = self.shown_commands()
+        self.assertEqual({c[0] for c in shown}, {"tp-product", "tp-agent", "python3"})
+        subs = next(a for a in cli.parser()._actions if isinstance(a, argparse._SubParsersAction)).choices
+        used = set()
+        for argv in shown:
+            with self.subTest(argv=" ".join(argv)):
+                if argv[0] == "tp-product":
+                    with contextlib.redirect_stderr(io.StringIO()) as err:
+                        try:
+                            args = cli.parser(argv[1:]).parse_args(argv[1:])
+                        except SystemExit:
+                            self.fail(err.getvalue())
+                    used.add(args.command)
+                elif argv[0] == "tp-agent":
+                    rc, out, err = tp_agent_inproc.run([argv[1], "--help"], env=session_env.outside_session())
+                    self.assertEqual(rc, 0, err)
+                    usage = " ".join(out.split("\n\n")[0].split())
+                    positionals = [w for w in usage.split()[3:] if not w.startswith(("[", "-")) and not w.isupper()]
+                    options = [w for w in argv[2:] if w.startswith("--")]
+                    for o in options:
+                        self.assertIn(o, out)
+                    self.assertEqual(len([w for w in argv[2:] if not w.startswith("--")]), len(positionals), usage)
+                else:
+                    self.assertEqual(argv[1], "tools/smoke/product_design_demo.py")
+                    r = subprocess.run([sys.executable, str(ROOT / argv[1]), "--help"], capture_output=True, text=True,
+                                       timeout=30)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    for o in (w for w in argv[2:] if w.startswith("--")):
+                        self.assertIn(o, r.stdout)
+        # the round uses each command a routine needs
+        self.assertLessEqual({"init", "apply", "status", "build", "import-feedback", "remap-anchor", "impact", "cases",
+                              "packet"}, used)
+        self.assertLessEqual(used, set(subs))
+
+    def test_the_files_and_entry_points_it_names_exist(self):
+        text = self.section("Routine use")
+        named = set(re.findall(r"`((?:claude|agent|tools|catalog|docs)/[^`\s]+)`", text))
+        self.assertGreaterEqual(len(named), 5, named)
+        for rel in named:
+            self.assertTrue((ROOT / rel).is_file(), rel)
+        for marker in ("/product-design", "/prepare-cases"):
+            self.assertIn(f"`{marker}`", text)
+
+    def test_the_synopsis_lists_every_command_with_only_its_options(self):
+        block = re.search(r"```\n(tp-product init.*?)```", self.section("The `tp-product` command"), re.S).group(1)
+        subs = next(a for a in cli.parser()._actions if isinstance(a, argparse._SubParsersAction)).choices
+        listed = set()
+        for line in block.splitlines():
+            if not line.startswith("tp-product "):
+                continue
+            name = line.split()[1]
+            listed.add(name)
+            self.assertIn(name, subs)
+            have = {o for a in subs[name]._actions for o in a.option_strings}
+            self.assertLessEqual(set(re.findall(r"--[a-z-]+", line)), have, line)
+        self.assertEqual(listed, set(subs))
 
 
 if __name__ == "__main__":

@@ -155,6 +155,20 @@ class ExportTests(CaseFlow):
         link = [l for l in pk["links"] if l["id"] == DRAFTY]
         self.assertEqual([(l["state"], l["relation"]) for l in link], [("blocked", "delivery-dependency")])
         self.assertEqual(missing_from(K.render_packet(pk), pk), [])
+        # the exported case draft shows that slice's readiness too (PD-E note F3), in cases.json and the Markdown,
+        # and the publication digest covers it (the draft shows it)
+        rc, text, err = self.run_cli("cases", str(self.pkg), "--slice", READY, "--out", str(out))
+        self.assertEqual(rc, 0, text + err)
+        md = (out / "case.reject-missing-field.md").read_text()
+        entry = json.loads((out / "cases.json").read_text())["cases"][0]
+        self.assertEqual(entry["references"][DRAFTY]["state"], "blocked")
+        self.assertIn(f"`{DRAFTY}` \\(slice\\)", md)
+        self.assertRegex(K.unescape(md), rf"`{re.escape(DRAFTY)}` \(slice\).*delivery dependency.*state now: blocked")
+        self.assertEqual(missing_from(md, entry, skip=fingerprints), [])
+        self.assertEqual(entry["digest"], K.case_digest(self.docs(), rec(self.docs(), "case.reject-missing-field"),
+                                                        P.index(self.docs())))
+        self.assertIn("state", K.published(self.docs(), rec(self.docs(), "case.reject-missing-field"),
+                                           P.index(self.docs()))["references"][DRAFTY])
 
     def test_a_blocked_or_unready_slice_names_what_it_is_missing(self):
         self.add_cases(self.case("case.reassign-keeps-notes", DRAFTY, ["rule.assigned-reviewer"]))

@@ -474,8 +474,8 @@ def _binding_index(tree):
 
 
 def _star(tree):
-    """True when the file has a `from m import *`: it then binds names no statement shows. The one test of it, used by _binds, the
-    use scan (_use_lines) and the absence check (_no_path_to)."""
+    """True when the file has a `from m import *`: it then binds names no statement shows, and runs modules no import shows. The one
+    test of it, used by _binds, the use scan (_use_lines) and the one per-file test of every walk (_opaque)."""
     return _binding_index(tree).star
 
 
@@ -970,9 +970,8 @@ def _changes_import_state(source, tree):
       `import sys as s`), since no alias analysis is made;
     - imports the site module (which adds to sys.path), in any form;
     - holds a word of _DYNAMIC_ACCESS (its raw text).
-    Reading __name__ and __file__ (`if __name__ == "__main__"`, `os.path.dirname(__file__)`) does not change it. _opaque calls this, and
-    _runs_clean calls it on every file Python runs on the way to an import; nothing else checks import state. The walk below reads
-    references only; no binding is decided here."""
+    Reading __name__ and __file__ (`if __name__ == "__main__"`, `os.path.dirname(__file__)`) does not change it. Only _opaque calls
+    this (round 14, Main: no walk is given it on its own). The walk below reads references only; no binding is decided here."""
     if tree is None or _DYNAMIC_ACCESS_RE.search(source) or _STATE_WORDS_RE.search(source):
         return True
     events = _binding_index(tree).events
@@ -996,8 +995,10 @@ def _changes_import_state(source, tree):
 
 
 def _opaque(source, tree):
-    """True when the file changes import state (_changes_import_state: which includes a word of _DYNAMIC_ACCESS) or has a star import:
-    what it loads is then not shown by its imports. One of the per-file tests of _refers."""
+    """THE one per-file test of whether a file's imports show what it loads (round 14, Main): False only when it does not change import
+    state (_changes_import_state: which includes a word of _DYNAMIC_ACCESS) and has no star import (_star: `from m import *` runs every
+    submodule m's __all__ names, which no import of the file shows; __all__ is not resolved). Every walk holds each file it visits to
+    it: the credit walk (_runs_clean) and the absence walk (_reaches, through _refers); no walk is given a narrower test."""
     return _star(tree) or _changes_import_state(source, tree)
 
 
@@ -1161,14 +1162,15 @@ def _reaches(start, name, module, graph):
 
 
 def _runs_clean(path, source, tree, graph):
-    """THE set of files that must not change import state for an import in the file at path to be credited (round 12, Main): the start
-    set (_start_set: the file's own package __init__s, which run first and decide __package__, then the file) and every run-root module
-    any of them can load, transitively (_walk_blocked), which takes in the target module T and every package __init__ on T's dotted
-    path. True when none of them changes import state (_changes_import_state), every one was supplied and parses, and every import on the
-    way resolves. A file that does not import T does not run T's path, so the test is per importing file: a T whose path changes import
-    state is credited through no import, and a file with no path to T keeps its "does not use" line (_no_path_to)."""
+    """THE set of files that must not be opaque for an import in the file at path to be credited (round 12, Main; round 14: the one
+    per-file test, _opaque): the start set (_start_set: the file's own package __init__s, which run first and decide __package__, then
+    the file) and every run-root module any of them can load, transitively (_walk_blocked), which takes in the target module T and every
+    package __init__ on T's dotted path. True when none of them is opaque (changes import state, or has a star import, which may run a
+    module no import shows), every one was supplied and parses, and every import on the way resolves. A file that does not import T
+    does not run T's path, so the test is per importing file: a T whose path is opaque is credited through no import, and a file with
+    no path to T keeps its "does not use" line (_no_path_to)."""
     start = _start_set(path, source, tree, graph)
-    return start is not None and not _walk_blocked(start, graph, _changes_import_state)
+    return start is not None and not _walk_blocked(start, graph, _opaque)
 
 
 def _string_text(node):

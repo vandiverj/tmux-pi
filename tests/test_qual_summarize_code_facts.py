@@ -986,6 +986,7 @@ class BindingProofUseTests(unittest.TestCase):
         # import line and nothing is credited. v.py imports nothing, so it keeps "does not use". Rows from the round-12 attack (23400
         # cases, 0 unsound after on both interpreters); the first two are the review's repros.
         sys_insert = "import sys\nsys.path.insert(0, 'alt')\n"
+        star = {"helperpkg/__init__.py": '__all__ = ["redirect"]\n', "helperpkg/redirect.py": 'import pkg\npkg.__path__ = [pkg.__path__[0] + "/alt"]\n'}
         rows = [("review F1: pkg/__init__.py redirects __path__", {"pkg/__init__.py": '__path__ = [__path__[0] + "/alt"]\n'}, ""),
                 ("review F2: u sets __package__ (relative forms)", {}, '__package__ = "alt"\n'),
                 ("u's package __init__ inserts into sys.path", {"app/__init__.py": sys_insert}, ""),
@@ -1011,10 +1012,24 @@ class BindingProofUseTests(unittest.TestCase):
                  {"app/__init__.py": "import h2\n", "h2.py": "import h\n", "h.py": sys_insert}, ""),
                 ("review: pkg/__init__.py binds __name__ as an except name",
                  {"pkg/__init__.py": "try:\n    raise ValueError()\nexcept ValueError as __name__:\n    pass\n"}, ""),
-                ("u binds __file__ as an except name", {}, "try:\n    pass\nexcept ValueError as __file__:\n    pass\n")]
+                ("u binds __file__ as an except name", {}, "try:\n    pass\nexcept ValueError as __file__:\n    pass\n"),
+                # round 14 (Main): one per-file test (_opaque) for every walk: a star import anywhere on the way is opaque, since it runs
+                # every submodule __all__ names, which no import shows. The first four are the review's repros (round 13 F1).
+                ("review: a helper u imports star-imports helperpkg, whose __all__ runs redirect",
+                 dict(star, **{"h.py": "from helperpkg import *\n"}), "import h\n"),
+                ("review: a helper two deep star-imports helperpkg", dict(star, **{"h.py": "import h2\n", "h2.py": "from helperpkg import *\n"}),
+                 "import h\n"),
+                ("review: u's package __init__ star-imports helperpkg", dict(star, **{"app/__init__.py": "from helperpkg import *\n"}), ""),
+                ("review: pkg/__init__.py star-imports helperpkg", dict(star, **{"pkg/__init__.py": "from helperpkg import *\n"}), ""),
+                ("helperpkg's __all__ is a tuple, extended", dict(star, **{"helperpkg/__init__.py": "__all__ = ()\n__all__ += ('redirect',)\n",
+                                                                           "h.py": "from helperpkg import *\n"}), "import h\n"),
+                ("a helper star-imports a plain module", {"h.py": "from m import *\n", "m.py": "x = 1\n"}, "import h\n"),
+                ("a helper only u's package __init__ imports star-imports helperpkg",
+                 dict(star, **{"app/__init__.py": "import h\n", "h.py": "from helperpkg import *\n"}), "")]
         controls = [("control: u's package __init__ imports a clean helper", {"app/__init__.py": "import h\n"}, ""),
                     ("control: u reads __name__ and __file__, and sys.argv", {}, "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n"),
                     ("control: an unrelated file inserts into sys.path", {"w.py": sys_insert}, ""),
+                    ("control: an unrelated file star-imports helperpkg", dict(star, **{"w.py": "from helperpkg import *\n"}), ""),
                     ("control: a comment says site", {}, "x = 1  # the web site\n")]
         relative = (("from .t import Q\nobj = Q()\n", 1), ("from . import t\nobj = t.Q()\n", 2))
         for label, extra, head in rows + controls:
@@ -1129,8 +1144,9 @@ class BindingProofUseTests(unittest.TestCase):
             for path, text in direct_forms:
                 with self.subTest(label, form=text.split("\n")[0], where=path):
                     lines, last = deep_scan(path, text, changes)
-                    self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last - 1),
-                                             "- {} creates a Q [{}:{}]".format(Path(path).name, path, last)])
+                    # round 14 (Main): a star import on the way is opaque (_opaque) for the direct form too: only the import line
+                    creates = [] if "star import" in label else ["- {} creates a Q [{}:{}]".format(Path(path).name, path, last)]
+                    self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last - 1)] + creates)
         # keep the line: no break, or an __init__ that binds the link only by importing exactly that submodule
         for label, changes in (("no break", {}), ("__init__: from . import t", {"pkg/sub/__init__.py": "from . import t\n"}),
                                ("__init__: import pkg.sub.t as t", {"pkg/sub/__init__.py": "import pkg.sub.t as t\n"}),

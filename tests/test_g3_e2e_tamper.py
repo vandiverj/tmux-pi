@@ -29,6 +29,7 @@ TAMPER_EXPECT = {
     "lane-record-exists": ("setup", "no lane record of this name exists"),
     "worktree-exists": ("setup", "nothing is registered or exists at the configured worktree path"),
     "session-exists": ("setup", "no tmux session of this name exists"),
+    "pinode-mismatch": ("setup", "tmux session carries the caller's TP_PI_NODE"),
     "dispatch-id": ("dispatch", "dispatch returned a task id"),
     "dispatch-queued": ("dispatch", "started, not queued"),
     "dispatch-meta": ("dispatch", "meta.json names the lane and step"),

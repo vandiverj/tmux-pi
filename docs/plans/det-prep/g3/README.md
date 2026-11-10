@@ -21,6 +21,14 @@ A pane that cannot be captured in time (a hung tmux, or a list whose scan budget
 (approve the prompt, type `/exit`) so tmux-pi's Claude profile trusts the repository. Whether trust given to the repository also covers its new worktrees depends on Claude Code;
 if the message names the worktree, trust that folder as the message says and rerun.
 
+**Before a live run: when pi reviewers need a Node other than the pinned one, Main's session sets `TP_PI_NODE` and the smoke carries it.** `bin/tp-pi` runs pi on
+`${TP_PI_NODE-$HOME/.nvm/versions/node/v24.16.0/bin/node}` (`TP_PI_NODE=` empty means: run `pi` from PATH). A worker pane takes its environment from the tmux server and
+the tmux session, not from the process that ran tmux, so the session the smoke makes would not see Main's setting and `tp-pi` would exit at once on a machine without the pinned
+Node (live runs 6 and 7: `tp-review ... no such pane`, `reviewer 'pi' ... could not start`). So the smoke names the variables it carries in one tuple, `CARRIED_ENV` (today only `TP_PI_NODE`;
+never the whole environment): when the caller's environment has one (set, even empty), the session is made with the same value, in the same call (`new-session -e NAME=VALUE`, tmux 3.2 or newer;
+an older tmux is refused at setup, naming the requirement, before anything is made). Unset in the caller: nothing is added and `tp-pi`'s default applies. Setup then reads it back
+(`show-environment -t =<run> TP_PI_NODE`) in the check "the run's tmux session carries the caller's TP_PI_NODE"; a mismatch fails step `setup`.
+
 Exit 0: every step and the cleanup passed. Exit 1: stderr says `FAILED at step '<name>': <what>`, and `cleanup: ...` / `left behind: ...` lines.
 `--out` gets the JSON summary (run, run_id, mode, ok, failed_step, error, `made` (what the run recorded as its own), socket and tmux_tmpdir (fake only), per-step name / rc / seconds / asserted list / commands,
 cleanup report (errors, leftovers, kept), task ids). Useful flags: `--keep` (keep the temp state dir), `--coder-model` (default `claude-haiku-5-5`), `--prompt-wait 240`,

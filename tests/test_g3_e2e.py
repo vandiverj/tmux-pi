@@ -794,6 +794,78 @@ class SessionOwnershipTest(Base):
         self.assert_clean(summary)
 
 
+class PiNodeTest(Base):
+    """G3 round 7: a worker pane takes its environment from the tmux session, so the smoke's own session carries the caller's TP_PI_NODE
+    (set, even empty), made in the same `new-session` call, and setup reads it back. Rows: the caller's value unset / empty / a path / a path
+    with a space / a value with `=` and both quotes, as the argv tmux receives (the recording shim) and as the session answers (the check row).
+    A setup-only run: `--inject-failure dispatch` fails right after setup."""
+
+    ROW = "the run's tmux session carries the caller's TP_PI_NODE"
+    VALUES = {"empty": "", "path": "/home/me/.nvm/versions/node/v22.1.0/bin/node", "space": "/opt/my node/bin/node",
+              "equals-and-quotes": "/x/a=b \"q\" 'r' $HOME `id`;/node"}
+
+    def setup_run(self, value):
+        """(summary, the new-session argv of this run's own session) with the caller's TP_PI_NODE = value (None: unset)."""
+        env = {k: v for k, v in os.environ.items() if k != "TP_PI_NODE"}
+        if value is not None:
+            env["TP_PI_NODE"] = value
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc, summary, err = self.smoke("--inject-failure", "dispatch")
+        self.assertEqual((rc, summary["failed_step"]), (1, "dispatch"), summary.get("error"))
+        calls = [c["argv"] for c in records()[self.mark:] if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"]]
+        creating = [argv for argv in calls if "new-session" in argv and summary["run"] in argv]
+        self.assertEqual(len(creating), 1, calls)
+        self.assert_clean(summary)
+        return summary, creating[0]
+
+    def test_the_session_is_made_with_the_callers_value_as_one_argv_word_and_setup_reads_it_back(self):
+        for label, value in self.VALUES.items():
+            with self.subTest(value=label):
+                summary, argv = self.setup_run(value)
+                self.assertEqual(argv.count("-e"), 1, "only the one named variable is carried, not the environment")
+                self.assertEqual(argv[argv.index("-e") + 1], f"TP_PI_NODE={value}")
+                self.assertLess(argv.index("-e"), argv.index(";"), "in the call that creates the session, not a later one")
+                self.assertIn(self.ROW, summary["steps"][0]["asserted"])
+
+    def test_an_unset_caller_value_adds_nothing(self):
+        summary, argv = self.setup_run(None)
+        self.assertNotIn("-e", argv)
+        self.assertFalse([a for a in summary["steps"][0]["asserted"] if "TP_PI_NODE" in a], "nothing to check when nothing was carried")
+
+    def test_an_older_tmux_is_refused_before_anything_is_made_and_a_newer_or_development_one_is_not(self):
+        smoke = g3.Smoke(g3.parse(["--fake", "--out", str(self.out)]))
+        self.addCleanup(shutil.rmtree, smoke.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, smoke.tmux_tmp, ignore_errors=True)
+        smoke.step_name = "setup"
+        for said, refused in (("tmux 3.1c", True), ("tmux 2.9a", True), ("tmux 1.8", True), ("something else", True), ("", True),
+                              ("tmux 3.2", False), ("tmux 3.7c", False), ("tmux 10.0", False), ("tmux next-3.4", False), ("tmux master", False)):
+            with self.subTest(said=said), mock.patch.object(smoke, "tmux", return_value=mock.Mock(stdout=said + "\n")) as tmux:
+                if refused:
+                    with self.assertRaises(g3.SmokeError) as raised:
+                        smoke.require_env_flag()
+                    self.assertIn("needs tmux 3.2 or newer", raised.exception.message)
+                    self.assertIn("TP_PI_NODE", raised.exception.message)
+                else:
+                    smoke.require_env_flag()
+                tmux.assert_called_once_with("-V")
+
+    def test_a_run_on_an_old_tmux_makes_no_session(self):
+        original = g3.Smoke.tmux
+
+        def old(smoke, *args, **kw):
+            return mock.Mock(stdout="tmux 3.1\n") if args == ("-V",) else original(smoke, *args, **kw)
+        with mock.patch.object(g3.Smoke, "tmux", old):
+            rc, summary, err = self.smoke("--inject-failure", "dispatch")
+        self.assertEqual((rc, summary["failed_step"]), (1, "setup"))
+        self.assertIn("needs tmux 3.2 or newer", summary["error"])
+        self.assertEqual(summary["made"]["session"], False)
+        calls = [c["argv"] for c in records()[self.mark:] if c["TMUX_TMPDIR"] == summary["tmux_tmpdir"]]
+        self.assertFalse([a for a in calls if "new-session" in a and summary["run"] in a], calls)
+
+    def test_the_carried_names_are_one_tuple_with_only_this_variable(self):
+        self.assertEqual(g3.CARRIED_ENV, ("TP_PI_NODE",))
+
+
 class ConfiguredNamesTest(Base):
     """Round 4 F1: the integration branch, the lane branch prefix and the worktree pattern are the repository's own lane config, not constants of
     the script. The integration branch is the one shared name: a second run refuses at setup (it cannot carry a run id, the lane tools read it

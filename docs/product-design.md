@@ -188,7 +188,7 @@ traceback. Reads never write. No command makes a network call or starts anything
 | `adapter.invalid` | 1 | `build`: `prototype/adapter.json` is unreadable or outside its schema, names an unknown page, contract or operation, repeats an id, or its script or style cannot be inlined (a symlink, outside the package, over 2 MiB, not UTF-8, or holding `</script`, `</style` or `<!--`) |
 | `build.exists` | 3 | `build`: the build file exists with other bytes (or is not a regular file), including any recorded build whose bytes are not its recorded digest; it is never replaced and never reported up to date. Also when `builds/` is not a folder (a file) or is a symbolic link: nothing is written through it |
 | `build.conflict` | 3 | `build`: the commit failed before its commit point and the build file had been replaced by someone else meanwhile; their bytes are kept |
-| `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem. Also a `status` trust problem when a build the manifest records is missing, and a `build` refusal when that build cannot be written back (the package no longer renders its recorded bytes): nothing is written |
+| `package.build-missing` | 3 | a journal (or `apply --recover`) would record a build whose file is missing or holds other bytes than its digest; the commit record is not written and the journal is kept; `status` reports it as a trust problem. Also a `status` trust problem when a build the manifest records is missing, and a `build` refusal when that build cannot be written back (the package no longer renders bytes that every entry naming that file records, for example two entries that disagree): nothing is written |
 | `package.build-changed` | 3 | `status`: a build the manifest records is not a regular file holding its recorded digest (for an entry from before digests: the page the committed package renders for it) (truncated, rewritten, a directory, a symlink). `tp-product build` refuses to replace it (`build.exists`); once it is moved aside, build writes back every recorded build the committed package still renders byte for byte, and refuses (`package.build-missing`) for one it does not |
 | `build.unproved`, `package.build-unproved` | 3 | `build` refuses, and `status` does not trust, a recorded build from before digests (no `digest` in its entry) whose bytes cannot be proved: the committed package no longer renders it (its entry records another source), cannot render it (an invalid adapter or asset), or (`status`) a package file differs from the commit record. Check the file against version control, then record its sha256 as the entry's `digest` (or remove the entry) with an `adopt-external-edit` changeset. Nothing is written |
 | `bundle.unreadable` | 1 | `import-feedback`: the bundle file cannot be read |
@@ -385,6 +385,13 @@ other change, so the build moves the package to the next revision.
   `builds/` that is a file or a symbolic link is refused (`build.exists`); a build is never written through a link.
   Each refusal writes no build file, so `status` and `build` agree afterwards. An older build that is lost for good
   must be put back from version control before the package builds again.
+- **Every entry is its own proof.** When several entries in `builds` name one file, each entry must hold for its
+  bytes: its digest, or (an entry from before digests) the page the committed package renders for that entry. The
+  file is up to date only when it satisfies all of them, and a missing file is written back only with a page that
+  satisfies all of them. Entries that disagree (another digest, revision or source) are refused by name: a present
+  file is `build.exists` or `build.unproved`, and a missing one `package.build-missing` ("is named by N recorded
+  entries ... that no single page satisfies"). After writing back, the list is checked again and anything still
+  unproved is `build.exists`.
 - **Built from committed state.** A build first re-evaluates note anchors against the current registry; if that changes
   stored anchors, it commits that change as its own revision before it renders, so the page shows only committed
   state and building again reports up to date.
@@ -440,11 +447,15 @@ other change, so the build moves the package to the next revision.
   an unknown field, a bad record, a conflicting id), offers the stored bytes as a download as they are and, whenever
   at least one note or answer in them is importable on its own, an export of those records as importable parts.
   The records are found in the stored text without parsing all of it, by one rule whatever surrounds them (other
-  bytes before or after, a BOM, the text cut short, a refused part before, between or after them): a record is a
-  complete object that is an element of a `notes`, `inputs` or `sessions` array at any depth, unless it lies inside
-  another record (a note's captured state may hold anything). Each is checked for depth before it is parsed and then
-  against every rule the CLI's import applies to it on its own; those it would import are offered, the others are
-  listed by id with the reason, both records of a conflicting id among them. The refused data is never
+  bytes before or after, a BOM, the text cut short, a refused part before, between or after them, any wrapping key
+  or array): every complete JSON object in the text, in the order it starts, is a candidate, and it is offered when
+  the CLI's import would accept it on its own as a note, an answer or a session. Its inner objects are then its
+  content; a candidate that is not accepted hides nothing inside it. Position and key names decide nothing. Each is
+  checked for depth and size before it is parsed and then against every rule the CLI's import applies to it on its
+  own (numbers as the CLI reads them: `1.0` or an integer beyond 2^53 is kept, a number Python reads as infinite is
+  not); the others that look like records are listed by id with the reason, both records of a conflicting id among
+  them. An offered record is exported as its exact stored text, never re-serialized. The open session is offered as
+  a session record without its prototype checkpoint. The refused data is never
   taken into the page's state. What was last exported is saved as a short hash, so exporting never doubles what is stored.
 - **Export and import:** Export downloads the feedback bundle (notes, inputs and sessions) and lists every part on the
   page with a save control and its JSON to copy, in case a download was blocked; the records count as exported only

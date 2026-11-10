@@ -147,6 +147,56 @@ class BuildTests(BuildCase):
             self.tamper_rows(r, page, form)
         self.tail_rows(page)  # the last build's entry has no digest from here on
 
+    def adopt_builds(self, builds):
+        m = json.loads((self.pkg / "package.json").read_text())
+        if m["builds"] == builds:
+            return
+        m["builds"] = builds
+        (self.pkg / "package.json").write_text(json.dumps(m))
+        C.apply(self.pkg, {"schema": "tp-product-changeset", "schema_version": 1, "actor": "Main", "summary": "t",
+                           "operations": [{"op": "adopt-external-edit", "by": "Main", "reason": "builds"}]},
+                cli.status_report(self.pkg)[0]["revision"])
+
+    def test_every_entry_naming_a_build_file_is_its_own_proof(self):
+        R.build(self.pkg)
+        page = (self.pkg / BUILD).read_bytes()
+        for form in ("digest", "legacy"):
+            if form == "legacy":
+                self.legacy(cli.status_report(self.pkg)[0]["revision"])
+            self.duplicate_rows(page, form)
+
+    def duplicate_rows(self, page, form):
+        """Several entries naming one file: each is its own proof obligation. Bytes are put back only when they satisfy
+        every entry; entries that disagree are refused by name, whichever of them comes last."""
+        base = self.docs()["manifest"]["builds"]
+        own = base[-1]
+        others = {"same": dict(own), "other digest": dict(own, digest="sha256:" + "0" * 64),
+                  "other revision": {k: v for k, v in dict(own, revision=1).items() if k != "digest"},
+                  "other source": dict(own, source="sha256:" + "1" * 64)}
+        for why, other in others.items():
+            for order in ("other last", "other first"):
+                with self.subTest(why, order=order, form=form):
+                    self.adopt_builds(base[:-1] + ([own, other] if order == "other last" else [other, own]))
+                    # the recorded bytes in place: trusted only when every entry is proved by them
+                    agree = self.status_codes() == (0, [])
+                    self.assertEqual(agree, why == "same" or (why == "other source" and form == "digest"))
+                    if not agree:  # a present file that one entry refuses is never reported up to date
+                        with self.assertRaises(T.StoreError) as cm:
+                            R.build(self.pkg)
+                        self.assertIn(cm.exception.code, ("build.exists", "build.unproved"))
+                    (self.pkg / BUILD).unlink()
+                    if agree:
+                        self.assertEqual(R.build(self.pkg)["restored"], True)
+                        self.assertEqual(((self.pkg / BUILD).read_bytes(), self.status_codes()), (page, (0, [])))
+                    else:
+                        e = self.refused("package.build-missing", 3)
+                        self.assertIn(BUILD + " is named by 2 recorded entries", str(e))
+                        self.assertFalse(os.path.lexists(self.pkg / BUILD))
+                        self.assertEqual(self.status_codes(), (3, ["package.build-missing"]))
+                        (self.pkg / BUILD).write_bytes(page)
+        self.adopt_builds(base)
+        self.assertEqual(self.status_codes(), (0, []))
+
     def tamper_rows(self, r, page, form):
         tampers = {
             "delete": (lambda p: p.unlink(), "package.build-missing"),
@@ -763,6 +813,13 @@ class BrowserAcceptanceTests(BuildCase):
         self.assertEqual(len(out["parts"]), 2)
         self.assertEqual(sorted(i for f in out["parts"] for i in accepted(f)), sorted(json.loads(Path(out["noteIds"]).read_text())))
         self.assertEqual(sorted(i for f in out["recovered"] for i in accepted(f)), sorted(out["recoverable"]))
+        # recovered records keep their exact text: the CLI reads the numbers as they were stored
+        for path, text in out["exact"]:
+            self.assertIn(text, Path(path).read_text(encoding="utf-8"), path)
+        num = [n for f in dict.fromkeys(f for f, _ in out["exact"]) for n in C.check_bundle(docs, Path(f).read_bytes())["notes"]
+               if n["id"] == "note.num.1"]
+        self.assertEqual([(type(n["state"]["counter"]), n["state"]["counter"], n["state"]["big"], repr(n["state"]["neg"]),
+                           n["state"]["e"]) for n in num], [(float, 1.0, 9007199254740993, "-0.0", 100.0)])
 
 
 if __name__ == "__main__":

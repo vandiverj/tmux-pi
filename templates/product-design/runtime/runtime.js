@@ -784,134 +784,247 @@
     var p = recordProblem(coll, r);
     return p ? "it would not be importable in an export bundle (" + p + ")" : null;
   }
-  // The records in stored text, found without parsing the whole of it (refused text may be too deep, cut short, not
-  // JSON, or have other bytes around it), as text slices. One rule: a record is a complete object (its closing brace
-  // read, at the end of the text too) that is an element of an array given as the notes, inputs or sessions member of
-  // an object, at any depth, unless it lies inside another record (a note's captured state may hold anything); the
-  // session and run are complete object members of those names, outside records (the last one read). Outside any
-  // object the bytes are skipped (a BOM, whitespace, anything else) until a "{" that opens a well-formed first member
-  // ({ "name": ...) or none ({}); inside one only strings and brackets are followed. Anything else is not a record: an
-  // element that is no object, a member of another name, an object cut short. What each record is worth is decided
-  // after, record by record (salvagePlan).
-  function storedParts(raw) {
-    var out = {notes: [], inputs: [], sessions: [], session: null, run: null};
-    if (typeof raw !== "string") return out;
-    var n = raw.length;
-    function skipWs(j) {
-      for (var c; j < n && ((c = raw.charCodeAt(j)) === 32 || c === 9 || c === 10 || c === 13); j++);
-      return j;
-    }
-    function strEnd(j) {   // raw[j] is a quote: the index of the quote that closes the string, or -1 (cut short)
-      for (j += 1; j < n; j++) { var c = raw.charCodeAt(j); if (c === 92) j += 1; else if (c === 34) return j; }
-      return -1;
-    }
-    function opens(j) {    // raw[j] is "{": does an object start here?
-      var k = skipWs(j + 1);
-      if (k >= n || raw.charCodeAt(k) === 125) return true;
-      if (raw.charCodeAt(k) !== 34) return false;
-      var e = strEnd(k);
-      return e < 0 || (k = skipWs(e + 1)) >= n || raw.charCodeAt(k) === 58;
-    }
-    function name(k) { try { return k === null ? null : JSON.parse(k); } catch (e) { return null; } }
-    // the object at s and everything in it; returns the index after it (n when it is cut short). Each open bracket is
-    // a frame: an object's frame keeps the member name being read, an array's the collection its elements belong to;
-    // a record (or the session or run) is read as one slice, nothing inside it looked at.
-    function object(s) {
-      var stack = [], rec = -1, recDepth = 0, recInto = null;
-      for (var j = s; j < n; j++) {
-        var c = raw.charCodeAt(j), top = stack[stack.length - 1];
-        if (c === 34) {
-          var e = strEnd(j);
-          if (e < 0) return n;
-          if (rec < 0 && top && top.obj) top.last = raw.slice(j, e + 1);
-          j = e;
-        } else if (rec >= 0) {
-          if (c === 123 || c === 91) recDepth += 1;
-          else if (c === 125 || c === 93) {
-            recDepth -= 1;
-            if (recDepth === 0) {
-              if (c === 125) { if (recInto === "session" || recInto === "run") out[recInto] = raw.slice(rec, j + 1); else out[recInto].push(raw.slice(rec, j + 1)); }
-              rec = -1;
-            }
-          }
-        } else if (c === 58 && top && top.obj) top.key = name(top.last);
-        else if (c === 44 && top && top.obj) top.key = top.last = null;
-        else if (c === 123 && top && !top.obj && top.coll !== null) { rec = j; recDepth = 1; recInto = top.coll; }
-        else if (c === 123 && top && top.obj && (top.key === "session" || top.key === "run")) { rec = j; recDepth = 1; recInto = top.key; }
-        else if (c === 123) stack.push({obj: true, key: null, last: null});
-        else if (c === 91) stack.push({obj: false, coll: top && top.obj && (top.key === "notes" || top.key === "inputs" || top.key === "sessions") ? top.key : null});
-        else if (c === 125 || c === 93) {
-          stack.pop();
-          if (!stack.length) return j + 1;
+  // Every complete JSON object in stored text, found without parsing the whole of it (refused text may be too deep,
+  // cut short, not JSON, or have other bytes around it): [{s, e, depth}] in start order, the object being raw[s..e)
+  // and depth its nesting (an object alone is 1, arrays counted). One pass reads the text by the JSON grammar: outside
+  // any object every byte is skipped but "{" (a BOM, whitespace, a quote, anything else), which opens one; inside one
+  // the grammar is followed, and an object is complete when its closing brace is read with every value in it
+  // well-formed. Bytes the grammar does not allow end every object still open (none of them is complete); the scan
+  // goes on from that byte as from outside any object, so an object that starts after it is still found. What each
+  // object is worth is decided after (salvagePlan).
+  function storedObjects(raw) {
+    var out = [], n = typeof raw === "string" ? raw.length : 0, stack = [], i = 0;
+    var num = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+    function strEnd(j) {   // raw[j] is a quote: the index of the quote closing a well-formed string, or -1
+      for (j += 1; j < n; j++) {
+        var c = raw.charCodeAt(j);
+        if (c === 34) return j;
+        if (c < 32) return -1;
+        if (c === 92) {
+          var x = raw.charAt(j + 1);
+          if (x === "u") { if (!/^[0-9a-fA-F]{4}$/.test(raw.substr(j + 2, 4))) return -1; j += 5; }
+          else if ('"\\/bfnrt'.indexOf(x) >= 0 && x !== "") j += 1;
+          else return -1;
         }
       }
-      return n;
+      return -1;
     }
-    for (var i = 0; i < n;) {
-      if (raw.charCodeAt(i) === 123 && opens(i)) i = object(i);
-      else i += 1;
+    function done(top) {   // a value ended inside `top`: it expects a separator or its close next
+      if (top) top.st = ",";
     }
-    return out;
+    while (i < n) {
+      var c = raw.charCodeAt(i), top = stack[stack.length - 1];
+      if (!top) {   // outside any object
+        if (c === 123) stack.push({obj: true, s: i, st: "k0", d: 1});
+        i += 1;
+        continue;
+      }
+      if (c === 32 || c === 9 || c === 10 || c === 13) { i += 1; continue; }
+      var bad = false;
+      if (top.st === "v" || top.st === "v0") {   // a value (or, first in an array, its close)
+        if (c === 93 && top.st === "v0" && !top.obj) { stack.pop(); close(top, i); i += 1; continue; }
+        if (c === 123 || c === 91) { stack.push({obj: c === 123, s: i, st: c === 123 ? "k0" : "v0", d: 1}); i += 1; continue; }
+        if (c === 34) { var e = strEnd(i); if (e < 0) bad = true; else { i = e + 1; done(top); continue; } }
+        else if (raw.startsWith("true", i)) { i += 4; done(top); continue; }
+        else if (raw.startsWith("false", i)) { i += 5; done(top); continue; }
+        else if (raw.startsWith("null", i)) { i += 4; done(top); continue; }
+        else { num.lastIndex = i; var m = num.exec(raw); if (m) { i += m[0].length; done(top); continue; } bad = true; }
+      } else if (top.st === "k0" || top.st === "k") {   // a member name (or, first, the object's close)
+        if (c === 125 && top.st === "k0") { stack.pop(); close(top, i); i += 1; continue; }
+        if (c === 34) { var k = strEnd(i); if (k < 0) bad = true; else { i = k + 1; top.st = ":"; continue; } }
+        else bad = true;
+      } else if (top.st === ":") {
+        if (c === 58) { top.st = "v"; i += 1; continue; }
+        bad = true;
+      } else {   // "," : a separator or the close
+        if (c === 44) { top.st = top.obj ? "k" : "v"; i += 1; continue; }
+        if (c === (top.obj ? 125 : 93)) { stack.pop(); close(top, i); i += 1; continue; }
+        bad = true;
+      }
+      if (bad) stack = [];   // nothing open is complete; this byte is read again from outside any object
+    }
+    function close(f, j) {
+      var up = stack[stack.length - 1];
+      if (f.obj) out.push({s: f.s, e: j + 1, depth: f.d});
+      if (up) { if (f.d + 1 > up.d) up.d = f.d + 1; up.st = ","; }
+    }
+    return out.sort(function (a, b) { return a.s - b.s; });
   }
-  // What can be recovered from refused saved data: each record found in its bytes that is importable on its own (its
-  // text within the depth one bundle allows before it is parsed, its numbers exported as written, every bundle rule),
-  // then the shared id rule over what is kept (a conflicting id leaves every record with it out; the same record
-  // again is exported once), as importable parts. Everything left out is listed by id with the reason.
+  // How the CLI reads the numbers of a record's exact text (Python's json): an integer token is an exact int, any
+  // token with a fraction or an exponent a float, never an integer, even when its value is whole (1.0, 1e2). Returns
+  // {why} when the CLI refuses a number (a float that is infinite, an integer of more than 4300 digits), else
+  // {check, key}: the text with every float made non-whole and every integer kept (an integer beyond a double's range
+  // written as its sign and 1e308), read for the schema as the CLI reads types; and the text read as the CLI compares
+  // records (strings, ints and floats kept apart, ints exact), for the id rule. The record's own text is what is
+  // exported: no number in it is rewritten.
+  function pyNumbers(text) {
+    var re = /"(?:[^"\\]|\\.)*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/g, m, at = 0, check = [], key = [];
+    while ((m = re.exec(text)) !== null) {
+      var tok = m[0], before = text.slice(at, m.index);
+      at = m.index + tok.length;
+      check.push(before);
+      key.push(before);
+      if (tok.charCodeAt(0) === 34) { check.push(tok); key.push('"s' + tok.slice(1)); continue; }
+      var neg = tok.charCodeAt(0) === 45, v = Number(tok);
+      if (/[.eE]/.test(tok)) {
+        if (!isFinite(v)) return {why: "the number " + tok + " is an infinite number, which the CLI refuses"};
+        check.push(neg ? "-0.5" : "0.5");
+        key.push('"f' + (Object.is(v, -0) ? "-0" : String(v)) + '"');
+      } else {
+        if (tok.length - (neg ? 1 : 0) > 4300) return {why: "the number " + tok.slice(0, 12) + "... has more than 4300 digits, which the CLI refuses"};
+        check.push(isFinite(v) ? tok : (neg ? "-1e308" : "1e308"));
+        key.push('"i' + BigInt(tok).toString() + '"');
+      }
+    }
+    check.push(text.slice(at));
+    key.push(text.slice(at));
+    return {check: check.join(""), key: key.join("")};
+  }
+  // The member names and the id (when it is a string) of the object text `t`, read from its top level only, without
+  // parsing it: how a record left out is named.
+  function ownFields(t) {
+    var names = [], id = null, d = 0, idNext = false;
+    function str(x) { try { return JSON.parse(x); } catch (err) { return null; } }
+    for (var j = 0; j < t.length; j++) {
+      var c = t.charCodeAt(j);
+      if (c === 34) {
+        var e = j + 1;
+        for (; e < t.length; e++) { var x = t.charCodeAt(e); if (x === 92) e += 1; else if (x === 34) break; }
+        var s = t.slice(j, e + 1), k = e + 1;
+        j = e;
+        if (d !== 1) continue;
+        if (idNext) { id = str(s); idNext = false; continue; }   // the value of "id"
+        while (k < t.length && /[ \t\n\r]/.test(t.charAt(k))) k += 1;
+        if (t.charAt(k) !== ":") continue;
+        var name = str(s);
+        if (typeof name !== "string") continue;
+        names.push(name);
+        if (name === "id") { id = null; idNext = true; }
+        j = k;
+      } else if (c === 123 || c === 91) { idNext = false; d += 1; }
+      else if (c === 125 || c === 93) d -= 1;
+      else if (d === 1 && c > 32 && c !== 44) idNext = false;   // a value that is no string
+    }
+    return {names: names, id: typeof id === "string" ? id : null};
+  }
+  // The kinds of record a feedback bundle holds, in the order an object is tried as one, and how a left-out object
+  // of each kind is recognised (by its own id, or a session's own fields) to be named in the list of what is left out.
+  var KINDS = [["notes", function (f) { return typeof f.id === "string" && f.id.indexOf("note.") === 0; }],
+               ["inputs", function (f) { return typeof f.id === "string" && f.id.indexOf("input.") === 0; }],
+               ["sessions", function (f) { return ["reviewer", "build", "visited"].every(function (k) { return f.names.indexOf(k) >= 0; }); }]];
+  // A feedback bundle written around records' exact texts: {coll: [text]}; the records are not reformatted.
+  function textBundle(texts, exported) {
+    function list(coll) { return texts[coll].length ? "[\n    " + texts[coll].join(",\n    ") + "\n  ]" : "[]"; }
+    return "{\n  \"schema\": \"tp-product-feedback\",\n  \"schema_version\": 1,\n  \"package\": " + JSON.stringify(DATA.package.id) +
+           ",\n  \"exported\": " + JSON.stringify(exported) + ",\n  \"notes\": " + list("notes") + ",\n  \"inputs\": " + list("inputs") +
+           ",\n  \"sessions\": " + list("sessions") + "\n}";
+  }
+  // Why the CLI's import-feedback would refuse a bundle of these records ([] when it takes it): its size, record
+  // count and depth on the text itself, every other rule on the text as the CLI reads its numbers.
+  function textBundleProblems(recs, exported) {
+    var texts = {notes: [], inputs: [], sessions: []}, checks = {notes: [], inputs: [], sessions: []}, deep = 0;
+    recs.forEach(function (r) { texts[r.coll].push(r.text); checks[r.coll].push(r.check); if (r.depth > deep) deep = r.depth; });
+    var text = textBundle(texts, exported), p = [];
+    if (utf8Length(text) > DATA.limits.bytes) p.push(utf8Length(text) + " bytes; at most " + DATA.limits.bytes);
+    if (texts.notes.length + texts.inputs.length > DATA.limits.records) p.push((texts.notes.length + texts.inputs.length) + " records; at most " + DATA.limits.records);
+    if (deep + 2 > DATA.limits.depth) p.push("nested deeper than " + DATA.limits.depth + " levels");
+    if (p.length) return {text: text, problems: p};
+    var v;
+    try { v = JSON.parse(textBundle(checks, exported)); } catch (e) { return {text: text, problems: ["not readable (" + (e && e.message) + ")"]}; }
+    return {text: text, problems: bundleProblems(v), value: v};
+  }
+  // What can be recovered from refused saved data. Every complete object in its bytes is a candidate, in the order
+  // it starts; one is offered when the CLI's import-feedback would take it on its own, as the record of its kind it
+  // is (note, input or review session: its text within the depth and size one bundle allows, its numbers as the CLI
+  // reads them, every bundle rule). An offered record holds its objects: they are its content, not records. A
+  // candidate that is not offered (a wrapper, a saved state, a record no bundle can hold) hides nothing: the objects
+  // in it are candidates as any other. Then the shared id rule over what is offered, ids compared as the CLI compares
+  // them (a conflicting id leaves every record with it out; the same record again is exported once), and the records
+  // are exported in importable parts written from their exact text. Everything left out that is a record by its own
+  // id (or a session by its fields) is listed with the reason.
   function salvagePlan(raw) {
-    var found = storedParts(raw), excluded = [], L = DATA.limits.depth, keep = {notes: [], inputs: [], sessions: []};
-    function take(slice, room) {
-      try {
-        if (textDepth(slice, L) > room) return {why: "nested deeper than one bundle allows (" + L + " levels)"};
-        var v = JSON.parse(slice), n = numberProblems(slice);
-        return n.length ? {value: v, why: n[0]} : {value: v};
-      } catch (e) { return {why: "not readable on its own (" + (e && e.message) + ")"}; }
-    }
-    function label(v, fallback) { return isType("object", v) && typeof v.id === "string" ? readable(v.id) : fallback; }
-    ["notes", "inputs"].forEach(function (coll) {
-      found[coll].forEach(function (slice, i) {
-        var got = take(slice, L - 2), why = got.why || recordProblem(coll, got.value);
-        if (why) excluded.push(label(got.value, coll + "." + i) + ": " + why); else keep[coll].push(got.value);
-      });
-    });
-    var cands = [];
-    if (found.session !== null) {
-      var s = take(found.session, L - 2), r = found.run === null ? {value: null} : take(found.run, L - 3);
-      if (s.why || r.why || !isType("object", s.value)) excluded.push("the open session: " + (s.why || (r.why ? "its prototype checkpoint: " + r.why : "not a session")));
-      else cands.push(sessionRecord(s.value, isType("object", r.value) ? r.value : null));
-    }
-    found.sessions.forEach(function (slice, i) {
-      var got = take(slice, L - 2);
-      if (got.why) excluded.push("session " + i + ": " + got.why); else cands.push(got.value);
-    });
-    cands.forEach(function (x, i) {
-      var b = emptyBundle([x]), why;
-      try { why = exportProblems(bundleText(b), b); } catch (e) { why = [String(e && e.message)]; }
-      if (why.length) excluded.push("session " + label(x, String(i)) + ": " + why.slice(0, 2).join("; ")); else keep.sessions.push(x);
-    });
-    var clash = idConflicts(keep);
-    ["notes", "inputs", "sessions"].forEach(function (coll) {
-      var once = dict();
-      keep[coll] = keep[coll].filter(function (r) {
-        if (clash[coll + ":" + r.id] !== undefined) {
-          excluded.push(readable(r.id) + ": another saved record has this id with other content (an import refuses both), so neither is exported");
-          return false;
+    var text = typeof raw === "string" ? raw : String(raw), excluded = [], L = DATA.limits.depth, keep = [];
+    var exported = now(), hidden = 0;
+    storedObjects(text).forEach(function (o) {
+      if (o.s < hidden) return;   // inside a record offered: its content
+      var slice = text.slice(o.s, o.e), why = null, got = null;
+      if (o.depth + 2 > L) why = "nested deeper than one bundle allows (" + L + " levels)";
+      else if (utf8Length(slice) > DATA.limits.bytes) why = "larger than one bundle allows (" + DATA.limits.bytes + " bytes)";
+      else got = pyNumbers(slice);
+      if (got && got.why) why = got.why;
+      var tried = [];
+      if (!why) {
+        for (var i = 0; i < KINDS.length; i++) {
+          var r = {coll: KINDS[i][0], text: slice, check: got.check, key: got.key, depth: o.depth};
+          var b = textBundleProblems([r], exported);
+          if (!b.problems.length) { r.id = b.value[r.coll][0].id; keep.push(r); hidden = o.e; return; }
+          tried.push(b.problems);
         }
-        if (once[r.id]) { excluded.push(readable(r.id) + ": the same record again; it is exported once"); return false; }
-        once[r.id] = 1;
-        return true;
-      });
+      }
+      var f = ownFields(slice);
+      for (var j = 0; j < KINDS.length; j++) {
+        if (!KINDS[j][1](f)) continue;
+        var label = KINDS[j][0] === "sessions" ? "session " + readable(String(f.id)) : readable(f.id);
+        excluded.push(label + ": " + (why || tried[j].slice(0, 3).join("; ")));
+        return;
+      }
     });
-    var whole = emptyBundle(keep.sessions);
-    whole.notes = keep.notes;
-    whole.inputs = keep.inputs;
-    var got = exportParts(whole);
-    if (got.error && whole.sessions.length) {   // sessions that fit one by one but not together: the records still go
-      whole.sessions.forEach(function (x) { excluded.push("session " + readable(x.id) + ": the sessions together exceed one bundle"); });
-      whole.sessions = [];
-      got = exportParts(whole);
+    // the id rule, as the CLI keys it (notes and inputs share ids; sessions, as this page's import keeps them)
+    var seen = dict(), clash = dict();
+    keep.forEach(function (r) {
+      var k = (r.coll === "sessions" ? "s:" : "r:") + r.id, c = canonical(JSON.parse(r.key));
+      if (seen[k] === undefined) seen[k] = c; else if (seen[k] !== c) clash[k] = 1;
+    });
+    var once = dict();
+    keep = keep.filter(function (r) {
+      var k = (r.coll === "sessions" ? "s:" : "r:") + r.id;
+      if (clash[k]) { excluded.push(readable(r.id) + ": another saved record has this id with other content (an import refuses both), so neither is exported"); return false; }
+      if (once[k]) { excluded.push(readable(r.id) + ": the same record again; it is exported once"); return false; }
+      once[k] = 1;
+      return true;
+    });
+    var got = textParts(keep, exported);
+    if (got.error && keep.some(function (r) { return r.coll === "sessions"; })) {   // sessions that fit one by one but not together
+      keep = keep.filter(function (r) {
+        if (r.coll !== "sessions") return true;
+        excluded.push("session " + readable(r.id) + ": the sessions together exceed one bundle");
+        return false;
+      });
+      got = textParts(keep, exported);
     }
-    return {parts: got.parts ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null,
-            excluded: excluded, records: got.parts ? keep.notes.length + keep.inputs.length : 0};
+    var n = keep.filter(function (r) { return r.coll !== "sessions"; }).length;
+    return {parts: got.parts && n ? offered(got.parts, DATA.package.id + "-stored-records") : null, error: got.error || null,
+            excluded: excluded, records: got.parts ? n : 0};
+  }
+  // The recovered records as importable bundles written from their exact text: one when they fit, otherwise split, in
+  // order, into bundles that each fit (the sessions go with the first); every part is checked as the CLI reads it.
+  // Returns {parts: [{bundle: {notes, inputs}, text}]} or {error}.
+  function textParts(recs, exported) {
+    var sessions = recs.filter(function (r) { return r.coll === "sessions"; }), rest = recs.filter(function (r) { return r.coll !== "sessions"; });
+    var groups = [], cur = sessions.slice(), size = utf8Length(textBundle({notes: [], inputs: [], sessions: sessions.map(function (r) { return r.text; })}, exported));
+    if (size > DATA.limits.bytes) return {error: "the review sessions alone exceed one bundle"};
+    var count = 0;
+    rest.forEach(function (r) {
+      var cost = utf8Length(r.text) + 7;   // its text, a separator and an indented line
+      if (count > 0 && (size + cost > DATA.limits.bytes || count + 1 > DATA.limits.records)) {
+        groups.push(cur);
+        cur = [];
+        count = 0;
+        size = utf8Length(textBundle({notes: [], inputs: [], sessions: []}, exported));
+      }
+      cur.push(r);
+      count += 1;
+      size += cost;
+    });
+    groups.push(cur);
+    var out = [];
+    for (var j = 0; j < groups.length; j++) {
+      var b = textBundleProblems(groups[j], exported);
+      if (b.problems.length) return {error: (groups.length === 1 ? "the bundle" : "part " + (j + 1) + " of " + groups.length) +
+                                            " would not be importable (" + b.problems.slice(0, 3).join("; ") + ")"};
+      out.push({bundle: {notes: b.value.notes, inputs: b.value.inputs}, text: b.text});
+    }
+    return {parts: out};
   }
   // The recovery export: the plan made when the saved data was refused, offered on the page and downloaded.
   function salvage() {

@@ -644,23 +644,39 @@ async function limits(htmlPath, workDir) {
       await p.settle();
       out.recovered.push(save("recovered-3.json", await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
       check("the deep saved data stays as it was", (await p.ev(stored)) === raw);
-      // other bytes before the saved object (a BOM, an object around it), or the text cut right after a complete note:
-      // that note is still offered
-      const one = (id) => Object.assign({}, note, {id}), cuts = {
-        "note.bom.1": (t) => "\ufeff" + t,
-        "note.wrap.1": (t) => '[{"a":' + t,
-        "note.cut.1": (t) => t.slice(0, t.indexOf(JSON.stringify(one("note.cut.1"))) + JSON.stringify(one("note.cut.1")).length)};
-      for (const [id, cut] of Object.entries(cuts)) {
-        const text = cut(JSON.stringify(Object.assign({}, saved, {notes: [one(id)]})));
-        out.recoverable.push(id);
+      // other bytes before the saved object (a BOM, an object around it, one named as a saved state's part), the text
+      // cut right after a complete note, the note in nested arrays, or numbers JavaScript would rewrite (1.0, an
+      // integer past 2^53, -0.0, 1E+2) beside an unknown field: that note is still offered, its text as it was
+      const one = (id) => Object.assign({}, note, {id}), rec = (id) => id === "note.num.1"
+        ? JSON.stringify(Object.assign(one(id), {state: {counter: 0}})).replace('"counter":0', '"counter":1.0,"big":9007199254740993,"neg":-0.0,"e":1E+2')
+        : JSON.stringify(one(id));
+      // Two stored texts (one reload each): every wrapper around one saved state that holds a plain note, a note in
+      // nested arrays and a note with such numbers, beside an unknown field; and a state cut right after its note.
+      const state = (items) => JSON.stringify(Object.assign({}, saved, {notes: items.map((x, i) => "@REC" + i + "@")}))
+        .replace(/"@REC(\d+)@"/g, (m, i) => items[Number(i)]);
+      const [wrapped, nested, num, cut] = ["note.wrap.1", "note.nested.1", "note.num.1", "note.cut.1"].map(rec);
+      const texts = [
+        {name: "wrapped", ids: ["note.wrap.1", "note.nested.1", "note.num.1"],
+         text: '\ufeff[{"a":{"notes":[{"session":' + state([wrapped, "[[" + nested + "]]", num]).replace(/}$/, ',"zz":1}')},
+        {name: "cut", ids: ["note.cut.1"], text: ((t) => t.slice(0, t.indexOf(cut) + cut.length))(state([cut]))}];
+      out.exact = [];
+      for (const {name, ids, text} of texts) {
+        out.recoverable.push(...ids);
         await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(text)})`);
         await p.reload();
         d = await p.dbg();
-        check(`${id}: refused, and its complete note is offered`, d.notes === 0 && (await p.count("#tp-saved-export")) === 1, d.storageNotice);
+        check(`${name}: refused, and its ${ids.length} complete note(s) offered`, d.notes === 0 && (await p.count("#tp-saved-export")) === 1 &&
+              new RegExp(`export the ${ids.length} record`).test(d.storageNotice || ""), d.storageNotice);
         await p.click("#tp-saved-export");
         await p.settle();
-        out.recovered.push(save(`recovered-${id}.json`, await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`)));
-        check(`${id}: the saved data stays as it was`, (await p.ev(stored)) === text);
+        const got = await p.ev(`(document.querySelector("#tp-saved-text-1") || {}).value || ""`);
+        out.recovered.push(save(`recovered-${name}.json`, got));
+        for (const id of ids) {
+          const r = rec(id);
+          out.exact.push([out.recovered[out.recovered.length - 1], r]);
+          check(`${id}: the record is exported as its exact text`, got.indexOf(r) >= 0, got.slice(0, 400));
+        }
+        check(`${name}: the saved data stays as it was`, (await p.ev(stored)) === text);
       }
       const none = JSON.stringify(Object.assign({}, saved, {notes: [Object.assign({}, note, {id: "note.bad.2", text: "lone \ud800"})]})).replace(/}$/, `,"zz":${nest}}`);
       await p.ev(`localStorage.setItem(${JSON.stringify(KEY)}, ${JSON.stringify(none)})`);

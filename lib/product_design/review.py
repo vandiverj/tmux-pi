@@ -465,29 +465,29 @@ def _recorded_builds(root, docs, source, prove, fault) -> list:
     file that is there but is not the recorded build (other bytes, not a regular file, a link on its way: build.exists,
     never replaced), one whose bytes cannot be proved (build.unproved: no digest and no page to compare with), and a
     gone file this source no longer renders (package.build-missing: only its own bytes can be put back, from version
-    control). Returns the files restored."""
+    control). Every entry is its own proof obligation: when several entries name one file, the bytes put back must
+    satisfy each of them (its digest, or without one the page rendered for it); entries that no single page satisfies
+    are refused by name (package.build-missing: "named by N recorded entries"), never settled by picking one. Returns the
+    files restored."""
     changed, unproved, missing, todo = [], [], [], []
-    by_file = {}
-    for entry in docs["manifest"].get("builds", []):
-        if isinstance(entry, dict) and isinstance(entry.get("file"), str):
-            by_file.setdefault(entry["file"], []).append(entry)
-    for rel, why in T.recorded_build_problems(root, docs, prove):
+    gone = {}  # normalised file name -> the checks (entry kept) of every entry naming that gone file
+    for check in T.recorded_build_checks(root, docs, prove):
+        rel, why = check["file"], check["why"]
         if isinstance(rel, str) and rel and not os.path.lexists(Path(root) / rel):  # gone (or its folder is not one)
-            for entry in by_file.get(rel, []):
-                if entry.get("source") != source:
-                    continue
-                page = prove(docs, entry)
-                want = entry.get("digest") if isinstance(entry.get("digest"), str) else None
-                if page is not None and (want is None or "sha256:" + hashlib.sha256(page).hexdigest() == want):
-                    if rel not in [r for r, _ in todo]:
-                        todo.append((rel, page))
-                    break
-            else:
-                missing.append((rel, why))
+            gone.setdefault(os.path.normpath(rel), []).append(check)
         elif why.startswith(T.UNPROVED):
             unproved.append((rel, why))
         else:
             changed.append((rel, why))
+    for checks in gone.values():
+        rel, page, why = checks[0]["file"], _satisfying_page(docs, [c["entry"] for c in checks], source, prove), None
+        if page is not None:
+            todo.append((rel, page))
+            continue
+        if len(checks) > 1:
+            why = (f"is named by {len(checks)} recorded entries (entries "
+                   + ", ".join(str(c["index"]) for c in checks) + ") that no single page satisfies")
+        missing.append((rel, why or checks[0]["why"]))
     if changed:
         rel, why = changed[0]
         raise T.StoreError("build.exists", "; ".join(f"{r} {w}" for r, w in changed) + ": the manifest records "
@@ -504,15 +504,40 @@ def _recorded_builds(root, docs, source, prove, fault) -> list:
                            details={"builds": [{"file": r, "problem": w} for r, w in unproved]})
     if missing:
         raise T.StoreError("package.build-missing", "; ".join(f"{r} {w}" for r, w in missing) + ": the manifest records "
-                                                    "that review build and this package no longer renders its bytes, "
-                                                    "so it cannot be built again. Put the recorded file back (from "
-                                                    "version control) and build again. No build file was "
-                                                    "written.", exit=3,
+                                                    "that review build and this package no longer renders bytes that "
+                                                    "every entry for it records, so it cannot be built again. Put the "
+                                                    "recorded file back (from version control) and build again. No "
+                                                    "build file was written.", exit=3,
                            details={"builds": [{"file": r, "problem": w} for r, w in missing]})
     for rel, page in todo:
         _builds_dir(root, rel)
         _restore(root, rel, page, fault)
+    left = T.recorded_build_checks(root, docs, prove)  # e.g. two spellings of one file on a case-folding disk
+    if left:
+        raise T.StoreError("build.exists", "; ".join(f"{c['file']} {c['why']}" for c in left) + ": after the recorded "
+                                           "builds were put back, the manifest still records bytes that file does "
+                                           "not hold; it is not reported up to date. Check the recorded entries for "
+                                           "that file.", exit=3,
+                           details={"builds": [{"file": c["file"], "problem": c["why"], "entry": c["index"]}
+                                               for c in left]})
     return [rel for rel, _ in todo]
+
+
+def _satisfying_page(docs, entries, source, prove):
+    """The page that satisfies every entry in `entries` (all naming one gone file), or None: a page this source
+    renders for one of them (its entry has this source fingerprint), whose sha256 is each digest entry's digest and
+    which is the page rendered for each entry without one."""
+    for entry in entries:
+        if entry.get("source") != source:
+            continue
+        page = prove(docs, entry)
+        if page is None:
+            continue
+        digest = "sha256:" + hashlib.sha256(page).hexdigest()
+        if all((e.get("digest") == digest) if isinstance(e.get("digest"), str) else (prove(docs, e) == page)
+               for e in entries):
+            return page
+    return None
 
 
 def _restore(root, rel, page, fault):

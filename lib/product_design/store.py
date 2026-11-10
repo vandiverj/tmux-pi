@@ -737,18 +737,26 @@ def recorded_build_problems(root, docs, prove=None) -> list:
     """[(file, why)] for each build the manifest records whose bytes are not proved to be that build: missing, not a
     regular file, other bytes than its digest, or (an entry from before digests) other bytes than the page the
     committed package renders for it, or no such page. prove(docs, entry) returns that page (bytes) or None; without
-    `prove`, an entry with no digest is unproved."""
+    `prove`, an entry with no digest is unproved. The view of recorded_build_checks for a reader that only names."""
+    return [(c["file"], c["why"]) for c in recorded_build_checks(root, docs, prove)]
+
+
+def recorded_build_checks(root, docs, prove=None) -> list:
+    """recorded_build_problems with each problem's entry kept: [{"index", "entry", "file", "why"}], one per manifest
+    build entry whose bytes are not proved, in manifest order. Every entry is its own proof obligation: several entries
+    naming one file are each checked against its bytes, and a writer that puts a file back must satisfy all of them
+    (review._recorded_builds)."""
     builds = _get(docs, "manifest", "builds")
     out = []
-    for b in builds if isinstance(builds, list) else []:
+    for i, b in enumerate(builds if isinstance(builds, list) else []):
         if not isinstance(b, dict):
-            out.append((None, "is not a build entry"))
+            out.append({"index": i, "entry": b, "file": None, "why": "is not a build entry"})
             continue
         want = b.get("digest") if isinstance(b.get("digest"), str) else None
         why = build_file_problem(root, b.get("file"), want,
                                  (lambda b=b: prove(docs, b)) if prove is not None else (lambda: None))
         if why:
-            out.append((b.get("file"), why))
+            out.append({"index": i, "entry": b, "file": b.get("file"), "why": why})
     return out
 
 

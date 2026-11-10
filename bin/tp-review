@@ -311,7 +311,7 @@ fi
 # oversized author packet/result is never excerpted: it is split into ordered, labelled
 # segments that together hold every character. If all evidence cannot fit in one
 # packet, fail before spawning rather than drop any of it.
-max_file=60000 max_packet=300000 packet_reserve=20000 per_file_overhead=300
+max_file=60000 max_packet=400000 packet_reserve=20000 per_file_overhead=300
 ctx_list=()
 # add_segments <file> <label> [origin]: appends context paths to ctx_list (runs in this shell,
 # so excerpt_dir and ctx_list survive for cleanup and spawning). origin is the path a segment label names (default: the file).

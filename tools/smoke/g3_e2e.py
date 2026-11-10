@@ -98,7 +98,7 @@ TAMPERS = {
     "dispatch-lane": "dispatch", "dispatch-worktree": "dispatch",
     "no-prompt": "prompt", "prompt-no-reason": "prompt", "trust-dialog": "prompt",
     "still-pending": "decline", "authorized": "decline", "no-redirect-record": "decline", "first-never-settles": "decline",
-    "first-complete": "decline", "first-changed": "decline",
+    "first-complete": "decline", "first-changed": "decline", "settled-odd": "decline", "declined-no-event": "decline", "unconfirmed-redirect": "decline",
     "first-not-stopped": "retry", "retry-same-id": "retry", "retry-meta": "retry", "task-state": "retry", "retry-incomplete": "retry",
     "retry-extra-file": "retry", "retry-wrong-line": "retry",
     "reviewer-id": "review", "review-of": "review", "same-provider": "review", "independence": "review", "reviewed-tree": "review",
@@ -110,6 +110,21 @@ TAMPERS = {
     "leftover-worktree": "leftovers", "leftover-branch": "leftovers", "leftover-lane-record": "leftovers", "leftover-pane": "leftovers",
     "session-kept": "leftovers",
 }
+
+
+FAKE_SUBMIT = '''import json, os, subprocess, sys
+hook, state, pane, typed = sys.argv[1:5]
+tasks = os.path.join(state, "tasks")
+for ident in sorted(os.listdir(tasks)):
+    try:
+        meta = json.load(open(os.path.join(tasks, ident, "meta.json")))
+    except (OSError, ValueError):
+        continue
+    if meta.get("pane") == pane:
+        event = {"hook_event_name": "UserPromptSubmit", "prompt": open(typed).read()}
+        env = dict(os.environ, TP_TASK_DIR=os.path.join(tasks, ident), TP_TASK_ID=ident)
+        subprocess.run(["bash", hook], input=json.dumps(event).encode(), env=env)
+'''   # the fake worker's UserPromptSubmit: the real report.sh on the typed text (see fake_setup)
 
 
 def shell_quote(text):
@@ -252,6 +267,7 @@ class Smoke:
             env["TMUX_TMPDIR"] = str(self.tmux_tmp)
             env["PATH"] = f"{self.tmp / 'fakebin'}{os.pathsep}{env['PATH']}"
             env["TP_MAIN_CWD"] = str(self.repo)
+            env["TP_SEND_CONFIRM_SECONDS"] = "1"      # the fake hook has run before Enter returns; an unconfirmed-redirect tamper fails in ~3 s
         return env
 
     def quiet(self, argv, timeout=None, env=None):
@@ -275,7 +291,26 @@ class Smoke:
         return run
 
     def tool(self, name, *args, **kw):
-        return self.run([self.root / "bin" / name, *args], **kw)
+        run = self.run([self.root / "bin" / name, *args], **kw)
+        if self.fake and name == "tp-agent" and args[:1] == ("message",):
+            self.fake_turn(args[1], args[args.index("--text") + 1])
+        return run
+
+    def fake_turn(self, ident, text):
+        """Fake mode stands in for the worker's UserPromptSubmit hook: the owner's next prompt settles a request still pending, as
+        settled_record in lib/redact_hook.py writes it (status, event, updated; every other field stays). Only after the prompt is
+        in messages.jsonl, so a script that waits for the settle before sending it never sees it. Tamper `still-pending` never
+        settles; `authorized` writes the wrong status."""
+        path = self.task_dir(ident) / "permission-request.json"
+        request = self.read(path, {})
+        try:
+            recorded = text in [json.loads(line).get("text") for line in self.text(self.task_dir(ident) / "messages.jsonl").splitlines()]
+        except (OSError, ValueError):
+            recorded = False
+        if recorded and request.get("status") == "pending" and not self.tamper("still-pending"):
+            request.update(status="authorized" if self.tamper("authorized") else "wedged" if self.tamper("settled-odd") else "declined",
+                           event=None if self.tamper("declined-no-event") else "UserPromptSubmit", updated=now())
+            self.write(path, json.dumps(request) + "\n")
 
     def agent_json(self, *args, **kw):
         out = self.tool("tp-agent", *args, **kw).stdout
@@ -542,22 +577,24 @@ class Smoke:
         self.check("task record: permission-request.json is pending and carries a reason", permission.get("status") == "pending" and bool(permission.get("reason")), permission)
 
     def step_decline(self):
-        first, pane = self.ids["first"], self.read(self.task_dir(self.ids["first"]) / "meta.json", {}).get("pane")
+        """The order is the contract. Claude Code fires no PermissionDenied for an interactive reject, so the request stays `pending`
+        until the asker's next UserPromptSubmit (or Stop) settles it `declined` (lib/redact_hook.py settle_declined). The redirect is
+        that next prompt: send it first, check it is recorded, and only then wait for the request to leave pending."""
+        first = self.ids["first"]
+        pane = self.read(self.task_dir(first) / "meta.json", {}).get("pane")
         self.tmux("send-keys", "-t", pane, "Escape")           # decline the dialog, the way Main does
-        if self.fake and not self.tamper("still-pending"):
-            request = self.read(self.task_dir(first) / "permission-request.json", {})
-            request.update(status="authorized" if self.tamper("authorized") else "denied", updated=now())
-            self.write(self.task_dir(first) / "permission-request.json", json.dumps(request) + "\n")
-            self.write(self.task_dir(first) / "state.json", json.dumps({"state": "working", "updated": now()}) + "\n")
-
-        def declined():
-            status = (self.inspect(first).get("permission") or {}).get("status")
-            return status != "pending", status
-        status = self.wait("the permission request to leave pending after Escape", declined, self.args.prompt_wait)
-        self.check("task record: the declined request is not authorized", status != "authorized", status)
         redirect = ("Do not run that command: the request was declined. Do nothing else in this attempt and make no change. "
                     "Reply only with the line RESULT_STATUS: incomplete.")
-        self.tool("tp-agent", "message", first, "--text", redirect)
+        # exit 1 is "typed, not confirmed" (its JSON is still printed); only exit 0 with submitted: true counts. Either way the
+        # failure names the tool's own words.
+        run = self.tool("tp-agent", "message", first, "--text", redirect, rc_ok=(0, 1))    # fake mode: the fake hook settles the request once this is recorded
+        try:
+            sent = json.loads(run.stdout)
+        except ValueError:
+            sent = {}
+        self.check("tp-agent message: the redirect was confirmed submitted (a promptLog record carries its delivery id)",
+                   run.returncode == 0 and sent.get("submitted") is True,
+                   f"exit {run.returncode}, {sent or run.stdout[:200]!r}: {(run.stderr.strip() or run.stdout.strip())[-400:]}")
         if self.tamper("no-redirect-record"):
             (self.task_dir(first) / "messages.jsonl").unlink()
         try:
@@ -565,6 +602,17 @@ class Smoke:
         except FileNotFoundError:
             sent = []
         self.check("task record: messages.jsonl holds the redirect message sent to the worker", redirect in sent, sent)
+
+        def left_pending():
+            status = (self.inspect(first).get("permission") or {}).get("status")
+            return status != "pending", status
+        status = self.wait("the permission request to leave pending after Escape", left_pending, self.args.prompt_wait)
+        request = self.read(self.task_dir(first) / "permission-request.json", {})
+        self.check("task record: the declined request is not authorized", status != "authorized", status)
+        self.check("task record: the request is declined (by the redirect's turn) or denied", status in ("declined", "denied"), status)
+        if status == "declined":
+            self.check("task record: a declined request carries the event that settled it", request.get("event") in ("UserPromptSubmit", "Stop"), request.get("event"))
+        self.facts["decline"] = {"status": status, "event": request.get("event")}
         if self.fake and not self.tamper("first-never-settles"):
             result = "RESULT_STATUS: complete" if self.tamper("first-complete") else "RESULT_STATUS: incomplete"
             self.write(self.task_dir(first) / "result.md", f"Declined; no change made.\n{result}\n")
@@ -821,10 +869,29 @@ class Smoke:
         # a worker pane is a sleeper; with --tamper trust-dialog it first waits for the fake trust screen (written by the prompt step) and prints it
         pane_script = f"until [ -f {screen} ]; do sleep 0.05; done; cat {screen}; sleep 300; :" if self.tamper("trust-dialog") else "sleep 300; :"
         # Belt and braces: whatever calls this wrapper, it reaches the private server only (its own TMUX_TMPDIR, -L socket, no TMUX).
+        # The worker's UserPromptSubmit hook. Typed text (send-keys -l) is held per pane; the Enter after it submits it: the real
+        # claude/plugins/tmux-pi/hooks/report.sh runs with a UserPromptSubmit event whose `prompt` is that text, so state.json gets
+        # the promptLog record (n, at, tokens) exactly as the live hook writes it. The real script, not a copy: its fields, its bound
+        # of 8 and its token pattern cannot drift from what lib/pane_send.py waits on. Cost: one python3, one bash and a few jq per
+        # submit. --tamper unconfirmed-redirect drops the record: the text is typed and submitted, no hook runs.
+        helper = fakebin / "fake_submit.py"
+        helper.write_text(FAKE_SUBMIT)
+        hook = ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "report.sh"
+        if self.tamper("unconfirmed-redirect"):
+            submit_sh = f'exec {tmux} -L {self.sock} "$@"'
+        else:
+            submit_sh = f'''
+   pane=; prev=; for a; do [ "$prev" = -t ] && pane=$a; prev=$a; done
+   typed="{self.tmp}/typed-$(printf %s "$pane" | tr -c 'A-Za-z0-9' _)"
+   case " $* " in *" -l "*) printf %s "$prev" > "$typed" ;; esac
+   {tmux} -L {self.sock} "$@"; rc=$?
+   if [ "$prev" = Enter ] && [ -f "$typed" ]; then {sys.executable} {helper} {hook} "$TP_STATE_DIR" "$pane" "$typed"; rm -f "$typed"; fi
+   exit $rc'''
         wrapper.write_text(f'''#!/bin/sh
 TMUX_TMPDIR='{self.tmux_tmp}'; export TMUX_TMPDIR; unset TMUX TMUX_PANE
 case "$1" in
- new-session|list-panes|kill-pane|kill-session|has-session|send-keys|list-sessions|capture-pane) exec {tmux} -L {self.sock} "$@" ;;
+ new-session|list-panes|kill-pane|kill-session|has-session|list-sessions|capture-pane) exec {tmux} -L {self.sock} "$@" ;;
+ send-keys) {submit_sh} ;;
  display-message) case "$*" in *pane_current_path*) printf '%s\\n' "$TP_MAIN_CWD"; exit 0 ;; esac; exec {tmux} -L {self.sock} "$@" ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window)
@@ -1002,7 +1069,7 @@ esac
                    "socket": self.sock if self.fake else None, "started": self.stamp,
                    "failed_step": failure.step if failure else None, "error": failure.message if failure else None,
                    "seconds": round(time.monotonic() - self.started, 2), "steps": self.steps, "cleanup": self.cleanup_report,
-                   "ids": self.ids}
+                   "ids": self.ids, "decline": self.facts.get("decline")}
         out = Path(self.args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(summary, indent=2) + "\n")

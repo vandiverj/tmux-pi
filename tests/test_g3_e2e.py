@@ -112,6 +112,7 @@ class FlowTest(Base):
             self.assertTrue(step["asserted"], f"step {step['name']} asserted nothing")
         self.assert_clean(summary)
         self.assertEqual(set(summary["ids"]), {"first", "retry", "reviewer"})
+        self.assertEqual(summary["decline"], {"status": "declined", "event": "UserPromptSubmit"}, "what the real settle_declined writes for the redirect's prompt")
         self.assertGreater(len(records()), 3)      # the runs did use tmux, all through the shim
 
     def test_every_parallel_run_used_only_its_own_private_tmux(self):
@@ -126,6 +127,25 @@ class FlowTest(Base):
         for summary in summaries:
             started = any(c["TMUX_TMPDIR"] == summary["tmux_tmpdir"] and "new-session" in c["argv"] for c in calls)   # a run refused at setup starts none
             self.assertEqual(stopped.get(summary["tmux_tmpdir"], 0), 1 if started else 0, f"{summary['run']}: each run stopped its own server once")
+
+
+class DeclineOrderTest(Base):
+    def test_waiting_for_the_settle_before_the_redirect_times_out_at_decline(self):
+        """G3 round 6: the request is settled by the redirect's own UserPromptSubmit, so the fake settles it only once the redirect is in
+        messages.jsonl. A step that waits first (the old order, live run 3) sits out --prompt-wait and fails at decline."""
+        def old_order(smoke):
+            first = smoke.ids["first"]
+            smoke.tmux("send-keys", "-t", smoke.read(smoke.task_dir(first) / "meta.json", {}).get("pane"), "Escape")
+            smoke.wait("the permission request to leave pending after Escape",
+                       lambda: ((smoke.inspect(first).get("permission") or {}).get("status") != "pending", "pending"), smoke.args.prompt_wait)
+            smoke.tool("tp-agent", "message", first, "--text", "too late")
+        with mock.patch.object(g3.Smoke, "step_decline", old_order):
+            t0 = time.monotonic()
+            rc, summary, _ = self.smoke("--prompt-wait", "1")
+        self.assertEqual((rc, summary["failed_step"]), (1, "decline"))
+        self.assertIn("no the permission request to leave pending after Escape within 1 s", summary["error"])
+        self.assertLess(time.monotonic() - t0, 60)
+        self.assert_clean(summary)
 
 
 class HookTriggerTest(Base):

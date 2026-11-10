@@ -88,13 +88,20 @@ Which hook asks is decided by the redaction mode the worker runs in (`TP_REDACTI
 - `bin/tp-trust-guard` lets the command through in every mode.
 
 `tp-agent inspect` then reports `status: needs_input` with a `permission` block (`lib/tp_detail.py`). The script does what Main does: sends `Escape` to the task's pane
-(declines the dialog; the `PermissionDenied` event settles the request to `denied`), waits for it to leave `pending`, and sends the redirect with `tp-agent message`
+(declines the dialog; Claude Code fires no event for an interactive reject, so the request stays `pending`), sends the redirect with `tp-agent message` and checks that `messages.jsonl` holds it,
+then waits for the request to leave `pending`. The redirect is the asker's next `UserPromptSubmit`, and that settles the request `declined` (DS1: `lib/redact_hook.py` `settle_declined`; every other field stays, `event` is
+the settling event). `denied` is only what a `PermissionDenied` event writes. The script requires `declined` or `denied`, never `authorized`, requires a `declined` request to carry `event` `UserPromptSubmit` or `Stop`, and records
+which one it saw in the summary (`decline`). The order is part of the contract: the script never waits for the settle before the redirect is recorded (a wait first would sit out `--prompt-wait`, the live run 3 failure).
+Fake mode settles `declined` with `event: UserPromptSubmit` only once the redirect is in `messages.jsonl`.
+The redirect must also be confirmed delivered: `tp-agent message` (MS1, `lib/pane_send.py`) ends the typed text with a token ` [tp:<10 hex>]` and exits 1 unless a `promptLog` record in the task's `state.json` carries it, written by `claude/plugins/tmux-pi/hooks/report.sh` on `UserPromptSubmit`. The script requires exit 0 with `submitted: true`; anything else fails step `decline` with the tool's own words (`--tamper unconfirmed-redirect`).
+Fake mode: the `tmux` wrapper holds text typed with `send-keys -l`, and the Enter after it runs the real `report.sh` with a `UserPromptSubmit` event whose `prompt` is that text, so `promptLog` is written by the hook itself (same fields, bound of 8 and token extraction). The tamper drops that run.
+The live run also checks MS1's open note: that the hook's `prompt` for a typed (and possibly paste-collapsed) redirect carries the token. A live `submitted: false` with the text visibly submitted in the pane is the sign that it does not. Record both the `submitted` field and the pane tail in the run's facts.
 ("do not run that command, make no change, reply RESULT_STATUS: incomplete").
 
 Proof (no model, no pane): `HookTriggerTest` in `tests/test_g3_e2e.py` builds the exact `PreToolUse` Bash event (and the `PermissionDenied` one) and calls the real entry points in
 this process, in each mode: `redact_hook.handle` and `bin/tp-sensitive-read`'s `main()` (with the arguments `hooks/sensitive-read.sh` passes) with `TP_REDACTION` set to `on`, `shadow`, `off`
-in turn. In each mode exactly the expected hook answers `ask`, the other defers, the request is `pending` with a reason and target, then `denied` after `PermissionDenied`, and the absent path stays absent.
-It also checks that `hooks.json` loads both hooks for every tool, and that `tp-trust-guard` lets the event through. The test builds its strings from the script's constants; no shell command names a `.env*` path.
+in turn. In each mode exactly the expected hook answers `ask`, the other defers, the request is `pending` with a reason and target, then `denied` after `PermissionDenied` (or `declined` after the next `UserPromptSubmit` or `Stop`, with its other fields kept), and the absent path stays absent.
+It also checks that `hooks.json` loads both hooks for every tool, that `redact.sh` is registered on `UserPromptSubmit`, `Stop` and `SubagentStop`, and that `tp-trust-guard` lets the event through. The test builds its strings from the script's constants; no shell command names a `.env*` path.
 
 Two more tests show the command is harmless when accepted (`HookTriggerTest`): `test_the_trigger_is_only_noop_builtins_with_operands` parses it with shlex and requires exactly the
 commands `:` (with the two operands) and `exit 3` joined by `;`, with no other operator, substitution or redirection; `test_accepting_the_trigger_is_harmless` creates, in Python under a temp directory,
@@ -117,7 +124,8 @@ the passing flow makes has no case.
 - dispatch: a `coder-` task id (`dispatch-id`); started, not queued (`dispatch-queued`); `meta.json` names the lane and step `s1` (`dispatch-meta`); a pane is recorded (`dispatch-pane`);
   the lane record is `open`, on the configured lane branch, based on the scratch integration branch (`dispatch-lane`); the lane worktree exists at the path the config's `worktree_pattern` gives (`dispatch-worktree`).
 - prompt: task state `needs_input` with a pending permission request (`no-prompt`); `permission-request.json` is `pending` and carries a reason (`prompt-no-reason`); inspect reports no `trust_dialog` (`trust-dialog`: the worker's pane shows Claude Code's folder-trust screen, and the step fails at once with the message above).
-- decline: after `Escape` the request leaves `pending` (`still-pending`) and is not `authorized` (`authorized`); the redirect is recorded in `messages.jsonl` (`no-redirect-record`);
+- decline: after `Escape` the redirect is sent, confirmed submitted (`unconfirmed-redirect`) and recorded in `messages.jsonl` (`no-redirect-record`); then the request leaves `pending` (`still-pending`), is not `authorized` (`authorized`),
+  is `declined` or `denied` (`settled-odd`), and a `declined` one names its settling event (`declined-no-event`);
   the task settles (`first-never-settles`) with `result_status: incomplete` (`first-complete`); the lane worktree is still unchanged (`first-changed`).
 - retry: the first task is stopped (`first-not-stopped`; a lane allows one writer); `retry` starts a new task (`retry-same-id`) that keeps the lane and step (`retry-meta`);
   it settles (`task-state`, a failed exit) with `result_status: complete` (`retry-incomplete`); the worktree holds exactly the one new file (`retry-extra-file`),

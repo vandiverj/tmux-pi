@@ -383,8 +383,9 @@ class _Refused(str):
 # enumerated from this source by tests/test_sensitive_read.py test_non_search_sites). A hit any other path makes is a plain
 # tuple, and a plain tuple refuses: a new path with no cause here refuses by default.
 RUNS_CODE = "runs code"                      # an interpreter or shell given a script file or code, `source`/`.`
-# (RUNS_CODE: a script file given the file, or inline code naming it as a literal and starting no program; never inline code
-# given it as an argument, round 5. Each site that gives it says which form, _command_hit.)
+# (RUNS_CODE: only where _code_run's positive parse shows it, round 6: a script file, not itself sensitive, given the file;
+# or inline code naming it as a literal, starting no program, that no operand, stdin or environment value hands a sensitive
+# name. Each site that gives it says which form, _command_hit.)
 ELSEWHERE = "runs on a remote host or in a container"           # ssh, docker/kubectl/... and what they run
 TRANSFORM = "encodes or transforms a file"   # base64, xxd, gzip, openssl, ... on a file operand or `<` input
 GIT_OUTPUT = "git output, not a search"     # git diff/show/log/blame/cat-file/archive/stash: history and patches
@@ -2140,7 +2141,8 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         # `xargs grep`, `xargs sed -n`, `xargs git grep`, `xargs sh -c 'grep TOKEN {}'` are searches and refuse.
         hit = (_producer_hit(cmd, base) if sub in _BULK or _search_read(sub, rest) else None) or _command_hit(
             sub, rest, cmd, base, depth, True)
-        return _because(_program_cause(found[1], base, depth, _xargs_tokens(args)), hit)
+        # xargs' own options name its replace strings; the command's (`ruby -I lib`) do not (sg1 round 6 attack)
+        return _because(_program_cause(found[1], base, depth, _xargs_tokens(args[:len(args) - len(found[1])])), hit)
     if prog == "find":
         roots = _find_roots(args)
         for i, arg in enumerate(args):
@@ -2167,67 +2169,180 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         return _because(GIT_OUTPUT, _git_output_hit(args, sub, rest, cmd, base, depth, bulk))
     if prog in _GREPS:
         return _search_hit(prog, args, cmd, base, bulk)
-    # RUNS_CODE claims the command runs code and not a search or read of the file; it is given only where that is shown
-    # (sg1 round 5). Each of the three forms says which it is: SCRIPT FILE, a script given the file as an argument (project
-    # code; a known limit); INLINE LITERAL, inline code naming the file as a literal, which has the cause unless it starts
-    # another program (round 4); INLINE ARGUMENT, inline code given the file as an argument (an operand after the code, the
-    # code on stdin), which has none: the code receives the file to do something with it, and nothing shows it is not a read.
+    # RUNS_CODE claims the command runs code and not a search or read of the file. It is given only where _code_run, one
+    # positive parse for every site, shows what runs (sg1 round 6). Each form says which it is: SCRIPT FILE, a script file
+    # given the file as an argument (project code; a known limit); INLINE LITERAL, inline code naming the file as a literal
+    # that nothing else hands a sensitive name, which has the cause unless it starts another program (round 4); INLINE
+    # ARGUMENT, inline code a sensitive name reaches another way (an operand, stdin, an environment value), which has none.
     if prog in _SHELLS:  # the hit of the command line it runs, with its cause, as it is
         at = _dash_c_at(args)
         if at is not None:
             line = args[at]
             hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
-            given = _other_hit(args[at + 1:], base, True)
+            given = _other_hit(args[at + 1:], base, True) or _env_hit(cmd, base)
             return _because(None, hit or given) if given else hit  # INLINE ARGUMENT: `sh -c 'grep x "$1"' sh FILE`
-        stdin = _stdin_code(args, r"-[A-Za-z]*s[A-Za-z]*")  # `bash -s FILE`: the code is on stdin
-        return _because(None if stdin else RUNS_CODE, _other_hit(args, base, True))  # INLINE ARGUMENT / SCRIPT FILE
+        form = _code_run(prog, args, base)[0]
+        given = _other_hit(args, base, True) or (_env_hit(cmd, base) if form != _SCRIPT else None)
+        return _because(RUNS_CODE if form == _SCRIPT else None, given)  # SCRIPT FILE; anything else: INLINE ARGUMENT
     if prog == "eval":
         return _shell_hit(" ".join(args), base, depth + 1)
     if prog in _INTERPRETERS:
-        rest, codes, skip = [], [], False
-        flags = _CODE_FLAGS.get(prog, "cep")
-        for i, arg in enumerate(args):
-            if skip:
-                skip = False
-            elif arg in ("--eval", "--print") or re.fullmatch(rf"-[A-Za-z]*[{flags}]", arg) or (
-                    prog == "deno" and i == 0 and arg == "eval"):
-                codes.append(args[i + 1] if i + 1 < len(args) else "")
-                skip = True
-            elif arg == "-m":
-                skip = True
-            else:
-                rest.append(arg)
+        form, codes, rest = _code_run(prog, args, base)
+        given = _other_hit(args, base, True)
+        if form == _SCRIPT:
+            return _because(RUNS_CODE, given)  # SCRIPT FILE
         literal = _first(_literal_hit(code, base) for code in codes if code)
-        given = _other_hit(rest, base, True)
-        if given and (codes or _stdin_code(rest)):  # INLINE ARGUMENT: no cause
-            return _because(None, literal or given)
-        if literal:  # INLINE LITERAL: code that starts another program may run a search: no cause
+        reached = _other_hit(rest, base, True) or _env_hit(cmd, base)
+        if form == _INLINE and literal and not reached:  # INLINE LITERAL: code that starts another program may search
             return _because(None if any(_SHELLS_OUT.search(code) for code in codes) else RUNS_CODE, literal)
-        return _because(RUNS_CODE, given)  # SCRIPT FILE (and `-m MODULE`, a named module)
+        return _because(None, literal or reached or given)  # INLINE ARGUMENT, or no parse: no cause
     return _other_command_hit(prog, args, cmd, base, depth, bulk)
 
 
-# The inline-code flags of an interpreter beyond -c/-e/-p (a cluster ending in one, `-ne`): php's -r, perl's -E.
-_CODE_FLAGS = {"php": "cepr", "perl": "cepE"}
-_STDIN_SCRIPTS = {"-", "/dev/stdin", "/dev/fd/0"}
+def _env_hit(cmd, base):
+    """A sensitive path that an assignment on the command (`F=config/local.json python3 -c ...`, `env F=... node -e ...`)
+    hands the code it runs in its environment, whatever the variable is called; None when there is none."""
+    for word in cmd.get("words", ()) if isinstance(cmd, dict) else ():
+        if _ASSIGN.match(word):
+            value = word.partition("=")[2]
+            hit = _other_hit([value], base, True) or _read_hit(value, base, False)
+            if hit:
+                return hit
+    return None
 
 
-def _stdin_code(args, flag=None):
-    """Whether a shell or interpreter reads its code from standard input while its operands are arguments: its script
-    operand is `-` or /dev/stdin, or (`flag`, a shell's -s) an option cluster before the first operand says so."""
-    skip = False
-    for arg in args:
+# _code_run: how an interpreter or shell is shown to run a script file (sg1 round 6). Each program has a closed list of the
+# options that take no code: `flags` alone, `values` with one value after them, `forms` whole-word patterns (an attached or
+# `=` value); `code` are its inline-code options (a value after them, or `--eval=CODE`); `attached` the code letters that take
+# their code in the same word (`-c'CODE'`, `-ne'CODE'`) after any of the no-value letters of `cluster`; `sub` a subcommand
+# that may (or with `need`, must) come first; `script` an option whose value is the script (php -f). Anything else ends the
+# parse with no form: a list cannot hold every spelling of code, so what it does not hold is never shown to be a script.
+_SCRIPT, _STDIN, _INLINE = "script file", "code on stdin", "inline code"
+_SHELL_RUN = dict(flags={"-" + c for c in "euxvnfabhmpCETBHPilr"} | {"+" + c for c in "euxvnfabhmpCETBHP"} | {
+    "--login", "--norc", "--noprofile", "--posix", "--verbose", "--noediting", "--restricted", "--no-config"},
+    values={"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, stdin={"-s"})
+_NODE_FORMS = r"--(?:max-old-space-size|max-semi-space-size|stack-size)=\d+|--unhandled-rejections=[\w-]+|--title=[\w.-]+"
+_RUN_TABLE = {
+    "python": dict(flags={"-b", "-bb", "-B", "-d", "-E", "-i", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-v", "-vv",
+                          "-x", "-R"}, values={"-W", "-X", "--check-hash-based-pycs"}, code={"-c"}, attached="c",
+                   cluster="bBdEiIOPqRsSuvx"),
+    "node": dict(flags={"--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-deprecation", "--trace-uncaught",
+                        "--enable-source-maps", "--preserve-symlinks", "--preserve-symlinks-main", "--expose-gc",
+                        "--experimental-vm-modules", "--experimental-strip-types", "--experimental-transform-types",
+                        "--abort-on-uncaught-exception", "--pending-deprecation", "--throw-deprecation", "--inspect",
+                        "--inspect-brk", "--watch"},
+                 values={"-r", "--require", "--import"}, forms=_NODE_FORMS, code={"-e", "--eval", "-p", "--print"}),
+    "bun": dict(flags={"--bun", "--smol", "--hot", "--watch", "--silent"}, code={"-e", "--eval", "-p", "--print"}, sub="run"),
+    "deno": dict(flags={"-A", "--allow-all", "-q", "--quiet", "--no-check", "--no-prompt", "--reload"},
+                 forms=r"--(?:allow|deny)-(?:read|write|net|env|run|sys|ffi|hrtime|import)(?:=\S*)?|--unstable(?:-[\w-]+)?",
+                 sub="run", need=True),
+    "ruby": dict(flags={"-w", "-W", "-W0", "-W1", "-W2", "-d", "-v", "--verbose", "-U", "--disable-gems", "--jit", "--yjit"},
+                 values={"-I", "-r"}, forms=r"-I[\w./-]+|-r[\w./-]+", code={"-e"}, attached="e", cluster="nplawdv"),
+    "perl": dict(flags={"-w", "-W", "-X", "-T", "-t", "-s"}, forms=r"-I[\w./-]+|-[Mm][\w:]+", code={"-e", "-E"},
+                 attached="eE", cluster="nplaswWTtX"),
+    "php": dict(flags={"-n", "-q", "-H", "-C", "-e"}, values={"-d", "-c"}, code={"-r", "-B", "-R", "-E"}, attached="rBRE",
+                script="-f"),
+    "osascript": dict(flags={"-i"}, values={"-l", "-s"}, code={"-e"}),
+    ".": dict(), "source": dict(),
+}
+_RUN_TABLE["python3"] = _RUN_TABLE["python"]
+for _shell in _SHELLS:
+    _RUN_TABLE[_shell] = _SHELL_RUN
+
+
+def _code_run(prog, args, base=""):
+    """What an interpreter or shell given `args` runs, by a positive parse (sg1 round 6): (form, codes, rest).
+
+    _SCRIPT: a script file (the operand, after options on the program's closed list and at most one `--`) that is not
+    `-`, /dev/stdin, /dev/fd/N or a sensitive file, `rest` its arguments, never read as options. _STDIN: the code is read
+    from standard input (`-`, /dev/stdin, no operand, a shell's -s), `rest` its arguments. _INLINE: the parse ended at an
+    inline-code option in a spelling the table knows, `codes` the code, `rest` what follows it. None: anything else (an
+    unknown option, a cluster, an attached value, a code option in another spelling, an option value or operand that is
+    sensitive): nothing shows a script file runs."""
+    table = _RUN_TABLE.get(prog)
+    if table is None:
+        return None, [], list(args)
+    flags, values, code = table.get("flags", set()), table.get("values", set()), table.get("code", set())
+    forms = re.compile(table["forms"]) if table.get("forms") else None
+    i, dashed = 0, False
+    if table.get("sub"):
+        if args[:1] == [table["sub"]]:
+            i = 1
+        elif prog == "deno" and args[:1] == ["eval"]:
+            return _deno_eval(args[1:])
+        elif table.get("need"):
+            return None, [], list(args)
+    while i < len(args):
+        arg = args[i]
+        if dashed or arg in ("-", "/dev/stdin", "/dev/fd/0") or not arg.startswith(("-", "+")) or arg == "+":
+            break
+        if arg == "--":
+            dashed, i = True, i + 1
+            continue
+        if arg in flags:
+            i += 1
+        elif forms and forms.fullmatch(arg):  # an attached or `=` value: a sensitive one is not a script's option
+            if _other_hit([arg.partition("=")[2] if "=" in arg else arg[2:]], base, True):
+                return None, [], list(args)
+            i += 1
+        elif arg in values or arg == table.get("script"):
+            if i + 1 >= len(args) or _other_hit([args[i + 1]], base, True):
+                return None, [], list(args)
+            if arg == table.get("script"):
+                return _script_operand(args[i + 1], args[i + 2:], base)
+            i += 2
+        elif arg in table.get("stdin", ()):
+            return _STDIN, [], list(args[i + 1:])
+        else:
+            return _inline(arg, args[i + 1:], table)
+    if i >= len(args):
+        return (_STDIN, [], []) if prog not in (".", "source") else (None, [], [])
+    return _script_operand(args[i], args[i + 1:], base)
+
+
+def _script_operand(operand, rest, base):
+    if operand in ("-", "/dev/stdin", "/dev/fd/0"):
+        return _STDIN, [], list(rest)
+    if operand.startswith(("/dev/fd/", "<(", "=(")) or _other_hit([operand], base, True) or _read_hit(operand, base, False):
+        return None, [], [operand, *rest]
+    return _SCRIPT, [], list(rest)
+
+
+def _inline(arg, rest, table):
+    """The parse ended at `arg`: inline code when it is a code option in a spelling the table knows, else no form."""
+    code, attached, cluster = table.get("code", set()), table.get("attached", ""), table.get("cluster", "")
+    name, equals, value = arg.partition("=")
+    if arg in code:
+        codes, rest = [rest[0] if rest else ""], rest[1:]
+    elif equals and name.startswith("--") and name in code:
+        codes = [value]
+    else:
+        letters = arg[1:] if arg.startswith("-") and not arg.startswith("--") else ""
+        at = next((j for j, letter in enumerate(letters) if letter not in cluster), len(letters))
+        if at >= len(letters) or letters[at] not in attached:
+            return None, [], [arg, *rest]
+        tail = letters[at + 1:]
+        codes, rest = ([tail], rest) if tail else ([rest[0] if rest else ""], rest[1:])
+    others, skip = [], False
+    for j, word in enumerate(rest):  # perl's and ruby's further -e: more code, not an argument
         if skip:
             skip = False
-        elif arg in _STDIN_SCRIPTS:
-            return True
-        elif arg == "--" or not arg.startswith(("-", "+") if flag else "-"):
-            return False
-        elif flag and arg in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-            skip = True  # a shell option's value
-        elif flag and not arg.startswith("--") and re.fullmatch(flag, arg):
-            return True
-    return False
+        elif word in code and j + 1 < len(rest):
+            codes.append(rest[j + 1])
+            skip = True
+        else:
+            others.append(word)
+    return _INLINE, codes, others
+
+
+def _deno_eval(args):
+    for i, arg in enumerate(args):
+        if arg in ("-p", "--print", "-q", "--quiet"):
+            continue
+        if arg.startswith("-"):
+            return None, [], list(args)
+        return _INLINE, [arg], list(args[i + 1:])
+    return _INLINE, [""], []
 
 
 def _git_output_hit(args, sub, rest, cmd, base, depth, bulk):
@@ -2311,8 +2426,9 @@ def _other_command_hit(prog, args, cmd, base, depth, bulk):
             if hit:
                 return hit
         hit = _first(_read_hit(word, base) for word in operands + values)
-        # `. FILE` / `source FILE`: SCRIPT FILE, the file is the script the shell runs.
-        return _because(TRANSFORM if prog in _TRANSFORMS else RUNS_CODE if prog in (".", "source") else None, hit)
+        script = prog in (".", "source") and _code_run(prog, args, base)[0] == _SCRIPT
+        # `. FILE ARGS` / `source FILE ARGS`: SCRIPT FILE when _code_run shows FILE is a script; a sensitive FILE is not one.
+        return _because(TRANSFORM if prog in _TRANSFORMS else RUNS_CODE if script else None, hit)
     if prog in _LISTERS or prog in _SYNTAX:
         return None
     hit = _other_hit(args, base)
@@ -2349,8 +2465,13 @@ def _document_hit(prog, cmd, base, depth):
             # program; a substitution the shell runs in it is judged as any command, and one with no cause is that hit's.
             # Any other program reads it as text (`cat <<EOF`): no cause.
             unsearched = all(_cause(sub) for sub in subs if sub)
-            code = prog in _INTERPRETERS and not _SHELLS_OUT.search(body)  # INLINE LITERAL: the body is the code, naming it
-            return _because(RUNS_CODE if code and unsearched else None, hit)
+            form, _, rest = _code_run(prog, _program(cmd["words"])[1], base) if prog in _INTERPRETERS else (None, [], [])
+            reached = _other_hit(rest, base, True) or _env_hit(cmd, base)
+            # The body is the code (_STDIN), naming it, and nothing else hands the code a sensitive name; or it is a script
+            # file's input. Inline code given another way (`python3 -c CODE <<EOF`, an operand, an env value) has none.
+            code = form == _STDIN and not reached and not _SHELLS_OUT.search(body)
+            # INLINE LITERAL (code) / SCRIPT FILE (form == _SCRIPT)
+            return _because(RUNS_CODE if (code or form == _SCRIPT) and unsearched else None, hit)
     if prog in _SHELLS:
         return _first(_shell_hit(text, base, depth + 1) for text in cmd["strings"])
     return None
@@ -2824,10 +2945,20 @@ def _dash_c(args):
 
 
 def _dash_c_at(args):
-    """The index in `args` of the command line a shell's `-c` hands it (the words after it are $0, $1, ...), or None."""
+    """The index in `args` of the command line a shell's `-c` hands it (the words after it are $0, $1, ...), or None.
+
+    Only the shell's own options are read: the first operand (a script file) or `--` ends them, and what follows belongs to
+    the script (`bash tools/x.sh -c x`: the script's -c, sg1 round 6)."""
+    skip = False
     for i, arg in enumerate(args[:-1]):
-        if re.fullmatch(r"-[A-Za-z]*c", arg):
+        if skip:
+            skip = False
+        elif arg == "--" or not arg.startswith(("-", "+")) or arg in ("-", "+"):
+            return None
+        elif re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg):  # `-c`, `-lc`, `-cx`: the first word after it is the line
             return i + 1
+        elif arg in _SHELL_RUN["values"]:
+            skip = True
     return None
 
 

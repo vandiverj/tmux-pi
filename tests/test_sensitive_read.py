@@ -988,6 +988,7 @@ class SensitiveReadTableTests(unittest.TestCase):
                 # sg1 round 4: the mark is inverted. A search the classifier gives no non-search cause is refused, however
                 # it is wrapped: a pattern file (F1), a shell under xargs, a heredoc's substitution (F2), find -exec grep.
                 (f"grep -f {ENV} README.md", generic), (f"grep -f {ENV} README.md | base64", generic),
+                (f"grep --file={ENV} README.md", generic), (f"grep --file {ENV} README.md", generic),  # sg1 round 6 F6
                 (f"printf '%s\\n' {LOCAL} | xargs -I{{}} sh -c 'grep -n TOKEN {{}}'", generic),
                 ("printf x | xargs sh -c 'grep -rn TOKEN config/'", generic),
                 (f'cat <<EOF\nsee\n$(grep TOKEN "{ENV}")\nEOF', generic),
@@ -1222,16 +1223,66 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"printf '%s\\n' {LOCAL} | xargs python3 -c 'import sys; print(open(sys.argv[1]).read())'",
             "find . -name x -exec node -e 'x' {} \\;", f"fd -g '{ENV}' -x ruby -e 'x'",
             f"for f in {LOCAL}; do python3 -c 'import sys; print(open(sys.argv[1]).read())' $f; done",
+            # sg1 round 6: RUNS_CODE only from a positive parse (_code_run). Each spelling of inline code the old list missed,
+            # per interpreter: attached code (F1), a cluster ending in a code option, `--eval=`, code on stdin after `--` or a
+            # valued option (F2), an option not on the program's list, and an environment value naming the file (F3).
+            f"python3 -c'import sys; print(open(sys.argv[1]).read())' {LOCAL}", f"python3 -Bc 'import sys' {LOCAL}",
+            f"python3 -uc'import sys' {LOCAL}", f"python3 -- - {LOCAL} < README.md", f"python3 -W ignore - {LOCAL} < README.md",
+            f"python3 -X dev /dev/stdin {LOCAL} < README.md", f"python3 -Q new tools/x.py {LOCAL}",
+            f"python3 -m tools.x {LOCAL}", f"python3 -m json.tool {LOCAL}",
+            f"node --eval='console.log(1)' {LOCAL}", f"node --print='1' {LOCAL}", f"node -pe '1' {LOCAL}",
+            f"node -- - {LOCAL} < README.md", f"node --no-warnings - {LOCAL} < README.md", f"node --env-file={ENV} tools/x.js",
+            f"bun --eval='1' {LOCAL}", f"bun --smol - {LOCAL} < README.md", f"deno run --allow-read - {LOCAL} < README.md",
+            f"deno tools/x.ts {LOCAL}", f"deno eval --ext=ts '1' {LOCAL}",
+            f"ruby -e'puts File.read(ARGV[0])' {LOCAL}", f"ruby -ne 'print' {LOCAL}", f"ruby -W0 - {LOCAL} < README.md",
+            f"perl -ne'print' {LOCAL}", f"perl -lne 'print' {LOCAL}", f"perl -E'say 1' {LOCAL}", f"perl -e 1 -e 2 {LOCAL}",
+            f"perl -pi -e 's/a/b/' {LOCAL}", f"perl -w - {LOCAL} < README.md", f"php -r'echo 1;' {LOCAL}",
+            f"php -n /dev/stdin {LOCAL} < README.md", f"osascript -l JavaScript - {LOCAL} < README.md",
+            f"bash -cx 'cat \"$1\"' sh {LOCAL}", f"sh -- /dev/stdin {LOCAL} < README.md", f"bash -o pipefail -s {LOCAL} < README.md",
+            f"bash -eu tools/x.sh {LOCAL}", f"sh -c 'cat \"$F\"' F={LOCAL}", f"F={LOCAL} sh -c 'cat \"$F\"'",
+            f"python3 -- - {LOCAL} <<'EOF'\nimport sys\nprint(open(sys.argv[1]).read())\nEOF",
+            f"sh -- /dev/stdin {LOCAL} <<'EOF'\ncat \"$1\"\nEOF",
+            f"python3 -c 'import sys; print(sys.stdin.read())' <<'EOF'\n{ENV}\nEOF",
+            f"ENV_FILE={ENV}.local python3 -c 'import os; print(open(os.getenv(\"ENV_FILE\", \"{ENV}\")).read())'",
+            f"F={LOCAL} python3 -c 'import os; print(open(os.environ[\"F\"]).read())'",
+            f"env F={LOCAL} node -e 'x'", f"F={LOCAL} ruby -e 'x'", f"F={LOCAL} perl -e 'x'", f"F={LOCAL} php -r 'x'",
+            f"F={LOCAL} deno eval 'x'", f"F={LOCAL} bun -e 'x'", f"F={LOCAL} osascript -e 'x'",
+            f"F={LOCAL} python3 - <<'EOF'\nprint(1)\nEOF",
+            # a sensitive file as the script itself is not a script file the parse shows (round 6, rule 3), at every site
+            f"sh {ENV}", f". ./{ENV}", f"python3 {LOCAL}", f"xargs python3 < {LOCAL}", "find . -name x -exec python3 {} \\;",
+            f"printf '%s\\n' {LOCAL} | xargs python3", f"fd -g '{ENV}' -x node", f"for f in {ENV}; do python3 $f; done",
+            # ... and each new spelling through xargs, find -exec, fd -x and a loop
+            f"printf '%s\\n' {LOCAL} | xargs python3 -c'import sys'", "find . -name x -exec perl -ne'print' {} \\;",
+            f"fd -g '{ENV}' -x node --eval='x'", f"for f in {LOCAL}; do bash -cx 'cat \"$1\"' sh $f; done",
+            f"printf '%s\\n' {LOCAL} | xargs python3 -- -",
         ]
         kept = [  # each non-search cause, from the site that decides it
-            (f"python3 -c 'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"sh {ENV}", sr.RUNS_CODE),
+            (f"python3 -c 'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"sh tools/x.sh {ENV}", sr.RUNS_CODE),
             (f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md", sr.RUNS_CODE),
-            (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", sr.RUNS_CODE), (f". ./{ENV}", sr.RUNS_CODE),
-            (f"xargs python3 < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 {} \\;", sr.RUNS_CODE),
-            (f"printf '%s\\n' {LOCAL} | xargs python3", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node", sr.RUNS_CODE),
-            # round 5: a script file given the file keeps the cause (project code; a known limit), as a named module does
+            (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", sr.RUNS_CODE), (f". tools/x.sh {ENV}", sr.RUNS_CODE),
+            (f"xargs python3 tools/x.py < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 tools/x.py {} \\;", sr.RUNS_CODE),
+            (f"printf '%s\\n' {LOCAL} | xargs python3 tools/x.py", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node tools/x.js", sr.RUNS_CODE),
+            (f"for f in {LOCAL}; do python3 tools/x.py $f; done", sr.RUNS_CODE),
+            (f"printf '%s\\n' {LOCAL} | xargs ruby -I lib tools/x.rb", sr.RUNS_CODE),  # xargs' -I, not ruby's, names its token
+            # round 5: a script file given the file keeps the cause (project code; a known limit)
             (f"python3 tools/x.py {ENV}", sr.RUNS_CODE), (f"node tools/x.js {LOCAL}", sr.RUNS_CODE),
-            (f"bash tools/x.sh {LOCAL}", sr.RUNS_CODE), (f"python3 -m tools.x {LOCAL}", sr.RUNS_CODE),
+            (f"bash tools/x.sh {LOCAL}", sr.RUNS_CODE),
+            # round 6: the parse passes options on each program's list and `--`, and stops at the script: what follows it
+            # is the script's own, however it looks (F4: `-c dev`, `-e y` are the script's arguments, not inline code)
+            (f"python3 tools/check.py -c dev {LOCAL}", sr.RUNS_CODE), (f"node scripts/x.js -e y {LOCAL}", sr.RUNS_CODE),
+            (f"perl tools/x.pl -e x {LOCAL}", sr.RUNS_CODE), (f"bash tools/x.sh -c x {LOCAL}", sr.RUNS_CODE),
+            (f"ruby tools/x.rb -e x {LOCAL}", sr.RUNS_CODE), (f"python3 -W ignore -u tools/x.py {LOCAL}", sr.RUNS_CODE),
+            (f"python3 -- tools/x.py {LOCAL}", sr.RUNS_CODE), (f"node --no-warnings -r ./tools/r.js tools/x.js {LOCAL}", sr.RUNS_CODE),
+            (f"node --max-old-space-size=4096 tools/x.js {LOCAL}", sr.RUNS_CODE), (f"ruby -Ilib tools/x.rb {LOCAL}", sr.RUNS_CODE),
+            (f"perl -Ilib -MData::Dumper tools/x.pl {LOCAL}", sr.RUNS_CODE), (f"deno run --allow-read tools/x.ts {LOCAL}", sr.RUNS_CODE),
+            (f"bun run tools/x.ts {LOCAL}", sr.RUNS_CODE), (f"php -f tools/x.php {LOCAL}", sr.RUNS_CODE),
+            (f"osascript tools/x.scpt {LOCAL}", sr.RUNS_CODE), (f"bash -e tools/x.sh {LOCAL}", sr.RUNS_CODE),
+            (f"source tools/x.sh {LOCAL}", sr.RUNS_CODE),
+            # ... and inline code naming the file as a literal, in any spelling the parse knows (round 4's rule); `deno eval`
+            # is inline code as `node -e` is (round 5, accepted by Main)
+            (f"python3 -c'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"node --eval='require(\"fs\").readFileSync(\"{ENV}\")'", sr.RUNS_CODE),
+            (f"perl -e'open(F, \"{ENV}\")'", sr.RUNS_CODE), (f"deno eval 'Deno.readTextFileSync(\"{ENV}\")'", sr.RUNS_CODE),
+            (f"python3 - <<'EOF'\nprint(open(\"{ENV}\").read())\nEOF", sr.RUNS_CODE),
             (f"ssh host cat {ENV}", sr.ELSEWHERE), (f"docker exec c cat {ENV}", sr.ELSEWHERE),
             (f"docker run --env-file {ENV} image", sr.ELSEWHERE), (f"kubectl exec pod -- cat {ENV}", sr.ELSEWHERE),
             (f"base64 {ENV}", sr.TRANSFORM), (f"base64 < {ENV}", sr.TRANSFORM), (f"xxd {LOCAL}", sr.TRANSFORM),
@@ -1239,7 +1290,7 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"git diff -- {LOCAL}", sr.GIT_OUTPUT), (f"git show HEAD:{LOCAL}", sr.GIT_OUTPUT),
             (f"git log -p -- {LOCAL}", sr.GIT_OUTPUT), ("bash -c 'git diff -- config/'", sr.GIT_OUTPUT),
             (f"printf '%s\\n' {LOCAL} | xargs git diff --", sr.GIT_OUTPUT),
-            (f"ls -la {ENV}", sr.NAMES_ONLY), (f"rm {ENV}", sr.NAMES_ONLY), (f"for f in {ENV}; do python3 $f; done", sr.NAMES_ONLY),
+            (f"ls -la {ENV}", sr.NAMES_ONLY), (f"rm {ENV}", sr.NAMES_ONLY), (f"for f in {ENV}; do ls $f; done", sr.NAMES_ONLY),
         ]
         self.assertEqual({cause for _, cause in kept}, set(sr.NON_SEARCH_CAUSES))  # every cause has a row
         for command in refused:
@@ -1313,6 +1364,15 @@ class SensitiveReadTableTests(unittest.TestCase):
                 self.assertTrue(any(form in near for form in forms[:2]), lines[site.lineno - 1])
         for form in forms:  # each form is stated at a site
             self.assertTrue(any(form in " ".join(lines[s.lineno - 2:s.lineno]) for s in sites), form)
+        # sg1 round 6: RUNS_CODE comes from one positive parse (_code_run): every function with a site that can give it
+        # calls it, so no site decides "runs code" by a list of its own.
+        holders = [fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and any(site in list(ast.walk(fn))
+                                                                                          for site in runs_code)]
+        self.assertEqual({fn.name for fn in holders}, {"_command_hit", "_other_command_hit", "_document_hit"})
+        for fn in holders:
+            with self.subTest(function=fn.name):
+                self.assertTrue(any(isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_code_run"
+                                    for node in ast.walk(fn)), fn.name)
         made = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_NonSearch"]
         self.assertEqual(len(made), 1)  # in _because alone
         returns = [node.value for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "_program_cause"

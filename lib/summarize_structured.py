@@ -412,12 +412,13 @@ def _binding_index(tree):
     """_Index(events, star, dynamic): every way the file binds or writes a name, read once and kept on the tree.
     events is {name: [(kind, node, statement, scope, role)]}.
     kind is "name" (a Store or Del target of any form, an import alias, an except name, a match capture), "def" (a def, async def or
-    class), "arg" (a parameter), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
+    class), "arg" (a parameter, or a type parameter `def f[t]()`), "global" (global or nonlocal) or "write" (an attribute or subscript write that names it, as `x.name = v`
     or `name.x = v` or `name[k] = v`). scope is the def, lambda or class the node sits in, None for the module. role (round 7b) says
     which part of a write names it: "attr" when the name is the attribute written (`x.name = v`: x may be the module), "root" when it is
     the root of the target (`name.x = v`, `name[k] = v`, `name[k] += v`: a write into the object the name holds, which cannot unbind or
     rebind the name); None for every other kind. The context of the write (Store or Del) is that of the node (node.ctx). star: some
-    `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import)."""
+    `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import) or `sys.modules` (an attribute `modules`, or
+    `from sys import modules`), by which it can rebind or delete any name of any module."""
     cached = getattr(tree, "_binding_index", None)
     if cached:
         return cached
@@ -428,8 +429,8 @@ def _binding_index(tree):
         if isinstance(node, ast.stmt):
             stmt = node
         found = []  # (name, kind[, role])
-        if isinstance(node, ast.Name) and node.id in _DYNAMIC or isinstance(node, ast.Attribute) and node.attr in _DYNAMIC:
-            dynamic = True
+        if isinstance(node, ast.Name) and node.id in _DYNAMIC or isinstance(node, ast.Attribute) and (node.attr in _DYNAMIC or node.attr == "modules"):
+            dynamic = True  # (`sys.modules[name] = m` replaces a module for every later importer)
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             found.append((node.id, "name"))
         elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -449,11 +450,13 @@ def _binding_index(tree):
             else:
                 found.append((node.asname or node.name.split(".")[0], "name"))
         elif isinstance(node, ast.ImportFrom):
-            dynamic = dynamic or (node.module or "").split(".")[0] in _DYNAMIC
+            dynamic = dynamic or (node.module or "").split(".")[0] in _DYNAMIC or node.module == "sys" and any(a.name == "modules" for a in node.names)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             found.extend((n, "global") for n in node.names)
         elif type(node).__name__ in ("MatchAs", "MatchStar") and node.name:  # absent from ast before Python 3.10
             found.append((node.name, "name"))
+        elif type(node).__name__ in ("TypeVar", "ParamSpec", "TypeVarTuple"):  # `def f[t]()`, `class C[t]`, `type X[t] = ...` (Python 3.12+): binds t like a parameter
+            found.append((node.name, "arg"))
         elif type(node).__name__ == "MatchMapping" and node.rest:
             found.append((node.rest, "name"))
         for name, kind, *role in found:
@@ -741,20 +744,38 @@ def _imports_of(path, tree):
 
 
 def _single_names(tree):
-    """The names the module provably holds as attributes once it has run: those _single_binding proves bound once, simply, in its module
-    scope (a plain def, class or `NAME = value`, not under an if or try, nothing else binding, deleting it or writing it as an attribute, no
-    star import, no dynamic form). It asks whether the name exists, so a write into the object it holds (`name[k] = v`, `name.x = v`) does
+    """The names the module provably holds as attributes once it has run: those _single_binding proves bound once, in its module scope
+    (a def, class, an assignment of any value, or an import alias, not under an if or try, nothing else binding, deleting it or writing
+    it as an attribute, no star import, no dynamic form). The one place a member import (`from m import name`) is proved, through the
+    one predicate, and what it proves is EXISTENCE, not value (round 8, Main). The question is only whether `from m import name` takes
+    an attribute of m or falls back to importing a submodule m.name that may come from outside the run root; Python takes the attribute
+    when m binds the name at module scope. One unconditional binding proves that, whatever the right-hand side: if it raises, m fails to
+    import and so does the importer. What the name holds is m's business: m is in the import graph (_reaches), every module it imports
+    is walked and every module the walk visits is checked by _opaque, so a value that reaches the target makes a path. The proof does
+    not judge the value. Because it asks whether the name exists, a write into the object it holds (`name[k] = v`, `name.x = v`) does
     not count (_single_binding, existence). A name that is only annotated, deleted, bound under a condition, written as `obj.name = v`,
-    or bound twice is not in it. The one place a member import (`from m import name`) is proved, through the one predicate."""
+    or bound twice is not in it."""
     return frozenset(name for name in _binding_index(tree).events if _single_binding(tree, name, existence=True) is not None)
+
+
+_ANY = "*"  # not an identifier: the member _written_names puts in its set when the file may write any attribute
 
 
 def _written_names(tree):
     """The names the file may unbind or rebind on another object, which may be a module: `h.x = v` and `del h.x` name x (_binding_index
     kind "write", role "attr"), and a Del of any form rooted at a name (`del x[k]`) names x. A Store into the object a name holds
-    (`x[k] = v`) does not: it cannot remove the name from a module."""
-    return frozenset(name for name, events in _binding_index(tree).events.items()
-                     if any(e[0] == "write" and (e[4] == "attr" or isinstance(e[1].ctx, ast.Del)) for e in events))
+    (`x[k] = v`) does not: it cannot remove the name from a module. A file that uses a dynamic form (_binding_index dynamic: setattr,
+    delattr, vars, __dict__, globals, exec, eval, importlib, sys.modules...) may write or delete any attribute of any module, which no
+    source line shows (round 8 attack): _ANY is then in the set, and _may_write is the one test of it."""
+    index = _binding_index(tree)
+    names = frozenset(name for name, events in index.events.items()
+                      if any(e[0] == "write" and (e[4] == "attr" or isinstance(e[1].ctx, ast.Del)) for e in events))
+    return names | {_ANY} if index.dynamic else names
+
+
+def _may_write(written, name):
+    """True when a set from _written_names (of one file, or the union over the run root) may write or delete an attribute called name."""
+    return name in written or _ANY in written
 
 
 def _opaque(source, tree):
@@ -820,8 +841,8 @@ def _unresolved(name, graph, attribute=False):
     """THE one rule for what a dotted import name is against the run root: True when it cannot be resolved. A name is resolved when it is
     a name of a run-root module or directory (_Graph: any dotted suffix of the path, a directory a package whether or not it has an
     __init__.py). The name of a `from m import c` member (attribute) is resolved too when m names run-root modules and every one of them
-    proves c (_single_names: bound once, simply, at module scope) and no file of the run root writes or deletes an attribute c
-    (_written_names). A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
+    proves c exists (_single_names: bound once at module scope, whatever the value) and no file of the run root writes or deletes an
+    attribute c (_written_names). A name that is not resolved but has a proper prefix that is a name of the run root (`import h.missing` with a
     run-root h, `from h import missing` when h does not provably bind missing, `from .missing import x` in a package) is unresolved: it
     names no module of the run root and may be one nobody gave us, so it counts as a path to every module. A name none of whose
     prefixes is a name of the run root is outside it and is not unresolved."""
@@ -833,7 +854,7 @@ def _unresolved(name, graph, attribute=False):
     parent, _dot, last = name.rpartition(".")
     if attribute and parent:
         owners = [graph[m] for m in graph.by_name.get(parent, ())]
-        if owners and all(o is not None and last in o[3] and not any(g is not None and last in g[5] for g in graph.values()) for o in owners):
+        if owners and all(o is not None and last in o[3] and not any(g is not None and _may_write(g[5], last) for g in graph.values()) for o in owners):
             return False
     parts = name.split(".")
     return any(known(".".join(parts[:i])) for i in range(1, len(parts)))
@@ -868,32 +889,69 @@ def _reaches(names, members, resolved, module, graph):
     return False
 
 
+def _string_text(node):
+    """The text a string expression is made of, or None when it is not one: a str or bytes constant; the `+` of two such; an f-string,
+    whose constant parts are joined with a NUL where a value is formatted in (a name split by a value is two tokens)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return node.value if isinstance(node.value, str) else node.value.decode("latin-1")
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _string_text(node.left), _string_text(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        return "\0".join(_string_text(part) or "" for part in node.values)
+    return None
+
+
+def _string_mentions(tree, tokens):
+    """True when some string of the file, split on `.`, `:` and `/`, has a token that is in tokens (round 8b: a name in a string is a
+    reference). Strings are read as written (_string_text: one constant, a `+` of constants, the constant parts of an f-string), and
+    every constant on its own as well, so `"pkg.sub." + "t"`, `f"{pkg}.t.Q"`, `"t:Q"` and `"pkg/sub/t.py"` all mention t. A token must
+    be equal: `"QUEUE"` does not mention Q."""
+    for node in ast.walk(tree):
+        text = _string_text(node)
+        if text is not None and not tokens.isdisjoint(re.split(r"[.:/\0]", text)):
+            return True
+    return False
+
+
 def _no_path_to(source, tree, path, name, module, graph):
     """True when the file's text and the run root's import graph prove the file has no path to the name defined in the dotted module
     `module`, so that "does not use" may be said. All of these hold; none is a list of syntax cases:
     - the bare name occurs nowhere in the raw text (code, strings, bytes, comments, docstrings), on identifier boundaries;
+    - no string constant of the file is a reference to the target (_string_mentions, round 8b): split on `.`, `:` and `/`, none has a
+      token equal to the name or to the last component of the module's names, whether the string is one constant, a `+` of constants,
+      or the constant parts of an f-string. Every string-built loader (pydoc.locate, unittest.mock.patch, logging.config, an entry point
+      "t:Q", a path "pkg/sub/t.py", pkgutil.resolve_name, ...) needs the target's name as text, and the set of loaders is open while the
+      text is not, so this is a rule over strings and not a list of loaders;
     - the text holds none of _DYNAMIC_ACCESS;
     - no star import (_star);
     - no path through the import graph to the module (_reaches): none of its imports, nor those of any run-root module it loads,
       is the target module, an ancestor package or a submodule of it, or cannot be resolved, and none of those modules is itself opaque
       (_opaque: the same two checks above, made on each module the walk visits).
-    Anything else gives no absence line."""
+    Anything else gives no absence line.
+    The limit, stated once: a name that reaches the file from outside its source (a configuration file, the environment, the network)
+    is beyond static proof; the absence line is a statement about the source it was given."""
     if _opaque(source, tree) or re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", source):
+        return False
+    if _string_mentions(tree, {name, module.split(".")[-1]}):
         return False
     return not _reaches(*_imports_of(path, tree), module, graph)
 
 
-def _use_lines(f, tree, target, kind, module, others, members, dup):
+def _use_lines(f, tree, target, kind, module, others, members, dup, rewritten=False):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
     path, `from m import *`, a dynamic form such as globals() or setattr (_DYNAMIC; the file then gives no line at all), an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
-    that no import of the target explains, the name as a string) or binds it from two of the definers (ambiguous). module is the
+    that no import of the target explains; a name in a string is decided by _no_path_to, _string_mentions) or binds it from two of the definers (ambiguous). module is the
     target's dotted module name from the run root, others those of the other files that define the same name. An import counts as
     the target's only when its module resolves to `module` by full dotted path (a basename alone never does). A call, a creation or
     a use is attributed only through a name that _single_binding proves bound once, by that import: a name that is bound again,
     written (`t.Q = x`), shadowed, or in a file with a star import (_star: a parameter attribution too) gives the import line at most. dup (the name is defined in more
     than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
-    this module."""
+    this module. rewritten (round 8): some file of the run root writes or deletes an attribute of this name (`x.<T> = v`, `x.<T> += v`,
+    `del x.<T>`, any x: use_scan, _written_names), so the module's attribute may be another object by the time of a call, whatever the
+    name it is reached by (`t.<T>`, an alias of t, or a `from m import <T>` that ran after the write): the import lines are the only
+    facts of a file that imports the target, and it is undecided. No alias analysis: the write of the attribute name is the block."""
     if _binding_index(tree).dynamic:
         return [], [], [], True  # a dynamic form (_DYNAMIC) anywhere: the source does not show what any name in this file is
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
@@ -934,6 +992,8 @@ def _use_lines(f, tree, target, kind, module, others, members, dup):
         # a star import binds names no statement shows: the import line is a fact, no call, creation or attribute use is (a parameter
         # included: whatever `q` is, it may be a name the star import brought)
         return sorted(imports, key=lambda item: item[0]), [], [], True
+    if rewritten and (direct or modules):
+        return sorted(imports, key=lambda item: item[0]), [], [], True
     valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
     valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
     if valid_direct != set(direct) or valid_modules != set(modules):
@@ -944,8 +1004,6 @@ def _use_lines(f, tree, target, kind, module, others, members, dup):
             unexplained = unexplained or node.id not in other_direct  # a use of this module's name is a line, or else (a star import) undecided
         elif isinstance(node, ast.Attribute) and node.attr == target:
             unexplained = unexplained or _dotted(node.value) not in set(modules) | other_modules
-        elif isinstance(node, ast.Constant) and node.value == target:
-            unexplained = True
 
     def is_ref(func):
         if isinstance(func, ast.Name):
@@ -997,6 +1055,9 @@ def use_scan(task, files):
     out = []
     parsed = {f["path"]: _parse(f["path"], f["text"]) for f in files}
     graph = _import_graph(files, parsed)
+    # round 8: every attribute name some file of the run root writes or deletes (_written_names), on any object; a file that does not
+    # parse cannot run, so it writes nothing
+    written = frozenset().union(*(_written_names(t) for t in parsed.values() if t is not None))
     for f in files:
         for line, kind, name, owner in outline(f["path"], f["text"]):
             if kind not in ("class", "function") or owner or not re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", task):
@@ -1012,7 +1073,7 @@ def use_scan(task, files):
             for g in files:
                 if g["path"] in definers or parsed[g["path"]] is None:
                     continue
-                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1)
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, _may_write(written, name))
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)

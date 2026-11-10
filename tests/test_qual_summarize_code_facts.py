@@ -364,6 +364,11 @@ class UseScanTests(unittest.TestCase):
                 ("a member that only another object is given", "from h import missing\n",
                  (("h.py", "class C: pass\nobj = C()\nobj.missing = 1\n"),)),
                 ("a member bound twice", "from h import x\n", (("h.py", "x = 1\nx = 2\n"),)),
+                # round 8 F2: a member's value is h's business: h is in the graph, so what x holds is walked and every module visited is
+                # opaque-checked. A value that reaches the target is a path.
+                ("a member that h takes from the target", "from h import x\n", (("h.py", "from t import Q as x\n"),)),
+                ("a member that h takes from the target's module", "from h import x\n", (("h.py", "import pkg.sub.t as x\n"),)),
+                ("a member read from sys.modules", "from h import x\n", (("h.py", "import sys\nx = sys.modules['t'].Q\n"),)),
                 ("a member bound in a try", "from h import x\n", (("h.py", "try:\n    x = 1\nexcept Exception:\n    pass\n"),)),
                 # round 7b: only a Del, a write whose attribute is the name, or another binding can unbind the name
                 ("a member whose item is deleted", "from h import x\n", (("h.py", "x = {}\nx['a'] = 1\ndel x['a']\n"),)),
@@ -373,8 +378,27 @@ class UseScanTests(unittest.TestCase):
                 ("a member that another file sets as an attribute of h", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\nh.x = 2\n"))),
                 ("a member rebound by an augmented assignment", "from h import x\n", (("h.py", "x = {}\nx |= {}\n"),)),
                 ("a member that another module deletes", "from h import x\n", (("h.py", "x = 1\n"), ("g.py", "import h\ndel h.x\n"))),
+                # round 8 attack: another file of the run root can rewrite or delete any module attribute by a dynamic form
+                ("a member that another module deletes by delattr", "from h import x\n", (("h.py", "x = 1\n"), ("g.py", "import h\ndelattr(h, 'x')\n"))),
+                ("a member that another module pops from vars", "from h import x\n", (("h.py", "x = 1\n"), ("g.py", "import h\nvars(h).pop('x')\n"))),
+                ("a member that another module pops from __dict__", "from h import x\n", (("h.py", "x = 1\n"), ("g.py", "import h\nh.__dict__.pop('x')\n"))),
+                ("a member that another module replaces in sys.modules", "from h import x\n",
+                 (("h.py", "x = 1\n"), ("g.py", "import sys\nimport h\nsys.modules['h'] = object()\n"))),
+                ("a member that another module replaces, from sys import modules", "from h import x\n",
+                 (("h.py", "x = 1\n"), ("g.py", "from sys import modules\nmodules['h'] = object()\n"))),
                 ("a member of one of two files of one module name, only one proves it", "from h import y\n",
                  (h_pkg, ("h.py", "y = 2\n"))),
+                # round 8b: a name in a string is a reference. Any string constant, split on . : /, with a token equal to the target's name or to
+                # the last component of its module's names, blocks; the set of string-built loaders is open, the text they need is not
+                ("pydoc.locate of a string built from constants", "import pydoc\nresult = pydoc.locate('pkg.sub.t.' + chr(81))\n", ()),
+                ("unittest.mock.patch of such a string", "import unittest.mock as mock\nmock.patch('pkg.sub.t.' + chr(81)).start()\n", ()),
+                ("logging.config with such a string", "import logging.config\nlogging.config.dictConfig({'handlers': {'h': {'()': 'pkg.sub.t.' + chr(81)}}})\n", ()),
+                ("an f-string with a constant part t.", "import pydoc\nname = chr(81)\nresult = pydoc.locate(f'pkg.sub.t.{name}')\n", ()),
+                ("an entry-point string t:", "import pkgutil\nresult = pkgutil.resolve_name('pkg.sub.t:' + chr(81))\n", ()),
+                ("a path string pkg/sub/t.py", "import pydoc\nresult = pydoc.importfile('pkg/sub/t.py')\n", ()),
+                ("constants joined by +", "import pydoc\nresult = pydoc.locate('pkg.' + 'sub.' + 't.' + chr(81))\n", ()),
+                ("the module name as bytes", "import pydoc\nresult = pydoc.locate(b'pkg.sub.t.'.decode() + chr(81))\n", ()),
+                ("the module name as a bare string", "x = 't'\n", ()),
                 # round 7 F2: any directory may be on sys.path, so a module is known by every dotted suffix of its path and a directory
                 # above it by its own suffixes, with or without an __init__.py
                 ("a missing submodule of a namespace package under src", "import h.missing\n", (("src/h/real.py", "x = 1\n"),)),
@@ -407,6 +431,11 @@ class UseScanTests(unittest.TestCase):
                 self.assertEqual(scan(user, *others, at="pkg2/u.py"), [])
         for label, user, others in (
                 ("nothing imported", "x = 1\n", ()),
+                # round 8b: strings that name neither the target nor its module's last component keep the line
+                ("an unrelated string", "x = 'hello world'\n", ()),
+                ("Q as a substring of a longer token", "x = 'QUEUE'\n", ()),
+                ("a dotted string without the module name", "x = 'pkg.sub.other'\n", ()),
+                ("a path string of another file", "x = 'pkg/sub/other.py'\n", ()),
                 ("the standard library", "import os\nfrom collections import OrderedDict\n", ()),
                 ("a package that only looks alike", "import pkg2\nfrom other.pkg import sub\n", ()),
                 ("a module of its own", "import h\n", (("h.py", "import os\n"),)),
@@ -433,6 +462,11 @@ class UseScanTests(unittest.TestCase):
                 ("a member whose item another file deletes", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\ndel h.x['a']\n"))),
                 ("a member another file writes an item of", "from h import x\n", (("h.py", "x = {}\n"), ("g.py", "import h\nh.x['a'] = 1\n"))),
                 ("a member defined by one plain def", "from h import f\n", (("h.py", "def f():\n    pass\n"),)),
+                # round 8 F2: one unconditional binding of any value proves the member exists (the import takes the attribute, not a
+                # submodule from outside the run root); a right-hand side that raises makes h, and so the importer, fail to import
+                ("a member bound to a call", "from h import x\n", (("h.py", "def unknown():\n    pass\n\n\nx = unknown()\n"),)),
+                ("a member bound to an import alias", "from h import x\n", (("h.py", "import os as x\n"),)),
+                ("a member bound to an undefined name", "from h import x\n", (("h.py", "x = nonexistent\n"),)),
                 ("a member defined by one plain class", "from h import C\n", (("h.py", "class C:\n    pass\n"),)),
                 ("a member that a package binds, in a package", "from h import f\n", (("h/__init__.py", "def f():\n    pass\n"),)),
                 ("a module of a namespace package under src", "import h.real\n", (("src/h/real.py", "y = 1\n"),)),
@@ -712,8 +746,8 @@ class BindingProofUseTests(unittest.TestCase):
     name nothing else binds, writes or shadows."""
     FILES = [num("pkg/t.py", "class Q:\n    def pop(self):\n        return 1\n")]
 
-    def scan(self, text, path="app/u.py"):
-        return ss.use_scan("Who uses Q?", self.FILES + [num(path, text)])
+    def scan(self, text, path="app/u.py", *others):
+        return ss.use_scan("Who uses Q?", self.FILES + [num(p, t) for p, t in others] + [num(path, text)])
 
     def test_resolution_by_full_dotted_path(self):
         both = ["- u.py imports Q [{p}:{i}]", "- u.py creates a Q [{p}:{c}]"]
@@ -745,6 +779,42 @@ class BindingProofUseTests(unittest.TestCase):
         self.assertEqual(self.scan("import pkg.t\npkg.t.Q = other\npkg.t.Q()\n"), [])
         self.assertEqual(self.scan("from pkg.t import Q\nQ.pop = other\nQ()\n"), ["- u.py imports Q [app/u.py:1]"])
 
+    def test_an_attribute_write_anywhere_in_the_run_root_unproves_the_module_member(self):
+        """Round 8 F1: a call, creation or use through `m.Q` or a `from m import Q` name holds only if no file of the run root writes or
+        deletes an attribute named Q (`x.Q = v`, `x.Q += v`, `del x.Q`, any x): the module attribute may be another object by then. No
+        alias analysis: the write of the attribute name is the block. The direct import line stays (the import itself is a fact)."""
+        module_form, direct_form = "import pkg.t as t\n{}t.Q()\n", "from pkg.t import Q\n{}Q()\n"
+        for label, write in (("the review's alias write", "a = t\na.Q = other\n"), ("an augmented write", "a = t\na.Q += 1\n"),
+                             ("a delete", "a = t\ndel a.Q\n"), ("a write in a function", "def f(a):\n    a.Q = other\n\n\n")):
+            with self.subTest(label, form="module attribute"):
+                self.assertEqual(self.scan(module_form.format(write)), [])
+            with self.subTest(label, form="module attribute, and an instance"):
+                self.assertEqual(self.scan("import pkg.t as t\n" + write + "x = t.Q()\nx.pop()\n"), [])
+        for label, other in (("a write", "def f(x):\n    x.Q = 1\n"), ("an augmented write", "def f(x):\n    x.Q += 1\n"),
+                             ("a delete", "def f(x):\n    del x.Q\n"), ("a write at module level", "import os\nos.Q = 1\n")):
+            with self.subTest(label, form="module attribute, the write in another file"):
+                self.assertEqual(self.scan(module_form.format(""), "app/u.py", ("app/g.py", other)), [])
+            with self.subTest(label, form="direct import, the write in another file"):
+                self.assertEqual(self.scan(direct_form.format(""), "app/u.py", ("app/g.py", other)), ["- u.py imports Q [app/u.py:1]"])
+        # round 8 attack: a dynamic form in another file can rewrite or delete any module attribute (`_ANY` in _written_names), and so can
+        # a `sys.modules` write (a dynamic file); neither names the attribute Q
+        for label, other in (("setattr", "import pkg.t as p\nsetattr(p, 'Q', other)\n"), ("delattr", "import pkg.t as p\ndelattr(p, 'Q')\n"),
+                             ("vars", "import pkg.t as p\nvars(p)['Q'] = other\n"), ("__dict__", "import pkg.t as p\np.__dict__['Q'] = other\n"),
+                             ("sys.modules", "import sys\nsys.modules['pkg.t'] = other\n"),
+                             ("from sys import modules", "from sys import modules\nmodules['pkg.t'] = other\n")):
+            with self.subTest(label, form="module attribute, a dynamic write in another file"):
+                self.assertEqual(self.scan(module_form.format(""), "app/u.py", ("app/g.py", other)), [])
+            with self.subTest(label, form="direct import, a dynamic write in another file"):
+                self.assertEqual(self.scan(direct_form.format(""), "app/u.py", ("app/g.py", other)), ["- u.py imports Q [app/u.py:1]"])
+        # keep the line: an unrelated attribute, or a write into the object the name holds, is not a write of the attribute Q
+        for label, text, others in (("an unrelated attribute, same file", "import pkg.t as t\na = t\na.R = other\nt.Q()\n", ()),
+                                    ("an unrelated attribute, another file", "import pkg.t as t\nt.Q()\n", (("app/g.py", "def f(x):\n    x.R = 1\n"),)),
+                                    ("an item of Q, another file", "import pkg.t as t\nt.Q()\n", (("app/g.py", "Q = {}\nQ['a'] = 1\n"),))):
+            with self.subTest(label):
+                call = text.count("\n")
+                self.assertEqual([line for line in self.scan(text, "app/u.py", *others) if line.startswith("- u.py")],
+                                 ["- u.py imports Q [app/u.py:{}]".format(call), "- u.py creates a Q [app/u.py:{}]".format(call)])
+
     def test_an_import_under_a_compound_statement_or_shadowed_in_a_function_attributes_no_call(self):
         for head in COMPOUND:
             if head == "match" and not MATCH:
@@ -759,6 +829,21 @@ class BindingProofUseTests(unittest.TestCase):
                             ("a def in a function", "from pkg.t import Q\n\n\ndef f():\n    def Q():\n        pass\n    Q()\n")):
             with self.subTest(label):
                 self.assertEqual([line for line in self.scan(text) if "imports" not in line], [])
+
+    def test_a_type_parameter_binds_its_name_like_a_parameter(self):
+        """Round 8 attack: `def f[t]()`, `class C[t]` and `type X[t] = ...` (Python 3.12+) bind t in their own scope; a use of t there is
+        the type parameter, not the import. The rows are skipped where the syntax does not parse."""
+        for label, form in (("a def", "def f[{n}]():\n    return {c}\n"), ("an async def", "async def f[{n}]():\n    return {c}\n"),
+                            ("a class", "class C[{n}]:\n    x = {c}\n"), ("a type alias", "type X[{n}] = {c}\n"),
+                            ("a ParamSpec", "def f[**{n}]():\n    return {c}\n"), ("a TypeVarTuple", "def f[*{n}]():\n    return {c}\n")):
+            for name, imp, call in (("t", "import pkg.t as t\n", "t.Q()"), ("Q", "from pkg.t import Q\n", "Q()")):
+                text = imp + form.format(n=name, c=call)
+                try:
+                    ast.parse(text)
+                except SyntaxError:
+                    continue
+                with self.subTest(label, name=name):
+                    self.assertEqual([line for line in self.scan(text) if "imports" not in line], [])
 
     def test_each_extra_binding_silences_the_calls_through_a_name(self):
         # with no extra binding every line is there

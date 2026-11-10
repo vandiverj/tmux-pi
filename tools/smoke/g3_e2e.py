@@ -888,7 +888,7 @@ class Smoke:
         # a worker pane is a sleeper; with --tamper trust-dialog it first waits for the fake trust screen (written by the prompt step) and prints it
         pane_script = f"until [ -f {screen} ]; do sleep 0.05; done; cat {screen}; sleep 300; :" if self.tamper("trust-dialog") else "sleep 300; :"
         # Belt and braces: whatever calls this wrapper, it reaches the private server only (its own TMUX_TMPDIR, -L socket, no TMUX).
-        # The worker's UserPromptSubmit hook. Typed text (send-keys -l) is held per pane; the Enter after it submits it: the real
+        # The worker's UserPromptSubmit hook. Typed or pasted text is held per pane; the Enter after it submits it: the real
         # claude/plugins/tmux-pi/hooks/report.sh runs with a UserPromptSubmit event whose `prompt` is that text, so state.json gets
         # the promptLog record (n, at, tokens) exactly as the live hook writes it. The real script, not a copy: its fields, its bound
         # of 8 and its token pattern cannot drift from what lib/pane_send.py waits on. Cost: one python3, one bash and a few jq per
@@ -896,8 +896,19 @@ class Smoke:
         helper = fakebin / "fake_submit.py"
         helper.write_text(FAKE_SUBMIT)
         hook = ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "report.sh"
+        # A Claude task's text arrives as one paste (MS2): load-buffer -b NAME - keeps stdin per buffer name and paste-buffer -b NAME
+        # -t PANE moves it to that pane's typed text, which the Enter then submits as above.
+        paste_sh = f'''
+   name=; pane=; prev=; for a; do [ "$prev" = -b ] && name=$a; [ "$prev" = -t ] && pane=$a; prev=$a; done
+   buf="{self.tmp}/buf-$(printf %s "$name" | tr -c 'A-Za-z0-9' _)"
+   case "$1" in
+    load-buffer) cat > "$buf" ;;
+    paste-buffer) [ -f "$buf" ] && mv "$buf" "{self.tmp}/typed-$(printf %s "$pane" | tr -c 'A-Za-z0-9' _)" ;;
+   esac
+   exit 0'''
         if self.tamper("unconfirmed-redirect"):
             submit_sh = f'exec {tmux} -L {self.sock} "$@"'
+            paste_sh = 'case "$1" in load-buffer) cat >/dev/null ;; esac; exit 0'  # the paste goes nowhere and no hook runs
         else:
             submit_sh = f'''
    pane=; prev=; for a; do [ "$prev" = -t ] && pane=$a; prev=$a; done
@@ -912,6 +923,7 @@ case "$1" in
  set-option) case "$*" in *remain-on-exit*) exec {tmux} -L {self.sock} "$@" ;; esac; exit 0 ;;
  new-session|list-panes|kill-pane|kill-session|has-session|list-sessions|capture-pane) exec {tmux} -L {self.sock} "$@" ;;
  send-keys) {submit_sh} ;;
+ load-buffer|paste-buffer) {paste_sh} ;;
  display-message) case "$*" in *pane_current_path*) printf '%s\\n' "$TP_MAIN_CWD"; exit 0 ;; esac; exec {tmux} -L {self.sock} "$@" ;;
  show-options) printf '%s\\n' "$TP_STATE_DIR" ;;
  new-window)

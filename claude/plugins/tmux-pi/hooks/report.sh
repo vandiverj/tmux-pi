@@ -83,20 +83,37 @@ if [[ ( "$event" == Stop || "$event" == UserPromptSubmit ) && -f "$transcript" ]
 fi
 
 # The submit record lib/pane_send.py waits on. Only a UserPromptSubmit writes it: promptSubmits (a running count, the
-# source of n) and promptLog, the last 8 records {n, at, tokens} in order, so two quick submits cannot hide each other.
-# `tokens` is every delivery id found in the hook's `prompt` (lib/pane_send.py send() types one at the end of each message;
-# the pattern below is pane_send.TOKEN_PATTERN, and a test keeps them equal). The text itself is neither stored nor compared,
-# so no whitespace rule has to agree between this hook and the sender. A prompt with no marker records tokens [].
-marker_re='\[tp:[0-9a-f]{10}\]'
-tokens='[]'
+# source of n) and promptLog, the last 8 records {n, at, tokens, marks} in order, so two quick submits cannot hide each other.
+# prompt_record prints {tokens, marks} for the hook's `prompt`: tokens is every delivery id in it (lib/pane_send.py send()
+# puts one, "[tp:<10 hex>/<length>]", before each message); marks is pane_send.prompt_marks(): per id, the normalized
+# length of the prompt after it and a sha256 of the first <length> normalized characters after it, so the sender can tell
+# its whole text arrived from only part of it arriving. The prompt text itself is not stored. The two patterns and the code below are
+# pane_send's; a test runs both on the same prompts. Any failure records {tokens: [], marks: []}.
+prompt_record() {
+  python3 -c '
+import hashlib, json, re, sys
+TOKEN_RE = re.compile(r"\[tp:[0-9a-f]{10}/[0-9]{1,7}\]")
+NORM_PATTERN = r"[\s\x00-\x1f\x7f]+"
+prompt = json.loads(sys.stdin.read()).get("prompt")
+prompt = prompt if isinstance(prompt, str) else ""
+marks = []
+for m in TOKEN_RE.finditer(prompt):
+    n = int(m.group()[:-1].rsplit("/", 1)[1])
+    after = re.sub(NORM_PATTERN, "", prompt[m.end():])
+    marks.append({"id": m.group(), "after": len(after),
+                  "sha256": hashlib.sha256(after[:n].encode("utf-8", "surrogatepass")).hexdigest()})
+print(json.dumps({"tokens": [m["id"] for m in marks], "marks": marks}))
+' 2>/dev/null <<<"$input" || printf '%s\n' '{"tokens":[],"marks":[]}'
+}
+record='{"tokens":[],"marks":[]}'
 if [[ "$event" == UserPromptSubmit ]]; then
-  tokens="$(jq -c --arg re "$marker_re" '[(.prompt // "" | tostring) | scan($re)]' <<<"$input" 2>/dev/null)" || tokens='[]'
-  if [[ -z "$tokens" ]]; then tokens='[]'; fi
+  record="$(prompt_record)"
+  if [[ -z "$record" ]]; then record='{"tokens":[],"marks":[]}'; fi
 fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson tokens "$tokens" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -111,7 +128,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       elif $in.hook_event_name == "UserPromptSubmit" then
         { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
           promptSubmits: (($prev.promptSubmits // 0) + 1),
-          promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $tokens }]) | .[-8:]) }
+          promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $record.tokens, marks: $record.marks }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
       elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }

@@ -34,12 +34,13 @@ class PrivateTmux:
     def tmux(self, *args):
         return subprocess.run([str(self.bin_dir / "tmux"), *args], capture_output=True, text=True, timeout=10)
 
-    def worker(self, mode="normal", task_dir=None, paste_ms=150, foreign=False, hold=False):
-        """Start a fake worker in a new session; returns (pane id, log path, raw path). Waits for its ready file."""
+    def worker(self, mode="normal", task_dir=None, paste_ms=150, foreign=False, hold=False, options=()):
+        """Start a fake worker in a new session; returns (pane id, log path, raw path). Waits for its ready file. `options` are
+        more fake_tui.py arguments (what arrives: --drop-first K, --keep-first K, --prefill TEXT, --twice)."""
         self.count += 1
         log, raw, ready = (self.dir / "w{}.{}".format(self.count, n) for n in ("log", "raw", "ready"))
         cmd = [sys.executable, str(FAKE), "--mode", mode, "--paste-ms", str(paste_ms), "--log", str(log), "--raw", str(raw),
-               "--ready", str(ready)] + (["--task-dir", str(task_dir)] if task_dir else []) + (["--foreign"] if foreign else []) + (["--hold"] if hold else [])
+               "--ready", str(ready)] + (["--task-dir", str(task_dir)] if task_dir else []) + (["--foreign"] if foreign else []) + (["--hold"] if hold else []) + list(options)
         made = self.tmux("new-session", "-d", "-s", "w{}".format(self.count), "-x", "100", "-y", "20", " ".join(map(_quote, cmd)))
         if made.returncode:
             raise RuntimeError(made.stderr)
@@ -56,7 +57,14 @@ class PrivateTmux:
         Path(str(log) + ".release").write_text("")
 
     def submitted(self, log):
-        return [json.loads(line)["submitted"] for line in log.read_text().splitlines()] if log.exists() else []
+        """The prompts the worker submitted, in order (not the ones its bash mode ran: see ran_as_bash)."""
+        lines = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [entry["submitted"] for entry in lines if "submitted" in entry]
+
+    def ran_as_bash(self, log):
+        """What a --bang worker ran as a shell command instead of submitting it as a prompt."""
+        lines = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [entry["bash"] for entry in lines if "bash" in entry]
 
     def typed(self, raw, text):
         """How many times `text` arrived at the worker as typed input."""

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,25 +58,52 @@ class ClaudeReportTests(unittest.TestCase):
             self.assertTrue("has no result yet" in run.stderr or "has not completed successfully" in run.stderr, run.stderr)
 
     def test_submit_log_records_every_delivery_id_in_the_prompt_and_keeps_the_last_records(self):
-        # The hook finds the delivery ids lib/pane_send.py send() types; it stores no text and compares none.
-        one, two = pane_send.new_token(), pane_send.new_token()
-        self.hook("UserPromptSubmit", prompt="  Use the local renderer \t\x1f for\n the {} evidence {}\n".format(one, two))
+        # The hook finds the delivery ids lib/pane_send.py send() puts before each message and records, per id, the
+        # normalized length after it and a digest (MS2); it stores no prompt text.
+        one, two = pane_send.new_token(33), pane_send.new_token(9)
+        prompt = "  {} Use the local renderer \t\x1f for\n the evidence {} more words\n".format(one, two)
+        self.hook("UserPromptSubmit", prompt=prompt)
         self.assertEqual(self.state()["promptLog"][-1]["tokens"], [one, two])  # all of them, in order
-        self.hook("UserPromptSubmit", prompt="no id here, only [tp:123] [tp:0123456789a] [tp:0123456789A]")
-        self.assertEqual(self.state()["promptLog"][-1]["tokens"], [])  # near misses are not ids
+        self.assertEqual(self.state()["promptLog"][-1]["marks"], pane_send.prompt_marks(prompt))
+        self.assertEqual([m["after"] for m in self.state()["promptLog"][-1]["marks"]], [33 + len(two) + 9, 9])  # "Usethelocalrendererfortheevidence", the next id, "morewords"
+        self.assertNotIn("renderer", json.dumps(self.state()))  # the text itself is not stored
+        self.hook("UserPromptSubmit", prompt="no id here, only [tp:123/1] [tp:0123456789a/1] [tp:0123456789A/1] "
+                                             "[tp:0123456789] [tp:0123456789/] [tp:0123456789/12345678]")
+        self.assertEqual(self.state()["promptLog"][-1]["tokens"], [])  # near misses (and the old id with no length) are not ids
         self.hook("UserPromptSubmit")  # no prompt at all
         self.assertEqual(self.state()["promptLog"][-1]["tokens"], [])
+        self.assertEqual(self.state()["promptLog"][-1]["marks"], [])
         for i in range(4, 11):
-            self.hook("UserPromptSubmit", prompt="p{} {}".format(i, "[tp:00000000{:02x}]".format(i)))
+            self.hook("UserPromptSubmit", prompt="p{} {}".format(i, "[tp:00000000{:02x}/2]".format(i)))
         log = self.state()["promptLog"]
         self.assertEqual([r["n"] for r in log], list(range(3, 11)))  # the last 8 of 10, oldest first
-        self.assertEqual(log[-1]["tokens"], ["[tp:000000000a]"])
+        self.assertEqual(log[-1]["tokens"], ["[tp:000000000a/2]"])
         self.assertEqual(self.state()["promptSubmits"], 10)
-        self.assertNotIn("promptHash", self.state())  # no text hash: the id is the whole rule
+        self.assertNotIn("promptHash", self.state())
 
-    def test_the_hook_and_the_sender_use_the_same_id_pattern(self):
-        self.assertIn("marker_re='{}'".format(pane_send.TOKEN_PATTERN), HOOK.read_text())
-        self.assertRegex(pane_send.new_token(), "^" + pane_send.TOKEN_PATTERN + "$")
+    def test_the_hook_records_what_pane_send_prompt_marks_says(self):
+        # MS2: report.sh's prompt_record and pane_send.prompt_marks are one rule written twice. Run report.sh's own code
+        # (cut out of the file, in-process) and the function on the same prompts; the records must be equal.
+        text = HOOK.read_text()
+        start = text.index("prompt_record() {\n  python3 -c \'") + len("prompt_record() {\n  python3 -c \'")
+        code = text[start:text.index("\' 2>/dev/null <<<\"$input\"", start)]
+        msg = "Main: cost $HOME \\ \"q\" \'s\' !x Grüße 漢字"
+        tok = pane_send.new_token(len(pane_send.normalize(msg)))
+        wrap = '\n\n<pasted_content id="1f02">\n{}\n</pasted_content id="1f02">\n'  # a long paste in Claude Code 2.1.322
+        prompts = ["", "no id", tok + " " + msg, "box text " + tok + " " + msg, wrap.format(tok + " " + msg),
+                   tok + " " + msg[:-10], tok + " " + msg[:4] + msg[16:], tok + " " + msg + " " + tok + " " + msg,
+                   msg + " " + tok, "[tp:0123456789/6] a\x1cb\x1dc\x1ed\x1fe\t\u00a0f", "[tp:0123456789/0] ",
+                   "[tp:0123456789/3] x\ud800y", "[tp:0123456789/999] short"]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                import contextlib
+                import io
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), unittest.mock.patch("sys.stdin", io.StringIO(json.dumps({"prompt": prompt}))):
+                    exec(compile(code, str(HOOK), "exec"), {})
+                marks = pane_send.prompt_marks(prompt)
+                self.assertEqual(json.loads(out.getvalue()), {"tokens": [m["id"] for m in marks], "marks": marks})
+        self.assertRegex(pane_send.new_token(1089), "^" + pane_send.TOKEN_PATTERN + "$")
 
     def test_late_tool_does_not_reopen_stop_but_new_prompt_does(self):
         self.hook("SessionStart", model="claude-opus-5-5")
@@ -83,7 +111,7 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("UserPromptSubmit", prompt="first")
         submit = self.state()  # the record lib/pane_send.py waits on: count, and a log entry with the ids in the prompt
         self.assertEqual(submit["promptSubmits"], 1)
-        self.assertEqual(submit["promptLog"], [{"n": 1, "at": submit["updated"], "tokens": []}])
+        self.assertEqual(submit["promptLog"], [{"n": 1, "at": submit["updated"], "tokens": [], "marks": []}])
         self.hook("PreToolUse", tool_name="Read", tool_input={"file_path": "fixture.txt"})
         self.assertEqual({k: self.state()[k] for k in ("promptSubmits", "promptLog")},
                          {k: submit[k] for k in ("promptSubmits", "promptLog")})  # other events leave it
@@ -99,12 +127,12 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((self.task / "result.md").read_text(), "first reply\nRESULT_STATUS: complete\n")
         self.assertFalse(list(self.task.glob(".state.*")) + list(self.task.glob(".result.*")))
 
-        self.hook("UserPromptSubmit", prompt="confirm [tp:abcdef0123]")
+        self.hook("UserPromptSubmit", prompt="confirm [tp:abcdef0123/7]")
         self.assertEqual(self.state()["state"], "working")
         self.assertEqual(self.state()["promptTurn"], 2)
         self.assertEqual(self.state()["promptSubmits"], 2)
         self.assertEqual([(r["n"], r["tokens"]) for r in self.state()["promptLog"]],
-                         [(1, []), (2, ["[tp:abcdef0123]"])])  # in order
+                         [(1, []), (2, ["[tp:abcdef0123/7]"])])  # in order
         self.assertFalse((self.task / "result.md").exists())
         self.review()  # old answer cannot be reviewed for the new prompt
         self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})

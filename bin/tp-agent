@@ -1687,7 +1687,7 @@ def _main(argv):
             if (path / "reaped.json").exists():
                 raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
             sent = pane_send.send(pane, args.text, task_dir=path)
-            submit = {"submitted": sent["submitted"], "attempts": sent["attempts"]}
+            submit = {k: sent[k] for k in ("submitted", "attempts", "received", "length") if k in sent}
             (path / "collected.json").unlink(missing_ok=True)
             value = {"id": args.id, "sent": True, **submit}
             try:
@@ -1702,6 +1702,12 @@ def _main(argv):
                         atomic_json(requested, pending, base)
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
+            if not sent["submitted"] and "received" in sent:  # MS2: submitted, but only the end of it reached the worker
+                print(json.dumps(value, indent=2))
+                raise RuntimeError(f"message to {args.id} was not delivered whole: the worker's prompt held {sent['received']} "
+                                   f"of its {sent['length']} characters (spaces not counted) after the delivery id. Nothing "
+                                   "was retyped. Send it again; for a long text, write it to a file and send a short message "
+                                   "that points the worker at the file")
             if not sent["submitted"]:
                 print(json.dumps(value, indent=2))
                 raise RuntimeError(f"message to {args.id} was typed but not confirmed submitted after {sent['attempts']} Enter(s); "

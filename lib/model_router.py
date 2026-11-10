@@ -351,11 +351,13 @@ def meta_card(meta, role=None):
                                  meta.get("context") or (), meta.get("workdir"))
 
 
-def escalate_route(meta, cat, role=None, worker=None, approve_effort=False, base=None, log=True, local_only=False):
+def escalate_route(meta, cat, role=None, worker=None, approve_effort=False, base=None, log=True, local_only=False, gate=None):
     """The next route after repeated failure: effort up before level, never above the ceiling without approval.
     Returns the same result as select(); raises RouteStop at the top level at the ceiling, and for a local-only task
     (the flag is also read from the failed attempt's recorded route) when no stronger local option exists: it never
-    escalates to a cloud model."""
+    escalates to a cloud model. gate is the route of a retry the repeated-family gate stopped (rule-first or design):
+    the level goes up first (rr.escalate level_first), and the record says the gate chose it (decided_by
+    gated_retry, the reason names the route)."""
     started = time.monotonic()
     local_only = bool(local_only or (meta.get("route_info") or {}).get("local_only"))
     level, effort = level_effort_of_task(meta, cat)
@@ -366,11 +368,12 @@ def escalate_route(meta, cat, role=None, worker=None, approve_effort=False, base
            "est_tokens": estimate_tokens(meta.get("task", ""), meta.get("deliverable", ""), meta.get("context"), meta.get("workdir"))}
     if local_only and worker and worker not in {v["worker"] for v in cat["providers"].values() if v["kind"] == "local"}:
         raise ValueError("--worker {} cannot run local-only work".format(worker))
-    rec = rr.escalate(prior, cat, read_health(base), ctx, ctx["approvals"])
+    rec = rr.escalate(prior, cat, read_health(base), ctx, ctx["approvals"], level_first=bool(gate))
     if local_only and rec["source"] != "stop_and_ask" and (rec["model"], rec["effort"]) == (meta.get("model"), meta.get("thinking")):
         rec = dict(rec, source="stop_and_ask", reason="local-only task: no stronger local model or effort to escalate to")
-    rec["decided_by_name"] = "escalation"
-    rec["reason"] = "escalation after repeated failure: {}".format(rec.get("reason") or rec.get("source", ""))
+    rec["decided_by_name"] = "gated_retry" if gate else "escalation"
+    rec["reason"] = ("gated retry (--route {}: a repeated finding family), one level up first: {}".format(gate, rec.get("reason") or rec.get("source", ""))
+                     if gate else "escalation after repeated failure: {}".format(rec.get("reason") or rec.get("source", "")))
     request = {"role": role, "task": meta.get("task") or "escalation of {}".format(meta.get("id", "")), "worker": worker,
                "approve_effort": approve_effort, "local_only": local_only}
     return _finish("escalation", request, cat, rec, meta_card(meta, role), None, None, started, base, log)

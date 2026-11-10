@@ -451,17 +451,26 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
 
 # ---------------------------------------------------------------- escalation and reviewers
 
-def escalate(rec, cat, health=None, ctx=None, approvals=None):
+def escalate(rec, cat, health=None, ctx=None, approvals=None, level_first=False):
     """After two failed attempts or two REQUEST_CHANGES: raise the effort one step if it is below the ceiling,
     otherwise move one level up. Effort never goes above the ceiling without a recorded approval; with one,
     effort keeps rising (as far as the model allows) before the level does. At the top level at the ceiling with
-    nothing further, stop and ask."""
+    nothing further, stop and ask. level_first (a retry the repeated-family gate stopped: a capability gap, not
+    care) tries the levels above in order at the same effort and takes the first that places the task above its level (a level with no
+    model the worker pin or local-only allows is passed over), and takes the steps above when none does (the top level, or a
+    local-only task)."""
     ctx = dict(ctx or {}, skip_caps=True)
     approved = bool((approvals or {}).get("effort_above_high")) or bool(ctx.get("approvals", {}).get("effort_above_high"))
     ctx["approvals"] = {"effort_above_high": approved}
     vocab, order, ceiling = cat["effort"]["vocabulary"], cat["effort"]["order"], cat["effort"]["ceiling"]
     keys, shown = level_keys(cat), shown_keys(cat)
     level_key, eff = rec["level_key"], rec["effort_abstract"]
+    if level_first:
+        for key in [k for k in shown if keys.index(k) > keys.index(level_key)]:  # the next level the pin and local-only can place
+            up = resolve({"level_key": key, "effort": eff, "review": rec.get("review", "optional"), "shape": None,
+                          "reason": "escalation: level up (gated retry)", "source": "escalation"}, cat, health, ctx, rec.get("decided_by"))
+            if up["source"] != "stop_and_ask" and keys.index(up["level_key"]) > keys.index(level_key):  # not a fallback back down
+                return dict(up, source="escalation_level_up")
     model = (level_of(cat, rec.get("model"), rec.get("effort") or eff)[1] or {"efforts": order}) if rec.get("model") else {"efforts": order}
     if eff in vocab and effort_rank(cat, eff) < effort_rank(cat, ceiling):
         new_eff, new_key, how = vocab[vocab.index(eff) + 1], level_key, "effort up"

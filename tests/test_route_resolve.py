@@ -488,6 +488,9 @@ class LocalOnlyResolveTests(unittest.TestCase):
         e2 = rr.escalate(dict(prior, effort_abstract="high"), CAT, ctx={"local_only": True})
         self.assertEqual(e2["source"], "stop_and_ask")
         self.assertIn("local-only", e2["reason"])
+        g1 = rr.escalate(prior, CAT, ctx={"local_only": True}, level_first=True)  # no local model above: effort, never cloud
+        self.assertEqual((g1["source"], g1["provider"], g1["model"]), ("escalation_effort_up", "local", QWEN))
+        self.assertEqual(rr.escalate(dict(prior, effort_abstract="high"), CAT, ctx={"local_only": True}, level_first=True)["source"], "stop_and_ask")
 
 
 class RedirectTests(unittest.TestCase):
@@ -561,6 +564,14 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(X(SOL, "pi", "medium")["level_key"], "mid")
         with self.assertRaisesRegex(rr.ExplicitError, "not offered"):
             X(SOL, "pi", "high")
+        # level_first (a gated retry): the next level that the pin allows, at the same effort; the top level steps effort instead
+        g = rr.escalate(r, CAT, ctx=dict(role="coder"), level_first=True)
+        self.assertEqual((g["level_key"], g["effort_abstract"], g["source"]), ("top", "medium", "escalation_level_up"))
+        self.assertEqual(rr.escalate(g, CAT, ctx=dict(role="coder"), level_first=True)["source"], "escalation_effort_up")
+        sonnet = {"model": SONNET, "level_key": "mid", "effort": "medium", "effort_abstract": "medium", "review": "optional"}
+        pinned = {w: rr.escalate(sonnet, cat, ctx={"role": "coder", "require_worker": w}, level_first=True) for w in ("claude", "pi")}
+        self.assertEqual((pinned["claude"]["model"], pinned["claude"]["level_key"]), (OPUS, "top"))  # strong has no claude model
+        self.assertEqual((pinned["pi"]["model"], pinned["pi"]["level_key"]), (SOL, "strong"))
 
     def test_escalation_skips_the_hidden_level_and_role_caps(self):
         r = R(D("mid", "high"), role="tester")

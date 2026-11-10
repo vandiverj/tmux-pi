@@ -271,7 +271,7 @@ class DispatchTests(Base):
 
 
 class EscalationTests(Base):
-    def fail(self, item):
+    def mark_failed(self, item):  # not fail(): that would shadow unittest.TestCase.fail(msg), which every failing assertion calls
         (self.state / "tasks" / item["id"] / "exit").write_text("1")
 
     def retry(self, item, *extra, check=True):
@@ -279,25 +279,26 @@ class EscalationTests(Base):
 
     def test_effort_steps_up_before_the_level_after_two_failures_then_stops(self):
         first = self.dispatch("--model", SONNET, "--thinking", "medium")
-        self.fail(first)
+        self.mark_failed(first)
         early = self.retry(first, "--escalate", check=False)
         self.assertEqual(early.returncode, 1)
         self.assertIn("needs 2 failed attempts", early.stderr)
         second = self.retry(first, "--model", SONNET, "--thinking", "medium")
-        self.fail(second)
+        self.mark_failed(second)
         third = self.retry(second, "--escalate")
         self.assertEqual((self.meta(third)["model"], self.meta(third)["thinking"]), (SONNET, "high"))
         self.assertEqual(self.meta(third)["route_info"]["source"], "escalation_effort_up")
-        self.fail(third)
+        self.assertEqual(self.meta(third)["route_info"]["decided_by"], "escalation")  # a plain --escalate keeps effort first
+        self.mark_failed(third)
         # Was: the level step went straight to (OPUS, "high"). Strong is offered now, so it first goes to gpt-6.1-sol at high.
         strong = self.retry(third, "--escalate")
         self.assertEqual((self.meta(strong)["model"], self.meta(strong)["thinking"]), (SOL, "high"))
         self.assertEqual(self.meta(strong)["route_info"]["source"], "escalation_level_up")
-        self.fail(strong)
+        self.mark_failed(strong)
         fourth = self.retry(strong, "--escalate")
         self.assertEqual((self.meta(fourth)["model"], self.meta(fourth)["thinking"]), (OPUS, "high"))
         self.assertEqual(self.meta(fourth)["route_info"]["source"], "escalation_level_up")
-        self.fail(fourth)
+        self.mark_failed(fourth)
         stop = self.retry(fourth, "--escalate", check=False)
         self.assertEqual(stop.returncode, 1)
         self.assertIn("approval needed", stop.stderr)
@@ -338,34 +339,53 @@ class EscalationTests(Base):
 
     def test_escalate_cannot_be_combined_with_an_explicit_model(self):
         first = self.dispatch("--model", SONNET)
-        self.fail(first)
+        self.mark_failed(first)
         run = self.retry(first, "--escalate", "--model", OPUS, check=False)
         self.assertEqual(run.returncode, 1)
 
-    def test_request_changes_reviews_count_as_failures(self):
-        first = self.dispatch("--model", SONNET, "--thinking", "medium")
+    def gated_chain(self, model, thinking, tag=""):
+        """An author retried once, each attempt with a REQUEST_CHANGES review: the latest review of the second is gated."""
+        first = self.dispatch("--model", model, "--thinking", thinking)
         task = self.state / "tasks" / first["id"]
         (task / "exit").write_text("0")
         (task / "result.md").write_text("RESULT_STATUS: complete\n")
         for n in (1, 2):
-            review = self.state / "tasks" / f"review-{n}"
+            review = self.state / "tasks" / f"review{tag}-{n}"
             review.mkdir()
-            (review / "meta.json").write_text(json.dumps({"id": f"review-{n}"}))
+            (review / "meta.json").write_text(json.dumps({"id": f"review{tag}-{n}"}))
             (review / "result.md").write_text("REQUEST_CHANGES\nRESULT_STATUS: complete\nF1 [defect] fix it\nFamily: shared-defect\nCloses by: code")
         # only one review is linked per attempt, so link the first attempt to one and retry once more
         meta = json.loads((task / "meta.json").read_text())
-        (task / "meta.json").write_text(json.dumps(dict(meta, review="review-1")))
-        second = self.retry(first, "--model", SONNET, "--thinking", "medium")
+        (task / "meta.json").write_text(json.dumps(dict(meta, review=f"review{tag}-1")))
+        second = self.retry(first, "--model", model, "--thinking", thinking)
         task2 = self.state / "tasks" / second["id"]
         (task2 / "exit").write_text("0")
         (task2 / "result.md").write_text("RESULT_STATUS: complete\n")
-        (task2 / "meta.json").write_text(json.dumps(dict(json.loads((task2 / "meta.json").read_text()), review="review-2")))
+        (task2 / "meta.json").write_text(json.dumps(dict(json.loads((task2 / "meta.json").read_text()), review=f"review{tag}-2")))
+        return second
+
+    def test_request_changes_reviews_count_as_failures(self):
+        second = self.gated_chain(SONNET, "medium")
         # the second REQUEST_CHANGES in a row is gated: a retry needs a --route (--escalate alone does not pass it)
         alone = self.retry(second, "--escalate", check=False)
         self.assertEqual(alone.returncode, 1, alone.stdout)
         self.assertIn("--route", alone.stderr)
-        third = self.retry(second, "--escalate", "--route", "rule-first")
-        self.assertEqual(self.meta(third)["thinking"], "high")
+        # a gated retry goes a level up first (was: effort up, Sonnet at high), with or without --escalate, and says why
+        for extra in (("--escalate",), ()):
+            third = self.meta(self.retry(second, *extra, "--route", "rule-first"))
+            self.assertEqual((third["model"], third["thinking"], third["route_info"]["source"]), (SOL, "high", "escalation_level_up"))
+            self.assertEqual(third["route_info"]["decided_by"], "gated_retry")
+            self.assertIn("--route rule-first", third["route_info"]["reason"])
+        pinned = self.meta(self.retry(second, "--route", "design", "--worker", "claude"))  # strong has no claude model: Opus
+        self.assertEqual((pinned["model"], pinned["route_info"]["source"]), (OPUS, "escalation_level_up"))
+        mine = self.meta(self.retry(second, "--route", "design", "--model", SONNET, "--thinking", "medium"))  # the user's model wins
+        self.assertEqual((mine["model"], mine["thinking"]), (SONNET, "medium"))
+        self.assertNotEqual(mine["route_info"]["decided_by"], "gated_retry")
+        top = self.gated_chain(OPUS, "high", "-top")  # nothing stronger without approval: the retry is routed as a plain one
+        run = self.retry(top, "--route", "rule-first", check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("the gated retry was not escalated", run.stderr)
+        self.assertNotEqual(self.meta(json.loads(run.stdout))["route_info"]["decided_by"], "gated_retry")
 
 
 class LocalOnlyCommandTests(Base):
@@ -401,16 +421,16 @@ class LocalOnlyCommandTests(Base):
         # an explicit --level overrides the researcher's floor; the router's pick and escalation would not
         return self.dispatch("--local-only", "--level", "local", *extra, role="researcher")
 
-    def fail(self, item):
+    def mark_failed(self, item):  # not fail(): that would shadow unittest.TestCase.fail(msg), which every failing assertion calls
         (self.state / "tasks" / item["id"] / "exit").write_text("1")
 
     def test_escalation_stays_local_or_stops_and_never_picks_a_cloud_model(self):
         first = self.local_task()
         self.assertEqual(self.meta(first)["model"], QWEN)
-        self.fail(first)
+        self.mark_failed(first)
         second = self.agent("retry", first["id"], "--reason", "again", "--level", "local")  # a plain retry would be routed, and held to the floor
         self.assertTrue(self.meta(second)["route_info"]["local_only"])  # the constraint survives a plain retry
-        self.fail(second)
+        self.mark_failed(second)
         before = sorted(p.name for p in (self.state / "tasks").iterdir())
         run = self.agent("retry", second["id"], "--reason", "failed", "--escalate", check=False)
         self.assertEqual(run.returncode, 1, run.stdout)
@@ -427,15 +447,21 @@ class LocalOnlyCommandTests(Base):
     def test_escalation_is_local_only_when_only_the_recorded_route_says_so(self):
         # the flag is read from the failed attempt's route, so a retry that forgets --local-only cannot drop it
         first = self.local_task()
-        self.fail(first)
+        self.mark_failed(first)
         second = self.agent("retry", first["id"], "--reason", "again", "--level", "local")  # a plain retry would be routed, and held to the floor
-        self.fail(second)
+        self.mark_failed(second)
         sys.path.insert(0, str(ROOT / "lib"))
         import router_catalog
         meta = json.loads((self.state / "tasks" / second["id"] / "meta.json").read_text())
         self.assertTrue(meta["route_info"]["local_only"])
-        with self.assertRaises(model_router.RouteStop):
-            model_router.escalate_route(meta, router_catalog.load_catalog(), role="researcher", base=self.state, log=False)
+        for gate in (None, "rule-first"):  # a gated retry goes a level up first, and still never to a cloud model
+            with self.assertRaises(model_router.RouteStop):
+                model_router.escalate_route(meta, router_catalog.load_catalog(), role="researcher", base=self.state, log=False, gate=gate)
+        cloud = dict(meta, model=SONNET, thinking="medium", route_info={"level": "mid", "effort_abstract": "medium"})
+        gated = model_router.escalate_route(cloud, router_catalog.load_catalog(), role="coder", worker="claude", base=self.state,
+                                            log=False, gate="design")
+        self.assertEqual((gated["model"], gated["source"], gated["decided_by"]), (OPUS, "escalation_level_up", "gated_retry"))
+        self.assertIn("--route design", gated["reason"])
 
 
 class ExplicitValidationCommandTests(Base):

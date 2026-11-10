@@ -445,16 +445,17 @@ def escalation_evidence(base, previous):
     return failed, changes
 
 
-def escalation_route(base, previous, args, contexts):
+def escalation_route(base, previous, args, contexts, gate=None):
     """(worker, model, effort, route_info) for `retry --escalate`: effort up before level, only after the catalog's
-    number of failed attempts or REQUEST_CHANGES reviews."""
+    number of failed attempts or REQUEST_CHANGES reviews. gate is the route of a retry the repeated-family gate stopped
+    (rule-first or design): the gate is the evidence, so no count is needed, and the level goes up first."""
     sys.path.insert(0, str(ROOT / "lib"))
     import model_router
     import router_catalog
     catalog = router_catalog.load_catalog()
     failed, changes = escalation_evidence(base, previous)
     need = catalog["escalation"]["after"]
-    if max(failed, changes) < need:
+    if not gate and max(failed, changes) < need:
         raise ValueError(f"escalation needs {need} failed attempts or {need} REQUEST_CHANGES reviews; found {failed} and "
                          f"{changes}. Retry without --escalate, or request a level explicitly with --level")
     meta = read_json(previous / "meta.json")
@@ -464,7 +465,7 @@ def escalation_route(base, previous, args, contexts):
         pass
     result = model_router.escalate_route(meta, catalog, role=args.role or meta.get("role"), worker=args.worker,
                                          approve_effort=args.approve_effort, base=base,
-                                         local_only=getattr(args, "local_only", False))
+                                         local_only=getattr(args, "local_only", False), gate=gate)
     return result["worker"], result["model"], result["thinking"], route_info(result)
 
 
@@ -1560,7 +1561,13 @@ def _main(argv):
         if args.escalate:
             if args.model or args.level or args.thinking:
                 raise ValueError("--escalate chooses the next step itself; use --level to request a level instead")
-            preroute = escalation_route(base, previous, args, contexts)
+            preroute = escalation_route(base, previous, args, contexts, gate=args.route if repeated else None)
+        elif repeated and args.route in ("rule-first", "design") and not (args.model or args.level or args.thinking):
+            # a repeated family is a capability gap: the gated retry goes a level up (a user's --model, --level or --thinking wins)
+            try:
+                preroute = escalation_route(base, previous, args, contexts, gate=args.route)
+            except ValueError as error:  # RouteStop: nothing stronger the limits allow; the retry is routed as a plain one
+                print(f"tp-agent: the gated retry was not escalated: {error}", file=sys.stderr)
         task, brief_note = args.task, ""
         if not task:  # a --reason that names a usable .md file is the fix brief: the new attempt's request starts by saying to read it
             brief, brief_problem = fix_brief(args.reason)

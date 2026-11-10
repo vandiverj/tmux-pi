@@ -380,7 +380,7 @@ echo review-1
         self.assertTrue(all(len(self.copy(p).read_text()) <= 60000 for p in segs))
         self.assertIn("DIFF-TAIL-MARKER", self.copy(segs[-1]).read_text())
         self.assertIn("Review segment 1 of 3 of diff-now", self.copy(segs[0]).read_text())
-        (self.work / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(30000)))  # about 330000 chars: over the packet budget
+        (self.work / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(40000)))  # about 440000 chars: over the packet budget
         self.log.unlink()
         r = self.review()
         self.assertEqual(r.returncode, 1, r.stderr)
@@ -389,16 +389,16 @@ echo review-1
 
     def test_a_large_verified_copy_keeps_the_packet_under_the_limit_and_the_same_lane_without_the_manifest_is_refused(self):
         # FC1: a copy of a committed file that frozen-copies.json vouches for is named, not repeated; without the manifest the
-        # same 330000-char copy is refused as before (the limit is not raised and nothing is dropped)
+        # same 440000-char copy is refused as before (the limit is not raised and nothing is dropped)
         self.git("init", "-q")
         (self.work / "vendor").mkdir()
-        (self.work / "vendor" / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(30000)))
+        (self.work / "vendor" / "big.txt").write_text("".join(f"line {i:05d}\n" for i in range(40000)))
         self.git("add", "-A")
         self.git("commit", "-qm", "first")
         head = subprocess.run(["git", "-C", str(self.work), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
         (self.work / "fx").mkdir()
         shutil.copyfile(self.work / "vendor" / "big.txt", self.work / "fx" / "big.txt")
-        r = self.review()  # no manifest: the copy is an ordinary 330000-char addition
+        r = self.review()  # no manifest: the copy is an ordinary 440000-char addition
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("without dropping author evidence", r.stderr)
         self.assertFalse(self.log.exists())
@@ -849,7 +849,7 @@ echo review-1
         self.assertFalse(any(Path(p).exists() for p in segs))
 
     def test_aggregate_overflow_fails_before_spawn_and_cleans_up(self):
-        (self.task / "packet.md").write_text("p" * 230000)
+        (self.task / "packet.md").write_text("p" * 330000)
         (self.task / "result.md").write_text("RESULT_STATUS: complete\n" + "r" * 80000)
         r = self.review()
         self.assertEqual(r.returncode, 1)
@@ -1059,7 +1059,7 @@ echo review-1
 
     def test_evidence_that_overflows_the_packet_budget_is_refused_without_trimming(self):
         (self.task / "packet.md").write_text("p" * 200000)
-        r = self.review("--evidence", self.supplied("big.txt", "e" * 150000))
+        r = self.review("--evidence", self.supplied("big.txt", "e" * 250000))
         self.assertEqual(r.returncode, 1)
         self.assertIn("without dropping author evidence", r.stderr)
         self.assertFalse(self.log.exists())
@@ -1069,7 +1069,7 @@ echo review-1
 
     def test_a_contract_counts_against_the_budget_too(self):
         (self.task / "packet.md").write_text("p" * 200000)
-        r = self.review("--contract", self.supplied("c.md", "c" * 150000))
+        r = self.review("--contract", self.supplied("c.md", "c" * 250000))
         self.assertEqual(r.returncode, 1)
         self.assertIn("without dropping author evidence", r.stderr)
 
@@ -1178,7 +1178,7 @@ echo review-1
 
     def test_dispositions_count_against_the_budget_and_are_never_trimmed(self):
         (self.task / "packet.md").write_text("p" * 200000)
-        r = self.review("--dispositions", self.supplied("d.md", "d" * 150000))
+        r = self.review("--dispositions", self.supplied("d.md", "d" * 250000))
         self.assertEqual(r.returncode, 1)
         self.assertIn("without dropping author evidence", r.stderr)
 

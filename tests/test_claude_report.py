@@ -223,6 +223,199 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("PostToolUse", tool_name="Bash", transcript_path=str(self.base / "t.jsonl"))
         self.assertEqual(self.state()["turns"], 2)
 
+    # --- RO1: the report is kept by what the reply says, never by who started the turn -------------------------------
+    REPORT = "full report\nRESULT_STATUS: complete\n"
+    REPLIES = {"complete": "r\nRESULT_STATUS: complete", "empty-status": "r\nRESULT_STATUS: empty",
+               "blocked": "r\nRESULT_STATUS: blocked", "incomplete": "r\nRESULT_STATUS: incomplete",
+               "bold": "r\n**RESULT_STATUS: complete**", "malformed": "r\nRESULT_STATUS: done", "partial": "r\nRESULT_STATUS:",
+               "prefixed": "r\nNote: RESULT_STATUS: complete", "none": "nothing new", "empty": ""}
+    VALID = ("complete", "empty-status", "blocked", "incomplete", "bold")  # what lib/result_status.py (tp-review's gate) accepts
+
+    def turn(self, origin, reply):
+        """One Claude turn, its origin shown to the hook the ways the engine can show it. The hook must not read any of
+        them: none, human, task-notification, source-user (UserPromptSubmit source "user"), composer, unknown, lagging (a
+        transcript that still shows only earlier human entries while this turn is a task notification)."""
+        self.entries = getattr(self, "entries", [])
+        fields = {}
+        if origin == "human":
+            fields["origin"] = {"kind": "human"}
+            self.entries.append({"type": "user", "promptSource": "typed", "turnOrigin": "human", "origin": {"kind": "human"}})
+        elif origin == "task-notification":
+            fields.update(origin={"kind": "task-notification"}, prompt="<task-notification>\n<task-id>b1</task-id>\n</task-notification>")
+            self.entries.append({"type": "user", "promptSource": "system", "origin": {"kind": "task-notification"}})
+        elif origin in ("source-user", "composer"):
+            fields.update({"source": "user", "prompt": "Please confirm."} if origin == "source-user" else {"origin": {"kind": "composer"}})
+            self.entries.append({"type": "user", "origin": {"kind": "composer"}})
+        elif origin == "unknown":
+            fields["origin"] = {"kind": "something-new"}
+        elif origin == "lagging":
+            fields["origin"] = {"kind": "task-notification"}
+            self.entries = [{"type": "user", "origin": {"kind": "human"}}] * 3
+        self.hook("UserPromptSubmit", **fields)
+        self.hook("Stop", last_assistant_message=reply,
+                  **({"transcript_path": self.transcript(self.entries)} if self.entries else {}))
+
+    def kept(self):
+        return sorted(p.read_text() for p in (self.task / "results").glob("*.md")) if (self.task / "results").is_dir() else []
+
+    def later(self):
+        state = self.state()
+        return state.get("laterReplies", 0), state.get("laterReplyPath", "")
+
+    def test_task_notification_turn_leaves_the_report_and_records_its_reply(self):
+        self.turn("none", self.REPORT.rstrip("\n"))
+        for n in (1, 2, 3):
+            self.turn("task-notification", f"nothing new {n}")
+            self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+            self.assertEqual(self.later(), (n, f"results/{n + 1}.md"))
+            self.assertEqual((self.task / self.state()["laterReplyPath"]).read_text(), f"nothing new {n}\n")
+        self.assertEqual(self.state()["state"], "waiting")
+        self.assertEqual(self.kept().count(self.REPORT), 1)  # kept apart from result.md once, not once per turn
+        self.review(accepted=True)
+
+    def test_inspect_and_list_rows_show_a_later_reply(self):
+        import tp_agent_inproc
+        agent = tp_agent_inproc.load()
+        self.turn("none", self.REPORT.rstrip("\n"))
+        self.assertNotIn("later_replies", agent.record(self.task))
+        self.turn("task-notification", "nothing new")
+        row = agent.record(self.task)
+        self.assertEqual((row["later_replies"], row["later_reply_path"]), (1, str(self.task / "results/2.md")))
+        self.assertEqual(row["result_status"], "complete")
+        index = [r for k in ("active", "pending", "paused", "unstatused", "recent") for r in agent.build_index(self.state_dir)[k]
+                 if r["id"] == "w1"]
+        self.assertTrue(index and all(r.get("later_replies") == 1 for r in index), index)
+
+    def test_a_statused_reply_replaces_the_report_and_an_unstatused_one_never_does(self):
+        self.turn("none", self.REPORT.rstrip("\n"))
+        self.turn("human", "second\nRESULT_STATUS: blocked")
+        self.assertEqual((self.task / "result.md").read_text(), "second\nRESULT_STATUS: blocked\n")
+        self.assertIn(self.REPORT, self.kept())
+        self.assertEqual(self.later(), (0, ""))
+        self.hook("UserPromptSubmit", prompt="msg", origin={"kind": "human"})
+        self.assertFalse((self.task / "result.md").exists())  # the next prompt withdraws the old reply while it works
+        self.hook("Stop", last_assistant_message="short")  # a human-asked turn without a status does not replace it either
+        self.assertEqual((self.task / "result.md").read_text(), "second\nRESULT_STATUS: blocked\n")
+        self.assertEqual((self.task / self.later()[1]).read_text(), "short\n")
+
+    def test_overlapping_turns_keep_the_report_and_both_replies(self):
+        self.turn("none", self.REPORT.rstrip("\n"))
+        self.hook("UserPromptSubmit", prompt="msg")
+        self.hook("UserPromptSubmit", origin={"kind": "task-notification"})  # before the first turn's Stop
+        self.hook("Stop", last_assistant_message="meh")
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual(self.later()[0], 1)
+        self.hook("Stop", last_assistant_message="second")  # the other turn's Stop: no open prompt, settles nothing
+        self.hook("Stop", last_assistant_message="second")  # a duplicate of it adds nothing
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual(self.later()[0], 2)
+        self.assertEqual((self.task / self.later()[1]).read_text(), "second\n")
+        self.assertEqual(sorted(self.kept()), sorted([self.REPORT, "meh\n", "second\n"]))
+
+    def test_reply_decides_attack_table(self):
+        # prior result.md x reply x turn origin (rows from evidence/attack.py; the origin never changes the answer).
+        # The 'lagging' row was F1, 'source-user' F3 of review-coder-c28747a7ad-220316.
+        rows = (("status", "task-notification", "none"), ("status", "lagging", "none"), ("status", "source-user", "none"),
+                ("status", "composer", "complete"), ("status", "human", "partial"), ("status", "unknown", "malformed"),
+                ("status", "none", "prefixed"), ("status", "human", "bold"), ("status", "task-notification", "incomplete"),
+                ("status", "none", "empty"), ("plain", "task-notification", "none"), ("plain", "human", "empty"),
+                ("none", "unknown", "blocked"), ("none", "composer", "empty-status"))
+        prior_text = {"none": None, "status": self.REPORT, "plain": "plain old reply\n"}
+        for prior, origin, reply in rows:
+            with self.subTest(prior=prior, origin=origin, reply=reply):
+                self.tearDown_task()
+                self.entries = []
+                if prior_text[prior] is not None:
+                    self.turn("none", prior_text[prior].rstrip("\n"))
+                self.turn(origin, self.REPLIES[reply])
+                protected = prior == "status" and reply not in self.VALID
+                want = prior_text[prior] if protected else (self.REPLIES[reply] + "\n" if self.REPLIES[reply] else None)
+                got = (self.task / "result.md").read_text() if (self.task / "result.md").exists() else None
+                self.assertEqual(got, want)
+                if prior_text[prior] is not None:
+                    self.assertIn(prior_text[prior], self.kept())  # the old reply is never lost
+                self.assertEqual(self.later()[0], 1 if protected and reply != "empty" else 0)
+                if self.later()[0]:
+                    self.assertEqual((self.task / self.later()[1]).read_text(), self.REPLIES[reply] + "\n")
+
+    def tearDown_task(self):
+        for p in list(self.task.iterdir()):
+            if p.name not in ("meta.json", "task.md", "packet.md"):
+                if p.is_dir():
+                    for q in p.iterdir():
+                        q.unlink()
+                    p.rmdir()
+                else:
+                    p.unlink()
+
+    def test_an_archive_write_never_overwrites(self):
+        # state written before RO1 (no resultTurn), with results/ already holding the next numbers (F2)
+        (self.task / "state.json").write_text(json.dumps({"state": "waiting", "promptTurn": 2, "settledTurn": 2}))
+        (self.task / "result.md").write_text(self.REPORT)
+        (self.task / "results").mkdir()
+        before = {n: f"kept before {n}\n" for n in (2, 3, 4)}
+        for n, text in before.items():
+            (self.task / f"results/{n}.md").write_text(text)
+        for reply in ("short A", "short B", "short C"):
+            self.turn("task-notification", reply)
+        self.assertEqual({n: (self.task / f"results/{n}.md").read_text() for n in before}, before)
+        self.assertEqual(sorted(self.kept()), sorted([*before.values(), self.REPORT, "short A\n", "short B\n", "short C\n"]))
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual(self.later()[0], 3)
+        self.assertEqual((self.task / self.later()[1]).read_text(), "short C\n")
+        self.assertFalse(list((self.task / "results").glob(".keep.*")))
+        # no hard links (ln always fails): a noclobber write takes over, never over a name that exists, and loses nothing
+        fake_ln = Path(self.env["PATH"].split(os.pathsep)[0]) / "ln"
+        fake_ln.write_text("#!/bin/sh\nexit 1\n")
+        fake_ln.chmod(0o755)
+        fresh = "not archived yet\nRESULT_STATUS: complete\n"
+        (self.task / "result.md").write_text(fresh)
+        self.turn("task-notification", "short D")
+        self.assertEqual((self.task / "result.md").read_text(), fresh)
+        self.assertEqual((self.task / self.later()[1]).read_text(), "short D\n")
+        self.assertEqual({n: (self.task / f"results/{n}.md").read_text() for n in before}, before)
+        self.assertTrue({fresh, "short D\n"} <= set(self.kept()))
+        self.assertFalse(list((self.task / "results").glob(".keep.*")))
+        # nothing can be created under results/: result.md and every reply still stay on disk, each one recorded
+        (self.task / "results").chmod(0o555)
+        self.addCleanup((self.task / "results").chmod, 0o755)
+        unkept = "no copy anywhere\nRESULT_STATUS: complete\n"
+        (self.task / "result.md").write_text(unkept)
+        for reply in ("short E", "final\nRESULT_STATUS: complete"):
+            self.turn("task-notification", reply)
+            self.assertEqual((self.task / "result.md").read_text(), unkept)
+            self.assertEqual((self.task / self.later()[1]).read_text(), reply + "\n")
+        self.assertEqual(sorted(p.read_text() for p in self.task.glob(".reply.*")),
+                         ["final\nRESULT_STATUS: complete\n", "short E\n"])
+        # a late duplicate of a reply kept only in its own file, not the latest one, is already kept: nothing changes
+        settled = (self.later(), sorted(p.name for p in self.task.glob(".reply.*")))
+        self.hook("Stop", last_assistant_message="short E")
+        self.assertEqual((self.later(), sorted(p.name for p in self.task.glob(".reply.*"))), settled)
+
+    def test_stop_without_an_open_prompt_keeps_its_reply_and_changes_nothing_else(self):
+        self.hook("Stop", last_assistant_message="orphan\nRESULT_STATUS: complete")
+        self.assertFalse((self.task / "result.md").exists())
+        self.assertEqual(self.kept(), ["orphan\nRESULT_STATUS: complete\n"])
+        self.turn("none", self.REPORT.rstrip("\n"))
+        before = self.kept()
+        self.hook("Stop", last_assistant_message=self.REPORT.rstrip("\n"))  # a duplicate Stop: nothing new to keep
+        self.assertEqual((self.kept(), self.later()), (before, (0, "")))
+        self.hook("Stop", last_assistant_message="late short")
+        self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
+        self.assertEqual(self.state()["state"], "waiting")
+        self.assertEqual((self.task / self.later()[1]).read_text(), "late short\n")
+        # a delayed duplicate is identified by its bytes against every kept reply, not only result.md and the latest one
+        # (F1 of review-coder-a6d0364bbf-235539): with one intervening reply (A after B) and two (late short after A, B)
+        self.turn("task-notification", "short A")
+        self.turn("task-notification", "short B")
+        settled = (self.kept(), self.later(), (self.task / "result.md").read_text())
+        self.assertEqual(settled[1][0], 3)
+        for duplicate in ("short A", "late short", self.REPORT.rstrip("\n"), "orphan\nRESULT_STATUS: complete"):
+            with self.subTest(duplicate=duplicate):
+                self.hook("Stop", last_assistant_message=duplicate)
+                self.assertEqual((self.kept(), self.later(), (self.task / "result.md").read_text()), settled)
+        self.assertEqual((self.task / self.later()[1]).read_text(), "short B\n")
+
 
 if __name__ == "__main__":
     unittest.main()

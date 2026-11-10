@@ -55,6 +55,28 @@ class ClaudeSubagentsMcpExposureTests(unittest.TestCase):
                 names = {t["name"] for t in self.tools(**env)}
                 self.assertEqual(names, EXPECTED if exposed else set())
 
+    def test_every_plugin_command_that_loads_a_skill_gets_its_body(self):
+        # a Claude slash command (claude/plugins/tmux-pi/commands/<name>.md) says "call the `get_skill` tool with id `X`";
+        # the command only works if the server's enum and the catalogue both know X
+        import re
+        commands = sorted((ROOT / "claude/plugins/tmux-pi/commands").glob("*.md"))
+        wanted = {}
+        for path in commands:
+            found = re.search(r"`get_skill` tool with id `([a-z0-9-]+)`", path.read_text())
+            if found:
+                wanted[path.stem] = found.group(1)
+        self.assertTrue({"product-fit", "product-design", "prepare-cases"} <= set(wanted), wanted)
+        calls = [{"id": i, "method": "tools/call", "params": {"name": "get_skill", "arguments": {"id": ident}}}
+                 for i, ident in enumerate(wanted.values(), start=10)]
+        replies = self.rpc({"id": 1, "method": "initialize", "params": {}}, *calls, TMUX=FAKE_TMUX, TP_MAIN="claude")
+        catalogue = {s["id"]: s for s in json.loads((ROOT / "config/skill-catalog.json").read_text())["skills"]}
+        for call in calls:
+            ident = call["params"]["arguments"]["id"]
+            with self.subTest(skill=ident):
+                result = replies[call["id"]]["result"]
+                self.assertFalse(result.get("isError"), result["content"][0]["text"])
+                self.assertIn((ROOT / catalogue[ident]["path"]).read_text(), result["content"][0]["text"])
+
     def test_hidden_tools_cannot_be_called(self):
         call = {"id": 1, "method": "tools/call", "params": {"name": "get_skill", "arguments": {"id": "make-qa"}}}
         for env in ({"TMUX": FAKE_TMUX, "TP_MODE": "orchestrator"},

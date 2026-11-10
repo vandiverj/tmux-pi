@@ -3,8 +3,9 @@
 Status: the package contract (schema version 1), its validator, a synthetic fixture, and `bin/tp-product` with `init`,
 `status`, `validate`, `apply`, `build` and `import-feedback` exist, with atomic commits, external-edit detection,
 feedback ingestion, and the offline review page (`lib/product_design/review.py`,
-`templates/product-design/runtime/`). The skills and case export are not built yet; nothing below describes them as
-available.
+`templates/product-design/runtime/`), and the `product-design` and `prepare-cases` workflow skills with their entry
+points, the product review contract and session resume (see "Workflow skills"). Case export (`tp-product cases`,
+`packet`) is not built yet; nothing below describes it as available.
 
 A product design package is the durable record of one product design effort: facts and their sources, scenarios, rules,
 questions, decisions, proposed API and data contracts, delivery slices and the reviews of them. It lives in the
@@ -514,6 +515,45 @@ The script calls `TPReview.registerPrototype({id, seeds, reduce, render, conditi
 The target registry is the one list a note may be anchored to: the views, every design record id and the adapter's
 targets. The page and `import-feedback` use the same rule.
 
+## Workflow skills
+
+Two selective catalogue skills (`config/skill-catalog.json`) guide Main. They are instructions only: they approve
+nothing, open no ticket and publish nothing.
+
+- **`product-design`** (`catalog/skills/product-design/SKILL.md`): frame (with `product-fit`), investigate with bounded
+  workers, shape the package, build and inspect the review page, reconcile feedback, and persist the next action.
+  Observed evidence (a claim with a source) is kept apart from generated hypotheses; AI role-play is never customer
+  validation. Optional reference: `catalog/skills/product-design/references/techniques.md`.
+- **`prepare-cases`** (`catalog/skills/prepare-cases/SKILL.md`): turns a slice whose effective readiness is
+  `ready-for-case-preparation` into small case drafts, each an observable behaviour with its exception path, never one
+  per screen, endpoint or table. Drafts are committed as `cases` records with `tp-product apply`. Reference with a
+  worked changeset: `catalog/skills/prepare-cases/references/case-shape.md`.
+
+Selection: an explicit marker (`/product-design`, `/prepare-cases`) or a narrow phrase ("start a product design
+package", "resume the product design workflow", "do product discovery", "prepare cases for slice", "break the slice
+into cases" and the others listed in the catalogue). Incidental words such as "product", "design" or "case" select
+nothing. At most three skills are selected, explicit markers first.
+
+Entry points:
+
+| Harness | Command | How it resolves |
+| --- | --- | --- |
+| Claude | `/product-design`, `/prepare-cases` | `claude/plugins/tmux-pi/commands/<name>.md` calls the `get_skill` tool with the id; the id must be in `ON_DEMAND_SKILLS` in `claude/mcp/subagents.mjs` |
+| Pi | `/product-design`, `/prepare-cases` | `tp-pi` sets `PI_CODING_AGENT_DIR` to `agent/`, so `agent/prompts/<name>.md` is a prompt template; the catalogue extension first selects the skill from the raw `/name …` input |
+| Worker packet | (selected by the task text) | `tp-skills --mode packet` inlines the selected SKILL.md |
+
+**Product review.** `templates/product-design/review-contract.md` is a contract for `tp-review --contract FILE` (or
+`tp-agent review ID --contract FILE`). It adds the product criteria (value assumptions, journeys, rules, exceptions,
+testability, scope, evidence). It asks the reviewer to compare claims with their sources and to exercise the built
+prototype, and it keeps product findings and prototype defects apart, each with its own dispositions. It changes what
+is judged, not who judges: the reviewer and its provider independence come from the usual review plan.
+
+**Resume.** The manifest (`activity`, `next_action`, set with a `set-manifest` changeset) is the durable record. At
+each pause Main also records `tp-agent objective "product-design package=<absolute DIR> revision=<N> slice=<id or
+none> next: <text>"`. A new main in the same tmux session sees it in the session index. It then runs
+`tp-product status DIR`, and the status wins where the two disagree. A different tmux session has its own state and
+no objective: it resumes from the package path alone.
+
 ## Known limits
 
 The tools run on packages and saved states they wrote themselves, changed through the documented commands
@@ -535,3 +575,5 @@ and what the tool does. They are not fixed round by round.
   uses the same measured packer but was not attacked at those byte boundaries.
 - **The page's own import** refuses a number whose JavaScript round trip would change it (an integer beyond 2^53,
   `-0`, an exponent, a trailing zero), visibly; recovery keeps such numbers as their exact text.
+- **A package path containing spaces** in the resume objective: the `package=` field ends at the first space. Give the
+  path to `tp-product status` by hand; the manifest is the record either way.

@@ -65,6 +65,24 @@
       "authority": "instructions only; drafts files, no push, MR or post",
       "markers": ["/case-handoff"],
       "phrases": ["draft the mr description", "draft the youtrack handoff", "case handoff drafts", "write the handoff comments"]
+    },
+    {
+      "id": "product-design",
+      "description": "Explicit product design workflow: frame, investigate, shape, build and review a tp-product package; persist the next action.",
+      "path": "catalog/skills/product-design/SKILL.md",
+      "status": "pilot; Main workflow guidance",
+      "authority": "instructions only; no approval, ticket or publication",
+      "markers": ["/product-design"],
+      "phrases": ["start a product design package", "create a product design package", "resume the product design package", "continue the product design package", "run the product design workflow", "start the product design workflow", "resume the product design workflow", "continue the product design workflow", "do product discovery", "run product discovery"]
+    },
+    {
+      "id": "prepare-cases",
+      "description": "Turn an accepted product design slice into small observable-behaviour case drafts with provenance; drafts only.",
+      "path": "catalog/skills/prepare-cases/SKILL.md",
+      "status": "pilot; drafting guidance",
+      "authority": "instructions only; drafts, no ticket or publication",
+      "markers": ["/prepare-cases"],
+      "phrases": ["prepare cases for slice", "prepare the cases for slice", "prepare implementation cases", "draft implementation cases", "break the slice into cases", "split the slice into cases"]
     }
   ]
 }

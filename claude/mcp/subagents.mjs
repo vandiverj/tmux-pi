@@ -14,7 +14,7 @@ const bin = (n) => join(ROOT, "bin", n);
 // are only for the separate TP_MAIN=claude prompt path.
 const active = !process.env.TP_TASK_DIR && process.env.TP_MODE !== "orchestrator" && !!process.env.TMUX;
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const ON_DEMAND_SKILLS = ["make-qa", "counterpoint", "product-fit", "threat-model"];
+const ON_DEMAND_SKILLS = ["make-qa", "counterpoint", "product-fit", "threat-model", "product-design", "prepare-cases"];
 const lastInput = new Map();
 
 const run = (cmd, args, input) =>
@@ -204,7 +204,7 @@ const TOOLS = {
     },
   },
   get_skill: {
-    description: "Load the full instructions of one on-demand skill for an explicit user command (make-qa, counterpoint, product-fit, threat-model). Guidance only; grants no tool, edit or external-write authority.",
+    description: "Load the full instructions of one on-demand skill for an explicit user command (make-qa, counterpoint, product-fit, threat-model, product-design, prepare-cases). Guidance only; grants no tool, edit or external-write authority.",
     schema: { type: "object", required: ["id"], properties: { id: { type: "string", enum: ON_DEMAND_SKILLS } } },
     async run(p) {
       if (!ON_DEMAND_SKILLS.includes(p.id)) throw new Error(`unknown skill: ${p.id}`);

@@ -25,7 +25,7 @@ PLAN = {"review": "required", "policy": "required",
 
 class TpReviewTests(unittest.TestCase):
     TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "command_wrappers.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py", "trust_dialog.py")   # the last three: the files contract.py's lifecycle and bin/tp-agent read
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py", "trust_dialog.py", "pane_send.py")   # pane_send: bin/tp-agent imports it at load; owner_confirm..trust_dialog: the files contract.py's lifecycle and bin/tp-agent read
     # tp-agent imports these inside the commands that route, escalate and pick context; tp-review's tests only run its pause classifier.
     NOT_COPIED_ON_PURPOSE = (("model_router", "bin/tp-agent"), ("router_catalog", "bin/tp-agent"), ("context_broker", "bin/tp-agent"))
 
@@ -1241,6 +1241,24 @@ echo review-1
         self.assertIn("1. must handle X\n2. must handle Y", early)
         self.assertNotIn("Judge hard.", early)
         self.assertIn("Judge hard.", self.copy("main-contract.md").read_text())  # the whole contract is still at (f)
+
+    def test_the_shipped_product_review_contract_is_accepted_and_leaves_the_reviewer_choice_alone(self):
+        shipped = ROOT / "templates/product-design/review-contract.md"
+        self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})
+        r = self.review("--contract", str(shipped))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3, 4, 5]})
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertIn("Reviewer contract (supplied by Main)", body)
+        self.assertIn("AI role-play is never customer validation", body)
+        self.assertIn("Judge the work against that contract together with the task", self.task_text())
+        # the contract changes what is judged, not who judges: same route request, same reviewer, same independence
+        route = (self.plan.parent / "route.args").read_text()
+        self.assertIn(f"--review-plan {self.task}", route)
+        self.assertNotIn("--same-provider", route)
+        self.assertIn("--worker claude --model claude-sonnet-5-5 --thinking high", self.spawn_args())
+        self.assertIn("Review policy: required (different_provider)", self.spawn_args())
+        self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviewer"]["independence"], "different_provider")
 
     def test_a_task_record_without_request_md_gives_the_request_first_and_keeps_task_md_last(self):
         # a record from before request.md existed: task.md is the raw request (or a canonical record whose fenced summary is it)

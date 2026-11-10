@@ -139,8 +139,10 @@ class RedactHookTests(unittest.TestCase):
         # A plain shell read: main asks, naming mcp__tmux-pi-safe__safe_read; a worker is refused with the same name (sg1).
         routed = {"cat ~/.aws/credentials": "~/.aws/credentials", "cat notes.txt": "notes.txt",
                   "cat apps/web/.env.local; exit 3": "apps/web/.env.local"}
+        # sg1 round 2: a read batched with other commands is refused all the same; paths are named from the event's cwd.
+        routed.update({"cat notes.txt; ls -la": "notes.txt", "ls src && cat apps/web/.env.local; exit 3": "apps/web/.env.local"})
         for command, path in routed.items():
-            named = 'mcp__tmux-pi-safe__safe_read with path "{}"'.format(path)
+            named = 'mcp__tmux-pi-safe__safe_read with path "{}"'.format(path if path.startswith("~") else "{}/{}".format(self.proj, path))
             with self.subTest(command=command, worker=False):
                 out = self.bash(command, worker=False)
                 self.assertEqual(out["permissionDecision"], "ask")
@@ -156,7 +158,7 @@ class RedactHookTests(unittest.TestCase):
         for worker in (True, False):
             out = self.bash("cat .env.staging.local", worker=worker)
             self.assertEqual(out["permissionDecision"], "deny")
-            self.assertIn('mcp__tmux-pi-safe__safe_read with path ".env.staging.local"', out["permissionDecisionReason"])
+            self.assertIn('mcp__tmux-pi-safe__safe_read with path "{}/.env.staging.local"'.format(self.proj), out["permissionDecisionReason"])
             self.assertNotIn("permissionDecision", self.bash("grep -rn useAuth src", worker=worker))
 
     def test_placeholders_are_never_written_or_run(self):

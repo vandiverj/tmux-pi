@@ -93,14 +93,14 @@ def main():
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
         if result["sensitive"]:
             # A shell search or read names the safe tool that replaces it; in a worker task it is refused, not asked.
-            route = safe_route(event.get("tool_name", ""), event.get("tool_input", {}), "claude")
+            route = safe_route(event.get("tool_name", ""), event.get("tool_input", {}), "claude", cwd)
             refuse = bool(route) and worker_task()
             save_request({**result, "reason": f"{result['reason']}. {route}" if route else result["reason"]},
                          "refused" if refuse else "pending", event.get("tool_use_id"), event.get("agent_id"))
             print(json.dumps(response_for(result, route, refuse)))
     else:
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
-        route = args.route and result.get("sensitive") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}), args.route)
+        route = args.route and result.get("sensitive") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}), args.route, cwd)
         print(json.dumps({**result, "safe": route} if route else result))
 
 

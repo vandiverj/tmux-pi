@@ -1666,7 +1666,7 @@ class CommandLineTests(World):
     @staticmethod
     def main_hook_answer(event):
         """What the hook answers main (no TP_TASK_DIR) without lifts: the classifier's ask, naming the safe tool (sg1)."""
-        route = sr.safe_route(event["tool_name"], event["tool_input"], "claude")
+        route = sr.safe_route(event["tool_name"], event["tool_input"], "claude", event.get("cwd"))
         return sr.response_for(sr.classify(event["tool_name"], event["tool_input"], event.get("cwd")), route)
 
     def test_hook_mode_lifts_only_with_the_flag(self):

@@ -188,11 +188,16 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
   const request = () => JSON.parse(fs.readFileSync(path.join(taskDir, 'permission-request.json'), 'utf8'));
   const prompts = [];
   const ui = { cwd: repo, hasUI: true, ui: { confirm: async (title) => { prompts.push(title); return false; } } };
+  // Paths are named from the call's cwd, as the shell resolves them; a search batched with another command, or one no single
+  // call names, is refused all the same (sg1 round 2).
+  const at = (p) => JSON.stringify(path.join(repo, p)).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   const rows = [
-    ['grep -rn TOKEN config/', /safe_grep with pattern "TOKEN" and path "config\/"/],
-    ['cat .env', /safe_read with path "\.env"/],
-    ['sed -n 1,5p config/local.json', /safe_read with path "config\/local\.json"/],
-    ["grep -n 'a\\|b' .env | head -5", /safe_grep with pattern "a\|b" and path "\.env"/],
+    ['grep -rn TOKEN config/', new RegExp(`safe_grep with pattern "TOKEN" and path ${at('config')}`)],
+    ['cat .env', new RegExp(`safe_read with path ${at('.env')}`)],
+    ['sed -n 1,5p config/local.json', new RegExp(`safe_read with path ${at('config/local.json')}`)],
+    ["grep -n 'a\\|b' .env | head -5", new RegExp(`safe_grep with pattern "a\\|b" and path ${at('.env')}`)],
+    ['grep -rn TOKEN config/; ls', new RegExp(`safe_grep with pattern "TOKEN" and path ${at('config')}.* Run the other commands`)],
+    ['grep -r -f pats config/', /Search with safe_grep and read with safe_read/],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;

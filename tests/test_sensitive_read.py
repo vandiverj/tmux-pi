@@ -962,9 +962,16 @@ class SensitiveReadTableTests(unittest.TestCase):
                                   check=True, timeout=300)  # hang guard, not a speed limit
             out = json.loads(done.stdout)["hookSpecificOutput"] if done.stdout.strip() else None
             return out and (out["permissionDecision"], out["permissionDecisionReason"])
-        rows = [("grep -rn TOKEN config/", 'mcp__tmux-pi-safe__safe_grep with pattern "TOKEN" and path "config/"'),
-                (f"cat {ENV}", f'mcp__tmux-pi-safe__safe_read with path "{ENV}"'),
-                ("sed -n 1,9p config/local.json | head -3", 'mcp__tmux-pi-safe__safe_read with path "config/local.json"')]
+        # Paths are named from the event's cwd, as the shell resolves them (sg1 round 2). A search batched with another
+        # command, or one no single call names, is refused too, naming what it can and the safe tools for the rest.
+        grep_config = f'mcp__tmux-pi-safe__safe_grep with pattern "TOKEN" and path "{CWD}/config"'
+        generic = "Search with mcp__tmux-pi-safe__safe_grep and read with mcp__tmux-pi-safe__safe_read"
+        rows = [("grep -rn TOKEN config/", grep_config),
+                (f"cat {ENV}", f'mcp__tmux-pi-safe__safe_read with path "{CWD}/{ENV}"'),
+                ("sed -n 1,9p config/local.json | head -3", f'mcp__tmux-pi-safe__safe_read with path "{CWD}/config/local.json"'),
+                ("grep -rn TOKEN config/; ls tests", grep_config),
+                ("grep -n VERSION README.md && grep -rn TOKEN config/", grep_config),
+                ("grep -r -f pats config/", generic)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -982,54 +989,97 @@ class SensitiveReadTableTests(unittest.TestCase):
                     self.assertIn(named, reason)
             # Not sensitive: nothing in either; sensitive but no safe replacement: still an ask in a worker, recorded pending.
             self.assertIsNone(run("grep -n x README.md", task))
-            decision, reason = run(f"python3 -c 'open(\"{ENV}\").read()'", task)
-            self.assertEqual(decision, "ask")
-            self.assertNotIn("safe_grep with", reason)
-            self.assertEqual(json.loads(record.read_text())["status"], "pending")
+            for command in (f"python3 -c 'open(\"{ENV}\").read()'", f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md"):
+                with self.subTest(command=command):  # the ask is the program's, not the harmless search's
+                    decision, reason = run(command, task)
+                    self.assertEqual(decision, "ask")
+                    self.assertNotIn("safe_grep", reason)
+                    self.assertEqual(json.loads(record.read_text())["status"], "pending")
 
     def test_safe_route_table(self):
-        """The forms workers send (evidence/transcript_forms.log), each with the safe call that replaces it, or None
-        when the command is more than a search or read and so keeps its ask."""
-        grep = lambda pattern, *paths, i=False: (f"Use safe_grep with pattern {json.dumps(pattern)}"
-                                                 + (" and path " + ", ".join(json.dumps(p) for p in paths) if paths else "")
-                                                 + (" (one call per path)" if len(paths) > 1 else "")
-                                                 + (" and ignore_case true" if i else "")
-                                                 + " instead of a shell search; read a file with safe_read.")
-        read = lambda *files: ("Use safe_read with path " + ", ".join(json.dumps(f) for f in files)
-                               + (" (one call per file)" if len(files) > 1 else "")
-                               + " instead of a shell read (offset and limit select lines); search with safe_grep.")
+        """The forms workers send (evidence/transcript_forms.log), each with the safe calls that search or read the files the
+        shell would (sg1 round 2: every search and read in the command, the target as the shell resolves it), the safe tools
+        by name for one it cannot name, or None when the command holds no search or read, or holds other commands and no
+        search or read in it is sensitive on its own (the ask is theirs and stands)."""
+        grep = lambda pattern, path=None, i=False, glob=None: (
+            f"safe_grep with pattern {json.dumps(pattern)}" + (f" and path {json.dumps(path)}" if path else "")
+            + (f" and glob {json.dumps(glob)}" if glob else "") + (" and ignore_case true" if i else ""))
+        read = lambda path: f"safe_read with path {json.dumps(path)}"
+        generic = "Search with safe_grep and read with safe_read instead of a shell search or read."
+        separately = " Run the other commands in a call of their own, without the search or read."
+
+        def use(*calls, unnamed=False, other=False):
+            text = ("Use " + "; ".join(calls) + (" (one call each)" if len(calls) > 1 else "") + " instead of the shell."
+                    + (" For the searches and reads it does not name, search with safe_grep and read with safe_read."
+                       if unnamed else " Search with safe_grep, read with safe_read.")) if calls else generic
+            return text + (separately if other else "")
+        sensitive_dir = "config/"  # a directory the classifier asks about whatever it holds
         rows = [
-            ("grep -rn foo agent/", grep("foo", "agent/")),
-            ("grep -rn foo agent/ || echo exit-code: nonzero", grep("foo", "agent/")),
-            ("grep -n foo lib/x.py | head -20", grep("foo", "lib/x.py")),
-            ("grep -C3 -i foo -r . | head -20", grep("foo", ".", i=True)),
-            ("grep -rni foo agent", grep("foo", "agent", i=True)),
-            ("grep -A3 foo agent/x", grep("foo", "agent/x")),
-            ("grep -A 3 foo x", grep("foo", "x")),
-            ("grep -efoo x", grep("foo", "x")),
-            ("grep -c foo x", grep("foo", "x")),
-            ("grep -n x f | sort | uniq -c", grep("x", "f")),
-            ("grep -n 'a\\|b(c)' f", grep("a|b\\(c\\)", "f")),
-            ("grep -F 'a.b' f", grep("a\\.b", "f")),
-            ("grep -rnE 'a|b' agent", grep("a|b", "agent")),
-            ("rg -e a -e b src", grep("a|b", "src")),
-            ("cd /w; rg -n 'a b' lib tests", grep("a b", "/w/lib", "/w/tests")),
-            ("cd sub && grep -rn x", grep("x", "sub")),
-            ("git grep -n -e x -- bin lib", grep("x", "bin", "lib")),
-            ("git grep -n 'x\\+' bin/tp-spawn", grep("x+", "bin/tp-spawn")),
-            ("cat a b | grep x", grep("x", "a", "b")),
-            ("sed -n 1,20p config/router.json", read("config/router.json")),
-            ("cat -n lib/x.py", read("lib/x.py")),
-            ("head -n 5 x.py", read("x.py")),
-            ("tail -20 log", read("log")),
-            ("cat a b", read("a", "b")),
-            ("python3 -c 'print(1)'", None), ("grep -f pats .", None), ("grep -rn $(echo x) .", None),
-            ("find . -name x -exec grep y {} +", None), ("git show HEAD:x", None), ("cat x > y; rm y", None),
-            ("sed -n -i 's/a/b/p' f", None), ("sed -ni 1p f", None), ("sed -n --in-place 1p f", None),
+            ("grep -rn foo agent/", None, use(grep("foo", "agent"))),
+            ("grep -rn foo agent/ || echo exit-code: nonzero", None, use(grep("foo", "agent"))),
+            ("grep -n foo lib/x.py | head -20", None, use(grep("foo", "lib/x.py"))),
+            ("grep -C3 -i foo -r . | head -20", None, use(grep("foo", ".", i=True))),
+            ("grep -C3 TOKEN config/local.json", None, use(grep("TOKEN", "config/local.json"))),
+            ("grep -C 3 -rn TOKEN config/", "/w", use(grep("TOKEN", "/w/config"))),
+            ("grep -rni foo agent", None, use(grep("foo", "agent", i=True))),
+            ("grep -A3 foo agent/x", None, use(grep("foo", "agent/x"))),
+            ("grep -A 3 foo x", None, use(grep("foo", "x"))),
+            ("grep -efoo x", None, use(grep("foo", "x"))),
+            ("grep -c foo x", None, use(grep("foo", "x"))),
+            ("grep -n x f | sort | uniq -c", None, use(grep("x", "f"))),
+            ("grep -n 'a\\|b(c)' f", None, use(grep("a|b\\(c\\)", "f"))),
+            ("grep -F 'a.b' f", None, use(grep("a\\.b", "f"))),
+            ("grep -rnE 'a|b' agent", None, use(grep("a|b", "agent"))),
+            ("rg -e a -e b src", None, use(grep("a|b", "src"))),
+            ("cd /w; rg -n 'a b' lib tests", None, use(grep("a b", "/w/lib"), grep("a b", "/w/tests"))),
+            ("cd sub && grep -rn x", None, use(grep("x", "sub"))),
+            ("cd sub && grep -rn x", "/w", use(grep("x", "/w/sub"))),
+            ("(cd sub && grep -n x a); grep -n y b", "/w", use(grep("x", "/w/sub/a"), grep("y", "/w/b"))),
+            ("cd $D && grep -n x a", None, generic),
+            ("git grep -n -e x -- bin lib", None, use(grep("x", "bin"), grep("x", "lib"))),
+            ("git grep -n 'x\\+' bin/tp-spawn", None, use(grep("x+", "bin/tp-spawn"))),
+            ("cat a b | grep x", None, use(grep("x", "a"), grep("x", "b"))),
+            ("sed -n 1,20p config/router.json", None, use(read("config/router.json"))),
+            ("cat -n lib/x.py", None, use(read("lib/x.py"))),
+            ("cat -n lib/x.py", "/w", use(read("/w/lib/x.py"))),
+            ("head -n 5 x.py", None, use(read("x.py"))),
+            ("tail -20 log", None, use(read("log"))),
+            ("cat a b", None, use(read("a"), read("b"))),
+            ("cat ~/notes/a", "/w", use(read("~/notes/a"))),
+            # F1: a search or read that cannot be named, or batched with other commands, is still the search the ask is about.
+            ("grep -f pats .", None, generic), ("grep -rn $(echo x) .", None, generic),
+            ("git grep -f pats -- " + sensitive_dir, None, generic), ("grep -rn \"$PAT\" lib", None, generic),
+            ("git --git-dir=/r/.git grep x", None, generic), ("git grep TOKEN HEAD -- " + sensitive_dir, None, generic),
+            ("git ls-files | xargs grep -n TOKEN", None, use(unnamed=True, other=True)),
+            ("grep -rn TOKEN " + sensitive_dir + "; ls tests", "/w", use(grep("TOKEN", "/w/config"), other=True)),
+            ("grep -rn TOKEN " + sensitive_dir + " && git status --short", "/w", use(grep("TOKEN", "/w/config"), other=True)),
+            ("ls; grep -rn TOKEN " + sensitive_dir + " | head -5 || echo none", None, use(grep("TOKEN", "config"), other=True)),
+            ("grep -r -f pats " + sensitive_dir + "; ls", None, use(unnamed=True, other=True)),
+            ("grep -n x README.md; grep -f p " + sensitive_dir, None, use(grep("x", "README.md"), unnamed=True)),
+            # F2: the target is the one the shell searches.
+            ("git -C /other/repo grep -n TOKEN -- config/local.json", "/w", use(grep("TOKEN", "/other/repo/config/local.json"))),
+            ("git -C sub -C deeper grep -n TOKEN", "/w", use(grep("TOKEN", "/w/sub/deeper"))),
+            ("git -C sub grep -n TOKEN -- 'conf*'", "/w", generic),
+            ("grep -n TOKEN < config/local.json", "/w", use(grep("TOKEN", "/w/config/local.json"))),
+            ("cat config/local.json | grep TOKEN", "/w", use(grep("TOKEN", "/w/config/local.json"))),
+            ("grep -rn TOKEN config/*.json", "/w", use(grep("TOKEN", "/w/config", glob="*.json"))),
+            ("grep -n TOKEN *.env", None, use(grep("TOKEN", ".", glob="*.env"))),
+            ("grep -n TOKEN conf/{a,b}.json", None, use(grep("TOKEN", "conf/a.json"), grep("TOKEN", "conf/b.json"))),
+            ("grep -rn TOKEN */local.json", None, generic), ("cat config/*.json", None, generic),
+            # F3: every search is named, the sensitive one whichever order it comes in.
+            ("grep -n VERSION README.md; grep -rn TOKEN " + sensitive_dir, "/w",
+             use(grep("VERSION", "/w/README.md"), grep("TOKEN", "/w/config"))),
+            ("grep -rn TOKEN " + sensitive_dir + "; grep -n VERSION README.md", "/w",
+             use(grep("TOKEN", "/w/config"), grep("VERSION", "/w/README.md"))),
+            # A filter of another command's output or of a here-string searches no file.
+            ("git log | grep x", None, None), ("grep x <<< text", None, None),
+            ("python3 -c 'print(1)'", None, None), ("python3 -c 'print(1)'; grep -n x README.md", None, None),
+            ("find . -name x -exec grep y {} +", None, None), ("git show HEAD:x", None, None), ("cat x > y; rm y", None, None),
+            ("sed -n -i 's/a/b/p' f", None, None), ("sed -ni 1p f", None, None), ("sed -n --in-place 1p f", None, None),
         ]
-        for command, expected in rows:
-            with self.subTest(command=command):
-                self.assertEqual(sensitive_read.safe_route("bash", {"command": command}, "pi"), expected)
+        for command, cwd, expected in rows:
+            with self.subTest(command=command, cwd=cwd):
+                self.assertEqual(sensitive_read.safe_route("bash", {"command": command}, "pi", cwd), expected)
         self.assertIsNone(sensitive_read.safe_route("Read", {"file_path": "x"}, "claude"))
         # It never raises: a crashed Claude hook answers nothing, and the call would run without its ask.
         with mock.patch.object(sensitive_read, "_route_parts", side_effect=RuntimeError("boom")):
@@ -1061,7 +1111,8 @@ class SensitiveReadTableTests(unittest.TestCase):
                                   text=True, capture_output=True, cwd=CWD, check=True, timeout=300)
             return json.loads(done.stdout)
         self.assertEqual(run("grep -rn TOKEN config/", "--route", "pi")["safe"],
-                         'Use safe_grep with pattern "TOKEN" and path "config/" instead of a shell search; read a file with safe_read.')
+                         f'Use safe_grep with pattern "TOKEN" and path "{CWD}/config" instead of the shell. '
+                         'Search with safe_grep, read with safe_read.')
         self.assertIn("mcp__tmux-pi-safe__safe_grep", run("grep -rn TOKEN config/", "--route", "claude")["safe"])
         self.assertNotIn("safe", run("grep -rn TOKEN config/"))
         self.assertEqual(run("grep -n x README.md", "--route", "pi"), {"sensitive": False})

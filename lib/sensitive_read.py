@@ -34,6 +34,7 @@ from pathlib import Path
 import posixpath
 import re
 import select
+import shlex
 import signal
 import stat
 import subprocess
@@ -2383,13 +2384,18 @@ def hook_response(event, cwd=None, trust=None):
 # agent/extensions/safe.ts. Both redact what they return and never ask.
 SAFE_TOOL_NAMES = {"claude": ("mcp__tmux-pi-safe__safe_grep", "mcp__tmux-pi-safe__safe_read"),
                    "pi": ("safe_grep", "safe_read")}
-# Commands a shell search or read is made of besides the search and the read: moving, printing, and the filters its output
-# is piped through. A command with anything else (an interpreter, a copy, find -exec, git show) is not one the safe tools
-# replace, so it keeps its ask everywhere.
+# A shell search is a grep-family command or `git grep` (also behind xargs); a shell read is one of _ROUTE_READERS or
+# `sed -n`. Moving between directories, printing and the filters output is piped through are neither, and are no other
+# command either. Anything else (an interpreter, `ls`, base64, find -exec, git show) is another command: the safe tools do
+# not replace it, and a command made only of those keeps its ask (_route_parts).
 _ROUTE_READERS = {"cat", "tac", "nl", "head", "tail", "less", "more", "bat", "batcat"}
 _ROUTE_FILTERS = {"sort", "uniq", "cut", "wc", "tr", "column", "fold", "fmt"}
-_ROUTE_QUIET = _QUIET | {":", "exit", "sleep"}
+_ROUTE_QUIET = (_QUIET - {"cd", "pushd", "popd"}) | {":", "exit", "sleep"}
 _ROUTE_READ_ARGS = ({"-n", "-c", "--lines", "--bytes"}, "nc")
+# A word the shell still expands ($VAR, ${..}, $(..), `..`): what it stands for is not known here, so nothing is named from it.
+_UNKNOWN_WORD = re.compile(r"\$[\w{(@*#?!$-]|`")
+# git options before `grep` that change nothing about what it searches (-C and -c are read on their own).
+_GIT_PLAIN = {"--no-pager", "-P", "--paginate"}
 
 
 _REGEX_SPECIAL = set("\\.^$|?*+()[]{}")
@@ -2417,7 +2423,8 @@ def _as_safe_regex(pattern, syntax):
 
 
 def _route_grep(prog, args):
-    """(pattern, paths, ignore_case) of one grep-family or `git grep` command, or None when there is no one pattern.
+    """(pattern, paths, ignore_case, recursive) of one grep-family or `git grep` command, or None when there is no one
+    pattern to name (patterns from a file, a pattern the shell still expands) or, for git grep, when it searches a revision.
 
     Short options are read as a cluster (`-rni`, `-A3`, `-efoo`): a letter that takes a value takes the rest of the word,
     or the next word. Several patterns (`-e a -e b`) are named as one alternation."""
@@ -2430,17 +2437,19 @@ def _route_grep(prog, args):
         modes = {"F": "fixed"}
     longs = {"--extended-regexp": "extended", "--perl-regexp": "extended", "--fixed-strings": "fixed",
              "--basic-regexp": "basic"}
-    patterns, operands, ignore, i, after = [], [], False, 0, False
+    patterns, operands, ignore, i, after, recursive, dash = [], [], False, 0, False, False, None
     while i < len(args):
         arg = args[i]
         i += 1
         if after or arg == "-" or not arg.startswith("-"):
             operands.append(arg)
         elif arg == "--":
-            after = True
+            after, dash = True, len(operands)
         elif arg.startswith("--"):
             name, equals, value = arg.partition("=")
             ignore = ignore or name == "--ignore-case"
+            recursive = recursive or name in ("--recursive", "--dereference-recursive") or (
+                name == "--directories" and (value if equals else args[i] if i < len(args) else "") == "recurse")
             syntax = longs.get(name, syntax) if not (prog in _ALWAYS_RECURSIVE and name != "--fixed-strings") else syntax
             if name in pattern_opts:
                 if name == "--file":
@@ -2459,118 +2468,235 @@ def _route_grep(prog, args):
                     i += 0 if rest else 1
                     break
                 if letter in value_letters:
+                    recursive = recursive or (letter == "d" and not git and prog not in _ALWAYS_RECURSIVE and
+                                              (rest or (args[i] if i < len(args) else "")) == "recurse")
                     i += 0 if rest else 1
                     break
                 ignore = ignore or letter == "i"
+                recursive = recursive or (letter in "rR" and not git and prog not in _ALWAYS_RECURSIVE)
                 syntax = modes.get(letter, syntax)
     if not patterns:
         if not operands:
             return None
         patterns, operands = [operands[0]], operands[1:]
+        dash = None if dash is None else dash - 1
+    if git and dash:
+        return None  # `git grep x REV -- path`: the words before `--` are revisions, a tree the safe tools cannot search
+    if any(_UNKNOWN_WORD.search(p) for p in patterns):
+        return None
     if any("\n" in p for p in patterns):
         patterns = [part for p in patterns for part in p.split("\n")]  # grep reads each line as its own pattern
     pattern = "|".join(_as_safe_regex(p, syntax) for p in patterns)
-    return pattern, operands, ignore
+    return pattern, operands, ignore, recursive or git or prog in _ALWAYS_RECURSIVE
 
 
-def _route_parts(command):
-    """[(kind, text)] for each search ("grep") or read ("read") in a shell command made only of searches, reads and the
-    commands around them (_ROUTE_*); None when the command holds anything else or cannot be read for certain."""
-    try:
-        items = _commands(command)
-    except Exception:
+def _moved(base, target):
+    """Where `target` is from directory `base` (relative to the call's directory, "" for it), or None when unknown."""
+    if base is None or target is None or target == "-" or _UNKNOWN_WORD.search(target):
         return None
-    parts, base = [], ""
-    def placed(paths):  # a relative path after `cd DIR` is named from DIR, as the shell reads it
-        return [p if not base or p.startswith(("/", "~")) else posixpath.normpath(posixpath.join(base, p)) for p in paths]
+    if target == "~" or target.startswith(("/", "~/")):
+        return target
+    if target.startswith("~"):
+        return None  # ~user: whose home is not known here
+    return posixpath.join(base, target) if base else target
 
-    def roots(found):  # a search with no path searches what a read before it sends (`cat a | grep x`), or where it runs
-        fed = parts[-1][1] if parts and parts[-1][0] == "read" else []
-        return found[0], placed(found[1]) or fed or ([base] if base else []), found[2]
+
+def _place(path, base, cwd):
+    """`path` as the shell opens it from `base`, named so both safe tools open the same file: absolute from the call's
+    directory when it is known (the safe tools resolve a relative path from their own directory, which a worker's shell
+    may have left), as given otherwise. None when it is not known."""
+    where = _moved(base, path)
+    if where is None or where.startswith("~"):
+        return where  # the safe tools expand `~/` as the shell does
+    if not where.startswith("/") and cwd:
+        where = posixpath.join(cwd, where)
+    return posixpath.normpath(where)
+
+
+def _search_targets(words, base, cwd, globs=True):
+    """[(path, glob)] for the file operands of a search, after the shell's brace and glob expansion: a glob in the last
+    part becomes safe_grep's `glob` under its directory; one anywhere else, or (for a read, `globs` false) at all, cannot
+    be named, nor can a word the shell still expands. None when any operand cannot be named."""
+    out = []
+    for word in words:
+        for choice in _brace_expand(word):
+            if choice == "-":
+                return None  # standard input among the files
+            head, tail = posixpath.split(choice)
+            if _GLOB.search(head) or (_GLOB.search(tail) and (not globs or "{" in tail)):
+                return None
+            where = _place((head or ".") if _GLOB.search(tail) else choice, base, cwd)
+            if where is None:
+                return None
+            out.append((where, tail if _GLOB.search(tail) else None))
+    return out
+
+
+def _route_parts(command, cwd=None):
+    """The shell searches and reads in a command, and whether it holds any other command, or None when it holds no search
+    or read (or cannot be read).
+
+    Each search or read is {"calls": [...], "text": ...}: "calls" are the safe calls that do what it does, ("grep",
+    pattern, path, glob, ignore_case) or ("read", path); None when it cannot be named faithfully (patterns from a file,
+    a revision, a target the shell computes, xargs). "text" is the command that runs it on its own (the directory changes
+    before it, then it), or None when that cannot be written."""
+    items = _commands(command)
+    parts, other, base, stack, moves, scopes, before = [], False, "", [], [], [], None
     for item in items:
         if item in ("(", ")"):
+            if item == "(":
+                scopes.append((base, list(stack), list(moves)))
+            elif scopes:
+                base, stack, moves = scopes.pop()
+            before = None
             continue
-        if item["subs"] or item["heredocs"]:
-            return None  # what runs cannot be read statically
         words = item["words"]
         prog, args = _program(words)
+        fed, before = (before if item["piped"] else None), None
         if prog is None:
-            if words:
-                return None
+            other = other or bool(words or item["inputs"] or item["outputs"])
             continue
-        if prog == "git":
-            rest = list(args)
+        dynamic = bool(item["subs"] or item["heredocs"])
+        text = None if dynamic else "; ".join(moves + [shlex.join(words) + "".join(
+            " < " + shlex.quote(f) for f in item["inputs"])])
+        if prog == "xargs":
+            found = command_wrappers.unwrap("xargs", args)
+            inner = _program(found[1])[0] if isinstance(found, tuple) and found[0] == "words" else None
+            if inner in _GREPS or inner in _ROUTE_READERS or inner == "git":
+                parts.append({"calls": None, "text": None})  # it searches or reads files its input names
+            else:
+                other = True
+        elif prog == "git":
+            rest, where, plain = list(args), base, True
             while rest and rest[0].startswith("-"):
                 option = rest.pop(0)
-                if option in ("-C", "-c") and rest:
+                if option == "-C" and rest:
+                    where = _moved(where, rest.pop(0))
+                elif option == "-c" and rest:
                     rest.pop(0)
+                elif option not in _GIT_PLAIN:
+                    plain = False  # --git-dir, --work-tree, ...: what it searches is not read here
             if not rest or rest[0] != "grep":
-                return None
-            found = _route_grep("git", rest[1:])
-            if found is None:
-                return None
-            parts.append(("grep", roots(found)))
+                other = True
+                continue
+            found = _route_grep("git", rest[1:]) if plain and not dynamic else None
+            targets = None
+            if found and not any(_GLOB.search(p) or p.startswith(":") for p in found[1]):
+                # pathspecs are relative to where git runs; a glob or magic pathspec is git's own matching, not the shell's
+                targets = _search_targets(found[1], where, cwd, globs=False) if found[1] else (
+                    None if where is None else [(_place(".", where, cwd), None)])
+            parts.append({"calls": [("grep", found[0], path, None, found[2]) for path, _ in targets] if targets else None,
+                          "text": text})
         elif prog in _GREPS:
-            found = _route_grep(prog, args)
+            found = None if dynamic else _route_grep(prog, args)
             if found is None:
-                return None
-            parts.append(("grep", roots(found)))
+                parts.append({"calls": None, "text": text})
+                continue
+            pattern, operands, ignore, recursive = found
+            if operands:
+                targets = _search_targets(operands, base, cwd)
+            elif recursive and prog not in _ALWAYS_RECURSIVE:
+                targets = [(_place(".", base, cwd), None)]  # grep -r with no file searches its directory, whatever stdin is
+            elif item["inputs"]:
+                targets = _search_targets(item["inputs"][-1:], base, cwd, globs=False)  # the last `<` is what it reads
+            elif item["piped"]:
+                if not fed:
+                    continue  # it filters another command's output: no file is searched
+                targets = None if fed["calls"] is None else [(call[1], None) for call in fed["calls"]]
+                fed["calls"] = None if targets is None else []  # the file it reads is searched here, not read
+            elif item["strings"] or prog not in _ALWAYS_RECURSIVE:
+                continue  # it searches a here-string or the terminal
+            else:
+                targets = [(_place(".", base, cwd), None)]  # rg, ag, ... with no path search their directory
+            if targets and any(path is None for path, _ in targets):
+                targets = None
+            parts.append({"calls": [("grep", pattern, path, glob, ignore) for path, glob in targets] if targets is not None
+                          else None, "text": text})
         elif prog in _ROUTE_READERS or (prog in ("sed", "gsed") and any(a == "-n" or a.startswith("-n") for a in args)
                                         and not any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--")
                                                                                    and "i" in a) for a in args)):
             # (`sed -n -i` / `sed -ni` writes the file: not a read)
             if prog in ("sed", "gsed"):
-                _, before, after, _, has_script = _split_args(args, *_SCRIPT_ARGS)
-                files = (before if has_script else before[1:]) + (after or [])
+                _, before_dash, after_dash, _, has_script = _split_args(args, *_SCRIPT_ARGS)
+                files = (before_dash if has_script else before_dash[1:]) + (after_dash or [])
             else:
                 # head and tail take a count after -n / -c; cat -n, nl and the rest take no value
-                _, before, after, _, _ = _split_args(args, *(_ROUTE_READ_ARGS if prog in ("head", "tail") else ()))
-                files = before + (after or [])
-            parts.append(("read", placed([f for f in files + list(item["inputs"]) if f != "-"])))
-        elif prog in ("cd", "pushd"):
-            target = [a for a in args if not a.startswith("-")]
-            base = posixpath.join(base, target[0]) if len(target) == 1 else ""
-        elif prog in _ROUTE_FILTERS or prog in _ROUTE_QUIET:
-            continue
-        else:
-            return None
-    return parts or None
+                _, before_dash, after_dash, _, _ = _split_args(args, *(_ROUTE_READ_ARGS if prog in ("head", "tail") else ()))
+                files = before_dash + (after_dash or [])
+            files = [f for f in files if f != "-"] or list(item["inputs"][-1:])
+            if not files:
+                continue  # it reads its standard input: a filter
+            targets = None if dynamic else _search_targets(files, base, cwd, globs=False)
+            entry = {"calls": None if targets is None else [("read", path) for path, _ in targets], "text": text}
+            parts.append(entry)
+            before = entry
+        elif prog in ("cd", "pushd", "popd"):
+            moves.append(shlex.join(words))
+            if prog == "popd":
+                base = stack.pop() if stack else None
+                continue
+            target = [a for a in args if a == "-" or not a.startswith("-")]
+            if prog == "pushd":
+                stack.append(base)
+            base = None if dynamic else _moved(base, target[0] if target else ("~" if prog == "cd" else None))
+        elif prog not in _ROUTE_FILTERS and prog not in _ROUTE_QUIET:
+            other = True
+    return (parts, other) if parts else None
 
 
-def safe_route(tool, params, harness):
-    """The safe tool call that replaces a shell search or read, as one instruction, or None.
+def safe_route(tool, params, harness, cwd=None):
+    """The safe tool calls that replace the shell searches and reads in a call, as one instruction, or None.
 
-    None unless `tool` is a shell tool whose command is only searches and reads (see _route_parts): grep, egrep, rg, ag, ack,
-    git grep and the rest of _GREPS name the search tool with the same pattern and path (one call per path); cat, head,
-    tail, sed -n and the other readers name the read tool with the file. `harness` is "claude" or "pi".
+    None unless `tool` is a shell tool whose command holds a shell search or read (see _route_parts) that is the cause of
+    the ask: every one when the command holds nothing else, and when it does, at least one search or read that is
+    sensitive on its own (an ask that comes only from the other commands, a python program say, stays as it was). Each
+    search and read the shell would run is named with the safe call that searches or reads the same files (one call per
+    path); one that cannot be named faithfully gets the safe tools by name; any other command is to be run separately.
+    `harness` is "claude" or "pi"; `cwd`, the call's directory, makes the named paths absolute.
 
     Never raises: a hook that crashed would answer nothing, and Claude runs a call its hook did not answer. Anything that
     goes wrong is None, and the classifier's ask stands as it was."""
     try:
-        return _safe_route(tool, params, harness)
+        return _safe_route(tool, params, harness, cwd if isinstance(cwd, str) and cwd.startswith("/") else None)
     except Exception:
         return None
 
 
-def _safe_route(tool, params, harness):
+def _safe_route(tool, params, harness, cwd):
     if tool not in _SHELL_TOOLS:
         return None
     grep, read = SAFE_TOOL_NAMES.get(harness, SAFE_TOOL_NAMES["pi"])
-    parts = _route_parts(str((params or {}).get("command") or ""))
-    if not parts:
+    found = _route_parts(str((params or {}).get("command") or ""), cwd)
+    if not found:
         return None
-    for kind, found in parts:
-        if kind == "grep":
-            pattern, paths, ignore = found
-            where = (" and path " + ", ".join(json.dumps(p) for p in paths) + (" (one call per path)" if len(paths) > 1 else "")
-                     if paths else "")
-            return (f"Use {grep} with pattern {json.dumps(pattern)}{where}" + (" and ignore_case true" if ignore else "")
-                    + f" instead of a shell search; read a file with {read}.")
-    files = [f for _, found in parts for f in found]
-    if files:
-        return (f"Use {read} with path " + ", ".join(json.dumps(f) for f in files) + (" (one call per file)" if len(files) > 1
-                else "") + f" instead of a shell read (offset and limit select lines); search with {grep}.")
-    return f"Search with {grep} and read with {read} instead of a shell search or read."
+    parts, other = found
+    if other:
+        # The ask may come from another command alone: it is refused only when a search or read is sensitive on its own
+        # (one that cannot be written on its own counts as sensitive). All of these share one walk budget.
+        until = time.monotonic() + WALK_CALL_SECONDS
+        if not any(part["text"] is None or (time.monotonic() < until and
+                                            classify("Bash", {"command": part["text"]}, cwd)["sensitive"])
+                   for part in parts):
+            return None
+    calls = []
+    for part in parts:
+        for call in part["calls"] or []:
+            if call[0] == "grep":
+                _, pattern, path, glob, ignore = call
+                named = (f"{grep} with pattern {json.dumps(pattern)}" + (f" and path {json.dumps(path)}" if path else "")
+                         + (f" and glob {json.dumps(glob)}" if glob else "") + (" and ignore_case true" if ignore else ""))
+            else:
+                named = f"{read} with path {json.dumps(call[1])}"
+            if named not in calls:
+                calls.append(named)
+    unnamed = any(part["calls"] is None for part in parts)
+    if calls:
+        text = "Use " + "; ".join(calls) + (" (one call each)" if len(calls) > 1 else "") + " instead of the shell."
+        text += (f" For the searches and reads it does not name, search with {grep} and read with {read}." if unnamed
+                 else f" Search with {grep}, read with {read}.")
+    else:
+        text = f"Search with {grep} and read with {read} instead of a shell search or read."
+    return text + (" Run the other commands in a call of their own, without the search or read." if other else "")
 
 
 def worker_task(env=None):

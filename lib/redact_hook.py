@@ -301,13 +301,13 @@ def bash_placeholders(event, command, params, result, kinds_info):
             "source": "; ".join(origin(data, n) for n in names)}
 
 
-def routed(decision, params):
+def routed(decision, params, cwd=None):
     """A sensitive-read ask or deny on a Bash command: the reason names the safe tool that replaces a shell search or read
     (sensitive_read.safe_route), and in a worker task an ask becomes a deny marked `refused` (nobody answers a worker's
     prompt). Anything else, an ask about placeholders included, is returned as it is; a deny is never lifted."""
     try:
         from sensitive_read import safe_route, worker_task
-        route = safe_route("Bash", params, "claude")
+        route = safe_route("Bash", params, "claude", cwd)
     except Exception:
         return decision  # the decision as it was; a failure here never lifts or adds a prompt
     if not route:
@@ -360,20 +360,20 @@ def pre_decision(event):
     if "blocked" in kinds:
         path = next(p for k, p in reads if k == "blocked")
         return routed({**result, "decision": "deny", "target": path, "reason":
-                       f"tmux-pi blocks reading production/staging env file {path}. Ask the user if a value is needed."}, params)
+                       f"tmux-pi blocks reading production/staging env file {path}. Ask the user if a value is needed."}, params, cwd)
     if "store" in kinds:
         path = next(p for k, p in reads if k == "store")
         reason = f"This command reads credential store {path}. Allow only if its contents are needed."
         if holds:
-            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params)
-        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params)
+            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params, cwd)
+        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params, cwd)
     if "secret" in kinds and (network or transform):
         path = next(p for k, p in reads if k == "secret")
         how = "sends it over the network" if network else "encodes it so redaction cannot recognize the values"
         reason = f"This command reads {path} and {how}. Allow only if that is intended."
         if holds:
-            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params)
-        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params)
+            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params, cwd)
+        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params, cwd)
     if holds:
         return holds
     secret_ref = any(is_secret_name(n) for n in ENV_REF.findall(command))
@@ -381,7 +381,7 @@ def pre_decision(event):
         target = reads[0][1] if reads else "a secret environment variable"
         return routed({**result, "decision": "ask", "target": target, "reason":
                        f"This command reads {target}, and its form (heredoc, exit or trailing comment) means output from a "
-                       "failure cannot be redacted. Allow only if needed."}, params)
+                       "failure cannot be redacted. Allow only if needed."}, params, cwd)
     return result
 
 

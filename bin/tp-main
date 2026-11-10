@@ -15,36 +15,128 @@ export TP_MODE=orchestrator
 # Made here, not in bin/tp, because this is what a relaunch runs, and kept in the session's state directory, which every
 # relaunch in the same tmux session shares (bin/tp exports TP_STATE_DIR to the pane and the session): the same main keeps its id
 # across /clear, --resume, compaction and a second tp-main. Inherited by everything the harness starts (Bash tool, claude -p,
-# subagents, background shells). The id exported always matches the pattern: a TP_MAIN_ID given at launch and valid is kept
-# and written to the file (a later launch without it keeps it); an empty or bad file is replaced with a fresh id.
+# subagents, background shells). The id exported always matches the pattern.
+#
+# Every read, check, repair and write of $TP_STATE_DIR/main-id happens under one exclusive lock on $TP_STATE_DIR/.main-id.lock,
+# so two launches (a relaunch while the first is starting, several mains started together) cannot each repair the file and end
+# with different ids. The lock is python3 fcntl.flock, as in claude/plugins/tmux-pi/hooks/report.sh: flock(1) does not exist on
+# macOS, and the kernel drops the lock if the launcher dies. A mkdir lock was not chosen: a launcher killed while holding it
+# leaves the lock behind. Under the lock: a valid TP_MAIN_ID given at launch replaces the file (two concurrent launches with
+# different given ids: the last writer wins in the file and each exports its own given id; a later launch without one keeps the
+# file's); otherwise a valid file is used and never removed or rewritten; an empty or bad file is replaced with a fresh id,
+# written to a temp file and renamed over it, then read back. If the lock is not taken within MAIN_ID_LOCK_WAIT seconds
+# (default 5), the launch goes on without repairing or writing anything: it exports the file's id if valid, else the given id,
+# else a fresh id for this launch only, and says so on stderr. An empty id is never exported.
+# Test-only: MAIN_ID_TEST_PAUSE=R:G (fds) writes a byte to R and then blocks reading G, between the read and the repair, under
+# the lock; MAIN_ID_TEST_WAITING=W (fd) gets a byte when the lock is first found taken. tests/test_main_notify.py uses them.
+# (These three names carry no TP_ prefix on purpose: tests/test_session_env.py makes every TP_ name bin/ reads either a session key
+# or configuration, and these are neither.)
 id_pattern='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-idfile="${TP_STATE_DIR:+$TP_STATE_DIR/main-id}"
-have_dir=0
-[[ -n "$idfile" && -d "$TP_STATE_DIR" ]] && have_dir=1
-if [[ "${TP_MAIN_ID:-}" =~ $id_pattern ]]; then
-  if [[ "$have_dir" == 1 ]]; then
-    { printf '%s\n' "$TP_MAIN_ID" > "$idfile.$$" && mv -f "$idfile.$$" "$idfile"; } 2>/dev/null ||
-      { rm -f "$idfile.$$"; echo "tp-main: could not record TP_MAIN_ID in $idfile; a later launch without it will not keep this id" >&2; }
-  fi
-else
-  fresh="main-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:16])')"
-  main_id="$fresh"
-  if [[ "$have_dir" == 1 ]]; then
-    main_id="$(cat "$idfile" 2>/dev/null || true)"
-    if ! [[ "$main_id" =~ $id_pattern ]]; then
-      rm -f "$idfile" 2>/dev/null || true  # an empty file, or one with a bad id in it, is replaced
-      # ln fails when the file exists: of two launches racing, the first id wins and both read it back.
-      printf '%s\n' "$fresh" > "$idfile.$$" 2>/dev/null && { ln "$idfile.$$" "$idfile" 2>/dev/null || true; }
-      rm -f "$idfile.$$" 2>/dev/null || true
-      main_id="$(cat "$idfile" 2>/dev/null || true)"
-      if ! [[ "$main_id" =~ $id_pattern ]]; then
-        main_id="$fresh"
-        echo "tp-main: could not read the main id back from $idfile; using $fresh for this launch only" >&2
-      fi
-    fi
-  fi
-  export TP_MAIN_ID="$main_id"
+setup_main_id='
+import fcntl, os, re, sys, time, uuid
+state, given, wait = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    wait = float(wait)
+except ValueError:
+    wait = 5.0
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+def valid(text):
+    return ID.fullmatch(text) is not None
+def say(message):
+    print("tp-main: " + message, file=sys.stderr)
+def test_hook(name):
+    spec = os.environ.get(name, "")
+    try:
+        if name.endswith("PAUSE"):
+            reached, go = (int(part) for part in spec.split(":"))
+            os.write(reached, b"x")
+            os.read(go, 1)
+        elif spec:
+            os.write(int(spec), b"x")
+    except (OSError, ValueError):
+        pass
+fresh = "main-" + uuid.uuid4().hex[:16]
+good = given if valid(given) else ""
+if not state or not os.path.isdir(state):
+    print(good or fresh)
+    sys.exit(0)
+path = os.path.join(state, "main-id")
+def read():
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8", "replace").rstrip("\n")
+    except OSError:
+        return ""
+def write(value):
+    temp = "%s.%d" % (path, os.getpid())
+    try:
+        with open(temp, "w") as handle:
+            handle.write(value + "\n")
+        os.replace(temp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        return False
+def take_lock():
+    try:
+        handle = open(os.path.join(state, ".main-id.lock"), "a")
+    except OSError:
+        return None
+    deadline = time.monotonic() + wait
+    announced = False
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if not announced:
+                announced = True
+                test_hook("MAIN_ID_TEST_WAITING")
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            time.sleep(0.01)
+lock = take_lock()
+if lock is None:
+    current = read()
+    if good:
+        say("could not lock " + state + "; using the given TP_MAIN_ID " + good + " without recording it")
+        print(good)
+    elif valid(current):
+        say("could not lock " + state + "; using the recorded main id " + current + " without repair")
+        print(current)
+    else:
+        say("could not lock " + state + "; using " + fresh + " for this launch only")
+        print(fresh)
+    sys.exit(0)
+with lock:
+    if good:
+        if not write(good):
+            say("could not record TP_MAIN_ID in " + path + "; a later launch without it will not keep this id")
+        print(good)
+        sys.exit(0)
+    current = read()
+    test_hook("MAIN_ID_TEST_PAUSE")
+    if valid(current):
+        print(current)
+        sys.exit(0)
+    write(fresh)
+    current = read()
+    if valid(current):
+        print(current)
+    else:
+        say("could not read the main id back from " + path + "; using " + fresh + " for this launch only")
+        print(fresh)
+'
+main_id="$(python3 -c "$setup_main_id" "${TP_STATE_DIR:-}" "${TP_MAIN_ID:-}" "${MAIN_ID_LOCK_WAIT:-5}")" || main_id=""
+if ! [[ "$main_id" =~ $id_pattern ]]; then
+  printf -v main_id 'main-%04x%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"
+  echo "tp-main: could not set up the main id with python3; using $main_id for this launch only" >&2
 fi
+export TP_MAIN_ID="$main_id"
 core="$(cat "$ROOT/agent/orchestrator.md")"
 case "$harness" in
   pi)

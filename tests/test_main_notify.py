@@ -1,8 +1,10 @@
 """Which main dispatched a task, and `tp-agent list --main`: the data the Claude main's notifier wakes on."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -160,13 +162,49 @@ class MainLauncherIdentityTests(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
 
-    def launch(self, state="default", **env):
+    def env(self, state="default", **env):
         merged = {**outside_session(), "TP_MAIN_HARNESS": "claude", **env}
         if state is not None:
             merged["TP_STATE_DIR"] = str(self.state if state == "default" else state)
-        run = subprocess.run([str(self.root / "bin/tp-main")], env=merged, text=True, capture_output=True, timeout=25, cwd=str(self.root))
+        return merged
+
+    def launch(self, state="default", **env):
+        run = subprocess.run([str(self.root / "bin/tp-main")], env=self.env(state, **env), text=True, capture_output=True, timeout=25, cwd=str(self.root))
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout.strip()
+
+    def fresh_state(self, name, content=None):
+        state = self.root / name
+        state.mkdir()
+        if content is not None:
+            (state / "main-id").write_text(content)
+        return state
+
+    def together(self, envs):
+        """One tp-main per env, all started at the same moment: each waits on one pipe until every process exists."""
+        release, hold = os.pipe()
+        procs = [subprocess.Popen(["bash", "-c", 'read -r _ <&"$1"; shift; exec "$@"', "barrier", str(release), str(self.root / "bin/tp-main")],
+                                  env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(self.root), pass_fds=(release,))
+                 for env in envs]
+        self.addCleanup(lambda: [p.kill() for p in procs if p.poll() is None])
+        os.close(release)
+        os.close(hold)  # EOF on the pipe is the starting gun
+        results = [p.communicate(timeout=25) + (p.returncode,) for p in procs]
+        for out, err, code in results:
+            self.assertEqual((code, err), (0, ""), out)
+        return [out.strip() for out, _, _ in results]
+
+    def spawn(self, state, pass_fds, **env):
+        proc = subprocess.Popen([str(self.root / "bin/tp-main")], env=self.env(state, **env), text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=str(self.root), pass_fds=pass_fds)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        return proc
+
+    @staticmethod
+    def byte(fd):
+        """The next byte on a pipe, b'' at EOF (the writer ended without sending one), None if nothing comes in 20 s."""
+        ready, _, _ = select.select([fd], [], [], 20)
+        return os.read(fd, 1) if ready else None
 
     def test_the_launcher_gives_the_main_an_id_that_a_child_dispatch_records(self):
         fake = self.root / "fakebin"
@@ -228,6 +266,72 @@ class MainLauncherIdentityTests(unittest.TestCase):
 
     def test_with_no_state_directory_the_main_still_gets_an_id(self):
         self.assertRegex(self.launch(state=None), r"^main-[0-9a-f]{16}$")
+
+    # A missing, an empty and a bad file are the three states that make a launch write; each must hold under overlapping launches.
+    FILE_STATES = (("missing", None), ("empty", ""), ("bad", "not valid!\n"))
+
+    def test_launches_started_together_all_export_the_one_id_the_file_holds(self):
+        for round_number in range(3):
+            for name, content in self.FILE_STATES:
+                with self.subTest(file=name, round=round_number):
+                    state = self.fresh_state(f"together-{name}-{round_number}", content)
+                    ids = self.together([self.env(state)] * 8)
+                    self.assertEqual(len(set(ids)), 1, ids)
+                    self.assertRegex(ids[0], r"^main-[0-9a-f]{16}$")
+                    self.assertEqual((state / "main-id").read_text().strip(), ids[0])
+                    self.assertEqual(self.launch(state=state), ids[0])  # and a relaunch keeps it
+
+    def test_a_launch_paused_after_reading_the_file_is_not_overtaken_by_another(self):
+        """The review's reproduction, without a sleep: A holds the lock and has read the file; B starts and is shown to be
+        waiting for the lock; only then A goes on. Without the lock B installs its own id while A is paused, and A's differs."""
+        for name, content in self.FILE_STATES:
+            with self.subTest(file=name):
+                state = self.fresh_state(f"paused-{name}", content)
+                reached, reached_w = os.pipe()
+                go_r, go = os.pipe()
+                waiting, waiting_w = os.pipe()
+                a = self.spawn(state, (reached_w, go_r), MAIN_ID_TEST_PAUSE=f"{reached_w}:{go_r}")
+                os.close(reached_w)
+                os.close(go_r)
+                self.assertEqual(self.byte(reached), b"x", "A did not stop between its read and its repair")
+                b = self.spawn(state, (waiting_w,), MAIN_ID_TEST_WAITING=str(waiting_w))
+                os.close(waiting_w)
+                self.assertEqual(self.byte(waiting), b"x", "B did not find the lock taken")
+                os.write(go, b"x")
+                (a_out, a_err), (b_out, b_err) = a.communicate(timeout=25), b.communicate(timeout=25)
+                for fd in (reached, go, waiting):
+                    os.close(fd)
+                self.assertEqual((a.returncode, b.returncode, a_err, b_err), (0, 0, "", ""))
+                self.assertEqual(a_out, b_out)
+                self.assertEqual((state / "main-id").read_text().strip(), a_out.strip())
+                self.assertEqual(self.launch(state=state), a_out.strip())
+
+    def test_launches_started_together_with_different_given_ids_each_export_their_own_and_the_last_writer_is_kept(self):
+        state = self.fresh_state("given")
+        ids = self.together([self.env(state, TP_MAIN_ID=f"main-given-{n}") for n in range(4)])
+        self.assertEqual(ids, [f"main-given-{n}" for n in range(4)])
+        self.assertIn((state / "main-id").read_text().strip(), ids)
+        self.assertEqual(self.launch(state=state), (state / "main-id").read_text().strip())
+
+    def test_a_lock_that_stays_taken_never_blocks_the_launch_and_never_removes_a_valid_file(self):
+        """The lock is held by this test for the whole run: the launch waits MAIN_ID_LOCK_WAIT, then goes on without writing."""
+        for name, content, given, expect in (
+                ("valid file", "main-kept\n", None, "main-kept"), ("valid file, given id", "main-kept\n", "main-given", "main-given"),
+                ("missing file", None, None, None), ("bad file", "not valid!\n", None, None)):
+            with self.subTest(case=name):
+                state = self.fresh_state("locked-" + name.replace(",", "").replace(" ", "-"), content)
+                with open(state / ".main-id.lock", "a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    env = self.env(state, MAIN_ID_LOCK_WAIT="0.2", **({"TP_MAIN_ID": given} if given else {}))
+                    run = subprocess.run([str(self.root / "bin/tp-main")], env=env, text=True, capture_output=True, timeout=25, cwd=str(self.root))
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertIn("could not lock", run.stderr)
+                # the recorded id, else the given one, else a fresh one for this launch: never empty
+                self.assertRegex(run.stdout.strip(), f"^{expect}$" if expect else r"^main-[0-9a-f]{16}$")
+                if content is None:
+                    self.assertFalse((state / "main-id").exists())  # not created
+                else:
+                    self.assertEqual((state / "main-id").read_text(), content)  # not removed, not rewritten
 
 
 class LegacyEntryWarningTests(unittest.TestCase):

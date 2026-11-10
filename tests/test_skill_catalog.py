@@ -46,6 +46,13 @@ class SkillCatalogTests(unittest.TestCase):
             "/threat-model Review these new agent tool boundaries": "threat-model",
             "Conduct a privacy review of the proposed data export": "threat-model",
             "Test skill behavior before updating the selector": "test-skill-behavior",
+            "/product-design Frame the review queue: requesters submit, reviewers resolve": "product-design",
+            "Start a product design package for the review queue redesign": "product-design",
+            "Continue the product design workflow where we paused yesterday": "product-design",
+            "Let's do product discovery for the new intake form before anyone writes code": "product-design",
+            "/prepare-cases slice.submit-and-queue": "prepare-cases",
+            "Prepare cases for slice.submit-and-queue": "prepare-cases",
+            "Break the slice into cases for the delivery team": "prepare-cases",
         }
         for request, expected in cases.items():
             with self.subTest(request=request, expected=expected):
@@ -59,6 +66,8 @@ class SkillCatalogTests(unittest.TestCase):
             "Run `/product-fit` on the signup journey": "product-fit",
             'Then "/counterpoint": is the split worth it?': "counterpoint",
             "/Threat-Model!": "threat-model",
+            "Please run /product-design.": "product-design",
+            "Run `/prepare-cases` on the ready slice": "prepare-cases",
         }
         for request, expected in cases.items():
             with self.subTest(request=request, expected=expected):
@@ -71,7 +80,9 @@ class SkillCatalogTests(unittest.TestCase):
                         "Rename /threat-model.md to something clearer",
                         "List /product-fit/drafts",
                         "Add a /counterpoint-v2 command stub",
-                        "Compare and/counterpoint the two words"):
+                        "Compare and/counterpoint the two words",
+                        "Edit catalog/skills/product-design/SKILL.md wording",
+                        "Rename docs/prepare-cases.md to something clearer"):
             with self.subTest(request=request):
                 self.assertEqual(run(request), [], request)
 
@@ -83,7 +94,13 @@ class SkillCatalogTests(unittest.TestCase):
                         "Rename the contract spec fixture file",
                         "Run an adversarial pass over the parser fuzz corpus",
                         "Add adversarial pass counts to the fuzz report",
-                        "Rename the threat model fixture in the docs"):
+                        "Rename the threat model fixture in the docs",
+                        # product design lane work, QA and docs that name the topic without asking for the workflow
+                        "Implement tp-product status for the product design package",
+                        "Fix the case-sensitivity bug in product search",
+                        "Prepare test cases for the login page",
+                        "Update the product discovery section of the README",
+                        "Independent review of the product design lane commit"):
             with self.subTest(request=request):
                 self.assertEqual(run(request), [], request)
 
@@ -123,6 +140,8 @@ class SkillCatalogTests(unittest.TestCase):
     def test_selection_never_exceeds_three_and_explicit_ranks_first(self):
         every = run("/make-qa, (/counterpoint) /product-fit. /threat-model: for report.pdf")
         self.assertEqual([s["id"] for s in every], ["make-qa", "counterpoint", "product-fit"])
+        late = run("/product-design, /prepare-cases, /make-qa and /threat-model")
+        self.assertEqual([s["id"] for s in late], ["make-qa", "threat-model", "product-design"])
         mixed = run("Read report.pdf, write a QA script, product-fit check, then /threat-model.")
         self.assertEqual(len(mixed), 3)
         self.assertEqual(mixed[0]["id"], "threat-model")
@@ -148,6 +167,33 @@ class SkillCatalogTests(unittest.TestCase):
         self.assertEqual([s["id"] for s in review["selected"]], ["threat-model"])
         self.assertIn("not** a substitute for tmux-pi's required independent review", review["packet"])
         self.assertNotIn("PDF → DOCX", review["packet"])
+        design = run("/product-design resume the package", "packet")
+        self.assertEqual([s["id"] for s in design["selected"]], ["product-design"])
+        self.assertIn("**Generated hypothesis**", design["packet"])
+        self.assertIn("AI role-play is never customer validation", design["packet"])
+        cases = run("/prepare-cases slice.submit-and-queue", "packet")
+        self.assertEqual([s["id"] for s in cases["selected"]], ["prepare-cases"])
+        self.assertIn("Never write one ticket per screen", cases["packet"])
+        self.assertNotIn("**Generated hypothesis**", cases["packet"])
+
+    def test_every_pi_prompt_alias_selects_its_skill_from_the_raw_input(self):
+        # Pi loads prompt templates from $PI_CODING_AGENT_DIR/prompts (tp-pi sets it to agent/ and keeps templates on);
+        # agent/extensions/catalogue.ts selects from the raw `/name ...` input before the template expands.
+        import sys
+        sys.path.insert(0, str(ROOT / "lib"))
+        import skill_catalog
+        launcher = (ROOT / "bin/tp-pi").read_text()
+        self.assertIn('export PI_CODING_AGENT_DIR="$ROOT/agent"', launcher)
+        self.assertNotIn("--no-prompt-templates", launcher)
+        self.assertNotRegex(launcher, r"(?<![\w-])-np\b")
+        aliases = sorted(p.stem for p in (ROOT / "agent/prompts").glob("*.md"))
+        self.assertTrue({"product-design", "prepare-cases", "product-fit"} <= set(aliases), aliases)
+        for name in aliases:
+            with self.subTest(alias=name):
+                text = (ROOT / "agent/prompts" / f"{name}.md").read_text()
+                self.assertTrue(text.startswith("---\ndescription: "))
+                self.assertIn(f"{name}", text.split("---", 2)[2])
+                self.assertEqual([s["id"] for s in skill_catalog.select(f"/{name} the current work")], [name])
 
     def test_catalogue_paths_confined_to_repo(self):
         for skill in json.loads((ROOT / "config/skill-catalog.json").read_text())["skills"]:

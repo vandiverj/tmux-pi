@@ -1242,6 +1242,24 @@ echo review-1
         self.assertNotIn("Judge hard.", early)
         self.assertIn("Judge hard.", self.copy("main-contract.md").read_text())  # the whole contract is still at (f)
 
+    def test_the_shipped_product_review_contract_is_accepted_and_leaves_the_reviewer_choice_alone(self):
+        shipped = ROOT / "templates/product-design/review-contract.md"
+        self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high", "independence": "different_provider"})
+        r = self.review("--contract", str(shipped))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.marker().read_text()), {"items": [1, 2, 3, 4, 5]})
+        body = Path(str(self.log) + ".body").read_text()
+        self.assertIn("Reviewer contract (supplied by Main)", body)
+        self.assertIn("AI role-play is never customer validation", body)
+        self.assertIn("Judge the work against that contract together with the task", self.task_text())
+        # the contract changes what is judged, not who judges: same route request, same reviewer, same independence
+        route = (self.plan.parent / "route.args").read_text()
+        self.assertIn(f"--review-plan {self.task}", route)
+        self.assertNotIn("--same-provider", route)
+        self.assertIn("--worker claude --model claude-sonnet-5-5 --thinking high", self.spawn_args())
+        self.assertIn("Review policy: required (different_provider)", self.spawn_args())
+        self.assertEqual(json.loads((self.task / "meta.json").read_text())["reviewer"]["independence"], "different_provider")
+
     def test_a_task_record_without_request_md_gives_the_request_first_and_keeps_task_md_last(self):
         # a record from before request.md existed: task.md is the raw request (or a canonical record whose fenced summary is it)
         shutil.copy(ROOT / "lib/task_record.py", self.root / "lib/task_record.py")

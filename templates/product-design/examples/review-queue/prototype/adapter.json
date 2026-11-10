@@ -1,0 +1,47 @@
+{
+  "schema": "tp-product-adapter",
+  "schema_version": 1,
+  "prototype": "review-queue",
+  "script": "prototype.js",
+  "style": "prototype.css",
+  "pages": [
+    {"id": "page.submit", "label": "Submit a record"},
+    {"id": "page.queue", "label": "Review queue"},
+    {"id": "page.record", "label": "Record"},
+    {"id": "page.summary", "label": "Summary"}
+  ],
+  "targets": [
+    {"id": "page.submit", "label": "Submit page link", "page": "page.submit"},
+    {"id": "page.queue", "label": "Queue page link", "page": "page.queue"},
+    {"id": "page.summary", "label": "Summary page link", "page": "page.summary"},
+    {"id": "submit.title", "label": "Title field", "page": "page.submit"},
+    {"id": "submit.category", "label": "Category field", "page": "page.submit"},
+    {"id": "submit.speed", "label": "Simulated service speed", "page": "page.submit"},
+    {"id": "submit.send", "label": "Submit button", "page": "page.submit"},
+    {"id": "submit.response", "label": "Deliver the delayed response", "page": "page.submit"},
+    {"id": "queue.row", "label": "Queue row", "page": "page.queue", "instances": true},
+    {"id": "queue.waiting-count", "label": "Waiting count", "page": "page.queue"},
+    {"id": "record.approve", "label": "Approve button", "page": "page.record"},
+    {"id": "record.return", "label": "Return button", "page": "page.record"},
+    {"id": "record.claim", "label": "Assign to me button", "page": "page.record"},
+    {"id": "record.reassign", "label": "Reassign button", "page": "page.record"},
+    {"id": "summary.waiting", "label": "Waiting total", "page": "page.summary"},
+    {"id": "summary.resolved", "label": "Resolved total", "page": "page.summary"}
+  ],
+  "actions": [
+    {"id": "open-page", "label": "Open a page", "business": false},
+    {"id": "fill", "label": "Fill a field", "business": false},
+    {"id": "set-speed", "label": "Choose the simulated service speed", "business": false},
+    {"id": "submit", "label": "Submit the record", "business": true, "contract": "contract.submissions-api", "operation": "Create submission"},
+    {"id": "receive-response", "label": "Deliver the delayed response", "business": true, "contract": "contract.submissions-api", "operation": "Create submission"},
+    {"id": "open-record", "label": "Open a record", "business": false},
+    {"id": "claim", "label": "Assign to me", "business": true},
+    {"id": "resolve", "label": "Resolve a record", "business": true, "contract": "contract.submissions-api", "operation": "Resolve submission"},
+    {"id": "reassign", "label": "Reassign a record", "business": true}
+  ],
+  "seeds": [
+    {"id": "empty-queue", "label": "Empty queue (requester)"},
+    {"id": "one-assigned", "label": "S-1 assigned to you (reviewer-1)"},
+    {"id": "one-in-review", "label": "S-1 in review by you, with a draft note"}
+  ]
+}

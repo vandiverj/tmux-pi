@@ -969,6 +969,8 @@ class SensitiveReadTableTests(unittest.TestCase):
         # command, or one no single call names, is refused too, naming what it can and the safe tools for the rest.
         grep_config = f'mcp__tmux-pi-safe__safe_grep with pattern "TOKEN" and path "{CWD}/config"'
         generic = "Search with mcp__tmux-pi-safe__safe_grep and read with mcp__tmux-pi-safe__safe_read"
+        ask_main = generic + (" instead of a shell search or read. If it is not a search or read, ask Main for it "
+                              "(tp-agent request) instead of retrying the command.")
         rows = [("grep -rn TOKEN config/", grep_config),
                 (f"cat {ENV}", f'mcp__tmux-pi-safe__safe_read with path "{CWD}/{ENV}"'),
                 ("sed -n 1,9p config/local.json | head -3", f'mcp__tmux-pi-safe__safe_read with path "{CWD}/config/local.json"'),
@@ -989,7 +991,11 @@ class SensitiveReadTableTests(unittest.TestCase):
                 (f"printf '%s\\n' {LOCAL} | xargs -I{{}} sh -c 'grep -n TOKEN {{}}'", generic),
                 ("printf x | xargs sh -c 'grep -rn TOKEN config/'", generic),
                 (f'cat <<EOF\nsee\n$(grep TOKEN "{ENV}")\nEOF', generic),
-                ("find config -name '*.json' -exec grep -n TOKEN {} +", generic)]
+                ("find config -name '*.json' -exec grep -n TOKEN {} +", generic),
+                # sg1 round 5: inline code given the file as an argument has no cause (F1); a refusal of a command with no
+                # search or read in it (a copy, an upload, a code run) says to ask Main instead of retrying it (F3).
+                (f"python3 -c 'import subprocess,sys; subprocess.run([\"grep\", \"TOKEN\", sys.argv[1]])' {LOCAL}", ask_main),
+                (f"cp {ENV} /tmp/x", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -998,15 +1004,18 @@ class SensitiveReadTableTests(unittest.TestCase):
                     self.assertEqual(decision, "deny")
                     self.assertIn("refuses this shell read in a worker task", reason)
                     self.assertIn(named, reason)
-                    if named == generic:  # no path is named: none would be the files the shell searched
+                    if named in (generic, ask_main):  # no path is named: none would be the files the shell searched
                         self.assertNotIn(" with path ", reason)
+                    if named != ask_main:  # a search or read keeps naming the safe calls, and only them
+                        self.assertNotIn("ask Main", reason)
                     saved = json.loads(record.read_text())
                     self.assertEqual(saved["status"], "refused")
                     self.assertIn(named, saved["reason"])
                     decision, reason = run(command)
                     self.assertEqual(decision, "ask")
                     self.assertTrue(reason.startswith("Read may expose "), reason)
-                    self.assertIn(named, reason)
+                    self.assertIn(generic if named == ask_main else named, reason)
+                    self.assertNotIn("ask Main", reason)  # main is Main: only a worker's refusal says it
             # Not sensitive: nothing in either; sensitive but no safe replacement: still an ask in a worker, recorded pending.
             self.assertIsNone(run("grep -n x README.md", task))
             # sg1 round 3: a shell wrapper around a non-search, and xargs git diff (a patch, not a search), keep their ask.
@@ -1196,6 +1205,23 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"while read l; do echo $l; done < {ENV}", "rsync -a config/ /tmp/x", "ls config | xargs cat", f"while read f; do cat $f; done < {LOCAL}",
             f"ssh -o ProxyCommand='cat {ENV}' host", "npx cat " + ENV, "strace -o /dev/null cat " + ENV, f"ls < {ENV}",
             f"find . -name '*.env' -exec mv {{}} /tmp \\;",
+            # sg1 round 5, F1: inline code given the file as an argument has no cause, whatever the code (the review's rows)
+            f"python3 -c 'import subprocess,sys; subprocess.run([\"grep\", \"TOKEN\", sys.argv[1]])' {ENV}",
+            f"python3 -c 'import subprocess,sys; subprocess.run([\"grep\", \"TOKEN\", sys.argv[1]])' {LOCAL}",
+            f"python3 -c 'import os,sys; os.system(\"grep TOKEN \" + sys.argv[1])' {ENV}",
+            f"node -e 'require(\"child_process\").execFileSync(\"grep\", [\"TOKEN\", process.argv[1]])' {ENV}",
+            f"python3 -c 'import sys; print(open(sys.argv[1]).read())' {LOCAL}", f"python3 -c 'open(\"{ENV}\")' {LOCAL}",
+            # each interpreter's inline code; the code on stdin (`-`, a shell's -s, `<`); a shell's -c with $1
+            f"python -c 'import sys; print(open(sys.argv[1]).read())' {LOCAL}", f"ruby -e 'puts File.read(ARGV[0])' {LOCAL}",
+            f"perl -ne 'print' {LOCAL}", f"php -r 'echo file_get_contents($argv[1]);' {LOCAL}", f"bun -e 'x' {LOCAL}",
+            f"deno eval 'x' {LOCAL}", f"osascript -e 'x' {LOCAL}", f"python3 - {LOCAL} < README.md",
+            f"python3 -c 'import sys; print(sys.stdin.read())' < {ENV}", f"bash -s {LOCAL} < README.md",
+            f"sh -xs {ENV} < README.md", f"sh -c 'grep TOKEN \"$1\"' sh {LOCAL}",
+            f"node - {ENV} <<'EOF'\nconsole.log(1)\nEOF",
+            # ... and through each site that judges a program given a file: xargs, find -exec, fd -x, a loop
+            f"printf '%s\\n' {LOCAL} | xargs python3 -c 'import sys; print(open(sys.argv[1]).read())'",
+            "find . -name x -exec node -e 'x' {} \\;", f"fd -g '{ENV}' -x ruby -e 'x'",
+            f"for f in {LOCAL}; do python3 -c 'import sys; print(open(sys.argv[1]).read())' $f; done",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"python3 -c 'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"sh {ENV}", sr.RUNS_CODE),
@@ -1203,6 +1229,9 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", sr.RUNS_CODE), (f". ./{ENV}", sr.RUNS_CODE),
             (f"xargs python3 < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 {} \\;", sr.RUNS_CODE),
             (f"printf '%s\\n' {LOCAL} | xargs python3", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node", sr.RUNS_CODE),
+            # round 5: a script file given the file keeps the cause (project code; a known limit), as a named module does
+            (f"python3 tools/x.py {ENV}", sr.RUNS_CODE), (f"node tools/x.js {LOCAL}", sr.RUNS_CODE),
+            (f"bash tools/x.sh {LOCAL}", sr.RUNS_CODE), (f"python3 -m tools.x {LOCAL}", sr.RUNS_CODE),
             (f"ssh host cat {ENV}", sr.ELSEWHERE), (f"docker exec c cat {ENV}", sr.ELSEWHERE),
             (f"docker run --env-file {ENV} image", sr.ELSEWHERE), (f"kubectl exec pod -- cat {ENV}", sr.ELSEWHERE),
             (f"base64 {ENV}", sr.TRANSFORM), (f"base64 < {ENV}", sr.TRANSFORM), (f"xxd {LOCAL}", sr.TRANSFORM),
@@ -1267,9 +1296,23 @@ class SensitiveReadTableTests(unittest.TestCase):
             return isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_cause", "_program_cause")
         sites = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_because"]
         self.assertGreaterEqual(len(sites), 20)
+        # sg1 round 5: RUNS_CODE is a claim that the command runs code, not a search or read of the file. A site that can
+        # give it states, on its line or the line above, which of the three forms it covers: SCRIPT FILE or INLINE LITERAL
+        # (which have it), INLINE ARGUMENT (which has none: the code is given the file as an argument).
+        lines = (ROOT / "lib/sensitive_read.py").read_text().splitlines()
+        forms = ("SCRIPT FILE", "INLINE LITERAL", "INLINE ARGUMENT")
+        runs_code = [site for site in sites if any(isinstance(node, ast.Name) and node.id == "RUNS_CODE"
+                                                   for node in ast.walk(site.args[0]))]
+        self.assertGreaterEqual(len(runs_code), 5)
         for site in sites:
             with self.subTest(line=site.lineno):
                 self.assertTrue(given(site.args[0]), ast.unparse(site.args[0]) if hasattr(ast, "unparse") else site.lineno)
+        for site in runs_code:
+            with self.subTest(line=site.lineno, form="stated"):
+                near = " ".join(lines[site.lineno - 2:site.lineno])
+                self.assertTrue(any(form in near for form in forms[:2]), lines[site.lineno - 1])
+        for form in forms:  # each form is stated at a site
+            self.assertTrue(any(form in " ".join(lines[s.lineno - 2:s.lineno]) for s in sites), form)
         made = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_NonSearch"]
         self.assertEqual(len(made), 1)  # in _because alone
         returns = [node.value for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "_program_cause"

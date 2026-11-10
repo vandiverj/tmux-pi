@@ -1742,7 +1742,7 @@ class WiringTests(unittest.TestCase):
 
     def test_pi_extension_passes_the_flag(self):
         text = (ROOT / "agent/extensions/sensitive.ts").read_text()
-        self.assertIn('execFileSync(classifier, ["--trusted", "--route", "pi"]', text)
+        self.assertIn('execFileSync(classifier, ["--trusted", "--route", "pi", ...(taskDir ? ["--worker"] : [])]', text)
         self.assertNotIn('execFileSync(classifier, []', text)
 
     def test_offload_does_not(self):

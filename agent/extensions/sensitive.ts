@@ -82,7 +82,8 @@ export default function (pi: ExtensionAPI) {
 			// `--trusted`: this caller prompts the owner, so a name or directory guess in a tree the owner vouched for is lifted.
 			// offload.ts asks the same classifier whether to send text to a model and does not pass it.
 			// `--route pi`: a shell search or read also gets "safe", the safe_grep / safe_read call that replaces it.
-			decision = JSON.parse(execFileSync(classifier, ["--trusted", "--route", "pi"], {
+			// `--worker`: a worker's refusal ("worker_refuse") of a command with no search or read also says to ask Main.
+			decision = JSON.parse(execFileSync(classifier, ["--trusted", "--route", "pi", ...(taskDir ? ["--worker"] : [])], {
 				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),
 				encoding: "utf8", timeout: 5000,
 			}));

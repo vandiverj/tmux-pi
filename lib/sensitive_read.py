@@ -383,6 +383,8 @@ class _Refused(str):
 # enumerated from this source by tests/test_sensitive_read.py test_non_search_sites). A hit any other path makes is a plain
 # tuple, and a plain tuple refuses: a new path with no cause here refuses by default.
 RUNS_CODE = "runs code"                      # an interpreter or shell given a script file or code, `source`/`.`
+# (RUNS_CODE: a script file given the file, or inline code naming it as a literal and starting no program; never inline code
+# given it as an argument, round 5. Each site that gives it says which form, _command_hit.)
 ELSEWHERE = "runs on a remote host or in a container"           # ssh, docker/kubectl/... and what they run
 TRANSFORM = "encodes or transforms a file"   # base64, xxd, gzip, openssl, ... on a file operand or `<` input
 GIT_OUTPUT = "git output, not a search"     # git diff/show/log/blame/cat-file/archive/stash: history and patches
@@ -2165,30 +2167,67 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         return _because(GIT_OUTPUT, _git_output_hit(args, sub, rest, cmd, base, depth, bulk))
     if prog in _GREPS:
         return _search_hit(prog, args, cmd, base, bulk)
-    if prog in _SHELLS:  # the hit of the command line it runs, with its cause, as it is; a script file runs code
-        line = _dash_c(args)
-        if line is not None:
-            return (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
-        return _because(RUNS_CODE, _other_hit(args, base, True))
+    # RUNS_CODE claims the command runs code and not a search or read of the file; it is given only where that is shown
+    # (sg1 round 5). Each of the three forms says which it is: SCRIPT FILE, a script given the file as an argument (project
+    # code; a known limit); INLINE LITERAL, inline code naming the file as a literal, which has the cause unless it starts
+    # another program (round 4); INLINE ARGUMENT, inline code given the file as an argument (an operand after the code, the
+    # code on stdin), which has none: the code receives the file to do something with it, and nothing shows it is not a read.
+    if prog in _SHELLS:  # the hit of the command line it runs, with its cause, as it is
+        at = _dash_c_at(args)
+        if at is not None:
+            line = args[at]
+            hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
+            given = _other_hit(args[at + 1:], base, True)
+            return _because(None, hit or given) if given else hit  # INLINE ARGUMENT: `sh -c 'grep x "$1"' sh FILE`
+        stdin = _stdin_code(args, r"-[A-Za-z]*s[A-Za-z]*")  # `bash -s FILE`: the code is on stdin
+        return _because(None if stdin else RUNS_CODE, _other_hit(args, base, True))  # INLINE ARGUMENT / SCRIPT FILE
     if prog == "eval":
         return _shell_hit(" ".join(args), base, depth + 1)
     if prog in _INTERPRETERS:
-        rest, skip = [], False
+        rest, codes, skip = [], [], False
+        flags = _CODE_FLAGS.get(prog, "cep")
         for i, arg in enumerate(args):
             if skip:
                 skip = False
-            elif arg in ("--eval", "--print") or re.fullmatch(r"-[A-Za-z]*[cep]", arg):
-                code = args[i + 1] if i + 1 < len(args) else ""
-                hit = _literal_hit(code, base) if code else None
-                if hit:  # code that starts another program may run a search: no cause
-                    return _because(None if _SHELLS_OUT.search(code) else RUNS_CODE, hit)
+            elif arg in ("--eval", "--print") or re.fullmatch(rf"-[A-Za-z]*[{flags}]", arg) or (
+                    prog == "deno" and i == 0 and arg == "eval"):
+                codes.append(args[i + 1] if i + 1 < len(args) else "")
                 skip = True
             elif arg == "-m":
                 skip = True
             else:
                 rest.append(arg)
-        return _because(RUNS_CODE, _other_hit(rest, base, True))
+        literal = _first(_literal_hit(code, base) for code in codes if code)
+        given = _other_hit(rest, base, True)
+        if given and (codes or _stdin_code(rest)):  # INLINE ARGUMENT: no cause
+            return _because(None, literal or given)
+        if literal:  # INLINE LITERAL: code that starts another program may run a search: no cause
+            return _because(None if any(_SHELLS_OUT.search(code) for code in codes) else RUNS_CODE, literal)
+        return _because(RUNS_CODE, given)  # SCRIPT FILE (and `-m MODULE`, a named module)
     return _other_command_hit(prog, args, cmd, base, depth, bulk)
+
+
+# The inline-code flags of an interpreter beyond -c/-e/-p (a cluster ending in one, `-ne`): php's -r, perl's -E.
+_CODE_FLAGS = {"php": "cepr", "perl": "cepE"}
+_STDIN_SCRIPTS = {"-", "/dev/stdin", "/dev/fd/0"}
+
+
+def _stdin_code(args, flag=None):
+    """Whether a shell or interpreter reads its code from standard input while its operands are arguments: its script
+    operand is `-` or /dev/stdin, or (`flag`, a shell's -s) an option cluster before the first operand says so."""
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in _STDIN_SCRIPTS:
+            return True
+        elif arg == "--" or not arg.startswith(("-", "+") if flag else "-"):
+            return False
+        elif flag and arg in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            skip = True  # a shell option's value
+        elif flag and not arg.startswith("--") and re.fullmatch(flag, arg):
+            return True
+    return False
 
 
 def _git_output_hit(args, sub, rest, cmd, base, depth, bulk):
@@ -2272,6 +2311,7 @@ def _other_command_hit(prog, args, cmd, base, depth, bulk):
             if hit:
                 return hit
         hit = _first(_read_hit(word, base) for word in operands + values)
+        # `. FILE` / `source FILE`: SCRIPT FILE, the file is the script the shell runs.
         return _because(TRANSFORM if prog in _TRANSFORMS else RUNS_CODE if prog in (".", "source") else None, hit)
     if prog in _LISTERS or prog in _SYNTAX:
         return None
@@ -2309,7 +2349,7 @@ def _document_hit(prog, cmd, base, depth):
             # program; a substitution the shell runs in it is judged as any command, and one with no cause is that hit's.
             # Any other program reads it as text (`cat <<EOF`): no cause.
             unsearched = all(_cause(sub) for sub in subs if sub)
-            code = prog in _INTERPRETERS and not _SHELLS_OUT.search(body)
+            code = prog in _INTERPRETERS and not _SHELLS_OUT.search(body)  # INLINE LITERAL: the body is the code, naming it
             return _because(RUNS_CODE if code and unsearched else None, hit)
     if prog in _SHELLS:
         return _first(_shell_hit(text, base, depth + 1) for text in cmd["strings"])
@@ -2779,9 +2819,15 @@ def _search_targets(words, base, cwd, globs=True):
 
 def _dash_c(args):
     """The command line a shell's `-c` (alone or in a cluster: `-lc`, `-ec`) hands it, or None when it has none."""
+    at = _dash_c_at(args)
+    return None if at is None else args[at]
+
+
+def _dash_c_at(args):
+    """The index in `args` of the command line a shell's `-c` hands it (the words after it are $0, $1, ...), or None."""
     for i, arg in enumerate(args[:-1]):
         if re.fullmatch(r"-[A-Za-z]*c", arg):
-            return args[i + 1]
+            return i + 1
     return None
 
 
@@ -2816,9 +2862,10 @@ def _route_parts(command, cwd=None, base=""):
         words = item["words"]
         prog, args = _program(words)
         fed, before = (before if item["piped"] else None), None
-        for inner in item["subs"]:
+        heredoc_subs = [inner for holder, expands in item["heredocs"] if expands for inner in _substitutions("".join(holder))]
+        for inner in item["subs"] + heredoc_subs:
             if _route_parts(inner, cwd, None)[0]:
-                parts.append({"calls": None})  # a search in `$(...)` runs too
+                parts.append({"calls": None})  # a search in `$(...)` runs too, in a word or an expanding here-document
         if prog is None:
             other = other or bool(words or item["inputs"] or item["outputs"])
             continue
@@ -2832,8 +2879,8 @@ def _route_parts(command, cwd=None, base=""):
         elif prog == "xargs":
             found = command_wrappers.unwrap("xargs", args)
             sub, rest = _program(found[1]) if isinstance(found, tuple) and found[0] == "words" else (None, [])
-            if _search_read(sub, rest):
-                parts.append({"calls": None})  # it searches or reads files its input names
+            if _search_read(sub, rest) or (sub and _route_parts(" ".join(map(shlex.quote, found[1])), cwd, None)[0]):
+                parts.append({"calls": None})  # it searches or reads files its input names (`xargs sh -c 'grep ...'` too)
             else:
                 other = True
         elif prog == "git":
@@ -2912,9 +2959,23 @@ def _route_parts(command, cwd=None, base=""):
             base = None if dynamic or physical else _moved(base, target[0] if target else ("~" if prog == "cd" else None))
             if base and ".." in base.split("/"):
                 base = None if base.startswith("~") else posixpath.normpath(base)
+        elif prog in ("find", "fd", "fdfind") and any(_route_parts(run, cwd, None)[0] for run in _execs(prog, args)):
+            parts.append({"calls": None})  # it searches or reads each file it finds (find -exec grep, fd -x cat)
         elif prog not in _ROUTE_FILTERS and prog not in _ROUTE_QUIET:
             other = True
     return parts, other
+
+
+def _execs(prog, args):
+    """The commands `find -exec ...` / `fd -x ...` run, as shell lines, for _route_parts."""
+    runs, i = [], 0
+    while i < len(args):
+        if args[i] in (_FIND_EXEC if prog == "find" else _FD_EXEC):
+            end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args)) if prog == "find" else len(args)
+            runs.append(" ".join(shlex.quote(word) for word in args[i + 1:end]))
+            i = end
+        i += 1
+    return runs
 
 
 def _generic(harness):
@@ -2922,26 +2983,27 @@ def _generic(harness):
     return f"Search with {grep} and read with {read} instead of a shell search or read."
 
 
-def safe_route(tool, params, harness, cwd=None):
+def safe_route(tool, params, harness, cwd=None, refused=False):
     """What to use instead of a shell call a worker is refused (classify's "worker_refuse"), as one instruction; None when
     `tool` is not a shell tool. It only names calls: it never decides whether the call is refused.
 
     Each search and read the shell would run is named with the safe call that searches or reads the same files (one call
     per path); when one cannot be named faithfully the safe tools are named generically, and when none can, that is all it
     says. Any other command in the call is to be run separately. `harness` is "claude" or "pi"; `cwd`, the call's
-    directory, makes the named paths absolute.
+    directory, makes the named paths absolute. `refused`: the text is a worker's refusal; when the command holds no search
+    or read (a copy, an edit, an upload, a code run) it also says to ask Main instead of retrying (NOT_A_SEARCH).
 
     Never raises: a hook that crashed would answer nothing, and Claude runs a call its hook did not answer. A command it
     cannot read gets the generic guidance."""
     if tool not in _SHELL_TOOLS:
         return None
     try:
-        return _safe_route(params, harness, cwd if isinstance(cwd, str) and cwd.startswith("/") else None)
+        return _safe_route(params, harness, cwd if isinstance(cwd, str) and cwd.startswith("/") else None, refused)
     except Exception:
         return _generic(harness)
 
 
-def _safe_route(params, harness, cwd):
+def _safe_route(params, harness, cwd, refused=False):
     grep, read = SAFE_TOOL_NAMES.get(harness, SAFE_TOOL_NAMES["pi"])
     parts, other = _route_parts(str((params or {}).get("command") or ""), cwd)
     calls = []
@@ -2962,7 +3024,13 @@ def _safe_route(params, harness, cwd):
                  else f" Search with {grep}, read with {read}.")
     else:
         text = _generic(harness)
-    return text + (" Run the other commands in a call of their own, without the search or read." if other and parts else "")
+    if not parts:  # no shell search or read in it: a copy, move, edit, upload or code run the safe tools do not do (round 5)
+        return text + (" " + NOT_A_SEARCH if refused else "")
+    return text + (" Run the other commands in a call of their own, without the search or read." if other else "")
+
+
+# What a worker refused on a command that is not a search or read is told to do instead (sg1 round 5, F3).
+NOT_A_SEARCH = "If it is not a search or read, ask Main for it (tp-agent request) instead of retrying the command."
 
 
 def worker_task(env=None):

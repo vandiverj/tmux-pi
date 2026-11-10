@@ -308,12 +308,13 @@ def routed(decision, params, cwd=None):
     about placeholders included, is returned as it is; a deny is never lifted."""
     try:
         from sensitive_read import classify, safe_route, worker_task
-        route = classify("Bash", params, cwd).get("worker_refuse") and safe_route("Bash", params, "claude", cwd)
+        refuse = decision["decision"] == "ask" and worker_task()
+        route = classify("Bash", params, cwd).get("worker_refuse") and safe_route("Bash", params, "claude", cwd, refuse)
     except Exception:
         return decision  # the decision as it was; a failure here never lifts or adds a prompt
     if not route:
         return decision
-    if decision["decision"] == "ask" and worker_task():
+    if refuse:
         return {**decision, "decision": "deny", "refused": True,
                 "reason": f"tmux-pi refuses this shell read in a worker task. {decision['reason']} {route}"}
     return {**decision, "reason": f"{decision['reason']} {route}"}

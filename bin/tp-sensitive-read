@@ -55,6 +55,8 @@ def main():
                         help="stdin is a JSON array of events; print a JSON array with one decision per event, in order")
     parser.add_argument("--route", choices=("claude", "pi"),
                         help="with a sensitive answer, add \"safe\": the safe tool call (that harness's names) to use instead, when there is one")
+    parser.add_argument("--worker", action="store_true",
+                        help="with --route, the caller refuses a worker's call that has \"worker_refuse\": \"safe\" is that refusal's text")
     parser.add_argument("--trusted", action="store_true",
                         help="lift prompts that a name or directory guess raised in a tree the owner vouched for")
     # Test seams: where the trust store and its log live, and which directories count as temporary.
@@ -95,14 +97,15 @@ def main():
             # A shell ask with no non-search cause ("worker_refuse", sg1 round 4) names the safe tools; in a worker task it
             # is refused, not asked. An ask with a cause, and a Read or Grep tool ask, stays an ask in both.
             searched = result.get("worker_refuse")
-            route = safe_route(event.get("tool_name", ""), event.get("tool_input", {}), "claude", cwd) if searched else None
             refuse = bool(searched) and worker_task()
+            route = safe_route(event.get("tool_name", ""), event.get("tool_input", {}), "claude", cwd, refuse) if searched else None
             save_request({**result, "reason": f"{result['reason']}. {route}" if route else result["reason"]},
                          "refused" if refuse else "pending", event.get("tool_use_id"), event.get("agent_id"))
             print(json.dumps(response_for(result, route, refuse)))
     else:
         result = classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd, resolver(args))
-        route = args.route and result.get("worker_refuse") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}), args.route, cwd)
+        route = args.route and result.get("worker_refuse") and safe_route(event.get("tool_name", ""), event.get("tool_input", {}),
+                                                                          args.route, cwd, args.worker)
         print(json.dumps({**result, "safe": route} if route else result))
 
 

@@ -4,6 +4,7 @@ test_orchestration. Nothing here may contact the Laya endpoint (127.0.0.1:11436)
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -402,21 +403,14 @@ class EscalationTests(Base):
             pinned = self.meta(self.settled(self.retry(second, "--route", "design", "--worker", "claude", "--task", "Fix lib/sensitive_read.py and run its tests.")))
             self.assertEqual((pinned["model"], pinned["thinking"], pinned["route_info"]["source"]), (OPUS, "high", "escalation_level_up"))
             self.assertIn("protected path lib/sensitive_read.py: effort high", pinned["route_info"]["steps"])
-        # no readable catalog: the plain retry's validated fallback, and why it was not escalated (was: a traceback)
-        with self.subTest("no catalog"):
-            nocat = self.run_cmd("tp-agent", "retry", second["id"], "--reason", "failed", "--route", "rule-first",
-                                 env=dict(self.env, TP_MODEL_CATALOG=str(self.root / "missing-catalog.json")))
-            self.assertEqual(nocat.returncode, 0, nocat.stderr[-300:])
-            self.assertNotIn("Traceback", nocat.stderr)
-            self.assertIn("the gated retry was not escalated: model catalog unreadable", nocat.stderr)
-            self.assertEqual(self.meta(self.settled(json.loads(nocat.stdout)))["route_info"]["source"], "catalog_error_fallback")
-        # the same fallback holds the effort approval (was: xhigh and max started unapproved) and a catalog that parses
-        # with the wrong shape is a catalog error too (was: AttributeError / TypeError tracebacks)
-        for label, change, extra, effort in (("missing, xhigh unapproved", None, ("--thinking", "xhigh"), "high"),
-                                             ("missing, max unapproved", None, ("--thinking", "max"), "high"),
-                                             ("missing, xhigh approved", None, ("--thinking", "xhigh", "--approve-effort"), "xhigh"),
-                                             ("roles null", lambda c: c.update(roles=None), (), None),
-                                             ("protected_paths 42", lambda c: c.update(protected_paths=42), (), None)):
+        # no usable catalog: a gated retry asks for the level above the failed attempt, which only the catalog defines,
+        # so it stops, naming the catalog error, and nothing starts (was: the built-in pair started as a plain retry,
+        # silently; before that, a traceback). A catalog that parses with the wrong shape is a catalog error too.
+        for label, change, extra in (("missing", None, ()),
+                                     ("missing, xhigh unapproved", None, ("--thinking", "xhigh")),
+                                     ("missing, xhigh approved", None, ("--thinking", "xhigh", "--approve-effort")),
+                                     ("roles null", lambda c: c.update(roles=None), ()),
+                                     ("protected_paths 42", lambda c: c.update(protected_paths=42), ())):
             with self.subTest(label):
                 path = self.root / "missing-catalog.json"
                 if change:
@@ -424,15 +418,14 @@ class EscalationTests(Base):
                     change(shaped)
                     path = self.root / "shaped-catalog.json"
                     path.write_text(json.dumps(shaped))
+                before = sorted(p.name for p in (self.state / "tasks").iterdir())
                 run = self.run_cmd("tp-agent", "retry", second["id"], "--reason", "failed", "--route", "rule-first", *extra,
                                    env=dict(self.env, TP_MODEL_CATALOG=str(path)))
-                self.assertEqual(run.returncode, 0, run.stderr[-300:])
+                self.assertEqual(run.returncode, 1, run.stdout[-300:])
                 self.assertNotIn("Traceback", run.stderr)
-                self.assertIn("the gated retry was not escalated: model catalog unreadable", run.stderr)
-                got = self.meta(self.settled(json.loads(run.stdout)))
-                self.assertEqual((got["route_info"]["source"], got["model"]), ("catalog_error_fallback", SOL))
-                if effort:
-                    self.assertEqual(got["thinking"], effort)
+                self.assertIn("model catalog unreadable", run.stderr)
+                self.assertIn("the gated retry (--route rule-first) asks for the level above", run.stderr)
+                self.assertEqual(sorted(p.name for p in (self.state / "tasks").iterdir()), before)
         mine = self.meta(self.settled(self.retry(second, "--route", "design", "--model", SONNET, "--thinking", "medium")))  # the user's model wins
         self.assertEqual((mine["model"], mine["thinking"]), (SONNET, "medium"))
         self.assertNotEqual(mine["route_info"]["decided_by"], "gated_retry")
@@ -444,41 +437,143 @@ class EscalationTests(Base):
 
 
 class CatalogFallbackEffortTests(Base):
-    """Attack on one rule: no route starts above high without --approve-effort, whatever picked it and whatever state the
-    catalog is in. kind (first dispatch or plain retry, gated retry, --escalate) x --thinking x approval x catalog
-    (missing, not JSON, wrong shape) = the expected worker, model, concrete effort, source, step and reason."""
+    """Attack on one rule: no route starts above high without --approve-effort, and every route is a pair the active
+    policy allows, whatever picked it and whatever state the catalog is in. A rejected catalog is never read again: the
+    fallback is BUILTIN_POLICY. kind (first dispatch or plain retry, gated retry, --escalate) x worker x --thinking x
+    approval x catalog content (missing, empty, not JSON, 2000-deep, wrong shape, the review's two effort scales,
+    numbers out of bounds) = the expected worker, model, concrete effort, source, steps and reason."""
 
     def catalogs(self):
-        shaped = json.loads((ROOT / "config" / "model-catalog.json").read_text())
-        shaped["roles"] = None
-        (self.root / "not-json.json").write_text("{not json")
-        (self.root / "shaped.json").write_text(json.dumps(shaped))
-        return {"missing": self.root / "missing.json", "not json": self.root / "not-json.json", "wrong shape": self.root / "shaped.json"}
+        shipped = (ROOT / "config" / "model-catalog.json").read_text()
+
+        def changed(name, change):
+            cat = json.loads(shipped)
+            change(cat)
+            path = self.root / (name + ".json")
+            path.write_text(json.dumps(cat))
+            return path
+
+        def text(name, body):
+            path = self.root / (name + ".json")
+            path.write_text(body)
+            return path
+
+        def chain0(key, value):
+            return lambda c: c["router"]["chain"][0].update({key: value})
+
+        out = {"missing": self.root / "missing.json", "empty": text("empty", ""), "not json": text("not-json", "{not json"),
+               "2000-deep": text("deep", "[" * 2000 + "]" * 2000),
+               "wrong shape": changed("shaped", lambda c: c.update(roles=None)),
+               "order medium,max,high": changed("order-mmh", lambda c: c["effort"].update(order=["medium", "max", "high"])),
+               "order [null]": changed("order-null", lambda c: c["effort"].update(order=[None]))}
+        for value in (1e100, float("nan"), float("inf"), 0, -1):
+            out["timeout {}".format(value)] = changed("timeout-{}".format(value), chain0("timeout_seconds", value))
+            out["budget {}".format(value)] = changed("budget-{}".format(value), lambda c, v=value: c["router"].update(budget_seconds=v))
+        return out
+
+    @staticmethod
+    def expected(worker, thinking, approved):
+        """(worker, model, effort, steps) of the built-in policy: the effort asked for (medium by default) capped at high
+        without approval; with approval, xhigh and max are not efforts the built-in models allow, so high and a note."""
+        worker = worker or "pi"
+        model = {"pi": SOL, "claude": SONNET}[worker]
+        want = thinking or "medium"
+        if want in ("xhigh", "max"):
+            step = ("effort {} not allowed on {}; used high".format(want, model) if approved
+                    else "effort {} capped at high (no approval recorded)".format(want))
+            return worker, model, "high", [step]
+        return worker, model, want, []
 
     def test_the_catalog_error_fallback_applies_the_effort_approval_on_every_kind(self):
+        from unittest import mock
+        import router_catalog as rc
         prior = {"model": SONNET, "thinking": "medium", "route_info": {}}
+        catalogs = self.catalogs()
         rows = 0
-        for name, path in self.catalogs().items():
-            for kind in ("plain", "gated", "escalate"):
-                for thinking in (None, "low", "high", "xhigh", "max"):
-                    for approved in (False, True):
-                        rows += 1
-                        req = {"task": "Fix src/a.py", "role": "coder", "thinking": thinking, "approve_effort": approved}
-                        if kind != "plain":
-                            req["escalate"] = {"from": prior, "gate": "rule-first", "optional": kind == "gated"}
-                        with self.subTest(catalog=name, kind=kind, thinking=thinking, approved=approved):
-                            if kind == "escalate":  # a required escalation cannot be worked out without a catalog
-                                with self.assertRaises(model_router.RouteStop):
-                                    model_router.select(req, catalog_path=str(path), log=False)
-                                continue
-                            out = model_router.select(req, catalog_path=str(path), log=False)
-                            above = thinking in ("xhigh", "max") and not approved
-                            self.assertEqual((out["worker"], out["model"], out["source"], out["decided_by"]), ("pi", SOL, "catalog_error_fallback", None))
-                            self.assertEqual(out["effort"], "high" if above else thinking or "medium")
-                            self.assertEqual(out["steps"], ["effort {} capped at high (no approval recorded)".format(thinking)] if above else [])
-                            self.assertTrue(out["reason"].startswith("model catalog unreadable"), out["reason"])
-                            self.assertEqual(out.get("escalation_note") is not None, kind == "gated")
-        self.assertEqual(rows, 3 * 3 * 5 * 2)
+        for name, path in catalogs.items():
+            # the shipped catalog itself is the broken one too: no valid copy is read in its place
+            with mock.patch.object(rc, "CATALOG_PATH", path):
+                for kind in ("first", "gated", "escalate", "level mid", "level top"):
+                    for worker in (None, "claude", "pi"):
+                        for thinking in (None, "low", "medium", "high", "xhigh", "max"):
+                            for approved in (False, True):
+                                rows += 1
+                                req = {"task": "Fix src/a.py", "role": "coder", "worker": worker, "thinking": thinking, "approve_effort": approved}
+                                if kind in ("gated", "escalate"):
+                                    req["escalate"] = {"from": prior, "gate": "rule-first", "optional": kind == "gated"}
+                                if kind.startswith("level"):
+                                    req["level"] = kind.split()[1]
+                                with self.subTest(catalog=name, kind=kind, worker=worker, thinking=thinking, approved=approved):
+                                    if kind != "first":
+                                        # the catalog defines levels: a request that names one (--level, a gated retry's
+                                        # level above, --escalate's next step) stops, naming the catalog error (was, for
+                                        # --level and gated: the built-in pair, silently)
+                                        stop = {"gated": "the gated retry (--route rule-first) asks for the level above " + SONNET,
+                                                "escalate": "the next route cannot be worked out"}.get(
+                                            kind, "level {} is defined by the catalog and cannot be honored".format(kind.split()[-1]))
+                                        with self.assertRaisesRegex(model_router.RouteStop, "^model catalog unreadable \\(.+\\): " + re.escape(stop)):
+                                            model_router.select(req, catalog_path=str(path), log=False)
+                                        continue
+                                    out = model_router.select(req, catalog_path=str(path), log=False)
+                                    self.assertEqual((out["worker"], out["model"], out["effort"], out["steps"]), self.expected(worker, thinking, approved))
+                                    self.assertEqual((out["source"], out["decided_by"]), ("catalog_error_fallback", None))
+                                    self.assertTrue(out["reason"].startswith("model catalog unreadable"), out["reason"])
+                                    self.assertNotIn("escalation_note", out)
+        self.assertEqual(rows, len(catalogs) * 5 * 3 * 6 * 2)
+
+    def test_the_built_in_policy_agrees_with_the_shipped_catalog(self):
+        """BUILTIN_POLICY is code, so it is checked here against the shipped catalog: the same effort scale, ceiling and
+        default, and each built-in pair is a model of the same worker at a shown, unrestricted level no role's floor is
+        above, in the roster and not explicit-only, allowing every effort the policy gives it."""
+        import router_catalog as rc
+        from builtin_route_policy import BUILTIN_POLICY
+        cat = rc.load_catalog()
+        self.assertEqual(list(BUILTIN_POLICY["effort_order"]), cat["effort"]["order"])
+        self.assertEqual((BUILTIN_POLICY["ceiling"], BUILTIN_POLICY["default_effort"]), (cat["effort"]["ceiling"], cat["effort"]["default"]))
+        ranks = {lv["key"]: lv["rank"] for lv in cat["levels"]}
+        floor = max(ranks[r["min_level"]] for r in cat["roles"].values() if r.get("min_level"))
+        self.assertEqual(sorted(BUILTIN_POLICY["models"]), ["claude", "pi"])
+        for worker, (model, efforts) in BUILTIN_POLICY["models"].items():
+            with self.subTest(worker=worker):
+                for effort in efforts:
+                    level, entry = rc.level_of(cat, model, effort)
+                    self.assertIsNotNone(entry, (model, effort))
+                    self.assertEqual(entry["worker"], worker)
+                    self.assertIn(level["key"], rc.shown_keys(cat))
+                    self.assertFalse(level.get("restricted"), level["key"])
+                    self.assertGreaterEqual(level["rank"], floor)
+                    self.assertTrue(entry.get("in_roster", True) and not entry.get("explicit_only"), entry)
+
+    def test_a_route_that_fails_the_final_check_stops_and_is_never_rewritten(self):
+        """route_problem confirms the (worker, model, effort) every chooser returns; a failure is a stop. Each chooser
+        is made to return a bad pair: above the cap without approval, an effort the model does not allow, the wrong
+        worker for the model (the F2 shape: a pair the catalog does not have)."""
+        from unittest import mock
+        import route_resolve as rr
+        real = rr.resolve
+        bad = {"above cap": ("pi", ASTRA, "xhigh", "effort xhigh is above high"),
+               "not allowed": ("pi", SOL, "xhigh", "is not a worker, model and effort the catalog allows"),
+               "wrong worker": ("claude", SOL, "medium", "is not a worker, model and effort the catalog allows")}
+        for label, (worker, model, effort, why) in bad.items():
+            for req in ({"task": TASK, "role": "coder", "level": "mid"}, {"task": TASK, "role": "coder", "model": SONNET}):
+                with self.subTest(label, req=sorted(req)), mock.patch.object(
+                        rr, "resolve", lambda *a, **k: dict(real(*a, **k), worker=worker, model=model, effort=effort)):
+                    with self.assertRaises(model_router.RouteStop) as stop:
+                        model_router.select(req, log=False)
+                    self.assertIn("failed the final check", str(stop.exception))
+                    self.assertIn(why, str(stop.exception))
+        # approved, the same top-level pair passes the check unchanged
+        with mock.patch.object(rr, "resolve", lambda *a, **k: dict(real(*a, **k), worker="pi", model=ASTRA, effort="xhigh")):
+            out = model_router.select({"task": TASK, "role": "coder", "level": "mid", "approve_effort": True}, log=False)
+            self.assertEqual((out["model"], out["effort"]), (ASTRA, "xhigh"))
+        # the built-in fallback is checked against the built-in policy the same way
+        for worker, model, effort in (("pi", SOL, "xhigh"), ("pi", SONNET, "medium"), ("claude", SOL, "medium")):
+            with self.subTest("fallback", pair=(worker, model, effort)), mock.patch.object(
+                    model_router, "_builtin_route", lambda req, w=worker, m=model, e=effort: {
+                        "source": "catalog_error_fallback", "worker": w, "model": m, "effort": e, "steps": []}):
+                with self.assertRaises(model_router.RouteStop) as stop:
+                    model_router.select({"task": TASK, "role": "coder"}, catalog_path=str(self.root / "missing.json"), log=False)
+                self.assertIn("is not a worker, model and effort the built-in policy allows", str(stop.exception))
 
     def test_the_fallback_refuses_an_effort_the_scale_does_not_have(self):
         for thinking in ("bogus", "ultra"):
@@ -633,13 +728,6 @@ class CardHashTests(Base):
 
 
 class LocalRuleConstraintTests(Base):
-    def floorless_catalog(self):
-        cat = json.loads((ROOT / "config" / "model-catalog.json").read_text())
-        cat["roles"]["scribe"] = {"max_level": "mid"}  # no min_level: nothing to confirm
-        path = self.root / "floorless-catalog.json"
-        path.write_text(json.dumps(cat))
-        return path
-
     def rule(self, source, target, thinking="medium", pattern="pagination"):
         path = self.root / "local.json"
         path.write_text(json.dumps({"rules": [{"pattern": pattern, "from": [source], "to": {"model": target, "thinking": thinking}}]}))
@@ -735,29 +823,6 @@ class LocalRuleConstraintTests(Base):
         out = json.loads(run.stdout)
         self.assertEqual((out["model"], out["level"]), (HAIKU, "small"))
 
-    def test_the_emergency_fallback_never_substitutes_below_a_strict_floor(self):
-        config = {"claude_preference": {"ordinary": {"model": "nope"}}, "routes": {}, "models": [
-            {"model": HAIKU, "worker": "claude", "thinking": ["low"]}]}
-        self.assertEqual(model_router._emergency(config, "claude", "scribe", self.floorless_catalog())[1], HAIKU)
-        for role in ("coder", "tester", "researcher"):
-            with self.subTest(role=role), self.assertRaises(model_router.RouteStop):
-                model_router._emergency(config, "claude", role, None)
-
-    def test_the_emergency_fallback_for_a_coder_is_the_configured_pair_only_when_it_is_at_the_floor(self):
-        config = json.loads((ROOT / "config" / "router.json").read_text())
-        self.assertEqual(model_router._emergency(config, "claude", "coder")[:2], ("claude", SONNET))
-        self.assertEqual(model_router._emergency(config, "pi", "coder")[:2], ("pi", SOL))
-        config["claude_preference"]["ordinary"]["model"] = HAIKU
-        config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
-        for worker in ("claude", "pi"):
-            with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
-                model_router._emergency(config, worker, "coder")
-        # the same configuration still serves a role that has no strict floor
-        self.assertEqual(model_router._emergency(config, "claude", "scribe", self.floorless_catalog())[1], HAIKU)
-        for role in ("tester", "researcher"):
-            with self.subTest(role=role), self.assertRaises(model_router.RouteStop):
-                model_router._emergency(config, "claude", role)
-
     def test_a_redirect_that_does_not_fit_the_packet_is_dropped(self):
         (self.project / "big.txt").write_text("x" * 40000)
         env = self.rule(SONNET, "slotstream/qwen3.8-flash-next:4bit", "low")
@@ -767,126 +832,68 @@ class LocalRuleConstraintTests(Base):
 
 
 class InvalidCatalogCoderFloorTests(Base):
-    """A catalog that fails validation is not trusted, but the coder still must not land on Haiku or a local model."""
+    """A catalog that fails validation is not read again, and neither the router configuration nor the shipped catalog
+    stands in for it: the fallback is BUILTIN_POLICY's mid pair (Sonnet for claude, Sol for pi), so a coder never lands
+    on Haiku or a local model however the configuration or the broken catalog was changed (was: a lenient reread of
+    the rejected catalog and the configured pairs, held to the floor that reread found)."""
 
     def setUp(self):
         super().setUp()
-        cat = json.loads((ROOT / "config" / "model-catalog.json").read_text())
-        cat["unexpected_key"] = True  # valid JSON, fails strict validation, roles and levels intact
-        self.bad_catalog = self.root / "bad-catalog.json"
-        self.bad_catalog.write_text(json.dumps(cat))
+        self.shipped = json.loads((ROOT / "config" / "model-catalog.json").read_text())
         self.config = json.loads((ROOT / "config" / "router.json").read_text())
+        self.config["claude_preference"]["ordinary"]["model"] = HAIKU  # ignored: the fallback reads no configuration pair
+        self.config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
+        self.cfg = self.root / "router.json"
+        self.cfg.write_text(json.dumps(self.config))
 
-    def route(self, role, *args, config=None, catalog=None):
-        cfg = self.root / "router.json"
-        cfg.write_text(json.dumps(config or self.config))
-        return self.run_cmd("tp-route", "--no-log", "--role", role, "--catalog", str(catalog or self.bad_catalog), "--config", str(cfg),
-                            *args, stdin=TASK)
+    def catalog(self, name, change=None, text=None):
+        path = self.root / (name + ".json")
+        if text is not None:
+            path.write_text(text)
+        else:
+            cat = json.loads(json.dumps(self.shipped))
+            cat["unexpected_key"] = True  # valid JSON, fails strict validation, roles and levels intact
+            if change:
+                change(cat)
+            path.write_text(json.dumps(cat))
+        return path
 
-    def test_the_configured_mid_pairs_are_used(self):
+    def test_the_cli_fallback_is_the_built_in_pair_whatever_the_configuration_names(self):
+        bad = self.catalog("bad")
         for worker, model in (("claude", SONNET), ("pi", SOL)):
             with self.subTest(worker=worker):
-                run = self.route("coder", "--worker", worker)
+                run = self.run_cmd("tp-route", "--no-log", "--role", "coder", "--worker", worker, "--catalog", str(bad),
+                                   "--config", str(self.cfg), stdin=TASK)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 out = json.loads(run.stdout)
-                self.assertEqual((out["source"], out["worker"], out["model"]), ("catalog_error_fallback", worker, model))
-
-    def test_a_configured_pair_below_the_floor_stops_instead_of_routing_a_coder_to_it(self):
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        self.config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
-        for worker in ("claude", "pi", None):
-            with self.subTest(worker=worker):
-                run = self.route("coder", *(("--worker", worker) if worker else ()))
-                self.assertNotEqual(run.returncode, 0, run.stdout)
-                self.assertIn("cannot be confirmed", run.stderr)
+                self.assertEqual((out["source"], out["worker"], out["model"], out["thinking"]), ("catalog_error_fallback", worker, model, "medium"))
                 self.assertNotIn(HAIKU, run.stdout)
                 self.assertNotIn(QWEN, run.stdout)
 
-    def test_a_configured_pair_missing_from_the_roster_stops_a_coder_without_substituting(self):
-        self.config["claude_preference"]["ordinary"]["model"] = "no-such-model"
-        run = self.route("coder", "--worker", "claude")
-        self.assertNotEqual(run.returncode, 0, run.stdout)
-        self.assertNotIn(HAIKU, run.stdout)
-
-    def test_a_malformed_catalog_file_still_takes_the_floor_from_the_shipped_catalog(self):
-        broken = self.root / "broken.json"
-        broken.write_text("{ not json")
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        run = self.route("coder", "--worker", "claude", catalog=broken)
-        self.assertNotEqual(run.returncode, 0, run.stdout)
-        self.assertNotIn(HAIKU, run.stdout)
-        run = self.route("coder", "--worker", "claude", config=json.loads((ROOT / "config" / "router.json").read_text()), catalog=broken)
-        self.assertEqual(json.loads(run.stdout)["model"], SONNET)
-
-    def test_a_catalog_whose_coder_rule_was_dropped_cannot_lower_the_floor(self):
-        cat = json.loads(self.bad_catalog.read_text())
-        del cat["roles"]["coder"]
-        self.bad_catalog.write_text(json.dumps(cat))
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        run = self.route("coder", "--worker", "claude")
-        self.assertNotEqual(run.returncode, 0, run.stdout)
-
-    def test_a_configured_pair_the_catalog_places_below_mid_is_not_confirmed(self):
-        # the model is in the roster, but the lenient read of the catalog puts it at the small level
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        run = self.route("coder", "--worker", "claude")
-        self.assertNotEqual(run.returncode, 0)
-        self.assertIn("floor", run.stderr)
-
-    def test_a_role_without_a_min_level_keeps_the_configured_pair_even_below_mid(self):
-        cat = json.loads(self.bad_catalog.read_text())
-        cat["roles"]["scribe"] = {"max_level": "mid"}
-        self.bad_catalog.write_text(json.dumps(cat))
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        run = self.route("scribe", "--worker", "claude")
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(json.loads(run.stdout)["model"], HAIKU)
-
-    def test_tester_and_researcher_are_held_to_the_floor_too(self):
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        for role in ("tester", "researcher"):
-            with self.subTest(role=role):
-                run = self.route(role, "--worker", "claude")
-                self.assertNotEqual(run.returncode, 0, run.stdout)
-                self.assertNotIn(HAIKU, run.stdout)
-
-    def test_a_coder_rule_that_lost_strict_floor_but_kept_min_level_still_stops_a_coder(self):
+    def test_no_broken_catalog_or_configuration_lowers_the_fallback(self):
         from unittest import mock
-        cat = json.loads(self.bad_catalog.read_text())
-        del cat["roles"]["coder"]["strict_floor"]
-        self.bad_catalog.write_text(json.dumps(cat))
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        self.config["routes"]["coding"] = {"model": QWEN, "thinking": "off"}
-        cfg = self.root / "router.json"
-        cfg.write_text(json.dumps(self.config))
-        with mock.patch.object(model_router.rc, "CATALOG_PATH", self.bad_catalog):
-            for worker in ("claude", "pi", None):
-                with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
-                    model_router.select({"role": "coder", "worker": worker, "task": "fix named code"},
-                                        catalog_path=self.bad_catalog, config_path=cfg, log=False)
+        import router_catalog as rc
 
-    def test_an_invalid_shipped_catalog_that_lost_the_coder_rule_stops_a_coder(self):
-        # the shipped catalog itself is the invalid one, so no valid copy can restore the rule
-        from unittest import mock
-        cat = json.loads(self.bad_catalog.read_text())
-        del cat["roles"]["coder"]
-        self.bad_catalog.write_text(json.dumps(cat))
-        self.config["claude_preference"]["ordinary"]["model"] = HAIKU
-        cfg = self.root / "router.json"
-        cfg.write_text(json.dumps(self.config))
-        with mock.patch.object(model_router.rc, "CATALOG_PATH", self.bad_catalog):
-            for worker in ("claude", "pi", None):
-                with self.subTest(worker=worker), self.assertRaises(model_router.RouteStop):
-                    model_router.select({"role": "coder", "worker": worker, "task": "fix named code"},
-                                        catalog_path=self.bad_catalog, config_path=cfg, log=False)
-            # a role the broken catalog still names with a floor is held to it
-            with self.assertRaises(model_router.RouteStop):
-                model_router.select({"role": "tester", "worker": "claude", "task": "t"},
-                                    catalog_path=self.bad_catalog, config_path=cfg, log=False)
-            # a role it does not name cannot be confirmed either
-            with self.assertRaises(model_router.RouteStop):
-                model_router.select({"role": "unlisted", "worker": "claude", "task": "t"},
-                                    catalog_path=self.bad_catalog, config_path=cfg, log=False)
+        def drop(role, key=None):
+            return lambda c: c["roles"][role].pop(key) if key else c["roles"].pop(role)
+
+        catalogs = {"unexpected key": self.catalog("bad"), "not json": self.catalog("broken", text="{ not json"),
+                    "coder rule dropped": self.catalog("nocoder", drop("coder")),
+                    "strict_floor dropped": self.catalog("nostrict", drop("coder", "strict_floor")),
+                    "scribe without a floor": self.catalog("scribe", lambda c: c["roles"].update(scribe={"max_level": "mid"}))}
+        rows = 0
+        for name, path in catalogs.items():
+            for shipped_broken in (False, True):  # the shipped catalog itself is the invalid one: nothing valid is reread
+                with mock.patch.object(rc, "CATALOG_PATH", path if shipped_broken else rc.CATALOG_PATH):
+                    for role in ("coder", "tester", "researcher", "scribe", "unlisted"):
+                        for worker in (None, "claude", "pi"):
+                            rows += 1
+                            with self.subTest(catalog=name, shipped_broken=shipped_broken, role=role, worker=worker):
+                                out = model_router.select({"role": role, "worker": worker, "task": "fix named code"},
+                                                          catalog_path=path, config_path=self.cfg, log=False)
+                                self.assertEqual((out["source"], out["worker"], out["model"], out["effort"]),
+                                                 ("catalog_error_fallback", worker or "pi", SONNET if worker == "claude" else SOL, "medium"))
+        self.assertEqual(rows, 5 * 2 * 5 * 3)
 
 
 class ReviewPlanTests(Base):

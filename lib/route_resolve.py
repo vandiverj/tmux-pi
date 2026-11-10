@@ -70,16 +70,33 @@ def review_policy(cat, role, level_key, effort, files_touched=None):
 
 # ---------------------------------------------------------------- effort
 
-def concrete_effort(cat, level, model, abstract):
-    """Map the abstract effort onto the model's allowed list; return (effort, note or None)."""
-    order = cat["effort"]["order"]
-    want = level["effort_map"].get(abstract, abstract)
-    allowed = model["efforts"]
-    if want in allowed:
+def effort_cap(order, ceiling, approved):
+    """The highest effort a request may run at: the ceiling, or the top of the scale with --approve-effort. Fixed
+    before resolution, so every choice below is made within it (it is an input, never a rewrite of a result)."""
+    return order[-1] if approved else ceiling
+
+
+def pick_effort(order, want, allowed, cap, name):
+    """(effort, note) for a model that allows `allowed`: want when allowed, else the highest allowed below it, else the
+    lowest allowed; never above cap. (None, reason) when the model allows no effort at or below cap. The one rule for
+    a concrete effort: the resolver, an explicit model and the catalog-error fallback all use it."""
+    within = [e for e in allowed if order.index(e) <= order.index(cap)]
+    if not within:
+        return None, "{} allows no effort at or below {} ({}); more needs --approve-effort".format(name, cap, ", ".join(allowed))
+    if order.index(want) > order.index(cap):
+        want = cap
+    if want in within:
         return want, None
-    below = [e for e in allowed if order.index(e) <= order.index(want)]
-    used = below[-1] if below else allowed[0]
-    return used, "effort {} not allowed on {}; used {}".format(want, model["model"], used)
+    below = [e for e in within if order.index(e) <= order.index(want)]
+    used = below[-1] if below else within[0]
+    return used, "effort {} not allowed on {}; used {}".format(want, name, used)
+
+
+def concrete_effort(cat, level, model, abstract, cap=None):
+    """Map the abstract effort onto the model's allowed list within cap (default: no cap); return (effort, note or
+    None), or (None, reason) when the model allows nothing at or below cap."""
+    order = cat["effort"]["order"]
+    return pick_effort(order, level["effort_map"].get(abstract, abstract), model["efforts"], cap or order[-1], model["model"])
 
 
 def clamp_effort(cat, effort, approved):
@@ -144,6 +161,7 @@ def validate_explicit(cat, model, worker, thinking, ctx, health):
         raise ExplicitError("model {} cannot be used: {}".format(model, reason))
     notes = []
     approved = bool(ctx.get("approvals", {}).get("effort_above_high"))
+    cap = effort_cap(cat["effort"]["order"], cat["effort"]["ceiling"], approved)
     if thinking:
         if thinking not in entry["efforts"]:
             raise ExplicitError("model {} does not allow effort {!r}; it allows: {}".format(model, thinking, ", ".join(entry["efforts"])))
@@ -151,12 +169,14 @@ def validate_explicit(cat, model, worker, thinking, ctx, health):
         if note:
             notes.append(note)
         if effort not in entry["efforts"]:
-            effort, note = concrete_effort(cat, level, entry, effort)
+            effort, note = concrete_effort(cat, level, entry, effort, cap)
             notes.append(note)
     else:
-        effort, note = concrete_effort(cat, level, entry, cat["effort"]["default"])
-        if note:
+        effort, note = concrete_effort(cat, level, entry, cat["effort"]["default"], cap)
+        if note and effort:
             notes.append(note)
+    if effort is None:
+        raise ExplicitError("model {} cannot be used: {}".format(model, note))
     return level, entry, effort, notes
 
 
@@ -413,23 +433,33 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
             idx = gate
             steps.append("local-only: level {}".format(keys[idx]))
 
-    # find a model: this level, then up (never into a restricted or hidden level), then down with forced review
+    # find a model: this level, then up (never into a restricted or hidden level), then down with forced review.
+    # A model counts only with an effort it allows within the request's cap (the ceiling unless approved): the cap is
+    # an input to the choice, so no pair is made valid afterwards by cutting its effort.
+    cap = effort_cap(cat["effort"]["order"], cat["effort"]["ceiling"], approved)
     up = [j for j in range(idx + 1, len(keys)) if keys[j] in shown and not cat["levels"][j].get("restricted")]
     down = [j for j in range(idx - 1, -1, -1) if keys[j] in shown and (strict_floor is None or j >= strict_floor)]
-    chosen = None
+    chosen, over_cap = None, []
     for j in [idx] + up + down:
         if j != idx and cat["levels"][j].get("requires_shape") and not qualified:
             continue
-        found = candidates_at(cat, cat["levels"][j], ctx, health)
-        if found:
-            chosen = (j, found[0])
+        for m in candidates_at(cat, cat["levels"][j], ctx, health):
+            final_effort, note = concrete_effort(cat, cat["levels"][j], m, eff, cap)
+            if final_effort is None:
+                over_cap.append(note)
+                continue
+            chosen = (j, m)
+            break
+        if chosen:
             break
     if not chosen:
+        why = "; " + "; ".join(over_cap) if over_cap else ""
         if strict_floor is not None:
-            return _stop(rec, "no available model at level {} or above, the {}; the user must decide".format(
-                keys[strict_floor], bound_why))
-        return _stop(rec, "no available model at any level")
+            return _stop(rec, "no available model at level {} or above, the {}; the user must decide{}".format(
+                keys[strict_floor], bound_why, why))
+        return _stop(rec, "no available model at any level{}".format(why))
     j, model = chosen
+    steps.extend(over_cap)
     degraded = None
     if j != idx:
         degraded = "up" if j > idx else "down"
@@ -437,7 +467,6 @@ def resolve(decision, cat, health=None, ctx=None, decided_by=None):
         if degraded == "down":
             review = "required"
             steps.append("moved down: review forced to required")
-    final_effort, note = concrete_effort(cat, cat["levels"][j], model, eff)
     if note:
         steps.append(note)
     policy = review_policy(cat, ctx.get("role"), keys[j], eff, ctx.get("files_touched"))

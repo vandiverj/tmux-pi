@@ -593,6 +593,101 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual(self.step(r)["source"], "stop_and_ask")
 
 
+class EffortCapInputTests(unittest.TestCase):
+    """The effort cap (the ceiling unless --approve-effort) is an input to resolution: a model counts only with an effort
+    it allows within the cap, so no route is made valid afterwards by cutting its effort (was: the F2 catalog, where the
+    top level maps every effort to xhigh and its pi model allows only xhigh, gave pi / astra / high, a pair the catalog
+    does not have)."""
+
+    @staticmethod
+    def f2(cat):
+        top = cat["levels"][-1]
+        top["effort_map"] = {e: "xhigh" for e in cat["effort"]["vocabulary"]}
+        for m in top["models"]:
+            if m["worker"] == "pi":
+                m["efforts"] = ["xhigh"]
+
+    def variations(self):
+        """The F2 catalog, then each level's effort_map forced to one effort, then each worker's models allowed one
+        effort: every variation the validator accepts."""
+        shipped = fx.shipped_catalog()
+        order = shipped["effort"]["order"]
+        edits = {"F2": self.f2}
+        for i, lv in enumerate(shipped["levels"]):
+            for v in order:
+                edits["{} effort_map all {}".format(lv["key"], v)] = (
+                    lambda c, i=i, v=v: c["levels"][i].update(effort_map={e: v for e in c["effort"]["vocabulary"]}))
+        for worker in ("claude", "pi"):
+            for e in order:
+                edits["{} models allow only {}".format(worker, e)] = (
+                    lambda c, w=worker, e=e: [m.update(efforts=[e]) for lv in c["levels"] for m in lv["models"] if m["worker"] == w])
+        out, rejected = {}, 0
+        for name, edit in edits.items():
+            cat = copy.deepcopy(shipped)
+            edit(cat)
+            try:
+                out[name] = rc.validate_catalog(cat)
+            except rc.CatalogError:
+                rejected += 1
+        return out, rejected, len(edits)
+
+    def test_the_f2_catalog_never_routes_an_unallowed_pair(self):
+        cat = copy.deepcopy(fx.shipped_catalog())
+        self.f2(cat)
+        rc.validate_catalog(cat)
+        ctx = {"role": "coder", "require_worker": "pi", "skip_caps": True}
+        r = rr.resolve(K("top"), cat, None, ctx)
+        self.assertNotEqual((r.get("model"), r.get("effort")), (ASTRA, "high"))
+        self.assertEqual((r["model"], r["effort"], r["level_key"]), (SOL, "high", "strong"))
+        self.assertIn("openai/gpt-6-astra allows no effort at or below high (xhigh); more needs --approve-effort", r["steps"])
+        approved = rr.resolve(K("top"), cat, None, dict(ctx, approvals={"effort_above_high": True}))
+        self.assertEqual((approved["model"], approved["effort"], approved["level_key"]), (ASTRA, "xhigh", "top"))
+        with self.assertRaisesRegex(rr.ExplicitError, "allows no effort at or below high"):
+            rr.resolve(None, cat, None, {"role": "coder", "explicit": {"model": ASTRA, "worker": "pi", "thinking": None}})
+
+    def test_every_route_is_an_allowed_pair_within_the_cap(self):
+        """Attack (rule 2): the variations x worker x --thinking x approval x kind (each shown level asked for, each
+        model of the worker chosen explicitly, a plain and a gated escalation from mid). The oracle: a stop, or a
+        worker / model / effort the catalog has, on the worker asked for, at or below the cap."""
+        catalogs, rejected, edits = self.variations()
+        rows = stops = 0
+        for name, cat in catalogs.items():
+            order = cat["effort"]["order"]
+            for worker in ("claude", "pi"):
+                for thinking in [None] + order:
+                    for approved in (False, True):
+                        ctx = {"role": "coder", "require_worker": worker, "approvals": {"effort_above_high": approved}}
+                        if thinking:
+                            ctx["explicit_effort"] = thinking
+                        cap = rr.effort_cap(order, cat["effort"]["ceiling"], approved)
+                        kinds = [("level " + k, lambda k=k: rr.resolve(K(k), cat, None, dict(ctx, skip_caps=True))) for k in rc.shown_keys(cat)]
+                        kinds += [("explicit " + m["model"], lambda m=m: rr.resolve(None, cat, None, dict(ctx, explicit={
+                            "model": m["model"], "worker": worker, "thinking": thinking})))
+                                  for lv in cat["levels"] for m in lv["models"] if m["worker"] == worker]
+                        prior = rr.resolve(K("mid", "medium"), cat, None, ctx)
+                        if prior["source"] != "stop_and_ask":
+                            kinds += [("escalate", lambda: rr.escalate(prior, cat, None, ctx)),
+                                      ("gated", lambda: rr.escalate(prior, cat, None, ctx, level_first=True))]
+                        for kind, run in kinds:
+                            rows += 1
+                            with self.subTest(catalog=name, worker=worker, thinking=thinking, approved=approved, kind=kind):
+                                try:
+                                    r = run()
+                                except rr.ExplicitError:
+                                    stops += 1
+                                    continue
+                                if r["source"] == "stop_and_ask":
+                                    stops += 1
+                                    continue
+                                entry = rc.level_of(cat, r["model"], r["effort"])[1]
+                                self.assertIsNotNone(entry, (r["model"], r["effort"]))
+                                self.assertEqual((entry["worker"], r["worker"]), (worker, worker))
+                                self.assertLessEqual(order.index(r["effort"]), order.index(cap), r["effort"])
+        self.assertGreater(len(catalogs), edits // 2)
+        self.assertGreater(rows, stops)
+        self.assertGreater(stops, 0)
+
+
 class ReviewerTests(unittest.TestCase):
     def pick(self, provider, level, health=None, review="required", **ctx):
         return rr.pick_reviewer(provider, level, CAT, health, review, ctx)

@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import llm_router  # noqa: E402
+from builtin_route_policy import BUILTIN_POLICY  # noqa: E402
 import route_card  # noqa: E402
 import route_resolve as rr  # noqa: E402
 import router  # noqa: E402
@@ -87,64 +88,26 @@ def explicit_pair(cat, worker, model):
     return worker or (known["worker"] if known else "pi" if "/" in model else "claude")
 
 
-def _raw_catalogs(catalog_path):
-    """The catalog files that might say what a role's floor is, read leniently (the selected one failed validation, so
-    nothing in it is trusted beyond what is checked below): the selected file, then the shipped one. Unreadable ones are skipped."""
-    found = []
-    for path in dict.fromkeys(str(p) for p in (catalog_path or os.environ.get("TP_MODEL_CATALOG") or rc.CATALOG_PATH, rc.CATALOG_PATH)):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
-            found.append(data)
-    return found
-
-
-def _at_or_above_floor(raw, role, model):
-    """True when the raw catalog puts `model` in a level at or above the role's min_level; False on anything malformed."""
-    try:
-        keys = [level["key"] for level in raw["levels"]]
-        floor = keys.index(raw["roles"][role]["min_level"])
-        return any(entry["model"] == model for level in raw["levels"][floor:] for entry in level["models"])
-    except (KeyError, IndexError, TypeError, ValueError):
-        return False
-
-
-def _emergency(config, worker, role=None, catalog_path=None):
-    """Last resort when the catalog cannot be read: the legacy router config's ordinary pair.
-
-    A model is returned only for a role that a leniently read catalog file names. A role with a strict floor, or with any min_level (the catalog is invalid, so a lost strict_floor flag is not trusted), gets the
-    pair only when it is confirmed at or above the floor; it is never replaced by another model of the worker. When no
-    readable catalog names the role (including an invalid shipped catalog that lost it) nothing is routed."""
-    if not config:
-        raise RouteStop("model catalog and router config are both unreadable; choose a model explicitly with --model")
-    fallback = (config.get("claude_preference", {}).get("ordinary", {}) if worker == "claude"
-                else config.get("routes", {}).get("coding", {}))
-    entry = next((m for m in config["models"] if m["model"] == fallback.get("model")), None)
-    fits = bool(entry) and not (worker and entry["worker"] != worker)
-    raws = _raw_catalogs(catalog_path)
-    if not raws:
-        raise RouteStop("model catalog unreadable and no catalog file can say what role {} may run on, so it is not routed; "
-                        "fix the catalog".format(role))
-    named = [raw["roles"][role] for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)]
-    if not named:
-        # Absence of the role in a catalog that failed validation is not evidence that it has no floor.
-        raise RouteStop("model catalog unreadable and no catalog file confirms the floor of role {}, so it is not routed; "
-                        "fix the catalog or use --model".format(role))
-    strict = [raw for raw in raws if isinstance(raw.get("roles"), dict) and isinstance(raw["roles"].get(role), dict)
-              and (raw["roles"][role].get("strict_floor") or "min_level" in raw["roles"][role])]
-    if strict:
-        if not fits or not all(_at_or_above_floor(raw, role, entry["model"]) for raw in strict):
-            raise RouteStop("model catalog unreadable and the configured fallback ({}) cannot be confirmed at or above the floor "
-                            "of role {} for worker {}, so the user must decide (use --model)".format(fallback.get("model"), role, worker))
-    elif not fits:
-        entry = next((m for m in config["models"] if not worker or m["worker"] == worker), None)
-    if not entry:
-        raise RouteStop("no model available for worker {}".format(worker))
-    thinking = fallback.get("thinking") if fallback.get("thinking") in entry["thinking"] else entry["thinking"][0]
-    return entry["worker"], entry["model"], thinking
+def _builtin_route(req):
+    """The route record of the built-in policy for a request: its worker (default pi), that worker's model, and the
+    effort it asks for (default medium) within its cap (high unless --approve-effort) mapped onto what the model allows.
+    Raises ValueError for an effort or worker the policy does not have."""
+    policy = BUILTIN_POLICY
+    order = list(policy["effort_order"])
+    want = req.get("thinking") or policy["default_effort"]
+    if want not in order:
+        raise ValueError("effort {!r} is not one of: {}".format(want, ", ".join(order)))
+    worker = req.get("worker") or policy["default_worker"]
+    if worker not in policy["models"]:
+        raise ValueError("worker {!r} is not one of: {}".format(worker, ", ".join(policy["models"])))
+    model, efforts = policy["models"][worker]
+    cap = rr.effort_cap(order, policy["ceiling"], bool(req.get("approve_effort")))
+    steps = ["effort {} capped at {} (no approval recorded)".format(want, cap)] if order.index(want) > order.index(cap) else []
+    effort, note = rr.pick_effort(order, want, list(efforts), cap, model)
+    if effort is None:
+        return {"source": "stop_and_ask", "reason": note, "steps": steps}
+    return {"source": "catalog_error_fallback", "worker": worker, "model": model, "effort": effort,
+            "steps": steps + ([note] if note else [])}
 
 
 def write_selection(record, base=None):
@@ -237,8 +200,9 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
     escalate ({"from": the failed attempt's meta, "gate": rule-first|design|None, "optional": bool}) asks for the next
     route after that attempt instead of the router's pick (with no --model or --level). It is chosen under the same
     constraints as any route of this request (route_ctx: the request's own paths, local-only, --worker, approvals,
-    --thinking as the effort, the effort ceiling), and an unreadable catalog takes the same fallback. When nothing
-    stronger is allowed, an optional escalation (a gated retry) is routed as an ordinary request and the result's
+    --thinking as the effort, the effort ceiling). With an unreadable catalog only a request that names no level takes
+    the fallback (BUILTIN_POLICY, which reads no catalog bytes); --level, a gated retry and --escalate stop, since the
+    catalog defines the levels. When nothing stronger is allowed, an optional escalation (a gated retry) is routed as an ordinary request and the result's
     escalation_note says why; a required one (--escalate) stops. The result of a request with escalate carries
     escalation_note (None when it escalated)."""
     started = time.monotonic()
@@ -263,13 +227,23 @@ def select(req, runner=subprocess.run, base=None, catalog_path=None, config_path
             # checked, so the choice is refused rather than started unchecked.
             raise RouteStop("model catalog unreadable ({}): --model {} cannot be validated, so it is not routed".format(
                 str(exc)[:120], model))
+        # Levels are defined by the catalog: a request that names one (--level, or a gated retry, which asks for the
+        # level above the failed attempt) cannot be honored without it, and running the built-in pair in its place
+        # would be a silent rewrite. Only a request with no level takes the built-in policy.
+        if req.get("level"):
+            raise RouteStop("model catalog unreadable ({}): level {} is defined by the catalog and cannot be honored, so it is "
+                            "not routed".format(str(exc)[:120], req["level"]))
         if escalation and not escalation.get("optional"):
             raise RouteStop("model catalog unreadable ({}): the next route cannot be worked out, so it is not escalated".format(str(exc)[:120]))
-        w, m, t = _emergency(config, worker, req.get("role"), catalog_path)
-        out = _finish("route", req, None, {"source": "catalog_error_fallback", "worker": w, "model": m, "effort": thinking or t,
-                      "reason": "model catalog unreadable: {}".format(str(exc)[:160]), "steps": []},
-                      card, None, config_error, started, base, log)
-        return dict(out, escalation_note="model catalog unreadable: {}".format(str(exc)[:160])) if escalation else out
+        if escalation:
+            raise RouteStop("model catalog unreadable ({}): the gated retry{} asks for the level above {}, which the catalog "
+                            "defines, so it is not routed".format(str(exc)[:120],
+                                                                  " (--route {})".format(escalation["gate"]) if escalation.get("gate") else "",
+                                                                  escalation["from"].get("model") or "the failed attempt"))
+        rec = _builtin_route(req)
+        if rec["source"] != "stop_and_ask":
+            rec["reason"] = "model catalog unreadable: {}".format(str(exc)[:160])
+        return _finish("route", req, None, rec, card, None, config_error, started, base, log)
     ctx = route_ctx(req, cat)
     health = read_health(base or os.environ.get("TP_STATE_DIR"))
     chain, kind, note, rec = None, "route", None, None
@@ -367,42 +341,34 @@ def _escalated(meta, gate, cat, health, ctx):
     return rec
 
 
-FALLBACK_SCALE = (["off", "minimal", "low", "medium", "high", "xhigh", "max"], "high")
-
-
-def _effort_scale(cat):
-    """(effort order, ceiling): the catalog's, else the shipped catalog's read leniently, else the built-in scale. A
-    catalog that failed validation is never the source of the ceiling."""
+def route_problem(cat, req, rec):
+    """Why a route result breaks the rules every route keeps, or None: its worker/model/effort must be a pair the
+    active policy allows (the catalog, or BUILTIN_POLICY when there is none) and its effort within the request's cap
+    (the ceiling unless --approve-effort). The cap is an input to every choice (route_resolve.resolve, an explicit model,
+    the built-in policy), so this check only confirms it: a failure stops the route, it never rewrites it."""
     if cat:
-        return cat["effort"]["order"], cat["effort"]["ceiling"]
-    try:
-        eff = json.loads(Path(rc.CATALOG_PATH).read_text(encoding="utf-8"))["effort"]
-        if isinstance(eff["order"], list) and eff["ceiling"] in eff["order"]:
-            return eff["order"], eff["ceiling"]
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return FALLBACK_SCALE
-
-
-def _approve_effort(cat, req, rec):
-    """The one approval check every route result passes (resolved, escalated, explicit or the catalog-error fallback):
-    an effort above the ceiling without --approve-effort is cut to the ceiling, as normal selection does, and the
-    step says so. Raises ValueError for an effort the scale does not have."""
-    if rec["source"] == "stop_and_ask":
-        return
-    order, ceiling = _effort_scale(cat)
-    effort = rec["effort"]
-    if effort not in order:
-        raise ValueError("effort {!r} is not one of: {}".format(effort, ", ".join(order)))
-    if order.index(effort) > order.index(ceiling) and not req.get("approve_effort"):
-        rec["effort"] = ceiling
-        rec.setdefault("steps", []).append("effort {} capped at {} (no approval recorded)".format(effort, ceiling))
+        order, ceiling = cat["effort"]["order"], cat["effort"]["ceiling"]
+        entry = rc.level_of(cat, rec.get("model"), rec.get("effort"))[1]
+        allowed = bool(entry) and entry["worker"] == rec.get("worker")
+    else:
+        order, ceiling = list(BUILTIN_POLICY["effort_order"]), BUILTIN_POLICY["ceiling"]
+        model, efforts = BUILTIN_POLICY["models"].get(rec.get("worker"), (None, ()))
+        allowed = rec.get("model") == model and rec.get("effort") in efforts
+    if not allowed:
+        return "{} / {} / {} is not a worker, model and effort the {} allows".format(
+            rec.get("worker"), rec.get("model"), rec.get("effort"), "catalog" if cat else "built-in policy")
+    cap = rr.effort_cap(order, ceiling, bool(req.get("approve_effort")))
+    if order.index(rec["effort"]) > order.index(cap):
+        return "effort {} is above {} and no approval is recorded".format(rec["effort"], cap)
+    return None
 
 
 def _finish(kind, req, cat, rec, card, chain, config_error, started, base, log):
     rec.pop("_cat", None)
     rec.setdefault("steps", [])
-    _approve_effort(cat, req, rec)
+    problem = None if rec["source"] == "stop_and_ask" else route_problem(cat, req, rec)
+    if problem:
+        rec.update(source="stop_and_ask", reason="the route failed the final check, so it is not started: " + problem)
     record = _record(kind, req, cat, rec, card, chain, config_error, started)
     record["status"] = "stop_and_ask" if rec["source"] == "stop_and_ask" else "ok"
     selection_id = write_selection(record, base) if log else None

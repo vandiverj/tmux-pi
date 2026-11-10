@@ -252,6 +252,88 @@ class ValidationTests(unittest.TestCase):
         self.assertGreater(errors, used)
 
 
+class CatalogReadTests(unittest.TestCase):
+    """load_catalog is the one reader of catalog bytes: whatever is in the file, it returns a validated catalog or
+    raises CatalogError (was: RecursionError for deep JSON, OverflowError at the socket for a 1e100 timeout)."""
+
+    # Every number the router reads, by key, and the bound it is held to (router_catalog.BOUNDS). A numeric key of the
+    # shipped catalog missing here fails the test, so a new number cannot go unbounded.
+    NUMBERS = {"catalog_version": "count", "rank": "count", "after": "count", "files_optional_at": "count",
+               "files_required_at": "count", "expected_share": "share", "context_window": "tokens", "max_output": "tokens",
+               "max_packet_tokens": "tokens", "max_input_tokens": "tokens", "budget_seconds": "seconds",
+               "timeout_seconds": "seconds", "retries_on_invalid": "retries", "temperature": "temperature", "seed": "seed"}
+    FRACTIONAL = ("seconds", "temperature", "share")  # read with _number; the rest with _int
+    VALUES = (float("nan"), float("inf"), float("-inf"), 1e100, 0, -1, 0.5, 3601, 2 ** 40)
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def load(self, text):
+        path = self.dir / "catalog.json"
+        path.write_text(text)
+        return rc.load_catalog(path)
+
+    def in_bounds(self, kind, value):
+        low, high, low_ok = rc.BOUNDS[kind]
+        if kind not in self.FRACTIONAL and not isinstance(value, int):
+            return False
+        return value == value and (value >= low if low_ok else value > low) and value <= high
+
+    def numeric_paths(self, node, prefix=()):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield from self.numeric_paths(v, prefix + (k,))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from self.numeric_paths(v, prefix + (i,))
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            yield prefix
+
+    @staticmethod
+    def key_of(path):
+        return next(k for k in reversed(path) if isinstance(k, str))
+
+    def test_every_number_out_of_bounds_is_a_catalog_error_at_load(self):
+        raw = json.loads(fx.CATALOG_PATH.read_text(encoding="utf-8"))
+        paths = list(self.numeric_paths(raw))
+        self.assertEqual({self.key_of(p) for p in paths}, set(self.NUMBERS), "a number the catalog has is not listed with its bound")
+        cases = errors = 0
+        for path in paths:
+            kind = self.NUMBERS[self.key_of(path)]
+            for value in self.VALUES:
+                cases += 1
+                cat = copy.deepcopy(raw)
+                parent = cat
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = value
+                with self.subTest(path=path, value=value):
+                    try:
+                        self.load(json.dumps(cat))
+                    except rc.CatalogError:
+                        errors += 1
+                        continue
+                    self.assertTrue(self.in_bounds(kind, value), "{} = {} loaded".format(path, value))
+        self.assertGreater(errors, cases // 2)
+
+    def test_any_file_content_is_a_catalog_or_a_catalog_error(self):
+        def scale(order):
+            cat = copy.deepcopy(SHIPPED)
+            cat["effort"]["order"] = order
+            return json.dumps(cat)
+        bad = {"empty": "", "not json": "{not json", "2000-deep list": "[" * 2000 + "]" * 2000,
+               "2000-deep object": '{"a":' * 2000 + "1" + "}" * 2000, "a list": "[]", "null": "null",
+               "huge integer": "1" + "0" * 5000, "NaN": "NaN", "scale medium,max,high": scale(["medium", "max", "high"]),
+               "scale [null]": scale([None]), "scale empty": scale([]), "scale repeated": scale(["low", "low"])}
+        for name, text in bad.items():
+            with self.subTest(name), self.assertRaises(rc.CatalogError):
+                self.load(text)
+        self.assertEqual(self.load(fx.CATALOG_PATH.read_text(encoding="utf-8"))["effort"], SHIPPED["effort"])
+
+
 class QwenReasoningConfigTests(unittest.TestCase):
     QWEN_ID = "qwen/qwen3.6-35b-a3b"
 

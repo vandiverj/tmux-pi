@@ -420,7 +420,11 @@ def _binding_index(tree):
     the root of the target (`name.x = v`, `name[k] = v`, `name[k] += v`: a write into the object the name holds, which cannot unbind or
     rebind the name); None for every other kind. The context of the write (Store or Del) is that of the node (node.ctx). star: some
     `from m import *` is there. dynamic: the file uses one of _DYNAMIC (as a name, an attribute, an import) or `sys.modules` (an attribute `modules`, or
-    `from sys import modules`), by which it can rebind or delete any name of any module."""
+    `from sys import modules`), by which it can rebind or delete any name of any module.
+    Round 13 (Main): THE one enumeration of the syntax forms that bind a name. Every question "does this file bind name N" reads it
+    (_binds, _single_binding, _unbound, _single_names, _written_names, _changes_import_state); no other AST walk decides a binding. A
+    test lists every identifier and expr_context field of every ast class of the running interpreter and fails when one is neither
+    handled here nor excluded there with its reason."""
     cached = getattr(tree, "_binding_index", None)
     if cached:
         return cached
@@ -956,9 +960,9 @@ def _sys_node(node):
 def _changes_import_state(source, tree):
     """THE one test of whether running a file may change the import state the scan models (round 12, Main; _IMPORT_STATE). True when
     the file:
-    - binds a module attribute of _STATE_ATTRS in any form, at any scope (assignment, augmented or annotated assignment, del, global or
-      nonlocal, a for, with, walrus or match target, an import as, a def or class name), or writes or deletes it on any object
-      (`m.__name__ = v`);
+    - binds, writes or deletes a module attribute of _STATE_ATTRS in any form, at any scope: the file's _binding_index has any event for
+      the name (round 13, Main: the one enumeration of binding forms, so a form cannot be known to one reader and not another; that
+      includes `except E as __name__`, a match capture, a parameter or type parameter, `m.__name__ = v`);
     - references __path__, __package__, __spec__, __loader__, sys.meta_path, sys.path_hooks or sys.path_importer_cache at all: its
       raw text holds the word (_STATE_WORDS_RE: comments and strings too, on identifier boundaries; a false hit only loses a line);
     - references sys.path or sys.modules (any `<sys>.path` or `<sys>.modules`, `<sys>` the name sys or an attribute .sys), imports one
@@ -967,32 +971,26 @@ def _changes_import_state(source, tree):
     - imports the site module (which adds to sys.path), in any form;
     - holds a word of _DYNAMIC_ACCESS (its raw text).
     Reading __name__ and __file__ (`if __name__ == "__main__"`, `os.path.dirname(__file__)`) does not change it. _opaque calls this, and
-    _runs_clean calls it on every file Python runs on the way to an import; nothing else checks import state."""
+    _runs_clean calls it on every file Python runs on the way to an import; nothing else checks import state. The walk below reads
+    references only; no binding is decided here."""
     if tree is None or _DYNAMIC_ACCESS_RE.search(source) or _STATE_WORDS_RE.search(source):
+        return True
+    events = _binding_index(tree).events
+    if any(name in events for name in _STATE_ATTRS):
         return True
     objects = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}  # nodes read as the object of an attribute
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and (node.id in _STATE_ATTRS and isinstance(node.ctx, (ast.Store, ast.Del))
-                                           or node.id == "sys" and id(node) not in objects and not isinstance(node.ctx, ast.Store)):
+        if isinstance(node, ast.Name) and node.id == "sys" and id(node) not in objects and not isinstance(node.ctx, ast.Store):
             return True
-        if isinstance(node, ast.Attribute) and (node.attr in _STATE_ATTRS and isinstance(node.ctx, (ast.Store, ast.Del))
-                                                or node.attr in ("path", "modules") and _sys_node(node.value)
+        if isinstance(node, ast.Attribute) and (node.attr in ("path", "modules") and _sys_node(node.value)
                                                 or node.attr == "sys" and id(node) not in objects):
             return True
-        if isinstance(node, (ast.Global, ast.Nonlocal)) and not set(node.names).isdisjoint(_STATE_ATTRS):
-            return True
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in _STATE_ATTRS:
-            return True
-        if isinstance(node, ast.alias) and ((node.asname or node.name.split(".")[0]) in _STATE_ATTRS
-                                            or node.name == "sys" and node.asname not in (None, "sys")):
+        if isinstance(node, ast.alias) and node.name == "sys" and node.asname not in (None, "sys"):
             return True
         if isinstance(node, ast.ImportFrom) and not node.level and (node.module == "sys" and any(a.name in _STATE_SYS + ("*",) for a in node.names)
                                                                   or (node.module or "").split(".")[0] == "site"):
             return True
         if isinstance(node, ast.Import) and any(a.name.split(".")[0] == "site" for a in node.names):
-            return True
-        if type(node).__name__ in ("MatchAs", "MatchStar", "MatchMapping") \
-                and (getattr(node, "name", None) or getattr(node, "rest", None)) in _STATE_ATTRS:
             return True
     return False
 
@@ -1101,16 +1099,38 @@ def _unresolved(name, graph, attribute=False):
     return any(known(".".join(parts[:i])) for i in range(1, len(parts)))
 
 
-def _walk_blocked(texts, names, members, resolved, graph, test, stop=lambda dotted: False):
-    """THE walk of what code runs (round 9; round 12 shares it): True when code whose own files are `texts` ((source, tree) pairs) and
-    that imports the dotted names `names` and the (module, member) pairs `members` may run a file that fails the per-file test `test`
-    (source, tree) or an import that `stop` (dotted) refuses. Importing a module runs the modules of its ancestor packages (_Graph.loaded),
-    and each module it loads is followed through its own imports (transitively). An import that cannot be resolved (`resolved` False: a
-    relative one above the run root; or _unresolved, made on every import, the file's own and those of each module it loads), and a
-    loaded file that does not parse, count as blocked: what runs there is not shown."""
-    if not resolved or any(test(source, tree) for source, tree in texts):
+_Start = collections.namedtuple("_Start", "files names members resolved")
+
+
+def _start_set(path, source, tree, graph):
+    """THE start of the walk (round 13, Main): every file Python runs before the code of the file at path, as one list, and the
+    imports that seed the walk. files: ((path, source, tree), ...) of the package __init__s on the file's own package path, outermost
+    first (_package_inits), then the file. names, members, resolved: the union of _imports_of over those files, each resolved from its
+    own path (a relative import in a/__init__.py is relative to a), resolved False when any one has an import that does not resolve.
+    None when one of those __init__s was not supplied (it runs unseen) or does not parse. _runs_clean (credit) and _no_path_to
+    (absence) both start here, through _walk_blocked; nothing else starts a walk."""
+    files = [(path, source, tree)]
+    for init, supplied in _package_inits(path, graph.run):
+        if not supplied or graph.files.get(init) is None:
+            return None
+        files.insert(-1, (init,) + tuple(graph.files[init]))
+    names, members, resolved = set(), set(), True
+    for p, _s, t in files:
+        n, m, r = _imports_of(p, t)
+        names, members, resolved = names | n, members | m, resolved and r
+    return _Start(tuple(files), frozenset(names), frozenset(members), resolved)
+
+
+def _walk_blocked(start, graph, test, stop=lambda dotted: False):
+    """THE walk of what code runs (round 9; round 12 shares it; round 13 seeds it from _start_set only): True when the code whose start
+    set is `start` may run a file that fails the per-file test `test` (source, tree) or an import that `stop` (dotted) refuses. Every
+    file of the start set is tested, and the imports of every one of them seed the walk. Importing a module runs the modules of its
+    ancestor packages (_Graph.loaded), and each module it loads is followed through its own imports (transitively). An import that
+    cannot be resolved (start.resolved False: a relative one above the run root; or _unresolved, made on every import, those of the
+    start set and those of each module it loads), and a loaded file that does not parse, count as blocked: what runs there is not shown."""
+    if not start.resolved or any(test(source, tree) for _path, source, tree in start.files):
         return True
-    seen, todo = set(), [(n, False) for n in names] + [(s + "." + c, True) for s, c in members]
+    seen, todo = set(), [(n, False) for n in start.names] + [(s + "." + c, True) for s, c in start.members]
     while todo:
         item = todo.pop()
         if item in seen:
@@ -1127,39 +1147,28 @@ def _walk_blocked(texts, names, members, resolved, graph, test, stop=lambda dott
     return False
 
 
-def _reaches(texts, names, members, resolved, name, module, graph):
-    """True when code whose own files are `texts`, that imports `names` and `members`, may reach the name defined in the dotted module
-    `module` (round 9: the file and every module it can load are one closure, and every per-file test is made on each of them;
-    _walk_blocked). An import counts when it can name the target: it is equal to one of the target's names (every dotted suffix of its
-    path: src.h.t is also h.t and t, as any directory may be on sys.path), a descendant of one, or the name of a directory above it (an
-    ancestor package: src, src.h, h). The code's own files and every module the walk visits are held to the same per-file tests, _refers,
-    with the same target tokens: one that refers to the target counts as a path. An unresolved import, a file that does not parse, all
-    count as a path."""
+def _reaches(start, name, module, graph):
+    """True when the code whose start set is `start` (_start_set) may reach the name defined in the dotted module `module` (round 9:
+    the file and every module it can load are one closure, and every per-file test is made on each of them; _walk_blocked). An import
+    counts when it can name the target: it is equal to one of the target's names (every dotted suffix of its path: src.h.t is also h.t
+    and t, as any directory may be on sys.path), a descendant of one, or the name of a directory above it (an ancestor package: src,
+    src.h, h). Every file of the start set and every module the walk visits are held to the same per-file tests, _refers, with the
+    same target tokens: one that refers to the target counts as a path. An unresolved import, a file that does not parse, all count as
+    a path."""
     own, above = _suffixes(module), _ancestor_names(module)
-    return _walk_blocked(texts, names, members, resolved, graph, lambda source, tree: _refers(source, tree, name, module),
+    return _walk_blocked(start, graph, lambda source, tree: _refers(source, tree, name, module),
                          lambda dotted: dotted in above or any(_inside(dotted, n) for n in own))
 
 
-def _own_files(path, source, tree, graph):
-    """((source, tree), ...) of the file at path and of the package __init__s Python runs before it (_package_inits), or None when one
-    of those __init__s is not supplied (it runs unseen) or does not parse."""
-    texts = [(source, tree)]
-    for init, supplied in _package_inits(path, graph.run):
-        if not supplied or graph.files.get(init) is None:
-            return None
-        texts.insert(-1, graph.files[init])
-    return tuple(texts)
-
-
 def _runs_clean(path, source, tree, graph):
-    """THE set of files that must not change import state for an import in the file at path to be credited (round 12, Main): the file
-    itself, every package __init__ on its own package path (they run first, and the package decides __package__), and every run-root
-    module it can load, transitively (_walk_blocked), which takes in the target module T and every package __init__ on T's dotted
+    """THE set of files that must not change import state for an import in the file at path to be credited (round 12, Main): the start
+    set (_start_set: the file's own package __init__s, which run first and decide __package__, then the file) and every run-root module
+    any of them can load, transitively (_walk_blocked), which takes in the target module T and every package __init__ on T's dotted
     path. True when none of them changes import state (_changes_import_state), every one was supplied and parses, and every import on the
     way resolves. A file that does not import T does not run T's path, so the test is per importing file: a T whose path changes import
     state is credited through no import, and a file with no path to T keeps its "does not use" line (_no_path_to)."""
-    texts = _own_files(path, source, tree, graph)
-    return texts is not None and not _walk_blocked(texts, *_imports_of(path, tree), graph, _changes_import_state)
+    start = _start_set(path, source, tree, graph)
+    return start is not None and not _walk_blocked(start, graph, _changes_import_state)
 
 
 def _string_text(node):
@@ -1222,10 +1231,10 @@ def _no_path_to(source, tree, path, name, module, graph):
     change that state is opaque. Code outside the run (site-packages, .pth files, sitecustomize and usercustomize, PYTHONPATH, the
     interpreter's own startup) and whatever ran in the process before the file was imported (the entry script, an importer of the file)
     are beyond static proof.
-    The file's own package __init__s (_package_inits) run before it and are held to the same tests; one that was not supplied is a
-    path."""
-    texts = _own_files(path, source, tree, graph)
-    return texts is not None and not _reaches(texts, *_imports_of(path, tree), name, module, graph)
+    The file's own package __init__s run before it: the walk starts from all of them and the file (_start_set), each held to the same
+    tests, each one's imports followed; one that was not supplied is a path."""
+    start = _start_set(path, source, tree, graph)
+    return start is not None and not _reaches(start, name, module, graph)
 
 
 def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None, written=frozenset(), run=None, credited=True):

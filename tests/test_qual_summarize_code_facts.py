@@ -21,6 +21,56 @@ def num(path, text):
     return {"path": path, "text": "\n".join("{:>4}\t{}".format(n, line) for n, line in enumerate(text.split("\n"), 1))}
 
 
+def ast_binding_fields():
+    """{(class, field)} of every field of every ast class of the running interpreter that can name a binding: a field of type
+    identifier (identifier, identifier?, identifier*) or expr_context, read from the ASDL signature each class carries as its docstring.
+    A class whose docstring is not a signature must be a deprecated alias of Constant (3.9: Num, Str, Bytes, NameConstant)."""
+    fields = set()
+    for name in dir(ast):
+        cls = getattr(ast, name)
+        if not (isinstance(cls, type) and issubclass(cls, ast.AST)) or not cls._fields:
+            continue
+        match = re.match(r"\s*" + name + r"\((.*)\)\s*$", (cls.__doc__ or "").split("\n")[0])
+        if not match:
+            assert issubclass(cls, ast.Constant), "an ast class with fields and no signature: " + name
+            continue
+        for part in match.group(1).split(","):
+            kind, _sp, field = part.strip().rpartition(" ")
+            if kind.rstrip("*?") in ("identifier", "expr_context"):
+                fields.add((name, field))
+    return fields
+
+
+# Round 13 (Main): the binding forms, one or more snippets per ast field that binds a name ({n} is the name). The attack generates its
+# binding forms from this table. Snippets of a class the running ast does not have are not parsed.
+_NAME_FORMS = ("{n} = 1", "del {n}", "{n} += 1", "{n}: int = 1", "for {n} in ():\n    pass", "with f() as {n}:\n    pass",
+               "({n} := 1)", "x = [{n} for {n} in ()]", "a, *{n} = ()") + (("type {n} = int",) if hasattr(ast, "TypeAlias") else ())
+BINDING_FORMS = {
+    ("Name", "id"): _NAME_FORMS, ("Name", "ctx"): _NAME_FORMS,
+    ("Attribute", "attr"): ("x.{n} = 1", "del x.{n}", "x.{n} += 1"), ("Attribute", "ctx"): ("x.{n} = 1", "del x.{n}"),
+    ("Subscript", "ctx"): ("{n}[0] = 1", "del {n}[0]"),
+    ("FunctionDef", "name"): ("def {n}():\n    pass",), ("AsyncFunctionDef", "name"): ("async def {n}():\n    pass",),
+    ("ClassDef", "name"): ("class {n}:\n    pass",),
+    ("ExceptHandler", "name"): ("try:\n    raise E()\nexcept E as {n}:\n    pass",),
+    ("Global", "names"): ("global {n}",), ("Nonlocal", "names"): ("def f():\n    {n} = 1\n\n    def g():\n        nonlocal {n}",),
+    ("alias", "name"): ("import {n}", "from m import {n}"), ("alias", "asname"): ("import m as {n}", "from m import x as {n}"),
+    ("arg", "arg"): ("def f({n}):\n    pass", "x = lambda {n}: 0"),
+    ("MatchAs", "name"): ("match s:\n    case {n}:\n        pass", "match s:\n    case 1 as {n}:\n        pass"),
+    ("MatchStar", "name"): ("match s:\n    case [*{n}]:\n        pass",),
+    ("MatchMapping", "rest"): ("match s:\n    case {{**{n}}}:\n        pass",),
+    ("TypeVar", "name"): ("def f[{n}]():\n    pass",), ("ParamSpec", "name"): ("def f[**{n}]():\n    pass",),
+    ("TypeVarTuple", "name"): ("def f[*{n}]():\n    pass",),
+}
+BINDING_EXCLUDED = {
+    ("ImportFrom", "module"): "names the module imported from; the aliases bind",
+    ("keyword", "arg"): "the name of a keyword argument of a call or class header; binds nothing in the file",
+    ("MatchClass", "kwd_attrs"): "attribute names read from the match subject; the patterns beside them bind",
+    ("Starred", "ctx"): "a target container; the Name inside it carries its own Store or Del ctx",
+    ("List", "ctx"): "a target container; the Names inside it carry their own Store or Del ctx",
+    ("Tuple", "ctx"): "a target container; the Names inside it carry their own Store or Del ctx",
+}
+
+
 OLD = '''"""old"""
 LIMIT = 5
 NAME = "a"
@@ -540,6 +590,16 @@ class UseScanTests(unittest.TestCase):
                  "gp/u.py", []),
                 ("a helper u imports inserts into sys.path", "import h\n", (("h.py", sys_insert),), "u.py", []),
                 ("u's own package __init__ inserts into sys.path", "x = 1\n", (("gp/__init__.py", sys_insert),), "gp/u.py", []),
+                # round 13 (Main): the walk starts from every file Python runs before u (its package __init__s, then u); each one's
+                # imports seed it. The first row is the review's repro (round 12 F1, the absence variant).
+                ("review: u's package __init__ imports h, which creates Q", "x = 1\n",
+                 (("gp/__init__.py", "import h\n"), ("h.py", "from pkg.sub.t import Q\nobj = Q()\n")), "gp/u.py", []),
+                ("u's package __init__ imports h2, which imports h, which creates Q", "x = 1\n",
+                 (("gp/__init__.py", "import h2\n"), ("h2.py", "import h\n"), ("h.py", "from pkg.sub.t import Q\nobj = Q()\n")), "gp/u.py", []),
+                ("the outer of two package __init__s imports, relatively, a module that names Q", "x = 1\n",
+                 (("gp/__init__.py", "from . import hx\n"), ("gp/sub/__init__.py", ""), ("gp/hx.py", "def f():\n    return Q\n")), "gp/sub/u.py", []),
+                ("control: u's package __init__ imports a clean helper", "x = 1\n", (("gp/__init__.py", "import h\n"), ("h.py", "y = 1\n")),
+                 "gp/u.py", ["- u.py does not use Q [gp/u.py:1]"]),
                 ("control: u's own package __init__ reads __name__", "x = 1\n", (("gp/__init__.py", "if __name__ == '__main__':\n    pass\n"),),
                  "gp/u.py", ["- u.py does not use Q [gp/u.py:1]"])):
             with self.subTest(label):
@@ -550,6 +610,46 @@ class UseScanTests(unittest.TestCase):
             with self.subTest("u's own package __init__ on disk only"):
                 out = ss.use_scan("Who uses Q?", [target, num("gp/u.py", "x = 1\n")], tmp)
                 self.assertEqual([line for line in out if line.startswith("- u.py")], [])
+
+    def test_the_walk_starts_from_every_file_python_runs_first(self):
+        """Round 13 (Main): the start set of a file is its package __init__s from the outermost in, then the file; each one's imports,
+        resolved from its own path, seed the one walk (_start_set). Three-deep package a/b/c."""
+        texts = {"a/__init__.py": "import h1\nfrom . import x1\n", "a/b/__init__.py": "from .. import x2\nimport h2\n",
+                 "a/b/c/__init__.py": "from . import x3\nfrom ...q import y\n", "a/b/c/u.py": "from . import x4\nimport h4\n"}
+
+        def start(changes):
+            files = [num(p, t) for p, t in {**texts, **changes}.items()]
+            parsed = {f["path"]: ss._parse(f["path"], f["text"]) for f in files}
+            graph = ss._import_graph(files, parsed, ss._RunRoot(parsed))
+            return ss._start_set("a/b/c/u.py", texts["a/b/c/u.py"], parsed["a/b/c/u.py"], graph)
+
+        got = start({})
+        self.assertEqual([p for p, _s, _t in got.files], ["a/__init__.py", "a/b/__init__.py", "a/b/c/__init__.py", "a/b/c/u.py"])
+        self.assertEqual(got.names, {"h1", "a", "h2", "a.b.c", "a.q", "h4"})
+        self.assertEqual(got.members, {("a", "x1"), ("a", "x2"), ("a.b.c", "x3"), ("a.q", "y"), ("a.b.c", "x4")})
+        self.assertTrue(got.resolved)
+        self.assertFalse(start({"a/b/__init__.py": "from .... import z\n"}).resolved)  # above the run root, from an __init__
+        self.assertIsNone(start({"a/b/__init__.py": "def (:\n"}))  # an __init__ that does not parse runs unseen
+
+    def test_every_ast_field_that_binds_a_name_is_in_the_one_binding_enumeration(self):
+        """Round 13 (Main): every identifier and expr_context field of every ast class of the running interpreter is either handled by
+        _binding_index (each of its BINDING_FORMS snippets binds the name there) or excluded with a reason in BINDING_EXCLUDED. A binding
+        of a module attribute of _STATE_ATTRS in any handled form changes import state; the same snippet with another name does not."""
+        fields = ast_binding_fields()
+        self.assertEqual(fields - set(BINDING_FORMS) - set(BINDING_EXCLUDED), set(), "a field that may bind: handle it or exclude it")
+        self.assertEqual(set(BINDING_FORMS) & set(BINDING_EXCLUDED), set())
+        for cls, field in set(BINDING_FORMS) | set(BINDING_EXCLUDED):
+            if hasattr(ast, cls):
+                self.assertIn((cls, field), fields)
+        for (cls, field), snippets in sorted(BINDING_FORMS.items()):
+            if (cls, field) not in fields:
+                continue
+            for snippet in snippets:
+                for n in ("zz",) + ss._STATE_ATTRS:
+                    text = snippet.format(n=n) + "\n"
+                    with self.subTest(cls=cls, field=field, text=text):
+                        self.assertIn(n, ss._binding_index(ast.parse(text)).events)
+                        self.assertEqual(ss._changes_import_state(text, ast.parse(text)), n != "zz")
 
     def test_a_rebound_name_keeps_only_the_import(self):
         imp = "- u.py imports Q [u.py:1]"
@@ -902,8 +1002,18 @@ class BindingProofUseTests(unittest.TestCase):
                 ("u: an alias of sys", {}, "import sys\ns = sys\ns.path.insert(0, 'alt')\n"),
                 ("u: sys.meta_path in a function", {}, "def f():\n    import sys\n    return sys.meta_path\n"),
                 ("u imports site", {}, "import site\n"),
-                ("u holds a _DYNAMIC_ACCESS word", {}, "import re\nx = re.compile('a')\n")]
-        controls = [("control: u reads __name__ and __file__, and sys.argv", {}, "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n"),
+                ("u holds a _DYNAMIC_ACCESS word", {}, "import re\nx = re.compile('a')\n"),
+                # round 13 (Main): the walk starts from u's package __init__s too, and every binding form is read from _binding_index.
+                # The first and third are the review's repros (round 12 F1 and F2).
+                ("review: u's package __init__ imports h, which redirects pkg.__path__",
+                 {"app/__init__.py": "import h\n", "h.py": 'import pkg\npkg.__path__ = [pkg.__path__[0] + "/alt"]\n'}, ""),
+                ("u's package __init__ imports h2, which imports h, which inserts into sys.path",
+                 {"app/__init__.py": "import h2\n", "h2.py": "import h\n", "h.py": sys_insert}, ""),
+                ("review: pkg/__init__.py binds __name__ as an except name",
+                 {"pkg/__init__.py": "try:\n    raise ValueError()\nexcept ValueError as __name__:\n    pass\n"}, ""),
+                ("u binds __file__ as an except name", {}, "try:\n    pass\nexcept ValueError as __file__:\n    pass\n")]
+        controls = [("control: u's package __init__ imports a clean helper", {"app/__init__.py": "import h\n"}, ""),
+                    ("control: u reads __name__ and __file__, and sys.argv", {}, "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n"),
                     ("control: an unrelated file inserts into sys.path", {"w.py": sys_insert}, ""),
                     ("control: a comment says site", {}, "x = 1  # the web site\n")]
         relative = (("from .t import Q\nobj = Q()\n", 1), ("from . import t\nobj = t.Q()\n", 2))

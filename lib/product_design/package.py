@@ -142,17 +142,43 @@ def read_json_file(path):
     return value
 
 
+class _Absent:
+    """The value of a file that does not exist. Not a JSON value, and never truth-tested: absent and present are told
+    apart by `is ABSENT`, so no JSON value (null, false, 0, "", [], {}) can be read as absence."""
+
+    def __repr__(self):
+        return "ABSENT"
+
+    def __bool__(self):
+        raise TypeError("ABSENT is compared with `is`, never truth-tested")
+
+
+ABSENT = _Absent()
+
+
+def read_file(path):
+    """The one reader of a package or control file: ABSENT when no file is at `path`, else its parsed value, whatever
+    JSON value it is (decided by the file, never by the value). Raises OSError or ValueError when a file is there but
+    cannot be read under the reader's limits (read_json_file)."""
+    try:
+        return read_json_file(path)
+    except FileNotFoundError:
+        return ABSENT
+
+
 def read_docs(package_dir) -> tuple:
     """Read the three documents. Returns (docs, issues); a missing, oversized, too deep or unparsable file is an issue."""
     docs, issues = {}, []
     for key, (name, _, _) in DOCUMENTS.items():
-        path = Path(package_dir) / name
         try:
-            docs[key] = read_json_file(path)
-        except FileNotFoundError:
-            issues.append(S.Issue("file.missing", (name,), "file is missing"))
+            value = read_file(Path(package_dir) / name)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             issues.append(S.Issue("file.unreadable", (name,), str(exc)))
+            continue
+        if value is ABSENT:
+            issues.append(S.Issue("file.missing", (name,), "file is missing"))
+        else:
+            docs[key] = value
     return docs, issues
 
 

@@ -36,7 +36,7 @@ def status_report(package_dir) -> tuple:
     notes, inputs = docs["reviews"]["notes"], docs["reviews"]["inputs"]
     rep.update({
         "package": m["id"], "title": m["title"], "revision": m["revision"],
-        "committed_revision": (state["commit"] or {}).get("revision"),
+        "committed_revision": None if state["commit"] is None else state["commit"]["revision"],
         "activity": m["activity"], "next_action": m["next_action"],
         "content_fingerprint": P.content_fingerprint(docs),
         "slices": {sid: {"state": r["state"], "effective": r["effective"], "stale": r["stale"],

@@ -79,8 +79,9 @@ def history_path(package_dir, revision) -> Path:
 
 
 def _read_json(path: Path, root):
+    """P.ABSENT, or the parsed value of the control file at `path` below `root` (package.read_file: the one reader)."""
     safe_write.check_below(root, path, "package control file")
-    return P.read_json_file(path)
+    return P.read_file(path)
 
 
 def file_digests(docs) -> Dict[str, str]:
@@ -161,8 +162,8 @@ def history_problems(rec, revision=None) -> list:
                         "evidence", "operations", "files"), ("impact",))
     if rec.get("schema") != "tp-product-history" or type(rec.get("schema_version")) is not int or rec.get("schema_version") != 1:
         out.append("schema must be tp-product-history version 1")
-    if "revision" in rec and not (_is_int(rec["revision"], 1) and rec["revision"] == (revision or rec["revision"])):
-        out.append(f"revision is {revision}, the entry's number" if revision else "revision is a positive integer")
+    if "revision" in rec and not (_is_int(rec["revision"], 1) and (revision is None or rec["revision"] == revision)):
+        out.append("revision is a positive integer" if revision is None else f"revision is {revision}, the entry's number")
     if rec.get("base_revision") is not None and not _is_int(rec["base_revision"], 1):
         out.append("base_revision is null or a positive integer")
     for field in ("committed", "actor", "summary"):
@@ -183,11 +184,11 @@ def _load(root, rel, check):
     """("missing", None) | ("bad", message) | ("ok", value) for the control file at root/rel."""
     try:
         value = _read_json(root / rel, root)
-    except FileNotFoundError:
-        return "missing", None
     except (OSError, ValueError) as exc:
         return "bad", f"unreadable: {exc}"
-    problems = check(value)
+    if value is P.ABSENT:
+        return "missing", None
+    problems = check(value)  # whatever JSON value the file holds, null included, is checked as the record
     return ("bad", "; ".join(problems)) if problems else ("ok", value)
 
 
@@ -348,13 +349,13 @@ def inspect(package_dir) -> dict:
         for message in agreement_problems(commit, hist["numbers"], hist["entries"], docs, out["interrupted"]):
             mismatch(message)
 
-    committed = commit or {}
+    committed = commit if commit is not None else {"files": {}, "authority": {}, "originals": {}}
     live = file_digests(docs)
-    out["external"] = sorted(name for name in FILES.values() if live.get(name) != committed.get("files", {}).get(name))
+    out["external"] = sorted(name for name in FILES.values() if live.get(name) != committed["files"].get(name))
     if all(k in docs for k in FILES):
-        current, before = P.authority_map(docs), committed.get("authority", {})
+        current, before = P.authority_map(docs), committed["authority"]
         out["authority_changed"] = sorted(i for i in set(current) | set(before) if current.get(i) != before.get(i))
-        current, before = P.originals_map(docs), committed.get("originals", {})
+        current, before = P.originals_map(docs), committed["originals"]
         out["originals_changed"] = sorted(i for i in before if current.get(i) != before[i])
     return out
 
@@ -386,16 +387,17 @@ def trust_problems(state) -> list:
 
 # ---------------------------------------------------------------- the prospective state
 
-def prospective(root, docs, entry, record=None, revision=None) -> dict:
+def prospective(root, docs, entry, staged=None) -> dict:
     """Build the state a commit would publish and check it whole, with the checks `status` and `validate` apply to the
     published package (validate_docs, commit_problems, history_problems, check_history, chain_problems,
     agreement_problems) and the reader's limits (file_problem). Every commit (apply, adoption, ingest, init) calls it
     before its commit point, and recovery calls it on the journal's files before it replaces anything: no command
     publishes a state its own reader refuses (docs/product-design.md, "Persistence").
 
-    A commit passes the documents and its history entry without revision and files (`record` None): the commit record
-    is built here and the entry completed. Recovery passes the staged documents, entry and commit record, and the
-    journal's `revision`: they are checked as they are, the record against the one these documents make.
+    A commit passes the documents and its history entry without revision and files (`staged` None): the commit record
+    is built here and the entry completed. Recovery passes the staged documents and entry, and `staged` = (the staged
+    commit record, the journal's revision): each is checked as the value its file holds, whatever JSON value that is
+    (null is a malformed record, never "no record"), the record against the one these documents make.
 
     Returns {revision, record, entry, data, problems}. data holds the rendered bytes by file name (the package files,
     "history.json", "commit.json"); problems lists (code, file, message), empty when the state may be published:
@@ -406,15 +408,17 @@ def prospective(root, docs, entry, record=None, revision=None) -> dict:
       package.control-mismatch  the records disagree: the commit record is not the one the documents make, the history
                                 with the new entry is not whole, or the commit record is not its newest entry
     """
+    record = None if staged is None else staged[0]
     out = {"revision": None, "record": record, "entry": entry, "data": {}, "problems": []}
 
     def refuse(code, name, message):
         out["problems"].append((code, name, message))
         return out
 
-    docs = docs if isinstance(docs, dict) else {}
     for key, name in FILES.items():  # the reader's limits first: nothing below encodes a value it would refuse
-        data, problem = P.file_problem(docs.get(key), render)
+        if key not in docs:
+            return refuse("result.invalid", name, "is missing")
+        data, problem = P.file_problem(docs[key], render)
         if problem:
             return refuse("result.unreadable", name, f"would be {problem}")
         out["data"][name] = data
@@ -425,14 +429,14 @@ def prospective(root, docs, entry, record=None, revision=None) -> dict:
                                                          for i in issues))
     rev = out["revision"] = docs["manifest"]["revision"]
     built = commit_record(docs)
-    if record is None:
+    if staged is None:
         if not isinstance(entry, dict):
             return refuse("control.invalid", f"history entry {rev}", "is not a JSON object")
         record = out["record"] = built
         entry = out["entry"] = dict(entry, revision=rev, files=built["files"])
-    elif revision is not None and revision != rev:
+    elif staged[1] != rev:
         return refuse("control.invalid", "package.json", f"is revision {rev!r}, but the journal commits revision "
-                                                         f"{revision}")
+                                                         f"{staged[1]}")
     for name, problems in (("commit.json", commit_problems(record)),
                            (f"history entry {rev}", history_problems(entry, rev))):
         if problems:
@@ -500,20 +504,18 @@ def _write(root, path, data):
 
 def _live_digest(root: Path, rel) -> Optional[str]:
     """The canonical digest of a live file; None when it is absent; UNREADABLE when it cannot be read back."""
-    path = root / rel
-    if not os.path.lexists(path):
-        return None
     try:
-        return P.digest(_read_json(path, root))
+        value = _read_json(root / rel, root)
     except (OSError, ValueError):
         return UNREADABLE
+    return None if value is P.ABSENT else P.digest(value)
 
 
 def _expected(meta, name):
     """(old, new): the digest a live package file or commit.json had when the change was computed, and will have."""
     if name == "commit.json":
         return meta["old_commit"], meta["new_commit"]
-    return (meta["old"] or {}).get(name), meta["new"][name]
+    return (None if meta["old"] is None else meta["old"].get(name)), meta["new"][name]
 
 
 def _live_rel(name) -> Path:
@@ -775,18 +777,19 @@ def _staged(root: Path, meta) -> bytes:
                                 "kept. Restore the package from version control, or move the journal aside by hand",
                           exit=EXITS.get(code, 1), details={"file": name, "problem": message, "journal": str(txn),
                                                             "staged": staged})
-    for name in FILES.values():  # the journal must hold what txn.json says it holds
-        if _live_digest(txn, name) != meta["new"][name]:
+    values = {}
+    for name in ALL + ("history.json",):  # each staged file once, by the one reader: absent only if it is not there
+        try:
+            values[name] = _read_json(txn / name, txn)
+        except (OSError, ValueError) as exc:
+            raise refuse("control.invalid", name, f"is unreadable: {exc}") from None
+        if values[name] is P.ABSENT:
+            raise refuse("control.invalid", name, "is missing")
+    for name in ALL:  # the journal must hold what txn.json says it holds
+        if P.digest(values[name]) != _expected(meta, name)[1]:
             raise refuse("control.invalid", name, f"does not match {txn / 'txn.json'}")
-    if _live_digest(txn, "commit.json") != meta["new_commit"]:
-        raise refuse("control.invalid", "commit.json", f"does not match {txn / 'txn.json'}")
-    try:
-        docs = {key: _read_json(txn / name, txn) for key, name in FILES.items()}
-        record = _read_json(txn / "commit.json", txn)
-        entry = _read_json(txn / "history.json", txn)
-    except (OSError, ValueError) as exc:
-        raise refuse("control.invalid", "a staged file", f"is unreadable: {exc}") from None
-    state = prospective(root, docs, entry, record, revision=meta["revision"])
+    docs = {key: values[name] for key, name in FILES.items()}
+    state = prospective(root, docs, values["history.json"], staged=(values["commit.json"], meta["revision"]))
     if state["problems"]:
         code, name, message = state["problems"][0]
         raise refuse("control.invalid" if code.startswith("result.") else code, name, message)

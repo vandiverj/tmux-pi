@@ -393,8 +393,8 @@ def _open(package_dir, expected_revision, adopting=False):
     # holds any acceptance record (authority_changed then lists every one): acceptances are recorded only by operations.
     # Without a commit record but with a history (commit.json deleted), the revision continues from the history, which
     # inspect has checked whole: the next entry follows its top, whatever the manifest says.
-    current = commit["revision"] if commit else (state["history"][-1] if state["history"] else
-                                                 state["docs"].get("manifest", {}).get("revision"))
+    current = commit["revision"] if commit is not None else (state["history"][-1] if state["history"] else
+                                                             _get(state["docs"], "manifest", "revision"))
     if not isinstance(current, int) or isinstance(current, bool):
         raise T.StoreError("package.invalid", "the manifest has no integer revision", exit=1)
     if expected_revision is not None and expected_revision != current and commit is None and state["history"]:

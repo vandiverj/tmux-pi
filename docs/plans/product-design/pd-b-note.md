@@ -120,3 +120,20 @@ Limits, stated:
 - **Report correction (F3).** Round 3's report said adoption replaces `commit.json`. It also replaces `package.json`:
   adoption commits the edited files as the next revision, so the manifest's revision is incremented and
   `package.json` is rewritten along with `commit.json` and the new history entry.
+
+## Round 5: a staged record that is present is validated as it is (2026-11-10)
+
+- **Absent is decided by the file (F1).** Recovery published a staged `commit.json` holding JSON `null` when the
+  journal's digest matched it: `prospective(..., record=None)` meant "build the record", so a parsed `null` was taken
+  as "no record" and a record built from the documents was checked instead. `prospective(root, docs, entry,
+  staged=None)` now takes recovery's staged record as `staged=(record, revision)`, so any staged value, `null`
+  included, is checked by `commit_problems`, the function `status` uses.
+- **One reader.** `package.read_file(path)` returns `package.ABSENT` when no file is there, else the parsed value
+  under the reader's limits. `ABSENT` refuses truth-testing (`bool(ABSENT)` raises), so callers must use `is`. It is
+  used for every document (`read_docs`), every control file (`store._read_json`, so `_load` for `commit.json`, history
+  entries and `txn.json`, and `_live_digest`) and every staged file (`_staged` reads each staged file once through it;
+  a missing staged file is `control.invalid`).
+- **No reader turns a falsy value into absence.** Every `or {}`, `if commit` and `revision or ...` on a control value
+  was replaced with an explicit `is None` or `is ABSENT` test (`inspect`, `_expected`, `history_problems`,
+  `changes._open`, `cli.status_report`). `prospective` refuses a commit whose documents lack a key instead of
+  rendering that key as `null`. The task report lists each site and how it was handled.

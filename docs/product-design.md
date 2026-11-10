@@ -240,7 +240,10 @@ whose file digests differ from `commit.json`, or a journal for an unexpected rev
 (`NNNNNN.json`, six digits or more; other names are ignored), and its `base_revision` against the entry before it. Any
 `control.invalid` makes the package untrusted in every output (`package.control-invalid`). Writers, adoption included,
 refuse until the owner repairs it, and no command writes a revision on top of a history that fails these checks. History
-may start after revision 1 (an imported package) when its chain is complete from there. A package whose `commit.json`
+may start after revision 1 (an imported package) when its chain is complete from there. Whether a package or control
+file (a document, `commit.json`, a history entry, the journal or a staged file) is absent is decided by the file,
+never by its value: one reader (`package.read_file`) returns "absent" only when there is no file, and any JSON value a
+file holds (`null`, `false`, `0`, `""`, `[]`, `{}`) is checked as that record and, if it is not one, is malformed. A package whose `commit.json`
 is missing but whose history is whole is adopted from the newest history entry (`--expected-revision` is that entry's
 revision, whatever the manifest says).
 

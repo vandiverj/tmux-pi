@@ -1125,7 +1125,7 @@ class ControlRecordTests(PackageCase):
         fn(value)
         (txn / name).write_text(json.dumps(value))
         meta, record, entry = load("txn.json"), load("commit.json"), load("history.json")
-        if name in T.FILES.values():
+        if name in T.FILES.values() and isinstance(record, dict) and isinstance(entry, dict):
             digest = digest_of(value)
             for files in (meta["new"], record["files"], entry["files"]):
                 files[name] = digest
@@ -1166,14 +1166,31 @@ class ControlRecordTests(PackageCase):
              True, "control.invalid"),
             ("history summary a lone low surrogate", "history.json", lambda d: d.update(summary="\udc00"), True,
              "control.invalid"),
+            # Round 5 (the review's probes_r4): a staged record that is present is validated as the value it holds.
+            # JSON null was read as "no record" and a synthesized record checked instead; recovery published null.
+            # "value": the staged file holds this JSON value and the journal's digest is made to match it.
+            *[(f"commit {v!r} after {w}", "commit.json", v, "value", "control.invalid", w)
+              for w in ("apply", "adopt", "ingest") for v in (None,)],
+            ("commit false", "commit.json", False, "value", "control.invalid"),
+            ("commit an empty object", "commit.json", {}, "value", "control.invalid"),
+            ("history null", "history.json", None, "value", "control.invalid"),
+            ("manifest null", "package.json", None, "value", "control.invalid"),
         ]
-        for name, staged, change, consistent, code in rows:
+        writers = {"apply": lambda f: C.apply(self.pkg, cs(CommitTests.EDIT), 3, fault=f),
+                   "adopt": lambda f: (self.rewrite(self.pkg / "package.json", lambda d: d.update(title="Hand edited")),
+                                       C.apply(self.pkg, cs({"op": "adopt-external-edit", "by": "Owner",
+                                                             "reason": "hand"}), 3, fault=f)),
+                   "ingest": lambda f: C.ingest(self.pkg, bundle(IngestTests.note(self)), fault=f)}
+        for name, staged, change, consistent, code, *writer in rows:
             with self.subTest(name):
                 shutil.rmtree(self.pkg)
                 shutil.copytree(FIXTURE, self.pkg)
                 with self.assertRaises(Crash):
-                    C.apply(self.pkg, cs(CommitTests.EDIT), 3, fault=crash_at("after-commit-point"))
-                if consistent == "bytes":
+                    writers[writer[0] if writer else "apply"](crash_at("after-commit-point"))
+                if consistent == "value":
+                    (self.pkg / ".tp-product/txn" / staged).write_text(json.dumps(change))
+                    self.restage(self.pkg, staged, lambda d: None)
+                elif consistent == "bytes":
                     path = self.pkg / ".tp-product/txn" / staged
                     path.unlink() if change is None else path.write_bytes(change)
                 elif consistent:

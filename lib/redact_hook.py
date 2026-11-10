@@ -300,6 +300,23 @@ def bash_placeholders(event, command, params, result, kinds_info):
             "source": "; ".join(origin(data, n) for n in names)}
 
 
+def routed(decision, params):
+    """A sensitive-read ask or deny on a Bash command: the reason names the safe tool that replaces a shell search or read
+    (sensitive_read.safe_route), and in a worker task an ask becomes a deny marked `refused` (nobody answers a worker's
+    prompt). Anything else, an ask about placeholders included, is returned as it is; a deny is never lifted."""
+    try:
+        from sensitive_read import safe_route, worker_task
+        route = safe_route("Bash", params, "claude")
+    except Exception:
+        return decision  # the decision as it was; a failure here never lifts or adds a prompt
+    if not route:
+        return decision
+    if decision["decision"] == "ask" and worker_task():
+        return {**decision, "decision": "deny", "refused": True,
+                "reason": f"tmux-pi refuses this shell read in a worker task. {decision['reason']} {route}"}
+    return {**decision, "reason": f"{decision['reason']} {route}"}
+
+
 def pre_decision(event):
     """Return {decision, reason, target, input, ...} for a PreToolUse event; decision None means no prompt.
 
@@ -341,29 +358,29 @@ def pre_decision(event):
         result["input"] = {**params, "command": wrapped}
     if "blocked" in kinds:
         path = next(p for k, p in reads if k == "blocked")
-        return {**result, "decision": "deny", "target": path, "reason":
-                f"tmux-pi blocks reading production/staging env file {path}. Ask the user if a value is needed."}
+        return routed({**result, "decision": "deny", "target": path, "reason":
+                       f"tmux-pi blocks reading production/staging env file {path}. Ask the user if a value is needed."}, params)
     if "store" in kinds:
         path = next(p for k, p in reads if k == "store")
         reason = f"This command reads credential store {path}. Allow only if its contents are needed."
         if holds:
-            return {**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}
-        return {**result, "decision": "ask", "target": path, "reason": reason}
+            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params)
+        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params)
     if "secret" in kinds and (network or transform):
         path = next(p for k, p in reads if k == "secret")
         how = "sends it over the network" if network else "encodes it so redaction cannot recognize the values"
         reason = f"This command reads {path} and {how}. Allow only if that is intended."
         if holds:
-            return {**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}
-        return {**result, "decision": "ask", "target": path, "reason": reason}
+            return routed({**holds, "decision": "ask", "reason": reason + " " + holds["reason"]}, params)
+        return routed({**result, "decision": "ask", "target": path, "reason": reason}, params)
     if holds:
         return holds
     secret_ref = any(is_secret_name(n) for n in ENV_REF.findall(command))
     if not wrapped and not params.get("run_in_background") and (kinds or secret_ref):
         target = reads[0][1] if reads else "a secret environment variable"
-        return {**result, "decision": "ask", "target": target, "reason":
-                f"This command reads {target}, and its form (heredoc, exit or trailing comment) means output from a "
-                "failure cannot be redacted. Allow only if needed."}
+        return routed({**result, "decision": "ask", "target": target, "reason":
+                       f"This command reads {target}, and its form (heredoc, exit or trailing comment) means output from a "
+                       "failure cannot be redacted. Allow only if needed."}, params)
     return result
 
 
@@ -892,8 +909,8 @@ def handle(event):
                 out = {"hookEventName": "PreToolUse"}
                 if decision["decision"]:
                     out.update(permissionDecision=decision["decision"], permissionDecisionReason=decision["reason"])
-                    if decision["decision"] == "ask":
-                        save_request(decision["target"], decision["reason"], "pending",
+                    if decision["decision"] == "ask" or decision.get("refused"):
+                        save_request(decision["target"], decision["reason"], "refused" if decision.get("refused") else "pending",
                                      placeholder=", ".join(decision["placeholders"]), source=decision["source"],
                                      scope=decision["scope"], call=event.get("tool_use_id"))
                 if decision["input"] and decision["decision"] != "deny":

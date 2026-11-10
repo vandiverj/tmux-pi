@@ -2316,11 +2316,219 @@ def hook_response(event, cwd=None, trust=None):
     return response_for(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd or event.get("cwd"), trust))
 
 
-def response_for(result):
-    """The PreToolUse `ask` for a classification, or None when it is not sensitive."""
+# The safe tools by harness: (search, read). Claude's come from the tmux-pi-safe MCP server (claude/mcp/safe.mjs), pi's from
+# agent/extensions/safe.ts. Both redact what they return and never ask.
+SAFE_TOOL_NAMES = {"claude": ("mcp__tmux-pi-safe__safe_grep", "mcp__tmux-pi-safe__safe_read"),
+                   "pi": ("safe_grep", "safe_read")}
+# Commands a shell search or read is made of besides the search and the read: moving, printing, and the filters its output
+# is piped through. A command with anything else (an interpreter, a copy, find -exec, git show) is not one the safe tools
+# replace, so it keeps its ask everywhere.
+_ROUTE_READERS = {"cat", "tac", "nl", "head", "tail", "less", "more", "bat", "batcat"}
+_ROUTE_FILTERS = {"sort", "uniq", "cut", "wc", "tr", "column", "fold", "fmt"}
+_ROUTE_QUIET = _QUIET | {":", "exit", "sleep"}
+_ROUTE_READ_ARGS = ({"-n", "-c", "--lines", "--bytes"}, "nc")
+
+
+_REGEX_SPECIAL = set("\\.^$|?*+()[]{}")
+_BRE_SWAPPED = set("|(){}+?")  # escaped in a basic regex to be special, bare in an extended one
+
+
+def _as_safe_regex(pattern, syntax):
+    """`pattern` as the extended (ripgrep) regex safe_grep runs: a basic regex (grep's and git grep's default) has its
+    `\\|`, `\\(`, ... made bare and its bare `|`, `(`, ... escaped; fixed strings have every special character escaped."""
+    if syntax == "extended":
+        return pattern
+    out, i = [], 0
+    while i < len(pattern):
+        char = pattern[i]
+        if syntax == "fixed":
+            out.append("\\" + char if char in _REGEX_SPECIAL else char)
+        elif char == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            out.append(nxt if nxt in _BRE_SWAPPED else char + nxt)
+            i += 1
+        else:
+            out.append("\\" + char if char in _BRE_SWAPPED else char)
+        i += 1
+    return "".join(out)
+
+
+def _route_grep(prog, args):
+    """(pattern, paths, ignore_case) of one grep-family or `git grep` command, or None when there is no one pattern.
+
+    Short options are read as a cluster (`-rni`, `-A3`, `-efoo`): a letter that takes a value takes the rest of the word,
+    or the next word. Several patterns (`-e a -e b`) are named as one alternation."""
+    git = prog == "git"
+    spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
+    value_opts, value_letters, pattern_opts, pattern_letters = spec
+    syntax = "extended" if prog in _ALWAYS_RECURSIVE or prog == "egrep" else "fixed" if prog == "fgrep" else "basic"
+    modes = {"E": "extended", "P": "extended", "F": "fixed", "G": "basic"}
+    if prog in _ALWAYS_RECURSIVE:
+        modes = {"F": "fixed"}
+    longs = {"--extended-regexp": "extended", "--perl-regexp": "extended", "--fixed-strings": "fixed",
+             "--basic-regexp": "basic"}
+    patterns, operands, ignore, i, after = [], [], False, 0, False
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if after or arg == "-" or not arg.startswith("-"):
+            operands.append(arg)
+        elif arg == "--":
+            after = True
+        elif arg.startswith("--"):
+            name, equals, value = arg.partition("=")
+            ignore = ignore or name == "--ignore-case"
+            syntax = longs.get(name, syntax) if not (prog in _ALWAYS_RECURSIVE and name != "--fixed-strings") else syntax
+            if name in pattern_opts:
+                if name == "--file":
+                    return None  # patterns from a file: there is no one pattern to name
+                patterns.append(value if equals else args[i] if i < len(args) else "")
+                i += 0 if equals else 1
+            elif name in value_opts and not equals:
+                i += 1
+        else:
+            for at in range(1, len(arg)):
+                letter, rest = arg[at], arg[at + 1:]
+                if letter in pattern_letters:
+                    if letter == "f":
+                        return None
+                    patterns.append(rest if rest else args[i] if i < len(args) else "")
+                    i += 0 if rest else 1
+                    break
+                if letter in value_letters:
+                    i += 0 if rest else 1
+                    break
+                ignore = ignore or letter == "i"
+                syntax = modes.get(letter, syntax)
+    if not patterns:
+        if not operands:
+            return None
+        patterns, operands = [operands[0]], operands[1:]
+    if any("\n" in p for p in patterns):
+        patterns = [part for p in patterns for part in p.split("\n")]  # grep reads each line as its own pattern
+    pattern = "|".join(_as_safe_regex(p, syntax) for p in patterns)
+    return pattern, operands, ignore
+
+
+def _route_parts(command):
+    """[(kind, text)] for each search ("grep") or read ("read") in a shell command made only of searches, reads and the
+    commands around them (_ROUTE_*); None when the command holds anything else or cannot be read for certain."""
+    try:
+        items = _commands(command)
+    except Exception:
+        return None
+    parts, base = [], ""
+    def placed(paths):  # a relative path after `cd DIR` is named from DIR, as the shell reads it
+        return [p if not base or p.startswith(("/", "~")) else posixpath.normpath(posixpath.join(base, p)) for p in paths]
+
+    def roots(found):  # a search with no path searches what a read before it sends (`cat a | grep x`), or where it runs
+        fed = parts[-1][1] if parts and parts[-1][0] == "read" else []
+        return found[0], placed(found[1]) or fed or ([base] if base else []), found[2]
+    for item in items:
+        if item in ("(", ")"):
+            continue
+        if item["subs"] or item["heredocs"]:
+            return None  # what runs cannot be read statically
+        words = item["words"]
+        prog, args = _program(words)
+        if prog is None:
+            if words:
+                return None
+            continue
+        if prog == "git":
+            rest = list(args)
+            while rest and rest[0].startswith("-"):
+                option = rest.pop(0)
+                if option in ("-C", "-c") and rest:
+                    rest.pop(0)
+            if not rest or rest[0] != "grep":
+                return None
+            found = _route_grep("git", rest[1:])
+            if found is None:
+                return None
+            parts.append(("grep", roots(found)))
+        elif prog in _GREPS:
+            found = _route_grep(prog, args)
+            if found is None:
+                return None
+            parts.append(("grep", roots(found)))
+        elif prog in _ROUTE_READERS or (prog in ("sed", "gsed") and any(a == "-n" or a.startswith("-n") for a in args)
+                                        and not any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--")
+                                                                                   and "i" in a) for a in args)):
+            # (`sed -n -i` / `sed -ni` writes the file: not a read)
+            if prog in ("sed", "gsed"):
+                _, before, after, _, has_script = _split_args(args, *_SCRIPT_ARGS)
+                files = (before if has_script else before[1:]) + (after or [])
+            else:
+                # head and tail take a count after -n / -c; cat -n, nl and the rest take no value
+                _, before, after, _, _ = _split_args(args, *(_ROUTE_READ_ARGS if prog in ("head", "tail") else ()))
+                files = before + (after or [])
+            parts.append(("read", placed([f for f in files + list(item["inputs"]) if f != "-"])))
+        elif prog in ("cd", "pushd"):
+            target = [a for a in args if not a.startswith("-")]
+            base = posixpath.join(base, target[0]) if len(target) == 1 else ""
+        elif prog in _ROUTE_FILTERS or prog in _ROUTE_QUIET:
+            continue
+        else:
+            return None
+    return parts or None
+
+
+def safe_route(tool, params, harness):
+    """The safe tool call that replaces a shell search or read, as one instruction, or None.
+
+    None unless `tool` is a shell tool whose command is only searches and reads (see _route_parts): grep, egrep, rg, ag, ack,
+    git grep and the rest of _GREPS name the search tool with the same pattern and path (one call per path); cat, head,
+    tail, sed -n and the other readers name the read tool with the file. `harness` is "claude" or "pi".
+
+    Never raises: a hook that crashed would answer nothing, and Claude runs a call its hook did not answer. Anything that
+    goes wrong is None, and the classifier's ask stands as it was."""
+    try:
+        return _safe_route(tool, params, harness)
+    except Exception:
+        return None
+
+
+def _safe_route(tool, params, harness):
+    if tool not in _SHELL_TOOLS:
+        return None
+    grep, read = SAFE_TOOL_NAMES.get(harness, SAFE_TOOL_NAMES["pi"])
+    parts = _route_parts(str((params or {}).get("command") or ""))
+    if not parts:
+        return None
+    for kind, found in parts:
+        if kind == "grep":
+            pattern, paths, ignore = found
+            where = (" and path " + ", ".join(json.dumps(p) for p in paths) + (" (one call per path)" if len(paths) > 1 else "")
+                     if paths else "")
+            return (f"Use {grep} with pattern {json.dumps(pattern)}{where}" + (" and ignore_case true" if ignore else "")
+                    + f" instead of a shell search; read a file with {read}.")
+    files = [f for _, found in parts for f in found]
+    if files:
+        return (f"Use {read} with path " + ", ".join(json.dumps(f) for f in files) + (" (one call per file)" if len(files) > 1
+                else "") + f" instead of a shell read (offset and limit select lines); search with {grep}.")
+    return f"Search with {grep} and read with {read} instead of a shell search or read."
+
+
+def worker_task(env=None):
+    """Whether this process runs in a worker task: bin/tp-spawn exports TP_TASK_DIR to workers only, never to main."""
+    return bool((os.environ if env is None else env).get("TP_TASK_DIR"))
+
+
+def response_for(result, route=None, refuse=False):
+    """The PreToolUse `ask` for a classification, or None when it is not sensitive.
+
+    `route` (safe_route) is the safe call to use instead; it is named in the reason. With `refuse` (a worker task, and a
+    route exists) the answer is a deny with that reason: nobody answers a worker's prompt."""
     if not result["sensitive"]:
         return None
-    reason = f"Read may expose {result['target']}. Authorize this specific tool call only if its scope is needed."
+    if refuse and route:
+        decision = "deny"
+        reason = f"tmux-pi refuses this shell read in a worker task: it may expose {result['target']}. {route}"
+    else:
+        decision = "ask"
+        reason = f"Read may expose {result['target']}. Authorize this specific tool call only if its scope is needed."
+        reason += f" {route}" if route else ""
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                   "permissionDecision": "ask",
+                                   "permissionDecision": decision,
                                    "permissionDecisionReason": reason}}

@@ -947,6 +947,125 @@ class SensitiveReadTableTests(unittest.TestCase):
         self.assertEqual(run({**event, "cwd": "lib"}, "--claude-hook")["hookSpecificOutput"]["permissionDecision"],
                          "ask")
 
+    def test_claude_hook_refuses_a_worker_shell_search_and_names_the_safe_tool(self):
+        """sg1: a Bash search or read that would ask is denied in a worker task (TP_TASK_DIR), naming
+        mcp__tmux-pi-safe__safe_grep / safe_read with the same pattern and path, and recorded as "refused" where the
+        ask is recorded; main asks exactly as before, the reason now naming the safe tool too. Nothing else moves."""
+        def run(command, task=None):
+            env = {key: value for key, value in os.environ.items() if key != "TP_TASK_DIR"}
+            env["TP_REDACTION"] = "shadow"
+            if task:
+                env["TP_TASK_DIR"] = task
+            event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}, "cwd": CWD}
+            done = subprocess.run([sys.executable, str(ROOT / "bin/tp-sensitive-read"), "--claude-hook"],
+                                  input=json.dumps(event), text=True, capture_output=True, env=env, cwd=CWD,
+                                  check=True, timeout=300)  # hang guard, not a speed limit
+            out = json.loads(done.stdout)["hookSpecificOutput"] if done.stdout.strip() else None
+            return out and (out["permissionDecision"], out["permissionDecisionReason"])
+        rows = [("grep -rn TOKEN config/", 'mcp__tmux-pi-safe__safe_grep with pattern "TOKEN" and path "config/"'),
+                (f"cat {ENV}", f'mcp__tmux-pi-safe__safe_read with path "{ENV}"'),
+                ("sed -n 1,9p config/local.json | head -3", 'mcp__tmux-pi-safe__safe_read with path "config/local.json"')]
+        with tempfile.TemporaryDirectory() as task:
+            record = Path(task) / "permission-request.json"
+            for command, named in rows:
+                with self.subTest(command=command):
+                    decision, reason = run(command, task)
+                    self.assertEqual(decision, "deny")
+                    self.assertIn("refuses this shell read in a worker task", reason)
+                    self.assertIn(named, reason)
+                    saved = json.loads(record.read_text())
+                    self.assertEqual(saved["status"], "refused")
+                    self.assertIn(named, saved["reason"])
+                    decision, reason = run(command)
+                    self.assertEqual(decision, "ask")
+                    self.assertTrue(reason.startswith("Read may expose "), reason)
+                    self.assertIn(named, reason)
+            # Not sensitive: nothing in either; sensitive but no safe replacement: still an ask in a worker, recorded pending.
+            self.assertIsNone(run("grep -n x README.md", task))
+            decision, reason = run(f"python3 -c 'open(\"{ENV}\").read()'", task)
+            self.assertEqual(decision, "ask")
+            self.assertNotIn("safe_grep with", reason)
+            self.assertEqual(json.loads(record.read_text())["status"], "pending")
+
+    def test_safe_route_table(self):
+        """The forms workers send (evidence/transcript_forms.log), each with the safe call that replaces it, or None
+        when the command is more than a search or read and so keeps its ask."""
+        grep = lambda pattern, *paths, i=False: (f"Use safe_grep with pattern {json.dumps(pattern)}"
+                                                 + (" and path " + ", ".join(json.dumps(p) for p in paths) if paths else "")
+                                                 + (" (one call per path)" if len(paths) > 1 else "")
+                                                 + (" and ignore_case true" if i else "")
+                                                 + " instead of a shell search; read a file with safe_read.")
+        read = lambda *files: ("Use safe_read with path " + ", ".join(json.dumps(f) for f in files)
+                               + (" (one call per file)" if len(files) > 1 else "")
+                               + " instead of a shell read (offset and limit select lines); search with safe_grep.")
+        rows = [
+            ("grep -rn foo agent/", grep("foo", "agent/")),
+            ("grep -rn foo agent/ || echo exit-code: nonzero", grep("foo", "agent/")),
+            ("grep -n foo lib/x.py | head -20", grep("foo", "lib/x.py")),
+            ("grep -C3 -i foo -r . | head -20", grep("foo", ".", i=True)),
+            ("grep -rni foo agent", grep("foo", "agent", i=True)),
+            ("grep -A3 foo agent/x", grep("foo", "agent/x")),
+            ("grep -A 3 foo x", grep("foo", "x")),
+            ("grep -efoo x", grep("foo", "x")),
+            ("grep -c foo x", grep("foo", "x")),
+            ("grep -n x f | sort | uniq -c", grep("x", "f")),
+            ("grep -n 'a\\|b(c)' f", grep("a|b\\(c\\)", "f")),
+            ("grep -F 'a.b' f", grep("a\\.b", "f")),
+            ("grep -rnE 'a|b' agent", grep("a|b", "agent")),
+            ("rg -e a -e b src", grep("a|b", "src")),
+            ("cd /w; rg -n 'a b' lib tests", grep("a b", "/w/lib", "/w/tests")),
+            ("cd sub && grep -rn x", grep("x", "sub")),
+            ("git grep -n -e x -- bin lib", grep("x", "bin", "lib")),
+            ("git grep -n 'x\\+' bin/tp-spawn", grep("x+", "bin/tp-spawn")),
+            ("cat a b | grep x", grep("x", "a", "b")),
+            ("sed -n 1,20p config/router.json", read("config/router.json")),
+            ("cat -n lib/x.py", read("lib/x.py")),
+            ("head -n 5 x.py", read("x.py")),
+            ("tail -20 log", read("log")),
+            ("cat a b", read("a", "b")),
+            ("python3 -c 'print(1)'", None), ("grep -f pats .", None), ("grep -rn $(echo x) .", None),
+            ("find . -name x -exec grep y {} +", None), ("git show HEAD:x", None), ("cat x > y; rm y", None),
+            ("sed -n -i 's/a/b/p' f", None), ("sed -ni 1p f", None), ("sed -n --in-place 1p f", None),
+        ]
+        for command, expected in rows:
+            with self.subTest(command=command):
+                self.assertEqual(sensitive_read.safe_route("bash", {"command": command}, "pi"), expected)
+        self.assertIsNone(sensitive_read.safe_route("Read", {"file_path": "x"}, "claude"))
+        # It never raises: a crashed Claude hook answers nothing, and the call would run without its ask.
+        with mock.patch.object(sensitive_read, "_route_parts", side_effect=RuntimeError("boom")):
+            self.assertIsNone(sensitive_read.safe_route("Bash", {"command": "cat x"}, "claude"))
+        self.assertIsNone(sensitive_read.safe_route("Bash", {"command": 42}, "claude"))
+        self.assertIsNone(sensitive_read.safe_route("Bash", None, "claude"))
+        claude = sensitive_read.safe_route("Bash", {"command": "grep -rn foo agent/"}, "claude")
+        self.assertTrue(claude.startswith("Use mcp__tmux-pi-safe__safe_grep with pattern"), claude)
+        self.assertIn("mcp__tmux-pi-safe__safe_read", claude)
+        # response_for: a route is named in an ask; with refuse it is a deny; refuse without a route stays an ask.
+        result = {"sensitive": True, "target": "t", "reason": "r"}
+        out = lambda *args: sensitive_read.response_for(result, *args)["hookSpecificOutput"]
+        self.assertEqual(out()["permissionDecision"], "ask")
+        self.assertEqual(out("R.")["permissionDecisionReason"],
+                         "Read may expose t. Authorize this specific tool call only if its scope is needed. R.")
+        self.assertEqual(out("R.", True), {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                           "permissionDecisionReason": "tmux-pi refuses this shell read in a worker task: it may expose t. R."})
+        self.assertEqual(out(None, True)["permissionDecision"], "ask")
+        self.assertIsNone(sensitive_read.response_for({"sensitive": False}, "R.", True))
+        self.assertTrue(sensitive_read.worker_task({"TP_TASK_DIR": "/x"}))
+        self.assertFalse(sensitive_read.worker_task({"TP_TASK_DIR": ""}))
+        self.assertFalse(sensitive_read.worker_task({}))
+
+    def test_classifier_names_the_safe_call_with_route(self):
+        """--route: a sensitive shell search or read gets "safe", in the asking harness's names; others are unchanged."""
+        def run(command, *args):
+            done = subprocess.run([sys.executable, str(ROOT / "bin/tp-sensitive-read"), *args],
+                                  input=json.dumps({"tool_name": "bash", "tool_input": {"command": command}, "cwd": CWD}),
+                                  text=True, capture_output=True, cwd=CWD, check=True, timeout=300)
+            return json.loads(done.stdout)
+        self.assertEqual(run("grep -rn TOKEN config/", "--route", "pi")["safe"],
+                         'Use safe_grep with pattern "TOKEN" and path "config/" instead of a shell search; read a file with safe_read.')
+        self.assertIn("mcp__tmux-pi-safe__safe_grep", run("grep -rn TOKEN config/", "--route", "claude")["safe"])
+        self.assertNotIn("safe", run("grep -rn TOKEN config/"))
+        self.assertEqual(run("grep -n x README.md", "--route", "pi"), {"sensitive": False})
+
     def test_symlink_to_sensitive_file_prompts(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / ENV

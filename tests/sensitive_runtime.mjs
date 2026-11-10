@@ -62,7 +62,8 @@ const call = (toolName, input) => ({ type: 'tool_call', toolName, input });
 await h4.tool_call(call('bash', { command: 'git diff' }), { cwd: '/some/session/dir', hasUI: false });
 assert.equal(JSON.parse(fs.readFileSync(seen, 'utf8')).cwd, '/some/session/dir');
 // The worker gate prompts the owner, so it asks for the trusted lifts (T7 slice 4); offload.ts, which does not, never does.
-assert.equal(fs.readFileSync(seenArgs, 'utf8'), '--trusted\n');
+// `--route pi` asks it for the safe_grep / safe_read call that replaces a shell search or read.
+assert.equal(fs.readFileSync(seenArgs, 'utf8'), '--trusted --route pi\n');
 // A missing or odd cwd is left out, so the classifier assumes nothing.
 for (const odd of [undefined, '', 42, null]) {
   fs.rmSync(seen, { force: true });
@@ -171,4 +172,54 @@ assert.equal((await diff(undefined))?.block, true, 'no cwd must prompt');
 assert.equal((await diff(path.join(repo, 'missing')))?.block, true, 'odd cwd must prompt');
 fs.appendFileSync(path.join(repo, 'config/local.json'), 'more\n');
 assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json must prompt');
+
+// A shell search or read that would prompt: a worker task (TP_TASK_DIR) is refused without a prompt, and the reason names
+// safe_grep / safe_read with the same pattern and path; main keeps the prompt, which names them too. A call that does not
+// prompt is untouched in both, and a prompt the safe tools cannot replace stays a prompt in a worker.
+{
+  fs.writeFileSync(path.join(repo, '.env'), 'X=1\n');
+  const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-sens-worker-'));
+  process.env.TP_TASK_DIR = taskDir;
+  const hw = {};
+  mod.default({ on(name, fn) { hw[name] = fn; } });
+  delete process.env.TP_TASK_DIR;
+  const hm = {};
+  mod.default({ on(name, fn) { hm[name] = fn; } });
+  const request = () => JSON.parse(fs.readFileSync(path.join(taskDir, 'permission-request.json'), 'utf8'));
+  const prompts = [];
+  const ui = { cwd: repo, hasUI: true, ui: { confirm: async (title) => { prompts.push(title); return false; } } };
+  const rows = [
+    ['grep -rn TOKEN config/', /safe_grep with pattern "TOKEN" and path "config\/"/],
+    ['cat .env', /safe_read with path "\.env"/],
+    ['sed -n 1,5p config/local.json', /safe_read with path "config\/local\.json"/],
+    ["grep -n 'a\\|b' .env | head -5", /safe_grep with pattern "a\|b" and path "\.env"/],
+  ];
+  for (const [command, named] of rows) {
+    prompts.length = 0;
+    const worker = await hw.tool_call(call('bash', { command }), ui);
+    assert.equal(worker?.block, true, `worker ran ${command}`);
+    assert.match(worker.reason, /refuses this shell read in a worker task/);
+    assert.match(worker.reason, named);
+    assert.doesNotMatch(worker.reason, /mcp__/, 'pi names its own tools');
+    assert.equal(prompts.length, 0, `worker was prompted for ${command}`);
+    assert.equal(request().status, 'refused');
+    assert.match(request().reason, named);
+    const main = await hm.tool_call(call('bash', { command }), ui);
+    assert.equal(prompts.length, 1, `main was not prompted for ${command}`);
+    assert.equal(main?.block, true);
+    assert.match(main.reason, /User denied access/);
+    assert.match(main.reason, named);
+    const unattended = await hm.tool_call(call('bash', { command }), { cwd: repo, hasUI: false });
+    assert.match(unattended.reason, /needs user authorization/);
+    assert.match(unattended.reason, named);
+  }
+  // Not sensitive: runs in both. Sensitive but not a plain search or read: the worker is still prompted, not refused.
+  assert.equal(await hw.tool_call(call('bash', { command: 'grep -n one README.md' }), ui), undefined);
+  assert.equal(await hm.tool_call(call('bash', { command: 'grep -n one README.md' }), ui), undefined);
+  prompts.length = 0;
+  const other = await hw.tool_call(call('bash', { command: "python3 -c 'print(open(\".env\").read())'" }), ui);
+  assert.equal(prompts.length, 1, 'a worker prompt the safe tools cannot replace was refused');
+  assert.match(other.reason, /User denied access/);
+  assert.equal(request().status, 'denied');
+}
 console.log('ok');

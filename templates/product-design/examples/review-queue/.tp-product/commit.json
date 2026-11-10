@@ -1,0 +1,16 @@
+{
+  "schema": "tp-product-commit",
+  "schema_version": 1,
+  "revision": 3,
+  "files": {
+    "package.json": "sha256:65fb4135e0f3f971a84d48f5469c3ae757c3ffbedffa38c84b312171bb9bda3a",
+    "design.json": "sha256:2d3ca3bb4d7b63251549a71daa986c5203e63be5ad35eb4fa2ac9340a2f0da9f",
+    "reviews.json": "sha256:6b019adad4b5c863a3703b3d9209aae82d720f61de80d0c74061f0dde1e54529"
+  },
+  "authority": {
+    "decision.missing-field-rejects": "sha256:b8b50893caf5dce73653ed867f54de0fbee90e1858e816557e43e5e4cdae9516",
+    "slice.submit-and-queue": "sha256:1c41b7bea6fe791c054f0734d914a0429292b4eacd63e2918aff270c05509501",
+    "slice.reassignment": "sha256:626fdba091fed61ea11c53cca19c4013e8b093ea23c52539a3816fefc7a0f6d4",
+    "input.session-b.answer-1": "sha256:a839711b15b8e9862282ec0ed1034f134efb54b5d9969e66ea285babef923d4a"
+  }
+}

@@ -109,6 +109,17 @@ class ValidationTests(unittest.TestCase):
              lambda d: rec(d, "review.submit-and-queue-1").update(fingerprint="sha256:" + "b" * 64), "slice.acceptance"),
             ("acceptance review did not accept",
              lambda d: rec(d, "review.submit-and-queue-1").update(verdict="comment"), "slice.acceptance"),
+            # decision 9 (PD-B): who may make a slice ready
+            ("model review accepts the slice",
+             lambda d: rec(d, "review.submit-and-queue-1")["reviewer"].update(type="model"), "acceptance.not-human"),
+            ("acceptance without decision evidence",
+             lambda d: rec(d, READY)["readiness"]["acceptance"].update(evidence=[]), "schema.min-items"),
+            ("implemented-verified without delivery",
+             lambda d: rec(d, READY)["readiness"].update(state="implemented-verified"), "delivery.missing"),
+            ("delivery evidence on a slice not implemented",
+             lambda d: rec(d, READY)["readiness"].update(delivery={"by": "O", "date": "2026-11-10", "origin": "local",
+                                                                   "evidence": [{"kind": "commit", "ref": "abc"}]}),
+             "delivery.unexpected"),
             ("reconciled input without its event",
              lambda d: rec(d, "input.session-b.answer-1").update(status="reconciled"), "input.reconciliation"),
         ]

@@ -246,17 +246,8 @@ def _invariants(docs) -> List[S.Issue]:
             if not rec.get(need):
                 add("contract.shape", coll, i, need, f"a {rec['kind']} contract lists its {need}")
         if kind == "slice":
-            r = rec["readiness"]
-            acc = r.get("acceptance")
-            if r["state"] in ACCEPTED_STATES and not acc:
-                add("slice.acceptance", coll, i, "readiness", f"a {r['state']} slice records its acceptance")
-            elif r["state"] not in ACCEPTED_STATES and acc:
-                add("slice.acceptance", coll, i, "readiness", f"a {r['state']} slice has no acceptance")
-            elif acc:
-                review = idx[acc["review"]][1]
-                if review["verdict"] != "accept" or rid not in review["scope"] or review["fingerprint"] != acc["fingerprint"]:
-                    add("slice.acceptance", coll, i, "readiness",
-                        f"{acc['review']} must accept {rid} at the acceptance fingerprint")
+            for code, message in acceptance_problems(rec, idx, docs):
+                add(code, coll, i, "readiness", message)
         if kind == "input":
             if rec["status"] == "pending" and "reconciliation" in rec:
                 add("input.reconciliation", coll, i, "reconciliation", "a pending input has no reconciliation")
@@ -267,6 +258,47 @@ def _invariants(docs) -> List[S.Issue]:
 
 
 # ---------------------------------------------------------------- readiness
+
+def acceptance_problems(rec: dict, idx, docs) -> List[tuple]:
+    """Who can make a slice ready (brief decision 9), as (code, message) pairs; empty when the stored state is earned.
+
+    - ready-for-human-review and draft need nothing and carry no acceptance: any review, a model review included, can
+      bring a slice at most to ready-for-human-review.
+    - ready-for-case-preparation needs a local acceptance event (the responsible person, the decision evidence, the slice
+      fingerprint) whose review is a HUMAN review that accepted this slice at that fingerprint.
+    - implemented-verified needs that acceptance and local delivery evidence; a review-build (prototype) run is not
+      delivery evidence.
+    Imported records (notes, inputs) are never read here: a reviewer label or note claiming approval counts for nothing.
+    """
+    r = rec["readiness"]
+    state, acc, delivery, sid = r["state"], r.get("acceptance"), r.get("delivery"), rec["id"]
+    out = []
+    if state in ACCEPTED_STATES and not acc:
+        out.append(("slice.acceptance", f"a {state} slice records its local acceptance"))
+    elif state not in ACCEPTED_STATES and acc:
+        out.append(("slice.acceptance", f"a {state} slice has no acceptance"))
+    elif acc:
+        kind, review = idx.get(acc["review"], (None, None))
+        if kind != "review":
+            out.append(("slice.acceptance", f"{acc['review']} is not a review"))
+        else:
+            if review["reviewer"]["type"] != "human":
+                out.append(("acceptance.not-human",
+                            f"{acc['review']} is a {review['reviewer']['type']} review: only a human review accepts a slice; "
+                            "a model review brings it at most to ready-for-human-review"))
+            if review["verdict"] != "accept" or sid not in review["scope"] or review["fingerprint"] != acc["fingerprint"]:
+                out.append(("slice.acceptance", f"{acc['review']} must accept {sid} at the acceptance fingerprint"))
+    if state == "implemented-verified" and not delivery:
+        out.append(("delivery.missing", "an implemented-verified slice records delivery evidence; a prototype run is not delivery"))
+    elif state != "implemented-verified" and delivery:
+        out.append(("delivery.unexpected", f"a {state} slice has no delivery evidence"))
+    elif delivery:
+        builds = {b["file"] for b in docs["manifest"].get("builds", [])}
+        for item in delivery["evidence"]:
+            if item["ref"] in builds:
+                out.append(("delivery.prototype", f"{item['ref']} is a review build of this package, not delivery evidence"))
+    return out
+
 
 def decision_accepted(rec: dict) -> bool:
     """Accepted, and unchanged since its local acceptance."""
@@ -304,8 +336,51 @@ def readiness(docs) -> Dict[str, dict]:
             elif state in ACCEPTED_STATES and kind == "decision" and not decision_accepted(d):
                 blockers.append({"code": "decision.not-accepted", "id": dep,
                                  "reason": f"{dep} is {d['status']}" if d["status"] != "accepted" else f"{dep} changed after its acceptance"})
+        for code, message in acceptance_problems(rec, idx, docs):  # the same rule validation applies (decision 9)
+            blockers.append({"code": code, "id": sid, "reason": message})
         acc = rec["readiness"].get("acceptance")
         stale = bool(acc) and acc["fingerprint"] != fp
         effective = "blocked" if blockers else "stale" if stale else state
         out[sid] = {"state": state, "fingerprint": fp, "stale": stale, "blockers": blockers, "effective": effective}
+    return out
+
+
+def stale_cases(docs, report=None) -> List[dict]:
+    """Draft cases whose slice changed since the case was prepared: (case id, slice, prepared fingerprint, current)."""
+    report = report if report is not None else readiness(docs)
+    out = []
+    for case in docs["design"]["cases"]:
+        current = report[case["slice"]]["fingerprint"]
+        if case["source"]["slice_fingerprint"] != current:
+            out.append({"id": case["id"], "slice": case["slice"], "prepared": case["source"]["slice_fingerprint"],
+                        "current": current})
+    return out
+
+
+def content_fingerprint(docs) -> str:
+    """The package's semantic content: every design record's fingerprint, by id. Review bookkeeping (reviews.json, titles,
+    readiness, acceptances, dispositions) and the manifest are left out, so a note or a revision bump never changes it."""
+    return digest(sorted([rec["id"], record_fingerprint(rec, kind)] for coll, _, kind, rec in records(docs)
+                         if COLLECTIONS[coll][0] == "design" and isinstance(rec, dict) and "id" in rec))
+
+
+# Fields that record an acceptance event. Only the acceptance operations of a changeset write them (changes.py), and an
+# external edit that changes them is never adopted (store.py): a direct edit cannot manufacture an acceptance.
+AUTHORITY = {
+    "decision": ("acceptance",),
+    "slice": ("readiness",),
+    "input": ("status", "reconciliation"),
+    "question": ("uncertainty",),
+}
+
+
+def authority_map(docs) -> Dict[str, str]:
+    """id -> digest of the record's authority fields, for every record that has any."""
+    out = {}
+    for _, _, kind, rec in records(docs):
+        fields = AUTHORITY.get(kind)
+        if fields and isinstance(rec, dict) and isinstance(rec.get("id"), str):
+            held = {f: rec[f] for f in fields if f in rec}
+            if held:
+                out[rec["id"]] = digest(held)
     return out

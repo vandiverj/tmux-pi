@@ -281,12 +281,30 @@
           "properties": {
             "state": {"enum": ["draft", "ready-for-human-review", "ready-for-case-preparation", "implemented-verified"]},
             "acceptance": {
-              "type": "object", "additionalProperties": false, "required": ["by", "date", "review", "fingerprint", "origin"],
+              "$comment": "The local reconciliation event that accepts a slice (brief decision 9): the responsible person, the decision evidence, the human review that accepted it and the slice fingerprint.",
+              "type": "object", "additionalProperties": false, "required": ["by", "date", "review", "evidence", "fingerprint", "origin"],
               "properties": {
                 "by": {"$ref": "#/$defs/label"},
                 "date": {"$ref": "#/$defs/date"},
                 "review": {"type": "string", "x-ref": ["review"]},
+                "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
                 "fingerprint": {"$ref": "#/$defs/fingerprint"},
+                "origin": {"const": "local"}
+              }
+            },
+            "delivery": {
+              "$comment": "Delivery evidence for implemented-verified: what was built and verified in the product, never a prototype or review-build run.",
+              "type": "object", "additionalProperties": false, "required": ["by", "date", "evidence", "origin"],
+              "properties": {
+                "by": {"$ref": "#/$defs/label"},
+                "date": {"$ref": "#/$defs/date"},
+                "evidence": {"type": "array", "minItems": 1, "items": {
+                  "type": "object", "additionalProperties": false, "required": ["kind", "ref"],
+                  "properties": {
+                    "kind": {"enum": ["commit", "merge-request", "release", "ci-run", "ticket"]},
+                    "ref": {"$ref": "#/$defs/label"}
+                  }
+                }},
                 "origin": {"const": "local"}
               }
             },
@@ -338,6 +356,18 @@
         "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}},
         "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}},
         "reviews": {"type": "array", "items": {"$ref": "#/$defs/review"}}
+      }
+    },
+    "feedback": {
+      "$comment": "A feedback bundle exported by a review build and ingested into reviews.json. Records carry no bookkeeping: an input is pending, a note has no anchor or disposition (lib/product_design/changes.py ingest).",
+      "type": "object", "additionalProperties": false, "required": ["schema", "schema_version", "package", "exported", "notes", "inputs"],
+      "properties": {
+        "schema": {"const": "tp-product-feedback"},
+        "schema_version": {"const": 1},
+        "package": {"type": "string"},
+        "exported": {"$ref": "#/$defs/timestamp"},
+        "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}}
       }
     },
     "note": {

@@ -194,6 +194,18 @@ class RevisionAndReadinessTests(unittest.TestCase):
                 rec(d, OPEN_Q).update(status="answered", decision="decision.keep-draft")
             return mutate
 
+        def contradict(question, uncertainty=False):
+            def mutate(d):
+                item = {"evidence": "source.queue-observation", "statement": "The observed service answers 400, not 422."}
+                if question:
+                    item["question"] = question
+                rec(d, "contract.submissions-api")["contradicted_by"] = [item]
+                if uncertainty:
+                    rec(d, question).update(status="accepted-uncertainty", uncertainty={
+                        "scope": "Status code only", "rationale": "Clients read the error list, not the code.",
+                        "revisit_trigger": "A client keys on the code", "accepted_by": "Owner", "date": "2026-11-10"})
+            return mutate
+
         ready, blocked, stale, review = "ready-for-case-preparation", "blocked", "stale", "ready-for-human-review"
         rows = [  # name, mutation, ready slice effective, blocked slice effective
             ("note disposition (bookkeeping)", lambda d: d["reviews"]["notes"][0]["disposition"].update(kind="defer"),
@@ -210,6 +222,11 @@ class RevisionAndReadinessTests(unittest.TestCase):
             ("dependency rule made proposed", lambda d: rec(d, "rule.queue-order").update(status="proposed"), blocked, blocked),
             ("accepted dependency rule without examples", lambda d: rec(d, "rule.queue-order").update(examples=[]),
              blocked, blocked),
+            # PD-E: a required contract that contradicts known evidence blocks every slice that depends on it ...
+            ("shared contract contradicts evidence", contradict(None), blocked, blocked),
+            # ... until a named person decides it: here by accepting bounded uncertainty on the linked question
+            ("contradiction with its uncertainty accepted", contradict(OPEN_Q, uncertainty=True), stale, review),
+            ("contradiction with its question still open", contradict(OPEN_Q), blocked, blocked),
         ]
         for name, mutate, want_ready, want_blocked in rows:
             with self.subTest(name):

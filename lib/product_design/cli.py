@@ -1,10 +1,11 @@
 """tp-product: deterministic product design package commands (init, status, validate, apply, build, import-feedback,
-remap-anchor).
+remap-anchor, cases, packet, impact).
 
 Exit status: 0 done; 1 invalid or unreadable package, changeset, bundle or prototype adapter (nothing written); 2 usage;
 3 the package cannot be trusted yet (interrupted commit, uncommitted external edit, no commit record, control records
 that disagree, a file changed by someone else during the commit) or a build file exists with other content; 4 stale write (--expected-revision is not the current revision);
-5 another writer holds the lock. Reads (status, validate) never write and start nothing. With --json every refusal is
+5 another writer holds the lock. Reads (status, validate, impact) never write and start nothing; cases and packet write
+only their output and never change the package. A blocked or stale slice or case is refused by name (exit 1). With --json every refusal is
 one JSON object {"ok": false, "code", "message", "details"} on stdout.
 """
 from __future__ import annotations
@@ -13,6 +14,7 @@ import argparse
 import json
 import sys
 
+from . import cases as K
 from . import changes as C
 from . import package as P
 from . import review as R
@@ -91,7 +93,7 @@ def _print_status(rep, out):
         for b in r["blockers"]:
             print(f"    blocker {b['code']} {b['id']}: {b['reason']}", file=out)
     for c in rep["stale_cases"]:
-        print(f"stale case {c['id']}: {c['slice']} changed since it was prepared", file=out)
+        print(f"stale case {c['id']}: " + "; ".join(r["reason"] for r in c["reasons"]), file=out)
     for q in rep["open_questions"]:
         print(f"open question {q['id']}" + (f" (blocks {', '.join(q['affected_slices'])})" if q["blocking"] else ""), file=out)
     for key, ids in rep["pending"].items():
@@ -205,6 +207,22 @@ def main(argv=None, out=None, err=None) -> int:
     c.add_argument("--by", default="tp-product remap-anchor", help="who decided it")
     c.add_argument("--expected-revision", type=int, help="refuse unless the package is at this revision")
     c.add_argument("--json", action="store_true")
+    c = sub.add_parser("cases", help="render the slice's prepared cases to Markdown and cases.json; refuses a blocked "
+                                     "or stale slice or case by name")
+    c.add_argument("package_dir")
+    c.add_argument("--slice", required=True, help="the slice id")
+    c.add_argument("--out", required=True, help="the folder to write <case id>.md, cases.json and export.json in")
+    c.add_argument("--json", action="store_true")
+    c = sub.add_parser("packet", help="write one case's bounded worker packet (Markdown, or JSON for a .json file); "
+                                      "refuses a stale or blocked case by name")
+    c.add_argument("package_dir")
+    c.add_argument("--case", required=True, help="the case id")
+    c.add_argument("--out", required=True, help="the packet file")
+    c.add_argument("--json", action="store_true")
+    c = sub.add_parser("impact", help="slices, reviews and cases affected by changes: stale, blocked, published ids")
+    c.add_argument("package_dir")
+    c.add_argument("--since", type=int, help="also list the design records changed after this revision (history)")
+    c.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     as_json = getattr(args, "json", False)
     try:
@@ -258,6 +276,63 @@ def main(argv=None, out=None, err=None) -> int:
             else:
                 print(f"no change: {args.note} is already remapped to {args.target} with this reason", file=out)
             return 0
+        if args.command == "cases":
+            r = K.export_cases(args.package_dir, args.slice, args.out)
+            if as_json:
+                print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
+            else:
+                print(f"exported {len(r['cases'])} case(s) of {r['slice']} to {r['out']} (package {r['package']} revision "
+                      f"{r['package_revision']}, slice {r['slice_fingerprint']})", file=out)
+                for c in r["cases"]:
+                    pr = c["proposal"]
+                    where = ", ".join(f"{s['system']} {s['external_id']} {s['action']}" for s in pr["systems"])
+                    print(f"  {c['file']}: publication {pr['action']}" + (f" ({where})" if where else ""), file=out)
+                    if pr.get("check"):
+                        print(f"    {pr['check']}", file=out)
+                if not r["written"]:
+                    print("  every file already held these bytes; nothing was written", file=out)
+            return 0
+        if args.command == "packet":
+            r = K.packet(args.package_dir, args.case, args.out)
+            if as_json:
+                print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
+            else:
+                print(f"packet for {r['case']} written to {r['out']} ({r['format']}; package {r['package']} revision "
+                      f"{r['package_revision']}, slice {r['slice_fingerprint']})", file=out)
+                for kind, ids in r["scope"].items():
+                    if ids:
+                        print(f"  {kind}: {', '.join(ids)}", file=out)
+                if r["sources"]:
+                    print(f"  sources: {', '.join(r['sources'])}", file=out)
+                print(f"  linked, not included: {len(r['links'])} record(s)", file=out)
+            return 0
+        if args.command == "impact":
+            r = K.impact_report(args.package_dir, args.since)
+            if as_json:
+                print(json.dumps(dict(r, ok=True), indent=2, ensure_ascii=False), file=out)
+                return 0
+            print(f"{r['package']} revision {r['revision']}", file=out)
+            for sid, s in r["slices"].items():
+                print(f"  slice {sid}: {s['effective']}" + (" (stale: needs a new review)" if s["stale"] else ""), file=out)
+                for b in s["blockers"]:
+                    print(f"    blocker {b['code']} {b['id']}: {b['reason']}", file=out)
+            for rv in r["reviews"]:
+                print(f"  review {rv['review']} of {rv['slice']} no longer matches its content"
+                      + (" (it accepted the slice)" if rv["accepts_slice"] else ""), file=out)
+            for c in r["cases"]:
+                pub = ", ".join(f"{p['system']} {p['external_id']}" for p in c["publication"])
+                print(f"  case {c['id']}: {c['state']}" + (f" (published as {pub}; kept)" if pub else ""), file=out)
+                for b in c["stale"] + c["blockers"]:
+                    print(f"    {b['code']} {b['id']}: {b['reason']}", file=out)
+            if "since" in r:
+                s = r["since"]
+                print(f"  changed after revision {s['revision']}: {', '.join(s['changed']) or 'nothing'}", file=out)
+                for u in s["unlinked"]:
+                    print(f"    {u['id']} changed outside every slice's dependency links: review its impact by hand",
+                          file=out)
+            if not (r["slices"] or r["reviews"] or r["cases"]):
+                print("  nothing is stale or blocked", file=out)
+            return 0
         # apply
         if args.recover:
             if args.changeset:
@@ -285,7 +360,7 @@ def main(argv=None, out=None, err=None) -> int:
                           + (f" (named by {', '.join(u['named_by'])})" if u["named_by"] else "")
                           + ": review its impact by hand", file=out)
                 for c in eff["cases"]:
-                    print(f"  case {c['id']} is stale: {c['slice']} changed", file=out)
+                    print(f"  case {c['id']} is stale: " + "; ".join(r["reason"] for r in c["reasons"]), file=out)
         return 0
     except T.StoreError as exc:
         return _fail(exc, out, err, as_json)

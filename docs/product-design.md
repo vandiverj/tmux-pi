@@ -4,8 +4,8 @@ Status: the package contract (schema version 1), its validator, a synthetic fixt
 `status`, `validate`, `apply`, `build` and `import-feedback` exist, with atomic commits, external-edit detection,
 feedback ingestion, and the offline review page (`lib/product_design/review.py`,
 `templates/product-design/runtime/`), and the `product-design` and `prepare-cases` workflow skills with their entry
-points, the product review contract and session resume (see "Workflow skills"). Case export (`tp-product cases`,
-`packet`) is not built yet; nothing below describes it as available.
+points, the product review contract and session resume (see "Workflow skills"), and case export: `tp-product cases`,
+`packet` and `impact`, with the `reopen-question` and `record-publication` operations (see "Cases and packets").
 
 A product design package is the durable record of one product design effort: facts and their sources, scenarios, rules,
 questions, decisions, proposed API and data contracts, delivery slices and the reviews of them. It lives in the
@@ -134,7 +134,8 @@ readiness):
 Readiness is derived per slice, never for the package as a whole:
 
 - **Blockers** (any state): a blocking, unresolved question that names the slice; a superseded rule or decision in the
-  closure. In addition, for the two accepted states: a rule in the closure that is not accepted or is accepted without
+  closure; a contract in the closure whose `contradicted_by` names evidence (a claim or source) that contradicts it,
+  unless that entry links a question that is resolved (`contract.contradicted`). In addition, for the two accepted states: a rule in the closure that is not accepted or is accepted without
   examples, and a decision in the closure that is not accepted (or changed after its acceptance).
 - **Stale**: the slice has an acceptance and its fingerprint differs from the slice's current fingerprint.
 - **Effective** readiness is `blocked` if there is any blocker, else `stale` if stale, else the stored state.
@@ -158,6 +159,12 @@ tp-product import-feedback DIR BUNDLE [--expected-revision N] [--json]
                                     import a feedback bundle exported by a review page; all or nothing
 tp-product remap-anchor DIR NOTE TARGET --reason TEXT [--by LABEL] [--expected-revision N] [--json]
                                     anchor a note to another target of the review build, keeping its original
+tp-product cases DIR --slice ID --out OUTDIR [--json]
+                                    export the slice's cases as OUTDIR/<case>.md and OUTDIR/cases.json
+tp-product packet DIR --case ID --out FILE [--json]
+                                    write one case's worker packet (FILE.json: JSON; otherwise Markdown)
+tp-product impact DIR [--since REV] [--json]
+                                    stale or blocked slices, reviews to redo, cases to re-prepare (read only)
 ```
 
 | Exit | Meaning |
@@ -299,17 +306,20 @@ value. Each operation's fields are checked against the table below before the pa
 | `accept-uncertainty` | `question`, `scope`, `rationale`, `revisit_trigger`, `by`, `date` | |
 | `set-disposition` | `note`, `kind`, `rationale`, `by`, `date`, optional `link` | Bookkeeping only |
 | `set-manifest` | `fields` | Only `title`, `owner`, `objective`, `source_roots`, `activity`, `next_action` |
+| `reopen-question` | `question`, `reason`, `by`, `date`, optional `cases` | The question must be answered, accepted-uncertainty or withdrawn. It becomes `open`; its decision, uncertainty or withdrawal reason move into a `reopened` event. Each affected case (default: the cases of the question's slices) gets a `reopened` event keeping its prior source, and reads stale. Published ids are kept |
+| `record-publication` | `case`, `system`, `external_id`, `package_revision`, `digest`, `by`, `date` | Data only: records that a case was published under an external id. An identical entry is no change; an external id mapped to two cases, or a case to two ids in one system, is refused (`publication.duplicate`) |
 | `adopt-external-edit` | `by`, `reason` | Must be the only operation |
 
 **Authority fields** (a decision's `acceptance`, a slice's `readiness`, an input's `status` and `reconciliation`, a
-question's `uncertainty`) are written only by the acceptance operations. `add`, `set` and `replace` refuse them
+question's `uncertainty` and `reopened`, a case's `publication` and `reopened`) are written only by their own
+operations. `add`, `set` and `replace` refuse them
 (`op.authority`), a bundle cannot carry them, and an external edit that changes them is not adopted. An acceptance made
 earlier in a changeset is re-checked against the final result (`acceptance.blocked`).
 
 **Impact.** Every commit reports, and records in history: the design records whose fingerprint changed; slices that
 became stale (their accepted content changed: they need a new review); changed records no slice reaches through
-dependency links, with the records that name them (`unlinked`, for review by hand); and draft cases whose slice
-changed. Review bookkeeping (notes, inputs, reviews, dispositions, titles) changes no fingerprint and stales nothing.
+dependency links, with the records that name them (`unlinked`, for review by hand); and cases that are stale (their
+slice changed, or a question they depend on was reopened), with the reasons. Review bookkeeping (notes, inputs, reviews, dispositions, titles) changes no fingerprint and stales nothing.
 
 ## Feedback ingestion
 
@@ -515,6 +525,77 @@ The script calls `TPReview.registerPrototype({id, seeds, reduce, render, conditi
 The target registry is the one list a note may be anchored to: the views, every design record id and the adapter's
 targets. The page and `import-feedback` use the same rule.
 
+## Cases and packets
+
+A case (`cases` in `design.json`) is one observable behaviour of one slice, with its exception path: `slice`, `title`,
+`acceptance_examples`, `dependencies` (the rules, scenarios, decisions and contracts it relies on), `source` (the
+package revision and slice fingerprint it was prepared from) and, optionally, `actor`, `outcome`, `scope`,
+`exclusions`, `feasibility`, `nonblocking`, `qa` (`approach`, `fixtures`, `nonfunctional`), `completion_evidence` and
+`implementation_areas` (each `observed` with a source, or `tentative`). `catalog/skills/prepare-cases` shapes them.
+
+**Case readiness** comes from the slice readiness above (decision 9); there is no second rule and no force flag. A
+case is:
+
+- **stale** when its `source.slice_fingerprint` is not the slice's current fingerprint (`case.slice-changed`: a rule,
+  scenario, decision or contract the slice reaches changed, a shared rule included, so every case of every slice
+  reaching it is stale), or when its last `reopened` event still holds its current source (`case.reopened`). Prepare
+  it again from the current slice (a `set` of `source`, after checking its examples) once the slice is accepted again.
+- **blocked**, by name, when its slice has a blocker (an unresolved blocking question, with the decision needed and
+  its owner; a superseded record; a rule without examples; a contract contradicted by evidence), when the slice's
+  review is stale (`review.stale`), when the slice is not `ready-for-case-preparation` or `implemented-verified`
+  (`slice.not-accepted`), or when the case depends on a record outside the slice's closure
+  (`case.dependency-outside-slice`).
+- **ready** otherwise.
+
+A recorded human acceptance of bounded uncertainty (`accept-uncertainty` on the question, linked from a contract's
+`contradicted_by` when the doubt is about a contract) resolves the question and unblocks the case. A stale review or
+a rule without examples is not accepted away: review the slice again, or add the examples.
+
+**`tp-product cases DIR --slice ID --out OUTDIR`** refuses a slice that is not ready (`slice.unknown`,
+`slice.blocked`, `slice.not-ready`, naming each blocker) and a slice with a stale or blocked case (`case.stale`,
+`case.blocked`) or with no case (`cases.none`). Otherwise it writes, with no model call:
+
+- `OUTDIR/<case id>.md`, one per case: title, provenance (package, revision, slice, slice fingerprint, case digest),
+  outcome, scope, exclusions, examples, rules, scenarios, decisions, contracts, QA, completion evidence, areas;
+- `OUTDIR/cases.json`: schema `tp-product-cases`, the provenance, and per case its key (the case id), file, digest
+  (the case's content and the record fingerprints of everything it names), the case, its references, its recorded
+  publications and reopen events, and a publication **proposal** per system: `create` (never published), `unchanged`
+  (published at this digest) or `update` (published at another digest: update the existing external record, never
+  create a second one, and check it was not edited there first: never overwrite it silently);
+- `OUTDIR/export.json`, the export record: what was written and its digests.
+
+Keys are sorted and the output is a function of the committed package, so exporting twice writes nothing the second
+time. A file in OUTDIR that is neither what the last export wrote nor the new bytes (hand-edited) is refused
+(`export.edited`), as is an OUTDIR whose export record belongs to another package or cannot be read
+(`export.foreign`). Every text field is rendered inert: Markdown and HTML characters are escaped, controls become
+spaces, bidirectional controls are shown as `[U+XXXX]`, and only ids and digests are set as code.
+
+**`tp-product packet DIR --case ID --out FILE`** checks staleness first (`case.stale`), then blockers
+(`case.blocked`), then writes one worker packet: the provenance (package fingerprint, revision, slice fingerprint,
+case digest); the case; its dependencies; only the scenarios, rules (with examples), decisions, contracts, claims and
+actors in its scope; the excerpts and anchors of the sources they cite; the verification requirements; its
+publications; and links (id, kind, title, file) for every other record. It has no Git facts (branch, commit, dirty
+files): the worker reads those live. An existing FILE that is not a packet is refused (`packet.exists`).
+
+**`tp-product impact DIR [--since REV]`** lists slices that are stale or blocked, reviews whose fingerprint is not the
+slice's current one (with whether the review accepted the slice), and cases that are not ready with their
+publications ("published as X; kept"); `--since REV` adds the records changed after revision REV, from history.
+
+**Publication** is data only: no command calls a tracker. After publishing a case by hand or with another tool,
+record it with a `record-publication` changeset (the external id, the package revision and the case digest from
+`cases.json`). Reopening a question (`reopen-question`) keeps the published id and the prior source revision and
+fingerprint in the case's `reopened` event; the next export proposes an `update` of that id.
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `slice.unknown`, `case.unknown` | 1 | No such slice or case |
+| `slice.blocked`, `slice.not-ready` | 1 | The slice is blocked or stale, or not accepted; `details.blockers` names each |
+| `case.stale`, `case.blocked` | 1 | A case is stale or blocked; the message names the reason |
+| `cases.none` | 1 | The slice has no cases |
+| `export.edited`, `export.foreign`, `export.unsafe` | 1 | OUTDIR holds hand edits, another package's export, or is unsafe to write (a symlink) |
+| `packet.exists` | 1 | FILE exists and is not a worker packet |
+| `publication.duplicate` | 1 | `record-publication` would map one external id to two cases, or one case to two ids in a system |
+
 ## Workflow skills
 
 Two selective catalogue skills (`config/skill-catalog.json`) guide Main. They are instructions only: they approve
@@ -526,8 +607,9 @@ nothing, open no ticket and publish nothing.
   validation. Optional reference: `catalog/skills/product-design/references/techniques.md`.
 - **`prepare-cases`** (`catalog/skills/prepare-cases/SKILL.md`): turns a slice whose effective readiness is
   `ready-for-case-preparation` into small case drafts, each an observable behaviour with its exception path, never one
-  per screen, endpoint or table. Drafts are committed as `cases` records with `tp-product apply`. Reference with a
-  worked changeset: `catalog/skills/prepare-cases/references/case-shape.md`.
+  per screen, endpoint or table. Drafts are committed as `cases` records with `tp-product apply`, then exported with
+  `tp-product cases` and handed to workers with `tp-product packet`. Reference with a worked changeset:
+  `catalog/skills/prepare-cases/references/case-shape.md`.
 
 Selection: an explicit marker (`/product-design`, `/prepare-cases`) or a narrow phrase ("start a product design
 package", "resume the product design workflow", "do product discovery", "prepare cases for slice", "break the slice
@@ -575,5 +657,12 @@ and what the tool does. They are not fixed round by round.
   uses the same measured packer but was not attacked at those byte boundaries.
 - **The page's own import** refuses a number whose JavaScript round trip would change it (an integer beyond 2^53,
   `-0`, an exponent, a trailing zero), visibly; recovery keeps such numbers as their exact text.
+- **A bare URL in a case's text**: escaped characters stay inert, but a Markdown viewer that autolinks bare URLs
+  (GitHub) shows it as a link; nothing fetches it.
+- **A question set back to `open` with `set`** instead of `reopen-question`: its cases are blocked through the
+  question, but carry no `reopened` event and keep no prior revision.
+- **A tracker record deleted and re-created under a new id**: `record-publication` refuses the second id for the
+  same case and system (`publication.duplicate`), and no operation removes a publication entry. Record the new id
+  under another `system` label (for example `tracker-2`) and say why in the changeset summary.
 - **A package path containing spaces** in the resume objective: the `package=` field ends at the first space. Give the
   path to `tp-product status` by hand; the manifest is the record either way.

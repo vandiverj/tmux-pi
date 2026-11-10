@@ -367,6 +367,9 @@ def _invariants(docs) -> List[S.Issue]:
             need = "entities" if rec["kind"] == "data" else "operations"
             if not rec.get(need):
                 add("contract.shape", coll, i, need, f"a {rec['kind']} contract lists its {need}")
+        if kind == "case" and rec["source"]["package_revision"] > docs["manifest"]["revision"]:
+            add("case.source", coll, i, "source", f"prepared from revision {rec['source']['package_revision']}, after "
+                                                  f"the package's revision {docs['manifest']['revision']}")
         if kind == "slice":
             for code, message in acceptance_problems(rec, idx, docs):
                 add(code, coll, i, "readiness", message)
@@ -376,6 +379,9 @@ def _invariants(docs) -> List[S.Issue]:
             if rec["status"] != "pending" and "reconciliation" not in rec:
                 add("input.reconciliation", coll, i, "reconciliation",
                     f"a {rec['status']} input records its local reconciliation")
+    where = {rec["id"]: i for i, rec in enumerate(docs["design"]["cases"])}
+    for cid, message in publication_problems(docs):
+        add("case.publication", "cases", where[cid], "publication", message)
     return issues
 
 
@@ -458,6 +464,15 @@ def readiness(docs) -> Dict[str, dict]:
             elif state in ACCEPTED_STATES and kind == "decision" and not decision_accepted(d):
                 blockers.append({"code": "decision.not-accepted", "id": dep,
                                  "reason": f"{dep} is {d['status']}" if d["status"] != "accepted" else f"{dep} changed after its acceptance"})
+            if kind == "contract":
+                for item in d.get("contradicted_by", []):
+                    q = item.get("question")
+                    if q and question_resolved(idx[q][1], idx):
+                        continue  # the contradiction was decided: answered and accepted, or its uncertainty accepted
+                    blockers.append({"code": "contract.contradicted", "id": dep, "evidence": item["evidence"],
+                                     "reason": f"{dep} contradicts {item['evidence']}: {item['statement']}" + (
+                                         f" ({q} is {idx[q][1]['status']})" if q else
+                                         " (no question records the decision it needs)")})
         for code, message in acceptance_problems(rec, idx, docs):  # the same rule validation applies (decision 9)
             blockers.append({"code": code, "id": sid, "reason": message})
         acc = rec["readiness"].get("acceptance")
@@ -467,15 +482,83 @@ def readiness(docs) -> Dict[str, dict]:
     return out
 
 
-def stale_cases(docs, report=None) -> List[dict]:
-    """Draft cases whose slice changed since the case was prepared: (case id, slice, prepared fingerprint, current)."""
+CASE_DEP_KINDS = ("rule", "scenario", "decision", "contract")  # what a case may depend on only inside its slice
+
+
+def case_report(docs, report=None) -> Dict[str, dict]:
+    """Per case: state (ready | stale | blocked), stale reasons, blockers. The one case rule: every command that says
+    whether a case can be exported or handed to a worker (status, impact, cases, packet, apply's impact) reads it, and it
+    reads slice readiness (`readiness`, decision 9) rather than deciding readiness again. Call only on a valid package.
+
+    stale     the case was prepared from content that has changed: its slice fingerprint is no longer the slice's
+              (case.slice-changed), or an implementation discovery reopened a question since it was prepared
+              (case.reopened: its last reopen event's prior source is still its source). Prepare it again.
+    blocked   its slice cannot hand out cases: the slice's own blockers (an unresolved blocking question, with the
+              decision it needs and its owner; a superseded dependency; an accepted rule without examples; a contract
+              that contradicts known evidence; ...), a stale slice review (review.stale), a slice not accepted for case
+              preparation (slice.not-accepted), or a rule, scenario, decision or contract dependency outside the slice's
+              dependency links (case.dependency-outside-slice: the reviewed fingerprint does not cover it).
+    """
     report = report if report is not None else readiness(docs)
-    out = []
+    idx = index(docs)
+    out = {}
     for case in docs["design"]["cases"]:
-        current = report[case["slice"]]["fingerprint"]
-        if case["source"]["slice_fingerprint"] != current:
-            out.append({"id": case["id"], "slice": case["slice"], "prepared": case["source"]["slice_fingerprint"],
-                        "current": current})
+        cid, sid, src = case["id"], case["slice"], case["source"]
+        r = report[sid]
+        stale = []
+        if src["slice_fingerprint"] != r["fingerprint"]:
+            stale.append({"code": "case.slice-changed", "id": sid,
+                          "reason": f"{sid} changed since {cid} was prepared at revision {src['package_revision']}"})
+        last = (case.get("reopened") or [None])[-1]
+        if last and last["prior"] == src:
+            stale.append({"code": "case.reopened", "id": last["question"],
+                          "reason": f"{last['question']} was reopened on {last['date']} by {last['by']}: {last['reason']}"})
+        blockers = []
+        for b in r["blockers"]:
+            b = dict(b)
+            if b["code"] == "question.unresolved":
+                q = idx[b["id"]][1]
+                b.update(decision_needed=q["decision_needed"], owner=q["owner"])
+            blockers.append(b)
+        if r["stale"]:
+            acc = idx[sid][1]["readiness"]["acceptance"]
+            blockers.append({"code": "review.stale", "id": sid,
+                             "reason": f"{sid} changed since {acc['review']} accepted it: it needs a new human review"})
+        if r["state"] not in ACCEPTED_STATES:
+            blockers.append({"code": "slice.not-accepted", "id": sid,
+                             "reason": f"{sid} is {r['state']}: a human review accepts it for case preparation first"})
+        inside = set(closure(docs, sid, idx))
+        for dep in case["dependencies"]:
+            if idx[dep][0] in CASE_DEP_KINDS and dep not in inside:
+                blockers.append({"code": "case.dependency-outside-slice", "id": dep,
+                                 "reason": f"{cid} depends on {dep}, which {sid} does not link: the reviewed slice "
+                                           "does not cover it"})
+        state = "stale" if stale else "blocked" if blockers else "ready"
+        out[cid] = {"slice": sid, "state": state, "stale": stale, "blockers": blockers,
+                    "prepared": src["slice_fingerprint"], "current": r["fingerprint"]}
+    return out
+
+
+def stale_cases(docs, report=None) -> List[dict]:
+    """Cases prepared from content that has changed (case_report's stale): id, slice, prepared and current slice
+    fingerprint, and the reasons."""
+    return [{"id": cid, "slice": c["slice"], "prepared": c["prepared"], "current": c["current"], "reasons": c["stale"]}
+            for cid, c in case_report(docs, report).items() if c["stale"]]
+
+
+def publication_problems(docs) -> List[tuple]:
+    """(case id, message) for publication mappings that would duplicate a record: an external id mapped to two cases of
+    one system, or one case mapped to two external ids of one system (a re-publication updates the same id)."""
+    owner, out = {}, []
+    for case in docs["design"]["cases"]:
+        mine = {}
+        for p in case.get("publication", []):
+            key = (p["system"], p["external_id"])
+            if owner.setdefault(key, case["id"]) != case["id"]:
+                out.append((case["id"], f"{p['system']} {p['external_id']} is already mapped to {owner[key]}"))
+            if mine.setdefault(p["system"], p["external_id"]) != p["external_id"]:
+                out.append((case["id"], f"{case['id']} is already published to {p['system']} as "
+                                        f"{mine[p['system']]}: a re-publication updates that record"))
     return out
 
 
@@ -486,13 +569,15 @@ def content_fingerprint(docs) -> str:
                          if COLLECTIONS[coll][0] == "design" and isinstance(rec, dict) and "id" in rec))
 
 
-# Fields that record an acceptance event. Only the acceptance operations of a changeset write them (changes.py), and an
-# external edit that changes them is never adopted (store.py): a direct edit cannot manufacture an acceptance.
+# Fields that record an acceptance or another local event (a publication, a reopened question). Only their own operations
+# of a changeset write them (changes.py), and an external edit that changes them is never adopted (store.py): a direct
+# edit cannot manufacture an acceptance, a publication mapping or a reopen.
 AUTHORITY = {
     "decision": ("acceptance",),
     "slice": ("readiness",),
     "input": ("status", "reconciliation"),
-    "question": ("uncertainty",),
+    "question": ("uncertainty", "reopened"),
+    "case": ("publication", "reopened"),
 }
 
 

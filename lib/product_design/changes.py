@@ -4,9 +4,10 @@ Every change goes through one transaction (store.lock + store.commit): validated
 committed atomically, recorded in history. A refused change writes nothing. See docs/product-design.md, "Changesets".
 
 Acceptance is never a side effect. The fields in package.AUTHORITY (a decision's acceptance, a slice's readiness, an
-input's status and reconciliation, a question's accepted uncertainty) are written only by the acceptance operations
-below, each a local event naming who, when and on what evidence; `add`, `set` and `replace` refuse them, imported
-bundles cannot carry them, and an external edit that changes them is not adopted.
+input's status and reconciliation, a question's accepted uncertainty and reopen history, a case's publication mapping and
+reopen events) are written only by their own operations below, each a local event naming who, when and on what
+evidence; `add`, `set` and `replace` refuse them, imported bundles cannot carry them, and an external edit that changes
+them is not adopted.
 """
 from __future__ import annotations
 
@@ -98,7 +99,8 @@ def _collection(kind):
 def _refuse_authority(kind, fields, rid):
     held = sorted(set(fields) & set(P.AUTHORITY.get(kind, ())))
     if held:
-        raise OpError("op.authority", f"{rid}: {', '.join(held)} records an acceptance event; use the acceptance operation")
+        raise OpError("op.authority", f"{rid}: {', '.join(held)} records an acceptance or local event; only its own "
+                                      "operation writes it (docs/product-design.md, Changesets)")
 
 
 def _generic_kind(kind, rid):
@@ -260,6 +262,58 @@ def op_accept_uncertainty(work, op, ctx):
         "accepted_by": op["by"], "date": op["date"]})
 
 
+def op_reopen_question(work, op, ctx):
+    """An implementation discovery reopens a resolved question. The question becomes open again (its answer, accepted
+    uncertainty or withdrawal moves into its `reopened` history), and every affected case gets a reopen event naming the
+    revision and slice fingerprint it was prepared from: it is stale until prepared again, and keeps its publication
+    mapping (the published id and the revision it was published from). The cases default to those of the question's
+    affected slices; `cases` names them instead."""
+    _need(op, "question", "reason", "by", "date")
+    qid = op["question"]
+    _, q = _find(work, qid, {"question"})
+    status = _get(q, "status")
+    if status not in ("answered", "accepted-uncertainty", "withdrawn"):
+        raise OpError("op.state", f"{qid} is {status!r}: only a resolved question is reopened")
+    affected = _get(q, "affected_slices") if isinstance(_get(q, "affected_slices"), list) else []
+    if "cases" in op:
+        cases = []
+        for cid in op["cases"]:
+            cases.append(_find(work, cid, {"case"})[1])
+    else:
+        cases = [c for c in work["design"]["cases"] if isinstance(c, dict) and c.get("slice") in affected]
+    prior = {"status": status}
+    for field in ("decision", "uncertainty", "withdrawn_reason"):
+        if field in q:
+            prior[field] = q.pop(field)
+    q["status"] = "open"  # a blocking question blocks its slices again until it is resolved
+    if not affected and cases:
+        q["affected_slices"] = sorted({c.get("slice") for c in cases})
+    q.setdefault("reopened", []).append({"reason": op["reason"], "by": op["by"], "date": op["date"],
+                                        "cases": [c.get("id") for c in cases], "prior": prior})
+    for case in cases:
+        case.setdefault("reopened", []).append({"question": qid, "reason": op["reason"], "by": op["by"],
+                                                "date": op["date"], "prior": copy.deepcopy(case.get("source"))})
+
+
+def op_record_publication(work, op, ctx):
+    """Record that a case was published: the external id a tracker returned for it, the package revision and case digest
+    published (from `tp-product cases`). Data only: tp-product never calls a tracker. A re-publication of the same id is
+    appended; another external id for the same case and system, or an id already mapped to another case, is refused (a
+    re-export proposes an update to the mapped record, never a duplicate)."""
+    _need(op, "case", "system", "external_id", "package_revision", "digest", "by", "date")
+    _, case = _find(work, op["case"], {"case"})
+    entry = {k: op[k] for k in ("system", "external_id", "package_revision", "digest", "by", "date")}
+    if op["package_revision"] > _get(work, "manifest", "revision"):
+        raise OpError("op.shape", f"package_revision {op['package_revision']!r} is not a revision of this package")
+    held = case.setdefault("publication", [])
+    if any(all(p.get(k) == v for k, v in entry.items() if k not in ("by", "date")) for p in held):
+        return  # this revision and digest is already recorded for this id
+    held.append(entry)
+    problems = [m for cid, m in P.publication_problems(work) if cid == op["case"]]
+    if problems:
+        raise OpError("publication.duplicate", "; ".join(problems))
+
+
 def op_set_disposition(work, op, ctx):
     _need(op, "note", "kind", "rationale", "by", "date")
     _, rec = _find(work, op["note"], {"note"})
@@ -295,6 +349,7 @@ OPERATIONS = {
     "add": op_add, "set": op_set, "replace": op_replace, "supersede": op_supersede,
     "accept-decision": op_accept_decision, "set-readiness": op_set_readiness, "reconcile-input": op_reconcile_input,
     "accept-uncertainty": op_accept_uncertainty, "set-disposition": op_set_disposition, "set-manifest": op_set_manifest, "remap-anchor": op_remap_anchor,
+    "reopen-question": op_reopen_question, "record-publication": op_record_publication,
     "adopt-external-edit": None,  # handled by apply: it must be the only operation
 }
 
@@ -303,7 +358,8 @@ OPERATIONS = {
 TYPES = {"text": (lambda v: isinstance(v, str), "text"),
          "object": (lambda v: isinstance(v, dict), "an object"),
          "list": (lambda v: isinstance(v, list), "a list"),
-         "texts": (lambda v: isinstance(v, list) and all(isinstance(e, str) for e in v), "a list of text")}
+         "texts": (lambda v: isinstance(v, list) and all(isinstance(e, str) for e in v), "a list of text"),
+         "revision": (lambda v: type(v) is int and v >= 1, "a revision number")}
 _EVENT = {"by": "text", "date": "text"}
 SPECS = {
     "add": ({"collection": "text", "record": "object"}, {}),
@@ -319,6 +375,9 @@ SPECS = {
     "set-manifest": ({"fields": "object"}, {}),
     "remap-anchor": (dict(_EVENT, note="text", target="text", reason="text"), {}),
     "adopt-external-edit": ({"by": "text", "reason": "text"}, {}),
+    "reopen-question": (dict(_EVENT, question="text", reason="text"), {"cases": "texts"}),
+    "record-publication": (dict(_EVENT, case="text", system="text", external_id="text", package_revision="revision",
+                                digest="text"), {}),
 }
 
 
@@ -363,7 +422,7 @@ def impact(before, after) -> dict:
     stale       slices that were not stale and now are: their acceptance no longer matches (they need a new review)
     unlinked    changed records no slice reaches through dependency links, with the records that name them: possible
                 impact the package cannot follow (for human or model review; impact detection is not complete)
-    cases       draft cases whose slice changed since they were prepared
+    cases       cases prepared from content that has changed (package.stale_cases: slice changed, question reopened)
     """
     fps = [{rec["id"]: P.record_fingerprint(rec, kind) for coll, _, kind, rec in P.records(d) if P.COLLECTIONS[coll][0] == "design"}
            for d in (before, after)]

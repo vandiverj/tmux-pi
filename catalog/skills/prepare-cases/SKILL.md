@@ -45,6 +45,19 @@ Use when the human asks to prepare cases (`/prepare-cases`, or "prepare cases fo
 Commit the case definitions with an `add` changeset to the `cases` collection, through `tp-product apply DIR CHANGESET
 --expected-revision N`. Then run `tp-product validate DIR`. Never edit `design.json` by hand.
 
+## Export and hand over
+- `tp-product cases DIR --slice ID --out OUTDIR` writes one Markdown file per case and `cases.json`. It refuses a slice
+  or case that is blocked or stale, naming the missing decision; report that, do not work around it. It never
+  overwrites a file someone edited.
+- `tp-product packet DIR --case ID --out FILE` writes the worker packet for one case: only its scope, with links for
+  the rest. Give the worker that file, not the package. It holds no Git facts; the worker reads them live.
+- Publishing to a tracker is the human's step. After it, record the external id with a `record-publication`
+  changeset (the `digest` and revision from `cases.json`). A later export proposes `update` for that id: never
+  create a second ticket, and check the ticket was not edited there before replacing its text.
+- When an answer turns out wrong, reopen its question with a `reopen-question` changeset (`question`, `reason`, `by`,
+  `date`). Its cases go stale and keep their published ids. `tp-product impact DIR` lists what must be reviewed
+  and prepared again.
+
 ## Output
 The cases, each with its key, outcome and acceptance examples; the slices that got no cases, with their blockers; and the next action,
 which you also save in the manifest and in `tp-agent objective` as the product-design skill describes.

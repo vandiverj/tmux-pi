@@ -201,14 +201,36 @@
         "blocking": {"type": "boolean"},
         "status": {"enum": ["open", "answered", "accepted-uncertainty", "withdrawn"]},
         "decision": {"type": "string", "x-ref": ["decision"]},
-        "uncertainty": {
-          "type": "object", "additionalProperties": false, "required": ["scope", "rationale", "revisit_trigger", "accepted_by", "date"],
+        "uncertainty": {"$ref": "#/$defs/uncertainty"},
+        "withdrawn_reason": {"$ref": "#/$defs/text"},
+        "reopened": {
+          "$comment": "Each time an implementation discovery reopened this question: why, who, and how it was resolved before. Written only by reopen-question.",
+          "x-bookkeeping": true, "type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["reason", "by", "date", "cases", "prior"],
           "properties": {
-            "scope": {"$ref": "#/$defs/text"}, "rationale": {"$ref": "#/$defs/text"},
-            "revisit_trigger": {"$ref": "#/$defs/text"}, "accepted_by": {"$ref": "#/$defs/label"}, "date": {"$ref": "#/$defs/date"}
+            "reason": {"$ref": "#/$defs/text"},
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"},
+            "cases": {"type": "array", "items": {"type": "string", "x-ref": ["case"]}},
+            "prior": {
+              "type": "object", "additionalProperties": false, "required": ["status"],
+              "properties": {
+                "status": {"enum": ["answered", "accepted-uncertainty", "withdrawn"]},
+                "decision": {"type": "string", "x-ref": ["decision"]},
+                "uncertainty": {"$ref": "#/$defs/uncertainty"},
+                "withdrawn_reason": {"$ref": "#/$defs/text"}
+              }
+            }
           }
-        },
-        "withdrawn_reason": {"$ref": "#/$defs/text"}
+        }}
+      }
+    },
+    "uncertainty": {
+      "$comment": "A named person's acceptance of bounded uncertainty: its scope, rationale and when to revisit it.",
+      "type": "object", "additionalProperties": false, "required": ["scope", "rationale", "revisit_trigger", "accepted_by", "date"],
+      "properties": {
+        "scope": {"$ref": "#/$defs/text"}, "rationale": {"$ref": "#/$defs/text"},
+        "revisit_trigger": {"$ref": "#/$defs/text"}, "accepted_by": {"$ref": "#/$defs/label"}, "date": {"$ref": "#/$defs/date"}
       }
     },
     "decision": {
@@ -259,7 +281,18 @@
         }},
         "compatibility": {"$ref": "#/$defs/text"},
         "sources": {"type": "array", "items": {"type": "string", "x-ref": ["source"]}},
-        "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"], "x-dep": true}}
+        "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"], "x-dep": true}},
+        "contradicted_by": {
+          "$comment": "Known evidence this contract contradicts. It blocks every slice whose dependencies include the contract (contract.contradicted) until the linked question is resolved: answered with an accepted decision, or its bounded uncertainty accepted by a named person. Fix the contract and remove the entry when the evidence wins.",
+          "type": "array", "items": {
+            "type": "object", "additionalProperties": false, "required": ["evidence", "statement"],
+            "properties": {
+              "evidence": {"type": "string", "x-ref": ["claim", "source"]},
+              "statement": {"$ref": "#/$defs/text"},
+              "question": {"type": "string", "x-ref": ["question"]}
+            }
+          }
+        }
       }
     },
     "slice": {
@@ -327,12 +360,52 @@
           "type": "object", "additionalProperties": false, "required": ["package_revision", "slice_fingerprint"],
           "properties": {"package_revision": {"$ref": "#/$defs/revision"}, "slice_fingerprint": {"$ref": "#/$defs/fingerprint"}}
         },
-        "publication": {"x-bookkeeping": true, "type": "array", "items": {
+        "actor": {"type": "string", "x-ref": ["actor"]},
+        "outcome": {"$ref": "#/$defs/text"},
+        "scope": {"$ref": "#/$defs/texts"},
+        "exclusions": {"$ref": "#/$defs/texts"},
+        "feasibility": {"$ref": "#/$defs/texts"},
+        "nonblocking": {"$ref": "#/$defs/texts"},
+        "qa": {
+          "type": "object", "additionalProperties": false, "required": ["approach"],
+          "properties": {"approach": {"$ref": "#/$defs/text"}, "fixtures": {"$ref": "#/$defs/texts"},
+                         "nonfunctional": {"$ref": "#/$defs/texts"}}
+        },
+        "completion_evidence": {"$ref": "#/$defs/texts"},
+        "implementation_areas": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["area", "basis"],
+          "properties": {
+            "area": {"$ref": "#/$defs/label"},
+            "basis": {"enum": ["observed", "tentative"]},
+            "source": {"type": "string", "x-ref": ["source"]}
+          }
+        }},
+        "publication": {
+          "$comment": "Publication mapping (data only): local case key and the package revision it was published from -> the external id the tracker returned. Written only by record-publication; tp-product never calls a tracker.",
+          "x-bookkeeping": true, "type": "array", "items": {
           "type": "object", "additionalProperties": false, "required": ["system", "external_id", "package_revision"],
           "properties": {
             "system": {"$ref": "#/$defs/label"},
             "external_id": {"$ref": "#/$defs/label"},
-            "package_revision": {"$ref": "#/$defs/revision"}
+            "package_revision": {"$ref": "#/$defs/revision"},
+            "digest": {"$ref": "#/$defs/fingerprint"},
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"}
+          }
+        }},
+        "reopened": {
+          "$comment": "Implementation discoveries that reopened a design question: the case is stale until it is prepared again from a later package revision. Written only by reopen-question; the published ids are kept.",
+          "x-bookkeeping": true, "type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["question", "reason", "by", "date", "prior"],
+          "properties": {
+            "question": {"type": "string", "x-ref": ["question"]},
+            "reason": {"$ref": "#/$defs/text"},
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"},
+            "prior": {
+              "type": "object", "additionalProperties": false, "required": ["package_revision", "slice_fingerprint"],
+              "properties": {"package_revision": {"$ref": "#/$defs/revision"}, "slice_fingerprint": {"$ref": "#/$defs/fingerprint"}}
+            }
           }
         }}
       }

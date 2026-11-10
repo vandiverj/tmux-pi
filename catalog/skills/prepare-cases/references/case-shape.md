@@ -34,10 +34,24 @@ Then commit the changeset with `tp-product apply DIR CHANGESET --expected-revisi
       {"situation": "No title, category 'Hardware'.", "outcome": "Rejected: 'Title is required'. The queue is unchanged."}
     ],
     "dependencies": ["rule.required-fields", "decision.missing-field-rejects", "scenario.submit-missing-category"],
+    "actor": "actor.requester",
+    "outcome": "A requester who leaves out a required field is told which one, and nothing is queued.",
+    "scope": ["Server-side check of title and category", "A message naming each missing field"],
+    "exclusions": ["Saving drafts"],
+    "qa": {"approach": "One API test per missing field, plus one form test", "fixtures": ["An empty queue"]},
+    "completion_evidence": ["A test run showing the 422 response for each missing field"],
+    "implementation_areas": [{"area": "Submission request handler", "basis": "tentative"}],
     "source": {"package_revision": 3, "slice_fingerprint": "sha256:<slices.slice.submit-and-queue.fingerprint>"}}}
  ]}
 ```
 
-The other fields of a case draft (actor, scope, contracts and their confidence, QA approach, fixtures, completion evidence,
-implementation areas labelled observed or tentative) go in the Markdown draft you show the human. This package version stores
-the fields above.
+`actor` through `implementation_areas` are optional; also available are `feasibility` and `nonblocking` (lists of
+text) and, per area, `"basis": "observed"` with the `source` it was seen in. Contracts and their confidence come from
+the dependencies.
+
+Then export and hand over:
+
+```
+tp-product cases DIR --slice slice.submit-and-queue --out OUTDIR
+tp-product packet DIR --case case.reject-missing-field --out OUTDIR/packets/case.reject-missing-field.md
+```

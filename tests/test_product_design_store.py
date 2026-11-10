@@ -366,6 +366,19 @@ class ChangesetTests(PackageCase):
                                  "by": "Owner", "date": "2026-11-10", "outcome": "x"}, "op.shape"),
             ("result invalid", {"op": "set", "id": "rule.queue-order", "fields": {"status": "approved"}},
              "result.invalid"),
+            # PD-E: a publication mapping and a reopen are local events with their own operations
+            ("add a case with a publication", {"op": "add", "collection": "cases", "record": {
+                "id": "case.x", "publication": [{"system": "tracker", "external_id": "T-1", "package_revision": 3}]}},
+             "op.authority"),
+            ("add a case with a reopen", {"op": "add", "collection": "cases", "record": {"id": "case.x", "reopened": []}},
+             "op.authority"),
+            ("set a question's reopen history", {"op": "set", "id": "question.missing-field-behaviour",
+                                                 "fields": {"reopened": []}}, "op.authority"),
+            ("reopen an open question", {"op": "reopen-question", "question": "question.reassignment-during-review",
+                                         "reason": "x", "by": "Owner", "date": "2026-11-10"}, "op.state"),
+            ("publish a rule", {"op": "record-publication", "case": "rule.queue-order", "system": "tracker",
+                                "external_id": "T-1", "package_revision": 3, "digest": "sha256:" + "0" * 64,
+                                "by": "Owner", "date": "2026-11-10"}, "op.kind"),
         ]
         for name, op, code in rows:
             with self.subTest(name):
@@ -1362,7 +1375,7 @@ class OperationShapeTests(PackageCase):
     """Rule 5: every expected bad input is a structured refusal: operation fields are checked against changes.SPECS
     before use, and under --json every refusal is the JSON error object with the documented exit code."""
     WRONG = {"list": [], "dict": {}, "number": 3, "null": None, "bool": True, "list of numbers": [1]}
-    GOOD = {"text": "x", "object": {}, "list": [], "texts": []}
+    GOOD = {"text": "x", "object": {}, "list": [], "texts": [], "revision": 1}
 
     def test_every_field_of_every_operation_refuses_a_wrong_type(self):
         for name, (required, optional) in C.SPECS.items():

@@ -808,7 +808,9 @@ class BindingProofUseTests(unittest.TestCase):
     def test_an_attribute_write_anywhere_in_the_run_root_unproves_the_module_member(self):
         """Round 8 F1: a call, creation or use through `m.Q` or a `from m import Q` name holds only if no file of the run root writes or
         deletes an attribute named Q (`x.Q = v`, `x.Q += v`, `del x.Q`, any x): the module attribute may be another object by then. No
-        alias analysis: the write of the attribute name is the block. The direct import line stays (the import itself is a fact)."""
+        alias analysis: the write of the attribute name is the block. The direct import line stays (the import itself is a fact).
+        Round 10: the same holds for every link a module-path name goes through (the package attributes on the way to the module), and
+        a package __init__ that binds a link by anything but an import of that very submodule unproves it too."""
         module_form, direct_form = "import pkg.t as t\n{}t.Q()\n", "from pkg.t import Q\n{}Q()\n"
         for label, write in (("the review's alias write", "a = t\na.Q = other\n"), ("an augmented write", "a = t\na.Q += 1\n"),
                              ("a delete", "a = t\ndel a.Q\n"), ("a write in a function", "def f(a):\n    a.Q = other\n\n\n")):
@@ -840,6 +842,71 @@ class BindingProofUseTests(unittest.TestCase):
                 call = text.count("\n")
                 self.assertEqual([line for line in self.scan(text, "app/u.py", *others) if line.startswith("- u.py")],
                                  ["- u.py imports Q [app/u.py:{}]".format(call), "- u.py creates a Q [app/u.py:{}]".format(call)])
+        # Round 10: a module-path name (`import pkg.sub.t`, `as x`, `from pkg.sub import t`, relative) goes through the package
+        # attributes sub and t too; each link must be proved: no run-root write or delete of an attribute of its name, and the
+        # package's __init__ binds it only by importing exactly that submodule. `from pkg.sub.t import Q` reads sys.modules and keeps
+        # its facts. Rows come from the round-10 attack (600 cases run through use_scan and executed, 0 unsound after).
+        deep = {"pkg/__init__.py": "", "pkg/sub/__init__.py": "", "pkg/sub/t.py": "class Q:\n    pass\n", "pkg/sub/alt.py": "Q = 1\n",
+                "other.py": "Q = lambda: 'other'\n\n\nclass t:\n    Q = staticmethod(Q)\n"}
+        module_forms = (("u.py", "import pkg.sub.t\nobj = pkg.sub.t.Q()\n"), ("u.py", "import pkg.sub.t as x\nobj = x.Q()\n"),
+                        ("u.py", "from pkg.sub import t\nobj = t.Q()\n"), ("pkg/sub/u.py", "from . import t\nobj = t.Q()\n"),
+                        ("pkg/u.py", "from .sub import t\nobj = t.Q()\n"))
+        direct_forms = (("u.py", "from pkg.sub.t import Q\nobj = Q()\n"), ("pkg/sub/u.py", "from .t import Q\nobj = Q()\n"))
+
+        def deep_scan(path, text, changes):
+            files = dict(deep, **changes)
+            head = "import h\n" if "h.py" in changes else ""
+            files[path] = head + text
+            last = files[path].count("\n")
+            out = ss.use_scan("Who uses Q?", [num(p, t) for p, t in files.items()])
+            return [line for line in out if "[{}:".format(path) in line], last
+
+        # the review's repro, verbatim: A (h rebinds the package attribute t through an alias), B (the __init__ binds t to another module)
+        helper = ("app/h.py", "import pkg.t\nimport other\na = pkg\na.t = other\n")
+        for text in ("import h\nimport pkg.t\nobj = pkg.t.Q()\n", "import h\nimport pkg.t as t\nobj = t.Q()\n", "import h\nfrom pkg import t\nobj = t.Q()\n"):
+            with self.subTest("review A", form=text.split("\n")[1]):
+                self.assertEqual([line for line in self.scan(text, "app/u.py", helper) if line.startswith("- u.py")], [])
+        self.assertEqual(self.scan("import h\nfrom pkg.t import Q\nobj = Q()\n", "app/u.py", helper),
+                         ["- u.py imports Q [app/u.py:2]", "- u.py creates a Q [app/u.py:3]"])
+        with self.subTest("review B"):
+            self.assertEqual(self.scan("from pkg import t\nobj = t.Q()\n", "app/u.py", ("pkg/__init__.py", "from . import other as t\n"),
+                                       ("pkg/other.py", "Q = lambda: 'other'\n")), [])
+        breaker = "import pkg.sub.t\nimport other\n"
+        for label, changes in (
+                ("review A: t written through an alias, in an imported module", {"h.py": breaker + "a = pkg.sub\na.t = other\n"}),
+                ("sub written through the package name, in an imported module", {"h.py": breaker + "pkg.sub = other\n"}),
+                ("t deleted, in a module nobody imports", {"g.py": breaker + "del pkg.sub.t\n"}),
+                ("sub written through an alias, in the package __init__", {"pkg/__init__.py": breaker + "a = pkg\na.sub = other\n"}),
+                ("review B: __init__ binds t by a relative as import", {"pkg/sub/__init__.py": "from . import alt as t\n"}),
+                ("__init__ binds t by an as import", {"pkg/sub/__init__.py": "import other as t\n"}),
+                ("__init__ binds t by an assignment", {"pkg/sub/__init__.py": "import other\nt = other\n"}),
+                ("__init__ binds t by a def", {"pkg/sub/__init__.py": "def t():\n    pass\n"}),
+                ("__init__ binds t by a class", {"pkg/sub/__init__.py": "class t:\n    Q = None\n"}),
+                ("__init__ binds t by a for target", {"pkg/sub/__init__.py": "import other\nfor t in [other]:\n    pass\n"}),
+                ("__init__ binds t by a with target", {"pkg/sub/__init__.py": "import contextlib\nwith contextlib.nullcontext(1) as t:\n    pass\n"}),
+                ("__init__ binds t by a global", {"pkg/sub/__init__.py": "def f():\n    global t\n    t = 1\n\n\nf()\n"}),
+                ("__init__ binds t by a star import", {"pkg/sub/__init__.py": "from other import *\n"}),
+                ("__init__ answers any name by __getattr__", {"pkg/sub/__init__.py": "def __getattr__(name):\n    return None\n"}),
+                ("__init__ binds sub by an assignment", {"pkg/__init__.py": "sub = None\n"})):
+            for path, text in module_forms:
+                with self.subTest(label, form=text.split("\n")[0], where=path):
+                    self.assertEqual(deep_scan(path, text, changes)[0], [])
+            for path, text in direct_forms:
+                with self.subTest(label, form=text.split("\n")[0], where=path):
+                    lines, last = deep_scan(path, text, changes)
+                    self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last - 1),
+                                             "- {} creates a Q [{}:{}]".format(Path(path).name, path, last)])
+        # keep the line: no break, or an __init__ that binds the link only by importing exactly that submodule
+        for label, changes in (("no break", {}), ("__init__: from . import t", {"pkg/sub/__init__.py": "from . import t\n"}),
+                               ("__init__: import pkg.sub.t as t", {"pkg/sub/__init__.py": "import pkg.sub.t as t\n"}),
+                               ("__init__: from . import sub", {"pkg/__init__.py": "from . import sub\n"}),
+                               ("__init__: a method named __getattr__",
+                                {"pkg/sub/__init__.py": "class C:\n    def __getattr__(self, n):\n        return 1\n"})):
+            for path, text in module_forms:
+                with self.subTest(label, form=text.split("\n")[0], where=path):
+                    lines, last = deep_scan(path, text, changes)
+                    self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last),
+                                             "- {} creates a Q [{}:{}]".format(Path(path).name, path, last)])
 
     def test_an_import_under_a_compound_statement_or_shadowed_in_a_function_attributes_no_call(self):
         for head in COMPOUND:

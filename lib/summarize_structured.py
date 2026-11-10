@@ -778,6 +778,54 @@ def _may_write(written, name):
     return name in written or _ANY in written
 
 
+def _path_links(module, target, through_package):
+    """The links a name of the target is resolved through, in order: (holder, name) pairs, holder the dotted package whose attribute
+    name is read, or None for the target itself (its binding in the defining file is proved by use_scan). through_package (the
+    `modules` map of _use_lines: `import a.b.c`, `import a.b.c as x`, `from a.b import c`, and their relative forms): the code reaches
+    the module object through package attributes, so every component after the first is a link (b held by a, c held by a.b), then the
+    target. Else (`from a.b.c import T`, which reads sys.modules['a.b.c']): the target only."""
+    parts = module.split(".")
+    steps = [(".".join(parts[:i]), parts[i]) for i in range(1, len(parts))] if through_package else []
+    return steps + [(None, target)]
+
+
+def _holder_binds_other(holder, name, parsed):
+    """True when the run root does not prove that the package holder's attribute name is only ever its submodule holder.name: the
+    package's __init__.py binds name by any statement other than an import of exactly that submodule (`from . import name`,
+    `from <holder> import name`, `import <holder>.<name> as name`), that is an `as` import of another module, an assignment, a def or
+    class, a for or with target, a global, a delete, a star import or a dynamic form (_binds); or it defines a module `__getattr__`,
+    which can answer any name; or the __init__.py does not parse; or a module file holder.py stands beside the package. A package with
+    no __init__.py in the run root (a namespace directory) binds nothing."""
+    base = holder.replace(".", "/")
+    if base + ".py" in parsed:
+        return True
+    init = base + "/__init__.py"
+    if init not in parsed:
+        return False
+    tree = parsed[init]
+    if tree is None or _binds(tree, "__getattr__", None, False, existence=True) != []:
+        return True  # (None: a dynamic form or a star import, which binds names no statement shows)
+    found = _binds(tree, name, None, False, existence=True)
+    for kind, node, stmt, _scope, _role in found:
+        if not (kind == "name" and isinstance(node, ast.alias)):
+            return True
+        if isinstance(stmt, ast.ImportFrom) and _imported_module(init, stmt) == holder and node.name == name:
+            continue
+        if isinstance(stmt, ast.Import) and node.name == holder + "." + name and node.asname == name:
+            continue
+        return True
+    return False
+
+
+def _path_proved(module, target, through_package, parsed, written):
+    """THE one proof of a name the use scan attributes through (round 10, Main): every link the name is resolved through (_path_links)
+    is proved. A link is unproved when some run-root file writes or deletes an attribute of the link's name on any object (_written_names,
+    _may_write: no alias analysis, as round 8), or, for a link held by a package, when that package's __init__ may bind the name to
+    something other than its submodule (_holder_binds_other). Every form of import is proved here, so no form can skip a link."""
+    return not any(_may_write(written, name) or holder is not None and _holder_binds_other(holder, name, parsed)
+                   for holder, name in _path_links(module, target, through_package))
+
+
 def _opaque(source, tree):
     """True when the file's raw text holds a word of _DYNAMIC_ACCESS or the file has a star import: what it loads is then not shown by
     its imports. One of the per-file tests of _refers."""
@@ -946,7 +994,7 @@ def _no_path_to(source, tree, path, name, module, graph):
     return not _reaches(((source, tree),), *_imports_of(path, tree), name, module, graph)
 
 
-def _use_lines(f, tree, target, kind, module, others, members, dup, rewritten=False):
+def _use_lines(f, tree, target, kind, module, others, members, dup, parsed=None, written=frozenset()):
     """(imports, creates, uses, undecided) for one target in one other file: lists of (line, text), and whether the file refers to
     the target name in a way this scan cannot attribute (an import of it from a module that is not the target's by its full dotted
     path, `from m import *`, a dynamic form such as globals() or setattr (_DYNAMIC; the file then gives no line at all), an import of the target that is rebound or may be overwritten, a use of the bare name or of `x.<name>`
@@ -956,10 +1004,16 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, rewritten=Fa
     a use is attributed only through a name that _single_binding proves bound once, by that import: a name that is bound again,
     written (`t.Q = x`), shadowed, or in a file with a star import (_star: a parameter attribution too) gives the import line at most. dup (the name is defined in more
     than one file) names the target `<module>.<T>` in each line and takes a use through a parameter only from a file that imports
-    this module. rewritten (round 8): some file of the run root writes or deletes an attribute of this name (`x.<T> = v`, `x.<T> += v`,
-    `del x.<T>`, any x: use_scan, _written_names), so the module's attribute may be another object by the time of a call, whatever the
-    name it is reached by (`t.<T>`, an alias of t, or a `from m import <T>` that ran after the write): the import lines are the only
-    facts of a file that imports the target, and it is undecided. No alias analysis: the write of the attribute name is the block."""
+    this module.
+    The rule over links (round 10, Main): a call, creation or use is attributed through a name only when every link the name is
+    resolved through is proved (_path_proved, the one function every form calls; parsed is {path: tree} of the run root, written the
+    union of _written_names over it). A direct member import (`from a.b.c import T`) reads sys.modules['a.b.c'] and has one link, T:
+    when some file of the run root writes or deletes an attribute named T (`x.T = v`, `x.T += v`, `del x.T`, any x; round 8) the import
+    lines are the only facts of the file, and it is undecided. A module-path name (`import a.b.c`, `import a.b.c as x`,
+    `from a.b import c`, relative forms too) also goes through each attribute step after the first component (b, c): when one of those
+    is written or deleted anywhere, or the __init__ of its package binds it by anything but an import of exactly that submodule
+    (_holder_binds_other), nothing is attributed through the module-path names and the file is undecided; direct member imports of the
+    same file keep their facts. No alias analysis: the write of the attribute name is the block."""
     if _binding_index(tree).dynamic:
         return [], [], [], True  # a dynamic form (_DYNAMIC) anywhere: the source does not show what any name in this file is
     base, path, source = _base(f), f["path"], _source(f["text"]).split("\n")
@@ -1000,13 +1054,20 @@ def _use_lines(f, tree, target, kind, module, others, members, dup, rewritten=Fa
         # a star import binds names no statement shows: the import line is a fact, no call, creation or attribute use is (a parameter
         # included: whatever `q` is, it may be a name the star import brought)
         return sorted(imports, key=lambda item: item[0]), [], [], True
-    if rewritten and (direct or modules):
+    parsed = parsed or {}
+    if (direct or modules) and not _path_proved(module, target, False, parsed, written):
         return sorted(imports, key=lambda item: item[0]), [], [], True
     valid_direct = {name for name, stmt in direct.items() if _single_binding(tree, name, shadow=True) is stmt}
     valid_modules = {code for code, (bound, stmt) in modules.items() if _single_binding(tree, bound, shadow=True) is stmt}
     if valid_direct != set(direct) or valid_modules != set(modules):
         # the import is a fact; what the name then is, is not shown. Nothing is attributed through a name that may not be the import.
         return sorted(imports, key=lambda item: item[0]), [], [], True
+    if modules and not _path_proved(module, target, True, parsed, written):
+        # a package link may hold another object: no line through a module-path name, nor through a parameter when no direct import
+        # of the target is left to explain it
+        if not valid_direct:
+            return sorted(imports, key=lambda item: item[0]), [], [], True
+        valid_modules, unexplained = set(), True
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == target:
             unexplained = unexplained or node.id not in other_direct  # a use of this module's name is a line, or else (a star import) undecided
@@ -1055,7 +1116,11 @@ def use_scan(task, files):
     named .py file defines, and whose binding there is proven single (_single_binding). Per other .py file: its import, creation or
     call, and the attribute uses through a variable bound once from T(...) or a parameter (only of a name the class defines, dunder
     methods too), each only through an import of the target by its full dotted path whose name nothing else binds, writes or
-    shadows (see _use_lines); `from m import *` attributes nothing. A file with none of these gives `<base> does not use <T> [path:1]`,
+    shadows (see _use_lines); `from m import *` attributes nothing. Round 10 (Main): a line is attributed through a name only when
+    every link the name is resolved through is proved (_path_proved): for a module-path name (`import a.b.c`, `import a.b.c as x`,
+    `from a.b import c`) each attribute step after the first component and the target; for `from a.b.c import T` the target only. A
+    link is unproved when a run-root file writes or deletes an attribute of its name, or the __init__ of the package that holds it
+    binds it by anything but an import of exactly that submodule. A file with none of these gives `<base> does not use <T> [path:1]`,
     unless the file's text and the run root's import graph do not prove it has no path to the name (_no_path_to: a star import, a word of
     _DYNAMIC_ACCESS, the name anywhere in the text, a string that names it or its module, in the file or in any run-root module it can
 load (_refers), or a path through the imports to the target's module): then it gives nothing. When more than one file
@@ -1082,7 +1147,7 @@ load (_refers), or a path through the imports to the target's module): then it g
             for g in files:
                 if g["path"] in definers or parsed[g["path"]] is None:
                     continue
-                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, _may_write(written, name))
+                imports, creates, uses, undecided = _use_lines(g, parsed[g["path"]], name, kind, module, others, members, len(definers) > 1, parsed, written)
                 found = [text for _n, text in imports + creates + uses]
                 if found:
                     out.extend(found)

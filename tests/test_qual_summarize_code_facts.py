@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_qual_summarize_structured as base  # noqa: E402  (names only: no test class is imported, so no test runs twice)
@@ -528,6 +529,27 @@ class UseScanTests(unittest.TestCase):
                 with self.subTest(label, root="on disk"):
                     files = [target] + [num(p, t) for p, t in others] + [num("u.py", user)]
                     self.assertEqual([line for line in ss.use_scan("Who uses Q?", files, str(root)) if line.startswith("- u.py")], expected)
+        # round 12: a file on the way that changes import state (_changes_import_state) is opaque; the file's own package __init__s
+        # run before it and count too (one on disk only runs unseen)
+        sys_insert = "import sys\nsys.path.insert(0, 'alt')\n"
+        for label, user, others, at, expected in (
+                ("review F1: h/__init__.py redirects __path__, h/alt/helper.py creates Q", "import h.helper\n",
+                 (("h/__init__.py", '__path__ = [__path__[0] + "/alt"]\n'), ("h/helper.py", ""), ("h/alt/helper.py", "from pkg.sub.t import Q\nobj = Q()\n")),
+                 "u.py", []),
+                ("u sets __package__ before a relative import", "__package__ = 'alt'\nfrom . import hx\n", (("gp/__init__.py", ""), ("gp/hx.py", "")),
+                 "gp/u.py", []),
+                ("a helper u imports inserts into sys.path", "import h\n", (("h.py", sys_insert),), "u.py", []),
+                ("u's own package __init__ inserts into sys.path", "x = 1\n", (("gp/__init__.py", sys_insert),), "gp/u.py", []),
+                ("control: u's own package __init__ reads __name__", "x = 1\n", (("gp/__init__.py", "if __name__ == '__main__':\n    pass\n"),),
+                 "gp/u.py", ["- u.py does not use Q [gp/u.py:1]"])):
+            with self.subTest(label):
+                self.assertEqual(scan(user, *others, at=at), expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "gp").mkdir()
+            (Path(tmp) / "gp" / "__init__.py").write_text(sys_insert)
+            with self.subTest("u's own package __init__ on disk only"):
+                out = ss.use_scan("Who uses Q?", [target, num("gp/u.py", "x = 1\n")], tmp)
+                self.assertEqual([line for line in out if line.startswith("- u.py")], [])
 
     def test_a_rebound_name_keeps_only_the_import(self):
         imp = "- u.py imports Q [u.py:1]"
@@ -859,6 +881,46 @@ class BindingProofUseTests(unittest.TestCase):
                 out = ss.use_scan("Who uses Q?", [num(path, "class Q:\n    pass\n"), num("app/u.py", "from {} import Q\nQ()\n".format(module)),
                                                   num("v.py", "x = 1\n")])
                 self.assertEqual(out, ["- u.py imports Q [app/u.py:1]"])
+        # Round 12 (Main): no file Python runs on the way to the import (u, u's package __init__s, every run-root module u loads, which
+        # takes in t and the __init__s on t's path) may change import state (_changes_import_state); else the direct form keeps its
+        # import line and nothing is credited. v.py imports nothing, so it keeps "does not use". Rows from the round-12 attack (23400
+        # cases, 0 unsound after on both interpreters); the first two are the review's repros.
+        sys_insert = "import sys\nsys.path.insert(0, 'alt')\n"
+        rows = [("review F1: pkg/__init__.py redirects __path__", {"pkg/__init__.py": '__path__ = [__path__[0] + "/alt"]\n'}, ""),
+                ("review F2: u sets __package__ (relative forms)", {}, '__package__ = "alt"\n'),
+                ("u's package __init__ inserts into sys.path", {"app/__init__.py": sys_insert}, ""),
+                ("u inserts into sys.path", {}, sys_insert),
+                ("a helper u imports first, through import sys as", {"h.py": "import sys as s\ns.path.insert(0, 'alt')\n"}, "import h\n"),
+                ("t itself rebinds __spec__", {"pkg/t.py": "{target}__spec__ = None\n"}, ""),
+                ("pkg/__init__.py defines __name__", {"pkg/__init__.py": "def __name__():\n    pass\n"}, ""),
+                ("pkg/__init__.py binds __file__ through global", {"pkg/__init__.py": "def f():\n    global __file__\n    __file__ = ''\n"}, ""),
+                ("pkg/__init__.py binds __cached__ as a for target", {"pkg/__init__.py": "for __cached__ in ():\n    pass\n"}, ""),
+                ("u writes pkg.__name__", {}, "import pkg\npkg.__name__ = 'alt'\n"),
+                ("u imports os as __loader__", {}, "import os as __loader__\n"),
+                ("u: from sys import path", {}, "from sys import path\npath.insert(0, 'alt')\n"),
+                ("u: os.sys.path", {}, "import os\nos.sys.path.insert(0, 'alt')\n"),
+                ("u: an alias of sys", {}, "import sys\ns = sys\ns.path.insert(0, 'alt')\n"),
+                ("u: sys.meta_path in a function", {}, "def f():\n    import sys\n    return sys.meta_path\n"),
+                ("u imports site", {}, "import site\n"),
+                ("u holds a _DYNAMIC_ACCESS word", {}, "import re\nx = re.compile('a')\n")]
+        controls = [("control: u reads __name__ and __file__, and sys.argv", {}, "import os, sys\nif __name__ == '__main__':\n    print(os.path.dirname(__file__), sys.argv)\n"),
+                    ("control: an unrelated file inserts into sys.path", {"w.py": sys_insert}, ""),
+                    ("control: a comment says site", {}, "x = 1  # the web site\n")]
+        relative = (("from .t import Q\nobj = Q()\n", 1), ("from . import t\nobj = t.Q()\n", 2))
+        for label, extra, head in rows + controls:
+            for kind, target, verb in (("class", "class Q:\n    pass\n", "creates a"), ("function", "def Q():\n    pass\n", "calls")):
+                upath = "pkg/u.py" if label.startswith("review F2") else "app/u.py"
+                for text, imp in relative if upath == "pkg/u.py" else forms:
+                    files = {"pkg/__init__.py": "", "pkg/t.py": target, "v.py": "x = 1\n", "h.py": ""}
+                    files.update({p: t.format(target=target) for p, t in extra.items()})
+                    files[upath] = head + text
+                    lines = head.count("\n")
+                    with self.subTest(label, kind=kind, form=text.split("\n")[0]):
+                        out = ss.use_scan("Who uses Q?", [num(p, t) for p, t in files.items()])
+                        credited = ["- u.py imports Q [{}:{}]".format(upath, imp + lines), "- u.py {} Q [{}:{}]".format(verb, upath, 2 + lines)]
+                        expected = credited if label.startswith("control") else ["- u.py imports Q [{}:{}]".format(upath, 1 + lines)] if imp == 1 else []
+                        self.assertEqual([line for line in out if line.startswith("- u.py")], expected)
+                        self.assertIn("- v.py does not use Q [v.py:1]", out)
 
     def test_the_review_reproductions(self):
         # F1: the module overwritten by a star import, the name by a dotted import, the attribute by a write
@@ -1139,18 +1201,25 @@ class GuardTests(unittest.TestCase):
     def test_real_files_cite_their_line_when_their_names_are_asked_about(self):
         """The real rows ask no question about a name, so code_facts says nothing for them; ask about every top-level name."""
         root = base.DATA / "fixtures"
-        checked = 0
-        for row in map(json.loads, (base.DATA / "chores.jsonl").read_text().splitlines()):
-            if row["split"] != "real":
-                continue
-            names = set()
-            for f in ss.prepare(root, row["files"], GUARD_BUDGET_CHARS):
-                if f["path"].endswith(".py"):
-                    tree = ast.parse("\n".join(_plain(f)))
-                    names.update(n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
-            if names:
-                checked += self.check_lines(root, row["files"], "Who uses " + ", ".join("`{}`".format(n) for n in sorted(names)) + "?")
-        self.assertGreater(checked, 0)
+
+        def probe():
+            checked = 0
+            for row in map(json.loads, (base.DATA / "chores.jsonl").read_text().splitlines()):
+                if row["split"] != "real":
+                    continue
+                names = set()
+                for f in ss.prepare(root, row["files"], GUARD_BUDGET_CHARS):
+                    if f["path"].endswith(".py"):
+                        tree = ast.parse("\n".join(_plain(f)))
+                        names.update(n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
+                if names:
+                    checked += self.check_lines(root, row["files"], "Who uses " + ", ".join("`{}`".format(n) for n in sorted(names)) + "?")
+            return checked
+
+        probe()  # every line is checked; round 12: the real files that gave lines run sys.path.insert, so they are opaque and give none
+        # so that the cite checks still reach real files, they are made again with import state taken as unchanged
+        with mock.patch.object(ss, "_changes_import_state", lambda source, tree: bool(ss._DYNAMIC_ACCESS_RE.search(source))):
+            self.assertGreater(probe(), 0)
 
 
 def _plain(f):

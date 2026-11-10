@@ -1232,7 +1232,27 @@ class BindingProofUseTests(unittest.TestCase):
         both = ["- u.py imports Q [app/u.py:{0}]", "- u.py creates a Q [app/u.py:{1}]"]
         self.assertEqual(mine("import h\nfrom pkg.t import Q\nQ()\n", "app/u.py", cycle[0], ("app/g.py", "y = 1\n")),
                          [line.format(2, 3) for line in both])
-        self.assertEqual(mine("import hp.x\ny = hp.x\nfrom pkg.t import Q\nQ()\n", "app/u.py", *hp), [line.format(3, 4) for line in both])
+        self.assertEqual(mine("import hp.x\ny = hp.x.v\nfrom pkg.t import Q\nQ()\n", "app/u.py", *hp), [line.format(3, 4) for line in both])
+        # round 19 (Main rule 3, review F1): a module value reaches a name only through an import. Handed to any other binding it is
+        # not followed: what is read through that binding is unknown, and a file that hands a module on is opaque (every file that
+        # could read it runs that file). hp.x is never loaded, so each of these raises before Q (the reexport: helper hands it on).
+        # The last row runs (hp.x loaded) and still loses its line: module values are not tracked through assignments.
+        for label, text, extra in (
+                ("assignment alias", "import hp\na = hp\ny = a.x.v\n", ()),
+                ("tuple alias", "import hp\na, = (hp,)\ny = a.x.v\n", ()),
+                ("container", "import hp\ny = [hp][0].x.v\n", ()),
+                ("returned module", "import hp\ndef identity(a):\n    return a\ny = identity(hp).x.v\n", ()),
+                ("default argument", "import hp\ndef f(m=hp):\n    return m.x.v\ny = f()\n", ()),
+                ("walrus", "import hp\ny = (a := hp).x.v\n", ()),
+                ("assignment reexport", "from helper import a\ny = a.x.v\n", (("app/helper.py", "import hp\na = hp\n"),)),
+                ("returned from another module", "import helper\ny = helper.get().x.v\n",
+                 (("app/helper.py", "import hp\ndef get():\n    return hp\n"),)),
+                ("bound in a class body, read through the class", "class C:\n    import hp\ny = C.hp.x.v\n", ()),
+                ("an import name rebound by an assignment", "import hp.x\nhp = 3\ny = hp.x.v\n", ()),
+                ("loaded, aliased (runs; not tracked)", "import hp.x\na = hp\ny = a.x.v\n", ())):
+            with self.subTest("round 19", case=label):
+                call = text.count("\n") + 1
+                self.assertEqual(mine(text + "from pkg.t import Q\nQ()\n", "app/u.py", *hp, *extra), ["- u.py imports Q [app/u.py:{}]".format(call)])
 
     def test_an_attribute_write_anywhere_in_the_run_root_unproves_the_module_member(self):
         """Round 8 F1: a call, creation or use through `m.Q` or a `from m import Q` name holds only if no file of the run root writes or
@@ -1264,7 +1284,8 @@ class BindingProofUseTests(unittest.TestCase):
             with self.subTest(label, form="direct import, a dynamic write in another file"):
                 self.assertEqual(self.scan(direct_form.format(""), "app/u.py", ("app/g.py", other)), ["- u.py imports Q [app/u.py:1]"])
         # keep the line: an unrelated attribute, or a write into the object the name holds, is not a write of the attribute Q
-        for label, text, others in (("an unrelated attribute, same file", "import pkg.t as t\na = t\na.R = other\nt.Q()\n", ()),
+        # (round 19: written through an alias of the module, `a = t; a.R = other`, the module is used as a value and u is opaque, rule 3)
+        for label, text, others in (("an unrelated attribute, same file", "import pkg.t as t\nf = lambda: 0\nf.R = other\nt.Q()\n", ()),
                                     ("an unrelated attribute, another file", "import pkg.t as t\nt.Q()\n", (("app/g.py", "def f(x):\n    x.R = 1\n"),)),
                                     ("an item of Q, another file", "import pkg.t as t\nt.Q()\n", (("app/g.py", "Q = {}\nQ['a'] = 1\n"),))):
             with self.subTest(label):
@@ -1296,9 +1317,10 @@ class BindingProofUseTests(unittest.TestCase):
         for text in ("import h\nimport pkg.t\nobj = pkg.t.Q()\n", "import h\nimport pkg.t as t\nobj = t.Q()\n", "import h\nfrom pkg import t\nobj = t.Q()\n"):
             with self.subTest("review A", form=text.split("\n")[1]):
                 self.assertEqual([line for line in self.scan(text, "app/u.py", helper, other) if line.startswith("- u.py")], [])
-        # round 15: other.py is supplied; unseen, `import other` would make h opaque (a module the scan was not given)
+        # round 15: other.py is supplied; unseen, `import other` would make h opaque (a module the scan was not given). Round 19
+        # (rule 3): h hands the module pkg to `a`, a name no import binds, so h is opaque and u, which runs h, keeps the import only
         self.assertEqual(self.scan("import h\nfrom pkg.t import Q\nobj = Q()\n", "app/u.py", helper, other),
-                         ["- u.py imports Q [app/u.py:2]", "- u.py creates a Q [app/u.py:3]"])
+                         ["- u.py imports Q [app/u.py:2]"])
         with self.subTest("review B"):
             self.assertEqual(self.scan("from pkg import t\nobj = t.Q()\n", "app/u.py", ("pkg/__init__.py", "from . import other as t\n"),
                                        ("pkg/other.py", "Q = lambda: 'other'\n")), [])
@@ -1329,7 +1351,11 @@ class BindingProofUseTests(unittest.TestCase):
                     # round 14 (Main): a star import on the way is opaque (_opaque) for the direct form too: only the import line.
                     # Round 18 (Main 1): `import pkg.sub.t` in pkg/__init__ binds pkg, the module still running: a self-edge, so the
                     # __init__ every import of pkg.sub.t runs first is opaque too
-                    creates = [] if "star import" in label or "in the package __init__" in label else ["- {} creates a Q [{}:{}]".format(Path(path).name, path, last)]
+                    # Round 19 (Main rule 3): a file the direct form runs that hands a module to a name no import binds (a = pkg.sub,
+                    # pkg.sub = other, t = other, for t in [other]) is opaque too
+                    handed = label in ("review A: t written through an alias, in an imported module", "sub written through the package name, in an imported module",
+                                       "__init__ binds t by an assignment", "__init__ binds t by a for target")
+                    creates = [] if "star import" in label or "in the package __init__" in label or handed else ["- {} creates a Q [{}:{}]".format(Path(path).name, path, last)]
                     self.assertEqual(lines, ["- {} imports Q [{}:{}]".format(Path(path).name, path, last - 1)] + creates)
         # keep the line: no break, or an __init__ that binds the link only by importing exactly that submodule
         for label, changes in (("no break", {}), ("__init__: from . import t", {"pkg/sub/__init__.py": "from . import t\n"}),

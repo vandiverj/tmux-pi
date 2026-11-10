@@ -1096,6 +1096,8 @@ def _find_outside_use(tree, graph):
     if path is not None and path in graph.cyclic():
         return "1: {} is in an import cycle (what it reads from a module of the cycle depends on which ran first)".format(path)
     before = (lambda node: graph.loaded_before(path, tree, node)) if path is not None else (lambda node: frozenset())
+    events = _binding_index(tree).events
+    in_class = {id(e[2]) for evs in events.values() for e in evs if isinstance(e[1], ast.alias) and isinstance(e[3], ast.ClassDef)}
     for al in _import_aliases(path, tree):
         if al.local is None:
             continue  # a star import: _opaque holds the file to _star
@@ -1108,9 +1110,17 @@ def _find_outside_use(tree, graph):
                 return "{}: {} (the scan cannot say what it binds: {})".format(al.node.lineno, statement, ref.name)
             if ref.kind == "outside" and ref.name not in allowed_names:
                 return "{}: {} ({} from outside the run root)".format(al.node.lineno, statement, ref.name)
+            if ref.kind == "module" and id(al.node) in in_class:
+                # rule 3: an import in a class body makes the module an attribute of the class, read as C.x or self.x through a name
+                # no import binds
+                return "{}: {} (a module bound in a class body is read through the class: unknown)".format(al.node.lineno, statement)
         kept = {r for r in refs if r.kind in ("outside", "module")}
         if kept:
             bound.setdefault(al.local, set()).update(kept)
+    # rule 3: a name an import binds that some other binding (any assignment form, for, with, walrus, a parameter, def, class, except,
+    # match capture, del) also binds is not provably the module: what a read of it gets depends on which binding ran last
+    rebound = {name: next(e for e in events[name] if e[0] in ("name", "def", "arg") and not isinstance(e[1], ast.alias))
+               for name in bound if any(e[0] in ("name", "def", "arg") and not isinstance(e[1], ast.alias) for e in events.get(name, ()))}
     parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in _LOADER_NAMES or isinstance(node, ast.Attribute) and node.attr in _LOADER_NAMES:
@@ -1128,6 +1138,10 @@ def _find_outside_use(tree, graph):
                                    for r in refs):
                 return "{}: .{} (a module from outside the run root)".format(node.lineno, node.attr)
         if isinstance(node, ast.Name) and node.id in bound:
+            if node.id in rebound:
+                other = rebound[node.id][1]
+                return "{}: {} (bound by an import and by line {}: a name bound by anything but an import is no module)".format(
+                    node.lineno, node.id, getattr(other, "lineno", "?"))
             chain, attrs = node, []
             while isinstance(parents.get(id(chain)), ast.Attribute):
                 chain = parents[id(chain)]
@@ -1151,6 +1165,13 @@ def _find_outside_use(tree, graph):
                     # or delete names need not exist, so only the object it is made on is resolved
                     read = attrs[:-1] if write else attrs
                     refs = _resolve(".".join([ref.name] + read), graph, loaded=before(node)) if read else frozenset()
+                    if not write and any(r.kind == "module" for r in (refs if read else {ref})):
+                        # rule 3 (round 19, Main): a module value reaches a name only through an import. Used as anything but the
+                        # object of an attribute read (assigned in any form, an argument, a container element, returned or yielded, a
+                        # default, a with or for value, an operand, a decorator or base), it goes to a binding the scan does not
+                        # follow, here or in a module this one calls: what is read through that binding is unknown
+                        return "{}: {} (a module used as a value: it reaches no name but by an import)".format(
+                            node.lineno, ".".join([node.id] + read))
                     for r in sorted(refs, key=str):
                         if r.kind == "unknown":
                             return "{}: {} (the scan cannot say what it is)".format(node.lineno, ".".join([node.id] + read))

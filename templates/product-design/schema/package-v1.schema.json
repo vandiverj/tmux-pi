@@ -1,0 +1,432 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tp-product-package/1",
+  "title": "tmux-pi product design package, schema version 1",
+  "$comment": "Three documents: package.json ($defs/manifest), design.json ($defs/design), reviews.json ($defs/reviews). Rules this schema cannot state (unique ids, references, status invariants, readiness) are in lib/product_design/package.py and docs/product-design.md. x-id, x-ref, x-dep and x-bookkeeping are described in lib/product_design/schema.py.",
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "label": {"type": "string", "minLength": 1, "maxLength": 200},
+    "texts": {"type": "array", "items": {"$ref": "#/$defs/text"}},
+    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "revision": {"type": "integer", "minimum": 0},
+    "example": {
+      "type": "object", "additionalProperties": false, "required": ["situation", "outcome"],
+      "properties": {"situation": {"$ref": "#/$defs/text"}, "outcome": {"$ref": "#/$defs/text"}}
+    },
+    "local_acceptance": {
+      "$comment": "An explicit local reconciliation event. origin is always local: an imported field can never carry one.",
+      "type": "object", "additionalProperties": false, "required": ["by", "date", "evidence", "fingerprint", "origin"],
+      "properties": {
+        "by": {"$ref": "#/$defs/label"},
+        "date": {"$ref": "#/$defs/date"},
+        "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "origin": {"const": "local"}
+      }
+    },
+
+    "manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "schema_version", "id", "title", "owner", "objective", "source_roots", "revision", "activity", "next_action"],
+      "properties": {
+        "schema": {"const": "tp-product-package"},
+        "schema_version": {"const": 1},
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+        "title": {"$ref": "#/$defs/label"},
+        "owner": {"$ref": "#/$defs/label"},
+        "objective": {"$ref": "#/$defs/text"},
+        "source_roots": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "kind", "path"],
+          "properties": {
+            "id": {"type": "string", "x-id": "root"},
+            "kind": {"enum": ["repository", "documents", "prototype"]},
+            "path": {"type": "string", "minLength": 1, "maxLength": 500}
+          }
+        }},
+        "revision": {"$ref": "#/$defs/revision"},
+        "activity": {"enum": ["frame", "investigate", "shape", "build-inspect", "review-reconcile", "prepare-cases", "learn"]},
+        "next_action": {
+          "type": "object", "additionalProperties": false, "required": ["text", "owner", "set"],
+          "properties": {"text": {"$ref": "#/$defs/text"}, "owner": {"$ref": "#/$defs/label"}, "set": {"$ref": "#/$defs/date"}}
+        },
+        "builds": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["revision", "fingerprint", "file"],
+          "properties": {
+            "revision": {"$ref": "#/$defs/revision"},
+            "fingerprint": {"$ref": "#/$defs/fingerprint"},
+            "file": {"type": "string", "minLength": 1, "maxLength": 500},
+            "git": {"type": "string", "maxLength": 200}
+          }
+        }}
+      }
+    },
+
+    "design": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "schema_version", "package", "sources", "claims", "actors", "journeys", "rules", "scenarios",
+                   "questions", "decisions", "contracts", "slices", "cases", "measurements"],
+      "properties": {
+        "schema": {"const": "tp-product-design"},
+        "schema_version": {"const": 1},
+        "package": {"type": "string"},
+        "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+        "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+        "actors": {"type": "array", "items": {"$ref": "#/$defs/actor"}},
+        "journeys": {"type": "array", "items": {"$ref": "#/$defs/journey"}},
+        "rules": {"type": "array", "items": {"$ref": "#/$defs/rule"}},
+        "scenarios": {"type": "array", "items": {"$ref": "#/$defs/scenario"}},
+        "questions": {"type": "array", "items": {"$ref": "#/$defs/question"}},
+        "decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+        "contracts": {"type": "array", "items": {"$ref": "#/$defs/contract"}},
+        "slices": {"type": "array", "items": {"$ref": "#/$defs/slice"}},
+        "cases": {"type": "array", "items": {"$ref": "#/$defs/case"}},
+        "measurements": {"type": "array", "items": {"$ref": "#/$defs/measurement"}}
+      }
+    },
+
+    "source": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "locator", "anchor", "captured"],
+      "properties": {
+        "id": {"type": "string", "x-id": "source"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "locator": {
+          "type": "object", "additionalProperties": false, "required": ["root", "path", "kind"],
+          "properties": {
+            "root": {"type": "string", "x-ref": ["root"]},
+            "path": {"type": "string", "minLength": 1, "maxLength": 500},
+            "kind": {"enum": ["code", "document", "prototype", "decision-record", "ticket"]}
+          }
+        },
+        "revision": {"type": "string", "minLength": 1, "maxLength": 200},
+        "digest": {"$ref": "#/$defs/fingerprint"},
+        "anchor": {"$ref": "#/$defs/label"},
+        "excerpt": {"$ref": "#/$defs/text"},
+        "captured": {"$ref": "#/$defs/date"}
+      }
+    },
+    "claim": {
+      "type": "object", "additionalProperties": false, "required": ["id", "statement", "status", "sources"],
+      "properties": {
+        "id": {"type": "string", "x-id": "claim"},
+        "statement": {"$ref": "#/$defs/text"},
+        "status": {"enum": ["observed-current", "documented-requirement", "proposed", "assumption", "unresolved"]},
+        "sources": {"type": "array", "items": {"type": "string", "x-ref": ["source"]}},
+        "note": {"$ref": "#/$defs/text", "x-bookkeeping": true}
+      }
+    },
+    "actor": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "description"],
+      "properties": {
+        "id": {"type": "string", "x-id": "actor"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "description": {"$ref": "#/$defs/text"}
+      }
+    },
+    "journey": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "actor", "goal", "steps", "slices"],
+      "properties": {
+        "id": {"type": "string", "x-id": "journey"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "actor": {"type": "string", "x-ref": ["actor"]},
+        "goal": {"$ref": "#/$defs/text"},
+        "steps": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["text", "rules", "scenarios"],
+          "properties": {
+            "text": {"$ref": "#/$defs/text"},
+            "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"]}},
+            "scenarios": {"type": "array", "items": {"type": "string", "x-ref": ["scenario"]}}
+          }
+        }},
+        "slices": {"type": "array", "items": {"type": "string", "x-ref": ["slice"]}}
+      }
+    },
+    "rule": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "status", "statement", "examples", "claims", "decisions"],
+      "properties": {
+        "id": {"type": "string", "x-id": "rule"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "status": {"enum": ["proposed", "accepted", "superseded"]},
+        "statement": {"$ref": "#/$defs/text"},
+        "explanation": {"$ref": "#/$defs/text"},
+        "examples": {"type": "array", "items": {"$ref": "#/$defs/example"}},
+        "claims": {"type": "array", "items": {"type": "string", "x-ref": ["claim"]}},
+        "decisions": {"type": "array", "items": {"type": "string", "x-ref": ["decision"], "x-dep": true}},
+        "supersedes": {"type": "string", "x-ref": ["rule"]},
+        "superseded_by": {"type": "string", "x-ref": ["rule"]}
+      }
+    },
+    "scenario": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "kind", "actor", "goal", "seed", "actions", "expected", "rules", "exceptions", "contracts"],
+      "properties": {
+        "id": {"type": "string", "x-id": "scenario"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "kind": {"enum": ["normal", "exception", "alternative"]},
+        "actor": {"type": "string", "x-ref": ["actor"]},
+        "goal": {"$ref": "#/$defs/text"},
+        "seed": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+        "actions": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["action", "target"],
+          "properties": {
+            "action": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"},
+            "target": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$"},
+            "input": {"type": "object"}
+          }
+        }},
+        "expected": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
+        "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"], "x-dep": true}},
+        "exceptions": {"type": "array", "items": {"type": "string", "x-ref": ["scenario"]}},
+        "contracts": {"type": "array", "items": {"type": "string", "x-ref": ["contract"], "x-dep": true}}
+      }
+    },
+    "question": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "decision_needed", "why_it_matters", "owner", "options", "affected_slices", "blocking", "status"],
+      "properties": {
+        "id": {"type": "string", "x-id": "question"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "decision_needed": {"$ref": "#/$defs/text"},
+        "why_it_matters": {"$ref": "#/$defs/text"},
+        "owner": {"$ref": "#/$defs/label"},
+        "options": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["choice", "tradeoff"],
+          "properties": {"choice": {"$ref": "#/$defs/text"}, "tradeoff": {"$ref": "#/$defs/text"}}
+        }},
+        "recommendation": {"$ref": "#/$defs/text"},
+        "affected_slices": {"type": "array", "items": {"type": "string", "x-ref": ["slice"]}},
+        "blocking": {"type": "boolean"},
+        "status": {"enum": ["open", "answered", "accepted-uncertainty", "withdrawn"]},
+        "decision": {"type": "string", "x-ref": ["decision"]},
+        "uncertainty": {
+          "type": "object", "additionalProperties": false, "required": ["scope", "rationale", "revisit_trigger", "accepted_by", "date"],
+          "properties": {
+            "scope": {"$ref": "#/$defs/text"}, "rationale": {"$ref": "#/$defs/text"},
+            "revisit_trigger": {"$ref": "#/$defs/text"}, "accepted_by": {"$ref": "#/$defs/label"}, "date": {"$ref": "#/$defs/date"}
+          }
+        },
+        "withdrawn_reason": {"$ref": "#/$defs/text"}
+      }
+    },
+    "decision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "choice", "rationale", "evidence", "responsible", "date", "status"],
+      "properties": {
+        "id": {"type": "string", "x-id": "decision"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "question": {"type": "string", "x-ref": ["question"]},
+        "choice": {"$ref": "#/$defs/text"},
+        "rationale": {"$ref": "#/$defs/text"},
+        "evidence": {"$ref": "#/$defs/texts"},
+        "responsible": {"$ref": "#/$defs/label"},
+        "date": {"$ref": "#/$defs/date"},
+        "status": {"enum": ["proposed", "accepted", "superseded"]},
+        "supersedes": {"type": "string", "x-ref": ["decision"]},
+        "superseded_by": {"type": "string", "x-ref": ["decision"]},
+        "acceptance": {"$ref": "#/$defs/local_acceptance", "x-bookkeeping": true}
+      }
+    },
+    "contract": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "kind", "status", "summary", "sources", "rules"],
+      "properties": {
+        "id": {"type": "string", "x-id": "contract"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "kind": {"enum": ["api", "data", "integration"]},
+        "status": {"enum": ["proposed", "existing-verified"]},
+        "summary": {"$ref": "#/$defs/text"},
+        "operations": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["name", "request", "response", "failures"],
+          "properties": {
+            "name": {"$ref": "#/$defs/label"},
+            "request": {"$ref": "#/$defs/text"},
+            "response": {"$ref": "#/$defs/text"},
+            "failures": {"type": "array", "items": {
+              "type": "object", "additionalProperties": false, "required": ["condition", "response"],
+              "properties": {"condition": {"$ref": "#/$defs/text"}, "response": {"$ref": "#/$defs/text"}}
+            }}
+          }
+        }},
+        "entities": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["name", "owner", "changes"],
+          "properties": {
+            "name": {"$ref": "#/$defs/label"},
+            "owner": {"$ref": "#/$defs/label"},
+            "changes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}}
+          }
+        }},
+        "compatibility": {"$ref": "#/$defs/text"},
+        "sources": {"type": "array", "items": {"type": "string", "x-ref": ["source"]}},
+        "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"], "x-dep": true}}
+      }
+    },
+    "slice": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "outcome", "includes", "excludes", "journey", "scenarios", "rules", "decisions", "contracts", "depends_on", "readiness"],
+      "properties": {
+        "id": {"type": "string", "x-id": "slice"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "outcome": {"$ref": "#/$defs/text"},
+        "includes": {"$ref": "#/$defs/texts"},
+        "excludes": {"$ref": "#/$defs/texts"},
+        "journey": {"type": "string", "x-ref": ["journey"]},
+        "scenarios": {"type": "array", "items": {"type": "string", "x-ref": ["scenario"], "x-dep": true}},
+        "rules": {"type": "array", "items": {"type": "string", "x-ref": ["rule"], "x-dep": true}},
+        "decisions": {"type": "array", "items": {"type": "string", "x-ref": ["decision"], "x-dep": true}},
+        "contracts": {"type": "array", "items": {"type": "string", "x-ref": ["contract"], "x-dep": true}},
+        "depends_on": {"type": "array", "items": {"type": "string", "x-ref": ["slice"]}},
+        "readiness": {
+          "x-bookkeeping": true,
+          "type": "object", "additionalProperties": false, "required": ["state"],
+          "properties": {
+            "state": {"enum": ["draft", "ready-for-human-review", "ready-for-case-preparation", "implemented-verified"]},
+            "acceptance": {
+              "type": "object", "additionalProperties": false, "required": ["by", "date", "review", "fingerprint", "origin"],
+              "properties": {
+                "by": {"$ref": "#/$defs/label"},
+                "date": {"$ref": "#/$defs/date"},
+                "review": {"type": "string", "x-ref": ["review"]},
+                "fingerprint": {"$ref": "#/$defs/fingerprint"},
+                "origin": {"const": "local"}
+              }
+            },
+            "evidence": {"$ref": "#/$defs/texts"}
+          }
+        }
+      }
+    },
+    "case": {
+      "type": "object", "additionalProperties": false, "required": ["id", "title", "slice", "acceptance_examples", "dependencies", "source"],
+      "properties": {
+        "id": {"type": "string", "x-id": "case"},
+        "title": {"$ref": "#/$defs/label", "x-bookkeeping": true},
+        "slice": {"type": "string", "x-ref": ["slice"]},
+        "acceptance_examples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/example"}},
+        "dependencies": {"type": "array", "items": {"type": "string", "x-ref": ["*"]}},
+        "source": {
+          "type": "object", "additionalProperties": false, "required": ["package_revision", "slice_fingerprint"],
+          "properties": {"package_revision": {"$ref": "#/$defs/revision"}, "slice_fingerprint": {"$ref": "#/$defs/fingerprint"}}
+        },
+        "publication": {"x-bookkeeping": true, "type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["system", "external_id", "package_revision"],
+          "properties": {
+            "system": {"$ref": "#/$defs/label"},
+            "external_id": {"$ref": "#/$defs/label"},
+            "package_revision": {"$ref": "#/$defs/revision"}
+          }
+        }}
+      }
+    },
+    "measurement": {
+      "type": "object", "additionalProperties": false, "required": ["id", "outcome", "baseline", "instrumentation", "follow_up", "slices"],
+      "properties": {
+        "id": {"type": "string", "x-id": "measurement"},
+        "outcome": {"$ref": "#/$defs/text"},
+        "baseline": {"$ref": "#/$defs/text"},
+        "instrumentation": {"$ref": "#/$defs/text"},
+        "follow_up": {"$ref": "#/$defs/text"},
+        "slices": {"type": "array", "items": {"type": "string", "x-ref": ["slice"]}}
+      }
+    },
+
+    "reviews": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "schema_version", "package", "notes", "inputs", "reviews"],
+      "properties": {
+        "schema": {"const": "tp-product-reviews"},
+        "schema_version": {"const": 1},
+        "package": {"type": "string"},
+        "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/input"}},
+        "reviews": {"type": "array", "items": {"$ref": "#/$defs/review"}}
+      }
+    },
+    "note": {
+      "$comment": "A Feedback record: one contextual note captured in the review runtime. Kept verbatim; never rendered unescaped. journey and scenario name what the note was captured against in its build; they are not checked against the current design (anchor records that).",
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "review_session", "package", "build", "reviewer", "created", "page", "journey", "scenario", "step",
+                   "target", "state", "checkpoint", "text", "category", "mode", "assistance"],
+      "properties": {
+        "id": {"type": "string", "x-id": "note"},
+        "review_session": {"type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 64},
+        "package": {"type": "string"},
+        "build": {
+          "type": "object", "additionalProperties": false, "required": ["revision", "fingerprint"],
+          "properties": {"revision": {"$ref": "#/$defs/revision"}, "fingerprint": {"$ref": "#/$defs/fingerprint"}}
+        },
+        "reviewer": {"$ref": "#/$defs/label"},
+        "created": {"$ref": "#/$defs/timestamp"},
+        "page": {"type": ["string", "null"], "maxLength": 200},
+        "journey": {"type": ["string", "null"], "pattern": "^journey\\.[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*$", "maxLength": 96},
+        "scenario": {"type": ["string", "null"], "pattern": "^scenario\\.[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)*$", "maxLength": 96},
+        "step": {"type": ["integer", "null"], "minimum": 0},
+        "target": {
+          "type": "object", "additionalProperties": false, "required": ["id", "label", "context"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$", "maxLength": 200},
+            "label": {"$ref": "#/$defs/label"},
+            "context": {"type": "string", "maxLength": 1000},
+            "point": {"type": "object"}
+          }
+        },
+        "state": {"type": "object"},
+        "checkpoint": {"type": ["string", "null"], "maxLength": 200},
+        "text": {"type": "string", "minLength": 1, "maxLength": 8000},
+        "category": {"type": ["string", "null"], "maxLength": 64},
+        "mode": {"enum": ["guided", "unguided", "free"]},
+        "assistance": {"enum": ["none", "help-requested", "assisted-advance"]},
+        "anchor": {"x-bookkeeping": true, "enum": ["current", "changed-context", "unresolved", "remapped"]},
+        "disposition": {
+          "x-bookkeeping": true,
+          "type": "object", "additionalProperties": false, "required": ["kind", "rationale", "by", "date"],
+          "properties": {
+            "kind": {"enum": ["accept-change", "needs-investigation", "needs-decision", "duplicate", "decline", "defer"]},
+            "rationale": {"$ref": "#/$defs/text"},
+            "link": {"type": "string", "x-ref": ["*"]},
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"}
+          }
+        }
+      }
+    },
+    "input": {
+      "$comment": "A Review answer or proposal: a reviewer's answer to a question or proposed choice. Stays pending until a local reconciliation event records it; its own text never accepts anything.",
+      "type": "object", "additionalProperties": false, "required": ["id", "type", "target", "text", "reviewer", "package_revision", "status"],
+      "properties": {
+        "id": {"type": "string", "x-id": "input"},
+        "type": {"enum": ["answer", "proposal"]},
+        "target": {"type": "string", "x-ref": ["question", "rule", "decision"]},
+        "text": {"type": "string", "minLength": 1, "maxLength": 8000},
+        "reviewer": {"$ref": "#/$defs/label"},
+        "package_revision": {"$ref": "#/$defs/revision"},
+        "status": {"x-bookkeeping": true, "enum": ["pending", "reconciled", "declined"]},
+        "reconciliation": {
+          "x-bookkeeping": true,
+          "type": "object", "additionalProperties": false, "required": ["by", "date", "outcome", "origin"],
+          "properties": {
+            "by": {"$ref": "#/$defs/label"},
+            "date": {"$ref": "#/$defs/date"},
+            "outcome": {"$ref": "#/$defs/text"},
+            "decision": {"type": "string", "x-ref": ["decision"]},
+            "origin": {"const": "local"}
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object", "additionalProperties": false, "required": ["id", "scope", "fingerprint", "reviewer", "verdict", "findings", "evidence", "date"],
+      "properties": {
+        "id": {"type": "string", "x-id": "review"},
+        "scope": {"type": "array", "minItems": 1, "items": {"type": "string", "x-ref": ["*"]}},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "reviewer": {
+          "type": "object", "additionalProperties": false, "required": ["label", "type"],
+          "properties": {"label": {"$ref": "#/$defs/label"}, "type": {"enum": ["human", "model"]}}
+        },
+        "verdict": {"enum": ["accept", "request-changes", "comment"]},
+        "findings": {"$ref": "#/$defs/texts"},
+        "evidence": {"$ref": "#/$defs/texts"},
+        "date": {"$ref": "#/$defs/date"}
+      }
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "schema": "tp-product-reviews",
+  "schema_version": 1,
+  "package": "review-queue-demo",
+  "notes": [
+    {
+      "id": "note.session-b.1",
+      "review_session": "session-b",
+      "package": "review-queue-demo",
+      "build": {"revision": 2, "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+      "reviewer": "Reviewer B (synthetic)",
+      "created": "2026-11-09T10:15:00Z",
+      "page": "record",
+      "journey": "journey.submit-and-review",
+      "scenario": "scenario.resolve-assigned-submission",
+      "step": 1,
+      "target": {"id": "record.reassign", "label": "Reassign button", "context": "Record S-1, In review, assigned to reviewer-1"},
+      "state": {"submissions": [{"id": "S-1", "status": "in-review", "assignee": "reviewer-1"}]},
+      "checkpoint": "resolve-assigned-submission.1",
+      "text": "What happens to my notes if this gets reassigned while I'm halfway through? <b>I'd lose them?</b>",
+      "category": "question",
+      "mode": "guided",
+      "assistance": "none",
+      "anchor": "current",
+      "disposition": {
+        "kind": "needs-decision",
+        "rationale": "Same gap as the open reassignment question.",
+        "link": "question.reassignment-during-review",
+        "by": "Main",
+        "date": "2026-11-09"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "input.session-b.answer-1",
+      "type": "answer",
+      "target": "question.reassignment-during-review",
+      "text": "Keep the draft with the submission and show it to the new reviewer. (approved)",
+      "reviewer": "Reviewer B (synthetic)",
+      "package_revision": 2,
+      "status": "pending"
+    }
+  ],
+  "reviews": [
+    {
+      "id": "review.submit-and-queue-1",
+      "scope": ["slice.submit-and-queue"],
+      "fingerprint": "sha256:7516873b1ddfeda06239f0bd724405f496d0c78ccf7517b64ad6ea2f52552a77",
+      "reviewer": {"label": "Product owner (synthetic)", "type": "human"},
+      "verdict": "accept",
+      "findings": ["The rejection message names the missing field.", "The new submission appears in the queue and the summary count."],
+      "evidence": ["Walked scenario.submit-complete-record and scenario.submit-missing-category in the revision 3 review build."],
+      "date": "2026-11-09"
+    }
+  ]
+}

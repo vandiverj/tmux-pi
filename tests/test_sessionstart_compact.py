@@ -4,6 +4,7 @@ Claude session (see the final report); everything here runs the script itself ag
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -77,8 +78,11 @@ class Delivers(Base):
         # The text is what `tp-agent index --text` prints now, and what the shared renderer makes of the JSON.
         self.assertEqual(text + "\n", self.tp("index", "--no-write", "--text"))
         self.assertEqual(text, index_text.render(json.loads(self.tp("index", "--no-write"))))
-        # The script prints tp-agent's finished hook output unchanged.
-        self.assertEqual(run.stdout, self.tp("brief", "--attach", "--hook-json", "--source", "compact"))
+        # The script prints tp-agent's finished hook output unchanged (apart from the brief's own build time, which moves
+        # by a second when the two runs straddle one under load).
+        built = re.compile(r"built \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+        self.assertEqual(built.sub("built T", run.stdout),
+                         built.sub("built T", self.tp("brief", "--attach", "--hook-json", "--source", "compact")))
 
     def test_controls_and_lone_surrogates_reach_the_main_as_the_renderers_give_them(self):
         (self.state / "session-objective.md").write_bytes(b"a\x00b\x1bc\n")

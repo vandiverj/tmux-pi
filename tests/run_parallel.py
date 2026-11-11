@@ -68,9 +68,16 @@ for name in names:
     ids = [t.id() for t in flat(unittest.TestLoader().discover(start, pattern=name))]
     if ids:
         groups.append([name[:-3], ids])
-with open(out + ".tmp", "w") as handle:
-    json.dump({"full": full, "groups": groups}, handle)
-os.replace(out + ".tmp", out)
+import tempfile
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(out) + ".", suffix=".tmp", dir=os.path.dirname(out) or ".")
+try:
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"full": full, "groups": groups}, handle)
+    os.replace(tmp, out)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
 """
 
 # The unit child. It loads one file the way discovery does and runs only its ids, in discovery order, in one flat suite:
@@ -124,9 +131,16 @@ data = {"ids": ids, "ran": result.testsRun, "failures": rows(result.failures), "
         "skipped": len(result.skipped), "expected_failures": len(result.expectedFailures),
         "unexpected_successes": [t.id() for t in result.unexpectedSuccesses], "class_seconds": class_seconds,
         "outcomes": outcomes}
-with open(out + ".tmp", "w") as handle:
-    json.dump(data, handle)
-os.replace(out + ".tmp", out)
+import tempfile
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(out) + ".", suffix=".tmp", dir=os.path.dirname(out) or ".")
+try:
+    with os.fdopen(fd, "w") as handle:
+        json.dump(data, handle)
+    os.replace(tmp, out)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
 sys.exit(0 if result.wasSuccessful() else 1)
 """
 
@@ -281,9 +295,15 @@ def update_times(path, results):
     times.update({m: round(s, 2) for m, s in modules.items()})
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(times, indent=1, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)  # unique: two runs may finish together
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(times, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def outcomes(results):

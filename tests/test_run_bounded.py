@@ -306,6 +306,39 @@ class RunParallelTests(unittest.TestCase):
                 yield from flat(t) if isinstance(t, unittest.TestSuite) else [t]
         return sorted(t.id() for t in flat(unittest.TestLoader().discover(str(self.tests), "test_*.py")))
 
+    def test_two_runs_finishing_together_both_write_the_times_file(self):
+        """update_times used a fixed `<times>.tmp`: both writers wrote it, one os.replace took it, the other's failed with
+        FileNotFoundError. Both reach os.replace together here (a barrier, no sleep); each must succeed and leave no temp file."""
+        path = self.dir / "times" / "times.json"
+        gate = threading.Barrier(2, timeout=30)
+        real = os.replace
+
+        def replace(src, dst):
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return real(src, dst)
+
+        errors = []
+
+        def write(unit):
+            try:
+                run_parallel.update_times(path, [{"unit": {"name": unit, "module": unit}, "seconds": 1.5,
+                                                  "data": {"class_seconds": {}}}])
+            except Exception as err:  # noqa: BLE001
+                errors.append(repr(err))
+
+        with mock.patch.object(run_parallel.os, "replace", replace):
+            threads = [threading.Thread(target=write, args=(name,)) for name in ("test_a", "test_b")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(list(json.loads(path.read_text()).values()), [1.5])  # the last writer's file, whole
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["times.json"])
+
     def test_default_jobs_follow_cores(self):
         self.assertEqual([run_parallel.default_jobs(c) for c in (18, 16, 4, 1)], [8, 8, 2, 1])
 

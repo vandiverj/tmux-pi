@@ -217,6 +217,8 @@ MUST_PASS = [
     "uv run --offline --no-project bash -eu <<< 'f=README.md; cat \"$f\"'",
     "cat <<EOF\n$(printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu)\nEOF",
     "cat <<'EOF'\n$(printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | bash -eu)\nEOF",
+    # a `cd` the shell expands, with ordinary names only (sg1 round 12)
+    "cd docs/*; printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu", "cd ~; printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu",
     "rg handler src",
     "rg -t py handler src",
     "rg --sort path handler src",
@@ -1035,7 +1037,9 @@ class SensitiveReadTableTests(unittest.TestCase):
                 # sg1 round 11: `cd` (F1), a local runner (F2), an expanding heredoc's substitution (F3)
                 ("cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ask_main),
                 (f"uv run --offline --no-project bash -eu <<< 'f={LOCAL}; cat \"$f\"'", ask_main),
-                (f"cat <<EOF\n$(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu)\nEOF", ask_main)]
+                (f"cat <<EOF\n$(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu)\nEOF", ask_main),
+                # sg1 round 12: a globbed `cd` (F1)
+                ("cd conf*; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1062,7 +1066,9 @@ class SensitiveReadTableTests(unittest.TestCase):
             # Round 4: each has a non-search cause the classifier gives (test_search_read_cause), as do these.
             for command in (f"python3 tools/x.py {ENV}", f"python3 tools/x.py {ENV}; grep -n x README.md",
                             f"bash -c 'python3 tools/x.py {ENV}'", "bash -c 'git diff -- config/'",
-                            f"printf '%s\\n' {LOCAL} | xargs git diff --", f"base64 {ENV}", f"ssh host cat {ENV}"):
+                            f"printf '%s\\n' {LOCAL} | xargs git diff --", f"base64 {ENV}", f"ssh host cat {ENV}",
+                            # sg1 round 12: a project script's arguments are not a stdin shell
+                            f"python3 tools/run.py -- bash -eu {LOCAL}"):
                 with self.subTest(command=command):  # the ask is the program's, not the harmless search's
                     decision, reason = run(command, task)
                     self.assertEqual(decision, "ask")
@@ -1373,6 +1379,14 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"uv run --offline --no-project bash -eu <<< 'f={LOCAL}; cat \"$f\"'",
             f"poetry run bash -eu <<< 'f={LOCAL}; cat \"$f\"'", f"strace bash -eu <<< 'f={LOCAL}; cat \"$f\"'",
             f"cat <<EOF\n$(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu)\nEOF",
+            # sg1 round 12 F1: a `cd` operand the shell expands (glob, brace, tilde, variable, substitution) is a directory
+            # known only at run time, so a bare name is judged as if under any directory
+            "cd conf*; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "cd con?ig; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "cd {config,x}; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "cd ~x; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "pushd conf*; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "cd $(echo config); printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),
@@ -1417,6 +1431,12 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"git diff -- {LOCAL}", sr.GIT_OUTPUT), (f"git show HEAD:{LOCAL}", sr.GIT_OUTPUT),
             (f"git log -p -- {LOCAL}", sr.GIT_OUTPUT), ("bash -c 'git diff -- config/'", sr.GIT_OUTPUT),
             (f"printf '%s\\n' {LOCAL} | xargs git diff --", sr.GIT_OUTPUT),
+            # sg1 round 12 F2: a project script's arguments and a git pathspec are not a command, so no stdin shell is
+            # found in them and the line keeps its round-10 decision
+            (f"python3 tools/run.py -- bash -eu {LOCAL}", sr.RUNS_CODE), (f"bash tools/run.sh -- bash -eu {LOCAL}", sr.RUNS_CODE),
+            (f"python3 tools/run.py run bash -eu {LOCAL}", sr.RUNS_CODE), (f"python3 tools/run.py -- bash -s {LOCAL}", sr.RUNS_CODE),
+            (f"node tools/run.js exec sh {LOCAL}", sr.RUNS_CODE),
+            (f"git diff -- bash {LOCAL}", sr.GIT_OUTPUT), (f"git show HEAD:{LOCAL} -- bash", sr.GIT_OUTPUT),
             (f"ls -la {ENV}", sr.NAMES_ONLY), (f"rm {ENV}", sr.NAMES_ONLY), (f"for f in {ENV}; do ls $f; done", sr.NAMES_ONLY),
         ]
         self.assertEqual({cause for _, cause in kept}, set(sr.NON_SEARCH_CAUSES))  # every cause has a row

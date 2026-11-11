@@ -2276,8 +2276,10 @@ def _has_stdin_shell(command, base, depth=0):
         prog, args = _runs(words) if _program(words)[0] == "xargs" else _program(words)
         candidates = [(prog, list(args))]
         # A local front end or task runner runs the command after it (`strace bash`, `uv run bash`, `poetry run bash`): the
-        # route _other_command_hit follows, every position tried. A container or VM's shell runs elsewhere (ELSEWHERE).
-        if prog not in _ELSEWHERE:
+        # route _other_command_hit follows, every position tried, and only for the programs that reach it (_dispatches): a
+        # project script's arguments (`python3 tools/run.py -- bash ...`) and a git pathspec are not a command (sg1 round
+        # 12). A container or VM's shell runs elsewhere (ELSEWHERE).
+        if prog not in _ELSEWHERE and _dispatches(prog):
             candidates += [(_ALIASES.get(name, name), list(args[i + 1:])) for i, name in enumerate(
                 posixpath.basename(arg).lower() if isinstance(arg, str) else "" for arg in args)
                 if (prog in _FRONT_ENDS or any(word in _RUN_WORDS for word in args[:i]))
@@ -2383,7 +2385,24 @@ def _line_dirs(text, starts, dirs):
                 prog, args = _program(cmd["words"])
                 if prog in _DIR_STEPS:
                     base, previous = _dir_step(prog, args, base, previous, pushed)
+                    if _dir_expands(prog, args):  # known only at run time; so is every directory reached from it
+                        base = "$" + base
                     dirs.add(base)
+
+
+_DIR_EXPANDS = re.compile(r"[*?\[{~$`]")
+
+
+def _dir_expands(prog, args):
+    """Whether the directory `cd`/`pushd` ARGS moves to is one the shell expands: an operand with a glob, brace, tilde,
+    variable or command substitution (`cd conf*`, `cd ~x`), or `cd` alone (`cd ~`). The parser cannot know it (sg1 round
+    12)."""
+    if prog == "popd":
+        return False
+    operands = [arg for arg in args if isinstance(arg, str) and arg != "-" and not arg.startswith(("-", "+"))]
+    if prog == "cd" and not operands and "-" not in args:
+        return True
+    return any(_DIR_EXPANDS.search(arg) for arg in operands)
 
 
 def _line_pieces(text, out, exempt=None, depth=0, dirs=None):
@@ -2430,7 +2449,8 @@ def _stdin_line_hit(command, base=""):
     if not _line_pieces(command, pieces, list(whole) if whole else None, dirs=dirs) or len(dirs) > _LINE_DIRS:
         return "stdin shell line", "the line is too deep or too large to check"
     # Each name is judged in every directory the line may run it in (sg1 round 11: `cd config; ... local.json`). Where a
-    # directory is known only at run time (`cd "$x"`, `cd -`), a name is judged as if under any directory, by the rule for an
+    # directory is known only at run time (`cd "$x"`, `cd -`, `cd conf*`: _dir_expands), a name is judged as if under any
+    # directory, by the rule for an
     # unknown working directory (_pair_tail: a bare `local.json` or `sessions` hits).
     known = sorted(d for d in dirs if "$" not in d and "`" not in d)
     hit = _first(_words_hit(pieces, d) for d in known) or (len(known) < len(dirs) and _anywhere_hit(pieces))
@@ -2696,6 +2716,14 @@ def _git_output_hit(args, sub, rest, cmd, base, depth, bulk):
     if hit and sub in ("diff", "log") and _queried(args, rest, cmd, depth, bulk):
         return _patch_listing(sub, rest, before, after, base, hit)
     return hit
+
+
+def _dispatches(prog):
+    """Whether _command_hit hands `prog` to the dispatch loop at the end of _other_command_hit (a front end or task runner
+    running a program after it): no branch before that loop judges the program itself. Kept in step with those branches."""
+    return not (prog in (_OPAQUE, "xargs", "find", "fd", "fdfind", "git", "eval", "curl", "wget", "ssh", "tar")
+                or prog in _GREPS or prog in _SHELLS or prog in _INTERPRETERS or prog in _SCRIPT_FIRST
+                or prog in _READERS or prog in _LISTERS or prog in _SYNTAX)
 
 
 def _other_command_hit(prog, args, cmd, base, depth, bulk):

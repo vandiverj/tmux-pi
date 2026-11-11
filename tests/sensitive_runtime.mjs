@@ -258,6 +258,8 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["(cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu)", ASK_MAIN],
     ["uv run --offline --no-project bash -eu <<< 'f=config/local.json; cat \"$f\"'", ASK_MAIN],
     ["cat <<EOF\n$(printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | bash -eu)\nEOF", ASK_MAIN],
+    // sg1 round 12: a globbed `cd` is an unknown directory (F1)
+    ["cd conf*; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ASK_MAIN],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;
@@ -291,7 +293,9 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
                          "printf '%s\\n' config/local.json | xargs git diff --", 'base64 .env', 'ssh host cat .env',
                          'python3 tools/check.py -c dev config/local.json',  // round 6 F4: the script's own -c
                          // sg1 round 10: a script call that is the whole text a stdin shell receives, whatever its options
-                         "echo 'bash tools/x.sh config/local.json' | bash -s", "echo 'bash tools/x.sh config/local.json' | bash -eu"]) {
+                         "echo 'bash tools/x.sh config/local.json' | bash -s", "echo 'bash tools/x.sh config/local.json' | bash -eu",
+                         // sg1 round 12: a project script's arguments and a git pathspec are not a stdin shell
+                         'python3 tools/run.py -- bash -eu config/local.json', 'git diff -- bash config/local.json']) {
     prompts.length = 0;
     const other = await hw.tool_call(call('bash', { command }), ui);
     assert.equal(prompts.length, 1, `a worker prompt the safe tools cannot replace was refused: ${command}`);

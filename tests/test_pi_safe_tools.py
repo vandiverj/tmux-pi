@@ -76,6 +76,13 @@ class PiSafeToolsTests(unittest.TestCase):
             tools = preamble.HARNESS_TOOLS[harness]
             self.assertIn('const READ = "%s";' % tools["read_tool"], text)
             self.assertIn('const SHELL = "%s";' % tools["shell"], text)
+        # The grep description carries the contract's own clause on shell greps (a rule neither stricter nor looser than SG1's).
+        clause = re.search(r"only on exact paths in the working tree that are known not to be sensitive \([^)]*\)",
+                           (ROOT / "agent/contract/worker.md").read_text()).group(0)
+        for name_, text in (("pi", source), ("claude", server)):
+            joined = re.sub(r'[`"] \+ [`"]', "", template(text, "SAFE_GREP_HELP"))
+            self.assertIn(clause, joined, name_)
+            self.assertNotIn("every content search", joined, name_)
         self.assertIn("description: SAFE_READ_HELP,", source)
         self.assertIn("description: SAFE_READ_HELP + CLAUDE_ONLY,", server)   # the one declared harness-only sentence
         for text in (server, source):

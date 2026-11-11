@@ -139,6 +139,9 @@ standing rules every worker needs (scope, the read/search rule, permission promp
 `tp-agent request`, `tools/agent/test-run.sh`) are not here: they are the worker contract, `agent/contract/worker.md`,
 which every worker gets on every route, manifest or not.
 
+Known portability limit: `safe_grep` uses `rg` and skips `.git` and gitignored files; on a machine without `rg` its
+fallback grep does not exclude `.git` or gitignored files.
+
 ## The worker's system prompt
 
 `python3 lib/preamble.py WORKDIR ROLE SOURCE --harness pi|claude [--state-dir DIR --parent ID]` prints what tp-spawn

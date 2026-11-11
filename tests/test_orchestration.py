@@ -499,6 +499,14 @@ esac
                 self.assertEqual((prompt + packet).count("contract: worker v1"), 1, f"{name}: the contract is not there once")
                 self.assertIn(SAFE_SEARCH_RULE_PI if harness == "pi" else SAFE_SEARCH_RULE_CLAUDE, prompt, name)
                 self.assertNotRegex(prompt + packet, r"grep -rn|\brg -|\brg\b.*recursive", name)
+                # Each directive is given once: the packet states the report path as a fact and leaves the rules (where the
+                # report goes, the RESULT_STATUS line) to the contract.
+                self.assertEqual(packet.count("report.md"), 1, f"{name}: the report path is stated once")
+                for directive in ("Put durable findings", "write it to", "end every final reply"):
+                    self.assertNotIn(directive, packet, f"{name}: {directive!r} repeats the contract")
+                self.assertEqual(prompt.count("RESULT_STATUS: complete|empty|blocked|incomplete"), 1, name)
+                if name != "review":   # a review task places the line (after its verdict), as the contract allows
+                    self.assertNotIn("RESULT_STATUS: complete|empty|blocked|incomplete", packet, name)
                 self.assertEqual(packet.count("# Worker Role\n\n" + role + "\n"), 1, f"{name}: role text")
                 self.assertEqual(packet.count("\n# Return\n"), 1, f"{name}: Return block")
                 self.assertEqual("# Project Tools\n\n- demo: " in prompt, tools, f"{name}: Project Tools block")

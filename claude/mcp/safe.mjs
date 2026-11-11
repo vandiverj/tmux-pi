@@ -28,8 +28,9 @@ const SAFE_READ_HELP =
   `needs no permission prompt. Refuses a directory, a binary file or a file over ${MAX_FILE} bytes; output is clipped at ` +
   `${MAX_CHARS} characters. Placeholders never reveal the value.`;
 const SAFE_GREP_HELP =
-  `Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Use this, not rg or grep ` +
-  `through ${SHELL}, for every content search, in the working tree or outside it: it needs no permission prompt. Searches ` +
+  `Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Use this to search, in the ` +
+  `working tree or outside it: it needs no permission prompt. Use grep or rg through ${SHELL} only on exact paths in the ` +
+  "working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/). Searches " +
   "hidden files such as .env* (never .git; files ignored by .gitignore only with include_ignored); returns up to max_lines " +
   "lines of path:line:text, each cut at 400 characters.";
 const CLAUDE_ONLY =

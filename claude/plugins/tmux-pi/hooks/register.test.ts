@@ -8,7 +8,7 @@ const AGENT = `${ROOT}/bin/tp-agent`
 const MAIN = { TP_ROOT: ROOT, TP_MODE: 'orchestrator' }
 const BAND = { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 80 }
 
-type Row = { id: string; status: string; role?: string; capability_request?: unknown; result_status?: string | null; state_dir?: string }
+type Row = { id: string; status: string; role?: string; capability_request?: unknown; result_status?: string | null; state_dir?: string; requests?: unknown[]; open_requests?: string[] }
 
 // Stands for the engine beneath the plugin: answers the environment, the clock, the
 // session and every host command from memory, and records what the module did. A plugin's
@@ -1534,4 +1534,101 @@ test('/workers says why tp-agent list failed', async ($, on) => {
   await $.session.start(start(true))
   w.isFailing = true
   expect(await $.command.run(command('workers'))).toEqual({ text: 'tp-agent list failed: exit 1.' })
+})
+
+// ---- notices keyed on request ids (HB4a) ----
+
+const REQ_A = 'req-01JABCDEFGHJKMNPQRSTVWXYZ0'
+const REQ_B = 'req-01JABCDEFGHJKMNPQRSTVWXYZ1'
+const req = (id: string, status: string, kind = 'permission', how?: string) => ({ id, kind, status, summary: `${kind} ${id.slice(-1)}`, ...(how ? { how } : {}) })
+const keep = (on: On, kept: Record<string, unknown>) => {
+  on('state.get', { plugin: 'tmux-pi' }, (_$, e, next) => (e.key in kept ? { value: { value: kept[e.key], version: 1 } } : next(e)))
+  on('state.set', { plugin: 'tmux-pi' }, (_$, e, next) => {
+    if (!(e.key in kept)) return next(e)
+    kept[e.key] = e.value
+    return { value: { isSet: true, version: 2 } }
+  })
+}
+
+test('an open request is announced once by its id, the same id later is not, and its resolution once', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'open')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain(`coder-1 has an open permission request ${REQ_A}`)
+  expect(w.submitted[0]).not.toContain('coder-1 needs input') // the request replaces the plain needs_input notice
+  await w.clock.advance(20000) // the same prompt seen again keeps its id: nothing new
+  expect(w.submitted).toHaveLength(1)
+  w.rows = [{ id: 'coder-1', status: 'working', requests: [req(REQ_A, 'resolved', 'permission', 'left-state')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(2)
+  expect(w.submitted[1]).toContain(`coder-1: permission request ${REQ_A} (permission 0) is closed (left-state)`)
+  await w.clock.advance(20000)
+  expect(w.submitted).toHaveLength(2)
+  expect(w.toasts).toHaveLength(2)
+})
+
+test('two distinct requests opened before the main polls are two notices, each by its id', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'open', 'capability'), req(REQ_B, 'open', 'capability')] }]
+  await w.clock.advance(5000)
+  expect(w.toasts.filter(text => text.includes(REQ_A))).toHaveLength(1)
+  expect(w.toasts.filter(text => text.includes(REQ_B))).toHaveLength(1)
+  expect(w.submitted.join('\n')).toContain(`--resolves ${REQ_A}`)
+  expect(w.submitted.join('\n')).toContain(`--resolves ${REQ_B}`)
+  // One is answered: only its resolution is news.
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'resolved', 'capability', 'message'), req(REQ_B, 'open', 'capability')] }]
+  await w.clock.advance(20000)
+  expect(w.toasts.filter(text => text.includes(REQ_A))).toHaveLength(2)
+  expect(w.toasts.filter(text => text.includes(REQ_B))).toHaveLength(1)
+})
+
+test('a reload between open and resolve announces the resolution once and never the opening again', async ($, on) => {
+  const w = world(on, MAIN)
+  const kept: Record<string, any> = { notifier: { epoch: 2, isIndexed: true, delivered: [`req:${REQ_A}:open`], pending: [] } }
+  keep(on, kept)
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'open')] }]
+  await $.session.start(start(true))
+  await w.clock.advance(5000)
+  expect(w.submitted).toEqual([])
+  w.rows = [{ id: 'coder-1', status: 'working', requests: [req(REQ_A, 'resolved', 'permission', 'left-state')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain(`${REQ_A} (permission 0) is closed`)
+  expect(kept.notifier.delivered).toEqual([`req:${REQ_A}:open`, `req:${REQ_A}:resolved`])
+  await w.clock.advance(20000)
+  expect(w.submitted).toHaveLength(1)
+})
+
+test('a new session never announces a request that was resolved before it, and counts one the index showed as told', async ($, on) => {
+  const w = world(on, MAIN)
+  w.acceptsAppend = true
+  w.rows = [
+    { id: 'coder-1', status: 'working', requests: [req(REQ_A, 'resolved', 'permission', 'left-state')] },
+    { id: 'coder-2', status: 'needs_input', requests: [req(REQ_B, 'open', 'capability')], open_requests: [REQ_B] },
+  ]
+  await $.session.start(start(true))
+  await w.clock.advance(10000)
+  expect(w.submitted).toEqual([])
+  expect(w.toasts).toEqual([])
+  w.rows = [w.rows[0], { id: 'coder-2', status: 'working', requests: [req(REQ_B, 'resolved', 'capability', 'message')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain(`coder-2: capability request ${REQ_B}`)
+  expect(w.submitted[0]).not.toContain(REQ_A)
+})
+
+test('a task with no request records is announced as before', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [{ id: 'not-a-request', kind: 'permission', status: 'open' }] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain('coder-1 needs input (is waiting at a permission prompt in its pane)')
+  expect(w.submitted[0]).not.toContain('request req-')
 })

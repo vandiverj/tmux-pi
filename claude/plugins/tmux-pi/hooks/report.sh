@@ -254,6 +254,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
         { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) }
       elif $in.hook_event_name == "Notification" and active then
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
+      elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" }
       elif $in.hook_event_name == "Stop" and active then
         { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn }
       else {} end )
@@ -263,4 +264,17 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + { updated: $now }
 ' > "$state_tmp" 2>/dev/null && mv "$state_tmp" "$state"
 rm -f "$state_tmp"
+
+# Request identity (HB4a, docs/plans/det-prep/hub/interfaces.md section 4): entering `permission` opens (or finds, for the
+# same prompt seen again) a request record under requests/ with an id; leaving `permission` (a tool event, a new prompt, a
+# PermissionDenied, a Stop) resolves it with how `left-state`. lib/hub_records.py is the one writer; it runs only on those
+# transitions, so ordinary tool events start no extra process. A failure there never fails the hook.
+prev_state="$(jq -r '.state // empty' <<<"$prev" 2>/dev/null)"
+new_state="$(jq -r '.state // empty' "$state" 2>/dev/null)"
+if [[ "$prev_state" == permission || "$new_state" == permission || "$event" == PermissionDenied ]]; then
+  hub_py="$(dirname "$0")/../../../../lib/hub_records.py"
+  py=/usr/bin/python3; [[ -x "$py" ]] || py=python3
+  [[ -f "$hub_py" ]] && "$py" "$hub_py" claude-hook --task-dir "$TP_TASK_DIR" --prev-state "$prev_state" \
+    --new-state "$new_state" --prev-tool "$(jq -r '.tool // empty' <<<"$prev" 2>/dev/null)" <<<"$input" >/dev/null 2>&1
+fi
 exit 0

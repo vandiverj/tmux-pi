@@ -46,6 +46,13 @@ DONE = ("settled", "completed", "paused", "failed", "killed", "stopped", "escala
 # A dependency (--after) is met by an ended task, never a paused one: paused work is not finished,
 # whether or not its reply carries a RESULT_STATUS line.
 DEPENDENCY_DONE = tuple(s for s in DONE if s != "paused")
+# A pause is recorded only when it is confirmed (bin/tp-contract cmd_enforce): "pause-requested" is written before the
+# Escape, then "pause" when a check shows the worker stopped, else "pause-unverified". An unverified pause keeps the
+# dependency hold, is not shown as paused, and is tried again at most PAUSE_RETRIES more times, PAUSE_RETRY_SECONDS
+# apart (a contract may set pause_retries); a failed send therefore never loops every few seconds.
+PAUSE_RETRIES = 2
+PAUSE_RETRY_SECONDS = 60
+PAUSE_ATTEMPT_ACTIONS = ("pause", "pause-requested", "pause-unverified", "extend")
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),
            "useful": ("yes", "partly", "no")}
 THINKING_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
@@ -379,8 +386,39 @@ def evaluate(meta, state, art, now, alive, events=()):
                 "report saved with Status: {}".format(status) if saved else
                 "no partial report saved ({})".format("left at Status: {}".format(status) if status else
                                                       "file has no status line" if art["exists"] else "nothing written")))
+    if action and action[0] == "pause" and not pause_may_try(c, since_extend, now):
+        action = None  # tries used up, or the last unverified try is too recent: the hold stays, nothing is typed
     return {"elapsed": elapsed, "turns": turns, "tokens": tokens, "status": status, "phase": phase,
             "write_age": write_age, "over": over, "warnings": warnings, "action": action, "budget": b}
+
+
+def pause_tries(events):
+    """How many Escapes were requested since main's last "continue" (extend)."""
+    events = [e for e in events if isinstance(e, dict)]
+    extends = [i for i, e in enumerate(events) if e.get("action") == "extend"]
+    return sum(1 for e in events[extends[-1] + 1 if extends else 0:] if e.get("action") == "pause-requested")
+
+
+def pause_may_try(contract, events, now):
+    """May another Escape be typed now? At most 1 + pause_retries tries, PAUSE_RETRY_SECONDS apart."""
+    tries = pause_tries(events)
+    retries = contract.get("pause_retries", PAUSE_RETRIES) if isinstance(contract, dict) else PAUSE_RETRIES
+    if tries >= 1 + max(0, int(retries)):
+        return False
+    return tries == 0 or _since(events, "pause-requested", now) >= PAUSE_RETRY_SECONDS
+
+
+def pause_unconfirmed(state, events=()):
+    """Is an Escape requested but not confirmed, and not cleared since? The dependency hold stays then (the worker may
+    still be writing), though the task is not shown as paused. Cleared by main's extend, by a confirmed pause (which is
+    then the hold), or by the worker settling on its own (state waiting/error, reported after the last try)."""
+    state = state if isinstance(state, dict) else {}
+    events = [e for e in events if isinstance(e, dict)] if isinstance(events, (list, tuple)) else []
+    last = next((e for e in reversed(events) if e.get("action") in PAUSE_ATTEMPT_ACTIONS), None)
+    if not last or last["action"] not in ("pause-requested", "pause-unverified"):
+        return False
+    settled_at = _epoch(state.get("updated")) if state.get("state") in ("waiting", "error") else None
+    return not (settled_at and settled_at > (last.get("at") or 0))
 
 
 def _since(events, action, now):
@@ -456,13 +494,13 @@ def satisfies_dependency(life, state=None, events=(), reply=""):
     """May a task in lifecycle state `life` be the predecessor of a --after dependent? The one answer, used by
     tp-agent (queue admission) and tp-contract (slot).
 
-    Never when a pause is on record or the reply lacks a RESULT_STATUS line, whatever state is reported:
+    Never when a pause is on record, an Escape is not confirmed (pause_unconfirmed) or the reply lacks a RESULT_STATUS line, whatever state is reported:
     main's own markers (stopped, escalated) outrank the reported state but not this. Otherwise the ended
     states in DEPENDENCY_DONE satisfy it. A task with no reply at all (killed, failed) has nothing to be
     unstatused about and keeps satisfying."""
     if life not in DEPENDENCY_DONE:
         return False
-    if recorded_pause(state, events):
+    if recorded_pause(state, events) or pause_unconfirmed(state, events):
         return False
     reply = reply if isinstance(reply, str) else ""
     return not (reply.strip() and not RESULT_STATUS_RE.search(reply))

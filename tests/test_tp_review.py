@@ -25,7 +25,7 @@ PLAN = {"review": "required", "policy": "required",
 
 class TpReviewTests(unittest.TestCase):
     TEMPLATE_LIBS = ("safe_write.py", "review_verdict.py", "review_rounds.py", "sensitive_read.py", "command_wrappers.py", "redact.py", "redact_rules.py", "redaction_store.py",
-                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py", "trust_dialog.py", "pane_send.py")   # autonomy, owner_confirm, trust_dialog: the files contract.py's lifecycle and bin/tp-agent read; pane_send: bin/tp-agent imports it at load (MS1)
+                     "request_file.py", "lifecycle_files.py", "task_archive.py", "lanes.py", "lane_commands.py", "lane_lease.py", "lane_steps.py", "lane_remove.py", "lane_deps.py", "index_text.py", "failing_tests.py", "family_sweep.py", "result_status.py", "work.py", "work_commands.py", "work_find.py", "work_index.py", "work_checkpoint.py", "work_promote.py", "autonomy.py", "owner_confirm.py", "trust_dialog.py", "pane_send.py", "hub_records.py")   # autonomy, owner_confirm, trust_dialog: the files contract.py's lifecycle and bin/tp-agent read; pane_send: bin/tp-agent imports it at load (MS1)
     # tp-agent imports these inside the commands that route, escalate and pick context; tp-review's tests only run its pause classifier.
     NOT_COPIED_ON_PURPOSE = (("model_router", "bin/tp-agent"), ("router_catalog", "bin/tp-agent"), ("context_broker", "bin/tp-agent"))
 

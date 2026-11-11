@@ -4,7 +4,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
-import type { NotifierState, OtherRow, TaskRow, TaskSummary } from '../types'
+import type { NotifierState, OtherRow, RequestRef, TaskRow, TaskSummary } from '../types'
 
 const TP_AGENT_TIMEOUT_MS = 20000
 const POLL_MS = 5000
@@ -22,6 +22,12 @@ const UNREAD_EPOCH = 1e15
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 // tp-agent's MAIN_ID pattern.
 const MAIN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+// lib/hub_records.py REQUEST_ID: req- and a ULID.
+const REQUEST_ID = /^req-[0-9A-HJKMNP-TV-Z]{26}$/
+// Row statuses under which an open request is announced. An `input` request (a pi worker waiting) only while the row waits
+// for the main (paused, needs_input): a settled worker's reply is already announced as settled.
+const REQUEST_ROWS = new Set(['needs_input', 'paused', 'working', 'starting'])
+const INPUT_ROWS = new Set(['needs_input', 'paused'])
 
 // The one gate. Workers, headless runs, legacy mains and tp-claude-bootstrap load this
 // plugin too; every hook returns next(e) untouched while this is false.
@@ -142,6 +148,7 @@ async function readTasks($: EngineInterface): Promise<Read> {
       result_status: typeof row.result_status === 'string' ? row.result_status : null,
       ...(typeof row.state_dir === 'string' && row.state_dir.startsWith('/') ? { state_dir: row.state_dir } : {}),
       ...(typeof row.failing_tests === 'object' && row.failing_tests !== null ? { failing_tests: true as const } : {}),
+      ...requestRefs(row.requests),
     })
   }
   const left = Array.isArray(parsed?.other_main?.rows) ? parsed.other_main.rows : []
@@ -151,6 +158,19 @@ async function readTasks($: EngineInterface): Promise<Read> {
     others.push({ id: row.id, status: typeof row.status === 'string' ? row.status : '?', main: typeof row.main === 'string' ? row.main : '?' })
   }
   return { rows: found, other: others }
+}
+
+// A row's request records (bin/tp-agent record `requests`, lib/hub_records.py row_requests): only well-formed ones, and no key at
+// all for a task that has none, so its row is what it was before.
+function requestRefs(value: unknown): { requests?: RequestRef[] } {
+  if (!Array.isArray(value)) return {}
+  const refs: RequestRef[] = []
+  for (const item of value) {
+    const { id, kind, status, summary, how } = (item ?? {}) as Record<string, unknown>
+    if (typeof id !== 'string' || !REQUEST_ID.test(id) || typeof kind !== 'string' || typeof status !== 'string') continue
+    refs.push({ id, kind, status, summary: typeof summary === 'string' ? summary : '', ...(typeof how === 'string' ? { how } : {}) })
+  }
+  return refs.length === 0 ? {} : { requests: refs }
 }
 
 function summarize(rows: readonly TaskRow[]): TaskSummary {
@@ -201,6 +221,13 @@ function agent(row: TaskRow, verb: string): string {
 }
 
 function hint(row: TaskRow): string {
+  const notice = row.notice
+  if (notice !== undefined) {
+    const about = `${notice.kind} request ${notice.id}${notice.summary === '' ? '' : ` (${notice.summary})`}`
+    if (notice.state === 'resolved') return `${row.id}: ${about} is closed${notice.how === undefined ? '' : ` (${notice.how})`}`
+    const answer = notice.kind === 'permission' ? 'answer it in its pane' : `answer with ${agent(row, 'message')} --resolves ${notice.id} "..."`
+    return `${row.id} has an open ${about}: ${answer}, or ${agent(row, 'inspect')}`
+  }
   if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or ${agent(row, 'stop')}`
   if (row.status === 'settled') {
     return row.failing_tests === true
@@ -222,36 +249,75 @@ function hint(row: TaskRow): string {
 
 // The key a row is announced under, or undefined when it is not news: `id:status` for a notable status, and
 // `id:refused` for a queue entry tp-agent will not start (it keeps status queued, so the status alone cannot say).
+// A notice row made for one request (noticeRows) is keyed on the request id, `req:<id>:open` or `req:<id>:resolved`.
 function noticeKey(row: unknown): string | undefined {
-  const { id, status } = (row ?? {}) as Record<string, unknown>
+  const { id, status, notice } = (row ?? {}) as Record<string, unknown>
+  if (typeof notice === 'object' && notice !== null) {
+    const { id: req, state } = notice as Record<string, unknown>
+    return typeof req === 'string' && (state === 'open' || state === 'resolved') ? `req:${req}:${state}` : undefined
+  }
   if (typeof id !== 'string' || typeof status !== 'string') return undefined
   if (NOTABLE.has(status)) return `${id}:${status}`
   return isRefused(row) ? `${id}:refused` : undefined
 }
 
-// What the injected index already told the main is waiting wakes nobody.
+// What the injected index already told the main is waiting wakes nobody: its status, and each open request id it listed
+// (tp-agent index `open_requests`), whose resolution is then announced once.
 function baseline(rows: readonly unknown[]) {
   for (const row of rows) {
     const key = noticeKey(row)
     if (key !== undefined) delivered.add(key)
+    const opened = (row as { open_requests?: unknown } | null)?.open_requests
+    for (const req of Array.isArray(opened) ? opened : []) if (typeof req === 'string' && REQUEST_ID.test(req)) delivered.add(`req:${req}:open`)
   }
 }
 
-// The rows that entered a notable status since the last read and are not already waiting in `held` or `inFlight`. They are NOT
-// marked delivered here: only a submit that succeeded does that (wake). A key leaves `delivered` when its task leaves that
-// status, so a second permission prompt on the same task notifies again.
-function transitions(rows: readonly TaskRow[]): TaskRow[] {
-  const now = new Set(rows.map(noticeKey))
-  for (const key of delivered) if (!now.has(key)) delivered.delete(key)
+// The rows to announce, keyed by noticeKey. A task with request records gets one notice row per open request the main should
+// hear of, and one per request that closed after its opening was announced (`req:<id>:open` delivered): so a request is
+// announced once when it opens and once when it closes, and a closed request whose opening this main never heard of (a new
+// session) is not announced at all. Such a row's own needs_input/paused notice is left out while a request on it is
+// announced: the request says more. A task with no request records is announced as before.
+function noticeRows(rows: readonly TaskRow[]): TaskRow[] {
+  const out: TaskRow[] = []
+  for (const row of rows) {
+    const { requests, ...plainRow } = row
+    let isAsking = false
+    for (const req of requests ?? []) {
+      const base = { id: req.id, kind: req.kind, summary: req.summary, ...(req.how === undefined ? {} : { how: req.how }) }
+      if (req.status === 'open') {
+        if (!(req.kind === 'input' ? INPUT_ROWS : REQUEST_ROWS).has(row.status)) continue
+        isAsking = true
+        out.push({ ...plainRow, notice: { ...base, state: 'open' } })
+      } else if (delivered.has(`req:${req.id}:open`)) {
+        out.push({ ...plainRow, notice: { ...base, how: req.how ?? req.status, state: 'resolved' } })
+      }
+    }
+    if (!(isAsking && (row.status === 'needs_input' || row.status === 'paused'))) out.push(row)
+  }
+  return out
+}
+
+// The notices that are new since the last read and are not already waiting in `held` or `inFlight` (`fresh`), and the keys
+// that are current. They are NOT marked delivered here: only a submit that succeeded does that (wake). A status key leaves
+// `delivered` when its task leaves that status, so a second permission prompt on the same task notifies again; a request key
+// stays for as long as tp-agent lists that request id, so a closed request is never announced again, even after a reload.
+function transitions(rows: readonly TaskRow[]): { fresh: TaskRow[]; current: Set<string | undefined> } {
+  const listed = new Set(rows.flatMap(row => (row.requests ?? []).map(req => req.id)))
+  const notices = noticeRows(rows)
+  const current = new Set(notices.map(noticeKey))
+  for (const key of delivered) {
+    const isKept = key.startsWith('req:') ? listed.has(key.split(':')[1]) : current.has(key)
+    if (!isKept) delivered.delete(key)
+  }
   const waiting = new Set([...held, ...inFlight].map(noticeKey))
   const fresh: TaskRow[] = []
-  for (const row of rows) {
+  for (const row of notices) {
     const key = noticeKey(row)
     if (key === undefined || delivered.has(key) || waiting.has(key)) continue
     waiting.add(key)
     fresh.push(row)
   }
-  return fresh
+  return { fresh, current }
 }
 
 // The lines under the counts in the band: what the main would otherwise not learn. None while all is well.
@@ -387,9 +453,8 @@ async function poll($: EngineInterface) {
     }
     seenOther = now
     lastSummary = summarize(rows)
-    const fresh = transitions(rows)
+    const { fresh, current } = transitions(rows)
     // A row whose task left its status while waiting for a submit is no longer news.
-    const current = new Set(rows.map(noticeKey))
     held = [...held, ...fresh].filter(row => current.has(noticeKey(row)))
     // Nothing is waiting any more (the rows left that status): the warning about a main that could not be woken is over.
     if (held.length === 0 && inFlight.length === 0) {

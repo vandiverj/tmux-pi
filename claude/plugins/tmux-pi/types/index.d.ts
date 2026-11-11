@@ -10,7 +10,15 @@ export type TaskRow = {
   failing_tests?: true
   // Set for a task that lives in another session's state directory (tp-agent list --main).
   state_dir?: string
+  // HB4a request records of the task (tp-agent list `requests`, newest 20); absent for a task with none.
+  requests?: RequestRef[]
+  // Set on a notice row the notifier made for one request: announced under `req:<id>:open` / `req:<id>:resolved`.
+  notice?: RequestNotice
 }
+
+export type RequestRef = { id: string; kind: string; status: string; summary: string; how?: string }
+
+export type RequestNotice = { id: string; kind: string; state: 'open' | 'resolved'; summary: string; how?: string }
 
 export type TaskSummary = {
   active: number

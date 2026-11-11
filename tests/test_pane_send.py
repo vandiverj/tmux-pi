@@ -85,6 +85,17 @@ class PaneSendTests(unittest.TestCase):
         self.assertEqual([self.box_text(t) for t in self.server.submitted(log)], ["line one line two"])
         self.assertEqual(self.state()["promptSubmits"], 5)
 
+    def test_a_callers_delivery_id_is_the_one_typed_and_a_malformed_one_is_replaced(self):
+        # HB4a: tp-agent message makes the id first so it can record it; send() types that id, not a new one.
+        pane, log, raw = self.claude_worker()
+        mine = pane_send.new_token(len(pane_send.normalize(pane_send.flatten(TEXT))))
+        self.assertEqual(pane_send.send(pane, TEXT, task_dir=self.task, token=mine, **FAST)["submitted"], True)
+        self.assertEqual(self.ids_typed(raw), [mine])
+        pane, log, raw = self.claude_worker()
+        pane_send.send(pane, TEXT, task_dir=self.task, token="[tp:0000000000/1]", **FAST)  # wrong length for TEXT
+        [typed] = self.ids_typed(raw)
+        self.assertNotEqual(typed, "[tp:0000000000/1]")
+
     def test_never_confirmed_reports_false_after_every_enter_and_types_once(self):
         pane, log, raw = self.claude_worker("never")
         result = pane_send.send(pane, TEXT, task_dir=self.task, **FAST)

@@ -20,6 +20,10 @@ class ClaudePluginModuleTests(unittest.TestCase):
         commands = json.dumps(hooks["hooks"])
         self.assertIn("report.sh", commands)
         self.assertIn("sensitive-read.sh", commands)
+        # HB4a: a denied permission prompt reaches report.sh (it resolves the open permission request), before the others.
+        denied = [Path(h["command"].strip('"')).name for g in hooks["hooks"]["PermissionDenied"] for h in g["hooks"]]
+        self.assertEqual(denied[0], "report.sh")
+        self.assertEqual(denied.count("report.sh"), 1)
 
     def test_trust_guard_runs_first_and_only_before_tools(self):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]

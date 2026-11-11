@@ -599,6 +599,21 @@ class ContractTests(unittest.TestCase):
         self.assertIsNone(act(13, draft, [{"action": stall, "at": T0 + 660}]))
         self.assertEqual(act(14, draft, [{"action": stall, "at": T0 + 660}]), "pause")
 
+    def test_an_unconfirmed_pause_is_retried_a_bounded_number_of_times_and_never_every_few_seconds(self):
+        def act(minutes, events):
+            state = {"state": "working", "turns": 3, "toolErrors": 6}
+            r = evaluate(self.meta, state, self.art("draft", now=T0 + 300), T0 + minutes * 60, True, events)
+            return r["action"][0] if r["action"] else None
+
+        nudged = [{"action": "nudge-errors", "at": T0 + 480}]
+        tried = lambda at: [{"action": "pause-requested", "at": at}, {"action": "pause-unverified", "at": at}]
+        self.assertEqual(act(11, nudged), "pause")
+        self.assertIsNone(act(11, nudged + tried(T0 + 630)))  # 30 s after an unverified try: nothing is typed
+        self.assertEqual(act(11, nudged + tried(T0 + 600)), "pause")  # a minute later: one more try
+        three = nudged + tried(T0 + 480) + tried(T0 + 540) + tried(T0 + 600)
+        self.assertIsNone(act(12, three))  # 1 + PAUSE_RETRIES tries, then the hold stays and nothing more is typed
+        self.assertEqual(act(12, nudged + tried(T0 + 600) + [{"action": "pause", "at": T0 + 600, "tools": 0}]), "halted")
+
     def test_halted_and_one_extension(self):
         stop = {"action": "stop", "reason": "time budget used up", "at": T0 + 1200}
         waiting = {"state": "waiting", "turns": 20, "updated": iso(T0 + 1260)}
@@ -710,32 +725,102 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
         return match.group(1) if match else None
 
-    def enforce(self, send_fails):
+    def enforce(self, send_fails=False, pane="", after_escape=None):
+        """Enforce a pause with a fake tmux: capture-pane shows `pane`, an Escape fails (send_fails) or runs after_escape
+        (the worker's reaction: a new state.json). Returns the tmux calls."""
         from unittest import mock
         self.tool.write_record(self.task, lifecycle_state="working", force=True)
         self.assertEqual(self.recorded_state(), "working")
+        calls = []
 
         def run(command, *args, **kwargs):
-            if send_fails:
-                raise subprocess.CalledProcessError(1, command)
-            return subprocess.CompletedProcess(command, 0)
+            calls.append(command[1:])
+            if command[1] == "capture-pane":
+                return subprocess.CompletedProcess(command, 0, stdout=pane, stderr="")
+            if command[-1] == "Escape":
+                if send_fails:
+                    raise subprocess.CalledProcessError(1, command)
+                if after_escape:
+                    (self.task / "state.json").write_text(json.dumps(after_escape))
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
-        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state)}), \
+        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_PAUSE_CONFIRM_SECONDS": "1"}), \
                 mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
                 mock.patch.object(self.tool, "evaluate", return_value=decision), \
                 mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
                 mock.patch.object(self.tool.time, "sleep"):
             self.tool.cmd_enforce(None)
+        return calls
 
-    def test_a_pause_updates_the_record_with_no_pane_involved(self):
-        self.enforce(send_fails=False)
+    def actions(self):
+        return [e["action"] for e in json.loads((self.task / "checkpoints.json").read_text())["events"]]
+
+    def journal(self):
+        path = self.task / "events.jsonl"
+        return [json.loads(line)["kind"] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def held(self):
+        from contract import satisfies_dependency
+        _life, state, events, _reply = self.tool.task_lifecycle(self.task, "alive")
+        # Asked as if the task had ended with a good reply: only the pause record can hold it.
+        return not satisfies_dependency("settled", state, events, "RESULT_STATUS: complete")
+
+    def test_a_pause_is_recorded_when_the_escape_is_confirmed(self):
+        calls = self.enforce(pane="some output\n\u276f \n  ? for shortcuts\n")  # Claude's prompt, nothing at work
+        self.assertEqual(self.actions(), ["pause-requested", "pause"])
+        self.assertEqual(self.journal(), ["pause.requested", "pause.confirmed"])
         self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
         self.assertEqual(self.recorded_state(), "paused")
+        self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape", "C-u", "C-u", "C-u"])
+        self.assertTrue(self.held())
 
-    def test_a_pause_whose_escape_cannot_be_sent_still_updates_the_record(self):
+    def test_an_escape_the_worker_ignores_is_unverified_keeps_the_hold_and_is_not_shown_paused(self):
+        calls = self.enforce(pane="\u273b Working\u2026 (esc to interrupt)\n\u276f \n",
+                             after_escape={"state": "tool", "turns": 3, "tools": 5, "updated": "later"})
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
+        self.assertEqual(self.journal(), ["pause.requested", "pause.unverified", "hold.kept"])
+        self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "working")
+        self.assertEqual(self.recorded_state(), "working")
+        self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape"])  # nothing cleared: it was not stopped
+        self.assertTrue(self.held())
+
+    def test_a_pause_whose_escape_cannot_be_sent_is_unverified_and_recorded_once(self):
         self.enforce(send_fails=True)
-        self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "pause")
-        self.assertEqual(self.recorded_state(), "paused")
+        events = json.loads((self.task / "checkpoints.json").read_text())["events"]
+        self.assertEqual([e["action"] for e in events], ["pause-requested", "pause-unverified"])
+        self.assertEqual(events[-1]["why"], "Escape not sent")
+        self.assertEqual(self.recorded_state(), "working")
+        self.assertTrue(self.held())
+        # The next tick a few seconds later types nothing (lib/contract.py pause_may_try).
+        from contract import pause_may_try
+        self.assertFalse(pause_may_try({}, events, events[0]["at"] + 5))
+        self.assertTrue(pause_may_try({}, events, events[0]["at"] + 60))
+
+    def test_a_worker_that_finished_meanwhile_is_not_paused(self):
+        (self.task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 3, "tools": 4}))
+        calls = self.enforce(pane="\u276f \n")
+        self.assertFalse((self.task / "checkpoints.json").exists())
+        self.assertEqual(self.journal(), [])
+        self.assertEqual([c for c in calls if c[0] == "send-keys"], [])
+
+    def test_a_pi_pause_is_confirmed_by_its_reporter_not_by_the_pane(self):
+        meta = json.loads((self.task / "meta.json").read_text())
+        (self.task / "meta.json").write_text(json.dumps(dict(meta, worker="pi")))
+        self.enforce(pane="> \n")  # a prompt-looking pane is not enough for pi
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
+        (self.task / "checkpoints.json").unlink()
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        self.enforce(after_escape={"state": "waiting", "turns": 3, "tools": 4, "updated": "2026-01-01T00:00:00Z"})
+        self.assertEqual(self.actions(), ["pause-requested", "pause"])
+
+    def test_an_unconfirmed_pause_hold_ends_when_the_worker_settles_on_its_own(self):
+        from contract import satisfies_dependency
+        events = [{"action": "pause-requested", "at": T0}, {"action": "pause-unverified", "at": T0}]
+        reply = "Done.\nRESULT_STATUS: complete"
+        self.assertFalse(satisfies_dependency("settled", {"state": "working"}, events, reply))
+        self.assertFalse(satisfies_dependency("settled", {"state": "waiting", "updated": iso(T0 - 10)}, events, reply))
+        self.assertTrue(satisfies_dependency("settled", {"state": "waiting", "updated": iso(T0 + 10)}, events, reply))
+        self.assertTrue(satisfies_dependency("settled", {"state": "working"}, events + [{"action": "extend", "at": T0 + 1}], reply))
 
     def nudge(self, submit_recorded):
         """Enforce a reminder with a tmux that records keys. The task is a Claude one (meta.json worker), so it is confirmed

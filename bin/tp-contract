@@ -37,6 +37,7 @@ checkpoints.json.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,10 +45,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import hub_records  # noqa: E402
 import pane_send  # noqa: E402
 import safe_write  # noqa: E402
 from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
-                      escalation_record, extension, is_local, ledger_row, load_research, message, note,
+                      escalation_record, extension, is_local, ledger_row, load_research, message, note, pause_tries,
                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
                       write_escalations)
 from worker_process import end_or_refuse  # noqa: E402
@@ -232,6 +234,92 @@ def send(pane, text, task_dir=None):
     return pane_send.send(pane, text, task_dir=task_dir)
 
 
+PAUSE_CONFIRM_SECONDS = 5.0  # bounded wait after the Escape for the worker to show it stopped (TP_PAUSE_CONFIRM_SECONDS)
+PAUSE_POLL_SECONDS = 0.25
+# Claude's input prompt at the bottom of its pane, and the line it shows while it is still at work.
+CLAUDE_PROMPT = re.compile(r"^\s*[\u2502|]?\s*[>\u276f](\s|$)")
+CLAUDE_BUSY = "esc to interrupt"
+
+
+def journal(d, kind, confidence="exact", source="pane", **detail):
+    """One hub event (lib/hub_records.py); journalling never stops enforcement."""
+    try:
+        hub_records.event(d, kind, "main", source, confidence, detail=detail or None)
+    except Exception as error:  # noqa: BLE001 - the checkpoint is the record; the journal is a copy
+        print("tp-contract: event {} for {} not written: {}".format(kind, d.name, error), file=sys.stderr)
+
+
+def pane_tail(pane):
+    try:
+        return subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True, text=True).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def worker_stopped(d, meta, before):
+    """After an Escape: did the worker stop? pi: its reporter says waiting/error (agent_settled). Claude reports no Stop
+    on an interrupt, so: its pane shows the input prompt with no "esc to interrupt", and its state is not at work, or is
+    "working"/"tool" with the tool count and update time unchanged since the Escape. (confirmed, why)."""
+    state = read(d / "state.json")
+    now_state = state.get("state")
+    if now_state in ("waiting", "error"):
+        return True, "state {}".format(now_state)
+    if meta.get("worker") == "pi":
+        return False, "pi state still {}".format(now_state or "unknown")
+    lines = [line for line in pane_tail(meta["pane"]).splitlines() if line.strip()][-8:]
+    if any(CLAUDE_BUSY in line for line in lines):
+        return False, "pane still shows '{}'".format(CLAUDE_BUSY)
+    if not any(CLAUDE_PROMPT.match(line) for line in lines):
+        return False, "pane shows no input prompt"
+    moved = (state.get("tools") or 0) != (before.get("tools") or 0) or state.get("updated") != before.get("updated")
+    if now_state in ("working", "tool") and moved:
+        return False, "state moved after the Escape (tools {} -> {})".format(before.get("tools") or 0, state.get("tools") or 0)
+    return True, "prompt shown, state {}".format(now_state or "unknown")
+
+
+def pause_worker(d, meta, events, reason, now):
+    """Type an Escape and record a pause only when it is confirmed. "pause-requested" is saved before the Escape (so a
+    failed send is not retried every few seconds), then "pause" if worker_stopped says so within PAUSE_CONFIRM_SECONDS,
+    else "pause-unverified" (the dependency hold stays; the next tick may try again, lib/contract.py pause_may_try).
+    Returns the outcome: skipped (the worker finished meanwhile), confirmed or unverified."""
+    before = read(d / "state.json")
+    if before.get("state") not in ("working", "tool"):
+        return "skipped"
+    tries = pause_tries(events) + 1
+    events.append({"action": "pause-requested", "reason": reason, "at": now, "tools": before.get("tools") or 0, "try": tries})
+    save_events(d, events)
+    journal(d, "pause.requested", reason=reason, attempt=tries)
+    confirmed, why = False, "Escape not sent"
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "Escape"], check=True)
+        try:
+            wait = float(os.environ.get("TP_PAUSE_CONFIRM_SECONDS", PAUSE_CONFIRM_SECONDS))
+        except ValueError:
+            wait = PAUSE_CONFIRM_SECONDS
+        for _ in range(max(1, int(wait / PAUSE_POLL_SECONDS))):
+            time.sleep(PAUSE_POLL_SECONDS)
+            confirmed, why = worker_stopped(d, meta, before)
+            if confirmed:
+                break
+        if confirmed:
+            # An interrupted worker puts queued messages (our reminders) back in its input box;
+            # clear them so the user's next message is not appended to one.
+            for _ in range(3):
+                subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "C-u"], check=True)
+                time.sleep(0.1)
+    except subprocess.CalledProcessError:
+        pass  # confirmed stays as it was: an Escape that was not sent is unverified
+    if confirmed:
+        events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0})
+        journal(d, "pause.confirmed", source="pane" if meta.get("worker") != "pi" else "file", reason=reason, why=why)
+    else:
+        events.append({"action": "pause-unverified", "reason": reason, "at": now, "why": why, "try": tries})
+        journal(d, "pause.unverified", confidence="derived", reason=reason, why=why, attempt=tries)
+        journal(d, "hold.kept", confidence="derived", reason="pause not confirmed")
+    save_events(d, events)
+    return "confirmed" if confirmed else "unverified"
+
+
 def cmd_enforce(_args):
     root, pane_map, now = state_dir(), panes(), time.time()
     for d, meta in tasks(root):
@@ -251,10 +339,15 @@ def cmd_enforce(_args):
             continue
         action, reason = r["action"]
         text_ = message(action, contract)
-        # Record first, so a failed send is not retried every few seconds.
-        events.append(dict({"action": action, "reason": reason, "at": now},
-                           **({"tools": state.get("tools") or 0} if action == "pause" else {})))
-        save_events(d, events)
+        outcome = None
+        if action == "pause":  # recorded as a pause only when confirmed (pause_worker)
+            outcome = pause_worker(d, meta, events, reason, now)
+            if outcome == "skipped":
+                continue
+        else:
+            # Record first, so a failed send is not retried every few seconds.
+            events.append({"action": action, "reason": reason, "at": now})
+            save_events(d, events)
         # The event can change the state (a pause), so task.md is brought up to date here, before the send that may fail:
         # a failed send must not leave the record saying the old state. A failure here is said, and the action goes on.
         try:
@@ -262,16 +355,8 @@ def cmd_enforce(_args):
         except Exception as error:  # noqa: BLE001 - the checkpoint is already saved; report, never undo
             print("tp-contract: task.md of {} was not refreshed: {}".format(meta.get("id", d.name), error), file=sys.stderr)
         try:
-            if action == "halted":
-                pass  # main decides; nothing is typed
-            elif action == "pause":
-                subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "Escape"], check=True)
-                # An interrupted worker puts queued messages (our reminders) back in its input box;
-                # clear them so the user's next message is not appended to one.
-                time.sleep(1.5)
-                for _ in range(3):
-                    subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "C-u"], check=True)
-                    time.sleep(0.1)
+            if action in ("halted", "pause"):
+                pass  # halted: main decides, nothing is typed; pause: typed and checked above
             else:
                 sent = send(meta["pane"], text_, task_dir=d)
                 if not sent["submitted"]:
@@ -282,7 +367,8 @@ def cmd_enforce(_args):
         print(json.dumps({"id": meta.get("id", d.name), "action": action.split("@")[0], "reason": reason,
                           "trigger": trigger_for_event(action.split("@")[0], reason),
                           "kind": contract["kind"], "artifact": contract["artifact"], "status": r["status"],
-                          "extended": any(e["action"] == "extend" for e in events)}), flush=True)
+                          "extended": any(e["action"] == "extend" for e in events),
+                          **({"outcome": outcome} if outcome else {})}), flush=True)
 
 
 def cmd_extend(args):

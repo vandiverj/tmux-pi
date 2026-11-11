@@ -11,10 +11,16 @@
  * tools counts tool calls; toolErrors counts failed tool calls in a row (reset by a
  * success), which tp-contract reads to spot a worker that cannot reach its sources.
  * tp-spawn's run.sh records the process exit separately.
+ *
+ * A worker that settles waiting with a reply that has no RESULT_STATUS line waits for an answer: it opens (or finds) an
+ * `input` request under $TP_TASK_DIR/requests/ through lib/hub_records.py (pi-state), and the next start resolves it
+ * (left-state). That bookkeeping never breaks the worker.
  */
 
-import { readFileSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ensureDir, refuseLinks, taskStateRoot, writeFileAtomic } from "./lib/state-write.ts";
 
@@ -36,6 +42,9 @@ type State = {
 	error: string;
 	updated: string;
 };
+
+// lib/hub_records.py, the one writer of request records (TP_HUB_RECORDS_PY overrides it for a copy of this file in a test).
+const hubRecords = (): string => process.env.TP_HUB_RECORDS_PY || fileURLToPath(new URL("../../lib/hub_records.py", import.meta.url));
 
 // A short, single-line hint of what a tool is doing (path, command, pattern).
 function toolLabel(name: string, args: any): string {
@@ -133,6 +142,18 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	};
 
+	// The task's request records (lib/hub_records.py pi-state): only a worker's task dir has them, never main's. Nothing to resolve
+	// when the task has no requests/ yet, so a start costs no process then.
+	const requests = (state: string, textFile?: string) => {
+		if (!taskDir || dir !== taskDir) return;
+		if (state !== "waiting" && !existsSync(join(dir, "requests"))) return;
+		try {
+			execFileSync(existsSync("/usr/bin/python3") ? "/usr/bin/python3" : "python3",
+				[hubRecords(), "pi-state", "--task-dir", dir, "--state", state, ...(textFile ? ["--text-file", textFile] : [])],
+				{ stdio: "ignore", timeout: 5000 });
+		} catch {}
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		restore();
 		s.model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
@@ -149,6 +170,7 @@ export default function (pi: ExtensionAPI) {
 		// A link at tasks/ or the task dir would make this delete a file outside the state dir.
 		try { refuseLinks(root, dir); unlinkSync(join(dir, "result.md")); } catch {}
 		save();
+		requests("working");
 	});
 	pi.on("tool_execution_start", (event) => {
 		s.state = "tool";
@@ -194,10 +216,13 @@ export default function (pi: ExtensionAPI) {
 		s.state = s.error ? "error" : "waiting";
 		s.tool = "";
 		save();
+		let replied = false;
 		if (lastReply) {
 			try {
 				atomic("result.md", `${lastReply}\n`);
+				replied = true;
 			} catch {}
 		}
+		requests(s.state, replied ? join(dir, "result.md") : undefined);
 	});
 }

@@ -63,4 +63,32 @@ assert.equal(state().turns, 0);
 fs.writeFileSync(path.join(task, 'state.json'), JSON.stringify({ ...s, id: 'other' }));
 h = start(undefined);
 assert.equal(state().tokens.input, 0);
+
+// HB4a: a pi worker that settles waiting with a question (no RESULT_STATUS line) opens one input request through
+// lib/hub_records.py; the same reply seen again is the same id; its next start resolves it (left-state); a reply that
+// ends the task opens none.
+process.env.TP_HUB_RECORDS_PY = path.join(root, 'lib/hub_records.py');
+const said = (text) => ({ message: { role: 'assistant', content: [{ type: 'text', text }] } });
+const reqs = () => {
+  const d = path.join(task, 'requests');
+  return fs.existsSync(d) ? fs.readdirSync(d).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), 'utf8'))) : [];
+};
+h = start(undefined);
+h.agent_start();
+assert.equal(fs.existsSync(path.join(task, 'requests')), false); // nothing to resolve: no process, no directory
+h.message_end(said('Which of the two files should I change?'));
+h.agent_settled();
+assert.equal(reqs().length, 1);
+const [asked] = reqs();
+assert.match(asked.id, /^req-[0-9A-HJKMNP-TV-Z]{26}$/);
+assert.deepEqual([asked.kind, asked.status, asked.summary], ['input', 'open', 'Which of the two files should I change?']);
+h.agent_settled(); // the same reply again: the same request
+assert.deepEqual(reqs().map((r) => r.id), [asked.id]);
+h.agent_start();
+assert.deepEqual(reqs().map((r) => [r.id, r.status, r.resolution.how]), [[asked.id, 'resolved', 'left-state']]);
+h.message_end(said('Done.\nRESULT_STATUS: complete'));
+h.agent_settled();
+assert.deepEqual(reqs().map((r) => r.status), ['resolved']); // a finished task waits for nobody
+const kinds = fs.readFileSync(path.join(task, 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l).kind);
+assert.deepEqual(kinds, ['request.opened', 'request.resolved']);
 console.log('ok');

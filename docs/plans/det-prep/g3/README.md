@@ -80,18 +80,20 @@ claude-haiku-5-5 at low thinking for both coder tasks, and the reviewer tp-route
 
 The first coder task tells the worker to run exactly one Bash command first (`PROMPT_COMMAND` in the script):
 
-    : ./<a dotenv-shaped name> '$<a secret-shaped variable name>'; exit 3
+    test -e ./<a dotenv-shaped name>; : '$<a secret-shaped variable name>'; exit 3
 
 (both names are built from pieces in the script; they are `.env.g3-smoke-absent` and `G3_SMOKE_API_TOKEN`). It is harmless if the owner accepts it, by construction, whatever
-exists on disk or in the environment: it runs only the no-op builtin `:` and `exit 3`. `:` opens no file and prints nothing; its two operands are only text for the hooks to
-match (the variable is in single quotes, so the shell does not even expand it). Accepting it does nothing and exits 3. Other forms were tried and rejected: `cat ./<name> "$VAR"`
+exists on disk or in the environment: it runs only the builtins `test -e`, `:` and `exit 3`. `test -e` only checks that the name exists (it opens no file and prints nothing);
+`:` gets the variable name in single quotes, so the shell does not even expand it. Accepting it does nothing and exits 3. Under SG1 a worker's shell read of a sensitive name
+with no non-search cause is refused, not asked: the earlier trigger `: ./<name> '$<var>'; exit 3` is refused to a worker in every mode (Main is still asked). An existence check
+names the file without reading it (`NAMES_ONLY` in `lib/sensitive_read.py`), so the current trigger still asks a worker (SG1 round 13). Other forms were tried and rejected: `cat ./<name> "$VAR"`
 (opens a file, and prints a variable if one is set), and forms with only one of the two operands (they ask in some modes only).
 
 Which hook asks is decided by the redaction mode the worker runs in (`TP_REDACTION` env, else `config/local.json` `redaction.mode`, else `shadow`;
 `tp-spawn` does not set it, so the worker inherits Main's mode; Main's is `on`). All three modes ask, decided by code:
 - `on`: `bin/tp-redact --claude-hook` (`lib/redact_hook.py` `pre_decision`): a secret-variable reference (matched as text, quotes included) in a command it cannot wrap (the `exit`) is an `ask`;
   `handle` writes `permission-request.json` (`status: pending`, with `reason`, `target`, `call` = the tool_use_id) in `TP_TASK_DIR`. `bin/tp-sensitive-read` defers.
-- `shadow` and `off`: `bin/tp-sensitive-read --claude-hook --trusted` (`lib/sensitive_read.py` `classify`): the dotenv-shaped name inline in a command is an `ask`; it writes the same
+- `shadow` and `off`: `bin/tp-sensitive-read --claude-hook --trusted` (`lib/sensitive_read.py` `classify`): the dotenv-shaped name given to `test -e` is an `ask` with the non-search cause `NAMES_ONLY`, so a worker is asked, not refused; it writes the same
   request, `status: pending`. `lib/redact_hook.py` does not gate in these modes.
 - `bin/tp-trust-guard` lets the command through in every mode.
 
@@ -108,11 +110,11 @@ The live run also checks MS1's open note: that the hook's `prompt` for a typed (
 
 Proof (no model, no pane): `HookTriggerTest` in `tests/test_g3_e2e.py` builds the exact `PreToolUse` Bash event (and the `PermissionDenied` one) and calls the real entry points in
 this process, in each mode: `redact_hook.handle` and `bin/tp-sensitive-read`'s `main()` (with the arguments `hooks/sensitive-read.sh` passes) with `TP_REDACTION` set to `on`, `shadow`, `off`
-in turn. In each mode exactly the expected hook answers `ask`, the other defers, the request is `pending` with a reason and target, then `denied` after `PermissionDenied` (or `declined` after the next `UserPromptSubmit` or `Stop`, with its other fields kept), and the absent path stays absent.
+in turn. In each mode exactly the expected hook answers `ask`, the other defers, the request is `pending` with a reason and target, then `denied` after `PermissionDenied` (or `declined` after the next `UserPromptSubmit` or `Stop`, with its other fields kept), and the absent path stays absent. The same test shows the earlier trigger refused to a worker in each mode (`deny` naming the safe tools, a `refused` record that is not `needs_input` and that a turn leaves as it is) and still asked of Main.
 It also checks that `hooks.json` loads both hooks for every tool, that `redact.sh` is registered on `UserPromptSubmit`, `Stop` and `SubagentStop`, and that `tp-trust-guard` lets the event through. The test builds its strings from the script's constants; no shell command names a `.env*` path.
 
-Two more tests show the command is harmless when accepted (`HookTriggerTest`): `test_the_trigger_is_only_noop_builtins_with_operands` parses it with shlex and requires exactly the
-commands `:` (with the two operands) and `exit 3` joined by `;`, with no other operator, substitution or redirection; `test_accepting_the_trigger_is_harmless` creates, in Python under a temp directory,
+Two more tests show the command is harmless when accepted (`HookTriggerTest`): `test_the_trigger_is_only_harmless_builtins_with_operands` parses it with shlex and requires exactly the
+commands `test -e <name>`, `:` (with the variable name) and `exit 3` joined by `;`, with no other operator, substitution or redirection; `test_accepting_the_trigger_is_harmless` creates, in Python under a temp directory,
 the dotenv-shaped file with sentinel content and another sentinel file whose path is the value of the secret-shaped variable, runs the exact command under `bash -c` in that directory, and requires
 exit code 3, empty stdout and stderr, and neither sentinel (nor the path) anywhere in the output.
 

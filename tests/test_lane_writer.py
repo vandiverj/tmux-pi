@@ -14,18 +14,15 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lane_fixture import GIT_ENV, MODEL, ROOT, TmuxCase, git  # noqa: E402,F401  (GIT_ENV, git: other lane test files import them from here)
+import lane_template  # noqa: E402
 
 
 class LaneCase(TmuxCase):
     """A scratch repository (with the integration branch) beside the fixture's state directory. The repository is built once per
     class and copied for each test; the tmux server is the class's (TmuxCase.shared_server)."""
     shared_server = True
-    snapshot_lane = False  # True: `lane_ok()` with the default arguments restores the class's first real dispatch (see restore_lane)
-    _lane_snapshot = None
-
-    @property
-    def stable_root(self):  # a copied lane holds absolute paths (worktree .git file, lane.json), so it must come back to the same path
-        return self.snapshot_lane
+    snapshot_lane = False  # True: `lane_ok()` with the default arguments restores the class's real dispatch, made in setUpClass (see restore_lane)
+    _lane_snapshot = None  # (key, the dispatch's stdout, the saved root, the path that root was built at)
 
     @classmethod
     def setUpClass(cls):
@@ -45,6 +42,19 @@ class LaneCase(TmuxCase):
         (cls.template / ".tmux-pi/worker-preamble.md").write_text("PREAMBLE-OF-THE-MAIN-TREE\n")
         git(cls.template, "config", "core.excludesFile", "/dev/null")
         (cls.template / ".git/info/exclude").write_text(".tmux-pi/\n")
+        if cls.snapshot_lane:
+            cls.build_lane_template()
+
+    @classmethod
+    def build_lane_template(cls):
+        """The class's one real default dispatch, made once in a probe test's own root (the class's setUp, then `lane_ok()`):
+        lane_ok saves that root as the template every later default call of the class restores a copy of."""
+        probe = cls("runTest")
+        probe.setUp()
+        try:
+            probe.lane_ok()
+        finally:
+            probe.doCleanups()
 
     def setUp(self):
         super().setUp()
@@ -78,11 +88,18 @@ class LaneCase(TmuxCase):
         shutil.copytree(self.template, self.repo, symlinks=True)
 
     def restore_lane(self):
-        """Replace the root's content with the class's snapshot (the root right after its first real dispatch). Returns that dispatch's stdout."""
-        _, stdout, saved = self._lane_snapshot
+        """Replace the root's content with a copy of the class's snapshot (a root right after its real dispatch), made this test's
+        own: every path in it that named the root it was built at names this root (lane_template.copy_template, which fails if one
+        is left). Returns that dispatch's stdout, its paths rewritten the same way."""
+        _, stdout, saved, origin = self._lane_snapshot
         shutil.rmtree(self.root)
-        shutil.copytree(saved, self.root, symlinks=True)
-        return stdout
+        lane_template.copy_template(saved, origin, self.root)
+        return lane_template.rebase_text(stdout, origin, self.root)
+
+    def forget_snapshot(self):
+        """Drop the class's snapshot: the next default call dispatches for real and takes it again."""
+        type(self)._lane_snapshot = None
+        shutil.rmtree(self.class_root / "snapshot", ignore_errors=True)
 
     def lane_args(self, name="alpha", step="s1", role="coder", extra=("--repo", None, "--domain", "lib part", "--touches", "lib"), tests="none"):
         extra = [str(self.repo) if part is None else part for part in extra]
@@ -103,19 +120,21 @@ class LaneCase(TmuxCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         if key and not self._lane_snapshot:
             saved = self.class_root / "snapshot"
-            shutil.copytree(self.root, saved, symlinks=True)
-            type(self)._lane_snapshot = (key, run.stdout, saved)
+            lane_template.clone_tree(self.root, saved)
+            type(self)._lane_snapshot = (key, run.stdout, saved, self.root)
         return self.lane_item(run.stdout)
 
     def snapshot_key(self, snapshot=True, **kw):
         """What a snapshot is valid for: the default call (the arguments of a bare `lane_ok()`; `step="s1"` is that call) on this root's
-        tree (relative paths, modes, contents) and environment. None for any other call, and when the class has not opted in: those
-        are always real dispatches."""
+        tree (relative paths, modes, contents) and environment, each with this test's root written as `<root>` (every test has its
+        own). None for any other call, and when the class has not opted in: those are always real dispatches."""
         if not (snapshot and self.snapshot_lane) or self.lane_args(**kw) != self.lane_args():
             return None
         if (self.state / "live-window").exists():
             return None  # the dispatch started a real pane whose process the fixture ends with the test: a copy would hold a dead writer
-        return (self.fingerprint(), sorted(self.env.items()))
+        root = str(self.root)
+        return ([(path, mode, content.replace(root, "<root>")) for path, mode, content in self.fingerprint()],
+                sorted((name, value.replace(root, "<root>")) for name, value in self.env.items()))
 
     def lane_item(self, stdout):
         item = json.loads(stdout)
@@ -381,6 +400,8 @@ class RefusalTableTests(LaneCase):
 
 
 class NoWayAroundTheLaneTests(LaneCase):
+    snapshot_lane = True  # four of five tests start from the default dispatch (make_lane); setUpClass makes it once
+
     def make_lane(self):
         item, task = self.lane_ok()
         self.settle(task)
@@ -423,6 +444,8 @@ class NoWayAroundTheLaneTests(LaneCase):
 
 
 class RetryAndReviewTests(LaneCase):
+    snapshot_lane = True  # every test starts from the default dispatch; setUpClass makes it once
+
     def test_retry_carries_the_lane_and_step_from_the_prior_meta_and_runs_in_the_lane_tree(self):
         item, task = self.lane_ok()
         self.settle(task)
@@ -474,6 +497,8 @@ class RetryAndReviewTests(LaneCase):
 
 
 class TickTests(LaneCase):
+    snapshot_lane = True  # every test starts from the default dispatch; setUpClass makes it once
+
     def queued(self, ident, step):
         item = {"id": ident, "created": "2026-10-08T00:00:00Z", "role": "coder", "task": "t", "workdir": str(self.worktree),
                 "worker": "pi", "model": MODEL, "thinking": "medium", "route_info": {}, "deliverable": "", "parent": "", "after": [],
@@ -614,10 +639,6 @@ class LaneSnapshotTests(LaneCase):
         lease = self.lane_dir() / "lease.json"
         self.assertEqual(json.loads(lease.read_text())["holders"] if lease.exists() else [], [])
 
-    def forget_snapshot(self):
-        type(self)._lane_snapshot = None
-        shutil.rmtree(self.class_root / "snapshot", ignore_errors=True)
-
     def count_dispatches(self):
         """A list that gains one entry for each real dispatch this test makes."""
         counted = []
@@ -628,7 +649,7 @@ class LaneSnapshotTests(LaneCase):
     def test_the_snapshot_is_off_by_default_and_a_key_changes_with_the_tree_the_environment_and_the_arguments(self):
         self.assertFalse(LaneCase.snapshot_lane)
         self.assertFalse(DispatchIntoALaneTests.snapshot_lane)
-        self.assertFalse(DispatchIntoALaneTests.stable_root.fget(DispatchIntoALaneTests))
+        self.assertFalse(self.root.is_relative_to(self.class_root), "a snapshot class's test has its own root, not a shared path")
         key = self.snapshot_key()
         self.assertIsNotNone(key)
         self.assertIsNone(self.snapshot_key(snapshot=False))
@@ -697,6 +718,36 @@ class LaneSnapshotTests(LaneCase):
         self.assertEqual(len(counted), 5)
         self.assertIsNone(self._lane_snapshot)
 
+    def test_a_restored_lane_is_this_tests_own_and_no_copied_file_names_the_template(self):
+        self.forget_snapshot()
+        type(self).build_lane_template()  # as setUpClass makes it: a real dispatch in a probe test's own root, saved aside
+        _, _, saved, origin = self._lane_snapshot
+        self.assertNotEqual(origin, self.root)
+        counted = self.count_dispatches()
+        item, task = self.lane_ok()
+        self.assertEqual(counted, [], "a copy of the template, not a dispatch")
+        forms = [form.encode() for path in (origin, saved) for form in lane_template.path_forms(path)]
+        named, read = [], []
+        for folder, dirs, files in os.walk(self.root):
+            for name in dirs + files:
+                path = Path(folder) / name
+                if path.is_symlink():
+                    data = os.readlink(path).encode()
+                elif path.is_file():
+                    data = path.read_bytes()
+                else:
+                    continue
+                read.append(path)
+                if any(form in data for form in forms):
+                    named.append(str(path.relative_to(self.root)))
+        self.assertEqual(named, [], "copied files that still name the template's path")
+        self.assertIn(self.worktree / ".git", read)  # the files that held the template's path were read, and now name this root
+        self.assertEqual(Path(git(self.worktree, "rev-parse", "--absolute-git-dir")).parent.parent, self.repo / ".git")
+        self.assertIn(str(self.worktree), git(self.repo, "worktree", "list"))
+        self.expect_dispatched(item, task)
+        (self.worktree / "lib/x.py").write_text("changed in the copy\n")  # not an alias: the template keeps its own contents
+        self.assertEqual((saved / self.worktree.relative_to(self.root) / "lib/x.py").read_text(), "x\n")
+
 
 class LeaseShapedSnapshotTests(LaneCase):
     """A class like LeaseCase: its setUp adds a second session's folders under the root after LaneCase.setUp."""
@@ -707,6 +758,7 @@ class LeaseShapedSnapshotTests(LaneCase):
         (self.root / "session2" / ".tmux-pi" / "tasks").mkdir(parents=True)
 
     def test_the_second_dispatch_is_restored(self):
+        self.forget_snapshot()  # setUpClass made one; this test's first call must be the real one
         counted = []
         real = self.lane_dispatch
         self.lane_dispatch = lambda **kw: (counted.append(kw), real(**kw))[1]
@@ -723,6 +775,7 @@ class StepShapedSnapshotTests(LaneCase):
     snapshot_lane = True
 
     def test_the_second_dispatch_is_restored(self):
+        self.forget_snapshot()  # setUpClass made one; this test's first call must be the real one
         counted = []
         real = self.lane_dispatch
         self.lane_dispatch = lambda **kw: (counted.append(kw), real(**kw))[1]

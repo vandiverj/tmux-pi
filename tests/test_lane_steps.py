@@ -967,5 +967,312 @@ class OwnerOverrideTests(StepCase):
         self.assertEqual(self.record()["closed"], [])
 
 
+def finding(number, text, family=None, closes="code"):
+    return f"F{number} [defect] {text}.\n" + (f"Family: {family}\n" if family else "") + f"Closes by: {closes}\n"
+
+
+# the gate review: one code finding in family stale-cache; the check finding's family is not one a code change closes
+GATE = "REQUEST_CHANGES\n\n" + finding(1, "the cache is read stale", "stale-cache") + finding(2, "no log", "path-form", "check") + COVERAGE
+# the last round's review: the same family twice under the reviewer's own ids (F3, F7, not 1..n), a check finding between them,
+# and an "Owed before close" item that closes by check with no F<n> lead (the form this session's reviews use)
+LAST_FINDINGS = (finding(3, "another stale read", "stale-cache") + finding(4, "no log", None, "check")
+                 + finding(7, "a third stale read", "stale-cache"))
+OWED = "\n## Owed before close\n\n- **rerun log:** Main owes the log of the full run.\nCloses by: check\n"
+LAST = "REQUEST_CHANGES\n\n" + LAST_FINDINGS + OWED + COVERAGE
+NEW = finding(9, "a query is built from user text", "new-security")
+
+
+REFUSES = "refuses"  # an attack row whose review authorize-stop must refuse too
+NEW_FAMILY = ["stale-cache", "new-security"]  # an attack row whose review authorize-stop would show with this family list
+
+
+class StopRuleTests(StepCase):
+    """SR1: the owner authorizes a last round once (`lane authorize-stop`, typed-back code); Main closes under it with `lane close
+    --stop-rule --known-limits PATH` only when the tool proves the case. Driven in-process as OwnerOverrideTests drives the override:
+    the code is the CLI's (`confirm` is owner_confirm.confirm there, a recorder here)."""
+
+    def common(self):
+        return lane_steps.lane_commands._main_repo(str(self.repo))[0]
+
+    def authorize(self, step="s1", reason="families recur: merge with them as known limits"):
+        shown = []
+        record = lane_steps.authorize_stop(self.state, self.common(), "alpha", step, reason, shown.append)
+        return record, shown
+
+    def stop_close(self, path="docs/limits.md", **extra):
+        return lane_steps.close_step(self.state, self.common(), "alpha", "s1", known_limits=path, **extra)
+
+    def commit_main(self, rel, text):
+        (self.repo / rel).write_text(text)
+        git(self.repo, "add", rel)
+        git(self.repo, "commit", "-q", "-m", f"add {rel}")
+
+    def set_authorizations(self, auths):
+        common = self.common()
+        with lane_steps.lanes.lane_lock(common):
+            record = dict(lane_steps.lanes.read_lane(common, "alpha"))
+            record.pop("stop_authorizations", None)
+            if auths:
+                record["stop_authorizations"] = auths
+            lane_steps.lanes.write_lane(common, record)
+
+    def last_round(self):
+        """Round n asked for changes (the gate), the owner authorized, the gated retry committed its work and its review asked for
+        changes again in the authorized family; a known-limits file naming that review and F3, F7 is committed in the main repository."""
+        first, _ = self.writer()
+        self.edit(text="v1\n")
+        self.commit()
+        gate, _ = self.review(first, GATE)
+        record, shown = self.authorize()
+        retry, retry_task = self.writer()
+        meta = json.loads((retry_task / "meta.json").read_text())
+        meta.update(parent=first, gate="rule-first", gate_review=gate)  # what `tp-agent retry --route rule-first` records since RR1
+        (retry_task / "meta.json").write_text(json.dumps(meta))
+        self.edit(text="v2\n")
+        coming = f"review-fabricated{self.made + 1:02d}"  # the closing review's id, named by a known-limits file in the reviewed tree
+        (self.worktree / "docs").mkdir(exist_ok=True)
+        (self.worktree / "docs" / "lane-part.md").write_text(f"{coming}: F3\n")  # at the lane's HEAD only, and it misses F7
+        self.commit()
+        closing, closing_task = self.review(retry, LAST)
+        self.assertEqual(closing, coming)
+        self.commit_main("docs/limits.md", f"Known limits of s1 (review {closing}): F3 and F7 recur as stale-cache.\n")
+        return {"gate": gate, "retry": retry, "retry_task": retry_task, "closing": closing, "closing_task": closing_task,
+                "auth": record["stop_authorizations"][0], "shown": shown}
+
+    def test_authorize_binds_the_newest_changes_review_and_its_code_families_and_again_replaces_it(self):
+        first, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(first, CHANGES)  # older, no families
+        gate, _ = self.review(first, GATE)
+        record, shown = self.authorize()
+        auth = record["stop_authorizations"][0]
+        self.assertEqual({k: auth[k] for k in ("step", "gate_review", "families", "reason")},
+                         {"step": "s1", "gate_review": gate, "families": ["stale-cache"],
+                          "reason": "families recur: merge with them as known limits"})
+        self.assertRegex(auth["id"], r"^stop-[0-9a-f]{12}$")
+        for word in ("lane alpha", "step s1", gate, "Families: stale-cache", "Reason: families recur"):
+            self.assertIn(word, shown[0])
+        again, shown = self.authorize(reason="second thoughts")
+        self.assertEqual([(a["step"], a["reason"]) for a in again["stop_authorizations"]], [("s1", "second thoughts")])
+        self.assertNotEqual(again["stop_authorizations"][0]["id"], auth["id"])
+        self.assertIn(f"replaces the step's authorization {auth['id']}", shown[0])
+        self.assertEqual(self.record()["stop_authorizations"], again["stop_authorizations"])  # it survives the record's check on read
+        asked = []
+
+        def meanwhile(text):  # the held authorization leaves while the owner reads the code: what was shown is no longer true
+            asked.append(text)
+            self.set_authorizations([])
+        with self.assertRaisesRegex(ValueError, "changed while the owner confirmed .*held authorization stop-[0-9a-f]{12} -> None"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "third", meanwhile)
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("stop_authorizations", self.record())  # nothing written over the change
+
+    def test_authorize_refuses_a_step_with_no_changes_review_or_a_closed_one_before_asking(self):
+        author, _ = self.approved_and_committed()
+        refused = []
+        with self.assertRaisesRegex(ValueError, "has no review that asked for changes"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "x", refused.append)
+        self.closes()
+        with self.assertRaisesRegex(ValueError, "already closed"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "x", refused.append)
+        with self.assertRaisesRegex(ValueError, "needs a --reason"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "  ", refused.append)
+        self.assertEqual(refused, [])  # the owner is never asked for a refused authorization
+        self.assertNotIn("stop_authorizations", self.record())
+
+    def cli(self, *args, env=None):
+        return subprocess.run([str(ROOT / "bin/tp-agent"), "lane", *args, "--repo", str(self.repo)], env=env or self.env, text=True,
+                              capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_the_cli_asks_the_owner_at_a_terminal_and_pairs_the_flags(self):
+        """authorize-stop takes owner_confirm's refusals (an agent session, no terminal) after its own checks; lane close takes
+        --stop-rule only with --known-limits and never with --override-review. Each refusal writes nothing."""
+        first, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(first, GATE)
+        bare = {k: v for k, v in self.env.items() if k not in ("TP_TASK_ID", "TP_TASK_DIR", "TP_MODE")}
+        self.untouched(lambda: self.cli("authorize-stop", "alpha", "s1", "--reason", "x", env=bare), "must be a terminal")
+        self.untouched(lambda: self.cli("authorize-stop", "alpha", "s1", "--reason", "x", env={**bare, "TP_TASK_ID": "coder-0000000000"}),
+                       "TP_TASK_ID is set")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule", "--known-limits", "d.md", "--override-review", "--reason", "x"),
+                       "exclusive")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule"), "--stop-rule needs --known-limits")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--known-limits", "d.md"), "--known-limits goes only with --stop-rule")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule", "--known-limits", "d.md"), "(a): it has no authorization")
+
+    def test_the_close_attack_table(self):
+        """Every row is refused by name and changes nothing, except the last, which closes."""
+        case = self.last_round()
+        common, auth, closing = self.common(), case["auth"], case["closing_task"] / "result.md"
+        meta_path = case["retry_task"] / "meta.json"
+        meta = meta_path.read_text()
+
+        def rewrite(path, text):
+            old = path.read_text()
+            path.write_text(text)
+            return lambda: path.write_text(old)
+
+        def scratch(path):
+            path.write_text("F1 F3\n")
+            return path.unlink
+
+        def f7_then(owed):  # the last finding in a new family with no Closes by:, then `owed` before the Owed heading
+            return LAST.replace("a third stale read.\nFamily: stale-cache\nCloses by: code\n", f"a third stale read.\nFamily: new-security\n\n{owed}\n")
+
+        def another_review(text=None, life="settled"):  # a second review of the closed tree, newer than the closing one
+            _, task = self.review(case["retry"], text, life=life)
+            return lambda: shutil.rmtree(task)
+
+        rows = [
+            ("no authorization", lambda: self.set_authorizations([]) or (lambda: self.set_authorizations([auth])), {}, "(a): it has no authorization"),
+            ("authorization for another step", lambda: self.set_authorizations([dict(auth, step="s0")]) or (lambda: self.set_authorizations([auth])),
+             {}, "holds one for step(s) s0 only"),
+            ("review approved", lambda: rewrite(closing, APPROVED), {}, "nothing to override"),
+            ("tree changed after the review", lambda: scratch(self.worktree / "lib" / "late.py"), {}, "1 uncommitted path(s)"),
+            ("a second retry: another gate_review", lambda: rewrite(meta_path, meta.replace(case["gate"], "review-later")), {},
+             "(c): the closing review"),
+            ("a gated author with no gate_review", lambda: rewrite(meta_path, json.dumps({k: v for k, v in json.loads(meta).items() if k != "gate_review"})),
+             {}, "no gate_review"),
+            ("finding with a new family", lambda: rewrite(closing, LAST.replace("a third stale read.\nFamily: stale-cache", "a third stale read.\nFamily: path-form")),
+             {}, "(d): finding F7"),
+            # one reading decides a review for authorize and close alike (round 3): a code finding with no family beside an authorized one
+            ("code finding with no family", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n", "another stale read.\n")),
+             {}, "finding F3 (line 3) closes by code and names no Family:", REFUSES),
+            # a section ends at the next Markdown heading: the last finding never takes the Owed item's `Closes by: check` (review F1)
+            ("last code finding with no Closes by: above an Owed heading", lambda: rewrite(closing, LAST.replace(
+                "a third stale read.\nFamily: stale-cache\nCloses by: code\n", "a third stale read.\nFamily: new-security\n")),
+             {}, "finding F7 (line 8) has no Closes by: line", REFUSES),
+            # a bold lead paragraph ends a section too (Main, round 3): the owed item's `Closes by: check` below it is not F7's
+            ("last code finding with no Closes by: above a bold Owed paragraph", lambda: rewrite(closing, LAST.replace(
+                "a third stale read.\nFamily: stale-cache\nCloses by: code\n",
+                "a third stale read.\nFamily: new-security\n\n**Owed before close:** Main owes the log of the full run.\nCloses by: check\n")),
+             {}, "finding F7 (line 8) has no Closes by: line", REFUSES),
+            # round 4: after a lead, a heading, a thematic break or a `**`/`__` line that is not a label ends the section, and a label on
+            # it or after it is no finding's; a list item, a quote, fenced code or an indented line and their continuation lines stay in
+            # the section and never carry a label. The review's two cases (a bold list lead with its lazy `Closes by:` line; a label
+            # ending a bold paragraph), then a quote and its lazy line, a label inside fenced code, a label ending an indented line
+            *((f"last code finding with no Closes by: above {name}", lambda owed=owed: rewrite(closing, f7_then(owed)), {},
+               "finding F7 (line 8) has no Closes by: line", REFUSES) for name, owed in (
+                ("a bold list lead", "- **rerun log:** Main owes the log of the full run.\nCloses by: check"),
+                ("a bold paragraph ending in a label", "**Owed before close:** Main owes the log of the full run. Closes by: check"),
+                ("a quote", "> Main owes the log of the full run.\nCloses by: check"),
+                ("fenced code", "```text\nmain owes the log. Closes by: check\n```"),
+                ("an indented line", "    Main owes the log of the full run. Closes by: check"))),
+            # the second is a label line in a `__` wrap (round 4: a label line may be wrapped in `**` or `__`)
+            ("two Closes by: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\nCloses by: code\n",
+                                                                     "another stale read.\nFamily: stale-cache\nCloses by: code\n__Closes by:__ check\n")),
+             {}, "finding F3 (line 3) has 2 Closes by: lines", REFUSES),
+            ("two Family: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n",
+                                                                  "another stale read.\nFamily: stale-cache\nFamily: stale-cache\n")),
+             {}, "finding F3 (line 3) has 2 Family: lines", REFUSES),
+            # every review of the tree is read by the one function before any is left out (review F2): the older label reader calls
+            # this one check-only, and it holds a bold F9 code finding in a new family after its Verification heading
+            ("a second review: check finding, Verification, bold F9", lambda: another_review(
+                "REQUEST_CHANGES\n\n" + finding(4, "no log", None, "check") + "\n## Verification\nI ran the tests.\n\n"
+                "**F9 — a query is built from user text.**\nFamily: new-security\nCloses by: code\n" + COVERAGE),
+             {}, "(d): finding F9 of review-fabricated", ("newest", ["new-security"])),
+            ("a second review that ended failed", lambda: another_review(life="failed"), {}, "(it ended failed", REFUSES),
+            # the extraction is complete or refuses (round 2): the count reads the whole reply, the quoting splitter does not
+            ("new family after a Verification section", lambda: rewrite(closing, "REQUEST_CHANGES\n\n" + LAST_FINDINGS + "\n## Verification\n"
+                                                                         "I ran the tests.\n\n" + NEW + COVERAGE), {}, "(d): finding F9", NEW_FAMILY),
+            ("new family after Coverage", lambda: rewrite(closing, LAST + "\n" + NEW), {}, "(d): finding F9", NEW_FAMILY),
+            ("unclosed fence before a finding", lambda: rewrite(closing, "REQUEST_CHANGES\n\n" + LAST_FINDINGS.replace("F7 [", "```\nF7 [") + NEW
+                                                                 + COVERAGE), {}, "a fenced code block is never closed", REFUSES),
+            ("reason-only REQUEST_CHANGES: reason", lambda: rewrite(closing, CHANGES), {}, "no line starts a finding", REFUSES),
+            ("REQUEST_CHANGES with prose and no finding line", lambda: rewrite(closing, "REQUEST_CHANGES\n\nThe cache is read stale.\n" + COVERAGE),
+             {}, "no line starts a finding", REFUSES),
+            ("an unled code finding before the first counted one", lambda: rewrite(closing, "REQUEST_CHANGES: stale\n\nA query is built from "
+                                                                     "user text.\nFamily: new-security\nCloses by: code\n" + LAST_FINDINGS + COVERAGE), {},
+             "line 4 (Family: new-security) is outside every finding's section", REFUSES),
+            ("an unled code finding below a heading after the findings", lambda: rewrite(closing, LAST.replace(OWED, OWED + "\n## More\n\nAlso a "
+                                                                                 "query is built from user text.\nFamily: new-security\nCloses by: code\n")),
+             {}, "(Family: new-security) is outside every finding's section", REFUSES),
+            ("a counted finding with no Closes by:", lambda: rewrite(closing, LAST.replace("no log.\nCloses by: check\n", "no log.\n")), {},
+             "finding F4 (line 6) has no Closes by: line", REFUSES),
+            ("an unled code finding after a counted one", lambda: rewrite(closing, LAST.replace(OWED, "Also a query is built from user text.\n"
+                                                                          "Family: new-security\nCloses by: code\n")), {}, "finding F7 (line 8) has 2 Closes by: lines", REFUSES),
+            ("duplicate id", lambda: rewrite(closing, LAST.replace("F7 [defect]", "F3 [defect]")), {}, "two findings have the id F3", REFUSES),
+            ("known-limits file missing", lambda: None, {"path": "docs/none.md"}, "(e): docs/none.md is not a file committed"),
+            ("known-limits file uncommitted", lambda: scratch(self.repo / "docs" / "draft.md"), {"path": "docs/draft.md"}, "is not a file committed"),
+            ("known-limits file is a directory", lambda: None, {"path": "docs"}, "is not a file committed"),
+            ("known-limits misses F7", lambda: self.commit_main("docs/part.md", f"{case['closing']}: F3\n"), {"path": "docs/part.md"},
+             f"does not name F7 (a code finding of {case['closing']})"),
+            ("known-limits only at the lane's HEAD", lambda: None, {"path": "docs/lane-part.md"},
+             f"at the lane's HEAD it does not name F7 (a code finding of {case['closing']})"),
+            ("known-limits misses the review id", lambda: self.commit_main("docs/noid.md", "F3 F7\n"), {"path": "docs/noid.md"},
+             f"does not name {case['closing']}"),
+            ("known-limits names F70, not F7", lambda: self.commit_main("docs/f70.md", f"{case['closing']}: F3 F70\n"), {"path": "docs/f70.md"},
+             "does not name F7"),
+            ("known-limits names ordinals F1 F2, not the reviewer's F3 F7", lambda: self.commit_main("docs/ord.md", f"{case['closing']}: F1 F2\n"),
+             {"path": "docs/ord.md"}, "does not name F3 (a code finding of"),
+            ("known-limits outside both trees", lambda: None, {"path": str(self.root / "elsewhere.md")}, "is not inside"),
+            ("--stop-rule with --override-review", lambda: None, {"override_reason": "x"}, "exclusive"),
+        ]
+        # what starts a finding: the lead forms this session's reviews use count; their back-references (`F1: ...`, `F2's`) do not
+        for line, want in (("### F1 — defect, P1: x", "F1"), ("**F12 — note: x.**", "F12"), ("- **F4 — note; x:** y", "F4"),
+                           ("F1 **defect** x", "F1"), ("F2 — **defect x", "F2"), ("F3 (defect) — x", "F3"), ("__F8__ x", "F8"),
+                           ("F1: qualify the claim", None), ("- F2: provide the path", None), ("F1’s checks", None),
+                           ("F1 coverage acceptance", None), ("> **F1 — quoted**", None), ("    ### F1 code", None)):
+            self.assertEqual(lane_steps.finding_lead(line), want, line)
+        table = []
+        for name, arrange, kw, words, *authorize in rows:
+            with self.subTest(case=name):
+                undo = arrange()
+                before = self.snap()
+                try:
+                    with self.assertRaises(ValueError) as caught:
+                        self.stop_close(**kw)
+                    table.append((name, words, str(caught.exception)))
+                    self.assertIn(words, str(caught.exception))
+                    self.assertEqual(self.snap(), before, "a refusal changed something")
+                    if authorize == [REFUSES]:  # the owner is never shown a partial list: authorize reads the same extraction
+                        asked = []
+                        with self.assertRaises(ValueError) as refused:
+                            lane_steps.authorize_stop(self.state, common, "alpha", "s1", "x", asked.append)
+                        table.append((f"{name} (authorize)", words, str(refused.exception)))
+                        self.assertIn(words, str(refused.exception))
+                        self.assertIn("--override-review", str(refused.exception))
+                        self.assertEqual((asked, self.snap()), ([], before))
+                    elif authorize:  # a complete review: the plan the owner would confirm shows the new family
+                        gate, families = authorize[0] if isinstance(authorize[0], tuple) else (case["closing"], authorize[0])
+                        gate = f"review-fabricated{self.made:02d}" if gate == "newest" else gate
+                        plan = lane_steps.stop_plan(lane_steps.Session(self.state), self.record(), "s1")
+                        table.append((f"{name} (authorize plan)", (gate, families), (plan["gate_review"], plan["families"])))
+                        self.assertEqual((plan["gate_review"], plan["families"]), (gate, families))
+                finally:
+                    if undo:
+                        undo()
+        record = self.stop_close()
+        entry = record["closed"][0]
+        blob = git(self.repo, "rev-parse", "HEAD:docs/limits.md")
+        self.assertEqual({k: entry[k] for k in ("step", "review", "verdict", "override_reason")},
+                         {"step": "s1", "review": case["closing"], "verdict": "OWNER_OVERRIDE", "override_reason": auth["reason"]})
+        self.assertEqual(entry["stop_rule"], {"id": auth["id"], "authorized_at": auth["authorized_at"], "gate_review": case["gate"],
+                                              "families": ["stale-cache"], "known_limits": "docs/limits.md", "known_limits_blob": blob})
+        self.assertNotIn("stop_authorizations", self.record())  # used once: removed in the same write
+        self.assertEqual(self.record()["closed"][0], entry)
+        if os.environ.get("TP_STOP_RULE_TABLE"):  # the report's Case | Expected | Got table
+            Path(os.environ["TP_STOP_RULE_TABLE"]).write_text(json.dumps(table + [("authorized and every condition holds", "closes", entry["verdict"])], indent=1))
+
+    def test_an_approved_close_drops_a_held_authorization(self):
+        """An authorization ends with its step whatever closes it: a later approval closes normally and takes it out of the record."""
+        first, _ = self.writer()
+        self.edit(text="v1\n")
+        self.commit()
+        self.review(first, GATE)
+        self.authorize()
+        retry, _ = self.writer()
+        self.edit(text="v2\n")
+        self.commit()
+        self.review(retry, APPROVED)
+        with self.assertRaisesRegex(ValueError, "nothing to override"):
+            self.stop_close()
+        entry = self.closes()["closed"][0]
+        self.assertEqual(entry["verdict"], "APPROVED")
+        self.assertNotIn("stop_authorizations", self.record())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -122,24 +122,7 @@ def findings(text):
         review_verdict.normalise(text.strip())
     except ValueError:
         return []
-    raw = text.strip().replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").split("\n")
-    fence, outside = None, []  # per raw line: the line when it is outside fenced code, else None
-    for line in raw:
-        match = review_verdict.FENCE.match(line)
-        if fence is None:
-            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
-                fence = match.group(1)
-                outside.append(None)
-            else:
-                outside.append(line)
-        else:
-            outside.append(None)
-            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
-                fence = None
-    kept = [line for line in outside if line is not None]
-    clean = re.sub(r"<!--.*?-->", lambda m: "\n" * m.group().count("\n"), "\n".join(kept), flags=re.S).split("\n")
-    seen = iter(clean)
-    visible = [None if line is None else next(seen) for line in outside]
+    raw, visible = visible_lines(text)
     blocks, current, stop = [], [], len(raw)
     for index in range(1, len(raw)):  # line 0 is the verdict
         line, shown = raw[index], visible[index]
@@ -165,6 +148,31 @@ def findings(text):
         tokens, ambiguous = scan(block_text)
         out.append((block_text, [name.lower() for name in names], tokens, ambiguous))
     return out
+
+
+def visible_lines(text):
+    """(raw lines, visible): the reply's lines (stripped, CRLF and CR as LF, no BOM) and, per line, the line as the label readers see
+    it, or None for a line inside fenced code (an HTML comment's text is blanked; its lines stay). A fence never closed hides every
+    line after it: check review_verdict.normalise first when that matters."""
+    raw = text.strip().replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").split("\n")
+    fence, outside = None, []  # per raw line: the line when it is outside fenced code, else None
+    for line in raw:
+        match = review_verdict.FENCE.match(line)
+        if fence is None:
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
+                outside.append(None)
+            else:
+                outside.append(line)
+        else:
+            outside.append(None)
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
+                fence = None
+    kept = [line for line in outside if line is not None]
+    clean = re.sub(r"<!--.*?-->", lambda m: "\n" * m.group().count("\n"), "\n".join(kept), flags=re.S).split("\n")
+    seen = iter(clean)
+    visible = [None if line is None else next(seen) for line in outside]
+    return raw, visible
 
 
 class SweepTooLarge(ValueError):

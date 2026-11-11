@@ -234,6 +234,14 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     // sg1 round 8: a stdin shell's arguments (F1) and here-string text (F2) are data: no word after `-e` is skipped
     ["bash -s -- -e config/local.json <<< 'cat \"$2\"'", ASK_MAIN],
     ["python3 -c 'print(1)' <<< '-e config/local.json'", ASK_MAIN],
+    // sg1 round 9: shell source text is checked word by word (F1): a `set --` operand or an assignment value in a stdin
+    // shell's heredoc or here-string (round 8's wording: the route does not look into stdin text), or a -c line
+    ["bash -s <<'SH'\nset -- -e config/local.json\ncat \"$2\"\nSH", ASK_MAIN],
+    ["bash -s <<< 'set -- -e config/local.json ; cat \"$2\"'", ASK_MAIN],
+    ["bash -c 'set -- -e config/local.json ; cat \"$2\"'", /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
+    ["bash -s <<'SH'\nf=config/local.json\ncat \"$f\"\nSH", ASK_MAIN],
+    ["bash -s <<< 'f=config/local.json ; cat \"$f\"'", ASK_MAIN],
+    ["bash -c 'f=config/local.json ; cat \"$f\"'", /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;

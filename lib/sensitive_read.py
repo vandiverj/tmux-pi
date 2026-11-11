@@ -275,6 +275,8 @@ _INCLUDE_FILTERS = {"grep", "egrep", "fgrep", "ugrep", "ug"}
 _PRINTERS = {"echo", "printf"}
 _READ_VALUES = "dnNptuik"
 _PROCESS_SUB = re.compile(r"<\s*<\(")
+_INPUT_SUB = re.compile(r"<\(")  # any process substitution read as a file
+_SOURCE_SPLIT = re.compile(r"[\s;|&()<>`\"']+")  # blanks and shell operators inside one word of shell source
 # (options taking a value, short letters taking a value, options naming the pattern, their short letters)
 _GREP_ARGS = ({"-A", "-B", "-C", "-m", "-d", "-D", "--include", "--exclude", "--exclude-dir", "--exclude-from",
                "--max-count", "--after-context", "--before-context", "--context", "--label", "--binary-files",
@@ -2172,9 +2174,9 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         env = _before_program(cmd, prog, args)
         startup = _startup_hit(env, base)  # BASH_ENV=/ENV= naming a sensitive file: the shell sources it first
         at = _dash_c_at(args)
-        if at is not None:  # INLINE CODE: the line it runs is judged as any command line, its hit's cause as it is
+        if at is not None:  # INLINE CODE: the line it runs is judged as SHELL SOURCE (_commands_hit `source`)
             line = args[at]
-            hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
+            hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1, source=True)
             given = (startup or _words_hit(args[:at], base) or _words_hit(args[at + 1:], base) or _env_hit(env, base) or
                      _input_text_hit(cmd, base))
             # A sensitive name reaching the line another way (an operand, an option value such as `--rcfile .env`, an env
@@ -2185,9 +2187,11 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         # Every word alone: no shell option takes text, and the words after a script or `-s` are its data, so none is
         # skipped as an option's (`bash -s -- -e FILE <<EOF`, sg1 round 8).
         given = _words_hit(args, base) or (_env_hit(env, base) if form != _SCRIPT else None)
-        return _because(_runs_code(form), given)  # SCRIPT FILE; anything else: INLINE CODE, no cause
+        if given or form != _STDIN:
+            return _because(_runs_code(form), given)  # SCRIPT FILE; anything else: INLINE CODE, no cause
+        return _piped_source_hit(cmd, base, depth)  # code on stdin from a pipe: the text printed into it is SHELL SOURCE
     if prog == "eval":
-        return _shell_hit(" ".join(args), base, depth + 1)
+        return _shell_hit(" ".join(args), base, depth + 1, source=True)
     if prog in _INTERPRETERS:
         form, codes, rest = _code_run(prog, args, base)
         if form == _SCRIPT:  # options from the closed list take no text; the script's arguments are its data (sg1 round 8)
@@ -2199,6 +2203,51 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         return _because(None, given or _words_hit(rest, base) or literal or
                         _env_hit(_before_program(cmd, prog, args), base) or _input_text_hit(cmd, base))
     return _other_command_hit(prog, args, cmd, base, depth, bulk)
+
+
+def _piped_source_hit(cmd, base, depth):
+    """The hit in the SHELL SOURCE a pipeline prints into a shell reading code on stdin (`printf '%s\\n' LINE ... | bash -s`,
+    `echo LINE | sh`, `cat <<'SH' | bash`): the arguments of echo or printf, and the here-document and here-string text of
+    the pipeline's first command, judged as shell source (sg1 round 9). What any other program prints is not visible."""
+    first = cmd.get("first") if isinstance(cmd, dict) and cmd.get("piped") else None
+    if not isinstance(first, dict) or first is cmd:
+        return None
+    return _printed_source_hit(first, base, depth)
+
+
+def _printed_source_hit(first, base, depth):
+    """The hit in the text the command `first` prints for a shell to run: echo or printf arguments, here-document and
+    here-string text, each judged as SHELL SOURCE (sg1 round 9)."""
+    prog, args = _program(first["words"])
+    texts = (list(args) if prog in _PRINTERS else []) + list(first["strings"]) + [
+        "".join(holder) for holder, _ in first["heredocs"]]
+    return _first(_shell_hit(text, base, depth + 1, source=True) for text in texts if isinstance(text, str) and text)
+
+
+def _process_source_hit(body, base, depth):
+    """The hit in a process substitution a shell or `.`/`source` runs as a script (`bash <(echo LINE)`): when its one
+    command prints text (echo, printf, a here-document to cat), that text is SHELL SOURCE; any other body is judged as
+    shell source itself, so a name in it has no cause (sg1 round 9)."""
+    cmds = [c for c in _commands(body) if isinstance(c, dict)]
+    if len(cmds) == 1 and (_program(cmds[0]["words"])[0] in _PRINTERS or cmds[0]["heredocs"] or cmds[0]["strings"]):
+        printed = _printed_source_hit(cmds[0], base, depth)
+        return printed or _because(None, _shell_hit(body, base, depth + 1))
+    return _because(None, _shell_hit(body, base, depth + 1, source=True))
+
+
+def _source_words_hit(cmd, base):
+    """A sensitive name among the words of one command of SHELL SOURCE (sg1 round 9): its words (a `NAME=value` assignment's
+    value, the operands of set, export, local, declare, echo), here-strings and redirect targets, each looked at alone. A word
+    is also split at blanks and shell operators, so printed source in one word (`echo 'f=FILE; cat "$f"'`, `-c "$(echo
+    ...)"`) has its words looked at too."""
+    words = [w for w in cmd["words"] + cmd["strings"] + cmd["inputs"] + cmd["outputs"] if isinstance(w, str)]
+    return _words_hit(words + [piece for w in words for piece in _SOURCE_SPLIT.split(w) if piece and piece != w], base)
+
+
+def _reads_source(prog, args, base):
+    """Whether `prog args` runs SHELL SOURCE from its standard input or a process substitution: a shell, or `.`/`source`
+    reading /dev/stdin (sg1 round 9)."""
+    return prog in _SHELLS or (prog in (".", "source") and _code_run(prog, args, base)[0] == _STDIN)
 
 
 def _runs_code(form):
@@ -2471,6 +2520,8 @@ def _other_command_hit(prog, args, cmd, base, depth, bulk):
                 return hit
         hit = _first(_read_hit(word, base) for word in operands + values)
         script = _code_run(prog, args, base)[0] if prog in (".", "source") else None
+        if script == _STDIN and not hit:  # `... | source /dev/stdin`: what the pipe prints is SHELL SOURCE, its hit the
+            return _piped_source_hit(cmd, base, depth)  # cause of what that source runs, as for a shell (sg1 round 9)
         # `. FILE ARGS` / `source FILE ARGS`: SCRIPT FILE when _code_run shows FILE is a script; a sensitive FILE is not one.
         return _because(TRANSFORM if prog in _TRANSFORMS else _runs_code(script), hit)
     if prog in _LISTERS or prog in _SYNTAX:
@@ -2490,17 +2541,19 @@ def _other_command_hit(prog, args, cmd, base, depth, bulk):
 
 
 def _document_hit(prog, cmd, base, depth):
-    """Here-documents and here-strings: path literals always, commands when a shell receives them."""
+    """Here-documents and here-strings: path literals always, commands when a shell (or `.`/`source` of /dev/stdin) receives
+    them."""
+    shell = _reads_source(prog, _program(cmd["words"])[1], base)
     for holder, expands in cmd["heredocs"]:
         body = "".join(holder)
         subs = [_shell_hit(inner, base, depth + 1) for inner in _substitutions(body)] if expands else []
         hit = _literal_hit(body, base) or _first(subs)
-        if prog in _SHELLS:
+        if shell:  # a shell runs the body: SHELL SOURCE (_commands_hit `source`)
             if hit:
-                _prompts_now()  # a shell runs the body: the cause is that of what it runs, none when it runs nothing found
-                ran = _shell_hit(body, base, depth + 1)
+                _prompts_now()  # the cause is that of what it runs, none when it runs nothing found
+                ran = _shell_hit(body, base, depth + 1, source=True)
                 return _because(_cause(ran) if ran else None, hit)
-            hit = _shell_hit(body, base, depth + 1)
+            hit = _shell_hit(body, base, depth + 1, source=True)
             if hit:
                 return hit
             continue
@@ -2512,8 +2565,8 @@ def _document_hit(prog, cmd, base, depth):
             unsearched = all(_cause(sub) for sub in subs if sub)
             form = _code_run(prog, _program(cmd["words"])[1], base)[0] if prog in _INTERPRETERS else None
             return _because(_runs_code(form) if unsearched else None, hit)  # SCRIPT FILE; anything else: no cause
-    if prog in _SHELLS:
-        return _first(_shell_hit(text, base, depth + 1) for text in cmd["strings"])
+    if shell:
+        return _first(_shell_hit(text, base, depth + 1, source=True) for text in cmd["strings"])
     return None
 
 
@@ -2578,10 +2631,11 @@ def _keeps_state(prog, args, cmd):
     return prog in _QUIET
 
 
-def _shell_hit(command, base="", depth=0):
+def _shell_hit(command, base="", depth=0, source=False):
     """The first hit in a shell command line, or None. It has a non-search cause (_NonSearch) only when every hit in the line
     has one: a hit with none anywhere (`python3 -c ...; grep TOKEN config/`) takes it away, though the target stays the first
-    hit's, so the prompt reads as it did, and the line refuses in a worker (sg1)."""
+    hit's, so the prompt reads as it did, and the line refuses in a worker (sg1). `source`: the line is SHELL SOURCE another
+    shell runs (_commands_hit)."""
     inline = INLINE_NAME.search(command)
     if inline and not _only_printed(command):
         named = inline.group(0), _NAME_REASON
@@ -2592,13 +2646,13 @@ def _shell_hit(command, base="", depth=0):
         # The call prompts whatever that finds, so the owner's trust has nothing left to lift.
         _prompts_now()
         try:
-            found = _commands_hit(command, base, depth, named=True)
+            found = _commands_hit(command, base, depth, named=True, source=source)
         except Exception:  # what the name alone found stands, with no cause
             found = None
         return _because(_cause(found), named)
     if depth > 4:
         return "nested shell command", "command nesting is too deep to verify"
-    return _commands_hit(command, base, depth)
+    return _commands_hit(command, base, depth, source=source)
 
 
 def _prompts_now():
@@ -2607,12 +2661,19 @@ def _prompts_now():
     _SHELL.update(trust=None)
 
 
-def _commands_hit(command, base, depth, named=False):
+def _commands_hit(command, base, depth, named=False, source=False):
     """The first hit in the commands of a line, with a non-search cause only when every hit the look finds has one.
 
     `named`: the line names a sensitive file (_shell_hit). A command that names one where no look below finds a hit is a
     hit too, so the name is never left without a cause decided for it: one that only names or prints files (a lister, a
-    printer, cd, a loop's word list) has NAMES_ONLY; any other (`grep -f .env x`, whose pattern file no look reads) none."""
+    printer, cd, a loop's word list) has NAMES_ONLY; any other (`grep -f .env x`, whose pattern file no look reads) none.
+
+    `source`: the line is SHELL SOURCE another shell runs (a shell's -c line, eval, a here-document, here-string or pipe a
+    shell reads as code, under any wrapper). Every command is judged as above, and a command whose look finds no hit is then
+    checked word by word (_source_words_hit): a sensitive name in it (`set -- -e FILE`, `f=FILE`, `export F=FILE`,
+    `echo FILE`) may reach a later command through a variable no look follows, so it has no cause and refuses in a worker,
+    and so do names in command substitutions inside it (sg1 round 9). A look that finds a hit keeps its decision (round 6's
+    script file: `bash -c 'python3 tools/x.py FILE'`)."""
     # Directory context: `cd -` target, pushd stack, enclosing subshells, and open loops with the
     # hit their word list or their file-name producer would cause once a command reads the loop
     # variable (any command but a lister for a word list, a reader for a `while read` loop).
@@ -2648,8 +2709,14 @@ def _commands_hit(command, base, depth, named=False):
         seen = False
         prog, args = _program(cmd["words"])
         listed = None
+        if (prog in _SHELLS or prog in (".", "source")) and _code_run(prog, args, base)[0] != _SCRIPT:
+            # `bash <(echo LINE)`, `source <(printf ...)`: the process substitution's text is SHELL SOURCE (sg1 round 9)
+            for match in _INPUT_SUB.finditer(command):
+                body = command[match.end():_close_paren(command, match.end()) - 1]
+                if stop(_process_source_hit(body, base, depth)):  # the cause is what that source runs
+                    return _because(None, first)
         for inner in cmd["subs"]:
-            if stop(_shell_hit(inner, base, depth + 1)):
+            if stop(_shell_hit(inner, base, depth + 1, source=source)):
                 return _because(None, first)
             for item in _commands(inner) if any(pending for _, pending, _ in loops) else []:
                 name, rest = _program(item["words"]) if isinstance(item, dict) else (None, [])
@@ -2700,6 +2767,8 @@ def _commands_hit(command, base, depth, named=False):
                 return _because(None, first)
             if stop(_command_hit(prog, args, cmd, base, depth)):
                 return _because(None, first)
+        if source and not seen and stop(_because(None, _source_words_hit(cmd, base))):
+            return _because(None, first)  # SHELL SOURCE: a name no look accounts for has no cause (sg1 round 9)
         if named and not seen and any(INLINE_NAME.search(word) for word in cmd["words"] + cmd["inputs"]):
             # A name no look above accounts for. Only a command that names or prints files without opening them gives a
             # cause; any other (`grep -f .env README.md`: the pattern file is read) refuses in a worker.

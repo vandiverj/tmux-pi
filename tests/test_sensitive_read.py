@@ -202,6 +202,10 @@ MUST_PASS = [
     f"cd .. && grep -rn TODO {WORK.name}/tests",
     "(cd agent && ls) && grep -rn TODO lib",
     "bash -c 'grep -rn TODO tests/'",
+    # shell source naming only ordinary files: its words are checked and none is sensitive (sg1 round 9)
+    "bash -c 'set -- -e README.md; cat \"$2\"'", "bash -s <<'SH'\nf=README.md\ncat \"$f\"\nSH",
+    "printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -s", "bash -c 'export F=lib/x.py; echo \"$F\"'",
+    "source <(echo 'f=README.md; cat \"$f\"')", "echo 'cat README.md' | source /dev/stdin",
     "rg handler src",
     "rg -t py handler src",
     "rg --sort path handler src",
@@ -1004,7 +1008,14 @@ class SensitiveReadTableTests(unittest.TestCase):
                 (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", ask_main),
                 # sg1 round 8: a stdin shell's arguments (F1) and here-string or heredoc text (F2) are data, not options
                 (f"bash -s -- -e {LOCAL} <<< 'cat \"$2\"'", ask_main), (f"python3 -c 'print(1)' <<< '-e {LOCAL}'", ask_main),
-                (f"python3 -c 'print(1)' <<'EOF'\n-e {LOCAL}\nEOF", ask_main)]
+                (f"python3 -c 'print(1)' <<'EOF'\n-e {LOCAL}\nEOF", ask_main),
+                # sg1 round 9: shell source text is checked word by word (F1): a `set --` operand or an assignment value in a
+                # stdin shell's heredoc or here-string, or a -c line (was allowed in both). The route looks into a -c line
+                # only, so stdin text gets round 8's wording.
+                (f"bash -s <<'SH'\nset -- -e {LOCAL}\ncat \"$2\"\nSH", ask_main),
+                (f"bash -s <<< 'set -- -e {LOCAL} ; cat \"$2\"'", ask_main), (f"bash -c 'set -- -e {LOCAL} ; cat \"$2\"'", generic),
+                (f"bash -s <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH", ask_main), (f"bash -s <<< 'f={LOCAL} ; cat \"$f\"'", ask_main),
+                (f"bash -c 'f={LOCAL} ; cat \"$f\"'", generic)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1301,11 +1312,31 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"python3 -c 'x' <<< '-e {LOCAL}'", f"node -e 'x' <<'EOF'\nfirst\n-m {LOCAL}\nEOF", f"bash -c 'x' sh <<< '-e {LOCAL}'",
             # ... and startup env set before the program, through a wrapper and nested, still refuses (F3)
             f"env BASH_ENV={ENV} bash -c 'x'", f"find . -name x -exec env BASH_ENV={ENV} bash -c 'cat \"$1\"' sh {{}} \\;",
+            # sg1 round 9: shell source text is checked word by word, like any inline code: a `set --` operand, an assignment
+            # value, an export/local/declare value or an echo operand in a -c line, eval, a stdin shell's heredoc or
+            # here-string, or what echo, printf or a heredoc pipes into a stdin shell, and so under env, xargs, find -exec
+            f"bash -s <<'SH'\nset -- -e {LOCAL}\ncat \"$2\"\nSH", f"bash -s <<< 'set -- -e {LOCAL} ; cat \"$2\"'",
+            f"bash -c 'set -- -e {LOCAL} ; cat \"$2\"'", f"sh <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH", f"bash -c 'f={LOCAL}; cat \"$f\"'",
+            f"bash -c 'export F={LOCAL}; tools/x.sh'", f"bash -c 'f() {{ local g={LOCAL}; cat \"$g\"; }}; f'",
+            f"bash -c 'declare -r F={LOCAL}; cat \"$F\"'", f"bash -c 'echo {LOCAL}' | xargs cat", f"eval 'f={LOCAL}; cat \"$f\"'",
+            f"bash -c 'x=$(echo {LOCAL}); cat \"$x\"'", f"F={LOCAL} bash -c 'python3 tools/x.py'",
+            f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -s", f"echo 'set -- {LOCAL}; cat \"$1\"' | sh",
+            f"cat <<'SH' | bash\nf={LOCAL}\ncat \"$f\"\nSH", f"env bash -c 'set -- {LOCAL}; cat \"$1\"'",
+            f"printf x | xargs sh -c 'f={LOCAL}; cat \"$f\"'", f"find . -name x -exec bash -c 'set -- {LOCAL}; cat \"$1\"' \\;",
+            # ... and the other routes the round-9 sweep found: `.`/`source` of /dev/stdin, a process substitution run as
+            # the script, and source printed into a -c line by a command substitution
+            f"source /dev/stdin <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH", f". /dev/stdin <<< 'set -- {LOCAL}; cat \"$1\"'",
+            f"echo 'f={LOCAL}; cat \"$f\"' | source /dev/stdin", f"bash <(echo 'f={LOCAL}; cat \"$f\"')",
+            f"source <(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"')", f"bash -c \"$(echo 'f={LOCAL}; cat \"$f\"')\"",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),
             (f"bash -c 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE), (f". tools/x.sh {ENV}", sr.RUNS_CODE),
             (f"bash -lc 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE),  # a shell's -c line: the cause of what it runs
+            # sg1 round 9: in any shell source, a command a look finds a hit in keeps its decision (round 6's script file)
+            (f"bash -s <<'SH'\npython3 tools/x.py {LOCAL}\nSH", sr.RUNS_CODE), (f"echo 'bash tools/x.sh {LOCAL}' | sh", sr.RUNS_CODE),
+            (f"source /dev/stdin <<< 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE),
+            (f"bash <(echo 'python3 tools/x.py {LOCAL}')", sr.RUNS_CODE),
             (f"xargs python3 tools/x.py < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 tools/x.py {} \\;", sr.RUNS_CODE),
             (f"printf '%s\\n' {LOCAL} | xargs python3 tools/x.py", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node tools/x.js", sr.RUNS_CODE),
             (f"for f in {LOCAL}; do python3 tools/x.py $f; done", sr.RUNS_CODE),

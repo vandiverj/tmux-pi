@@ -973,9 +973,17 @@ def finding(number, text, family=None, closes="code"):
 
 # the gate review: one code finding in family stale-cache; the check finding's family is not one a code change closes
 GATE = "REQUEST_CHANGES\n\n" + finding(1, "the cache is read stale", "stale-cache") + finding(2, "no log", "path-form", "check") + COVERAGE
-# the last round's review: the same family twice (F1, F3) and a check finding between them
-LAST = ("REQUEST_CHANGES\n\n" + finding(1, "another stale read", "stale-cache") + finding(2, "no log", None, "check")
-        + finding(3, "a third stale read", "stale-cache") + COVERAGE)
+# the last round's review: the same family twice under the reviewer's own ids (F3, F7, not 1..n), a check finding between them,
+# and an "Owed before close" item that closes by check with no F<n> lead (the form this session's reviews use)
+LAST_FINDINGS = (finding(3, "another stale read", "stale-cache") + finding(4, "no log", None, "check")
+                 + finding(7, "a third stale read", "stale-cache"))
+OWED = "\n## Owed before close\n\n- **rerun log:** Main owes the log of the full run.\nCloses by: check\n"
+LAST = "REQUEST_CHANGES\n\n" + LAST_FINDINGS + OWED + COVERAGE
+NEW = finding(9, "a query is built from user text", "new-security")
+
+
+REFUSES = "refuses"  # an attack row whose review authorize-stop must refuse too
+NEW_FAMILY = ["stale-cache", "new-security"]  # an attack row whose review authorize-stop would show with this family list
 
 
 class StopRuleTests(StepCase):
@@ -1010,7 +1018,7 @@ class StopRuleTests(StepCase):
 
     def last_round(self):
         """Round n asked for changes (the gate), the owner authorized, the gated retry committed its work and its review asked for
-        changes again in the authorized family; a known-limits file naming that review and F1, F3 is committed in the main repository."""
+        changes again in the authorized family; a known-limits file naming that review and F3, F7 is committed in the main repository."""
         first, _ = self.writer()
         self.edit(text="v1\n")
         self.commit()
@@ -1021,9 +1029,13 @@ class StopRuleTests(StepCase):
         meta.update(parent=first, gate="rule-first", gate_review=gate)  # what `tp-agent retry --route rule-first` records since RR1
         (retry_task / "meta.json").write_text(json.dumps(meta))
         self.edit(text="v2\n")
+        coming = f"review-fabricated{self.made + 1:02d}"  # the closing review's id, named by a known-limits file in the reviewed tree
+        (self.worktree / "docs").mkdir(exist_ok=True)
+        (self.worktree / "docs" / "lane-part.md").write_text(f"{coming}: F3\n")  # at the lane's HEAD only, and it misses F7
         self.commit()
         closing, closing_task = self.review(retry, LAST)
-        self.commit_main("docs/limits.md", f"Known limits of s1 (review {closing}): F1 and F3 recur as stale-cache.\n")
+        self.assertEqual(closing, coming)
+        self.commit_main("docs/limits.md", f"Known limits of s1 (review {closing}): F3 and F7 recur as stale-cache.\n")
         return {"gate": gate, "retry": retry, "retry_task": retry_task, "closing": closing, "closing_task": closing_task,
                 "auth": record["stop_authorizations"][0], "shown": shown}
 
@@ -1046,6 +1058,15 @@ class StopRuleTests(StepCase):
         self.assertNotEqual(again["stop_authorizations"][0]["id"], auth["id"])
         self.assertIn(f"replaces the step's authorization {auth['id']}", shown[0])
         self.assertEqual(self.record()["stop_authorizations"], again["stop_authorizations"])  # it survives the record's check on read
+        asked = []
+
+        def meanwhile(text):  # the held authorization leaves while the owner reads the code: what was shown is no longer true
+            asked.append(text)
+            self.set_authorizations([])
+        with self.assertRaisesRegex(ValueError, "changed while the owner confirmed .*held authorization stop-[0-9a-f]{12} -> None"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "third", meanwhile)
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("stop_authorizations", self.record())  # nothing written over the change
 
     def test_authorize_refuses_a_step_with_no_changes_review_or_a_closed_one_before_asking(self):
         author, _ = self.approved_and_committed()
@@ -1108,23 +1129,50 @@ class StopRuleTests(StepCase):
             ("a gated author with no gate_review", lambda: rewrite(meta_path, json.dumps({k: v for k, v in json.loads(meta).items() if k != "gate_review"})),
              {}, "no gate_review"),
             ("finding with a new family", lambda: rewrite(closing, LAST.replace("a third stale read.\nFamily: stale-cache", "a third stale read.\nFamily: path-form")),
+             {}, "(d): finding F7"),
+            ("code finding with no family", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n", "another stale read.\n")),
              {}, "(d): finding F3"),
-            ("code finding with no family", lambda: rewrite(closing, LAST.replace("Family: stale-cache\nCloses by: code\nF2", "Closes by: code\nF2")),
-             {}, "(d): finding F1"),
+            # the extraction is complete or refuses (round 2): the count reads the whole reply, the quoting splitter does not
+            ("new family after a Verification section", lambda: rewrite(closing, "REQUEST_CHANGES\n\n" + LAST_FINDINGS + "\n## Verification\n"
+                                                                         "I ran the tests.\n\n" + NEW + COVERAGE), {}, "(d): finding F9", NEW_FAMILY),
+            ("new family after Coverage", lambda: rewrite(closing, LAST + "\n" + NEW), {}, "(d): finding F9", NEW_FAMILY),
+            ("unclosed fence before a finding", lambda: rewrite(closing, "REQUEST_CHANGES\n\n" + LAST_FINDINGS.replace("F7 [", "```\nF7 [") + NEW
+                                                                 + COVERAGE), {}, "a fenced code block is never closed", REFUSES),
+            ("reason-only REQUEST_CHANGES: reason", lambda: rewrite(closing, CHANGES), {}, "no line starts a finding", REFUSES),
+            ("REQUEST_CHANGES with prose and no finding line", lambda: rewrite(closing, "REQUEST_CHANGES\n\nThe cache is read stale.\n" + COVERAGE),
+             {}, "no line starts a finding", REFUSES),
+            ("an unled code finding before the first counted one", lambda: rewrite(closing, "REQUEST_CHANGES: stale\n\nA query is built from "
+                                                                     "user text.\nFamily: new-security\nCloses by: code\n" + LAST_FINDINGS + COVERAGE), {},
+             "before the first finding", REFUSES),
+            ("a counted finding with no Closes by:", lambda: rewrite(closing, LAST.replace("no log.\nCloses by: check\n", "no log.\n")), {},
+             "finding F4 (line 6) has no Closes by: line", REFUSES),
+            ("an unled code finding after a counted one", lambda: rewrite(closing, LAST.replace(OWED, "Also a query is built from user text.\n"
+                                                                          "Family: new-security\nCloses by: code\n")), {}, "after finding F7's own Closes by:", REFUSES),
+            ("duplicate id", lambda: rewrite(closing, LAST.replace("F7 [defect]", "F3 [defect]")), {}, "two findings have the id F3", REFUSES),
             ("known-limits file missing", lambda: None, {"path": "docs/none.md"}, "(e): docs/none.md is not a file committed"),
             ("known-limits file uncommitted", lambda: scratch(self.repo / "docs" / "draft.md"), {"path": "docs/draft.md"}, "is not a file committed"),
             ("known-limits file is a directory", lambda: None, {"path": "docs"}, "is not a file committed"),
-            ("known-limits misses F3", lambda: self.commit_main("docs/part.md", f"{case['closing']}: F1\n"), {"path": "docs/part.md"},
-             "does not name F3"),
-            ("known-limits misses the review id", lambda: self.commit_main("docs/noid.md", "F1 F3\n"), {"path": "docs/noid.md"},
+            ("known-limits misses F7", lambda: self.commit_main("docs/part.md", f"{case['closing']}: F3\n"), {"path": "docs/part.md"},
+             f"does not name F7 (a code finding of {case['closing']})"),
+            ("known-limits only at the lane's HEAD", lambda: None, {"path": "docs/lane-part.md"},
+             f"at the lane's HEAD it does not name F7 (a code finding of {case['closing']})"),
+            ("known-limits misses the review id", lambda: self.commit_main("docs/noid.md", "F3 F7\n"), {"path": "docs/noid.md"},
              f"does not name {case['closing']}"),
-            ("known-limits names F30, not F3", lambda: self.commit_main("docs/f30.md", f"{case['closing']}: F1 F30\n"), {"path": "docs/f30.md"},
-             "does not name F3"),
+            ("known-limits names F70, not F7", lambda: self.commit_main("docs/f70.md", f"{case['closing']}: F3 F70\n"), {"path": "docs/f70.md"},
+             "does not name F7"),
+            ("known-limits names ordinals F1 F2, not the reviewer's F3 F7", lambda: self.commit_main("docs/ord.md", f"{case['closing']}: F1 F2\n"),
+             {"path": "docs/ord.md"}, "does not name F3 (a code finding of"),
             ("known-limits outside both trees", lambda: None, {"path": str(self.root / "elsewhere.md")}, "is not inside"),
             ("--stop-rule with --override-review", lambda: None, {"override_reason": "x"}, "exclusive"),
         ]
+        # what starts a finding: the lead forms this session's reviews use count; their back-references (`F1: ...`, `F2's`) do not
+        for line, want in (("### F1 — defect, P1: x", "F1"), ("**F12 — note: x.**", "F12"), ("- **F4 — note; x:** y", "F4"),
+                           ("F1 **defect** x", "F1"), ("F2 — **defect x", "F2"), ("F3 (defect) — x", "F3"), ("__F8__ x", "F8"),
+                           ("F1: qualify the claim", None), ("- F2: provide the path", None), ("F1’s checks", None),
+                           ("F1 coverage acceptance", None), ("> **F1 — quoted**", None), ("    ### F1 code", None)):
+            self.assertEqual(lane_steps.finding_lead(line), want, line)
         table = []
-        for name, arrange, kw, words in rows:
+        for name, arrange, kw, words, *authorize in rows:
             with self.subTest(case=name):
                 undo = arrange()
                 before = self.snap()
@@ -1134,6 +1182,18 @@ class StopRuleTests(StepCase):
                     table.append((name, words, str(caught.exception)))
                     self.assertIn(words, str(caught.exception))
                     self.assertEqual(self.snap(), before, "a refusal changed something")
+                    if authorize == [REFUSES]:  # the owner is never shown a partial list: authorize reads the same extraction
+                        asked = []
+                        with self.assertRaises(ValueError) as refused:
+                            lane_steps.authorize_stop(self.state, common, "alpha", "s1", "x", asked.append)
+                        table.append((f"{name} (authorize)", words, str(refused.exception)))
+                        self.assertIn(words, str(refused.exception))
+                        self.assertIn("--override-review", str(refused.exception))
+                        self.assertEqual((asked, self.snap()), ([], before))
+                    elif authorize:  # a complete review: the plan the owner would confirm shows the new family
+                        plan = lane_steps.stop_plan(lane_steps.Session(self.state), self.record(), "s1")
+                        table.append((f"{name} (authorize plan)", authorize[0], plan["families"]))
+                        self.assertEqual((plan["gate_review"], plan["families"]), (case["closing"], authorize[0]))
                 finally:
                     if undo:
                         undo()
